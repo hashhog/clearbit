@@ -1115,3 +1115,494 @@ test "transaction weight computation" {
     // Non-segwit tx: base_size == total_size, so weight = base * 3 + total = 4 * size
     try std.testing.expectEqual(size * 4, weight);
 }
+
+// ============================================================================
+// Fee Estimator
+// ============================================================================
+
+/// Fee estimator that tracks transaction confirmation times to provide
+/// fee rate recommendations for desired confirmation targets.
+///
+/// The estimator works by:
+/// 1. Tracking when transactions enter the mempool and their fee rates
+/// 2. Recording when those transactions confirm and how many blocks it took
+/// 3. Grouping data into exponentially-spaced fee rate buckets
+/// 4. Computing success rates (what % confirmed within N blocks at fee rate X)
+/// 5. Recommending the lowest fee rate that achieves high success rate for target
+pub const FeeEstimator = struct {
+    /// Number of fee rate buckets.
+    pub const NUM_BUCKETS: usize = 48;
+
+    /// Each bucket is 10% wider than the previous.
+    pub const BUCKET_SPACING: f64 = 1.1;
+
+    /// Minimum fee rate (1 sat/vB).
+    pub const MIN_BUCKET_FEE: f64 = 1.0;
+
+    /// Maximum confirmation target (1 day = 144 blocks).
+    pub const MAX_CONFIRMATION_TARGET: usize = 144;
+
+    /// Minimum success rate required for estimation (85%).
+    pub const MIN_SUCCESS_RATE: f64 = 0.85;
+
+    /// Minimum data points needed per bucket for reliable estimates.
+    pub const MIN_DATA_POINTS: u32 = 10;
+
+    /// Tracked transaction info.
+    pub const TrackedTx = struct {
+        bucket: usize,
+        height: u32,
+    };
+
+    /// Confirmation data per bucket per target.
+    /// confirmed_counts[target][bucket] = number of txs confirmed within `target` blocks.
+    confirmed_counts: [MAX_CONFIRMATION_TARGET][NUM_BUCKETS]u32,
+
+    /// Total transactions seen per bucket.
+    total_counts: [NUM_BUCKETS]u32,
+
+    /// Bucket boundaries (fee rates in sat/vB).
+    bucket_bounds: [NUM_BUCKETS + 1]f64,
+
+    /// Tracked unconfirmed transactions: txid -> (bucket_index, block_entered).
+    tracked: std.AutoHashMap(types.Hash256, TrackedTx),
+
+    /// Current block height.
+    current_height: u32,
+
+    /// Decay factor: older data has less weight (~0.5 after 346 blocks, ~2.4 days).
+    decay: f64,
+
+    allocator: std.mem.Allocator,
+
+    /// Initialize a new fee estimator.
+    pub fn init(allocator: std.mem.Allocator) FeeEstimator {
+        var est = FeeEstimator{
+            .confirmed_counts = [_][NUM_BUCKETS]u32{[_]u32{0} ** NUM_BUCKETS} ** MAX_CONFIRMATION_TARGET,
+            .total_counts = [_]u32{0} ** NUM_BUCKETS,
+            .bucket_bounds = undefined,
+            .tracked = std.AutoHashMap(types.Hash256, TrackedTx).init(allocator),
+            .current_height = 0,
+            .decay = 0.998, // ~0.5 after 346 blocks (~2.4 days)
+            .allocator = allocator,
+        };
+
+        // Initialize exponentially spaced bucket boundaries
+        var boundary: f64 = MIN_BUCKET_FEE;
+        for (0..NUM_BUCKETS + 1) |i| {
+            est.bucket_bounds[i] = boundary;
+            boundary *= BUCKET_SPACING;
+        }
+
+        return est;
+    }
+
+    /// Deinitialize the fee estimator.
+    pub fn deinit(self: *FeeEstimator) void {
+        self.tracked.deinit();
+    }
+
+    /// Map a fee rate (sat/vB) to a bucket index.
+    pub fn feeToBucket(self: *const FeeEstimator, fee_rate: f64) usize {
+        for (0..NUM_BUCKETS) |i| {
+            if (fee_rate < self.bucket_bounds[i + 1]) return i;
+        }
+        return NUM_BUCKETS - 1; // Highest bucket
+    }
+
+    /// Record a transaction entering the mempool.
+    pub fn trackTransaction(self: *FeeEstimator, txid: types.Hash256, fee_rate: f64, height: u32) !void {
+        const bucket = self.feeToBucket(fee_rate);
+        try self.tracked.put(txid, .{ .bucket = bucket, .height = height });
+        self.total_counts[bucket] += 1;
+    }
+
+    /// Record a transaction being confirmed in a block.
+    pub fn confirmTransaction(self: *FeeEstimator, txid: types.Hash256, block_height: u32) void {
+        const entry = self.tracked.fetchRemove(txid);
+        if (entry) |kv| {
+            const blocks_to_confirm = block_height - kv.value.height;
+            if (blocks_to_confirm < MAX_CONFIRMATION_TARGET) {
+                // Record in all target buckets >= blocks_to_confirm
+                for (blocks_to_confirm..MAX_CONFIRMATION_TARGET) |target| {
+                    self.confirmed_counts[target][kv.value.bucket] += 1;
+                }
+            }
+        }
+    }
+
+    /// Process a new block: decay old data and update height.
+    pub fn processBlock(self: *FeeEstimator, height: u32) void {
+        self.current_height = height;
+
+        // Apply decay to all counters
+        for (0..MAX_CONFIRMATION_TARGET) |target| {
+            for (0..NUM_BUCKETS) |bucket| {
+                const count = @as(f64, @floatFromInt(self.confirmed_counts[target][bucket]));
+                self.confirmed_counts[target][bucket] = @intFromFloat(count * self.decay);
+            }
+        }
+        for (0..NUM_BUCKETS) |bucket| {
+            const count = @as(f64, @floatFromInt(self.total_counts[bucket]));
+            self.total_counts[bucket] = @intFromFloat(count * self.decay);
+        }
+    }
+
+    /// Estimate the fee rate needed for confirmation within `target` blocks.
+    /// Returns the fee rate in sat/vB, or null if insufficient data.
+    pub fn estimateFee(self: *const FeeEstimator, target: usize) ?f64 {
+        if (target == 0 or target >= MAX_CONFIRMATION_TARGET) return null;
+
+        // Find the lowest bucket where success rate >= 85%.
+        // Search from highest fee rate down to find the cheapest bucket
+        // that meets the target success rate.
+        var best_bucket: ?usize = null;
+
+        var bucket: usize = NUM_BUCKETS;
+        while (bucket > 0) {
+            bucket -= 1;
+            if (self.total_counts[bucket] < MIN_DATA_POINTS) continue;
+
+            const confirmed: f64 = @floatFromInt(self.confirmed_counts[target][bucket]);
+            const total: f64 = @floatFromInt(self.total_counts[bucket]);
+            const success_rate = confirmed / total;
+
+            if (success_rate >= MIN_SUCCESS_RATE) {
+                best_bucket = bucket;
+            } else if (best_bucket != null) {
+                // We've gone past the viable range
+                break;
+            }
+        }
+
+        if (best_bucket) |b| {
+            // Return the median of the bucket range
+            return (self.bucket_bounds[b] + self.bucket_bounds[b + 1]) / 2.0;
+        }
+
+        return null; // Insufficient data
+    }
+
+    /// Get fee estimates for common confirmation targets.
+    pub fn getEstimates(self: *const FeeEstimator) struct {
+        high_priority: ?f64, // 1-2 blocks
+        medium_priority: ?f64, // 6 blocks
+        low_priority: ?f64, // 12 blocks
+        economy: ?f64, // 24 blocks
+    } {
+        return .{
+            .high_priority = self.estimateFee(2),
+            .medium_priority = self.estimateFee(6),
+            .low_priority = self.estimateFee(12),
+            .economy = self.estimateFee(24),
+        };
+    }
+
+    /// Get the bucket boundary for a given index (for testing).
+    pub fn getBucketBound(self: *const FeeEstimator, index: usize) f64 {
+        if (index > NUM_BUCKETS) return self.bucket_bounds[NUM_BUCKETS];
+        return self.bucket_bounds[index];
+    }
+
+    /// Get the number of tracked (unconfirmed) transactions.
+    pub fn trackedCount(self: *const FeeEstimator) usize {
+        return self.tracked.count();
+    }
+};
+
+// ============================================================================
+// Fee Estimator Tests
+// ============================================================================
+
+test "FeeEstimator initialization with correct bucket boundaries" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    // First bucket starts at MIN_BUCKET_FEE (1.0)
+    try std.testing.expectEqual(@as(f64, 1.0), estimator.getBucketBound(0));
+
+    // Each subsequent boundary should be ~10% higher
+    const first = estimator.getBucketBound(0);
+    const second = estimator.getBucketBound(1);
+    const ratio = second / first;
+    try std.testing.expectApproxEqRel(@as(f64, 1.1), ratio, 0.001);
+
+    // Verify exponential spacing across all buckets
+    for (0..FeeEstimator.NUM_BUCKETS) |i| {
+        const lower = estimator.getBucketBound(i);
+        const upper = estimator.getBucketBound(i + 1);
+        try std.testing.expect(upper > lower);
+        const bucket_ratio = upper / lower;
+        try std.testing.expectApproxEqRel(@as(f64, 1.1), bucket_ratio, 0.001);
+    }
+
+    // Current height should be 0
+    try std.testing.expectEqual(@as(u32, 0), estimator.current_height);
+
+    // No tracked transactions
+    try std.testing.expectEqual(@as(usize, 0), estimator.trackedCount());
+
+    // All counts should be zero
+    for (0..FeeEstimator.NUM_BUCKETS) |i| {
+        try std.testing.expectEqual(@as(u32, 0), estimator.total_counts[i]);
+    }
+}
+
+test "track and confirm transaction updates counts" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    const txid = [_]u8{0xAA} ** 32;
+    const fee_rate: f64 = 5.0; // sat/vB
+    const enter_height: u32 = 100;
+
+    // Track the transaction
+    try estimator.trackTransaction(txid, fee_rate, enter_height);
+
+    // Verify it's tracked
+    try std.testing.expectEqual(@as(usize, 1), estimator.trackedCount());
+
+    // Find which bucket this fee rate falls into
+    const bucket = estimator.feeToBucket(fee_rate);
+
+    // Total count for that bucket should be 1
+    try std.testing.expectEqual(@as(u32, 1), estimator.total_counts[bucket]);
+
+    // Confirm the transaction 2 blocks later
+    const confirm_height: u32 = 102;
+    estimator.confirmTransaction(txid, confirm_height);
+
+    // Transaction should no longer be tracked
+    try std.testing.expectEqual(@as(usize, 0), estimator.trackedCount());
+
+    // Confirmed counts should be updated for targets >= 2
+    // blocks_to_confirm = 102 - 100 = 2
+    // So confirmed_counts[2][bucket], confirmed_counts[3][bucket], etc. should be 1
+    try std.testing.expectEqual(@as(u32, 1), estimator.confirmed_counts[2][bucket]);
+    try std.testing.expectEqual(@as(u32, 1), estimator.confirmed_counts[3][bucket]);
+    try std.testing.expectEqual(@as(u32, 1), estimator.confirmed_counts[10][bucket]);
+
+    // But not for targets < 2
+    try std.testing.expectEqual(@as(u32, 0), estimator.confirmed_counts[0][bucket]);
+    try std.testing.expectEqual(@as(u32, 0), estimator.confirmed_counts[1][bucket]);
+}
+
+test "fee estimation returns null with no data" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    // No transactions tracked, should return null
+    try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(2));
+    try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(6));
+    try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(12));
+
+    // Invalid targets should also return null
+    try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(0));
+    try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(FeeEstimator.MAX_CONFIRMATION_TARGET));
+    try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(FeeEstimator.MAX_CONFIRMATION_TARGET + 1));
+
+    // getEstimates should return all nulls
+    const estimates = estimator.getEstimates();
+    try std.testing.expectEqual(@as(?f64, null), estimates.high_priority);
+    try std.testing.expectEqual(@as(?f64, null), estimates.medium_priority);
+    try std.testing.expectEqual(@as(?f64, null), estimates.low_priority);
+    try std.testing.expectEqual(@as(?f64, null), estimates.economy);
+}
+
+test "fee estimation with sufficient data" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    // Simulate tracking and confirming many transactions at 10 sat/vB
+    // that all confirm within 2 blocks
+    const fee_rate: f64 = 10.0;
+    const enter_height: u32 = 100;
+
+    // Need at least MIN_DATA_POINTS (10) transactions for reliable estimate
+    var i: u32 = 0;
+    while (i < 15) : (i += 1) {
+        var txid: types.Hash256 = undefined;
+        txid[0] = @truncate(i);
+        txid[1] = @truncate(i >> 8);
+        for (2..32) |j| {
+            txid[j] = 0xBB;
+        }
+
+        try estimator.trackTransaction(txid, fee_rate, enter_height + i);
+        estimator.confirmTransaction(txid, enter_height + i + 1); // Confirm 1 block later
+    }
+
+    const bucket = estimator.feeToBucket(fee_rate);
+
+    // Should have 15 total transactions in this bucket
+    try std.testing.expectEqual(@as(u32, 15), estimator.total_counts[bucket]);
+
+    // All 15 should be confirmed within 1 block (and thus 2, 3, etc.)
+    try std.testing.expectEqual(@as(u32, 15), estimator.confirmed_counts[1][bucket]);
+    try std.testing.expectEqual(@as(u32, 15), estimator.confirmed_counts[2][bucket]);
+
+    // Now estimation should return a value for target=2
+    const estimate = estimator.estimateFee(2);
+    try std.testing.expect(estimate != null);
+
+    // The estimate should be somewhere around the fee rate we used
+    if (estimate) |est| {
+        // The bucket for 10 sat/vB should give us a median near 10
+        // Bucket bounds grow exponentially from 1.0 by 1.1x
+        // 10 sat/vB falls in bucket where bounds bracket 10
+        try std.testing.expect(est >= 5.0);
+        try std.testing.expect(est <= 20.0);
+    }
+}
+
+test "decay reduces old data over time" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    // Add some initial data
+    const txid = [_]u8{0xCC} ** 32;
+    const fee_rate: f64 = 5.0;
+    try estimator.trackTransaction(txid, fee_rate, 100);
+
+    const bucket = estimator.feeToBucket(fee_rate);
+    const initial_count = estimator.total_counts[bucket];
+    try std.testing.expectEqual(@as(u32, 1), initial_count);
+
+    // Process many blocks to trigger decay
+    // With decay = 0.998, after ~346 blocks we should have ~0.5x
+    // After just 1 block with count=1, decay won't show (1 * 0.998 = 0 when cast to int)
+    // Let's add more data first
+
+    // Add 1000 transactions
+    var i: u32 = 0;
+    while (i < 999) : (i += 1) {
+        var txid2: types.Hash256 = undefined;
+        txid2[0] = @truncate(i);
+        txid2[1] = @truncate(i >> 8);
+        txid2[2] = @truncate(i >> 16);
+        for (3..32) |j| {
+            txid2[j] = 0xDD;
+        }
+        try estimator.trackTransaction(txid2, fee_rate, 100 + i);
+    }
+
+    const count_after_adds = estimator.total_counts[bucket];
+    try std.testing.expectEqual(@as(u32, 1000), count_after_adds);
+
+    // Process several blocks with decay
+    var block: u32 = 0;
+    while (block < 100) : (block += 1) {
+        estimator.processBlock(200 + block);
+    }
+
+    // After 100 blocks with 0.998 decay: 1000 * 0.998^100 ≈ 818
+    const count_after_decay = estimator.total_counts[bucket];
+    try std.testing.expect(count_after_decay < count_after_adds);
+    try std.testing.expect(count_after_decay > 0);
+
+    // Should be roughly 818 (1000 * 0.998^100)
+    // Allow some tolerance
+    try std.testing.expect(count_after_decay >= 750);
+    try std.testing.expect(count_after_decay <= 900);
+}
+
+test "feeToBucket maps rates to correct buckets" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    // Fee rate of 1.0 should be in bucket 0 (1.0 <= x < 1.1)
+    try std.testing.expectEqual(@as(usize, 0), estimator.feeToBucket(1.0));
+    try std.testing.expectEqual(@as(usize, 0), estimator.feeToBucket(1.05));
+
+    // Fee rate of 1.1 should be in bucket 1 (1.1 <= x < 1.21)
+    try std.testing.expectEqual(@as(usize, 1), estimator.feeToBucket(1.1));
+    try std.testing.expectEqual(@as(usize, 1), estimator.feeToBucket(1.15));
+
+    // Very high fee rate should be in the last bucket
+    try std.testing.expectEqual(FeeEstimator.NUM_BUCKETS - 1, estimator.feeToBucket(10000.0));
+    try std.testing.expectEqual(FeeEstimator.NUM_BUCKETS - 1, estimator.feeToBucket(1000000.0));
+
+    // Very low fee rate (below minimum) should be in bucket 0
+    try std.testing.expectEqual(@as(usize, 0), estimator.feeToBucket(0.5));
+    try std.testing.expectEqual(@as(usize, 0), estimator.feeToBucket(0.1));
+
+    // Calculate expected bucket for fee_rate = 10
+    // bucket bounds: 1.0, 1.1, 1.21, 1.331, ...
+    // We need to find i where bounds[i] <= 10 < bounds[i+1]
+    // 1.1^n = 10 => n = log(10)/log(1.1) ≈ 24.2
+    // So bucket 24 should contain 10 sat/vB
+    const bucket_for_10 = estimator.feeToBucket(10.0);
+    const lower_bound = estimator.getBucketBound(bucket_for_10);
+    const upper_bound = estimator.getBucketBound(bucket_for_10 + 1);
+    try std.testing.expect(lower_bound <= 10.0);
+    try std.testing.expect(upper_bound > 10.0);
+}
+
+test "processBlock updates current height" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), estimator.current_height);
+
+    estimator.processBlock(100);
+    try std.testing.expectEqual(@as(u32, 100), estimator.current_height);
+
+    estimator.processBlock(200);
+    try std.testing.expectEqual(@as(u32, 200), estimator.current_height);
+}
+
+test "confirming unknown transaction is a no-op" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    // Try to confirm a transaction we never tracked
+    const unknown_txid = [_]u8{0xFF} ** 32;
+    estimator.confirmTransaction(unknown_txid, 100);
+
+    // Should not crash, counts should remain zero
+    for (0..FeeEstimator.NUM_BUCKETS) |i| {
+        try std.testing.expectEqual(@as(u32, 0), estimator.total_counts[i]);
+    }
+}
+
+test "confirmation beyond MAX_CONFIRMATION_TARGET is ignored" {
+    const allocator = std.testing.allocator;
+
+    var estimator = FeeEstimator.init(allocator);
+    defer estimator.deinit();
+
+    const txid = [_]u8{0xEE} ** 32;
+    const fee_rate: f64 = 5.0;
+    const enter_height: u32 = 100;
+
+    try estimator.trackTransaction(txid, fee_rate, enter_height);
+
+    // Confirm way later than MAX_CONFIRMATION_TARGET
+    const confirm_height = enter_height + @as(u32, FeeEstimator.MAX_CONFIRMATION_TARGET) + 50;
+    estimator.confirmTransaction(txid, confirm_height);
+
+    // Transaction should be removed from tracking
+    try std.testing.expectEqual(@as(usize, 0), estimator.trackedCount());
+
+    // But confirmed_counts should NOT be updated (blocks_to_confirm >= MAX_CONFIRMATION_TARGET)
+    const bucket = estimator.feeToBucket(fee_rate);
+    for (0..FeeEstimator.MAX_CONFIRMATION_TARGET) |target| {
+        try std.testing.expectEqual(@as(u32, 0), estimator.confirmed_counts[target][bucket]);
+    }
+}
