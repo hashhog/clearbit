@@ -227,7 +227,7 @@ pub fn readBlock(reader: *Reader, allocator: std.mem.Allocator) !types.Block {
     };
 }
 
-/// Write a transaction to the binary stream
+/// Write a transaction to the binary stream (full serialization with witness)
 pub fn writeTransaction(writer: *Writer, tx: *const types.Transaction) !void {
     try writer.writeInt(i32, tx.version);
 
@@ -265,6 +265,35 @@ pub fn writeTransaction(writer: *Writer, tx: *const types.Transaction) !void {
             }
         }
     }
+
+    try writer.writeInt(u32, tx.lock_time);
+}
+
+/// Write a transaction without witness data (for txid computation)
+pub fn writeTransactionNoWitness(writer: *Writer, tx: *const types.Transaction) !void {
+    try writer.writeInt(i32, tx.version);
+
+    // No segwit marker/flag for non-witness serialization
+
+    // Write inputs
+    try writer.writeCompactSize(tx.inputs.len);
+    for (tx.inputs) |input| {
+        try writer.writeBytes(&input.previous_output.hash);
+        try writer.writeInt(u32, input.previous_output.index);
+        try writer.writeCompactSize(input.script_sig.len);
+        try writer.writeBytes(input.script_sig);
+        try writer.writeInt(u32, input.sequence);
+    }
+
+    // Write outputs
+    try writer.writeCompactSize(tx.outputs.len);
+    for (tx.outputs) |output| {
+        try writer.writeInt(i64, output.value);
+        try writer.writeCompactSize(output.script_pubkey.len);
+        try writer.writeBytes(output.script_pubkey);
+    }
+
+    // No witness data
 
     try writer.writeInt(u32, tx.lock_time);
 }
