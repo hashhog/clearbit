@@ -5,6 +5,7 @@ pub const crypto = @import("crypto.zig");
 pub const serialize = @import("serialize.zig");
 pub const address = @import("address.zig");
 pub const script = @import("script.zig");
+pub const storage = @import("storage.zig");
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -17,4 +18,5 @@ test {
     _ = serialize;
     _ = address;
     _ = script;
+    _ = storage;
 }
