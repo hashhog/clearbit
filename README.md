@@ -26,7 +26,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Peer connections (TCP, version/verack handshake, ping/pong)
 - [x] Peer manager and discovery (DNS seeds, addr relay, connection pool)
 - [x] Header synchronization (getheaders/headers, block locator, chain work)
-- [ ] Full block download
+- [x] Block download and IBD (parallel downloads, UTXO updates, timeout handling)
 - [ ] Mempool
 - [ ] RPC interface
 
@@ -58,7 +58,7 @@ src/
   validation.zig     # block and transaction validation
   p2p.zig            # P2P protocol message serialization
   peer.zig           # TCP peer connections and handshake
-  sync.zig           # header synchronization and chain sync
+  sync.zig           # header sync, block download, and IBD
 ```
 
 ## Running tests
