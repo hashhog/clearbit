@@ -108,7 +108,7 @@ pub const Peer = struct {
             return PeerError.ConnectionFailed;
 
         // Set socket options for timeouts (30 seconds)
-        const timeout = std.posix.timeval{ .tv_sec = 30, .tv_usec = 0 };
+        const timeout = std.posix.timeval{ .sec = 30, .usec = 0 };
         std.posix.setsockopt(
             stream.handle,
             std.posix.SOL.SOCKET,
