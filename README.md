@@ -34,29 +34,29 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness commitment)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, mining support)
 - [x] Wallet (key generation, P2PKH/P2WPKH/P2TR addresses, coin selection, tx signing)
+- [x] CLI and application entry point (argument parsing, config files, signal handling)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
 
 ```bash
 zig build              # build the node
-zig build run          # run the node
-zig build test         # run tests
+./zig-out/bin/clearbit --help     # show usage
+./zig-out/bin/clearbit --version  # show version
+./zig-out/bin/clearbit --regtest  # run on regtest
 
 # With RocksDB support (requires librocksdb-dev):
 zig build -Drocksdb=true test
-zig build -Drocksdb=true test-rocksdb
 
 # With wallet/secp256k1 support (requires libsecp256k1-dev):
 zig build -Dsecp256k1=true test
-zig build -Dsecp256k1=true test-wallet
 ```
 
 ## Project structure
 
 ```
 src/
-  main.zig           # entry point and module exports
+  main.zig           # CLI entry point, config, signal handling
   types.zig          # core bitcoin types
   serialize.zig      # binary serialization
   crypto.zig         # hash functions, merkle trees, sighash
@@ -64,7 +64,6 @@ src/
   script.zig         # script interpreter and opcodes
   consensus.zig      # consensus rules, network params, difficulty
   storage.zig        # RocksDB storage layer, UTXO set, chain state
-  storage_rocksdb.zig  # RocksDB C bindings (when linked)
   validation.zig     # block and transaction validation
   p2p.zig            # P2P protocol message serialization
   peer.zig           # TCP peer connections and handshake
