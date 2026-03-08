@@ -6,6 +6,8 @@ pub const serialize = @import("serialize.zig");
 pub const address = @import("address.zig");
 pub const script = @import("script.zig");
 pub const storage = @import("storage.zig");
+pub const consensus = @import("consensus.zig");
+pub const validation = @import("validation.zig");
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -19,4 +21,6 @@ test {
     _ = address;
     _ = script;
     _ = storage;
+    _ = consensus;
+    _ = validation;
 }
