@@ -23,7 +23,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] RocksDB storage layer (blocks, UTXOs, chain state)
 - [x] Block and transaction validation (BIP-34, BIP-141 segwit)
 - [x] P2P message serialization (version, inv, headers, blocks)
-- [ ] P2P networking (TCP connections, peer management)
+- [x] Peer connections (TCP, version/verack handshake, ping/pong)
+- [ ] Block download and chain sync
 - [ ] Mempool
 - [ ] RPC interface
 
@@ -54,6 +55,7 @@ src/
   storage_rocksdb.zig  # RocksDB C bindings (when linked)
   validation.zig     # block and transaction validation
   p2p.zig            # P2P protocol message serialization
+  peer.zig           # TCP peer connections and handshake
 ```
 
 ## Running tests
