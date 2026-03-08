@@ -3,6 +3,7 @@ const std = @import("std");
 pub const types = @import("types.zig");
 pub const crypto = @import("crypto.zig");
 pub const serialize = @import("serialize.zig");
+pub const address = @import("address.zig");
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -13,4 +14,5 @@ test {
     _ = types;
     _ = crypto;
     _ = serialize;
+    _ = address;
 }
