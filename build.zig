@@ -38,8 +38,9 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run clearbit");
     run_step.dependOn(&run_cmd.step);
 
+    // Main test step uses tests.zig as root for comprehensive test coverage
     const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
     });
