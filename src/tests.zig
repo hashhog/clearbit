@@ -759,4 +759,6 @@ comptime {
     _ = @import("address.zig");
     _ = @import("validation.zig");
     _ = @import("mempool.zig");
+    _ = @import("perf.zig");
+    _ = @import("bench.zig");
 }
