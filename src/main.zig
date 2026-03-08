@@ -14,6 +14,7 @@ pub const sync = @import("sync.zig");
 pub const mempool = @import("mempool.zig");
 pub const block_template = @import("block_template.zig");
 pub const rpc = @import("rpc.zig");
+pub const wallet = @import("wallet.zig");
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -35,4 +36,7 @@ test {
     _ = mempool;
     _ = block_template;
     _ = rpc;
+    // Note: wallet tests require libsecp256k1 to be linked
+    // Run with: zig build test -Dsecp256k1=true
+    // _ = wallet;
 }
