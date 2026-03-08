@@ -31,11 +31,12 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Chain state tracking (reorg support, undo data)
 - [x] Mempool (BIP-125 RBF, ancestor/descendant limits, dust detection, eviction)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
-- [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness commitment)
+- [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, mining support)
 - [x] Wallet (key generation, P2PKH/P2WPKH/P2TR addresses, coin selection, tx signing)
 - [x] CLI and application entry point (argument parsing, config files, signal handling)
-- [x] Comprehensive test suite (194 tests, Bitcoin Core test vectors, fuzz targets)
+- [x] Performance optimization (arena allocators, SIMD, comptime tables, UTXO cache)
+- [x] Benchmarking suite (SHA256, merkle root, UTXO cache, block deserialization)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -45,12 +46,16 @@ zig build              # build the node
 ./zig-out/bin/clearbit --help     # show usage
 ./zig-out/bin/clearbit --version  # show version
 ./zig-out/bin/clearbit --regtest  # run on regtest
+./zig-out/bin/clearbit --benchmark  # run performance benchmarks
 
 # With RocksDB support (requires librocksdb-dev):
 zig build -Drocksdb=true test
 
 # With wallet/secp256k1 support (requires libsecp256k1-dev):
 zig build -Dsecp256k1=true test
+
+# Build with full optimizations for benchmarking:
+zig build -Doptimize=ReleaseFast
 ```
 
 ## Project structure
@@ -73,8 +78,9 @@ src/
   block_template.zig # block template construction for mining
   rpc.zig            # JSON-RPC server over HTTP
   wallet.zig         # key management, address derivation, tx signing
+  perf.zig           # performance utilities (arena, SIMD, comptime tables)
+  bench.zig          # benchmarking suite
   tests.zig          # comprehensive test suite with test vectors
-  testdata/          # genesis block, Bitcoin Core test data
 resources/
   bip39-english.txt  # BIP-39 mnemonic wordlist
 ```
@@ -82,7 +88,7 @@ resources/
 ## Running tests
 
 ```bash
-zig build test                    # run all 194 tests
+zig build test                    # run all tests
 zig build test --summary all      # run tests with detailed summary
 
 # Optional tests with external dependencies:
