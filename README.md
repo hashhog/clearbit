@@ -30,6 +30,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] UTXO set manager (compact storage, caching, block connect/disconnect)
 - [x] Chain state tracking (reorg support, undo data)
 - [x] Mempool (BIP-125 RBF, ancestor/descendant limits, dust detection, eviction)
+- [x] Fee estimation (confirmation tracking, exponential buckets, decay)
 - [ ] RPC interface
 
 ## Quick start
@@ -61,7 +62,7 @@ src/
   p2p.zig            # P2P protocol message serialization
   peer.zig           # TCP peer connections and handshake
   sync.zig           # header sync, block download, and IBD
-  mempool.zig        # transaction memory pool with RBF
+  mempool.zig        # transaction memory pool with RBF and fee estimation
 ```
 
 ## Running tests
