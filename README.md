@@ -24,6 +24,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Block and transaction validation (BIP-34, BIP-141 segwit)
 - [x] P2P message serialization (version, inv, headers, blocks)
 - [x] Peer connections (TCP, version/verack handshake, ping/pong)
+- [x] Peer manager and discovery (DNS seeds, addr relay, connection pool)
 - [ ] Block download and chain sync
 - [ ] Mempool
 - [ ] RPC interface
