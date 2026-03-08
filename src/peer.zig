@@ -5,6 +5,39 @@ const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
 
 // ============================================================================
+// Peer Manager Constants
+// ============================================================================
+
+/// Maximum number of outbound connections (8 full-relay as per Bitcoin Core).
+pub const MAX_OUTBOUND_CONNECTIONS: usize = 8;
+
+/// Maximum number of inbound connections.
+pub const MAX_INBOUND_CONNECTIONS: usize = 117;
+
+/// Maximum total connections (125 as per Bitcoin Core).
+pub const MAX_TOTAL_CONNECTIONS: usize = MAX_OUTBOUND_CONNECTIONS + MAX_INBOUND_CONNECTIONS;
+
+/// Peer rotation interval in seconds (30 minutes).
+pub const PEER_ROTATION_INTERVAL: i64 = 30 * 60;
+
+/// DNS seed resolution timeout in seconds.
+pub const DNS_SEED_TIMEOUT: u32 = 10;
+
+/// Default ban duration in seconds (24 hours).
+pub const DEFAULT_BAN_DURATION: i64 = 24 * 60 * 60;
+
+/// Minimum time between connection attempts to the same address (10 minutes).
+pub const MIN_RECONNECT_INTERVAL: i64 = 10 * 60;
+
+/// Ping interval for idle peers (2 minutes).
+pub const PING_INTERVAL: i64 = 2 * 60;
+
+/// Hardcoded fallback peers for testnet4 (DNS seeds unreliable).
+pub const TESTNET_FALLBACK_PEERS: []const []const u8 = &[_][]const u8{
+    "127.0.0.1", // Placeholder - would be real testnet4 peers
+};
+
+// ============================================================================
 // Peer State Machine
 // ============================================================================
 
@@ -394,26 +427,57 @@ pub const Peer = struct {
 };
 
 // ============================================================================
+// Address Info
+// ============================================================================
+
+/// Source of a peer address.
+pub const AddressSource = enum {
+    dns_seed,
+    peer_addr,
+    manual,
+};
+
+/// Tracked information about a known peer address.
+pub const AddressInfo = struct {
+    address: std.net.Address,
+    services: u64,
+    last_seen: i64,
+    last_tried: i64,
+    attempts: u32,
+    success: bool,
+    source: AddressSource,
+};
+
+// ============================================================================
 // Peer Manager
 // ============================================================================
 
-/// Manages multiple peer connections.
+/// Manages multiple peer connections with discovery and connection management.
 pub const PeerManager = struct {
     peers: std.ArrayList(*Peer),
-    max_peers: usize,
+    known_addresses: std.AutoHashMap(u64, AddressInfo),
+    banned_ips: std.AutoHashMap(u32, i64), // IP (as u32) -> ban expiry timestamp
+    listener: ?std.net.Server,
     network_params: *const consensus.NetworkParams,
     allocator: std.mem.Allocator,
+    our_height: i32,
+    running: std.atomic.Value(bool),
+    last_rotation_time: i64,
 
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
-        max_peers: usize,
     ) PeerManager {
         return .{
             .peers = std.ArrayList(*Peer).init(allocator),
-            .max_peers = max_peers,
+            .known_addresses = std.AutoHashMap(u64, AddressInfo).init(allocator),
+            .banned_ips = std.AutoHashMap(u32, i64).init(allocator),
+            .listener = null,
             .network_params = params,
             .allocator = allocator,
+            .our_height = 0,
+            .running = std.atomic.Value(bool).init(false),
+            .last_rotation_time = 0,
         };
     }
 
@@ -423,11 +487,441 @@ pub const PeerManager = struct {
             self.allocator.destroy(peer);
         }
         self.peers.deinit();
+        self.known_addresses.deinit();
+        self.banned_ips.deinit();
+        if (self.listener) |*l| l.deinit();
     }
 
-    /// Connect to a new peer.
+    /// Hash an address for use as a map key.
+    pub fn addressKey(address: std.net.Address) u64 {
+        // For IPv4, combine IP and port into a u64
+        // For IPv6, use a simple hash
+        switch (address.any.family) {
+            std.posix.AF.INET => {
+                const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+                const ip_bytes = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                const ip_u32 = std.mem.readInt(u32, ip_bytes, .big);
+                const port = std.mem.bigToNative(u16, ip4.port);
+                return (@as(u64, ip_u32) << 16) | @as(u64, port);
+            },
+            std.posix.AF.INET6 => {
+                const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&address.any)));
+                var hash: u64 = 0;
+                for (ip6.addr, 0..) |b, i| {
+                    hash ^= @as(u64, b) << @intCast((i % 8) * 8);
+                }
+                hash ^= @as(u64, std.mem.bigToNative(u16, ip6.port));
+                return hash;
+            },
+            else => return 0,
+        }
+    }
+
+    /// Extract IPv4 as u32 for ban tracking.
+    pub fn ipv4AsU32(address: std.net.Address) ?u32 {
+        switch (address.any.family) {
+            std.posix.AF.INET => {
+                const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+                const ip_bytes = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                return std.mem.readInt(u32, ip_bytes, .big);
+            },
+            else => return null,
+        }
+    }
+
+    /// Perform DNS seed resolution to discover initial peers.
+    pub fn dnsSeeds(self: *PeerManager) !void {
+        for (self.network_params.dns_seeds) |seed| {
+            // Resolve DNS seed to list of addresses
+            const addrs = std.net.getAddressList(self.allocator, seed, self.network_params.default_port) catch continue;
+            defer addrs.deinit();
+
+            for (addrs.addrs) |addr| {
+                self.addAddress(addr, 0, .dns_seed) catch continue;
+            }
+        }
+    }
+
+    /// Add a known address.
+    pub fn addAddress(
+        self: *PeerManager,
+        address: std.net.Address,
+        services: u64,
+        source: AddressSource,
+    ) !void {
+        const key = addressKey(address);
+        if (self.known_addresses.contains(key)) return;
+
+        // Check if IP is banned
+        if (ipv4AsU32(address)) |ip| {
+            if (self.banned_ips.get(ip)) |expiry| {
+                if (std.time.timestamp() < expiry) return;
+                // Ban expired, remove it
+                _ = self.banned_ips.remove(ip);
+            }
+        }
+
+        try self.known_addresses.put(key, AddressInfo{
+            .address = address,
+            .services = services,
+            .last_seen = std.time.timestamp(),
+            .last_tried = 0,
+            .attempts = 0,
+            .success = false,
+            .source = source,
+        });
+    }
+
+    /// Check if an address is already connected.
+    fn isConnected(self: *const PeerManager, address: std.net.Address) bool {
+        const key = addressKey(address);
+        for (self.peers.items) |peer| {
+            if (addressKey(peer.address) == key) return true;
+        }
+        return false;
+    }
+
+    /// Select an address to connect to (prefer untried, recent addresses).
+    pub fn selectPeerToConnect(self: *PeerManager) ?std.net.Address {
+        const now = std.time.timestamp();
+        var best: ?*AddressInfo = null;
+        var best_key: u64 = 0;
+
+        var iter = self.known_addresses.iterator();
+        while (iter.next()) |entry| {
+            const info = entry.value_ptr;
+
+            // Skip already connected addresses
+            if (self.isConnected(info.address)) continue;
+
+            // Skip recently tried addresses
+            if (info.last_tried > 0 and now - info.last_tried < MIN_RECONNECT_INTERVAL) continue;
+
+            // Skip banned IPs
+            if (ipv4AsU32(info.address)) |ip| {
+                if (self.banned_ips.get(ip)) |expiry| {
+                    if (now < expiry) continue;
+                }
+            }
+
+            // Prefer addresses with fewer attempts
+            if (best == null or info.attempts < best.?.attempts) {
+                best = info;
+                best_key = entry.key_ptr.*;
+            }
+        }
+
+        if (best) |b| {
+            // Update last_tried and attempts via the map
+            if (self.known_addresses.getPtr(best_key)) |info_ptr| {
+                info_ptr.last_tried = now;
+                info_ptr.attempts += 1;
+            }
+            return b.address;
+        }
+        return null;
+    }
+
+    /// Start listening for inbound connections.
+    pub fn startListening(self: *PeerManager, port: u16) !void {
+        const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+        self.listener = try addr.listen(.{
+            .reuse_address = true,
+        });
+    }
+
+    /// Ban an IP address.
+    pub fn banIP(self: *PeerManager, address: std.net.Address, duration: i64) !void {
+        if (ipv4AsU32(address)) |ip| {
+            try self.banned_ips.put(ip, std.time.timestamp() + duration);
+        }
+    }
+
+    /// Connect to peers until we have MAX_OUTBOUND_CONNECTIONS outbound.
+    pub fn maintainOutbound(self: *PeerManager) !void {
+        var outbound_count: usize = 0;
+        for (self.peers.items) |peer| {
+            if (peer.direction == .outbound) outbound_count += 1;
+        }
+
+        while (outbound_count < MAX_OUTBOUND_CONNECTIONS) {
+            const addr = self.selectPeerToConnect() orelse break;
+            const peer = self.allocator.create(Peer) catch break;
+            peer.* = Peer.connect(addr, self.network_params, self.allocator) catch {
+                self.allocator.destroy(peer);
+                continue;
+            };
+            peer.performHandshake(self.our_height) catch {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+                continue;
+            };
+
+            // Mark address as successful
+            const key = addressKey(addr);
+            if (self.known_addresses.getPtr(key)) |info| {
+                info.success = true;
+                info.last_seen = std.time.timestamp();
+            }
+
+            self.peers.append(peer) catch {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+                break;
+            };
+            outbound_count += 1;
+        }
+    }
+
+    /// Accept a waiting inbound connection if available (non-blocking).
+    pub fn acceptInbound(self: *PeerManager) !void {
+        if (self.listener == null) return;
+
+        // Try to accept without blocking
+        const conn = self.listener.?.accept() catch |err| {
+            switch (err) {
+                error.WouldBlock => return,
+                else => return err,
+            }
+        };
+
+        if (self.peers.items.len >= MAX_TOTAL_CONNECTIONS) {
+            conn.stream.close();
+            return;
+        }
+
+        // Check if IP is banned
+        if (ipv4AsU32(conn.address)) |ip| {
+            if (self.banned_ips.get(ip)) |expiry| {
+                if (std.time.timestamp() < expiry) {
+                    conn.stream.close();
+                    return;
+                }
+            }
+        }
+
+        const peer = try self.allocator.create(Peer);
+        peer.* = Peer.accept(conn.stream, conn.address, self.network_params, self.allocator);
+        peer.performHandshake(self.our_height) catch {
+            peer.disconnect();
+            self.allocator.destroy(peer);
+            return;
+        };
+        try self.peers.append(peer);
+    }
+
+    /// Process messages from all connected peers.
+    pub fn processAllMessages(self: *PeerManager) !void {
+        var i: usize = 0;
+        while (i < self.peers.items.len) {
+            const peer = self.peers.items[i];
+            const msg = peer.receiveMessage() catch |err| {
+                switch (err) {
+                    PeerError.ConnectionClosed, PeerError.Timeout => {
+                        self.removePeerByIndex(i);
+                        continue;
+                    },
+                    else => {
+                        if (peer.addBanScore(10)) {
+                            // Ban and remove
+                            self.banIP(peer.address, DEFAULT_BAN_DURATION) catch {};
+                            self.removePeerByIndex(i);
+                            continue;
+                        }
+                    },
+                }
+                i += 1;
+                continue;
+            };
+
+            self.handleMessage(peer, msg) catch {};
+            i += 1;
+        }
+    }
+
+    /// Handle a received message.
+    fn handleMessage(self: *PeerManager, peer: *Peer, msg: p2p.Message) !void {
+        switch (msg) {
+            .ping => |pp| {
+                const pong = p2p.Message{ .pong = pp };
+                try peer.sendMessage(&pong);
+            },
+            .pong => |pp| peer.handlePong(pp.nonce),
+            .addr => |a| {
+                for (a.addrs) |entry| {
+                    // Convert TimestampedAddr to std.net.Address
+                    // Check if it's an IPv4-mapped IPv6 address
+                    if (std.mem.eql(u8, entry.addr.ip[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
+                        const addr = std.net.Address.initIp4(
+                            entry.addr.ip[12..16].*,
+                            entry.addr.port,
+                        );
+                        self.addAddress(addr, entry.addr.services, .peer_addr) catch continue;
+                    }
+                }
+            },
+            .inv => {
+                // Forward to sync manager for block/tx handling (TODO)
+            },
+            .headers => {
+                // Forward to sync manager (TODO)
+            },
+            .getaddr => {
+                // Send some known addresses back
+                try self.sendAddresses(peer);
+            },
+            else => {},
+        }
+    }
+
+    /// Send known addresses to a peer.
+    fn sendAddresses(self: *PeerManager, peer: *Peer) !void {
+        var addrs = std.ArrayList(p2p.TimestampedAddr).init(self.allocator);
+        defer addrs.deinit();
+
+        var iter = self.known_addresses.iterator();
+        var count: usize = 0;
+        while (iter.next()) |entry| : (count += 1) {
+            if (count >= 100) break; // Limit to 100 addresses
+
+            const info = entry.value_ptr;
+            if (!info.success) continue; // Only send successfully connected addresses
+
+            // Convert std.net.Address to NetworkAddress
+            var net_addr = types.NetworkAddress{
+                .services = info.services,
+                .ip = [_]u8{0} ** 16,
+                .port = 0,
+            };
+
+            switch (info.address.any.family) {
+                std.posix.AF.INET => {
+                    const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&info.address.any)));
+                    // IPv4-mapped IPv6 format
+                    net_addr.ip[10] = 0xff;
+                    net_addr.ip[11] = 0xff;
+                    const ip_bytes = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                    @memcpy(net_addr.ip[12..16], ip_bytes);
+                    net_addr.port = std.mem.bigToNative(u16, ip4.port);
+                },
+                else => continue,
+            }
+
+            try addrs.append(p2p.TimestampedAddr{
+                .timestamp = @intCast(@as(i64, @truncate(info.last_seen))),
+                .addr = net_addr,
+            });
+        }
+
+        if (addrs.items.len > 0) {
+            const msg = p2p.Message{ .addr = .{ .addrs = addrs.items } };
+            try peer.sendMessage(&msg);
+        }
+    }
+
+    /// Send pings to peers that have been idle for > PING_INTERVAL.
+    pub fn sendPings(self: *PeerManager) !void {
+        const now = std.time.timestamp();
+        for (self.peers.items) |peer| {
+            if (peer.state == .handshake_complete and now - peer.last_ping_time > PING_INTERVAL) {
+                peer.sendPing() catch continue;
+            }
+        }
+    }
+
+    /// Disconnect stale or timed-out peers.
+    pub fn disconnectStale(self: *PeerManager) void {
+        var i: usize = 0;
+        while (i < self.peers.items.len) {
+            if (self.peers.items[i].isTimedOut()) {
+                self.removePeerByIndex(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Rotate peers: disconnect longest-connected outbound and connect a new one.
+    pub fn rotatePeers(self: *PeerManager) void {
+        const now = std.time.timestamp();
+        if (now - self.last_rotation_time < PEER_ROTATION_INTERVAL) return;
+        self.last_rotation_time = now;
+
+        // Find the oldest outbound peer
+        var oldest_idx: ?usize = null;
+        var oldest_time: i64 = now;
+
+        for (self.peers.items, 0..) |peer, i| {
+            if (peer.direction == .outbound and peer.state == .handshake_complete) {
+                // Use last_message_time as a proxy for connection age
+                if (peer.last_message_time < oldest_time) {
+                    oldest_time = peer.last_message_time;
+                    oldest_idx = i;
+                }
+            }
+        }
+
+        // Disconnect the oldest if we have enough outbound connections
+        var outbound_count: usize = 0;
+        for (self.peers.items) |peer| {
+            if (peer.direction == .outbound) outbound_count += 1;
+        }
+
+        if (oldest_idx != null and outbound_count >= MAX_OUTBOUND_CONNECTIONS) {
+            self.removePeerByIndex(oldest_idx.?);
+        }
+    }
+
+    /// Remove and disconnect a peer by index.
+    fn removePeerByIndex(self: *PeerManager, index: usize) void {
+        const peer = self.peers.swapRemove(index);
+        peer.disconnect();
+        self.allocator.destroy(peer);
+    }
+
+    /// Main peer management loop.
+    pub fn run(self: *PeerManager) !void {
+        self.running.store(true, .release);
+
+        // Initial DNS seeding
+        self.dnsSeeds() catch {};
+
+        while (self.running.load(.acquire)) {
+            // 1. Open new outbound connections if needed
+            self.maintainOutbound() catch {};
+
+            // 2. Accept inbound connections
+            self.acceptInbound() catch {};
+
+            // 3. Process messages from all peers
+            self.processAllMessages() catch {};
+
+            // 4. Send pings to idle peers
+            self.sendPings() catch {};
+
+            // 5. Disconnect timed-out peers
+            self.disconnectStale();
+
+            // 6. Peer rotation
+            self.rotatePeers();
+
+            // 7. Brief sleep to avoid busy-loop
+            std.time.sleep(100 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Stop the peer manager.
+    pub fn stop(self: *PeerManager) void {
+        self.running.store(false, .release);
+    }
+
+    // ========================================================================
+    // Legacy API compatibility
+    // ========================================================================
+
+    /// Connect to a new peer (legacy API).
     pub fn connectToPeer(self: *PeerManager, address: std.net.Address) !*Peer {
-        if (self.peers.items.len >= self.max_peers) {
+        if (self.peers.items.len >= MAX_TOTAL_CONNECTIONS) {
             return error.TooManyPeers;
         }
 
@@ -437,7 +931,7 @@ pub const PeerManager = struct {
         return peer;
     }
 
-    /// Remove a peer from the manager.
+    /// Remove a peer from the manager (legacy API).
     pub fn removePeer(self: *PeerManager, peer: *Peer) void {
         for (self.peers.items, 0..) |p, i| {
             if (p == peer) {
@@ -458,16 +952,39 @@ pub const PeerManager = struct {
         return count;
     }
 
-    /// Disconnect timed-out peers.
+    /// Get the number of outbound peers.
+    pub fn outboundCount(self: *const PeerManager) usize {
+        var count: usize = 0;
+        for (self.peers.items) |peer| {
+            if (peer.direction == .outbound) count += 1;
+        }
+        return count;
+    }
+
+    /// Get the number of inbound peers.
+    pub fn inboundCount(self: *const PeerManager) usize {
+        var count: usize = 0;
+        for (self.peers.items) |peer| {
+            if (peer.direction == .inbound) count += 1;
+        }
+        return count;
+    }
+
+    /// Get number of known addresses.
+    pub fn knownAddressCount(self: *const PeerManager) usize {
+        return self.known_addresses.count();
+    }
+
+    /// Disconnect timed-out peers (legacy API).
     pub fn pruneTimedOut(self: *PeerManager) void {
-        var i: usize = 0;
-        while (i < self.peers.items.len) {
-            if (self.peers.items[i].isTimedOut()) {
-                const peer = self.peers.swapRemove(i);
-                peer.disconnect();
-                self.allocator.destroy(peer);
-            } else {
-                i += 1;
+        self.disconnectStale();
+    }
+
+    /// Broadcast a message to all connected peers.
+    pub fn broadcast(self: *PeerManager, msg: *const p2p.Message) void {
+        for (self.peers.items) |peer| {
+            if (peer.state == .handshake_complete) {
+                peer.sendMessage(msg) catch continue;
             }
         }
     }
@@ -821,12 +1338,13 @@ test "peer manager initialization" {
     const allocator = std.testing.allocator;
     const params = &consensus.MAINNET;
 
-    var manager = PeerManager.init(allocator, params, 125);
+    var manager = PeerManager.init(allocator, params);
     defer manager.deinit();
 
-    try std.testing.expectEqual(@as(usize, 125), manager.max_peers);
     try std.testing.expectEqual(@as(usize, 0), manager.peers.items.len);
     try std.testing.expectEqual(@as(usize, 0), manager.connectedCount());
+    try std.testing.expectEqual(@as(usize, 0), manager.knownAddressCount());
+    try std.testing.expectEqual(@as(i32, 0), manager.our_height);
 }
 
 test "peer direction enum" {
@@ -848,4 +1366,177 @@ test "peer error types" {
     try std.testing.expect(err1 != err2);
     try std.testing.expect(err2 != err3);
     try std.testing.expect(err1 != err3);
+}
+
+// ============================================================================
+// Peer Manager Discovery Tests
+// ============================================================================
+
+test "peer manager constants" {
+    // Verify constants match Bitcoin Core defaults
+    try std.testing.expectEqual(@as(usize, 8), MAX_OUTBOUND_CONNECTIONS);
+    try std.testing.expectEqual(@as(usize, 117), MAX_INBOUND_CONNECTIONS);
+    try std.testing.expectEqual(@as(usize, 125), MAX_TOTAL_CONNECTIONS);
+    try std.testing.expectEqual(@as(i64, 30 * 60), PEER_ROTATION_INTERVAL);
+    try std.testing.expectEqual(@as(u32, 10), DNS_SEED_TIMEOUT);
+    try std.testing.expectEqual(@as(i64, 24 * 60 * 60), DEFAULT_BAN_DURATION);
+}
+
+test "address info struct" {
+    const addr = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+
+    const info = AddressInfo{
+        .address = addr,
+        .services = p2p.NODE_NETWORK | p2p.NODE_WITNESS,
+        .last_seen = 1234567890,
+        .last_tried = 0,
+        .attempts = 0,
+        .success = false,
+        .source = .dns_seed,
+    };
+
+    try std.testing.expectEqual(@as(u64, p2p.NODE_NETWORK | p2p.NODE_WITNESS), info.services);
+    try std.testing.expectEqual(@as(i64, 1234567890), info.last_seen);
+    try std.testing.expectEqual(@as(u32, 0), info.attempts);
+    try std.testing.expect(!info.success);
+    try std.testing.expectEqual(AddressSource.dns_seed, info.source);
+}
+
+test "address source enum" {
+    const dns: AddressSource = .dns_seed;
+    const peer: AddressSource = .peer_addr;
+    const manual: AddressSource = .manual;
+
+    try std.testing.expect(dns != peer);
+    try std.testing.expect(peer != manual);
+    try std.testing.expect(dns != manual);
+}
+
+test "peer manager address tracking - add and dedup" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 2 }, 8333);
+
+    // Add first address
+    try manager.addAddress(addr1, p2p.NODE_NETWORK, .dns_seed);
+    try std.testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
+
+    // Add same address again - should be deduplicated
+    try manager.addAddress(addr1, p2p.NODE_NETWORK, .dns_seed);
+    try std.testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
+
+    // Add different address
+    try manager.addAddress(addr2, p2p.NODE_WITNESS, .peer_addr);
+    try std.testing.expectEqual(@as(usize, 2), manager.knownAddressCount());
+}
+
+test "peer manager address selection" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    // No addresses - should return null
+    try std.testing.expect(manager.selectPeerToConnect() == null);
+
+    // Add an address
+    const addr = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+    try manager.addAddress(addr, p2p.NODE_NETWORK, .dns_seed);
+
+    // Should select the address
+    const selected = manager.selectPeerToConnect();
+    try std.testing.expect(selected != null);
+
+    // After selection, attempts should be incremented
+    // Cannot easily verify this without internal access, but selection happened
+}
+
+test "peer manager ban ip" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    const addr = std.net.Address.initIp4([4]u8{ 192, 168, 1, 100 }, 8333);
+
+    // Add address first
+    try manager.addAddress(addr, p2p.NODE_NETWORK, .dns_seed);
+    try std.testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
+
+    // Ban the IP
+    try manager.banIP(addr, DEFAULT_BAN_DURATION);
+
+    // Adding a new address with same IP should be rejected
+    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 100 }, 18333); // Same IP, different port
+    try manager.addAddress(addr2, p2p.NODE_NETWORK, .dns_seed);
+    // Still only 1 address since same IP is banned
+    try std.testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
+}
+
+test "peer manager outbound/inbound count" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    // No peers initially
+    try std.testing.expectEqual(@as(usize, 0), manager.outboundCount());
+    try std.testing.expectEqual(@as(usize, 0), manager.inboundCount());
+    try std.testing.expectEqual(@as(usize, 0), manager.connectedCount());
+}
+
+test "peer manager address key generation" {
+    // Test that different addresses produce different keys
+    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 2 }, 8333);
+    const addr3 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8334); // Same IP, different port
+
+    const key1 = PeerManager.addressKey(addr1);
+    const key2 = PeerManager.addressKey(addr2);
+    const key3 = PeerManager.addressKey(addr3);
+
+    try std.testing.expect(key1 != key2);
+    try std.testing.expect(key1 != key3);
+    try std.testing.expect(key2 != key3);
+
+    // Same address should produce same key
+    const key1_again = PeerManager.addressKey(addr1);
+    try std.testing.expectEqual(key1, key1_again);
+}
+
+test "peer manager ipv4 extraction" {
+    const addr = std.net.Address.initIp4([4]u8{ 192, 168, 1, 100 }, 8333);
+
+    const ip_u32 = PeerManager.ipv4AsU32(addr);
+    try std.testing.expect(ip_u32 != null);
+
+    // 192.168.1.100 in big-endian u32
+    const expected: u32 = (192 << 24) | (168 << 16) | (1 << 8) | 100;
+    try std.testing.expectEqual(expected, ip_u32.?);
+}
+
+test "peer manager running state" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    // Initially not running
+    try std.testing.expect(!manager.running.load(.acquire));
+
+    // Start and immediately stop
+    manager.running.store(true, .release);
+    try std.testing.expect(manager.running.load(.acquire));
+
+    manager.stop();
+    try std.testing.expect(!manager.running.load(.acquire));
 }
