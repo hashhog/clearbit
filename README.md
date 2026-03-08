@@ -18,7 +18,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Sighash computation (legacy and BIP-143 segwit)
 - [x] libsecp256k1 integration stubs (ECDSA, Schnorr)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
-- [ ] Script interpreter
+- [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [ ] Consensus validation
 - [ ] P2P networking
 - [ ] Block storage
@@ -42,6 +42,7 @@ src/
   serialize.zig  # binary serialization
   crypto.zig     # hash functions, merkle trees, sighash
   address.zig    # address encoding (Base58, Bech32)
+  script.zig     # script interpreter and opcodes
 ```
 
 ## Running tests
