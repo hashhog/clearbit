@@ -12,6 +12,7 @@ pub const p2p = @import("p2p.zig");
 pub const peer = @import("peer.zig");
 pub const sync = @import("sync.zig");
 pub const mempool = @import("mempool.zig");
+pub const block_template = @import("block_template.zig");
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -31,4 +32,5 @@ test {
     _ = peer;
     _ = sync;
     _ = mempool;
+    _ = block_template;
 }
