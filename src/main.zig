@@ -22,6 +22,8 @@ pub const mempool = @import("mempool.zig");
 pub const block_template = @import("block_template.zig");
 pub const rpc = @import("rpc.zig");
 pub const wallet = @import("wallet.zig");
+pub const perf = @import("perf.zig");
+pub const bench = @import("bench.zig");
 
 // ============================================================================
 // Version Info
@@ -63,6 +65,9 @@ pub const Config = struct {
     debug: bool = false,
     printtoconsole: bool = true,
     logfile: ?[]const u8 = null,
+
+    // Benchmarking
+    run_benchmark: bool = false,
 
     pub const Network = enum {
         mainnet,
@@ -162,6 +167,10 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         } else if (std.mem.eql(u8, arg, "--printtoconsole") or std.mem.eql(u8, arg, "-printtoconsole")) {
             config.printtoconsole = true;
         }
+        // Benchmarking
+        else if (std.mem.eql(u8, arg, "--benchmark") or std.mem.eql(u8, arg, "-benchmark")) {
+            config.run_benchmark = true;
+        }
         // Help and version
         else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
@@ -214,6 +223,9 @@ pub fn printUsage() void {
         \\Debug options:
         \\  --debug                Enable debug logging
         \\  --printtoconsole       Print to console
+        \\
+        \\Performance:
+        \\  --benchmark            Run performance benchmarks and exit
         \\
         \\General:
         \\  --help, -h             Show this help message
@@ -419,6 +431,16 @@ pub fn main() !void {
 
     if (should_exit) {
         return; // --help or --version was specified
+    }
+
+    // Run benchmarks if requested
+    if (config.run_benchmark) {
+        const stdout = std.io.getStdOut().writer();
+        bench.runAllBenchmarks(allocator, stdout) catch |err| {
+            std.debug.print("Error running benchmarks: {}\n", .{err});
+            std.process.exit(1);
+        };
+        return;
     }
 
     // 2. Resolve and create data directory
