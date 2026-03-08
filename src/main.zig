@@ -8,6 +8,7 @@ pub const script = @import("script.zig");
 pub const storage = @import("storage.zig");
 pub const consensus = @import("consensus.zig");
 pub const validation = @import("validation.zig");
+pub const p2p = @import("p2p.zig");
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -23,4 +24,5 @@ test {
     _ = storage;
     _ = consensus;
     _ = validation;
+    _ = p2p;
 }
