@@ -21,7 +21,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Consensus parameters (network config, difficulty, subsidy)
 - [x] RocksDB storage layer (blocks, UTXOs, chain state)
-- [ ] Block validation
+- [x] Block and transaction validation (BIP-34, BIP-141 segwit)
 - [ ] P2P networking
 - [ ] Mempool
 - [ ] RPC interface
@@ -42,15 +42,16 @@ zig build -Drocksdb=true test-rocksdb  # run RocksDB-specific tests
 
 ```
 src/
-  main.zig         # entry point
-  types.zig        # core bitcoin types
-  serialize.zig    # binary serialization
-  crypto.zig       # hash functions, merkle trees, sighash
-  address.zig      # address encoding (Base58, Bech32)
-  script.zig       # script interpreter and opcodes
-  consensus.zig    # consensus rules, network params, difficulty
-  storage.zig      # RocksDB storage layer (blocks, UTXOs, chain state)
+  main.zig           # entry point and module exports
+  types.zig          # core bitcoin types
+  serialize.zig      # binary serialization
+  crypto.zig         # hash functions, merkle trees, sighash
+  address.zig        # address encoding (Base58, Bech32)
+  script.zig         # script interpreter and opcodes
+  consensus.zig      # consensus rules, network params, difficulty
+  storage.zig        # RocksDB storage layer
   storage_rocksdb.zig  # RocksDB C bindings (when linked)
+  validation.zig     # block and transaction validation
 ```
 
 ## Running tests
