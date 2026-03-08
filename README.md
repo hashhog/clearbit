@@ -32,7 +32,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Mempool (BIP-125 RBF, ancestor/descendant limits, dust detection, eviction)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
 - [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness commitment)
-- [ ] Mining RPC server (JSON-RPC interface)
+- [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, mining support)
+- [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
 
@@ -65,6 +66,7 @@ src/
   sync.zig           # header sync, block download, and IBD
   mempool.zig        # transaction memory pool with RBF and fee estimation
   block_template.zig # block template construction for mining
+  rpc.zig            # JSON-RPC server over HTTP
 ```
 
 ## Running tests
