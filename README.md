@@ -19,7 +19,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] libsecp256k1 integration stubs (ECDSA, Schnorr)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
-- [ ] Consensus validation
+- [x] Consensus parameters (network config, difficulty, subsidy)
+- [ ] Block validation
 - [ ] P2P networking
 - [ ] Block storage
 - [ ] Mempool
@@ -43,6 +44,7 @@ src/
   crypto.zig     # hash functions, merkle trees, sighash
   address.zig    # address encoding (Base58, Bech32)
   script.zig     # script interpreter and opcodes
+  consensus.zig  # consensus rules, network params, difficulty
 ```
 
 ## Running tests
