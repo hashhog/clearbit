@@ -27,6 +27,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Peer manager and discovery (DNS seeds, addr relay, connection pool)
 - [x] Header synchronization (getheaders/headers, block locator, chain work)
 - [x] Block download and IBD (parallel downloads, UTXO updates, timeout handling)
+- [x] UTXO set manager (compact storage, caching, block connect/disconnect)
+- [x] Chain state tracking (reorg support, undo data)
 - [ ] Mempool
 - [ ] RPC interface
 
@@ -53,7 +55,7 @@ src/
   address.zig        # address encoding (Base58, Bech32)
   script.zig         # script interpreter and opcodes
   consensus.zig      # consensus rules, network params, difficulty
-  storage.zig        # RocksDB storage layer
+  storage.zig        # RocksDB storage layer, UTXO set, chain state
   storage_rocksdb.zig  # RocksDB C bindings (when linked)
   validation.zig     # block and transaction validation
   p2p.zig            # P2P protocol message serialization
