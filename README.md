@@ -17,6 +17,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Transaction hashing (txid, wtxid)
 - [x] Sighash computation (legacy and BIP-143 segwit)
 - [x] libsecp256k1 integration stubs (ECDSA, Schnorr)
+- [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [ ] Script interpreter
 - [ ] Consensus validation
 - [ ] P2P networking
@@ -40,6 +41,7 @@ src/
   types.zig      # core bitcoin types
   serialize.zig  # binary serialization
   crypto.zig     # hash functions, merkle trees, sighash
+  address.zig    # address encoding (Base58, Bech32)
 ```
 
 ## Running tests
