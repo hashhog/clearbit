@@ -13,6 +13,10 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Core types (Transaction, Block, BlockHeader, OutPoint)
 - [x] Binary serialization (CompactSize, Reader/Writer)
 - [x] Crypto primitives (SHA256, RIPEMD160, HASH160, HASH256)
+- [x] Merkle root computation
+- [x] Transaction hashing (txid, wtxid)
+- [x] Sighash computation (legacy and BIP-143 segwit)
+- [x] libsecp256k1 integration stubs (ECDSA, Schnorr)
 - [ ] Script interpreter
 - [ ] Consensus validation
 - [ ] P2P networking
@@ -35,15 +39,11 @@ src/
   main.zig       # entry point
   types.zig      # core bitcoin types
   serialize.zig  # binary serialization
-  crypto.zig     # hash functions
+  crypto.zig     # hash functions, merkle trees, sighash
 ```
 
 ## Running tests
 
 ```bash
 zig build test
-
-# or test individual modules
-zig test src/serialize.zig
-zig test src/types.zig
 ```
