@@ -31,7 +31,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Chain state tracking (reorg support, undo data)
 - [x] Mempool (BIP-125 RBF, ancestor/descendant limits, dust detection, eviction)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
-- [ ] RPC interface
+- [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness commitment)
+- [ ] Mining RPC server (JSON-RPC interface)
 
 ## Quick start
 
@@ -63,6 +64,7 @@ src/
   peer.zig           # TCP peer connections and handshake
   sync.zig           # header sync, block download, and IBD
   mempool.zig        # transaction memory pool with RBF and fee estimation
+  block_template.zig # block template construction for mining
 ```
 
 ## Running tests
