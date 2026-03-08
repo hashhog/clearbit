@@ -15,8 +15,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Crypto primitives (SHA256, RIPEMD160, HASH160, HASH256)
 - [x] Merkle root computation
 - [x] Transaction hashing (txid, wtxid)
-- [x] Sighash computation (legacy and BIP-143 segwit)
-- [x] libsecp256k1 integration stubs (ECDSA, Schnorr)
+- [x] Sighash computation (legacy, BIP-143 segwit, BIP-341 taproot)
+- [x] libsecp256k1 integration (ECDSA signing/verification, Schnorr)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Consensus parameters (network config, difficulty, subsidy)
@@ -33,6 +33,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
 - [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness commitment)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, mining support)
+- [x] Wallet (key generation, P2PKH/P2WPKH/P2TR addresses, coin selection, tx signing)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -44,7 +45,11 @@ zig build test         # run tests
 
 # With RocksDB support (requires librocksdb-dev):
 zig build -Drocksdb=true test
-zig build -Drocksdb=true test-rocksdb  # run RocksDB-specific tests
+zig build -Drocksdb=true test-rocksdb
+
+# With wallet/secp256k1 support (requires libsecp256k1-dev):
+zig build -Dsecp256k1=true test
+zig build -Dsecp256k1=true test-wallet
 ```
 
 ## Project structure
@@ -67,6 +72,9 @@ src/
   mempool.zig        # transaction memory pool with RBF and fee estimation
   block_template.zig # block template construction for mining
   rpc.zig            # JSON-RPC server over HTTP
+  wallet.zig         # key management, address derivation, tx signing
+resources/
+  bip39-english.txt  # BIP-39 mnemonic wordlist
 ```
 
 ## Running tests
