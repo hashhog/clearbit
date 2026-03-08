@@ -8,6 +8,25 @@ const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
 
 // ============================================================================
+// Block Download Constants
+// ============================================================================
+
+/// Maximum blocks in flight per peer (prevents one slow peer from blocking).
+pub const MAX_BLOCKS_IN_FLIGHT: usize = 16;
+
+/// Maximum blocks in flight total across all peers.
+pub const MAX_BLOCKS_IN_FLIGHT_TOTAL: usize = 128;
+
+/// Timeout in seconds before re-requesting a block from another peer.
+pub const BLOCK_DOWNLOAD_TIMEOUT: i64 = 60;
+
+/// Number of blocks to validate in one batch during IBD.
+pub const IBD_BATCH_SIZE: usize = 500;
+
+/// Interval between UTXO flushes during IBD (every N blocks).
+pub const UTXO_FLUSH_INTERVAL: u32 = 2000;
+
+// ============================================================================
 // Sync State
 // ============================================================================
 
@@ -427,6 +446,454 @@ pub fn buildBlockLocator(
 }
 
 // ============================================================================
+// Block Downloader
+// ============================================================================
+
+/// Errors specific to block download and validation.
+pub const BlockDownloadError = error{
+    BadMerkleRoot,
+    MissingInput,
+    ImmatureCoinbase,
+    InsufficientFunds,
+    ExcessiveCoinbaseValue,
+    InvalidBlock,
+    NoBestTip,
+    OutOfMemory,
+    StorageError,
+};
+
+/// Serialize an OutPoint to a 36-byte key for UTXO lookups.
+/// Format: txid (32 bytes) || output_index (4 bytes LE)
+pub fn outpointKey(outpoint: *const types.OutPoint) [36]u8 {
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &outpoint.hash);
+    std.mem.writeInt(u32, key[32..36], outpoint.index, .little);
+    return key;
+}
+
+/// Block downloader handles IBD (Initial Block Download) and ongoing block sync.
+/// It manages parallel block downloads from multiple peers and processes
+/// blocks in order to build the UTXO set.
+pub const BlockDownloader = struct {
+    sync_manager: *SyncManager,
+    allocator: std.mem.Allocator,
+
+    /// Blocks requested but not yet received: hash -> request info
+    in_flight: std.AutoHashMap(types.Hash256, InFlightBlock),
+
+    /// Downloaded blocks waiting to be connected (may arrive out of order)
+    downloaded_queue: std.AutoHashMap(types.Hash256, types.Block),
+
+    /// Next height to download
+    download_height: u32,
+
+    /// Next height to validate and connect
+    connect_height: u32,
+
+    /// Last height where we flushed UTXO to disk
+    last_flush_height: u32,
+
+    /// Stall timeout tracking (adaptive: base 5s, doubles on stall, max 64s)
+    stall_timeout_base: i64,
+
+    /// Track per-peer in-flight counts for fair distribution
+    peer_in_flight_counts: std.AutoHashMap(*peer_mod.Peer, usize),
+
+    /// Request info for in-flight blocks.
+    pub const InFlightBlock = struct {
+        peer: *peer_mod.Peer,
+        height: u32,
+        request_time: i64,
+    };
+
+    /// Initialize a new BlockDownloader.
+    pub fn init(sync_manager: *SyncManager, allocator: std.mem.Allocator) BlockDownloader {
+        return BlockDownloader{
+            .sync_manager = sync_manager,
+            .allocator = allocator,
+            .in_flight = std.AutoHashMap(types.Hash256, InFlightBlock).init(allocator),
+            .downloaded_queue = std.AutoHashMap(types.Hash256, types.Block).init(allocator),
+            .download_height = 1, // Start after genesis
+            .connect_height = 1,
+            .last_flush_height = 0,
+            .stall_timeout_base = 5, // Start at 5 seconds
+            .peer_in_flight_counts = std.AutoHashMap(*peer_mod.Peer, usize).init(allocator),
+        };
+    }
+
+    /// Clean up resources.
+    pub fn deinit(self: *BlockDownloader) void {
+        self.in_flight.deinit();
+        // Note: downloaded_queue blocks should be freed by caller if they allocated them
+        self.downloaded_queue.deinit();
+        self.peer_in_flight_counts.deinit();
+    }
+
+    /// Get count of blocks in flight for a specific peer.
+    fn getPeerInFlightCount(self: *BlockDownloader, peer: *peer_mod.Peer) usize {
+        return self.peer_in_flight_counts.get(peer) orelse 0;
+    }
+
+    /// Increment in-flight count for a peer.
+    fn incrementPeerCount(self: *BlockDownloader, peer: *peer_mod.Peer) !void {
+        const current = self.getPeerInFlightCount(peer);
+        try self.peer_in_flight_counts.put(peer, current + 1);
+    }
+
+    /// Decrement in-flight count for a peer.
+    fn decrementPeerCount(self: *BlockDownloader, peer: *peer_mod.Peer) void {
+        const current = self.getPeerInFlightCount(peer);
+        if (current > 0) {
+            self.peer_in_flight_counts.put(peer, current - 1) catch {};
+        }
+    }
+
+    /// Main IBD loop: request blocks, process received blocks, connect to chain.
+    pub fn runIBD(self: *BlockDownloader) !void {
+        const tip_height = if (self.sync_manager.best_tip) |tip| tip.height else return BlockDownloadError.NoBestTip;
+
+        while (self.connect_height <= tip_height) {
+            // 1. Request more blocks if we have capacity
+            self.requestBlocks() catch |err| {
+                std.log.warn("Error requesting blocks: {}", .{err});
+            };
+
+            // 2. Process incoming messages from peers
+            self.processMessages() catch {};
+
+            // 3. Try to connect downloaded blocks in order
+            self.connectBlocks() catch |err| {
+                std.log.err("Error connecting blocks: {}", .{err});
+                return err;
+            };
+
+            // 4. Handle timeouts and retries
+            self.handleTimeouts();
+
+            // 5. Periodic UTXO flush
+            if (self.connect_height - self.last_flush_height >= UTXO_FLUSH_INTERVAL) {
+                if (self.sync_manager.chain_store) |cs| {
+                    cs.db.flush() catch {};
+                }
+                self.last_flush_height = self.connect_height;
+            }
+
+            // Progress logging
+            if (self.connect_height % 1000 == 0) {
+                std.log.info("IBD progress: {d}/{d} ({d:.1}%)", .{
+                    self.connect_height,
+                    tip_height,
+                    @as(f64, @floatFromInt(self.connect_height)) /
+                        @as(f64, @floatFromInt(tip_height)) * 100.0,
+                });
+            }
+
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
+
+        self.sync_manager.state = .synced;
+        std.log.info("IBD complete at height {d}", .{self.connect_height - 1});
+    }
+
+    /// Request blocks from peers, distributing requests across available peers.
+    /// Batches multiple inv items per getdata message for efficiency.
+    pub fn requestBlocks(self: *BlockDownloader) !void {
+        if (self.in_flight.count() >= MAX_BLOCKS_IN_FLIGHT_TOTAL) return;
+
+        const tip_height = if (self.sync_manager.best_tip) |tip| tip.height else return;
+        const peers = self.sync_manager.peer_manager.peers.items;
+
+        if (peers.len == 0) return;
+
+        var peer_idx: usize = 0;
+
+        // Collect inv items per peer for batch getdata messages
+        var peer_requests = std.AutoHashMap(*peer_mod.Peer, std.ArrayList(p2p.InvVector)).init(self.allocator);
+        defer {
+            var iter = peer_requests.valueIterator();
+            while (iter.next()) |list| {
+                list.deinit();
+            }
+            peer_requests.deinit();
+        }
+
+        while (self.download_height <= tip_height and
+            self.in_flight.count() < MAX_BLOCKS_IN_FLIGHT_TOTAL)
+        {
+            // Get the hash for this height from the active chain
+            if (self.download_height >= self.sync_manager.active_chain.items.len) break;
+            const hash = self.sync_manager.active_chain.items[self.download_height];
+
+            // Skip if already downloaded or in flight
+            if (self.in_flight.contains(hash) or self.downloaded_queue.contains(hash)) {
+                self.download_height += 1;
+                continue;
+            }
+
+            // Find a peer to request from (round-robin with per-peer limits)
+            var found_peer: ?*peer_mod.Peer = null;
+            for (0..peers.len) |_| {
+                peer_idx = (peer_idx + 1) % peers.len;
+                const p = peers[peer_idx];
+                if (p.state != .handshake_complete) continue;
+                if (!p.is_witness_capable) continue;
+
+                // Check per-peer in-flight limit
+                const peer_count = self.getPeerInFlightCount(p);
+                if (peer_count >= MAX_BLOCKS_IN_FLIGHT) continue;
+
+                found_peer = p;
+                break;
+            }
+
+            const peer = found_peer orelse break;
+
+            // Add to peer's request batch
+            const request_list = peer_requests.getPtr(peer) orelse blk: {
+                try peer_requests.put(peer, std.ArrayList(p2p.InvVector).init(self.allocator));
+                break :blk peer_requests.getPtr(peer).?;
+            };
+
+            try request_list.append(p2p.InvVector{
+                .inv_type = .msg_witness_block,
+                .hash = hash,
+            });
+
+            try self.in_flight.put(hash, InFlightBlock{
+                .peer = peer,
+                .height = self.download_height,
+                .request_time = std.time.timestamp(),
+            });
+            try self.incrementPeerCount(peer);
+
+            self.download_height += 1;
+        }
+
+        // Send batched getdata messages
+        var iter = peer_requests.iterator();
+        while (iter.next()) |entry| {
+            const peer = entry.key_ptr.*;
+            const inv_list = entry.value_ptr;
+            if (inv_list.items.len > 0) {
+                const msg = p2p.Message{ .getdata = p2p.InvMessage{
+                    .inventory = inv_list.items,
+                } };
+                peer.sendMessage(&msg) catch {};
+            }
+        }
+    }
+
+    /// Handle a received block message.
+    pub fn handleBlock(self: *BlockDownloader, block: types.Block) !void {
+        // Compute block hash from header
+        const hash = crypto.computeBlockHash(&block.header);
+
+        // Remove from in_flight and update peer counts
+        if (self.in_flight.fetchRemove(hash)) |entry| {
+            self.decrementPeerCount(entry.value.peer);
+
+            // Success - decay stall timeout back towards base
+            if (self.stall_timeout_base > 5) {
+                self.stall_timeout_base = @max(5, self.stall_timeout_base - 1);
+            }
+        }
+
+        // Add to download queue
+        try self.downloaded_queue.put(hash, block);
+    }
+
+    /// Connect blocks in order from the download queue.
+    fn connectBlocks(self: *BlockDownloader) !void {
+        var connected: usize = 0;
+
+        while (connected < IBD_BATCH_SIZE) {
+            if (self.connect_height >= self.sync_manager.active_chain.items.len) break;
+            const expected_hash = self.sync_manager.active_chain.items[self.connect_height];
+
+            // Check if this block is in the download queue
+            const block_entry = self.downloaded_queue.fetchRemove(expected_hash);
+            if (block_entry == null) break;
+            const block = block_entry.?.value;
+
+            // Validate the block
+            try self.validateAndConnectBlock(&block, self.connect_height);
+
+            // Update the block index status
+            if (self.sync_manager.block_index.getPtr(expected_hash)) |idx_ptr| {
+                idx_ptr.*.status = .validated;
+            }
+
+            self.connect_height += 1;
+            connected += 1;
+        }
+    }
+
+    /// Validate a block and update the UTXO set.
+    fn validateAndConnectBlock(self: *BlockDownloader, block: *const types.Block, height: u32) BlockDownloadError!void {
+        const chain_store = self.sync_manager.chain_store;
+        const params = self.sync_manager.network_params;
+
+        // Use an arena allocator for per-block temporary allocations
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        // 1. Verify merkle root
+        const tx_hashes = arena_alloc.alloc(types.Hash256, block.transactions.len) catch
+            return BlockDownloadError.OutOfMemory;
+        for (block.transactions, 0..) |tx, i| {
+            tx_hashes[i] = crypto.computeTxid(&tx, arena_alloc) catch
+                return BlockDownloadError.OutOfMemory;
+        }
+        const computed_root = crypto.computeMerkleRoot(tx_hashes, arena_alloc) catch
+            return BlockDownloadError.OutOfMemory;
+        if (!std.mem.eql(u8, &computed_root, &block.header.merkle_root))
+            return BlockDownloadError.BadMerkleRoot;
+
+        // 2. Validate coinbase subsidy
+        const subsidy = consensus.getBlockSubsidy(height, params);
+        var total_fees: i64 = 0;
+
+        // 3. Process each transaction: validate inputs, update UTXO set
+        for (block.transactions, 0..) |tx, tx_idx| {
+            if (tx_idx == 0) {
+                // Coinbase: only creates outputs, no inputs to validate
+            } else {
+                // Non-coinbase: validate and spend inputs
+                var input_sum: i64 = 0;
+                for (tx.inputs) |input| {
+                    if (chain_store) |cs| {
+                        const utxo = cs.getUtxo(&input.previous_output) catch
+                            return BlockDownloadError.StorageError;
+                        if (utxo == null) return BlockDownloadError.MissingInput;
+
+                        // Coinbase maturity check
+                        if (utxo.?.is_coinbase and height - utxo.?.height < consensus.COINBASE_MATURITY)
+                            return BlockDownloadError.ImmatureCoinbase;
+
+                        input_sum += utxo.?.value;
+
+                        // Mark UTXO as spent (delete from set)
+                        cs.deleteUtxo(&input.previous_output) catch
+                            return BlockDownloadError.StorageError;
+
+                        // Free the script_pubkey we allocated
+                        self.allocator.free(utxo.?.script_pubkey);
+                    }
+                }
+
+                var output_sum: i64 = 0;
+                for (tx.outputs) |output| {
+                    output_sum += output.value;
+                }
+
+                if (input_sum < output_sum) return BlockDownloadError.InsufficientFunds;
+                total_fees += input_sum - output_sum;
+            }
+
+            // Add new UTXOs for all outputs
+            const tx_hash = crypto.computeTxid(&tx, arena_alloc) catch
+                return BlockDownloadError.OutOfMemory;
+            for (tx.outputs, 0..) |output, out_idx| {
+                // Skip unspendable outputs (OP_RETURN)
+                if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) continue;
+
+                const outpoint = types.OutPoint{
+                    .hash = tx_hash,
+                    .index = @intCast(out_idx),
+                };
+                if (chain_store) |cs| {
+                    cs.putUtxo(&outpoint, &output, height, tx_idx == 0) catch
+                        return BlockDownloadError.StorageError;
+                }
+            }
+        }
+
+        // 4. Verify coinbase amount <= subsidy + fees
+        var coinbase_value: i64 = 0;
+        for (block.transactions[0].outputs) |output| {
+            coinbase_value += output.value;
+        }
+        if (coinbase_value > subsidy + total_fees)
+            return BlockDownloadError.ExcessiveCoinbaseValue;
+
+        // 5. Update chain tip
+        const block_hash = crypto.computeBlockHash(&block.header);
+        if (chain_store) |cs| {
+            cs.putChainTip(&block_hash, height) catch
+                return BlockDownloadError.StorageError;
+        }
+    }
+
+    /// Handle block download timeouts: re-request from a different peer.
+    /// Uses adaptive timeout: doubles on stall, decays on success, capped at 64s.
+    fn handleTimeouts(self: *BlockDownloader) void {
+        const now = std.time.timestamp();
+        var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
+        defer to_remove.deinit();
+
+        var iter = self.in_flight.iterator();
+        while (iter.next()) |entry| {
+            const timeout = @max(BLOCK_DOWNLOAD_TIMEOUT, self.stall_timeout_base);
+            if (now - entry.value_ptr.request_time > timeout) {
+                // Re-request from another peer in the next cycle
+                to_remove.append(entry.key_ptr.*) catch continue;
+
+                // Penalize slow peer
+                _ = entry.value_ptr.peer.addBanScore(2);
+
+                // Update peer in-flight count
+                self.decrementPeerCount(entry.value_ptr.peer);
+            }
+        }
+
+        if (to_remove.items.len > 0) {
+            // Adaptive timeout: double on stall, cap at 64 seconds
+            self.stall_timeout_base = @min(64, self.stall_timeout_base * 2);
+        }
+
+        for (to_remove.items) |hash| {
+            _ = self.in_flight.remove(hash);
+            // Reset download_height to re-request
+            if (self.sync_manager.block_index.get(hash)) |idx| {
+                if (idx.height < self.download_height) {
+                    self.download_height = idx.height;
+                }
+            }
+        }
+    }
+
+    /// Process incoming messages from peers.
+    /// Block messages are routed to handleBlock.
+    fn processMessages(self: *BlockDownloader) !void {
+        // This would typically be called by the peer manager's message loop
+        // For now, it's a placeholder - the peer manager routes block messages
+        // to handleBlock directly.
+        _ = self;
+    }
+
+    /// Check if IBD is still in progress.
+    pub fn isDownloading(self: *const BlockDownloader) bool {
+        return self.in_flight.count() > 0 or self.downloaded_queue.count() > 0;
+    }
+
+    /// Get current download progress.
+    pub fn getProgress(self: *const BlockDownloader) struct {
+        connect_height: u32,
+        download_height: u32,
+        in_flight: usize,
+        queued: usize,
+    } {
+        return .{
+            .connect_height = self.connect_height,
+            .download_height = self.download_height,
+            .in_flight = self.in_flight.count(),
+            .queued = self.downloaded_queue.count(),
+        };
+    }
+};
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -743,4 +1210,246 @@ test "block locator with empty chain" {
     defer allocator.free(locator);
 
     try std.testing.expectEqual(@as(usize, 0), locator.len);
+}
+
+// ============================================================================
+// Block Downloader Tests
+// ============================================================================
+
+test "block downloader initialization" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, params);
+    defer peer_manager.deinit();
+
+    var sync_mgr = SyncManager.init(null, &peer_manager, params, allocator);
+    defer sync_mgr.deinit();
+
+    var downloader = BlockDownloader.init(&sync_mgr, allocator);
+    defer downloader.deinit();
+
+    // Initial state
+    try std.testing.expectEqual(@as(u32, 1), downloader.download_height);
+    try std.testing.expectEqual(@as(u32, 1), downloader.connect_height);
+    try std.testing.expectEqual(@as(usize, 0), downloader.in_flight.count());
+    try std.testing.expectEqual(@as(usize, 0), downloader.downloaded_queue.count());
+    try std.testing.expectEqual(@as(i64, 5), downloader.stall_timeout_base);
+    try std.testing.expect(!downloader.isDownloading());
+}
+
+test "outpointKey produces correct 36-byte key" {
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x11} ** 32,
+        .index = 0x12345678,
+    };
+
+    const key = outpointKey(&outpoint);
+
+    // First 32 bytes should be the hash
+    try std.testing.expectEqualSlices(u8, &outpoint.hash, key[0..32]);
+
+    // Last 4 bytes should be index in little-endian
+    try std.testing.expectEqual(@as(u8, 0x78), key[32]);
+    try std.testing.expectEqual(@as(u8, 0x56), key[33]);
+    try std.testing.expectEqual(@as(u8, 0x34), key[34]);
+    try std.testing.expectEqual(@as(u8, 0x12), key[35]);
+}
+
+test "outpointKey with zero index" {
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0xAB} ** 32,
+        .index = 0,
+    };
+
+    const key = outpointKey(&outpoint);
+
+    try std.testing.expectEqualSlices(u8, &outpoint.hash, key[0..32]);
+    try std.testing.expectEqual(@as(u8, 0x00), key[32]);
+    try std.testing.expectEqual(@as(u8, 0x00), key[33]);
+    try std.testing.expectEqual(@as(u8, 0x00), key[34]);
+    try std.testing.expectEqual(@as(u8, 0x00), key[35]);
+}
+
+test "outpointKey with max index" {
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0} ** 32,
+        .index = 0xFFFFFFFF,
+    };
+
+    const key = outpointKey(&outpoint);
+
+    try std.testing.expectEqual(@as(u8, 0xFF), key[32]);
+    try std.testing.expectEqual(@as(u8, 0xFF), key[33]);
+    try std.testing.expectEqual(@as(u8, 0xFF), key[34]);
+    try std.testing.expectEqual(@as(u8, 0xFF), key[35]);
+}
+
+test "block downloader getProgress" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, params);
+    defer peer_manager.deinit();
+
+    var sync_mgr = SyncManager.init(null, &peer_manager, params, allocator);
+    defer sync_mgr.deinit();
+
+    var downloader = BlockDownloader.init(&sync_mgr, allocator);
+    defer downloader.deinit();
+
+    const progress = downloader.getProgress();
+    try std.testing.expectEqual(@as(u32, 1), progress.connect_height);
+    try std.testing.expectEqual(@as(u32, 1), progress.download_height);
+    try std.testing.expectEqual(@as(usize, 0), progress.in_flight);
+    try std.testing.expectEqual(@as(usize, 0), progress.queued);
+}
+
+test "block download constants are sensible" {
+    // Verify constants have reasonable values
+    try std.testing.expectEqual(@as(usize, 16), MAX_BLOCKS_IN_FLIGHT);
+    try std.testing.expectEqual(@as(usize, 128), MAX_BLOCKS_IN_FLIGHT_TOTAL);
+    try std.testing.expectEqual(@as(i64, 60), BLOCK_DOWNLOAD_TIMEOUT);
+    try std.testing.expectEqual(@as(usize, 500), IBD_BATCH_SIZE);
+    try std.testing.expectEqual(@as(u32, 2000), UTXO_FLUSH_INTERVAL);
+
+    // Total should be >= per-peer * expected peer count (8 typical)
+    try std.testing.expect(MAX_BLOCKS_IN_FLIGHT_TOTAL >= MAX_BLOCKS_IN_FLIGHT * 8);
+}
+
+test "merkle root verification with single transaction" {
+    const allocator = std.testing.allocator;
+
+    // Create a simple coinbase transaction
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x02, 0x03 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const coinbase_output = types.TxOut{
+        .value = 5_000_000_000,
+        .script_pubkey = &[_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac },
+    };
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+
+    // Compute txid
+    const txid = try crypto.computeTxid(&coinbase_tx, allocator);
+
+    // For a single transaction, merkle root equals the txid
+    const merkle_root = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, allocator);
+
+    try std.testing.expectEqualSlices(u8, &txid, &merkle_root);
+}
+
+test "merkle root changes with tampered transaction" {
+    const allocator = std.testing.allocator;
+
+    // Create original transaction
+    const orig_output = types.TxOut{
+        .value = 1_000_000,
+        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0x11} ** 20,
+    };
+    const orig_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{orig_output},
+        .lock_time = 0,
+    };
+
+    // Create tampered transaction (different value)
+    const tampered_output = types.TxOut{
+        .value = 2_000_000, // Different value
+        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0x11} ** 20,
+    };
+    const tampered_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{tampered_output},
+        .lock_time = 0,
+    };
+
+    const orig_txid = try crypto.computeTxid(&orig_tx, allocator);
+    const tampered_txid = try crypto.computeTxid(&tampered_tx, allocator);
+
+    // Txids should be different
+    try std.testing.expect(!std.mem.eql(u8, &orig_txid, &tampered_txid));
+
+    // Merkle roots should therefore be different
+    const orig_root = try crypto.computeMerkleRoot(&[_]types.Hash256{orig_txid}, allocator);
+    const tampered_root = try crypto.computeMerkleRoot(&[_]types.Hash256{tampered_txid}, allocator);
+
+    try std.testing.expect(!std.mem.eql(u8, &orig_root, &tampered_root));
+}
+
+test "block download error variants" {
+    // Verify all error variants are distinct
+    const errors = [_]BlockDownloadError{
+        BlockDownloadError.BadMerkleRoot,
+        BlockDownloadError.MissingInput,
+        BlockDownloadError.ImmatureCoinbase,
+        BlockDownloadError.InsufficientFunds,
+        BlockDownloadError.ExcessiveCoinbaseValue,
+        BlockDownloadError.InvalidBlock,
+        BlockDownloadError.NoBestTip,
+        BlockDownloadError.OutOfMemory,
+        BlockDownloadError.StorageError,
+    };
+
+    for (errors, 0..) |e1, i| {
+        for (errors[i + 1 ..]) |e2| {
+            try std.testing.expect(e1 != e2);
+        }
+    }
+}
+
+test "in-flight block tracking" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, params);
+    defer peer_manager.deinit();
+
+    var sync_mgr = SyncManager.init(null, &peer_manager, params, allocator);
+    defer sync_mgr.deinit();
+
+    var downloader = BlockDownloader.init(&sync_mgr, allocator);
+    defer downloader.deinit();
+
+    // Manually add an in-flight block for testing
+    const test_hash = [_]u8{0x42} ** 32;
+    const test_height: u32 = 100;
+    const request_time = std.time.timestamp();
+
+    // Create a mock peer pointer (unsafe for real use, but ok for testing the map)
+    // We use a comptime-known address that won't be dereferenced
+    const mock_peer: *peer_mod.Peer = @ptrFromInt(0x1000);
+
+    try downloader.in_flight.put(test_hash, BlockDownloader.InFlightBlock{
+        .peer = mock_peer,
+        .height = test_height,
+        .request_time = request_time,
+    });
+
+    // Verify block is tracked
+    try std.testing.expectEqual(@as(usize, 1), downloader.in_flight.count());
+    try std.testing.expect(downloader.in_flight.contains(test_hash));
+
+    const entry = downloader.in_flight.get(test_hash);
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqual(test_height, entry.?.height);
+    try std.testing.expectEqual(request_time, entry.?.request_time);
+
+    // Now downloading
+    try std.testing.expect(downloader.isDownloading());
+
+    // Remove and verify
+    _ = downloader.in_flight.remove(test_hash);
+    try std.testing.expectEqual(@as(usize, 0), downloader.in_flight.count());
+    try std.testing.expect(!downloader.isDownloading());
 }
