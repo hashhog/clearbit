@@ -35,6 +35,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, mining support)
 - [x] Wallet (key generation, P2PKH/P2WPKH/P2TR addresses, coin selection, tx signing)
 - [x] CLI and application entry point (argument parsing, config files, signal handling)
+- [x] Comprehensive test suite (194 tests, Bitcoin Core test vectors, fuzz targets)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -72,6 +73,8 @@ src/
   block_template.zig # block template construction for mining
   rpc.zig            # JSON-RPC server over HTTP
   wallet.zig         # key management, address derivation, tx signing
+  tests.zig          # comprehensive test suite with test vectors
+  testdata/          # genesis block, Bitcoin Core test data
 resources/
   bip39-english.txt  # BIP-39 mnemonic wordlist
 ```
@@ -79,5 +82,10 @@ resources/
 ## Running tests
 
 ```bash
-zig build test
+zig build test                    # run all 194 tests
+zig build test --summary all      # run tests with detailed summary
+
+# Optional tests with external dependencies:
+zig build -Drocksdb=true test     # include RocksDB storage tests
+zig build -Dsecp256k1=true test   # include wallet/crypto tests
 ```
