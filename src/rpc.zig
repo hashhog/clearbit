@@ -14,6 +14,7 @@ const types = @import("types.zig");
 const storage = @import("storage.zig");
 const mempool_mod = @import("mempool.zig");
 const peer_mod = @import("peer.zig");
+const banlist = @import("banlist.zig");
 const serialize = @import("serialize.zig");
 const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
@@ -329,6 +330,12 @@ pub const RpcServer = struct {
             return self.handleSubmitBlock(params, id);
         } else if (std.mem.eql(u8, method, "getdifficulty")) {
             return self.handleGetDifficulty(id);
+        } else if (std.mem.eql(u8, method, "listbanned")) {
+            return self.handleListBanned(id);
+        } else if (std.mem.eql(u8, method, "setban")) {
+            return self.handleSetBan(params, id);
+        } else if (std.mem.eql(u8, method, "clearbanned")) {
+            return self.handleClearBanned(id);
         } else if (std.mem.eql(u8, method, "stop")) {
             self.stop();
             return self.jsonRpcResult("\"clearbit stopping\"", id);
@@ -620,6 +627,115 @@ pub const RpcServer = struct {
         });
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // Ban Management Methods
+    // ========================================================================
+
+    fn handleListBanned(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+
+        var ban_list = self.peer_manager.getBanList();
+        var iter = ban_list.iterator();
+        var first = true;
+        while (iter.next()) |entry| {
+            // Skip expired entries
+            const now = std.time.timestamp();
+            if (now >= entry.value_ptr.ban_until) continue;
+
+            if (!first) try writer.writeByte(',');
+            first = false;
+
+            const ip = entry.value_ptr.ip;
+            try writer.print("{{\"address\":\"{d}.{d}.{d}.{d}\",\"ban_created\":{d},\"banned_until\":{d},\"ban_reason\":\"", .{
+                ip[0], ip[1], ip[2], ip[3],
+                entry.value_ptr.create_time,
+                entry.value_ptr.ban_until,
+            });
+            // Escape the reason string
+            for (entry.value_ptr.reason) |c| {
+                if (c == '"') {
+                    try writer.writeAll("\\\"");
+                } else if (c == '\\') {
+                    try writer.writeAll("\\\\");
+                } else {
+                    try writer.writeByte(c);
+                }
+            }
+            try writer.writeAll("\"}");
+        }
+
+        try writer.writeByte(']');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    fn handleSetBan(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // setban "ip" "add|remove" [bantime] [absolute]
+        if (params != .array or params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "setban requires ip and command", id);
+        }
+
+        const ip_str = blk: {
+            const item = params.array.items[0];
+            if (item == .string) break :blk item.string;
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid IP address", id);
+        };
+
+        const command = blk: {
+            const item = params.array.items[1];
+            if (item == .string) break :blk item.string;
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid command", id);
+        };
+
+        // Parse IP address
+        var ip_parts: [4]u8 = undefined;
+        var part_iter = std.mem.splitSequence(u8, ip_str, ".");
+        var i: usize = 0;
+        while (part_iter.next()) |part| : (i += 1) {
+            if (i >= 4) break;
+            ip_parts[i] = std.fmt.parseInt(u8, part, 10) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid IP address format", id);
+            };
+        }
+        if (i != 4) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid IP address format", id);
+        }
+
+        const address = std.net.Address.initIp4(ip_parts, 0);
+
+        if (std.mem.eql(u8, command, "add")) {
+            // Get optional ban time (default 24 hours)
+            var ban_time: i64 = banlist.DEFAULT_BAN_DURATION;
+            if (params.array.items.len >= 3) {
+                const bt = params.array.items[2];
+                if (bt == .integer) {
+                    ban_time = bt.integer;
+                }
+            }
+
+            self.peer_manager.banIP(address, ban_time, "manual ban via RPC") catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to add ban", id);
+            };
+
+            return self.jsonRpcResult("null", id);
+        } else if (std.mem.eql(u8, command, "remove")) {
+            if (!self.peer_manager.unbanIP(address)) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "IP not found in ban list", id);
+            }
+            return self.jsonRpcResult("null", id);
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid command (use add or remove)", id);
+        }
+    }
+
+    fn handleClearBanned(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        self.peer_manager.getBanList().clearAll();
+        return self.jsonRpcResult("null", id);
     }
 
     // ========================================================================
