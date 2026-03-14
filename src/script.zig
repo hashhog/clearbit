@@ -152,6 +152,7 @@ pub const ScriptError = error{
     VerifyFailed,
     OpReturnEncountered,
     UnbalancedConditional,
+    SigPushOnly, // BIP-16: P2SH scriptSig must be push-only
 };
 
 // ============================================================================
@@ -199,6 +200,82 @@ const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 pub fn isCompressedPubkey(pubkey: []const u8) bool {
     if (pubkey.len != 33) return false;
     return pubkey[0] == 0x02 or pubkey[0] == 0x03;
+}
+
+/// Check if a script contains only push operations.
+/// Per BIP-16, P2SH scriptSig must be push-only (literals only).
+/// Push opcodes include:
+/// - OP_0 (0x00)
+/// - Direct pushes: opcodes 0x01-0x4b push that many bytes
+/// - OP_PUSHDATA1 (0x4c), OP_PUSHDATA2 (0x4d), OP_PUSHDATA4 (0x4e)
+/// - OP_1NEGATE (0x4f)
+/// - OP_1 through OP_16 (0x51-0x60)
+///
+/// Any opcode > 0x60 is NOT a push operation and would make this return false.
+/// Reference: Bitcoin Core script/script.cpp IsPushOnly()
+pub fn isPushOnly(script: []const u8) bool {
+    var pc: usize = 0;
+
+    while (pc < script.len) {
+        const opcode = script[pc];
+        pc += 1;
+
+        // OP_0 (0x00) is a push (pushes empty array)
+        if (opcode == 0x00) {
+            continue;
+        }
+
+        // Direct push: opcodes 0x01-0x4b push that many bytes
+        if (opcode >= 0x01 and opcode <= 0x4b) {
+            const n: usize = opcode;
+            if (pc + n > script.len) return false; // Invalid script
+            pc += n;
+            continue;
+        }
+
+        // OP_PUSHDATA1: next byte is length, then that many data bytes
+        if (opcode == 0x4c) {
+            if (pc >= script.len) return false;
+            const n: usize = script[pc];
+            pc += 1;
+            if (pc + n > script.len) return false;
+            pc += n;
+            continue;
+        }
+
+        // OP_PUSHDATA2: next 2 bytes (little-endian) are length
+        if (opcode == 0x4d) {
+            if (pc + 2 > script.len) return false;
+            const n: usize = std.mem.readInt(u16, script[pc..][0..2], .little);
+            pc += 2;
+            if (pc + n > script.len) return false;
+            pc += n;
+            continue;
+        }
+
+        // OP_PUSHDATA4: next 4 bytes (little-endian) are length
+        if (opcode == 0x4e) {
+            if (pc + 4 > script.len) return false;
+            const n: usize = std.mem.readInt(u32, script[pc..][0..4], .little);
+            pc += 4;
+            if (pc + n > script.len) return false;
+            pc += n;
+            continue;
+        }
+
+        // OP_1NEGATE (0x4f) through OP_16 (0x60) are push operations
+        // Note: OP_RESERVED (0x50) is technically between OP_1NEGATE and OP_1,
+        // but Bitcoin Core's IsPushOnly considers opcode <= OP_16 as push.
+        // However, OP_RESERVED would cause script failure anyway.
+        if (opcode >= 0x4f and opcode <= 0x60) {
+            continue;
+        }
+
+        // Any other opcode (> 0x60) is not a push operation
+        return false;
+    }
+
+    return true;
 }
 
 // ============================================================================
@@ -461,6 +538,13 @@ pub const ScriptEngine = struct {
 
         // 4. Handle P2SH
         if (self.flags.verify_p2sh and classifyScript(script_pubkey) == .p2sh) {
+            // BIP-16: scriptSig must be push-only for P2SH transactions.
+            // This is enforced unconditionally (not flag-gated beyond verify_p2sh).
+            // Reference: Bitcoin Core interpreter.cpp VerifyScript()
+            if (!isPushOnly(script_sig)) {
+                return ScriptError.SigPushOnly;
+            }
+
             if (saved_stack.items.len == 0) return false;
 
             // The last element of the original stack is the serialized script
@@ -2231,5 +2315,350 @@ test "witness cleanstack: single false value fails (eval false, not cleanstack)"
     } else |err| {
         // Should not be CleanStack error - it's exactly 1 item
         try std.testing.expect(err != ScriptError.CleanStack);
+    }
+}
+
+// ============================================================================
+// isPushOnly Tests (BIP-16 P2SH Push-Only scriptSig)
+// ============================================================================
+// Per BIP-16, when spending a P2SH output, the scriptSig must contain only
+// push operations. This is enforced unconditionally when P2SH validation
+// is enabled. Reference: Bitcoin Core script/script.cpp IsPushOnly()
+
+test "isPushOnly: empty script is push-only" {
+    try std.testing.expect(isPushOnly(&[_]u8{}));
+}
+
+test "isPushOnly: OP_0 is push-only" {
+    try std.testing.expect(isPushOnly(&[_]u8{0x00}));
+}
+
+test "isPushOnly: direct push opcodes (0x01-0x4b) are push-only" {
+    // Push 1 byte
+    try std.testing.expect(isPushOnly(&[_]u8{ 0x01, 0xAB }));
+    // Push 5 bytes
+    try std.testing.expect(isPushOnly(&[_]u8{ 0x05, 0x01, 0x02, 0x03, 0x04, 0x05 }));
+    // Push 0x4b (75) bytes
+    var script: [76]u8 = undefined;
+    script[0] = 0x4b;
+    @memset(script[1..76], 0xAB);
+    try std.testing.expect(isPushOnly(&script));
+}
+
+test "isPushOnly: OP_PUSHDATA1 is push-only" {
+    // OP_PUSHDATA1 with 2 bytes of data
+    try std.testing.expect(isPushOnly(&[_]u8{ 0x4c, 0x02, 0xAB, 0xCD }));
+}
+
+test "isPushOnly: OP_PUSHDATA2 is push-only" {
+    // OP_PUSHDATA2 with 2 bytes length (little-endian) and data
+    try std.testing.expect(isPushOnly(&[_]u8{ 0x4d, 0x02, 0x00, 0xAB, 0xCD }));
+}
+
+test "isPushOnly: OP_PUSHDATA4 is push-only" {
+    // OP_PUSHDATA4 with 4 bytes length (little-endian) and data
+    try std.testing.expect(isPushOnly(&[_]u8{ 0x4e, 0x02, 0x00, 0x00, 0x00, 0xAB, 0xCD }));
+}
+
+test "isPushOnly: OP_1NEGATE is push-only" {
+    try std.testing.expect(isPushOnly(&[_]u8{0x4f}));
+}
+
+test "isPushOnly: OP_1 through OP_16 are push-only" {
+    try std.testing.expect(isPushOnly(&[_]u8{0x51})); // OP_1
+    try std.testing.expect(isPushOnly(&[_]u8{0x52})); // OP_2
+    try std.testing.expect(isPushOnly(&[_]u8{0x60})); // OP_16
+}
+
+test "isPushOnly: multiple pushes are push-only" {
+    // OP_1 OP_2 <3 bytes> OP_0
+    try std.testing.expect(isPushOnly(&[_]u8{ 0x51, 0x52, 0x03, 0xAA, 0xBB, 0xCC, 0x00 }));
+}
+
+test "isPushOnly: OP_DUP (0x76) is NOT push-only" {
+    try std.testing.expect(!isPushOnly(&[_]u8{0x76}));
+}
+
+test "isPushOnly: OP_NOP (0x61) is NOT push-only" {
+    // OP_NOP is 0x61 which is > 0x60
+    try std.testing.expect(!isPushOnly(&[_]u8{0x61}));
+}
+
+test "isPushOnly: OP_ADD (0x93) is NOT push-only" {
+    try std.testing.expect(!isPushOnly(&[_]u8{0x93}));
+}
+
+test "isPushOnly: OP_HASH160 (0xa9) is NOT push-only" {
+    try std.testing.expect(!isPushOnly(&[_]u8{0xa9}));
+}
+
+test "isPushOnly: OP_CHECKSIG (0xac) is NOT push-only" {
+    try std.testing.expect(!isPushOnly(&[_]u8{0xac}));
+}
+
+test "isPushOnly: script with push followed by OP_DUP is NOT push-only" {
+    // OP_1 OP_DUP
+    try std.testing.expect(!isPushOnly(&[_]u8{ 0x51, 0x76 }));
+}
+
+test "isPushOnly: truncated direct push is NOT push-only" {
+    // Claims to push 5 bytes but only has 3
+    try std.testing.expect(!isPushOnly(&[_]u8{ 0x05, 0x01, 0x02, 0x03 }));
+}
+
+test "isPushOnly: truncated PUSHDATA1 is NOT push-only" {
+    // OP_PUSHDATA1 claims 5 bytes but has only 2
+    try std.testing.expect(!isPushOnly(&[_]u8{ 0x4c, 0x05, 0x01, 0x02 }));
+}
+
+// ============================================================================
+// P2SH Push-Only Enforcement Tests (BIP-16)
+// ============================================================================
+// When spending a P2SH output, the scriptSig must be push-only.
+// This check is enforced unconditionally (not flag-gated beyond verify_p2sh).
+// Reference: Bitcoin Core interpreter.cpp VerifyScript()
+
+test "P2SH push_only: scriptSig with OP_DUP must fail" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Create a P2SH redeem script: OP_1 (pushes true)
+    const redeem_script = [_]u8{0x51};
+    const redeem_hash = crypto.hash160(&redeem_script);
+
+    // Create P2SH scriptPubKey with correct hash
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9; // OP_HASH160
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memcpy(script_pubkey[2..22], &redeem_hash);
+    script_pubkey[22] = 0x87; // OP_EQUAL
+
+    // Create a scriptSig that:
+    // 1. Contains OP_DUP (non-push opcode) - should fail isPushOnly
+    // 2. After execution, leaves [0x51] on the stack - P2SH scriptPubKey will pass
+    // scriptSig: push [0x51], OP_DUP, OP_DROP
+    // Execution: push [0x51] -> dup -> [[0x51], [0x51]] -> drop -> [[0x51]]
+    // P2SH check: HASH160([0x51]) matches, so scriptPubKey returns true
+    // isPushOnly: [0x01, 0x51, 0x76, 0x75] contains 0x76 (OP_DUP) -> NOT push-only
+    const script_sig = [_]u8{ 0x01, 0x51, 0x76, 0x75 }; // push(0x51) OP_DUP OP_DROP
+
+    const result = engine.verify(&script_sig, &script_pubkey, &[_][]const u8{});
+    try std.testing.expectError(ScriptError.SigPushOnly, result);
+}
+
+test "P2SH push_only: scriptSig with only pushes succeeds past push-only check" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Create a simple P2SH redeem script: OP_1 (just pushes true)
+    const redeem_script = [_]u8{0x51}; // OP_1
+    const redeem_hash = crypto.hash160(&redeem_script);
+
+    // Create P2SH scriptPubKey with correct hash
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9; // OP_HASH160
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memcpy(script_pubkey[2..22], &redeem_hash);
+    script_pubkey[22] = 0x87; // OP_EQUAL
+
+    // Create a push-only scriptSig that pushes the redeem script
+    var script_sig: [2]u8 = undefined;
+    script_sig[0] = 0x01; // Push 1 byte
+    script_sig[1] = 0x51; // The byte being pushed (which is also OP_1)
+
+    const result = engine.verify(&script_sig, &script_pubkey, &[_][]const u8{});
+    // Should NOT fail with SigPushOnly - push-only check passes
+    // May fail for other reasons (cleanstack, etc.) but not SigPushOnly
+    if (result) |_| {
+        // Success is fine
+    } else |err| {
+        try std.testing.expect(err != ScriptError.SigPushOnly);
+    }
+}
+
+test "P2SH push_only: scriptSig with OP_CHECKSIG must fail" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Create a P2SH redeem script: OP_1 (pushes true)
+    const redeem_script = [_]u8{0x51};
+    const redeem_hash = crypto.hash160(&redeem_script);
+
+    // Create P2SH scriptPubKey with correct hash
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9; // OP_HASH160
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memcpy(script_pubkey[2..22], &redeem_hash);
+    script_pubkey[22] = 0x87; // OP_EQUAL
+
+    // Create a scriptSig with OP_CHECKSIG (non-push opcode)
+    // We need the script to execute successfully but fail isPushOnly
+    // Script: push fake sig, push fake pubkey, OP_CHECKSIG, then push redeem_script
+    // Note: OP_CHECKSIG with secp256k1 unavailable returns true for testing
+    // After execution: stack will have [true/false, redeem_script_bytes]
+    // But for P2SH scriptPubKey to pass, we need top = redeem_script
+    // This is tricky - let's use a simpler approach: OP_1 OP_DROP push(redeem)
+    // Actually, we need OP_CHECKSIG in the script. Let's try:
+    // push(sig), push(pubkey), OP_CHECKSIG, OP_DROP, push(redeem)
+    // Result: [sig, pubkey] -> OP_CHECKSIG -> [true] -> OP_DROP -> [] -> push(redeem) -> [redeem]
+
+    var fake_sig: [72]u8 = undefined;
+    @memset(&fake_sig, 0x30);
+    fake_sig[71] = 0x01; // SIGHASH_ALL
+
+    var compressed_pubkey: [33]u8 = undefined;
+    compressed_pubkey[0] = 0x02;
+    @memset(compressed_pubkey[1..33], 0xCD);
+
+    // Build scriptSig: push(sig) push(pubkey) OP_CHECKSIG OP_DROP push(redeem)
+    // Sizes: 1+72 + 1+33 + 1 + 1 + 1+1 = 111 bytes
+    var script_sig_buf: [111]u8 = undefined;
+    var pos: usize = 0;
+
+    // Push 72 bytes sig
+    script_sig_buf[pos] = 72;
+    pos += 1;
+    @memcpy(script_sig_buf[pos .. pos + 72], &fake_sig);
+    pos += 72;
+
+    // Push 33 bytes pubkey
+    script_sig_buf[pos] = 33;
+    pos += 1;
+    @memcpy(script_sig_buf[pos .. pos + 33], &compressed_pubkey);
+    pos += 33;
+
+    // OP_CHECKSIG
+    script_sig_buf[pos] = 0xac;
+    pos += 1;
+
+    // OP_DROP
+    script_sig_buf[pos] = 0x75;
+    pos += 1;
+
+    // Push 1 byte redeem script
+    script_sig_buf[pos] = 0x01;
+    pos += 1;
+    script_sig_buf[pos] = 0x51;
+    pos += 1;
+
+    const result = engine.verify(script_sig_buf[0..pos], &script_pubkey, &[_][]const u8{});
+    try std.testing.expectError(ScriptError.SigPushOnly, result);
+}
+
+test "P2SH push_only: scriptSig with OP_HASH160 must fail" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Create a P2SH redeem script: OP_1 (pushes true)
+    const redeem_script = [_]u8{0x51};
+    const redeem_hash = crypto.hash160(&redeem_script);
+
+    // Create P2SH scriptPubKey with correct hash
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9; // OP_HASH160
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memcpy(script_pubkey[2..22], &redeem_hash);
+    script_pubkey[22] = 0x87; // OP_EQUAL
+
+    // Create a scriptSig with OP_HASH160 (non-push opcode)
+    // Script: push(some_data) OP_HASH160 OP_DROP push(redeem)
+    // After execution: [hash(some_data)] -> OP_DROP -> [] -> push(redeem) -> [redeem]
+    // P2SH check: HASH160([0x51]) matches -> true
+    // isPushOnly: contains 0xa9 (OP_HASH160) -> NOT push-only
+    const some_data = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    var script_sig_buf: [10]u8 = undefined;
+    var pos: usize = 0;
+
+    // Push 4 bytes
+    script_sig_buf[pos] = 0x04;
+    pos += 1;
+    @memcpy(script_sig_buf[pos .. pos + 4], &some_data);
+    pos += 4;
+
+    // OP_HASH160
+    script_sig_buf[pos] = 0xa9;
+    pos += 1;
+
+    // OP_DROP
+    script_sig_buf[pos] = 0x75;
+    pos += 1;
+
+    // Push 1 byte redeem script
+    script_sig_buf[pos] = 0x01;
+    pos += 1;
+    script_sig_buf[pos] = 0x51;
+    pos += 1;
+
+    const result = engine.verify(script_sig_buf[0..pos], &script_pubkey, &[_][]const u8{});
+    try std.testing.expectError(ScriptError.SigPushOnly, result);
+}
+
+test "P2SH push_only: non-P2SH scripts allow non-push scriptSig" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // P2PKH scriptPubKey (not P2SH)
+    var script_pubkey: [25]u8 = undefined;
+    script_pubkey[0] = 0x76; // OP_DUP
+    script_pubkey[1] = 0xa9; // OP_HASH160
+    script_pubkey[2] = 0x14; // Push 20 bytes
+    @memset(script_pubkey[3..23], 0xAB);
+    script_pubkey[23] = 0x88; // OP_EQUALVERIFY
+    script_pubkey[24] = 0xac; // OP_CHECKSIG
+
+    // scriptSig with non-push opcodes (normally invalid, but should not fail with SigPushOnly)
+    const script_sig = [_]u8{ 0x51, 0x76 }; // OP_1 OP_DUP
+
+    const result = engine.verify(&script_sig, &script_pubkey, &[_][]const u8{});
+    // Should NOT fail with SigPushOnly - P2PKH doesn't require push-only
+    if (result) |_| {
+        // Success is fine (unlikely given fake data)
+    } else |err| {
+        try std.testing.expect(err != ScriptError.SigPushOnly);
     }
 }
