@@ -35,7 +35,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Mempool (BIP-125 RBF, ancestor/descendant limits, dust detection, eviction)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
 - [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness, locktime validation)
-- [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, mining, sendrawtransaction)
+- [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, batch requests, mining, sendrawtransaction)
 - [x] Wallet (key generation, P2PKH/P2WPKH/P2TR addresses, coin selection, tx signing, anti-fee-sniping)
 - [x] CLI and application entry point (argument parsing, config files, signal handling)
 - [x] Performance optimization (arena allocators, SIMD, comptime tables, UTXO cache)
