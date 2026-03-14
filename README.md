@@ -21,7 +21,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Consensus parameters (network config, difficulty, subsidy)
 - [x] RocksDB storage layer (blocks, UTXOs, chain state)
-- [x] Block and transaction validation (BIP-16 P2SH push-only, BIP-34, BIP-141 segwit, BIP-146 NULLFAIL, WITNESS_PUBKEYTYPE, witness cleanstack)
+- [x] Block and transaction validation (BIP-16 P2SH push-only, BIP-34, BIP-141 segwit, BIP-146 NULLFAIL, WITNESS_PUBKEYTYPE, witness cleanstack, MINIMALIF)
 - [x] P2P message serialization (version, inv, headers, blocks)
 - [x] Peer connections (TCP, version/verack handshake, ping/pong)
 - [x] Peer manager and discovery (DNS seeds, addr relay, connection pool)
