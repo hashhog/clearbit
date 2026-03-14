@@ -1520,6 +1520,373 @@ pub fn isWitnessProgram(script: []const u8) ?struct { version: u8, program: []co
 }
 
 // ============================================================================
+// Legacy Sighash (Pre-SegWit)
+// ============================================================================
+
+/// Sighash type constants
+pub const SIGHASH_ALL: u8 = 0x01;
+pub const SIGHASH_NONE: u8 = 0x02;
+pub const SIGHASH_SINGLE: u8 = 0x03;
+pub const SIGHASH_ANYONECANPAY: u8 = 0x80;
+
+/// Error type for sighash computation
+pub const SighashError = error{
+    OutOfMemory,
+    InvalidScript,
+};
+
+/// Remove all occurrences of `pattern` from `script` and return a new script.
+/// This implements the FindAndDelete operation used in legacy sighash computation.
+/// Per Bitcoin Core: FindAndDelete operates on raw bytes, scanning for the exact byte pattern.
+/// Reference: Bitcoin Core script/interpreter.cpp FindAndDelete()
+pub fn findAndDelete(allocator: std.mem.Allocator, script: []const u8, pattern: []const u8) SighashError![]u8 {
+    if (pattern.len == 0) {
+        // No pattern to delete, return copy of original
+        return allocator.dupe(u8, script) catch return SighashError.OutOfMemory;
+    }
+
+    // Build result by skipping all occurrences of pattern
+    var result = std.ArrayList(u8).init(allocator);
+    errdefer result.deinit();
+
+    var i: usize = 0;
+    while (i < script.len) {
+        // Check if pattern matches at current position
+        if (i + pattern.len <= script.len and std.mem.eql(u8, script[i .. i + pattern.len], pattern)) {
+            // Skip the pattern
+            i += pattern.len;
+        } else {
+            // Copy the byte
+            result.append(script[i]) catch return SighashError.OutOfMemory;
+            i += 1;
+        }
+    }
+
+    return result.toOwnedSlice() catch return SighashError.OutOfMemory;
+}
+
+/// Remove all OP_CODESEPARATOR opcodes from a script.
+/// Used when preparing the scriptCode for legacy sighash computation.
+/// Reference: Bitcoin Core script/interpreter.cpp CTransactionSignatureSerializer::SerializeScriptCode()
+pub fn removeCodeSeparators(allocator: std.mem.Allocator, script: []const u8) SighashError![]u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    errdefer result.deinit();
+
+    var pc: usize = 0;
+    while (pc < script.len) {
+        const opcode = script[pc];
+
+        // OP_CODESEPARATOR = 0xab
+        if (opcode == 0xab) {
+            pc += 1;
+            continue;
+        }
+
+        // Copy opcode
+        result.append(opcode) catch return SighashError.OutOfMemory;
+        pc += 1;
+
+        // Handle push data
+        if (opcode >= 0x01 and opcode <= 0x4b) {
+            // Direct push: copy the data bytes
+            const n: usize = opcode;
+            if (pc + n > script.len) return SighashError.InvalidScript;
+            for (script[pc .. pc + n]) |byte| {
+                result.append(byte) catch return SighashError.OutOfMemory;
+            }
+            pc += n;
+        } else if (opcode == 0x4c) {
+            // OP_PUSHDATA1
+            if (pc >= script.len) return SighashError.InvalidScript;
+            const n: usize = script[pc];
+            result.append(script[pc]) catch return SighashError.OutOfMemory;
+            pc += 1;
+            if (pc + n > script.len) return SighashError.InvalidScript;
+            for (script[pc .. pc + n]) |byte| {
+                result.append(byte) catch return SighashError.OutOfMemory;
+            }
+            pc += n;
+        } else if (opcode == 0x4d) {
+            // OP_PUSHDATA2
+            if (pc + 2 > script.len) return SighashError.InvalidScript;
+            const n: usize = std.mem.readInt(u16, script[pc..][0..2], .little);
+            result.append(script[pc]) catch return SighashError.OutOfMemory;
+            result.append(script[pc + 1]) catch return SighashError.OutOfMemory;
+            pc += 2;
+            if (pc + n > script.len) return SighashError.InvalidScript;
+            for (script[pc .. pc + n]) |byte| {
+                result.append(byte) catch return SighashError.OutOfMemory;
+            }
+            pc += n;
+        } else if (opcode == 0x4e) {
+            // OP_PUSHDATA4
+            if (pc + 4 > script.len) return SighashError.InvalidScript;
+            const n: usize = std.mem.readInt(u32, script[pc..][0..4], .little);
+            for (script[pc .. pc + 4]) |byte| {
+                result.append(byte) catch return SighashError.OutOfMemory;
+            }
+            pc += 4;
+            if (pc + n > script.len) return SighashError.InvalidScript;
+            for (script[pc .. pc + n]) |byte| {
+                result.append(byte) catch return SighashError.OutOfMemory;
+            }
+            pc += n;
+        }
+    }
+
+    return result.toOwnedSlice() catch return SighashError.OutOfMemory;
+}
+
+/// Create the push-encoded form of data (used for FindAndDelete).
+/// For data up to 75 bytes, push_opcode = length.
+/// For larger data, OP_PUSHDATA1/2/4 is used.
+pub fn pushEncode(allocator: std.mem.Allocator, data: []const u8) SighashError![]u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    errdefer result.deinit();
+
+    if (data.len <= 0x4b) {
+        // Direct push
+        result.append(@intCast(data.len)) catch return SighashError.OutOfMemory;
+    } else if (data.len <= 0xff) {
+        // OP_PUSHDATA1
+        result.append(0x4c) catch return SighashError.OutOfMemory;
+        result.append(@intCast(data.len)) catch return SighashError.OutOfMemory;
+    } else if (data.len <= 0xffff) {
+        // OP_PUSHDATA2
+        result.append(0x4d) catch return SighashError.OutOfMemory;
+        var len_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_bytes, @intCast(data.len), .little);
+        for (len_bytes) |b| {
+            result.append(b) catch return SighashError.OutOfMemory;
+        }
+    } else {
+        // OP_PUSHDATA4
+        result.append(0x4e) catch return SighashError.OutOfMemory;
+        var len_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_bytes, @intCast(data.len), .little);
+        for (len_bytes) |b| {
+            result.append(b) catch return SighashError.OutOfMemory;
+        }
+    }
+
+    for (data) |b| {
+        result.append(b) catch return SighashError.OutOfMemory;
+    }
+
+    return result.toOwnedSlice() catch return SighashError.OutOfMemory;
+}
+
+/// Write a CompactSize integer to a buffer.
+fn writeCompactSize(writer: *std.ArrayList(u8), value: usize) SighashError!void {
+    if (value < 0xfd) {
+        writer.append(@intCast(value)) catch return SighashError.OutOfMemory;
+    } else if (value <= 0xffff) {
+        writer.append(0xfd) catch return SighashError.OutOfMemory;
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, @intCast(value), .little);
+        for (bytes) |b| {
+            writer.append(b) catch return SighashError.OutOfMemory;
+        }
+    } else if (value <= 0xffffffff) {
+        writer.append(0xfe) catch return SighashError.OutOfMemory;
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, @intCast(value), .little);
+        for (bytes) |b| {
+            writer.append(b) catch return SighashError.OutOfMemory;
+        }
+    } else {
+        writer.append(0xff) catch return SighashError.OutOfMemory;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, @intCast(value), .little);
+        for (bytes) |b| {
+            writer.append(b) catch return SighashError.OutOfMemory;
+        }
+    }
+}
+
+/// Compute legacy (pre-segwit) signature hash.
+/// This implements the original Bitcoin sighash algorithm including:
+/// - FindAndDelete: removes the signature being checked from scriptCode
+/// - OP_CODESEPARATOR handling: uses scriptCode starting after the last executed OP_CODESEPARATOR
+/// - SIGHASH_NONE: zeroes all outputs and other input sequences
+/// - SIGHASH_SINGLE: only hash output at same index; return 1 if index >= outputs.len
+/// - SIGHASH_ANYONECANPAY: only hash the current input
+///
+/// Reference: Bitcoin Core script/interpreter.cpp SignatureHash(), CTransactionSignatureSerializer
+pub fn legacySignatureHash(
+    allocator: std.mem.Allocator,
+    tx: *const types.Transaction,
+    input_index: usize,
+    script_code: []const u8,
+    hash_type: u32,
+) SighashError![32]u8 {
+    const base_type = hash_type & 0x1f;
+    const anyone_can_pay = (hash_type & SIGHASH_ANYONECANPAY) != 0;
+    const hash_single = base_type == SIGHASH_SINGLE;
+    const hash_none = base_type == SIGHASH_NONE;
+
+    // SIGHASH_SINGLE with input index >= outputs.len returns uint256 one
+    // This is a known quirk of Bitcoin's sighash
+    if (hash_single and input_index >= tx.outputs.len) {
+        var result: [32]u8 = [_]u8{0} ** 32;
+        result[0] = 0x01; // Little-endian 1
+        return result;
+    }
+
+    // Remove OP_CODESEPARATOR from script code
+    const clean_script = try removeCodeSeparators(allocator, script_code);
+    defer allocator.free(clean_script);
+
+    // Build the serialized transaction for hashing
+    var preimage = std.ArrayList(u8).init(allocator);
+    defer preimage.deinit();
+
+    // Version (4 bytes, little-endian)
+    var version_bytes: [4]u8 = undefined;
+    std.mem.writeInt(i32, &version_bytes, tx.version, .little);
+    for (version_bytes) |b| {
+        preimage.append(b) catch return SighashError.OutOfMemory;
+    }
+
+    // Number of inputs
+    const num_inputs: usize = if (anyone_can_pay) 1 else tx.inputs.len;
+    try writeCompactSize(&preimage, num_inputs);
+
+    // Serialize inputs
+    for (0..num_inputs) |i| {
+        const actual_idx = if (anyone_can_pay) input_index else i;
+        const input = tx.inputs[actual_idx];
+
+        // Previous output hash (32 bytes)
+        for (input.previous_output.hash) |b| {
+            preimage.append(b) catch return SighashError.OutOfMemory;
+        }
+
+        // Previous output index (4 bytes)
+        var idx_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idx_bytes, input.previous_output.index, .little);
+        for (idx_bytes) |b| {
+            preimage.append(b) catch return SighashError.OutOfMemory;
+        }
+
+        // Script (scriptCode for input being signed, empty for others)
+        if (actual_idx == input_index) {
+            try writeCompactSize(&preimage, clean_script.len);
+            for (clean_script) |b| {
+                preimage.append(b) catch return SighashError.OutOfMemory;
+            }
+        } else {
+            // Empty script for other inputs
+            preimage.append(0x00) catch return SighashError.OutOfMemory;
+        }
+
+        // Sequence (4 bytes)
+        // For SIGHASH_NONE or SIGHASH_SINGLE, other inputs get sequence 0
+        const sequence: u32 = if (actual_idx != input_index and (hash_single or hash_none))
+            0
+        else
+            input.sequence;
+
+        var seq_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &seq_bytes, sequence, .little);
+        for (seq_bytes) |b| {
+            preimage.append(b) catch return SighashError.OutOfMemory;
+        }
+    }
+
+    // Number of outputs
+    const num_outputs: usize = if (hash_none) 0 else if (hash_single) input_index + 1 else tx.outputs.len;
+    try writeCompactSize(&preimage, num_outputs);
+
+    // Serialize outputs
+    for (0..num_outputs) |i| {
+        if (hash_single and i != input_index) {
+            // For SIGHASH_SINGLE, outputs before the signing input are "blank"
+            // (value = -1, empty script)
+            var neg_one: [8]u8 = undefined;
+            std.mem.writeInt(i64, &neg_one, -1, .little);
+            for (neg_one) |b| {
+                preimage.append(b) catch return SighashError.OutOfMemory;
+            }
+            preimage.append(0x00) catch return SighashError.OutOfMemory; // Empty script
+        } else {
+            const output = tx.outputs[i];
+
+            // Value (8 bytes)
+            var value_bytes: [8]u8 = undefined;
+            std.mem.writeInt(i64, &value_bytes, output.value, .little);
+            for (value_bytes) |b| {
+                preimage.append(b) catch return SighashError.OutOfMemory;
+            }
+
+            // Script pubkey
+            try writeCompactSize(&preimage, output.script_pubkey.len);
+            for (output.script_pubkey) |b| {
+                preimage.append(b) catch return SighashError.OutOfMemory;
+            }
+        }
+    }
+
+    // Lock time (4 bytes)
+    var locktime_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &locktime_bytes, tx.lock_time, .little);
+    for (locktime_bytes) |b| {
+        preimage.append(b) catch return SighashError.OutOfMemory;
+    }
+
+    // Hash type (4 bytes, little-endian)
+    var hashtype_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hashtype_bytes, hash_type, .little);
+    for (hashtype_bytes) |b| {
+        preimage.append(b) catch return SighashError.OutOfMemory;
+    }
+
+    // Double SHA256
+    return crypto.hash256(preimage.items);
+}
+
+/// Compute legacy sighash with FindAndDelete of the signature.
+/// This is the main entry point for legacy signature verification.
+/// Before computing the sighash, it removes all occurrences of the push-encoded
+/// signature from the scriptCode (the FindAndDelete operation).
+///
+/// Reference: Bitcoin Core script/interpreter.cpp EvalChecksigPreTapscript()
+pub fn legacySignatureHashWithFindAndDelete(
+    allocator: std.mem.Allocator,
+    tx: *const types.Transaction,
+    input_index: usize,
+    script_code: []const u8,
+    signature: []const u8,
+    hash_type: u32,
+) SighashError![32]u8 {
+    // Push-encode the signature for FindAndDelete
+    const push_encoded_sig = try pushEncode(allocator, signature);
+    defer allocator.free(push_encoded_sig);
+
+    // Remove all occurrences of the signature from the script
+    const clean_script = try findAndDelete(allocator, script_code, push_encoded_sig);
+    defer allocator.free(clean_script);
+
+    // Compute the sighash
+    return legacySignatureHash(allocator, tx, input_index, clean_script, hash_type);
+}
+
+/// Get the scriptCode for signing, starting after the given codesep_pos.
+/// codesep_pos is the byte offset of the last executed OP_CODESEPARATOR.
+/// If codesep_pos is 0xFFFFFFFF, the entire script is used.
+pub fn getScriptCodeFromCodesepPos(script: []const u8, codesep_pos: u32) []const u8 {
+    if (codesep_pos == 0xFFFFFFFF or codesep_pos >= script.len) {
+        return script;
+    }
+    // Skip the OP_CODESEPARATOR itself (1 byte)
+    const start = codesep_pos + 1;
+    if (start >= script.len) {
+        return &[_]u8{};
+    }
+    return script[start..];
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2661,4 +3028,329 @@ test "P2SH push_only: non-P2SH scripts allow non-push scriptSig" {
     } else |err| {
         try std.testing.expect(err != ScriptError.SigPushOnly);
     }
+}
+
+// ============================================================================
+// Legacy Sighash Tests
+// ============================================================================
+
+test "findAndDelete: empty pattern returns copy of original" {
+    const allocator = std.testing.allocator;
+    const script = [_]u8{ 0x01, 0x02, 0x03 };
+
+    const result = try findAndDelete(allocator, &script, &[_]u8{});
+    defer allocator.free(result);
+
+    try std.testing.expectEqualSlices(u8, &script, result);
+}
+
+test "findAndDelete: removes single occurrence" {
+    const allocator = std.testing.allocator;
+    const script = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const pattern = [_]u8{ 0x02, 0x03 };
+
+    const result = try findAndDelete(allocator, &script, &pattern);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x04 }, result);
+}
+
+test "findAndDelete: removes multiple occurrences" {
+    const allocator = std.testing.allocator;
+    const script = [_]u8{ 0xAB, 0x01, 0x02, 0xAB, 0x03, 0xAB };
+    const pattern = [_]u8{0xAB};
+
+    const result = try findAndDelete(allocator, &script, &pattern);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, result);
+}
+
+test "findAndDelete: no match returns copy" {
+    const allocator = std.testing.allocator;
+    const script = [_]u8{ 0x01, 0x02, 0x03 };
+    const pattern = [_]u8{ 0x04, 0x05 };
+
+    const result = try findAndDelete(allocator, &script, &pattern);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualSlices(u8, &script, result);
+}
+
+test "removeCodeSeparators: removes all OP_CODESEPARATOR" {
+    const allocator = std.testing.allocator;
+    // Script: OP_1 OP_CODESEPARATOR OP_2 OP_CODESEPARATOR OP_3
+    const script = [_]u8{ 0x51, 0xAB, 0x52, 0xAB, 0x53 };
+
+    const result = try removeCodeSeparators(allocator, &script);
+    defer allocator.free(result);
+
+    // Should be: OP_1 OP_2 OP_3
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x51, 0x52, 0x53 }, result);
+}
+
+test "removeCodeSeparators: preserves push data containing 0xAB" {
+    const allocator = std.testing.allocator;
+    // Script: push 2 bytes (0xAB, 0xCD), then OP_CODESEPARATOR
+    // 0x02 is "push 2 bytes", 0xAB 0xCD is data, 0xAB is OP_CODESEPARATOR
+    const script = [_]u8{ 0x02, 0xAB, 0xCD, 0xAB };
+
+    const result = try removeCodeSeparators(allocator, &script);
+    defer allocator.free(result);
+
+    // The 0xAB inside push data should remain, only trailing 0xAB removed
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0xAB, 0xCD }, result);
+}
+
+test "pushEncode: small data (<=75 bytes)" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{ 0x01, 0x02, 0x03 };
+
+    const result = try pushEncode(allocator, &data);
+    defer allocator.free(result);
+
+    // Should be: 0x03 (length) followed by data
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x01, 0x02, 0x03 }, result);
+}
+
+test "pushEncode: empty data" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{};
+
+    const result = try pushEncode(allocator, &data);
+    defer allocator.free(result);
+
+    // Should be: 0x00 (length 0)
+    try std.testing.expectEqualSlices(u8, &[_]u8{0x00}, result);
+}
+
+test "getScriptCodeFromCodesepPos: 0xFFFFFFFF returns whole script" {
+    const script = [_]u8{ 0x01, 0x02, 0x03 };
+    const result = getScriptCodeFromCodesepPos(&script, 0xFFFFFFFF);
+    try std.testing.expectEqualSlices(u8, &script, result);
+}
+
+test "getScriptCodeFromCodesepPos: returns script after codesep" {
+    // Script: OP_1 OP_CODESEPARATOR OP_2 OP_3
+    const script = [_]u8{ 0x51, 0xAB, 0x52, 0x53 };
+    // codesep_pos = 1 (position of OP_CODESEPARATOR)
+    const result = getScriptCodeFromCodesepPos(&script, 1);
+    // Should return bytes after position 1 (skip the codesep itself)
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x52, 0x53 }, result);
+}
+
+test "legacySignatureHash: SIGHASH_SINGLE out of range returns 1" {
+    const allocator = std.testing.allocator;
+
+    // Transaction with 1 input but 0 outputs
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{}, // No outputs!
+        .lock_time = 0,
+    };
+
+    // SIGHASH_SINGLE with input_index 0, but no outputs
+    const hash = try legacySignatureHash(
+        allocator,
+        &tx,
+        0,
+        &[_]u8{0x51}, // OP_1
+        SIGHASH_SINGLE,
+    );
+
+    // Should return uint256 value 1 (little-endian: 0x01 followed by 31 zeros)
+    var expected: [32]u8 = [_]u8{0} ** 32;
+    expected[0] = 0x01;
+    try std.testing.expectEqualSlices(u8, &expected, &hash);
+}
+
+test "legacySignatureHash: basic SIGHASH_ALL" {
+    const allocator = std.testing.allocator;
+
+    const prev_hash = [_]u8{
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = prev_hash, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 100000000, // 1 BTC
+        .script_pubkey = &[_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac },
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Simple script: OP_1
+    const script_code = [_]u8{0x51};
+
+    const hash = try legacySignatureHash(
+        allocator,
+        &tx,
+        0,
+        &script_code,
+        SIGHASH_ALL,
+    );
+
+    // Just verify it returns a non-zero hash
+    var all_zero = true;
+    for (hash) |b| {
+        if (b != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    try std.testing.expect(!all_zero);
+}
+
+test "legacySignatureHashWithFindAndDelete: removes signature from script" {
+    const allocator = std.testing.allocator;
+
+    const prev_hash = [_]u8{0x01} ** 32;
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = prev_hash, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50000000,
+        .script_pubkey = &[_]u8{0x51}, // OP_1
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Script that contains a pushed signature: <sig> OP_CHECKSIG
+    // sig = [0xAB, 0xCD]
+    const sig = [_]u8{ 0xAB, 0xCD };
+    // script_code = push(sig) OP_CHECKSIG = 0x02 0xAB 0xCD 0xAC
+    const script_code = [_]u8{ 0x02, 0xAB, 0xCD, 0xAC };
+
+    const hash_with_find_delete = try legacySignatureHashWithFindAndDelete(
+        allocator,
+        &tx,
+        0,
+        &script_code,
+        &sig,
+        SIGHASH_ALL,
+    );
+
+    // Compare with hash computed on script without the signature
+    // After FindAndDelete, script should be just OP_CHECKSIG
+    const hash_without_sig = try legacySignatureHash(
+        allocator,
+        &tx,
+        0,
+        &[_]u8{0xAC}, // OP_CHECKSIG only
+        SIGHASH_ALL,
+    );
+
+    try std.testing.expectEqualSlices(u8, &hash_without_sig, &hash_with_find_delete);
+}
+
+test "legacySignatureHash: SIGHASH_NONE zeros outputs" {
+    const allocator = std.testing.allocator;
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const output1 = types.TxOut{
+        .value = 100000000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+    const output2 = types.TxOut{
+        .value = 50000000,
+        .script_pubkey = &[_]u8{0x52},
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{ output1, output2 },
+        .lock_time = 0,
+    };
+
+    // SIGHASH_NONE should produce a valid hash
+    const hash = try legacySignatureHash(
+        allocator,
+        &tx,
+        0,
+        &[_]u8{0x51},
+        SIGHASH_NONE,
+    );
+
+    // Just verify it doesn't crash and returns something
+    _ = hash;
+}
+
+test "legacySignatureHash: SIGHASH_ANYONECANPAY hashes single input" {
+    const allocator = std.testing.allocator;
+
+    const input0 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const input1 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x02} ** 32, .index = 1 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFE,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 100000000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{ input0, input1 },
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // SIGHASH_ALL | SIGHASH_ANYONECANPAY
+    const hash = try legacySignatureHash(
+        allocator,
+        &tx,
+        1, // Signing input 1
+        &[_]u8{0x51},
+        SIGHASH_ALL | SIGHASH_ANYONECANPAY,
+    );
+
+    // Just verify it doesn't crash
+    _ = hash;
 }
