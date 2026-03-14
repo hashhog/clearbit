@@ -3107,3 +3107,1115 @@ test "flat_file_blockstore path generation" {
     const path99999_slice = std.mem.sliceTo(&path99999, 0);
     try std.testing.expectEqualStrings("/data/blocks/blk99999.dat", path99999_slice);
 }
+
+// ============================================================================
+// UTXO Cache Layer (Phase 24)
+// ============================================================================
+
+/// A UTXO entry matching Bitcoin Core's Coin structure.
+/// Serialized format: VARINT((coinbase ? 1 : 0) | (height << 1)) + TxOut
+pub const Coin = struct {
+    /// The unspent transaction output.
+    tx_out: types.TxOut,
+    /// The block height at which this coin was created.
+    height: u32,
+    /// Whether this coin came from a coinbase transaction.
+    is_coinbase: bool,
+
+    /// Check if this coin is spent (null output).
+    pub fn isSpent(self: *const Coin) bool {
+        return self.tx_out.value == 0 and self.tx_out.script_pubkey.len == 0;
+    }
+
+    /// Clear this coin (mark as spent).
+    pub fn clear(self: *Coin) void {
+        self.tx_out.value = 0;
+        self.tx_out.script_pubkey = &[_]u8{};
+        self.is_coinbase = false;
+        self.height = 0;
+    }
+
+    /// Estimate dynamic memory usage.
+    pub fn dynamicMemoryUsage(self: *const Coin) usize {
+        return self.tx_out.script_pubkey.len;
+    }
+
+    /// Serialize the coin to bytes for storage.
+    /// Format: VARINT(height << 1 | coinbase) + value (i64 LE) + script_len (varint) + script
+    pub fn toBytes(self: *const Coin, allocator: std.mem.Allocator) ![]const u8 {
+        var writer = serialize.Writer.init(allocator);
+        errdefer writer.deinit();
+
+        // Pack height and coinbase flag: height * 2 + coinbase
+        const code: u64 = @as(u64, self.height) * 2 + @intFromBool(self.is_coinbase);
+        try writer.writeCompactSize(code);
+
+        // Write value
+        try writer.writeInt(i64, self.tx_out.value);
+
+        // Write script
+        try writer.writeCompactSize(self.tx_out.script_pubkey.len);
+        try writer.writeBytes(self.tx_out.script_pubkey);
+
+        return writer.toOwnedSlice();
+    }
+
+    /// Deserialize a coin from bytes.
+    pub fn fromBytes(data: []const u8, allocator: std.mem.Allocator) !Coin {
+        var reader = serialize.Reader{ .data = data };
+
+        // Unpack height and coinbase flag
+        const code = try reader.readCompactSize();
+        const height: u32 = @intCast(code >> 1);
+        const is_coinbase = (code & 1) != 0;
+
+        // Read value
+        const value = try reader.readInt(i64);
+
+        // Read script
+        const script_len = try reader.readCompactSize();
+        const script_bytes = try reader.readBytes(@intCast(script_len));
+        const script_pubkey = try allocator.dupe(u8, script_bytes);
+
+        return Coin{
+            .tx_out = .{
+                .value = value,
+                .script_pubkey = script_pubkey,
+            },
+            .height = height,
+            .is_coinbase = is_coinbase,
+        };
+    }
+
+    /// Free the script_pubkey memory.
+    pub fn deinit(self: *Coin, allocator: std.mem.Allocator) void {
+        if (self.tx_out.script_pubkey.len > 0) {
+            // Only free if it's heap-allocated (not a static empty slice)
+            allocator.free(self.tx_out.script_pubkey);
+        }
+    }
+};
+
+/// Cache entry flags matching Bitcoin Core's CCoinsCacheEntry.
+/// DIRTY: Modified since last flush to parent.
+/// FRESH: Not present in parent cache (created in this cache).
+pub const CoinEntry = struct {
+    /// The cached coin (null if spent but not yet flushed).
+    coin: ?Coin,
+    /// True if this entry has been modified since last flush.
+    dirty: bool,
+    /// True if this entry doesn't exist in the parent/database.
+    /// If FRESH and spent, can be deleted without writing to parent.
+    fresh: bool,
+
+    pub fn init(coin: Coin, dirty: bool, fresh: bool) CoinEntry {
+        return .{
+            .coin = coin,
+            .dirty = dirty,
+            .fresh = fresh,
+        };
+    }
+
+    pub fn initEmpty() CoinEntry {
+        return .{
+            .coin = null,
+            .dirty = false,
+            .fresh = false,
+        };
+    }
+
+    /// Check if this entry represents a spent coin.
+    pub fn isSpent(self: *const CoinEntry) bool {
+        return self.coin == null or self.coin.?.isSpent();
+    }
+
+    /// Estimate memory usage.
+    pub fn memoryUsage(self: *const CoinEntry) usize {
+        if (self.coin) |*c| {
+            return c.dynamicMemoryUsage() + @sizeOf(CoinEntry);
+        }
+        return @sizeOf(CoinEntry);
+    }
+
+    pub fn deinit(self: *CoinEntry, allocator: std.mem.Allocator) void {
+        if (self.coin) |*c| {
+            c.deinit(allocator);
+            self.coin = null;
+        }
+    }
+};
+
+/// Hash context for OutPoint in AutoHashMap.
+pub const OutPointContext = struct {
+    pub fn hash(_: OutPointContext, key: types.OutPoint) u64 {
+        // Use the first 8 bytes of txid + index for hashing
+        var h: u64 = 0;
+        h = std.mem.readInt(u64, key.hash[0..8], .little);
+        h ^= @as(u64, key.index) *% 0x9e3779b97f4a7c15;
+        return h;
+    }
+
+    pub fn eql(_: OutPointContext, a: types.OutPoint, b: types.OutPoint) bool {
+        return std.mem.eql(u8, &a.hash, &b.hash) and a.index == b.index;
+    }
+};
+
+/// RocksDB key prefix for UTXO entries.
+const UTXO_KEY_PREFIX: u8 = 'C';
+
+/// Build the RocksDB key for a UTXO: "C" + serialized outpoint.
+fn makeCoinsDbKey(outpoint: *const types.OutPoint) [37]u8 {
+    var key: [37]u8 = undefined;
+    key[0] = UTXO_KEY_PREFIX;
+    @memcpy(key[1..33], &outpoint.hash);
+    std.mem.writeInt(u32, key[33..37], outpoint.index, .little);
+    return key;
+}
+
+/// CoinsViewDB: Direct RocksDB access layer for UTXO data.
+/// This is the lowest level of the cache hierarchy.
+pub const CoinsViewDB = struct {
+    db: *Database,
+    allocator: std.mem.Allocator,
+
+    pub fn init(db: *Database, allocator: std.mem.Allocator) CoinsViewDB {
+        return .{
+            .db = db,
+            .allocator = allocator,
+        };
+    }
+
+    /// Get a coin from the database.
+    pub fn getCoin(self: *const CoinsViewDB, outpoint: *const types.OutPoint) StorageError!?Coin {
+        const key = makeCoinsDbKey(outpoint);
+
+        const data = try self.db.get(CF_UTXO, &key);
+        if (data == null) return null;
+        defer self.allocator.free(data.?);
+
+        return Coin.fromBytes(data.?, self.allocator) catch return StorageError.CorruptData;
+    }
+
+    /// Check if a coin exists in the database.
+    pub fn haveCoin(self: *const CoinsViewDB, outpoint: *const types.OutPoint) bool {
+        const key = makeCoinsDbKey(outpoint);
+        const data = self.db.get(CF_UTXO, &key) catch return false;
+        if (data) |d| {
+            self.allocator.free(d);
+            return true;
+        }
+        return false;
+    }
+
+    /// Write a coin to the database.
+    pub fn putCoin(self: *const CoinsViewDB, outpoint: *const types.OutPoint, coin: *const Coin) StorageError!void {
+        const key = makeCoinsDbKey(outpoint);
+        const value = coin.toBytes(self.allocator) catch return StorageError.SerializationFailed;
+        defer self.allocator.free(value);
+
+        try self.db.put(CF_UTXO, &key, value);
+    }
+
+    /// Delete a coin from the database.
+    pub fn deleteCoin(self: *const CoinsViewDB, outpoint: *const types.OutPoint) StorageError!void {
+        const key = makeCoinsDbKey(outpoint);
+        try self.db.delete(CF_UTXO, &key);
+    }
+
+    /// Coin put operation for batch writes.
+    pub const CoinPut = struct { outpoint: types.OutPoint, coin: Coin };
+
+    /// Batch write multiple coin operations atomically.
+    pub fn batchWrite(
+        self: *const CoinsViewDB,
+        puts: []const CoinPut,
+        deletes: []const types.OutPoint,
+    ) StorageError!void {
+        var ops = std.ArrayList(BatchOp).init(self.allocator);
+        defer {
+            // Free allocated key/value buffers
+            for (ops.items) |op| {
+                switch (op) {
+                    .put => |p| {
+                        self.allocator.free(@constCast(p.key));
+                        self.allocator.free(@constCast(p.value));
+                    },
+                    .delete => |d| self.allocator.free(@constCast(d.key)),
+                }
+            }
+            ops.deinit();
+        }
+
+        // Build put operations
+        for (puts) |entry| {
+            const key = makeCoinsDbKey(&entry.outpoint);
+            const key_copy = self.allocator.alloc(u8, 37) catch return StorageError.OutOfMemory;
+            @memcpy(key_copy, &key);
+
+            const value = entry.coin.toBytes(self.allocator) catch return StorageError.SerializationFailed;
+
+            ops.append(.{
+                .put = .{ .cf = CF_UTXO, .key = key_copy, .value = value },
+            }) catch return StorageError.OutOfMemory;
+        }
+
+        // Build delete operations
+        for (deletes) |outpoint| {
+            const key = makeCoinsDbKey(&outpoint);
+            const key_copy = self.allocator.alloc(u8, 37) catch return StorageError.OutOfMemory;
+            @memcpy(key_copy, &key);
+
+            ops.append(.{
+                .delete = .{ .cf = CF_UTXO, .key = key_copy },
+            }) catch return StorageError.OutOfMemory;
+        }
+
+        try self.db.writeBatch(ops.items);
+    }
+};
+
+/// Default UTXO cache size: 450 MiB (matching Bitcoin Core's -dbcache default).
+pub const DEFAULT_DB_CACHE_BYTES: usize = 450 * 1024 * 1024;
+
+/// CoinsViewCache: In-memory UTXO cache backed by CoinsViewDB.
+/// Implements the cache layer with FRESH/DIRTY optimization.
+pub const CoinsViewCache = struct {
+    /// In-memory cache of coin entries.
+    cache: std.HashMap(types.OutPoint, CoinEntry, OutPointContext, std.hash_map.default_max_load_percentage),
+    /// Backing database view (null for top-level test caches).
+    base: ?*CoinsViewDB,
+    /// Parent cache (for layered caching).
+    parent_cache: ?*CoinsViewCache,
+    /// Current memory usage estimate.
+    cached_coins_usage: usize,
+    /// Number of dirty entries.
+    dirty_count: usize,
+    /// Maximum cache size before flush.
+    max_cache_size: usize,
+    /// Allocator for cache operations.
+    allocator: std.mem.Allocator,
+
+    // Statistics
+    hits: u64,
+    misses: u64,
+
+    pub fn init(base: ?*CoinsViewDB, max_cache_size: usize, allocator: std.mem.Allocator) CoinsViewCache {
+        return .{
+            .cache = std.HashMap(types.OutPoint, CoinEntry, OutPointContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .base = base,
+            .parent_cache = null,
+            .cached_coins_usage = 0,
+            .dirty_count = 0,
+            .max_cache_size = max_cache_size,
+            .allocator = allocator,
+            .hits = 0,
+            .misses = 0,
+        };
+    }
+
+    /// Initialize with a parent cache (for layered caching during block validation).
+    pub fn initWithParent(parent: *CoinsViewCache, allocator: std.mem.Allocator) CoinsViewCache {
+        return .{
+            .cache = std.HashMap(types.OutPoint, CoinEntry, OutPointContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .base = parent.base,
+            .parent_cache = parent,
+            .cached_coins_usage = 0,
+            .dirty_count = 0,
+            .max_cache_size = parent.max_cache_size,
+            .allocator = allocator,
+            .hits = 0,
+            .misses = 0,
+        };
+    }
+
+    pub fn deinit(self: *CoinsViewCache) void {
+        var iter = self.cache.iterator();
+        while (iter.next()) |entry| {
+            var e = entry.value_ptr.*;
+            e.deinit(self.allocator);
+        }
+        self.cache.deinit();
+    }
+
+    /// Get a coin from the cache, falling back to parent/database.
+    pub fn getCoin(self: *CoinsViewCache, outpoint: *const types.OutPoint) ?Coin {
+        // Check cache first
+        if (self.cache.get(outpoint.*)) |entry| {
+            self.hits += 1;
+            if (entry.coin) |c| {
+                if (!c.isSpent()) {
+                    // Return a copy
+                    return Coin{
+                        .tx_out = .{
+                            .value = c.tx_out.value,
+                            .script_pubkey = self.allocator.dupe(u8, c.tx_out.script_pubkey) catch return null,
+                        },
+                        .height = c.height,
+                        .is_coinbase = c.is_coinbase,
+                    };
+                }
+            }
+            return null;
+        }
+
+        self.misses += 1;
+
+        // Try parent cache
+        if (self.parent_cache) |parent| {
+            if (parent.getCoin(outpoint)) |coin| {
+                // Cache the result (not dirty, not fresh since it exists in parent)
+                self.cacheInsert(outpoint.*, CoinEntry.init(coin, false, false));
+                // Return a copy
+                return Coin{
+                    .tx_out = .{
+                        .value = coin.tx_out.value,
+                        .script_pubkey = self.allocator.dupe(u8, coin.tx_out.script_pubkey) catch return null,
+                    },
+                    .height = coin.height,
+                    .is_coinbase = coin.is_coinbase,
+                };
+            }
+            return null;
+        }
+
+        // Fall back to database
+        if (self.base) |db| {
+            const coin = db.getCoin(outpoint) catch return null;
+            if (coin) |c| {
+                // Cache the result (not dirty, not fresh since it exists in DB)
+                self.cacheInsert(outpoint.*, CoinEntry.init(c, false, false));
+                // Return a copy
+                return Coin{
+                    .tx_out = .{
+                        .value = c.tx_out.value,
+                        .script_pubkey = self.allocator.dupe(u8, c.tx_out.script_pubkey) catch return null,
+                    },
+                    .height = c.height,
+                    .is_coinbase = c.is_coinbase,
+                };
+            }
+        }
+
+        return null;
+    }
+
+    /// Check if a coin exists.
+    pub fn haveCoin(self: *CoinsViewCache, outpoint: *const types.OutPoint) bool {
+        // Check cache first
+        if (self.cache.get(outpoint.*)) |entry| {
+            return !entry.isSpent();
+        }
+
+        // Try parent cache
+        if (self.parent_cache) |parent| {
+            return parent.haveCoin(outpoint);
+        }
+
+        // Fall back to database
+        if (self.base) |db| {
+            return db.haveCoin(outpoint);
+        }
+
+        return false;
+    }
+
+    /// Check if a coin is in the cache (without database lookup).
+    pub fn haveCoinInCache(self: *const CoinsViewCache, outpoint: *const types.OutPoint) bool {
+        if (self.cache.get(outpoint.*)) |entry| {
+            return !entry.isSpent();
+        }
+        return false;
+    }
+
+    /// Add a new coin to the cache.
+    /// possible_overwrite: if true, allows overwriting an existing unspent coin.
+    pub fn addCoin(
+        self: *CoinsViewCache,
+        outpoint: *const types.OutPoint,
+        coin: Coin,
+        possible_overwrite: bool,
+    ) !void {
+        // Check for OP_RETURN (unspendable)
+        if (coin.tx_out.script_pubkey.len > 0 and coin.tx_out.script_pubkey[0] == 0x6a) {
+            return;
+        }
+
+        // Check for existing entry
+        if (self.cache.getPtr(outpoint.*)) |entry_ptr| {
+            const existing_spent = entry_ptr.isSpent();
+
+            if (!possible_overwrite and !existing_spent) {
+                return error.CoinOverwrite;
+            }
+
+            // Determine if we can mark as FRESH
+            // If the coin exists as spent and is DIRTY, we can't mark new one as FRESH
+            // because spentness hasn't been flushed yet
+            const fresh = !entry_ptr.dirty;
+
+            // Update memory tracking
+            if (entry_ptr.dirty) {
+                self.dirty_count -= 1;
+            }
+            self.cached_coins_usage -= entry_ptr.memoryUsage();
+
+            // Clean up old entry
+            entry_ptr.deinit(self.allocator);
+
+            // Insert new coin
+            entry_ptr.* = CoinEntry{
+                .coin = Coin{
+                    .tx_out = .{
+                        .value = coin.tx_out.value,
+                        .script_pubkey = self.allocator.dupe(u8, coin.tx_out.script_pubkey) catch return error.OutOfMemory,
+                    },
+                    .height = coin.height,
+                    .is_coinbase = coin.is_coinbase,
+                },
+                .dirty = true,
+                .fresh = fresh,
+            };
+
+            self.dirty_count += 1;
+            self.cached_coins_usage += entry_ptr.memoryUsage();
+        } else {
+            // New entry - mark as FRESH (doesn't exist in parent)
+            const entry = CoinEntry{
+                .coin = Coin{
+                    .tx_out = .{
+                        .value = coin.tx_out.value,
+                        .script_pubkey = self.allocator.dupe(u8, coin.tx_out.script_pubkey) catch return error.OutOfMemory,
+                    },
+                    .height = coin.height,
+                    .is_coinbase = coin.is_coinbase,
+                },
+                .dirty = true,
+                .fresh = true,
+            };
+
+            self.cache.put(outpoint.*, entry) catch return error.OutOfMemory;
+            self.dirty_count += 1;
+            self.cached_coins_usage += entry.memoryUsage();
+        }
+    }
+
+    /// Spend a coin. Returns true if the coin existed and was spent.
+    /// If moveout is provided, the spent coin is moved there.
+    pub fn spendCoin(self: *CoinsViewCache, outpoint: *const types.OutPoint, moveout: ?*Coin) bool {
+        // First, ensure the coin is in the cache
+        if (self.cache.getPtr(outpoint.*)) |entry_ptr| {
+            if (entry_ptr.isSpent()) {
+                return false;
+            }
+
+            // Update memory tracking
+            if (entry_ptr.dirty) {
+                self.dirty_count -= 1;
+            }
+            self.cached_coins_usage -= entry_ptr.memoryUsage();
+
+            // Move coin out if requested
+            if (moveout) |m| {
+                m.* = entry_ptr.coin.?;
+                entry_ptr.coin = null;
+            }
+
+            // FRESH optimization: if FRESH, we can delete entirely (never hit DB)
+            if (entry_ptr.fresh) {
+                entry_ptr.deinit(self.allocator);
+                _ = self.cache.remove(outpoint.*);
+            } else {
+                // Not FRESH: mark as dirty spent (needs to be written to parent)
+                if (moveout == null) {
+                    entry_ptr.deinit(self.allocator);
+                }
+                entry_ptr.coin = null;
+                entry_ptr.dirty = true;
+                self.dirty_count += 1;
+                // Don't add memory usage for spent entries
+            }
+
+            return true;
+        }
+
+        // Not in cache - try to fetch it
+        _ = self.getCoin(outpoint);
+
+        // Try again after fetch
+        if (self.cache.getPtr(outpoint.*)) |entry_ptr| {
+            if (entry_ptr.isSpent()) {
+                return false;
+            }
+
+            // Update memory tracking
+            if (entry_ptr.dirty) {
+                self.dirty_count -= 1;
+            }
+            self.cached_coins_usage -= entry_ptr.memoryUsage();
+
+            // Move coin out if requested
+            if (moveout) |m| {
+                m.* = entry_ptr.coin.?;
+                entry_ptr.coin = null;
+            }
+
+            // Not FRESH since we just fetched from parent
+            if (moveout == null) {
+                entry_ptr.deinit(self.allocator);
+            }
+            entry_ptr.coin = null;
+            entry_ptr.dirty = true;
+            self.dirty_count += 1;
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /// Flush all dirty entries to the backing store.
+    pub fn flush(self: *CoinsViewCache) !void {
+        if (self.dirty_count == 0) return;
+
+        // Collect operations
+        var puts = std.ArrayList(CoinsViewDB.CoinPut).init(self.allocator);
+        defer puts.deinit();
+
+        var deletes = std.ArrayList(types.OutPoint).init(self.allocator);
+        defer deletes.deinit();
+
+        var iter = self.cache.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.dirty) {
+                if (entry.value_ptr.coin) |*c| {
+                    if (!c.isSpent()) {
+                        // Unspent coin: write to parent/DB
+                        try puts.append(.{ .outpoint = entry.key_ptr.*, .coin = c.* });
+                    } else if (!entry.value_ptr.fresh) {
+                        // Spent coin, not fresh: delete from parent/DB
+                        try deletes.append(entry.key_ptr.*);
+                    }
+                    // Spent + fresh: skip entirely (FRESH optimization)
+                } else {
+                    // Null coin (spent): delete if not fresh
+                    if (!entry.value_ptr.fresh) {
+                        try deletes.append(entry.key_ptr.*);
+                    }
+                }
+            }
+        }
+
+        // Flush to parent cache or database
+        if (self.parent_cache) |parent| {
+            // Flush to parent cache
+            for (puts.items) |p| {
+                try parent.addCoin(&p.outpoint, p.coin, true);
+            }
+            for (deletes.items) |outpoint| {
+                _ = parent.spendCoin(&outpoint, null);
+            }
+        } else if (self.base) |db| {
+            // Flush to database
+            try db.batchWrite(puts.items, deletes.items);
+        }
+
+        // Clear the cache
+        var clear_iter = self.cache.iterator();
+        while (clear_iter.next()) |entry| {
+            var e = entry.value_ptr.*;
+            e.deinit(self.allocator);
+        }
+        self.cache.clearRetainingCapacity();
+        self.cached_coins_usage = 0;
+        self.dirty_count = 0;
+    }
+
+    /// Check if memory usage exceeds the limit.
+    pub fn shouldFlush(self: *const CoinsViewCache) bool {
+        return self.cached_coins_usage >= self.max_cache_size;
+    }
+
+    /// Get cache statistics.
+    pub fn getStats(self: *const CoinsViewCache) struct {
+        cache_size: usize,
+        memory_usage: usize,
+        dirty_count: usize,
+        hits: u64,
+        misses: u64,
+        hit_rate: f64,
+    } {
+        const total = self.hits + self.misses;
+        const hit_rate = if (total > 0) @as(f64, @floatFromInt(self.hits)) / @as(f64, @floatFromInt(total)) else 0;
+
+        return .{
+            .cache_size = self.cache.count(),
+            .memory_usage = self.cached_coins_usage,
+            .dirty_count = self.dirty_count,
+            .hits = self.hits,
+            .misses = self.misses,
+            .hit_rate = hit_rate,
+        };
+    }
+
+    /// Internal: insert an entry into the cache.
+    fn cacheInsert(self: *CoinsViewCache, outpoint: types.OutPoint, entry: CoinEntry) void {
+        if (entry.dirty) {
+            self.dirty_count += 1;
+        }
+        self.cached_coins_usage += entry.memoryUsage();
+        self.cache.put(outpoint, entry) catch {};
+    }
+};
+
+// ============================================================================
+// UTXO Cache Tests (Phase 24)
+// ============================================================================
+
+test "coin serialization roundtrip" {
+    const allocator = std.testing.allocator;
+
+    const script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAB} ** 20;
+    const coin = Coin{
+        .tx_out = .{
+            .value = 5000000000,
+            .script_pubkey = &script,
+        },
+        .height = 500000,
+        .is_coinbase = true,
+    };
+
+    const serialized = try coin.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    var deserialized = try Coin.fromBytes(serialized, allocator);
+    defer deserialized.deinit(allocator);
+
+    try std.testing.expectEqual(coin.tx_out.value, deserialized.tx_out.value);
+    try std.testing.expectEqual(coin.height, deserialized.height);
+    try std.testing.expectEqual(coin.is_coinbase, deserialized.is_coinbase);
+    try std.testing.expectEqualSlices(u8, coin.tx_out.script_pubkey, deserialized.tx_out.script_pubkey);
+}
+
+test "coin non-coinbase serialization" {
+    const allocator = std.testing.allocator;
+
+    const script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xCD} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const coin = Coin{
+        .tx_out = .{
+            .value = 123456789,
+            .script_pubkey = &script,
+        },
+        .height = 700000,
+        .is_coinbase = false,
+    };
+
+    const serialized = try coin.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    var deserialized = try Coin.fromBytes(serialized, allocator);
+    defer deserialized.deinit(allocator);
+
+    try std.testing.expectEqual(coin.height, deserialized.height);
+    try std.testing.expect(!deserialized.is_coinbase);
+}
+
+test "coin is_spent check" {
+    const script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+
+    var coin = Coin{
+        .tx_out = .{
+            .value = 1000,
+            .script_pubkey = &script,
+        },
+        .height = 100,
+        .is_coinbase = false,
+    };
+
+    try std.testing.expect(!coin.isSpent());
+
+    coin.clear();
+    try std.testing.expect(coin.isSpent());
+}
+
+test "coin entry flags" {
+    const allocator = std.testing.allocator;
+
+    // Allocate script dynamically so deinit can free it
+    const script_data = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20;
+    const script1 = try allocator.dupe(u8, &script_data);
+    const script2 = try allocator.dupe(u8, &script_data);
+
+    const coin1 = Coin{
+        .tx_out = .{
+            .value = 1000,
+            .script_pubkey = script1,
+        },
+        .height = 100,
+        .is_coinbase = false,
+    };
+
+    const coin2 = Coin{
+        .tx_out = .{
+            .value = 1000,
+            .script_pubkey = script2,
+        },
+        .height = 100,
+        .is_coinbase = false,
+    };
+
+    // Fresh + dirty (new coin)
+    var entry1 = CoinEntry.init(coin1, true, true);
+    try std.testing.expect(entry1.dirty);
+    try std.testing.expect(entry1.fresh);
+    try std.testing.expect(!entry1.isSpent());
+
+    // Not fresh, not dirty (fetched from DB)
+    var entry2 = CoinEntry.init(coin2, false, false);
+    try std.testing.expect(!entry2.dirty);
+    try std.testing.expect(!entry2.fresh);
+
+    // Empty entry
+    const entry3 = CoinEntry.initEmpty();
+    try std.testing.expect(entry3.isSpent());
+    try std.testing.expect(entry3.coin == null);
+
+    // Memory usage should include script
+    try std.testing.expect(entry1.memoryUsage() > @sizeOf(CoinEntry));
+
+    entry1.deinit(allocator);
+    entry2.deinit(allocator);
+}
+
+test "coins db key generation" {
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x11} ** 32,
+        .index = 0x12345678,
+    };
+
+    const key = makeCoinsDbKey(&outpoint);
+
+    // Key should be 37 bytes: 'C' + txid (32) + index (4)
+    try std.testing.expectEqual(@as(usize, 37), key.len);
+    try std.testing.expectEqual(@as(u8, 'C'), key[0]);
+    try std.testing.expectEqualSlices(u8, &outpoint.hash, key[1..33]);
+
+    // Index should be little-endian
+    try std.testing.expectEqual(@as(u8, 0x78), key[33]);
+    try std.testing.expectEqual(@as(u8, 0x56), key[34]);
+    try std.testing.expectEqual(@as(u8, 0x34), key[35]);
+    try std.testing.expectEqual(@as(u8, 0x12), key[36]);
+}
+
+test "coins view cache add and get" {
+    const allocator = std.testing.allocator;
+
+    var cache = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cache.deinit();
+
+    const script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xCC} ** 20;
+    const coin = Coin{
+        .tx_out = .{
+            .value = 5000000000,
+            .script_pubkey = &script,
+        },
+        .height = 100,
+        .is_coinbase = true,
+    };
+
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x11} ** 32,
+        .index = 0,
+    };
+
+    // Add coin
+    try cache.addCoin(&outpoint, coin, false);
+
+    // Verify it's in cache
+    try std.testing.expect(cache.haveCoin(&outpoint));
+    try std.testing.expect(cache.haveCoinInCache(&outpoint));
+
+    // Get the coin
+    var fetched = cache.getCoin(&outpoint).?;
+    defer fetched.deinit(allocator);
+
+    try std.testing.expectEqual(coin.tx_out.value, fetched.tx_out.value);
+    try std.testing.expectEqual(coin.height, fetched.height);
+    try std.testing.expectEqual(coin.is_coinbase, fetched.is_coinbase);
+
+    // Check stats
+    const stats = cache.getStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.cache_size);
+    try std.testing.expectEqual(@as(usize, 1), stats.dirty_count);
+    try std.testing.expect(stats.memory_usage > 0);
+}
+
+test "coins view cache spend coin" {
+    const allocator = std.testing.allocator;
+
+    var cache = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cache.deinit();
+
+    const script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xDD} ** 20;
+    const coin = Coin{
+        .tx_out = .{
+            .value = 1000000,
+            .script_pubkey = &script,
+        },
+        .height = 200,
+        .is_coinbase = false,
+    };
+
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x22} ** 32,
+        .index = 1,
+    };
+
+    // Add and then spend
+    try cache.addCoin(&outpoint, coin, false);
+    try std.testing.expect(cache.haveCoin(&outpoint));
+
+    var spent_coin: Coin = undefined;
+    const result = cache.spendCoin(&outpoint, &spent_coin);
+    defer spent_coin.deinit(allocator);
+
+    try std.testing.expect(result);
+    try std.testing.expectEqual(coin.tx_out.value, spent_coin.tx_out.value);
+
+    // Should no longer exist
+    try std.testing.expect(!cache.haveCoin(&outpoint));
+}
+
+test "coins view cache fresh optimization" {
+    const allocator = std.testing.allocator;
+
+    var cache = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cache.deinit();
+
+    const script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xEE} ** 20;
+    const coin = Coin{
+        .tx_out = .{
+            .value = 500000,
+            .script_pubkey = &script,
+        },
+        .height = 300,
+        .is_coinbase = false,
+    };
+
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x33} ** 32,
+        .index = 2,
+    };
+
+    // Add coin (marked FRESH since it doesn't exist in DB)
+    try cache.addCoin(&outpoint, coin, false);
+
+    // Verify cache state
+    const stats_before = cache.getStats();
+    try std.testing.expectEqual(@as(usize, 1), stats_before.cache_size);
+    try std.testing.expectEqual(@as(usize, 1), stats_before.dirty_count);
+
+    // Spend the coin (FRESH optimization: should remove entirely)
+    const result = cache.spendCoin(&outpoint, null);
+    try std.testing.expect(result);
+
+    // After spending a FRESH coin, it should be completely removed
+    // (no need to write delete to DB since it was never written)
+    const stats_after = cache.getStats();
+    try std.testing.expectEqual(@as(usize, 0), stats_after.cache_size);
+    try std.testing.expectEqual(@as(usize, 0), stats_after.dirty_count);
+}
+
+test "coins view cache hit miss tracking" {
+    const allocator = std.testing.allocator;
+
+    var cache = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cache.deinit();
+
+    const script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xFF} ** 20;
+    const coin = Coin{
+        .tx_out = .{
+            .value = 100000,
+            .script_pubkey = &script,
+        },
+        .height = 400,
+        .is_coinbase = false,
+    };
+
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x44} ** 32,
+        .index = 3,
+    };
+
+    // Initial stats
+    var stats = cache.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.hits);
+    try std.testing.expectEqual(@as(u64, 0), stats.misses);
+
+    // Miss: coin doesn't exist
+    _ = cache.getCoin(&outpoint);
+    stats = cache.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.misses);
+
+    // Add the coin
+    try cache.addCoin(&outpoint, coin, false);
+
+    // Hit: coin now exists in cache
+    var fetched = cache.getCoin(&outpoint).?;
+    defer fetched.deinit(allocator);
+    stats = cache.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.misses);
+
+    // Hit rate should be 50%
+    try std.testing.expectEqual(@as(f64, 0.5), stats.hit_rate);
+}
+
+test "coins view cache flush to parent" {
+    const allocator = std.testing.allocator;
+
+    // Create parent cache
+    var parent = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer parent.deinit();
+
+    // Create child cache backed by parent
+    var child = CoinsViewCache.initWithParent(&parent, allocator);
+    defer child.deinit();
+
+    const script = [_]u8{ 0x51, 0x20 } ++ [_]u8{0xAA} ** 32;
+    const coin = Coin{
+        .tx_out = .{
+            .value = 312500000, // 3.125 BTC
+            .script_pubkey = &script,
+        },
+        .height = 800000,
+        .is_coinbase = true,
+    };
+
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x55} ** 32,
+        .index = 0,
+    };
+
+    // Add to child
+    try child.addCoin(&outpoint, coin, false);
+
+    // Not in parent yet
+    try std.testing.expect(!parent.haveCoin(&outpoint));
+
+    // Flush child to parent
+    try child.flush();
+
+    // Now in parent
+    try std.testing.expect(parent.haveCoin(&outpoint));
+
+    // Child should be empty
+    try std.testing.expectEqual(@as(usize, 0), child.getStats().cache_size);
+}
+
+test "coins view cache memory tracking" {
+    const allocator = std.testing.allocator;
+
+    var cache = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cache.deinit();
+
+    // Add several coins
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        const script = [_]u8{ 0x00, 0x14 } ++ [_]u8{@truncate(i)} ** 20;
+        var hash: [32]u8 = undefined;
+        @memset(&hash, @truncate(i));
+
+        const coin = Coin{
+            .tx_out = .{
+                .value = @as(i64, i) * 10000,
+                .script_pubkey = &script,
+            },
+            .height = 100 + i,
+            .is_coinbase = false,
+        };
+
+        const outpoint = types.OutPoint{
+            .hash = hash,
+            .index = i,
+        };
+
+        try cache.addCoin(&outpoint, coin, false);
+    }
+
+    const stats = cache.getStats();
+    try std.testing.expectEqual(@as(usize, 10), stats.cache_size);
+    try std.testing.expectEqual(@as(usize, 10), stats.dirty_count);
+    try std.testing.expect(stats.memory_usage > 0);
+
+    // Should not need to flush yet (small cache)
+    try std.testing.expect(!cache.shouldFlush());
+}
+
+test "coins view cache skip op_return" {
+    const allocator = std.testing.allocator;
+
+    var cache = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cache.deinit();
+
+    // OP_RETURN script (unspendable)
+    const script = [_]u8{ 0x6a, 0x04, 0x74, 0x65, 0x73, 0x74 }; // OP_RETURN PUSH4 "test"
+    const coin = Coin{
+        .tx_out = .{
+            .value = 0,
+            .script_pubkey = &script,
+        },
+        .height = 100,
+        .is_coinbase = false,
+    };
+
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x66} ** 32,
+        .index = 0,
+    };
+
+    // Should not add OP_RETURN outputs
+    try cache.addCoin(&outpoint, coin, false);
+
+    try std.testing.expect(!cache.haveCoin(&outpoint));
+    try std.testing.expectEqual(@as(usize, 0), cache.getStats().cache_size);
+}
+
+test "outpoint context hash and equality" {
+    const ctx = OutPointContext{};
+
+    const op1 = types.OutPoint{
+        .hash = [_]u8{0x11} ** 32,
+        .index = 0,
+    };
+
+    const op2 = types.OutPoint{
+        .hash = [_]u8{0x11} ** 32,
+        .index = 0,
+    };
+
+    const op3 = types.OutPoint{
+        .hash = [_]u8{0x11} ** 32,
+        .index = 1,
+    };
+
+    const op4 = types.OutPoint{
+        .hash = [_]u8{0x22} ** 32,
+        .index = 0,
+    };
+
+    // Same outpoints should be equal
+    try std.testing.expect(ctx.eql(op1, op2));
+    try std.testing.expectEqual(ctx.hash(op1), ctx.hash(op2));
+
+    // Different index should not be equal
+    try std.testing.expect(!ctx.eql(op1, op3));
+
+    // Different txid should not be equal
+    try std.testing.expect(!ctx.eql(op1, op4));
+}
+
+test "coins view cache default size" {
+    // Verify default cache size matches Bitcoin Core
+    try std.testing.expectEqual(@as(usize, 450 * 1024 * 1024), DEFAULT_DB_CACHE_BYTES);
+}
