@@ -514,8 +514,11 @@ pub const ScriptEngine = struct {
                     self.sig_version = .witness_v0;
                     try self.execute(&p2pkh_script);
 
-                    if (self.stack.items.len == 0) return false;
-                    if (!self.stackToBool(self.stack.items[self.stack.items.len - 1])) return false;
+                    // Witness cleanstack: UNCONDITIONALLY require exactly 1 stack element
+                    // This is NOT flag-gated (unlike legacy CLEANSTACK)
+                    // Reference: Bitcoin Core interpreter.cpp ExecuteWitnessScript()
+                    if (self.stack.items.len != 1) return ScriptError.CleanStack;
+                    if (!self.stackToBool(self.stack.items[0])) return false;
                 },
                 .p2wsh => {
                     if (witness.len == 0) return false;
@@ -536,23 +539,29 @@ pub const ScriptEngine = struct {
                     self.sig_version = .witness_v0;
                     try self.execute(witness_script);
 
-                    if (self.stack.items.len == 0) return false;
-                    if (!self.stackToBool(self.stack.items[self.stack.items.len - 1])) return false;
+                    // Witness cleanstack: UNCONDITIONALLY require exactly 1 stack element
+                    // This is NOT flag-gated (unlike legacy CLEANSTACK)
+                    // Reference: Bitcoin Core interpreter.cpp ExecuteWitnessScript()
+                    if (self.stack.items.len != 1) return ScriptError.CleanStack;
+                    if (!self.stackToBool(self.stack.items[0])) return false;
                 },
                 .p2tr => {
                     // Taproot key path or script path spend
                     if (witness.len == 0) return false;
 
-                    // Key path: single 64 or 65 byte signature
+                    // Key path: single 64 or 65 byte signature (no script execution)
                     if (witness.len == 1 and (witness[0].len == 64 or witness[0].len == 65)) {
                         // Schnorr signature verification would go here
                         // For now, we mark this as requiring libsecp256k1
                         if (!crypto.isSecp256k1Available()) {
                             return false; // Can't verify without library
                         }
+                        // Key path doesn't involve script execution, so no cleanstack check
                         // Full taproot verification would call verifySchnorr
                     }
-                    // Script path spending is more complex and requires control block parsing
+                    // Script path spending: when implemented, must enforce witness cleanstack
+                    // (stack.items.len == 1 after tapscript execution, just like P2WSH)
+                    // This is UNCONDITIONAL for tapscript - not flag-gated
                 },
                 else => {},
             }
@@ -2052,4 +2061,175 @@ test "WITNESS_PUBKEYTYPE: ScriptEngine initializes with base sig_version" {
     defer engine.deinit();
 
     try std.testing.expectEqual(SigVersion.base, engine.sig_version);
+}
+
+// ============================================================================
+// Witness CLEANSTACK Tests (BIP 141/143)
+// ============================================================================
+// Witness scripts (P2WPKH, P2WSH, tapscript) UNCONDITIONALLY require exactly
+// one element on the stack after execution. This is NOT flag-gated like the
+// legacy CLEANSTACK flag. Reference: Bitcoin Core interpreter.cpp ExecuteWitnessScript()
+
+test "witness cleanstack: P2WSH with extra stack items fails" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Create a P2WSH scriptPubKey
+    // The witness script will be: OP_1 OP_1 (pushes two items, violates cleanstack)
+    const witness_script = [_]u8{ 0x51, 0x51 }; // OP_1 OP_1
+    const witness_hash = crypto.sha256(&witness_script);
+
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0
+    script_pubkey[1] = 0x20; // Push 32 bytes
+    @memcpy(script_pubkey[2..34], &witness_hash);
+
+    // Witness: [witness_script]
+    const witness = [_][]const u8{&witness_script};
+
+    const result = engine.verify(&[_]u8{}, &script_pubkey, &witness);
+    try std.testing.expectError(ScriptError.CleanStack, result);
+}
+
+test "witness cleanstack: P2WSH with exactly one true item succeeds" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Witness script: OP_1 (pushes single true value)
+    const witness_script = [_]u8{0x51}; // OP_1
+    const witness_hash = crypto.sha256(&witness_script);
+
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0
+    script_pubkey[1] = 0x20; // Push 32 bytes
+    @memcpy(script_pubkey[2..34], &witness_hash);
+
+    // Witness: [witness_script]
+    const witness = [_][]const u8{&witness_script};
+
+    const result = engine.verify(&[_]u8{}, &script_pubkey, &witness);
+    // Should succeed - exactly one true item on stack
+    if (result) |valid| {
+        try std.testing.expect(valid);
+    } else |_| {
+        // Should not fail
+        try std.testing.expect(false);
+    }
+}
+
+test "witness cleanstack: P2WSH with empty stack fails" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Witness script: OP_1 OP_DROP (leaves empty stack)
+    const witness_script = [_]u8{ 0x51, 0x75 }; // OP_1 OP_DROP
+    const witness_hash = crypto.sha256(&witness_script);
+
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0
+    script_pubkey[1] = 0x20; // Push 32 bytes
+    @memcpy(script_pubkey[2..34], &witness_hash);
+
+    // Witness: [witness_script]
+    const witness = [_][]const u8{&witness_script};
+
+    const result = engine.verify(&[_]u8{}, &script_pubkey, &witness);
+    // Should fail with CleanStack (0 != 1)
+    try std.testing.expectError(ScriptError.CleanStack, result);
+}
+
+test "witness cleanstack: is NOT flag-gated (always enforced for witness)" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    // Even with verify_clean_stack disabled, witness cleanstack is enforced
+    var flags = ScriptFlags{};
+    flags.verify_clean_stack = false;
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    // Witness script: OP_1 OP_1 (pushes two items)
+    const witness_script = [_]u8{ 0x51, 0x51 }; // OP_1 OP_1
+    const witness_hash = crypto.sha256(&witness_script);
+
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0
+    script_pubkey[1] = 0x20; // Push 32 bytes
+    @memcpy(script_pubkey[2..34], &witness_hash);
+
+    const witness = [_][]const u8{&witness_script};
+
+    const result = engine.verify(&[_]u8{}, &script_pubkey, &witness);
+    // Should STILL fail with CleanStack even though flag is disabled
+    // because witness cleanstack is unconditional
+    try std.testing.expectError(ScriptError.CleanStack, result);
+}
+
+test "witness cleanstack: single false value fails (eval false, not cleanstack)" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Witness script: OP_0 (pushes single false value)
+    const witness_script = [_]u8{0x00}; // OP_0
+    const witness_hash = crypto.sha256(&witness_script);
+
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0
+    script_pubkey[1] = 0x20; // Push 32 bytes
+    @memcpy(script_pubkey[2..34], &witness_hash);
+
+    const witness = [_][]const u8{&witness_script};
+
+    const result = engine.verify(&[_]u8{}, &script_pubkey, &witness);
+    // Should return false (not error) because stack has exactly 1 item
+    // but that item is false
+    if (result) |valid| {
+        try std.testing.expect(!valid);
+    } else |err| {
+        // Should not be CleanStack error - it's exactly 1 item
+        try std.testing.expect(err != ScriptError.CleanStack);
+    }
 }
