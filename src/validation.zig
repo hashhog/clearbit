@@ -51,6 +51,7 @@ pub const ValidationError = error{
     BadWitnessCommitment,
     BadProofOfWork,
     BadCoinbaseValue,
+    SequenceLockNotSatisfied,
 
     // General errors
     OutOfMemory,
@@ -544,6 +545,148 @@ pub fn checkBlockTimestamp(
 }
 
 // ============================================================================
+// BIP-68 Sequence Lock Validation
+// ============================================================================
+
+/// Result of sequence lock calculation.
+/// Contains the minimum height and time that must be reached for the transaction
+/// to be valid. Uses -1 as a sentinel meaning "no constraint".
+pub const SequenceLockResult = struct {
+    /// Minimum block height required (-1 means no height constraint).
+    /// The transaction can be included in a block with height > min_height.
+    min_height: i32,
+    /// Minimum median time past required (-1 means no time constraint).
+    /// The transaction can be included in a block with MTP > min_time.
+    min_time: i64,
+};
+
+/// UTXO information needed for sequence lock calculation.
+pub const UtxoInfo = struct {
+    /// Height at which this UTXO was confirmed.
+    height: u32,
+    /// Median time past of the block that contained this UTXO.
+    mtp: u32,
+};
+
+/// A view interface for looking up UTXO information by outpoint.
+pub const UtxoView = struct {
+    context: *anyopaque,
+    lookupFn: *const fn (ctx: *anyopaque, outpoint: *const types.OutPoint) ?UtxoInfo,
+
+    pub fn lookup(self: *const UtxoView, outpoint: *const types.OutPoint) ?UtxoInfo {
+        return self.lookupFn(self.context, outpoint);
+    }
+};
+
+/// Block index information needed for sequence lock evaluation.
+pub const BlockIndex = struct {
+    height: u32,
+    /// Median time past of this block's parent (used for evaluation).
+    prev_mtp: u32,
+};
+
+/// Calculate sequence locks for a transaction.
+///
+/// For each input where BIP-68 is active (bit 31 not set in nSequence),
+/// calculate the minimum height or time that must be reached.
+///
+/// BIP-68 only applies if:
+/// - tx.version >= 2
+/// - The current block height is >= csv_height (BIP-68 activation)
+///
+/// For each input:
+/// - If bit 31 (SEQUENCE_LOCKTIME_DISABLE_FLAG) is set, skip this input
+/// - If bit 22 (SEQUENCE_LOCKTIME_TYPE_FLAG) is set, it's time-based:
+///   - Lock value = (sequence & 0xFFFF) * 512 seconds
+///   - Compare against MTP of block containing the UTXO
+/// - Otherwise, it's height-based:
+///   - Lock value = sequence & 0xFFFF blocks
+///   - Compare against height of block containing the UTXO
+///
+/// Returns: SequenceLockResult with the maximum required height/time across all inputs.
+pub fn calculateSequenceLocks(
+    tx: *const types.Transaction,
+    utxo_view: *const UtxoView,
+    block_height: u32,
+    params: *const consensus.NetworkParams,
+) SequenceLockResult {
+    // Initialize to -1 (no constraint)
+    var result = SequenceLockResult{
+        .min_height = -1,
+        .min_time = -1,
+    };
+
+    // BIP-68 only applies to tx version >= 2
+    if (tx.version < 2) {
+        return result;
+    }
+
+    // BIP-68 only applies after CSV activation
+    if (block_height < params.csv_height) {
+        return result;
+    }
+
+    // Coinbase transactions have no inputs to check
+    if (tx.isCoinbase()) {
+        return result;
+    }
+
+    for (tx.inputs) |input| {
+        const sequence = input.sequence;
+
+        // If disable flag is set, BIP-68 doesn't apply to this input
+        if ((sequence & consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0) {
+            continue;
+        }
+
+        // Look up the UTXO being spent
+        const utxo_info = utxo_view.lookup(&input.previous_output) orelse {
+            // If UTXO not found, skip this input (validation should catch this elsewhere)
+            continue;
+        };
+
+        const lock_value = sequence & consensus.SEQUENCE_LOCKTIME_MASK;
+
+        if ((sequence & consensus.SEQUENCE_LOCKTIME_TYPE_FLAG) != 0) {
+            // Time-based lock: lock_value * 512 seconds relative to UTXO's block MTP
+            // The MTP used is from the block *prior* to the one containing the UTXO
+            // (Bitcoin Core: block.GetAncestor(nCoinHeight - 1)->GetMedianTimePast())
+            // But we simplify by using the MTP of the block containing the UTXO
+            const lock_time = @as(i64, lock_value) << consensus.SEQUENCE_LOCKTIME_GRANULARITY;
+            // Subtract 1 to convert from "first valid" to "last invalid" semantics
+            const required_time = @as(i64, utxo_info.mtp) + lock_time - 1;
+            result.min_time = @max(result.min_time, required_time);
+        } else {
+            // Height-based lock: lock_value blocks relative to UTXO's confirmation height
+            // Subtract 1 to convert from "first valid" to "last invalid" semantics
+            const required_height = @as(i32, @intCast(utxo_info.height)) + @as(i32, @intCast(lock_value)) - 1;
+            result.min_height = @max(result.min_height, required_height);
+        }
+    }
+
+    return result;
+}
+
+/// Check if sequence locks are satisfied for inclusion in a block.
+///
+/// The transaction can be included in a block if:
+/// - Block height > result.min_height (or min_height == -1)
+/// - Block's parent MTP > result.min_time (or min_time == -1)
+pub fn checkSequenceLocks(result: SequenceLockResult, tip: *const BlockIndex) bool {
+    // Height check: block height must be > min_height
+    if (result.min_height >= @as(i32, @intCast(tip.height))) {
+        return false;
+    }
+
+    // Time check: parent's MTP must be > min_time
+    if (result.min_time >= @as(i64, tip.prev_mtp)) {
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -894,4 +1037,333 @@ test "checkDifficulty validates non-retarget block" {
     current_header.bits = 0x1d00fffe;
     const result = checkDifficulty(&current_header, 1, &[_]types.BlockHeader{prev_header}, &consensus.MAINNET);
     try std.testing.expectError(ValidationError.BadDifficulty, result);
+}
+
+// ============================================================================
+// Sequence Lock Tests
+// ============================================================================
+
+fn testUtxoLookup(ctx: *anyopaque, outpoint: *const types.OutPoint) ?UtxoInfo {
+    const utxos = @as(*const std.AutoHashMap([36]u8, UtxoInfo), @ptrCast(@alignCast(ctx)));
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &outpoint.hash);
+    std.mem.writeInt(u32, key[32..36], outpoint.index, .little);
+    return utxos.get(key);
+}
+
+test "calculateSequenceLocks returns no constraint for version 1 tx" {
+    var utxos = std.AutoHashMap([36]u8, UtxoInfo).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    const view = UtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testUtxoLookup,
+    };
+
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 10, // BIP-68 enabled, 10 blocks relative lock
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x00},
+    };
+
+    // Version 1 tx - BIP-68 should not apply
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    const result = calculateSequenceLocks(&tx, &view, 500000, &consensus.MAINNET);
+    try std.testing.expectEqual(@as(i32, -1), result.min_height);
+    try std.testing.expectEqual(@as(i64, -1), result.min_time);
+}
+
+test "calculateSequenceLocks returns no constraint before CSV activation" {
+    var utxos = std.AutoHashMap([36]u8, UtxoInfo).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    const view = UtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testUtxoLookup,
+    };
+
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 10,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x00},
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Before CSV activation height (419,328 on mainnet)
+    const result = calculateSequenceLocks(&tx, &view, 400000, &consensus.MAINNET);
+    try std.testing.expectEqual(@as(i32, -1), result.min_height);
+    try std.testing.expectEqual(@as(i64, -1), result.min_time);
+}
+
+test "calculateSequenceLocks with disable flag returns no constraint" {
+    var utxos = std.AutoHashMap([36]u8, UtxoInfo).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    const view = UtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testUtxoLookup,
+    };
+
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        // Disable flag set (bit 31)
+        .sequence = consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG | 100,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x00},
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    const result = calculateSequenceLocks(&tx, &view, 500000, &consensus.MAINNET);
+    try std.testing.expectEqual(@as(i32, -1), result.min_height);
+    try std.testing.expectEqual(@as(i64, -1), result.min_time);
+}
+
+test "calculateSequenceLocks with height-based lock" {
+    var utxos = std.AutoHashMap([36]u8, UtxoInfo).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    // Add UTXO at height 100
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &([_]u8{0x11} ** 32));
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    try utxos.put(key, UtxoInfo{ .height = 100, .mtp = 1000000 });
+
+    const view = UtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testUtxoLookup,
+    };
+
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        // 10 block relative lock (no type flag = height-based)
+        .sequence = 10,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x00},
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    const result = calculateSequenceLocks(&tx, &view, 500000, &consensus.MAINNET);
+    // min_height = utxo_height + lock_value - 1 = 100 + 10 - 1 = 109
+    try std.testing.expectEqual(@as(i32, 109), result.min_height);
+    try std.testing.expectEqual(@as(i64, -1), result.min_time);
+}
+
+test "calculateSequenceLocks with time-based lock" {
+    var utxos = std.AutoHashMap([36]u8, UtxoInfo).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    // Add UTXO with MTP of 1000000
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &([_]u8{0x11} ** 32));
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    try utxos.put(key, UtxoInfo{ .height = 100, .mtp = 1000000 });
+
+    const view = UtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testUtxoLookup,
+    };
+
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        // Time-based lock: 10 units * 512 seconds = 5120 seconds
+        .sequence = consensus.SEQUENCE_LOCKTIME_TYPE_FLAG | 10,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x00},
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    const result = calculateSequenceLocks(&tx, &view, 500000, &consensus.MAINNET);
+    // min_time = utxo_mtp + (10 << 9) - 1 = 1000000 + 5120 - 1 = 1005119
+    try std.testing.expectEqual(@as(i32, -1), result.min_height);
+    try std.testing.expectEqual(@as(i64, 1005119), result.min_time);
+}
+
+test "calculateSequenceLocks takes maximum across multiple inputs" {
+    var utxos = std.AutoHashMap([36]u8, UtxoInfo).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    // Add two UTXOs at different heights
+    var key1: [36]u8 = undefined;
+    @memcpy(key1[0..32], &([_]u8{0x11} ** 32));
+    std.mem.writeInt(u32, key1[32..36], 0, .little);
+    try utxos.put(key1, UtxoInfo{ .height = 100, .mtp = 1000000 });
+
+    var key2: [36]u8 = undefined;
+    @memcpy(key2[0..32], &([_]u8{0x22} ** 32));
+    std.mem.writeInt(u32, key2[32..36], 0, .little);
+    try utxos.put(key2, UtxoInfo{ .height = 200, .mtp = 1100000 });
+
+    const view = UtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testUtxoLookup,
+    };
+
+    const input1 = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 10, // 10 block lock
+        .witness = &[_][]const u8{},
+    };
+
+    const input2 = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x22} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 5, // 5 block lock
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x00},
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{ input1, input2 },
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    const result = calculateSequenceLocks(&tx, &view, 500000, &consensus.MAINNET);
+    // input1: 100 + 10 - 1 = 109
+    // input2: 200 + 5 - 1 = 204
+    // max = 204
+    try std.testing.expectEqual(@as(i32, 204), result.min_height);
+}
+
+test "checkSequenceLocks passes when constraints satisfied" {
+    const result = SequenceLockResult{
+        .min_height = 100,
+        .min_time = 1000000,
+    };
+
+    // Block at height 101 with prev_mtp 1000001 should pass
+    const tip = BlockIndex{
+        .height = 101,
+        .prev_mtp = 1000001,
+    };
+
+    try std.testing.expect(checkSequenceLocks(result, &tip));
+}
+
+test "checkSequenceLocks fails when height constraint not met" {
+    const result = SequenceLockResult{
+        .min_height = 100,
+        .min_time = -1,
+    };
+
+    // Block at height 100 should fail (need > 100)
+    const tip = BlockIndex{
+        .height = 100,
+        .prev_mtp = 2000000,
+    };
+
+    try std.testing.expect(!checkSequenceLocks(result, &tip));
+}
+
+test "checkSequenceLocks fails when time constraint not met" {
+    const result = SequenceLockResult{
+        .min_height = -1,
+        .min_time = 1000000,
+    };
+
+    // Block with prev_mtp 1000000 should fail (need > 1000000)
+    const tip = BlockIndex{
+        .height = 200,
+        .prev_mtp = 1000000,
+    };
+
+    try std.testing.expect(!checkSequenceLocks(result, &tip));
+}
+
+test "checkSequenceLocks passes with no constraints" {
+    const result = SequenceLockResult{
+        .min_height = -1,
+        .min_time = -1,
+    };
+
+    const tip = BlockIndex{
+        .height = 1,
+        .prev_mtp = 0,
+    };
+
+    try std.testing.expect(checkSequenceLocks(result, &tip));
 }
