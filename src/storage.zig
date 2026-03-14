@@ -36,6 +36,9 @@ pub const StorageError = error{
     OutOfMemory,
     SerializationFailed,
     RocksDBNotAvailable,
+    PathTooLong,
+    UndoManagerNotConfigured,
+    UndoDataNotFound,
 };
 
 /// Batch operation for atomic writes.
@@ -891,15 +894,326 @@ pub const UtxoSet = struct {
 // Chain State Manager (Phase 14)
 // ============================================================================
 
+// ============================================================================
+// Undo Data Structures (Phase 7)
+// ============================================================================
+
+/// Undo data for a single transaction input — stores the UTXO that was spent.
+/// Matches Bitcoin Core's CTxUndo / Coin structure from undo.h.
+pub const TxUndo = struct {
+    /// The previous outputs spent by this transaction's inputs.
+    /// One entry per input.
+    prev_outputs: []TxOut,
+
+    pub const TxOut = struct {
+        value: i64,
+        script_pubkey: []const u8,
+        height: u32,
+        is_coinbase: bool,
+
+        pub fn deinit(self: *TxOut, allocator: std.mem.Allocator) void {
+            allocator.free(self.script_pubkey);
+        }
+    };
+
+    pub fn deinit(self: *TxUndo, allocator: std.mem.Allocator) void {
+        for (self.prev_outputs) |*output| {
+            output.deinit(allocator);
+        }
+        allocator.free(self.prev_outputs);
+    }
+};
+
+/// Undo data for an entire block — stores undo data for all non-coinbase transactions.
+/// Matches Bitcoin Core's CBlockUndo from undo.h.
+/// The coinbase transaction has no inputs to undo, so it's not included.
+pub const BlockUndoData = struct {
+    /// Undo data for each non-coinbase transaction.
+    /// tx_undo[0] corresponds to block.transactions[1], etc.
+    tx_undo: []TxUndo,
+
+    pub fn deinit(self: *BlockUndoData, allocator: std.mem.Allocator) void {
+        for (self.tx_undo) |*tx| {
+            tx.deinit(allocator);
+        }
+        allocator.free(self.tx_undo);
+    }
+
+    /// Serialize BlockUndoData to bytes for storage.
+    /// Format:
+    /// - num_tx_undo (CompactSize)
+    /// - For each TxUndo:
+    ///   - num_prev_outputs (CompactSize)
+    ///   - For each prev_output:
+    ///     - packed_height_coinbase (varint): height * 2 + is_coinbase
+    ///     - value (i64 LE)
+    ///     - script_pubkey_len (CompactSize)
+    ///     - script_pubkey bytes
+    pub fn toBytes(self: *const BlockUndoData, allocator: std.mem.Allocator) ![]const u8 {
+        const ser = @import("serialize.zig");
+        var writer = ser.Writer.init(allocator);
+        errdefer writer.deinit();
+
+        // Number of transaction undos
+        try writer.writeCompactSize(self.tx_undo.len);
+
+        for (self.tx_undo) |tx_undo| {
+            // Number of previous outputs for this transaction
+            try writer.writeCompactSize(tx_undo.prev_outputs.len);
+
+            for (tx_undo.prev_outputs) |prev_out| {
+                // Pack height and coinbase flag: height * 2 + is_coinbase
+                // This matches Bitcoin Core's TxInUndoFormatter
+                const packed_code: u64 = @as(u64, prev_out.height) * 2 + @intFromBool(prev_out.is_coinbase);
+                try writer.writeCompactSize(packed_code);
+
+                // Value
+                try writer.writeInt(i64, prev_out.value);
+
+                // Script pubkey
+                try writer.writeCompactSize(prev_out.script_pubkey.len);
+                try writer.writeBytes(prev_out.script_pubkey);
+            }
+        }
+
+        return writer.toOwnedSlice();
+    }
+
+    /// Deserialize BlockUndoData from bytes.
+    pub fn fromBytes(data: []const u8, allocator: std.mem.Allocator) !BlockUndoData {
+        const ser = @import("serialize.zig");
+        var reader = ser.Reader{ .data = data };
+
+        const num_tx_undo = try reader.readCompactSize();
+
+        var tx_undo_list = std.ArrayList(TxUndo).init(allocator);
+        errdefer {
+            for (tx_undo_list.items) |*tx| {
+                tx.deinit(allocator);
+            }
+            tx_undo_list.deinit();
+        }
+
+        for (0..num_tx_undo) |_| {
+            const num_prev_outputs = try reader.readCompactSize();
+
+            var prev_outputs_list = std.ArrayList(TxUndo.TxOut).init(allocator);
+            errdefer {
+                for (prev_outputs_list.items) |*out| {
+                    out.deinit(allocator);
+                }
+                prev_outputs_list.deinit();
+            }
+
+            for (0..num_prev_outputs) |_| {
+                // Unpack height and coinbase flag
+                const packed_code = try reader.readCompactSize();
+                const height: u32 = @intCast(packed_code >> 1);
+                const is_coinbase = (packed_code & 1) != 0;
+
+                // Value
+                const value = try reader.readInt(i64);
+
+                // Script pubkey
+                const script_len = try reader.readCompactSize();
+                const script_bytes = try reader.readBytes(@intCast(script_len));
+                const script_pubkey = try allocator.dupe(u8, script_bytes);
+
+                try prev_outputs_list.append(.{
+                    .value = value,
+                    .script_pubkey = script_pubkey,
+                    .height = height,
+                    .is_coinbase = is_coinbase,
+                });
+            }
+
+            try tx_undo_list.append(.{
+                .prev_outputs = try prev_outputs_list.toOwnedSlice(),
+            });
+        }
+
+        return BlockUndoData{
+            .tx_undo = try tx_undo_list.toOwnedSlice(),
+        };
+    }
+};
+
+/// Undo file manager for writing/reading rev*.dat files.
+/// Files are stored alongside blk*.dat files in the blocks directory.
+pub const UndoFileManager = struct {
+    data_dir: []const u8,
+    allocator: std.mem.Allocator,
+
+    /// Network magic bytes for file header (mainnet default).
+    const MAGIC: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+
+    pub fn init(data_dir: []const u8, allocator: std.mem.Allocator) UndoFileManager {
+        return .{
+            .data_dir = data_dir,
+            .allocator = allocator,
+        };
+    }
+
+    /// Get the path for a rev*.dat file. Returns a null-terminated path.
+    fn getUndoFilePath(self: *const UndoFileManager, file_number: u32) ![256]u8 {
+        var path_buf: [256]u8 = [_]u8{0} ** 256;
+        const path_slice = std.fmt.bufPrint(&path_buf, "{s}/rev{d:0>5}.dat", .{ self.data_dir, file_number }) catch {
+            return error.PathTooLong;
+        };
+        // Null-terminate (bufPrint doesn't null-terminate)
+        if (path_slice.len < 256) {
+            path_buf[path_slice.len] = 0;
+        }
+        return path_buf;
+    }
+
+    /// Write undo data for a block to disk.
+    /// File format:
+    /// - magic (4 bytes)
+    /// - undo_size (4 bytes LE)
+    /// - prev_block_hash (32 bytes) — for integrity check
+    /// - serialized BlockUndoData
+    /// - checksum: double-SHA256(prev_block_hash || BlockUndoData)
+    pub fn writeUndoData(
+        self: *const UndoFileManager,
+        file_number: u32,
+        prev_block_hash: *const types.Hash256,
+        undo_data: *const BlockUndoData,
+    ) !void {
+        const crypto = @import("crypto.zig");
+
+        // Serialize the undo data
+        const serialized = try undo_data.toBytes(self.allocator);
+        defer self.allocator.free(serialized);
+
+        // Compute checksum: double-SHA256(prev_block_hash || serialized_undo)
+        var hasher_data = try self.allocator.alloc(u8, 32 + serialized.len);
+        defer self.allocator.free(hasher_data);
+        @memcpy(hasher_data[0..32], prev_block_hash);
+        @memcpy(hasher_data[32..], serialized);
+        const checksum = crypto.hash256(hasher_data);
+
+        // Get file path
+        const path_buf = try self.getUndoFilePath(file_number);
+        const path_slice = std.mem.sliceTo(&path_buf, 0);
+
+        // Open file for writing (append mode)
+        const file = std.fs.cwd().createFile(path_slice, .{ .truncate = false }) catch |err| {
+            return switch (err) {
+                error.FileNotFound => std.fs.cwd().createFile(path_slice, .{}) catch error.WriteFailed,
+                else => error.WriteFailed,
+            };
+        };
+        defer file.close();
+
+        // Seek to end
+        file.seekFromEnd(0) catch return error.WriteFailed;
+
+        var buffered = std.io.bufferedWriter(file.writer());
+        const writer = buffered.writer();
+
+        // Write header
+        writer.writeAll(&MAGIC) catch return error.WriteFailed;
+
+        // Write undo size
+        const undo_size: u32 = @intCast(serialized.len);
+        writer.writeInt(u32, undo_size, .little) catch return error.WriteFailed;
+
+        // Write prev block hash
+        writer.writeAll(prev_block_hash) catch return error.WriteFailed;
+
+        // Write serialized undo data
+        writer.writeAll(serialized) catch return error.WriteFailed;
+
+        // Write checksum
+        writer.writeAll(&checksum) catch return error.WriteFailed;
+
+        // Flush
+        buffered.flush() catch return error.WriteFailed;
+    }
+
+    /// Read undo data for a block from disk.
+    /// Returns null if file doesn't exist.
+    pub fn readUndoData(
+        self: *const UndoFileManager,
+        file_number: u32,
+        file_offset: u64,
+        prev_block_hash: *const types.Hash256,
+    ) !?BlockUndoData {
+        const crypto = @import("crypto.zig");
+
+        // Get file path
+        const path_buf = try self.getUndoFilePath(file_number);
+        const path_slice = std.mem.sliceTo(&path_buf, 0);
+
+        // Open file for reading
+        const file = std.fs.cwd().openFile(path_slice, .{}) catch |err| {
+            return switch (err) {
+                error.FileNotFound => null,
+                else => error.ReadFailed,
+            };
+        };
+        defer file.close();
+
+        // Seek to offset
+        file.seekTo(file_offset) catch return error.ReadFailed;
+
+        var buffered = std.io.bufferedReader(file.reader());
+        const reader = buffered.reader();
+
+        // Read and verify magic
+        var magic: [4]u8 = undefined;
+        reader.readNoEof(&magic) catch return error.CorruptData;
+        if (!std.mem.eql(u8, &magic, &MAGIC)) {
+            return error.CorruptData;
+        }
+
+        // Read undo size
+        const undo_size = reader.readInt(u32, .little) catch return error.CorruptData;
+
+        // Read prev block hash and verify
+        var stored_prev_hash: [32]u8 = undefined;
+        reader.readNoEof(&stored_prev_hash) catch return error.CorruptData;
+        if (!std.mem.eql(u8, &stored_prev_hash, prev_block_hash)) {
+            return error.CorruptData;
+        }
+
+        // Read serialized undo data
+        const serialized = try self.allocator.alloc(u8, undo_size);
+        defer self.allocator.free(serialized);
+        reader.readNoEof(serialized) catch return error.CorruptData;
+
+        // Read checksum
+        var stored_checksum: [32]u8 = undefined;
+        reader.readNoEof(&stored_checksum) catch return error.CorruptData;
+
+        // Verify checksum
+        var hasher_data = try self.allocator.alloc(u8, 32 + undo_size);
+        defer self.allocator.free(hasher_data);
+        @memcpy(hasher_data[0..32], prev_block_hash);
+        @memcpy(hasher_data[32..], serialized);
+        const computed_checksum = crypto.hash256(hasher_data);
+
+        if (!std.mem.eql(u8, &stored_checksum, &computed_checksum)) {
+            return error.CorruptData;
+        }
+
+        // Deserialize
+        return try BlockUndoData.fromBytes(serialized, self.allocator);
+    }
+};
+
 /// Chain state tracks the current best chain and supports reorgs.
 pub const ChainState = struct {
     best_hash: types.Hash256,
     best_height: u32,
     total_work: [32]u8,
     utxo_set: UtxoSet,
+    undo_manager: ?UndoFileManager,
     allocator: std.mem.Allocator,
 
     /// Undo data for a connected block — needed for disconnection during reorgs.
+    /// This is the in-memory representation used during block connection.
     pub const BlockUndo = struct {
         /// UTXOs that were spent by this block (for restoring on disconnect)
         spent_utxos: []SpentUtxo,
@@ -919,16 +1233,89 @@ pub const ChainState = struct {
             allocator.free(self.spent_utxos);
             allocator.free(self.created_outpoints);
         }
+
+        /// Convert to BlockUndoData for file persistence.
+        /// Groups spent UTXOs by transaction for the file format.
+        pub fn toBlockUndoData(self: *const BlockUndo, block: *const types.Block, allocator: std.mem.Allocator) !BlockUndoData {
+            // Count inputs per non-coinbase transaction
+            if (block.transactions.len <= 1) {
+                // Only coinbase, no undo data needed
+                return BlockUndoData{ .tx_undo = try allocator.alloc(TxUndo, 0) };
+            }
+
+            var tx_undo_list = std.ArrayList(TxUndo).init(allocator);
+            errdefer {
+                for (tx_undo_list.items) |*tx| {
+                    tx.deinit(allocator);
+                }
+                tx_undo_list.deinit();
+            }
+
+            var spent_idx: usize = 0;
+
+            // For each non-coinbase transaction
+            for (block.transactions[1..]) |tx| {
+                var prev_outputs = std.ArrayList(TxUndo.TxOut).init(allocator);
+                errdefer {
+                    for (prev_outputs.items) |*out| {
+                        out.deinit(allocator);
+                    }
+                    prev_outputs.deinit();
+                }
+
+                // For each input in this transaction
+                for (tx.inputs) |_| {
+                    if (spent_idx >= self.spent_utxos.len) {
+                        return error.CorruptData;
+                    }
+
+                    const spent = self.spent_utxos[spent_idx];
+                    spent_idx += 1;
+
+                    // Reconstruct the script for storage
+                    const script = try spent.utxo.reconstructScript(allocator);
+
+                    try prev_outputs.append(.{
+                        .value = spent.utxo.value,
+                        .script_pubkey = script,
+                        .height = spent.utxo.height,
+                        .is_coinbase = spent.utxo.is_coinbase,
+                    });
+                }
+
+                try tx_undo_list.append(.{
+                    .prev_outputs = try prev_outputs.toOwnedSlice(),
+                });
+            }
+
+            return BlockUndoData{
+                .tx_undo = try tx_undo_list.toOwnedSlice(),
+            };
+        }
     };
 
     /// Initialize chain state.
     /// If db is null, operates in memory-only mode (useful for testing).
+    /// If data_dir is provided, undo data will be persisted to rev*.dat files.
     pub fn init(db: ?*Database, allocator: std.mem.Allocator) ChainState {
         return ChainState{
             .best_hash = [_]u8{0} ** 32,
             .best_height = 0,
             .total_work = [_]u8{0} ** 32,
             .utxo_set = UtxoSet.init(db, 450, allocator), // 450 MB UTXO cache
+            .undo_manager = null,
+            .allocator = allocator,
+        };
+    }
+
+    /// Initialize chain state with undo file persistence.
+    pub fn initWithUndo(db: ?*Database, data_dir: []const u8, allocator: std.mem.Allocator) ChainState {
+        return ChainState{
+            .best_hash = [_]u8{0} ** 32,
+            .best_height = 0,
+            .total_work = [_]u8{0} ** 32,
+            .utxo_set = UtxoSet.init(db, 450, allocator),
+            .undo_manager = UndoFileManager.init(data_dir, allocator),
             .allocator = allocator,
         };
     }
@@ -1031,6 +1418,108 @@ pub const ChainState = struct {
     /// Flush UTXO set to disk.
     pub fn flush(self: *ChainState) !void {
         try self.utxo_set.flush();
+    }
+
+    /// Connect a block and persist undo data to file.
+    /// This is the preferred method when file persistence is enabled.
+    /// Returns the in-memory BlockUndo for immediate use, but also writes to disk.
+    pub fn connectBlockWithUndo(
+        self: *ChainState,
+        block: *const types.Block,
+        hash: *const types.Hash256,
+        height: u32,
+        file_number: u32,
+    ) !BlockUndo {
+        // First, connect the block normally
+        var undo = try self.connectBlock(block, hash, height);
+        errdefer undo.deinit(self.allocator);
+
+        // If we have an undo manager, persist the undo data
+        if (self.undo_manager) |manager| {
+            // Convert to file format
+            var undo_data = try undo.toBlockUndoData(block, self.allocator);
+            defer undo_data.deinit(self.allocator);
+
+            // Write to file
+            try manager.writeUndoData(file_number, &block.header.prev_block, &undo_data);
+        }
+
+        return undo;
+    }
+
+    /// Disconnect a block using file-based undo data.
+    /// Reads undo data from the rev*.dat file and reverses the block's changes.
+    pub fn disconnectBlockFromFile(
+        self: *ChainState,
+        block: *const types.Block,
+        file_number: u32,
+        file_offset: u64,
+        prev_hash: types.Hash256,
+    ) !void {
+        const manager = self.undo_manager orelse return error.UndoManagerNotConfigured;
+
+        // Read undo data from file
+        var undo_data = try manager.readUndoData(file_number, file_offset, &prev_hash) orelse return error.UndoDataNotFound;
+        defer undo_data.deinit(self.allocator);
+
+        // Remove created outputs (in reverse order)
+        // We need to iterate through transactions in reverse
+        var tx_idx = block.transactions.len;
+        while (tx_idx > 0) {
+            tx_idx -= 1;
+            const tx = block.transactions[tx_idx];
+            const crypto = @import("crypto.zig");
+            const tx_hash = try crypto.computeTxid(&tx, self.allocator);
+
+            // Remove outputs created by this transaction (in reverse)
+            var out_idx = tx.outputs.len;
+            while (out_idx > 0) {
+                out_idx -= 1;
+                const output = tx.outputs[out_idx];
+
+                // Skip OP_RETURN outputs
+                if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) continue;
+
+                const outpoint = types.OutPoint{
+                    .hash = tx_hash,
+                    .index = @intCast(out_idx),
+                };
+
+                if (try self.utxo_set.spend(&outpoint)) |*spent| {
+                    var s = spent.*;
+                    s.deinit(self.allocator);
+                }
+            }
+        }
+
+        // Restore spent UTXOs
+        // The undo data contains the previous outputs, but we need the outpoints
+        // which are in the block's transaction inputs
+        var undo_idx: usize = 0;
+        for (block.transactions[1..]) |tx| {
+            if (undo_idx >= undo_data.tx_undo.len) break;
+            const tx_undo = undo_data.tx_undo[undo_idx];
+            undo_idx += 1;
+
+            for (tx.inputs, 0..) |input, input_idx| {
+                if (input_idx >= tx_undo.prev_outputs.len) break;
+                const prev_out = tx_undo.prev_outputs[input_idx];
+
+                const txout = types.TxOut{
+                    .value = prev_out.value,
+                    .script_pubkey = prev_out.script_pubkey,
+                };
+                try self.utxo_set.add(
+                    &input.previous_output,
+                    &txout,
+                    prev_out.height,
+                    prev_out.is_coinbase,
+                );
+            }
+        }
+
+        self.best_hash = prev_hash;
+        self.best_height -= 1;
     }
 };
 
@@ -1666,4 +2155,254 @@ test "chain state disconnect block restores state" {
     try std.testing.expectEqual(@as(u32, 0), chain_state.best_height);
     try std.testing.expectEqualSlices(u8, &prev_hash, &chain_state.best_hash);
     try std.testing.expectEqual(@as(u64, 0), chain_state.utxo_set.total_utxos);
+}
+
+// ============================================================================
+// Undo Data Tests (Phase 7)
+// ============================================================================
+
+test "block undo data serialization roundtrip" {
+    const allocator = std.testing.allocator;
+
+    // Create sample undo data with multiple transactions
+    const script1 = try allocator.dupe(u8, &([_]u8{0x76} ++ [_]u8{0xa9} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20 ++ [_]u8{0x88} ++ [_]u8{0xac}));
+    const script2 = try allocator.dupe(u8, &([_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xBB} ** 20));
+
+    var prev_outputs1 = try allocator.alloc(TxUndo.TxOut, 2);
+    prev_outputs1[0] = .{
+        .value = 5000000000,
+        .script_pubkey = script1,
+        .height = 100,
+        .is_coinbase = true,
+    };
+    const script1_copy = try allocator.dupe(u8, &([_]u8{0x76} ++ [_]u8{0xa9} ++ [_]u8{0x14} ++ [_]u8{0xCC} ** 20 ++ [_]u8{0x88} ++ [_]u8{0xac}));
+    prev_outputs1[1] = .{
+        .value = 1000000,
+        .script_pubkey = script1_copy,
+        .height = 150,
+        .is_coinbase = false,
+    };
+
+    var prev_outputs2 = try allocator.alloc(TxUndo.TxOut, 1);
+    prev_outputs2[0] = .{
+        .value = 250000,
+        .script_pubkey = script2,
+        .height = 200,
+        .is_coinbase = false,
+    };
+
+    var tx_undo_arr = try allocator.alloc(TxUndo, 2);
+    tx_undo_arr[0] = .{ .prev_outputs = prev_outputs1 };
+    tx_undo_arr[1] = .{ .prev_outputs = prev_outputs2 };
+
+    var undo_data = BlockUndoData{ .tx_undo = tx_undo_arr };
+    defer undo_data.deinit(allocator);
+
+    // Serialize
+    const serialized = try undo_data.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    // Deserialize
+    var deserialized = try BlockUndoData.fromBytes(serialized, allocator);
+    defer deserialized.deinit(allocator);
+
+    // Verify structure
+    try std.testing.expectEqual(@as(usize, 2), deserialized.tx_undo.len);
+    try std.testing.expectEqual(@as(usize, 2), deserialized.tx_undo[0].prev_outputs.len);
+    try std.testing.expectEqual(@as(usize, 1), deserialized.tx_undo[1].prev_outputs.len);
+
+    // Verify values
+    try std.testing.expectEqual(@as(i64, 5000000000), deserialized.tx_undo[0].prev_outputs[0].value);
+    try std.testing.expectEqual(@as(u32, 100), deserialized.tx_undo[0].prev_outputs[0].height);
+    try std.testing.expect(deserialized.tx_undo[0].prev_outputs[0].is_coinbase);
+
+    try std.testing.expectEqual(@as(i64, 1000000), deserialized.tx_undo[0].prev_outputs[1].value);
+    try std.testing.expectEqual(@as(u32, 150), deserialized.tx_undo[0].prev_outputs[1].height);
+    try std.testing.expect(!deserialized.tx_undo[0].prev_outputs[1].is_coinbase);
+
+    try std.testing.expectEqual(@as(i64, 250000), deserialized.tx_undo[1].prev_outputs[0].value);
+    try std.testing.expectEqual(@as(u32, 200), deserialized.tx_undo[1].prev_outputs[0].height);
+}
+
+test "block undo data empty serialization" {
+    const allocator = std.testing.allocator;
+
+    // Empty undo data (coinbase-only block)
+    const tx_undo_arr = try allocator.alloc(TxUndo, 0);
+    var undo_data = BlockUndoData{ .tx_undo = tx_undo_arr };
+    defer undo_data.deinit(allocator);
+
+    const serialized = try undo_data.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    // Should just be the count (1 byte for 0)
+    try std.testing.expectEqual(@as(usize, 1), serialized.len);
+    try std.testing.expectEqual(@as(u8, 0), serialized[0]);
+
+    var deserialized = try BlockUndoData.fromBytes(serialized, allocator);
+    defer deserialized.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), deserialized.tx_undo.len);
+}
+
+test "tx undo height and coinbase packing" {
+    const allocator = std.testing.allocator;
+
+    // Test various height and coinbase combinations
+    const test_cases = [_]struct { height: u32, is_coinbase: bool }{
+        .{ .height = 0, .is_coinbase = false },
+        .{ .height = 0, .is_coinbase = true },
+        .{ .height = 1, .is_coinbase = false },
+        .{ .height = 1, .is_coinbase = true },
+        .{ .height = 500000, .is_coinbase = false },
+        .{ .height = 500000, .is_coinbase = true },
+        .{ .height = 0x7FFFFFFF, .is_coinbase = false },
+        .{ .height = 0x7FFFFFFF, .is_coinbase = true },
+    };
+
+    for (test_cases) |tc| {
+        const script = try allocator.dupe(u8, &([_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20));
+        var prev_outputs = try allocator.alloc(TxUndo.TxOut, 1);
+        prev_outputs[0] = .{
+            .value = 100,
+            .script_pubkey = script,
+            .height = tc.height,
+            .is_coinbase = tc.is_coinbase,
+        };
+
+        var tx_undo_arr = try allocator.alloc(TxUndo, 1);
+        tx_undo_arr[0] = .{ .prev_outputs = prev_outputs };
+
+        var undo_data = BlockUndoData{ .tx_undo = tx_undo_arr };
+        defer undo_data.deinit(allocator);
+
+        const serialized = try undo_data.toBytes(allocator);
+        defer allocator.free(serialized);
+
+        var deserialized = try BlockUndoData.fromBytes(serialized, allocator);
+        defer deserialized.deinit(allocator);
+
+        try std.testing.expectEqual(tc.height, deserialized.tx_undo[0].prev_outputs[0].height);
+        try std.testing.expectEqual(tc.is_coinbase, deserialized.tx_undo[0].prev_outputs[0].is_coinbase);
+    }
+}
+
+test "chain state init with undo manager" {
+    const allocator = std.testing.allocator;
+
+    // Test regular init (no undo manager)
+    var chain_state1 = ChainState.init(null, allocator);
+    defer chain_state1.deinit();
+    try std.testing.expect(chain_state1.undo_manager == null);
+
+    // Test init with undo (has undo manager)
+    var chain_state2 = ChainState.initWithUndo(null, "/tmp/testdata", allocator);
+    defer chain_state2.deinit();
+    try std.testing.expect(chain_state2.undo_manager != null);
+    try std.testing.expectEqualStrings("/tmp/testdata", chain_state2.undo_manager.?.data_dir);
+}
+
+test "undo file manager path generation" {
+    const allocator = std.testing.allocator;
+
+    const manager = UndoFileManager.init("/data/blocks", allocator);
+
+    // Test path generation for file 0
+    const path0 = try manager.getUndoFilePath(0);
+    const path0_slice = std.mem.sliceTo(&path0, 0);
+    try std.testing.expectEqualStrings("/data/blocks/rev00000.dat", path0_slice);
+
+    // Test path generation for file 12345
+    const path12345 = try manager.getUndoFilePath(12345);
+    const path12345_slice = std.mem.sliceTo(&path12345, 0);
+    try std.testing.expectEqualStrings("/data/blocks/rev12345.dat", path12345_slice);
+}
+
+test "block undo to block undo data conversion" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    // Create a block with coinbase + one spending transaction
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const coinbase_output = types.TxOut{
+        .value = 5000000000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+
+    // First, add a UTXO that will be spent
+    const prev_outpoint = types.OutPoint{
+        .hash = [_]u8{0x11} ** 32,
+        .index = 0,
+    };
+    const prev_output = types.TxOut{
+        .value = 1000000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    try chain_state.utxo_set.add(&prev_outpoint, &prev_output, 50, false);
+
+    // Create a spending transaction
+    const spending_input = types.TxIn{
+        .previous_output = prev_outpoint,
+        .script_sig = &[_]u8{0x00},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const spending_output = types.TxOut{
+        .value = 900000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const spending_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{spending_input},
+        .outputs = &[_]types.TxOut{spending_output},
+        .lock_time = 0,
+    };
+
+    const block = types.Block{
+        .header = types.BlockHeader{
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 0,
+            .bits = 0,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{ coinbase_tx, spending_tx },
+    };
+
+    const block_hash = [_]u8{0x33} ** 32;
+
+    // Connect the block
+    var undo = try chain_state.connectBlock(&block, &block_hash, 1);
+    defer undo.deinit(allocator);
+
+    // Verify undo data
+    try std.testing.expectEqual(@as(usize, 1), undo.spent_utxos.len);
+    try std.testing.expectEqual(@as(usize, 2), undo.created_outpoints.len);
+
+    // Convert to file format
+    var undo_data = try undo.toBlockUndoData(&block, allocator);
+    defer undo_data.deinit(allocator);
+
+    // Verify conversion
+    try std.testing.expectEqual(@as(usize, 1), undo_data.tx_undo.len);
+    try std.testing.expectEqual(@as(usize, 1), undo_data.tx_undo[0].prev_outputs.len);
+    try std.testing.expectEqual(@as(i64, 1000000), undo_data.tx_undo[0].prev_outputs[0].value);
+    try std.testing.expectEqual(@as(u32, 50), undo_data.tx_undo[0].prev_outputs[0].height);
 }
