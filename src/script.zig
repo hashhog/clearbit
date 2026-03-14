@@ -139,6 +139,7 @@ pub const ScriptError = error{
     NullFail, // BIP-146: failed signature check with non-empty signature
     CleanStack,
     MinimalData,
+    MinimalIf, // BIP-342/segwit: OP_IF/OP_NOTIF argument must be empty or exactly 0x01
     NegativeLocktime,
     UnsatisfiedLocktime,
     WitnessProgramMismatch,
@@ -751,6 +752,13 @@ pub const ScriptEngine = struct {
                 var execute_branch = false;
                 if (self.isExecuting(exec_stack)) {
                     const data = try self.pop();
+                    // MINIMALIF: For witness v0 and tapscript, the argument must be exactly
+                    // empty (false) or exactly &[1]u8{0x01} (true). No other values allowed.
+                    // Reference: Bitcoin Core interpreter.cpp OP_IF handler
+                    if (self.sig_version == .witness_v0 or self.sig_version == .tapscript) {
+                        if (data.len > 1) return ScriptError.MinimalIf;
+                        if (data.len == 1 and data[0] != 1) return ScriptError.MinimalIf;
+                    }
                     execute_branch = self.stackToBool(data);
                 }
                 exec_stack.append(execute_branch) catch return ScriptError.OutOfMemory;
@@ -760,6 +768,13 @@ pub const ScriptEngine = struct {
                 var execute_branch = false;
                 if (self.isExecuting(exec_stack)) {
                     const data = try self.pop();
+                    // MINIMALIF: For witness v0 and tapscript, the argument must be exactly
+                    // empty (false) or exactly &[1]u8{0x01} (true). No other values allowed.
+                    // Reference: Bitcoin Core interpreter.cpp OP_NOTIF handler
+                    if (self.sig_version == .witness_v0 or self.sig_version == .tapscript) {
+                        if (data.len > 1) return ScriptError.MinimalIf;
+                        if (data.len == 1 and data[0] != 1) return ScriptError.MinimalIf;
+                    }
                     execute_branch = !self.stackToBool(data);
                 }
                 exec_stack.append(execute_branch) catch return ScriptError.OutOfMemory;
