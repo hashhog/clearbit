@@ -21,6 +21,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Consensus parameters (network config, subsidy, soft fork heights)
 - [x] Difficulty adjustment (mainnet retarget, testnet 20-min rule, BIP-94, regtest)
+- [x] BIP-9 version bits (soft fork deployment state machine, signaling, caching)
 - [x] RocksDB storage layer (blocks, UTXOs, chain state)
 - [x] Block and transaction validation (BIP-16 P2SH, BIP-34, BIP-68 sequence locks, BIP-141 segwit, BIP-146 NULLFAIL, sigops with witness discount)
 - [x] P2P message serialization (version, inv, headers, blocks)
@@ -69,7 +70,7 @@ src/
   crypto.zig         # hash functions, merkle trees, sighash
   address.zig        # address encoding (Base58, Bech32)
   script.zig         # script interpreter and opcodes
-  consensus.zig      # consensus rules, network params, difficulty
+  consensus.zig      # consensus rules, network params, difficulty, BIP-9
   storage.zig        # RocksDB storage layer, UTXO set, chain state
   validation.zig     # block and transaction validation
   p2p.zig            # P2P protocol message serialization
