@@ -380,7 +380,7 @@ pub const HeaderSyncManager = struct {
             return null;
         }
 
-        return state.processPresyncHeaders(headers) catch |_| {
+        return state.processPresyncHeaders(headers) catch {
             return PresyncResult{ .action = .abort, .reason = .invalid_pow };
         };
     }
