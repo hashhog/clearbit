@@ -168,6 +168,10 @@ pub const NetworkParams = struct {
     pow_target_spacing: u32,
     /// Target timespan in seconds (2 weeks = 1,209,600).
     pow_target_timespan: u32,
+    /// Minimum chain work required for header sync anti-DoS (PRESYNC/REDOWNLOAD).
+    /// A peer must demonstrate this much cumulative work before we store their headers.
+    /// Set to zero for regtest/testing to disable the check.
+    min_chain_work: [32]u8,
 };
 
 /// Mainnet parameters.
@@ -210,6 +214,10 @@ pub const MAINNET = NetworkParams{
     .enforce_bip94 = false,
     .pow_target_spacing = TARGET_SPACING,
     .pow_target_timespan = TARGET_TIMESPAN,
+    // Mainnet min_chain_work: ~7.9 * 10^73 (as of late 2024)
+    // This is approximately the work at block ~870,000
+    // Stored as little-endian 256-bit integer
+    .min_chain_work = hexToHash("00000000000000000000000000000000000000009c68c8e19c0c2e0b00000000"),
 };
 
 /// Testnet3 parameters.
@@ -247,6 +255,8 @@ pub const TESTNET3 = NetworkParams{
     .enforce_bip94 = false,
     .pow_target_spacing = TARGET_SPACING,
     .pow_target_timespan = TARGET_TIMESPAN,
+    // Testnet3 min_chain_work: lower threshold for testing
+    .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
 };
 
 /// Alias for backwards compatibility.
@@ -285,6 +295,8 @@ pub const TESTNET4 = NetworkParams{
     .enforce_bip94 = true,
     .pow_target_spacing = TARGET_SPACING,
     .pow_target_timespan = TARGET_TIMESPAN,
+    // Testnet4 min_chain_work: lower threshold for testing
+    .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
 };
 
 /// Signet parameters.
@@ -321,6 +333,8 @@ pub const SIGNET = NetworkParams{
     .enforce_bip94 = false,
     .pow_target_spacing = TARGET_SPACING,
     .pow_target_timespan = TARGET_TIMESPAN,
+    // Signet min_chain_work: lower threshold for testing
+    .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
 };
 
 /// Regtest parameters.
@@ -357,6 +371,8 @@ pub const REGTEST = NetworkParams{
     .enforce_bip94 = false,
     .pow_target_spacing = TARGET_SPACING,
     .pow_target_timespan = 24 * 60 * 60, // 1 day for regtest
+    // Regtest: zero min_chain_work (no anti-DoS check needed for local testing)
+    .min_chain_work = [_]u8{0} ** 32,
 };
 
 // ============================================================================
