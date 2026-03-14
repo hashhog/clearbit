@@ -1535,6 +1535,223 @@ pub fn isWitnessProgram(script: []const u8) ?struct { version: u8, program: []co
 }
 
 // ============================================================================
+// Sigop Counting
+// ============================================================================
+
+/// Maximum number of public keys in a multisig.
+pub const MAX_PUBKEYS_PER_MULTISIG: u32 = 20;
+
+/// Witness v0 keyhash size (P2WPKH).
+pub const WITNESS_V0_KEYHASH_SIZE: usize = 20;
+
+/// Witness v0 scripthash size (P2WSH).
+pub const WITNESS_V0_SCRIPTHASH_SIZE: usize = 32;
+
+/// Check if a script is P2SH: OP_HASH160 <20 bytes> OP_EQUAL.
+pub fn isPayToScriptHash(script: []const u8) bool {
+    return script.len == 23 and
+        script[0] == 0xa9 and // OP_HASH160
+        script[1] == 0x14 and // Push 20 bytes
+        script[22] == 0x87; // OP_EQUAL
+}
+
+/// Count signature operations in a script.
+/// If `accurate` is true, use the preceding OP_N for CHECKMULTISIG sigop count.
+/// If `accurate` is false, always assume MAX_PUBKEYS_PER_MULTISIG for CHECKMULTISIG.
+///
+/// This counts:
+/// - OP_CHECKSIG and OP_CHECKSIGVERIFY as 1 sigop each
+/// - OP_CHECKMULTISIG and OP_CHECKMULTISIGVERIFY as N sigops where N is the
+///   number of public keys (from preceding OP_N) if accurate, or 20 otherwise.
+///
+/// Reference: Bitcoin Core script/script.cpp CScript::GetSigOpCount(bool fAccurate)
+pub fn getSigOpCount(script: []const u8, accurate: bool) u32 {
+    var n: u32 = 0;
+    var pc: usize = 0;
+    var last_opcode: u8 = 0xff; // Invalid opcode
+
+    while (pc < script.len) {
+        const opcode = script[pc];
+
+        // Handle push opcodes - skip the data
+        if (opcode <= 0x4b) {
+            // Direct push: opcode is the number of bytes to push
+            if (opcode > 0) {
+                pc += @as(usize, opcode);
+            }
+        } else if (opcode == 0x4c) {
+            // OP_PUSHDATA1: next byte is length
+            if (pc + 1 >= script.len) break;
+            pc += 1 + @as(usize, script[pc + 1]);
+        } else if (opcode == 0x4d) {
+            // OP_PUSHDATA2: next 2 bytes are length (little-endian)
+            if (pc + 2 >= script.len) break;
+            const len = @as(usize, script[pc + 1]) | (@as(usize, script[pc + 2]) << 8);
+            pc += 2 + len;
+        } else if (opcode == 0x4e) {
+            // OP_PUSHDATA4: next 4 bytes are length (little-endian)
+            if (pc + 4 >= script.len) break;
+            const len = @as(usize, script[pc + 1]) |
+                (@as(usize, script[pc + 2]) << 8) |
+                (@as(usize, script[pc + 3]) << 16) |
+                (@as(usize, script[pc + 4]) << 24);
+            pc += 4 + len;
+        }
+
+        // Count sigops
+        if (opcode == @intFromEnum(Opcode.op_checksig) or opcode == @intFromEnum(Opcode.op_checksigverify)) {
+            n += 1;
+        } else if (opcode == @intFromEnum(Opcode.op_checkmultisig) or opcode == @intFromEnum(Opcode.op_checkmultisigverify)) {
+            // Count sigops: if accurate and last opcode was OP_1-OP_16, use that value
+            if (accurate and last_opcode >= 0x51 and last_opcode <= 0x60) {
+                // OP_1 (0x51) = 1, OP_16 (0x60) = 16
+                n += @as(u32, last_opcode - 0x50);
+            } else {
+                n += MAX_PUBKEYS_PER_MULTISIG;
+            }
+        }
+
+        last_opcode = opcode;
+        pc += 1;
+    }
+
+    return n;
+}
+
+/// Get the last push data from a push-only script (for P2SH subscript extraction).
+/// Returns the last data item pushed, or null if the script is not push-only.
+///
+/// Reference: Bitcoin Core script/script.cpp CScript::GetSigOpCount(const CScript& scriptSig)
+fn getLastPushData(script_sig: []const u8) ?[]const u8 {
+    var pc: usize = 0;
+    var last_data: ?[]const u8 = null;
+
+    while (pc < script_sig.len) {
+        const opcode = script_sig[pc];
+
+        // Handle push opcodes
+        if (opcode == 0x00) {
+            // OP_0: push empty
+            last_data = script_sig[pc..pc]; // empty slice
+            pc += 1;
+        } else if (opcode <= 0x4b) {
+            // Direct push: opcode is the number of bytes to push
+            const push_len = @as(usize, opcode);
+            if (pc + 1 + push_len > script_sig.len) return null;
+            last_data = script_sig[pc + 1 .. pc + 1 + push_len];
+            pc += 1 + push_len;
+        } else if (opcode == 0x4c) {
+            // OP_PUSHDATA1
+            if (pc + 2 > script_sig.len) return null;
+            const push_len = @as(usize, script_sig[pc + 1]);
+            if (pc + 2 + push_len > script_sig.len) return null;
+            last_data = script_sig[pc + 2 .. pc + 2 + push_len];
+            pc += 2 + push_len;
+        } else if (opcode == 0x4d) {
+            // OP_PUSHDATA2
+            if (pc + 3 > script_sig.len) return null;
+            const push_len = @as(usize, script_sig[pc + 1]) | (@as(usize, script_sig[pc + 2]) << 8);
+            if (pc + 3 + push_len > script_sig.len) return null;
+            last_data = script_sig[pc + 3 .. pc + 3 + push_len];
+            pc += 3 + push_len;
+        } else if (opcode == 0x4e) {
+            // OP_PUSHDATA4
+            if (pc + 5 > script_sig.len) return null;
+            const push_len = @as(usize, script_sig[pc + 1]) |
+                (@as(usize, script_sig[pc + 2]) << 8) |
+                (@as(usize, script_sig[pc + 3]) << 16) |
+                (@as(usize, script_sig[pc + 4]) << 24);
+            if (pc + 5 + push_len > script_sig.len) return null;
+            last_data = script_sig[pc + 5 .. pc + 5 + push_len];
+            pc += 5 + push_len;
+        } else if (opcode >= 0x51 and opcode <= 0x60) {
+            // OP_1 through OP_16: push a single byte value
+            // For sigop counting, we don't need the actual value
+            last_data = null; // These push small numbers, not script data
+            pc += 1;
+        } else {
+            // Non-push opcode - script is not push-only
+            return null;
+        }
+    }
+
+    return last_data;
+}
+
+/// Count P2SH sigops by extracting the redeemScript from scriptSig.
+/// The scriptPubKey must be P2SH. The function extracts the last push from
+/// scriptSig and counts sigops in that subscript.
+///
+/// Reference: Bitcoin Core script/script.cpp CScript::GetSigOpCount(const CScript& scriptSig)
+pub fn getP2SHSigOpCount(script_pubkey: []const u8, script_sig: []const u8) u32 {
+    if (!isPayToScriptHash(script_pubkey)) {
+        return getSigOpCount(script_pubkey, true);
+    }
+
+    // Extract the redeemScript (last push data from scriptSig)
+    const redeem_script = getLastPushData(script_sig) orelse return 0;
+
+    // Count sigops in the redeemScript (accurate mode)
+    return getSigOpCount(redeem_script, true);
+}
+
+/// Count sigops in witness programs (witness v0 only).
+/// - P2WPKH (20-byte program): 1 sigop
+/// - P2WSH (32-byte program): count sigops in the witnessScript (last witness item)
+/// - Other witness versions: 0 sigops (future-proofing)
+///
+/// Reference: Bitcoin Core script/interpreter.cpp WitnessSigOps()
+fn witnessSigOps(wit_version: u8, wit_program: []const u8, witness: []const []const u8) u32 {
+    if (wit_version == 0) {
+        if (wit_program.len == WITNESS_V0_KEYHASH_SIZE) {
+            // P2WPKH: 1 signature operation
+            return 1;
+        }
+
+        if (wit_program.len == WITNESS_V0_SCRIPTHASH_SIZE and witness.len > 0) {
+            // P2WSH: count sigops in the witnessScript (last witness item)
+            const witness_script = witness[witness.len - 1];
+            return getSigOpCount(witness_script, true);
+        }
+    }
+
+    // Future witness versions: no sigop counting (not yet defined)
+    return 0;
+}
+
+/// Count witness sigops for a transaction input.
+/// Handles both native witness programs and P2SH-wrapped witness programs.
+///
+/// Reference: Bitcoin Core script/interpreter.cpp CountWitnessSigOps()
+pub fn countWitnessSigOps(
+    script_sig: []const u8,
+    script_pubkey: []const u8,
+    witness: []const []const u8,
+    flags: ScriptFlags,
+) u32 {
+    if (!flags.verify_witness) {
+        return 0;
+    }
+
+    // Check for native witness program
+    if (isWitnessProgram(script_pubkey)) |wp| {
+        return witnessSigOps(wp.version, wp.program, witness);
+    }
+
+    // Check for P2SH-wrapped witness program
+    if (isPayToScriptHash(script_pubkey) and isPushOnly(script_sig)) {
+        // Extract the redeemScript (subscript) from scriptSig
+        const subscript = getLastPushData(script_sig) orelse return 0;
+
+        if (isWitnessProgram(subscript)) |wp| {
+            return witnessSigOps(wp.version, wp.program, witness);
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================================
 // Legacy Sighash (Pre-SegWit)
 // ============================================================================
 
@@ -3368,4 +3585,221 @@ test "legacySignatureHash: SIGHASH_ANYONECANPAY hashes single input" {
 
     // Just verify it doesn't crash
     _ = hash;
+}
+
+// ============================================================================
+// Sigop Counting Tests
+// ============================================================================
+
+test "getSigOpCount: empty script has 0 sigops" {
+    const count = getSigOpCount(&[_]u8{}, false);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "getSigOpCount: OP_CHECKSIG counts as 1" {
+    const script_data = [_]u8{0xac}; // OP_CHECKSIG
+    const count = getSigOpCount(&script_data, false);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getSigOpCount: OP_CHECKSIGVERIFY counts as 1" {
+    const script_data = [_]u8{0xad}; // OP_CHECKSIGVERIFY
+    const count = getSigOpCount(&script_data, false);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getSigOpCount: OP_CHECKMULTISIG inaccurate counts as 20" {
+    const script_data = [_]u8{0xae}; // OP_CHECKMULTISIG
+    const count = getSigOpCount(&script_data, false);
+    try std.testing.expectEqual(@as(u32, MAX_PUBKEYS_PER_MULTISIG), count);
+}
+
+test "getSigOpCount: OP_CHECKMULTISIG accurate with OP_2 counts as 2" {
+    const script_data = [_]u8{ 0x52, 0xae }; // OP_2 OP_CHECKMULTISIG
+    const count = getSigOpCount(&script_data, true);
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "getSigOpCount: OP_CHECKMULTISIG accurate with OP_16 counts as 16" {
+    const script_data = [_]u8{ 0x60, 0xae }; // OP_16 OP_CHECKMULTISIG
+    const count = getSigOpCount(&script_data, true);
+    try std.testing.expectEqual(@as(u32, 16), count);
+}
+
+test "getSigOpCount: OP_CHECKMULTISIGVERIFY accurate with OP_3 counts as 3" {
+    const script_data = [_]u8{ 0x53, 0xaf }; // OP_3 OP_CHECKMULTISIGVERIFY
+    const count = getSigOpCount(&script_data, true);
+    try std.testing.expectEqual(@as(u32, 3), count);
+}
+
+test "getSigOpCount: P2PKH scriptPubKey has 1 sigop" {
+    // OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    var script_data: [25]u8 = undefined;
+    script_data[0] = 0x76; // OP_DUP
+    script_data[1] = 0xa9; // OP_HASH160
+    script_data[2] = 0x14; // Push 20 bytes
+    @memset(script_data[3..23], 0xAB);
+    script_data[23] = 0x88; // OP_EQUALVERIFY
+    script_data[24] = 0xac; // OP_CHECKSIG
+
+    const count = getSigOpCount(&script_data, false);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getSigOpCount: multiple CHECKSIG ops add up" {
+    // OP_CHECKSIG OP_CHECKSIG OP_CHECKSIG
+    const script_data = [_]u8{ 0xac, 0xac, 0xac };
+    const count = getSigOpCount(&script_data, false);
+    try std.testing.expectEqual(@as(u32, 3), count);
+}
+
+test "getSigOpCount: skips push data correctly" {
+    // push 3 bytes (contains 0xac) then OP_CHECKSIG
+    // The 0xac inside push data should NOT count
+    const script_data = [_]u8{ 0x03, 0xac, 0xac, 0xac, 0xac }; // push [0xac, 0xac, 0xac] then OP_CHECKSIG
+    const count = getSigOpCount(&script_data, false);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "isPayToScriptHash: valid P2SH" {
+    var script_data: [23]u8 = undefined;
+    script_data[0] = 0xa9; // OP_HASH160
+    script_data[1] = 0x14; // Push 20 bytes
+    @memset(script_data[2..22], 0xAB);
+    script_data[22] = 0x87; // OP_EQUAL
+
+    try std.testing.expect(isPayToScriptHash(&script_data));
+}
+
+test "isPayToScriptHash: wrong length returns false" {
+    var script_data: [22]u8 = undefined;
+    script_data[0] = 0xa9;
+    script_data[1] = 0x14;
+    @memset(script_data[2..21], 0xAB);
+    script_data[21] = 0x87;
+
+    try std.testing.expect(!isPayToScriptHash(&script_data));
+}
+
+test "isPayToScriptHash: P2PKH is not P2SH" {
+    var script_data: [25]u8 = undefined;
+    script_data[0] = 0x76;
+    script_data[1] = 0xa9;
+    script_data[2] = 0x14;
+    @memset(script_data[3..23], 0xAB);
+    script_data[23] = 0x88;
+    script_data[24] = 0xac;
+
+    try std.testing.expect(!isPayToScriptHash(&script_data));
+}
+
+test "getP2SHSigOpCount: counts sigops in redeemScript" {
+    // P2SH scriptPubKey
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xAB);
+    script_pubkey[22] = 0x87;
+
+    // scriptSig: push OP_CHECKSIG as redeemScript
+    const script_sig = [_]u8{ 0x01, 0xac }; // push 1 byte (OP_CHECKSIG)
+
+    const count = getP2SHSigOpCount(&script_pubkey, &script_sig);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getP2SHSigOpCount: returns 0 for non-push scriptSig" {
+    // P2SH scriptPubKey
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xAB);
+    script_pubkey[22] = 0x87;
+
+    // scriptSig with OP_DUP (non-push)
+    const script_sig = [_]u8{ 0x76, 0x01, 0xac }; // OP_DUP push(OP_CHECKSIG)
+
+    const count = getP2SHSigOpCount(&script_pubkey, &script_sig);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "countWitnessSigOps: P2WPKH returns 1" {
+    // P2WPKH: OP_0 <20 bytes>
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memset(script_pubkey[2..22], 0xAB);
+
+    const witness = &[_][]const u8{
+        &[_]u8{0xAA} ** 71, // Signature
+        &[_]u8{0xBB} ** 33, // Pubkey
+    };
+
+    var flags = ScriptFlags{};
+    flags.verify_witness = true;
+    flags.verify_p2sh = true;
+
+    const count = countWitnessSigOps(&[_]u8{}, &script_pubkey, witness, flags);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "countWitnessSigOps: P2WSH counts witness script sigops" {
+    // P2WSH: OP_0 <32 bytes>
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x20;
+    @memset(script_pubkey[2..34], 0xAB);
+
+    // Witness script: OP_CHECKSIG
+    const witness_script = [_]u8{0xac};
+    const witness = &[_][]const u8{
+        &[_]u8{0xAA} ** 71, // Signature
+        &witness_script,   // Witness script (last item)
+    };
+
+    var flags = ScriptFlags{};
+    flags.verify_witness = true;
+    flags.verify_p2sh = true;
+
+    const count = countWitnessSigOps(&[_]u8{}, &script_pubkey, witness, flags);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "countWitnessSigOps: returns 0 when witness flag disabled" {
+    // P2WPKH scriptPubKey
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xAB);
+
+    const witness = &[_][]const u8{
+        &[_]u8{0xAA} ** 71,
+        &[_]u8{0xBB} ** 33,
+    };
+
+    var flags = ScriptFlags{};
+    flags.verify_witness = false; // Disabled
+
+    const count = countWitnessSigOps(&[_]u8{}, &script_pubkey, witness, flags);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "countWitnessSigOps: witness version 1 returns 0" {
+    // P2TR: OP_1 <32 bytes>
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x51; // OP_1 (witness version 1)
+    script_pubkey[1] = 0x20;
+    @memset(script_pubkey[2..34], 0xAB);
+
+    const witness = &[_][]const u8{
+        &[_]u8{0xAA} ** 64, // Schnorr signature
+    };
+
+    var flags = ScriptFlags{};
+    flags.verify_witness = true;
+    flags.verify_p2sh = true;
+
+    // Taproot/witness v1 sigop counting is not defined (returns 0)
+    const count = countWitnessSigOps(&[_]u8{}, &script_pubkey, witness, flags);
+    try std.testing.expectEqual(@as(u32, 0), count);
 }
