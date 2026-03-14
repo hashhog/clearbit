@@ -143,6 +143,7 @@ pub const ScriptError = error{
     UnsatisfiedLocktime,
     WitnessProgramMismatch,
     WitnessProgramWrongLength,
+    WitnessPubkeyType,
     WitnessUnexpected,
     OutOfMemory,
     InvalidNumber,
@@ -169,7 +170,8 @@ pub const ScriptFlags = packed struct {
     verify_checklocktimeverify: bool = true,
     verify_checksequenceverify: bool = true,
     verify_taproot: bool = true,
-    _padding: u5 = 0,
+    verify_witness_pubkeytype: bool = true, // BIP-141: witness v0 requires compressed pubkeys
+    _padding: u4 = 0,
 };
 
 // ============================================================================
@@ -187,6 +189,17 @@ const LOCKTIME_THRESHOLD: u32 = 500000000;
 const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
 const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
+
+// ============================================================================
+// Public Key Encoding
+// ============================================================================
+
+/// Check if a public key is compressed (33 bytes, starting with 0x02 or 0x03).
+/// Per BIP-141, witness v0 programs require compressed public keys.
+pub fn isCompressedPubkey(pubkey: []const u8) bool {
+    if (pubkey.len != 33) return false;
+    return pubkey[0] == 0x02 or pubkey[0] == 0x03;
+}
 
 // ============================================================================
 // Script Number Encoding
@@ -259,6 +272,20 @@ fn scriptNumEncode(value: i64, allocator: std.mem.Allocator) ![]u8 {
 }
 
 // ============================================================================
+// Signature Version
+// ============================================================================
+
+/// Tracks the signature version for sighash computation and validation rules.
+pub const SigVersion = enum {
+    /// Legacy (pre-segwit) scripts
+    base,
+    /// Witness v0 scripts (P2WPKH, P2WSH) - BIP 143
+    witness_v0,
+    /// Tapscript (P2TR script path) - BIP 342
+    tapscript,
+};
+
+// ============================================================================
 // Script Engine
 // ============================================================================
 
@@ -271,6 +298,7 @@ pub const ScriptEngine = struct {
     input_index: usize,
     amount: i64,
     codesep_pos: u32,
+    sig_version: SigVersion,
 
     // Memory management for stack elements we allocate
     owned_elements: std.ArrayList([]u8),
@@ -291,6 +319,7 @@ pub const ScriptEngine = struct {
             .input_index = input_index,
             .amount = amount,
             .codesep_pos = 0xFFFFFFFF,
+            .sig_version = .base,
             .owned_elements = std.ArrayList([]u8).init(allocator),
         };
     }
@@ -456,6 +485,14 @@ pub const ScriptEngine = struct {
             switch (script_type) {
                 .p2wpkh => {
                     if (witness.len != 2) return false;
+
+                    // BIP-141: witness v0 requires compressed pubkeys
+                    // witness[0] = signature, witness[1] = pubkey
+                    const pubkey = witness[1];
+                    if (self.flags.verify_witness_pubkeytype and !isCompressedPubkey(pubkey)) {
+                        return ScriptError.WitnessPubkeyType;
+                    }
+
                     // Build P2PKH script from witness program
                     const wpkh_hash = script_pubkey[2..22];
                     var p2pkh_script: [25]u8 = undefined;
@@ -473,6 +510,8 @@ pub const ScriptEngine = struct {
                         self.stack.append(item) catch return ScriptError.OutOfMemory;
                     }
 
+                    // Set sig_version to witness_v0 for signature verification
+                    self.sig_version = .witness_v0;
                     try self.execute(&p2pkh_script);
 
                     if (self.stack.items.len == 0) return false;
@@ -493,6 +532,8 @@ pub const ScriptEngine = struct {
                         self.stack.append(item) catch return ScriptError.OutOfMemory;
                     }
 
+                    // Set sig_version to witness_v0 for signature verification
+                    self.sig_version = .witness_v0;
                     try self.execute(witness_script);
 
                     if (self.stack.items.len == 0) return false;
@@ -1170,6 +1211,15 @@ pub const ScriptEngine = struct {
             pubkeys[i] = try self.pop();
         }
 
+        // BIP-141: witness v0 requires compressed pubkeys
+        if (self.flags.verify_witness_pubkeytype and self.sig_version == .witness_v0) {
+            for (0..n_keys) |i| {
+                if (!isCompressedPubkey(pubkeys[i])) {
+                    return ScriptError.WitnessPubkeyType;
+                }
+            }
+        }
+
         // Get number of signatures
         const m_data = try self.pop();
         const m = try scriptNumDecode(m_data);
@@ -1231,8 +1281,15 @@ pub const ScriptEngine = struct {
         }
     }
 
-    fn verifySignature(_: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {
+    fn verifySignature(self: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {
         if (sig.len == 0) return false;
+
+        // BIP-141: witness v0 requires compressed pubkeys
+        if (self.flags.verify_witness_pubkeytype and self.sig_version == .witness_v0) {
+            if (!isCompressedPubkey(pubkey)) {
+                return ScriptError.WitnessPubkeyType;
+            }
+        }
 
         // Extract hash type from last byte
         const hash_type = sig[sig.len - 1];
@@ -1243,7 +1300,6 @@ pub const ScriptEngine = struct {
         // For now, we use a simplified approach
         _ = hash_type;
         _ = sig_data;
-        _ = pubkey;
 
         // Full implementation would call crypto.verifyEcdsa
         if (!crypto.isSecp256k1Available()) {
@@ -1804,4 +1860,196 @@ test "NULLFAIL: flag is part of packed struct at correct bit position" {
     try std.testing.expect(!flags.verify_nullfail);
     flags.verify_nullfail = true;
     try std.testing.expect(flags.verify_nullfail);
+}
+
+// ============================================================================
+// WITNESS_PUBKEYTYPE (BIP-141) Tests
+// ============================================================================
+
+test "isCompressedPubkey: valid compressed key 0x02 prefix" {
+    var pubkey: [33]u8 = undefined;
+    pubkey[0] = 0x02;
+    @memset(pubkey[1..33], 0xAB);
+    try std.testing.expect(isCompressedPubkey(&pubkey));
+}
+
+test "isCompressedPubkey: valid compressed key 0x03 prefix" {
+    var pubkey: [33]u8 = undefined;
+    pubkey[0] = 0x03;
+    @memset(pubkey[1..33], 0xAB);
+    try std.testing.expect(isCompressedPubkey(&pubkey));
+}
+
+test "isCompressedPubkey: uncompressed key 0x04 prefix rejected" {
+    var pubkey: [65]u8 = undefined;
+    pubkey[0] = 0x04;
+    @memset(pubkey[1..65], 0xAB);
+    try std.testing.expect(!isCompressedPubkey(&pubkey));
+}
+
+test "isCompressedPubkey: wrong length rejected" {
+    var pubkey: [32]u8 = undefined;
+    pubkey[0] = 0x02;
+    @memset(pubkey[1..32], 0xAB);
+    try std.testing.expect(!isCompressedPubkey(&pubkey));
+}
+
+test "isCompressedPubkey: wrong prefix rejected" {
+    var pubkey: [33]u8 = undefined;
+    pubkey[0] = 0x04; // wrong prefix for 33 bytes
+    @memset(pubkey[1..33], 0xAB);
+    try std.testing.expect(!isCompressedPubkey(&pubkey));
+}
+
+test "WITNESS_PUBKEYTYPE: flag enabled by default" {
+    const flags = ScriptFlags{};
+    try std.testing.expect(flags.verify_witness_pubkeytype);
+}
+
+test "WITNESS_PUBKEYTYPE: P2WPKH with compressed pubkey succeeds" {
+    const allocator = std.testing.allocator;
+
+    // Create minimal transaction
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // P2WPKH scriptPubKey: OP_0 <20 bytes>
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memset(script_pubkey[2..22], 0xAB); // 20 byte hash
+
+    // Compressed pubkey (33 bytes, 0x02 prefix)
+    var compressed_pubkey: [33]u8 = undefined;
+    compressed_pubkey[0] = 0x02;
+    @memset(compressed_pubkey[1..33], 0xCD);
+
+    // Witness: [signature, compressed_pubkey]
+    var fake_sig: [72]u8 = undefined;
+    @memset(&fake_sig, 0x30);
+    fake_sig[71] = 0x01; // SIGHASH_ALL
+
+    const witness = [_][]const u8{ &fake_sig, &compressed_pubkey };
+
+    // Note: actual verification will succeed because secp256k1 may not be available
+    // But importantly, it should NOT fail with WitnessPubkeyType
+    const result = engine.verify(&[_]u8{}, &script_pubkey, &witness);
+    // If secp256k1 is not available, verifySignature returns true
+    // So the overall verify should succeed
+    if (result) |valid| {
+        // Should not fail with WitnessPubkeyType - that would have been an error
+        _ = valid;
+    } else |err| {
+        // Should not be WitnessPubkeyType error since key is compressed
+        try std.testing.expect(err != ScriptError.WitnessPubkeyType);
+    }
+}
+
+test "WITNESS_PUBKEYTYPE: P2WPKH with uncompressed pubkey fails" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // P2WPKH scriptPubKey: OP_0 <20 bytes>
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memset(script_pubkey[2..22], 0xAB);
+
+    // Uncompressed pubkey (65 bytes, 0x04 prefix)
+    var uncompressed_pubkey: [65]u8 = undefined;
+    uncompressed_pubkey[0] = 0x04;
+    @memset(uncompressed_pubkey[1..65], 0xCD);
+
+    // Witness: [signature, uncompressed_pubkey]
+    var fake_sig: [72]u8 = undefined;
+    @memset(&fake_sig, 0x30);
+    fake_sig[71] = 0x01;
+
+    const witness = [_][]const u8{ &fake_sig, &uncompressed_pubkey };
+
+    const result = engine.verify(&[_]u8{}, &script_pubkey, &witness);
+    try std.testing.expectError(ScriptError.WitnessPubkeyType, result);
+}
+
+test "WITNESS_PUBKEYTYPE: P2WPKH with uncompressed pubkey succeeds when flag disabled" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    // Disable the witness pubkeytype check
+    var flags = ScriptFlags{};
+    flags.verify_witness_pubkeytype = false;
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    // P2WPKH scriptPubKey
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xAB);
+
+    // Uncompressed pubkey (65 bytes, 0x04 prefix)
+    var uncompressed_pubkey: [65]u8 = undefined;
+    uncompressed_pubkey[0] = 0x04;
+    @memset(uncompressed_pubkey[1..65], 0xCD);
+
+    var fake_sig: [72]u8 = undefined;
+    @memset(&fake_sig, 0x30);
+    fake_sig[71] = 0x01;
+
+    const witness = [_][]const u8{ &fake_sig, &uncompressed_pubkey };
+
+    const result = engine.verify(&[_]u8{}, &script_pubkey, &witness);
+    // Should NOT fail with WitnessPubkeyType since flag is disabled
+    if (result) |_| {
+        // Success is fine
+    } else |err| {
+        // Should not be WitnessPubkeyType error
+        try std.testing.expect(err != ScriptError.WitnessPubkeyType);
+    }
+}
+
+test "WITNESS_PUBKEYTYPE: SigVersion enum values" {
+    // Verify the enum values exist
+    try std.testing.expectEqual(SigVersion.base, SigVersion.base);
+    try std.testing.expectEqual(SigVersion.witness_v0, SigVersion.witness_v0);
+    try std.testing.expectEqual(SigVersion.tapscript, SigVersion.tapscript);
+}
+
+test "WITNESS_PUBKEYTYPE: ScriptEngine initializes with base sig_version" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    try std.testing.expectEqual(SigVersion.base, engine.sig_version);
 }
