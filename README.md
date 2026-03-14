@@ -42,6 +42,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Benchmarking suite (SHA256, merkle root, UTXO cache, block deserialization)
 - [x] Misbehavior scoring and peer banning (per-peer score, 100pt threshold, ban list persistence)
 - [x] Eclipse attack protections (netgroup diversity, anchor connections, inbound eviction)
+- [x] Checkpoint verification (comptime checkpoints, binary search lookup, fork rejection)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
