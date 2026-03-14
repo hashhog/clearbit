@@ -43,6 +43,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Misbehavior scoring and peer banning (per-peer score, 100pt threshold, ban list persistence)
 - [x] Eclipse attack protections (netgroup diversity, anchor connections, inbound eviction)
 - [x] Checkpoint verification (comptime checkpoints, binary search lookup, fork rejection)
+- [x] Flat file block storage (blk*.dat files, 128 MiB max, pre-allocation, RocksDB index)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -75,7 +76,7 @@ src/
   address.zig        # address encoding (Base58, Bech32)
   script.zig         # script interpreter and opcodes
   consensus.zig      # consensus rules, network params, difficulty, BIP-9
-  storage.zig        # RocksDB storage layer, UTXO set, chain state
+  storage.zig        # RocksDB storage layer, UTXO set, chain state, flat file blocks
   validation.zig     # block and transaction validation
   p2p.zig            # P2P protocol message serialization
   peer.zig           # TCP peer connections, handshake, misbehavior scoring
