@@ -15,7 +15,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Crypto primitives (SHA256, RIPEMD160, HASH160, HASH256)
 - [x] Merkle root computation
 - [x] Transaction hashing (txid, wtxid)
-- [x] Sighash computation (legacy, BIP-143 segwit, BIP-341 taproot)
+- [x] Sighash computation (legacy FindAndDelete/OP_CODESEPARATOR, BIP-143 segwit, BIP-341 taproot)
 - [x] libsecp256k1 integration (ECDSA signing/verification, Schnorr)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
