@@ -330,6 +330,192 @@ test "Script: OP_RETURN classified as null_data" {
 }
 
 // ============================================================
+// MINIMALIF test vectors (BIP-342 / segwit consensus)
+// ============================================================
+
+test "MINIMALIF: OP_IF with 0x02 fails in witness v0" {
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+
+    // Set witness v0 mode to enforce MINIMALIF
+    engine.sig_version = .witness_v0;
+
+    // Push 0x02 (invalid MINIMALIF value), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    // Script: <0x02> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x01, 0x02, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    const result = engine.execute(&s);
+    try testing.expectError(script.ScriptError.MinimalIf, result);
+}
+
+test "MINIMALIF: OP_IF with 0x01 passes in witness v0" {
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+
+    // Set witness v0 mode to enforce MINIMALIF
+    engine.sig_version = .witness_v0;
+
+    // Push 0x01 (valid MINIMALIF true value), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    // Script: <0x01> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x01, 0x01, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    try engine.execute(&s);
+
+    // Should have taken the true branch and pushed OP_1
+    try testing.expectEqual(@as(usize, 1), engine.stack.items.len);
+    try testing.expectEqual(@as(u8, 1), engine.stack.items[0][0]);
+}
+
+test "MINIMALIF: OP_IF with empty slice takes else branch in witness v0" {
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+
+    // Set witness v0 mode to enforce MINIMALIF
+    engine.sig_version = .witness_v0;
+
+    // Push empty (OP_0), then OP_IF OP_1 OP_ELSE OP_2 OP_ENDIF
+    // Script: OP_0 OP_IF OP_1 OP_ELSE OP_2 OP_ENDIF
+    const s = [_]u8{ 0x00, 0x63, 0x51, 0x67, 0x52, 0x68 };
+    try engine.execute(&s);
+
+    // Should have taken the false (else) branch and pushed OP_2
+    try testing.expectEqual(@as(usize, 1), engine.stack.items.len);
+    try testing.expectEqual(@as(u8, 2), engine.stack.items[0][0]);
+}
+
+test "MINIMALIF: OP_IF with 0x00 byte fails in witness v0" {
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+
+    // Set witness v0 mode to enforce MINIMALIF
+    engine.sig_version = .witness_v0;
+
+    // Push a single 0x00 byte (invalid - only empty slice is acceptable for false)
+    // Script: <0x00> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x01, 0x00, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    const result = engine.execute(&s);
+    try testing.expectError(script.ScriptError.MinimalIf, result);
+}
+
+test "MINIMALIF: OP_NOTIF with 0x02 fails in witness v0" {
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+
+    // Set witness v0 mode to enforce MINIMALIF
+    engine.sig_version = .witness_v0;
+
+    // Push 0x02 (invalid MINIMALIF value), then OP_NOTIF OP_1 OP_ELSE OP_0 OP_ENDIF
+    // Script: <0x02> OP_NOTIF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x01, 0x02, 0x64, 0x51, 0x67, 0x00, 0x68 };
+    const result = engine.execute(&s);
+    try testing.expectError(script.ScriptError.MinimalIf, result);
+}
+
+test "MINIMALIF: multi-byte value fails in witness v0" {
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+
+    // Set witness v0 mode to enforce MINIMALIF
+    engine.sig_version = .witness_v0;
+
+    // Push [0x01, 0x00] (multi-byte, even though would be truthy, fails MINIMALIF)
+    // Script: <0x01 0x00> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x02, 0x01, 0x00, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    const result = engine.execute(&s);
+    try testing.expectError(script.ScriptError.MinimalIf, result);
+}
+
+test "MINIMALIF: OP_IF with 0x02 allowed in legacy (base) mode" {
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+
+    // Default is base mode (legacy), MINIMALIF not enforced
+    // Push 0x02 (truthy in legacy), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    // Script: <0x02> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x01, 0x02, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    try engine.execute(&s);
+
+    // Should have taken the true branch since 0x02 is truthy in legacy
+    try testing.expectEqual(@as(usize, 1), engine.stack.items.len);
+    try testing.expectEqual(@as(u8, 1), engine.stack.items[0][0]);
+}
+
+test "MINIMALIF: enforced in tapscript mode" {
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+
+    // Set tapscript mode to enforce MINIMALIF
+    engine.sig_version = .tapscript;
+
+    // Push 0x02 (invalid MINIMALIF value), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x01, 0x02, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    const result = engine.execute(&s);
+    try testing.expectError(script.ScriptError.MinimalIf, result);
+}
+
+// ============================================================
 // Consensus rules test vectors
 // ============================================================
 
