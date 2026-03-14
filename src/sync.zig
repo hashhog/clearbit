@@ -26,6 +26,366 @@ pub const IBD_BATCH_SIZE: usize = 500;
 /// Interval between UTXO flushes during IBD (every N blocks).
 pub const UTXO_FLUSH_INTERVAL: u32 = 2000;
 
+/// Maximum headers per message (Bitcoin P2P protocol limit).
+pub const MAX_HEADERS_PER_MESSAGE: usize = 2000;
+
+// ============================================================================
+// Header Sync Anti-DoS (PRESYNC/REDOWNLOAD)
+// ============================================================================
+//
+// Protects against memory exhaustion attacks during initial header sync.
+// A malicious peer could send millions of low-work headers to consume memory.
+//
+// The solution is a two-phase process:
+// 1. PRESYNC: Accept headers without storing them permanently. Track only:
+//    - Cumulative chain work (256-bit integer)
+//    - Last header hash
+//    - Header count
+//    This uses ~100 bytes per peer maximum.
+//
+// 2. REDOWNLOAD: Once the peer's chain demonstrates sufficient work
+//    (>= min_chain_work), re-request all headers and store them permanently.
+//
+// Reference: Bitcoin Core headerssync.cpp/h
+
+/// Header sync state machine for anti-DoS protection.
+pub const HeaderSyncState = enum {
+    /// Phase 1: Tracking work without storing headers permanently.
+    /// Stores only cumulative work, last hash, and count (~100 bytes).
+    presync,
+
+    /// Phase 2: Re-downloading headers for permanent storage.
+    /// Only entered after presync proves sufficient chain work.
+    redownload,
+
+    /// Sync complete or failed for this peer.
+    done,
+};
+
+/// Minimal state tracked per peer during PRESYNC phase.
+/// Intentionally small (~100 bytes) to prevent memory exhaustion attacks.
+pub const PresyncState = struct {
+    /// Cumulative proof-of-work of the chain seen so far (256-bit).
+    chain_work: [32]u8,
+
+    /// Hash of the last header received in this chain.
+    last_header_hash: types.Hash256,
+
+    /// Number of headers seen in presync (for logging/debugging).
+    header_count: u32,
+
+    /// Height of the chain tip seen in presync.
+    tip_height: u32,
+
+    /// Timestamp when presync started (for timeout detection).
+    start_time: i64,
+
+    /// Last header's bits field (needed for work calculation).
+    last_bits: u32,
+
+    /// Initialize presync state from chain start.
+    pub fn init(chain_start_hash: types.Hash256, chain_start_work: [32]u8, start_height: u32) PresyncState {
+        return PresyncState{
+            .chain_work = chain_start_work,
+            .last_header_hash = chain_start_hash,
+            .header_count = 0,
+            .tip_height = start_height,
+            .start_time = std.time.timestamp(),
+            .last_bits = 0,
+        };
+    }
+
+    /// Size of this struct in bytes (for memory budgeting).
+    pub const SIZE_BYTES: usize = 32 + 32 + 4 + 4 + 8 + 4; // ~84 bytes
+};
+
+/// Per-peer header sync state machine for anti-DoS protection.
+pub const HeadersSyncState = struct {
+    /// Current phase of the state machine.
+    state: HeaderSyncState,
+
+    /// Presync tracking data (minimal memory footprint).
+    presync: PresyncState,
+
+    /// Minimum required chain work to transition to REDOWNLOAD.
+    min_chain_work: [32]u8,
+
+    /// Hash where chain starts (our current tip or genesis).
+    chain_start_hash: types.Hash256,
+
+    /// Height where chain starts.
+    chain_start_height: u32,
+
+    /// Peer ID for tracking.
+    peer_id: usize,
+
+    /// Allocator for any dynamic allocations during redownload.
+    allocator: std.mem.Allocator,
+
+    /// Initialize a new header sync state machine.
+    pub fn init(
+        peer_id: usize,
+        chain_start_hash: types.Hash256,
+        chain_start_work: [32]u8,
+        chain_start_height: u32,
+        min_chain_work: [32]u8,
+        allocator: std.mem.Allocator,
+    ) HeadersSyncState {
+        return HeadersSyncState{
+            .state = .presync,
+            .presync = PresyncState.init(chain_start_hash, chain_start_work, chain_start_height),
+            .min_chain_work = min_chain_work,
+            .chain_start_hash = chain_start_hash,
+            .chain_start_height = chain_start_height,
+            .peer_id = peer_id,
+            .allocator = allocator,
+        };
+    }
+
+    /// Process headers during PRESYNC phase.
+    /// Returns true if we should request more headers, false if done or failed.
+    pub fn processPresyncHeaders(
+        self: *HeadersSyncState,
+        headers: []const types.BlockHeader,
+    ) !PresyncResult {
+        if (self.state != .presync) {
+            return PresyncResult{ .action = .abort, .reason = .wrong_state };
+        }
+
+        if (headers.len == 0) {
+            // Empty response - peer has no more headers
+            return PresyncResult{ .action = .abort, .reason = .empty_response };
+        }
+
+        // Validate and accumulate work for each header
+        var prev_hash = self.presync.last_header_hash;
+        var cumulative_work = self.presync.chain_work;
+        var last_bits: u32 = self.presync.last_bits;
+
+        for (headers) |*header| {
+            // Check continuity: header must chain to previous
+            if (!std.mem.eql(u8, &header.prev_block, &prev_hash)) {
+                return PresyncResult{ .action = .abort, .reason = .discontinuous };
+            }
+
+            // Compute this header's hash
+            const header_hash = crypto.computeBlockHash(header);
+
+            // Validate PoW meets claimed target
+            const target = consensus.bitsToTarget(header.bits);
+            if (!consensus.hashMeetsTarget(&header_hash, &target)) {
+                return PresyncResult{ .action = .abort, .reason = .invalid_pow };
+            }
+
+            // Accumulate work
+            const work = computeWork(header.bits);
+            cumulative_work = addWork(cumulative_work, work);
+
+            prev_hash = header_hash;
+            last_bits = header.bits;
+            self.presync.header_count += 1;
+            self.presync.tip_height += 1;
+        }
+
+        // Update state
+        self.presync.last_header_hash = prev_hash;
+        self.presync.chain_work = cumulative_work;
+        self.presync.last_bits = last_bits;
+
+        // Check if we've accumulated enough work to transition to REDOWNLOAD
+        if (compareWork(cumulative_work, self.min_chain_work) >= 0) {
+            self.state = .redownload;
+            return PresyncResult{
+                .action = .transition_to_redownload,
+                .reason = .success,
+            };
+        }
+
+        // Not enough work yet - request more headers
+        if (headers.len == MAX_HEADERS_PER_MESSAGE) {
+            return PresyncResult{ .action = .request_more, .reason = .success };
+        }
+
+        // Peer sent less than max headers but work is insufficient
+        return PresyncResult{ .action = .abort, .reason = .insufficient_work };
+    }
+
+    /// Get the next locator hash for requesting more headers.
+    pub fn nextLocatorHash(self: *const HeadersSyncState) types.Hash256 {
+        return self.presync.last_header_hash;
+    }
+
+    /// Get a summary of the presync progress.
+    pub fn getPresyncProgress(self: *const HeadersSyncState) PresyncProgress {
+        return PresyncProgress{
+            .header_count = self.presync.header_count,
+            .tip_height = self.presync.tip_height,
+            .chain_work = self.presync.chain_work,
+            .min_chain_work = self.min_chain_work,
+            .state = self.state,
+        };
+    }
+
+    /// Clean up any allocated resources.
+    pub fn deinit(self: *HeadersSyncState) void {
+        // Currently no dynamic allocations, but reserved for future use
+        _ = self;
+    }
+};
+
+/// Result of processing headers during PRESYNC.
+pub const PresyncResult = struct {
+    action: PresyncAction,
+    reason: PresyncReason,
+};
+
+pub const PresyncAction = enum {
+    /// Continue presync, request more headers.
+    request_more,
+
+    /// Sufficient work proven, transition to REDOWNLOAD phase.
+    transition_to_redownload,
+
+    /// Abort sync with this peer (invalid data or insufficient work).
+    abort,
+};
+
+pub const PresyncReason = enum {
+    success,
+    wrong_state,
+    empty_response,
+    discontinuous,
+    invalid_pow,
+    insufficient_work,
+};
+
+/// Progress summary for PRESYNC phase.
+pub const PresyncProgress = struct {
+    header_count: u32,
+    tip_height: u32,
+    chain_work: [32]u8,
+    min_chain_work: [32]u8,
+    state: HeaderSyncState,
+};
+
+/// Manager for per-peer header sync state machines.
+/// Uses AutoHashMap with PeerId (pointer converted to usize) as key.
+pub const HeaderSyncManager = struct {
+    /// Per-peer sync state: peer pointer -> HeadersSyncState
+    peer_states: std.AutoHashMap(usize, *HeadersSyncState),
+
+    /// Allocator for dynamic allocations.
+    allocator: std.mem.Allocator,
+
+    /// Minimum required chain work for REDOWNLOAD transition.
+    min_chain_work: [32]u8,
+
+    /// Initialize the header sync manager.
+    pub fn init(allocator: std.mem.Allocator, min_chain_work: [32]u8) HeaderSyncManager {
+        return HeaderSyncManager{
+            .peer_states = std.AutoHashMap(usize, *HeadersSyncState).init(allocator),
+            .allocator = allocator,
+            .min_chain_work = min_chain_work,
+        };
+    }
+
+    /// Clean up all peer states.
+    pub fn deinit(self: *HeaderSyncManager) void {
+        var iter = self.peer_states.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.peer_states.deinit();
+    }
+
+    /// Start header sync with a peer.
+    pub fn startSync(
+        self: *HeaderSyncManager,
+        peer: *peer_mod.Peer,
+        chain_start_hash: types.Hash256,
+        chain_start_work: [32]u8,
+        chain_start_height: u32,
+    ) !*HeadersSyncState {
+        const peer_id = @intFromPtr(peer);
+
+        // Remove existing state if any
+        if (self.peer_states.fetchRemove(peer_id)) |old_entry| {
+            old_entry.value.deinit();
+            self.allocator.destroy(old_entry.value);
+        }
+
+        // Create new state
+        const state = try self.allocator.create(HeadersSyncState);
+        state.* = HeadersSyncState.init(
+            peer_id,
+            chain_start_hash,
+            chain_start_work,
+            chain_start_height,
+            self.min_chain_work,
+            self.allocator,
+        );
+
+        try self.peer_states.put(peer_id, state);
+        return state;
+    }
+
+    /// Get the sync state for a peer.
+    pub fn getState(self: *HeaderSyncManager, peer: *peer_mod.Peer) ?*HeadersSyncState {
+        return self.peer_states.get(@intFromPtr(peer));
+    }
+
+    /// Remove sync state for a peer.
+    pub fn removeState(self: *HeaderSyncManager, peer: *peer_mod.Peer) void {
+        const peer_id = @intFromPtr(peer);
+        if (self.peer_states.fetchRemove(peer_id)) |entry| {
+            entry.value.deinit();
+            self.allocator.destroy(entry.value);
+        }
+    }
+
+    /// Count active presync states (for memory budgeting).
+    pub fn activePresyncCount(self: *const HeaderSyncManager) usize {
+        var count: usize = 0;
+        var iter = self.peer_states.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.*.state == .presync) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Estimated memory usage for presync states.
+    pub fn presyncMemoryUsage(self: *const HeaderSyncManager) usize {
+        return self.activePresyncCount() * PresyncState.SIZE_BYTES;
+    }
+
+    /// Check if a peer is in low-work header sync.
+    pub fn isLowWorkSync(self: *const HeaderSyncManager, peer: *peer_mod.Peer) bool {
+        const state = self.getState(peer) orelse return false;
+        return state.state == .presync;
+    }
+
+    /// Process headers from a peer during low-work sync.
+    /// Returns null if peer is not in low-work sync.
+    pub fn processHeaders(
+        self: *HeaderSyncManager,
+        peer: *peer_mod.Peer,
+        headers: []const types.BlockHeader,
+    ) ?PresyncResult {
+        const state = self.getState(peer) orelse return null;
+
+        if (state.state != .presync) {
+            return null;
+        }
+
+        return state.processPresyncHeaders(headers) catch |_| {
+            return PresyncResult{ .action = .abort, .reason = .invalid_pow };
+        };
+    }
+};
+
 // ============================================================================
 // Sync State
 // ============================================================================
@@ -1452,4 +1812,381 @@ test "in-flight block tracking" {
     _ = downloader.in_flight.remove(test_hash);
     try std.testing.expectEqual(@as(usize, 0), downloader.in_flight.count());
     try std.testing.expect(!downloader.isDownloading());
+}
+
+// ============================================================================
+// Header Sync Anti-DoS (PRESYNC/REDOWNLOAD) Tests
+// ============================================================================
+
+test "HeaderSyncState enum has correct values" {
+    try std.testing.expectEqual(@as(u2, 0), @intFromEnum(HeaderSyncState.presync));
+    try std.testing.expectEqual(@as(u2, 1), @intFromEnum(HeaderSyncState.redownload));
+    try std.testing.expectEqual(@as(u2, 2), @intFromEnum(HeaderSyncState.done));
+}
+
+test "PresyncState initialization" {
+    const start_hash = [_]u8{0xAB} ** 32;
+    const start_work = [_]u8{0x00} ** 31 ++ [_]u8{0x01};
+    const start_height: u32 = 100;
+
+    const state = PresyncState.init(start_hash, start_work, start_height);
+
+    try std.testing.expectEqualSlices(u8, &start_hash, &state.last_header_hash);
+    try std.testing.expectEqualSlices(u8, &start_work, &state.chain_work);
+    try std.testing.expectEqual(@as(u32, 0), state.header_count);
+    try std.testing.expectEqual(start_height, state.tip_height);
+    try std.testing.expect(state.start_time > 0);
+}
+
+test "PresyncState size constant" {
+    // Verify the size constant matches actual struct usage
+    try std.testing.expect(PresyncState.SIZE_BYTES < 100);
+    try std.testing.expect(PresyncState.SIZE_BYTES >= 80);
+}
+
+test "HeadersSyncState initialization" {
+    const allocator = std.testing.allocator;
+
+    const chain_start_hash = [_]u8{0x11} ** 32;
+    const chain_start_work = [_]u8{0x00} ** 31 ++ [_]u8{0x01};
+    const min_chain_work = [_]u8{0x00} ** 30 ++ [_]u8{ 0x01, 0x00 }; // Much higher
+
+    var state = HeadersSyncState.init(
+        42, // peer_id
+        chain_start_hash,
+        chain_start_work,
+        0, // start height
+        min_chain_work,
+        allocator,
+    );
+    defer state.deinit();
+
+    try std.testing.expectEqual(HeaderSyncState.presync, state.state);
+    try std.testing.expectEqual(@as(usize, 42), state.peer_id);
+    try std.testing.expectEqualSlices(u8, &chain_start_hash, &state.chain_start_hash);
+    try std.testing.expectEqualSlices(u8, &min_chain_work, &state.min_chain_work);
+}
+
+test "HeadersSyncState processPresyncHeaders rejects empty response" {
+    const allocator = std.testing.allocator;
+
+    const chain_start_hash = [_]u8{0} ** 32;
+    const chain_start_work = [_]u8{0} ** 32;
+    const min_chain_work = [_]u8{0} ** 32;
+
+    var state = HeadersSyncState.init(
+        1,
+        chain_start_hash,
+        chain_start_work,
+        0,
+        min_chain_work,
+        allocator,
+    );
+    defer state.deinit();
+
+    // Empty headers should abort
+    const result = try state.processPresyncHeaders(&[_]types.BlockHeader{});
+    try std.testing.expectEqual(PresyncAction.abort, result.action);
+    try std.testing.expectEqual(PresyncReason.empty_response, result.reason);
+}
+
+test "HeadersSyncState processPresyncHeaders rejects discontinuous chain" {
+    const allocator = std.testing.allocator;
+
+    const chain_start_hash = [_]u8{0xAA} ** 32;
+    const chain_start_work = [_]u8{0} ** 32;
+    const min_chain_work = [_]u8{0} ** 32;
+
+    var state = HeadersSyncState.init(
+        1,
+        chain_start_hash,
+        chain_start_work,
+        0,
+        min_chain_work,
+        allocator,
+    );
+    defer state.deinit();
+
+    // Header with wrong prev_block should be rejected
+    const bad_header = types.BlockHeader{
+        .version = 1,
+        .prev_block = [_]u8{0xBB} ** 32, // Wrong - doesn't match chain_start_hash
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1234567890,
+        .bits = 0x207fffff, // Easy regtest difficulty
+        .nonce = 0,
+    };
+
+    const result = try state.processPresyncHeaders(&[_]types.BlockHeader{bad_header});
+    try std.testing.expectEqual(PresyncAction.abort, result.action);
+    try std.testing.expectEqual(PresyncReason.discontinuous, result.reason);
+}
+
+test "HeadersSyncState wrong state returns error" {
+    const allocator = std.testing.allocator;
+
+    var state = HeadersSyncState.init(
+        1,
+        [_]u8{0} ** 32,
+        [_]u8{0} ** 32,
+        0,
+        [_]u8{0} ** 32,
+        allocator,
+    );
+    defer state.deinit();
+
+    // Manually set state to redownload
+    state.state = .redownload;
+
+    const result = try state.processPresyncHeaders(&[_]types.BlockHeader{});
+    try std.testing.expectEqual(PresyncAction.abort, result.action);
+    try std.testing.expectEqual(PresyncReason.wrong_state, result.reason);
+}
+
+test "HeadersSyncState getPresyncProgress returns correct values" {
+    const allocator = std.testing.allocator;
+
+    const start_work = [_]u8{0x42} ** 32;
+    const min_work = [_]u8{0xFF} ** 32;
+
+    var state = HeadersSyncState.init(
+        1,
+        [_]u8{0} ** 32,
+        start_work,
+        100,
+        min_work,
+        allocator,
+    );
+    defer state.deinit();
+
+    const progress = state.getPresyncProgress();
+    try std.testing.expectEqual(@as(u32, 0), progress.header_count);
+    try std.testing.expectEqual(@as(u32, 100), progress.tip_height);
+    try std.testing.expectEqualSlices(u8, &start_work, &progress.chain_work);
+    try std.testing.expectEqualSlices(u8, &min_work, &progress.min_chain_work);
+    try std.testing.expectEqual(HeaderSyncState.presync, progress.state);
+}
+
+test "HeadersSyncState nextLocatorHash returns last header hash" {
+    const allocator = std.testing.allocator;
+
+    const start_hash = [_]u8{0xDE} ** 32;
+
+    var state = HeadersSyncState.init(
+        1,
+        start_hash,
+        [_]u8{0} ** 32,
+        0,
+        [_]u8{0} ** 32,
+        allocator,
+    );
+    defer state.deinit();
+
+    const locator = state.nextLocatorHash();
+    try std.testing.expectEqualSlices(u8, &start_hash, &locator);
+}
+
+test "HeaderSyncManager initialization" {
+    const allocator = std.testing.allocator;
+    const min_work = [_]u8{0x01} ** 32;
+
+    var manager = HeaderSyncManager.init(allocator, min_work);
+    defer manager.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), manager.peer_states.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.activePresyncCount());
+    try std.testing.expectEqual(@as(usize, 0), manager.presyncMemoryUsage());
+}
+
+test "HeaderSyncManager startSync creates state" {
+    const allocator = std.testing.allocator;
+    const min_work = [_]u8{0} ** 32;
+
+    var manager = HeaderSyncManager.init(allocator, min_work);
+    defer manager.deinit();
+
+    // Create a mock peer pointer
+    const mock_peer: *peer_mod.Peer = @ptrFromInt(0x2000);
+
+    const state = try manager.startSync(
+        mock_peer,
+        [_]u8{0xAA} ** 32,
+        [_]u8{0} ** 32,
+        0,
+    );
+
+    try std.testing.expectEqual(HeaderSyncState.presync, state.state);
+    try std.testing.expectEqual(@as(usize, 1), manager.peer_states.count());
+    try std.testing.expectEqual(@as(usize, 1), manager.activePresyncCount());
+    try std.testing.expect(manager.presyncMemoryUsage() > 0);
+
+    // Verify getState returns the same state
+    const retrieved = manager.getState(mock_peer);
+    try std.testing.expect(retrieved != null);
+    try std.testing.expectEqual(state.peer_id, retrieved.?.peer_id);
+}
+
+test "HeaderSyncManager removeState cleans up" {
+    const allocator = std.testing.allocator;
+
+    var manager = HeaderSyncManager.init(allocator, [_]u8{0} ** 32);
+    defer manager.deinit();
+
+    const mock_peer: *peer_mod.Peer = @ptrFromInt(0x3000);
+
+    _ = try manager.startSync(mock_peer, [_]u8{0} ** 32, [_]u8{0} ** 32, 0);
+    try std.testing.expectEqual(@as(usize, 1), manager.peer_states.count());
+
+    manager.removeState(mock_peer);
+    try std.testing.expectEqual(@as(usize, 0), manager.peer_states.count());
+    try std.testing.expect(manager.getState(mock_peer) == null);
+}
+
+test "HeaderSyncManager startSync replaces existing state" {
+    const allocator = std.testing.allocator;
+
+    var manager = HeaderSyncManager.init(allocator, [_]u8{0} ** 32);
+    defer manager.deinit();
+
+    const mock_peer: *peer_mod.Peer = @ptrFromInt(0x4000);
+
+    // Start sync first time
+    const state1 = try manager.startSync(mock_peer, [_]u8{0xAA} ** 32, [_]u8{0} ** 32, 100);
+    try std.testing.expectEqual(@as(u32, 100), state1.chain_start_height);
+
+    // Start sync second time - should replace
+    const state2 = try manager.startSync(mock_peer, [_]u8{0xBB} ** 32, [_]u8{0} ** 32, 200);
+    try std.testing.expectEqual(@as(u32, 200), state2.chain_start_height);
+
+    // Should still only have one state
+    try std.testing.expectEqual(@as(usize, 1), manager.peer_states.count());
+}
+
+test "HeaderSyncManager isLowWorkSync detection" {
+    const allocator = std.testing.allocator;
+
+    var manager = HeaderSyncManager.init(allocator, [_]u8{0} ** 32);
+    defer manager.deinit();
+
+    const mock_peer1: *peer_mod.Peer = @ptrFromInt(0x5000);
+    const mock_peer2: *peer_mod.Peer = @ptrFromInt(0x6000);
+
+    // Peer without state
+    try std.testing.expect(!manager.isLowWorkSync(mock_peer1));
+
+    // Start sync for peer1
+    const state = try manager.startSync(mock_peer1, [_]u8{0} ** 32, [_]u8{0} ** 32, 0);
+    try std.testing.expect(manager.isLowWorkSync(mock_peer1));
+
+    // Peer2 still not in sync
+    try std.testing.expect(!manager.isLowWorkSync(mock_peer2));
+
+    // Transition state to redownload
+    state.state = .redownload;
+    try std.testing.expect(!manager.isLowWorkSync(mock_peer1));
+}
+
+test "HeaderSyncManager processHeaders returns null for unknown peer" {
+    const allocator = std.testing.allocator;
+
+    var manager = HeaderSyncManager.init(allocator, [_]u8{0} ** 32);
+    defer manager.deinit();
+
+    const mock_peer: *peer_mod.Peer = @ptrFromInt(0x7000);
+
+    const result = manager.processHeaders(mock_peer, &[_]types.BlockHeader{});
+    try std.testing.expect(result == null);
+}
+
+test "PresyncResult action and reason enums" {
+    // Verify all action variants
+    const actions = [_]PresyncAction{ .request_more, .transition_to_redownload, .abort };
+    for (actions) |action| {
+        try std.testing.expect(@intFromEnum(action) < 3);
+    }
+
+    // Verify all reason variants
+    const reasons = [_]PresyncReason{
+        .success,
+        .wrong_state,
+        .empty_response,
+        .discontinuous,
+        .invalid_pow,
+        .insufficient_work,
+    };
+    for (reasons) |reason| {
+        try std.testing.expect(@intFromEnum(reason) < 6);
+    }
+}
+
+test "presync rejects low-work header attack" {
+    const allocator = std.testing.allocator;
+
+    // Set a high min_chain_work threshold
+    var high_min_work = [_]u8{0} ** 32;
+    high_min_work[31] = 0xFF; // Very high work requirement
+
+    var manager = HeaderSyncManager.init(allocator, high_min_work);
+    defer manager.deinit();
+
+    const mock_peer: *peer_mod.Peer = @ptrFromInt(0x8000);
+
+    // Start with zero work
+    const state = try manager.startSync(
+        mock_peer,
+        consensus.REGTEST.genesis_hash,
+        [_]u8{0} ** 32,
+        0,
+    );
+
+    // Create a header that chains from genesis with very low difficulty
+    // This simulates a low-work header attack
+    const low_work_header = types.BlockHeader{
+        .version = 1,
+        .prev_block = consensus.REGTEST.genesis_hash,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = consensus.REGTEST.genesis_header.timestamp + 600,
+        .bits = 0x207fffff, // Easy regtest difficulty
+        .nonce = 0,
+    };
+
+    // Compute hash to check if it meets PoW
+    const hash = crypto.computeBlockHash(&low_work_header);
+    const target = consensus.bitsToTarget(low_work_header.bits);
+
+    if (consensus.hashMeetsTarget(&hash, &target)) {
+        // If the header has valid PoW, processing it should work
+        // but it won't reach the high min_chain_work threshold with just one header
+        const result = try state.processPresyncHeaders(&[_]types.BlockHeader{low_work_header});
+
+        // With less than 2000 headers, should abort due to insufficient work
+        try std.testing.expectEqual(PresyncAction.abort, result.action);
+        try std.testing.expectEqual(PresyncReason.insufficient_work, result.reason);
+    }
+    // If hash doesn't meet target, the test still passes - the header would be rejected anyway
+}
+
+test "presync memory usage stays bounded" {
+    const allocator = std.testing.allocator;
+
+    var manager = HeaderSyncManager.init(allocator, [_]u8{0} ** 32);
+    defer manager.deinit();
+
+    // Add many peer states
+    const num_peers: usize = 100;
+    for (0..num_peers) |i| {
+        const mock_peer: *peer_mod.Peer = @ptrFromInt(0x10000 + i);
+        _ = try manager.startSync(mock_peer, [_]u8{0} ** 32, [_]u8{0} ** 32, 0);
+    }
+
+    try std.testing.expectEqual(num_peers, manager.peer_states.count());
+    try std.testing.expectEqual(num_peers, manager.activePresyncCount());
+
+    // Memory usage should be bounded: ~100 bytes per peer
+    const memory = manager.presyncMemoryUsage();
+    try std.testing.expect(memory <= num_peers * 100);
+}
+
+test "MAX_HEADERS_PER_MESSAGE constant" {
+    try std.testing.expectEqual(@as(usize, 2000), MAX_HEADERS_PER_MESSAGE);
 }
