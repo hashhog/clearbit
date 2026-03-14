@@ -636,6 +636,106 @@ pub const Wallet = struct {
 };
 
 // ============================================================================
+// Transaction Creation
+// ============================================================================
+
+/// Options for creating a transaction.
+pub const CreateTxOptions = struct {
+    /// Fee rate in satoshis per virtual byte.
+    fee_rate: u64 = 1,
+    /// Current block height (for anti-fee-sniping locktime).
+    current_height: u32 = 0,
+    /// Whether to enable anti-fee-sniping (set locktime to current_height).
+    anti_fee_sniping: bool = true,
+    /// Sighash type for signing (default: SIGHASH_ALL).
+    sighash_type: u32 = 0x01,
+};
+
+/// Output for a new transaction.
+pub const TxOutput = struct {
+    value: i64,
+    script_pubkey: []const u8,
+};
+
+/// Create and sign a transaction spending selected UTXOs to the specified outputs.
+///
+/// Anti-fee-sniping: Sets nLockTime to current_height to discourage miners from
+/// reordering blocks to steal fees. This makes the transaction invalid until
+/// the specified block height, preventing fee sniping attacks.
+///
+/// Reference: Bitcoin Core wallet/spend.cpp CreateTransactionInternal()
+pub fn createTransaction(
+    wallet: *Wallet,
+    utxos_to_spend: []const OwnedUtxo,
+    outputs: []const TxOutput,
+    change_output: ?TxOutput,
+    options: CreateTxOptions,
+) !types.Transaction {
+    const allocator = wallet.allocator;
+
+    // Count total inputs and outputs
+    const num_inputs = utxos_to_spend.len;
+    const num_outputs = outputs.len + if (change_output != null) @as(usize, 1) else @as(usize, 0);
+
+    // Build inputs
+    var inputs = try allocator.alloc(types.TxIn, num_inputs);
+    errdefer allocator.free(inputs);
+
+    for (utxos_to_spend, 0..) |utxo, i| {
+        inputs[i] = types.TxIn{
+            .previous_output = utxo.outpoint,
+            .script_sig = &[_]u8{}, // Will be filled during signing
+            .sequence = 0xFFFFFFFE, // Enable locktime (not SEQUENCE_FINAL)
+            .witness = &[_][]const u8{}, // Will be filled during signing
+        };
+    }
+
+    // Build outputs
+    var tx_outputs = try allocator.alloc(types.TxOut, num_outputs);
+    errdefer allocator.free(tx_outputs);
+
+    for (outputs, 0..) |out, i| {
+        tx_outputs[i] = types.TxOut{
+            .value = out.value,
+            .script_pubkey = out.script_pubkey,
+        };
+    }
+
+    // Add change output if provided
+    if (change_output) |change| {
+        tx_outputs[outputs.len] = types.TxOut{
+            .value = change.value,
+            .script_pubkey = change.script_pubkey,
+        };
+    }
+
+    // Anti-fee-sniping: Set locktime to current block height
+    // This makes the transaction invalid until that block, preventing miners
+    // from reorganizing blocks to steal high-fee transactions
+    //
+    // Reference: BIP-0199, Bitcoin Core wallet/spend.cpp
+    const lock_time: u32 = if (options.anti_fee_sniping and options.current_height > 0)
+        options.current_height
+    else
+        0;
+
+    // Create the transaction
+    var tx = types.Transaction{
+        .version = 2,
+        .inputs = inputs,
+        .outputs = tx_outputs,
+        .lock_time = lock_time,
+    };
+
+    // Sign each input
+    for (utxos_to_spend, 0..) |utxo, i| {
+        try wallet.signInput(&tx, i, utxo, options.sighash_type);
+    }
+
+    return tx;
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -1173,4 +1273,101 @@ test "wallet balance tracking" {
     const removed = wallet.removeUtxo(.{ .hash = [_]u8{0x01} ** 32, .index = 0 });
     try std.testing.expect(removed);
     try std.testing.expectEqual(@as(i64, 30000), wallet.getBalance());
+}
+
+test "anti-fee-sniping sets locktime to current height" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    // Create a mock P2WPKH scriptPubKey
+    const script_pubkey = [_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Add a UTXO to spend
+    const utxo = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .output = .{ .value = 100000, .script_pubkey = &script_pubkey },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+
+    // Create transaction with anti-fee-sniping enabled
+    const tx = try createTransaction(
+        &wallet,
+        &[_]OwnedUtxo{utxo},
+        &[_]TxOutput{.{
+            .value = 50000,
+            .script_pubkey = &script_pubkey,
+        }},
+        null,
+        .{
+            .current_height = 800000,
+            .anti_fee_sniping = true,
+        },
+    );
+    defer {
+        allocator.free(tx.inputs);
+        allocator.free(tx.outputs);
+    }
+
+    // Verify locktime is set to current_height
+    try std.testing.expectEqual(@as(u32, 800000), tx.lock_time);
+
+    // Verify inputs have non-final sequence to enable locktime
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFE), tx.inputs[0].sequence);
+}
+
+test "anti-fee-sniping disabled sets locktime to 0" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    const script_pubkey = [_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20;
+
+    const utxo = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .output = .{ .value = 100000, .script_pubkey = &script_pubkey },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+
+    // Create transaction with anti-fee-sniping disabled
+    const tx = try createTransaction(
+        &wallet,
+        &[_]OwnedUtxo{utxo},
+        &[_]TxOutput{.{
+            .value = 50000,
+            .script_pubkey = &script_pubkey,
+        }},
+        null,
+        .{
+            .current_height = 800000,
+            .anti_fee_sniping = false,
+        },
+    );
+    defer {
+        allocator.free(tx.inputs);
+        allocator.free(tx.outputs);
+    }
+
+    // Verify locktime is 0 when anti-fee-sniping is disabled
+    try std.testing.expectEqual(@as(u32, 0), tx.lock_time);
 }
