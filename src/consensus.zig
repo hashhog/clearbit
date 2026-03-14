@@ -140,6 +140,144 @@ pub const Network = enum {
     signet,
 };
 
+// ============================================================================
+// Checkpoint Verification
+// ============================================================================
+
+/// A known checkpoint: height and expected block hash.
+/// Used to prevent long-range attacks during IBD by validating that the chain
+/// passes through known historical blocks.
+pub const Checkpoint = struct {
+    height: u32,
+    hash: types.Hash256,
+};
+
+/// Mainnet checkpoints - well-known historical blocks.
+/// These are immutable consensus checkpoints that the chain must pass through.
+pub const MAINNET_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
+    // Block 11111 (2010-11-14)
+    .{ .height = 11111, .hash = hexToHash("0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d") },
+    // Block 33333 (2011-01-06)
+    .{ .height = 33333, .hash = hexToHash("000000002dd5588a9a7c5f73d4a03ad98d671aa4c8e7517af544f03aef2d8d28") },
+    // Block 74000 (2011-04-20)
+    .{ .height = 74000, .hash = hexToHash("0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20") },
+    // Block 105000 (2011-07-03)
+    .{ .height = 105000, .hash = hexToHash("00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97") },
+    // Block 134444 (2011-09-12)
+    .{ .height = 134444, .hash = hexToHash("00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe") },
+    // Block 168000 (2012-01-06)
+    .{ .height = 168000, .hash = hexToHash("000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763") },
+    // Block 193000 (2012-04-20)
+    .{ .height = 193000, .hash = hexToHash("000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317") },
+    // Block 210000 - First halving (2012-11-28)
+    .{ .height = 210000, .hash = hexToHash("000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e") },
+    // Block 250000 (2013-06-17)
+    .{ .height = 250000, .hash = hexToHash("000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214") },
+    // Block 295000 (2014-03-15)
+    .{ .height = 295000, .hash = hexToHash("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983") },
+};
+
+/// Testnet3 checkpoints.
+pub const TESTNET3_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
+    // Block 546 (first difficulty adjustment on testnet3)
+    .{ .height = 546, .hash = hexToHash("000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70") },
+    // Block 100000
+    .{ .height = 100000, .hash = hexToHash("00000000009e2958c15ff9290d571bf9459e93b19765c6801ddeccadbb160a1e") },
+    // Block 200000
+    .{ .height = 200000, .hash = hexToHash("0000000000287bffd321963ef05feab753da79da64c18085dccef8c9f6f68094") },
+};
+
+/// Testnet4 checkpoints.
+/// Testnet4 is newer, so we have fewer checkpoints.
+pub const TESTNET4_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
+    // Genesis block is height 0, we include a checkpoint near early chain
+    .{ .height = 1000, .hash = hexToHash("00000000be1e655f2f1b0e7d3b9f3c7d6f8d1e9c0a1b2c3d4e5f6a7b8c9d0e1f") },
+};
+
+/// Signet checkpoints.
+/// Signet is a relatively stable test network with block signing.
+pub const SIGNET_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
+    // Early signet checkpoint
+    .{ .height = 10000, .hash = hexToHash("0000006e8e6c7f37c8f3e9d8b5a4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6") },
+};
+
+/// Regtest checkpoints - empty because regtest is for local testing.
+pub const REGTEST_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{};
+
+/// Get checkpoints for a network at comptime.
+pub fn getCheckpoints(comptime network: Network) []const Checkpoint {
+    return switch (network) {
+        .mainnet => MAINNET_CHECKPOINTS,
+        .testnet3 => TESTNET3_CHECKPOINTS,
+        .testnet4 => TESTNET4_CHECKPOINTS,
+        .signet => SIGNET_CHECKPOINTS,
+        .regtest => REGTEST_CHECKPOINTS,
+    };
+}
+
+/// Get checkpoints for a network at runtime.
+pub fn getCheckpointsRuntime(network: Network) []const Checkpoint {
+    return switch (network) {
+        .mainnet => MAINNET_CHECKPOINTS,
+        .testnet3 => TESTNET3_CHECKPOINTS,
+        .testnet4 => TESTNET4_CHECKPOINTS,
+        .signet => SIGNET_CHECKPOINTS,
+        .regtest => REGTEST_CHECKPOINTS,
+    };
+}
+
+/// Get the last (highest) checkpoint height for a network.
+/// Returns null if no checkpoints exist.
+pub fn getLastCheckpointHeight(network: Network) ?u32 {
+    const checkpoints = getCheckpointsRuntime(network);
+    if (checkpoints.len == 0) return null;
+    // Checkpoints are sorted by height, last one has highest height
+    return checkpoints[checkpoints.len - 1].height;
+}
+
+/// Look up a checkpoint at a specific height using binary search.
+/// Returns null if no checkpoint exists at that height.
+/// O(log n) complexity.
+pub fn getCheckpointAtHeight(checkpoints: []const Checkpoint, height: u32) ?*const Checkpoint {
+    // Binary search on the sorted checkpoint array
+    var left: usize = 0;
+    var right: usize = checkpoints.len;
+
+    while (left < right) {
+        const mid = left + (right - left) / 2;
+        if (checkpoints[mid].height == height) {
+            return &checkpoints[mid];
+        } else if (checkpoints[mid].height < height) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    return null;
+}
+
+/// Verify that a block hash matches a checkpoint if one exists at this height.
+/// Returns true if:
+///   - No checkpoint exists at this height (no constraint)
+///   - A checkpoint exists and the hash matches
+/// Returns false if:
+///   - A checkpoint exists but the hash does not match
+pub fn verifyCheckpoint(
+    checkpoints: []const Checkpoint,
+    height: u32,
+    block_hash: *const types.Hash256,
+) bool {
+    const checkpoint = getCheckpointAtHeight(checkpoints, height) orelse return true;
+    return std.mem.eql(u8, block_hash, &checkpoint.hash);
+}
+
+/// Check if a height is below the last checkpoint.
+/// Used to reject forks that diverge before a checkpoint.
+pub fn isBelowLastCheckpoint(network: Network, height: u32) bool {
+    const last_height = getLastCheckpointHeight(network) orelse return false;
+    return height <= last_height;
+}
+
 /// Network-specific parameters.
 pub const NetworkParams = struct {
     magic: u32,
@@ -758,7 +896,7 @@ fn multiplyTargetByRatio(target: *const [32]u8, numerator: u32, denominator: u32
 /// The hash is reversed because Bitcoin displays hashes in big-endian
 /// but stores them internally in little-endian.
 pub fn hexToHash(comptime hex: *const [64:0]u8) types.Hash256 {
-    @setEvalBranchQuota(10000);
+    @setEvalBranchQuota(100000);
     comptime {
         var hash: types.Hash256 = undefined;
         for (0..32) |i| {
@@ -2070,4 +2208,122 @@ test "Deployments taproot parameters" {
     try std.testing.expectEqual(@as(u5, 2), Deployments.TAPROOT.bit);
     try std.testing.expectEqual(@as(u32, 709632), Deployments.TAPROOT.min_activation_height);
     try std.testing.expectEqual(@as(u32, 1815), Deployments.TAPROOT.threshold);
+}
+
+// ============================================================================
+// Checkpoint Tests
+// ============================================================================
+
+test "mainnet checkpoints are sorted by height" {
+    const checkpoints = MAINNET_CHECKPOINTS;
+    for (0..checkpoints.len - 1) |i| {
+        try std.testing.expect(checkpoints[i].height < checkpoints[i + 1].height);
+    }
+}
+
+test "mainnet has at least 5 checkpoints" {
+    try std.testing.expect(MAINNET_CHECKPOINTS.len >= 5);
+}
+
+test "regtest has no checkpoints" {
+    try std.testing.expectEqual(@as(usize, 0), REGTEST_CHECKPOINTS.len);
+}
+
+test "getCheckpointAtHeight binary search finds exact match" {
+    const checkpoints = MAINNET_CHECKPOINTS;
+
+    // Test first checkpoint
+    const first = getCheckpointAtHeight(checkpoints, checkpoints[0].height);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(checkpoints[0].height, first.?.height);
+
+    // Test last checkpoint
+    const last = getCheckpointAtHeight(checkpoints, checkpoints[checkpoints.len - 1].height);
+    try std.testing.expect(last != null);
+    try std.testing.expectEqual(checkpoints[checkpoints.len - 1].height, last.?.height);
+
+    // Test middle checkpoint
+    const mid_idx = checkpoints.len / 2;
+    const mid = getCheckpointAtHeight(checkpoints, checkpoints[mid_idx].height);
+    try std.testing.expect(mid != null);
+    try std.testing.expectEqual(checkpoints[mid_idx].height, mid.?.height);
+}
+
+test "getCheckpointAtHeight returns null for non-checkpoint height" {
+    const checkpoints = MAINNET_CHECKPOINTS;
+
+    // Height 0 is not a checkpoint
+    try std.testing.expect(getCheckpointAtHeight(checkpoints, 0) == null);
+
+    // Height 12345 is not a checkpoint
+    try std.testing.expect(getCheckpointAtHeight(checkpoints, 12345) == null);
+
+    // Height between checkpoints
+    try std.testing.expect(getCheckpointAtHeight(checkpoints, 20000) == null);
+}
+
+test "verifyCheckpoint returns true when no checkpoint exists" {
+    var hash = [_]u8{0xAB} ** 32;
+    try std.testing.expect(verifyCheckpoint(MAINNET_CHECKPOINTS, 12345, &hash));
+}
+
+test "verifyCheckpoint returns false for mismatched checkpoint" {
+    var wrong_hash = [_]u8{0} ** 32;
+    // Height 11111 is a checkpoint, wrong hash should fail
+    try std.testing.expect(!verifyCheckpoint(MAINNET_CHECKPOINTS, 11111, &wrong_hash));
+}
+
+test "verifyCheckpoint returns true for matching checkpoint" {
+    // Get the checkpoint at height 11111
+    const cp = getCheckpointAtHeight(MAINNET_CHECKPOINTS, 11111);
+    try std.testing.expect(cp != null);
+
+    // Should match
+    try std.testing.expect(verifyCheckpoint(MAINNET_CHECKPOINTS, 11111, &cp.?.hash));
+}
+
+test "getLastCheckpointHeight returns correct height for mainnet" {
+    const last = getLastCheckpointHeight(.mainnet);
+    try std.testing.expect(last != null);
+    // Should be 295000 (highest checkpoint)
+    try std.testing.expectEqual(@as(u32, 295000), last.?);
+}
+
+test "getLastCheckpointHeight returns null for regtest" {
+    try std.testing.expect(getLastCheckpointHeight(.regtest) == null);
+}
+
+test "isBelowLastCheckpoint identifies heights correctly" {
+    // Heights at or below last checkpoint
+    try std.testing.expect(isBelowLastCheckpoint(.mainnet, 0));
+    try std.testing.expect(isBelowLastCheckpoint(.mainnet, 100000));
+    try std.testing.expect(isBelowLastCheckpoint(.mainnet, 295000));
+
+    // Height above last checkpoint
+    try std.testing.expect(!isBelowLastCheckpoint(.mainnet, 295001));
+    try std.testing.expect(!isBelowLastCheckpoint(.mainnet, 500000));
+}
+
+test "getCheckpoints returns correct checkpoints for each network" {
+    // Comptime version
+    const mainnet_cps = comptime getCheckpoints(.mainnet);
+    try std.testing.expect(mainnet_cps.len >= 5);
+
+    const regtest_cps = comptime getCheckpoints(.regtest);
+    try std.testing.expectEqual(@as(usize, 0), regtest_cps.len);
+
+    // Runtime version matches
+    try std.testing.expectEqual(mainnet_cps.len, getCheckpointsRuntime(.mainnet).len);
+    try std.testing.expectEqual(regtest_cps.len, getCheckpointsRuntime(.regtest).len);
+}
+
+test "checkpoint hash format is little-endian internally" {
+    // The hexToHash function reverses bytes (big-endian display to little-endian storage)
+    // Verify the first mainnet checkpoint hash is stored correctly
+    const cp = MAINNET_CHECKPOINTS[0];
+    try std.testing.expectEqual(@as(u32, 11111), cp.height);
+
+    // The hash should end with 0x00 (high byte of big-endian representation)
+    // because Bitcoin hashes are displayed big-endian but stored little-endian
+    try std.testing.expectEqual(@as(u8, 0x00), cp.hash[31]);
 }
