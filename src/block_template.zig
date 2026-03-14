@@ -184,7 +184,13 @@ pub fn createBlockTemplate(
     const candidates = try mempool.getBlockCandidates(allocator);
     defer allocator.free(candidates);
 
+    // Get current block time for locktime validation
+    const block_time: u64 = @intCast(std.time.timestamp());
+
     for (candidates) |entry| {
+        // Check transaction finality (locktime validation)
+        if (!isFinalTx(&entry.tx, height, block_time)) continue;
+
         // Check weight limit
         if (total_weight + entry.weight > options.max_weight) continue;
 
@@ -206,18 +212,32 @@ pub fn createBlockTemplate(
         total_sigops += tx_sigops;
     }
 
-    // 4. Construct coinbase transaction
-    const coinbase = try constructCoinbase(
+    // 4. Extract transactions for witness commitment computation
+    var txs_for_witness = try allocator.alloc(types.Transaction, selected.items.len);
+    defer allocator.free(txs_for_witness);
+    for (selected.items, 0..) |stx, i| {
+        txs_for_witness[i] = stx.tx;
+    }
+
+    // 5. Compute witness commitment if needed
+    var witness_commitment: ?types.Hash256 = null;
+    const witness_nonce: [32]u8 = [_]u8{0} ** 32;
+    if (options.include_witness_commitment) {
+        witness_commitment = try computeWitnessCommitment(txs_for_witness, witness_nonce, allocator);
+    }
+
+    // 6. Construct coinbase transaction with the computed witness commitment
+    const coinbase = try constructCoinbaseWithCommitment(
         height,
         total_fees,
         options.coinbase_extra,
         options.payout_script,
-        options.include_witness_commitment,
+        witness_commitment,
         params,
         allocator,
     );
 
-    // 5. Compute merkle root
+    // 7. Compute merkle root
     var tx_hashes = try allocator.alloc(types.Hash256, 1 + selected.items.len);
     defer allocator.free(tx_hashes);
 
@@ -227,7 +247,7 @@ pub fn createBlockTemplate(
     }
     const merkle_root = try crypto.computeMerkleRoot(tx_hashes, allocator);
 
-    // 6. Construct block header
+    // 8. Construct block header
     const header = types.BlockHeader{
         .version = 0x20000000, // BIP-9 version bits base
         .prev_block = chain_state.best_hash,
@@ -237,7 +257,7 @@ pub fn createBlockTemplate(
         .nonce = 0, // Miner will iterate this
     };
 
-    // 7. Define mutable fields
+    // 9. Define mutable fields
     const mutable = &[_][]const u8{
         "time",
         "transactions",
@@ -259,19 +279,19 @@ pub fn createBlockTemplate(
     };
 }
 
-/// Construct the coinbase transaction.
+/// Construct the coinbase transaction with an optional precomputed witness commitment.
 ///
 /// The coinbase transaction is special:
 /// - Has a single input with null outpoint (all zeros hash, 0xFFFFFFFF index)
 /// - BIP-34: scriptSig must start with the block height
 /// - Output value = block subsidy + total fees
 /// - BIP-141: May include a witness commitment output
-fn constructCoinbase(
+fn constructCoinbaseWithCommitment(
     height: u32,
     total_fees: i64,
     extra_data: []const u8,
     payout_script: []const u8,
-    include_witness_commitment: bool,
+    witness_commitment: ?types.Hash256,
     params: *const consensus.NetworkParams,
     allocator: std.mem.Allocator,
 ) !BlockTemplate.CoinbaseTx {
@@ -313,22 +333,17 @@ fn constructCoinbase(
     }
 
     // Witness commitment output (BIP-141)
-    if (include_witness_commitment) {
+    if (witness_commitment) |commitment| {
         // Format: OP_RETURN OP_PUSH36 0xaa21a9ed <32-byte commitment>
         // The commitment is SHA256d(witness_merkle_root || witness_nonce)
-        // For now, use a placeholder commitment (all zeros)
-        var witness_commitment: [38]u8 = undefined;
-        witness_commitment[0] = 0x6a; // OP_RETURN
-        witness_commitment[1] = 0x24; // Push 36 bytes
-        witness_commitment[2] = 0xaa;
-        witness_commitment[3] = 0x21;
-        witness_commitment[4] = 0xa9;
-        witness_commitment[5] = 0xed;
-        @memset(witness_commitment[6..38], 0); // Placeholder commitment
-
-        // Allocate the script on the heap so it outlives this function
         const witness_script = try allocator.alloc(u8, 38);
-        @memcpy(witness_script, &witness_commitment);
+        witness_script[0] = 0x6a; // OP_RETURN
+        witness_script[1] = 0x24; // Push 36 bytes
+        witness_script[2] = 0xaa;
+        witness_script[3] = 0x21;
+        witness_script[4] = 0xa9;
+        witness_script[5] = 0xed;
+        @memcpy(witness_script[6..38], &commitment);
 
         try outputs.append(.{
             .value = 0,
@@ -340,9 +355,9 @@ fn constructCoinbase(
     const inputs = try allocator.alloc(types.TxIn, 1);
     const script_sig_owned = try script_sig.toOwnedSlice();
 
-    // Coinbase witness (BIP-141): single 32-byte zero value
+    // Coinbase witness (BIP-141): single 32-byte zero value (the witness nonce)
     var witness: [][]const u8 = &[_][]const u8{};
-    if (include_witness_commitment) {
+    if (witness_commitment != null) {
         const witness_items = try allocator.alloc([]const u8, 1);
         const witness_nonce = try allocator.alloc(u8, 32);
         @memset(witness_nonce, 0);
@@ -350,27 +365,61 @@ fn constructCoinbase(
         witness = witness_items;
     }
 
+    // Coinbase input:
+    // - sequence = 0xFFFFFFFF (SEQUENCE_FINAL) to opt out of BIP-68
+    // - This makes the coinbase immediately final regardless of nLockTime
     inputs[0] = .{
         .previous_output = types.OutPoint.COINBASE,
         .script_sig = script_sig_owned,
-        .sequence = 0xFFFFFFFF,
+        .sequence = 0xFFFFFFFF, // SEQUENCE_FINAL - opts out of BIP-68
         .witness = witness,
     };
 
     const outputs_owned = try outputs.toOwnedSlice();
 
+    // Coinbase transaction:
+    // - nLockTime = 0 (no locktime constraint)
+    // Note: Bitcoin Core uses nLockTime = height - 1 for anti-fee-sniping,
+    // but coinbase is always valid at its height anyway
     return .{
         .tx = .{
             .version = 2,
             .inputs = inputs,
             .outputs = outputs_owned,
-            .lock_time = 0,
+            .lock_time = 0, // No locktime for coinbase
         },
         .script_sig = script_sig_owned,
         .outputs = outputs_owned,
         .inputs = inputs,
         .witness = witness,
     };
+}
+
+/// Legacy constructCoinbase without precomputed commitment (uses placeholder).
+/// Kept for backwards compatibility with existing tests.
+fn constructCoinbase(
+    height: u32,
+    total_fees: i64,
+    extra_data: []const u8,
+    payout_script: []const u8,
+    include_witness_commitment: bool,
+    params: *const consensus.NetworkParams,
+    allocator: std.mem.Allocator,
+) !BlockTemplate.CoinbaseTx {
+    // For legacy calls, use a placeholder commitment (all zeros)
+    const commitment: ?types.Hash256 = if (include_witness_commitment)
+        [_]u8{0} ** 32
+    else
+        null;
+    return constructCoinbaseWithCommitment(
+        height,
+        total_fees,
+        extra_data,
+        payout_script,
+        commitment,
+        params,
+        allocator,
+    );
 }
 
 /// Encode a block height as a minimal CScriptNum push (BIP-34).
@@ -520,6 +569,49 @@ pub fn createWitnessCommitmentScript(commitment: types.Hash256) [38]u8 {
     script[5] = 0xed;
     @memcpy(script[6..38], &commitment);
     return script;
+}
+
+// ============================================================================
+// Block Submission
+// ============================================================================
+
+// ============================================================================
+// Transaction Finality (Locktime Validation)
+// ============================================================================
+
+/// LOCKTIME_THRESHOLD: values below are block heights, values >= are unix timestamps.
+pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
+
+/// Check if a transaction is final according to BIP-65 rules.
+///
+/// A transaction is final if:
+/// 1. nLockTime == 0, OR
+/// 2. nLockTime < threshold (height if < 500M, time if >= 500M), OR
+/// 3. All inputs have sequence == 0xFFFFFFFF (SEQUENCE_FINAL)
+///
+/// Reference: Bitcoin Core tx_verify.cpp IsFinalTx()
+pub fn isFinalTx(tx: *const types.Transaction, block_height: u32, block_time: u64) bool {
+    // If nLockTime is 0, transaction is always final
+    if (tx.lock_time == 0) return true;
+
+    // Determine if locktime is height-based or time-based
+    const lock_time: i64 = @intCast(tx.lock_time);
+    const threshold: i64 = if (tx.lock_time < LOCKTIME_THRESHOLD)
+        @intCast(block_height)
+    else
+        @intCast(block_time);
+
+    // If locktime has already passed, transaction is final
+    if (lock_time < threshold) return true;
+
+    // Even if nLockTime isn't satisfied, transaction is final if all
+    // inputs have SEQUENCE_FINAL (0xFFFFFFFF)
+    for (tx.inputs) |input| {
+        if (input.sequence != 0xFFFFFFFF) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // ============================================================================
@@ -972,4 +1064,186 @@ test "block merkle root is correctly computed" {
 
     // For a block with only the coinbase, the merkle root should equal the coinbase txid
     try std.testing.expectEqualSlices(u8, &coinbase_txid, &template.header.merkle_root);
+}
+
+// ============================================================================
+// Locktime / isFinalTx Tests
+// ============================================================================
+
+test "isFinalTx with locktime 0 is always final" {
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000, // Non-final sequence
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0, // locktime 0 means always final
+    };
+
+    // Should be final regardless of block height/time
+    try std.testing.expect(isFinalTx(&tx, 0, 0));
+    try std.testing.expect(isFinalTx(&tx, 1000, 1000000));
+    try std.testing.expect(isFinalTx(&tx, 500000, 1600000000));
+}
+
+test "isFinalTx with height-based locktime" {
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFE, // Non-final sequence (enables locktime)
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+    };
+
+    // Locktime = 100000 (height-based, < LOCKTIME_THRESHOLD)
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 100000,
+    };
+
+    // Not final at height 99999
+    try std.testing.expect(!isFinalTx(&tx, 99999, 0));
+
+    // Not final at height 100000 (lock_time must be < height)
+    try std.testing.expect(!isFinalTx(&tx, 100000, 0));
+
+    // Final at height 100001
+    try std.testing.expect(isFinalTx(&tx, 100001, 0));
+
+    // Final at height 200000
+    try std.testing.expect(isFinalTx(&tx, 200000, 0));
+}
+
+test "isFinalTx with time-based locktime" {
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFE, // Non-final sequence (enables locktime)
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+    };
+
+    // Locktime = 1600000000 (time-based, >= LOCKTIME_THRESHOLD = 500000000)
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 1600000000,
+    };
+
+    // Not final at earlier time
+    try std.testing.expect(!isFinalTx(&tx, 800000, 1599999999));
+
+    // Not final at exact time
+    try std.testing.expect(!isFinalTx(&tx, 800000, 1600000000));
+
+    // Final at later time
+    try std.testing.expect(isFinalTx(&tx, 800000, 1600000001));
+}
+
+test "isFinalTx with all SEQUENCE_FINAL inputs" {
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF, // SEQUENCE_FINAL
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+    };
+
+    // Locktime = 100000 (not yet reached)
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 100000,
+    };
+
+    // Should be final because all inputs have SEQUENCE_FINAL
+    // Even though locktime hasn't been reached
+    try std.testing.expect(isFinalTx(&tx, 50000, 0));
+    try std.testing.expect(isFinalTx(&tx, 99999, 0));
+}
+
+test "isFinalTx with mixed sequences" {
+    const input1 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF, // SEQUENCE_FINAL
+        .witness = &[_][]const u8{},
+    };
+    const input2 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFE, // Not SEQUENCE_FINAL
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+    };
+
+    // Locktime = 100000 (not yet reached)
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{ input1, input2 },
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 100000,
+    };
+
+    // Not final because one input doesn't have SEQUENCE_FINAL
+    try std.testing.expect(!isFinalTx(&tx, 50000, 0));
+
+    // Final when locktime is reached
+    try std.testing.expect(isFinalTx(&tx, 100001, 0));
+}
+
+test "coinbase transaction has correct sequence and locktime" {
+    const allocator = std.testing.allocator;
+
+    const payout_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    const coinbase = try constructCoinbase(
+        100, // height
+        1000000, // fees
+        "test pool",
+        &payout_script,
+        false, // no witness commitment
+        &consensus.MAINNET,
+        allocator,
+    );
+    defer {
+        allocator.free(coinbase.script_sig);
+        allocator.free(coinbase.outputs);
+        allocator.free(coinbase.inputs);
+    }
+
+    // Verify coinbase has SEQUENCE_FINAL (0xFFFFFFFF) to opt out of BIP-68
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), coinbase.tx.inputs[0].sequence);
+
+    // Verify coinbase has locktime 0
+    try std.testing.expectEqual(@as(u32, 0), coinbase.tx.lock_time);
+
+    // Verify coinbase is always final
+    try std.testing.expect(isFinalTx(&coinbase.tx, 0, 0));
+    try std.testing.expect(isFinalTx(&coinbase.tx, 100, 1000000));
 }
