@@ -345,8 +345,21 @@ pub const RpcServer = struct {
         }
     }
 
+    /// Maximum batch size (matching Bitcoin Core).
+    pub const MAX_BATCH_SIZE: usize = 1000;
+
     /// Handle batch requests.
     fn handleBatch(self: *RpcServer, requests: []std.json.Value) ![]const u8 {
+        // Empty batch is an error (per JSON-RPC spec)
+        if (requests.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_REQUEST, "Empty batch request", null);
+        }
+
+        // Limit batch size to prevent DoS
+        if (requests.len > MAX_BATCH_SIZE) {
+            return self.jsonRpcError(RPC_INVALID_REQUEST, "Batch too large (max 1000)", null);
+        }
+
         var responses = std.ArrayList(u8).init(self.allocator);
         errdefer responses.deinit();
 
@@ -1606,6 +1619,136 @@ test "batch request handling" {
     // Should be an array response
     try std.testing.expect(result[0] == '[');
     try std.testing.expect(result[result.len - 1] == ']');
+}
+
+test "batch request empty array returns error" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const request = "[]";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Should return error for empty batch
+    try std.testing.expect(std.mem.indexOf(u8, result, "error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Empty batch") != null);
+}
+
+test "batch request with mixed success and failure" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // One valid method, one invalid
+    const request = "[{\"id\":1,\"method\":\"getblockcount\",\"params\":[]},{\"id\":2,\"method\":\"nonexistent_method\",\"params\":[]}]";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Should be array response
+    try std.testing.expect(result[0] == '[');
+    // Should contain both a result and an error
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Method not found") != null);
+}
+
+test "batch request with invalid element type" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Array with non-object element
+    const request = "[{\"id\":1,\"method\":\"getblockcount\",\"params\":[]},\"not_an_object\"]";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Should be array response with error for invalid element
+    try std.testing.expect(result[0] == '[');
+    try std.testing.expect(std.mem.indexOf(u8, result, "Invalid Request") != null);
+}
+
+test "batch request preserves request order" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Multiple requests with different IDs
+    const request = "[{\"id\":\"first\",\"method\":\"getblockcount\",\"params\":[]},{\"id\":\"second\",\"method\":\"getdifficulty\",\"params\":[]}]";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Verify order by checking that "first" appears before "second"
+    const first_pos = std.mem.indexOf(u8, result, "\"first\"").?;
+    const second_pos = std.mem.indexOf(u8, result, "\"second\"").?;
+    try std.testing.expect(first_pos < second_pos);
 }
 
 test "findHeader extracts header value" {
