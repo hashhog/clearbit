@@ -14,6 +14,7 @@ const types = @import("types.zig");
 const storage = @import("storage.zig");
 const mempool_mod = @import("mempool.zig");
 const peer_mod = @import("peer.zig");
+const p2p = @import("p2p.zig");
 const banlist = @import("banlist.zig");
 const serialize = @import("serialize.zig");
 const consensus = @import("consensus.zig");
@@ -742,9 +743,14 @@ pub const RpcServer = struct {
     // Transaction Methods
     // ========================================================================
 
+    /// Default max fee rate: 0.10 BTC/kvB = 10,000,000 satoshis per 1000 vbytes
+    /// This matches Bitcoin Core's DEFAULT_MAX_RAW_TX_FEE_RATE
+    const DEFAULT_MAX_FEERATE: i64 = 10_000_000;
+
     fn handleSendRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Extract hex-encoded raw transaction
         var hex: []const u8 = undefined;
+        var max_feerate: i64 = DEFAULT_MAX_FEERATE; // satoshis per 1000 vbytes
 
         if (params == .array and params.array.items.len > 0) {
             const h = params.array.items[0];
@@ -752,6 +758,25 @@ pub const RpcServer = struct {
                 hex = h.string;
             } else {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid hex string", id);
+            }
+
+            // Parse optional maxfeerate parameter (BTC/kvB)
+            if (params.array.items.len > 1) {
+                const feerate_param = params.array.items[1];
+                if (feerate_param == .float) {
+                    // Convert BTC/kvB to satoshis/kvB
+                    const btc_per_kvb = feerate_param.float;
+                    max_feerate = @intFromFloat(btc_per_kvb * 100_000_000.0);
+                } else if (feerate_param == .integer) {
+                    // Assume already in satoshis/kvB
+                    max_feerate = feerate_param.integer;
+                } else if (feerate_param == .string) {
+                    // Parse string as float (BTC/kvB)
+                    const btc_per_kvb = std.fmt.parseFloat(f64, feerate_param.string) catch {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid maxfeerate", id);
+                    };
+                    max_feerate = @intFromFloat(btc_per_kvb * 100_000_000.0);
+                }
             }
         } else {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing hex string", id);
@@ -762,6 +787,10 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length", id);
         }
 
+        if (hex.len == 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.", id);
+        }
+
         const raw = self.allocator.alloc(u8, hex.len / 2) catch {
             return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
         };
@@ -769,34 +798,147 @@ pub const RpcServer = struct {
 
         for (0..raw.len) |i| {
             raw[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex", id);
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex character", id);
             };
         }
 
         // Deserialize transaction
         var reader = serialize.Reader{ .data = raw };
         const tx = serialize.readTransaction(&reader, self.allocator) catch {
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.", id);
         };
+        defer {
+            // Free transaction memory if we don't add it to mempool
+            // (mempool takes ownership on success)
+        }
+
+        // Basic validation: tx must have at least one input and output
+        if (tx.inputs.len == 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.", id);
+        }
+        if (tx.outputs.len == 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Transaction has no outputs.", id);
+        }
 
         // Compute txid
         const txid = crypto.computeTxid(&tx, self.allocator) catch {
             return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to compute txid", id);
         };
 
+        // Check if transaction is already in mempool - return txid (not an error)
+        if (self.mempool.contains(txid)) {
+            // Transaction already in mempool, re-announce and return txid
+            return self.returnTxidAndBroadcast(txid, id);
+        }
+
+        // Check if transaction is already confirmed (outputs exist in UTXO set)
+        // Bitcoin Core checks if any output of this tx exists in the UTXO set
+        const is_confirmed = self.isTransactionConfirmed(&txid, &tx);
+        if (is_confirmed) {
+            return self.jsonRpcError(RPC_VERIFY_ALREADY_IN_CHAIN, "Transaction already in block chain", id);
+        }
+
+        // Compute transaction weight and vsize for fee rate validation
+        const weight = mempool_mod.computeTxWeight(&tx, self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to compute tx weight", id);
+        };
+        const vsize = (weight + 3) / 4;
+
+        // Compute fee by looking up input values (if chain state available)
+        var fee: i64 = 0;
+        var have_fee = false;
+        if (self.chain_state.utxo_set.db != null or self.mempool.chain_state != null) {
+            var total_in: i64 = 0;
+            var inputs_found = true;
+
+            for (tx.inputs) |input| {
+                // Check mempool first
+                if (self.mempool.getOutputFromMempool(&input.previous_output)) |output| {
+                    total_in += output.value;
+                } else {
+                    // Check UTXO set
+                    const utxo = self.chain_state.utxo_set.get(&input.previous_output) catch null;
+                    if (utxo) |u| {
+                        var mut_u = u;
+                        defer mut_u.deinit(self.allocator);
+                        total_in += u.value;
+                    } else {
+                        inputs_found = false;
+                        break;
+                    }
+                }
+            }
+
+            if (inputs_found) {
+                var total_out: i64 = 0;
+                for (tx.outputs) |output| {
+                    total_out += output.value;
+                }
+                fee = total_in - total_out;
+                have_fee = true;
+
+                // Validate fee rate against maxfeerate (if fee is positive and maxfeerate > 0)
+                if (fee > 0 and max_feerate > 0 and vsize > 0) {
+                    // fee_rate = fee / vsize, compare to max_feerate / 1000
+                    // Equivalent: fee * 1000 > max_feerate * vsize
+                    const fee_rate_check = @as(i128, fee) * 1000;
+                    const max_fee_check = @as(i128, max_feerate) * @as(i128, @intCast(vsize));
+                    if (fee_rate_check > max_fee_check) {
+                        return self.jsonRpcError(RPC_VERIFY_REJECTED, "Fee exceeds maximum configured by user (maxfeerate)", id);
+                    }
+                }
+            }
+        }
+
         // Add to mempool
         self.mempool.addTransaction(tx) catch |err| {
             return switch (err) {
-                mempool_mod.MempoolError.AlreadyInMempool => self.jsonRpcError(RPC_VERIFY_ALREADY_IN_CHAIN, "Transaction already in mempool", id),
-                mempool_mod.MempoolError.InsufficientFee => self.jsonRpcError(RPC_VERIFY_REJECTED, "Insufficient fee", id),
-                mempool_mod.MempoolError.DustOutput => self.jsonRpcError(RPC_VERIFY_REJECTED, "Dust output", id),
-                mempool_mod.MempoolError.NonStandard => self.jsonRpcError(RPC_VERIFY_REJECTED, "Non-standard transaction", id),
-                mempool_mod.MempoolError.MissingInputs => self.jsonRpcError(RPC_VERIFY_REJECTED, "Missing inputs", id),
-                else => self.jsonRpcError(RPC_VERIFY_ERROR, "Transaction rejected", id),
+                mempool_mod.MempoolError.AlreadyInMempool => {
+                    // Should have been caught above, but handle anyway
+                    return self.returnTxidAndBroadcast(txid, id);
+                },
+                mempool_mod.MempoolError.InsufficientFee => self.jsonRpcError(RPC_VERIFY_REJECTED, "min relay fee not met", id),
+                mempool_mod.MempoolError.DustOutput => self.jsonRpcError(RPC_VERIFY_REJECTED, "dust output", id),
+                mempool_mod.MempoolError.NonStandard => self.jsonRpcError(RPC_VERIFY_REJECTED, "non-standard transaction", id),
+                mempool_mod.MempoolError.MissingInputs => self.jsonRpcError(RPC_VERIFY_REJECTED, "missing inputs", id),
+                mempool_mod.MempoolError.TooManyAncestors => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many unconfirmed ancestors", id),
+                mempool_mod.MempoolError.TooManyDescendants => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many unconfirmed descendants", id),
+                mempool_mod.MempoolError.AncestorSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "ancestor size limit exceeded", id),
+                mempool_mod.MempoolError.DescendantSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "descendant size limit exceeded", id),
+                mempool_mod.MempoolError.NonBIP125Replaceable => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),
+                mempool_mod.MempoolError.ReplacementFeeTooLow => self.jsonRpcError(RPC_VERIFY_REJECTED, "insufficient fee for replacement", id),
+                mempool_mod.MempoolError.MempoolFull => self.jsonRpcError(RPC_VERIFY_REJECTED, "mempool full", id),
+                mempool_mod.MempoolError.ConflictsWithMempool => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),
+                mempool_mod.MempoolError.TxValidationFailed => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction validation failed", id),
+                mempool_mod.MempoolError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "out of memory", id),
             };
         };
 
-        // Return txid
+        // Transaction accepted - broadcast inv to peers and return txid
+        return self.returnTxidAndBroadcast(txid, id);
+    }
+
+    /// Check if a transaction is already confirmed in the blockchain.
+    /// Following Bitcoin Core's approach: check if any output of this tx exists in UTXO set.
+    fn isTransactionConfirmed(self: *RpcServer, txid: *const types.Hash256, tx: *const types.Transaction) bool {
+        // Check each output index - if any exists in UTXO set, tx is confirmed
+        for (0..tx.outputs.len) |i| {
+            const outpoint = types.OutPoint{
+                .hash = txid.*,
+                .index = @intCast(i),
+            };
+            const exists = self.chain_state.utxo_set.contains(&outpoint) catch false;
+            if (exists) return true;
+        }
+        return false;
+    }
+
+    /// Return txid as JSON result and queue inv relay to peers.
+    fn returnTxidAndBroadcast(self: *RpcServer, txid: types.Hash256, id: ?std.json.Value) ![]const u8 {
+        // Queue inv message to all connected peers
+        self.broadcastTxInv(&txid);
+
+        // Return txid as hex string
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
@@ -806,6 +948,25 @@ pub const RpcServer = struct {
         try writer.writeByte('"');
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Broadcast transaction inv to all connected peers.
+    fn broadcastTxInv(self: *RpcServer, txid: *const types.Hash256) void {
+        // Create inv message with MSG_WITNESS_TX type (for SegWit-aware peers)
+        const inv_item = p2p.InvVector{
+            .inv_type = .msg_witness_tx,
+            .hash = txid.*,
+        };
+
+        // Allocate inventory array on stack
+        const inventory = [_]p2p.InvVector{inv_item};
+
+        const inv_msg = p2p.Message{
+            .inv = p2p.InvMessage{ .inventory = &inventory },
+        };
+
+        // Broadcast to all connected peers
+        self.peer_manager.broadcast(&inv_msg);
     }
 
     fn handleGetRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
@@ -1493,4 +1654,138 @@ test "RPC error codes" {
     try std.testing.expectEqual(@as(i32, -25), RPC_VERIFY_ERROR);
     try std.testing.expectEqual(@as(i32, -26), RPC_VERIFY_REJECTED);
     try std.testing.expectEqual(@as(i32, -27), RPC_VERIFY_ALREADY_IN_CHAIN);
+}
+
+test "sendrawtransaction rejects odd-length hex string" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Odd-length hex string
+    const request = "{\"id\":1,\"method\":\"sendrawtransaction\",\"params\":[\"abc\"]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Should return deserialization error for invalid hex length
+    try std.testing.expect(std.mem.indexOf(u8, result, "-22") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Invalid hex length") != null);
+}
+
+test "sendrawtransaction rejects empty hex string" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Empty hex string
+    const request = "{\"id\":1,\"method\":\"sendrawtransaction\",\"params\":[\"\"]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Should return deserialization error
+    try std.testing.expect(std.mem.indexOf(u8, result, "-22") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "TX decode failed") != null);
+}
+
+test "sendrawtransaction rejects missing params" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Missing params
+    const request = "{\"id\":1,\"method\":\"sendrawtransaction\",\"params\":[]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Should return invalid params error
+    try std.testing.expect(std.mem.indexOf(u8, result, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Missing hex string") != null);
+}
+
+test "sendrawtransaction default maxfeerate constant" {
+    // Verify DEFAULT_MAX_FEERATE matches Bitcoin Core's 0.10 BTC/kvB
+    // 0.10 BTC = 10_000_000 satoshis per 1000 vbytes
+    try std.testing.expectEqual(@as(i64, 10_000_000), RpcServer.DEFAULT_MAX_FEERATE);
+}
+
+test "sendrawtransaction with non-string hex param" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Numeric instead of string
+    const request = "{\"id\":1,\"method\":\"sendrawtransaction\",\"params\":[12345]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Should return invalid params error
+    try std.testing.expect(std.mem.indexOf(u8, result, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Invalid hex string") != null);
 }
