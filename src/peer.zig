@@ -602,27 +602,27 @@ pub fn buildEvictionCandidates(peers: []*Peer, allocator: std.mem.Allocator) ![]
 }
 
 /// Comparison function for sorting by min ping time (ascending - lower is better).
-fn comparePingTime(a: EvictionCandidate, b: EvictionCandidate) bool {
+fn comparePingTime(_: void, a: EvictionCandidate, b: EvictionCandidate) bool {
     return a.min_ping_time < b.min_ping_time;
 }
 
 /// Comparison function for sorting by last tx time (descending - more recent is better).
-fn compareTxTime(a: EvictionCandidate, b: EvictionCandidate) bool {
+fn compareTxTime(_: void, a: EvictionCandidate, b: EvictionCandidate) bool {
     return a.last_tx_time > b.last_tx_time;
 }
 
 /// Comparison function for sorting by last block time (descending - more recent is better).
-fn compareBlockTime(a: EvictionCandidate, b: EvictionCandidate) bool {
+fn compareBlockTime(_: void, a: EvictionCandidate, b: EvictionCandidate) bool {
     return a.last_block_time > b.last_block_time;
 }
 
 /// Comparison function for sorting by connect time (ascending - longer connected is better).
-fn compareConnectTime(a: EvictionCandidate, b: EvictionCandidate) bool {
+fn compareConnectTime(_: void, a: EvictionCandidate, b: EvictionCandidate) bool {
     return a.connect_time < b.connect_time;
 }
 
 /// Comparison function for sorting by netgroup.
-fn compareNetGroup(a: EvictionCandidate, b: EvictionCandidate) bool {
+fn compareNetGroup(_: void, a: EvictionCandidate, b: EvictionCandidate) bool {
     return a.net_group < b.net_group;
 }
 
@@ -638,7 +638,7 @@ pub fn selectEvictionCandidate(candidates: []EvictionCandidate, allocator: std.m
     if (candidates.len == 0) return null;
 
     // Make a mutable copy for protection marking
-    var working = allocator.dupe(EvictionCandidate, candidates) catch return null;
+    const working = allocator.dupe(EvictionCandidate, candidates) catch return null;
     defer allocator.free(working);
 
     // Mark protected candidates
