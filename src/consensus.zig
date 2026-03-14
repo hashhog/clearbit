@@ -1226,3 +1226,832 @@ test "difficulty adjustment 4x clamp up" {
     }
     try std.testing.expect(!new_larger); // New target should be smaller
 }
+
+// ============================================================================
+// BIP9 Version Bits (Soft Fork Deployment State Machine)
+// ============================================================================
+
+/// BIP9 threshold state for soft fork deployments.
+/// State transitions occur at retarget boundaries (every 2016 blocks).
+pub const ThresholdState = enum(u8) {
+    /// Initial state for all deployments. Genesis block is always DEFINED.
+    defined = 0,
+    /// Deployment has started signaling (MTP >= start_time).
+    started = 1,
+    /// Threshold reached, deployment locked in for activation.
+    locked_in = 2,
+    /// Deployment is active (final state).
+    active = 3,
+    /// Deployment failed to activate before timeout (final state).
+    failed = 4,
+
+    pub fn name(self: ThresholdState) []const u8 {
+        return switch (self) {
+            .defined => "defined",
+            .started => "started",
+            .locked_in => "locked_in",
+            .active => "active",
+            .failed => "failed",
+        };
+    }
+};
+
+/// BIP9 deployment parameters.
+pub const Deployment = struct {
+    /// Bit position in nVersion (0-28).
+    bit: u5,
+    /// Start time (MTP) for signaling. Use ALWAYS_ACTIVE or NEVER_ACTIVE for special cases.
+    start_time: i64,
+    /// Timeout time (MTP) after which deployment fails if not locked in.
+    timeout: i64,
+    /// Minimum activation height (activation delayed until this height).
+    min_activation_height: u32 = 0,
+    /// Signaling period (usually 2016 blocks, same as retarget interval).
+    period: u32 = DIFFICULTY_ADJUSTMENT_INTERVAL,
+    /// Threshold for lock-in (mainnet: 1815/2016 = 90%, testnet: 1512/2016 = 75%).
+    threshold: u32 = 1815,
+
+    /// Special value: deployment is always active (for testing).
+    pub const ALWAYS_ACTIVE: i64 = -1;
+    /// Special value: deployment is never active.
+    pub const NEVER_ACTIVE: i64 = -2;
+    /// No timeout.
+    pub const NO_TIMEOUT: i64 = std.math.maxInt(i64);
+};
+
+/// Well-known deployments for mainnet.
+pub const Deployments = struct {
+    /// Taproot (BIPs 340-342) - deployed on mainnet.
+    pub const TAPROOT = Deployment{
+        .bit = 2,
+        .start_time = 1619222400, // April 24, 2021
+        .timeout = 1628640000, // August 11, 2021
+        .min_activation_height = 709632,
+        .threshold = 1815, // 90%
+    };
+
+    /// Test dummy deployment (for testing only).
+    pub const TESTDUMMY = Deployment{
+        .bit = 28,
+        .start_time = Deployment.NEVER_ACTIVE,
+        .timeout = Deployment.NO_TIMEOUT,
+    };
+};
+
+/// Version bits constants from BIP9.
+pub const VERSIONBITS_TOP_BITS: i32 = 0x20000000;
+pub const VERSIONBITS_TOP_MASK: i32 = @bitCast(@as(u32, 0xE0000000));
+pub const VERSIONBITS_NUM_BITS: u5 = 29;
+pub const VERSIONBITS_LAST_OLD_BLOCK_VERSION: i32 = 4;
+
+/// Block index entry for BIP9 state computation.
+/// Contains the minimal fields needed for state transitions.
+pub const VersionBitsBlockIndex = struct {
+    height: u32,
+    version: i32,
+    /// Median-time-past of this block.
+    median_time_past: i64,
+};
+
+/// Interface for looking up blocks during BIP9 state computation.
+pub const VersionBitsIndexView = struct {
+    context: *anyopaque,
+    /// Get block at specific height. Returns null if height is invalid.
+    getAtHeightFn: *const fn (ctx: *anyopaque, height: u32) ?VersionBitsBlockIndex,
+
+    pub fn getAtHeight(self: *const VersionBitsIndexView, height: u32) ?VersionBitsBlockIndex {
+        return self.getAtHeightFn(self.context, height);
+    }
+};
+
+/// Cache key for BIP9 state: deployment bit + period boundary height.
+pub const StateCacheKey = struct {
+    bit: u5,
+    /// Height of the first block in the period (height % period == 0).
+    period_start_height: u32,
+};
+
+/// Cache for BIP9 deployment states.
+/// States are cached at period boundaries since all blocks in a period share the same state.
+pub const VersionBitsCache = struct {
+    states: std.AutoHashMap(StateCacheKey, ThresholdState),
+
+    pub fn init(allocator: std.mem.Allocator) VersionBitsCache {
+        return .{
+            .states = std.AutoHashMap(StateCacheKey, ThresholdState).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *VersionBitsCache) void {
+        self.states.deinit();
+    }
+
+    pub fn get(self: *const VersionBitsCache, key: StateCacheKey) ?ThresholdState {
+        return self.states.get(key);
+    }
+
+    pub fn put(self: *VersionBitsCache, key: StateCacheKey, state: ThresholdState) !void {
+        try self.states.put(key, state);
+    }
+
+    pub fn clear(self: *VersionBitsCache) void {
+        self.states.clearRetainingCapacity();
+    }
+};
+
+/// Check if a block version signals for a specific deployment bit.
+/// Version must have top 3 bits set to 001 (0x20000000) AND the deployment bit set.
+pub fn versionBitSignals(version: i32, bit: u5) bool {
+    // Top 3 bits must be 001 (BIP9 version bits blocks)
+    if ((version & VERSIONBITS_TOP_MASK) != VERSIONBITS_TOP_BITS) {
+        return false;
+    }
+    // Check if the specific bit is set
+    const mask = @as(i32, 1) << bit;
+    return (version & mask) != 0;
+}
+
+/// Get the signal mask for a deployment bit.
+pub fn versionBitMask(bit: u5) u32 {
+    return @as(u32, 1) << bit;
+}
+
+/// Get the deployment state for a block.
+///
+/// This implements the BIP9 state machine:
+/// - DEFINED: Initial state, before start_time
+/// - STARTED: After start_time, miners are signaling
+/// - LOCKED_IN: Threshold reached, waiting for activation
+/// - ACTIVE: Deployment is active (final state)
+/// - FAILED: Timeout reached without lock-in (final state)
+///
+/// State transitions only occur at retarget boundaries (height % period == 0).
+/// The state for block at height H is the same as the state for all blocks in
+/// the same period. It's computed based on conditions at the end of the
+/// *previous* period.
+///
+/// Parameters:
+/// - deployment: BIP9 deployment parameters
+/// - height: Height of the block we're computing state for
+/// - index_view: Interface to look up block data
+/// - cache: Optional cache for memoization
+///
+/// Reference: Bitcoin Core versionbits.cpp GetStateFor()
+pub fn getDeploymentState(
+    deployment: Deployment,
+    height: u32,
+    index_view: *const VersionBitsIndexView,
+    cache: ?*VersionBitsCache,
+) ThresholdState {
+    const period = deployment.period;
+
+    // Special cases: always active or never active
+    if (deployment.start_time == Deployment.ALWAYS_ACTIVE) {
+        return .active;
+    }
+    if (deployment.start_time == Deployment.NEVER_ACTIVE) {
+        return .failed;
+    }
+
+    // For state computation, we use pindexPrev (parent of the block).
+    // Bitcoin Core: pindexPrev = pindexPrev->GetAncestor(pindexPrev->nHeight - ((pindexPrev->nHeight + 1) % nPeriod))
+    // This finds the last block of the previous period.
+    // If height is 0, there's no previous block, return DEFINED.
+    if (height == 0) {
+        return .defined;
+    }
+
+    // pindexPrev is at height-1. Find the period boundary.
+    // For block at height H, pindexPrev is at H-1.
+    // Period boundary: (H-1) - ((H-1+1) % period) = (H-1) - (H % period)
+    const prev_height = height - 1;
+    const boundary_height = prev_height - ((prev_height + 1) % period);
+
+    // Check cache for this boundary
+    if (cache) |c| {
+        const cache_key = StateCacheKey{ .bit = deployment.bit, .period_start_height = boundary_height + 1 };
+        if (c.get(cache_key)) |cached_state| {
+            return cached_state;
+        }
+    }
+
+    // Walk backwards to find a known state or base case
+    var compute_stack = std.BoundedArray(u32, 256){};
+    var check_boundary = boundary_height;
+
+    while (true) {
+        // Check cache for this boundary
+        if (cache) |c| {
+            const cache_key = StateCacheKey{ .bit = deployment.bit, .period_start_height = check_boundary + 1 };
+            if (c.get(cache_key)) |_| {
+                break;
+            }
+        }
+
+        // Get the block at the boundary
+        if (check_boundary >= height) {
+            // Invalid, shouldn't happen
+            break;
+        }
+
+        const block = index_view.getAtHeight(check_boundary);
+        if (block == null) {
+            // Genesis or before: DEFINED
+            break;
+        }
+
+        // Optimization: if MTP is before start_time, we know state is DEFINED
+        if (block.?.median_time_past < deployment.start_time) {
+            // Cache this as DEFINED and stop
+            if (cache) |c| {
+                const cache_key = StateCacheKey{ .bit = deployment.bit, .period_start_height = check_boundary + 1 };
+                c.put(cache_key, .defined) catch {};
+            }
+            break;
+        }
+
+        // Need to compute this period's state
+        compute_stack.append(check_boundary) catch break;
+
+        // Move to previous period boundary
+        if (check_boundary < period) {
+            // At or before genesis period
+            break;
+        }
+        check_boundary -= period;
+    }
+
+    // Now walk forward computing states
+    // Start from the earliest unknown boundary and compute forward
+    var state: ThresholdState = .defined;
+
+    // Get the base state from cache or assume DEFINED
+    if (compute_stack.len > 0) {
+        const first_boundary = compute_stack.buffer[compute_stack.len - 1];
+        if (first_boundary >= period) {
+            const prev_boundary = first_boundary - period;
+            if (cache) |c| {
+                const cache_key = StateCacheKey{ .bit = deployment.bit, .period_start_height = prev_boundary + 1 };
+                state = c.get(cache_key) orelse .defined;
+            }
+        }
+    }
+
+    // Process boundaries in reverse order (oldest first)
+    var idx = compute_stack.len;
+    while (idx > 0) {
+        idx -= 1;
+        const current_boundary = compute_stack.buffer[idx];
+
+        // Get the block at this boundary
+        const boundary_block = index_view.getAtHeight(current_boundary) orelse continue;
+
+        // Apply state transition based on current state
+        state = switch (state) {
+            .defined => blk: {
+                // Transition to STARTED if MTP >= start_time
+                if (boundary_block.median_time_past >= deployment.start_time) {
+                    break :blk .started;
+                }
+                break :blk .defined;
+            },
+            .started => blk: {
+                // Check for timeout first (MTP at end of period)
+                if (boundary_block.median_time_past >= deployment.timeout) {
+                    break :blk .failed;
+                }
+                // Count signaling blocks in the period ending at current_boundary
+                // Period spans from (current_boundary - period + 1) to current_boundary inclusive
+                const period_start = if (current_boundary >= period - 1) current_boundary - period + 1 else 0;
+                const signal_count = countSignalingBlocksInRange(
+                    deployment.bit,
+                    period_start,
+                    current_boundary,
+                    index_view,
+                );
+                if (signal_count >= deployment.threshold) {
+                    break :blk .locked_in;
+                }
+                break :blk .started;
+            },
+            .locked_in => blk: {
+                // Transition to ACTIVE if min_activation_height is reached
+                // The next period starts at current_boundary + 1
+                if (current_boundary + 1 >= deployment.min_activation_height) {
+                    break :blk .active;
+                }
+                break :blk .locked_in;
+            },
+            .active, .failed => state, // Terminal states
+        };
+
+        // Cache the result for the period starting at current_boundary + 1
+        if (cache) |c| {
+            const cache_key = StateCacheKey{ .bit = deployment.bit, .period_start_height = current_boundary + 1 };
+            c.put(cache_key, state) catch {};
+        }
+    }
+
+    return state;
+}
+
+/// Count the number of blocks signaling for a deployment bit in a range (inclusive).
+fn countSignalingBlocksInRange(
+    bit: u5,
+    start_height: u32,
+    end_height: u32,
+    index_view: *const VersionBitsIndexView,
+) u32 {
+    var count: u32 = 0;
+    var h: u32 = start_height;
+
+    while (h <= end_height) : (h += 1) {
+        const block = index_view.getAtHeight(h) orelse continue;
+        if (versionBitSignals(block.version, bit)) {
+            count += 1;
+        }
+    }
+
+    return count;
+}
+
+/// Check if a deployment is active at a given height.
+pub fn isDeploymentActive(
+    deployment: Deployment,
+    height: u32,
+    index_view: *const VersionBitsIndexView,
+    cache: ?*VersionBitsCache,
+) bool {
+    return getDeploymentState(deployment, height, index_view, cache) == .active;
+}
+
+/// Compute the block version for a new block being mined.
+/// Sets version bits for all deployments that are in STARTED or LOCKED_IN state.
+///
+/// Parameters:
+/// - deployments: Slice of active deployments to consider
+/// - height: Height of the block being mined
+/// - index_view: Interface to look up block data
+/// - cache: Optional cache for state computation
+///
+/// Returns the nVersion value to use for the new block.
+pub fn computeBlockVersion(
+    deployments: []const Deployment,
+    height: u32,
+    index_view: *const VersionBitsIndexView,
+    cache: ?*VersionBitsCache,
+) i32 {
+    var version: i32 = VERSIONBITS_TOP_BITS;
+
+    for (deployments) |dep| {
+        const state = getDeploymentState(dep, height, index_view, cache);
+        if (state == .started or state == .locked_in) {
+            version |= @as(i32, 1) << dep.bit;
+        }
+    }
+
+    return version;
+}
+
+/// BIP9 statistics for a deployment in the current period.
+pub const BIP9Stats = struct {
+    /// Length of the signaling period.
+    period: u32,
+    /// Threshold required for lock-in.
+    threshold: u32,
+    /// Number of blocks elapsed in current period.
+    elapsed: u32,
+    /// Number of signaling blocks in current period.
+    count: u32,
+    /// Whether it's still possible to reach threshold.
+    possible: bool,
+};
+
+/// Get statistics for a deployment at a given height.
+pub fn getDeploymentStats(
+    deployment: Deployment,
+    height: u32,
+    index_view: *const VersionBitsIndexView,
+) BIP9Stats {
+    const period = deployment.period;
+    const period_start = height - (height % period);
+    const blocks_in_period = (height % period) + 1;
+
+    var count: u32 = 0;
+    var h: u32 = period_start;
+    while (h <= height) : (h += 1) {
+        const block = index_view.getAtHeight(h) orelse continue;
+        if (versionBitSignals(block.version, deployment.bit)) {
+            count += 1;
+        }
+    }
+
+    const remaining = period - blocks_in_period;
+    const possible = (count + remaining) >= deployment.threshold;
+
+    return BIP9Stats{
+        .period = period,
+        .threshold = deployment.threshold,
+        .elapsed = blocks_in_period,
+        .count = count,
+        .possible = possible,
+    };
+}
+
+// ============================================================================
+// BIP9 Version Bits Tests
+// ============================================================================
+
+fn createMockVersionBitsView(blocks: []const VersionBitsBlockIndex) VersionBitsIndexView {
+    return VersionBitsIndexView{
+        .context = @constCast(@ptrCast(blocks.ptr)),
+        .getAtHeightFn = struct {
+            fn get(ctx: *anyopaque, height: u32) ?VersionBitsBlockIndex {
+                const entries: [*]const VersionBitsBlockIndex = @ptrCast(@alignCast(ctx));
+                // We assume the slice has enough entries
+                if (height >= 20000) return null;
+                return entries[height];
+            }
+        }.get,
+    };
+}
+
+test "versionBitSignals detects signaling" {
+    // Version with top bits 001 and bit 2 set
+    const version_signaling: i32 = 0x20000004; // 0x20000000 | (1 << 2)
+    try std.testing.expect(versionBitSignals(version_signaling, 2));
+    try std.testing.expect(!versionBitSignals(version_signaling, 3));
+    try std.testing.expect(!versionBitSignals(version_signaling, 1));
+
+    // Version without proper top bits
+    const version_old: i32 = 4; // Old version, not BIP9
+    try std.testing.expect(!versionBitSignals(version_old, 2));
+
+    // Version with wrong top bits (010 instead of 001)
+    const version_wrong_top: i32 = 0x40000004;
+    try std.testing.expect(!versionBitSignals(version_wrong_top, 2));
+}
+
+test "versionBitMask returns correct mask" {
+    try std.testing.expectEqual(@as(u32, 1), versionBitMask(0));
+    try std.testing.expectEqual(@as(u32, 2), versionBitMask(1));
+    try std.testing.expectEqual(@as(u32, 4), versionBitMask(2));
+    try std.testing.expectEqual(@as(u32, 0x10000000), versionBitMask(28));
+}
+
+test "ThresholdState names" {
+    try std.testing.expectEqualStrings("defined", ThresholdState.defined.name());
+    try std.testing.expectEqualStrings("started", ThresholdState.started.name());
+    try std.testing.expectEqualStrings("locked_in", ThresholdState.locked_in.name());
+    try std.testing.expectEqualStrings("active", ThresholdState.active.name());
+    try std.testing.expectEqualStrings("failed", ThresholdState.failed.name());
+}
+
+test "getDeploymentState always active" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = Deployment.ALWAYS_ACTIVE,
+        .timeout = Deployment.NO_TIMEOUT,
+    };
+
+    var blocks: [100]VersionBitsBlockIndex = undefined;
+    for (0..100) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 1,
+            .median_time_past = @intCast(i * 600),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    const state = getDeploymentState(deployment, 50, &view, null);
+    try std.testing.expectEqual(ThresholdState.active, state);
+}
+
+test "getDeploymentState never active" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = Deployment.NEVER_ACTIVE,
+        .timeout = Deployment.NO_TIMEOUT,
+    };
+
+    var blocks: [100]VersionBitsBlockIndex = undefined;
+    for (0..100) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 0x20000004, // Signaling
+            .median_time_past = @intCast(i * 600),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    const state = getDeploymentState(deployment, 50, &view, null);
+    try std.testing.expectEqual(ThresholdState.failed, state);
+}
+
+test "getDeploymentState genesis is defined" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 1000000,
+        .timeout = 2000000,
+    };
+
+    var blocks: [1]VersionBitsBlockIndex = undefined;
+    blocks[0] = VersionBitsBlockIndex{
+        .height = 0,
+        .version = 1,
+        .median_time_past = 0,
+    };
+    const view = createMockVersionBitsView(&blocks);
+
+    const state = getDeploymentState(deployment, 0, &view, null);
+    try std.testing.expectEqual(ThresholdState.defined, state);
+}
+
+test "getDeploymentState defined before start_time" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 1000000,
+        .timeout = 2000000,
+        .period = 100,
+        .threshold = 75,
+    };
+
+    var blocks: [500]VersionBitsBlockIndex = undefined;
+    for (0..500) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 0x20000004, // Signaling
+            .median_time_past = @intCast(i * 100), // MTP increases slowly
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // At height 200, MTP = 200 * 100 = 20000 < 1000000 (start_time)
+    const state = getDeploymentState(deployment, 200, &view, null);
+    try std.testing.expectEqual(ThresholdState.defined, state);
+}
+
+test "getDeploymentState transitions to started" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 10000,
+        .timeout = 100000,
+        .period = 100,
+        .threshold = 75,
+    };
+
+    var blocks: [500]VersionBitsBlockIndex = undefined;
+    for (0..500) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 0x20000004, // Signaling
+            .median_time_past = @intCast(i * 100),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // At height 200, MTP = 200 * 100 = 20000 >= 10000 (start_time)
+    // The transition happens at period boundary 200
+    const state = getDeploymentState(deployment, 200, &view, null);
+    try std.testing.expectEqual(ThresholdState.started, state);
+}
+
+test "getDeploymentState transitions to locked_in" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 10000,
+        .timeout = 100000,
+        .period = 100,
+        .threshold = 75,
+    };
+
+    var blocks: [500]VersionBitsBlockIndex = undefined;
+    for (0..500) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 0x20000004, // All blocks signaling
+            .median_time_past = @intCast(i * 100),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // Period 0-99: DEFINED (MTP < 10000 at end)
+    // Period 100-199: STARTED (MTP >= 10000 at end of period 0)
+    // Period 200-299: LOCKED_IN (100 blocks signaled in period 100-199, >= 75 threshold)
+    const state = getDeploymentState(deployment, 300, &view, null);
+    try std.testing.expectEqual(ThresholdState.locked_in, state);
+}
+
+test "getDeploymentState transitions to active" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 10000,
+        .timeout = 100000,
+        .period = 100,
+        .threshold = 75,
+        .min_activation_height = 0,
+    };
+
+    var blocks: [500]VersionBitsBlockIndex = undefined;
+    for (0..500) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 0x20000004, // All blocks signaling
+            .median_time_past = @intCast(i * 100),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // Period 0-99: DEFINED
+    // Period 100-199: STARTED
+    // Period 200-299: LOCKED_IN
+    // Period 300-399: ACTIVE
+    const state = getDeploymentState(deployment, 400, &view, null);
+    try std.testing.expectEqual(ThresholdState.active, state);
+}
+
+test "getDeploymentState timeout causes failure" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 10000,
+        .timeout = 30000,
+        .period = 100,
+        .threshold = 75,
+    };
+
+    var blocks: [500]VersionBitsBlockIndex = undefined;
+    for (0..500) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 0x20000000, // NOT signaling (no bit 2)
+            .median_time_past = @intCast(i * 100),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // MTP at height 300 = 30000 >= timeout
+    // State should transition to FAILED
+    const state = getDeploymentState(deployment, 400, &view, null);
+    try std.testing.expectEqual(ThresholdState.failed, state);
+}
+
+test "getDeploymentState insufficient signaling stays started" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 10000,
+        .timeout = 100000,
+        .period = 100,
+        .threshold = 75,
+    };
+
+    var blocks: [500]VersionBitsBlockIndex = undefined;
+    for (0..500) |i| {
+        // Only 50% of blocks signal (alternating)
+        const signaling = (i % 2) == 0;
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = if (signaling) 0x20000004 else 0x20000000,
+            .median_time_past = @intCast(i * 100),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // With 50% signaling (50 blocks per period), threshold of 75 not reached
+    // Should stay in STARTED
+    const state = getDeploymentState(deployment, 300, &view, null);
+    try std.testing.expectEqual(ThresholdState.started, state);
+}
+
+test "getDeploymentState min_activation_height delays activation" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 10000,
+        .timeout = 100000,
+        .period = 100,
+        .threshold = 75,
+        .min_activation_height = 500,
+    };
+
+    var blocks: [600]VersionBitsBlockIndex = undefined;
+    for (0..600) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 0x20000004, // All blocks signaling
+            .median_time_past = @intCast(i * 100),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // At height 400, should be LOCKED_IN (activation delayed to 500)
+    const state_400 = getDeploymentState(deployment, 400, &view, null);
+    try std.testing.expectEqual(ThresholdState.locked_in, state_400);
+
+    // At height 500+, should be ACTIVE
+    const state_500 = getDeploymentState(deployment, 500, &view, null);
+    try std.testing.expectEqual(ThresholdState.active, state_500);
+}
+
+test "VersionBitsCache caches states" {
+    var cache = VersionBitsCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const key = StateCacheKey{ .bit = 2, .period_start_height = 2016 };
+    try cache.put(key, .started);
+
+    const cached = cache.get(key);
+    try std.testing.expectEqual(ThresholdState.started, cached.?);
+
+    // Non-existent key
+    const key2 = StateCacheKey{ .bit = 3, .period_start_height = 2016 };
+    try std.testing.expectEqual(@as(?ThresholdState, null), cache.get(key2));
+}
+
+test "computeBlockVersion sets bits for started deployments" {
+    const deployments = [_]Deployment{
+        Deployment{
+            .bit = 2,
+            .start_time = 10000,
+            .timeout = 100000,
+            .period = 100,
+            .threshold = 75,
+        },
+        Deployment{
+            .bit = 5,
+            .start_time = Deployment.NEVER_ACTIVE,
+            .timeout = Deployment.NO_TIMEOUT,
+        },
+    };
+
+    var blocks: [500]VersionBitsBlockIndex = undefined;
+    for (0..500) |i| {
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = 0x20000004,
+            .median_time_past = @intCast(i * 100),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // Deployment with bit 2 should be STARTED at height 200
+    // Deployment with bit 5 is NEVER_ACTIVE, so FAILED
+    const version = computeBlockVersion(&deployments, 200, &view, null);
+
+    // Should have top bits + bit 2, but not bit 5
+    try std.testing.expectEqual(@as(i32, 0x20000004), version);
+}
+
+test "getDeploymentStats counts signaling blocks" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = 10000,
+        .timeout = 100000,
+        .period = 100,
+        .threshold = 75,
+    };
+
+    var blocks: [200]VersionBitsBlockIndex = undefined;
+    for (0..200) |i| {
+        // 80 blocks signal in each period (0-79, 100-179)
+        const in_signaling_range = (i % 100) < 80;
+        blocks[i] = VersionBitsBlockIndex{
+            .height = @intCast(i),
+            .version = if (in_signaling_range) 0x20000004 else 0x20000000,
+            .median_time_past = @intCast(i * 100),
+        };
+    }
+    const view = createMockVersionBitsView(&blocks);
+
+    // At height 149 (50 blocks into period 100-199)
+    const stats = getDeploymentStats(deployment, 149, &view);
+
+    try std.testing.expectEqual(@as(u32, 100), stats.period);
+    try std.testing.expectEqual(@as(u32, 75), stats.threshold);
+    try std.testing.expectEqual(@as(u32, 50), stats.elapsed);
+    try std.testing.expectEqual(@as(u32, 50), stats.count); // All 50 blocks so far are signaling
+    try std.testing.expect(stats.possible); // 50 + 50 remaining >= 75
+}
+
+test "isDeploymentActive returns true for active deployment" {
+    const deployment = Deployment{
+        .bit = 2,
+        .start_time = Deployment.ALWAYS_ACTIVE,
+        .timeout = Deployment.NO_TIMEOUT,
+    };
+
+    var blocks: [1]VersionBitsBlockIndex = undefined;
+    blocks[0] = VersionBitsBlockIndex{
+        .height = 0,
+        .version = 1,
+        .median_time_past = 0,
+    };
+    const view = createMockVersionBitsView(&blocks);
+
+    try std.testing.expect(isDeploymentActive(deployment, 0, &view, null));
+}
+
+test "Deployments taproot parameters" {
+    try std.testing.expectEqual(@as(u5, 2), Deployments.TAPROOT.bit);
+    try std.testing.expectEqual(@as(u32, 709632), Deployments.TAPROOT.min_activation_height);
+    try std.testing.expectEqual(@as(u32, 1815), Deployments.TAPROOT.threshold);
+}
