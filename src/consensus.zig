@@ -106,6 +106,27 @@ pub const SEGWIT_HEIGHT: u32 = 481_824;
 /// Taproot activation height (BIP-341/342).
 pub const TAPROOT_HEIGHT: u32 = 709_632;
 
+/// BIP-68/112/113 (CSV) activation height - relative timelocks.
+pub const CSV_HEIGHT: u32 = 419_328;
+
+// ============================================================================
+// BIP-68 Sequence Lock Constants
+// ============================================================================
+
+/// If this flag is set, CTxIn::nSequence is NOT interpreted as a relative lock-time.
+/// BIP-68 is disabled for this input.
+pub const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+
+/// If CTxIn::nSequence encodes a relative lock-time and this flag is set,
+/// the relative lock-time has units of 512 seconds; otherwise it specifies blocks.
+pub const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+
+/// Mask to extract the lock-time value from the sequence field.
+pub const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
+
+/// Time-based relative lock-times are measured in 512-second increments (2^9).
+pub const SEQUENCE_LOCKTIME_GRANULARITY: u5 = 9;
+
 // ============================================================================
 // Network Configuration
 // ============================================================================
@@ -128,6 +149,7 @@ pub const NetworkParams = struct {
     bip34_height: u32,
     bip65_height: u32,
     bip66_height: u32,
+    csv_height: u32, // BIP-68/112/113 activation
     segwit_height: u32,
     taproot_height: u32,
     address_prefix: u8, // P2PKH version byte
@@ -165,6 +187,7 @@ pub const MAINNET = NetworkParams{
     .bip34_height = 227_931,
     .bip65_height = 388_381,
     .bip66_height = 363_725,
+    .csv_height = 419_328,
     .segwit_height = 481_824,
     .taproot_height = 709_632,
     .address_prefix = 0x00,
@@ -197,6 +220,7 @@ pub const TESTNET = NetworkParams{
     .bip34_height = 21111,
     .bip65_height = 581885,
     .bip66_height = 330776,
+    .csv_height = 770112,
     .segwit_height = 834624,
     .taproot_height = 2032291,
     .address_prefix = 0x6f,
@@ -224,6 +248,7 @@ pub const REGTEST = NetworkParams{
     .bip34_height = 500,
     .bip65_height = 1351,
     .bip66_height = 1251,
+    .csv_height = 0,
     .segwit_height = 0,
     .taproot_height = 0,
     .address_prefix = 0x6f,
