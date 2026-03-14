@@ -28,7 +28,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Header synchronization (getheaders/headers, block locator, chain work)
 - [x] Block download and IBD (parallel downloads, UTXO updates, timeout handling)
 - [x] UTXO set manager (compact storage, caching, block connect/disconnect)
-- [x] Chain state tracking (reorg support, undo data)
+- [x] Chain state tracking (reorg support, undo data with rev*.dat file persistence)
 - [x] Mempool (BIP-125 RBF, ancestor/descendant limits, dust detection, eviction)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
 - [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness)
