@@ -2406,3 +2406,704 @@ test "block undo to block undo data conversion" {
     try std.testing.expectEqual(@as(i64, 1000000), undo_data.tx_undo[0].prev_outputs[0].value);
     try std.testing.expectEqual(@as(u32, 50), undo_data.tx_undo[0].prev_outputs[0].height);
 }
+
+// ============================================================================
+// Flat File Block Storage (Phase 23)
+// ============================================================================
+
+/// Maximum size of a blk?????.dat file (128 MiB, matching Bitcoin Core).
+pub const MAX_BLOCKFILE_SIZE: u64 = 128 * 1024 * 1024;
+
+/// Pre-allocation chunk size for block files (16 MiB, matching Bitcoin Core).
+pub const BLOCKFILE_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Size of the header written before each block (8 bytes: 4 magic + 4 size).
+pub const STORAGE_HEADER_BYTES: usize = 8;
+
+/// Position of a block within flat files.
+pub const FlatFilePos = struct {
+    /// File number (blk{nFile:0>5}.dat).
+    file: u32,
+    /// Position within the file (byte offset).
+    pos: u64,
+
+    pub fn isNull(self: FlatFilePos) bool {
+        return self.file == 0xFFFFFFFF and self.pos == 0;
+    }
+
+    pub const NULL: FlatFilePos = .{ .file = 0xFFFFFFFF, .pos = 0 };
+};
+
+/// Metadata for a single block file.
+/// Tracks statistics needed for pruning and block file management.
+pub const BlockFileInfo = struct {
+    /// Number of blocks stored in this file.
+    num_blocks: u32,
+    /// Total size of data stored in this file (bytes).
+    size: u64,
+    /// Lowest block height in this file.
+    height_first: u32,
+    /// Highest block height in this file.
+    height_last: u32,
+    /// Earliest block timestamp in this file.
+    time_first: u64,
+    /// Latest block timestamp in this file.
+    time_last: u64,
+
+    /// Serialize to bytes for storage.
+    pub fn toBytes(self: *const BlockFileInfo) [32]u8 {
+        var buf: [32]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], self.num_blocks, .little);
+        std.mem.writeInt(u64, buf[4..12], self.size, .little);
+        std.mem.writeInt(u32, buf[12..16], self.height_first, .little);
+        std.mem.writeInt(u32, buf[16..20], self.height_last, .little);
+        std.mem.writeInt(u64, buf[20..28], self.time_first, .little);
+        // Only 4 bytes left for time_last; store low 32 bits
+        std.mem.writeInt(u32, buf[28..32], @truncate(self.time_last), .little);
+        return buf;
+    }
+
+    /// Deserialize from bytes.
+    pub fn fromBytes(data: *const [32]u8) BlockFileInfo {
+        return BlockFileInfo{
+            .num_blocks = std.mem.readInt(u32, data[0..4], .little),
+            .size = std.mem.readInt(u64, data[4..12], .little),
+            .height_first = std.mem.readInt(u32, data[12..16], .little),
+            .height_last = std.mem.readInt(u32, data[16..20], .little),
+            .time_first = std.mem.readInt(u64, data[20..28], .little),
+            .time_last = std.mem.readInt(u32, data[28..32], .little),
+        };
+    }
+
+    /// Update metadata when adding a block.
+    pub fn addBlock(self: *BlockFileInfo, height: u32, timestamp: u64, block_size: u64) void {
+        if (self.num_blocks == 0) {
+            self.height_first = height;
+            self.height_last = height;
+            self.time_first = timestamp;
+            self.time_last = timestamp;
+        } else {
+            if (height < self.height_first) self.height_first = height;
+            if (height > self.height_last) self.height_last = height;
+            if (timestamp < self.time_first) self.time_first = timestamp;
+            if (timestamp > self.time_last) self.time_last = timestamp;
+        }
+        self.num_blocks += 1;
+        self.size += block_size;
+    }
+};
+
+/// Flat file block storage manager.
+/// Stores blocks in blk{nnnnn}.dat files with a maximum size per file.
+/// Each block is prefixed with [magic (4 bytes)][size (4 bytes LE)].
+pub const FlatFileBlockStore = struct {
+    /// Directory where block files are stored.
+    data_dir: []const u8,
+    /// Network magic bytes for file headers.
+    network_magic: u32,
+    /// Metadata for each block file.
+    file_info: std.ArrayList(BlockFileInfo),
+    /// Current file number being written to.
+    current_file: u32,
+    /// Current position in the current file.
+    current_pos: u64,
+    /// Allocator for internal operations.
+    allocator: std.mem.Allocator,
+    /// Optional database for block index persistence.
+    db: ?*Database,
+
+    const Self = @This();
+
+    /// Initialize a new flat file block store.
+    /// If db is provided, block positions will be indexed in RocksDB.
+    pub fn init(
+        data_dir: []const u8,
+        network_magic: u32,
+        db: ?*Database,
+        allocator: std.mem.Allocator,
+    ) Self {
+        var file_info = std.ArrayList(BlockFileInfo).init(allocator);
+        // Initialize with at least one file info entry
+        file_info.append(BlockFileInfo{
+            .num_blocks = 0,
+            .size = 0,
+            .height_first = 0,
+            .height_last = 0,
+            .time_first = 0,
+            .time_last = 0,
+        }) catch {};
+
+        return Self{
+            .data_dir = data_dir,
+            .network_magic = network_magic,
+            .file_info = file_info,
+            .current_file = 0,
+            .current_pos = 0,
+            .allocator = allocator,
+            .db = db,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.file_info.deinit();
+    }
+
+    /// Generate the path for a block file.
+    fn getBlockFilePath(self: *const Self, file_number: u32) ![256]u8 {
+        var path_buf: [256]u8 = [_]u8{0} ** 256;
+        const path_slice = std.fmt.bufPrint(&path_buf, "{s}/blk{d:0>5}.dat", .{ self.data_dir, file_number }) catch {
+            return error.PathTooLong;
+        };
+        if (path_slice.len < 256) {
+            path_buf[path_slice.len] = 0;
+        }
+        return path_buf;
+    }
+
+    /// Open or create a block file at the given position.
+    fn openBlockFile(self: *const Self, file_number: u32, read_only: bool) !std.fs.File {
+        const path_buf = try self.getBlockFilePath(file_number);
+        const path_slice = std.mem.sliceTo(&path_buf, 0);
+
+        if (read_only) {
+            return std.fs.cwd().openFile(path_slice, .{ .mode = .read_only }) catch |err| {
+                return switch (err) {
+                    error.FileNotFound => error.NotFound,
+                    else => error.ReadFailed,
+                };
+            };
+        } else {
+            // Open for read+write, create if doesn't exist
+            return std.fs.cwd().createFile(path_slice, .{
+                .truncate = false,
+                .read = true,
+            }) catch {
+                return error.WriteFailed;
+            };
+        }
+    }
+
+    /// Pre-allocate file space in chunks for performance.
+    fn preAllocate(self: *Self, file: std.fs.File, target_size: u64) !void {
+        _ = self;
+        const stat = file.stat() catch return;
+        if (target_size > stat.size) {
+            // Allocate in BLOCKFILE_CHUNK_SIZE increments
+            const chunks_needed = (target_size + BLOCKFILE_CHUNK_SIZE - 1) / BLOCKFILE_CHUNK_SIZE;
+            const new_size = chunks_needed * BLOCKFILE_CHUNK_SIZE;
+            file.setEndPos(new_size) catch {};
+        }
+    }
+
+    /// Find the next position to write a block.
+    /// Returns a file position with enough space for the block.
+    fn findNextBlockPos(self: *Self, block_size: u64, height: u32, timestamp: u64) !FlatFilePos {
+        const total_size = block_size + STORAGE_HEADER_BYTES;
+
+        // Check if we need to move to a new file
+        if (self.current_pos + total_size > MAX_BLOCKFILE_SIZE) {
+            // Start a new file
+            self.current_file += 1;
+            self.current_pos = 0;
+
+            // Ensure we have file info for the new file
+            while (self.file_info.items.len <= self.current_file) {
+                try self.file_info.append(BlockFileInfo{
+                    .num_blocks = 0,
+                    .size = 0,
+                    .height_first = 0,
+                    .height_last = 0,
+                    .time_first = 0,
+                    .time_last = 0,
+                });
+            }
+        }
+
+        const pos = FlatFilePos{
+            .file = self.current_file,
+            .pos = self.current_pos,
+        };
+
+        // Update file info
+        if (self.current_file < self.file_info.items.len) {
+            self.file_info.items[self.current_file].addBlock(height, timestamp, total_size);
+        }
+
+        // Advance position
+        self.current_pos += total_size;
+
+        return pos;
+    }
+
+    /// Write a block to disk.
+    /// Returns the position where the block was written.
+    /// The position points to after the storage header (where block data starts).
+    pub fn writeBlock(
+        self: *Self,
+        block_data: []const u8,
+        block_hash: *const types.Hash256,
+        height: u32,
+        timestamp: u64,
+    ) !FlatFilePos {
+        const block_size: u64 = block_data.len;
+
+        // Find position for this block
+        var pos = try self.findNextBlockPos(block_size, height, timestamp);
+
+        // Open the file
+        var file = try self.openBlockFile(pos.file, false);
+        defer file.close();
+
+        // Pre-allocate space for performance
+        try self.preAllocate(file, pos.pos + block_size + STORAGE_HEADER_BYTES);
+
+        // Seek to position
+        file.seekTo(pos.pos) catch return error.WriteFailed;
+
+        // Write using buffered writer for performance
+        var buffered = std.io.bufferedWriter(file.writer());
+        const writer = buffered.writer();
+
+        // Write magic (4 bytes LE)
+        var magic_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &magic_buf, self.network_magic, .little);
+        writer.writeAll(&magic_buf) catch return error.WriteFailed;
+
+        // Write block size (4 bytes LE)
+        var size_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &size_buf, @intCast(block_size), .little);
+        writer.writeAll(&size_buf) catch return error.WriteFailed;
+
+        // Write block data
+        writer.writeAll(block_data) catch return error.WriteFailed;
+
+        // Flush the buffer
+        buffered.flush() catch return error.WriteFailed;
+
+        // Update position to point after header (where block data starts)
+        pos.pos += STORAGE_HEADER_BYTES;
+
+        // Store block index in database if available
+        if (self.db) |db| {
+            try self.putBlockIndex(db, block_hash, pos);
+        }
+
+        return pos;
+    }
+
+    /// Read a block from disk at the given position.
+    /// The position should point to the block data (after the storage header).
+    pub fn readBlockFromDisk(
+        self: *const Self,
+        pos: FlatFilePos,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (pos.isNull()) {
+            return error.NotFound;
+        }
+
+        // Position should be at least STORAGE_HEADER_BYTES
+        if (pos.pos < STORAGE_HEADER_BYTES) {
+            return error.CorruptData;
+        }
+
+        // Open the file
+        var file = try self.openBlockFile(pos.file, true);
+        defer file.close();
+
+        // Seek to the storage header (before block data)
+        const header_pos = pos.pos - STORAGE_HEADER_BYTES;
+        file.seekTo(header_pos) catch return error.ReadFailed;
+
+        // Use buffered reader for performance
+        var buffered = std.io.bufferedReader(file.reader());
+        const reader = buffered.reader();
+
+        // Read and verify magic
+        var magic_buf: [4]u8 = undefined;
+        reader.readNoEof(&magic_buf) catch return error.CorruptData;
+        const magic = std.mem.readInt(u32, &magic_buf, .little);
+        if (magic != self.network_magic) {
+            return error.CorruptData;
+        }
+
+        // Read block size
+        var size_buf: [4]u8 = undefined;
+        reader.readNoEof(&size_buf) catch return error.CorruptData;
+        const block_size = std.mem.readInt(u32, &size_buf, .little);
+
+        // Sanity check: block size shouldn't be too large
+        if (block_size > 4 * 1024 * 1024) { // 4 MB max
+            return error.CorruptData;
+        }
+
+        // Allocate and read block data
+        const block_data = try allocator.alloc(u8, block_size);
+        errdefer allocator.free(block_data);
+
+        reader.readNoEof(block_data) catch {
+            allocator.free(block_data);
+            return error.CorruptData;
+        };
+
+        return block_data;
+    }
+
+    /// Read a block and deserialize it.
+    pub fn readBlock(
+        self: *const Self,
+        pos: FlatFilePos,
+        allocator: std.mem.Allocator,
+    ) !types.Block {
+        const block_data = try self.readBlockFromDisk(pos, allocator);
+        defer allocator.free(block_data);
+
+        var reader = serialize.Reader{ .data = block_data };
+        return serialize.readBlock(&reader, allocator) catch error.CorruptData;
+    }
+
+    /// Store a block index entry: block_hash -> FlatFilePos.
+    fn putBlockIndex(self: *Self, db: *Database, block_hash: *const types.Hash256, pos: FlatFilePos) !void {
+        _ = self;
+        // Key: "b" prefix + block hash (33 bytes total)
+        var key: [33]u8 = undefined;
+        key[0] = 'b';
+        @memcpy(key[1..33], block_hash);
+
+        // Value: file (4 bytes) + pos (8 bytes) = 12 bytes
+        var value: [12]u8 = undefined;
+        std.mem.writeInt(u32, value[0..4], pos.file, .little);
+        std.mem.writeInt(u64, value[4..12], pos.pos, .little);
+
+        try db.put(CF_BLOCK_INDEX, &key, &value);
+    }
+
+    /// Get the file position for a block hash.
+    pub fn getBlockPos(self: *const Self, block_hash: *const types.Hash256) !?FlatFilePos {
+        const db = self.db orelse return null;
+
+        var key: [33]u8 = undefined;
+        key[0] = 'b';
+        @memcpy(key[1..33], block_hash);
+
+        const value = db.get(CF_BLOCK_INDEX, &key) catch return null;
+        if (value == null) return null;
+        defer self.allocator.free(value.?);
+
+        if (value.?.len != 12) return error.CorruptData;
+
+        return FlatFilePos{
+            .file = std.mem.readInt(u32, value.?[0..4], .little),
+            .pos = std.mem.readInt(u64, value.?[4..12], .little),
+        };
+    }
+
+    /// Get file info for a specific file number.
+    pub fn getBlockFileInfo(self: *const Self, file_number: u32) ?BlockFileInfo {
+        if (file_number >= self.file_info.items.len) return null;
+        return self.file_info.items[file_number];
+    }
+
+    /// Get the total number of block files.
+    pub fn getNumFiles(self: *const Self) u32 {
+        return @intCast(self.file_info.items.len);
+    }
+
+    /// Flush all pending writes and sync file metadata.
+    pub fn flush(self: *Self) !void {
+        // Sync the current file if we have written to it
+        if (self.current_pos > 0) {
+            var file = self.openBlockFile(self.current_file, false) catch return;
+            defer file.close();
+            file.sync() catch {};
+        }
+    }
+
+    /// Write block and also serialize it first.
+    pub fn writeBlockSerialized(
+        self: *Self,
+        block: *const types.Block,
+        block_hash: *const types.Hash256,
+        height: u32,
+    ) !FlatFilePos {
+        // Serialize block
+        var writer = serialize.Writer.init(self.allocator);
+        defer writer.deinit();
+
+        serialize.writeBlock(&writer, block) catch return error.SerializationFailed;
+        const block_data = writer.getWritten();
+
+        return self.writeBlock(block_data, block_hash, height, block.header.timestamp);
+    }
+};
+
+// ============================================================================
+// Flat File Block Storage Tests
+// ============================================================================
+
+test "blockstore constants" {
+    // Verify constants match Bitcoin Core
+    try std.testing.expectEqual(@as(u64, 128 * 1024 * 1024), MAX_BLOCKFILE_SIZE);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), BLOCKFILE_CHUNK_SIZE);
+    try std.testing.expectEqual(@as(usize, 8), STORAGE_HEADER_BYTES);
+}
+
+test "flat_file_pos null check" {
+    const null_pos = FlatFilePos.NULL;
+    try std.testing.expect(null_pos.isNull());
+
+    const valid_pos = FlatFilePos{ .file = 0, .pos = 100 };
+    try std.testing.expect(!valid_pos.isNull());
+}
+
+test "block_file_info serialization" {
+    const info = BlockFileInfo{
+        .num_blocks = 100,
+        .size = 50 * 1024 * 1024, // 50 MB
+        .height_first = 1000,
+        .height_last = 1100,
+        .time_first = 1600000000,
+        .time_last = 1600100000,
+    };
+
+    const serialized = info.toBytes();
+    const deserialized = BlockFileInfo.fromBytes(&serialized);
+
+    try std.testing.expectEqual(info.num_blocks, deserialized.num_blocks);
+    try std.testing.expectEqual(info.size, deserialized.size);
+    try std.testing.expectEqual(info.height_first, deserialized.height_first);
+    try std.testing.expectEqual(info.height_last, deserialized.height_last);
+    try std.testing.expectEqual(info.time_first, deserialized.time_first);
+}
+
+test "block_file_info add_block" {
+    var info = BlockFileInfo{
+        .num_blocks = 0,
+        .size = 0,
+        .height_first = 0,
+        .height_last = 0,
+        .time_first = 0,
+        .time_last = 0,
+    };
+
+    // First block
+    info.addBlock(100, 1600000000, 1000);
+    try std.testing.expectEqual(@as(u32, 1), info.num_blocks);
+    try std.testing.expectEqual(@as(u64, 1000), info.size);
+    try std.testing.expectEqual(@as(u32, 100), info.height_first);
+    try std.testing.expectEqual(@as(u32, 100), info.height_last);
+    try std.testing.expectEqual(@as(u64, 1600000000), info.time_first);
+    try std.testing.expectEqual(@as(u64, 1600000000), info.time_last);
+
+    // Second block with higher height
+    info.addBlock(200, 1600100000, 2000);
+    try std.testing.expectEqual(@as(u32, 2), info.num_blocks);
+    try std.testing.expectEqual(@as(u64, 3000), info.size);
+    try std.testing.expectEqual(@as(u32, 100), info.height_first);
+    try std.testing.expectEqual(@as(u32, 200), info.height_last);
+    try std.testing.expectEqual(@as(u64, 1600000000), info.time_first);
+    try std.testing.expectEqual(@as(u64, 1600100000), info.time_last);
+
+    // Third block with lower height (reorg case)
+    info.addBlock(50, 1599900000, 1500);
+    try std.testing.expectEqual(@as(u32, 3), info.num_blocks);
+    try std.testing.expectEqual(@as(u64, 4500), info.size);
+    try std.testing.expectEqual(@as(u32, 50), info.height_first);
+    try std.testing.expectEqual(@as(u32, 200), info.height_last);
+    try std.testing.expectEqual(@as(u64, 1599900000), info.time_first);
+    try std.testing.expectEqual(@as(u64, 1600100000), info.time_last);
+}
+
+test "flat_file_blockstore init and deinit" {
+    const allocator = std.testing.allocator;
+
+    var store = FlatFileBlockStore.init("/tmp/clearbit_test", 0xD9B4BEF9, null, allocator);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), store.current_file);
+    try std.testing.expectEqual(@as(u64, 0), store.current_pos);
+    try std.testing.expectEqual(@as(u32, 0xD9B4BEF9), store.network_magic);
+}
+
+test "flat_file_blockstore write and read block" {
+    const allocator = std.testing.allocator;
+
+    // Create a temporary directory
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var store = FlatFileBlockStore.init(path, 0xD9B4BEF9, null, allocator);
+    defer store.deinit();
+
+    // Create some test block data
+    const block_data = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const block_hash = [_]u8{0xAB} ** 32;
+
+    // Write the block
+    const pos = try store.writeBlock(&block_data, &block_hash, 100, 1600000000);
+
+    // Verify position
+    try std.testing.expectEqual(@as(u32, 0), pos.file);
+    try std.testing.expectEqual(@as(u64, STORAGE_HEADER_BYTES), pos.pos);
+
+    // Read the block back
+    const read_data = try store.readBlockFromDisk(pos, allocator);
+    defer allocator.free(read_data);
+
+    try std.testing.expectEqualSlices(u8, &block_data, read_data);
+}
+
+test "flat_file_blockstore multiple blocks" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var store = FlatFileBlockStore.init(path, 0xD9B4BEF9, null, allocator);
+    defer store.deinit();
+
+    // Write multiple blocks
+    const block1 = [_]u8{0x11} ** 100;
+    const block2 = [_]u8{0x22} ** 200;
+    const block3 = [_]u8{0x33} ** 150;
+
+    const hash1 = [_]u8{0x01} ** 32;
+    const hash2 = [_]u8{0x02} ** 32;
+    const hash3 = [_]u8{0x03} ** 32;
+
+    const pos1 = try store.writeBlock(&block1, &hash1, 100, 1600000000);
+    const pos2 = try store.writeBlock(&block2, &hash2, 101, 1600000600);
+    const pos3 = try store.writeBlock(&block3, &hash3, 102, 1600001200);
+
+    // All should be in file 0
+    try std.testing.expectEqual(@as(u32, 0), pos1.file);
+    try std.testing.expectEqual(@as(u32, 0), pos2.file);
+    try std.testing.expectEqual(@as(u32, 0), pos3.file);
+
+    // Positions should be sequential
+    try std.testing.expectEqual(@as(u64, STORAGE_HEADER_BYTES), pos1.pos);
+    try std.testing.expectEqual(@as(u64, STORAGE_HEADER_BYTES + 100 + STORAGE_HEADER_BYTES), pos2.pos);
+    try std.testing.expectEqual(@as(u64, STORAGE_HEADER_BYTES + 100 + STORAGE_HEADER_BYTES + 200 + STORAGE_HEADER_BYTES), pos3.pos);
+
+    // Read them all back
+    const read1 = try store.readBlockFromDisk(pos1, allocator);
+    defer allocator.free(read1);
+    try std.testing.expectEqualSlices(u8, &block1, read1);
+
+    const read2 = try store.readBlockFromDisk(pos2, allocator);
+    defer allocator.free(read2);
+    try std.testing.expectEqualSlices(u8, &block2, read2);
+
+    const read3 = try store.readBlockFromDisk(pos3, allocator);
+    defer allocator.free(read3);
+    try std.testing.expectEqualSlices(u8, &block3, read3);
+}
+
+test "flat_file_blockstore file rotation" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var store = FlatFileBlockStore.init(path, 0xD9B4BEF9, null, allocator);
+    defer store.deinit();
+
+    // Simulate approaching file size limit
+    // Set current position close to MAX_BLOCKFILE_SIZE
+    store.current_pos = MAX_BLOCKFILE_SIZE - 100;
+
+    // Write a block that won't fit in current file
+    const large_block = try allocator.alloc(u8, 200);
+    defer allocator.free(large_block);
+    @memset(large_block, 0xFF);
+
+    const hash = [_]u8{0xDD} ** 32;
+    const pos = try store.writeBlock(large_block, &hash, 500, 1700000000);
+
+    // Should have moved to a new file
+    try std.testing.expectEqual(@as(u32, 1), pos.file);
+    try std.testing.expectEqual(@as(u64, STORAGE_HEADER_BYTES), pos.pos);
+
+    // Current file should be updated
+    try std.testing.expectEqual(@as(u32, 1), store.current_file);
+}
+
+test "flat_file_blockstore file info tracking" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var store = FlatFileBlockStore.init(path, 0xD9B4BEF9, null, allocator);
+    defer store.deinit();
+
+    const block_data = [_]u8{0x55} ** 1000;
+    const hash = [_]u8{0xEE} ** 32;
+
+    _ = try store.writeBlock(&block_data, &hash, 12345, 1650000000);
+
+    // Check file info was updated
+    const info = store.getBlockFileInfo(0).?;
+    try std.testing.expectEqual(@as(u32, 1), info.num_blocks);
+    try std.testing.expect(info.size > 0);
+    try std.testing.expectEqual(@as(u32, 12345), info.height_first);
+    try std.testing.expectEqual(@as(u32, 12345), info.height_last);
+    try std.testing.expectEqual(@as(u64, 1650000000), info.time_first);
+}
+
+test "flat_file_blockstore invalid magic rejected" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    // Write a block with one magic
+    var store1 = FlatFileBlockStore.init(path, 0xD9B4BEF9, null, allocator);
+    defer store1.deinit();
+
+    const block_data = [_]u8{0xAA} ** 50;
+    const hash = [_]u8{0xBB} ** 32;
+    const pos = try store1.writeBlock(&block_data, &hash, 1, 1600000000);
+
+    // Try to read with different magic
+    var store2 = FlatFileBlockStore.init(path, 0x12345678, null, allocator);
+    defer store2.deinit();
+
+    const result = store2.readBlockFromDisk(pos, allocator);
+    try std.testing.expectError(error.CorruptData, result);
+}
+
+test "flat_file_blockstore path generation" {
+    const allocator = std.testing.allocator;
+
+    var store = FlatFileBlockStore.init("/data/blocks", 0xD9B4BEF9, null, allocator);
+    defer store.deinit();
+
+    // Test path generation
+    const path0 = try store.getBlockFilePath(0);
+    const path0_slice = std.mem.sliceTo(&path0, 0);
+    try std.testing.expectEqualStrings("/data/blocks/blk00000.dat", path0_slice);
+
+    const path123 = try store.getBlockFilePath(123);
+    const path123_slice = std.mem.sliceTo(&path123, 0);
+    try std.testing.expectEqualStrings("/data/blocks/blk00123.dat", path123_slice);
+
+    const path99999 = try store.getBlockFilePath(99999);
+    const path99999_slice = std.mem.sliceTo(&path99999, 0);
+    try std.testing.expectEqualStrings("/data/blocks/blk99999.dat", path99999_slice);
+}
