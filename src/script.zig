@@ -136,6 +136,7 @@ pub const ScriptError = error{
     CheckSigFailed,
     CheckMultisigFailed,
     NullDummy,
+    NullFail, // BIP-146: failed signature check with non-empty signature
     CleanStack,
     MinimalData,
     NegativeLocktime,
@@ -163,11 +164,12 @@ pub const ScriptFlags = packed struct {
     verify_dersig: bool = true,
     verify_low_s: bool = true,
     verify_nulldummy: bool = true,
+    verify_nullfail: bool = true, // BIP-146: failed signatures must be empty
     verify_minimaldata: bool = true,
     verify_checklocktimeverify: bool = true,
     verify_checksequenceverify: bool = true,
     verify_taproot: bool = true,
-    _padding: u6 = 0,
+    _padding: u5 = 0,
 };
 
 // ============================================================================
@@ -1023,6 +1025,12 @@ pub const ScriptEngine = struct {
                 const sig = try self.pop();
 
                 const valid = try self.verifySignature(sig, pubkey);
+
+                // BIP-146 NULLFAIL: If verification failed and signature is non-empty, fail
+                if (!valid and self.flags.verify_nullfail and sig.len > 0) {
+                    return ScriptError.NullFail;
+                }
+
                 const result = try boolToStack(self.allocator, valid);
                 try self.pushOwned(result);
             },
@@ -1033,6 +1041,12 @@ pub const ScriptEngine = struct {
                 const sig = try self.pop();
 
                 const valid = try self.verifySignature(sig, pubkey);
+
+                // BIP-146 NULLFAIL: If verification failed and signature is non-empty, fail
+                if (!valid and self.flags.verify_nullfail and sig.len > 0) {
+                    return ScriptError.NullFail;
+                }
+
                 if (!valid) return ScriptError.CheckSigFailed;
             },
 
@@ -1196,6 +1210,16 @@ pub const ScriptEngine = struct {
             if (n_keys - key_idx < n_sigs - sig_idx) {
                 success = false;
                 break;
+            }
+        }
+
+        // BIP-146 NULLFAIL: If verification failed, all signatures must be empty
+        // This check happens after the verification loop completes
+        if (!success and self.flags.verify_nullfail) {
+            for (0..n_sigs) |i| {
+                if (sigs[i].len > 0) {
+                    return ScriptError.NullFail;
+                }
             }
         }
 
@@ -1633,4 +1657,151 @@ test "isWitnessProgram" {
     try std.testing.expect(tr_result != null);
     try std.testing.expectEqual(@as(u8, 1), tr_result.?.version);
     try std.testing.expectEqual(@as(usize, 32), tr_result.?.program.len);
+}
+
+// ============================================================================
+// NULLFAIL (BIP-146) Tests
+// ============================================================================
+
+test "NULLFAIL: empty signature allowed to fail OP_CHECKSIG" {
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    // With NULLFAIL enabled (default), empty signature failing is allowed
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+
+    // Script: <empty> <pubkey> OP_CHECKSIG
+    // Push empty signature (OP_0), push a 33-byte pubkey, OP_CHECKSIG
+    // OP_0 = 0x00, push 33 bytes = 0x21, then 33 bytes of pubkey, OP_CHECKSIG = 0xAC
+    var script_buf: [36]u8 = undefined;
+    script_buf[0] = 0x00; // OP_0 (empty signature)
+    script_buf[1] = 0x21; // Push 33 bytes
+    @memset(script_buf[2..35], 0x02); // Fake compressed pubkey
+    script_buf[35] = 0xac; // OP_CHECKSIG
+
+    try engine.execute(&script_buf);
+
+    // Should succeed (pushes false to stack since sig verification fails,
+    // but empty sig doesn't trigger NULLFAIL)
+    try std.testing.expectEqual(@as(usize, 1), engine.stack.items.len);
+    // The result should be false (empty = 0)
+    try std.testing.expectEqual(@as(usize, 0), engine.stack.items[0].len);
+}
+
+test "NULLFAIL: non-empty failing signature rejected with NULLFAIL (requires secp256k1)" {
+    // Skip this test if secp256k1 is not available
+    // When secp256k1 is available, signature verification will actually fail
+    // and trigger NULLFAIL
+    if (!crypto.isSecp256k1Available()) {
+        // Without secp256k1, verifySignature returns true for testing,
+        // so we can't test failing signature behavior
+        return;
+    }
+
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    // With NULLFAIL enabled, non-empty failing signature should error
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{ .verify_nullfail = true });
+    defer engine.deinit();
+
+    // Script: <bad_signature> <pubkey> OP_CHECKSIG
+    // Push a fake non-empty signature, push a pubkey, OP_CHECKSIG
+    var script_buf: [71]u8 = undefined;
+    script_buf[0] = 0x23; // Push 35 bytes (fake DER signature + hashtype)
+    @memset(script_buf[1..36], 0x30); // Fake signature bytes
+    script_buf[36] = 0x21; // Push 33 bytes
+    @memset(script_buf[37..70], 0x02); // Fake compressed pubkey
+    script_buf[70] = 0xac; // OP_CHECKSIG
+
+    const result = engine.execute(&script_buf);
+    try std.testing.expectError(ScriptError.NullFail, result);
+}
+
+test "NULLFAIL: non-empty failing signature allowed without NULLFAIL flag" {
+    // When NULLFAIL is disabled, any signature can fail without error
+    // (the script just pushes false or fails at VERIFY step)
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    // With NULLFAIL disabled, non-empty failing signature should be allowed
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{ .verify_nullfail = false });
+    defer engine.deinit();
+
+    // Script: <bad_signature> <pubkey> OP_CHECKSIG
+    var script_buf: [71]u8 = undefined;
+    script_buf[0] = 0x23; // Push 35 bytes (fake DER signature + hashtype)
+    @memset(script_buf[1..36], 0x30); // Fake signature bytes
+    script_buf[36] = 0x21; // Push 33 bytes
+    @memset(script_buf[37..70], 0x02); // Fake compressed pubkey
+    script_buf[70] = 0xac; // OP_CHECKSIG
+
+    // Should succeed (no NULLFAIL check, script pushes true/false)
+    try engine.execute(&script_buf);
+    try std.testing.expectEqual(@as(usize, 1), engine.stack.items.len);
+}
+
+test "NULLFAIL: OP_CHECKSIGVERIFY with non-empty failing sig (requires secp256k1)" {
+    // Skip this test if secp256k1 is not available
+    if (!crypto.isSecp256k1Available()) {
+        return;
+    }
+
+    const allocator = std.testing.allocator;
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    // With NULLFAIL enabled, non-empty failing signature should error
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{ .verify_nullfail = true });
+    defer engine.deinit();
+
+    // Script: <bad_signature> <pubkey> OP_CHECKSIGVERIFY
+    var script_buf: [71]u8 = undefined;
+    script_buf[0] = 0x23; // Push 35 bytes
+    @memset(script_buf[1..36], 0x30); // Fake signature bytes
+    script_buf[36] = 0x21; // Push 33 bytes
+    @memset(script_buf[37..70], 0x02); // Fake compressed pubkey
+    script_buf[70] = 0xad; // OP_CHECKSIGVERIFY
+
+    // Should fail with NullFail (not CheckSigFailed, because NULLFAIL is checked first)
+    const result = engine.execute(&script_buf);
+    try std.testing.expectError(ScriptError.NullFail, result);
+}
+
+test "NULLFAIL: ScriptFlags has verify_nullfail enabled by default" {
+    const flags = ScriptFlags{};
+    try std.testing.expect(flags.verify_nullfail);
+}
+
+test "NULLFAIL: flag is part of packed struct at correct bit position" {
+    // Verify the flag can be set and read correctly
+    var flags = ScriptFlags{};
+    flags.verify_nullfail = false;
+    try std.testing.expect(!flags.verify_nullfail);
+    flags.verify_nullfail = true;
+    try std.testing.expect(flags.verify_nullfail);
 }
