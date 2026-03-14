@@ -682,7 +682,7 @@ pub const Mempool = struct {
     }
 
     /// Get an output from a mempool transaction.
-    fn getOutputFromMempool(self: *Mempool, outpoint: *const types.OutPoint) ?types.TxOut {
+    pub fn getOutputFromMempool(self: *Mempool, outpoint: *const types.OutPoint) ?types.TxOut {
         const entry = self.entries.get(outpoint.hash) orelse return null;
         if (outpoint.index >= entry.tx.outputs.len) return null;
         return entry.tx.outputs[outpoint.index];
@@ -760,7 +760,7 @@ pub const Mempool = struct {
 // ============================================================================
 
 /// Compute transaction weight (BIP-141).
-fn computeTxWeight(tx: *const types.Transaction, allocator: std.mem.Allocator) !usize {
+pub fn computeTxWeight(tx: *const types.Transaction, allocator: std.mem.Allocator) !usize {
     // base_size = serialization without witness
     // total_size = serialization with witness
     // weight = base_size * 3 + total_size
