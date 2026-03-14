@@ -52,6 +52,7 @@ pub const ValidationError = error{
     BadProofOfWork,
     BadCoinbaseValue,
     SequenceLockNotSatisfied,
+    TooManySigops,
 
     // General errors
     OutOfMemory,
@@ -174,6 +175,111 @@ pub fn checkTransactionContextual(
 }
 
 // ============================================================================
+// Sigop Counting
+// ============================================================================
+
+/// UTXO information needed for sigop cost calculation.
+/// Contains the scriptPubKey of the previous output being spent.
+pub const SigopUtxoView = struct {
+    context: *anyopaque,
+    lookupFn: *const fn (ctx: *anyopaque, outpoint: *const types.OutPoint) ?[]const u8,
+
+    pub fn lookup(self: *const SigopUtxoView, outpoint: *const types.OutPoint) ?[]const u8 {
+        return self.lookupFn(self.context, outpoint);
+    }
+};
+
+/// Count legacy sigops in a transaction (scriptSig + scriptPubKey of outputs).
+/// This is the "old-fashioned" (pre-BIP16) sigop counting method.
+/// Uses inaccurate mode (CHECKMULTISIG = 20 sigops).
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp GetLegacySigOpCount()
+pub fn getLegacySigOpCount(tx: *const types.Transaction) u32 {
+    var n: u32 = 0;
+
+    // Count sigops in all input scriptSigs
+    for (tx.inputs) |input| {
+        n += script.getSigOpCount(input.script_sig, false);
+    }
+
+    // Count sigops in all output scriptPubKeys
+    for (tx.outputs) |output| {
+        n += script.getSigOpCount(output.script_pubkey, false);
+    }
+
+    return n;
+}
+
+/// Count P2SH sigops in a transaction.
+/// For each input spending a P2SH output, extract the redeemScript from
+/// the scriptSig and count sigops in it.
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp GetP2SHSigOpCount()
+pub fn getP2SHSigOpCount(
+    tx: *const types.Transaction,
+    utxo_view: *const SigopUtxoView,
+) u32 {
+    if (tx.isCoinbase()) {
+        return 0;
+    }
+
+    var n: u32 = 0;
+
+    for (tx.inputs) |input| {
+        // Look up the previous output's scriptPubKey
+        const prev_script_pubkey = utxo_view.lookup(&input.previous_output) orelse continue;
+
+        if (script.isPayToScriptHash(prev_script_pubkey)) {
+            n += script.getP2SHSigOpCount(prev_script_pubkey, input.script_sig);
+        }
+    }
+
+    return n;
+}
+
+/// Calculate the total sigop cost for a transaction.
+/// This is the main function for sigop counting with witness discount.
+///
+/// The total cost is:
+/// - Legacy sigops (scriptSig + output scriptPubKey) * WITNESS_SCALE_FACTOR (4)
+/// - P2SH sigops * WITNESS_SCALE_FACTOR (4) if P2SH flag is set
+/// - Witness sigops * 1 (no scaling, witness discount)
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp GetTransactionSigOpCost()
+pub fn getTransactionSigOpCost(
+    tx: *const types.Transaction,
+    utxo_view: *const SigopUtxoView,
+    flags: script.ScriptFlags,
+) u64 {
+    // Start with legacy sigops, scaled by witness factor
+    var cost: u64 = @as(u64, getLegacySigOpCount(tx)) * consensus.WITNESS_SCALE_FACTOR;
+
+    // Coinbase transactions only have legacy sigops
+    if (tx.isCoinbase()) {
+        return cost;
+    }
+
+    // Add P2SH sigops if P2SH verification is enabled
+    if (flags.verify_p2sh) {
+        cost += @as(u64, getP2SHSigOpCount(tx, utxo_view)) * consensus.WITNESS_SCALE_FACTOR;
+    }
+
+    // Add witness sigops (no scaling - witness discount)
+    for (tx.inputs) |input| {
+        const prev_script_pubkey = utxo_view.lookup(&input.previous_output) orelse continue;
+
+        cost += @as(u64, script.countWitnessSigOps(
+            input.script_sig,
+            prev_script_pubkey,
+            input.witness,
+            flags,
+        ));
+    }
+
+    return cost;
+}
+
+// ============================================================================
 // Block Header Validation
 // ============================================================================
 
@@ -283,7 +389,19 @@ pub fn checkBlock(
         // which are only known after validating all transactions
     }
 
-    // 10. Check segwit witness commitment (BIP-141)
+    // 10. Basic sigop check (legacy sigops only, doesn't need UTXO access)
+    // This is a conservative check - full sigop counting with P2SH and witness
+    // sigops requires UTXO access and is done in connectBlock.
+    // Reference: Bitcoin Core validation.cpp CheckBlock() nSigOps check
+    var legacy_sigops: u64 = 0;
+    for (block.transactions) |*tx| {
+        legacy_sigops += getLegacySigOpCount(tx);
+    }
+    if (legacy_sigops * consensus.WITNESS_SCALE_FACTOR > consensus.MAX_BLOCK_SIGOPS_COST) {
+        return ValidationError.TooManySigops;
+    }
+
+    // 11. Check segwit witness commitment (BIP-141)
     if (height >= params.segwit_height) {
         // Check for witness commitment if any transactions have witness data
         var has_witness = false;
@@ -298,6 +416,49 @@ pub fn checkBlock(
             try checkWitnessCommitment(block, allocator);
         }
     }
+}
+
+/// Connect a block to the chain, performing full validation including sigop counting.
+/// This function requires UTXO access to count P2SH and witness sigops.
+///
+/// Returns the total fees collected by the block.
+///
+/// Reference: Bitcoin Core validation.cpp ConnectBlock()
+pub fn connectBlock(
+    block: *const types.Block,
+    height: u32,
+    params: *const consensus.NetworkParams,
+    utxo_view: *const SigopUtxoView,
+) ValidationError!i64 {
+    // Determine script verification flags based on block height
+    var flags = script.ScriptFlags{};
+    flags.verify_p2sh = height >= params.bip34_height; // Approximate P2SH activation
+    flags.verify_witness = height >= params.segwit_height;
+
+    // Track total sigop cost and fees
+    var total_sigops_cost: u64 = 0;
+    const total_fees: i64 = 0; // TODO: Calculate actual fees when full tx validation is implemented
+
+    // Process each transaction
+    for (block.transactions) |*tx| {
+        // Calculate sigop cost
+        // GetTransactionSigOpCost counts 3 types of sigops:
+        // * legacy (always)
+        // * p2sh (when P2SH enabled in flags and excludes coinbase)
+        // * witness (when witness enabled in flags and excludes coinbase)
+        total_sigops_cost += getTransactionSigOpCost(tx, utxo_view, flags);
+
+        if (total_sigops_cost > consensus.MAX_BLOCK_SIGOPS_COST) {
+            return ValidationError.TooManySigops;
+        }
+
+        // TODO: Add fee calculation here when we have full transaction validation
+    }
+
+    // TODO: Verify coinbase value <= subsidy + total_fees
+    // const subsidy = consensus.getBlockSubsidy(height, params);
+
+    return total_fees;
 }
 
 /// Calculate block weight per BIP-141.
@@ -1366,4 +1527,325 @@ test "checkSequenceLocks passes with no constraints" {
     };
 
     try std.testing.expect(checkSequenceLocks(result, &tip));
+}
+
+// ============================================================================
+// Sigop Counting Tests
+// ============================================================================
+
+test "getLegacySigOpCount counts CHECKSIG in scriptPubKey" {
+    // P2PKH scriptPubKey: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    // Contains 1 CHECKSIG
+    var script_pubkey: [25]u8 = undefined;
+    script_pubkey[0] = 0x76; // OP_DUP
+    script_pubkey[1] = 0xa9; // OP_HASH160
+    script_pubkey[2] = 0x14; // Push 20 bytes
+    @memset(script_pubkey[3..23], 0xAB); // 20 byte hash
+    script_pubkey[23] = 0x88; // OP_EQUALVERIFY
+    script_pubkey[24] = 0xac; // OP_CHECKSIG
+
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{}, // Empty scriptSig for counting
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &script_pubkey,
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Legacy count: 1 CHECKSIG in output scriptPubKey
+    const count = getLegacySigOpCount(&tx);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getLegacySigOpCount counts CHECKMULTISIG as 20 sigops" {
+    // Bare multisig output: OP_1 <pk1> <pk2> OP_2 OP_CHECKMULTISIG
+    // In inaccurate mode, CHECKMULTISIG = 20 sigops
+    var script_pubkey: [3]u8 = undefined;
+    script_pubkey[0] = 0x51; // OP_1
+    script_pubkey[1] = 0x52; // OP_2
+    script_pubkey[2] = 0xae; // OP_CHECKMULTISIG
+
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &script_pubkey,
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Legacy count: CHECKMULTISIG in output = 20 sigops (inaccurate mode)
+    const count = getLegacySigOpCount(&tx);
+    try std.testing.expectEqual(@as(u32, 20), count);
+}
+
+test "getTransactionSigOpCost applies witness scale factor" {
+    // P2PKH output with 1 CHECKSIG
+    var script_pubkey: [25]u8 = undefined;
+    script_pubkey[0] = 0x76; // OP_DUP
+    script_pubkey[1] = 0xa9; // OP_HASH160
+    script_pubkey[2] = 0x14; // Push 20 bytes
+    @memset(script_pubkey[3..23], 0xAB);
+    script_pubkey[23] = 0x88; // OP_EQUALVERIFY
+    script_pubkey[24] = 0xac; // OP_CHECKSIG
+
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000_000,
+        .script_pubkey = &script_pubkey,
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // For coinbase, only legacy sigops are counted
+    // 1 CHECKSIG * WITNESS_SCALE_FACTOR (4) = 4
+    const empty_view = SigopUtxoView{
+        .context = undefined,
+        .lookupFn = struct {
+            fn lookup(_: *anyopaque, _: *const types.OutPoint) ?[]const u8 {
+                return null;
+            }
+        }.lookup,
+    };
+
+    const cost = getTransactionSigOpCost(&tx, &empty_view, script.ScriptFlags{});
+    try std.testing.expectEqual(@as(u64, 4), cost);
+}
+
+fn testSigopUtxoLookup(ctx: *anyopaque, outpoint: *const types.OutPoint) ?[]const u8 {
+    const utxos = @as(*const std.AutoHashMap([36]u8, []const u8), @ptrCast(@alignCast(ctx)));
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &outpoint.hash);
+    std.mem.writeInt(u32, key[32..36], outpoint.index, .little);
+    return utxos.get(key);
+}
+
+test "getTransactionSigOpCost counts P2SH sigops" {
+    // P2SH scriptPubKey: OP_HASH160 <20> OP_EQUAL
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9; // OP_HASH160
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memset(script_pubkey[2..22], 0xAB); // placeholder hash
+    script_pubkey[22] = 0x87; // OP_EQUAL
+
+    // Redeem script: OP_CHECKSIG (1 sigop)
+    const redeem_script = [_]u8{0xac}; // OP_CHECKSIG
+
+    // scriptSig: push the redeem script
+    var script_sig: [2]u8 = undefined;
+    script_sig[0] = 0x01; // Push 1 byte
+    script_sig[1] = 0xac; // OP_CHECKSIG
+
+    const outpoint_hash = [_]u8{0x11} ** 32;
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = outpoint_hash,
+            .index = 0,
+        },
+        .script_sig = &script_sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x51}, // OP_1 (simple output)
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Set up UTXO view with the P2SH scriptPubKey
+    var utxos = std.AutoHashMap([36]u8, []const u8).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &outpoint_hash);
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    try utxos.put(key, &script_pubkey);
+
+    const view = SigopUtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testSigopUtxoLookup,
+    };
+
+    // Legacy sigops: 0 (no CHECKSIG in scriptSig or output scriptPubKey)
+    // P2SH sigops: 1 CHECKSIG in redeem script * 4 = 4
+    // Total: 4
+    var flags = script.ScriptFlags{};
+    flags.verify_p2sh = true;
+    _ = redeem_script;
+    const cost = getTransactionSigOpCost(&tx, &view, flags);
+    try std.testing.expectEqual(@as(u64, 4), cost);
+}
+
+test "getTransactionSigOpCost counts P2WPKH as 1 sigop" {
+    // P2WPKH scriptPubKey: OP_0 <20 bytes>
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0 (witness version 0)
+    script_pubkey[1] = 0x14; // Push 20 bytes
+    @memset(script_pubkey[2..22], 0xAB); // 20 byte hash
+
+    const outpoint_hash = [_]u8{0x11} ** 32;
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = outpoint_hash,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{}, // Empty for native segwit
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{
+            &[_]u8{0xAA} ** 71, // Signature
+            &[_]u8{0xBB} ** 33, // Pubkey
+        },
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Set up UTXO view
+    var utxos = std.AutoHashMap([36]u8, []const u8).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &outpoint_hash);
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    try utxos.put(key, &script_pubkey);
+
+    const view = SigopUtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testSigopUtxoLookup,
+    };
+
+    // Legacy sigops: 0
+    // Witness sigops: 1 (P2WPKH is always 1) - no scaling
+    // Total: 1
+    var flags = script.ScriptFlags{};
+    flags.verify_witness = true;
+    flags.verify_p2sh = true;
+    const cost = getTransactionSigOpCost(&tx, &view, flags);
+    try std.testing.expectEqual(@as(u64, 1), cost);
+}
+
+test "getTransactionSigOpCost counts P2WSH sigops" {
+    // P2WSH scriptPubKey: OP_0 <32 bytes>
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x00; // OP_0 (witness version 0)
+    script_pubkey[1] = 0x20; // Push 32 bytes
+    @memset(script_pubkey[2..34], 0xAB); // 32 byte hash
+
+    // Witness script: OP_1 <pk> OP_1 OP_CHECKMULTISIG (1 sigop)
+    var witness_script: [3]u8 = undefined;
+    witness_script[0] = 0x51; // OP_1
+    witness_script[1] = 0x51; // OP_1
+    witness_script[2] = 0xae; // OP_CHECKMULTISIG
+
+    const outpoint_hash = [_]u8{0x11} ** 32;
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = outpoint_hash,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{}, // Empty for native segwit
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{
+            &[_]u8{0x00},      // Dummy
+            &[_]u8{0xAA} ** 71, // Signature
+            &witness_script,  // Witness script (last item)
+        },
+    };
+
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Set up UTXO view
+    var utxos = std.AutoHashMap([36]u8, []const u8).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &outpoint_hash);
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    try utxos.put(key, &script_pubkey);
+
+    const view = SigopUtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testSigopUtxoLookup,
+    };
+
+    // Legacy sigops: 0
+    // Witness sigops: 1 (1-of-1 multisig in witness script, accurate mode) - no scaling
+    // Total: 1
+    var flags = script.ScriptFlags{};
+    flags.verify_witness = true;
+    flags.verify_p2sh = true;
+    const cost = getTransactionSigOpCost(&tx, &view, flags);
+    try std.testing.expectEqual(@as(u64, 1), cost);
+}
+
+test "MAX_BLOCK_SIGOPS_COST is 80000" {
+    try std.testing.expectEqual(@as(u32, 80_000), consensus.MAX_BLOCK_SIGOPS_COST);
+}
+
+test "WITNESS_SCALE_FACTOR is 4" {
+    try std.testing.expectEqual(@as(u32, 4), consensus.WITNESS_SCALE_FACTOR);
 }
