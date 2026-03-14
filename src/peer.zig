@@ -33,10 +33,68 @@ pub const MIN_RECONNECT_INTERVAL: i64 = 10 * 60;
 /// Ping interval for idle peers (2 minutes).
 pub const PING_INTERVAL: i64 = 2 * 60;
 
+/// Maximum number of block-relay-only anchor connections.
+pub const MAX_BLOCK_RELAY_ONLY_ANCHORS: usize = 2;
+
+/// Maximum number of block-relay-only connections.
+pub const MAX_BLOCK_RELAY_ONLY_CONNECTIONS: usize = 2;
+
 /// Hardcoded fallback peers for testnet4 (DNS seeds unreliable).
 pub const TESTNET_FALLBACK_PEERS: []const []const u8 = &[_][]const u8{
     "127.0.0.1", // Placeholder - would be real testnet4 peers
 };
+
+// ============================================================================
+// Eclipse Attack Protection Constants
+// ============================================================================
+
+/// Number of peers to protect by fastest ping time.
+pub const EVICTION_PROTECT_PING: usize = 4;
+
+/// Number of peers to protect by most recent transaction relay.
+pub const EVICTION_PROTECT_TX: usize = 4;
+
+/// Number of peers to protect by most recent block relay.
+pub const EVICTION_PROTECT_BLOCK: usize = 4;
+
+/// Number of peers to protect by longest connection time.
+pub const EVICTION_PROTECT_TIME: usize = 8;
+
+/// Number of peers to protect by distinct netgroups.
+pub const EVICTION_PROTECT_NETGROUP: usize = 4;
+
+// ============================================================================
+// Network Group Functions (Eclipse Attack Protection)
+// ============================================================================
+
+/// Compute network group for an address.
+/// For IPv4: returns /16 subnet identifier (first 2 octets).
+/// For IPv6: returns /32 identifier (first 4 bytes).
+/// This is used to ensure outbound connection diversity.
+pub fn netGroup(address: std.net.Address) u32 {
+    switch (address.any.family) {
+        std.posix.AF.INET => {
+            // IPv4: use /16 prefix (first 2 octets)
+            const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+            const ip_bytes = @as(*const [4]u8, @ptrCast(&ip4.addr));
+            return (@as(u32, ip_bytes[0]) << 8) | @as(u32, ip_bytes[1]);
+        },
+        std.posix.AF.INET6 => {
+            // IPv6: use /32 prefix (first 4 bytes)
+            const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&address.any)));
+            return (@as(u32, ip6.addr[0]) << 24) |
+                (@as(u32, ip6.addr[1]) << 16) |
+                (@as(u32, ip6.addr[2]) << 8) |
+                @as(u32, ip6.addr[3]);
+        },
+        else => return 0,
+    }
+}
+
+/// Check if two addresses are in the same network group.
+pub fn sameNetGroup(addr1: std.net.Address, addr2: std.net.Address) bool {
+    return netGroup(addr1) == netGroup(addr2);
+}
 
 // ============================================================================
 // Peer State Machine
@@ -55,6 +113,22 @@ pub const PeerState = enum {
 pub const PeerDirection = enum {
     inbound,
     outbound,
+};
+
+/// Connection type for more granular tracking (as per Bitcoin Core).
+pub const ConnectionType = enum {
+    /// Standard inbound connection.
+    inbound,
+    /// Full-relay outbound connection (8 slots).
+    outbound_full_relay,
+    /// Block-relay-only outbound connection (2 slots).
+    block_relay,
+    /// Manual connection (-addnode).
+    manual,
+    /// Feeler connection (short-lived address validation).
+    feeler,
+    /// Address fetch connection.
+    addr_fetch,
 };
 
 // ============================================================================
@@ -99,6 +173,20 @@ pub const Peer = struct {
     is_headers_first: bool,
     ban_score: u32,
     should_ban: bool,
+    /// Connection type for eclipse protection.
+    conn_type: ConnectionType,
+    /// Time of last block received from this peer.
+    last_block_time: i64,
+    /// Time of last transaction received from this peer.
+    last_tx_time: i64,
+    /// Minimum ping time observed (in seconds).
+    min_ping_time: i64,
+    /// Whether this peer relays transactions.
+    relay_txs: bool,
+    /// Whether this is a protected peer (cannot be evicted).
+    is_protected: bool,
+    /// Time when connection was established.
+    connect_time: i64,
 
     /// Connect to a remote peer.
     pub fn connect(
@@ -124,6 +212,7 @@ pub const Peer = struct {
             std.mem.asBytes(&timeout),
         ) catch {};
 
+        const now = std.time.timestamp();
         return Peer{
             .stream = stream,
             .address = address,
@@ -134,7 +223,7 @@ pub const Peer = struct {
             .last_ping_time = 0,
             .last_pong_time = 0,
             .last_ping_nonce = 0,
-            .last_message_time = std.time.timestamp(),
+            .last_message_time = now,
             .bytes_sent = 0,
             .bytes_received = 0,
             .start_height = 0,
@@ -145,6 +234,13 @@ pub const Peer = struct {
             .is_headers_first = false,
             .ban_score = 0,
             .should_ban = false,
+            .conn_type = .outbound_full_relay,
+            .last_block_time = 0,
+            .last_tx_time = 0,
+            .min_ping_time = std.math.maxInt(i64),
+            .relay_txs = true,
+            .is_protected = false,
+            .connect_time = now,
         };
     }
 
@@ -155,6 +251,7 @@ pub const Peer = struct {
         params: *const consensus.NetworkParams,
         allocator: std.mem.Allocator,
     ) Peer {
+        const now = std.time.timestamp();
         return Peer{
             .stream = stream,
             .address = address,
@@ -165,7 +262,7 @@ pub const Peer = struct {
             .last_ping_time = 0,
             .last_pong_time = 0,
             .last_ping_nonce = 0,
-            .last_message_time = std.time.timestamp(),
+            .last_message_time = now,
             .bytes_sent = 0,
             .bytes_received = 0,
             .start_height = 0,
@@ -176,6 +273,13 @@ pub const Peer = struct {
             .is_headers_first = false,
             .ban_score = 0,
             .should_ban = false,
+            .conn_type = .inbound,
+            .last_block_time = 0,
+            .last_tx_time = 0,
+            .min_ping_time = std.math.maxInt(i64),
+            .relay_txs = true,
+            .is_protected = false,
+            .connect_time = now,
         };
     }
 
@@ -371,6 +475,11 @@ pub const Peer = struct {
     pub fn handlePong(self: *Peer, nonce: u64) void {
         if (nonce == self.last_ping_nonce) {
             self.last_pong_time = std.time.timestamp();
+            // Update minimum ping time for eviction scoring
+            const latency = self.last_pong_time - self.last_ping_time;
+            if (latency >= 0 and latency < self.min_ping_time) {
+                self.min_ping_time = latency;
+            }
         }
     }
 
@@ -450,6 +559,185 @@ pub const Peer = struct {
 };
 
 // ============================================================================
+// Eviction Candidate (Eclipse Attack Protection)
+// ============================================================================
+
+/// Candidate for inbound connection eviction.
+/// Contains all the metrics used to decide which peer to evict.
+pub const EvictionCandidate = struct {
+    peer_index: usize,
+    net_group: u32,
+    min_ping_time: i64,
+    last_block_time: i64,
+    last_tx_time: i64,
+    connect_time: i64,
+    relay_txs: bool,
+    is_protected: bool,
+};
+
+/// Build eviction candidate list from inbound peers.
+pub fn buildEvictionCandidates(peers: []*Peer, allocator: std.mem.Allocator) ![]EvictionCandidate {
+    var candidates = std.ArrayList(EvictionCandidate).init(allocator);
+    errdefer candidates.deinit();
+
+    for (peers, 0..) |peer, i| {
+        // Only consider inbound connections for eviction
+        if (peer.direction != .inbound) continue;
+        // Skip protected peers
+        if (peer.is_protected) continue;
+
+        try candidates.append(.{
+            .peer_index = i,
+            .net_group = netGroup(peer.address),
+            .min_ping_time = peer.min_ping_time,
+            .last_block_time = peer.last_block_time,
+            .last_tx_time = peer.last_tx_time,
+            .connect_time = peer.connect_time,
+            .relay_txs = peer.relay_txs,
+            .is_protected = false,
+        });
+    }
+
+    return candidates.toOwnedSlice();
+}
+
+/// Comparison function for sorting by min ping time (ascending - lower is better).
+fn comparePingTime(a: EvictionCandidate, b: EvictionCandidate) bool {
+    return a.min_ping_time < b.min_ping_time;
+}
+
+/// Comparison function for sorting by last tx time (descending - more recent is better).
+fn compareTxTime(a: EvictionCandidate, b: EvictionCandidate) bool {
+    return a.last_tx_time > b.last_tx_time;
+}
+
+/// Comparison function for sorting by last block time (descending - more recent is better).
+fn compareBlockTime(a: EvictionCandidate, b: EvictionCandidate) bool {
+    return a.last_block_time > b.last_block_time;
+}
+
+/// Comparison function for sorting by connect time (ascending - longer connected is better).
+fn compareConnectTime(a: EvictionCandidate, b: EvictionCandidate) bool {
+    return a.connect_time < b.connect_time;
+}
+
+/// Comparison function for sorting by netgroup.
+fn compareNetGroup(a: EvictionCandidate, b: EvictionCandidate) bool {
+    return a.net_group < b.net_group;
+}
+
+/// Select an inbound peer to evict using Bitcoin Core's eviction algorithm.
+/// Protects peers by category:
+/// - 4 with fastest ping time
+/// - 4 with most recent tx relay
+/// - 4 with most recent block relay
+/// - 8 longest-connected
+/// - 4 from distinct netgroups
+/// Returns the index of the peer to evict, or null if no eviction candidate.
+pub fn selectEvictionCandidate(candidates: []EvictionCandidate, allocator: std.mem.Allocator) ?usize {
+    if (candidates.len == 0) return null;
+
+    // Make a mutable copy for protection marking
+    var working = allocator.dupe(EvictionCandidate, candidates) catch return null;
+    defer allocator.free(working);
+
+    // Mark protected candidates
+    var protected = std.AutoHashMap(usize, void).init(allocator);
+    defer protected.deinit();
+
+    // 1. Protect 4 peers with fastest ping time
+    std.mem.sort(EvictionCandidate, working, {}, comparePingTime);
+    for (0..@min(EVICTION_PROTECT_PING, working.len)) |i| {
+        protected.put(working[i].peer_index, {}) catch {};
+    }
+
+    // 2. Protect 4 peers with most recent tx relay
+    std.mem.sort(EvictionCandidate, working, {}, compareTxTime);
+    for (0..@min(EVICTION_PROTECT_TX, working.len)) |i| {
+        protected.put(working[i].peer_index, {}) catch {};
+    }
+
+    // 3. Protect 4 peers with most recent block relay
+    std.mem.sort(EvictionCandidate, working, {}, compareBlockTime);
+    for (0..@min(EVICTION_PROTECT_BLOCK, working.len)) |i| {
+        protected.put(working[i].peer_index, {}) catch {};
+    }
+
+    // 4. Protect 8 longest-connected peers
+    std.mem.sort(EvictionCandidate, working, {}, compareConnectTime);
+    for (0..@min(EVICTION_PROTECT_TIME, working.len)) |i| {
+        protected.put(working[i].peer_index, {}) catch {};
+    }
+
+    // 5. Protect 4 peers from distinct netgroups
+    std.mem.sort(EvictionCandidate, working, {}, compareNetGroup);
+    var seen_netgroups = std.AutoHashMap(u32, void).init(allocator);
+    defer seen_netgroups.deinit();
+    var netgroup_protected: usize = 0;
+    for (working) |c| {
+        if (netgroup_protected >= EVICTION_PROTECT_NETGROUP) break;
+        if (!seen_netgroups.contains(c.net_group)) {
+            seen_netgroups.put(c.net_group, {}) catch {};
+            protected.put(c.peer_index, {}) catch {};
+            netgroup_protected += 1;
+        }
+    }
+
+    // Find unprotected candidates
+    var unprotected = std.ArrayList(EvictionCandidate).init(allocator);
+    defer unprotected.deinit();
+    for (candidates) |c| {
+        if (!protected.contains(c.peer_index)) {
+            unprotected.append(c) catch {};
+        }
+    }
+
+    if (unprotected.items.len == 0) return null;
+
+    // Group by netgroup and find the netgroup with most connections
+    var netgroup_counts = std.AutoHashMap(u32, usize).init(allocator);
+    defer netgroup_counts.deinit();
+    var netgroup_youngest = std.AutoHashMap(u32, EvictionCandidate).init(allocator);
+    defer netgroup_youngest.deinit();
+
+    for (unprotected.items) |c| {
+        const count = netgroup_counts.get(c.net_group) orelse 0;
+        netgroup_counts.put(c.net_group, count + 1) catch {};
+
+        if (netgroup_youngest.get(c.net_group)) |existing| {
+            // Keep the youngest (most recent connect_time)
+            if (c.connect_time > existing.connect_time) {
+                netgroup_youngest.put(c.net_group, c) catch {};
+            }
+        } else {
+            netgroup_youngest.put(c.net_group, c) catch {};
+        }
+    }
+
+    // Find netgroup with most connections
+    var max_group: u32 = 0;
+    var max_count: usize = 0;
+    var max_youngest_time: i64 = 0;
+    var iter = netgroup_counts.iterator();
+    while (iter.next()) |entry| {
+        const count = entry.value_ptr.*;
+        const youngest = netgroup_youngest.get(entry.key_ptr.*) orelse continue;
+        if (count > max_count or (count == max_count and youngest.connect_time > max_youngest_time)) {
+            max_count = count;
+            max_group = entry.key_ptr.*;
+            max_youngest_time = youngest.connect_time;
+        }
+    }
+
+    // Evict the youngest peer from the most-connected netgroup
+    if (netgroup_youngest.get(max_group)) |victim| {
+        return victim.peer_index;
+    }
+
+    return null;
+}
+
+// ============================================================================
 // Address Info
 // ============================================================================
 
@@ -486,6 +774,14 @@ pub const PeerManager = struct {
     our_height: i32,
     running: std.atomic.Value(bool),
     last_rotation_time: i64,
+    /// Set of netgroups for current outbound connections (for diversity).
+    outbound_netgroups: std.AutoHashMap(u32, void),
+    /// Path to anchor connections file.
+    anchors_path: []const u8,
+    /// Anchor addresses to connect on startup.
+    anchor_addresses: std.ArrayList(std.net.Address),
+    /// Data directory for persistence.
+    data_dir: ?[]const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -501,12 +797,17 @@ pub const PeerManager = struct {
             .our_height = 0,
             .running = std.atomic.Value(bool).init(false),
             .last_rotation_time = 0,
+            .outbound_netgroups = std.AutoHashMap(u32, void).init(allocator),
+            .anchors_path = "anchors.dat",
+            .anchor_addresses = std.ArrayList(std.net.Address).init(allocator),
+            .data_dir = null,
         };
     }
 
     pub fn deinit(self: *PeerManager) void {
-        // Save ban list before shutdown
+        // Save ban list and anchors before shutdown
         self.ban_list.save() catch {};
+        self.saveAnchors() catch {};
         for (self.peers.items) |peer| {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -514,6 +815,8 @@ pub const PeerManager = struct {
         self.peers.deinit();
         self.known_addresses.deinit();
         self.ban_list.deinit();
+        self.outbound_netgroups.deinit();
+        self.anchor_addresses.deinit();
         if (self.listener) |*l| l.deinit();
     }
 
@@ -623,6 +926,7 @@ pub const PeerManager = struct {
     }
 
     /// Select an address to connect to (prefer untried, recent addresses).
+    /// Enforces netgroup diversity: rejects addresses from netgroups we already have.
     pub fn selectPeerToConnect(self: *PeerManager) ?std.net.Address {
         const now = std.time.timestamp();
         var best: ?*AddressInfo = null;
@@ -640,6 +944,9 @@ pub const PeerManager = struct {
 
             // Skip banned IPs
             if (self.ban_list.isAddressBanned(info.address)) continue;
+
+            // Eclipse protection: skip addresses from netgroups we already have
+            if (self.violatesNetgroupDiversity(info.address)) continue;
 
             // Prefer addresses with fewer attempts
             if (best == null or info.attempts < best.?.attempts) {
@@ -687,7 +994,157 @@ pub const PeerManager = struct {
         return &self.ban_list;
     }
 
+    // ========================================================================
+    // Eclipse Attack Protection: Anchor Connections
+    // ========================================================================
+
+    /// Load anchor connections from disk (anchors.dat).
+    pub fn loadAnchors(self: *PeerManager) !void {
+        var file = std.fs.cwd().openFile(self.anchors_path, .{}) catch |err| {
+            if (err == error.FileNotFound) return;
+            return err;
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(content);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, content, .{}) catch |err| {
+            std.log.warn("Failed to parse anchors.dat: {}", .{err});
+            return;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) return;
+
+        const anchors_array = root.object.get("anchors") orelse return;
+        if (anchors_array != .array) return;
+
+        for (anchors_array.array.items) |item| {
+            if (item != .object) continue;
+
+            const ip_str = item.object.get("ip") orelse continue;
+            const port_val = item.object.get("port") orelse continue;
+
+            if (ip_str != .string or port_val != .integer) continue;
+
+            // Parse IP address
+            var ip_parts: [4]u8 = undefined;
+            var part_iter = std.mem.splitSequence(u8, ip_str.string, ".");
+            var i: usize = 0;
+            while (part_iter.next()) |part| : (i += 1) {
+                if (i >= 4) break;
+                ip_parts[i] = std.fmt.parseInt(u8, part, 10) catch continue;
+            }
+            if (i != 4) continue;
+
+            const port: u16 = @intCast(@as(i64, @truncate(port_val.integer)));
+            const addr = std.net.Address.initIp4(ip_parts, port);
+            self.anchor_addresses.append(addr) catch continue;
+        }
+
+        std.log.info("Loaded {} anchor connections from {s}", .{ self.anchor_addresses.items.len, self.anchors_path });
+    }
+
+    /// Save current block-relay-only connections as anchors.
+    pub fn saveAnchors(self: *PeerManager) !void {
+        var file = std.fs.cwd().createFile(self.anchors_path, .{}) catch |err| {
+            std.log.err("Failed to create anchors file: {}", .{err});
+            return err;
+        };
+        defer file.close();
+
+        var writer = file.writer();
+        try writer.writeAll("{\n  \"anchors\": [\n");
+
+        var first = true;
+        var count: usize = 0;
+        for (self.peers.items) |peer| {
+            // Save block-relay-only outbound peers as anchors
+            if (peer.conn_type == .block_relay and count < MAX_BLOCK_RELAY_ONLY_ANCHORS) {
+                if (!first) {
+                    try writer.writeAll(",\n");
+                }
+                first = false;
+
+                switch (peer.address.any.family) {
+                    std.posix.AF.INET => {
+                        const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&peer.address.any)));
+                        const ip_bytes = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                        const port = std.mem.bigToNative(u16, ip4.port);
+                        try writer.print("    {{\"ip\": \"{d}.{d}.{d}.{d}\", \"port\": {d}}}", .{
+                            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], port,
+                        });
+                        count += 1;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        try writer.writeAll("\n  ]\n}\n");
+        std.log.info("Saved {} anchor connections to {s}", .{ count, self.anchors_path });
+    }
+
+    /// Connect to anchor peers first on startup.
+    pub fn connectToAnchors(self: *PeerManager) void {
+        for (self.anchor_addresses.items) |addr| {
+            if (self.isConnected(addr)) continue;
+            if (self.ban_list.isAddressBanned(addr)) continue;
+
+            const peer = self.allocator.create(Peer) catch continue;
+            peer.* = Peer.connect(addr, self.network_params, self.allocator) catch {
+                self.allocator.destroy(peer);
+                continue;
+            };
+            peer.conn_type = .block_relay;
+
+            peer.performHandshake(self.our_height) catch {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+                continue;
+            };
+
+            // Track netgroup
+            self.outbound_netgroups.put(netGroup(addr), {}) catch {};
+
+            self.peers.append(peer) catch {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+                continue;
+            };
+
+            std.log.info("Connected to anchor peer: {}", .{addr});
+        }
+    }
+
+    // ========================================================================
+    // Eclipse Attack Protection: Netgroup Diversity
+    // ========================================================================
+
+    /// Check if adding a peer from the given address would violate netgroup diversity.
+    pub fn violatesNetgroupDiversity(self: *const PeerManager, address: std.net.Address) bool {
+        const group = netGroup(address);
+        return self.outbound_netgroups.contains(group);
+    }
+
+    /// Update netgroup tracking when a peer is connected.
+    fn trackOutboundNetgroup(self: *PeerManager, peer: *const Peer) void {
+        if (peer.direction == .outbound) {
+            self.outbound_netgroups.put(netGroup(peer.address), {}) catch {};
+        }
+    }
+
+    /// Remove netgroup tracking when a peer is disconnected.
+    fn untrackOutboundNetgroup(self: *PeerManager, peer: *const Peer) void {
+        if (peer.direction == .outbound) {
+            _ = self.outbound_netgroups.remove(netGroup(peer.address));
+        }
+    }
+
     /// Connect to peers until we have MAX_OUTBOUND_CONNECTIONS outbound.
+    /// Enforces netgroup diversity by tracking connected netgroups.
     pub fn maintainOutbound(self: *PeerManager) !void {
         var outbound_count: usize = 0;
         for (self.peers.items) |peer| {
@@ -714,7 +1171,11 @@ pub const PeerManager = struct {
                 info.last_seen = std.time.timestamp();
             }
 
+            // Track netgroup for diversity enforcement
+            self.trackOutboundNetgroup(peer);
+
             self.peers.append(peer) catch {
+                self.untrackOutboundNetgroup(peer);
                 peer.disconnect();
                 self.allocator.destroy(peer);
                 break;
@@ -724,6 +1185,7 @@ pub const PeerManager = struct {
     }
 
     /// Accept a waiting inbound connection if available (non-blocking).
+    /// When inbound slots are full, uses eviction protection algorithm.
     pub fn acceptInbound(self: *PeerManager) !void {
         if (self.listener == null) return;
 
@@ -735,15 +1197,36 @@ pub const PeerManager = struct {
             }
         };
 
-        if (self.peers.items.len >= MAX_TOTAL_CONNECTIONS) {
-            conn.stream.close();
-            return;
-        }
-
         // Check if IP is banned
         if (self.ban_list.isAddressBanned(conn.address)) {
             conn.stream.close();
             return;
+        }
+
+        // Count inbound connections
+        var inbound_count: usize = 0;
+        for (self.peers.items) |peer| {
+            if (peer.direction == .inbound) inbound_count += 1;
+        }
+
+        // If inbound slots are full, try to evict a peer
+        if (inbound_count >= MAX_INBOUND_CONNECTIONS) {
+            // Build eviction candidates
+            const candidates = buildEvictionCandidates(self.peers.items, self.allocator) catch {
+                conn.stream.close();
+                return;
+            };
+            defer self.allocator.free(candidates);
+
+            // Select victim
+            if (selectEvictionCandidate(candidates, self.allocator)) |victim_idx| {
+                std.log.info("Evicting inbound peer to make room for new connection", .{});
+                self.removePeerByIndex(victim_idx);
+            } else {
+                // No victim found, reject new connection
+                conn.stream.close();
+                return;
+            }
         }
 
         const peer = try self.allocator.create(Peer);
@@ -944,6 +1427,8 @@ pub const PeerManager = struct {
     /// Remove and disconnect a peer by index.
     fn removePeerByIndex(self: *PeerManager, index: usize) void {
         const peer = self.peers.swapRemove(index);
+        // Untrack netgroup for outbound connections
+        self.untrackOutboundNetgroup(peer);
         peer.disconnect();
         self.allocator.destroy(peer);
     }
@@ -951,6 +1436,12 @@ pub const PeerManager = struct {
     /// Main peer management loop.
     pub fn run(self: *PeerManager) !void {
         self.running.store(true, .release);
+
+        // Load anchor connections from disk
+        self.loadAnchors() catch {};
+
+        // Connect to anchor peers first (priority)
+        self.connectToAnchors();
 
         // Initial DNS seeding
         self.dnsSeeds() catch {};
@@ -1104,6 +1595,13 @@ test "peer struct initialization with default values" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 12345,
     };
 
     try std.testing.expectEqual(PeerState.connecting, dummy_peer.state);
@@ -1200,6 +1698,13 @@ test "ban score accumulation" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = std.time.timestamp(),
     };
 
     // Initial score is 0
@@ -1253,6 +1758,13 @@ test "peer timeout detection" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = now,
     };
 
     try std.testing.expect(!active_peer.isTimedOut());
@@ -1304,6 +1816,13 @@ test "peer ready check" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
     };
 
     // Connecting state - not ready
@@ -1354,6 +1873,13 @@ test "handle pong message" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
     };
 
     // Wrong nonce - should not update pong time
@@ -1393,6 +1919,13 @@ test "peer latency calculation" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
     };
 
     // No ping/pong yet - no latency
@@ -1648,6 +2181,13 @@ test "misbehaving function increments score and sets should_ban" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = std.time.timestamp(),
     };
 
     // Initially not marked for ban
@@ -1693,6 +2233,13 @@ test "misbehaving with 100 points immediately bans" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .inbound,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = std.time.timestamp(),
     };
 
     // Invalid block header = 100 points = immediate ban
@@ -1729,6 +2276,13 @@ test "addBanScore sets should_ban at threshold" {
         .is_headers_first = false,
         .ban_score = 0,
         .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
     };
 
     // Add 99 points - not banned yet
@@ -1771,4 +2325,205 @@ test "peer manager ban integration" {
     // Unban addr1
     try std.testing.expect(manager.unbanIP(addr1));
     try std.testing.expect(!manager.isIPBanned(addr1));
+}
+
+// ============================================================================
+// Eclipse Attack Protection Tests
+// ============================================================================
+
+test "eclipse protection: netGroup returns /16 for IPv4" {
+    // 192.168.1.1 should have netgroup (192 << 8) | 168 = 49320
+    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+    const group1 = netGroup(addr1);
+    const expected1: u32 = (192 << 8) | 168;
+    try std.testing.expectEqual(expected1, group1);
+
+    // 192.168.2.2 should have same netgroup (same /16)
+    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 2, 2 }, 8333);
+    const group2 = netGroup(addr2);
+    try std.testing.expectEqual(group1, group2);
+
+    // 10.0.0.1 should have different netgroup
+    const addr3 = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 8333);
+    const group3 = netGroup(addr3);
+    const expected3: u32 = (10 << 8) | 0;
+    try std.testing.expectEqual(expected3, group3);
+    try std.testing.expect(group1 != group3);
+}
+
+test "eclipse protection: sameNetGroup compares correctly" {
+    // Same /16 subnet
+    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 255, 255 }, 8333);
+    try std.testing.expect(sameNetGroup(addr1, addr2));
+
+    // Different /16 subnet
+    const addr3 = std.net.Address.initIp4([4]u8{ 192, 169, 1, 1 }, 8333);
+    try std.testing.expect(!sameNetGroup(addr1, addr3));
+}
+
+test "eclipse protection: netgroup diversity tracking" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    // Initially no netgroups tracked
+    try std.testing.expectEqual(@as(usize, 0), manager.outbound_netgroups.count());
+
+    // Add an address from 192.168.x.x
+    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+    manager.outbound_netgroups.put(netGroup(addr1), {}) catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), manager.outbound_netgroups.count());
+
+    // Same netgroup should violate diversity
+    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 2, 2 }, 8333);
+    try std.testing.expect(manager.violatesNetgroupDiversity(addr2));
+
+    // Different netgroup should not violate
+    const addr3 = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 8333);
+    try std.testing.expect(!manager.violatesNetgroupDiversity(addr3));
+}
+
+test "eclipse protection: eviction candidate building" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    // Create mock peers
+    var peers: [3]*Peer = undefined;
+    var buffers: [3]std.ArrayList(u8) = undefined;
+    for (0..3) |i| {
+        buffers[i] = std.ArrayList(u8).init(allocator);
+        peers[i] = allocator.create(Peer) catch unreachable;
+        peers[i].* = .{
+            .stream = undefined,
+            .address = std.net.Address.initIp4([4]u8{ 192, 168, @intCast(i), 1 }, 8333),
+            .state = .handshake_complete,
+            .direction = if (i == 0) .outbound else .inbound,
+            .version_info = null,
+            .services = p2p.NODE_NETWORK,
+            .last_ping_time = 0,
+            .last_pong_time = 0,
+            .last_ping_nonce = 0,
+            .last_message_time = 1000,
+            .bytes_sent = 0,
+            .bytes_received = 0,
+            .start_height = 0,
+            .network_params = params,
+            .allocator = allocator,
+            .recv_buffer = buffers[i],
+            .is_witness_capable = true,
+            .is_headers_first = false,
+            .ban_score = 0,
+            .should_ban = false,
+            .conn_type = if (i == 0) .outbound_full_relay else .inbound,
+            .last_block_time = @as(i64, @intCast(i)) * 100,
+            .last_tx_time = @as(i64, @intCast(i)) * 50,
+            .min_ping_time = @as(i64, @intCast(3 - i)) * 10,
+            .relay_txs = true,
+            .is_protected = false,
+            .connect_time = @as(i64, @intCast(i)) * 200,
+        };
+    }
+    defer {
+        for (0..3) |i| {
+            buffers[i].deinit();
+            allocator.destroy(peers[i]);
+        }
+    }
+
+    const candidates = try buildEvictionCandidates(&peers, allocator);
+    defer allocator.free(candidates);
+
+    // Should only include inbound peers (2 of 3)
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+
+    // Verify candidates are inbound only
+    for (candidates) |c| {
+        try std.testing.expect(peers[c.peer_index].direction == .inbound);
+    }
+}
+
+test "eclipse protection: eviction algorithm protects by categories" {
+    const allocator = std.testing.allocator;
+
+    // Create a set of candidates with different characteristics
+    var candidates = [_]EvictionCandidate{
+        // Fast ping (should be protected)
+        .{ .peer_index = 0, .net_group = 1, .min_ping_time = 10, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1000, .relay_txs = true, .is_protected = false },
+        // Recent tx (should be protected)
+        .{ .peer_index = 1, .net_group = 2, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 900, .connect_time = 500, .relay_txs = true, .is_protected = false },
+        // Recent block (should be protected)
+        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 100, .last_block_time = 800, .last_tx_time = 0, .connect_time = 600, .relay_txs = true, .is_protected = false },
+        // Long connection (should be protected)
+        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 0, .connect_time = 100, .relay_txs = true, .is_protected = false },
+        // Distinct netgroup (should be protected)
+        .{ .peer_index = 4, .net_group = 5, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 0, .connect_time = 700, .relay_txs = true, .is_protected = false },
+        // Unprotected - same netgroup as another, no special characteristics
+        .{ .peer_index = 5, .net_group = 1, .min_ping_time = 200, .last_block_time = 0, .last_tx_time = 0, .connect_time = 800, .relay_txs = true, .is_protected = false },
+        // Another unprotected - same netgroup
+        .{ .peer_index = 6, .net_group = 1, .min_ping_time = 300, .last_block_time = 0, .last_tx_time = 0, .connect_time = 900, .relay_txs = true, .is_protected = false },
+    };
+
+    const victim = selectEvictionCandidate(&candidates, allocator);
+
+    // Should select a victim (the algorithm will pick from netgroup 1 which has most connections)
+    try std.testing.expect(victim != null);
+    // The victim should be from netgroup 1 (most connections)
+    if (victim) |v| {
+        try std.testing.expect(v == 5 or v == 6); // One of the unprotected peers in netgroup 1
+    }
+}
+
+test "eclipse protection: eviction returns null when all protected" {
+    const allocator = std.testing.allocator;
+
+    // Create candidates that will all be protected
+    // 4 distinct netgroups, each with unique characteristics
+    var candidates = [_]EvictionCandidate{
+        .{ .peer_index = 0, .net_group = 1, .min_ping_time = 10, .last_block_time = 100, .last_tx_time = 100, .connect_time = 100, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 1, .net_group = 2, .min_ping_time = 20, .last_block_time = 200, .last_tx_time = 200, .connect_time = 200, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 30, .last_block_time = 300, .last_tx_time = 300, .connect_time = 300, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 40, .last_block_time = 400, .last_tx_time = 400, .connect_time = 400, .relay_txs = true, .is_protected = false },
+    };
+
+    // With only 4 candidates and protection for ping(4), tx(4), block(4), time(8), netgroup(4)
+    // all 4 should be protected
+    const victim = selectEvictionCandidate(&candidates, allocator);
+
+    // All protected, no victim
+    try std.testing.expect(victim == null);
+}
+
+test "eclipse protection: connection type enum" {
+    // Test all connection types are distinct
+    const types_arr = [_]ConnectionType{
+        .inbound,
+        .outbound_full_relay,
+        .block_relay,
+        .manual,
+        .feeler,
+        .addr_fetch,
+    };
+
+    for (types_arr, 0..) |t1, i| {
+        for (types_arr, 0..) |t2, j| {
+            if (i == j) {
+                try std.testing.expectEqual(t1, t2);
+            } else {
+                try std.testing.expect(t1 != t2);
+            }
+        }
+    }
+}
+
+test "eclipse protection: eclipse constants match Bitcoin Core" {
+    // Verify protection limits match Bitcoin Core defaults
+    try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_PING);
+    try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_TX);
+    try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_BLOCK);
+    try std.testing.expectEqual(@as(usize, 8), EVICTION_PROTECT_TIME);
+    try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_NETGROUP);
+    try std.testing.expectEqual(@as(usize, 2), MAX_BLOCK_RELAY_ONLY_ANCHORS);
 }
