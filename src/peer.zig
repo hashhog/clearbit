@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const p2p = @import("p2p.zig");
 const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
+const banlist = @import("banlist.zig");
 
 // ============================================================================
 // Peer Manager Constants
@@ -97,6 +98,7 @@ pub const Peer = struct {
     is_witness_capable: bool,
     is_headers_first: bool,
     ban_score: u32,
+    should_ban: bool,
 
     /// Connect to a remote peer.
     pub fn connect(
@@ -142,6 +144,7 @@ pub const Peer = struct {
             .is_witness_capable = false,
             .is_headers_first = false,
             .ban_score = 0,
+            .should_ban = false,
         };
     }
 
@@ -172,6 +175,7 @@ pub const Peer = struct {
             .is_witness_capable = false,
             .is_headers_first = false,
             .ban_score = 0,
+            .should_ban = false,
         };
     }
 
@@ -401,7 +405,26 @@ pub const Peer = struct {
     /// Add to ban score; return true if peer should be banned (score >= 100).
     pub fn addBanScore(self: *Peer, score: u32) bool {
         self.ban_score += score;
-        return self.ban_score >= 100;
+        if (self.ban_score >= 100) {
+            self.should_ban = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// Record misbehavior with a reason. Adds to ban score and logs. If score >= 100, marks for ban.
+    pub fn misbehaving(self: *Peer, howmuch: u32, message: []const u8) void {
+        self.ban_score += howmuch;
+        if (self.ban_score >= 100) {
+            self.should_ban = true;
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = self.getAddressString(&addr_buf);
+            std.log.warn("Misbehaving: peer={s} score={d}: {s}", .{ addr_str, self.ban_score, message });
+        } else {
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = self.getAddressString(&addr_buf);
+            std.log.info("Misbehaving: peer={s} score={d}: {s}", .{ addr_str, self.ban_score, message });
+        }
     }
 
     /// Get the latency in milliseconds based on last ping/pong.
@@ -456,7 +479,7 @@ pub const AddressInfo = struct {
 pub const PeerManager = struct {
     peers: std.ArrayList(*Peer),
     known_addresses: std.AutoHashMap(u64, AddressInfo),
-    banned_ips: std.AutoHashMap(u32, i64), // IP (as u32) -> ban expiry timestamp
+    ban_list: banlist.BanList,
     listener: ?std.net.Server,
     network_params: *const consensus.NetworkParams,
     allocator: std.mem.Allocator,
@@ -471,7 +494,7 @@ pub const PeerManager = struct {
         return .{
             .peers = std.ArrayList(*Peer).init(allocator),
             .known_addresses = std.AutoHashMap(u64, AddressInfo).init(allocator),
-            .banned_ips = std.AutoHashMap(u32, i64).init(allocator),
+            .ban_list = banlist.BanList.init(allocator, "banlist.json"),
             .listener = null,
             .network_params = params,
             .allocator = allocator,
@@ -482,14 +505,26 @@ pub const PeerManager = struct {
     }
 
     pub fn deinit(self: *PeerManager) void {
+        // Save ban list before shutdown
+        self.ban_list.save() catch {};
         for (self.peers.items) |peer| {
             peer.disconnect();
             self.allocator.destroy(peer);
         }
         self.peers.deinit();
         self.known_addresses.deinit();
-        self.banned_ips.deinit();
+        self.ban_list.deinit();
         if (self.listener) |*l| l.deinit();
+    }
+
+    /// Load ban list from disk.
+    pub fn loadBanList(self: *PeerManager) !void {
+        try self.ban_list.load();
+    }
+
+    /// Save ban list to disk.
+    pub fn saveBanList(self: *PeerManager) !void {
+        try self.ban_list.save();
     }
 
     /// Hash an address for use as a map key.
@@ -529,6 +564,18 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Extract IPv4 bytes for ban tracking.
+    pub fn ipv4AsBytes(address: std.net.Address) ?[4]u8 {
+        switch (address.any.family) {
+            std.posix.AF.INET => {
+                const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+                const ip_bytes = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                return ip_bytes.*;
+            },
+            else => return null,
+        }
+    }
+
     /// Perform DNS seed resolution to discover initial peers.
     pub fn dnsSeeds(self: *PeerManager) !void {
         for (self.network_params.dns_seeds) |seed| {
@@ -553,13 +600,7 @@ pub const PeerManager = struct {
         if (self.known_addresses.contains(key)) return;
 
         // Check if IP is banned
-        if (ipv4AsU32(address)) |ip| {
-            if (self.banned_ips.get(ip)) |expiry| {
-                if (std.time.timestamp() < expiry) return;
-                // Ban expired, remove it
-                _ = self.banned_ips.remove(ip);
-            }
-        }
+        if (self.ban_list.isAddressBanned(address)) return;
 
         try self.known_addresses.put(key, AddressInfo{
             .address = address,
@@ -598,11 +639,7 @@ pub const PeerManager = struct {
             if (info.last_tried > 0 and now - info.last_tried < MIN_RECONNECT_INTERVAL) continue;
 
             // Skip banned IPs
-            if (ipv4AsU32(info.address)) |ip| {
-                if (self.banned_ips.get(ip)) |expiry| {
-                    if (now < expiry) continue;
-                }
-            }
+            if (self.ban_list.isAddressBanned(info.address)) continue;
 
             // Prefer addresses with fewer attempts
             if (best == null or info.attempts < best.?.attempts) {
@@ -630,11 +667,24 @@ pub const PeerManager = struct {
         });
     }
 
-    /// Ban an IP address.
-    pub fn banIP(self: *PeerManager, address: std.net.Address, duration: i64) !void {
-        if (ipv4AsU32(address)) |ip| {
-            try self.banned_ips.put(ip, std.time.timestamp() + duration);
-        }
+    /// Ban an IP address with a reason.
+    pub fn banIP(self: *PeerManager, address: std.net.Address, duration: i64, reason: []const u8) !void {
+        try self.ban_list.banAddress(address, duration, reason);
+    }
+
+    /// Unban an IP address.
+    pub fn unbanIP(self: *PeerManager, address: std.net.Address) bool {
+        return self.ban_list.unbanAddress(address);
+    }
+
+    /// Check if an IP is banned.
+    pub fn isIPBanned(self: *PeerManager, address: std.net.Address) bool {
+        return self.ban_list.isAddressBanned(address);
+    }
+
+    /// Get the ban list for RPC.
+    pub fn getBanList(self: *PeerManager) *banlist.BanList {
+        return &self.ban_list;
     }
 
     /// Connect to peers until we have MAX_OUTBOUND_CONNECTIONS outbound.
@@ -691,13 +741,9 @@ pub const PeerManager = struct {
         }
 
         // Check if IP is banned
-        if (ipv4AsU32(conn.address)) |ip| {
-            if (self.banned_ips.get(ip)) |expiry| {
-                if (std.time.timestamp() < expiry) {
-                    conn.stream.close();
-                    return;
-                }
-            }
+        if (self.ban_list.isAddressBanned(conn.address)) {
+            conn.stream.close();
+            return;
         }
 
         const peer = try self.allocator.create(Peer);
@@ -715,21 +761,44 @@ pub const PeerManager = struct {
         var i: usize = 0;
         while (i < self.peers.items.len) {
             const peer = self.peers.items[i];
+
+            // Check if peer should be banned from previous misbehavior
+            if (peer.should_ban) {
+                self.banIP(peer.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                self.removePeerByIndex(i);
+                continue;
+            }
+
             const msg = peer.receiveMessage() catch |err| {
                 switch (err) {
                     PeerError.ConnectionClosed, PeerError.Timeout => {
                         self.removePeerByIndex(i);
                         continue;
                     },
+                    PeerError.BadMagic => {
+                        peer.misbehaving(100, "invalid network magic");
+                    },
+                    PeerError.BadChecksum => {
+                        peer.misbehaving(50, "bad message checksum");
+                    },
+                    PeerError.MessageTooLarge => {
+                        peer.misbehaving(50, "oversized message");
+                    },
+                    PeerError.ProtocolViolation => {
+                        peer.misbehaving(20, "protocol violation");
+                    },
                     else => {
-                        if (peer.addBanScore(10)) {
-                            // Ban and remove
-                            self.banIP(peer.address, DEFAULT_BAN_DURATION) catch {};
-                            self.removePeerByIndex(i);
-                            continue;
-                        }
+                        peer.misbehaving(10, "message receive error");
                     },
                 }
+
+                // Check if should be banned after misbehavior
+                if (peer.should_ban) {
+                    self.banIP(peer.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                    self.removePeerByIndex(i);
+                    continue;
+                }
+
                 i += 1;
                 continue;
             };
@@ -1034,6 +1103,7 @@ test "peer struct initialization with default values" {
         .is_witness_capable = false,
         .is_headers_first = false,
         .ban_score = 0,
+        .should_ban = false,
     };
 
     try std.testing.expectEqual(PeerState.connecting, dummy_peer.state);
@@ -1129,6 +1199,7 @@ test "ban score accumulation" {
         .is_witness_capable = false,
         .is_headers_first = false,
         .ban_score = 0,
+        .should_ban = false,
     };
 
     // Initial score is 0
@@ -1181,6 +1252,7 @@ test "peer timeout detection" {
         .is_witness_capable = true,
         .is_headers_first = false,
         .ban_score = 0,
+        .should_ban = false,
     };
 
     try std.testing.expect(!active_peer.isTimedOut());
@@ -1231,6 +1303,7 @@ test "peer ready check" {
         .is_witness_capable = false,
         .is_headers_first = false,
         .ban_score = 0,
+        .should_ban = false,
     };
 
     // Connecting state - not ready
@@ -1280,6 +1353,7 @@ test "handle pong message" {
         .is_witness_capable = false,
         .is_headers_first = false,
         .ban_score = 0,
+        .should_ban = false,
     };
 
     // Wrong nonce - should not update pong time
@@ -1318,6 +1392,7 @@ test "peer latency calculation" {
         .is_witness_capable = false,
         .is_headers_first = false,
         .ban_score = 0,
+        .should_ban = false,
     };
 
     // No ping/pong yet - no latency
@@ -1471,7 +1546,7 @@ test "peer manager ban ip" {
     try std.testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
 
     // Ban the IP
-    try manager.banIP(addr, DEFAULT_BAN_DURATION);
+    try manager.banIP(addr, DEFAULT_BAN_DURATION, "test ban");
 
     // Adding a new address with same IP should be rejected
     const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 100 }, 18333); // Same IP, different port
@@ -1539,4 +1614,161 @@ test "peer manager running state" {
 
     manager.stop();
     try std.testing.expect(!manager.running.load(.acquire));
+}
+
+// ============================================================================
+// Misbehavior Scoring Tests
+// ============================================================================
+
+test "misbehaving function increments score and sets should_ban" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var recv_buffer = std.ArrayList(u8).init(allocator);
+    defer recv_buffer.deinit();
+
+    var peer = Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333),
+        .state = .handshake_complete,
+        .direction = .outbound,
+        .version_info = null,
+        .services = p2p.NODE_NETWORK,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = std.time.timestamp(),
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = params,
+        .allocator = allocator,
+        .recv_buffer = recv_buffer,
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+    };
+
+    // Initially not marked for ban
+    try std.testing.expect(!peer.should_ban);
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
+
+    // Add misbehavior with 50 points
+    peer.misbehaving(50, "test misbehavior");
+    try std.testing.expectEqual(@as(u32, 50), peer.ban_score);
+    try std.testing.expect(!peer.should_ban);
+
+    // Add another 50 points - now at 100, should be banned
+    peer.misbehaving(50, "second misbehavior");
+    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    try std.testing.expect(peer.should_ban);
+}
+
+test "misbehaving with 100 points immediately bans" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var recv_buffer = std.ArrayList(u8).init(allocator);
+    defer recv_buffer.deinit();
+
+    var peer = Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4([4]u8{ 10, 0, 0, 5 }, 8333),
+        .state = .handshake_complete,
+        .direction = .inbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = std.time.timestamp(),
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = params,
+        .allocator = allocator,
+        .recv_buffer = recv_buffer,
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+    };
+
+    // Invalid block header = 100 points = immediate ban
+    peer.misbehaving(100, "invalid block header");
+    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    try std.testing.expect(peer.should_ban);
+}
+
+test "addBanScore sets should_ban at threshold" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var recv_buffer = std.ArrayList(u8).init(allocator);
+    defer recv_buffer.deinit();
+
+    var peer = Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4([4]u8{ 172, 16, 0, 1 }, 8333),
+        .state = .connected,
+        .direction = .outbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = params,
+        .allocator = allocator,
+        .recv_buffer = recv_buffer,
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+    };
+
+    // Add 99 points - not banned yet
+    try std.testing.expect(!peer.addBanScore(99));
+    try std.testing.expect(!peer.should_ban);
+
+    // Add 1 more - now banned
+    try std.testing.expect(peer.addBanScore(1));
+    try std.testing.expect(peer.should_ban);
+}
+
+test "peer manager ban integration" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 50, 1 }, 8333);
+    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 50, 2 }, 8333);
+
+    // Add addresses
+    try manager.addAddress(addr1, p2p.NODE_NETWORK, .dns_seed);
+    try manager.addAddress(addr2, p2p.NODE_NETWORK, .dns_seed);
+    try std.testing.expectEqual(@as(usize, 2), manager.knownAddressCount());
+
+    // Ban addr1
+    try manager.banIP(addr1, DEFAULT_BAN_DURATION, "protocol violation");
+
+    // Verify addr1 is banned
+    try std.testing.expect(manager.isIPBanned(addr1));
+    try std.testing.expect(!manager.isIPBanned(addr2));
+
+    // Can't add same IP again
+    const addr1_different_port = std.net.Address.initIp4([4]u8{ 192, 168, 50, 1 }, 9999);
+    try manager.addAddress(addr1_different_port, p2p.NODE_NETWORK, .manual);
+    // Count should still be 2
+    try std.testing.expectEqual(@as(usize, 2), manager.knownAddressCount());
+
+    // Unban addr1
+    try std.testing.expect(manager.unbanIP(addr1));
+    try std.testing.expect(!manager.isIPBanned(addr1));
 }
