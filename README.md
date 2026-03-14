@@ -40,6 +40,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] CLI and application entry point (argument parsing, config files, signal handling)
 - [x] Performance optimization (arena allocators, SIMD, comptime tables, UTXO cache)
 - [x] Benchmarking suite (SHA256, merkle root, UTXO cache, block deserialization)
+- [x] Misbehavior scoring and peer banning (per-peer score, 100pt threshold, ban list persistence)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -75,7 +76,8 @@ src/
   storage.zig        # RocksDB storage layer, UTXO set, chain state
   validation.zig     # block and transaction validation
   p2p.zig            # P2P protocol message serialization
-  peer.zig           # TCP peer connections and handshake
+  peer.zig           # TCP peer connections, handshake, misbehavior scoring
+  banlist.zig        # ban list management with JSON persistence
   sync.zig           # header sync, block download, IBD, anti-DoS
   mempool.zig        # transaction memory pool with RBF and fee estimation
   block_template.zig # block template construction for mining
