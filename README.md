@@ -44,6 +44,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Eclipse attack protections (netgroup diversity, anchor connections, inbound eviction)
 - [x] Checkpoint verification (comptime checkpoints, binary search lookup, fork rejection)
 - [x] Flat file block storage (blk*.dat files, 128 MiB max, pre-allocation, RocksDB index)
+- [x] UTXO cache layer (CoinsViewCache, FRESH/DIRTY optimization, batch flush)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
