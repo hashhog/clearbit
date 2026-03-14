@@ -54,6 +54,10 @@ pub const ValidationError = error{
     SequenceLockNotSatisfied,
     TooManySigops,
 
+    // Checkpoint errors
+    CheckpointMismatch,
+    ForkBelowCheckpoint,
+
     // General errors
     OutOfMemory,
 };
@@ -304,6 +308,78 @@ pub fn checkBlockHeader(
 
     // Note: Timestamp validation (not too far in the future) requires current time
     // which should be passed as a parameter in production use.
+}
+
+// ============================================================================
+// Checkpoint Verification
+// ============================================================================
+
+/// Verify that a block passes checkpoint validation.
+/// This function should be called during header validation to ensure:
+/// 1. If a checkpoint exists at this height, the block hash must match exactly.
+/// 2. No forks are allowed at or below the last checkpoint height (unless they
+///    match the checkpoint).
+///
+/// This prevents long-range attacks during IBD where an attacker could try to
+/// feed the node an alternative chain.
+pub fn verifyCheckpoint(
+    header: *const types.BlockHeader,
+    height: u32,
+    network: consensus.Network,
+) ValidationError!void {
+    const checkpoints = consensus.getCheckpointsRuntime(network);
+
+    // Compute the block hash
+    const block_hash = crypto.computeBlockHash(header);
+
+    // Check if there's a checkpoint at this height
+    if (consensus.getCheckpointAtHeight(checkpoints, height)) |checkpoint| {
+        // Checkpoint exists - hash must match exactly
+        if (!std.mem.eql(u8, &block_hash, &checkpoint.hash)) {
+            return ValidationError.CheckpointMismatch;
+        }
+    }
+}
+
+/// Validate that a header does not fork below the last checkpoint.
+/// This should be called when accepting a new header to ensure we don't
+/// build on a chain that diverges from known checkpoints.
+///
+/// Parameters:
+///   - height: Height of the block we're validating
+///   - network: Which network we're on
+///   - ancestor_checker: A function/context to verify that the block at a
+///                       checkpoint height in our chain matches the checkpoint hash.
+///                       Returns true if the ancestor at checkpoint.height has
+///                       checkpoint.hash, false otherwise.
+///
+/// Returns error if:
+///   - The chain forks from the checkpointed chain at any checkpoint height
+pub fn verifyChainAgainstCheckpoints(
+    height: u32,
+    network: consensus.Network,
+    ancestor_checker: *const fn (height: u32, expected_hash: *const types.Hash256) bool,
+) ValidationError!void {
+    const checkpoints = consensus.getCheckpointsRuntime(network);
+
+    // For each checkpoint at or below our height, verify our ancestor matches
+    for (checkpoints) |checkpoint| {
+        if (checkpoint.height <= height) {
+            if (!ancestor_checker(checkpoint.height, &checkpoint.hash)) {
+                return ValidationError.ForkBelowCheckpoint;
+            }
+        }
+    }
+}
+
+/// Check if we should reject a header because it forks before a checkpoint.
+/// During IBD, we should only accept headers that are on the checkpointed chain.
+///
+/// This is a simpler version of verifyChainAgainstCheckpoints that just checks
+/// if the block's height is at or below the last checkpoint - if so, we need
+/// to verify checkpoint matching elsewhere.
+pub fn requiresCheckpointValidation(height: u32, network: consensus.Network) bool {
+    return consensus.isBelowLastCheckpoint(network, height);
 }
 
 // ============================================================================
@@ -1848,4 +1924,141 @@ test "MAX_BLOCK_SIGOPS_COST is 80000" {
 
 test "WITNESS_SCALE_FACTOR is 4" {
     try std.testing.expectEqual(@as(u32, 4), consensus.WITNESS_SCALE_FACTOR);
+}
+
+// ============================================================================
+// Checkpoint Verification Tests
+// ============================================================================
+
+test "verifyCheckpoint passes for genesis block" {
+    // Genesis block should pass checkpoint verification (no checkpoint at height 0)
+    const genesis = consensus.MAINNET.genesis_header;
+    try verifyCheckpoint(&genesis, 0, .mainnet);
+}
+
+test "verifyCheckpoint fails for mismatched checkpoint" {
+    // Create a fake header at checkpoint height 11111
+    var fake_header = types.BlockHeader{
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 0,
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+
+    // This should fail because the hash won't match the checkpoint
+    const result = verifyCheckpoint(&fake_header, 11111, .mainnet);
+    try std.testing.expectError(ValidationError.CheckpointMismatch, result);
+}
+
+test "verifyCheckpoint passes for non-checkpoint height" {
+    // At a height where there's no checkpoint, any valid header should pass
+    var header = types.BlockHeader{
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 0,
+        .bits = 0x1d00ffff,
+        .nonce = 12345,
+    };
+
+    // Height 12345 has no checkpoint, so this should pass
+    try verifyCheckpoint(&header, 12345, .mainnet);
+}
+
+test "getCheckpointAtHeight returns correct checkpoint" {
+    const checkpoints = consensus.MAINNET_CHECKPOINTS;
+
+    // Should find checkpoint at height 11111
+    const cp = consensus.getCheckpointAtHeight(checkpoints, 11111);
+    try std.testing.expect(cp != null);
+    try std.testing.expectEqual(@as(u32, 11111), cp.?.height);
+
+    // Should find checkpoint at height 210000
+    const cp2 = consensus.getCheckpointAtHeight(checkpoints, 210000);
+    try std.testing.expect(cp2 != null);
+    try std.testing.expectEqual(@as(u32, 210000), cp2.?.height);
+
+    // Should not find checkpoint at height 99999
+    const cp3 = consensus.getCheckpointAtHeight(checkpoints, 99999);
+    try std.testing.expect(cp3 == null);
+}
+
+test "getLastCheckpointHeight returns highest checkpoint" {
+    const last = consensus.getLastCheckpointHeight(.mainnet);
+    try std.testing.expect(last != null);
+    // Mainnet has checkpoint at 295000 as the last one
+    try std.testing.expectEqual(@as(u32, 295000), last.?);
+}
+
+test "getLastCheckpointHeight returns null for regtest" {
+    const last = consensus.getLastCheckpointHeight(.regtest);
+    try std.testing.expect(last == null);
+}
+
+test "isBelowLastCheckpoint correctly identifies heights" {
+    // Height below last checkpoint
+    try std.testing.expect(consensus.isBelowLastCheckpoint(.mainnet, 100000));
+
+    // Height at last checkpoint
+    try std.testing.expect(consensus.isBelowLastCheckpoint(.mainnet, 295000));
+
+    // Height above last checkpoint
+    try std.testing.expect(!consensus.isBelowLastCheckpoint(.mainnet, 500000));
+
+    // Regtest has no checkpoints, so nothing is "below" them
+    try std.testing.expect(!consensus.isBelowLastCheckpoint(.regtest, 0));
+}
+
+test "requiresCheckpointValidation returns true for heights at or below checkpoint" {
+    // Height 0 is below the last checkpoint on mainnet
+    try std.testing.expect(requiresCheckpointValidation(0, .mainnet));
+
+    // Height 295000 is at the last checkpoint
+    try std.testing.expect(requiresCheckpointValidation(295000, .mainnet));
+
+    // Height 500000 is above all checkpoints
+    try std.testing.expect(!requiresCheckpointValidation(500000, .mainnet));
+
+    // Regtest has no checkpoints
+    try std.testing.expect(!requiresCheckpointValidation(0, .regtest));
+}
+
+test "verifyChainAgainstCheckpoints rejects fork below checkpoint" {
+    // Simulate a chain that diverges at height 11111
+    const ancestor_checker = struct {
+        fn check(height: u32, expected_hash: *const types.Hash256) bool {
+            _ = expected_hash;
+            // Pretend all checkpoints match except 11111
+            return height != 11111;
+        }
+    }.check;
+
+    // Should fail because the ancestor at 11111 doesn't match
+    const result = verifyChainAgainstCheckpoints(100000, .mainnet, &ancestor_checker);
+    try std.testing.expectError(ValidationError.ForkBelowCheckpoint, result);
+}
+
+test "verifyChainAgainstCheckpoints passes when all ancestors match" {
+    // Simulate a chain where all checkpoints match
+    const ancestor_checker = struct {
+        fn check(_: u32, _: *const types.Hash256) bool {
+            return true;
+        }
+    }.check;
+
+    // Should pass
+    try verifyChainAgainstCheckpoints(100000, .mainnet, &ancestor_checker);
+}
+
+test "mainnet has at least 5 checkpoints" {
+    try std.testing.expect(consensus.MAINNET_CHECKPOINTS.len >= 5);
+}
+
+test "checkpoints are sorted by height" {
+    const checkpoints = consensus.MAINNET_CHECKPOINTS;
+    for (0..checkpoints.len - 1) |i| {
+        try std.testing.expect(checkpoints[i].height < checkpoints[i + 1].height);
+    }
 }
