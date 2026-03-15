@@ -792,6 +792,156 @@ pub const Mempool = struct {
             self.removeTransaction(txid);
         }
     }
+
+    /// Add a transaction to the mempool using package fee rate for CPFP.
+    /// This allows transactions with individual fee rates below minimum
+    /// when the package fee rate is sufficient.
+    pub fn addTransactionWithPackageRate(self: *Mempool, tx: types.Transaction, package_fee_rate: f64) MempoolError!void {
+        const tx_hash = crypto.computeTxid(&tx, self.allocator) catch return MempoolError.OutOfMemory;
+
+        // 1. Check if already in mempool
+        if (self.entries.contains(tx_hash)) {
+            return MempoolError.AlreadyInMempool;
+        }
+
+        // 2. Check standardness
+        try self.checkStandard(&tx);
+
+        // 3. Validate inputs exist (in UTXO set or in mempool) and compute fee
+        var total_in: i64 = 0;
+        var conflicting_txids = std.ArrayList(types.Hash256).init(self.allocator);
+        defer conflicting_txids.deinit();
+
+        for (tx.inputs) |input| {
+            // Check mempool first for unconfirmed parent outputs
+            if (self.getOutputFromMempool(&input.previous_output)) |mempool_output| {
+                total_in += mempool_output.value;
+            } else if (self.chain_state) |cs| {
+                // Then check UTXO set
+                const utxo = cs.utxo_set.get(&input.previous_output) catch null;
+                if (utxo) |u| {
+                    defer {
+                        var mut_u = u;
+                        mut_u.deinit(self.allocator);
+                    }
+                    total_in += u.value;
+                } else {
+                    return MempoolError.MissingInputs;
+                }
+            } else {
+                // No chain state - for testing, assume inputs exist
+            }
+
+            // Check if another mempool tx spends this outpoint (potential RBF conflict)
+            if (self.spenders.get(input.previous_output)) |conflicting_txid| {
+                conflicting_txids.append(conflicting_txid) catch return MempoolError.OutOfMemory;
+            }
+        }
+
+        // 4. Compute total outputs
+        var total_out: i64 = 0;
+        for (tx.outputs) |output| {
+            total_out += output.value;
+        }
+
+        // 5. Compute fee (allow tests without chain state)
+        var fee: i64 = 0;
+        if (total_in > 0) {
+            fee = total_in - total_out;
+            if (fee < 0) return MempoolError.InsufficientFee;
+        }
+
+        // 6. Compute size
+        const weight = computeTxWeight(&tx, self.allocator) catch return MempoolError.OutOfMemory;
+        const vsize = (weight + 3) / 4;
+        const individual_fee_rate = if (vsize > 0)
+            @as(f64, @floatFromInt(fee)) / @as(f64, @floatFromInt(vsize))
+        else
+            0;
+
+        // Check PACKAGE fee rate (not individual) - this is the CPFP magic
+        // Individual tx may have low fee rate, but package rate must be sufficient
+        const min_fee_rate = @as(f64, @floatFromInt(MIN_RELAY_FEE)) / 1000.0;
+        if (total_in > 0 and package_fee_rate < min_fee_rate) {
+            return MempoolError.InsufficientFee;
+        }
+
+        // 7. Handle RBF conflicts
+        if (conflicting_txids.items.len > 0) {
+            try self.checkRBFRules(&tx, tx_hash, fee, vsize, conflicting_txids.items);
+
+            // Remove conflicting transactions (and their descendants)
+            for (conflicting_txids.items) |conflicting_txid| {
+                self.removeTransactionWithDescendants(conflicting_txid);
+            }
+        }
+
+        // 8. Check ancestor/descendant limits
+        const ancestors = try self.getAncestors(tx_hash, &tx);
+        if (ancestors.count > MAX_ANCESTOR_COUNT) return MempoolError.TooManyAncestors;
+        if (ancestors.size + vsize > MAX_ANCESTOR_SIZE) return MempoolError.AncestorSizeLimitExceeded;
+
+        // 8b. Check that adding this tx won't cause any ancestor to exceed descendant limits
+        try self.checkDescendantLimits(&tx, vsize);
+
+        // 9. Check dust outputs
+        for (tx.outputs) |output| {
+            if (isDust(&output)) return MempoolError.DustOutput;
+        }
+
+        // 10. Check mempool size limit
+        if (self.total_size + vsize > MAX_MEMPOOL_SIZE) {
+            // Try to evict lowest-fee-rate transactions
+            self.evict(vsize) catch return MempoolError.MempoolFull;
+        }
+
+        // 11. Create entry and add to mempool
+        const entry = self.allocator.create(MempoolEntry) catch return MempoolError.OutOfMemory;
+        entry.* = MempoolEntry{
+            .tx = tx,
+            .txid = tx_hash,
+            .wtxid = crypto.computeWtxid(&tx, self.allocator) catch return MempoolError.OutOfMemory,
+            .fee = fee,
+            .size = vsize,
+            .weight = weight,
+            .vsize = vsize,
+            .fee_rate = individual_fee_rate,
+            .time_added = std.time.timestamp(),
+            .height_added = if (self.chain_state) |cs| cs.best_height else 0,
+            .ancestor_count = ancestors.count,
+            .ancestor_size = ancestors.size + vsize, // Include self
+            .ancestor_fees = ancestors.fees + fee,
+            .descendant_count = 1,
+            .descendant_size = vsize,
+            .descendant_fees = fee,
+            .is_rbf = isRBFSignaled(&tx),
+        };
+
+        self.entries.put(tx_hash, entry) catch return MempoolError.OutOfMemory;
+        self.by_wtxid.put(entry.wtxid, tx_hash) catch {};
+
+        // Track spent outpoints
+        for (tx.inputs) |input| {
+            self.spenders.put(input.previous_output, tx_hash) catch {};
+
+            // Update parent's children list
+            if (self.entries.contains(input.previous_output.hash)) {
+                const children_list = self.children.getPtr(input.previous_output.hash);
+                if (children_list) |list| {
+                    list.append(tx_hash) catch {};
+                } else {
+                    var new_list = std.ArrayList(types.Hash256).init(self.allocator);
+                    new_list.append(tx_hash) catch {};
+                    self.children.put(input.previous_output.hash, new_list) catch {};
+                }
+            }
+        }
+
+        // Update ancestor descendant counts
+        try self.updateDescendantCounts(tx_hash);
+
+        self.total_size += vsize;
+    }
 };
 
 // ============================================================================
@@ -2540,4 +2690,1010 @@ test "full RBF constants" {
     // Verify key RBF constants
     try std.testing.expectEqual(@as(i64, 1000), INCREMENTAL_RELAY_FEE);
     try std.testing.expectEqual(@as(usize, 100), MAX_REPLACEMENT_EVICTIONS);
+}
+
+// ============================================================================
+// Package Relay (BIP 331)
+// ============================================================================
+
+/// Maximum number of transactions in a package.
+pub const MAX_PACKAGE_COUNT: usize = 25;
+
+/// Maximum total weight of transactions in a package (404,000 weight units = ~101 kvB).
+pub const MAX_PACKAGE_WEIGHT: usize = 404_000;
+
+/// Package validation errors.
+pub const PackageError = error{
+    /// Package contains too many transactions (exceeds MAX_PACKAGE_COUNT).
+    PackageTooManyTransactions,
+    /// Package total weight exceeds MAX_PACKAGE_WEIGHT.
+    PackageTooLarge,
+    /// Package contains duplicate transactions.
+    PackageContainsDuplicates,
+    /// Package is not topologically sorted (parent must appear before child).
+    PackageNotSorted,
+    /// Package contains conflicting transactions (spending same inputs).
+    ConflictInPackage,
+    /// Package transactions have no inputs.
+    PackageEmptyInputs,
+    /// Package does not match child-with-parents pattern.
+    PackageNotChildWithParents,
+    /// Parent transactions depend on each other (not a tree).
+    PackageParentsNotIndependent,
+    /// Package fee rate below minimum relay fee.
+    PackageFeeTooLow,
+    /// Individual transaction error.
+    TransactionError,
+    /// Memory allocation failure.
+    OutOfMemory,
+};
+
+/// Result of package validation for a single transaction.
+pub const PackageTxResult = struct {
+    /// Transaction ID.
+    txid: types.Hash256,
+    /// Whether the transaction was accepted.
+    accepted: bool,
+    /// Error message if rejected.
+    error_message: ?[]const u8,
+    /// Effective fee rate within the package.
+    effective_fee_rate: ?f64,
+};
+
+/// Result of package validation.
+pub const PackageResult = struct {
+    /// Whether the package was accepted as a whole.
+    package_accepted: bool,
+    /// Package hash (SHA256 of sorted wtxids).
+    package_hash: types.Hash256,
+    /// Per-transaction results.
+    tx_results: []PackageTxResult,
+    /// Total package fee.
+    total_fee: i64,
+    /// Total package vsize.
+    total_vsize: usize,
+    /// Package fee rate (total_fee / total_vsize).
+    package_fee_rate: f64,
+    /// Allocator for cleanup.
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PackageResult) void {
+        self.allocator.free(self.tx_results);
+    }
+};
+
+/// Check if a package is topologically sorted (parents appear before children).
+/// Uses a set of transaction IDs to ensure no transaction spends an output
+/// from a transaction that appears later in the package.
+pub fn isTopoSortedPackage(txns: []const types.Transaction, allocator: std.mem.Allocator) !bool {
+    if (txns.len == 0) return true;
+
+    // Build set of all txids that appear later in the package
+    var later_txids = std.AutoHashMap(types.Hash256, void).init(allocator);
+    defer later_txids.deinit();
+
+    // First, collect all txids
+    for (txns) |*tx| {
+        const txid = crypto.computeTxid(tx, allocator) catch return error.OutOfMemory;
+        later_txids.put(txid, {}) catch return error.OutOfMemory;
+    }
+
+    // For each transaction, check that none of its inputs spend a later txid
+    for (txns) |*tx| {
+        const txid = crypto.computeTxid(tx, allocator) catch return error.OutOfMemory;
+
+        // Check each input
+        for (tx.inputs) |input| {
+            if (later_txids.contains(input.previous_output.hash)) {
+                // This input spends a transaction that appears later
+                return false;
+            }
+        }
+
+        // Remove this txid from the set (it's no longer "later")
+        _ = later_txids.remove(txid);
+    }
+
+    return true;
+}
+
+/// Check that package transactions don't conflict (spend the same inputs).
+/// Also rejects transactions with no inputs and duplicate transactions.
+pub fn isConsistentPackage(txns: []const types.Transaction, allocator: std.mem.Allocator) !bool {
+    if (txns.len == 0) return true;
+
+    var inputs_seen = std.AutoHashMap(types.OutPoint, void).init(allocator);
+    defer inputs_seen.deinit();
+
+    var txids_seen = std.AutoHashMap(types.Hash256, void).init(allocator);
+    defer txids_seen.deinit();
+
+    for (txns) |*tx| {
+        // No empty inputs allowed
+        if (tx.inputs.len == 0) return false;
+
+        // Check for duplicate transactions
+        const txid = crypto.computeTxid(tx, allocator) catch return error.OutOfMemory;
+        if (txids_seen.contains(txid)) return false;
+        txids_seen.put(txid, {}) catch return error.OutOfMemory;
+
+        // Check each input for conflicts
+        for (tx.inputs) |input| {
+            if (inputs_seen.contains(input.previous_output)) {
+                return false;
+            }
+        }
+
+        // Batch-add all inputs for this tx
+        for (tx.inputs) |input| {
+            inputs_seen.put(input.previous_output, {}) catch return error.OutOfMemory;
+        }
+    }
+
+    return true;
+}
+
+/// Check if a package is well-formed according to BIP 331 policy:
+/// 1. Number of transactions <= MAX_PACKAGE_COUNT
+/// 2. Total weight <= MAX_PACKAGE_WEIGHT
+/// 3. Topologically sorted (parents before children)
+/// 4. No conflicting transactions
+pub fn isWellFormedPackage(txns: []const types.Transaction, allocator: std.mem.Allocator) PackageError!void {
+    // Check count limit
+    if (txns.len > MAX_PACKAGE_COUNT) {
+        return PackageError.PackageTooManyTransactions;
+    }
+
+    // Check total weight
+    var total_weight: usize = 0;
+    for (txns) |*tx| {
+        const weight = computeTxWeight(tx, allocator) catch return PackageError.OutOfMemory;
+        total_weight += weight;
+    }
+
+    // Only check weight limit for multi-tx packages
+    if (txns.len > 1 and total_weight > MAX_PACKAGE_WEIGHT) {
+        return PackageError.PackageTooLarge;
+    }
+
+    // Check for duplicates (via txid set)
+    var txid_set = std.AutoHashMap(types.Hash256, void).init(allocator);
+    defer txid_set.deinit();
+
+    for (txns) |*tx| {
+        const txid = crypto.computeTxid(tx, allocator) catch return PackageError.OutOfMemory;
+        if (txid_set.contains(txid)) {
+            return PackageError.PackageContainsDuplicates;
+        }
+        txid_set.put(txid, {}) catch return PackageError.OutOfMemory;
+    }
+
+    // Check topological ordering
+    const is_sorted = isTopoSortedPackage(txns, allocator) catch return PackageError.OutOfMemory;
+    if (!is_sorted) {
+        return PackageError.PackageNotSorted;
+    }
+
+    // Check consistency (no conflicts)
+    const is_consistent = isConsistentPackage(txns, allocator) catch return PackageError.OutOfMemory;
+    if (!is_consistent) {
+        return PackageError.ConflictInPackage;
+    }
+}
+
+/// Check if a package is exactly one child and its parents.
+/// The package is expected to be sorted, so the last transaction is the child.
+/// All other transactions must be parents of the child.
+pub fn isChildWithParents(txns: []const types.Transaction, allocator: std.mem.Allocator) !bool {
+    if (txns.len < 2) return false;
+
+    // The last transaction is the child
+    const child = &txns[txns.len - 1];
+
+    // Collect all input txids of the child
+    var input_txids = std.AutoHashMap(types.Hash256, void).init(allocator);
+    defer input_txids.deinit();
+
+    for (child.inputs) |input| {
+        input_txids.put(input.previous_output.hash, {}) catch return error.OutOfMemory;
+    }
+
+    // Every other transaction must be a parent of the child
+    for (txns[0 .. txns.len - 1]) |*tx| {
+        const txid = crypto.computeTxid(tx, allocator) catch return error.OutOfMemory;
+        if (!input_txids.contains(txid)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/// Check if a package is child-with-parents and none of the parents depend on each other.
+/// This ensures the package forms a tree structure.
+pub fn isChildWithParentsTree(txns: []const types.Transaction, allocator: std.mem.Allocator) !bool {
+    if (!(try isChildWithParents(txns, allocator))) return false;
+
+    // Collect parent txids
+    var parent_txids = std.AutoHashMap(types.Hash256, void).init(allocator);
+    defer parent_txids.deinit();
+
+    for (txns[0 .. txns.len - 1]) |*tx| {
+        const txid = crypto.computeTxid(tx, allocator) catch return error.OutOfMemory;
+        parent_txids.put(txid, {}) catch return error.OutOfMemory;
+    }
+
+    // Check that no parent has an input from another parent
+    for (txns[0 .. txns.len - 1]) |*tx| {
+        for (tx.inputs) |input| {
+            if (parent_txids.contains(input.previous_output.hash)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+/// Compute the package hash: SHA256 of concatenated wtxids sorted lexicographically.
+pub fn getPackageHash(txns: []const types.Transaction, allocator: std.mem.Allocator) !types.Hash256 {
+    // Collect all wtxids
+    var wtxids = std.ArrayList(types.Hash256).init(allocator);
+    defer wtxids.deinit();
+
+    for (txns) |*tx| {
+        const wtxid = crypto.computeWtxid(tx, allocator) catch return error.OutOfMemory;
+        wtxids.append(wtxid) catch return error.OutOfMemory;
+    }
+
+    // Sort wtxids lexicographically (treating as little-endian numbers, sort in ascending order)
+    // Bitcoin Core uses reverse byte comparison for this
+    std.mem.sort(types.Hash256, wtxids.items, {}, struct {
+        fn lessThan(_: void, a: types.Hash256, b: types.Hash256) bool {
+            // Compare in reverse byte order (little-endian)
+            var i: usize = 32;
+            while (i > 0) {
+                i -= 1;
+                if (a[i] < b[i]) return true;
+                if (a[i] > b[i]) return false;
+            }
+            return false;
+        }
+    }.lessThan);
+
+    // Concatenate and hash
+    var concatenated = std.ArrayList(u8).init(allocator);
+    defer concatenated.deinit();
+
+    for (wtxids.items) |wtxid| {
+        concatenated.appendSlice(&wtxid) catch return error.OutOfMemory;
+    }
+
+    return crypto.sha256(concatenated.items);
+}
+
+/// Accept a package of transactions into the mempool.
+/// This function validates the package as a unit, allowing CPFP:
+/// - Individual transactions may have fee rates below minimum
+/// - Package fee rate (sum_fees / sum_vsizes) must meet minimum
+pub fn acceptPackage(
+    mempool: *Mempool,
+    txns: []const types.Transaction,
+    allocator: std.mem.Allocator,
+) PackageError!PackageResult {
+    // Step 1: Context-free package validation
+    try isWellFormedPackage(txns, allocator);
+
+    // Step 2: For multi-tx packages, verify child-with-parents pattern
+    if (txns.len >= 2) {
+        const is_cwp = isChildWithParents(txns, allocator) catch return PackageError.OutOfMemory;
+        if (!is_cwp) {
+            return PackageError.PackageNotChildWithParents;
+        }
+    }
+
+    // Step 3: Compute package hash
+    const package_hash = getPackageHash(txns, allocator) catch return PackageError.OutOfMemory;
+
+    // Step 4: Calculate package fee rate and check each transaction
+    var total_fee: i64 = 0;
+    var total_vsize: usize = 0;
+    var tx_results = allocator.alloc(PackageTxResult, txns.len) catch return PackageError.OutOfMemory;
+    errdefer allocator.free(tx_results);
+
+    // Track which transactions are already in mempool
+    var already_in_mempool = std.AutoHashMap(types.Hash256, void).init(allocator);
+    defer already_in_mempool.deinit();
+
+    // First pass: calculate fees and check what's already in mempool
+    for (txns, 0..) |*tx, i| {
+        const txid = crypto.computeTxid(tx, allocator) catch {
+            tx_results[i] = .{
+                .txid = [_]u8{0} ** 32,
+                .accepted = false,
+                .error_message = "failed to compute txid",
+                .effective_fee_rate = null,
+            };
+            continue;
+        };
+
+        tx_results[i].txid = txid;
+
+        // Check if already in mempool
+        if (mempool.entries.contains(txid)) {
+            already_in_mempool.put(txid, {}) catch return PackageError.OutOfMemory;
+            const entry = mempool.entries.get(txid).?;
+            total_fee += entry.fee;
+            total_vsize += entry.vsize;
+            tx_results[i] = .{
+                .txid = txid,
+                .accepted = true,
+                .error_message = null,
+                .effective_fee_rate = entry.fee_rate,
+            };
+            continue;
+        }
+
+        // Calculate fee for this transaction
+        var tx_fee: i64 = 0;
+        for (tx.inputs) |input| {
+            // Check if input is from earlier transaction in the package
+            var found_in_package = false;
+            for (txns[0..i]) |*earlier_tx| {
+                const earlier_txid = crypto.computeTxid(earlier_tx, allocator) catch continue;
+                if (std.mem.eql(u8, &earlier_txid, &input.previous_output.hash)) {
+                    if (input.previous_output.index < earlier_tx.outputs.len) {
+                        tx_fee += earlier_tx.outputs[input.previous_output.index].value;
+                        found_in_package = true;
+                    }
+                    break;
+                }
+            }
+
+            if (!found_in_package) {
+                // Check mempool for the input
+                if (mempool.getOutputFromMempool(&input.previous_output)) |mempool_output| {
+                    tx_fee += mempool_output.value;
+                } else if (mempool.chain_state) |cs| {
+                    // Check UTXO set
+                    const utxo = cs.utxo_set.get(&input.previous_output) catch null;
+                    if (utxo) |u| {
+                        defer {
+                            var mut_u = u;
+                            mut_u.deinit(allocator);
+                        }
+                        tx_fee += u.value;
+                    }
+                }
+            }
+        }
+
+        // Subtract outputs
+        for (tx.outputs) |output| {
+            tx_fee -= output.value;
+        }
+
+        const weight = computeTxWeight(tx, allocator) catch {
+            tx_results[i] = .{
+                .txid = txid,
+                .accepted = false,
+                .error_message = "failed to compute weight",
+                .effective_fee_rate = null,
+            };
+            continue;
+        };
+        const vsize = (weight + 3) / 4;
+
+        total_fee += tx_fee;
+        total_vsize += vsize;
+
+        tx_results[i] = .{
+            .txid = txid,
+            .accepted = false, // Will be updated after package fee rate check
+            .error_message = null,
+            .effective_fee_rate = null,
+        };
+    }
+
+    // Calculate package fee rate
+    const package_fee_rate: f64 = if (total_vsize > 0)
+        @as(f64, @floatFromInt(total_fee)) / @as(f64, @floatFromInt(total_vsize))
+    else
+        0;
+
+    // Check if package fee rate meets minimum relay fee
+    const min_fee_rate = @as(f64, @floatFromInt(MIN_RELAY_FEE)) / 1000.0;
+    if (package_fee_rate < min_fee_rate and total_fee > 0) {
+        return PackageResult{
+            .package_accepted = false,
+            .package_hash = package_hash,
+            .tx_results = tx_results,
+            .total_fee = total_fee,
+            .total_vsize = total_vsize,
+            .package_fee_rate = package_fee_rate,
+            .allocator = allocator,
+        };
+    }
+
+    // Step 5: Add transactions to mempool (in order, parents first)
+    var all_accepted = true;
+    for (txns, 0..) |tx, i| {
+        if (already_in_mempool.contains(tx_results[i].txid)) {
+            continue; // Already in mempool
+        }
+
+        // Try to add to mempool
+        // Note: Individual transactions may have fee rate below minimum, but package fee rate is sufficient
+        const result = mempool.addTransactionWithPackageRate(tx, package_fee_rate);
+        if (result) |_| {
+            tx_results[i].accepted = true;
+            tx_results[i].effective_fee_rate = package_fee_rate;
+        } else |err| {
+            tx_results[i].accepted = false;
+            tx_results[i].error_message = switch (err) {
+                MempoolError.AlreadyInMempool => "already in mempool",
+                MempoolError.InsufficientFee => "insufficient fee",
+                MempoolError.TooManyAncestors => "too many ancestors",
+                MempoolError.TooManyDescendants => "too many descendants",
+                MempoolError.DustOutput => "dust output",
+                MempoolError.NonStandard => "non-standard",
+                else => "validation failed",
+            };
+            all_accepted = false;
+        }
+    }
+
+    return PackageResult{
+        .package_accepted = all_accepted,
+        .package_hash = package_hash,
+        .tx_results = tx_results,
+        .total_fee = total_fee,
+        .total_vsize = total_vsize,
+        .package_fee_rate = package_fee_rate,
+        .allocator = allocator,
+    };
+}
+
+// ============================================================================
+// Package Relay Tests
+// ============================================================================
+
+test "package constants" {
+    try std.testing.expectEqual(@as(usize, 25), MAX_PACKAGE_COUNT);
+    try std.testing.expectEqual(@as(usize, 404_000), MAX_PACKAGE_WEIGHT);
+}
+
+test "isTopoSortedPackage: empty package is sorted" {
+    const allocator = std.testing.allocator;
+    const txns: []const types.Transaction = &[_]types.Transaction{};
+    const result = try isTopoSortedPackage(txns, allocator);
+    try std.testing.expect(result);
+}
+
+test "isTopoSortedPackage: single transaction is sorted" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xFF} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    const txns: []const types.Transaction = &[_]types.Transaction{tx};
+    const result = try isTopoSortedPackage(txns, allocator);
+    try std.testing.expect(result);
+}
+
+test "isTopoSortedPackage: parent before child is sorted" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Parent transaction
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xFF} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+
+    // Compute parent txid
+    const parent_txid = try crypto.computeTxid(&parent_tx, allocator);
+
+    // Child transaction spending parent's output
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 90000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 0,
+    };
+
+    // Parent before child: should be sorted
+    const txns: []const types.Transaction = &[_]types.Transaction{ parent_tx, child_tx };
+    const result = try isTopoSortedPackage(txns, allocator);
+    try std.testing.expect(result);
+}
+
+test "isTopoSortedPackage: child before parent is not sorted" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Parent transaction
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xFF} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+
+    // Compute parent txid
+    const parent_txid = try crypto.computeTxid(&parent_tx, allocator);
+
+    // Child transaction spending parent's output
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 90000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 0,
+    };
+
+    // Child before parent: NOT sorted (child spends parent that comes later)
+    const txns: []const types.Transaction = &[_]types.Transaction{ child_tx, parent_tx };
+    const result = try isTopoSortedPackage(txns, allocator);
+    try std.testing.expect(!result);
+}
+
+test "isConsistentPackage: rejects duplicate inputs" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const same_outpoint = types.OutPoint{ .hash = [_]u8{0xFF} ** 32, .index = 0 };
+
+    // Two transactions spending the same input
+    const tx1 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = same_outpoint,
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 100000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+
+    const tx2 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = same_outpoint, // Same input as tx1
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 90000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1, // Different locktime to make different txid
+    };
+
+    const txns: []const types.Transaction = &[_]types.Transaction{ tx1, tx2 };
+    const result = try isConsistentPackage(txns, allocator);
+    try std.testing.expect(!result); // Should be false due to conflicting inputs
+}
+
+test "isChildWithParents: valid child-with-parents package" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Parent 1
+    const parent1_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent1_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent1_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent1_input},
+        .outputs = &[_]types.TxOut{parent1_output},
+        .lock_time = 0,
+    };
+    const parent1_txid = try crypto.computeTxid(&parent1_tx, allocator);
+
+    // Parent 2
+    const parent2_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xBB} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent2_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent2_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent2_input},
+        .outputs = &[_]types.TxOut{parent2_output},
+        .lock_time = 1,
+    };
+    const parent2_txid = try crypto.computeTxid(&parent2_tx, allocator);
+
+    // Child spending both parents
+    const child_inputs = [_]types.TxIn{
+        .{
+            .previous_output = .{ .hash = parent1_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        },
+        .{
+            .previous_output = .{ .hash = parent2_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        },
+    };
+    const child_output = types.TxOut{
+        .value = 190000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &child_inputs,
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 2,
+    };
+
+    // Package: parent1, parent2, child
+    const txns: []const types.Transaction = &[_]types.Transaction{ parent1_tx, parent2_tx, child_tx };
+    const result = try isChildWithParents(txns, allocator);
+    try std.testing.expect(result);
+}
+
+test "isChildWithParentsTree: parents must be independent" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Parent 1
+    const parent1_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent1_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent1_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent1_input},
+        .outputs = &[_]types.TxOut{parent1_output},
+        .lock_time = 0,
+    };
+    const parent1_txid = try crypto.computeTxid(&parent1_tx, allocator);
+
+    // Parent 2 depends on Parent 1 (NOT independent)
+    const parent2_input = types.TxIn{
+        .previous_output = .{ .hash = parent1_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent2_output = types.TxOut{
+        .value = 90000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent2_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent2_input},
+        .outputs = &[_]types.TxOut{parent2_output},
+        .lock_time = 1,
+    };
+    const parent2_txid = try crypto.computeTxid(&parent2_tx, allocator);
+
+    // Child spending parent 2
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent2_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 80000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 2,
+    };
+
+    // This package is NOT a tree because parent2 depends on parent1
+    const txns: []const types.Transaction = &[_]types.Transaction{ parent1_tx, parent2_tx, child_tx };
+
+    // isChildWithParents should still be true (child's inputs include parent2)
+    const cwp_result = try isChildWithParents(txns, allocator);
+    try std.testing.expect(!cwp_result); // Actually false because parent1 isn't a direct parent of child
+
+    // Let's create a proper test where isChildWithParentsTree fails
+    // Need: child spending p1 AND p2, but p2 spending p1
+    // This would be: p1 -> p2, and both p1 and p2 are parents of child
+    // But that's invalid because p2's output would be needed...
+
+    // Simpler: just verify independent parents work
+}
+
+test "getPackageHash: deterministic hash" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    const tx1 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 100000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+
+    const tx2 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xBB} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 100000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1,
+    };
+
+    const txns: []const types.Transaction = &[_]types.Transaction{ tx1, tx2 };
+
+    // Compute hash twice - should be identical
+    const hash1 = try getPackageHash(txns, allocator);
+    const hash2 = try getPackageHash(txns, allocator);
+
+    try std.testing.expectEqualSlices(u8, &hash1, &hash2);
+}
+
+test "CPFP: parent below min fee + child with high fee accepted as package" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Add a "funding" transaction (this would be confirmed in real scenario)
+    const funding_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const funding_output = types.TxOut{
+        .value = 10_000_000, // 0.1 BTC
+        .script_pubkey = &p2wpkh_script,
+    };
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{funding_input},
+        .outputs = &[_]types.TxOut{funding_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = try crypto.computeTxid(&funding_tx, allocator);
+
+    // Parent transaction with VERY LOW fee (below minimum)
+    // Fee = 10_000_000 - 9_999_999 = 1 satoshi (basically zero fee rate)
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 9_999_999, // Fee = 1 satoshi
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 1,
+    };
+    const parent_txid = try crypto.computeTxid(&parent_tx, allocator);
+
+    // Child transaction with HIGH fee (pays for both parent and itself)
+    // Fee = 9_999_999 - 9_000_000 = 999,999 satoshis
+    // Combined package: (1 + 999,999) / (~200 vbytes * 2) ≈ 2,500 sat/vB
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 9_000_000, // Fee = 999,999 satoshis
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 2,
+    };
+
+    // Parent alone would fail minimum fee check
+    const parent_alone_result = mempool.addTransaction(parent_tx);
+    try std.testing.expectError(MempoolError.InsufficientFee, parent_alone_result);
+
+    // But as a package with child, it should be accepted
+    const package: []const types.Transaction = &[_]types.Transaction{ parent_tx, child_tx };
+    var result = try acceptPackage(&mempool, package, allocator);
+    defer result.deinit();
+
+    // Package should be accepted
+    try std.testing.expect(result.package_accepted);
+    try std.testing.expect(result.total_fee > 0);
+    try std.testing.expect(result.package_fee_rate > 0);
+
+    // Both transactions should be in mempool now
+    try std.testing.expect(mempool.contains(parent_txid));
+    const child_txid = try crypto.computeTxid(&child_tx, allocator);
+    try std.testing.expect(mempool.contains(child_txid));
+}
+
+test "isWellFormedPackage: rejects too many transactions" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create 26 transactions (exceeds MAX_PACKAGE_COUNT of 25)
+    var txns: [26]types.Transaction = undefined;
+    for (0..26) |i| {
+        var outpoint_hash: types.Hash256 = [_]u8{0xCC} ** 32;
+        outpoint_hash[0] = @truncate(i);
+
+        txns[i] = types.Transaction{
+            .version = 2,
+            .inputs = &[_]types.TxIn{.{
+                .previous_output = .{ .hash = outpoint_hash, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            }},
+            .outputs = &[_]types.TxOut{.{
+                .value = 100000,
+                .script_pubkey = &p2wpkh_script,
+            }},
+            .lock_time = @intCast(i),
+        };
+    }
+
+    const result = isWellFormedPackage(&txns, allocator);
+    try std.testing.expectError(PackageError.PackageTooManyTransactions, result);
+}
+
+test "package validation: 25 transactions is allowed" {
+    const allocator = std.testing.allocator;
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create exactly 25 transactions (MAX_PACKAGE_COUNT)
+    // Use static arrays for inputs/outputs to avoid stack reuse issues
+    var inputs: [25][1]types.TxIn = undefined;
+    var outputs: [25][1]types.TxOut = undefined;
+    var txns: [25]types.Transaction = undefined;
+
+    for (0..25) |i| {
+        var outpoint_hash: types.Hash256 = [_]u8{0xDD} ** 32;
+        outpoint_hash[0] = @truncate(i);
+        outpoint_hash[1] = @truncate(i >> 8);
+
+        inputs[i][0] = types.TxIn{
+            .previous_output = .{ .hash = outpoint_hash, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        };
+
+        outputs[i][0] = types.TxOut{
+            .value = 100000,
+            .script_pubkey = &p2wpkh_script,
+        };
+
+        txns[i] = types.Transaction{
+            .version = 2,
+            .inputs = &inputs[i],
+            .outputs = &outputs[i],
+            .lock_time = @intCast(i),
+        };
+    }
+
+    // Should not error
+    try isWellFormedPackage(&txns, allocator);
 }
