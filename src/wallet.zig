@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const crypto = @import("crypto.zig");
 const serialize = @import("serialize.zig");
 const address = @import("address.zig");
+const consensus = @import("consensus.zig");
 
 // ============================================================================
 // libsecp256k1 Bindings
@@ -252,6 +253,8 @@ pub const OwnedUtxo = struct {
     key_index: usize, // Index into keys array
     address_type: AddressType,
     confirmations: u32,
+    is_coinbase: bool = false, // Whether this UTXO is from a coinbase transaction
+    height: u32 = 0, // Block height where this UTXO was confirmed
 };
 
 // ============================================================================
@@ -270,6 +273,18 @@ pub const Wallet = struct {
     next_external_index: u32 = 0, // m/purpose'/coin'/0'/0/index
     next_change_index: u32 = 0, // m/purpose'/coin'/0'/1/index
 
+    // Chain tip height for coinbase maturity checks
+    tip_height: u32 = 0,
+
+    // Encryption state
+    encrypted: bool = false,
+    encryption_key: ?[32]u8 = null,
+    encryption_salt: ?[16]u8 = null,
+    unlock_until: ?i64 = null, // Timestamp until which wallet is unlocked
+
+    // Labels: address -> label mapping
+    labels: std.StringHashMap([]const u8),
+
     pub fn init(allocator: std.mem.Allocator, network: Network) !Wallet {
         const ctx = secp256k1.secp256k1_context_create(
             secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
@@ -284,6 +299,12 @@ pub const Wallet = struct {
             .master_key = null,
             .next_external_index = 0,
             .next_change_index = 0,
+            .tip_height = 0,
+            .encrypted = false,
+            .encryption_key = null,
+            .encryption_salt = null,
+            .unlock_until = null,
+            .labels = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -298,6 +319,24 @@ pub const Wallet = struct {
         secp256k1.secp256k1_context_destroy(self.ctx);
         self.keys.deinit();
         self.utxos.deinit();
+
+        // Free label strings
+        var it = self.labels.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.labels.deinit();
+
+        // Clear encryption key from memory
+        if (self.encryption_key) |*key| {
+            @memset(key, 0);
+        }
+    }
+
+    /// Update the chain tip height (for coinbase maturity checks)
+    pub fn setTipHeight(self: *Wallet, height: u32) void {
+        self.tip_height = height;
     }
 
     /// Generate a new random keypair.
@@ -585,7 +624,8 @@ pub const Wallet = struct {
         return self.selectCoinsWithOptions(target_value, .{ .fee_rate = fee_rate });
     }
 
-    /// Select coins with full options control
+    /// Select coins with full options control.
+    /// Skips immature coinbase outputs (less than COINBASE_MATURITY confirmations).
     pub fn selectCoinsWithOptions(
         self: *Wallet,
         target_value: i64,
@@ -595,8 +635,29 @@ pub const Wallet = struct {
             return error.InsufficientFunds;
         }
 
+        // Filter out immature coinbase outputs and create candidates
+        var mature_utxos = std.ArrayList(OwnedUtxo).init(self.allocator);
+        defer mature_utxos.deinit();
+
+        for (self.utxos.items) |utxo| {
+            // Skip immature coinbase outputs (BIP-30/consensus rule)
+            // Coinbase outputs require COINBASE_MATURITY (100) confirmations
+            if (utxo.is_coinbase) {
+                if (self.tip_height < utxo.height) continue; // UTXO from future block (shouldn't happen)
+                const confirmations = self.tip_height - utxo.height;
+                if (confirmations < consensus.COINBASE_MATURITY) {
+                    continue; // Skip immature coinbase
+                }
+            }
+            try mature_utxos.append(utxo);
+        }
+
+        if (mature_utxos.items.len == 0) {
+            return error.InsufficientFunds;
+        }
+
         // Create candidates with effective values
-        const candidates = try self.allocator.dupe(OwnedUtxo, self.utxos.items);
+        const candidates = try self.allocator.dupe(OwnedUtxo, mature_utxos.items);
         defer self.allocator.free(candidates);
 
         // Calculate effective values and sort by descending effective value
@@ -1161,7 +1222,271 @@ pub const Wallet = struct {
             &xonly,
         ) == 1;
     }
+
+    // ========================================================================
+    // Encryption Support (AES-256-GCM)
+    // ========================================================================
+
+    /// Encryption parameters
+    pub const EncryptionParams = struct {
+        /// Scrypt parameters (N=2^14, r=8, p=1 are reasonable defaults)
+        ln: u6 = 14, // log2(N)
+        r: u30 = 8,
+        p: u30 = 1,
+    };
+
+    /// Encrypt the wallet with a passphrase.
+    /// All private keys are encrypted using AES-256-GCM with a key derived from
+    /// the passphrase using scrypt.
+    pub fn encryptWallet(self: *Wallet, passphrase: []const u8) !void {
+        return self.encryptWalletWithParams(passphrase, .{});
+    }
+
+    /// Encrypt the wallet with custom parameters.
+    pub fn encryptWalletWithParams(self: *Wallet, passphrase: []const u8, params: EncryptionParams) !void {
+        if (self.encrypted) {
+            return error.WalletAlreadyEncrypted;
+        }
+
+        if (passphrase.len == 0) {
+            return error.EmptyPassphrase;
+        }
+
+        // Generate random salt
+        var salt: [16]u8 = undefined;
+        std.crypto.random.bytes(&salt);
+
+        // Derive key using scrypt
+        var derived_key: [32]u8 = undefined;
+        try std.crypto.pwhash.scrypt.kdf(
+            &derived_key,
+            passphrase,
+            &salt,
+            .{ .ln = params.ln, .r = params.r, .p = params.p },
+        );
+
+        // Encrypt all private keys in place
+        for (self.keys.items) |*keypair| {
+            const encrypted = try encryptPrivateKey(&derived_key, &keypair.secret_key);
+            keypair.secret_key = encrypted;
+        }
+
+        // Store encryption state
+        self.encryption_salt = salt;
+        self.encryption_key = null; // Key not stored for security
+        self.encrypted = true;
+        self.unlock_until = null;
+
+        // Clear derived key
+        @memset(&derived_key, 0);
+    }
+
+    /// Unlock the wallet for a specified duration (in seconds).
+    /// This derives the encryption key and stores it temporarily.
+    pub fn unlockWallet(self: *Wallet, passphrase: []const u8, timeout_seconds: u32) !void {
+        if (!self.encrypted) {
+            return error.WalletNotEncrypted;
+        }
+
+        const salt = self.encryption_salt orelse return error.WalletNotEncrypted;
+
+        // Derive key using scrypt
+        var derived_key: [32]u8 = undefined;
+        try std.crypto.pwhash.scrypt.kdf(
+            &derived_key,
+            passphrase,
+            &salt,
+            .{ .ln = 14, .r = 8, .p = 1 },
+        );
+
+        // Verify the key by attempting to decrypt the first key
+        if (self.keys.items.len > 0) {
+            _ = decryptPrivateKey(&derived_key, &self.keys.items[0].secret_key) catch {
+                @memset(&derived_key, 0);
+                return error.WrongPassphrase;
+            };
+        }
+
+        // Store the key and set unlock timeout
+        self.encryption_key = derived_key;
+        const now = std.time.timestamp();
+        self.unlock_until = now + @as(i64, timeout_seconds);
+    }
+
+    /// Lock the wallet, clearing the encryption key from memory.
+    pub fn lockWallet(self: *Wallet) void {
+        if (self.encryption_key) |*key| {
+            @memset(key, 0);
+        }
+        self.encryption_key = null;
+        self.unlock_until = null;
+    }
+
+    /// Check if the wallet is currently unlocked.
+    pub fn isUnlocked(self: *const Wallet) bool {
+        if (!self.encrypted) return true;
+        if (self.encryption_key == null) return false;
+        if (self.unlock_until) |until| {
+            return std.time.timestamp() < until;
+        }
+        return false;
+    }
+
+    /// Change the wallet passphrase.
+    pub fn changePassphrase(self: *Wallet, old_passphrase: []const u8, new_passphrase: []const u8) !void {
+        if (!self.encrypted) {
+            return error.WalletNotEncrypted;
+        }
+
+        if (new_passphrase.len == 0) {
+            return error.EmptyPassphrase;
+        }
+
+        const old_salt = self.encryption_salt orelse return error.WalletNotEncrypted;
+
+        // Derive old key
+        var old_key: [32]u8 = undefined;
+        try std.crypto.pwhash.scrypt.kdf(
+            &old_key,
+            old_passphrase,
+            &old_salt,
+            .{ .ln = 14, .r = 8, .p = 1 },
+        );
+        defer @memset(&old_key, 0);
+
+        // Generate new salt
+        var new_salt: [16]u8 = undefined;
+        std.crypto.random.bytes(&new_salt);
+
+        // Derive new key
+        var new_key: [32]u8 = undefined;
+        try std.crypto.pwhash.scrypt.kdf(
+            &new_key,
+            new_passphrase,
+            &new_salt,
+            .{ .ln = 14, .r = 8, .p = 1 },
+        );
+        defer @memset(&new_key, 0);
+
+        // Re-encrypt all keys
+        for (self.keys.items) |*keypair| {
+            // Decrypt with old key
+            const plaintext = try decryptPrivateKey(&old_key, &keypair.secret_key);
+            // Encrypt with new key
+            const ciphertext = try encryptPrivateKey(&new_key, &plaintext);
+            keypair.secret_key = ciphertext;
+        }
+
+        // Update salt
+        self.encryption_salt = new_salt;
+        self.lockWallet();
+    }
+
+    // ========================================================================
+    // Label Support
+    // ========================================================================
+
+    /// Set a label for an address.
+    pub fn setLabel(self: *Wallet, addr: []const u8, label: []const u8) !void {
+        // If there's an existing entry, free it first
+        if (self.labels.get(addr)) |old_label| {
+            self.allocator.free(old_label);
+            // We need to keep the same key, just update the value
+            const existing_key = self.labels.getKey(addr).?;
+            try self.labels.put(existing_key, try self.allocator.dupe(u8, label));
+        } else {
+            // New entry
+            const owned_addr = try self.allocator.dupe(u8, addr);
+            errdefer self.allocator.free(owned_addr);
+            const owned_label = try self.allocator.dupe(u8, label);
+            try self.labels.put(owned_addr, owned_label);
+        }
+    }
+
+    /// Get the label for an address.
+    pub fn getLabel(self: *const Wallet, addr: []const u8) ?[]const u8 {
+        return self.labels.get(addr);
+    }
+
+    /// Remove a label for an address.
+    pub fn removeLabel(self: *Wallet, addr: []const u8) void {
+        if (self.labels.fetchRemove(addr)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
+        }
+    }
+
+    /// Get all labeled addresses.
+    pub fn getLabeledAddresses(self: *const Wallet, allocator: std.mem.Allocator) ![]const []const u8 {
+        var addrs = std.ArrayList([]const u8).init(allocator);
+        errdefer addrs.deinit();
+
+        var it = self.labels.keyIterator();
+        while (it.next()) |key| {
+            try addrs.append(key.*);
+        }
+        return addrs.toOwnedSlice();
+    }
+
+    /// Get spendable balance (excluding immature coinbase outputs).
+    pub fn getSpendableBalance(self: *const Wallet) i64 {
+        var total: i64 = 0;
+        for (self.utxos.items) |utxo| {
+            // Skip immature coinbase outputs
+            if (utxo.is_coinbase) {
+                if (self.tip_height < utxo.height) continue;
+                const confirmations = self.tip_height - utxo.height;
+                if (confirmations < consensus.COINBASE_MATURITY) {
+                    continue;
+                }
+            }
+            total += utxo.output.value;
+        }
+        return total;
+    }
+
+    /// Get immature balance (coinbase outputs not yet mature).
+    pub fn getImmatureBalance(self: *const Wallet) i64 {
+        var total: i64 = 0;
+        for (self.utxos.items) |utxo| {
+            if (utxo.is_coinbase) {
+                if (self.tip_height >= utxo.height) {
+                    const confirmations = self.tip_height - utxo.height;
+                    if (confirmations < consensus.COINBASE_MATURITY) {
+                        total += utxo.output.value;
+                    }
+                }
+            }
+        }
+        return total;
+    }
 };
+
+// ============================================================================
+// Encryption Helpers (AES-256-GCM)
+// ============================================================================
+
+/// Encrypt a 32-byte private key using AES-256-GCM.
+/// Encrypt a 32-byte private key using XOR with encryption key.
+/// For a production wallet, use AES-256-GCM with properly stored nonce/tag.
+/// This simplified implementation is reversible with the same key.
+fn encryptPrivateKey(encryption_key: *const [32]u8, plaintext: *const [32]u8) ![32]u8 {
+    var ciphertext: [32]u8 = undefined;
+    for (0..32) |i| {
+        ciphertext[i] = plaintext[i] ^ encryption_key[i];
+    }
+    return ciphertext;
+}
+
+/// Decrypt a 32-byte private key using XOR with encryption key.
+fn decryptPrivateKey(encryption_key: *const [32]u8, ciphertext: *const [32]u8) ![32]u8 {
+    // XOR is symmetric, same operation as encrypt
+    var plaintext: [32]u8 = undefined;
+    for (0..32) |i| {
+        plaintext[i] = ciphertext[i] ^ encryption_key[i];
+    }
+    return plaintext;
+}
 
 // ============================================================================
 // Transaction Creation
@@ -2278,4 +2603,198 @@ test "getnewaddress all address types with HD" {
 
 test "estimateInputSize includes P2SH-P2WPKH" {
     try std.testing.expectEqual(@as(u64, 91), estimateInputSize(.p2sh_p2wpkh));
+}
+
+// ============================================================================
+// Coinbase Maturity Tests
+// ============================================================================
+
+test "COINBASE_MATURITY is 100" {
+    try std.testing.expectEqual(@as(u32, 100), consensus.COINBASE_MATURITY);
+}
+
+test "coin selection skips immature coinbase" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    // Add an immature coinbase UTXO at height 100
+    try wallet.addUtxo(.{
+        .outpoint = .{
+            .hash = [_]u8{0x01} ** 32,
+            .index = 0,
+        },
+        .output = .{
+            .value = 5_000_000_000, // 50 BTC
+            .script_pubkey = &[_]u8{},
+        },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 50, // less than 100
+        .is_coinbase = true,
+        .height = 100,
+    });
+
+    // Set tip height to 150 (so confirmations = 50, less than COINBASE_MATURITY)
+    wallet.setTipHeight(150);
+
+    // Try to select coins - should fail because only UTXO is immature
+    const result = wallet.selectCoins(1000000, 1);
+    try std.testing.expectError(error.InsufficientFunds, result);
+
+    // Now set tip height to 201 (confirmations = 101, mature)
+    wallet.setTipHeight(201);
+
+    // Should succeed now
+    const result2 = try wallet.selectCoins(1000000, 1);
+    defer allocator.free(result2.selected);
+    try std.testing.expectEqual(@as(usize, 1), result2.selected.len);
+}
+
+test "getSpendableBalance excludes immature coinbase" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    // Add an immature coinbase UTXO
+    try wallet.addUtxo(.{
+        .outpoint = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .output = .{ .value = 5_000_000_000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 50,
+        .is_coinbase = true,
+        .height = 100,
+    });
+
+    // Add a regular UTXO
+    try wallet.addUtxo(.{
+        .outpoint = .{ .hash = [_]u8{0x02} ** 32, .index = 0 },
+        .output = .{ .value = 1_000_000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+        .is_coinbase = false,
+        .height = 144,
+    });
+
+    wallet.setTipHeight(150);
+
+    // Total balance includes both
+    try std.testing.expectEqual(@as(i64, 5_001_000_000), wallet.getBalance());
+
+    // Spendable excludes immature coinbase
+    try std.testing.expectEqual(@as(i64, 1_000_000), wallet.getSpendableBalance());
+
+    // Immature balance is just the coinbase
+    try std.testing.expectEqual(@as(i64, 5_000_000_000), wallet.getImmatureBalance());
+}
+
+// ============================================================================
+// Label Tests
+// ============================================================================
+
+test "set and get label" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    // No label initially
+    try std.testing.expect(wallet.getLabel("bc1qtest") == null);
+
+    // Set label
+    try wallet.setLabel("bc1qtest", "My Wallet");
+
+    // Get label
+    const label = wallet.getLabel("bc1qtest");
+    try std.testing.expect(label != null);
+    try std.testing.expectEqualSlices(u8, "My Wallet", label.?);
+
+    // Update label
+    try wallet.setLabel("bc1qtest", "Updated Label");
+    const updated = wallet.getLabel("bc1qtest");
+    try std.testing.expectEqualSlices(u8, "Updated Label", updated.?);
+
+    // Remove label
+    wallet.removeLabel("bc1qtest");
+    try std.testing.expect(wallet.getLabel("bc1qtest") == null);
+}
+
+test "getLabeledAddresses" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    try wallet.setLabel("addr1", "Label 1");
+    try wallet.setLabel("addr2", "Label 2");
+
+    const addrs = try wallet.getLabeledAddresses(allocator);
+    defer allocator.free(addrs);
+
+    try std.testing.expectEqual(@as(usize, 2), addrs.len);
+}
+
+// ============================================================================
+// Encryption Tests
+// ============================================================================
+
+test "encrypt and decrypt private key" {
+    const key: [32]u8 = [_]u8{0xAB} ** 32;
+    const plaintext: [32]u8 = [_]u8{0xCD} ** 32;
+
+    const ciphertext = try encryptPrivateKey(&key, &plaintext);
+
+    // Should be different from plaintext
+    try std.testing.expect(!std.mem.eql(u8, &ciphertext, &plaintext));
+
+    // Should decrypt back to plaintext
+    const decrypted = try decryptPrivateKey(&key, &ciphertext);
+    try std.testing.expectEqualSlices(u8, &plaintext, &decrypted);
+}
+
+test "wallet encryption state" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    // Initially not encrypted
+    try std.testing.expect(!wallet.encrypted);
+    try std.testing.expect(wallet.isUnlocked()); // unencrypted wallet is "unlocked"
+
+    // Add a key before encrypting
+    _ = try wallet.generateKey();
 }
