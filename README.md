@@ -55,6 +55,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Miniscript (AST, type system B/V/K/W, wrappers, script compilation, satisfaction, witness analysis)
 - [x] BIP-133 feefilter (per-peer fee filters, Poisson delay, hysteresis, incremental relay fee)
 - [x] BIP-330 Erlay (set reconciliation for tx relay, Minisketch, SipHash short IDs, negotiation)
+- [x] Tor/I2P proxy support (SOCKS5 RFC 1928, Tor control for hidden services, I2P SAM v3.1)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -105,6 +106,7 @@ src/
   indexes.zig        # block indexes (txindex, blockfilterindex, coinstatsindex)
   v2_transport.zig   # BIP-324 encrypted P2P transport
   erlay.zig          # BIP-330 Erlay set reconciliation
+  proxy.zig          # Tor SOCKS5 and I2P SAM proxy support
   perf.zig           # performance utilities (arena, SIMD, comptime tables)
   bench.zig          # benchmarking suite
   tests.zig          # comprehensive test suite with test vectors
