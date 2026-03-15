@@ -6,6 +6,14 @@ const crypto = @import("crypto.zig");
 const script = @import("script.zig");
 const consensus = @import("consensus.zig");
 const p2p = @import("p2p.zig");
+const miniscript = @import("miniscript.zig");
+const descriptor = @import("descriptor.zig");
+
+// Reference modules to include their tests
+comptime {
+    _ = miniscript;
+    _ = descriptor;
+}
 
 // ============================================================
 // SHA-256 / Hash256 test vectors
