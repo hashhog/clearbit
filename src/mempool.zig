@@ -41,6 +41,14 @@ pub const MEMPOOL_EXPIRY: i64 = 14 * 24 * 60 * 60;
 /// Minimum relay fee in satoshis per 1000 vbytes.
 pub const MIN_RELAY_FEE: i64 = 1000;
 
+/// Incremental relay fee in satoshis per 1000 vbytes (BIP125).
+/// Replacement tx must pay: old_fees + (incremental_relay_fee * new_vsize)
+pub const INCREMENTAL_RELAY_FEE: i64 = 1000;
+
+/// Maximum number of transactions that can be evicted by a single RBF replacement.
+/// This includes direct conflicts and all their descendants.
+pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
+
 // ============================================================================
 // Mempool Errors
 // ============================================================================
@@ -64,6 +72,8 @@ pub const MempoolError = error{
     NonBIP125Replaceable,
     /// Replacement transaction fee is too low.
     ReplacementFeeTooLow,
+    /// Replacement would evict too many transactions (exceeds MAX_REPLACEMENT_EVICTIONS).
+    TooManyEvictions,
     /// Mempool is full and transaction's fee is too low for eviction.
     MempoolFull,
     /// Transaction violates standardness rules.
@@ -362,8 +372,11 @@ pub const Mempool = struct {
             // Remove wtxid index
             _ = self.by_wtxid.remove(entry.wtxid);
 
-            // Remove from children lists
-            _ = self.children.remove(txid_hash);
+            // Remove from children lists and free the ArrayList
+            if (self.children.fetchRemove(txid_hash)) |children_kv| {
+                var children_list = children_kv.value;
+                children_list.deinit();
+            }
 
             self.total_size -|= entry.vsize;
             self.allocator.destroy(entry);
@@ -418,7 +431,14 @@ pub const Mempool = struct {
         }
     }
 
-    /// Check BIP-125 RBF replacement rules.
+    /// Check full RBF replacement rules.
+    /// Full RBF: ALL mempool transactions are replaceable regardless of nSequence signaling.
+    /// Rules:
+    /// 1. [REMOVED for full RBF] Original txs must signal RBF - no longer required
+    /// 2. New tx must not add new unconfirmed inputs (enforced elsewhere)
+    /// 3. New tx must pay higher absolute fee than sum of all evicted txs
+    /// 4. New fee must exceed old fees by at least incremental_relay_fee * new_vsize
+    /// 5. Total number of evicted transactions must not exceed MAX_REPLACEMENT_EVICTIONS
     fn checkRBFRules(
         self: *Mempool,
         new_tx: *const types.Transaction,
@@ -430,32 +450,51 @@ pub const Mempool = struct {
         _ = new_tx;
         _ = new_txid;
 
-        var total_conflicting_fee: i64 = 0;
-        var total_conflicting_size: usize = 0;
+        // Collect all transactions to be evicted (direct conflicts + all descendants)
+        var all_evicted = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer all_evicted.deinit();
+
+        var total_evicted_fee: i64 = 0;
 
         for (conflicting_txids) |conflicting_txid| {
-            const conflicting = self.entries.get(conflicting_txid) orelse continue;
+            // Add the direct conflict
+            if (!all_evicted.contains(conflicting_txid)) {
+                all_evicted.put(conflicting_txid, {}) catch return MempoolError.OutOfMemory;
 
-            // Rule 1: Original transaction(s) must signal RBF
-            if (!conflicting.is_rbf) return MempoolError.NonBIP125Replaceable;
+                if (self.entries.get(conflicting_txid)) |entry| {
+                    total_evicted_fee += entry.fee;
+                }
+            }
 
-            total_conflicting_fee += conflicting.fee;
-            total_conflicting_size += conflicting.vsize;
+            // Add all descendants of this conflict using BFS
+            const descendants = self.getDescendantTxids(conflicting_txid);
+            defer self.allocator.free(descendants);
 
-            // Include descendant fees/sizes
-            total_conflicting_fee += conflicting.descendant_fees - conflicting.fee;
-            total_conflicting_size += conflicting.descendant_size - conflicting.vsize;
+            for (descendants) |desc_txid| {
+                if (!all_evicted.contains(desc_txid)) {
+                    all_evicted.put(desc_txid, {}) catch return MempoolError.OutOfMemory;
+
+                    if (self.entries.get(desc_txid)) |entry| {
+                        total_evicted_fee += entry.fee;
+                    }
+                }
+            }
         }
 
-        // Rule 3: Replacement must pay higher absolute fee
-        if (new_fee <= total_conflicting_fee) {
+        // Rule 5: Check max eviction limit
+        if (all_evicted.count() > MAX_REPLACEMENT_EVICTIONS) {
+            return MempoolError.TooManyEvictions;
+        }
+
+        // Rule 3: Replacement must pay higher absolute fee than sum of all evicted txs
+        if (new_fee <= total_evicted_fee) {
             return MempoolError.ReplacementFeeTooLow;
         }
 
         // Rule 4: Replacement must pay for its own bandwidth
-        // The additional fee must cover the minimum relay fee for the new transaction
-        const additional_fee = new_fee - total_conflicting_fee;
-        const min_additional_fee = @divTrunc(@as(i64, @intCast(new_vsize)) * MIN_RELAY_FEE, 1000);
+        // new_fee - sum(old_fees) >= incremental_relay_fee * new_vsize
+        const additional_fee = new_fee - total_evicted_fee;
+        const min_additional_fee = @divTrunc(@as(i64, @intCast(new_vsize)) * INCREMENTAL_RELAY_FEE, 1000);
         if (additional_fee < min_additional_fee) {
             return MempoolError.ReplacementFeeTooLow;
         }
@@ -1987,4 +2026,518 @@ test "confirmation beyond MAX_CONFIRMATION_TARGET is ignored" {
     for (0..FeeEstimator.MAX_CONFIRMATION_TARGET) |target| {
         try std.testing.expectEqual(@as(u32, 0), estimator.confirmed_counts[target][bucket]);
     }
+}
+
+// ============================================================================
+// Full RBF Tests
+// ============================================================================
+
+test "full RBF: replacement succeeds with higher fee" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // First, add a "funding" transaction so the mempool can compute fees
+    // by looking up the output value from this transaction.
+    const funding_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const funding_output = types.TxOut{
+        .value = 1_000_000, // 0.01 BTC available for child txs
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{funding_input},
+        .outputs = &[_]types.TxOut{funding_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Original transaction spending the funding output (does NOT signal RBF)
+    const original_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF, // Does NOT signal RBF, but full RBF means it's still replaceable
+        .witness = &[_][]const u8{},
+    };
+    const original_output = types.TxOut{
+        .value = 900_000, // Fee = 1_000_000 - 900_000 = 100_000 sats
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{original_input},
+        .outputs = &[_]types.TxOut{original_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(original_tx);
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+
+    // Replacement transaction spending the SAME outpoint with higher fee
+    const replacement_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 }, // Same outpoint as original
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const replacement_output = types.TxOut{
+        .value = 700_000, // Fee = 1_000_000 - 700_000 = 300_000 sats (much higher)
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{replacement_input},
+        .outputs = &[_]types.TxOut{replacement_output},
+        .lock_time = 1, // Different locktime to make txid different
+    };
+
+    // Replacement should succeed - full RBF doesn't require opt-in signaling
+    try mempool.addTransaction(replacement_tx);
+
+    // Should have 2 transactions (funding + replacement)
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+
+    // Original should be gone
+    const original_txid = crypto.computeTxid(&original_tx, allocator) catch unreachable;
+    try std.testing.expect(!mempool.contains(original_txid));
+
+    // Replacement should be present
+    const replacement_txid = crypto.computeTxid(&replacement_tx, allocator) catch unreachable;
+    try std.testing.expect(mempool.contains(replacement_txid));
+}
+
+test "full RBF: replacement fails with lower or equal fee" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Original transaction
+    const original_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD, // Signals RBF
+        .witness = &[_][]const u8{},
+    };
+    const original_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{original_input},
+        .outputs = &[_]types.TxOut{original_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(original_tx);
+
+    // Replacement with same output value (same fee) - should fail
+    const replacement_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const replacement_output = types.TxOut{
+        .value = 100000, // Same value = same fee
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{replacement_input},
+        .outputs = &[_]types.TxOut{replacement_output},
+        .lock_time = 1,
+    };
+
+    const result = mempool.addTransaction(replacement_tx);
+    try std.testing.expectError(MempoolError.ReplacementFeeTooLow, result);
+
+    // Original should still be there
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+}
+
+test "full RBF: replacement must pay incremental relay fee" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Original transaction
+    const original_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x33} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const original_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{original_input},
+        .outputs = &[_]types.TxOut{original_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(original_tx);
+
+    // Replacement with slightly higher fee (but maybe not enough for incremental relay)
+    // For a ~100 vbyte tx, incremental relay fee = 100 * 1000 / 1000 = 100 sats
+    // So we need additional_fee >= 100 sats
+    const replacement_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x33} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const replacement_output = types.TxOut{
+        .value = 99999, // Only 1 sat more fee - not enough for incremental relay
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{replacement_input},
+        .outputs = &[_]types.TxOut{replacement_output},
+        .lock_time = 1,
+    };
+
+    const result = mempool.addTransaction(replacement_tx);
+    try std.testing.expectError(MempoolError.ReplacementFeeTooLow, result);
+}
+
+test "full RBF: replacement removes descendants" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // First, add a funding transaction so fees can be computed
+    const funding_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x04} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const funding_output = types.TxOut{
+        .value = 2_000_000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{funding_input},
+        .outputs = &[_]types.TxOut{funding_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Parent transaction spending funding
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 1_900_000, // Fee = 100,000 sats
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Child transaction spending parent's output
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 1_800_000, // Fee = 100,000 sats
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(child_tx);
+    try std.testing.expectEqual(@as(usize, 3), mempool.entries.count());
+
+    // Replacement transaction that conflicts with parent (spends same input)
+    // Must pay more than parent + child combined (200,000) + incremental relay fee
+    const replacement_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 }, // Same as parent
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const replacement_output = types.TxOut{
+        .value = 1_500_000, // Fee = 500,000 sats (much more than 200,000)
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{replacement_input},
+        .outputs = &[_]types.TxOut{replacement_output},
+        .lock_time = 1,
+    };
+
+    try mempool.addTransaction(replacement_tx);
+
+    // Funding + replacement should remain; parent and child should be evicted
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+
+    // Parent should be gone
+    try std.testing.expect(!mempool.contains(parent_txid));
+
+    // Child should be gone
+    const child_txid = crypto.computeTxid(&child_tx, allocator) catch unreachable;
+    try std.testing.expect(!mempool.contains(child_txid));
+}
+
+test "full RBF: multiple descendants evicted correctly" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Funding transaction
+    const funding_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x05} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const funding_output = types.TxOut{
+        .value = 10_000_000, // 0.1 BTC
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{funding_input},
+        .outputs = &[_]types.TxOut{funding_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Parent transaction spending the funding, with 10 outputs
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+
+    // Parent with 10 outputs
+    var parent_outputs: [10]types.TxOut = undefined;
+    for (0..10) |j| {
+        parent_outputs[j] = types.TxOut{
+            .value = 500_000, // 0.005 BTC per output
+            .script_pubkey = &p2wpkh_script,
+        };
+    }
+
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &parent_outputs,
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Add 10 children (one per output)
+    var child_inputs: [10][1]types.TxIn = undefined;
+    var child_outputs: [10][1]types.TxOut = undefined;
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        child_inputs[i][0] = types.TxIn{
+            .previous_output = .{ .hash = parent_txid, .index = @intCast(i) },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        };
+
+        child_outputs[i][0] = types.TxOut{
+            .value = 490_000, // Fee = 10,000 sats
+            .script_pubkey = &p2wpkh_script,
+        };
+
+        const child_tx = types.Transaction{
+            .version = 2,
+            .inputs = &child_inputs[i],
+            .outputs = &child_outputs[i],
+            .lock_time = @intCast(i + 1),
+        };
+
+        try mempool.addTransaction(child_tx);
+    }
+
+    // Should have 1 funding + 1 parent + 10 children = 12 txs
+    try std.testing.expectEqual(@as(usize, 12), mempool.entries.count());
+
+    // Now try to replace the parent - this evicts 11 txs (parent + 10 children)
+    // Well under MAX_REPLACEMENT_EVICTIONS (100)
+    // Parent fee = 10M - 5M = 5M sats
+    // Each child fee = 500k - 490k = 10k sats, total 100k sats
+    // Total evicted fees = 5.1M sats
+    // Replacement must pay > 5.1M sats + incremental_relay_fee * vsize
+    const replacement_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 }, // Same as parent
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const replacement_output = types.TxOut{
+        .value = 2_000_000, // Fee = 10M - 2M = 8M sats (much more than 5.1M evicted)
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{replacement_input},
+        .outputs = &[_]types.TxOut{replacement_output},
+        .lock_time = 999,
+    };
+
+    // This should succeed
+    try mempool.addTransaction(replacement_tx);
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count()); // funding + replacement
+
+    // Parent should be gone
+    try std.testing.expect(!mempool.contains(parent_txid));
+}
+
+test "full RBF: non-signaling tx is still replaceable" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Funding transaction first
+    const funding_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x06} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const funding_output = types.TxOut{
+        .value = 1_000_000, // 0.01 BTC
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{funding_input},
+        .outputs = &[_]types.TxOut{funding_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Transaction that does NOT signal RBF (sequence = 0xFFFFFFFF)
+    const original_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF, // Does NOT signal RBF
+        .witness = &[_][]const u8{},
+    };
+    const original_output = types.TxOut{
+        .value = 900_000, // Fee = 100,000 sats
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{original_input},
+        .outputs = &[_]types.TxOut{original_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(original_tx);
+
+    // Verify the tx does NOT signal RBF
+    const original_txid = crypto.computeTxid(&original_tx, allocator) catch unreachable;
+    const entry = mempool.get(original_txid).?;
+    try std.testing.expect(!entry.is_rbf);
+
+    // But with full RBF, it should still be replaceable
+    const replacement_input = types.TxIn{
+        .previous_output = .{ .hash = funding_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const replacement_output = types.TxOut{
+        .value = 700_000, // Fee = 300,000 sats (higher)
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{replacement_input},
+        .outputs = &[_]types.TxOut{replacement_output},
+        .lock_time = 1,
+    };
+
+    // Should succeed despite original not signaling RBF
+    try mempool.addTransaction(replacement_tx);
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count()); // funding + replacement
+    try std.testing.expect(!mempool.contains(original_txid));
+}
+
+test "full RBF constants" {
+    // Verify key RBF constants
+    try std.testing.expectEqual(@as(i64, 1000), INCREMENTAL_RELAY_FEE);
+    try std.testing.expectEqual(@as(usize, 100), MAX_REPLACEMENT_EVICTIONS);
 }
