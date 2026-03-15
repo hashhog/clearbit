@@ -45,6 +45,22 @@ pub const TESTNET_FALLBACK_PEERS: []const []const u8 = &[_][]const u8{
 };
 
 // ============================================================================
+// BIP-133 Feefilter Constants
+// ============================================================================
+
+/// Average delay between feefilter broadcasts in seconds (10 minutes).
+pub const AVG_FEEFILTER_BROADCAST_INTERVAL: i64 = 10 * 60;
+
+/// Maximum feefilter broadcast delay after significant change (5 minutes).
+pub const MAX_FEEFILTER_CHANGE_DELAY: i64 = 5 * 60;
+
+/// Default minimum relay fee in sat/kvB.
+pub const MIN_RELAY_FEE: u64 = 1000;
+
+/// Incremental relay fee in sat/kvB (for RBF replacement).
+pub const INCREMENTAL_RELAY_FEE: u64 = 1000;
+
+// ============================================================================
 // Eclipse Attack Protection Constants
 // ============================================================================
 
@@ -187,6 +203,13 @@ pub const Peer = struct {
     is_protected: bool,
     /// Time when connection was established.
     connect_time: i64,
+    /// Fee filter received from this peer (BIP-133). Minimum fee rate in sat/kvB.
+    /// We should not relay transactions below this rate to this peer.
+    fee_filter_received: u64,
+    /// Fee filter we last sent to this peer (BIP-133). In sat/kvB.
+    fee_filter_sent: u64,
+    /// Next time (microseconds since epoch) to send a feefilter message.
+    next_send_feefilter: i64,
 
     /// Connect to a remote peer.
     pub fn connect(
@@ -241,6 +264,9 @@ pub const Peer = struct {
             .relay_txs = true,
             .is_protected = false,
             .connect_time = now,
+            .fee_filter_received = 0,
+            .fee_filter_sent = 0,
+            .next_send_feefilter = 0,
         };
     }
 
@@ -280,6 +306,9 @@ pub const Peer = struct {
             .relay_txs = true,
             .is_protected = false,
             .connect_time = now,
+            .fee_filter_received = 0,
+            .fee_filter_sent = 0,
+            .next_send_feefilter = 0,
         };
     }
 
@@ -394,8 +423,15 @@ pub const Peer = struct {
                 const msg = try self.receiveMessage();
                 switch (msg) {
                     .verack => break,
-                    .wtxidrelay, .sendaddrv2, .sendcmpct, .sendheaders, .feefilter => {
+                    .wtxidrelay, .sendaddrv2, .sendcmpct, .sendheaders => {
                         // Accept these during handshake but no action needed
+                    },
+                    .feefilter => |ff| {
+                        // BIP-133: Store the peer's fee filter during handshake
+                        const MAX_MONEY: u64 = 2_100_000_000_000_000;
+                        if (ff.feerate <= MAX_MONEY) {
+                            self.fee_filter_received = ff.feerate;
+                        }
                     },
                     .ping => |ping| {
                         // Handle ping during handshake
@@ -481,6 +517,74 @@ pub const Peer = struct {
                 self.min_ping_time = latency;
             }
         }
+    }
+
+    /// Maybe send a feefilter message to this peer (BIP-133).
+    /// Uses Poisson delay (~10 min avg) with hysteresis to avoid rapid oscillation.
+    /// current_filter_sat_kvb: Our current minimum fee rate in sat/kvB.
+    /// is_ibd: Whether we're in initial block download (send MAX_MONEY during IBD).
+    pub fn maybeSendFeefilter(self: *Peer, current_filter_sat_kvb: u64, is_ibd: bool) void {
+        const now_seconds = std.time.timestamp();
+        const now_us = now_seconds * 1_000_000;
+
+        // Don't send to block-relay-only peers
+        if (self.conn_type == .block_relay) return;
+
+        // Don't send if peer doesn't relay transactions
+        if (!self.relay_txs) return;
+
+        // Determine the filter value to send
+        const MAX_MONEY: u64 = 2_100_000_000_000_000;
+        var filter_to_send: u64 = current_filter_sat_kvb;
+
+        if (is_ibd) {
+            // During IBD, tell peers not to send us transactions
+            filter_to_send = MAX_MONEY;
+        } else if (self.fee_filter_sent == MAX_MONEY) {
+            // We just exited IBD - send immediately
+            self.next_send_feefilter = 0;
+        }
+
+        // Ensure at least MIN_RELAY_FEE
+        filter_to_send = @max(filter_to_send, MIN_RELAY_FEE);
+
+        // Check if it's time to send
+        if (now_us > self.next_send_feefilter) {
+            // Time to send if the value has changed
+            if (filter_to_send != self.fee_filter_sent) {
+                const msg = p2p.Message{ .feefilter = .{ .feerate = filter_to_send } };
+                self.sendMessage(&msg) catch return;
+                self.fee_filter_sent = filter_to_send;
+            }
+
+            // Schedule next broadcast using exponential distribution (approximated)
+            // For simplicity, we use uniform random within [0.5, 1.5] * AVG_INTERVAL
+            const random_factor = @as(i64, @intCast(std.crypto.random.intRangeAtMost(u32, 500, 1500)));
+            const delay_seconds = @divTrunc(AVG_FEEFILTER_BROADCAST_INTERVAL * random_factor, 1000);
+            self.next_send_feefilter = now_us + delay_seconds * 1_000_000;
+        } else {
+            // Check hysteresis: if significant change and next broadcast too far away, accelerate
+            // Significant = decrease by 25% or increase by 33%
+            if (now_us + MAX_FEEFILTER_CHANGE_DELAY * 1_000_000 < self.next_send_feefilter) {
+                const significant_decrease = current_filter_sat_kvb < (3 * self.fee_filter_sent) / 4;
+                const significant_increase = current_filter_sat_kvb > (4 * self.fee_filter_sent) / 3;
+
+                if (significant_decrease or significant_increase) {
+                    // Schedule sooner - random within [0, MAX_FEEFILTER_CHANGE_DELAY]
+                    const random_delay = @as(i64, @intCast(std.crypto.random.intRangeAtMost(u32, 0, @intCast(MAX_FEEFILTER_CHANGE_DELAY))));
+                    self.next_send_feefilter = now_us + random_delay * 1_000_000;
+                }
+            }
+        }
+    }
+
+    /// Check if a transaction fee rate passes this peer's fee filter.
+    /// Returns true if the transaction should be relayed to this peer.
+    /// tx_fee_rate_sat_kvb: Transaction fee rate in sat/kvB.
+    pub fn passesFeeFilter(self: *const Peer, tx_fee_rate_sat_kvb: u64) bool {
+        // If peer hasn't sent a feefilter, accept all transactions
+        if (self.fee_filter_received == 0) return true;
+        return tx_fee_rate_sat_kvb >= self.fee_filter_received;
     }
 
     /// Disconnect from the peer.
@@ -1322,6 +1426,15 @@ pub const PeerManager = struct {
                 // Send some known addresses back
                 try self.sendAddresses(peer);
             },
+            .feefilter => |ff| {
+                // BIP-133: Store the peer's minimum fee rate (in sat/kvB).
+                // We should not relay transactions below this rate to this peer.
+                // Validate the fee is reasonable (not exceeding MAX_MONEY which is 21M BTC in sats).
+                const MAX_MONEY: u64 = 2_100_000_000_000_000;
+                if (ff.feerate <= MAX_MONEY) {
+                    peer.fee_filter_received = ff.feerate;
+                }
+            },
             else => {},
         }
     }
@@ -1602,6 +1715,9 @@ test "peer struct initialization with default values" {
         .relay_txs = true,
         .is_protected = false,
         .connect_time = 12345,
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
     };
 
     try std.testing.expectEqual(PeerState.connecting, dummy_peer.state);
@@ -1705,6 +1821,9 @@ test "ban score accumulation" {
         .relay_txs = true,
         .is_protected = false,
         .connect_time = std.time.timestamp(),
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
     };
 
     // Initial score is 0
@@ -1765,6 +1884,9 @@ test "peer timeout detection" {
         .relay_txs = true,
         .is_protected = false,
         .connect_time = now,
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
     };
 
     try std.testing.expect(!active_peer.isTimedOut());
@@ -1823,6 +1945,9 @@ test "peer ready check" {
         .relay_txs = true,
         .is_protected = false,
         .connect_time = 0,
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
     };
 
     // Connecting state - not ready
@@ -1880,6 +2005,9 @@ test "handle pong message" {
         .relay_txs = true,
         .is_protected = false,
         .connect_time = 0,
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
     };
 
     // Wrong nonce - should not update pong time
@@ -1926,6 +2054,9 @@ test "peer latency calculation" {
         .relay_txs = true,
         .is_protected = false,
         .connect_time = 0,
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
     };
 
     // No ping/pong yet - no latency
@@ -2283,6 +2414,9 @@ test "addBanScore sets should_ban at threshold" {
         .relay_txs = true,
         .is_protected = false,
         .connect_time = 0,
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
     };
 
     // Add 99 points - not banned yet
@@ -2526,4 +2660,204 @@ test "eclipse protection: eclipse constants match Bitcoin Core" {
     try std.testing.expectEqual(@as(usize, 8), EVICTION_PROTECT_TIME);
     try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_NETGROUP);
     try std.testing.expectEqual(@as(usize, 2), MAX_BLOCK_RELAY_ONLY_ANCHORS);
+}
+
+// ============================================================================
+// BIP-133 Feefilter Tests
+// ============================================================================
+
+test "feefilter: constants match Bitcoin Core defaults" {
+    // Verify feefilter constants match Bitcoin Core
+    try std.testing.expectEqual(@as(i64, 600), AVG_FEEFILTER_BROADCAST_INTERVAL); // 10 min
+    try std.testing.expectEqual(@as(i64, 300), MAX_FEEFILTER_CHANGE_DELAY); // 5 min
+    try std.testing.expectEqual(@as(u64, 1000), MIN_RELAY_FEE); // 1000 sat/kvB
+    try std.testing.expectEqual(@as(u64, 1000), INCREMENTAL_RELAY_FEE); // 1000 sat/kvB
+}
+
+test "feefilter: peer fee_filter fields initialized to zero" {
+    const allocator = std.testing.allocator;
+    var recv_buffer = std.ArrayList(u8).init(allocator);
+    defer recv_buffer.deinit();
+
+    const peer = Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8333),
+        .state = .connecting,
+        .direction = .outbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = &consensus.MAINNET,
+        .allocator = allocator,
+        .recv_buffer = recv_buffer,
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
+    };
+
+    try std.testing.expectEqual(@as(u64, 0), peer.fee_filter_received);
+    try std.testing.expectEqual(@as(u64, 0), peer.fee_filter_sent);
+    try std.testing.expectEqual(@as(i64, 0), peer.next_send_feefilter);
+}
+
+test "feefilter: passesFeeFilter accepts when no filter set" {
+    const allocator = std.testing.allocator;
+    var recv_buffer = std.ArrayList(u8).init(allocator);
+    defer recv_buffer.deinit();
+
+    const peer = Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8333),
+        .state = .handshake_complete,
+        .direction = .outbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = &consensus.MAINNET,
+        .allocator = allocator,
+        .recv_buffer = recv_buffer,
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
+        .fee_filter_received = 0, // No filter
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
+    };
+
+    // With no filter set, all transactions should pass
+    try std.testing.expect(peer.passesFeeFilter(0));
+    try std.testing.expect(peer.passesFeeFilter(500));
+    try std.testing.expect(peer.passesFeeFilter(1000));
+    try std.testing.expect(peer.passesFeeFilter(10000));
+}
+
+test "feefilter: passesFeeFilter filters below threshold" {
+    const allocator = std.testing.allocator;
+    var recv_buffer = std.ArrayList(u8).init(allocator);
+    defer recv_buffer.deinit();
+
+    var peer = Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8333),
+        .state = .handshake_complete,
+        .direction = .outbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = &consensus.MAINNET,
+        .allocator = allocator,
+        .recv_buffer = recv_buffer,
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
+        .fee_filter_received = 5000, // 5000 sat/kvB minimum
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
+    };
+
+    // Below threshold - should not pass
+    try std.testing.expect(!peer.passesFeeFilter(0));
+    try std.testing.expect(!peer.passesFeeFilter(1000));
+    try std.testing.expect(!peer.passesFeeFilter(4999));
+
+    // At or above threshold - should pass
+    try std.testing.expect(peer.passesFeeFilter(5000));
+    try std.testing.expect(peer.passesFeeFilter(5001));
+    try std.testing.expect(peer.passesFeeFilter(10000));
+}
+
+test "feefilter message encode/decode round-trip" {
+    const allocator = std.testing.allocator;
+
+    // Create a feefilter message with MIN_RELAY_FEE
+    const msg = p2p.Message{ .feefilter = .{ .feerate = MIN_RELAY_FEE } };
+    const encoded = try p2p.encodeMessage(&msg, p2p.NetworkMagic.MAINNET, allocator);
+    defer allocator.free(encoded);
+
+    // Decode header
+    const header = p2p.MessageHeader.decode(encoded[0..24]);
+    try std.testing.expectEqualStrings("feefilter", header.commandName());
+    try std.testing.expectEqual(@as(u32, 8), header.length); // u64 = 8 bytes
+
+    // Decode payload
+    const decoded = try p2p.decodePayload(header.commandName(), encoded[24..], allocator);
+    try std.testing.expectEqual(MIN_RELAY_FEE, decoded.feefilter.feerate);
+}
+
+test "feefilter: high fee rate message encoding" {
+    const allocator = std.testing.allocator;
+
+    // Test with MAX_MONEY fee filter (used during IBD)
+    const MAX_MONEY: u64 = 2_100_000_000_000_000;
+    const msg = p2p.Message{ .feefilter = .{ .feerate = MAX_MONEY } };
+    const encoded = try p2p.encodeMessage(&msg, p2p.NetworkMagic.MAINNET, allocator);
+    defer allocator.free(encoded);
+
+    const header = p2p.MessageHeader.decode(encoded[0..24]);
+    const decoded = try p2p.decodePayload(header.commandName(), encoded[24..], allocator);
+    try std.testing.expectEqual(MAX_MONEY, decoded.feefilter.feerate);
+}
+
+test "feefilter: hysteresis thresholds" {
+    // Test the hysteresis math: 25% decrease or 33% increase triggers early send
+    const current_filter: u64 = 1000;
+
+    // 25% decrease: new < 3/4 * old = 750
+    const decrease_threshold = (3 * current_filter) / 4;
+    try std.testing.expectEqual(@as(u64, 750), decrease_threshold);
+
+    // 33% increase: new > 4/3 * old = 1333
+    const increase_threshold = (4 * current_filter) / 3;
+    try std.testing.expectEqual(@as(u64, 1333), increase_threshold);
+
+    // Test boundary conditions
+    try std.testing.expect(749 < decrease_threshold); // Triggers
+    try std.testing.expect(750 == decrease_threshold); // Boundary - does not trigger
+    try std.testing.expect(1333 == increase_threshold); // Boundary - does not trigger
+    try std.testing.expect(1334 > increase_threshold); // Triggers
 }
