@@ -33,6 +33,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] UTXO set manager (compact storage, caching, block connect/disconnect)
 - [x] Chain state tracking (reorg support, undo data with rev*.dat file persistence)
 - [x] Mempool (full RBF with BIP-125 rules, ancestor/descendant limits, dust detection, eviction)
+- [x] Package relay (BIP-331 package validation, CPFP fee bumping, child-with-parents)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
 - [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness, locktime validation)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, batch requests, mining, sendrawtransaction, getmempoolentry)
