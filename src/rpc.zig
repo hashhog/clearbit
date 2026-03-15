@@ -22,6 +22,7 @@ const crypto = @import("crypto.zig");
 const block_template = @import("block_template.zig");
 const validation = @import("validation.zig");
 const wallet_mod = @import("wallet.zig");
+const descriptor = @import("descriptor.zig");
 
 // ============================================================================
 // RPC Error Codes (Bitcoin Core conventions)
@@ -396,6 +397,12 @@ pub const RpcServer = struct {
             return self.handleGetAddressInfo(params, id);
         } else if (std.mem.eql(u8, method, "getwalletinfo")) {
             return self.handleGetWalletInfo(id);
+        }
+        // Descriptor RPC methods
+        else if (std.mem.eql(u8, method, "getdescriptorinfo")) {
+            return self.handleGetDescriptorInfo(params, id);
+        } else if (std.mem.eql(u8, method, "deriveaddresses")) {
+            return self.handleDeriveAddresses(params, id);
         } else {
             return self.jsonRpcError(RPC_METHOD_NOT_FOUND, "Method not found", id);
         }
@@ -1567,6 +1574,143 @@ pub const RpcServer = struct {
     // ========================================================================
     // JSON-RPC Response Helpers
     // ========================================================================
+
+    // ========================================================================
+    // Descriptor RPC Methods
+    // ========================================================================
+
+    /// Handle getdescriptorinfo RPC
+    /// Returns information about a descriptor
+    fn handleGetDescriptorInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Extract descriptor string
+        var desc_str: []const u8 = undefined;
+
+        if (params == .array and params.array.items.len >= 1) {
+            const d = params.array.items[0];
+            if (d == .string) {
+                desc_str = d.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid descriptor", id);
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing descriptor", id);
+        }
+
+        // Parse and analyze the descriptor
+        var desc = descriptor.parseDescriptor(self.allocator, desc_str) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor", id);
+        };
+        defer desc.deinit(self.allocator);
+
+        // Get canonical form with checksum
+        const canonical = descriptor.toStringWithChecksum(self.allocator, &desc) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to serialize descriptor", id);
+        };
+        defer self.allocator.free(canonical);
+
+        // Extract checksum
+        const hash_pos = std.mem.lastIndexOf(u8, canonical, "#") orelse {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Checksum error", id);
+        };
+        const checksum = canonical[hash_pos + 1 ..];
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"descriptor\":\"");
+        // Escape descriptor for JSON
+        for (canonical) |c| {
+            if (c == '"' or c == '\\') {
+                try writer.writeByte('\\');
+            }
+            try writer.writeByte(c);
+        }
+        try writer.writeAll("\",\"checksum\":\"");
+        try writer.writeAll(checksum);
+        try writer.writeAll("\",\"isrange\":");
+        try writer.writeAll(if (desc.isRange()) "true" else "false");
+        try writer.writeAll(",\"issolvable\":true,\"hasprivatekeys\":");
+        try writer.writeAll(if (descriptor.hasPrivateKeys(&desc)) "true" else "false");
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle deriveaddresses RPC
+    /// Derives addresses from a descriptor
+    fn handleDeriveAddresses(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Extract descriptor string and optional range
+        var desc_str: []const u8 = undefined;
+        var range_start: u32 = 0;
+        var range_end: u32 = 1;
+
+        if (params == .array and params.array.items.len >= 1) {
+            const d = params.array.items[0];
+            if (d == .string) {
+                desc_str = d.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid descriptor", id);
+            }
+
+            // Parse optional range parameter
+            if (params.array.items.len >= 2) {
+                const range_param = params.array.items[1];
+                if (range_param == .array and range_param.array.items.len == 2) {
+                    // Range is [start, end]
+                    const start = range_param.array.items[0];
+                    const end = range_param.array.items[1];
+                    if (start == .integer and end == .integer) {
+                        range_start = @intCast(start.integer);
+                        range_end = @intCast(end.integer);
+                    }
+                } else if (range_param == .integer) {
+                    // Single number means [0, n]
+                    range_end = @intCast(range_param.integer);
+                }
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing descriptor", id);
+        }
+
+        // Determine network
+        const network: wallet_mod.Network = switch (self.network_params.magic) {
+            consensus.MAINNET.magic => .mainnet,
+            consensus.TESTNET.magic => .testnet,
+            else => .regtest,
+        };
+
+        // Derive addresses
+        const addresses = descriptor.deriveAddresses(
+            self.allocator,
+            desc_str,
+            network,
+            range_start,
+            range_end,
+        ) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive addresses from descriptor", id);
+        };
+        defer {
+            for (addresses) |a| self.allocator.free(a);
+            self.allocator.free(addresses);
+        }
+
+        // Build JSON array of addresses
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+        for (addresses, 0..) |addr, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            try writer.writeAll(addr);
+            try writer.writeByte('"');
+        }
+        try writer.writeByte(']');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
 
     /// Create a JSON-RPC success response.
     pub fn jsonRpcResult(self: *RpcServer, result: []const u8, id: ?std.json.Value) ![]const u8 {
