@@ -403,6 +403,14 @@ pub const RpcServer = struct {
             return self.handleGetDescriptorInfo(params, id);
         } else if (std.mem.eql(u8, method, "deriveaddresses")) {
             return self.handleDeriveAddresses(params, id);
+        }
+        // Regtest mining RPC methods
+        else if (std.mem.eql(u8, method, "generatetoaddress")) {
+            return self.handleGenerateToAddress(params, id);
+        } else if (std.mem.eql(u8, method, "generatetodescriptor")) {
+            return self.handleGenerateToDescriptor(params, id);
+        } else if (std.mem.eql(u8, method, "generateblock")) {
+            return self.handleGenerateBlock(params, id);
         } else {
             return self.jsonRpcError(RPC_METHOD_NOT_FOUND, "Method not found", id);
         }
@@ -1658,11 +1666,11 @@ pub const RpcServer = struct {
                 const range_param = params.array.items[1];
                 if (range_param == .array and range_param.array.items.len == 2) {
                     // Range is [start, end]
-                    const start = range_param.array.items[0];
-                    const end = range_param.array.items[1];
-                    if (start == .integer and end == .integer) {
-                        range_start = @intCast(start.integer);
-                        range_end = @intCast(end.integer);
+                    const range_s = range_param.array.items[0];
+                    const range_e = range_param.array.items[1];
+                    if (range_s == .integer and range_e == .integer) {
+                        range_start = @intCast(range_s.integer);
+                        range_end = @intCast(range_e.integer);
                     }
                 } else if (range_param == .integer) {
                     // Single number means [0, n]
@@ -1708,6 +1716,327 @@ pub const RpcServer = struct {
             try writer.writeByte('"');
         }
         try writer.writeByte(']');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // Regtest Mining RPC Methods
+    // ========================================================================
+
+    /// Handle generatetoaddress RPC.
+    /// Mine blocks to a specified address and return block hashes.
+    /// Usage: generatetoaddress nblocks "address" [maxtries]
+    fn handleGenerateToAddress(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Verify we're on regtest (mining RPCs only available on regtest)
+        if (self.network_params.magic != consensus.REGTEST.magic) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "generatetoaddress is only available in regtest mode", id);
+        }
+
+        // Parse parameters
+        var n_blocks: u32 = 1;
+        var address: []const u8 = undefined;
+        var max_tries: u64 = block_template.DEFAULT_MAX_TRIES;
+
+        if (params == .array and params.array.items.len >= 2) {
+            // nblocks
+            const n = params.array.items[0];
+            if (n == .integer) {
+                if (n.integer < 0 or n.integer > 10000) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid nblocks value", id);
+                }
+                n_blocks = @intCast(n.integer);
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "nblocks must be an integer", id);
+            }
+
+            // address
+            const a = params.array.items[1];
+            if (a == .string) {
+                address = a.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "address must be a string", id);
+            }
+
+            // optional maxtries
+            if (params.array.items.len >= 3) {
+                const m = params.array.items[2];
+                if (m == .integer) {
+                    max_tries = @intCast(m.integer);
+                }
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "generatetoaddress requires nblocks and address", id);
+        }
+
+        // Decode address to script pubkey
+        const payout_script = descriptor.decodeAddressToScript(self.allocator, address) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        };
+        defer self.allocator.free(payout_script);
+
+        // Generate blocks
+        var result = block_template.generateBlocks(
+            self.chain_state,
+            self.mempool,
+            self.network_params,
+            payout_script,
+            n_blocks,
+            max_tries,
+            self.allocator,
+        ) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block generation failed", id);
+        };
+        defer result.deinit();
+
+        // Format response as JSON array of block hashes
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+        for (result.block_hashes.items, 0..) |hash, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            // Write hash in reverse byte order (Bitcoin display format)
+            for (0..32) |j| {
+                try writer.print("{x:0>2}", .{hash[31 - j]});
+            }
+            try writer.writeByte('"');
+        }
+        try writer.writeByte(']');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle generatetodescriptor RPC.
+    /// Mine blocks to a specified descriptor and return block hashes.
+    /// Usage: generatetodescriptor num_blocks "descriptor" [maxtries]
+    fn handleGenerateToDescriptor(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Verify we're on regtest
+        if (self.network_params.magic != consensus.REGTEST.magic) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "generatetodescriptor is only available in regtest mode", id);
+        }
+
+        // Parse parameters
+        var n_blocks: u32 = 1;
+        var desc_str: []const u8 = undefined;
+        var max_tries: u64 = block_template.DEFAULT_MAX_TRIES;
+
+        if (params == .array and params.array.items.len >= 2) {
+            // num_blocks
+            const n = params.array.items[0];
+            if (n == .integer) {
+                if (n.integer < 0 or n.integer > 10000) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid num_blocks value", id);
+                }
+                n_blocks = @intCast(n.integer);
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "num_blocks must be an integer", id);
+            }
+
+            // descriptor
+            const d = params.array.items[1];
+            if (d == .string) {
+                desc_str = d.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "descriptor must be a string", id);
+            }
+
+            // optional maxtries
+            if (params.array.items.len >= 3) {
+                const m = params.array.items[2];
+                if (m == .integer) {
+                    max_tries = @intCast(m.integer);
+                }
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "generatetodescriptor requires num_blocks and descriptor", id);
+        }
+
+        // Parse descriptor and get script pubkey
+        var desc = descriptor.parseDescriptor(self.allocator, desc_str) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor", id);
+        };
+        defer desc.deinit();
+
+        // Get script pubkey from descriptor (index 0 for non-ranged)
+        const payout_script = desc.getScriptPubKey(0) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive script from descriptor", id);
+        };
+        defer self.allocator.free(payout_script);
+
+        // Generate blocks
+        var result = block_template.generateBlocks(
+            self.chain_state,
+            self.mempool,
+            self.network_params,
+            payout_script,
+            n_blocks,
+            max_tries,
+            self.allocator,
+        ) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block generation failed", id);
+        };
+        defer result.deinit();
+
+        // Format response
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+        for (result.block_hashes.items, 0..) |hash, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            for (0..32) |j| {
+                try writer.print("{x:0>2}", .{hash[31 - j]});
+            }
+            try writer.writeByte('"');
+        }
+        try writer.writeByte(']');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle generateblock RPC.
+    /// Mine a block with specific transactions.
+    /// Usage: generateblock "output" ["rawtx/txid",...] [submit]
+    fn handleGenerateBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Verify we're on regtest
+        if (self.network_params.magic != consensus.REGTEST.magic) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "generateblock is only available in regtest mode", id);
+        }
+
+        // Parse parameters
+        var output: []const u8 = undefined;
+        var submit_block: bool = true;
+        var transactions = std.ArrayList(types.Transaction).init(self.allocator);
+        defer transactions.deinit();
+
+        if (params == .array and params.array.items.len >= 2) {
+            // output (address or descriptor)
+            const o = params.array.items[0];
+            if (o == .string) {
+                output = o.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "output must be a string", id);
+            }
+
+            // transactions array
+            const txs = params.array.items[1];
+            if (txs == .array) {
+                for (txs.array.items) |tx_item| {
+                    if (tx_item == .string) {
+                        const tx_str = tx_item.string;
+
+                        // Check if it's a txid (64 hex chars) or raw transaction
+                        if (tx_str.len == 64) {
+                            // Txid - look up in mempool
+                            var txid: [32]u8 = undefined;
+                            for (0..32) |i| {
+                                // Parse in reverse (display order to internal)
+                                txid[31 - i] = std.fmt.parseInt(u8, tx_str[i * 2 ..][0..2], 16) catch {
+                                    return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid txid hex", id);
+                                };
+                            }
+
+                            // Look up in mempool
+                            const entry = self.mempool.get(&txid);
+                            if (entry) |e| {
+                                try transactions.append(e.tx);
+                            } else {
+                                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool", id);
+                            }
+                        } else {
+                            // Raw transaction hex
+                            if (tx_str.len % 2 != 0) {
+                                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid transaction hex", id);
+                            }
+
+                            const raw = self.allocator.alloc(u8, tx_str.len / 2) catch {
+                                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+                            };
+                            defer self.allocator.free(raw);
+
+                            for (0..raw.len) |i| {
+                                raw[i] = std.fmt.parseInt(u8, tx_str[i * 2 ..][0..2], 16) catch {
+                                    return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid transaction hex", id);
+                                };
+                            }
+
+                            var reader = serialize.Reader{ .data = raw };
+                            const tx = serialize.readTransaction(&reader, self.allocator) catch {
+                                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Transaction decode failed", id);
+                            };
+                            try transactions.append(tx);
+                        }
+                    }
+                }
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "transactions must be an array", id);
+            }
+
+            // optional submit
+            if (params.array.items.len >= 3) {
+                const s = params.array.items[2];
+                if (s == .bool) {
+                    submit_block = s.bool;
+                }
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "generateblock requires output and transactions", id);
+        }
+
+        // Get payout script (try as address first, then as descriptor)
+        var payout_script: []u8 = undefined;
+        var script_owned = false;
+
+        payout_script = descriptor.decodeAddressToScript(self.allocator, output) catch blk: {
+            // Try as descriptor
+            var desc = descriptor.parseDescriptor(self.allocator, output) catch {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address or descriptor", id);
+            };
+            defer desc.deinit();
+
+            const script = desc.getScriptPubKey(0) catch {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive script", id);
+            };
+            script_owned = true;
+            break :blk script;
+        };
+        defer if (script_owned) self.allocator.free(payout_script);
+
+        // Generate the block
+        const gen_result = block_template.generateBlockWithTxs(
+            self.chain_state,
+            self.mempool,
+            self.network_params,
+            payout_script,
+            transactions.items,
+            block_template.DEFAULT_MAX_TRIES,
+            submit_block,
+            self.allocator,
+        ) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block generation failed", id);
+        };
+
+        // Format response
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.print("{{\"hash\":\"", .{});
+        for (0..32) |j| {
+            try writer.print("{x:0>2}", .{gen_result.hash[31 - j]});
+        }
+        try writer.writeByte('"');
+
+        if (gen_result.hex) |hex| {
+            defer self.allocator.free(hex);
+            try writer.print(",\"hex\":\"{s}\"", .{hex});
+        }
+        try writer.writeByte('}');
 
         return self.jsonRpcResult(buf.items, id);
     }
