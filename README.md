@@ -53,6 +53,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] BIP-324 v2 P2P transport (ElligatorSwift FFI, HKDF-SHA256, FSChaCha20-Poly1305, short message IDs)
 - [x] Output descriptors (BIP-380/381/382/383/384/385/386, recursive parser, BCH checksum, RPCs)
 - [x] Miniscript (AST, type system B/V/K/W, wrappers, script compilation, satisfaction, witness analysis)
+- [x] BIP-133 feefilter (per-peer fee filters, Poisson delay, hysteresis, incremental relay fee)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
