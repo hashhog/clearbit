@@ -947,4 +947,5 @@ comptime {
     _ = @import("mempool.zig");
     _ = @import("perf.zig");
     _ = @import("bench.zig");
+    _ = @import("indexes.zig");
 }
