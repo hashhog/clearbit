@@ -759,6 +759,35 @@ pub const Mempool = struct {
         };
     }
 
+    /// Get the minimum fee rate required for a transaction to be accepted.
+    /// Returns the fee rate in sat/kvB (satoshis per 1000 virtual bytes).
+    /// When the mempool is not full, returns MIN_RELAY_FEE.
+    /// When the mempool is full, returns the fee rate of the lowest-fee transaction
+    /// plus INCREMENTAL_RELAY_FEE to ensure new transactions pay enough to evict.
+    pub fn getMinFee(self: *Mempool) u64 {
+        // If mempool is not full, use the default minimum relay fee
+        if (self.total_size < MAX_MEMPOOL_SIZE) {
+            return @intCast(MIN_RELAY_FEE);
+        }
+
+        // When full, find the minimum fee rate in the mempool
+        var min_fee_rate: f64 = std.math.floatMax(f64);
+        var iter = self.entries.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.*.fee_rate < min_fee_rate) {
+                min_fee_rate = entry.value_ptr.*.fee_rate;
+            }
+        }
+
+        // Convert fee rate from sat/vB to sat/kvB and add incremental relay fee
+        if (min_fee_rate < std.math.floatMax(f64)) {
+            const min_kvb = @as(u64, @intFromFloat(min_fee_rate * 1000));
+            return @max(min_kvb + @as(u64, @intCast(INCREMENTAL_RELAY_FEE)), @as(u64, @intCast(MIN_RELAY_FEE)));
+        }
+
+        return @intCast(MIN_RELAY_FEE);
+    }
+
     /// Check if mempool contains a transaction.
     pub fn contains(self: *Mempool, txid: types.Hash256) bool {
         return self.entries.contains(txid);
@@ -2690,6 +2719,62 @@ test "full RBF constants" {
     // Verify key RBF constants
     try std.testing.expectEqual(@as(i64, 1000), INCREMENTAL_RELAY_FEE);
     try std.testing.expectEqual(@as(usize, 100), MAX_REPLACEMENT_EVICTIONS);
+}
+
+// ============================================================================
+// BIP-133 Feefilter Tests
+// ============================================================================
+
+test "getMinFee returns MIN_RELAY_FEE when mempool is empty" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Empty mempool should return MIN_RELAY_FEE
+    try std.testing.expectEqual(@as(u64, 1000), mempool.getMinFee());
+}
+
+test "getMinFee returns MIN_RELAY_FEE when mempool is not full" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Add a transaction (doesn't make it full)
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 50000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(tx);
+
+    // Mempool is not full, should still return MIN_RELAY_FEE
+    try std.testing.expectEqual(@as(u64, 1000), mempool.getMinFee());
+}
+
+test "feefilter constants in sat/kvB" {
+    // Verify units are sat/kvB (satoshis per 1000 virtual bytes)
+    try std.testing.expectEqual(@as(i64, 1000), MIN_RELAY_FEE);
+    try std.testing.expectEqual(@as(i64, 1000), INCREMENTAL_RELAY_FEE);
+
+    // 1000 sat/kvB = 1 sat/vB, which is Bitcoin Core's default
+    const sat_per_vb = @as(f64, @floatFromInt(MIN_RELAY_FEE)) / 1000.0;
+    try std.testing.expectEqual(@as(f64, 1.0), sat_per_vb);
 }
 
 // ============================================================================
