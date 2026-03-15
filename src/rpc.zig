@@ -21,6 +21,7 @@ const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
 const block_template = @import("block_template.zig");
 const validation = @import("validation.zig");
+const wallet_mod = @import("wallet.zig");
 
 // ============================================================================
 // RPC Error Codes (Bitcoin Core conventions)
@@ -46,6 +47,18 @@ pub const RPC_VERIFY_ERROR: i32 = -25;
 pub const RPC_VERIFY_REJECTED: i32 = -26;
 pub const RPC_VERIFY_ALREADY_IN_CHAIN: i32 = -27;
 pub const RPC_IN_WARMUP: i32 = -28;
+
+/// Wallet-specific errors.
+pub const RPC_WALLET_ERROR: i32 = -4;
+pub const RPC_WALLET_INSUFFICIENT_FUNDS: i32 = -6;
+pub const RPC_WALLET_KEYPOOL_RAN_OUT: i32 = -12;
+pub const RPC_WALLET_UNLOCK_NEEDED: i32 = -13;
+pub const RPC_WALLET_PASSPHRASE_INCORRECT: i32 = -14;
+pub const RPC_WALLET_WRONG_ENC_STATE: i32 = -15;
+pub const RPC_WALLET_ENCRYPTION_FAILED: i32 = -16;
+pub const RPC_WALLET_ALREADY_UNLOCKED: i32 = -17;
+pub const RPC_WALLET_NOT_FOUND: i32 = -18;
+pub const RPC_WALLET_NOT_SPECIFIED: i32 = -19;
 
 // ============================================================================
 // RPC Server
@@ -79,6 +92,7 @@ pub const RpcServer = struct {
     mempool: *mempool_mod.Mempool,
     peer_manager: *peer_mod.PeerManager,
     network_params: *const consensus.NetworkParams,
+    wallet: ?*wallet_mod.Wallet,
     config: RpcConfig,
     running: std.atomic.Value(bool),
 
@@ -98,6 +112,30 @@ pub const RpcServer = struct {
             .mempool = mempool,
             .peer_manager = peer_manager,
             .network_params = network_params,
+            .wallet = null,
+            .config = config,
+            .running = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    /// Initialize the RPC server with a wallet.
+    pub fn initWithWallet(
+        allocator: std.mem.Allocator,
+        chain_state: *storage.ChainState,
+        mempool: *mempool_mod.Mempool,
+        peer_manager: *peer_mod.PeerManager,
+        network_params: *const consensus.NetworkParams,
+        wallet: *wallet_mod.Wallet,
+        config: RpcConfig,
+    ) RpcServer {
+        return RpcServer{
+            .listener = null,
+            .allocator = allocator,
+            .chain_state = chain_state,
+            .mempool = mempool,
+            .peer_manager = peer_manager,
+            .network_params = network_params,
+            .wallet = wallet,
             .config = config,
             .running = std.atomic.Value(bool).init(false),
         };
@@ -340,6 +378,22 @@ pub const RpcServer = struct {
         } else if (std.mem.eql(u8, method, "stop")) {
             self.stop();
             return self.jsonRpcResult("\"clearbit stopping\"", id);
+        }
+        // Wallet RPC methods
+        else if (std.mem.eql(u8, method, "encryptwallet")) {
+            return self.handleEncryptWallet(params, id);
+        } else if (std.mem.eql(u8, method, "walletpassphrase")) {
+            return self.handleWalletPassphrase(params, id);
+        } else if (std.mem.eql(u8, method, "walletlock")) {
+            return self.handleWalletLock(id);
+        } else if (std.mem.eql(u8, method, "walletpassphrasechange")) {
+            return self.handleWalletPassphraseChange(params, id);
+        } else if (std.mem.eql(u8, method, "setlabel")) {
+            return self.handleSetLabel(params, id);
+        } else if (std.mem.eql(u8, method, "getaddressinfo")) {
+            return self.handleGetAddressInfo(params, id);
+        } else if (std.mem.eql(u8, method, "getwalletinfo")) {
+            return self.handleGetWalletInfo(id);
         } else {
             return self.jsonRpcError(RPC_METHOD_NOT_FOUND, "Method not found", id);
         }
@@ -750,6 +804,256 @@ pub const RpcServer = struct {
     fn handleClearBanned(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         self.peer_manager.getBanList().clearAll();
         return self.jsonRpcResult("null", id);
+    }
+
+    // ========================================================================
+    // Wallet Methods
+    // ========================================================================
+
+    /// Check if wallet is available
+    fn requireWallet(self: *RpcServer, id: ?std.json.Value) ?[]const u8 {
+        if (self.wallet == null) {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id) catch null;
+        }
+        return null;
+    }
+
+    /// encryptwallet "passphrase"
+    /// Encrypts the wallet with a passphrase. This is for first time encryption.
+    fn handleEncryptWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        const wallet = self.wallet.?;
+
+        // Extract passphrase parameter
+        const passphrase = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const p = params.array.items[0];
+                if (p == .string) break :blk p.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing passphrase", id);
+        };
+
+        // Check if already encrypted
+        if (wallet.encrypted) {
+            return self.jsonRpcError(RPC_WALLET_WRONG_ENC_STATE, "Wallet is already encrypted", id);
+        }
+
+        // Encrypt the wallet
+        wallet.encryptWallet(passphrase) catch |err| {
+            return self.jsonRpcError(RPC_WALLET_ENCRYPTION_FAILED, @errorName(err), id);
+        };
+
+        return self.jsonRpcResult("\"Wallet encrypted; restart required\"", id);
+    }
+
+    /// walletpassphrase "passphrase" timeout
+    /// Unlocks the wallet for timeout seconds.
+    fn handleWalletPassphrase(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        const wallet = self.wallet.?;
+
+        // Extract passphrase and timeout
+        var passphrase: []const u8 = undefined;
+        var timeout: u32 = 60; // default 60 seconds
+
+        if (params == .array and params.array.items.len >= 1) {
+            const p = params.array.items[0];
+            if (p == .string) {
+                passphrase = p.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid passphrase", id);
+            }
+
+            if (params.array.items.len >= 2) {
+                const t = params.array.items[1];
+                if (t == .integer and t.integer > 0) {
+                    timeout = @intCast(t.integer);
+                }
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing passphrase", id);
+        }
+
+        // Check if wallet is encrypted
+        if (!wallet.encrypted) {
+            return self.jsonRpcError(RPC_WALLET_WRONG_ENC_STATE, "Wallet is not encrypted", id);
+        }
+
+        // Unlock the wallet
+        wallet.unlockWallet(passphrase, timeout) catch |err| {
+            if (err == error.WrongPassphrase) {
+                return self.jsonRpcError(RPC_WALLET_PASSPHRASE_INCORRECT, "The wallet passphrase entered was incorrect", id);
+            }
+            return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
+        };
+
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// walletlock
+    /// Locks the wallet.
+    fn handleWalletLock(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        const wallet = self.wallet.?;
+
+        if (!wallet.encrypted) {
+            return self.jsonRpcError(RPC_WALLET_WRONG_ENC_STATE, "Wallet is not encrypted", id);
+        }
+
+        wallet.lockWallet();
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// walletpassphrasechange "oldpassphrase" "newpassphrase"
+    /// Changes the wallet passphrase.
+    fn handleWalletPassphraseChange(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        const wallet = self.wallet.?;
+
+        // Extract old and new passphrases
+        var old_passphrase: []const u8 = undefined;
+        var new_passphrase: []const u8 = undefined;
+
+        if (params == .array and params.array.items.len >= 2) {
+            const old = params.array.items[0];
+            const new = params.array.items[1];
+            if (old == .string and new == .string) {
+                old_passphrase = old.string;
+                new_passphrase = new.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid passphrase parameters", id);
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing passphrase parameters", id);
+        }
+
+        if (!wallet.encrypted) {
+            return self.jsonRpcError(RPC_WALLET_WRONG_ENC_STATE, "Wallet is not encrypted", id);
+        }
+
+        wallet.changePassphrase(old_passphrase, new_passphrase) catch |err| {
+            if (err == error.WrongPassphrase) {
+                return self.jsonRpcError(RPC_WALLET_PASSPHRASE_INCORRECT, "The wallet passphrase entered was incorrect", id);
+            }
+            return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
+        };
+
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// setlabel "address" "label"
+    /// Sets the label associated with the given address.
+    fn handleSetLabel(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        const wallet = self.wallet.?;
+
+        // Extract address and label
+        var addr: []const u8 = undefined;
+        var label: []const u8 = "";
+
+        if (params == .array and params.array.items.len >= 1) {
+            const a = params.array.items[0];
+            if (a == .string) {
+                addr = a.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid address", id);
+            }
+
+            if (params.array.items.len >= 2) {
+                const l = params.array.items[1];
+                if (l == .string) {
+                    label = l.string;
+                }
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing address", id);
+        }
+
+        wallet.setLabel(addr, label) catch {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to set label", id);
+        };
+
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// getaddressinfo "address"
+    /// Returns information about the given address.
+    fn handleGetAddressInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        const wallet = self.wallet.?;
+
+        // Extract address
+        const addr = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const a = params.array.items[0];
+                if (a == .string) break :blk a.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing address", id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.print("{{\"address\":\"{s}\"", .{addr});
+
+        // Add label if exists
+        if (wallet.getLabel(addr)) |label| {
+            try writer.print(",\"label\":\"{s}\"", .{label});
+        }
+
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// getwalletinfo
+    /// Returns information about the wallet.
+    fn handleGetWalletInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        const wallet = self.wallet.?;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        const balance = wallet.getBalance();
+        const spendable = wallet.getSpendableBalance();
+        const immature = wallet.getImmatureBalance();
+        const unlocked = wallet.isUnlocked();
+
+        try writer.print("{{\"balance\":{d}.{d:0>8},\"unconfirmed_balance\":0.0,\"immature_balance\":{d}.{d:0>8}", .{
+            @divTrunc(balance, 100_000_000),
+            @abs(@rem(balance, 100_000_000)),
+            @divTrunc(immature, 100_000_000),
+            @abs(@rem(immature, 100_000_000)),
+        });
+
+        try writer.print(",\"txcount\":{d}", .{wallet.keys.items.len});
+        try writer.print(",\"keypoolsize\":{d}", .{wallet.keys.items.len});
+
+        if (wallet.encrypted) {
+            try writer.writeAll(",\"unlocked_until\":");
+            if (wallet.unlock_until) |until| {
+                try writer.print("{d}", .{until});
+            } else {
+                try writer.writeByte('0');
+            }
+        }
+
+        _ = spendable;
+        _ = unlocked;
+
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     // ========================================================================
