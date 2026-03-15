@@ -101,6 +101,13 @@ fn benchSha256Single(ctx_ptr: *anyopaque) usize {
     return ctx.data.len;
 }
 
+fn benchSha256Hw(ctx_ptr: *anyopaque) usize {
+    const ctx: *Sha256BenchContext = @ptrCast(@alignCast(ctx_ptr));
+    const result = crypto.sha256Hw(ctx.data);
+    std.mem.doNotOptimizeAway(&result);
+    return ctx.data.len;
+}
+
 fn benchHash256(ctx_ptr: *anyopaque) usize {
     const ctx: *Sha256BenchContext = @ptrCast(@alignCast(ctx_ptr));
     const result = crypto.hash256(ctx.data);
@@ -108,27 +115,86 @@ fn benchHash256(ctx_ptr: *anyopaque) usize {
     return ctx.data.len;
 }
 
+fn benchHash256Hw(ctx_ptr: *anyopaque) usize {
+    const ctx: *Sha256BenchContext = @ptrCast(@alignCast(ctx_ptr));
+    const result = crypto.hash256Hw(ctx.data);
+    std.mem.doNotOptimizeAway(&result);
+    return ctx.data.len;
+}
+
+const Sha256d64BenchContext = struct {
+    input: *[64]u8,
+    output: *[32]u8,
+};
+
+fn benchSha256d64(ctx_ptr: *anyopaque) usize {
+    const ctx: *Sha256d64BenchContext = @ptrCast(@alignCast(ctx_ptr));
+    crypto.sha256d64(ctx.output, ctx.input);
+    std.mem.doNotOptimizeAway(ctx.output);
+    return 64;
+}
+
 pub fn runSha256Benchmarks(writer: anytype) !void {
     try writer.print("\n=== SHA-256 Benchmarks ===\n", .{});
+    try writer.print("  Implementation: {s}\n", .{crypto.getSha256Implementation()});
 
-    // 64 bytes (one block)
+    // Report detected features
+    const features = crypto.detectCpuFeatures();
+    try writer.print("  CPU features: SHA-NI={}, SSE4.1={}, AVX2={}, ARM-SHA2={}\n", .{
+        features.has_sha_ni,
+        features.has_sse41,
+        features.has_avx2,
+        features.has_arm_sha2,
+    });
+
+    // 64 bytes (one block) - stdlib
     var data_64: [64]u8 = undefined;
     @memset(&data_64, 0xAB);
     var ctx_64 = Sha256BenchContext{ .data = &data_64 };
-    const result_64 = benchmark("SHA256 (64 bytes)", benchSha256Single, @ptrCast(&ctx_64), 1_000_000_000);
+    const result_64 = benchmark("SHA256 stdlib (64 bytes)", benchSha256Single, @ptrCast(&ctx_64), 1_000_000_000);
     try result_64.print(writer);
 
-    // 1 KB
+    // 64 bytes (one block) - hardware accelerated
+    var ctx_64_hw = Sha256BenchContext{ .data = &data_64 };
+    const result_64_hw = benchmark("SHA256 hw-accel (64 bytes)", benchSha256Hw, @ptrCast(&ctx_64_hw), 1_000_000_000);
+    try result_64_hw.print(writer);
+
+    // 1 KB - stdlib
     var data_1k: [1024]u8 = undefined;
     @memset(&data_1k, 0xCD);
     var ctx_1k = Sha256BenchContext{ .data = &data_1k };
-    const result_1k = benchmark("SHA256 (1 KB)", benchSha256Single, @ptrCast(&ctx_1k), 1_000_000_000);
+    const result_1k = benchmark("SHA256 stdlib (1 KB)", benchSha256Single, @ptrCast(&ctx_1k), 1_000_000_000);
     try result_1k.print(writer);
 
-    // Double SHA256 (hash256)
+    // 1 KB - hardware accelerated
+    var ctx_1k_hw = Sha256BenchContext{ .data = &data_1k };
+    const result_1k_hw = benchmark("SHA256 hw-accel (1 KB)", benchSha256Hw, @ptrCast(&ctx_1k_hw), 1_000_000_000);
+    try result_1k_hw.print(writer);
+
+    // 64 KB - hardware accelerated (large data throughput test)
+    var data_64k: [64 * 1024]u8 = undefined;
+    @memset(&data_64k, 0xEF);
+    var ctx_64k_hw = Sha256BenchContext{ .data = &data_64k };
+    const result_64k_hw = benchmark("SHA256 hw-accel (64 KB)", benchSha256Hw, @ptrCast(&ctx_64k_hw), 1_000_000_000);
+    try result_64k_hw.print(writer);
+
+    // Double SHA256 (hash256) - stdlib
     var ctx_h256 = Sha256BenchContext{ .data = &data_64 };
-    const result_h256 = benchmark("hash256 (64 bytes)", benchHash256, @ptrCast(&ctx_h256), 1_000_000_000);
+    const result_h256 = benchmark("hash256 stdlib (64 bytes)", benchHash256, @ptrCast(&ctx_h256), 1_000_000_000);
     try result_h256.print(writer);
+
+    // Double SHA256 (hash256) - hardware accelerated
+    var ctx_h256_hw = Sha256BenchContext{ .data = &data_64 };
+    const result_h256_hw = benchmark("hash256 hw-accel (64 bytes)", benchHash256Hw, @ptrCast(&ctx_h256_hw), 1_000_000_000);
+    try result_h256_hw.print(writer);
+
+    // sha256d64 - optimized for Merkle tree nodes
+    var merkle_input: [64]u8 = undefined;
+    var merkle_output: [32]u8 = undefined;
+    @memset(&merkle_input, 0x12);
+    var ctx_d64 = Sha256d64BenchContext{ .input = &merkle_input, .output = &merkle_output };
+    const result_d64 = benchmark("sha256d64 (Merkle node)", benchSha256d64, @ptrCast(&ctx_d64), 1_000_000_000);
+    try result_d64.print(writer);
 }
 
 // ============================================================================
