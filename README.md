@@ -18,7 +18,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Sighash computation (legacy FindAndDelete/OP_CODESEPARATOR, BIP-143 segwit, BIP-341 taproot)
 - [x] libsecp256k1 integration (ECDSA signing/verification, Schnorr)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
-- [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
+- [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A anchor outputs)
 - [x] Consensus parameters (network config, subsidy, soft fork heights)
 - [x] Difficulty adjustment (mainnet retarget, testnet 20-min rule, BIP-94, regtest)
 - [x] BIP-9 version bits (soft fork deployment state machine, signaling, caching)
