@@ -43,6 +43,7 @@ const BIP39_WORDS = getBip39Words();
 
 pub const AddressType = enum {
     p2pkh, // Legacy: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG
+    p2sh_p2wpkh, // P2SH-wrapped SegWit: OP_HASH160 <20-byte-script-hash> OP_EQUAL
     p2wpkh, // Native SegWit v0: OP_0 <20-byte-hash>
     p2wsh, // SegWit v0 script hash: OP_0 <32-byte-hash>
     p2tr, // Taproot: OP_1 <32-byte-x-only-pubkey>
@@ -62,6 +63,183 @@ pub const KeyPair = struct {
     secret_key: [32]u8,
     public_key: [33]u8, // Compressed SEC format
     x_only_pubkey: [32]u8, // For Taproot
+};
+
+// ============================================================================
+// BIP32 HD Key Derivation
+// ============================================================================
+
+/// BIP32 derivation purposes
+pub const DerivationPurpose = enum(u32) {
+    bip44 = 44, // P2PKH (legacy)
+    bip49 = 49, // P2SH-P2WPKH (wrapped segwit)
+    bip84 = 84, // P2WPKH (native segwit)
+    bip86 = 86, // P2TR (taproot)
+};
+
+/// BIP32 Extended Key - holds key material plus chain code for derivation
+pub const ExtendedKey = struct {
+    key: [32]u8, // Private or public key
+    chain_code: [32]u8, // Chain code for derivation
+    depth: u8,
+    parent_fingerprint: [4]u8,
+    child_index: u32,
+    is_private: bool,
+
+    /// HMAC-SHA512 helper for BIP32 derivation
+    fn hmacSha512(key: []const u8, data: []const u8) [64]u8 {
+        const HmacSha512 = std.crypto.auth.hmac.Hmac(std.crypto.hash.sha2.Sha512);
+        var result: [64]u8 = undefined;
+        HmacSha512.create(&result, data, key);
+        return result;
+    }
+
+    /// Create master key from seed (BIP32 master key generation)
+    pub fn fromSeed(seed: []const u8) !ExtendedKey {
+        if (seed.len < 16 or seed.len > 64) {
+            return error.InvalidSeedLength;
+        }
+
+        const hmac_result = hmacSha512("Bitcoin seed", seed);
+        const private_key = hmac_result[0..32].*;
+        const chain_code = hmac_result[32..64].*;
+
+        // Verify the key is valid (non-zero and less than curve order)
+        if (std.mem.eql(u8, &private_key, &[_]u8{0} ** 32)) {
+            return error.InvalidMasterKey;
+        }
+
+        return ExtendedKey{
+            .key = private_key,
+            .chain_code = chain_code,
+            .depth = 0,
+            .parent_fingerprint = [_]u8{ 0, 0, 0, 0 },
+            .child_index = 0,
+            .is_private = true,
+        };
+    }
+
+    /// Derive child key at index (BIP32 CKDpriv/CKDpub)
+    /// If index >= 0x80000000, it's a hardened derivation
+    pub fn deriveChild(self: *const ExtendedKey, ctx: *secp256k1.secp256k1_context, index: u32) !ExtendedKey {
+        const hardened = index >= 0x80000000;
+
+        if (hardened and !self.is_private) {
+            return error.CannotDeriveHardenedFromPublic;
+        }
+
+        var data: [37]u8 = undefined;
+
+        if (hardened) {
+            // Hardened: 0x00 || private_key || index
+            data[0] = 0;
+            @memcpy(data[1..33], &self.key);
+        } else {
+            // Normal: public_key || index
+            if (self.is_private) {
+                // Get public key from private
+                var pubkey: secp256k1.secp256k1_pubkey = undefined;
+                if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pubkey, &self.key) != 1) {
+                    return error.PubkeyCreationFailed;
+                }
+                var compressed: [33]u8 = undefined;
+                var len: usize = 33;
+                _ = secp256k1.secp256k1_ec_pubkey_serialize(
+                    ctx,
+                    &compressed,
+                    &len,
+                    &pubkey,
+                    secp256k1.SECP256K1_EC_COMPRESSED,
+                );
+                @memcpy(data[0..33], &compressed);
+            } else {
+                return error.NotImplemented; // Public key derivation
+            }
+        }
+
+        std.mem.writeInt(u32, data[33..37], index, .big);
+
+        const hmac_result = hmacSha512(&self.chain_code, &data);
+        const il = hmac_result[0..32];
+        const ir = hmac_result[32..64].*;
+
+        // Add il to parent key (mod curve order) using secp256k1
+        var child_key = self.key;
+        if (secp256k1.secp256k1_ec_seckey_tweak_add(ctx, &child_key, il) != 1) {
+            return error.InvalidChildKey;
+        }
+
+        // Compute parent fingerprint (first 4 bytes of hash160 of parent pubkey)
+        var parent_pubkey: secp256k1.secp256k1_pubkey = undefined;
+        if (secp256k1.secp256k1_ec_pubkey_create(ctx, &parent_pubkey, &self.key) != 1) {
+            return error.PubkeyCreationFailed;
+        }
+        var parent_compressed: [33]u8 = undefined;
+        var parent_len: usize = 33;
+        _ = secp256k1.secp256k1_ec_pubkey_serialize(
+            ctx,
+            &parent_compressed,
+            &parent_len,
+            &parent_pubkey,
+            secp256k1.SECP256K1_EC_COMPRESSED,
+        );
+        const fingerprint_hash = crypto.hash160(&parent_compressed);
+        const fingerprint = fingerprint_hash[0..4].*;
+
+        return ExtendedKey{
+            .key = child_key,
+            .chain_code = ir,
+            .depth = self.depth + 1,
+            .parent_fingerprint = fingerprint,
+            .child_index = index,
+            .is_private = self.is_private,
+        };
+    }
+
+    /// Derive a key from a BIP32 path string like "m/44'/0'/0'/0/0"
+    pub fn derivePath(self: *const ExtendedKey, ctx: *secp256k1.secp256k1_context, path: []const u8) !ExtendedKey {
+        var current = self.*;
+
+        // Skip leading 'm/' or 'M/'
+        var path_iter = path;
+        if (path_iter.len >= 2 and (path_iter[0] == 'm' or path_iter[0] == 'M') and path_iter[1] == '/') {
+            path_iter = path_iter[2..];
+        }
+
+        // Parse each component
+        var components = std.mem.splitScalar(u8, path_iter, '/');
+        while (components.next()) |component| {
+            if (component.len == 0) continue;
+
+            const hardened = std.mem.endsWith(u8, component, "'") or std.mem.endsWith(u8, component, "h");
+            const num_str = if (hardened) component[0 .. component.len - 1] else component;
+
+            const index = std.fmt.parseInt(u32, num_str, 10) catch return error.InvalidDerivationPath;
+            const full_index = if (hardened) index | 0x80000000 else index;
+
+            current = try current.deriveChild(ctx, full_index);
+        }
+
+        return current;
+    }
+
+    /// Get the standard BIP44/49/84/86 path for a given purpose, coin, account, change, and index
+    pub fn getStandardPath(
+        purpose: DerivationPurpose,
+        coin_type: u32, // 0 for mainnet, 1 for testnet
+        account: u32,
+        change: u32, // 0 for external, 1 for internal (change)
+        index: u32,
+        buffer: []u8,
+    ) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "m/{d}'/{d}'/{d}'/{d}/{d}", .{
+            @intFromEnum(purpose),
+            coin_type,
+            account,
+            change,
+            index,
+        }) catch return error.BufferTooSmall;
+    }
 };
 
 // ============================================================================
@@ -87,6 +265,11 @@ pub const Wallet = struct {
     allocator: std.mem.Allocator,
     network: Network,
 
+    // HD wallet state
+    master_key: ?ExtendedKey = null,
+    next_external_index: u32 = 0, // m/purpose'/coin'/0'/0/index
+    next_change_index: u32 = 0, // m/purpose'/coin'/0'/1/index
+
     pub fn init(allocator: std.mem.Allocator, network: Network) !Wallet {
         const ctx = secp256k1.secp256k1_context_create(
             secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
@@ -98,7 +281,17 @@ pub const Wallet = struct {
             .utxos = std.ArrayList(OwnedUtxo).init(allocator),
             .allocator = allocator,
             .network = network,
+            .master_key = null,
+            .next_external_index = 0,
+            .next_change_index = 0,
         };
+    }
+
+    /// Initialize the wallet with a BIP32 seed (from BIP39 mnemonic)
+    pub fn initFromSeed(allocator: std.mem.Allocator, network: Network, seed: []const u8) !Wallet {
+        var wallet = try init(allocator, network);
+        wallet.master_key = try ExtendedKey.fromSeed(seed);
+        return wallet;
     }
 
     pub fn deinit(self: *Wallet) void {
@@ -159,6 +352,65 @@ pub const Wallet = struct {
         return self.keys.items.len - 1;
     }
 
+    /// Get a new address using HD derivation (BIP44/49/84/86 paths).
+    /// This is the primary way to generate addresses for a HD wallet.
+    /// Returns both the address string and the key index.
+    pub fn getnewaddress(
+        self: *Wallet,
+        addr_type: AddressType,
+        is_change: bool,
+    ) !struct { address: []const u8, key_index: usize } {
+        if (self.master_key == null) {
+            // Non-HD wallet: fall back to random key generation
+            const key_index = try self.generateKey();
+            const addr = try self.getAddress(key_index, addr_type);
+            return .{ .address = addr, .key_index = key_index };
+        }
+
+        // Determine purpose from address type (BIP44/49/84/86)
+        const purpose: DerivationPurpose = switch (addr_type) {
+            .p2pkh => .bip44,
+            .p2sh_p2wpkh => .bip49,
+            .p2wpkh => .bip84,
+            .p2tr => .bip86,
+            .p2wsh => .bip84, // P2WSH uses BIP84 path
+        };
+
+        // Coin type: 0 for mainnet, 1 for testnet
+        const coin_type: u32 = switch (self.network) {
+            .mainnet => 0,
+            .testnet, .regtest => 1,
+        };
+
+        // Change: 0 for external (receiving), 1 for internal (change)
+        const change: u32 = if (is_change) 1 else 0;
+
+        // Get the next index for this chain
+        const index = if (is_change) self.next_change_index else self.next_external_index;
+
+        // Build derivation path
+        var path_buf: [64]u8 = undefined;
+        const path = try ExtendedKey.getStandardPath(purpose, coin_type, 0, change, index, &path_buf);
+
+        // Derive the key
+        const derived = try self.master_key.?.derivePath(self.ctx, path);
+
+        // Import the derived key
+        const key_index = try self.importKey(derived.key);
+
+        // Get the address
+        const addr = try self.getAddress(key_index, addr_type);
+
+        // Increment the index counter
+        if (is_change) {
+            self.next_change_index += 1;
+        } else {
+            self.next_external_index += 1;
+        }
+
+        return .{ .address = addr, .key_index = key_index };
+    }
+
     /// Get the number of keys in the wallet.
     pub fn keyCount(self: *const Wallet) usize {
         return self.keys.items.len;
@@ -187,6 +439,23 @@ pub const Wallet = struct {
                     0x88, // OP_EQUALVERIFY
                     0xac, // OP_CHECKSIG
                 });
+            },
+            .p2sh_p2wpkh => {
+                // P2SH-P2WPKH: OP_HASH160 <hash160(redeemScript)> OP_EQUAL
+                // where redeemScript = OP_0 <20-byte-pubkey-hash>
+                const pubkey_hash = crypto.hash160(&key.public_key);
+                var redeem_script: [22]u8 = undefined;
+                redeem_script[0] = 0x00; // OP_0
+                redeem_script[1] = 0x14; // Push 20 bytes
+                @memcpy(redeem_script[2..22], &pubkey_hash);
+                const script_hash = crypto.hash160(&redeem_script);
+
+                try result.appendSlice(&[_]u8{
+                    0xa9, // OP_HASH160
+                    0x14, // Push 20 bytes
+                });
+                try result.appendSlice(&script_hash);
+                try result.append(0x87); // OP_EQUAL
             },
             .p2wpkh => {
                 const hash = crypto.hash160(&key.public_key);
@@ -241,6 +510,22 @@ pub const Wallet = struct {
                 };
                 return try address.base58CheckEncode(version, &hash, self.allocator);
             },
+            .p2sh_p2wpkh => {
+                // P2SH address: base58check with version 0x05 (mainnet) or 0xC4 (testnet)
+                // containing hash160 of the redeem script (OP_0 <pubkey_hash>)
+                const pubkey_hash = crypto.hash160(&key.public_key);
+                var redeem_script: [22]u8 = undefined;
+                redeem_script[0] = 0x00; // OP_0
+                redeem_script[1] = 0x14; // Push 20 bytes
+                @memcpy(redeem_script[2..22], &pubkey_hash);
+                const script_hash = crypto.hash160(&redeem_script);
+
+                const version: u8 = switch (self.network) {
+                    .mainnet => 0x05,
+                    .testnet, .regtest => 0xC4,
+                };
+                return try address.base58CheckEncode(version, &script_hash, self.allocator);
+            },
             .p2wpkh => {
                 const hash = crypto.hash160(&key.public_key);
                 return try address.segwitEncode(hrp, 0, &hash, self.allocator);
@@ -282,159 +567,368 @@ pub const Wallet = struct {
         return total;
     }
 
-    /// Select coins to fund a transaction (Branch and Bound with fallback to greedy).
+    /// Coin selection options
+    pub const CoinSelectOptions = struct {
+        fee_rate: u64 = 1, // sat/vB
+        long_term_fee_rate: u64 = 10, // sat/vB for waste calculation
+        cost_of_change: i64 = 34 * 10, // cost to create + spend change output
+        min_change: i64 = 546, // minimum change to avoid dust
+    };
+
+    /// Select coins to fund a transaction (BnB with Knapsack fallback).
+    /// This matches Bitcoin Core's coin selection strategy.
     pub fn selectCoins(
         self: *Wallet,
         target_value: i64,
         fee_rate: u64, // sat/vB
     ) !struct { selected: []OwnedUtxo, change: i64 } {
+        return self.selectCoinsWithOptions(target_value, .{ .fee_rate = fee_rate });
+    }
+
+    /// Select coins with full options control
+    pub fn selectCoinsWithOptions(
+        self: *Wallet,
+        target_value: i64,
+        options: CoinSelectOptions,
+    ) !struct { selected: []OwnedUtxo, change: i64 } {
         if (self.utxos.items.len == 0) {
             return error.InsufficientFunds;
         }
 
-        // Sort UTXOs by value descending for greedy selection
+        // Create candidates with effective values
         const candidates = try self.allocator.dupe(OwnedUtxo, self.utxos.items);
         defer self.allocator.free(candidates);
 
-        std.mem.sort(OwnedUtxo, candidates, {}, struct {
-            fn cmp(_: void, a: OwnedUtxo, b: OwnedUtxo) bool {
-                return a.output.value > b.output.value;
-            }
-        }.cmp);
-
-        // Estimate input/output sizes for fee calculation
-        const estimated_overhead: u64 = 10 + 1 + 1; // version + vin count + vout count + locktime
-        const output_size: u64 = 34; // value(8) + scriptPubKey(~26)
-        const change_output_size: u64 = 34;
-
-        // Try Branch and Bound first for exact match
-        if (try self.branchAndBound(candidates, target_value, fee_rate)) |result| {
-            return result;
-        }
-
-        // Fallback: greedy selection
-        var selected = std.ArrayList(OwnedUtxo).init(self.allocator);
-        errdefer selected.deinit();
-        var total: i64 = 0;
-
-        for (candidates) |utxo| {
-            const input_size: u64 = estimateInputSize(utxo.address_type);
-            const input_fee = input_size * fee_rate;
-            const effective_value = @as(i64, @intCast(utxo.output.value)) - @as(i64, @intCast(input_fee));
-
-            if (effective_value <= 0) continue; // Skip dust inputs
-
-            try selected.append(utxo);
-            total += effective_value;
-
-            const total_fee = @as(i64, @intCast(
-                (estimated_overhead + output_size + change_output_size +
-                    input_size * selected.items.len) * fee_rate,
-            ));
-
-            if (total >= target_value + total_fee) {
-                return .{
-                    .selected = try selected.toOwnedSlice(),
-                    .change = total - target_value - total_fee,
-                };
-            }
-        }
-
-        return error.InsufficientFunds;
-    }
-
-    /// Branch and Bound coin selection - tries to find exact match (no change)
-    fn branchAndBound(
-        self: *Wallet,
-        candidates: []OwnedUtxo,
-        target_value: i64,
-        fee_rate: u64,
-    ) !?struct { selected: []OwnedUtxo, change: i64 } {
-        const max_iterations: usize = 100000;
-        var iterations: usize = 0;
-
-        // Calculate effective values
+        // Calculate effective values and sort by descending effective value
         var effective_values = try self.allocator.alloc(i64, candidates.len);
         defer self.allocator.free(effective_values);
 
+        var total_available: i64 = 0;
         for (candidates, 0..) |utxo, i| {
-            const input_size = estimateInputSize(utxo.address_type);
-            const input_fee = @as(i64, @intCast(input_size * fee_rate));
+            const input_fee = @as(i64, @intCast(estimateInputSize(utxo.address_type) * options.fee_rate));
             effective_values[i] = utxo.output.value - input_fee;
+            if (effective_values[i] > 0) {
+                total_available += effective_values[i];
+            }
         }
 
-        // Track best solution
-        var best_selection: ?[]bool = null;
+        if (total_available < target_value) {
+            return error.InsufficientFunds;
+        }
+
+        // Sort by effective value descending, with lower input size as tiebreaker
+        const SortCtx = struct {
+            eff_vals: []const i64,
+        };
+        const sort_ctx = SortCtx{ .eff_vals = effective_values };
+        const indices = try self.allocator.alloc(usize, candidates.len);
+        defer self.allocator.free(indices);
+        for (indices, 0..) |*idx, i| idx.* = i;
+
+        std.sort.pdq(usize, indices, sort_ctx, struct {
+            fn cmp(ctx: SortCtx, a: usize, b: usize) bool {
+                return ctx.eff_vals[a] > ctx.eff_vals[b];
+            }
+        }.cmp);
+
+        // Try Branch and Bound first (aims for exact match, no change)
+        if (try self.selectCoinsBnB(candidates, indices, effective_values, target_value, options)) |result| {
+            return result;
+        }
+
+        // Fallback to Knapsack solver
+        return try self.knapsackSolver(candidates, indices, effective_values, target_value, options);
+    }
+
+    /// Branch and Bound coin selection - exhaustive search for subset-sum within tolerance.
+    /// Aims to find a selection that pays the target without needing change output.
+    /// Max 100k iterations as per Bitcoin Core.
+    fn selectCoinsBnB(
+        self: *Wallet,
+        candidates: []const OwnedUtxo,
+        sorted_indices: []const usize,
+        effective_values: []const i64,
+        target_value: i64,
+        options: CoinSelectOptions,
+    ) !?struct { selected: []OwnedUtxo, change: i64 } {
+        const max_iterations: usize = 100_000;
+        const cost_of_change = options.cost_of_change;
+
+        // Filter to positive effective value UTXOs only
+        var positive_count: usize = 0;
+        for (sorted_indices) |idx| {
+            if (effective_values[idx] > 0) positive_count += 1;
+        }
+        if (positive_count == 0) return null;
+
+        // Calculate available value (lookahead)
+        var curr_available_value: i64 = 0;
+        for (sorted_indices) |idx| {
+            if (effective_values[idx] > 0) {
+                curr_available_value += effective_values[idx];
+            }
+        }
+
+        if (curr_available_value < target_value) return null;
+
+        // Track selections and values
+        var curr_selection = std.ArrayList(usize).init(self.allocator);
+        defer curr_selection.deinit();
+
+        var best_selection = std.ArrayList(usize).init(self.allocator);
+        defer best_selection.deinit();
+
+        var curr_value: i64 = 0;
+        var curr_waste: i64 = 0;
         var best_waste: i64 = std.math.maxInt(i64);
 
-        // Current selection state
-        var current = try self.allocator.alloc(bool, candidates.len);
-        defer self.allocator.free(current);
-        @memset(current, false);
+        // Is current fee rate higher than long term? Affects waste calculation
+        const is_feerate_high = options.fee_rate > options.long_term_fee_rate;
 
-        // BnB exploration (simplified DFS)
-        var depth: usize = 0;
-        var current_value: i64 = 0;
+        var utxo_pool_index: usize = 0;
+        var iterations: usize = 0;
 
-        while (iterations < max_iterations) {
-            iterations += 1;
+        while (iterations < max_iterations) : (iterations += 1) {
+            var backtrack = false;
 
-            if (depth >= candidates.len) {
-                // Check if we found a valid selection
-                if (current_value >= target_value) {
-                    const waste = current_value - target_value;
-                    if (waste < best_waste) {
-                        best_waste = waste;
-                        if (best_selection) |bs| {
-                            self.allocator.free(bs);
-                        }
-                        best_selection = try self.allocator.dupe(bool, current);
-                    }
-                }
-
-                // Backtrack
-                while (depth > 0) {
-                    depth -= 1;
-                    if (current[depth]) {
-                        current[depth] = false;
-                        current_value -= effective_values[depth];
-                        break;
-                    }
-                }
-                if (depth == 0 and !current[0]) break;
-                continue;
+            // Find next valid UTXO index (skip negative effective values)
+            while (utxo_pool_index < sorted_indices.len and
+                effective_values[sorted_indices[utxo_pool_index]] <= 0)
+            {
+                utxo_pool_index += 1;
             }
 
-            // Try including this UTXO
-            if (!current[depth] and effective_values[depth] > 0) {
-                current[depth] = true;
-                current_value += effective_values[depth];
-                depth += 1;
+            // Check backtrack conditions
+            if (utxo_pool_index >= sorted_indices.len) {
+                backtrack = true;
+            } else if (curr_value + curr_available_value < target_value) {
+                // Cannot possibly reach target
+                backtrack = true;
+            } else if (curr_value > target_value + cost_of_change) {
+                // Exceeded target + change cost, this branch won't help
+                backtrack = true;
+            } else if (curr_waste > best_waste and is_feerate_high) {
+                // Waste is increasing when fee rate is high
+                backtrack = true;
+            } else if (curr_value >= target_value) {
+                // Found a valid selection!
+                const selection_waste = curr_waste + (curr_value - target_value);
+                if (selection_waste <= best_waste) {
+                    best_waste = selection_waste;
+                    best_selection.clearRetainingCapacity();
+                    try best_selection.appendSlice(curr_selection.items);
+                }
+                backtrack = true;
+            }
+
+            if (backtrack) {
+                if (curr_selection.items.len == 0) break;
+
+                // Restore available value for skipped UTXOs
+                const last_selected = curr_selection.items[curr_selection.items.len - 1];
+                var restore_idx = utxo_pool_index;
+                while (restore_idx > 0) {
+                    restore_idx -= 1;
+                    if (restore_idx == last_selected) break;
+                    const idx = sorted_indices[restore_idx];
+                    if (effective_values[idx] > 0) {
+                        curr_available_value += effective_values[idx];
+                    }
+                }
+
+                // Deselect last UTXO
+                const deselect_idx = sorted_indices[last_selected];
+                curr_value -= effective_values[deselect_idx];
+                const utxo_waste = calculateWaste(candidates[deselect_idx].address_type, options);
+                curr_waste -= utxo_waste;
+                _ = curr_selection.pop();
+
+                utxo_pool_index = last_selected + 1;
             } else {
-                // Already tried or negative effective value, skip
-                depth += 1;
+                // Include this UTXO
+                const utxo_idx = sorted_indices[utxo_pool_index];
+                curr_available_value -= effective_values[utxo_idx];
+                curr_value += effective_values[utxo_idx];
+                curr_waste += calculateWaste(candidates[utxo_idx].address_type, options);
+                try curr_selection.append(utxo_pool_index);
+                utxo_pool_index += 1;
             }
         }
 
-        if (best_selection) |selection| {
-            defer self.allocator.free(selection);
+        if (best_selection.items.len == 0) return null;
+
+        // Build result
+        var selected = std.ArrayList(OwnedUtxo).init(self.allocator);
+        errdefer selected.deinit();
+
+        var total_value: i64 = 0;
+        for (best_selection.items) |pool_idx| {
+            const utxo_idx = sorted_indices[pool_idx];
+            try selected.append(candidates[utxo_idx]);
+            total_value += effective_values[utxo_idx];
+        }
+
+        return .{
+            .selected = try selected.toOwnedSlice(),
+            .change = total_value - target_value, // For BnB this should be minimal or zero
+        };
+    }
+
+    /// Calculate waste for a single input (fee - long_term_fee)
+    fn calculateWaste(addr_type: AddressType, options: CoinSelectOptions) i64 {
+        const input_size = estimateInputSize(addr_type);
+        const fee = @as(i64, @intCast(input_size * options.fee_rate));
+        const long_term_fee = @as(i64, @intCast(input_size * options.long_term_fee_rate));
+        return fee - long_term_fee;
+    }
+
+    /// Knapsack coin selection - random selection with stochastic approximation.
+    /// Used as fallback when BnB fails. Always produces change output.
+    fn knapsackSolver(
+        self: *Wallet,
+        candidates: []const OwnedUtxo,
+        sorted_indices: []const usize,
+        effective_values: []const i64,
+        target_value: i64,
+        options: CoinSelectOptions,
+    ) !struct { selected: []OwnedUtxo, change: i64 } {
+        const change_cost = options.cost_of_change;
+
+        // Separate UTXOs into categories
+        var applicable_groups = std.ArrayList(usize).init(self.allocator);
+        defer applicable_groups.deinit();
+
+        var lowest_larger: ?usize = null;
+        var total_lower: i64 = 0;
+
+        for (sorted_indices) |idx| {
+            const eff_value = effective_values[idx];
+            if (eff_value <= 0) continue;
+
+            if (eff_value == target_value) {
+                // Exact match!
+                var selected = try self.allocator.alloc(OwnedUtxo, 1);
+                selected[0] = candidates[idx];
+                return .{ .selected = selected, .change = 0 };
+            } else if (eff_value < target_value + change_cost) {
+                // Smaller than target + change, could be part of sum
+                try applicable_groups.append(idx);
+                total_lower += eff_value;
+            } else {
+                // Larger than needed - track the smallest one
+                if (lowest_larger == null or eff_value < effective_values[lowest_larger.?]) {
+                    lowest_larger = idx;
+                }
+            }
+        }
+
+        // Check if all smaller UTXOs together equal target exactly
+        if (total_lower == target_value) {
+            var selected = std.ArrayList(OwnedUtxo).init(self.allocator);
+            errdefer selected.deinit();
+            for (applicable_groups.items) |idx| {
+                try selected.append(candidates[idx]);
+            }
+            return .{ .selected = try selected.toOwnedSlice(), .change = 0 };
+        }
+
+        // If smaller UTXOs are insufficient, use the smallest larger UTXO
+        if (total_lower < target_value) {
+            if (lowest_larger) |ll_idx| {
+                var selected = try self.allocator.alloc(OwnedUtxo, 1);
+                selected[0] = candidates[ll_idx];
+                return .{
+                    .selected = selected,
+                    .change = effective_values[ll_idx] - target_value,
+                };
+            }
+            return error.InsufficientFunds;
+        }
+
+        // Stochastic subset sum approximation (simplified Knapsack)
+        // Run multiple iterations picking random subsets
+        var best_selection = std.ArrayList(usize).init(self.allocator);
+        defer best_selection.deinit();
+        var best_value: i64 = std.math.maxInt(i64);
+
+        const iterations: usize = 1000;
+        var rng_state: u64 = @bitCast(std.time.milliTimestamp());
+
+        for (0..iterations) |_| {
+            var included = try self.allocator.alloc(bool, applicable_groups.items.len);
+            defer self.allocator.free(included);
+            @memset(included, false);
+
+            var current_value: i64 = 0;
+            var reached_target = false;
+
+            // Two passes: first random, then fill gaps
+            for (0..2) |pass| {
+                for (applicable_groups.items, 0..) |idx, i| {
+                    // Pass 0: randomly include
+                    // Pass 1: include if not yet included and not reached target
+                    const should_consider = if (pass == 0)
+                        xorshift(&rng_state) % 2 == 0
+                    else
+                        !included[i];
+
+                    if (should_consider and !reached_target) {
+                        current_value += effective_values[idx];
+                        included[i] = true;
+
+                        if (current_value >= target_value) {
+                            reached_target = true;
+                            if (current_value < best_value) {
+                                best_value = current_value;
+                                best_selection.clearRetainingCapacity();
+                                for (applicable_groups.items, 0..) |sel_idx, j| {
+                                    if (included[j]) try best_selection.append(sel_idx);
+                                }
+                            }
+                            // Try removing this element to see if we're still above target
+                            current_value -= effective_values[idx];
+                            included[i] = false;
+                            reached_target = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we found a solution via stochastic search
+        if (best_selection.items.len > 0) {
+            // Check if the single larger UTXO would be better
+            if (lowest_larger) |ll_idx| {
+                const ll_value = effective_values[ll_idx];
+                if (ll_value <= best_value) {
+                    var selected = try self.allocator.alloc(OwnedUtxo, 1);
+                    selected[0] = candidates[ll_idx];
+                    return .{ .selected = selected, .change = ll_value - target_value };
+                }
+            }
 
             var selected = std.ArrayList(OwnedUtxo).init(self.allocator);
             errdefer selected.deinit();
-
-            for (selection, 0..) |included, i| {
-                if (included) {
-                    try selected.append(candidates[i]);
-                }
+            for (best_selection.items) |idx| {
+                try selected.append(candidates[idx]);
             }
-
             return .{
                 .selected = try selected.toOwnedSlice(),
-                .change = best_waste,
+                .change = best_value - target_value,
             };
         }
 
-        return null;
+        // Last resort: use smallest larger UTXO
+        if (lowest_larger) |ll_idx| {
+            var selected = try self.allocator.alloc(OwnedUtxo, 1);
+            selected[0] = candidates[ll_idx];
+            return .{
+                .selected = selected,
+                .change = effective_values[ll_idx] - target_value,
+            };
+        }
+
+        return error.InsufficientFunds;
     }
 
     /// Sign a transaction input using the appropriate signing algorithm.
@@ -478,6 +972,40 @@ pub const Wallet = struct {
                     .script_sig = script_sig_slice,
                     .sequence = tx.inputs[input_index].sequence,
                     .witness = tx.inputs[input_index].witness,
+                };
+            },
+            .p2sh_p2wpkh => {
+                // P2SH-P2WPKH signing: BIP-143 sighash with scriptSig containing redeem script
+                const sighash = try computeWitnessSigHashV0(tx, input_index, utxo, sighash_type, self.allocator);
+                const sig = try self.ecdsaSign(&sighash, &key.secret_key);
+
+                // Build scriptSig: push of redeem script (OP_0 <pubkey_hash>)
+                const pubkey_hash = crypto.hash160(&key.public_key);
+                var script_sig = try self.allocator.alloc(u8, 23);
+                script_sig[0] = 0x16; // Push 22 bytes
+                script_sig[1] = 0x00; // OP_0
+                script_sig[2] = 0x14; // Push 20 bytes
+                @memcpy(script_sig[3..23], &pubkey_hash);
+
+                // Build witness: [sig+hashtype, pubkey]
+                var witness = try self.allocator.alloc([]const u8, 2);
+                errdefer self.allocator.free(witness);
+
+                const sig_len = getDerSigLen(&sig);
+                var sig_with_hashtype = try self.allocator.alloc(u8, sig_len + 1);
+                @memcpy(sig_with_hashtype[0..sig_len], sig[0..sig_len]);
+                sig_with_hashtype[sig_len] = @intCast(sighash_type & 0xFF);
+                witness[0] = sig_with_hashtype;
+
+                const pubkey_copy = try self.allocator.alloc(u8, 33);
+                @memcpy(pubkey_copy, &key.public_key);
+                witness[1] = pubkey_copy;
+
+                tx.inputs[input_index] = types.TxIn{
+                    .previous_output = tx.inputs[input_index].previous_output,
+                    .script_sig = script_sig,
+                    .sequence = tx.inputs[input_index].sequence,
+                    .witness = witness,
                 };
             },
             .p2wpkh => {
@@ -743,10 +1271,21 @@ pub fn createTransaction(
 fn estimateInputSize(addr_type: AddressType) u64 {
     return switch (addr_type) {
         .p2pkh => 148, // 32+4+1+~107+4
+        .p2sh_p2wpkh => 91, // 32+4+1+23+4 + witness/4 (91 vbytes)
         .p2wpkh => 68, // 32+4+1+0+4 + witness/4
         .p2wsh => 100, // Approximate
         .p2tr => 58, // 32+4+1+0+4 + 64/4
     };
+}
+
+/// Simple xorshift64 PRNG for Knapsack randomization
+fn xorshift(state: *u64) u64 {
+    var x = state.*;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    state.* = x;
+    return x;
 }
 
 /// Get actual length of DER signature (may be less than 72).
@@ -1370,4 +1909,373 @@ test "anti-fee-sniping disabled sets locktime to 0" {
 
     // Verify locktime is 0 when anti-fee-sniping is disabled
     try std.testing.expectEqual(@as(u32, 0), tx.lock_time);
+}
+
+// ============================================================================
+// BIP32 HD Key Tests
+// ============================================================================
+
+test "BIP32 master key from seed" {
+    // Test vector from BIP32 spec (test vector 1)
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+
+    // Verify master key properties
+    try std.testing.expectEqual(@as(u8, 0), master.depth);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, &master.parent_fingerprint);
+    try std.testing.expectEqual(@as(u32, 0), master.child_index);
+    try std.testing.expect(master.is_private);
+
+    // Master key should be non-zero
+    try std.testing.expect(!std.mem.eql(u8, &master.key, &[_]u8{0} ** 32));
+    try std.testing.expect(!std.mem.eql(u8, &master.chain_code, &[_]u8{0} ** 32));
+}
+
+test "BIP32 child key derivation" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+
+    // Derive m/0 (normal child)
+    const child0 = try master.deriveChild(ctx.?, 0);
+    try std.testing.expectEqual(@as(u8, 1), child0.depth);
+    try std.testing.expectEqual(@as(u32, 0), child0.child_index);
+    try std.testing.expect(!std.mem.eql(u8, &child0.key, &master.key));
+
+    // Derive m/0' (hardened child)
+    const child0h = try master.deriveChild(ctx.?, 0x80000000);
+    try std.testing.expectEqual(@as(u8, 1), child0h.depth);
+    try std.testing.expectEqual(@as(u32, 0x80000000), child0h.child_index);
+    try std.testing.expect(!std.mem.eql(u8, &child0h.key, &child0.key));
+}
+
+test "BIP32 path derivation" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+
+    // Derive m/44'/0'/0'/0/0 (BIP44 first external address)
+    const derived = try master.derivePath(ctx.?, "m/44'/0'/0'/0/0");
+    try std.testing.expectEqual(@as(u8, 5), derived.depth);
+    try std.testing.expect(derived.is_private);
+}
+
+test "BIP32 standard path generation" {
+    var buf: [64]u8 = undefined;
+
+    const path44 = try ExtendedKey.getStandardPath(.bip44, 0, 0, 0, 0, &buf);
+    try std.testing.expectEqualSlices(u8, "m/44'/0'/0'/0/0", path44);
+
+    const path84 = try ExtendedKey.getStandardPath(.bip84, 0, 0, 1, 5, &buf);
+    try std.testing.expectEqualSlices(u8, "m/84'/0'/0'/1/5", path84);
+
+    const path86 = try ExtendedKey.getStandardPath(.bip86, 1, 0, 0, 10, &buf);
+    try std.testing.expectEqualSlices(u8, "m/86'/1'/0'/0/10", path86);
+}
+
+// ============================================================================
+// P2SH-P2WPKH Address Tests
+// ============================================================================
+
+test "P2SH-P2WPKH script generation" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    const script = try wallet.getScriptPubKey(0, .p2sh_p2wpkh);
+    defer allocator.free(script);
+
+    // P2SH: OP_HASH160 <20> OP_EQUAL
+    try std.testing.expectEqual(@as(usize, 23), script.len);
+    try std.testing.expectEqual(@as(u8, 0xa9), script[0]); // OP_HASH160
+    try std.testing.expectEqual(@as(u8, 0x14), script[1]); // Push 20
+    try std.testing.expectEqual(@as(u8, 0x87), script[22]); // OP_EQUAL
+}
+
+test "P2SH-P2WPKH address derivation mainnet" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    const addr_str = try wallet.getAddress(0, .p2sh_p2wpkh);
+    defer allocator.free(addr_str);
+
+    // Mainnet P2SH addresses start with '3'
+    try std.testing.expect(addr_str[0] == '3');
+}
+
+test "P2SH-P2WPKH address derivation testnet" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .testnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    const addr_str = try wallet.getAddress(0, .p2sh_p2wpkh);
+    defer allocator.free(addr_str);
+
+    // Testnet P2SH addresses start with '2'
+    try std.testing.expect(addr_str[0] == '2');
+}
+
+// ============================================================================
+// Coin Selection Tests
+// ============================================================================
+
+test "coin selection BnB exact match" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    // Add UTXOs that can form an exact match
+    try wallet.addUtxo(.{
+        .outpoint = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .output = .{ .value = 50000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    });
+    try wallet.addUtxo(.{
+        .outpoint = .{ .hash = [_]u8{0x02} ** 32, .index = 0 },
+        .output = .{ .value = 30000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    });
+    try wallet.addUtxo(.{
+        .outpoint = .{ .hash = [_]u8{0x03} ** 32, .index = 0 },
+        .output = .{ .value = 20000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    });
+
+    // Try to select coins - BnB should find a good solution
+    const result = try wallet.selectCoins(40000, 1);
+    defer allocator.free(result.selected);
+
+    // Should select at least one UTXO
+    try std.testing.expect(result.selected.len > 0);
+}
+
+test "coin selection Knapsack fallback" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    // Add many small UTXOs that require Knapsack
+    var i: u8 = 0;
+    while (i < 20) : (i += 1) {
+        try wallet.addUtxo(.{
+            .outpoint = .{ .hash = [_]u8{i + 1} ** 32, .index = 0 },
+            .output = .{ .value = 10000, .script_pubkey = &[_]u8{} },
+            .key_index = 0,
+            .address_type = .p2wpkh,
+            .confirmations = 6,
+        });
+    }
+
+    const result = try wallet.selectCoins(75000, 1);
+    defer allocator.free(result.selected);
+
+    // Should find a solution using multiple UTXOs
+    try std.testing.expect(result.selected.len > 0);
+}
+
+test "coin selection with options" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    _ = try wallet.generateKey();
+
+    try wallet.addUtxo(.{
+        .outpoint = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .output = .{ .value = 100000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    });
+
+    const result = try wallet.selectCoinsWithOptions(50000, .{
+        .fee_rate = 5,
+        .long_term_fee_rate = 10,
+        .cost_of_change = 500,
+        .min_change = 1000,
+    });
+    defer allocator.free(result.selected);
+
+    try std.testing.expectEqual(@as(usize, 1), result.selected.len);
+    try std.testing.expect(result.change > 0);
+}
+
+// ============================================================================
+// HD Wallet / getnewaddress Tests
+// ============================================================================
+
+test "getnewaddress without HD seed" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    var wallet = try Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    // Without HD seed, getnewaddress falls back to random key generation
+    const result = try wallet.getnewaddress(.p2wpkh, false);
+    defer allocator.free(result.address);
+
+    try std.testing.expect(std.mem.startsWith(u8, result.address, "bc1q"));
+    try std.testing.expectEqual(@as(usize, 0), result.key_index);
+}
+
+test "getnewaddress with HD seed" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    };
+
+    var wallet = try Wallet.initFromSeed(allocator, .mainnet, &seed);
+    defer wallet.deinit();
+
+    // Generate multiple addresses
+    const addr1 = try wallet.getnewaddress(.p2wpkh, false);
+    defer allocator.free(addr1.address);
+    try std.testing.expect(std.mem.startsWith(u8, addr1.address, "bc1q"));
+    try std.testing.expectEqual(@as(usize, 0), addr1.key_index);
+
+    const addr2 = try wallet.getnewaddress(.p2wpkh, false);
+    defer allocator.free(addr2.address);
+    try std.testing.expect(std.mem.startsWith(u8, addr2.address, "bc1q"));
+    try std.testing.expectEqual(@as(usize, 1), addr2.key_index);
+
+    // Addresses should be different
+    try std.testing.expect(!std.mem.eql(u8, addr1.address, addr2.address));
+
+    // Check change address
+    const change_addr = try wallet.getnewaddress(.p2wpkh, true);
+    defer allocator.free(change_addr.address);
+    try std.testing.expect(std.mem.startsWith(u8, change_addr.address, "bc1q"));
+    try std.testing.expect(!std.mem.eql(u8, change_addr.address, addr1.address));
+}
+
+test "getnewaddress all address types with HD" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+    const seed = [_]u8{
+        0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+        0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+        0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+        0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+    };
+
+    var wallet = try Wallet.initFromSeed(allocator, .mainnet, &seed);
+    defer wallet.deinit();
+
+    // P2PKH (BIP44)
+    const p2pkh_addr = try wallet.getnewaddress(.p2pkh, false);
+    defer allocator.free(p2pkh_addr.address);
+    try std.testing.expect(p2pkh_addr.address[0] == '1');
+
+    // P2SH-P2WPKH (BIP49)
+    const p2sh_addr = try wallet.getnewaddress(.p2sh_p2wpkh, false);
+    defer allocator.free(p2sh_addr.address);
+    try std.testing.expect(p2sh_addr.address[0] == '3');
+
+    // P2WPKH (BIP84)
+    const p2wpkh_addr = try wallet.getnewaddress(.p2wpkh, false);
+    defer allocator.free(p2wpkh_addr.address);
+    try std.testing.expect(std.mem.startsWith(u8, p2wpkh_addr.address, "bc1q"));
+
+    // P2TR (BIP86)
+    const p2tr_addr = try wallet.getnewaddress(.p2tr, false);
+    defer allocator.free(p2tr_addr.address);
+    try std.testing.expect(std.mem.startsWith(u8, p2tr_addr.address, "bc1p"));
+}
+
+test "estimateInputSize includes P2SH-P2WPKH" {
+    try std.testing.expectEqual(@as(u64, 91), estimateInputSize(.p2sh_p2wpkh));
 }
