@@ -948,4 +948,5 @@ comptime {
     _ = @import("perf.zig");
     _ = @import("bench.zig");
     _ = @import("indexes.zig");
+    _ = @import("v2_transport.zig");
 }
