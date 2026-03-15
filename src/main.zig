@@ -24,6 +24,7 @@ pub const rpc = @import("rpc.zig");
 pub const wallet = @import("wallet.zig");
 pub const perf = @import("perf.zig");
 pub const bench = @import("bench.zig");
+pub const indexes = @import("indexes.zig");
 
 // ============================================================================
 // Version Info
@@ -56,6 +57,8 @@ pub const Config = struct {
     prune: u64 = 0, // 0 = no pruning, else target size in MiB
     dbcache: u64 = 450, // UTXO cache size in MiB
     txindex: bool = false,
+    blockfilterindex: bool = false, // BIP-157/158 compact block filters
+    coinstatsindex: bool = false, // Per-block UTXO statistics
 
     // Mempool
     maxmempool: u64 = 300, // Max mempool size in MiB
@@ -152,6 +155,10 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
                 return ArgParseError.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--txindex")) {
             config.txindex = true;
+        } else if (std.mem.eql(u8, arg, "--blockfilterindex")) {
+            config.blockfilterindex = true;
+        } else if (std.mem.eql(u8, arg, "--coinstatsindex")) {
+            config.coinstatsindex = true;
         }
         // Mempool settings
         else if (std.mem.startsWith(u8, arg, "--maxmempool=")) {
@@ -215,6 +222,8 @@ pub fn printUsage() void {
         \\  --dbcache=<MiB>        UTXO cache size in MiB (default: 450)
         \\  --prune=<MiB>          Prune target in MiB (0 = disabled)
         \\  --txindex              Enable transaction index
+        \\  --blockfilterindex     Enable BIP-157/158 block filter index
+        \\  --coinstatsindex       Enable UTXO statistics index
         \\
         \\Mempool options:
         \\  --maxmempool=<MiB>     Max mempool size in MiB (default: 300)
@@ -346,6 +355,10 @@ pub fn loadConfigFile(
                 config.prune = std.fmt.parseInt(u64, value, 10) catch continue;
             } else if (std.mem.eql(u8, key, "txindex")) {
                 config.txindex = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "blockfilterindex")) {
+                config.blockfilterindex = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "coinstatsindex")) {
+                config.coinstatsindex = std.mem.eql(u8, value, "1");
             }
             // Mempool settings
             else if (std.mem.eql(u8, key, "maxmempool")) {
