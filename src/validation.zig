@@ -2062,3 +2062,914 @@ test "checkpoints are sorted by height" {
         try std.testing.expect(checkpoints[i].height < checkpoints[i + 1].height);
     }
 }
+
+// ============================================================================
+// Block Status Flags (Phase 51)
+// ============================================================================
+
+/// Block status flags for tracking validity state.
+/// These flags are stored in the block index and persisted to RocksDB.
+/// Reference: Bitcoin Core chain.h CBlockIndex::BlockStatus
+pub const BlockStatus = packed struct(u32) {
+    /// Block has been validated up to this point
+    valid_header: bool = false,
+    /// Full block data available
+    has_data: bool = false,
+    /// Undo data available
+    has_undo: bool = false,
+
+    /// Set if this block itself failed consensus validation.
+    /// Once set, this block and all its descendants are considered invalid.
+    /// Corresponds to BLOCK_FAILED_VALID in Bitcoin Core.
+    failed_valid: bool = false,
+
+    /// Set if a descendant of this block failed validation.
+    /// This flag propagates down from the failed ancestor.
+    /// Corresponds to BLOCK_FAILED_CHILD in Bitcoin Core.
+    failed_child: bool = false,
+
+    _padding: u27 = 0,
+
+    /// Check if this block or any ancestor is marked invalid.
+    pub fn isInvalid(self: BlockStatus) bool {
+        return self.failed_valid or self.failed_child;
+    }
+
+    /// Clear all failure flags.
+    pub fn clearFailure(self: *BlockStatus) void {
+        self.failed_valid = false;
+        self.failed_child = false;
+    }
+};
+
+/// Extended block index entry with chain management metadata.
+/// This struct extends the basic block header with validation state,
+/// chainwork, and sequence ID for tie-breaking.
+pub const BlockIndexEntry = struct {
+    /// Block hash (computed from header)
+    hash: types.Hash256,
+    /// Block header
+    header: types.BlockHeader,
+    /// Block height
+    height: u32,
+    /// Validation status flags
+    status: BlockStatus,
+    /// Total chain work up to and including this block
+    chain_work: [32]u8,
+    /// Sequence ID for tie-breaking in chain selection.
+    /// Lower sequence IDs are preferred (precious blocks get negative values).
+    /// Default value from disk is 0; blocks loaded first get sequential positive IDs.
+    sequence_id: i64,
+    /// Parent block index (null for genesis)
+    parent: ?*BlockIndexEntry,
+    /// File number where block data is stored (for disconnect)
+    file_number: u32,
+    /// File offset within the block file
+    file_offset: u64,
+
+    /// Check if this block is a valid candidate for the active chain.
+    pub fn isValidCandidate(self: *const BlockIndexEntry) bool {
+        return !self.status.isInvalid() and self.status.has_data;
+    }
+
+    /// Check if this block is an ancestor of another block.
+    pub fn isAncestorOf(self: *const BlockIndexEntry, other: *const BlockIndexEntry) bool {
+        if (self.height >= other.height) return false;
+
+        var current = other;
+        while (current.height > self.height) {
+            current = current.parent orelse return false;
+        }
+        return std.mem.eql(u8, &current.hash, &self.hash);
+    }
+
+    /// Get the ancestor at a specific height.
+    pub fn getAncestor(self: *BlockIndexEntry, target_height: u32) ?*BlockIndexEntry {
+        if (target_height > self.height) return null;
+        if (target_height == self.height) return self;
+
+        var current: *BlockIndexEntry = self;
+        while (current.height > target_height) {
+            current = current.parent orelse return null;
+        }
+        return current;
+    }
+};
+
+/// Chain manager for invalidateblock / reconsiderblock / preciousblock operations.
+/// This struct maintains the block index and provides chain management RPCs.
+pub const ChainManager = struct {
+    /// All known blocks indexed by hash
+    block_index: std.AutoHashMap(types.Hash256, *BlockIndexEntry),
+    /// Blocks eligible for being the chain tip (valid candidates)
+    chain_tips: std.ArrayList(*BlockIndexEntry),
+    /// Current active chain tip
+    active_tip: ?*BlockIndexEntry,
+    /// Best invalid block (for tracking attack chains)
+    best_invalid: ?*BlockIndexEntry,
+    /// Sequence ID counter for precious block tie-breaking.
+    /// Decrements for each precious block call.
+    reverse_sequence_id: i64,
+    /// Chain work at last precious block call (for reset detection)
+    last_precious_chainwork: [32]u8,
+    /// Chain state for UTXO operations
+    chain_state: ?*storage.ChainState,
+    /// Mempool for evicting conflicting transactions
+    mempool: ?*@import("mempool.zig").Mempool,
+    /// Allocator
+    allocator: std.mem.Allocator,
+
+    pub fn init(
+        chain_state: ?*storage.ChainState,
+        mempool: ?*@import("mempool.zig").Mempool,
+        allocator: std.mem.Allocator,
+    ) ChainManager {
+        return ChainManager{
+            .block_index = std.AutoHashMap(types.Hash256, *BlockIndexEntry).init(allocator),
+            .chain_tips = std.ArrayList(*BlockIndexEntry).init(allocator),
+            .active_tip = null,
+            .best_invalid = null,
+            .reverse_sequence_id = -1,
+            .last_precious_chainwork = [_]u8{0} ** 32,
+            .chain_state = chain_state,
+            .mempool = mempool,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *ChainManager) void {
+        var iter = self.block_index.valueIterator();
+        while (iter.next()) |entry| {
+            self.allocator.destroy(entry.*);
+        }
+        self.block_index.deinit();
+        self.chain_tips.deinit();
+    }
+
+    /// Add a block to the index.
+    pub fn addBlock(self: *ChainManager, entry: *BlockIndexEntry) !void {
+        try self.block_index.put(entry.hash, entry);
+    }
+
+    /// Get a block by hash.
+    pub fn getBlock(self: *ChainManager, hash: *const types.Hash256) ?*BlockIndexEntry {
+        return self.block_index.get(hash.*);
+    }
+
+    // ========================================================================
+    // invalidateblock RPC
+    // ========================================================================
+
+    /// Error set for chain management operations.
+    pub const ChainError = error{
+        BlockNotFound,
+        GenesisCannotBeInvalidated,
+        DisconnectFailed,
+        OutOfMemory,
+    };
+
+    /// Invalidate a block and all its descendants.
+    /// This disconnects the block if it's on the active chain and marks
+    /// all descendants with failed_child.
+    ///
+    /// Reference: Bitcoin Core validation.cpp InvalidateBlock()
+    pub fn invalidateBlock(self: *ChainManager, hash: *const types.Hash256) ChainError!void {
+        const target = self.block_index.get(hash.*) orelse return ChainError.BlockNotFound;
+
+        // Cannot invalidate genesis
+        if (target.height == 0) return ChainError.GenesisCannotBeInvalidated;
+
+        // Phase 1: If target is on active chain, disconnect blocks
+        if (self.active_tip) |tip| {
+            if (target.isAncestorOf(tip) or std.mem.eql(u8, &target.hash, &tip.hash)) {
+                // Disconnect blocks from tip down to target's parent
+                try self.disconnectToBlock(target.parent);
+            }
+        }
+
+        // Phase 2: Mark the target block as failed_valid
+        target.status.failed_valid = true;
+
+        // Phase 3: Mark all descendants with failed_child using BFS
+        try self.markDescendantsInvalid(target);
+
+        // Phase 4: Remove from chain_tips if present
+        self.removeFromChainTips(target);
+
+        // Phase 5: Update best_invalid if this has more work
+        if (self.best_invalid) |best| {
+            if (self.compareChainWork(&target.chain_work, &best.chain_work) > 0) {
+                self.best_invalid = target;
+            }
+        } else {
+            self.best_invalid = target;
+        }
+
+        // Phase 6: Activate the best valid chain
+        try self.activateBestChain();
+
+        // Phase 7: Evict conflicting transactions from mempool
+        if (self.mempool) |pool| {
+            self.evictConflictingTransactions(pool, target);
+        }
+    }
+
+    /// Mark all descendants of a block with failed_child flag.
+    fn markDescendantsInvalid(self: *ChainManager, ancestor: *BlockIndexEntry) ChainError!void {
+        // BFS queue for processing descendants
+        var queue = std.ArrayList(*BlockIndexEntry).init(self.allocator);
+        defer queue.deinit();
+
+        // Find all immediate children of ancestor
+        var iter = self.block_index.valueIterator();
+        while (iter.next()) |entry| {
+            if (entry.*.parent) |parent| {
+                if (std.mem.eql(u8, &parent.hash, &ancestor.hash)) {
+                    queue.append(entry.*) catch return ChainError.OutOfMemory;
+                }
+            }
+        }
+
+        // Process queue
+        var i: usize = 0;
+        while (i < queue.items.len) : (i += 1) {
+            const block = queue.items[i];
+            block.status.failed_child = true;
+
+            // Find children of this block
+            var child_iter = self.block_index.valueIterator();
+            while (child_iter.next()) |entry| {
+                if (entry.*.parent) |parent| {
+                    if (std.mem.eql(u8, &parent.hash, &block.hash)) {
+                        queue.append(entry.*) catch return ChainError.OutOfMemory;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Disconnect blocks from the active chain until we reach the target block.
+    fn disconnectToBlock(self: *ChainManager, target: ?*BlockIndexEntry) ChainError!void {
+        const chain_state = self.chain_state orelse return;
+
+        while (self.active_tip) |tip| {
+            // Stop if we've reached the target
+            if (target) |t| {
+                if (std.mem.eql(u8, &tip.hash, &t.hash)) break;
+            } else {
+                // Target is null (disconnecting genesis), stop
+                break;
+            }
+
+            // Disconnect the tip using undo data
+            const prev_hash = tip.header.prev_block;
+            chain_state.disconnectBlockFromFile(
+                undefined, // We don't have the full block here
+                tip.file_number,
+                tip.file_offset,
+                prev_hash,
+            ) catch return ChainError.DisconnectFailed;
+
+            // Update active tip
+            self.active_tip = tip.parent;
+        }
+    }
+
+    // ========================================================================
+    // reconsiderblock RPC
+    // ========================================================================
+
+    /// Reconsider a previously invalidated block.
+    /// Clears failed_valid on the target and failed_child on all descendants.
+    /// Re-evaluates if this chain is now the best chain.
+    ///
+    /// Reference: Bitcoin Core validation.cpp ReconsiderBlock() / ResetBlockFailureFlags()
+    pub fn reconsiderBlock(self: *ChainManager, hash: *const types.Hash256) ChainError!void {
+        const target = self.block_index.get(hash.*) orelse return ChainError.BlockNotFound;
+
+        // Phase 1: Clear failed_valid on the target
+        target.status.failed_valid = false;
+
+        // Phase 2: Clear failed_child on all descendants
+        try self.clearDescendantFailure(target);
+
+        // Phase 3: Clear best_invalid if it points to this block
+        if (self.best_invalid) |best| {
+            if (std.mem.eql(u8, &best.hash, &target.hash)) {
+                self.best_invalid = null;
+            }
+        }
+
+        // Phase 4: Re-add to chain_tips if valid candidate
+        if (target.isValidCandidate()) {
+            // Only add if no valid descendant exists (it's a tip)
+            var is_tip = true;
+            var iter = self.block_index.valueIterator();
+            while (iter.next()) |entry| {
+                if (entry.*.parent) |parent| {
+                    if (std.mem.eql(u8, &parent.hash, &target.hash)) {
+                        if (entry.*.isValidCandidate()) {
+                            is_tip = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (is_tip) {
+                self.chain_tips.append(target) catch return ChainError.OutOfMemory;
+            }
+        }
+
+        // Phase 5: Activate the best chain (may switch to this one)
+        try self.activateBestChain();
+    }
+
+    /// Clear failed_child flag on all descendants of a block.
+    fn clearDescendantFailure(self: *ChainManager, ancestor: *BlockIndexEntry) ChainError!void {
+        var queue = std.ArrayList(*BlockIndexEntry).init(self.allocator);
+        defer queue.deinit();
+
+        // Find immediate children
+        var iter = self.block_index.valueIterator();
+        while (iter.next()) |entry| {
+            if (entry.*.parent) |parent| {
+                if (std.mem.eql(u8, &parent.hash, &ancestor.hash)) {
+                    queue.append(entry.*) catch return ChainError.OutOfMemory;
+                }
+            }
+        }
+
+        // Process queue
+        var i: usize = 0;
+        while (i < queue.items.len) : (i += 1) {
+            const block = queue.items[i];
+            block.status.failed_child = false;
+
+            // Find children
+            var child_iter = self.block_index.valueIterator();
+            while (child_iter.next()) |entry| {
+                if (entry.*.parent) |parent| {
+                    if (std.mem.eql(u8, &parent.hash, &block.hash)) {
+                        queue.append(entry.*) catch return ChainError.OutOfMemory;
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // preciousblock RPC
+    // ========================================================================
+
+    /// Mark a block as precious, giving it priority in chain selection.
+    /// This sets a low sequence_id to prefer this block as a tie-breaker
+    /// when two chains have equal work.
+    ///
+    /// Reference: Bitcoin Core validation.cpp PreciousBlock()
+    pub fn preciousBlock(self: *ChainManager, hash: *const types.Hash256) ChainError!void {
+        const target = self.block_index.get(hash.*) orelse return ChainError.BlockNotFound;
+
+        // Only consider if block has at least as much work as current tip
+        if (self.active_tip) |tip| {
+            if (self.compareChainWork(&target.chain_work, &tip.chain_work) < 0) {
+                // Less work than current tip, nothing to do
+                return;
+            }
+        }
+
+        // Reset counter if chain has extended since last precious call
+        if (self.active_tip) |tip| {
+            if (self.compareChainWork(&tip.chain_work, &self.last_precious_chainwork) > 0) {
+                self.reverse_sequence_id = -1;
+            }
+        }
+
+        // Assign a lower (more negative) sequence ID for priority
+        target.sequence_id = self.reverse_sequence_id;
+        self.reverse_sequence_id -= 1;
+
+        // Update last precious chainwork
+        if (self.active_tip) |tip| {
+            self.last_precious_chainwork = tip.chain_work;
+        }
+
+        // Re-evaluate best chain
+        try self.activateBestChain();
+    }
+
+    // ========================================================================
+    // Chain Selection Helpers
+    // ========================================================================
+
+    /// Compare two chain work values (256-bit big-endian).
+    /// Returns >0 if a > b, <0 if a < b, 0 if equal.
+    fn compareChainWork(self: *ChainManager, a: *const [32]u8, b: *const [32]u8) i32 {
+        _ = self;
+        // Compare as big-endian integers
+        for (0..32) |i| {
+            if (a[i] > b[i]) return 1;
+            if (a[i] < b[i]) return -1;
+        }
+        return 0;
+    }
+
+    /// Compare two block index entries for chain selection.
+    /// Returns true if a should be preferred over b.
+    fn compareCandidates(self: *ChainManager, a: *const BlockIndexEntry, b: *const BlockIndexEntry) bool {
+        // Primary: more chainwork wins
+        const work_cmp = self.compareChainWork(&a.chain_work, &b.chain_work);
+        if (work_cmp > 0) return true;
+        if (work_cmp < 0) return false;
+
+        // Secondary: lower sequence_id wins (precious blocks get negative values)
+        if (a.sequence_id < b.sequence_id) return true;
+        if (a.sequence_id > b.sequence_id) return false;
+
+        // Tertiary: use hash as final tie-breaker (deterministic)
+        return std.mem.lessThan(u8, &a.hash, &b.hash);
+    }
+
+    /// Find and activate the best valid chain.
+    fn activateBestChain(self: *ChainManager) ChainError!void {
+        // Find the best valid candidate
+        var best: ?*BlockIndexEntry = null;
+        var iter = self.block_index.valueIterator();
+        while (iter.next()) |entry| {
+            if (!entry.*.isValidCandidate()) continue;
+
+            if (best) |b| {
+                if (self.compareCandidates(entry.*, b)) {
+                    best = entry.*;
+                }
+            } else {
+                best = entry.*;
+            }
+        }
+
+        // If best is different from active_tip, we need to reorganize
+        // For now, just update the active_tip
+        // Full reorg would involve disconnecting old chain and connecting new chain
+        if (best) |b| {
+            if (self.active_tip) |tip| {
+                if (!std.mem.eql(u8, &b.hash, &tip.hash)) {
+                    // TODO: Full reorg implementation
+                    self.active_tip = b;
+                }
+            } else {
+                self.active_tip = b;
+            }
+        }
+    }
+
+    /// Remove a block from the chain_tips list.
+    fn removeFromChainTips(self: *ChainManager, block: *BlockIndexEntry) void {
+        var i: usize = 0;
+        while (i < self.chain_tips.items.len) {
+            if (std.mem.eql(u8, &self.chain_tips.items[i].hash, &block.hash)) {
+                _ = self.chain_tips.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Evict transactions from mempool that conflict with the invalidated block.
+    fn evictConflictingTransactions(self: *ChainManager, pool: *@import("mempool.zig").Mempool, block: *BlockIndexEntry) void {
+        _ = self;
+        _ = pool;
+        _ = block;
+        // TODO: When we have full block data, evict transactions that:
+        // 1. Spend UTXOs created by transactions in the invalidated block
+        // 2. Were confirmed in the invalidated block but now need to go back to mempool
+    }
+};
+
+// ============================================================================
+// Chain Management Tests
+// ============================================================================
+
+test "BlockStatus packed struct size" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(BlockStatus));
+}
+
+test "BlockStatus default is valid" {
+    const status = BlockStatus{};
+    try std.testing.expect(!status.isInvalid());
+}
+
+test "BlockStatus failed_valid marks invalid" {
+    var status = BlockStatus{};
+    status.failed_valid = true;
+    try std.testing.expect(status.isInvalid());
+}
+
+test "BlockStatus failed_child marks invalid" {
+    var status = BlockStatus{};
+    status.failed_child = true;
+    try std.testing.expect(status.isInvalid());
+}
+
+test "BlockStatus clearFailure clears both flags" {
+    var status = BlockStatus{};
+    status.failed_valid = true;
+    status.failed_child = true;
+    try std.testing.expect(status.isInvalid());
+
+    status.clearFailure();
+    try std.testing.expect(!status.isInvalid());
+}
+
+test "ChainManager init and deinit" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    try std.testing.expect(manager.active_tip == null);
+    try std.testing.expect(manager.best_invalid == null);
+    try std.testing.expectEqual(@as(i64, -1), manager.reverse_sequence_id);
+}
+
+test "ChainManager invalidateBlock returns BlockNotFound for unknown hash" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    var unknown_hash: types.Hash256 = [_]u8{0xAB} ** 32;
+    const result = manager.invalidateBlock(&unknown_hash);
+    try std.testing.expectError(ChainManager.ChainError.BlockNotFound, result);
+}
+
+test "ChainManager reconsiderBlock returns BlockNotFound for unknown hash" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    var unknown_hash: types.Hash256 = [_]u8{0xCD} ** 32;
+    const result = manager.reconsiderBlock(&unknown_hash);
+    try std.testing.expectError(ChainManager.ChainError.BlockNotFound, result);
+}
+
+test "ChainManager preciousBlock returns BlockNotFound for unknown hash" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    var unknown_hash: types.Hash256 = [_]u8{0xEF} ** 32;
+    const result = manager.preciousBlock(&unknown_hash);
+    try std.testing.expectError(ChainManager.ChainError.BlockNotFound, result);
+}
+
+test "ChainManager invalidateBlock rejects genesis" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Create a genesis block entry
+    // NOTE: manager.deinit() will free this, so no defer destroy needed
+    const genesis = try allocator.create(BlockIndexEntry);
+
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+
+    try manager.addBlock(genesis);
+
+    const result = manager.invalidateBlock(&genesis.hash);
+    try std.testing.expectError(ChainManager.ChainError.GenesisCannotBeInvalidated, result);
+}
+
+test "ChainManager invalidateBlock marks block as failed_valid" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Create parent block (manager.deinit() will free)
+    const parent = try allocator.create(BlockIndexEntry);
+    parent.* = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(parent);
+
+    // Create child block (manager.deinit() will free)
+    const child = try allocator.create(BlockIndexEntry);
+    child.* = BlockIndexEntry{
+        .hash = [_]u8{0x02} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 1,
+        .parent = parent,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(child);
+
+    // Invalidate the child (not on active chain, so no disconnect needed)
+    try manager.invalidateBlock(&child.hash);
+
+    try std.testing.expect(child.status.failed_valid);
+    try std.testing.expect(child.status.isInvalid());
+}
+
+test "ChainManager invalidateBlock marks descendants with failed_child" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Create a chain: genesis -> block1 -> block2 -> block3
+    // (manager.deinit() will free all blocks)
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    const block1 = try allocator.create(BlockIndexEntry);
+    block1.* = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block1);
+
+    const block2 = try allocator.create(BlockIndexEntry);
+    block2.* = BlockIndexEntry{
+        .hash = [_]u8{0x02} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 2,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x02} ** 32,
+        .sequence_id = 2,
+        .parent = block1,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block2);
+
+    const block3 = try allocator.create(BlockIndexEntry);
+    block3.* = BlockIndexEntry{
+        .hash = [_]u8{0x03} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 3,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x03} ** 32,
+        .sequence_id = 3,
+        .parent = block2,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block3);
+
+    // Invalidate block1 - should mark block2 and block3 as failed_child
+    try manager.invalidateBlock(&block1.hash);
+
+    try std.testing.expect(block1.status.failed_valid);
+    try std.testing.expect(!block1.status.failed_child);
+
+    try std.testing.expect(!block2.status.failed_valid);
+    try std.testing.expect(block2.status.failed_child);
+
+    try std.testing.expect(!block3.status.failed_valid);
+    try std.testing.expect(block3.status.failed_child);
+}
+
+test "ChainManager reconsiderBlock clears failure flags" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Create a chain: genesis -> block1 -> block2 (manager.deinit() will free)
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    const block1 = try allocator.create(BlockIndexEntry);
+    block1.* = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block1);
+
+    const block2 = try allocator.create(BlockIndexEntry);
+    block2.* = BlockIndexEntry{
+        .hash = [_]u8{0x02} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 2,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x02} ** 32,
+        .sequence_id = 2,
+        .parent = block1,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block2);
+
+    // Invalidate block1
+    try manager.invalidateBlock(&block1.hash);
+    try std.testing.expect(block1.status.failed_valid);
+    try std.testing.expect(block2.status.failed_child);
+
+    // Reconsider block1
+    try manager.reconsiderBlock(&block1.hash);
+
+    try std.testing.expect(!block1.status.failed_valid);
+    try std.testing.expect(!block1.status.failed_child);
+    try std.testing.expect(!block2.status.failed_valid);
+    try std.testing.expect(!block2.status.failed_child);
+}
+
+test "ChainManager preciousBlock decrements sequence_id" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Create a block (manager.deinit() will free)
+    const block = try allocator.create(BlockIndexEntry);
+    block.* = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 100, // Original sequence ID
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block);
+
+    // Call preciousBlock
+    try manager.preciousBlock(&block.hash);
+
+    // Block should get a negative sequence ID
+    try std.testing.expect(block.sequence_id < 0);
+    try std.testing.expectEqual(@as(i64, -1), block.sequence_id);
+
+    // Counter should decrement
+    try std.testing.expectEqual(@as(i64, -2), manager.reverse_sequence_id);
+}
+
+test "ChainManager compareChainWork" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    const low: [32]u8 = [_]u8{0x00} ** 31 ++ [_]u8{0x01};
+    const high: [32]u8 = [_]u8{0x00} ** 31 ++ [_]u8{0xFF};
+    const equal: [32]u8 = [_]u8{0x00} ** 31 ++ [_]u8{0x01};
+
+    try std.testing.expect(manager.compareChainWork(&high, &low) > 0);
+    try std.testing.expect(manager.compareChainWork(&low, &high) < 0);
+    try std.testing.expect(manager.compareChainWork(&low, &equal) == 0);
+}
+
+test "BlockIndexEntry isAncestorOf" {
+    const allocator = std.testing.allocator;
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    defer allocator.destroy(genesis);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+
+    const block1 = try allocator.create(BlockIndexEntry);
+    defer allocator.destroy(block1);
+    block1.* = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+
+    const block2 = try allocator.create(BlockIndexEntry);
+    defer allocator.destroy(block2);
+    block2.* = BlockIndexEntry{
+        .hash = [_]u8{0x02} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 2,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = block1,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+
+    try std.testing.expect(genesis.isAncestorOf(block1));
+    try std.testing.expect(genesis.isAncestorOf(block2));
+    try std.testing.expect(block1.isAncestorOf(block2));
+    try std.testing.expect(!block2.isAncestorOf(block1));
+    try std.testing.expect(!block1.isAncestorOf(genesis));
+}
+
+test "BlockIndexEntry getAncestor" {
+    const allocator = std.testing.allocator;
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    defer allocator.destroy(genesis);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+
+    const block1 = try allocator.create(BlockIndexEntry);
+    defer allocator.destroy(block1);
+    block1.* = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+
+    const block2 = try allocator.create(BlockIndexEntry);
+    defer allocator.destroy(block2);
+    block2.* = BlockIndexEntry{
+        .hash = [_]u8{0x02} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 2,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = block1,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+
+    try std.testing.expectEqual(genesis, block2.getAncestor(0));
+    try std.testing.expectEqual(block1, block2.getAncestor(1));
+    try std.testing.expectEqual(block2, block2.getAncestor(2));
+    try std.testing.expect(block2.getAncestor(3) == null);
+}
