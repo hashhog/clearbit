@@ -8,11 +8,13 @@ const consensus = @import("consensus.zig");
 const p2p = @import("p2p.zig");
 const miniscript = @import("miniscript.zig");
 const descriptor = @import("descriptor.zig");
+const proxy = @import("proxy.zig");
 
 // Reference modules to include their tests
 comptime {
     _ = miniscript;
     _ = descriptor;
+    _ = proxy;
 }
 
 // ============================================================
