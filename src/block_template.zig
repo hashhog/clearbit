@@ -683,6 +683,295 @@ pub fn submitBlock(
 }
 
 // ============================================================================
+// Regtest Mining (generatetoaddress, generateblock)
+// ============================================================================
+
+/// Maximum nonce tries for mining (regtest: usually succeeds in first try due to min difficulty).
+pub const DEFAULT_MAX_TRIES: u64 = 1_000_000;
+
+/// Result of block generation.
+pub const GenerateResult = struct {
+    /// Block hashes of successfully mined blocks.
+    block_hashes: std.ArrayList(types.Hash256),
+
+    pub fn deinit(self: *GenerateResult) void {
+        self.block_hashes.deinit();
+    }
+};
+
+/// Mine a single block by finding a valid nonce.
+///
+/// This function:
+/// 1. Computes the merkle root from the coinbase and transactions
+/// 2. Iterates nonces until the block hash meets the target
+/// 3. Optionally submits the block to the chain
+///
+/// For regtest, the difficulty is so low that nonce 0-2 typically works.
+pub fn mineBlock(
+    template: *BlockTemplate,
+    chain_state: *storage.ChainState,
+    params: *const consensus.NetworkParams,
+    max_tries: u64,
+    submit_block: bool,
+    allocator: std.mem.Allocator,
+) !?types.Hash256 {
+    // 1. Compute merkle root
+    const merkle_root = try template.computeMerkleRoot();
+    template.header.merkle_root = merkle_root;
+
+    // 2. Get target from bits
+    const target = consensus.bitsToTarget(template.header.bits);
+
+    // 3. Mine: iterate nonces until we find valid PoW
+    var tries: u64 = 0;
+    while (tries < max_tries) : (tries += 1) {
+        // Update nonce
+        template.header.nonce = @intCast(tries & 0xFFFFFFFF);
+
+        // Compute block hash
+        const block_hash = crypto.computeBlockHash(&template.header);
+
+        // Check if hash meets target
+        if (consensus.hashMeetsTarget(&block_hash, &target)) {
+            // Found valid nonce
+            if (submit_block) {
+                // Build the full block
+                const block = try assembleBlock(template, allocator);
+                defer {
+                    allocator.free(block.transactions);
+                }
+
+                // Submit to chain
+                const result = try submitBlock(&block, chain_state, params, allocator);
+                if (!result.accepted) {
+                    return null;
+                }
+            }
+            return block_hash;
+        }
+
+        // If we've exhausted all nonces, try updating timestamp
+        if (tries > 0 and (tries % 0x100000000) == 0) {
+            template.header.timestamp +%= 1;
+        }
+    }
+
+    return null; // Failed to find valid nonce in max_tries
+}
+
+/// Assemble a complete Block from a BlockTemplate.
+fn assembleBlock(template: *const BlockTemplate, allocator: std.mem.Allocator) !types.Block {
+    // Build transactions array: coinbase + selected transactions
+    const tx_count = 1 + template.transactions.items.len;
+    var transactions = try allocator.alloc(types.Transaction, tx_count);
+    errdefer allocator.free(transactions);
+
+    // Coinbase is first
+    transactions[0] = template.coinbase_tx.tx;
+
+    // Copy selected transactions
+    for (template.transactions.items, 0..) |stx, i| {
+        transactions[1 + i] = stx.tx;
+    }
+
+    return types.Block{
+        .header = template.header,
+        .transactions = transactions,
+    };
+}
+
+/// Generate multiple blocks to a specified script pubkey.
+///
+/// This is the core implementation for generatetoaddress and generatetodescriptor RPCs.
+/// For regtest, mining is nearly instant due to minimum difficulty.
+pub fn generateBlocks(
+    chain_state: *storage.ChainState,
+    mempool: *mempool_mod.Mempool,
+    params: *const consensus.NetworkParams,
+    payout_script: []const u8,
+    n_blocks: u32,
+    max_tries: u64,
+    allocator: std.mem.Allocator,
+) !GenerateResult {
+    var result = GenerateResult{
+        .block_hashes = std.ArrayList(types.Hash256).init(allocator),
+    };
+    errdefer result.deinit();
+
+    var blocks_mined: u32 = 0;
+    while (blocks_mined < n_blocks) {
+        // Create block template
+        var template = try createBlockTemplate(
+            chain_state,
+            mempool,
+            params,
+            .{
+                .payout_script = payout_script,
+                .include_witness_commitment = true,
+            },
+            allocator,
+        );
+        defer template.deinit();
+
+        // Mine the block
+        const block_hash = try mineBlock(
+            &template,
+            chain_state,
+            params,
+            max_tries,
+            true, // submit to chain
+            allocator,
+        );
+
+        if (block_hash) |hash| {
+            try result.block_hashes.append(hash);
+            blocks_mined += 1;
+        } else {
+            // Failed to mine block (exhausted tries)
+            break;
+        }
+    }
+
+    return result;
+}
+
+/// Generate a single block with specific transactions.
+///
+/// This is the implementation for the generateblock RPC.
+/// Takes a list of transaction txids/raw transactions to include in the block.
+pub fn generateBlockWithTxs(
+    chain_state: *storage.ChainState,
+    mempool: *mempool_mod.Mempool,
+    params: *const consensus.NetworkParams,
+    payout_script: []const u8,
+    transactions: []const types.Transaction,
+    max_tries: u64,
+    submit_block: bool,
+    allocator: std.mem.Allocator,
+) !struct { hash: types.Hash256, hex: ?[]const u8 } {
+    // Create a minimal block template (not using mempool transactions)
+    var template = try createBlockTemplate(
+        chain_state,
+        mempool,
+        params,
+        .{
+            .payout_script = payout_script,
+            .include_witness_commitment = true,
+        },
+        allocator,
+    );
+    defer template.deinit();
+
+    // Clear any mempool transactions and add the specified ones
+    template.transactions.clearRetainingCapacity();
+    template.total_fees = 0;
+
+    // Add specified transactions
+    for (transactions) |tx| {
+        const txid = try crypto.computeTxid(&tx, allocator);
+        // Estimate weight (simplified)
+        const weight = estimateTxWeight(&tx);
+
+        try template.transactions.append(.{
+            .tx = tx,
+            .txid = txid,
+            .weight = weight,
+            .fee = 0, // Fee not tracked for generateblock
+            .sigops = estimateSigops(&tx),
+        });
+
+        template.total_weight += weight;
+    }
+
+    // Recompute witness commitment with new transactions
+    if (transactions.len > 0) {
+        var txs_for_witness = try allocator.alloc(types.Transaction, transactions.len);
+        defer allocator.free(txs_for_witness);
+        for (transactions, 0..) |tx, i| {
+            txs_for_witness[i] = tx;
+        }
+
+        const witness_nonce: [32]u8 = [_]u8{0} ** 32;
+        const witness_commitment = try computeWitnessCommitment(txs_for_witness, witness_nonce, allocator);
+
+        // Update coinbase witness commitment output
+        // (Simplified: in full implementation would reconstruct coinbase)
+        _ = witness_commitment;
+    }
+
+    // Mine the block
+    const block_hash = try mineBlock(
+        &template,
+        chain_state,
+        params,
+        max_tries,
+        submit_block,
+        allocator,
+    );
+
+    if (block_hash) |hash| {
+        var hex: ?[]const u8 = null;
+
+        if (!submit_block) {
+            // Return hex of the block
+            const block = try assembleBlock(&template, allocator);
+            defer allocator.free(block.transactions);
+
+            var writer = serialize.Writer.init(allocator);
+            defer writer.deinit();
+            try serialize.writeBlock(&writer, &block);
+            const bytes = writer.getWritten();
+
+            var hex_buf = try allocator.alloc(u8, bytes.len * 2);
+            for (bytes, 0..) |b, i| {
+                const chars = "0123456789abcdef";
+                hex_buf[i * 2] = chars[b >> 4];
+                hex_buf[i * 2 + 1] = chars[b & 0x0f];
+            }
+            hex = hex_buf;
+        }
+
+        return .{ .hash = hash, .hex = hex };
+    }
+
+    return error.MiningFailed;
+}
+
+/// Estimate transaction weight (simplified).
+fn estimateTxWeight(tx: *const types.Transaction) usize {
+    // Base size estimation
+    var base_size: usize = 4; // version
+    base_size += 1; // input count varint (simplified)
+    for (tx.inputs) |input| {
+        base_size += 32; // prev txid
+        base_size += 4; // prev index
+        base_size += 1 + input.script_sig.len; // scriptSig length + data
+        base_size += 4; // sequence
+    }
+    base_size += 1; // output count varint
+    for (tx.outputs) |output| {
+        base_size += 8; // value
+        base_size += 1 + output.script_pubkey.len; // scriptPubKey length + data
+    }
+    base_size += 4; // locktime
+
+    // Witness size estimation
+    var witness_size: usize = 0;
+    for (tx.inputs) |input| {
+        if (input.witness.len > 0) {
+            witness_size += 1; // witness count
+            for (input.witness) |item| {
+                witness_size += 1 + item.len; // item length + data
+            }
+        }
+    }
+
+    // Weight = base_size * 3 + total_size (where total_size = base_size + witness_size)
+    // Simplified: weight = base_size * 4 + witness_size (since witness has 1x multiplier)
+    return base_size * 4 + witness_size;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1246,4 +1535,195 @@ test "coinbase transaction has correct sequence and locktime" {
     // Verify coinbase is always final
     try std.testing.expect(isFinalTx(&coinbase.tx, 0, 0));
     try std.testing.expect(isFinalTx(&coinbase.tx, 100, 1000000));
+}
+
+// ============================================================================
+// Regtest Mining Tests
+// ============================================================================
+
+test "regtest: mine single block" {
+    const allocator = std.testing.allocator;
+
+    // Create chain state and mempool
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // P2WPKH payout script
+    const payout_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+
+    // Generate 1 block
+    var result = try generateBlocks(
+        &chain_state,
+        &mempool,
+        &consensus.REGTEST,
+        &payout_script,
+        1,
+        DEFAULT_MAX_TRIES,
+        allocator,
+    );
+    defer result.deinit();
+
+    // Should have mined 1 block
+    try std.testing.expectEqual(@as(usize, 1), result.block_hashes.items.len);
+
+    // Chain should now be at height 1
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+}
+
+test "regtest: mine multiple blocks" {
+    const allocator = std.testing.allocator;
+
+    // Create chain state and mempool
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const payout_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xBC} ** 20;
+
+    // Generate 10 blocks
+    var result = try generateBlocks(
+        &chain_state,
+        &mempool,
+        &consensus.REGTEST,
+        &payout_script,
+        10,
+        DEFAULT_MAX_TRIES,
+        allocator,
+    );
+    defer result.deinit();
+
+    // Should have mined all 10 blocks
+    try std.testing.expectEqual(@as(usize, 10), result.block_hashes.items.len);
+
+    // Chain should be at height 10
+    try std.testing.expectEqual(@as(u32, 10), chain_state.best_height);
+}
+
+test "regtest: blocks chain correctly" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const payout_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xCD} ** 20;
+
+    // Generate 5 blocks
+    var result = try generateBlocks(
+        &chain_state,
+        &mempool,
+        &consensus.REGTEST,
+        &payout_script,
+        5,
+        DEFAULT_MAX_TRIES,
+        allocator,
+    );
+    defer result.deinit();
+
+    // Verify each block hash is unique
+    for (result.block_hashes.items, 0..) |hash1, i| {
+        for (result.block_hashes.items[i + 1 ..]) |hash2| {
+            try std.testing.expect(!std.mem.eql(u8, &hash1, &hash2));
+        }
+    }
+}
+
+test "regtest: subsidy halving at block 150" {
+    // Regtest halves every 150 blocks instead of 210,000
+
+    // Check subsidy at height 149 (before halving)
+    const subsidy_149 = consensus.getBlockSubsidy(149, &consensus.REGTEST);
+    try std.testing.expectEqual(@as(i64, 5_000_000_000), subsidy_149); // 50 BTC
+
+    // Check subsidy at height 150 (first halving)
+    const subsidy_150 = consensus.getBlockSubsidy(150, &consensus.REGTEST);
+    try std.testing.expectEqual(@as(i64, 2_500_000_000), subsidy_150); // 25 BTC
+
+    // Check subsidy at height 300 (second halving)
+    const subsidy_300 = consensus.getBlockSubsidy(300, &consensus.REGTEST);
+    try std.testing.expectEqual(@as(i64, 1_250_000_000), subsidy_300); // 12.5 BTC
+}
+
+test "regtest: mineBlock finds valid nonce quickly" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const payout_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xEF} ** 20;
+
+    // Create block template
+    var template = try createBlockTemplate(
+        &chain_state,
+        &mempool,
+        &consensus.REGTEST,
+        .{
+            .payout_script = &payout_script,
+            .include_witness_commitment = true,
+        },
+        allocator,
+    );
+    defer template.deinit();
+
+    // Mine the block (regtest should find nonce very quickly)
+    const block_hash = try mineBlock(
+        &template,
+        &chain_state,
+        &consensus.REGTEST,
+        100, // Only try 100 nonces - should be enough for regtest
+        false, // Don't submit
+        allocator,
+    );
+
+    // Should have found a valid hash
+    try std.testing.expect(block_hash != null);
+
+    // Verify the hash meets the target
+    const target = consensus.bitsToTarget(template.header.bits);
+    try std.testing.expect(consensus.hashMeetsTarget(&block_hash.?, &target));
+}
+
+test "regtest: pow_no_retarget prevents difficulty adjustment" {
+    // Verify regtest has no retargeting
+    try std.testing.expect(consensus.REGTEST.pow_no_retarget);
+    try std.testing.expect(consensus.REGTEST.pow_allow_min_difficulty_blocks);
+
+    // Verify mainnet does retarget
+    try std.testing.expect(!consensus.MAINNET.pow_no_retarget);
+}
+
+test "regtest: genesis block parameters" {
+    // Verify regtest genesis hash (Bitcoin Core's regtest genesis)
+    const expected_genesis_hash = comptime blk: {
+        var hash: [32]u8 = undefined;
+        const hex = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
+        for (0..32) |i| {
+            hash[31 - i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch unreachable;
+        }
+        break :blk hash;
+    };
+
+    try std.testing.expectEqualSlices(u8, &expected_genesis_hash, &consensus.REGTEST.genesis_hash);
+
+    // Verify regtest port
+    try std.testing.expectEqual(@as(u16, 18444), consensus.REGTEST.default_port);
+
+    // Verify regtest magic bytes
+    try std.testing.expectEqual(@as(u32, 0xDAB5BFFA), consensus.REGTEST.magic);
+
+    // Verify regtest bech32 hrp
+    try std.testing.expectEqualStrings("bcrt", consensus.REGTEST.bech32_hrp);
+
+    // Verify halving interval
+    try std.testing.expectEqual(@as(u32, 150), consensus.REGTEST.subsidy_halving_interval);
 }
