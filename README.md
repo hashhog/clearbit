@@ -49,6 +49,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Flat file block storage (blk*.dat files, 128 MiB max, pre-allocation, RocksDB index)
 - [x] UTXO cache layer (CoinsViewCache, FRESH/DIRTY optimization, batch flush)
 - [x] Block indexes (txindex, BIP-157/158 blockfilterindex, coinstatsindex)
+- [x] BIP-324 v2 P2P transport (ElligatorSwift FFI, HKDF-SHA256, FSChaCha20-Poly1305, short message IDs)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -65,6 +66,9 @@ zig build -Drocksdb=true test
 
 # With wallet/secp256k1 support (requires libsecp256k1-dev):
 zig build -Dsecp256k1=true test
+
+# With BIP-324 ElligatorSwift support (requires libsecp256k1 with ellswift):
+zig build -Dsecp256k1=true -Dsecp256k1-include=../bitcoin/src/secp256k1/include test
 
 # Build with full optimizations for benchmarking:
 zig build -Doptimize=ReleaseFast
@@ -92,6 +96,7 @@ src/
   rpc.zig            # JSON-RPC server over HTTP
   wallet.zig         # key management, address derivation, tx signing
   indexes.zig        # block indexes (txindex, blockfilterindex, coinstatsindex)
+  v2_transport.zig   # BIP-324 encrypted P2P transport
   perf.zig           # performance utilities (arena, SIMD, comptime tables)
   bench.zig          # benchmarking suite
   tests.zig          # comprehensive test suite with test vectors
