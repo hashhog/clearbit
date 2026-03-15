@@ -51,6 +51,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] UTXO cache layer (CoinsViewCache, FRESH/DIRTY optimization, batch flush)
 - [x] Block indexes (txindex, BIP-157/158 blockfilterindex, coinstatsindex)
 - [x] BIP-324 v2 P2P transport (ElligatorSwift FFI, HKDF-SHA256, FSChaCha20-Poly1305, short message IDs)
+- [x] Output descriptors (BIP-380/381/382/383/384/385/386, recursive parser, BCH checksum, RPCs)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -96,6 +97,7 @@ src/
   block_template.zig # block template construction for mining
   rpc.zig            # JSON-RPC server over HTTP
   wallet.zig         # key management, address derivation, tx signing
+  descriptor.zig     # output descriptors (BIP-380-386), checksum, derivation
   indexes.zig        # block indexes (txindex, blockfilterindex, coinstatsindex)
   v2_transport.zig   # BIP-324 encrypted P2P transport
   perf.zig           # performance utilities (arena, SIMD, comptime tables)
