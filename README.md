@@ -54,6 +54,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Output descriptors (BIP-380/381/382/383/384/385/386, recursive parser, BCH checksum, RPCs)
 - [x] Miniscript (AST, type system B/V/K/W, wrappers, script compilation, satisfaction, witness analysis)
 - [x] BIP-133 feefilter (per-peer fee filters, Poisson delay, hysteresis, incremental relay fee)
+- [x] BIP-330 Erlay (set reconciliation for tx relay, Minisketch, SipHash short IDs, negotiation)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -103,6 +104,7 @@ src/
   miniscript.zig     # miniscript AST, type system, satisfaction, script compilation
   indexes.zig        # block indexes (txindex, blockfilterindex, coinstatsindex)
   v2_transport.zig   # BIP-324 encrypted P2P transport
+  erlay.zig          # BIP-330 Erlay set reconciliation
   perf.zig           # performance utilities (arena, SIMD, comptime tables)
   bench.zig          # benchmarking suite
   tests.zig          # comprehensive test suite with test vectors
