@@ -648,6 +648,20 @@ pub const ScriptEngine = struct {
                     // (stack.items.len == 1 after tapscript execution, just like P2WSH)
                     // This is UNCONDITIONAL for tapscript - not flag-gated
                 },
+                .anchor => {
+                    // P2A (Pay-to-Anchor) is anyone-can-spend.
+                    // Witness must be empty for standard spending.
+                    // Reference: Bitcoin Core script/sign.cpp - ANCHOR case returns immediately.
+                    if (witness.len != 0) {
+                        // Non-empty witness is non-standard but valid in consensus.
+                        // For policy, we reject non-empty witness.
+                    }
+                    // No script execution needed - anyone can spend.
+                    // Push true to satisfy the clean stack check below.
+                    const true_val = [_]u8{0x01};
+                    self.stack.clearRetainingCapacity();
+                    self.stack.append(&true_val) catch return ScriptError.OutOfMemory;
+                },
                 else => {},
             }
         }
@@ -1443,11 +1457,22 @@ pub const ScriptType = enum {
     p2wpkh, // OP_0 <20>
     p2wsh, // OP_0 <32>
     p2tr, // OP_1 <32>
+    anchor, // OP_1 <0x4e73> (P2A: Pay-to-Anchor, anyone-can-spend)
     p2pk, // <33 or 65> OP_CHECKSIG
     multisig, // OP_M <keys...> OP_N OP_CHECKMULTISIG
     null_data, // OP_RETURN <data>
     nonstandard,
 };
+
+/// Pay-to-Anchor (P2A) script: OP_1 PUSHBYTES_2 "Ns" (0x4e73)
+/// Used for anyone-can-spend fee bumping anchors.
+/// Reference: Bitcoin Core script/solver.cpp TxoutType::ANCHOR
+pub const P2A_SCRIPT = [_]u8{ 0x51, 0x02, 0x4e, 0x73 };
+
+/// Check if a script is a Pay-to-Anchor output.
+pub fn isPayToAnchor(script: []const u8) bool {
+    return std.mem.eql(u8, script, &P2A_SCRIPT);
+}
 
 pub fn classifyScript(script: []const u8) ScriptType {
     // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
@@ -1474,6 +1499,13 @@ pub fn classifyScript(script: []const u8) ScriptType {
     // 00 20 <32 bytes>
     if (script.len == 34 and script[0] == 0x00 and script[1] == 0x20) {
         return .p2wsh;
+    }
+
+    // P2A (Pay-to-Anchor): OP_1 <0x4e73>
+    // 51 02 4e 73 (4 bytes exactly)
+    // Must check before P2TR since both start with OP_1
+    if (isPayToAnchor(script)) {
+        return .anchor;
     }
 
     // P2TR: OP_1 <32>
@@ -2199,6 +2231,28 @@ test "P2TR template classification" {
     @memset(script[2..34], 0xAB); // 32 byte x-only pubkey
 
     try std.testing.expectEqual(ScriptType.p2tr, classifyScript(&script));
+}
+
+test "P2A (Pay-to-Anchor) template classification" {
+    // P2A: OP_1 PUSHBYTES_2 0x4e73 ("Ns")
+    // 4 bytes exactly: 0x51 0x02 0x4e 0x73
+    try std.testing.expectEqual(ScriptType.anchor, classifyScript(&P2A_SCRIPT));
+
+    // Verify isPayToAnchor helper
+    try std.testing.expect(isPayToAnchor(&P2A_SCRIPT));
+
+    // Should not match other scripts starting with OP_1
+    var p2tr_script: [34]u8 = undefined;
+    p2tr_script[0] = 0x51;
+    p2tr_script[1] = 0x20;
+    @memset(p2tr_script[2..34], 0xAB);
+    try std.testing.expect(!isPayToAnchor(&p2tr_script));
+    try std.testing.expectEqual(ScriptType.p2tr, classifyScript(&p2tr_script));
+
+    // Wrong data (not "Ns")
+    const wrong_data = [_]u8{ 0x51, 0x02, 0x00, 0x00 };
+    try std.testing.expect(!isPayToAnchor(&wrong_data));
+    try std.testing.expectEqual(ScriptType.nonstandard, classifyScript(&wrong_data));
 }
 
 test "OP_RETURN script classified as null_data" {
