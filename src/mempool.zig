@@ -80,6 +80,8 @@ pub const MempoolError = error{
     NonStandard,
     /// Output value is below the dust threshold.
     DustOutput,
+    /// Pay-to-Anchor output has non-zero value.
+    AnchorNonZeroValue,
     /// Transaction failed validation.
     TxValidationFailed,
     /// Input references a non-existent UTXO.
@@ -428,6 +430,13 @@ pub const Mempool = struct {
         for (tx.outputs) |output| {
             const stype = script.classifyScript(output.script_pubkey);
             if (stype == .nonstandard) return MempoolError.NonStandard;
+
+            // P2A (Pay-to-Anchor) outputs must have value 0.
+            // They're designed for fee bumping and non-zero value is non-standard.
+            // Reference: Bitcoin Core policy/policy.cpp
+            if (stype == .anchor and output.value != 0) {
+                return MempoolError.AnchorNonZeroValue;
+            }
         }
     }
 
@@ -506,6 +515,14 @@ pub const Mempool = struct {
         if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) return false;
 
         const stype = script.classifyScript(output.script_pubkey);
+
+        // P2A (Pay-to-Anchor) outputs are exempt from dust if value is 0.
+        // They're designed for fee bumping and must have zero value.
+        // Reference: Bitcoin Core policy/policy.cpp
+        if (stype == .anchor) {
+            // Anchor outputs with value 0 are never dust
+            return output.value != 0;
+        }
 
         // Spend size varies by script type
         const spend_size: i64 = switch (stype) {
@@ -1116,6 +1133,57 @@ test "dust detection for different output types" {
     const op_return_script = [_]u8{ 0x6a, 0x04, 0x01, 0x02, 0x03, 0x04 };
     const op_return_output = types.TxOut{ .value = 0, .script_pubkey = &op_return_script };
     try std.testing.expect(!Mempool.isDust(&op_return_output));
+
+    // P2A (Pay-to-Anchor) with value 0 is never dust
+    const p2a_output_zero = types.TxOut{ .value = 0, .script_pubkey = &script.P2A_SCRIPT };
+    try std.testing.expect(!Mempool.isDust(&p2a_output_zero));
+
+    // P2A with non-zero value is considered dust (actually an error, but isDust returns true)
+    const p2a_output_nonzero = types.TxOut{ .value = 1, .script_pubkey = &script.P2A_SCRIPT };
+    try std.testing.expect(Mempool.isDust(&p2a_output_nonzero));
+}
+
+test "P2A (Pay-to-Anchor) standardness" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Create input
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    // P2A output with value 0 should be accepted
+    const p2a_output_ok = types.TxOut{ .value = 0, .script_pubkey = &script.P2A_SCRIPT };
+
+    const inputs_ok = [_]types.TxIn{input};
+    const outputs_ok = [_]types.TxOut{p2a_output_ok};
+    const tx_ok = types.Transaction{
+        .version = 2,
+        .inputs = &inputs_ok,
+        .outputs = &outputs_ok,
+        .lock_time = 0,
+    };
+    // P2A with value 0 should pass standardness check
+    mempool.checkStandard(&tx_ok) catch |err| {
+        std.debug.print("Unexpected error: {}\n", .{err});
+        return error.TestUnexpectedResult;
+    };
+
+    // P2A output with non-zero value should be rejected
+    const p2a_output_bad = types.TxOut{ .value = 1000, .script_pubkey = &script.P2A_SCRIPT };
+    const outputs_bad = [_]types.TxOut{p2a_output_bad};
+    const tx_bad = types.Transaction{
+        .version = 2,
+        .inputs = &inputs_ok,
+        .outputs = &outputs_bad,
+        .lock_time = 0,
+    };
+    try std.testing.expectError(MempoolError.AnchorNonZeroValue, mempool.checkStandard(&tx_bad));
 }
 
 test "RBF signaling detection" {
