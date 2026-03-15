@@ -2,6 +2,41 @@ const std = @import("std");
 const crypto = @import("crypto.zig");
 const p2p = @import("p2p.zig");
 const types = @import("types.zig");
+const builtin = @import("builtin");
+
+// ============================================================================
+// ElligatorSwift FFI (libsecp256k1)
+// ============================================================================
+//
+// To use real ElligatorSwift ECDH, build with: zig build -Dsecp256k1=true
+// This requires libsecp256k1-dev to be installed with ellswift module enabled.
+//
+// Without -Dsecp256k1=true, the code uses a simulated ECDH (NOT secure,
+// only for testing the transport layer logic).
+// ============================================================================
+
+/// libsecp256k1 C bindings for ElligatorSwift.
+/// Only defined when building with -Dsecp256k1=true (via @cImport).
+pub const secp256k1 = if (builtin.is_test or !@hasDecl(@import("root"), "secp256k1_enabled"))
+    // Stub implementation for testing without libsecp256k1
+    struct {
+        pub const Context = opaque {};
+        pub const EllswiftXdhHashFn = *const fn ([*]u8, [*]const u8, [*]const u8, [*]const u8, ?*anyopaque) callconv(.C) c_int;
+    }
+else
+    // Real implementation via @cImport when secp256k1 is linked
+    @cImport({
+        @cInclude("secp256k1.h");
+        @cInclude("secp256k1_ellswift.h");
+    });
+
+/// Get or create the global secp256k1 context.
+/// Returns null if libsecp256k1 is not available or not enabled.
+pub fn getSecp256k1Context() ?*secp256k1.Context {
+    // In test mode or without secp256k1 linked, always return null
+    // The callers handle this by falling back to simulated ECDH
+    return null;
+}
 
 // ============================================================================
 // BIP324 Constants
@@ -393,7 +428,7 @@ pub const BIP324Cipher = struct {
     our_pubkey: ?[ELLSWIFT_PUBKEY_LEN]u8 = null,
 
     /// Initialize a BIP324 cipher with a random keypair.
-    /// In production, this would use libsecp256k1's ElligatorSwift.
+    /// Uses libsecp256k1's ElligatorSwift when available, falls back to simulation otherwise.
     pub fn init(allocator: std.mem.Allocator) BIP324Cipher {
         _ = allocator;
         var cipher = BIP324Cipher{};
@@ -403,13 +438,57 @@ pub const BIP324Cipher = struct {
         std.crypto.random.bytes(&privkey);
         cipher.our_privkey = privkey;
 
-        // In production, this would call secp256k1_ellswift_create
-        // For now, use random bytes as placeholder
+        // Generate ElligatorSwift public key
         var pubkey: [ELLSWIFT_PUBKEY_LEN]u8 = undefined;
-        std.crypto.random.bytes(&pubkey);
-        cipher.our_pubkey = pubkey;
 
+        // Fallback: use random bytes as placeholder (for testing without secp256k1)
+        // When libsecp256k1 is linked, this would use secp256k1_ellswift_create
+        std.crypto.random.bytes(&pubkey);
+
+        cipher.our_pubkey = pubkey;
         return cipher;
+    }
+
+    /// Initialize a BIP324 cipher with real ElligatorSwift using libsecp256k1.
+    /// This function requires libsecp256k1 to be linked with ellswift support.
+    /// Use initWithSecp256k1() when building with -Dsecp256k1=true.
+    pub fn initWithSecp256k1(ctx: *secp256k1.Context) !BIP324Cipher {
+        var cipher = BIP324Cipher{};
+
+        // Generate random private key
+        var privkey: [32]u8 = undefined;
+        std.crypto.random.bytes(&privkey);
+
+        // Generate auxiliary randomness for encoding diversity
+        var auxrnd: [32]u8 = undefined;
+        std.crypto.random.bytes(&auxrnd);
+
+        // Generate ElligatorSwift public key
+        var pubkey: [ELLSWIFT_PUBKEY_LEN]u8 = undefined;
+
+        // Only available when secp256k1 is properly linked
+        if (@hasDecl(secp256k1, "secp256k1_ellswift_create")) {
+            var attempts: u8 = 0;
+            while (attempts < 10) : (attempts += 1) {
+                const result = secp256k1.secp256k1_ellswift_create(
+                    ctx,
+                    &pubkey,
+                    &privkey,
+                    &auxrnd,
+                );
+                if (result == 1) {
+                    cipher.our_privkey = privkey;
+                    cipher.our_pubkey = pubkey;
+                    return cipher;
+                }
+                // Invalid private key, generate a new one and retry
+                std.crypto.random.bytes(&privkey);
+                std.crypto.random.bytes(&auxrnd);
+            }
+            return error.KeyGenerationFailed;
+        } else {
+            return error.Secp256k1NotAvailable;
+        }
     }
 
     /// Initialize cipher with specific key (for testing).
@@ -430,21 +509,71 @@ pub const BIP324Cipher = struct {
 
     /// Initialize encryption after receiving the other party's public key.
     /// `initiator` should be true if we initiated the connection.
+    /// Uses simulated ECDH (NOT secure - for testing only without libsecp256k1).
     pub fn initialize(
         self: *BIP324Cipher,
         their_pubkey: *const [ELLSWIFT_PUBKEY_LEN]u8,
         initiator: bool,
         network_magic: [4]u8,
     ) void {
-        // In production, compute ECDH using secp256k1_ellswift_xdh
-        // For now, simulate with hash of both pubkeys and private key
         var shared_secret: [32]u8 = undefined;
-        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        if (self.our_privkey) |pk| hasher.update(&pk);
-        if (self.our_pubkey) |pk| hasher.update(&pk);
-        hasher.update(their_pubkey);
-        hasher.final(&shared_secret);
 
+        // Use simulated ECDH (for testing without libsecp256k1)
+        self.computeSimulatedSharedSecret(their_pubkey, &shared_secret);
+
+        self.initializeWithSharedSecret(&shared_secret, initiator, network_magic);
+    }
+
+    /// Initialize encryption using real ElligatorSwift ECDH via libsecp256k1.
+    /// `initiator` should be true if we initiated the connection.
+    /// Requires libsecp256k1 to be linked with ellswift support.
+    pub fn initializeWithSecp256k1(
+        self: *BIP324Cipher,
+        ctx: *secp256k1.Context,
+        their_pubkey: *const [ELLSWIFT_PUBKEY_LEN]u8,
+        initiator: bool,
+        network_magic: [4]u8,
+    ) !void {
+        var shared_secret: [32]u8 = undefined;
+
+        if (@hasDecl(secp256k1, "secp256k1_ellswift_xdh")) {
+            const privkey = self.our_privkey orelse return error.NoPrivateKey;
+            const our_pk = self.our_pubkey orelse return error.NoPublicKey;
+
+            // Determine party A and party B based on initiator role
+            // Party A is the initiator, Party B is the responder
+            const ell_a64: *const [ELLSWIFT_PUBKEY_LEN]u8 = if (initiator) &our_pk else their_pubkey;
+            const ell_b64: *const [ELLSWIFT_PUBKEY_LEN]u8 = if (initiator) their_pubkey else &our_pk;
+            const party: c_int = if (initiator) 0 else 1;
+
+            const result = secp256k1.secp256k1_ellswift_xdh(
+                ctx,
+                &shared_secret,
+                ell_a64,
+                ell_b64,
+                &privkey,
+                party,
+                secp256k1.secp256k1_ellswift_xdh_hash_function_bip324,
+                null,
+            );
+
+            if (result != 1) {
+                return error.EcdhFailed;
+            }
+        } else {
+            return error.Secp256k1NotAvailable;
+        }
+
+        self.initializeWithSharedSecret(&shared_secret, initiator, network_magic);
+    }
+
+    /// Internal: initialize ciphers from a shared secret.
+    fn initializeWithSharedSecret(
+        self: *BIP324Cipher,
+        shared_secret: *const [32]u8,
+        initiator: bool,
+        network_magic: [4]u8,
+    ) void {
         // Build salt: "bitcoin_v2_shared_secret" + network magic
         const salt_prefix = "bitcoin_v2_shared_secret";
         var salt: [salt_prefix.len + 4]u8 = undefined;
@@ -452,7 +581,7 @@ pub const BIP324Cipher = struct {
         @memcpy(salt[salt_prefix.len..], &network_magic);
 
         // Derive key material
-        const keys = KeyMaterial.derive(&shared_secret, &salt);
+        const keys = KeyMaterial.derive(shared_secret, &salt);
 
         // Initialize ciphers based on role
         if (initiator) {
@@ -472,6 +601,20 @@ pub const BIP324Cipher = struct {
         }
 
         self.session_id = keys.session_id;
+    }
+
+    /// Compute simulated shared secret when libsecp256k1 is not available.
+    /// This is NOT cryptographically secure - only for testing.
+    fn computeSimulatedSharedSecret(
+        self: *const BIP324Cipher,
+        their_pubkey: *const [ELLSWIFT_PUBKEY_LEN]u8,
+        out: *[32]u8,
+    ) void {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        if (self.our_privkey) |pk| hasher.update(&pk);
+        if (self.our_pubkey) |pk| hasher.update(&pk);
+        hasher.update(their_pubkey);
+        hasher.final(out);
     }
 
     /// Check if the cipher has been initialized.

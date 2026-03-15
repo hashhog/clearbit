@@ -8,9 +8,13 @@ pub fn build(b: *std.Build) void {
     // When RocksDB is available, use: zig build -Drocksdb=true
     const rocksdb_enabled = b.option(bool, "rocksdb", "Enable RocksDB support (requires librocksdb-dev)") orelse false;
 
-    // libsecp256k1 is required for wallet functionality
+    // libsecp256k1 is required for wallet functionality and BIP324 v2 transport
     // When available, use: zig build -Dsecp256k1=true
     const secp256k1_enabled = b.option(bool, "secp256k1", "Enable libsecp256k1 support (requires libsecp256k1-dev)") orelse false;
+
+    // Path to libsecp256k1 include directory (for ElligatorSwift headers)
+    // Default to Bitcoin Core's bundled version, can be overridden
+    const secp256k1_include = b.option([]const u8, "secp256k1-include", "Path to libsecp256k1 include directory") orelse "../bitcoin/src/secp256k1/include";
 
     const exe = b.addExecutable(.{
         .name = "clearbit",
@@ -28,6 +32,7 @@ pub fn build(b: *std.Build) void {
     // Link libsecp256k1 if enabled
     if (secp256k1_enabled) {
         exe.linkSystemLibrary("secp256k1");
+        exe.addIncludePath(.{ .cwd_relative = secp256k1_include });
         exe.linkLibC();
     }
 
@@ -54,6 +59,7 @@ pub fn build(b: *std.Build) void {
     // Link libsecp256k1 for tests if enabled
     if (secp256k1_enabled) {
         unit_tests.linkSystemLibrary("secp256k1");
+        unit_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
         unit_tests.linkLibC();
     }
 
@@ -84,6 +90,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         wallet_tests.linkSystemLibrary("secp256k1");
+        wallet_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
         wallet_tests.linkLibC();
 
         const run_wallet_tests = b.addRunArtifact(wallet_tests);
