@@ -48,6 +48,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Checkpoint verification (comptime checkpoints, binary search lookup, fork rejection)
 - [x] Flat file block storage (blk*.dat files, 128 MiB max, pre-allocation, RocksDB index)
 - [x] UTXO cache layer (CoinsViewCache, FRESH/DIRTY optimization, batch flush)
+- [x] Block indexes (txindex, BIP-157/158 blockfilterindex, coinstatsindex)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -90,6 +91,7 @@ src/
   block_template.zig # block template construction for mining
   rpc.zig            # JSON-RPC server over HTTP
   wallet.zig         # key management, address derivation, tx signing
+  indexes.zig        # block indexes (txindex, blockfilterindex, coinstatsindex)
   perf.zig           # performance utilities (arena, SIMD, comptime tables)
   bench.zig          # benchmarking suite
   tests.zig          # comprehensive test suite with test vectors
