@@ -2,6 +2,7 @@ const std = @import("std");
 const crypto = @import("crypto.zig");
 const address = @import("address.zig");
 const wallet = @import("wallet.zig");
+const miniscript = @import("miniscript.zig");
 
 // ============================================================================
 // Output Descriptors (BIP-380 through BIP-386)
@@ -271,6 +272,37 @@ pub const TrDescriptor = struct {
 // Main Descriptor Type
 // ============================================================================
 
+/// Miniscript descriptor for wsh() and tapscript
+pub const MiniscriptDescriptor = struct {
+    node: *miniscript.MiniNode,
+    ctx: miniscript.ScriptContext,
+
+    pub fn deinit(self: *MiniscriptDescriptor, allocator: std.mem.Allocator) void {
+        self.node.deinit();
+        allocator.destroy(self.node);
+    }
+
+    pub fn toScript(self: *const MiniscriptDescriptor, allocator: std.mem.Allocator) ![]u8 {
+        return self.node.toScript(allocator, self.ctx);
+    }
+
+    pub fn maxWitnessSize(self: *MiniscriptDescriptor) u32 {
+        return self.node.computeMaxWitnessSize(self.ctx);
+    }
+
+    pub fn isValid(self: *const MiniscriptDescriptor) bool {
+        return self.node.isValidTopLevel(self.ctx);
+    }
+
+    pub fn isNonMalleable(self: *const MiniscriptDescriptor) bool {
+        return self.node.isNonMalleable();
+    }
+
+    pub fn needsSignature(self: *const MiniscriptDescriptor) bool {
+        return self.node.needsSignature();
+    }
+};
+
 /// Output descriptor AST
 pub const Descriptor = union(enum) {
     /// pk(KEY) - Pay to public key
@@ -283,6 +315,8 @@ pub const Descriptor = union(enum) {
     sh: *Descriptor,
     /// wsh(SCRIPT) - Pay to witness script hash (native segwit v0)
     wsh: *Descriptor,
+    /// wsh with miniscript
+    wsh_miniscript: MiniscriptDescriptor,
     /// tr(KEY) or tr(KEY,TREE) - Pay to taproot
     tr: TrDescriptor,
     /// multi(k,KEY,...) - k-of-n multisig
@@ -309,6 +343,7 @@ pub const Descriptor = union(enum) {
                 s.deinit(allocator);
                 allocator.destroy(s);
             },
+            .wsh_miniscript => |*m| m.deinit(allocator),
             .tr => |*t| t.deinit(allocator),
             .multi => |*m| m.deinit(allocator),
             .sorted_multi => |*m| m.deinit(allocator),
@@ -326,6 +361,7 @@ pub const Descriptor = union(enum) {
             .wpkh => |k| k.isRange(),
             .sh => |s| s.isRange(),
             .wsh => |s| s.isRange(),
+            .wsh_miniscript => false, // Miniscript doesn't support ranged keys directly
             .tr => |t| blk: {
                 if (t.internal_key.isRange()) break :blk true;
                 for (t.leaves) |leaf| {
@@ -345,6 +381,11 @@ pub const Descriptor = union(enum) {
             .raw => false,
             .combo => |k| k.isRange(),
         };
+    }
+
+    /// Check if this descriptor uses miniscript
+    pub fn isMiniscript(self: Descriptor) bool {
+        return self == .wsh_miniscript;
     }
 };
 
@@ -828,6 +869,15 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
             try script.append(0x20); // Push 32 bytes
             try script.appendSlice(&hash);
         },
+        .wsh_miniscript => |m| {
+            // P2WSH with miniscript: OP_0 <sha256(witness_script)>
+            const witness_script = try m.node.toScript(allocator, m.ctx);
+            defer allocator.free(witness_script);
+            const hash = crypto.sha256(witness_script);
+            try script.append(0x00); // OP_0
+            try script.append(0x20); // Push 32 bytes
+            try script.appendSlice(&hash);
+        },
         .tr => |t| {
             // P2TR: OP_1 <x-only-pubkey>
             // For key-path only, output the tweaked key
@@ -1011,6 +1061,11 @@ fn writeDescriptor(out: *std.ArrayList(u8), desc: *const Descriptor) !void {
             try writeDescriptor(out, inner);
             try out.append(')');
         },
+        .wsh_miniscript => {
+            // Miniscript descriptors use wsh() wrapper
+            // Full serialization would need to walk the miniscript tree
+            try out.appendSlice("wsh(...)");
+        },
         .tr => |t| {
             try out.appendSlice("tr(");
             try writeKey(out, t.internal_key);
@@ -1190,6 +1245,7 @@ pub fn hasPrivateKeys(desc: *const Descriptor) bool {
     return switch (desc.*) {
         .pk, .pkh, .wpkh, .combo => |k| k.key == .wif or k.key == .xprv,
         .sh, .wsh => |inner| hasPrivateKeys(inner),
+        .wsh_miniscript => false, // Miniscript keys tracked separately
         .tr => |t| t.internal_key.key == .wif or t.internal_key.key == .xprv,
         .multi, .sorted_multi => |m| {
             for (m.keys) |k| {
@@ -1551,4 +1607,62 @@ test "getDescriptorInfo" {
     try std.testing.expect(info.is_solvable);
     try std.testing.expect(!info.has_private_keys);
     try std.testing.expectEqualStrings("8fhd9pwu", &info.checksum);
+}
+
+test "miniscript descriptor integration" {
+    const allocator = std.testing.allocator;
+
+    // Parse a miniscript expression
+    const node = try miniscript.parse(
+        allocator,
+        "and_v(v:pk_k(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798),older(144))",
+        .p2wsh,
+    );
+
+    // Create a wsh_miniscript descriptor
+    var desc = Descriptor{
+        .wsh_miniscript = .{
+            .node = node,
+            .ctx = .p2wsh,
+        },
+    };
+    defer desc.deinit(allocator);
+
+    // Verify descriptor properties
+    try std.testing.expect(!desc.isRange());
+    try std.testing.expect(desc.isMiniscript());
+    try std.testing.expect(!hasPrivateKeys(&desc));
+
+    // Compile to scriptPubKey (P2WSH)
+    const script_pubkey = try deriveScript(allocator, &desc, 0);
+    defer allocator.free(script_pubkey);
+
+    // P2WSH: OP_0 <32-byte hash>
+    try std.testing.expectEqual(@as(usize, 34), script_pubkey.len);
+    try std.testing.expectEqual(@as(u8, 0x00), script_pubkey[0]); // OP_0
+    try std.testing.expectEqual(@as(u8, 0x20), script_pubkey[1]); // push 32
+}
+
+test "miniscript descriptor analysis" {
+    const allocator = std.testing.allocator;
+
+    const node = try miniscript.parse(
+        allocator,
+        "multi(2,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)",
+        .p2wsh,
+    );
+
+    var mini_desc = MiniscriptDescriptor{
+        .node = node,
+        .ctx = .p2wsh,
+    };
+    defer mini_desc.deinit(allocator);
+
+    // Check properties
+    try std.testing.expect(mini_desc.isValid());
+    try std.testing.expect(mini_desc.needsSignature());
+
+    // Witness size should be k signatures + dummy
+    const witness_size = mini_desc.maxWitnessSize();
+    try std.testing.expect(witness_size > 0);
 }
