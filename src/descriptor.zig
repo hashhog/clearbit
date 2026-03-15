@@ -1500,3 +1500,55 @@ test "verify known checksums" {
     try std.testing.expect(!verifyChecksum("pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#xxxxxxxx"));
     try std.testing.expect(!verifyChecksum("pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm8"));
 }
+
+test "parse wsh descriptor" {
+    const allocator = std.testing.allocator;
+
+    var desc = try parseDescriptor(allocator, "wsh(pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798))");
+    defer desc.deinit(allocator);
+
+    try std.testing.expect(desc == .wsh);
+    try std.testing.expect(desc.wsh.* == .pk);
+}
+
+test "parse sh(wsh) descriptor" {
+    const allocator = std.testing.allocator;
+
+    var desc = try parseDescriptor(allocator, "sh(wsh(pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)))");
+    defer desc.deinit(allocator);
+
+    try std.testing.expect(desc == .sh);
+    try std.testing.expect(desc.sh.* == .wsh);
+}
+
+test "parse tr descriptor with script tree" {
+    const allocator = std.testing.allocator;
+
+    // tr(KEY,{SCRIPT,SCRIPT}) format
+    var desc = try parseDescriptor(allocator, "tr(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,{pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798),pk(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)})");
+    defer desc.deinit(allocator);
+
+    try std.testing.expect(desc == .tr);
+    try std.testing.expectEqual(@as(usize, 2), desc.tr.leaves.len);
+}
+
+test "parse combo descriptor" {
+    const allocator = std.testing.allocator;
+
+    var desc = try parseDescriptor(allocator, "combo(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)");
+    defer desc.deinit(allocator);
+
+    try std.testing.expect(desc == .combo);
+}
+
+test "getDescriptorInfo" {
+    const allocator = std.testing.allocator;
+
+    const info = try getDescriptorInfo(allocator, "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)");
+    defer allocator.free(info.descriptor);
+
+    try std.testing.expect(!info.is_range);
+    try std.testing.expect(info.is_solvable);
+    try std.testing.expect(!info.has_private_keys);
+    try std.testing.expectEqualStrings("8fhd9pwu", &info.checksum);
+}
