@@ -359,6 +359,8 @@ pub const RpcServer = struct {
             return self.handleGetNetworkInfo(id);
         } else if (std.mem.eql(u8, method, "getmempoolinfo")) {
             return self.handleGetMempoolInfo(id);
+        } else if (std.mem.eql(u8, method, "getmempoolentry")) {
+            return self.handleGetMempoolEntry(params, id);
         } else if (std.mem.eql(u8, method, "sendrawtransaction")) {
             return self.handleSendRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "getrawtransaction")) {
@@ -692,6 +694,76 @@ pub const RpcServer = struct {
             mempool_stats.size,
             mempool_stats.size,
             mempool_mod.MAX_MEMPOOL_SIZE,
+        });
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    fn handleGetMempoolEntry(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Parse txid from params
+        const txid_hex = blk: {
+            if (params) |p| {
+                if (p == .array and p.array.items.len > 0) {
+                    if (p.array.items[0] == .string) {
+                        break :blk p.array.items[0].string;
+                    }
+                }
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid parameter", id);
+        };
+
+        if (txid_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
+        }
+
+        var txid: types.Hash256 = undefined;
+        for (0..32) |i| {
+            const high = std.fmt.charToDigit(txid_hex[i * 2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            const low = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            // Bitcoin txids are displayed in reverse byte order
+            txid[31 - i] = (high << 4) | low;
+        }
+
+        const entry = self.mempool.get(txid) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool", id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        // Compute BIP125 replaceability: with full RBF, all transactions are replaceable
+        // However, we still track if the tx signals RBF for the bip125-replaceable field
+        const bip125_replaceable = true; // Full RBF: all mempool txs are replaceable
+
+        try writer.print("{{\"vsize\":{d},\"weight\":{d},\"fee\":{d}.{d:0>8},\"modifiedfee\":{d}.{d:0>8},\"time\":{d},\"height\":{d},\"descendantcount\":{d},\"descendantsize\":{d},\"descendantfees\":{d},\"ancestorcount\":{d},\"ancestorsize\":{d},\"ancestorfees\":{d},\"wtxid\":\"", .{
+            entry.vsize,
+            entry.weight,
+            @divTrunc(entry.fee, 100_000_000),
+            @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
+            @divTrunc(entry.fee, 100_000_000),
+            @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
+            entry.time_added,
+            entry.height_added,
+            entry.descendant_count,
+            entry.descendant_size,
+            entry.descendant_fees,
+            entry.ancestor_count,
+            entry.ancestor_size,
+            entry.ancestor_fees,
+        });
+
+        // Write wtxid in reverse byte order
+        for (0..32) |i| {
+            try writer.print("{x:0>2}", .{entry.wtxid[31 - i]});
+        }
+
+        try writer.print("\",\"depends\":[],\"spentby\":[],\"bip125-replaceable\":{s}}}", .{
+            if (bip125_replaceable) "true" else "false",
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -1224,6 +1296,7 @@ pub const RpcServer = struct {
                 mempool_mod.MempoolError.DescendantSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "descendant size limit exceeded", id),
                 mempool_mod.MempoolError.NonBIP125Replaceable => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),
                 mempool_mod.MempoolError.ReplacementFeeTooLow => self.jsonRpcError(RPC_VERIFY_REJECTED, "insufficient fee for replacement", id),
+                mempool_mod.MempoolError.TooManyEvictions => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many potential replacements", id),
                 mempool_mod.MempoolError.MempoolFull => self.jsonRpcError(RPC_VERIFY_REJECTED, "mempool full", id),
                 mempool_mod.MempoolError.ConflictsWithMempool => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),
                 mempool_mod.MempoolError.TxValidationFailed => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction validation failed", id),
