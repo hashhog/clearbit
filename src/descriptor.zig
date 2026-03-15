@@ -1186,7 +1186,7 @@ pub fn getDescriptorInfo(allocator: std.mem.Allocator, input: []const u8) !Descr
     };
 }
 
-fn hasPrivateKeys(desc: *const Descriptor) bool {
+pub fn hasPrivateKeys(desc: *const Descriptor) bool {
     return switch (desc.*) {
         .pk, .pkh, .wpkh, .combo => |k| k.key == .wif or k.key == .xprv,
         .sh, .wsh => |inner| hasPrivateKeys(inner),
