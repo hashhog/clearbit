@@ -94,6 +94,7 @@ pub const RpcServer = struct {
     peer_manager: *peer_mod.PeerManager,
     network_params: *const consensus.NetworkParams,
     wallet: ?*wallet_mod.Wallet,
+    chain_manager: ?*validation.ChainManager,
     config: RpcConfig,
     running: std.atomic.Value(bool),
 
@@ -114,6 +115,7 @@ pub const RpcServer = struct {
             .peer_manager = peer_manager,
             .network_params = network_params,
             .wallet = null,
+            .chain_manager = null,
             .config = config,
             .running = std.atomic.Value(bool).init(false),
         };
@@ -137,9 +139,15 @@ pub const RpcServer = struct {
             .peer_manager = peer_manager,
             .network_params = network_params,
             .wallet = wallet,
+            .chain_manager = null,
             .config = config,
             .running = std.atomic.Value(bool).init(false),
         };
+    }
+
+    /// Set the chain manager for invalidateblock/reconsiderblock/preciousblock RPCs.
+    pub fn setChainManager(self: *RpcServer, chain_manager: *validation.ChainManager) void {
+        self.chain_manager = chain_manager;
     }
 
     /// Start listening for connections.
@@ -411,6 +419,14 @@ pub const RpcServer = struct {
             return self.handleGenerateToDescriptor(params, id);
         } else if (std.mem.eql(u8, method, "generateblock")) {
             return self.handleGenerateBlock(params, id);
+        }
+        // Chain management RPC methods (Phase 51)
+        else if (std.mem.eql(u8, method, "invalidateblock")) {
+            return self.handleInvalidateBlock(params, id);
+        } else if (std.mem.eql(u8, method, "reconsiderblock")) {
+            return self.handleReconsiderBlock(params, id);
+        } else if (std.mem.eql(u8, method, "preciousblock")) {
+            return self.handlePreciousBlock(params, id);
         } else {
             return self.jsonRpcError(RPC_METHOD_NOT_FOUND, "Method not found", id);
         }
@@ -2039,6 +2055,143 @@ pub const RpcServer = struct {
         try writer.writeByte('}');
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // Chain Management RPC Methods (Phase 51)
+    // ========================================================================
+
+    /// invalidateblock "blockhash"
+    /// Permanently marks a block as invalid, as if it violated a consensus rule.
+    /// Reference: Bitcoin Core rpc/blockchain.cpp invalidateblock
+    fn handleInvalidateBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Require chain_manager to be set
+        const chain_manager = self.chain_manager orelse {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Chain manager not initialized", id);
+        };
+
+        // Extract blockhash parameter
+        const blockhash_hex = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const h = params.array.items[0];
+                if (h == .string) break :blk h.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash parameter", id);
+        };
+
+        // Validate and parse blockhash
+        if (blockhash_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length (expected 64 hex chars)", id);
+        }
+
+        var blockhash: types.Hash256 = undefined;
+        for (0..32) |i| {
+            // Parse in reverse (display order to internal byte order)
+            blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
+            };
+        }
+
+        // Call the chain manager
+        chain_manager.invalidateBlock(&blockhash) catch |err| {
+            return switch (err) {
+                validation.ChainManager.ChainError.BlockNotFound => self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id),
+                validation.ChainManager.ChainError.GenesisCannotBeInvalidated => self.jsonRpcError(RPC_MISC_ERROR, "Genesis block cannot be invalidated", id),
+                validation.ChainManager.ChainError.DisconnectFailed => self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to disconnect block", id),
+                validation.ChainManager.ChainError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id),
+            };
+        };
+
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// reconsiderblock "blockhash"
+    /// Removes invalidity status of a block and its descendants, reconsider them for activation.
+    /// Reference: Bitcoin Core rpc/blockchain.cpp reconsiderblock
+    fn handleReconsiderBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Require chain_manager to be set
+        const chain_manager = self.chain_manager orelse {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Chain manager not initialized", id);
+        };
+
+        // Extract blockhash parameter
+        const blockhash_hex = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const h = params.array.items[0];
+                if (h == .string) break :blk h.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash parameter", id);
+        };
+
+        // Validate and parse blockhash
+        if (blockhash_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length (expected 64 hex chars)", id);
+        }
+
+        var blockhash: types.Hash256 = undefined;
+        for (0..32) |i| {
+            // Parse in reverse (display order to internal byte order)
+            blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
+            };
+        }
+
+        // Call the chain manager
+        chain_manager.reconsiderBlock(&blockhash) catch |err| {
+            return switch (err) {
+                validation.ChainManager.ChainError.BlockNotFound => self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id),
+                validation.ChainManager.ChainError.GenesisCannotBeInvalidated => self.jsonRpcError(RPC_MISC_ERROR, "Unexpected error", id),
+                validation.ChainManager.ChainError.DisconnectFailed => self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed during chain activation", id),
+                validation.ChainManager.ChainError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id),
+            };
+        };
+
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// preciousblock "blockhash"
+    /// Treats a block as if it were received before others with the same work.
+    /// A later preciousblock call can override this.
+    /// Reference: Bitcoin Core rpc/blockchain.cpp preciousblock
+    fn handlePreciousBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Require chain_manager to be set
+        const chain_manager = self.chain_manager orelse {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Chain manager not initialized", id);
+        };
+
+        // Extract blockhash parameter
+        const blockhash_hex = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const h = params.array.items[0];
+                if (h == .string) break :blk h.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash parameter", id);
+        };
+
+        // Validate and parse blockhash
+        if (blockhash_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length (expected 64 hex chars)", id);
+        }
+
+        var blockhash: types.Hash256 = undefined;
+        for (0..32) |i| {
+            // Parse in reverse (display order to internal byte order)
+            blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
+            };
+        }
+
+        // Call the chain manager
+        chain_manager.preciousBlock(&blockhash) catch |err| {
+            return switch (err) {
+                validation.ChainManager.ChainError.BlockNotFound => self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id),
+                validation.ChainManager.ChainError.GenesisCannotBeInvalidated => self.jsonRpcError(RPC_MISC_ERROR, "Unexpected error", id),
+                validation.ChainManager.ChainError.DisconnectFailed => self.jsonRpcError(RPC_INTERNAL_ERROR, "Chain activation failed", id),
+                validation.ChainManager.ChainError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id),
+            };
+        };
+
+        return self.jsonRpcResult("null", id);
     }
 
     /// Create a JSON-RPC success response.
