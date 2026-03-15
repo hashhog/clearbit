@@ -44,7 +44,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Address labels (setlabel RPC, label persistence)
 - [x] CLI and application entry point (argument parsing, config files, signal handling)
 - [x] Performance optimization (arena allocators, SIMD, comptime tables, UTXO cache)
-- [x] Benchmarking suite (SHA256, merkle root, UTXO cache, block deserialization)
+- [x] Hardware crypto detection (comptime/runtime CPU feature detection for SHA-NI, SSE4.1, AVX2, ARM SHA2)
+- [x] Benchmarking suite (SHA256, merkle root, UTXO cache, block deserialization, hw-accelerated hashing)
 - [x] Misbehavior scoring and peer banning (per-peer score, 100pt threshold, ban list persistence)
 - [x] Eclipse attack protections (netgroup diversity, anchor connections, inbound eviction)
 - [x] Checkpoint verification (comptime checkpoints, binary search lookup, fork rejection)
@@ -89,7 +90,7 @@ src/
   main.zig           # CLI entry point, config, signal handling
   types.zig          # core bitcoin types
   serialize.zig      # binary serialization
-  crypto.zig         # hash functions, merkle trees, sighash
+  crypto.zig         # hash functions, merkle trees, sighash, CPU feature detection
   address.zig        # address encoding (Base58, Bech32)
   script.zig         # script interpreter and opcodes
   consensus.zig      # consensus rules, network params, difficulty, BIP-9
