@@ -36,6 +36,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Package relay (BIP-331 package validation, CPFP fee bumping, child-with-parents)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
 - [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness, locktime validation)
+- [x] Regtest mining (generatetoaddress, generatetodescriptor, generateblock RPCs for instant block generation)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, batch requests, mining, sendrawtransaction, getmempoolentry)
 - [x] Wallet (BIP32 HD keys, P2PKH/P2SH-P2WPKH/P2WPKH/P2TR, BnB+Knapsack coin selection, tx signing)
 - [x] Coinbase maturity enforcement (100-block delay before spending coinbase outputs)
