@@ -57,6 +57,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] BIP-133 feefilter (per-peer fee filters, Poisson delay, hysteresis, incremental relay fee)
 - [x] BIP-330 Erlay (set reconciliation for tx relay, Minisketch, SipHash short IDs, negotiation)
 - [x] Tor/I2P proxy support (SOCKS5 RFC 1928, Tor control for hidden services, I2P SAM v3.1)
+- [x] Chain management RPCs (invalidateblock, reconsiderblock, preciousblock with BFS descendant marking)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
@@ -93,7 +94,7 @@ src/
   script.zig         # script interpreter and opcodes
   consensus.zig      # consensus rules, network params, difficulty, BIP-9
   storage.zig        # RocksDB storage layer, UTXO set, chain state, flat file blocks
-  validation.zig     # block and transaction validation
+  validation.zig     # block and transaction validation, chain management
   p2p.zig            # P2P protocol message serialization
   peer.zig           # TCP peer connections, handshake, misbehavior scoring
   banlist.zig        # ban list management with JSON persistence
