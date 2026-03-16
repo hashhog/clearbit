@@ -812,8 +812,29 @@ pub const RpcServer = struct {
             try writer.print("{x:0>2}", .{entry.wtxid[31 - i]});
         }
 
-        try writer.print("\",\"depends\":[],\"spentby\":[],\"bip125-replaceable\":{s}}}", .{
+        // Add mining_score (cluster mempool linearization score)
+        // Format: sat/vB with 8 decimal places
+        const mining_score_int = @as(i64, @intFromFloat(entry.mining_score * 100_000_000));
+        const mining_score_whole = @divTrunc(mining_score_int, 100_000_000);
+        const mining_score_frac = @as(u64, @intCast(@mod(mining_score_int, 100_000_000)));
+
+        try writer.print("\",\"depends\":[],\"spentby\":[],\"bip125-replaceable\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}}}", .{
             if (bip125_replaceable) "true" else "false",
+            // fees.base
+            @divTrunc(entry.fee, 100_000_000),
+            @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
+            // fees.modified
+            @divTrunc(entry.fee, 100_000_000),
+            @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
+            // fees.ancestor
+            @divTrunc(entry.ancestor_fees, 100_000_000),
+            @as(u64, @intCast(@mod(entry.ancestor_fees, 100_000_000))),
+            // fees.descendant
+            @divTrunc(entry.descendant_fees, 100_000_000),
+            @as(u64, @intCast(@mod(entry.descendant_fees, 100_000_000))),
+            // mining_score
+            mining_score_whole,
+            mining_score_frac,
         });
 
         return self.jsonRpcResult(buf.items, id);
