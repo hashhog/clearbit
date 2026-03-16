@@ -366,27 +366,30 @@ fn constructCoinbaseWithCommitment(
     }
 
     // Coinbase input:
-    // - sequence = 0xFFFFFFFF (SEQUENCE_FINAL) to opt out of BIP-68
-    // - This makes the coinbase immediately final regardless of nLockTime
+    // - sequence = 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) to enable locktime
+    // - This matches Bitcoin Core's CreateNewBlock behavior (miner.cpp)
+    // - Using 0xFFFFFFFE (not 0xFFFFFFFF) ensures locktime is enforced
     inputs[0] = .{
         .previous_output = types.OutPoint.COINBASE,
         .script_sig = script_sig_owned,
-        .sequence = 0xFFFFFFFF, // SEQUENCE_FINAL - opts out of BIP-68
+        .sequence = 0xFFFFFFFE, // MAX_SEQUENCE_NONFINAL - enables locktime
         .witness = witness,
     };
 
     const outputs_owned = try outputs.toOwnedSlice();
 
     // Coinbase transaction:
-    // - nLockTime = 0 (no locktime constraint)
-    // Note: Bitcoin Core uses nLockTime = height - 1 for anti-fee-sniping,
-    // but coinbase is always valid at its height anyway
+    // - nLockTime = height - 1 for anti-fee-sniping (matches Bitcoin Core miner.cpp)
+    // - This discourages miners from reorganizing blocks to steal fees
+    // - For height 0 (genesis), use locktime 0
+    const lock_time: u32 = if (height > 0) height - 1 else 0;
+
     return .{
         .tx = .{
             .version = 2,
             .inputs = inputs,
             .outputs = outputs_owned,
-            .lock_time = 0, // No locktime for coinbase
+            .lock_time = lock_time, // Anti-fee-sniping: set to height - 1
         },
         .script_sig = script_sig_owned,
         .outputs = outputs_owned,
@@ -1526,15 +1529,48 @@ test "coinbase transaction has correct sequence and locktime" {
         allocator.free(coinbase.inputs);
     }
 
-    // Verify coinbase has SEQUENCE_FINAL (0xFFFFFFFF) to opt out of BIP-68
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), coinbase.tx.inputs[0].sequence);
+    // Verify coinbase has MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) to enable locktime
+    // This matches Bitcoin Core's CreateNewBlock behavior (miner.cpp line 171)
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFE), coinbase.tx.inputs[0].sequence);
 
-    // Verify coinbase has locktime 0
+    // Verify coinbase has locktime = height - 1 for anti-fee-sniping
+    // This matches Bitcoin Core's CreateNewBlock behavior (miner.cpp line 196)
+    try std.testing.expectEqual(@as(u32, 99), coinbase.tx.lock_time);
+
+    // Verify coinbase is still final at its block height because locktime is satisfied
+    // locktime = 99, and we're at height 100, so 99 < 100 means it's final
+    try std.testing.expect(isFinalTx(&coinbase.tx, 100, 0));
+    try std.testing.expect(isFinalTx(&coinbase.tx, 101, 0));
+
+    // Not final at height 99 (locktime not yet satisfied)
+    try std.testing.expect(!isFinalTx(&coinbase.tx, 99, 0));
+}
+
+test "coinbase at height 1 has locktime 0" {
+    const allocator = std.testing.allocator;
+
+    const payout_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xBB} ** 20;
+
+    const coinbase = try constructCoinbase(
+        1, // height 1 (first block after genesis)
+        0, // no fees
+        "",
+        &payout_script,
+        false,
+        &consensus.REGTEST,
+        allocator,
+    );
+    defer {
+        allocator.free(coinbase.script_sig);
+        allocator.free(coinbase.outputs);
+        allocator.free(coinbase.inputs);
+    }
+
+    // Height 1 means locktime = height - 1 = 0
     try std.testing.expectEqual(@as(u32, 0), coinbase.tx.lock_time);
 
-    // Verify coinbase is always final
-    try std.testing.expect(isFinalTx(&coinbase.tx, 0, 0));
-    try std.testing.expect(isFinalTx(&coinbase.tx, 100, 1000000));
+    // Still has MAX_SEQUENCE_NONFINAL
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFE), coinbase.tx.inputs[0].sequence);
 }
 
 // ============================================================================
