@@ -48,7 +48,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Hardware crypto detection (comptime/runtime CPU feature detection for SHA-NI, SSE4.1, AVX2, ARM SHA2)
 - [x] Benchmarking suite (SHA256, merkle root, UTXO cache, block deserialization, hw-accelerated hashing)
 - [x] Misbehavior scoring and peer banning (per-peer score, 100pt threshold, ban list persistence)
-- [x] Eclipse attack protections (netgroup diversity, anchor connections, inbound eviction)
+- [x] Eclipse attack protections (netgroup diversity /16 IPv4 /32 IPv6, 2 anchor connections, inbound eviction with Bitcoin Core protection order)
 - [x] Checkpoint verification (comptime checkpoints, binary search lookup, fork rejection)
 - [x] Flat file block storage (blk*.dat files, 128 MiB max, pre-allocation, RocksDB index)
 - [x] UTXO cache layer (CoinsViewCache, FRESH/DIRTY optimization, batch flush)
