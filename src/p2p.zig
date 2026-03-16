@@ -117,6 +117,11 @@ pub const Message = union(enum) {
     sendaddrv2: void,
     reject: RejectMessage,
     mempool: void,
+    // BIP-331 Package relay messages
+    sendpackages: SendPackagesMessage,
+    ancpkginfo: AncPkgInfoMessage,
+    getpkgtxns: GetPkgTxnsMessage,
+    pkgtxns: PkgTxnsMessage,
 };
 
 /// Version message - exchanged during handshake.
@@ -204,6 +209,49 @@ pub const RejectMessage = struct {
 };
 
 // ============================================================================
+// BIP-331 Package Relay Messages
+// ============================================================================
+
+/// Maximum number of transactions in a package (BIP-331).
+pub const MAX_PACKAGE_COUNT: usize = 25;
+
+/// Maximum total package weight (BIP-331): 404,000 weight units.
+pub const MAX_PACKAGE_WEIGHT: usize = 404_000;
+
+/// sendpackages message - negotiate package relay support during handshake.
+/// Sent after verack. Version 1 indicates support for child-with-parents packages.
+pub const SendPackagesMessage = struct {
+    /// Package relay protocol version (currently 1).
+    version: u32,
+};
+
+/// ancpkginfo message - announce a package by its hash.
+/// Sent when a node has a package ready to relay.
+/// The package_hash is SHA256 of sorted wtxids concatenated.
+pub const AncPkgInfoMessage = struct {
+    /// Package hash (SHA256 of sorted wtxids).
+    package_hash: types.Hash256,
+    /// WTXID of the child transaction (last tx in package).
+    child_wtxid: types.Hash256,
+    /// Count of parent transactions (not including child).
+    parent_count: u32,
+};
+
+/// getpkgtxns message - request package transactions by their wtxids.
+/// Sent in response to ancpkginfo or proactively when orphan resolution fails.
+pub const GetPkgTxnsMessage = struct {
+    /// List of wtxids to request.
+    wtxids: []const types.Hash256,
+};
+
+/// pkgtxns message - provide package transactions.
+/// Sent in response to getpkgtxns.
+pub const PkgTxnsMessage = struct {
+    /// List of transactions in topological order (parents before child).
+    transactions: []const types.Transaction,
+};
+
+// ============================================================================
 // Encoding
 // ============================================================================
 
@@ -238,6 +286,11 @@ pub fn encodeMessage(
         .sendaddrv2 => "sendaddrv2",
         .reject => "reject",
         .mempool => "mempool",
+        // BIP-331 Package relay messages
+        .sendpackages => "sendpackages",
+        .ancpkginfo => "ancpkginfo",
+        .getpkgtxns => "getpkgtxns",
+        .pkgtxns => "pkgtxns",
     };
 
     // Encode payload based on message type
@@ -309,6 +362,27 @@ pub fn encodeMessage(
             try payload_writer.writeCompactSize(r.reason.len);
             try payload_writer.writeBytes(r.reason);
             try payload_writer.writeBytes(r.data);
+        },
+        // BIP-331 Package relay messages
+        .sendpackages => |sp| {
+            try payload_writer.writeInt(u32, sp.version);
+        },
+        .ancpkginfo => |api| {
+            try payload_writer.writeBytes(&api.package_hash);
+            try payload_writer.writeBytes(&api.child_wtxid);
+            try payload_writer.writeInt(u32, api.parent_count);
+        },
+        .getpkgtxns => |gpkt| {
+            try payload_writer.writeCompactSize(gpkt.wtxids.len);
+            for (gpkt.wtxids) |wtxid| {
+                try payload_writer.writeBytes(&wtxid);
+            }
+        },
+        .pkgtxns => |pkt| {
+            try payload_writer.writeCompactSize(pkt.transactions.len);
+            for (pkt.transactions) |transaction| {
+                try serialize.writeTransaction(&payload_writer, &transaction);
+            }
         },
     }
 
