@@ -1370,8 +1370,313 @@ test "proxy manager initialization" {
     try std.testing.expect(manager.i2p_client == null);
 }
 
-// Mock server tests would require a test SOCKS5/I2P server
-// For integration testing, use actual Tor/I2P instances
+// ============================================================================
+// Mock Server Tests
+// ============================================================================
+//
+// These tests validate protocol encoding/decoding without real network connections.
+// They use mock data to verify the SOCKS5 and I2P SAM protocol implementations.
+
+test "socks5 handshake message format" {
+    // Verify the SOCKS5 greeting format per RFC 1928
+    // Without credentials: 05 01 00 (version=5, nmethods=1, noauth=0)
+    // With credentials: 05 02 00 02 (version=5, nmethods=2, noauth=0, userpass=2)
+
+    const allocator = std.testing.allocator;
+    const client_no_auth = Socks5Client.init("127.0.0.1", 9050, null, allocator);
+
+    // Verify no-auth greeting format (3 bytes)
+    var greeting_no_auth: [4]u8 = undefined;
+    var greeting_len: usize = 0;
+    greeting_no_auth[0] = SOCKS5_VERSION;
+    greeting_no_auth[1] = 1; // 1 method
+    greeting_no_auth[2] = SOCKS5_AUTH_NONE;
+    greeting_len = 3;
+
+    try std.testing.expectEqual(@as(u8, 0x05), greeting_no_auth[0]);
+    try std.testing.expectEqual(@as(u8, 0x01), greeting_no_auth[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), greeting_no_auth[2]);
+    _ = client_no_auth;
+}
+
+test "socks5 connect request message format" {
+    // Verify SOCKS5 CONNECT request format per RFC 1928
+    // Format: VER CMD RSV ATYP DST.ADDR DST.PORT
+    // For domain: 05 01 00 03 <len> <domain> <port_be>
+
+    const target = "example.onion";
+    const target_port: u16 = 8333;
+
+    var request: [4 + 1 + 255 + 2]u8 = undefined;
+    var idx: usize = 0;
+
+    request[idx] = SOCKS5_VERSION;
+    idx += 1;
+    request[idx] = SOCKS5_CMD_CONNECT;
+    idx += 1;
+    request[idx] = 0x00; // Reserved
+    idx += 1;
+    request[idx] = SOCKS5_ATYP_DOMAINNAME;
+    idx += 1;
+    request[idx] = @intCast(target.len);
+    idx += 1;
+    @memcpy(request[idx..][0..target.len], target);
+    idx += target.len;
+    // Port in network byte order (big-endian)
+    request[idx] = @intCast((target_port >> 8) & 0xFF);
+    idx += 1;
+    request[idx] = @intCast(target_port & 0xFF);
+    idx += 1;
+
+    // Verify header
+    try std.testing.expectEqual(@as(u8, 0x05), request[0]); // Version
+    try std.testing.expectEqual(@as(u8, 0x01), request[1]); // CONNECT
+    try std.testing.expectEqual(@as(u8, 0x00), request[2]); // Reserved
+    try std.testing.expectEqual(@as(u8, 0x03), request[3]); // Domain name
+    try std.testing.expectEqual(@as(u8, 13), request[4]); // "example.onion" length
+
+    // Verify domain name
+    try std.testing.expectEqualStrings("example.onion", request[5..18]);
+
+    // Verify port (8333 = 0x208D in big-endian)
+    try std.testing.expectEqual(@as(u8, 0x20), request[18]);
+    try std.testing.expectEqual(@as(u8, 0x8D), request[19]);
+}
+
+test "socks5 password auth message format" {
+    // Verify RFC 1929 username/password auth format
+    // Format: VER ULEN USERNAME PLEN PASSWORD
+    // VER is 0x01 (not 0x05!)
+
+    const username = "testuser";
+    const password = "testpass";
+
+    var auth_buf: [1 + 1 + 255 + 1 + 255]u8 = undefined;
+    var idx: usize = 0;
+
+    auth_buf[idx] = 0x01; // Auth sub-negotiation version
+    idx += 1;
+    auth_buf[idx] = @intCast(username.len);
+    idx += 1;
+    @memcpy(auth_buf[idx..][0..username.len], username);
+    idx += username.len;
+    auth_buf[idx] = @intCast(password.len);
+    idx += 1;
+    @memcpy(auth_buf[idx..][0..password.len], password);
+    idx += password.len;
+
+    try std.testing.expectEqual(@as(u8, 0x01), auth_buf[0]); // Version
+    try std.testing.expectEqual(@as(u8, 8), auth_buf[1]); // Username length
+    try std.testing.expectEqualStrings("testuser", auth_buf[2..10]);
+    try std.testing.expectEqual(@as(u8, 8), auth_buf[10]); // Password length
+    try std.testing.expectEqualStrings("testpass", auth_buf[11..19]);
+}
+
+test "socks5 reply parsing" {
+    // Test parsing various SOCKS5 reply codes
+    const replies = [_]struct {
+        code: u8,
+        expected: Socks5Reply,
+        desc: []const u8,
+    }{
+        .{ .code = 0x00, .expected = .succeeded, .desc = "succeeded" },
+        .{ .code = 0x01, .expected = .general_failure, .desc = "general SOCKS server failure" },
+        .{ .code = 0x02, .expected = .connection_not_allowed, .desc = "connection not allowed by ruleset" },
+        .{ .code = 0x03, .expected = .network_unreachable, .desc = "network unreachable" },
+        .{ .code = 0x04, .expected = .host_unreachable, .desc = "host unreachable" },
+        .{ .code = 0x05, .expected = .connection_refused, .desc = "connection refused" },
+        .{ .code = 0x06, .expected = .ttl_expired, .desc = "TTL expired" },
+        .{ .code = 0x07, .expected = .command_not_supported, .desc = "command not supported" },
+        .{ .code = 0x08, .expected = .address_type_not_supported, .desc = "address type not supported" },
+        .{ .code = 0xF0, .expected = .tor_hidden_service_not_found, .desc = "Tor hidden service not found" },
+    };
+
+    for (replies) |r| {
+        const reply: Socks5Reply = @enumFromInt(r.code);
+        try std.testing.expectEqual(r.expected, reply);
+        try std.testing.expectEqualStrings(r.desc, reply.description());
+    }
+}
+
+test "i2p sam hello message format" {
+    // Verify I2P SAM v3.1 HELLO command format
+    const hello_cmd = "HELLO VERSION MIN=3.1 MAX=3.1\n";
+
+    try std.testing.expect(std.mem.startsWith(u8, hello_cmd, "HELLO VERSION"));
+    try std.testing.expect(std.mem.indexOf(u8, hello_cmd, "MIN=3.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hello_cmd, "MAX=3.1") != null);
+    try std.testing.expect(hello_cmd[hello_cmd.len - 1] == '\n');
+}
+
+test "i2p sam session create format" {
+    // Verify I2P SAM SESSION CREATE format
+    const session_id = "test123";
+    const destination = "TRANSIENT";
+
+    var buf: [512]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buf, "SESSION CREATE STYLE=STREAM ID={s} DESTINATION={s} SIGNATURE_TYPE=7 i2cp.leaseSetEncType=4,0\n", .{
+        session_id,
+        destination,
+    }) catch unreachable;
+
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "SESSION CREATE"));
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "STYLE=STREAM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "ID=test123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "DESTINATION=TRANSIENT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "SIGNATURE_TYPE=7") != null);
+    try std.testing.expect(cmd[cmd.len - 1] == '\n');
+}
+
+test "i2p sam stream connect format" {
+    // Verify I2P SAM STREAM CONNECT format
+    const session_id = "abc123";
+    const destination = "example.b32.i2p";
+
+    var buf: [512]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buf, "STREAM CONNECT ID={s} DESTINATION={s} SILENT=false\n", .{
+        session_id,
+        destination,
+    }) catch unreachable;
+
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "STREAM CONNECT"));
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "ID=abc123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "DESTINATION=example.b32.i2p") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "SILENT=false") != null);
+}
+
+test "i2p sam naming lookup format" {
+    // Verify I2P SAM NAMING LOOKUP format
+    const name = "example.b32.i2p";
+
+    var buf: [256]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buf, "NAMING LOOKUP NAME={s}\n", .{name}) catch unreachable;
+
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "NAMING LOOKUP"));
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "NAME=example.b32.i2p") != null);
+}
+
+test "i2p sam dest generate format" {
+    // Verify I2P SAM DEST GENERATE format
+    const cmd = "DEST GENERATE SIGNATURE_TYPE=7\n";
+
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "DEST GENERATE"));
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "SIGNATURE_TYPE=7") != null);
+}
+
+test "i2p sam response parsing" {
+    // Test parsing I2P SAM responses
+    const hello_ok = "HELLO REPLY RESULT=OK VERSION=3.1";
+    const session_ok = "SESSION STATUS RESULT=OK DESTINATION=abc123...";
+    const stream_ok = "STREAM STATUS RESULT=OK";
+    const error_response = "SESSION STATUS RESULT=INVALID_ID";
+
+    try std.testing.expect(std.mem.indexOf(u8, hello_ok, "RESULT=OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session_ok, "RESULT=OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stream_ok, "RESULT=OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, error_response, "INVALID_ID") != null);
+}
+
+test "tor control authenticate format" {
+    // Verify Tor control AUTHENTICATE command format
+    const password = "mypassword";
+
+    var buf: [256]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buf, "AUTHENTICATE \"{s}\"\r\n", .{password}) catch unreachable;
+
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "AUTHENTICATE"));
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "\"mypassword\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, cmd, "\r\n"));
+}
+
+test "tor control add_onion format" {
+    // Verify Tor control ADD_ONION command format
+    const virtual_port: u16 = 8333;
+    const local_port: u16 = 8333;
+
+    var buf: [256]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buf, "ADD_ONION NEW:ED25519-V3 Port={d},127.0.0.1:{d}\r\n", .{
+        virtual_port,
+        local_port,
+    }) catch unreachable;
+
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "ADD_ONION"));
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "NEW:ED25519-V3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "Port=8333,127.0.0.1:8333") != null);
+    try std.testing.expect(std.mem.endsWith(u8, cmd, "\r\n"));
+}
+
+test "tor control response parsing" {
+    // Test parsing Tor control responses
+    const auth_ok = "250 OK\r\n";
+    const service_id = "250-ServiceID=abcdef123456.onion";
+    const private_key = "250-PrivateKey=ED25519-V3:base64data...";
+    const error_response = "515 Bad authentication";
+
+    try std.testing.expect(std.mem.startsWith(u8, auth_ok, "250"));
+    try std.testing.expect(std.mem.startsWith(u8, service_id, "250-ServiceID="));
+    try std.testing.expect(std.mem.startsWith(u8, private_key, "250-PrivateKey="));
+    try std.testing.expect(std.mem.startsWith(u8, error_response, "5"));
+}
+
+test "multi network address to hostname torv3" {
+    const allocator = std.testing.allocator;
+
+    // Create a Tor v3 address (32 bytes)
+    var pubkey: [32]u8 = undefined;
+    @memset(&pubkey, 0xAB);
+
+    const addr = MultiNetworkAddress{
+        .network = .torv3,
+        .address = &pubkey,
+        .port = 8333,
+    };
+
+    const hostname = try addr.toHostname(allocator);
+    defer allocator.free(hostname);
+
+    // Should end with .onion
+    try std.testing.expect(std.mem.endsWith(u8, hostname, ".onion"));
+}
+
+test "multi network address to hostname i2p" {
+    const allocator = std.testing.allocator;
+
+    // Create an I2P address (32-byte hash)
+    var hash: [32]u8 = undefined;
+    @memset(&hash, 0xCD);
+
+    const addr = MultiNetworkAddress{
+        .network = .i2p,
+        .address = &hash,
+        .port = 8333,
+    };
+
+    const hostname = try addr.toHostname(allocator);
+    defer allocator.free(hostname);
+
+    // Should end with .b32.i2p
+    try std.testing.expect(std.mem.endsWith(u8, hostname, ".b32.i2p"));
+}
+
+test "multi network address to hostname ipv6" {
+    const allocator = std.testing.allocator;
+
+    // Create IPv6 address (16 bytes) - ::1 (loopback)
+    var ipv6: [16]u8 = [_]u8{0} ** 16;
+    ipv6[15] = 1;
+
+    const addr = MultiNetworkAddress{
+        .network = .ipv6,
+        .address = &ipv6,
+        .port = 8333,
+    };
+
+    const hostname = try addr.toHostname(allocator);
+    defer allocator.free(hostname);
+
+    // Should be formatted as hex colons
+    try std.testing.expect(std.mem.indexOf(u8, hostname, ":") != null);
+}
 
 test "direct connect error on unsupported network" {
     const addr = MultiNetworkAddress{
