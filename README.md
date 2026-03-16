@@ -24,6 +24,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] BIP-9 version bits (soft fork deployment state machine, signaling, caching)
 - [x] RocksDB storage layer (blocks, UTXOs, chain state)
 - [x] Block and transaction validation (BIP-16 P2SH, BIP-34, BIP-68 sequence locks, BIP-141 segwit, BIP-146 NULLFAIL, sigops with witness discount)
+- [x] Witness cleanstack enforcement (unconditional for P2WPKH, P2WSH, tapscript - not flag-gated)
 - [x] P2P message serialization (version, inv, headers, blocks)
 - [x] Peer connections (TCP, version/verack handshake, ping/pong)
 - [x] Peer manager and discovery (DNS seeds, addr relay, connection pool)
