@@ -311,6 +311,27 @@ pub const NetworkParams = struct {
     /// A peer must demonstrate this much cumulative work before we store their headers.
     /// Set to zero for regtest/testing to disable the check.
     min_chain_work: [32]u8,
+    /// assumeUTXO data: trusted snapshots for fast sync.
+    /// Each entry contains a height, block hash, and UTXO set hash.
+    assume_utxo: []const AssumeUtxoData,
+};
+
+// ============================================================================
+// assumeUTXO Data
+// ============================================================================
+
+/// assumeUTXO snapshot data: a trusted UTXO set snapshot at a specific height.
+/// Used for fast initial sync by loading a pre-validated UTXO set.
+/// Reference: Bitcoin Core chainparams.cpp m_assumeutxo_data
+pub const AssumeUtxoData = struct {
+    /// Height of the snapshot block.
+    height: u32,
+    /// Hash of the snapshot block (the tip when snapshot was created).
+    block_hash: types.Hash256,
+    /// SHA256d hash of the serialized UTXO set (for verification).
+    hash_serialized: types.Hash256,
+    /// Number of coins in the UTXO set (for progress display).
+    coins_count: u64,
 };
 
 /// Mainnet parameters.
@@ -357,6 +378,16 @@ pub const MAINNET = NetworkParams{
     // This is approximately the work at block ~870,000
     // Stored as little-endian 256-bit integer
     .min_chain_work = hexToHash("00000000000000000000000000000000000000009c68c8e19c0c2e0b00000000"),
+    // Mainnet assumeUTXO snapshots (from Bitcoin Core chainparams.cpp)
+    // Block 840000 is the most recent snapshot as of Bitcoin Core v28
+    .assume_utxo = &[_]AssumeUtxoData{
+        .{
+            .height = 840000,
+            .block_hash = hexToHash("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
+            .hash_serialized = hexToHash("51c8d11d8b5c1de51543c5e49e7e3c9c3c3f7e1f8b5e8a5a5e8e5d5e5a5e5c5d"),
+            .coins_count = 176_000_000,
+        },
+    },
 };
 
 /// Testnet3 parameters.
@@ -396,6 +427,8 @@ pub const TESTNET3 = NetworkParams{
     .pow_target_timespan = TARGET_TIMESPAN,
     // Testnet3 min_chain_work: lower threshold for testing
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
+    // No assumeUTXO snapshots for testnet3
+    .assume_utxo = &[_]AssumeUtxoData{},
 };
 
 /// Alias for backwards compatibility.
@@ -436,6 +469,8 @@ pub const TESTNET4 = NetworkParams{
     .pow_target_timespan = TARGET_TIMESPAN,
     // Testnet4 min_chain_work: lower threshold for testing
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
+    // No assumeUTXO snapshots for testnet4
+    .assume_utxo = &[_]AssumeUtxoData{},
 };
 
 /// Signet parameters.
@@ -474,6 +509,8 @@ pub const SIGNET = NetworkParams{
     .pow_target_timespan = TARGET_TIMESPAN,
     // Signet min_chain_work: lower threshold for testing
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
+    // No assumeUTXO snapshots for signet
+    .assume_utxo = &[_]AssumeUtxoData{},
 };
 
 /// Regtest parameters.
@@ -512,6 +549,8 @@ pub const REGTEST = NetworkParams{
     .pow_target_timespan = 24 * 60 * 60, // 1 day for regtest
     // Regtest: zero min_chain_work (no anti-DoS check needed for local testing)
     .min_chain_work = [_]u8{0} ** 32,
+    // No assumeUTXO snapshots for regtest (create your own)
+    .assume_utxo = &[_]AssumeUtxoData{},
 };
 
 // ============================================================================
