@@ -23,6 +23,7 @@ const block_template = @import("block_template.zig");
 const validation = @import("validation.zig");
 const wallet_mod = @import("wallet.zig");
 const descriptor = @import("descriptor.zig");
+const psbt_mod = @import("psbt.zig");
 
 // ============================================================================
 // RPC Error Codes (Bitcoin Core conventions)
@@ -427,6 +428,24 @@ pub const RpcServer = struct {
             return self.handleReconsiderBlock(params, id);
         } else if (std.mem.eql(u8, method, "preciousblock")) {
             return self.handlePreciousBlock(params, id);
+        }
+        // Package relay RPC methods
+        else if (std.mem.eql(u8, method, "submitpackage")) {
+            return self.handleSubmitPackage(params, id);
+        }
+        // PSBT RPC methods (BIP174/370)
+        else if (std.mem.eql(u8, method, "createpsbt")) {
+            return self.handleCreatePsbt(params, id);
+        } else if (std.mem.eql(u8, method, "decodepsbt")) {
+            return self.handleDecodePsbt(params, id);
+        } else if (std.mem.eql(u8, method, "analyzepsbt")) {
+            return self.handleAnalyzePsbt(params, id);
+        } else if (std.mem.eql(u8, method, "combinepsbt")) {
+            return self.handleCombinePsbt(params, id);
+        } else if (std.mem.eql(u8, method, "finalizepsbt")) {
+            return self.handleFinalizePsbt(params, id);
+        } else if (std.mem.eql(u8, method, "converttopsbt")) {
+            return self.handleConvertToPsbt(params, id);
         } else {
             return self.jsonRpcError(RPC_METHOD_NOT_FOUND, "Method not found", id);
         }
@@ -2192,6 +2211,745 @@ pub const RpcServer = struct {
         };
 
         return self.jsonRpcResult("null", id);
+    }
+
+    // ========================================================================
+    // Package Relay Methods
+    // ========================================================================
+
+    /// Handle submitpackage RPC - submit a package of related transactions.
+    /// Params: [[rawtx1, rawtx2, ...], maxfeerate, maxburnamount]
+    /// Returns JSON object with per-tx results keyed by txid.
+    fn handleSubmitPackage(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Extract parameters
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing required parameter: array of raw transactions", id);
+        }
+
+        // First param: array of raw transaction hex strings
+        const tx_array = params.array.items[0];
+        if (tx_array != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "First parameter must be array of hex strings", id);
+        }
+
+        if (tx_array.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Package must contain at least one transaction", id);
+        }
+
+        if (tx_array.array.items.len > mempool_mod.MAX_PACKAGE_COUNT) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Package exceeds maximum transaction count (25)", id);
+        }
+
+        // Parse optional maxfeerate (BTC/kvB)
+        var max_feerate: i64 = DEFAULT_MAX_FEERATE;
+        if (params.array.items.len > 1 and params.array.items[1] != .null) {
+            const feerate_param = params.array.items[1];
+            if (feerate_param == .float) {
+                max_feerate = @intFromFloat(feerate_param.float * 100_000_000.0);
+            } else if (feerate_param == .integer) {
+                max_feerate = feerate_param.integer;
+            }
+        }
+        _ = max_feerate; // TODO: implement maxfeerate check per-tx
+
+        // Parse all transactions from hex
+        var transactions = std.ArrayList(types.Transaction).init(self.allocator);
+        defer transactions.deinit();
+
+        var tx_bytes_list = std.ArrayList([]u8).init(self.allocator);
+        defer {
+            for (tx_bytes_list.items) |bytes| {
+                self.allocator.free(bytes);
+            }
+            tx_bytes_list.deinit();
+        }
+
+        for (tx_array.array.items) |item| {
+            if (item != .string) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "All package elements must be hex strings", id);
+            }
+
+            const hex = item.string;
+            if (hex.len % 2 != 0) {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length in package", id);
+            }
+
+            if (hex.len == 0) {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Empty transaction in package", id);
+            }
+
+            const raw = self.allocator.alloc(u8, hex.len / 2) catch {
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+            };
+            errdefer self.allocator.free(raw);
+
+            for (0..raw.len) |i| {
+                raw[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
+                    self.allocator.free(raw);
+                    return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex character in package", id);
+                };
+            }
+
+            // Track bytes for deferred cleanup
+            tx_bytes_list.append(raw) catch {
+                self.allocator.free(raw);
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+            };
+
+            // Deserialize transaction
+            var reader = serialize.Reader{ .data = raw };
+            const tx = serialize.readTransaction(&reader, self.allocator) catch {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed in package", id);
+            };
+
+            if (tx.inputs.len == 0) {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Transaction has no inputs", id);
+            }
+
+            transactions.append(tx) catch {
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+            };
+        }
+
+        // Validate and accept the package
+        var result = mempool_mod.acceptPackage(self.mempool, transactions.items, self.allocator) catch |err| {
+            return switch (err) {
+                mempool_mod.PackageError.PackageTooManyTransactions => self.jsonRpcError(RPC_INVALID_PARAMS, "package-too-many-transactions", id),
+                mempool_mod.PackageError.PackageTooLarge => self.jsonRpcError(RPC_INVALID_PARAMS, "package-too-large", id),
+                mempool_mod.PackageError.PackageContainsDuplicates => self.jsonRpcError(RPC_INVALID_PARAMS, "package-contains-duplicates", id),
+                mempool_mod.PackageError.PackageNotSorted => self.jsonRpcError(RPC_INVALID_PARAMS, "package-not-sorted", id),
+                mempool_mod.PackageError.ConflictInPackage => self.jsonRpcError(RPC_INVALID_PARAMS, "conflict-in-package", id),
+                mempool_mod.PackageError.PackageEmptyInputs => self.jsonRpcError(RPC_INVALID_PARAMS, "package-empty-inputs", id),
+                mempool_mod.PackageError.PackageNotChildWithParents => self.jsonRpcError(RPC_INVALID_PARAMS, "package-not-child-with-parents", id),
+                mempool_mod.PackageError.PackageParentsNotIndependent => self.jsonRpcError(RPC_INVALID_PARAMS, "package-parents-not-independent", id),
+                mempool_mod.PackageError.PackageFeeTooLow => self.jsonRpcError(RPC_VERIFY_REJECTED, "package-fee-too-low", id),
+                mempool_mod.PackageError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id),
+            };
+        };
+        defer result.deinit();
+
+        // Build response JSON
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"package_msg\":\"\",\"tx-results\":{");
+
+        for (result.tx_results, 0..) |tx_result, i| {
+            if (i > 0) try writer.writeByte(',');
+
+            // Write txid as key
+            try writer.writeByte('"');
+            try writeHashHex(writer, &tx_result.txid);
+            try writer.writeAll("\":{");
+
+            // Write per-tx result
+            if (tx_result.accepted) {
+                try writer.print("\"txid\":\"", .{});
+                try writeHashHex(writer, &tx_result.txid);
+                try writer.print("\",\"wtxid\":\"", .{});
+                try writeHashHex(writer, &tx_result.wtxid);
+                try writer.print("\",\"vsize\":{d},\"fees\":{{\"base\":{d}}}", .{
+                    tx_result.vsize,
+                    tx_result.fee,
+                });
+            } else {
+                try writer.print("\"txid\":\"", .{});
+                try writeHashHex(writer, &tx_result.txid);
+                try writer.print("\",\"error\":\"rejected\"", .{});
+            }
+
+            try writer.writeByte('}');
+        }
+
+        try writer.writeAll("},\"replaced-transactions\":[],\"package_feerate\":");
+        try writer.print("{d:.8}", .{result.package_fee_rate / 100000.0}); // Convert sat/vB to BTC/kvB
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // PSBT Methods (BIP174/370)
+    // ========================================================================
+
+    /// Handle createpsbt RPC - create a PSBT from inputs and outputs.
+    /// Params: [inputs, outputs, locktime, replaceable]
+    /// inputs: [{"txid": "<hex>", "vout": n}, ...]
+    /// outputs: [{"<address>": amount}, ...] or [{"data": "<hex>"}]
+    fn handleCreatePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "createpsbt requires inputs and outputs arrays", id);
+        }
+
+        const inputs_param = params.array.items[0];
+        const outputs_param = params.array.items[1];
+
+        if (inputs_param != .array or outputs_param != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs and outputs must be arrays", id);
+        }
+
+        // Parse locktime (optional, defaults to 0)
+        var locktime: u32 = 0;
+        if (params.array.items.len > 2 and params.array.items[2] == .integer) {
+            locktime = @intCast(params.array.items[2].integer);
+        }
+
+        // Parse replaceable (optional, defaults to true)
+        var replaceable = true;
+        if (params.array.items.len > 3 and params.array.items[3] == .bool) {
+            replaceable = params.array.items[3].bool;
+        }
+
+        // Build inputs
+        var tx_inputs = std.ArrayList(types.TxIn).init(self.allocator);
+        defer tx_inputs.deinit();
+
+        for (inputs_param.array.items) |input_obj| {
+            if (input_obj != .object) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Each input must be an object with txid and vout", id);
+            }
+
+            const txid_val = input_obj.object.get("txid") orelse {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Input missing txid", id);
+            };
+            const vout_val = input_obj.object.get("vout") orelse {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Input missing vout", id);
+            };
+
+            if (txid_val != .string or txid_val.string.len != 64) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid format", id);
+            }
+            if (vout_val != .integer) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout format", id);
+            }
+
+            // Parse txid (displayed in big-endian, stored in little-endian)
+            var txid: types.Hash256 = undefined;
+            for (0..32) |i| {
+                txid[31 - i] = std.fmt.parseInt(u8, txid_val.string[i * 2 ..][0..2], 16) catch {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+                };
+            }
+
+            // Parse sequence
+            var sequence: u32 = if (replaceable) 0xFFFFFFFD else 0xFFFFFFFF;
+            if (input_obj.object.get("sequence")) |seq_val| {
+                if (seq_val == .integer) {
+                    sequence = @intCast(seq_val.integer);
+                }
+            }
+
+            try tx_inputs.append(types.TxIn{
+                .previous_output = .{
+                    .hash = txid,
+                    .index = @intCast(vout_val.integer),
+                },
+                .script_sig = &[_]u8{},
+                .sequence = sequence,
+                .witness = &[_][]const u8{},
+            });
+        }
+
+        // Build outputs
+        var tx_outputs = std.ArrayList(types.TxOut).init(self.allocator);
+        defer tx_outputs.deinit();
+
+        for (outputs_param.array.items) |output_obj| {
+            if (output_obj != .object) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Each output must be an object", id);
+            }
+
+            var iter = output_obj.object.iterator();
+            while (iter.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "data")) {
+                    // OP_RETURN output
+                    if (entry.value_ptr.* != .string) {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "data must be hex string", id);
+                    }
+                    const hex = entry.value_ptr.string;
+                    if (hex.len % 2 != 0 or hex.len > 160) { // 80 bytes max
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid data length", id);
+                    }
+
+                    var data_script = std.ArrayList(u8).init(self.allocator);
+                    try data_script.append(0x6a); // OP_RETURN
+                    try data_script.append(@intCast(hex.len / 2));
+                    for (0..hex.len / 2) |i| {
+                        try data_script.append(std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
+                            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid data hex", id);
+                        });
+                    }
+
+                    try tx_outputs.append(types.TxOut{
+                        .value = 0,
+                        .script_pubkey = try data_script.toOwnedSlice(),
+                    });
+                } else {
+                    // Regular output: address -> amount
+                    const amount_val = entry.value_ptr.*;
+                    var amount_sats: i64 = 0;
+                    if (amount_val == .float) {
+                        amount_sats = @intFromFloat(amount_val.float * 100_000_000.0);
+                    } else if (amount_val == .integer) {
+                        amount_sats = @intCast(amount_val.integer * 100_000_000);
+                    } else {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
+                    }
+
+                    // For now, just create a placeholder script - in production, decode the address
+                    // This is a simplified implementation
+                    try tx_outputs.append(types.TxOut{
+                        .value = amount_sats,
+                        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0x00} ** 20, // P2WPKH placeholder
+                    });
+                }
+            }
+        }
+
+        // Create the transaction
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = tx_inputs.items,
+            .outputs = tx_outputs.items,
+            .lock_time = locktime,
+        };
+
+        // Create PSBT
+        var psbt = psbt_mod.Psbt.create(self.allocator, tx) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to create PSBT", id);
+        };
+        defer psbt.deinit();
+
+        // Encode to base64
+        const base64 = psbt.toBase64(self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to encode PSBT", id);
+        };
+        defer self.allocator.free(base64);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeByte('"');
+        try writer.writeAll(base64);
+        try writer.writeByte('"');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle decodepsbt RPC - decode a PSBT and return its contents.
+    fn handleDecodePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "decodepsbt requires psbt string", id);
+        }
+
+        const psbt_param = params.array.items[0];
+        if (psbt_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "PSBT must be a base64 string", id);
+        }
+
+        var psbt = psbt_mod.Psbt.fromBase64(self.allocator, psbt_param.string) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to decode PSBT", id);
+        };
+        defer psbt.deinit();
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"tx\":{");
+
+        // Transaction info
+        try writer.print("\"version\":{d},", .{psbt.tx.version});
+        try writer.print("\"locktime\":{d},", .{psbt.tx.lock_time});
+
+        // Inputs
+        try writer.writeAll("\"vin\":[");
+        for (psbt.tx.inputs, 0..) |input, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"txid\":\"");
+            try writeHashHex(writer, &input.previous_output.hash);
+            try writer.print("\",\"vout\":{d},\"sequence\":{d}}}", .{
+                input.previous_output.index,
+                input.sequence,
+            });
+        }
+        try writer.writeAll("],");
+
+        // Outputs
+        try writer.writeAll("\"vout\":[");
+        for (psbt.tx.outputs, 0..) |output, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{{\"value\":{d:.8},\"n\":{d}}}", .{
+                @as(f64, @floatFromInt(output.value)) / 100_000_000.0,
+                i,
+            });
+        }
+        try writer.writeAll("]},");
+
+        // PSBT version
+        try writer.print("\"psbt_version\":{d},", .{psbt.version});
+
+        // Inputs info
+        try writer.writeAll("\"inputs\":[");
+        for (psbt.inputs, 0..) |*input, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{");
+
+            var has_field = false;
+
+            if (input.witness_utxo != null) {
+                try writer.print("\"witness_utxo\":{{\"amount\":{d:.8}}}", .{
+                    @as(f64, @floatFromInt(input.witness_utxo.?.value)) / 100_000_000.0,
+                });
+                has_field = true;
+            }
+
+            if (input.partial_sigs.count() > 0) {
+                if (has_field) try writer.writeByte(',');
+                try writer.print("\"partial_signatures\":{d}", .{input.partial_sigs.count()});
+                has_field = true;
+            }
+
+            if (input.sighash_type != null) {
+                if (has_field) try writer.writeByte(',');
+                try writer.print("\"sighash\":{d}", .{input.sighash_type.?});
+                has_field = true;
+            }
+
+            if (input.isFinalized()) {
+                if (has_field) try writer.writeByte(',');
+                try writer.writeAll("\"final\":true");
+            }
+
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],");
+
+        // Outputs info
+        try writer.writeAll("\"outputs\":[");
+        for (psbt.outputs, 0..) |*output, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{");
+
+            var has_field = false;
+            if (output.bip32_derivation.count() > 0) {
+                try writer.print("\"bip32_derivs\":{d}", .{output.bip32_derivation.count()});
+                has_field = true;
+            }
+            _ = has_field;
+
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],");
+
+        // Fee if available
+        const analysis = psbt.analyze();
+        if (analysis.estimated_fee) |fee| {
+            try writer.print("\"fee\":{d:.8}", .{@as(f64, @floatFromInt(fee)) / 100_000_000.0});
+        } else {
+            try writer.writeAll("\"fee\":null");
+        }
+
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle analyzepsbt RPC - analyze a PSBT and provide status.
+    fn handleAnalyzePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "analyzepsbt requires psbt string", id);
+        }
+
+        const psbt_param = params.array.items[0];
+        if (psbt_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "PSBT must be a base64 string", id);
+        }
+
+        var psbt = psbt_mod.Psbt.fromBase64(self.allocator, psbt_param.string) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to decode PSBT", id);
+        };
+        defer psbt.deinit();
+
+        const analysis = psbt.analyze();
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"inputs\":[");
+
+        for (psbt.inputs, 0..) |*input, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{");
+
+            if (input.witness_utxo != null or input.non_witness_utxo != null) {
+                try writer.writeAll("\"has_utxo\":true,");
+            } else {
+                try writer.writeAll("\"has_utxo\":false,");
+            }
+
+            if (input.isFinalized()) {
+                try writer.writeAll("\"is_final\":true");
+            } else {
+                try writer.writeAll("\"is_final\":false");
+            }
+
+            try writer.writeByte('}');
+        }
+
+        try writer.writeAll("],");
+
+        // Estimated fee
+        if (analysis.estimated_fee) |fee| {
+            try writer.print("\"estimated_feerate\":{d:.8},", .{@as(f64, @floatFromInt(fee)) / 100_000_000.0});
+        }
+
+        try writer.print("\"next\":\"{s}\"", .{analysis.next_role});
+
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle combinepsbt RPC - combine multiple PSBTs.
+    fn handleCombinePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "combinepsbt requires array of PSBTs", id);
+        }
+
+        const psbt_array = params.array.items[0];
+        if (psbt_array != .array or psbt_array.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Must provide at least 2 PSBTs to combine", id);
+        }
+
+        // Parse all PSBTs
+        var psbts = std.ArrayList(psbt_mod.Psbt).init(self.allocator);
+        defer {
+            for (psbts.items) |*p| {
+                p.deinit();
+            }
+            psbts.deinit();
+        }
+
+        for (psbt_array.array.items) |item| {
+            if (item != .string) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Each PSBT must be a base64 string", id);
+            }
+
+            var psbt = psbt_mod.Psbt.fromBase64(self.allocator, item.string) catch {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to decode PSBT", id);
+            };
+            try psbts.append(psbt);
+        }
+
+        // Create pointer array for combine
+        var psbt_ptrs = try self.allocator.alloc(*psbt_mod.Psbt, psbts.items.len);
+        defer self.allocator.free(psbt_ptrs);
+        for (psbts.items, 0..) |*p, i| {
+            psbt_ptrs[i] = p;
+        }
+
+        // Combine
+        var combined = psbt_mod.Psbt.combine(self.allocator, psbt_ptrs) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to combine PSBTs", id);
+        };
+        defer combined.deinit();
+
+        // Encode result
+        const base64 = combined.toBase64(self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to encode combined PSBT", id);
+        };
+        defer self.allocator.free(base64);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeByte('"');
+        try writer.writeAll(base64);
+        try writer.writeByte('"');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle finalizepsbt RPC - finalize a PSBT and optionally extract the transaction.
+    fn handleFinalizePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "finalizepsbt requires psbt string", id);
+        }
+
+        const psbt_param = params.array.items[0];
+        if (psbt_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "PSBT must be a base64 string", id);
+        }
+
+        // Extract flag (optional, defaults to true)
+        var extract = true;
+        if (params.array.items.len > 1 and params.array.items[1] == .bool) {
+            extract = params.array.items[1].bool;
+        }
+
+        var psbt = psbt_mod.Psbt.fromBase64(self.allocator, psbt_param.string) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to decode PSBT", id);
+        };
+        defer psbt.deinit();
+
+        // Try to finalize
+        psbt.finalize() catch {};
+
+        const complete = psbt.isComplete();
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{");
+
+        if (complete and extract) {
+            // Extract the final transaction
+            const tx = psbt.extract() catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to extract transaction", id);
+            };
+            defer {
+                for (tx.inputs) |input| {
+                    if (input.script_sig.len > 0) self.allocator.free(input.script_sig);
+                    if (input.witness.len > 0) {
+                        for (input.witness) |item| {
+                            if (item.len > 0) self.allocator.free(item);
+                        }
+                        self.allocator.free(input.witness);
+                    }
+                }
+                self.allocator.free(tx.inputs);
+                for (tx.outputs) |output| {
+                    if (output.script_pubkey.len > 0) self.allocator.free(output.script_pubkey);
+                }
+                self.allocator.free(tx.outputs);
+            }
+
+            // Serialize transaction to hex
+            var tx_writer = serialize.Writer.init(self.allocator);
+            defer tx_writer.deinit();
+            try serialize.writeTransaction(&tx_writer, &tx);
+            const tx_bytes = tx_writer.getWritten();
+
+            try writer.writeAll("\"hex\":\"");
+            for (tx_bytes) |byte| {
+                try writer.print("{x:0>2}", .{byte});
+            }
+            try writer.writeAll("\",");
+        }
+
+        // Include the PSBT
+        const base64 = psbt.toBase64(self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to encode PSBT", id);
+        };
+        defer self.allocator.free(base64);
+
+        try writer.writeAll("\"psbt\":\"");
+        try writer.writeAll(base64);
+        try writer.writeAll("\",");
+
+        try writer.print("\"complete\":{s}", .{if (complete) "true" else "false"});
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle converttopsbt RPC - convert a raw transaction to PSBT.
+    fn handleConvertToPsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "converttopsbt requires hex transaction", id);
+        }
+
+        const hex_param = params.array.items[0];
+        if (hex_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Transaction must be hex string", id);
+        }
+
+        const hex = hex_param.string;
+        if (hex.len % 2 != 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length", id);
+        }
+
+        // Decode hex
+        const raw = self.allocator.alloc(u8, hex.len / 2) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer self.allocator.free(raw);
+
+        for (0..raw.len) |i| {
+            raw[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex character", id);
+            };
+        }
+
+        // Parse transaction
+        var reader = serialize.Reader{ .data = raw };
+        var tx = serialize.readTransaction(&reader, self.allocator) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
+        };
+        defer {
+            for (tx.inputs) |input| {
+                if (input.script_sig.len > 0) self.allocator.free(input.script_sig);
+                if (input.witness.len > 0) {
+                    for (input.witness) |item| {
+                        if (item.len > 0) self.allocator.free(item);
+                    }
+                    self.allocator.free(input.witness);
+                }
+            }
+            self.allocator.free(tx.inputs);
+            for (tx.outputs) |output| {
+                if (output.script_pubkey.len > 0) self.allocator.free(output.script_pubkey);
+            }
+            self.allocator.free(tx.outputs);
+        }
+
+        // Clear scriptSigs and witnesses for PSBT creation
+        // Clone the transaction with empty scripts
+        const unsigned_inputs = self.allocator.alloc(types.TxIn, tx.inputs.len) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer self.allocator.free(unsigned_inputs);
+
+        for (tx.inputs, 0..) |input, i| {
+            unsigned_inputs[i] = types.TxIn{
+                .previous_output = input.previous_output,
+                .script_sig = &[_]u8{},
+                .sequence = input.sequence,
+                .witness = &[_][]const u8{},
+            };
+        }
+
+        const unsigned_tx = types.Transaction{
+            .version = tx.version,
+            .inputs = unsigned_inputs,
+            .outputs = tx.outputs,
+            .lock_time = tx.lock_time,
+        };
+
+        // Create PSBT
+        var psbt = psbt_mod.Psbt.create(self.allocator, unsigned_tx) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to create PSBT", id);
+        };
+        defer psbt.deinit();
+
+        // Encode to base64
+        const base64 = psbt.toBase64(self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to encode PSBT", id);
+        };
+        defer self.allocator.free(base64);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeByte('"');
+        try writer.writeAll(base64);
+        try writer.writeByte('"');
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     /// Create a JSON-RPC success response.
