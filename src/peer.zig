@@ -33,6 +33,38 @@ pub const MIN_RECONNECT_INTERVAL: i64 = 10 * 60;
 /// Ping interval for idle peers (2 minutes).
 pub const PING_INTERVAL: i64 = 2 * 60;
 
+// ============================================================================
+// Stale Peer Eviction Constants (Bitcoin Core net_processing.cpp)
+// ============================================================================
+
+/// Stale tip check interval in seconds (45 seconds as per Bitcoin Core EXTRA_PEER_CHECK_INTERVAL).
+pub const STALE_CHECK_INTERVAL: i64 = 45;
+
+/// Stale tip threshold in seconds (30 minutes).
+/// If a peer's best_known_height is behind our tip for this long, consider eviction.
+pub const STALE_TIP_THRESHOLD: i64 = 30 * 60;
+
+/// Ping timeout in seconds (20 minutes as per Bitcoin Core TIMEOUT_INTERVAL).
+/// If we sent a ping and no pong within this time, disconnect.
+pub const PING_TIMEOUT: i64 = 20 * 60;
+
+/// Headers response timeout in seconds (2 minutes as per Bitcoin Core HEADERS_RESPONSE_TIME).
+/// If headers requested and no response within this time, misbehave.
+pub const HEADERS_RESPONSE_TIMEOUT: i64 = 2 * 60;
+
+/// Block download timeout in seconds (20 minutes as per Bitcoin Core).
+/// If a block is in-flight and not received within this time, disconnect.
+pub const BLOCK_DOWNLOAD_TIMEOUT: i64 = 20 * 60;
+
+/// Chain sync timeout in seconds (20 minutes as per Bitcoin Core CHAIN_SYNC_TIMEOUT).
+pub const CHAIN_SYNC_TIMEOUT: i64 = 20 * 60;
+
+/// Minimum connection time before eviction is considered (30 seconds as per Bitcoin Core).
+pub const MINIMUM_CONNECT_TIME: i64 = 30;
+
+/// Maximum number of outbound peers to protect from eviction (4 as per Bitcoin Core).
+pub const MAX_OUTBOUND_PEERS_TO_PROTECT: usize = 4;
+
 /// Maximum number of block-relay-only anchor connections.
 pub const MAX_BLOCK_RELAY_ONLY_ANCHORS: usize = 2;
 
@@ -213,6 +245,16 @@ pub const Peer = struct {
     fee_filter_sent: u64,
     /// Next time (microseconds since epoch) to send a feefilter message.
     next_send_feefilter: i64,
+    /// Best known block height from this peer (from headers or blocks).
+    best_known_height: u32,
+    /// Time when we last sent a getheaders request to this peer.
+    last_getheaders_time: i64,
+    /// Time when the oldest block-in-flight was requested (0 if no blocks in flight).
+    oldest_block_in_flight_time: i64,
+    /// Number of blocks currently in flight from this peer.
+    blocks_in_flight_count: u32,
+    /// Whether this peer is protected from stale tip eviction.
+    chain_sync_protected: bool,
 
     /// Connect to a remote peer.
     pub fn connect(
@@ -270,6 +312,11 @@ pub const Peer = struct {
             .fee_filter_received = 0,
             .fee_filter_sent = 0,
             .next_send_feefilter = 0,
+            .best_known_height = 0,
+            .last_getheaders_time = 0,
+            .oldest_block_in_flight_time = 0,
+            .blocks_in_flight_count = 0,
+            .chain_sync_protected = false,
         };
     }
 
@@ -312,6 +359,11 @@ pub const Peer = struct {
             .fee_filter_received = 0,
             .fee_filter_sent = 0,
             .next_send_feefilter = 0,
+            .best_known_height = 0,
+            .last_getheaders_time = 0,
+            .oldest_block_in_flight_time = 0,
+            .blocks_in_flight_count = 0,
+            .chain_sync_protected = false,
         };
     }
 
@@ -663,6 +715,137 @@ pub const Peer = struct {
         const formatted = std.fmt.bufPrint(buf, "{}", .{self.address}) catch return "unknown";
         return formatted;
     }
+
+    // ========================================================================
+    // Stale Peer Detection (Bitcoin Core net_processing.cpp)
+    // ========================================================================
+
+    /// Check if this peer has a stale tip (best_known_height behind our tip for >30 min).
+    /// our_height: Our current best block height.
+    /// Returns true if peer's tip is stale.
+    pub fn hasStaleTip(self: *const Peer, our_height: u32) bool {
+        const now = std.time.timestamp();
+
+        // Must have received a version message with their height
+        if (self.best_known_height == 0) return false;
+
+        // If peer is caught up, not stale
+        if (self.best_known_height >= our_height) return false;
+
+        // Check if they've been behind for too long
+        // We use last_block_time to track when they last made progress
+        if (self.last_block_time > 0) {
+            // If they sent us a block recently, give them time
+            if (now - self.last_block_time < STALE_TIP_THRESHOLD) return false;
+        }
+
+        // If we've received headers from them recently, they may be syncing
+        if (self.last_message_time > 0 and now - self.last_message_time < STALE_TIP_THRESHOLD) {
+            return false;
+        }
+
+        // Been behind for too long
+        return true;
+    }
+
+    /// Check if ping has timed out (ping sent, no pong within PING_TIMEOUT).
+    /// Returns true if peer should be disconnected due to ping timeout.
+    pub fn hasPingTimeout(self: *const Peer) bool {
+        const now = std.time.timestamp();
+
+        // No ping sent, no timeout
+        if (self.last_ping_nonce == 0 or self.last_ping_time == 0) return false;
+
+        // Pong received for this ping
+        if (self.last_pong_time >= self.last_ping_time) return false;
+
+        // Check if we've waited too long for pong
+        return now - self.last_ping_time > PING_TIMEOUT;
+    }
+
+    /// Check if headers request has timed out (getheaders sent, no response within 2 min).
+    /// Returns true if peer should be penalized for headers timeout.
+    pub fn hasHeadersTimeout(self: *const Peer) bool {
+        const now = std.time.timestamp();
+
+        // No getheaders sent
+        if (self.last_getheaders_time == 0) return false;
+
+        // Check if we've waited too long
+        return now - self.last_getheaders_time > HEADERS_RESPONSE_TIMEOUT;
+    }
+
+    /// Check if block download has timed out (block in flight for >20 min).
+    /// Returns true if peer should be disconnected due to block timeout.
+    pub fn hasBlockDownloadTimeout(self: *const Peer) bool {
+        const now = std.time.timestamp();
+
+        // No blocks in flight
+        if (self.blocks_in_flight_count == 0 or self.oldest_block_in_flight_time == 0) return false;
+
+        // Check if oldest block has been in flight too long
+        return now - self.oldest_block_in_flight_time > BLOCK_DOWNLOAD_TIMEOUT;
+    }
+
+    /// Update best known height from received headers/version.
+    pub fn updateBestKnownHeight(self: *Peer, height: u32) void {
+        if (height > self.best_known_height) {
+            self.best_known_height = height;
+        }
+    }
+
+    /// Record that we sent a getheaders request.
+    pub fn recordGetheadersRequest(self: *Peer) void {
+        self.last_getheaders_time = std.time.timestamp();
+    }
+
+    /// Clear the getheaders timeout (called when we receive headers).
+    pub fn clearGetheadersTimeout(self: *Peer) void {
+        self.last_getheaders_time = 0;
+    }
+
+    /// Record that we requested a block.
+    pub fn recordBlockRequest(self: *Peer) void {
+        const now = std.time.timestamp();
+        if (self.blocks_in_flight_count == 0) {
+            self.oldest_block_in_flight_time = now;
+        }
+        self.blocks_in_flight_count += 1;
+    }
+
+    /// Record that a block was received (or canceled).
+    pub fn recordBlockReceived(self: *Peer) void {
+        if (self.blocks_in_flight_count > 0) {
+            self.blocks_in_flight_count -= 1;
+            if (self.blocks_in_flight_count == 0) {
+                self.oldest_block_in_flight_time = 0;
+            }
+        }
+        self.last_block_time = std.time.timestamp();
+    }
+
+    /// Check if this peer is a candidate for stale tip eviction.
+    /// Must be outbound, not protected, connected long enough, and no blocks in flight.
+    pub fn isEvictionCandidate(self: *const Peer) bool {
+        const now = std.time.timestamp();
+
+        // Only evict outbound peers (prefer keeping inbound)
+        if (self.direction != .outbound) return false;
+
+        // Don't evict protected peers
+        if (self.chain_sync_protected) return false;
+
+        // Don't evict manual connections
+        if (self.conn_type == .manual) return false;
+
+        // Must be connected long enough
+        if (now - self.connect_time < MINIMUM_CONNECT_TIME) return false;
+
+        // Don't evict if blocks are in flight
+        if (self.blocks_in_flight_count > 0) return false;
+
+        return true;
+    }
 };
 
 // ============================================================================
@@ -914,6 +1097,12 @@ pub const PeerManager = struct {
     anchor_addresses: std.ArrayList(std.net.Address),
     /// Data directory for persistence.
     data_dir: ?[]const u8,
+    /// Last time we ran the stale tip check (seconds since epoch).
+    last_stale_check_time: i64,
+    /// Last time our tip was updated (for stale tip detection).
+    last_tip_update_time: i64,
+    /// Number of outbound peers protected from eviction.
+    outbound_protected_count: usize,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -933,6 +1122,9 @@ pub const PeerManager = struct {
             .anchors_path = "anchors.dat",
             .anchor_addresses = std.ArrayList(std.net.Address).init(allocator),
             .data_dir = null,
+            .last_stale_check_time = 0,
+            .last_tip_update_time = 0,
+            .outbound_protected_count = 0,
         };
     }
 
@@ -1534,6 +1726,140 @@ pub const PeerManager = struct {
         }
     }
 
+    // ========================================================================
+    // Stale Peer Eviction (Bitcoin Core net_processing.cpp)
+    // ========================================================================
+
+    /// Check for stale tips and evict peers. Run every STALE_CHECK_INTERVAL (45s).
+    /// Combines stale tip checking and peer eviction as per Bitcoin Core.
+    pub fn checkForStaleTipAndEvictPeers(self: *PeerManager) void {
+        const now = std.time.timestamp();
+
+        // Only run every STALE_CHECK_INTERVAL
+        if (now - self.last_stale_check_time < STALE_CHECK_INTERVAL) return;
+        self.last_stale_check_time = now;
+
+        // 1. Check ping timeouts - disconnect peers not responding to pings
+        self.checkPingTimeouts();
+
+        // 2. Check headers timeouts - misbehave peers not sending headers
+        self.checkHeadersTimeouts();
+
+        // 3. Check block download timeouts - disconnect stalled block downloads
+        self.checkBlockDownloadTimeouts();
+
+        // 4. Evict stale tip peers - disconnect one outbound peer with stale tip
+        self.evictStaleTipPeer();
+    }
+
+    /// Check for ping timeouts (ping sent, no pong within PING_TIMEOUT).
+    fn checkPingTimeouts(self: *PeerManager) void {
+        var i: usize = 0;
+        while (i < self.peers.items.len) {
+            const peer = self.peers.items[i];
+            if (peer.state == .handshake_complete and peer.hasPingTimeout()) {
+                var addr_buf: [64]u8 = undefined;
+                const addr_str = peer.getAddressString(&addr_buf);
+                std.log.info("Disconnecting peer={s} due to ping timeout", .{addr_str});
+                self.removePeerByIndex(i);
+                // Don't increment i since we removed the peer
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Check for headers request timeouts. Add misbehavior score (20) for non-responsive peers.
+    fn checkHeadersTimeouts(self: *PeerManager) void {
+        for (self.peers.items) |peer| {
+            if (peer.state == .handshake_complete and peer.hasHeadersTimeout()) {
+                peer.misbehaving(20, "headers timeout");
+                // Clear the timeout to avoid repeated scoring
+                peer.last_getheaders_time = 0;
+            }
+        }
+    }
+
+    /// Check for block download timeouts. Disconnect peers with stalled block downloads.
+    fn checkBlockDownloadTimeouts(self: *PeerManager) void {
+        var i: usize = 0;
+        while (i < self.peers.items.len) {
+            const peer = self.peers.items[i];
+            if (peer.state == .handshake_complete and peer.hasBlockDownloadTimeout()) {
+                var addr_buf: [64]u8 = undefined;
+                const addr_str = peer.getAddressString(&addr_buf);
+                std.log.info("Disconnecting peer={s} due to block download timeout (blocks_in_flight={d})", .{ addr_str, peer.blocks_in_flight_count });
+                self.removePeerByIndex(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Evict one outbound peer with a stale tip (behind our height for >30 min).
+    /// Only evicts if we have better alternatives and the peer is not protected.
+    fn evictStaleTipPeer(self: *PeerManager) void {
+        const our_height: u32 = if (self.our_height >= 0) @intCast(self.our_height) else 0;
+
+        // Count peers with good tips (at or above our height)
+        var good_tip_count: usize = 0;
+        for (self.peers.items) |peer| {
+            if (peer.direction == .outbound and peer.best_known_height >= our_height) {
+                good_tip_count += 1;
+            }
+        }
+
+        // Only evict if we have at least one peer with a good tip
+        if (good_tip_count == 0) return;
+
+        // Find the worst stale tip peer (prefer evicting inbound over outbound)
+        var worst_idx: ?usize = null;
+        var worst_height: u32 = std.math.maxInt(u32);
+
+        for (self.peers.items, 0..) |peer, i| {
+            if (!peer.isEvictionCandidate()) continue;
+            if (!peer.hasStaleTip(our_height)) continue;
+
+            // Find the peer furthest behind
+            if (peer.best_known_height < worst_height) {
+                worst_height = peer.best_known_height;
+                worst_idx = i;
+            }
+        }
+
+        // Evict the worst peer if found
+        if (worst_idx) |idx| {
+            const peer = self.peers.items[idx];
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = peer.getAddressString(&addr_buf);
+            std.log.info("Evicting stale tip peer={s} (height={d}, our_height={d})", .{ addr_str, peer.best_known_height, our_height });
+            self.removePeerByIndex(idx);
+        }
+    }
+
+    /// Update our tip height (call when a new block is connected).
+    pub fn updateTipHeight(self: *PeerManager, height: i32) void {
+        self.our_height = height;
+        self.last_tip_update_time = std.time.timestamp();
+    }
+
+    /// Check if our tip may be stale (no new blocks for 30 minutes).
+    pub fn tipMayBeStale(self: *const PeerManager) bool {
+        const now = std.time.timestamp();
+        if (self.last_tip_update_time == 0) return false;
+        return now - self.last_tip_update_time > STALE_TIP_THRESHOLD;
+    }
+
+    /// Protect an outbound peer from eviction (call when they provide good chain sync).
+    pub fn protectOutboundPeer(self: *PeerManager, peer: *Peer) void {
+        if (peer.direction != .outbound) return;
+        if (peer.chain_sync_protected) return;
+        if (self.outbound_protected_count >= MAX_OUTBOUND_PEERS_TO_PROTECT) return;
+
+        peer.chain_sync_protected = true;
+        self.outbound_protected_count += 1;
+    }
+
     /// Rotate peers: disconnect longest-connected outbound and connect a new one.
     pub fn rotatePeers(self: *PeerManager) void {
         const now = std.time.timestamp();
@@ -1603,10 +1929,13 @@ pub const PeerManager = struct {
             // 5. Disconnect timed-out peers
             self.disconnectStale();
 
-            // 6. Peer rotation
+            // 6. Check for stale tips and evict peers (runs every 45 seconds)
+            self.checkForStaleTipAndEvictPeers();
+
+            // 7. Peer rotation
             self.rotatePeers();
 
-            // 7. Brief sleep to avoid busy-loop
+            // 8. Brief sleep to avoid busy-loop
             std.time.sleep(100 * std.time.ns_per_ms);
         }
     }
@@ -1746,6 +2075,11 @@ test "peer struct initialization with default values" {
         .fee_filter_received = 0,
         .fee_filter_sent = 0,
         .next_send_feefilter = 0,
+        .best_known_height = 0,
+        .last_getheaders_time = 0,
+        .oldest_block_in_flight_time = 0,
+        .blocks_in_flight_count = 0,
+        .chain_sync_protected = false,
     };
 
     try std.testing.expectEqual(PeerState.connecting, dummy_peer.state);
@@ -1852,6 +2186,11 @@ test "ban score accumulation" {
         .fee_filter_received = 0,
         .fee_filter_sent = 0,
         .next_send_feefilter = 0,
+        .best_known_height = 0,
+        .last_getheaders_time = 0,
+        .oldest_block_in_flight_time = 0,
+        .blocks_in_flight_count = 0,
+        .chain_sync_protected = false,
     };
 
     // Initial score is 0
@@ -1915,6 +2254,11 @@ test "peer timeout detection" {
         .fee_filter_received = 0,
         .fee_filter_sent = 0,
         .next_send_feefilter = 0,
+        .best_known_height = 0,
+        .last_getheaders_time = 0,
+        .oldest_block_in_flight_time = 0,
+        .blocks_in_flight_count = 0,
+        .chain_sync_protected = false,
     };
 
     try std.testing.expect(!active_peer.isTimedOut());
@@ -1976,6 +2320,11 @@ test "peer ready check" {
         .fee_filter_received = 0,
         .fee_filter_sent = 0,
         .next_send_feefilter = 0,
+        .best_known_height = 0,
+        .last_getheaders_time = 0,
+        .oldest_block_in_flight_time = 0,
+        .blocks_in_flight_count = 0,
+        .chain_sync_protected = false,
     };
 
     // Connecting state - not ready
