@@ -63,6 +63,46 @@ pub const ValidationError = error{
 };
 
 // ============================================================================
+// Script Verification Flags
+// ============================================================================
+
+/// Get the script verification flags for a block at a given height.
+/// This implements the consensus-critical flag settings based on soft fork activation.
+///
+/// Reference: Bitcoin Core validation.cpp GetBlockScriptFlags()
+///
+/// CRITICAL: Only 7 flags are consensus (enforced during block validation):
+/// - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, TAPROOT
+///
+/// BIP-146 NULLFAIL and BIP-147 NULLDUMMY are activated with SegWit (BIP-141).
+/// Note: In Bitcoin Core, NULLFAIL is technically policy-only and not set in
+/// GetBlockScriptFlags(). However, clearbit enforces it at consensus level
+/// for additional safety.
+pub fn getBlockScriptFlags(height: u32, params: *const consensus.NetworkParams) script.ScriptFlags {
+    var flags = script.ScriptFlags{};
+
+    // Disable flags that should only be enabled at specific heights
+    // Start with minimal flags and enable based on activation heights
+    flags.verify_p2sh = height >= params.bip34_height;
+    flags.verify_dersig = height >= params.bip66_height;
+    flags.verify_checklocktimeverify = height >= params.bip65_height;
+    flags.verify_checksequenceverify = height >= params.csv_height;
+    flags.verify_witness = height >= params.segwit_height;
+    flags.verify_nulldummy = height >= params.segwit_height;
+    flags.verify_nullfail = height >= params.segwit_height;
+    flags.verify_taproot = height >= params.taproot_height;
+
+    // Policy flags that are always enabled for consensus
+    // (these are not height-dependent in Bitcoin Core either)
+    flags.verify_low_s = true;
+    flags.verify_minimaldata = true;
+    flags.verify_clean_stack = true;
+    flags.verify_witness_pubkeytype = height >= params.segwit_height;
+
+    return flags;
+}
+
+// ============================================================================
 // Transaction Validation
 // ============================================================================
 
@@ -506,10 +546,8 @@ pub fn connectBlock(
     params: *const consensus.NetworkParams,
     utxo_view: *const SigopUtxoView,
 ) ValidationError!i64 {
-    // Determine script verification flags based on block height
-    var flags = script.ScriptFlags{};
-    flags.verify_p2sh = height >= params.bip34_height; // Approximate P2SH activation
-    flags.verify_witness = height >= params.segwit_height;
+    // Get script verification flags for this block height
+    const flags = getBlockScriptFlags(height, params);
 
     // Track total sigop cost and fees
     var total_sigops_cost: u64 = 0;
@@ -2972,4 +3010,96 @@ test "BlockIndexEntry getAncestor" {
     try std.testing.expectEqual(block1, block2.getAncestor(1));
     try std.testing.expectEqual(block2, block2.getAncestor(2));
     try std.testing.expect(block2.getAncestor(3) == null);
+}
+
+// ============================================================================
+// Script Flag Tests (BIP-146 NULLFAIL, BIP-147 NULLDUMMY)
+// ============================================================================
+
+test "getBlockScriptFlags: NULLFAIL disabled before segwit activation" {
+    // Before segwit height, NULLFAIL should be disabled
+    const flags = getBlockScriptFlags(consensus.MAINNET.segwit_height - 1, &consensus.MAINNET);
+    try std.testing.expect(!flags.verify_nullfail);
+}
+
+test "getBlockScriptFlags: NULLFAIL enabled at segwit activation height" {
+    // At segwit activation height (481824 mainnet), NULLFAIL should be enabled
+    const flags = getBlockScriptFlags(consensus.MAINNET.segwit_height, &consensus.MAINNET);
+    try std.testing.expect(flags.verify_nullfail);
+}
+
+test "getBlockScriptFlags: NULLFAIL enabled after segwit activation" {
+    // After segwit activation, NULLFAIL should remain enabled
+    const flags = getBlockScriptFlags(consensus.MAINNET.segwit_height + 1000, &consensus.MAINNET);
+    try std.testing.expect(flags.verify_nullfail);
+}
+
+test "getBlockScriptFlags: NULLDUMMY follows NULLFAIL activation" {
+    // NULLDUMMY (BIP-147) is also activated with segwit
+    const pre_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height - 1, &consensus.MAINNET);
+    const at_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height, &consensus.MAINNET);
+
+    try std.testing.expect(!pre_segwit.verify_nulldummy);
+    try std.testing.expect(at_segwit.verify_nulldummy);
+}
+
+test "getBlockScriptFlags: regtest has NULLFAIL enabled from block 0" {
+    // Regtest has segwit_height = 0, so NULLFAIL is always enabled
+    const flags = getBlockScriptFlags(0, &consensus.REGTEST);
+    try std.testing.expect(flags.verify_nullfail);
+    try std.testing.expect(flags.verify_nulldummy);
+    try std.testing.expect(flags.verify_witness);
+}
+
+test "getBlockScriptFlags: segwit activation height is 481824 on mainnet" {
+    // Verify the activation height constant
+    try std.testing.expectEqual(@as(u32, 481_824), consensus.MAINNET.segwit_height);
+}
+
+test "getBlockScriptFlags: all flags disabled at height 0 mainnet" {
+    // Very early block should have minimal flags
+    const flags = getBlockScriptFlags(0, &consensus.MAINNET);
+    // BIP-34 height is 227931, so P2SH should be disabled at height 0
+    try std.testing.expect(!flags.verify_p2sh);
+    try std.testing.expect(!flags.verify_witness);
+    try std.testing.expect(!flags.verify_nullfail);
+    try std.testing.expect(!flags.verify_taproot);
+}
+
+test "getBlockScriptFlags: progressive flag activation mainnet" {
+    // Test that flags activate at correct heights
+
+    // Before BIP-66 (363725): no DERSIG
+    const pre_dersig = getBlockScriptFlags(363_724, &consensus.MAINNET);
+    try std.testing.expect(!pre_dersig.verify_dersig);
+
+    // At BIP-66: DERSIG enabled
+    const at_dersig = getBlockScriptFlags(363_725, &consensus.MAINNET);
+    try std.testing.expect(at_dersig.verify_dersig);
+
+    // Before BIP-65 (388381): no CLTV
+    const pre_cltv = getBlockScriptFlags(388_380, &consensus.MAINNET);
+    try std.testing.expect(!pre_cltv.verify_checklocktimeverify);
+
+    // At BIP-65: CLTV enabled
+    const at_cltv = getBlockScriptFlags(388_381, &consensus.MAINNET);
+    try std.testing.expect(at_cltv.verify_checklocktimeverify);
+
+    // Before CSV (419328): no CSV
+    const pre_csv = getBlockScriptFlags(419_327, &consensus.MAINNET);
+    try std.testing.expect(!pre_csv.verify_checksequenceverify);
+
+    // At CSV: CSV enabled
+    const at_csv = getBlockScriptFlags(419_328, &consensus.MAINNET);
+    try std.testing.expect(at_csv.verify_checksequenceverify);
+}
+
+test "getBlockScriptFlags: taproot activation" {
+    // Before taproot (709632): no TAPROOT
+    const pre_taproot = getBlockScriptFlags(709_631, &consensus.MAINNET);
+    try std.testing.expect(!pre_taproot.verify_taproot);
+
+    // At taproot: TAPROOT enabled
+    const at_taproot = getBlockScriptFlags(709_632, &consensus.MAINNET);
+    try std.testing.expect(at_taproot.verify_taproot);
 }
