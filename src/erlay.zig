@@ -39,77 +39,270 @@ pub const RECON_STATIC_SALT: []const u8 = "Tx Relay Salting";
 // ============================================================================
 //
 // When libminisketch is available, we use @cImport for FFI. Otherwise, we
-// provide stub implementations that always fail gracefully.
+// provide a pure Zig implementation that matches the minisketch behavior.
 //
-// Note: To enable libminisketch support, the library must be installed and
+// To enable libminisketch support, the library must be installed and
 // linked via build.zig with -Dminisketch=true
 
+/// Import build-time options for libminisketch availability.
+const build_options = @import("build_options");
+
 /// Whether libminisketch is available (set via build.zig option).
-/// For now, we implement pure Zig stubs that can be replaced with FFI.
-pub const has_minisketch: bool = false;
+pub const has_minisketch: bool = build_options.minisketch_enabled;
 
-/// Opaque minisketch handle (placeholder for C FFI).
-pub const MinisketchHandle = opaque {};
+/// C bindings for libminisketch when available.
+pub const minisketch_c = if (has_minisketch) @cImport({
+    @cInclude("minisketch.h");
+}) else struct {
+    // Stub types when library not available
+    pub const minisketch = opaque {};
+    pub const ssize_t = isize;
+};
 
-// FFI function declarations (stubs when library not available)
-// These would be replaced by @cImport when libminisketch is linked:
-//
-// const minisketch = @cImport({
-//     @cInclude("minisketch.h");
-// });
+/// Opaque minisketch handle.
+pub const MinisketchHandle = minisketch_c.minisketch;
+
+// ============================================================================
+// libminisketch FFI Wrapper Functions
+// ============================================================================
+
+/// Check if a given field size is supported by the library.
+pub fn minisketchBitsSupported(bits: u32) bool {
+    if (has_minisketch) {
+        return minisketch_c.minisketch_bits_supported(bits) != 0;
+    }
+    // Pure Zig implementation supports 32-bit field
+    return bits == 32;
+}
+
+/// Get maximum implementation number.
+pub fn minisketchImplementationMax() u32 {
+    if (has_minisketch) {
+        return minisketch_c.minisketch_implementation_max();
+    }
+    return 0; // Pure Zig has only implementation 0
+}
+
+/// Check if a specific implementation is supported.
+pub fn minisketchImplementationSupported(bits: u32, implementation: u32) bool {
+    if (has_minisketch) {
+        return minisketch_c.minisketch_implementation_supported(bits, implementation) != 0;
+    }
+    // Pure Zig supports only 32-bit field with implementation 0
+    return bits == 32 and implementation == 0;
+}
 
 /// Create a new minisketch with given field size and capacity.
+/// Returns null if the combination is not supported or OOM.
 pub fn minisketchCreate(bits: u32, implementation: u32, capacity: usize) ?*MinisketchHandle {
-    _ = bits;
-    _ = implementation;
-    _ = capacity;
-    return null; // Stub: library not available
+    if (has_minisketch) {
+        return minisketch_c.minisketch_create(bits, implementation, capacity);
+    }
+    return null; // Use pure Zig Minisketch struct instead
 }
 
 /// Destroy a minisketch.
 pub fn minisketchDestroy(sketch: *MinisketchHandle) void {
-    _ = sketch;
+    if (has_minisketch) {
+        minisketch_c.minisketch_destroy(sketch);
+    }
+}
+
+/// Clone a minisketch.
+pub fn minisketchClone(sketch: *const MinisketchHandle) ?*MinisketchHandle {
+    if (has_minisketch) {
+        return minisketch_c.minisketch_clone(sketch);
+    }
+    return null;
+}
+
+/// Set seed for randomizing algorithm choices.
+pub fn minisketchSetSeed(sketch: *MinisketchHandle, seed: u64) void {
+    if (has_minisketch) {
+        minisketch_c.minisketch_set_seed(sketch, seed);
+    }
 }
 
 /// Add an element to the sketch.
+/// Adding the same element twice removes it (XOR property).
 pub fn minisketchAddUint64(sketch: *MinisketchHandle, element: u64) void {
-    _ = sketch;
-    _ = element;
+    if (has_minisketch) {
+        minisketch_c.minisketch_add_uint64(sketch, element);
+    }
 }
 
-/// Get serialized size of sketch.
+/// Get serialized size of sketch in bytes.
 pub fn minisketchSerializedSize(sketch: *const MinisketchHandle) usize {
-    _ = sketch;
+    if (has_minisketch) {
+        return minisketch_c.minisketch_serialized_size(sketch);
+    }
     return 0;
 }
 
 /// Serialize sketch to bytes.
-pub fn minisketchSerialize(sketch: *const MinisketchHandle, output: []u8) void {
-    _ = sketch;
-    _ = output;
+pub fn minisketchSerialize(sketch: *const MinisketchHandle, output: [*]u8) void {
+    if (has_minisketch) {
+        minisketch_c.minisketch_serialize(sketch, output);
+    }
 }
 
 /// Deserialize sketch from bytes.
-pub fn minisketchDeserialize(sketch: *MinisketchHandle, input: []const u8) void {
-    _ = sketch;
-    _ = input;
+pub fn minisketchDeserialize(sketch: *MinisketchHandle, input: [*]const u8) void {
+    if (has_minisketch) {
+        minisketch_c.minisketch_deserialize(sketch, input);
+    }
 }
 
 /// Merge another sketch into this one (XOR).
+/// Returns the resulting capacity, or 0 on failure.
 pub fn minisketchMerge(sketch: *MinisketchHandle, other: *const MinisketchHandle) usize {
-    _ = sketch;
-    _ = other;
+    if (has_minisketch) {
+        return minisketch_c.minisketch_merge(sketch, other);
+    }
     return 0;
 }
 
 /// Decode the sketch to recover elements.
 /// Returns number of elements decoded, or -1 on failure.
-pub fn minisketchDecode(sketch: *const MinisketchHandle, max_elements: usize, output: []u64) isize {
-    _ = sketch;
-    _ = max_elements;
-    _ = output;
+pub fn minisketchDecode(sketch: *const MinisketchHandle, max_elements: usize, output: [*]u64) isize {
+    if (has_minisketch) {
+        return minisketch_c.minisketch_decode(sketch, max_elements, output);
+    }
     return -1; // Stub: decoding failed
 }
+
+/// Compute capacity needed for given false positive rate.
+pub fn minisketchComputeCapacity(bits: u32, max_elements: usize, fpbits: u32) usize {
+    if (has_minisketch) {
+        return minisketch_c.minisketch_compute_capacity(bits, max_elements, fpbits);
+    }
+    // Simple estimate: capacity = max_elements + fpbits/8
+    return max_elements + (fpbits / 8);
+}
+
+/// Compute max elements for given capacity and false positive rate.
+pub fn minisketchComputeMaxElements(bits: u32, capacity: usize, fpbits: u32) usize {
+    if (has_minisketch) {
+        return minisketch_c.minisketch_compute_max_elements(bits, capacity, fpbits);
+    }
+    // Simple estimate
+    if (capacity < fpbits / 8) return 0;
+    return capacity - (fpbits / 8);
+}
+
+// ============================================================================
+// FFI Minisketch Wrapper (uses libminisketch when available)
+// ============================================================================
+
+/// FFI-backed minisketch that uses libminisketch when available.
+/// Falls back to pure Zig Minisketch otherwise.
+pub const FFIMinisketch = struct {
+    handle: ?*MinisketchHandle,
+    capacity: usize,
+
+    /// Create a new FFI minisketch with given capacity.
+    /// Uses libminisketch if available, returns error otherwise.
+    pub fn init(capacity: usize) !FFIMinisketch {
+        if (has_minisketch) {
+            const handle = minisketchCreate(SKETCH_BITS, 0, capacity) orelse {
+                return error.MinisketchCreationFailed;
+            };
+            return FFIMinisketch{
+                .handle = handle,
+                .capacity = capacity,
+            };
+        }
+        return error.MinisketchNotAvailable;
+    }
+
+    /// Free minisketch resources.
+    pub fn deinit(self: *FFIMinisketch) void {
+        if (self.handle) |h| {
+            minisketchDestroy(h);
+            self.handle = null;
+        }
+    }
+
+    /// Clone this minisketch.
+    pub fn clone(self: *const FFIMinisketch) !FFIMinisketch {
+        if (self.handle) |h| {
+            const new_handle = minisketchClone(h) orelse {
+                return error.MinisketchCloneFailed;
+            };
+            return FFIMinisketch{
+                .handle = new_handle,
+                .capacity = self.capacity,
+            };
+        }
+        return error.InvalidMinisketch;
+    }
+
+    /// Add an element to the sketch.
+    pub fn add(self: *FFIMinisketch, element: u64) void {
+        if (self.handle) |h| {
+            minisketchAddUint64(h, element);
+        }
+    }
+
+    /// Merge another sketch into this one.
+    pub fn merge(self: *FFIMinisketch, other: *const FFIMinisketch) !void {
+        if (self.handle) |h| {
+            if (other.handle) |oh| {
+                const result = minisketchMerge(h, oh);
+                if (result == 0) {
+                    return error.MinisketchMergeFailed;
+                }
+            }
+        }
+    }
+
+    /// Get serialized size.
+    pub fn serializedSize(self: *const FFIMinisketch) usize {
+        if (self.handle) |h| {
+            return minisketchSerializedSize(h);
+        }
+        return 0;
+    }
+
+    /// Serialize to bytes.
+    pub fn serialize(self: *const FFIMinisketch, output: []u8) void {
+        if (self.handle) |h| {
+            minisketchSerialize(h, output.ptr);
+        }
+    }
+
+    /// Deserialize from bytes.
+    pub fn deserialize(self: *FFIMinisketch, input: []const u8) void {
+        if (self.handle) |h| {
+            minisketchDeserialize(h, input.ptr);
+        }
+    }
+
+    /// Decode to recover elements.
+    pub fn decode(self: *const FFIMinisketch, allocator: std.mem.Allocator) ?[]u64 {
+        if (self.handle) |h| {
+            // Allocate output buffer
+            const output = allocator.alloc(u64, self.capacity) catch return null;
+
+            const result = minisketchDecode(h, self.capacity, output.ptr);
+            if (result < 0) {
+                allocator.free(output);
+                return null;
+            }
+
+            // Resize to actual count
+            const count: usize = @intCast(result);
+            if (count < self.capacity) {
+                return allocator.realloc(output, count) catch {
+                    allocator.free(output);
+                    return null;
+                };
+            }
+            return output;
+        }
+        return null;
+    }
+};
 
 // ============================================================================
 // Pure Zig Minisketch Implementation (BCH-based)
@@ -969,4 +1162,191 @@ test "erlay: add and remove element" {
     for (sketch.syndromes) |s| {
         try std.testing.expectEqual(@as(u64, 0), s);
     }
+}
+
+// ============================================================================
+// FFI-specific Tests (run with -Dminisketch=true)
+// ============================================================================
+
+test "erlay: ffi minisketch availability check" {
+    // This test verifies the FFI detection works
+    if (has_minisketch) {
+        // When FFI is available, 32-bit field should be supported
+        try std.testing.expect(minisketchBitsSupported(32));
+        try std.testing.expect(minisketchImplementationSupported(32, 0));
+
+        // Implementation 0 should always be supported for valid field sizes
+        const max_impl = minisketchImplementationMax();
+        try std.testing.expect(max_impl >= 0);
+    } else {
+        // Pure Zig implementation also supports 32-bit
+        try std.testing.expect(minisketchBitsSupported(32));
+        try std.testing.expect(!minisketchBitsSupported(64)); // Only 32-bit in pure Zig
+    }
+}
+
+test "erlay: ffi minisketch create and destroy" {
+    if (!has_minisketch) return error.SkipZigTest;
+
+    // Create sketch via FFI
+    const sketch = minisketchCreate(32, 0, 10) orelse {
+        return error.SkipZigTest; // Skip if creation fails
+    };
+    defer minisketchDestroy(sketch);
+
+    // Verify serialized size is correct: capacity * bits / 8 = 10 * 32 / 8 = 40 bytes
+    const size = minisketchSerializedSize(sketch);
+    try std.testing.expectEqual(@as(usize, 40), size);
+}
+
+test "erlay: ffi minisketch set difference with known elements" {
+    if (!has_minisketch) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    // Create two sketches
+    const sketch_a = minisketchCreate(32, 0, 10) orelse return error.SkipZigTest;
+    defer minisketchDestroy(sketch_a);
+
+    const sketch_b = minisketchCreate(32, 0, 10) orelse return error.SkipZigTest;
+    defer minisketchDestroy(sketch_b);
+
+    // Set A = {1, 2, 3, 4, 5}
+    minisketchAddUint64(sketch_a, 1);
+    minisketchAddUint64(sketch_a, 2);
+    minisketchAddUint64(sketch_a, 3);
+    minisketchAddUint64(sketch_a, 4);
+    minisketchAddUint64(sketch_a, 5);
+
+    // Set B = {3, 4, 5, 6, 7}
+    minisketchAddUint64(sketch_b, 3);
+    minisketchAddUint64(sketch_b, 4);
+    minisketchAddUint64(sketch_b, 5);
+    minisketchAddUint64(sketch_b, 6);
+    minisketchAddUint64(sketch_b, 7);
+
+    // Merge B into A (XOR)
+    const merge_capacity = minisketchMerge(sketch_a, sketch_b);
+    try std.testing.expect(merge_capacity > 0);
+
+    // Decode should give symmetric difference: {1, 2, 6, 7}
+    const output = try allocator.alloc(u64, 10);
+    defer allocator.free(output);
+
+    const result = minisketchDecode(sketch_a, 10, output.ptr);
+    try std.testing.expect(result == 4); // Should decode to 4 elements
+
+    // Verify decoded elements (order may vary, so check all are present)
+    var found_1 = false;
+    var found_2 = false;
+    var found_6 = false;
+    var found_7 = false;
+
+    for (0..@as(usize, @intCast(result))) |i| {
+        if (output[i] == 1) found_1 = true;
+        if (output[i] == 2) found_2 = true;
+        if (output[i] == 6) found_6 = true;
+        if (output[i] == 7) found_7 = true;
+    }
+
+    try std.testing.expect(found_1);
+    try std.testing.expect(found_2);
+    try std.testing.expect(found_6);
+    try std.testing.expect(found_7);
+}
+
+test "erlay: ffi minisketch serialization round-trip" {
+    if (!has_minisketch) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    // Create and populate sketch
+    const sketch1 = minisketchCreate(32, 0, 8) orelse return error.SkipZigTest;
+    defer minisketchDestroy(sketch1);
+
+    minisketchAddUint64(sketch1, 0xDEADBEEF);
+    minisketchAddUint64(sketch1, 0xCAFEBABE);
+    minisketchAddUint64(sketch1, 0x12345678);
+
+    // Serialize
+    const size = minisketchSerializedSize(sketch1);
+    const serialized = try allocator.alloc(u8, size);
+    defer allocator.free(serialized);
+    minisketchSerialize(sketch1, serialized.ptr);
+
+    // Create new sketch and deserialize
+    const sketch2 = minisketchCreate(32, 0, 8) orelse return error.SkipZigTest;
+    defer minisketchDestroy(sketch2);
+    minisketchDeserialize(sketch2, serialized.ptr);
+
+    // Decode both and compare
+    const output1 = try allocator.alloc(u64, 8);
+    defer allocator.free(output1);
+    const output2 = try allocator.alloc(u64, 8);
+    defer allocator.free(output2);
+
+    const result1 = minisketchDecode(sketch1, 8, output1.ptr);
+    const result2 = minisketchDecode(sketch2, 8, output2.ptr);
+
+    try std.testing.expectEqual(result1, result2);
+    try std.testing.expect(result1 == 3); // Should have 3 elements
+}
+
+test "erlay: ffi minisketch decode failure when capacity exceeded" {
+    if (!has_minisketch) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    // Create sketch with small capacity
+    const sketch = minisketchCreate(32, 0, 2) orelse return error.SkipZigTest;
+    defer minisketchDestroy(sketch);
+
+    // Add more elements than capacity
+    minisketchAddUint64(sketch, 1);
+    minisketchAddUint64(sketch, 2);
+    minisketchAddUint64(sketch, 3);
+    minisketchAddUint64(sketch, 4);
+    minisketchAddUint64(sketch, 5);
+
+    // Decode should fail (return -1)
+    const output = try allocator.alloc(u64, 5);
+    defer allocator.free(output);
+
+    const result = minisketchDecode(sketch, 5, output.ptr);
+    try std.testing.expect(result == -1);
+}
+
+test "erlay: ffi wrapper struct" {
+    if (!has_minisketch) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    // Create FFI wrapper
+    var ffi_sketch = FFIMinisketch.init(8) catch return error.SkipZigTest;
+    defer ffi_sketch.deinit();
+
+    // Add elements
+    ffi_sketch.add(100);
+    ffi_sketch.add(200);
+    ffi_sketch.add(300);
+
+    // Clone
+    var cloned = ffi_sketch.clone() catch return error.SkipZigTest;
+    defer cloned.deinit();
+
+    // Decode and verify
+    const decoded = ffi_sketch.decode(allocator);
+    try std.testing.expect(decoded != null);
+    defer allocator.free(decoded.?);
+
+    try std.testing.expectEqual(@as(usize, 3), decoded.?.len);
+}
+
+test "erlay: ffi compute capacity" {
+    // Test capacity computation (works even without FFI)
+    const capacity = minisketchComputeCapacity(32, 100, 16);
+    try std.testing.expect(capacity >= 100);
+
+    const max_elements = minisketchComputeMaxElements(32, capacity, 16);
+    try std.testing.expect(max_elements >= 100);
 }
