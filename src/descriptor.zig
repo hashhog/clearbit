@@ -3,6 +3,70 @@ const crypto = @import("crypto.zig");
 const address = @import("address.zig");
 const wallet = @import("wallet.zig");
 const miniscript = @import("miniscript.zig");
+const builtin = @import("builtin");
+
+// ============================================================================
+// libsecp256k1 bindings (optional)
+// ============================================================================
+//
+// To enable WIF and xpub/xprv key derivation in descriptors, build with:
+//   zig build -Dsecp256k1=true
+//
+// Without -Dsecp256k1=true, descriptor parsing works but resolving keys
+// from WIF or extended keys will return an error.
+// ============================================================================
+
+const secp256k1 = if (builtin.is_test or !@hasDecl(@import("root"), "secp256k1_enabled"))
+    // Stub implementation for testing without libsecp256k1
+    struct {
+        pub const secp256k1_context = opaque {};
+        pub const secp256k1_pubkey = extern struct {
+            data: [64]u8,
+        };
+        pub const SECP256K1_CONTEXT_SIGN: c_uint = 0x0201;
+        pub const SECP256K1_CONTEXT_VERIFY: c_uint = 0x0101;
+        pub const SECP256K1_EC_COMPRESSED: c_uint = 0x0102;
+        pub const SECP256K1_EC_UNCOMPRESSED: c_uint = 0x0002;
+
+        // Stub functions that return failure
+        pub fn secp256k1_context_create(_: c_uint) ?*secp256k1_context {
+            return null;
+        }
+        pub fn secp256k1_ec_pubkey_create(_: ?*secp256k1_context, _: *secp256k1_pubkey, _: *const [32]u8) c_int {
+            return 0;
+        }
+        pub fn secp256k1_ec_pubkey_serialize(_: ?*secp256k1_context, _: [*]u8, _: *usize, _: *const secp256k1_pubkey, _: c_uint) c_int {
+            return 0;
+        }
+        pub fn secp256k1_ec_pubkey_parse(_: ?*secp256k1_context, _: *secp256k1_pubkey, _: [*]const u8, _: usize) c_int {
+            return 0;
+        }
+        pub fn secp256k1_ec_seckey_tweak_add(_: ?*secp256k1_context, _: *[32]u8, _: *const [32]u8) c_int {
+            return 0;
+        }
+        pub fn secp256k1_ec_pubkey_tweak_add(_: ?*secp256k1_context, _: *secp256k1_pubkey, _: *const [32]u8) c_int {
+            return 0;
+        }
+    }
+else
+    // Real implementation via @cImport when secp256k1 is linked
+    @cImport({
+        @cInclude("secp256k1.h");
+        @cInclude("secp256k1_extrakeys.h");
+    });
+
+// Thread-local secp256k1 context for descriptor key operations
+var secp_ctx: ?*secp256k1.secp256k1_context = null;
+
+fn getSecpContext() !*secp256k1.secp256k1_context {
+    if (secp_ctx) |ctx| {
+        return ctx;
+    }
+    secp_ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    ) orelse return error.Secp256k1NotAvailable;
+    return secp_ctx.?;
+}
 
 // ============================================================================
 // Output Descriptors (BIP-380 through BIP-386)
@@ -815,23 +879,20 @@ fn isHexPubkey(s: []const u8) bool {
 
 /// Generate scriptPubKey from descriptor at a specific index (for ranged descriptors)
 pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index: u32) ![]u8 {
-    // Note: index is used for ranged descriptors with wildcards
-    // Full xpub derivation would use this to derive the specific child key
-
     var script = std.ArrayList(u8).init(allocator);
     errdefer script.deinit();
 
     switch (desc.*) {
         .pk => |key| {
             // P2PK: <pubkey> OP_CHECKSIG
-            const pubkey = try resolveKeyToPubkey(allocator, key);
+            const pubkey = try resolveKeyToPubkey(allocator, key, index);
             defer allocator.free(pubkey);
             try pushData(&script, pubkey);
             try script.append(0xac); // OP_CHECKSIG
         },
         .pkh => |key| {
             // P2PKH: OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
-            const pubkey = try resolveKeyToPubkey(allocator, key);
+            const pubkey = try resolveKeyToPubkey(allocator, key, index);
             defer allocator.free(pubkey);
             const hash = crypto.hash160(pubkey);
             try script.append(0x76); // OP_DUP
@@ -843,7 +904,7 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
         },
         .wpkh => |key| {
             // P2WPKH: OP_0 <hash160>
-            const pubkey = try resolveKeyToPubkey(allocator, key);
+            const pubkey = try resolveKeyToPubkey(allocator, key, index);
             defer allocator.free(pubkey);
             const hash = crypto.hash160(pubkey);
             try script.append(0x00); // OP_0
@@ -881,7 +942,7 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
         .tr => |t| {
             // P2TR: OP_1 <x-only-pubkey>
             // For key-path only, output the tweaked key
-            const pubkey = try resolveKeyToXOnlyPubkey(allocator, t.internal_key);
+            const pubkey = try resolveKeyToXOnlyPubkey(allocator, t.internal_key, index);
             defer allocator.free(pubkey);
             try script.append(0x51); // OP_1
             try script.append(0x20); // Push 32 bytes
@@ -899,7 +960,7 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
             }
 
             for (m.keys) |key| {
-                const pk = try resolveKeyToPubkey(allocator, key);
+                const pk = try resolveKeyToPubkey(allocator, key, index);
                 try pubkeys.append(pk);
             }
 
@@ -933,7 +994,7 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
         },
         .combo => |key| {
             // combo() returns multiple scripts - for now just return P2PKH
-            const pubkey = try resolveKeyToPubkey(allocator, key);
+            const pubkey = try resolveKeyToPubkey(allocator, key, index);
             defer allocator.free(pubkey);
             const hash = crypto.hash160(pubkey);
             try script.append(0x76); // OP_DUP
@@ -964,41 +1025,268 @@ fn pushData(script: *std.ArrayList(u8), data: []const u8) !void {
     try script.appendSlice(data);
 }
 
-fn resolveKeyToPubkey(allocator: std.mem.Allocator, key: Key) ![]const u8 {
+/// Decode a WIF private key and derive the corresponding public key
+fn decodeWifToPubkey(allocator: std.mem.Allocator, wif: []const u8) ![]const u8 {
+    // Decode base58check
+    const decoded = address.base58CheckDecode(wif, allocator) catch return error.InvalidKeyExpression;
+    defer allocator.free(decoded.data);
+
+    // WIF format: version(1) + privkey(32) + [compressed flag(1)]
+    // Version 0x80 = mainnet, 0xEF = testnet
+    if (decoded.version != 0x80 and decoded.version != 0xEF) {
+        return error.InvalidKeyExpression;
+    }
+
+    var privkey: [32]u8 = undefined;
+    var compressed = true;
+
+    if (decoded.data.len == 32) {
+        // Uncompressed key
+        @memcpy(&privkey, decoded.data);
+        compressed = false;
+    } else if (decoded.data.len == 33 and decoded.data[32] == 0x01) {
+        // Compressed key
+        @memcpy(&privkey, decoded.data[0..32]);
+    } else {
+        return error.InvalidKeyExpression;
+    }
+
+    // Derive public key using secp256k1
+    const ctx = try getSecpContext();
+
+    var pubkey: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pubkey, &privkey) != 1) {
+        return error.InvalidKeyExpression;
+    }
+
+    // Serialize public key
+    if (compressed) {
+        const result = try allocator.alloc(u8, 33);
+        errdefer allocator.free(result);
+        var len: usize = 33;
+        _ = secp256k1.secp256k1_ec_pubkey_serialize(
+            ctx,
+            result.ptr,
+            &len,
+            &pubkey,
+            secp256k1.SECP256K1_EC_COMPRESSED,
+        );
+        return result;
+    } else {
+        const result = try allocator.alloc(u8, 65);
+        errdefer allocator.free(result);
+        var len: usize = 65;
+        _ = secp256k1.secp256k1_ec_pubkey_serialize(
+            ctx,
+            result.ptr,
+            &len,
+            &pubkey,
+            secp256k1.SECP256K1_EC_UNCOMPRESSED,
+        );
+        return result;
+    }
+}
+
+/// Decode extended key (xpub/xprv) and derive the public key at the specified index
+fn decodeExtendedKeyToPubkey(allocator: std.mem.Allocator, key_str: []const u8, path: []const u32, derive_type: DeriveType, index: u32, is_xprv: bool) ![]const u8 {
+    // Decode base58check
+    const decoded = address.base58CheckDecode(key_str, allocator) catch return error.InvalidKeyExpression;
+    defer allocator.free(decoded.data);
+
+    // Extended key format: 4 bytes version + 1 byte depth + 4 bytes fingerprint +
+    //                      4 bytes child number + 32 bytes chain code + 33 bytes key
+    // Total: 78 bytes payload (version already stripped by base58CheckDecode)
+    if (decoded.data.len != 77) {
+        return error.InvalidKeyExpression;
+    }
+
+    // Parse extended key components
+    // Bytes 0: depth
+    // Bytes 1-4: parent fingerprint
+    // Bytes 5-8: child number
+    // Bytes 9-40: chain code (32 bytes)
+    // Bytes 41-72: key (33 bytes) - for xprv: 0x00 + 32-byte key, for xpub: 33-byte pubkey
+    const depth = decoded.data[0];
+    _ = depth;
+    const chain_code = decoded.data[9..41];
+    const key_data = decoded.data[41..74];
+
+    const ctx = try getSecpContext();
+
+    // Start with the extended key's key material
+    var current_chain_code: [32]u8 = undefined;
+    @memcpy(&current_chain_code, chain_code);
+
+    var current_key: [32]u8 = undefined;
+    var current_pubkey: [33]u8 = undefined;
+
+    if (is_xprv) {
+        // xprv: key_data starts with 0x00, followed by 32-byte private key
+        if (key_data[0] != 0x00) {
+            return error.InvalidKeyExpression;
+        }
+        @memcpy(&current_key, key_data[1..33]);
+
+        // Derive public key from private key
+        var pubkey: secp256k1.secp256k1_pubkey = undefined;
+        if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pubkey, &current_key) != 1) {
+            return error.InvalidKeyExpression;
+        }
+        var len: usize = 33;
+        _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, &current_pubkey, &len, &pubkey, secp256k1.SECP256K1_EC_COMPRESSED);
+    } else {
+        // xpub: key_data is 33-byte compressed public key
+        @memcpy(&current_pubkey, key_data[0..33]);
+    }
+
+    // Derive along the path
+    for (path) |child_index| {
+        const hardened = child_index >= 0x80000000;
+
+        if (hardened and !is_xprv) {
+            // Cannot derive hardened child from public key
+            return error.InvalidKeyExpression;
+        }
+
+        // Prepare data for HMAC
+        var hmac_data: [37]u8 = undefined;
+        if (hardened) {
+            hmac_data[0] = 0x00;
+            @memcpy(hmac_data[1..33], &current_key);
+        } else {
+            @memcpy(hmac_data[0..33], &current_pubkey);
+        }
+        std.mem.writeInt(u32, hmac_data[33..37], child_index, .big);
+
+        // HMAC-SHA512
+        const HmacSha512 = std.crypto.auth.hmac.Hmac(std.crypto.hash.sha2.Sha512);
+        var hmac_result: [64]u8 = undefined;
+        HmacSha512.create(&hmac_result, &hmac_data, &current_chain_code);
+
+        const il = hmac_result[0..32];
+        @memcpy(&current_chain_code, hmac_result[32..64]);
+
+        if (is_xprv) {
+            // Add il to current private key (mod n)
+            if (secp256k1.secp256k1_ec_seckey_tweak_add(ctx, &current_key, il) != 1) {
+                return error.InvalidKeyExpression;
+            }
+            // Update public key
+            var pubkey: secp256k1.secp256k1_pubkey = undefined;
+            if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pubkey, &current_key) != 1) {
+                return error.InvalidKeyExpression;
+            }
+            var len: usize = 33;
+            _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, &current_pubkey, &len, &pubkey, secp256k1.SECP256K1_EC_COMPRESSED);
+        } else {
+            // Tweak public key by il
+            var pubkey: secp256k1.secp256k1_pubkey = undefined;
+            if (secp256k1.secp256k1_ec_pubkey_parse(ctx, &pubkey, &current_pubkey, 33) != 1) {
+                return error.InvalidKeyExpression;
+            }
+            if (secp256k1.secp256k1_ec_pubkey_tweak_add(ctx, &pubkey, il) != 1) {
+                return error.InvalidKeyExpression;
+            }
+            var len: usize = 33;
+            _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, &current_pubkey, &len, &pubkey, secp256k1.SECP256K1_EC_COMPRESSED);
+        }
+    }
+
+    // Now handle the wildcard derivation at index
+    if (derive_type != .non_ranged) {
+        const child_index: u32 = if (derive_type == .hardened) index | 0x80000000 else index;
+        const hardened = child_index >= 0x80000000;
+
+        if (hardened and !is_xprv) {
+            return error.InvalidKeyExpression;
+        }
+
+        var hmac_data: [37]u8 = undefined;
+        if (hardened) {
+            hmac_data[0] = 0x00;
+            @memcpy(hmac_data[1..33], &current_key);
+        } else {
+            @memcpy(hmac_data[0..33], &current_pubkey);
+        }
+        std.mem.writeInt(u32, hmac_data[33..37], child_index, .big);
+
+        const HmacSha512 = std.crypto.auth.hmac.Hmac(std.crypto.hash.sha2.Sha512);
+        var hmac_result: [64]u8 = undefined;
+        HmacSha512.create(&hmac_result, &hmac_data, &current_chain_code);
+
+        const il = hmac_result[0..32];
+
+        if (is_xprv) {
+            if (secp256k1.secp256k1_ec_seckey_tweak_add(ctx, &current_key, il) != 1) {
+                return error.InvalidKeyExpression;
+            }
+            var pubkey: secp256k1.secp256k1_pubkey = undefined;
+            if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pubkey, &current_key) != 1) {
+                return error.InvalidKeyExpression;
+            }
+            var len: usize = 33;
+            _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, &current_pubkey, &len, &pubkey, secp256k1.SECP256K1_EC_COMPRESSED);
+        } else {
+            var pubkey: secp256k1.secp256k1_pubkey = undefined;
+            if (secp256k1.secp256k1_ec_pubkey_parse(ctx, &pubkey, &current_pubkey, 33) != 1) {
+                return error.InvalidKeyExpression;
+            }
+            if (secp256k1.secp256k1_ec_pubkey_tweak_add(ctx, &pubkey, il) != 1) {
+                return error.InvalidKeyExpression;
+            }
+            var len: usize = 33;
+            _ = secp256k1.secp256k1_ec_pubkey_serialize(ctx, &current_pubkey, &len, &pubkey, secp256k1.SECP256K1_EC_COMPRESSED);
+        }
+    }
+
+    // Return the final public key
+    const result = try allocator.alloc(u8, 33);
+    @memcpy(result, &current_pubkey);
+    return result;
+}
+
+/// Resolve a key expression to a public key at the given derivation index
+fn resolveKeyToPubkey(allocator: std.mem.Allocator, key: Key, index: u32) ![]const u8 {
     switch (key.key) {
         .pubkey => |p| {
             // Decode hex pubkey
             return try decodeHex(allocator, p.data);
         },
-        .wif => {
-            // TODO: decode WIF and derive pubkey
-            return error.InvalidKeyExpression;
+        .wif => |wif| {
+            return try decodeWifToPubkey(allocator, wif);
         },
-        .xpub, .xprv => {
-            // TODO: derive pubkey from xpub/xprv
-            return error.InvalidKeyExpression;
+        .xpub => |x| {
+            return try decodeExtendedKeyToPubkey(allocator, x.key, x.path, x.derive_type, index, false);
+        },
+        .xprv => |x| {
+            return try decodeExtendedKeyToPubkey(allocator, x.key, x.path, x.derive_type, index, true);
         },
     }
 }
 
-fn resolveKeyToXOnlyPubkey(allocator: std.mem.Allocator, key: Key) ![]const u8 {
-    switch (key.key) {
-        .pubkey => |p| {
-            const decoded = try decodeHex(allocator, p.data);
-            if (decoded.len == 32) {
-                return decoded;
-            } else if (decoded.len == 33) {
-                // Extract x-coordinate from compressed pubkey
-                const result = try allocator.alloc(u8, 32);
-                @memcpy(result, decoded[1..33]);
-                allocator.free(decoded);
-                return result;
-            }
-            allocator.free(decoded);
-            return error.InvalidKeyExpression;
-        },
-        else => return error.InvalidKeyExpression,
+/// Resolve a key expression to an x-only public key (for taproot)
+fn resolveKeyToXOnlyPubkey(allocator: std.mem.Allocator, key: Key, index: u32) ![]const u8 {
+    // First get the full public key
+    const pubkey = try resolveKeyToPubkey(allocator, key, index);
+    defer allocator.free(pubkey);
+
+    if (pubkey.len == 32) {
+        // Already x-only
+        const result = try allocator.alloc(u8, 32);
+        @memcpy(result, pubkey);
+        return result;
+    } else if (pubkey.len == 33) {
+        // Extract x-coordinate from compressed pubkey
+        const result = try allocator.alloc(u8, 32);
+        @memcpy(result, pubkey[1..33]);
+        return result;
+    } else if (pubkey.len == 65) {
+        // Extract x-coordinate from uncompressed pubkey
+        const result = try allocator.alloc(u8, 32);
+        @memcpy(result, pubkey[1..33]);
+        return result;
     }
+    return error.InvalidKeyExpression;
 }
 
 fn decodeHex(allocator: std.mem.Allocator, hex: []const u8) ![]const u8 {
@@ -1665,4 +1953,154 @@ test "miniscript descriptor analysis" {
     // Witness size should be k signatures + dummy
     const witness_size = mini_desc.maxWitnessSize();
     try std.testing.expect(witness_size > 0);
+}
+
+test "derive P2PKH script from hex pubkey descriptor" {
+    const allocator = std.testing.allocator;
+
+    // Parse a pkh descriptor with hex pubkey
+    var desc = try parseDescriptor(allocator, "pkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)");
+    defer desc.deinit(allocator);
+
+    // Derive the scriptPubKey
+    const script = try deriveScript(allocator, &desc, 0);
+    defer allocator.free(script);
+
+    // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    try std.testing.expectEqual(@as(usize, 25), script.len);
+    try std.testing.expectEqual(@as(u8, 0x76), script[0]); // OP_DUP
+    try std.testing.expectEqual(@as(u8, 0xa9), script[1]); // OP_HASH160
+    try std.testing.expectEqual(@as(u8, 0x14), script[2]); // Push 20 bytes
+    try std.testing.expectEqual(@as(u8, 0x88), script[23]); // OP_EQUALVERIFY
+    try std.testing.expectEqual(@as(u8, 0xac), script[24]); // OP_CHECKSIG
+}
+
+test "derive P2WPKH script from hex pubkey descriptor" {
+    const allocator = std.testing.allocator;
+
+    // Parse a wpkh descriptor with hex pubkey
+    var desc = try parseDescriptor(allocator, "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)");
+    defer desc.deinit(allocator);
+
+    // Derive the scriptPubKey
+    const script = try deriveScript(allocator, &desc, 0);
+    defer allocator.free(script);
+
+    // P2WPKH: OP_0 <20 bytes>
+    try std.testing.expectEqual(@as(usize, 22), script.len);
+    try std.testing.expectEqual(@as(u8, 0x00), script[0]); // OP_0
+    try std.testing.expectEqual(@as(u8, 0x14), script[1]); // Push 20 bytes
+}
+
+test "derive P2SH-P2WPKH script from descriptor" {
+    const allocator = std.testing.allocator;
+
+    // Parse a sh(wpkh()) descriptor
+    var desc = try parseDescriptor(allocator, "sh(wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798))");
+    defer desc.deinit(allocator);
+
+    // Derive the scriptPubKey
+    const script = try deriveScript(allocator, &desc, 0);
+    defer allocator.free(script);
+
+    // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+    try std.testing.expectEqual(@as(usize, 23), script.len);
+    try std.testing.expectEqual(@as(u8, 0xa9), script[0]); // OP_HASH160
+    try std.testing.expectEqual(@as(u8, 0x14), script[1]); // Push 20 bytes
+    try std.testing.expectEqual(@as(u8, 0x87), script[22]); // OP_EQUAL
+}
+
+test "derive P2TR script from x-only pubkey descriptor" {
+    const allocator = std.testing.allocator;
+
+    // Parse a tr descriptor with 32-byte x-only pubkey
+    var desc = try parseDescriptor(allocator, "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)");
+    defer desc.deinit(allocator);
+
+    // Derive the scriptPubKey
+    const script = try deriveScript(allocator, &desc, 0);
+    defer allocator.free(script);
+
+    // P2TR: OP_1 <32 bytes>
+    try std.testing.expectEqual(@as(usize, 34), script.len);
+    try std.testing.expectEqual(@as(u8, 0x51), script[0]); // OP_1
+    try std.testing.expectEqual(@as(u8, 0x20), script[1]); // Push 32 bytes
+}
+
+test "parse and resolve WIF key requires secp256k1" {
+    const allocator = std.testing.allocator;
+
+    // Parse a descriptor with a WIF key
+    // This is a testnet WIF key
+    var desc = try parseDescriptor(allocator, "pkh(cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy)");
+    defer desc.deinit(allocator);
+
+    try std.testing.expect(desc == .pkh);
+    try std.testing.expect(desc.pkh.key == .wif);
+
+    // Attempting to derive the script will fail without secp256k1
+    // (in test mode, the stub implementation returns null context)
+    const result = deriveScript(allocator, &desc, 0);
+    try std.testing.expectError(error.Secp256k1NotAvailable, result);
+}
+
+test "parse xpub descriptor with derivation path" {
+    const allocator = std.testing.allocator;
+
+    // Parse an xpub descriptor with derivation path
+    var desc = try parseDescriptor(allocator, "pkh(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/0/*)");
+    defer desc.deinit(allocator);
+
+    try std.testing.expect(desc == .pkh);
+    try std.testing.expect(desc.pkh.key == .xpub);
+    try std.testing.expect(desc.isRange()); // Has wildcard
+
+    const xpub_key = desc.pkh.key.xpub;
+    try std.testing.expectEqual(@as(usize, 1), xpub_key.path.len);
+    try std.testing.expectEqual(@as(u32, 0), xpub_key.path[0]);
+    try std.testing.expect(xpub_key.derive_type == .unhardened);
+}
+
+test "parse xpub descriptor non-ranged" {
+    const allocator = std.testing.allocator;
+
+    // Parse an xpub descriptor without wildcard
+    var desc = try parseDescriptor(allocator, "pkh(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/0/1)");
+    defer desc.deinit(allocator);
+
+    try std.testing.expect(desc == .pkh);
+    try std.testing.expect(desc.pkh.key == .xpub);
+    try std.testing.expect(!desc.isRange()); // No wildcard
+
+    const xpub_key = desc.pkh.key.xpub;
+    try std.testing.expectEqual(@as(usize, 2), xpub_key.path.len);
+    try std.testing.expect(xpub_key.derive_type == .non_ranged);
+}
+
+test "descriptor checksum case sensitivity" {
+    // Checksum should be case-sensitive for letters
+    // Valid descriptor with valid checksum
+    try std.testing.expect(verifyChecksum("pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7"));
+
+    // Invalid: wrong case in checksum
+    try std.testing.expect(!verifyChecksum("pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#GN28YWM7"));
+}
+
+test "importdescriptors format parsing" {
+    const allocator = std.testing.allocator;
+
+    // Test that descriptors from importdescriptors RPC work
+    const desc_str = "wpkh([d34db33f/84'/0'/0']xpub6CUGRUonZSQ4TWtTMmzXdrXDtyEWKnTaKNkJmxGhaDFSzFx7qkJKvFPGX2H5n8qjRNqM7VqDnkKxNvCgrPVL7GBhE5MSnFVnAJB3MH82K1M/0/*)";
+    var desc = try parseDescriptor(allocator, desc_str);
+    defer desc.deinit(allocator);
+
+    try std.testing.expect(desc == .wpkh);
+    try std.testing.expect(desc.wpkh.origin != null);
+    try std.testing.expect(desc.wpkh.key == .xpub);
+    try std.testing.expect(desc.isRange());
+
+    const origin = desc.wpkh.origin.?;
+    try std.testing.expectEqual(@as(usize, 3), origin.path.len);
+    // 84' = 84 | 0x80000000
+    try std.testing.expectEqual(@as(u32, 84 | 0x80000000), origin.path[0]);
 }
