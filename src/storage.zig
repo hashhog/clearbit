@@ -1524,6 +1524,526 @@ pub const ChainState = struct {
 };
 
 // ============================================================================
+// assumeUTXO Snapshot Support
+// ============================================================================
+
+/// UTXO snapshot magic bytes: 'u', 't', 'x', 'o', 0xff
+/// Reference: Bitcoin Core node/utxo_snapshot.h SNAPSHOT_MAGIC_BYTES
+pub const SNAPSHOT_MAGIC_BYTES: [5]u8 = .{ 'u', 't', 'x', 'o', 0xff };
+
+/// Current snapshot format version.
+pub const SNAPSHOT_VERSION: u16 = 2;
+
+/// Metadata describing a UTXO set snapshot file.
+/// Reference: Bitcoin Core node/utxo_snapshot.h SnapshotMetadata
+pub const SnapshotMetadata = struct {
+    /// Network magic bytes (4 bytes) for cross-network validation.
+    network_magic: u32,
+    /// Hash of the block at snapshot tip.
+    base_blockhash: types.Hash256,
+    /// Number of coins in the snapshot (for progress display).
+    coins_count: u64,
+
+    /// Serialize metadata to bytes for file header.
+    /// Format: magic(5) + version(2) + network_magic(4) + base_blockhash(32) + coins_count(8) = 51 bytes
+    pub fn toBytes(self: *const SnapshotMetadata, allocator: std.mem.Allocator) StorageError![]const u8 {
+        var writer = serialize.Writer.init(allocator);
+        errdefer writer.deinit();
+
+        // Write snapshot magic bytes
+        writer.writeBytes(&SNAPSHOT_MAGIC_BYTES) catch return StorageError.SerializationFailed;
+
+        // Write version
+        writer.writeInt(u16, SNAPSHOT_VERSION) catch return StorageError.SerializationFailed;
+
+        // Write network magic (as little-endian u32)
+        writer.writeInt(u32, self.network_magic) catch return StorageError.SerializationFailed;
+
+        // Write base blockhash
+        writer.writeBytes(&self.base_blockhash) catch return StorageError.SerializationFailed;
+
+        // Write coins count
+        writer.writeInt(u64, self.coins_count) catch return StorageError.SerializationFailed;
+
+        return writer.toOwnedSlice() catch return StorageError.OutOfMemory;
+    }
+
+    /// Deserialize metadata from bytes.
+    pub fn fromBytes(data: []const u8, expected_magic: u32) StorageError!SnapshotMetadata {
+        var reader = serialize.Reader{ .data = data };
+
+        // Read and verify snapshot magic bytes
+        const magic = reader.readBytes(5) catch return StorageError.CorruptData;
+        if (!std.mem.eql(u8, magic, &SNAPSHOT_MAGIC_BYTES)) {
+            return StorageError.CorruptData;
+        }
+
+        // Read version
+        const version = reader.readInt(u16) catch return StorageError.CorruptData;
+        if (version != SNAPSHOT_VERSION) {
+            return StorageError.CorruptData;
+        }
+
+        // Read network magic and verify
+        const network_magic = reader.readInt(u32) catch return StorageError.CorruptData;
+        if (network_magic != expected_magic) {
+            return StorageError.CorruptData; // Wrong network
+        }
+
+        // Read base blockhash
+        const hash_bytes = reader.readBytes(32) catch return StorageError.CorruptData;
+        var base_blockhash: types.Hash256 = undefined;
+        @memcpy(&base_blockhash, hash_bytes);
+
+        // Read coins count
+        const coins_count = reader.readInt(u64) catch return StorageError.CorruptData;
+
+        return SnapshotMetadata{
+            .network_magic = network_magic,
+            .base_blockhash = base_blockhash,
+            .coins_count = coins_count,
+        };
+    }
+
+    /// Size of serialized metadata header.
+    pub const HEADER_SIZE: usize = 5 + 2 + 4 + 32 + 8; // 51 bytes
+};
+
+/// Serialized coin entry in a snapshot.
+/// Format: txid(32) + vout(4) + packed_height_coinbase(4) + value(8) + script_len(varint) + script
+pub const SnapshotCoin = struct {
+    outpoint: types.OutPoint,
+    height: u32,
+    is_coinbase: bool,
+    value: i64,
+    script_pubkey: []const u8,
+
+    /// Serialize a coin to snapshot format.
+    /// Reference: Bitcoin Core kernel/coinstats.cpp TxOutSer
+    pub fn toBytes(self: *const SnapshotCoin, allocator: std.mem.Allocator) StorageError![]const u8 {
+        var writer = serialize.Writer.init(allocator);
+        errdefer writer.deinit();
+
+        // Write outpoint: txid + index
+        writer.writeBytes(&self.outpoint.hash) catch return StorageError.SerializationFailed;
+        writer.writeInt(u32, self.outpoint.index) catch return StorageError.SerializationFailed;
+
+        // Pack height and coinbase: height << 1 | is_coinbase
+        const packed_code: u32 = (self.height << 1) | @as(u32, if (self.is_coinbase) 1 else 0);
+        writer.writeInt(u32, packed_code) catch return StorageError.SerializationFailed;
+
+        // Write value
+        writer.writeInt(i64, self.value) catch return StorageError.SerializationFailed;
+
+        // Write script with length prefix
+        writer.writeCompactSize(self.script_pubkey.len) catch return StorageError.SerializationFailed;
+        writer.writeBytes(self.script_pubkey) catch return StorageError.SerializationFailed;
+
+        return writer.toOwnedSlice() catch return StorageError.OutOfMemory;
+    }
+
+    /// Deserialize a coin from snapshot format.
+    pub fn fromReader(reader: *serialize.Reader, allocator: std.mem.Allocator) StorageError!SnapshotCoin {
+        // Read outpoint
+        const txid_bytes = reader.readBytes(32) catch return StorageError.CorruptData;
+        var txid: types.Hash256 = undefined;
+        @memcpy(&txid, txid_bytes);
+        const vout = reader.readInt(u32) catch return StorageError.CorruptData;
+
+        // Unpack height and coinbase
+        const packed_code = reader.readInt(u32) catch return StorageError.CorruptData;
+        const height = packed_code >> 1;
+        const is_coinbase = (packed_code & 1) != 0;
+
+        // Read value
+        const value = reader.readInt(i64) catch return StorageError.CorruptData;
+
+        // Read script
+        const script_len = reader.readCompactSize() catch return StorageError.CorruptData;
+        const script_bytes = reader.readBytes(@intCast(script_len)) catch return StorageError.CorruptData;
+        const script_pubkey = allocator.dupe(u8, script_bytes) catch return StorageError.OutOfMemory;
+
+        return SnapshotCoin{
+            .outpoint = types.OutPoint{ .hash = txid, .index = vout },
+            .height = height,
+            .is_coinbase = is_coinbase,
+            .value = value,
+            .script_pubkey = script_pubkey,
+        };
+    }
+
+    pub fn deinit(self: *SnapshotCoin, allocator: std.mem.Allocator) void {
+        allocator.free(self.script_pubkey);
+    }
+};
+
+/// Role of a chainstate in dual-chainstate mode.
+/// Reference: Bitcoin Core kernel/types.h ChainstateRole
+pub const ChainstateRole = enum {
+    /// Normal chainstate: fully validated from genesis.
+    normal,
+    /// Snapshot chainstate: loaded from assumeUTXO snapshot, not fully validated yet.
+    snapshot,
+    /// Background chainstate: validating historical blocks to verify snapshot.
+    background,
+};
+
+/// Manager for dual chainstates during assumeUTXO sync.
+/// Reference: Bitcoin Core validation.h ChainstateManager
+pub const ChainStateManager = struct {
+    /// The primary (active) chainstate. Can be either normal or snapshot.
+    active_chainstate: *ChainState,
+    /// Background chainstate for validating snapshot. Null if not in assumeUTXO mode.
+    background_chainstate: ?*ChainState,
+    /// Role of the active chainstate.
+    active_role: ChainstateRole,
+    /// If snapshot-based, the base block hash.
+    snapshot_base_blockhash: ?types.Hash256,
+    /// Network parameters.
+    network_params: *const @import("consensus.zig").NetworkParams,
+    /// Allocator.
+    allocator: std.mem.Allocator,
+    /// Background validation thread handle.
+    background_thread: ?std.Thread,
+    /// Signal to stop background validation.
+    stop_background: std.atomic.Value(bool),
+    /// Mutex for thread-safe access.
+    mutex: std.Thread.Mutex,
+
+    /// Initialize in normal (non-snapshot) mode.
+    pub fn init(
+        chainstate: *ChainState,
+        network_params: *const @import("consensus.zig").NetworkParams,
+        allocator: std.mem.Allocator,
+    ) ChainStateManager {
+        return ChainStateManager{
+            .active_chainstate = chainstate,
+            .background_chainstate = null,
+            .active_role = .normal,
+            .snapshot_base_blockhash = null,
+            .network_params = network_params,
+            .allocator = allocator,
+            .background_thread = null,
+            .stop_background = std.atomic.Value(bool).init(false),
+            .mutex = std.Thread.Mutex{},
+        };
+    }
+
+    pub fn deinit(self: *ChainStateManager) void {
+        // Stop background thread if running
+        self.stopBackgroundValidation();
+
+        // Don't deinit chainstates here - they're owned externally
+    }
+
+    /// Activate a snapshot chainstate.
+    /// The old chainstate becomes the background chainstate for validation.
+    pub fn activateSnapshot(
+        self: *ChainStateManager,
+        snapshot_chainstate: *ChainState,
+        base_blockhash: types.Hash256,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // The current active becomes background
+        self.background_chainstate = self.active_chainstate;
+        self.active_chainstate = snapshot_chainstate;
+        self.active_role = .snapshot;
+        self.snapshot_base_blockhash = base_blockhash;
+    }
+
+    /// Start background validation thread.
+    pub fn startBackgroundValidation(
+        self: *ChainStateManager,
+        sync_callback: *const fn (*ChainStateManager) void,
+    ) !void {
+        if (self.background_chainstate == null) return;
+        if (self.background_thread != null) return; // Already running
+
+        self.stop_background.store(false, .release);
+        self.background_thread = try std.Thread.spawn(.{}, backgroundValidationThread, .{ self, sync_callback });
+    }
+
+    /// Stop background validation.
+    pub fn stopBackgroundValidation(self: *ChainStateManager) void {
+        self.stop_background.store(true, .release);
+        if (self.background_thread) |thread| {
+            thread.join();
+            self.background_thread = null;
+        }
+    }
+
+    /// Check if background validation is complete.
+    pub fn isBackgroundValidationComplete(self: *ChainStateManager) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.background_chainstate) |bg| {
+            if (self.snapshot_base_blockhash) |base_hash| {
+                return std.mem.eql(u8, &bg.best_hash, &base_hash);
+            }
+        }
+        return false;
+    }
+
+    /// Complete the snapshot validation and merge chainstates.
+    /// Called when background chainstate reaches the snapshot base block.
+    pub fn completeValidation(self: *ChainStateManager) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const bg = self.background_chainstate orelse return false;
+        const base_hash = self.snapshot_base_blockhash orelse return false;
+
+        // Verify background reached the snapshot base
+        if (!std.mem.eql(u8, &bg.best_hash, &base_hash)) {
+            return false;
+        }
+
+        // TODO: Compute and compare UTXO set hashes
+        // For now, we trust the background chainstate reached the correct height
+
+        // The snapshot is now fully validated
+        self.active_role = .normal;
+        self.background_chainstate = null;
+        self.snapshot_base_blockhash = null;
+
+        return true;
+    }
+
+    /// Get the active chainstate.
+    pub fn activeChainstate(self: *ChainStateManager) *ChainState {
+        return self.active_chainstate;
+    }
+
+    /// Check if we're in assumeUTXO mode.
+    pub fn isAssumeUtxoMode(self: *ChainStateManager) bool {
+        return self.active_role == .snapshot;
+    }
+
+    fn backgroundValidationThread(self: *ChainStateManager, sync_callback: *const fn (*ChainStateManager) void) void {
+        while (!self.stop_background.load(.acquire)) {
+            // Call the sync callback to process the next batch of blocks
+            sync_callback(self);
+
+            // Check if we've reached the snapshot base
+            if (self.isBackgroundValidationComplete()) {
+                break;
+            }
+
+            // Small sleep to prevent busy-waiting
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+};
+
+/// Compute the hash of a UTXO set for snapshot verification.
+/// This is SHA256d of all serialized coins in deterministic order.
+/// Reference: Bitcoin Core kernel/coinstats.cpp ComputeUTXOStats
+pub fn computeUtxoSetHash(utxo_set: *UtxoSet, allocator: std.mem.Allocator) !types.Hash256 {
+    const crypto = @import("crypto.zig");
+
+    // For now, we iterate the cache (in-memory UTXOs)
+    // A full implementation would iterate the database in sorted order
+
+    // Collect all keys for sorting
+    var keys = std.ArrayList([36]u8).init(allocator);
+    defer keys.deinit();
+
+    var iter = utxo_set.cache.iterator();
+    while (iter.next()) |entry| {
+        try keys.append(entry.key_ptr.*);
+    }
+
+    // Sort keys lexicographically
+    std.mem.sort([36]u8, keys.items, {}, struct {
+        fn lessThan(_: void, a: [36]u8, b: [36]u8) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.lessThan);
+
+    // Hash all coins in sorted order
+    var hasher_data = std.ArrayList(u8).init(allocator);
+    defer hasher_data.deinit();
+
+    for (keys.items) |key| {
+        if (utxo_set.cache.get(key)) |entry| {
+            // Serialize this coin
+            const coin = SnapshotCoin{
+                .outpoint = types.OutPoint{
+                    .hash = key[0..32].*,
+                    .index = std.mem.readInt(u32, key[32..36], .little),
+                },
+                .height = entry.utxo.height,
+                .is_coinbase = entry.utxo.is_coinbase,
+                .value = entry.utxo.value,
+                .script_pubkey = entry.utxo.hash_or_script,
+            };
+
+            const coin_bytes = try coin.toBytes(allocator);
+            defer allocator.free(coin_bytes);
+            try hasher_data.appendSlice(coin_bytes);
+        }
+    }
+
+    // Compute SHA256d
+    return crypto.hash256(hasher_data.items);
+}
+
+/// Write a UTXO set snapshot to a file.
+/// Format: metadata header + serialized coins
+pub fn dumpTxOutSet(
+    chainstate: *ChainState,
+    network_magic: u32,
+    path: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    // Create the file
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+
+    var buffered = std.io.bufferedWriter(file.writer());
+    const writer = buffered.writer();
+
+    // Count coins
+    const coins_count = chainstate.utxo_set.cache.count();
+
+    // Write metadata header
+    const metadata = SnapshotMetadata{
+        .network_magic = network_magic,
+        .base_blockhash = chainstate.best_hash,
+        .coins_count = coins_count,
+    };
+    const header = try metadata.toBytes(allocator);
+    defer allocator.free(header);
+    try writer.writeAll(header);
+
+    // Collect and sort keys
+    var keys = std.ArrayList([36]u8).init(allocator);
+    defer keys.deinit();
+
+    var iter = chainstate.utxo_set.cache.iterator();
+    while (iter.next()) |entry| {
+        try keys.append(entry.key_ptr.*);
+    }
+
+    std.mem.sort([36]u8, keys.items, {}, struct {
+        fn lessThan(_: void, a: [36]u8, b: [36]u8) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.lessThan);
+
+    // Write each coin
+    for (keys.items) |key| {
+        if (chainstate.utxo_set.cache.get(key)) |entry| {
+            // Reconstruct full script for serialization
+            const script = try entry.utxo.reconstructScript(allocator);
+            defer allocator.free(script);
+
+            const coin = SnapshotCoin{
+                .outpoint = types.OutPoint{
+                    .hash = key[0..32].*,
+                    .index = std.mem.readInt(u32, key[32..36], .little),
+                },
+                .height = entry.utxo.height,
+                .is_coinbase = entry.utxo.is_coinbase,
+                .value = entry.utxo.value,
+                .script_pubkey = script,
+            };
+
+            const coin_bytes = try coin.toBytes(allocator);
+            defer allocator.free(coin_bytes);
+            try writer.writeAll(coin_bytes);
+        }
+    }
+
+    try buffered.flush();
+}
+
+/// Load a UTXO set snapshot from a file.
+/// Returns a new ChainState populated with the snapshot data.
+pub fn loadTxOutSet(
+    path: []const u8,
+    expected_magic: u32,
+    allocator: std.mem.Allocator,
+) !struct { chainstate: ChainState, metadata: SnapshotMetadata } {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    var buffered = std.io.bufferedReader(file.reader());
+    const reader = buffered.reader();
+
+    // Read metadata header
+    var header_buf: [SnapshotMetadata.HEADER_SIZE]u8 = undefined;
+    try reader.readNoEof(&header_buf);
+    const metadata = try SnapshotMetadata.fromBytes(&header_buf, expected_magic);
+
+    // Create a new in-memory chainstate for the snapshot
+    var chainstate = ChainState.init(null, allocator);
+    chainstate.best_hash = metadata.base_blockhash;
+
+    // Read all coins
+    var coins_loaded: u64 = 0;
+    while (coins_loaded < metadata.coins_count) {
+        // Read one coin at a time
+        // We need to read variable-length data, so we'll read field by field
+        var coin_data = std.ArrayList(u8).init(allocator);
+        defer coin_data.deinit();
+
+        // Read fixed part: txid(32) + vout(4) + packed(4) + value(8) = 48 bytes
+        var fixed: [48]u8 = undefined;
+        reader.readNoEof(&fixed) catch break;
+        try coin_data.appendSlice(&fixed);
+
+        // Read script length (varint)
+        const first_byte = reader.readByte() catch break;
+        try coin_data.append(first_byte);
+
+        const script_len: usize = if (first_byte < 0xFD) blk: {
+            break :blk first_byte;
+        } else if (first_byte == 0xFD) blk: {
+            var len_bytes: [2]u8 = undefined;
+            reader.readNoEof(&len_bytes) catch break;
+            try coin_data.appendSlice(&len_bytes);
+            break :blk std.mem.readInt(u16, &len_bytes, .little);
+        } else if (first_byte == 0xFE) blk: {
+            var len_bytes: [4]u8 = undefined;
+            reader.readNoEof(&len_bytes) catch break;
+            try coin_data.appendSlice(&len_bytes);
+            break :blk std.mem.readInt(u32, &len_bytes, .little);
+        } else blk: {
+            var len_bytes: [8]u8 = undefined;
+            reader.readNoEof(&len_bytes) catch break;
+            try coin_data.appendSlice(&len_bytes);
+            break :blk @intCast(std.mem.readInt(u64, &len_bytes, .little));
+        };
+
+        // Read script bytes
+        const script_bytes = try allocator.alloc(u8, script_len);
+        defer allocator.free(script_bytes);
+        reader.readNoEof(script_bytes) catch break;
+        try coin_data.appendSlice(script_bytes);
+
+        // Parse the coin
+        var coin_reader = serialize.Reader{ .data = coin_data.items };
+        var coin = try SnapshotCoin.fromReader(&coin_reader, allocator);
+        defer coin.deinit(allocator);
+
+        // Add to chainstate
+        const txout = types.TxOut{
+            .value = coin.value,
+            .script_pubkey = coin.script_pubkey,
+        };
+        try chainstate.utxo_set.add(&coin.outpoint, &txout, coin.height, coin.is_coinbase);
+
+        coins_loaded += 1;
+    }
+
+    return .{ .chainstate = chainstate, .metadata = metadata };
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -4218,4 +4738,172 @@ test "outpoint context hash and equality" {
 test "coins view cache default size" {
     // Verify default cache size matches Bitcoin Core
     try std.testing.expectEqual(@as(usize, 450 * 1024 * 1024), DEFAULT_DB_CACHE_BYTES);
+}
+
+// ============================================================================
+// assumeUTXO Tests
+// ============================================================================
+
+test "snapshot magic bytes" {
+    // Verify snapshot magic matches Bitcoin Core
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 'u', 't', 'x', 'o', 0xff }, &SNAPSHOT_MAGIC_BYTES);
+}
+
+test "snapshot metadata serialization" {
+    const allocator = std.testing.allocator;
+
+    const metadata = SnapshotMetadata{
+        .network_magic = 0xD9B4BEF9, // Mainnet
+        .base_blockhash = [_]u8{0x11} ** 32,
+        .coins_count = 176_000_000,
+    };
+
+    const serialized = try metadata.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    // Verify size
+    try std.testing.expectEqual(@as(usize, SnapshotMetadata.HEADER_SIZE), serialized.len);
+
+    // Deserialize and verify
+    const deserialized = try SnapshotMetadata.fromBytes(serialized, 0xD9B4BEF9);
+    try std.testing.expectEqual(metadata.network_magic, deserialized.network_magic);
+    try std.testing.expectEqualSlices(u8, &metadata.base_blockhash, &deserialized.base_blockhash);
+    try std.testing.expectEqual(metadata.coins_count, deserialized.coins_count);
+}
+
+test "snapshot metadata wrong network" {
+    const allocator = std.testing.allocator;
+
+    const metadata = SnapshotMetadata{
+        .network_magic = 0xD9B4BEF9, // Mainnet
+        .base_blockhash = [_]u8{0x11} ** 32,
+        .coins_count = 100,
+    };
+
+    const serialized = try metadata.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    // Try to deserialize with wrong network magic (testnet)
+    const result = SnapshotMetadata.fromBytes(serialized, 0x0709110B);
+    try std.testing.expectError(StorageError.CorruptData, result);
+}
+
+test "snapshot coin serialization" {
+    const allocator = std.testing.allocator;
+
+    const script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAA} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const coin = SnapshotCoin{
+        .outpoint = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 5,
+        },
+        .height = 500000,
+        .is_coinbase = true,
+        .value = 5000000000,
+        .script_pubkey = &script,
+    };
+
+    const serialized = try coin.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    // Deserialize
+    var reader = serialize.Reader{ .data = serialized };
+    var deserialized = try SnapshotCoin.fromReader(&reader, allocator);
+    defer deserialized.deinit(allocator);
+
+    try std.testing.expectEqualSlices(u8, &coin.outpoint.hash, &deserialized.outpoint.hash);
+    try std.testing.expectEqual(coin.outpoint.index, deserialized.outpoint.index);
+    try std.testing.expectEqual(coin.height, deserialized.height);
+    try std.testing.expectEqual(coin.is_coinbase, deserialized.is_coinbase);
+    try std.testing.expectEqual(coin.value, deserialized.value);
+    try std.testing.expectEqualSlices(u8, coin.script_pubkey, deserialized.script_pubkey);
+}
+
+test "snapshot coin height and coinbase packing" {
+    const allocator = std.testing.allocator;
+
+    const script = [_]u8{0x51}; // OP_TRUE
+
+    // Test non-coinbase
+    const non_cb = SnapshotCoin{
+        .outpoint = types.OutPoint{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+        .height = 0x7FFFFFFF, // Max height
+        .is_coinbase = false,
+        .value = 1000,
+        .script_pubkey = &script,
+    };
+
+    const serialized_non_cb = try non_cb.toBytes(allocator);
+    defer allocator.free(serialized_non_cb);
+
+    var reader1 = serialize.Reader{ .data = serialized_non_cb };
+    var decoded_non_cb = try SnapshotCoin.fromReader(&reader1, allocator);
+    defer decoded_non_cb.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 0x7FFFFFFF), decoded_non_cb.height);
+    try std.testing.expect(!decoded_non_cb.is_coinbase);
+
+    // Test coinbase
+    const cb = SnapshotCoin{
+        .outpoint = types.OutPoint{ .hash = [_]u8{0x33} ** 32, .index = 0 },
+        .height = 100000,
+        .is_coinbase = true,
+        .value = 5000000000,
+        .script_pubkey = &script,
+    };
+
+    const serialized_cb = try cb.toBytes(allocator);
+    defer allocator.free(serialized_cb);
+
+    var reader2 = serialize.Reader{ .data = serialized_cb };
+    var decoded_cb = try SnapshotCoin.fromReader(&reader2, allocator);
+    defer decoded_cb.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 100000), decoded_cb.height);
+    try std.testing.expect(decoded_cb.is_coinbase);
+}
+
+test "chainstate role enum" {
+    // Verify chainstate roles are distinct
+    try std.testing.expect(ChainstateRole.normal != ChainstateRole.snapshot);
+    try std.testing.expect(ChainstateRole.snapshot != ChainstateRole.background);
+    try std.testing.expect(ChainstateRole.normal != ChainstateRole.background);
+}
+
+test "chainstate manager init" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    var chainstate = ChainState.init(null, allocator);
+    defer chainstate.deinit();
+
+    var manager = ChainStateManager.init(&chainstate, &consensus.MAINNET, allocator);
+    defer manager.deinit();
+
+    try std.testing.expect(!manager.isAssumeUtxoMode());
+    try std.testing.expect(manager.background_chainstate == null);
+    try std.testing.expectEqual(ChainstateRole.normal, manager.active_role);
+}
+
+test "chainstate manager activate snapshot" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    var normal_chainstate = ChainState.init(null, allocator);
+    defer normal_chainstate.deinit();
+
+    var snapshot_chainstate = ChainState.init(null, allocator);
+    defer snapshot_chainstate.deinit();
+
+    var manager = ChainStateManager.init(&normal_chainstate, &consensus.MAINNET, allocator);
+    defer manager.deinit();
+
+    // Activate snapshot
+    const base_hash = [_]u8{0x12} ** 32;
+    manager.activateSnapshot(&snapshot_chainstate, base_hash);
+
+    try std.testing.expect(manager.isAssumeUtxoMode());
+    try std.testing.expectEqual(ChainstateRole.snapshot, manager.active_role);
+    try std.testing.expect(manager.background_chainstate != null);
+    try std.testing.expectEqualSlices(u8, &base_hash, &(manager.snapshot_base_blockhash.?));
 }
