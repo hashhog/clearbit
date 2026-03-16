@@ -16,6 +16,18 @@ pub fn build(b: *std.Build) void {
     // Default to Bitcoin Core's bundled version, can be overridden
     const secp256k1_include = b.option([]const u8, "secp256k1-include", "Path to libsecp256k1 include directory") orelse "../bitcoin/src/secp256k1/include";
 
+    // libminisketch is used for BIP-330 Erlay set reconciliation
+    // When available, use: zig build -Dminisketch=true
+    const minisketch_enabled = b.option(bool, "minisketch", "Enable libminisketch support for Erlay (requires libminisketch)") orelse false;
+
+    // Path to libminisketch include directory
+    // Default to Bitcoin Core's bundled version
+    const minisketch_include = b.option([]const u8, "minisketch-include", "Path to libminisketch include directory") orelse "../bitcoin/src/minisketch/include";
+
+    // Create build options module that all modules can import
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "minisketch_enabled", minisketch_enabled);
+
     const exe = b.addExecutable(.{
         .name = "clearbit",
         .root_source_file = b.path("src/main.zig"),
@@ -35,6 +47,16 @@ pub fn build(b: *std.Build) void {
         exe.addIncludePath(.{ .cwd_relative = secp256k1_include });
         exe.linkLibC();
     }
+
+    // Link libminisketch if enabled
+    if (minisketch_enabled) {
+        exe.linkSystemLibrary("minisketch");
+        exe.addIncludePath(.{ .cwd_relative = minisketch_include });
+        exe.linkLibC();
+    }
+
+    // Add build options module to exe
+    exe.root_module.addOptions("build_options", build_options);
 
     b.installArtifact(exe);
 
@@ -62,6 +84,16 @@ pub fn build(b: *std.Build) void {
         unit_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
         unit_tests.linkLibC();
     }
+
+    // Link libminisketch for tests if enabled
+    if (minisketch_enabled) {
+        unit_tests.linkSystemLibrary("minisketch");
+        unit_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        unit_tests.linkLibC();
+    }
+
+    // Add build options module to tests
+    unit_tests.root_module.addOptions("build_options", build_options);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -96,5 +128,22 @@ pub fn build(b: *std.Build) void {
         const run_wallet_tests = b.addRunArtifact(wallet_tests);
         const wallet_test_step = b.step("test-wallet", "Run wallet/secp256k1 tests");
         wallet_test_step.dependOn(&run_wallet_tests.step);
+    }
+
+    // Add a separate step for Erlay/minisketch tests
+    if (minisketch_enabled) {
+        const minisketch_tests = b.addTest(.{
+            .root_source_file = b.path("src/erlay.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        minisketch_tests.linkSystemLibrary("minisketch");
+        minisketch_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        minisketch_tests.linkLibC();
+        minisketch_tests.root_module.addOptions("build_options", build_options);
+
+        const run_minisketch_tests = b.addRunArtifact(minisketch_tests);
+        const minisketch_test_step = b.step("test-minisketch", "Run Erlay/minisketch tests with FFI");
+        minisketch_test_step.dependOn(&run_minisketch_tests.step);
     }
 }
