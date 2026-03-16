@@ -64,14 +64,17 @@ pub const INCREMENTAL_RELAY_FEE: u64 = 1000;
 // Eclipse Attack Protection Constants
 // ============================================================================
 
-/// Number of peers to protect by fastest ping time.
-pub const EVICTION_PROTECT_PING: usize = 4;
+/// Number of peers to protect by fastest ping time (8 as per Bitcoin Core).
+pub const EVICTION_PROTECT_PING: usize = 8;
 
 /// Number of peers to protect by most recent transaction relay.
 pub const EVICTION_PROTECT_TX: usize = 4;
 
 /// Number of peers to protect by most recent block relay.
 pub const EVICTION_PROTECT_BLOCK: usize = 4;
+
+/// Number of non-tx-relay peers to protect by block relay (Bitcoin Core protects 8).
+pub const EVICTION_PROTECT_BLOCK_RELAY_ONLY: usize = 8;
 
 /// Number of peers to protect by longest connection time.
 pub const EVICTION_PROTECT_TIME: usize = 8;
@@ -731,12 +734,13 @@ fn compareNetGroup(_: void, a: EvictionCandidate, b: EvictionCandidate) bool {
 }
 
 /// Select an inbound peer to evict using Bitcoin Core's eviction algorithm.
-/// Protects peers by category:
-/// - 4 with fastest ping time
-/// - 4 with most recent tx relay
-/// - 4 with most recent block relay
-/// - 8 longest-connected
-/// - 4 from distinct netgroups
+/// Protection order (matching Bitcoin Core's SelectNodeToEvict):
+/// 1. 4 by netgroup (distinct groups)
+/// 2. 8 by fastest ping time
+/// 3. 4 by most recent tx relay
+/// 4. 8 block-relay-only peers by most recent block
+/// 5. 4 by most recent block relay
+/// 6. Remaining half by longest connection time
 /// Returns the index of the peer to evict, or null if no eviction candidate.
 pub fn selectEvictionCandidate(candidates: []EvictionCandidate, allocator: std.mem.Allocator) ?usize {
     if (candidates.len == 0) return null;
@@ -749,31 +753,7 @@ pub fn selectEvictionCandidate(candidates: []EvictionCandidate, allocator: std.m
     var protected = std.AutoHashMap(usize, void).init(allocator);
     defer protected.deinit();
 
-    // 1. Protect 4 peers with fastest ping time
-    std.mem.sort(EvictionCandidate, working, {}, comparePingTime);
-    for (0..@min(EVICTION_PROTECT_PING, working.len)) |i| {
-        protected.put(working[i].peer_index, {}) catch {};
-    }
-
-    // 2. Protect 4 peers with most recent tx relay
-    std.mem.sort(EvictionCandidate, working, {}, compareTxTime);
-    for (0..@min(EVICTION_PROTECT_TX, working.len)) |i| {
-        protected.put(working[i].peer_index, {}) catch {};
-    }
-
-    // 3. Protect 4 peers with most recent block relay
-    std.mem.sort(EvictionCandidate, working, {}, compareBlockTime);
-    for (0..@min(EVICTION_PROTECT_BLOCK, working.len)) |i| {
-        protected.put(working[i].peer_index, {}) catch {};
-    }
-
-    // 4. Protect 8 longest-connected peers
-    std.mem.sort(EvictionCandidate, working, {}, compareConnectTime);
-    for (0..@min(EVICTION_PROTECT_TIME, working.len)) |i| {
-        protected.put(working[i].peer_index, {}) catch {};
-    }
-
-    // 5. Protect 4 peers from distinct netgroups
+    // 1. Protect 4 peers from distinct netgroups (Bitcoin Core does this first)
     std.mem.sort(EvictionCandidate, working, {}, compareNetGroup);
     var seen_netgroups = std.AutoHashMap(u32, void).init(allocator);
     defer seen_netgroups.deinit();
@@ -784,6 +764,54 @@ pub fn selectEvictionCandidate(candidates: []EvictionCandidate, allocator: std.m
             seen_netgroups.put(c.net_group, {}) catch {};
             protected.put(c.peer_index, {}) catch {};
             netgroup_protected += 1;
+        }
+    }
+
+    // 2. Protect 8 peers with fastest ping time
+    std.mem.sort(EvictionCandidate, working, {}, comparePingTime);
+    for (0..@min(EVICTION_PROTECT_PING, working.len)) |i| {
+        protected.put(working[i].peer_index, {}) catch {};
+    }
+
+    // 3. Protect 4 peers with most recent tx relay
+    std.mem.sort(EvictionCandidate, working, {}, compareTxTime);
+    for (0..@min(EVICTION_PROTECT_TX, working.len)) |i| {
+        protected.put(working[i].peer_index, {}) catch {};
+    }
+
+    // 4. Protect up to 8 non-tx-relay peers (block-relay-only) by most recent block
+    std.mem.sort(EvictionCandidate, working, {}, compareBlockTime);
+    var block_relay_only_protected: usize = 0;
+    for (working) |c| {
+        if (block_relay_only_protected >= EVICTION_PROTECT_BLOCK_RELAY_ONLY) break;
+        // Protect if not relaying txs (block-relay-only)
+        if (!c.relay_txs) {
+            protected.put(c.peer_index, {}) catch {};
+            block_relay_only_protected += 1;
+        }
+    }
+
+    // 5. Protect 4 peers with most recent block relay (all peers)
+    std.mem.sort(EvictionCandidate, working, {}, compareBlockTime);
+    for (0..@min(EVICTION_PROTECT_BLOCK, working.len)) |i| {
+        protected.put(working[i].peer_index, {}) catch {};
+    }
+
+    // 6. Protect half of remaining peers by longest connection time
+    std.mem.sort(EvictionCandidate, working, {}, compareConnectTime);
+    var unprotected_count: usize = 0;
+    for (working) |c| {
+        if (!protected.contains(c.peer_index)) {
+            unprotected_count += 1;
+        }
+    }
+    const to_protect_by_time = unprotected_count / 2;
+    var time_protected: usize = 0;
+    for (working) |c| {
+        if (time_protected >= to_protect_by_time) break;
+        if (!protected.contains(c.peer_index)) {
+            protected.put(c.peer_index, {}) catch {};
+            time_protected += 1;
         }
     }
 
@@ -2485,6 +2513,25 @@ test "eclipse protection: netGroup returns /16 for IPv4" {
     try std.testing.expect(group1 != group3);
 }
 
+test "eclipse protection: netGroup returns /32 for IPv6" {
+    // IPv6 uses first 4 bytes (32 bits) for netgroup
+    // 2001:db8:1234:5678::1 should use 2001:db8 (first 4 bytes)
+    const addr1 = std.net.Address.initIp6([16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 1 }, 8333, 0, 0);
+    const group1 = netGroup(addr1);
+    const expected1: u32 = (0x20 << 24) | (0x01 << 16) | (0x0d << 8) | 0xb8;
+    try std.testing.expectEqual(expected1, group1);
+
+    // Same /32 prefix should have same netgroup
+    const addr2 = std.net.Address.initIp6([16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, 8333, 0, 0);
+    const group2 = netGroup(addr2);
+    try std.testing.expectEqual(group1, group2);
+
+    // Different /32 prefix should have different netgroup
+    const addr3 = std.net.Address.initIp6([16]u8{ 0x20, 0x01, 0x0d, 0xb9, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 1 }, 8333, 0, 0);
+    const group3 = netGroup(addr3);
+    try std.testing.expect(group1 != group3);
+}
+
 test "eclipse protection: sameNetGroup compares correctly" {
     // Same /16 subnet
     const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
@@ -2622,7 +2669,7 @@ test "eclipse protection: eviction returns null when all protected" {
         .{ .peer_index = 3, .net_group = 4, .min_ping_time = 40, .last_block_time = 400, .last_tx_time = 400, .connect_time = 400, .relay_txs = true, .is_protected = false },
     };
 
-    // With only 4 candidates and protection for ping(4), tx(4), block(4), time(8), netgroup(4)
+    // With only 4 candidates and protection for netgroup(4), ping(8), tx(4), block-relay-only(8), block(4), time(remaining/2)
     // all 4 should be protected
     const victim = selectEvictionCandidate(&candidates, allocator);
 
@@ -2654,12 +2701,39 @@ test "eclipse protection: connection type enum" {
 
 test "eclipse protection: eclipse constants match Bitcoin Core" {
     // Verify protection limits match Bitcoin Core defaults
-    try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_PING);
+    try std.testing.expectEqual(@as(usize, 8), EVICTION_PROTECT_PING);
     try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_TX);
     try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_BLOCK);
+    try std.testing.expectEqual(@as(usize, 8), EVICTION_PROTECT_BLOCK_RELAY_ONLY);
     try std.testing.expectEqual(@as(usize, 8), EVICTION_PROTECT_TIME);
     try std.testing.expectEqual(@as(usize, 4), EVICTION_PROTECT_NETGROUP);
     try std.testing.expectEqual(@as(usize, 2), MAX_BLOCK_RELAY_ONLY_ANCHORS);
+}
+
+test "eclipse protection: block-relay-only peers get protected" {
+    const allocator = std.testing.allocator;
+
+    // Create candidates: some relay_txs=true, some relay_txs=false (block-relay-only)
+    var candidates = [_]EvictionCandidate{
+        // Block-relay-only peers (relay_txs=false) - should be protected
+        .{ .peer_index = 0, .net_group = 1, .min_ping_time = 500, .last_block_time = 100, .last_tx_time = 0, .connect_time = 900, .relay_txs = false, .is_protected = false },
+        .{ .peer_index = 1, .net_group = 2, .min_ping_time = 500, .last_block_time = 200, .last_tx_time = 0, .connect_time = 800, .relay_txs = false, .is_protected = false },
+        // Full relay peers
+        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 500, .last_block_time = 50, .last_tx_time = 50, .connect_time = 700, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 500, .last_block_time = 60, .last_tx_time = 60, .connect_time = 600, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 4, .net_group = 5, .min_ping_time = 500, .last_block_time = 70, .last_tx_time = 70, .connect_time = 500, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 5, .net_group = 6, .min_ping_time = 500, .last_block_time = 80, .last_tx_time = 80, .connect_time = 400, .relay_txs = true, .is_protected = false },
+    };
+
+    const victim = selectEvictionCandidate(&candidates, allocator);
+
+    // Should select a victim
+    try std.testing.expect(victim != null);
+
+    // The victim should NOT be a block-relay-only peer (0 or 1) since those get protected
+    if (victim) |v| {
+        try std.testing.expect(v != 0 and v != 1);
+    }
 }
 
 // ============================================================================
