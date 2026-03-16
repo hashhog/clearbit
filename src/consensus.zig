@@ -154,11 +154,12 @@ pub const Checkpoint = struct {
 
 /// Mainnet checkpoints - well-known historical blocks.
 /// These are immutable consensus checkpoints that the chain must pass through.
+/// Reference: Bitcoin Core chainparams.cpp (historical checkpointData before removal)
 pub const MAINNET_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
     // Block 11111 (2010-11-14)
     .{ .height = 11111, .hash = hexToHash("0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d") },
     // Block 33333 (2011-01-06)
-    .{ .height = 33333, .hash = hexToHash("000000002dd5588a9a7c5f73d4a03ad98d671aa4c8e7517af544f03aef2d8d28") },
+    .{ .height = 33333, .hash = hexToHash("000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6") },
     // Block 74000 (2011-04-20)
     .{ .height = 74000, .hash = hexToHash("0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20") },
     // Block 105000 (2011-07-03)
@@ -171,8 +172,14 @@ pub const MAINNET_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
     .{ .height = 193000, .hash = hexToHash("000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317") },
     // Block 210000 - First halving (2012-11-28)
     .{ .height = 210000, .hash = hexToHash("000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e") },
+    // Block 216116 (2012-12-21)
+    .{ .height = 216116, .hash = hexToHash("00000000000001b4f4b433e81ee46494af945cf96014816a4e2370f11b23df4e") },
+    // Block 225430 (2013-02-17)
+    .{ .height = 225430, .hash = hexToHash("00000000000001c108384350f74090433e7fcf79a606b8e797f065b130575932") },
     // Block 250000 (2013-06-17)
     .{ .height = 250000, .hash = hexToHash("000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214") },
+    // Block 279000 (2014-01-01)
+    .{ .height = 279000, .hash = hexToHash("0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40") },
     // Block 295000 (2014-03-15)
     .{ .height = 295000, .hash = hexToHash("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983") },
 };
@@ -188,18 +195,12 @@ pub const TESTNET3_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
 };
 
 /// Testnet4 checkpoints.
-/// Testnet4 is newer, so we have fewer checkpoints.
-pub const TESTNET4_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
-    // Genesis block is height 0, we include a checkpoint near early chain
-    .{ .height = 1000, .hash = hexToHash("00000000be1e655f2f1b0e7d3b9f3c7d6f8d1e9c0a1b2c3d4e5f6a7b8c9d0e1f") },
-};
+/// Testnet4 is newer and Bitcoin Core defined no checkpoints for it.
+pub const TESTNET4_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{};
 
 /// Signet checkpoints.
-/// Signet is a relatively stable test network with block signing.
-pub const SIGNET_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{
-    // Early signet checkpoint
-    .{ .height = 10000, .hash = hexToHash("0000006e8e6c7f37c8f3e9d8b5a4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6") },
-};
+/// Bitcoin Core defined no checkpoints for signet.
+pub const SIGNET_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{};
 
 /// Regtest checkpoints - empty because regtest is for local testing.
 pub const REGTEST_CHECKPOINTS: []const Checkpoint = &[_]Checkpoint{};
@@ -2227,6 +2228,16 @@ test "mainnet has at least 5 checkpoints" {
 
 test "regtest has no checkpoints" {
     try std.testing.expectEqual(@as(usize, 0), REGTEST_CHECKPOINTS.len);
+}
+
+test "testnet4 has no checkpoints" {
+    try std.testing.expectEqual(@as(usize, 0), TESTNET4_CHECKPOINTS.len);
+    try std.testing.expect(getLastCheckpointHeight(.testnet4) == null);
+}
+
+test "signet has no checkpoints" {
+    try std.testing.expectEqual(@as(usize, 0), SIGNET_CHECKPOINTS.len);
+    try std.testing.expect(getLastCheckpointHeight(.signet) == null);
 }
 
 test "getCheckpointAtHeight binary search finds exact match" {
