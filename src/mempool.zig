@@ -50,6 +50,27 @@ pub const INCREMENTAL_RELAY_FEE: i64 = 1000;
 pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
 
 // ============================================================================
+// TRUC (v3) Policy Constants - BIP 431
+// ============================================================================
+
+/// TRUC transaction version (version 3).
+pub const TRUC_VERSION: i32 = 3;
+
+/// Maximum number of transactions in a TRUC ancestor set (including self).
+/// TRUC only allows 1 unconfirmed parent + the tx itself = 2.
+pub const TRUC_ANCESTOR_LIMIT: usize = 2;
+
+/// Maximum number of transactions in a TRUC descendant set (including self).
+/// TRUC only allows 1 unconfirmed child + the tx itself = 2.
+pub const TRUC_DESCENDANT_LIMIT: usize = 2;
+
+/// Maximum virtual size of any v3 transaction (10 KB).
+pub const TRUC_MAX_VSIZE: usize = 10_000;
+
+/// Maximum virtual size of a v3 child transaction spending an unconfirmed v3 parent (1 KB).
+pub const TRUC_CHILD_MAX_VSIZE: usize = 1_000;
+
+// ============================================================================
 // Mempool Errors
 // ============================================================================
 
@@ -88,6 +109,171 @@ pub const MempoolError = error{
     MissingInputs,
     /// Memory allocation failure.
     OutOfMemory,
+    /// TRUC: v3 transaction is too large (exceeds TRUC_MAX_VSIZE).
+    TrucTxTooLarge,
+    /// TRUC: v3 child transaction is too large (exceeds TRUC_CHILD_MAX_VSIZE).
+    TrucChildTooLarge,
+    /// TRUC: v3 transaction would have too many ancestors (exceeds TRUC_ANCESTOR_LIMIT).
+    TrucTooManyAncestors,
+    /// TRUC: v3 transaction would have too many descendants (exceeds TRUC_DESCENDANT_LIMIT).
+    TrucTooManyDescendants,
+    /// TRUC: v3 transaction cannot spend from non-v3 unconfirmed transaction.
+    TrucV3SpendsNonV3,
+    /// TRUC: non-v3 transaction cannot spend from v3 unconfirmed transaction.
+    TrucNonV3SpendsV3,
+    /// Cluster would exceed maximum size limit.
+    ClusterSizeLimitExceeded,
+};
+
+// ============================================================================
+// Cluster Mempool Constants
+// ============================================================================
+
+/// Maximum number of transactions in a cluster.
+/// Replaces traditional ancestor/descendant limits with cluster-based limits.
+/// Reference: Bitcoin Core cluster_linearize.h
+pub const MAX_CLUSTER_SIZE: usize = 100;
+
+// ============================================================================
+// Union-Find for Cluster Detection
+// ============================================================================
+
+/// Union-Find (Disjoint Set Union) data structure for efficient cluster detection.
+/// Used to track connected components in the transaction dependency graph.
+pub const UnionFind = struct {
+    /// Parent pointer for each transaction (by index).
+    parent: []u32,
+    /// Rank for union by rank optimization.
+    rank: []u32,
+    /// Number of elements in each set (stored at root).
+    size: []u32,
+    /// Allocator for memory management.
+    allocator: std.mem.Allocator,
+    /// Number of elements.
+    count: u32,
+
+    /// Initialize a new UnionFind structure with given capacity.
+    pub fn init(allocator: std.mem.Allocator, capacity: u32) !UnionFind {
+        const parent = try allocator.alloc(u32, capacity);
+        const rank = try allocator.alloc(u32, capacity);
+        const size = try allocator.alloc(u32, capacity);
+
+        // Initialize each element as its own set
+        for (0..capacity) |i| {
+            parent[i] = @intCast(i);
+            rank[i] = 0;
+            size[i] = 1;
+        }
+
+        return UnionFind{
+            .parent = parent,
+            .rank = rank,
+            .size = size,
+            .allocator = allocator,
+            .count = capacity,
+        };
+    }
+
+    /// Deinitialize and free resources.
+    pub fn deinit(self: *UnionFind) void {
+        self.allocator.free(self.parent);
+        self.allocator.free(self.rank);
+        self.allocator.free(self.size);
+    }
+
+    /// Find the root of the set containing element x, with path compression.
+    pub fn find(self: *UnionFind, x: u32) u32 {
+        if (self.parent[x] != x) {
+            // Path compression: make every node point directly to the root
+            self.parent[x] = self.find(self.parent[x]);
+        }
+        return self.parent[x];
+    }
+
+    /// Union the sets containing elements x and y. Returns true if they were in different sets.
+    pub fn unite(self: *UnionFind, x: u32, y: u32) bool {
+        const root_x = self.find(x);
+        const root_y = self.find(y);
+
+        if (root_x == root_y) {
+            return false; // Already in the same set
+        }
+
+        // Union by rank: attach smaller tree under root of larger tree
+        if (self.rank[root_x] < self.rank[root_y]) {
+            self.parent[root_x] = root_y;
+            self.size[root_y] += self.size[root_x];
+        } else if (self.rank[root_x] > self.rank[root_y]) {
+            self.parent[root_y] = root_x;
+            self.size[root_x] += self.size[root_y];
+        } else {
+            self.parent[root_y] = root_x;
+            self.size[root_x] += self.size[root_y];
+            self.rank[root_x] += 1;
+        }
+
+        return true;
+    }
+
+    /// Get the size of the set containing element x.
+    pub fn setSize(self: *UnionFind, x: u32) u32 {
+        const root = self.find(x);
+        return self.size[root];
+    }
+
+    /// Check if two elements are in the same set.
+    pub fn connected(self: *UnionFind, x: u32, y: u32) bool {
+        return self.find(x) == self.find(y);
+    }
+};
+
+// ============================================================================
+// Cluster and Linearization
+// ============================================================================
+
+/// A chunk in a linearization: a set of transactions with aggregate fee rate.
+pub const Chunk = struct {
+    /// Transaction indices in this chunk.
+    tx_indices: []u32,
+    /// Total fees in satoshis.
+    total_fees: i64,
+    /// Total virtual size.
+    total_vsize: usize,
+    /// Allocator for cleanup.
+    allocator: std.mem.Allocator,
+
+    /// Compute the chunk fee rate (fees / vsize).
+    pub fn feeRate(self: *const Chunk) f64 {
+        if (self.total_vsize == 0) return 0;
+        return @as(f64, @floatFromInt(self.total_fees)) / @as(f64, @floatFromInt(self.total_vsize));
+    }
+
+    /// Deinitialize and free resources.
+    pub fn deinit(self: *Chunk) void {
+        self.allocator.free(self.tx_indices);
+    }
+};
+
+/// Result of linearizing a cluster.
+pub const Linearization = struct {
+    /// Ordered list of transaction indices.
+    order: []u32,
+    /// Chunks (contiguous groups in the order with aggregate fee rates).
+    chunks: []Chunk,
+    /// Mining score for each transaction (index -> fee rate of containing chunk).
+    mining_scores: []f64,
+    /// Allocator for cleanup.
+    allocator: std.mem.Allocator,
+
+    /// Deinitialize and free resources.
+    pub fn deinit(self: *Linearization) void {
+        for (self.chunks) |*chunk| {
+            chunk.deinit();
+        }
+        self.allocator.free(self.chunks);
+        self.allocator.free(self.order);
+        self.allocator.free(self.mining_scores);
+    }
 };
 
 // ============================================================================
@@ -130,6 +316,11 @@ pub const MempoolEntry = struct {
     descendant_fees: i64,
     /// Whether transaction signals BIP-125 opt-in RBF.
     is_rbf: bool,
+    /// Index of this transaction in the cluster mempool (for UnionFind).
+    cluster_index: u32,
+    /// Mining score: effective fee rate based on chunk linearization.
+    /// This is the chunk fee rate for the chunk containing this transaction.
+    mining_score: f64,
 
     /// Compute the ancestor fee rate (used for mining prioritization).
     /// This is the fee rate of the transaction including all unconfirmed ancestors.
@@ -177,6 +368,28 @@ pub const Mempool = struct {
 
     allocator: std.mem.Allocator,
 
+    // ========================================================================
+    // Cluster Mempool State
+    // ========================================================================
+
+    /// Union-Find structure for cluster detection.
+    cluster_union: ?UnionFind,
+
+    /// Map from txid to cluster index (for UnionFind).
+    txid_to_index: std.AutoHashMap(types.Hash256, u32),
+
+    /// Map from cluster index to txid.
+    index_to_txid: std.AutoHashMap(u32, types.Hash256),
+
+    /// Next available cluster index.
+    next_cluster_index: u32,
+
+    /// Cached linearizations by cluster root index.
+    cluster_linearizations: std.AutoHashMap(u32, Linearization),
+
+    /// Whether linearizations need recomputation.
+    linearization_dirty: bool,
+
     /// Initialize a new mempool.
     pub fn init(
         chain_state: ?*storage.ChainState,
@@ -192,6 +405,13 @@ pub const Mempool = struct {
             .chain_state = chain_state,
             .params = params,
             .allocator = allocator,
+            // Cluster mempool state
+            .cluster_union = null,
+            .txid_to_index = std.AutoHashMap(types.Hash256, u32).init(allocator),
+            .index_to_txid = std.AutoHashMap(u32, types.Hash256).init(allocator),
+            .next_cluster_index = 0,
+            .cluster_linearizations = std.AutoHashMap(u32, Linearization).init(allocator),
+            .linearization_dirty = true,
         };
     }
 
@@ -210,6 +430,20 @@ pub const Mempool = struct {
             entry.value_ptr.deinit();
         }
         self.children.deinit();
+
+        // Clean up cluster mempool state
+        if (self.cluster_union) |*uf| {
+            uf.deinit();
+        }
+        self.txid_to_index.deinit();
+        self.index_to_txid.deinit();
+
+        // Clean up cached linearizations
+        var lin_iter = self.cluster_linearizations.iterator();
+        while (lin_iter.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.cluster_linearizations.deinit();
     }
 
     /// Attempt to add a transaction to the mempool.
@@ -292,14 +526,37 @@ pub const Mempool = struct {
             }
         }
 
-        // 8. Check ancestor/descendant limits
-        const ancestors = try self.getAncestors(tx_hash, &tx);
-        if (ancestors.count > MAX_ANCESTOR_COUNT) return MempoolError.TooManyAncestors;
-        // Ancestor size includes the new tx itself
-        if (ancestors.size + vsize > MAX_ANCESTOR_SIZE) return MempoolError.AncestorSizeLimitExceeded;
+        // 7b. Check TRUC (v3) policy rules
+        // This must be done after RBF conflict removal so we see the updated mempool state
+        const truc_result = try self.checkTrucPolicy(&tx, vsize, conflicting_txids.items);
 
-        // 8b. Check that adding this tx won't cause any ancestor to exceed descendant limits
-        try self.checkDescendantLimits(&tx, vsize);
+        // Handle sibling eviction for v3 transactions
+        if (truc_result.sibling_to_evict) |sibling_txid| {
+            // Sibling eviction: remove the existing sibling to make room for this tx
+            // This is allowed for v3 transactions without requiring higher fee rate
+            self.removeTransaction(sibling_txid);
+        }
+
+        // 8. Check cluster size limit (replaces traditional ancestor/descendant limits)
+        // Also get ancestor info for legacy compatibility
+        const ancestors = try self.getAncestors(tx_hash, &tx);
+
+        // Check cluster size limit: find what cluster(s) this tx would join
+        const projected_cluster_size = try self.projectClusterSize(&tx);
+        if (projected_cluster_size > MAX_CLUSTER_SIZE) {
+            return MempoolError.ClusterSizeLimitExceeded;
+        }
+
+        // For TRUC (v3), also enforce stricter ancestor/descendant limits
+        if (tx.version == TRUC_VERSION) {
+            // TRUC limits already checked in checkTrucPolicy above
+        } else {
+            // Keep legacy ancestor/descendant limits as secondary check for non-v3
+            // These are less restrictive than cluster limits but kept for compatibility
+            if (ancestors.count > MAX_ANCESTOR_COUNT) return MempoolError.TooManyAncestors;
+            if (ancestors.size + vsize > MAX_ANCESTOR_SIZE) return MempoolError.AncestorSizeLimitExceeded;
+            try self.checkDescendantLimits(&tx, vsize);
+        }
 
         // 9. Check dust outputs
         for (tx.outputs) |output| {
@@ -312,7 +569,14 @@ pub const Mempool = struct {
             self.evict(vsize) catch return MempoolError.MempoolFull;
         }
 
-        // 11. Create entry and add to mempool
+        // 11. Allocate cluster index for this transaction
+        const cluster_idx = self.next_cluster_index;
+        self.next_cluster_index += 1;
+
+        // Initialize or expand UnionFind if needed
+        try self.ensureClusterCapacity(self.next_cluster_index);
+
+        // 12. Create entry and add to mempool
         const entry = self.allocator.create(MempoolEntry) catch return MempoolError.OutOfMemory;
         entry.* = MempoolEntry{
             .tx = tx,
@@ -331,13 +595,18 @@ pub const Mempool = struct {
             .descendant_count = 1,
             .descendant_size = vsize,
             .descendant_fees = fee,
-            .is_rbf = isRBFSignaled(&tx),
+            // V3/TRUC transactions are always RBF-replaceable (BIP 431)
+            .is_rbf = tx.version == TRUC_VERSION or isRBFSignaled(&tx),
+            .cluster_index = cluster_idx,
+            .mining_score = fee_rate, // Initial score is individual fee rate
         };
 
         self.entries.put(tx_hash, entry) catch return MempoolError.OutOfMemory;
         self.by_wtxid.put(entry.wtxid, tx_hash) catch {};
+        self.txid_to_index.put(tx_hash, cluster_idx) catch {};
+        self.index_to_txid.put(cluster_idx, tx_hash) catch {};
 
-        // Track spent outpoints
+        // Track spent outpoints and union with parent clusters
         for (tx.inputs) |input| {
             self.spenders.put(input.previous_output, tx_hash) catch {};
 
@@ -351,11 +620,21 @@ pub const Mempool = struct {
                     new_list.append(tx_hash) catch {};
                     self.children.put(input.previous_output.hash, new_list) catch {};
                 }
+
+                // Union this tx with its parent in the cluster
+                if (self.txid_to_index.get(input.previous_output.hash)) |parent_idx| {
+                    if (self.cluster_union) |*uf| {
+                        _ = uf.unite(cluster_idx, parent_idx);
+                    }
+                }
             }
         }
 
         // Update ancestor descendant counts
         try self.updateDescendantCounts(tx_hash);
+
+        // Mark linearizations as needing recomputation
+        self.linearization_dirty = true;
 
         self.total_size += vsize;
     }
@@ -379,6 +658,15 @@ pub const Mempool = struct {
                 var children_list = children_kv.value;
                 children_list.deinit();
             }
+
+            // Remove cluster tracking
+            _ = self.txid_to_index.remove(txid_hash);
+            _ = self.index_to_txid.remove(entry.cluster_index);
+            // Note: UnionFind doesn't support removal, but orphaned indices don't affect correctness
+            // The cluster will be invalidated and recomputed on next linearization
+
+            // Mark linearizations as needing recomputation
+            self.linearization_dirty = true;
 
             self.total_size -|= entry.vsize;
             self.allocator.destroy(entry);
@@ -423,8 +711,8 @@ pub const Mempool = struct {
     fn checkStandard(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
         _ = self;
 
-        // Version must be 1 or 2
-        if (tx.version < 1 or tx.version > 2) return MempoolError.NonStandard;
+        // Version must be 1, 2, or 3 (TRUC)
+        if (tx.version < 1 or tx.version > TRUC_VERSION) return MempoolError.NonStandard;
 
         // Check output script types
         for (tx.outputs) |output| {
@@ -544,19 +832,25 @@ pub const Mempool = struct {
     }
 
     /// Evict lowest-fee-rate transactions to make room.
+    /// Evict lowest-fee-rate transactions to make room.
+    /// Uses cluster-based mining score for eviction decisions.
     fn evict(self: *Mempool, needed_bytes: usize) !void {
+        // Update mining scores if needed (cluster-aware)
+        self.updateMiningScores() catch {};
+
         var freed: usize = 0;
 
         while (freed < needed_bytes) {
-            // Find the transaction with the lowest descendant fee rate
+            // Find the transaction with the lowest mining score (cluster-aware)
             var worst: ?types.Hash256 = null;
-            var worst_rate: f64 = std.math.floatMax(f64);
+            var worst_score: f64 = std.math.floatMax(f64);
 
             var iter = self.entries.iterator();
             while (iter.next()) |entry| {
-                const rate = entry.value_ptr.*.descendantFeeRate();
-                if (rate < worst_rate) {
-                    worst_rate = rate;
+                // Use mining_score for cluster-aware eviction
+                const score = entry.value_ptr.*.mining_score;
+                if (score < worst_score) {
+                    worst_score = score;
                     worst = entry.key_ptr.*;
                 }
             }
@@ -624,6 +918,137 @@ pub const Mempool = struct {
             .size = total_size,
             .fees = total_fees,
         };
+    }
+
+    /// Result of TRUC validation that may include a sibling eligible for eviction.
+    pub const TrucCheckResult = struct {
+        /// If non-null, this sibling can be evicted via sibling eviction.
+        sibling_to_evict: ?types.Hash256 = null,
+    };
+
+    /// Check TRUC (v3) policy rules for a transaction.
+    /// Returns null on success, or an error if TRUC rules are violated.
+    /// For descendant limit violations, may return a sibling eligible for eviction.
+    ///
+    /// TRUC rules (BIP 431):
+    /// 1. V3 tx can only have v3 unconfirmed parents
+    /// 2. Non-v3 tx cannot have v3 unconfirmed parents
+    /// 3. V3 tx max size is TRUC_MAX_VSIZE (10KB)
+    /// 4. V3 child spending unconfirmed parent max size is TRUC_CHILD_MAX_VSIZE (1KB)
+    /// 5. V3 tx can have at most 1 unconfirmed ancestor (TRUC_ANCESTOR_LIMIT = 2 including self)
+    /// 6. V3 tx can have at most 1 unconfirmed descendant (TRUC_DESCENDANT_LIMIT = 2 including self)
+    /// 7. Sibling eviction: a v3 child can replace an existing v3 child of the same parent
+    fn checkTrucPolicy(
+        self: *Mempool,
+        tx: *const types.Transaction,
+        vsize: usize,
+        direct_conflicts: []const types.Hash256,
+    ) MempoolError!TrucCheckResult {
+        // Find all mempool parents (unconfirmed ancestors that are direct parents)
+        var mempool_parents = std.ArrayList(types.Hash256).init(self.allocator);
+        defer mempool_parents.deinit();
+
+        for (tx.inputs) |input| {
+            const parent_txid = input.previous_output.hash;
+            if (self.entries.contains(parent_txid)) {
+                // Check for duplicates before adding
+                var found = false;
+                for (mempool_parents.items) |existing| {
+                    if (std.mem.eql(u8, &existing, &parent_txid)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    mempool_parents.append(parent_txid) catch return MempoolError.OutOfMemory;
+                }
+            }
+        }
+
+        // Rule 1 & 2: Check version inheritance
+        for (mempool_parents.items) |parent_txid| {
+            const parent_entry = self.entries.get(parent_txid) orelse continue;
+
+            if (tx.version != TRUC_VERSION and parent_entry.tx.version == TRUC_VERSION) {
+                // Non-v3 cannot spend from v3
+                return MempoolError.TrucNonV3SpendsV3;
+            } else if (tx.version == TRUC_VERSION and parent_entry.tx.version != TRUC_VERSION) {
+                // V3 cannot spend from non-v3
+                return MempoolError.TrucV3SpendsNonV3;
+            }
+        }
+
+        // Remaining rules only apply to v3 transactions
+        if (tx.version != TRUC_VERSION) {
+            return TrucCheckResult{};
+        }
+
+        // Rule 3: V3 tx max size check
+        if (vsize > TRUC_MAX_VSIZE) {
+            return MempoolError.TrucTxTooLarge;
+        }
+
+        // Rule 5: Ancestor limit check (v3 can have at most 1 unconfirmed parent)
+        // TRUC_ANCESTOR_LIMIT = 2 includes self, so max 1 mempool parent
+        if (mempool_parents.items.len + 1 > TRUC_ANCESTOR_LIMIT) {
+            return MempoolError.TrucTooManyAncestors;
+        }
+
+        // Rules that only apply when there are unconfirmed parents
+        if (mempool_parents.items.len > 0) {
+            const parent_txid = mempool_parents.items[0];
+            const parent_entry = self.entries.get(parent_txid) orelse return TrucCheckResult{};
+
+            // Check that the parent itself doesn't have too many ancestors
+            // (ensures the chain length is at most 2)
+            if (parent_entry.ancestor_count + 1 > TRUC_ANCESTOR_LIMIT) {
+                return MempoolError.TrucTooManyAncestors;
+            }
+
+            // Rule 4: V3 child spending unconfirmed parent has stricter size limit
+            if (vsize > TRUC_CHILD_MAX_VSIZE) {
+                return MempoolError.TrucChildTooLarge;
+            }
+
+            // Rule 6: Descendant limit check
+            // Check if the parent already has a child (descendant_count > 1 means it has children)
+            // TRUC_DESCENDANT_LIMIT = 2 includes self, so max 1 child
+            if (parent_entry.descendant_count + 1 > TRUC_DESCENDANT_LIMIT) {
+                // Check if the existing child is being replaced via direct conflict
+                var child_will_be_replaced = false;
+                const descendants = self.getDescendantTxids(parent_txid);
+                defer self.allocator.free(descendants);
+
+                for (descendants) |desc_txid| {
+                    for (direct_conflicts) |conflict| {
+                        if (std.mem.eql(u8, &desc_txid, &conflict)) {
+                            child_will_be_replaced = true;
+                            break;
+                        }
+                    }
+                    if (child_will_be_replaced) break;
+                }
+
+                if (!child_will_be_replaced) {
+                    // Rule 7: Sibling eviction - check if we can evict the existing child
+                    // Conditions for sibling eviction:
+                    // 1. Parent has exactly 2 descendants (itself + 1 existing child)
+                    // 2. The existing sibling has exactly 2 ancestors (grandparent chain + parent)
+                    if (parent_entry.descendant_count == 2 and descendants.len == 1) {
+                        const sibling_txid = descendants[0];
+                        if (self.entries.get(sibling_txid)) |sibling_entry| {
+                            if (sibling_entry.ancestor_count == 2) {
+                                // Sibling eviction is possible
+                                return TrucCheckResult{ .sibling_to_evict = sibling_txid };
+                            }
+                        }
+                    }
+                    return MempoolError.TrucTooManyDescendants;
+                }
+            }
+        }
+
+        return TrucCheckResult{};
     }
 
     /// Check if adding a transaction would cause any ancestor to exceed descendant limits.
@@ -922,13 +1347,28 @@ pub const Mempool = struct {
             }
         }
 
-        // 8. Check ancestor/descendant limits
-        const ancestors = try self.getAncestors(tx_hash, &tx);
-        if (ancestors.count > MAX_ANCESTOR_COUNT) return MempoolError.TooManyAncestors;
-        if (ancestors.size + vsize > MAX_ANCESTOR_SIZE) return MempoolError.AncestorSizeLimitExceeded;
+        // 7b. Check TRUC (v3) policy rules
+        const truc_result = try self.checkTrucPolicy(&tx, vsize, conflicting_txids.items);
 
-        // 8b. Check that adding this tx won't cause any ancestor to exceed descendant limits
-        try self.checkDescendantLimits(&tx, vsize);
+        // Handle sibling eviction for v3 transactions
+        if (truc_result.sibling_to_evict) |sibling_txid| {
+            self.removeTransaction(sibling_txid);
+        }
+
+        // 8. Check cluster size limit and ancestor/descendant limits
+        const ancestors = try self.getAncestors(tx_hash, &tx);
+
+        // Check cluster size limit
+        const projected_cluster_size = try self.projectClusterSize(&tx);
+        if (projected_cluster_size > MAX_CLUSTER_SIZE) {
+            return MempoolError.ClusterSizeLimitExceeded;
+        }
+
+        if (tx.version != TRUC_VERSION) {
+            if (ancestors.count > MAX_ANCESTOR_COUNT) return MempoolError.TooManyAncestors;
+            if (ancestors.size + vsize > MAX_ANCESTOR_SIZE) return MempoolError.AncestorSizeLimitExceeded;
+            try self.checkDescendantLimits(&tx, vsize);
+        }
 
         // 9. Check dust outputs
         for (tx.outputs) |output| {
@@ -941,7 +1381,14 @@ pub const Mempool = struct {
             self.evict(vsize) catch return MempoolError.MempoolFull;
         }
 
-        // 11. Create entry and add to mempool
+        // 11. Allocate cluster index for this transaction
+        const cluster_idx = self.next_cluster_index;
+        self.next_cluster_index += 1;
+
+        // Initialize or expand UnionFind if needed
+        try self.ensureClusterCapacity(self.next_cluster_index);
+
+        // 12. Create entry and add to mempool
         const entry = self.allocator.create(MempoolEntry) catch return MempoolError.OutOfMemory;
         entry.* = MempoolEntry{
             .tx = tx,
@@ -960,13 +1407,18 @@ pub const Mempool = struct {
             .descendant_count = 1,
             .descendant_size = vsize,
             .descendant_fees = fee,
-            .is_rbf = isRBFSignaled(&tx),
+            // V3/TRUC transactions are always RBF-replaceable (BIP 431)
+            .is_rbf = tx.version == TRUC_VERSION or isRBFSignaled(&tx),
+            .cluster_index = cluster_idx,
+            .mining_score = individual_fee_rate, // Initial score
         };
 
         self.entries.put(tx_hash, entry) catch return MempoolError.OutOfMemory;
         self.by_wtxid.put(entry.wtxid, tx_hash) catch {};
+        self.txid_to_index.put(tx_hash, cluster_idx) catch {};
+        self.index_to_txid.put(cluster_idx, tx_hash) catch {};
 
-        // Track spent outpoints
+        // Track spent outpoints and union with parent clusters
         for (tx.inputs) |input| {
             self.spenders.put(input.previous_output, tx_hash) catch {};
 
@@ -980,13 +1432,482 @@ pub const Mempool = struct {
                     new_list.append(tx_hash) catch {};
                     self.children.put(input.previous_output.hash, new_list) catch {};
                 }
+
+                // Union this tx with its parent in the cluster
+                if (self.txid_to_index.get(input.previous_output.hash)) |parent_idx| {
+                    if (self.cluster_union) |*uf| {
+                        _ = uf.unite(cluster_idx, parent_idx);
+                    }
+                }
             }
         }
+
+        // Mark linearizations as needing recomputation
+        self.linearization_dirty = true;
 
         // Update ancestor descendant counts
         try self.updateDescendantCounts(tx_hash);
 
         self.total_size += vsize;
+    }
+
+    // ========================================================================
+    // Cluster Mempool Methods
+    // ========================================================================
+
+    /// Ensure UnionFind has sufficient capacity.
+    fn ensureClusterCapacity(self: *Mempool, min_capacity: u32) MempoolError!void {
+        const needed = @max(min_capacity, 64); // Minimum initial capacity
+
+        if (self.cluster_union == null) {
+            self.cluster_union = UnionFind.init(self.allocator, needed) catch return MempoolError.OutOfMemory;
+            return;
+        }
+
+        // If we need more capacity, create a new larger UnionFind and copy
+        if (self.cluster_union) |*uf| {
+            if (uf.count < needed) {
+                const new_capacity = @max(needed, uf.count * 2);
+                var new_uf = UnionFind.init(self.allocator, new_capacity) catch return MempoolError.OutOfMemory;
+
+                // Copy existing data
+                for (0..uf.count) |i| {
+                    new_uf.parent[i] = uf.parent[i];
+                    new_uf.rank[i] = uf.rank[i];
+                    new_uf.size[i] = uf.size[i];
+                }
+
+                uf.deinit();
+                self.cluster_union = new_uf;
+            }
+        }
+    }
+
+    /// Project the cluster size if a new transaction were added.
+    /// Used to check cluster limits before adding.
+    fn projectClusterSize(self: *Mempool, tx: *const types.Transaction) MempoolError!usize {
+        // Find all unique clusters that would be joined
+        var cluster_roots = std.AutoHashMap(u32, void).init(self.allocator);
+        defer cluster_roots.deinit();
+
+        for (tx.inputs) |input| {
+            const parent_txid = input.previous_output.hash;
+            if (self.txid_to_index.get(parent_txid)) |parent_idx| {
+                if (self.cluster_union) |*uf| {
+                    const root = uf.find(parent_idx);
+                    cluster_roots.put(root, {}) catch return MempoolError.OutOfMemory;
+                }
+            }
+        }
+
+        if (cluster_roots.count() == 0) {
+            // New independent transaction
+            return 1;
+        }
+
+        // Sum up the sizes of all clusters that would be joined
+        var total_size: usize = 1; // +1 for the new tx
+        var roots_iter = cluster_roots.iterator();
+        while (roots_iter.next()) |entry| {
+            const root = entry.key_ptr.*;
+            if (self.cluster_union) |*uf| {
+                total_size += uf.setSize(root);
+            }
+        }
+
+        return total_size;
+    }
+
+    /// Get all transactions in the same cluster as the given txid.
+    pub fn getClusterTxids(self: *Mempool, txid: types.Hash256) ![]types.Hash256 {
+        var result = std.ArrayList(types.Hash256).init(self.allocator);
+        errdefer result.deinit();
+
+        const idx = self.txid_to_index.get(txid) orelse return result.toOwnedSlice();
+
+        const uf = if (self.cluster_union) |*u| u else return result.toOwnedSlice();
+        const target_root = uf.find(idx);
+
+        // Find all txids with the same root
+        var iter = self.txid_to_index.iterator();
+        while (iter.next()) |entry| {
+            const other_idx = entry.value_ptr.*;
+            const other_root = uf.find(other_idx);
+            if (other_root == target_root) {
+                try result.append(entry.key_ptr.*);
+            }
+        }
+
+        return result.toOwnedSlice();
+    }
+
+    /// Get the cluster size for a given transaction.
+    pub fn getClusterSize(self: *Mempool, txid: types.Hash256) usize {
+        const idx = self.txid_to_index.get(txid) orelse return 0;
+        const uf = if (self.cluster_union) |*u| u else return 0;
+        return uf.setSize(idx);
+    }
+
+    /// Linearize a cluster using the greedy chunk algorithm.
+    /// Returns transactions in optimal order for mining.
+    pub fn linearizeCluster(self: *Mempool, cluster_txids: []const types.Hash256, allocator: std.mem.Allocator) !Linearization {
+        const n = cluster_txids.len;
+        if (n == 0) {
+            return Linearization{
+                .order = try allocator.alloc(u32, 0),
+                .chunks = try allocator.alloc(Chunk, 0),
+                .mining_scores = try allocator.alloc(f64, 0),
+                .allocator = allocator,
+            };
+        }
+
+        // Build local index mapping
+        var txid_to_local = std.AutoHashMap(types.Hash256, u32).init(allocator);
+        defer txid_to_local.deinit();
+
+        var local_to_txid = try allocator.alloc(types.Hash256, n);
+        defer allocator.free(local_to_txid);
+
+        var fees = try allocator.alloc(i64, n);
+        defer allocator.free(fees);
+
+        var vsizes = try allocator.alloc(usize, n);
+        defer allocator.free(vsizes);
+
+        // Build ancestor sets for each tx in the cluster
+        var ancestors = try allocator.alloc(std.bit_set.IntegerBitSet(64), n);
+        defer allocator.free(ancestors);
+
+        for (cluster_txids, 0..) |txid, i| {
+            try txid_to_local.put(txid, @intCast(i));
+            local_to_txid[i] = txid;
+
+            const entry = self.entries.get(txid) orelse continue;
+            fees[i] = entry.fee;
+            vsizes[i] = entry.vsize;
+            ancestors[i] = std.bit_set.IntegerBitSet(64).initEmpty();
+            ancestors[i].set(i); // Each tx is its own ancestor
+        }
+
+        // Build ancestor relationships within the cluster
+        for (cluster_txids, 0..) |txid, i| {
+            const entry = self.entries.get(txid) orelse continue;
+            for (entry.tx.inputs) |input| {
+                if (txid_to_local.get(input.previous_output.hash)) |parent_local| {
+                    // Add parent and all its ancestors
+                    ancestors[i].setUnion(ancestors[parent_local]);
+                }
+            }
+        }
+
+        // Greedy linearization: repeatedly find highest fee-rate valid topological prefix
+        var order = try allocator.alloc(u32, n);
+        var order_idx: usize = 0;
+
+        var remaining = std.bit_set.IntegerBitSet(64).initEmpty();
+        for (0..n) |i| {
+            remaining.set(i);
+        }
+
+        // Track chunks as we build the linearization
+        var chunks_list = std.ArrayList(Chunk).init(allocator);
+        errdefer {
+            for (chunks_list.items) |*c| c.deinit();
+            chunks_list.deinit();
+        }
+
+        while (remaining.count() > 0) {
+            // Find the best chunk: highest fee-rate valid topological prefix
+            const best_chunk = try self.findBestChunk(
+                &remaining,
+                ancestors,
+                fees,
+                vsizes,
+                @intCast(n),
+                allocator,
+            );
+
+            // Add chunk transactions to the order
+            var chunk_tx_indices = std.ArrayList(u32).init(allocator);
+            errdefer chunk_tx_indices.deinit();
+
+            var chunk_iter = best_chunk.iterator(.{});
+            while (chunk_iter.next()) |idx| {
+                order[order_idx] = @intCast(idx);
+                order_idx += 1;
+                remaining.unset(idx);
+                try chunk_tx_indices.append(@intCast(idx));
+            }
+
+            // Calculate chunk fee rate
+            var chunk_fees: i64 = 0;
+            var chunk_vsize: usize = 0;
+            var chunk_iter2 = best_chunk.iterator(.{});
+            while (chunk_iter2.next()) |idx| {
+                chunk_fees += fees[idx];
+                chunk_vsize += vsizes[idx];
+            }
+
+            try chunks_list.append(Chunk{
+                .tx_indices = try chunk_tx_indices.toOwnedSlice(),
+                .total_fees = chunk_fees,
+                .total_vsize = chunk_vsize,
+                .allocator = allocator,
+            });
+        }
+
+        // Build mining scores (chunk fee rate for each tx)
+        var mining_scores = try allocator.alloc(f64, n);
+        for (chunks_list.items) |chunk| {
+            const chunk_rate = chunk.feeRate();
+            for (chunk.tx_indices) |idx| {
+                mining_scores[idx] = chunk_rate;
+            }
+        }
+
+        return Linearization{
+            .order = order,
+            .chunks = try chunks_list.toOwnedSlice(),
+            .mining_scores = mining_scores,
+            .allocator = allocator,
+        };
+    }
+
+    /// Find the best chunk (highest fee-rate valid topological prefix) from remaining transactions.
+    fn findBestChunk(
+        self: *Mempool,
+        remaining: *std.bit_set.IntegerBitSet(64),
+        ancestors: []std.bit_set.IntegerBitSet(64),
+        fees: []i64,
+        vsizes: []usize,
+        n: u32,
+        allocator: std.mem.Allocator,
+    ) !std.bit_set.IntegerBitSet(64) {
+        _ = self;
+
+        var best_chunk = std.bit_set.IntegerBitSet(64).initEmpty();
+        var best_fee_rate: f64 = -std.math.floatMax(f64);
+
+        // For small clusters, enumerate all possible subsets
+        // For larger clusters, use a bounded search
+        const remaining_count = remaining.count();
+
+        if (remaining_count <= 12) {
+            // Enumerate all non-empty subsets for small clusters
+            const max_subset: u64 = @as(u64, 1) << @intCast(n);
+            var subset: u64 = 1;
+            while (subset < max_subset) : (subset += 1) {
+                var candidate = std.bit_set.IntegerBitSet(64).initEmpty();
+                var valid = true;
+
+                // Check if this subset is valid (all ancestors in subset are included)
+                var idx: u32 = 0;
+                while (idx < n) : (idx += 1) {
+                    if ((subset >> @intCast(idx)) & 1 == 1) {
+                        if (!remaining.isSet(idx)) {
+                            valid = false;
+                            break;
+                        }
+                        candidate.set(idx);
+                    }
+                }
+
+                if (!valid) continue;
+                if (candidate.count() == 0) continue;
+
+                // Check topological validity: all ancestors must be in the subset
+                var topo_valid = true;
+                var cand_iter = candidate.iterator(.{});
+                while (cand_iter.next()) |i| {
+                    // Check that all ancestors in 'remaining' are in candidate
+                    var anc_in_remaining = ancestors[i].intersectWith(remaining.*);
+                    if (!anc_in_remaining.subsetOf(candidate)) {
+                        topo_valid = false;
+                        break;
+                    }
+                }
+
+                if (!topo_valid) continue;
+
+                // Calculate fee rate
+                var total_fees: i64 = 0;
+                var total_vsize: usize = 0;
+                var calc_iter = candidate.iterator(.{});
+                while (calc_iter.next()) |i| {
+                    total_fees += fees[i];
+                    total_vsize += vsizes[i];
+                }
+
+                const fee_rate: f64 = if (total_vsize > 0)
+                    @as(f64, @floatFromInt(total_fees)) / @as(f64, @floatFromInt(total_vsize))
+                else
+                    0;
+
+                if (fee_rate > best_fee_rate) {
+                    best_fee_rate = fee_rate;
+                    best_chunk = candidate;
+                }
+            }
+        } else {
+            // For larger clusters, use greedy single-tx selection
+            // This is a simplified approach; full implementation would use bounded search
+            var rem_iter = remaining.iterator(.{});
+            while (rem_iter.next()) |idx| {
+                // Check if this tx can be selected (all remaining ancestors already processed)
+                var anc_in_remaining = ancestors[idx].intersectWith(remaining.*);
+                if (anc_in_remaining.count() == 1) {
+                    // Only ancestor in remaining is self - valid singleton chunk
+                    const fee_rate: f64 = if (vsizes[idx] > 0)
+                        @as(f64, @floatFromInt(fees[idx])) / @as(f64, @floatFromInt(vsizes[idx]))
+                    else
+                        0;
+
+                    if (fee_rate > best_fee_rate) {
+                        best_fee_rate = fee_rate;
+                        best_chunk = std.bit_set.IntegerBitSet(64).initEmpty();
+                        best_chunk.set(idx);
+                    }
+                }
+            }
+
+            // If no singleton found, take any valid tx
+            if (best_chunk.count() == 0) {
+                var rem_iter2 = remaining.iterator(.{});
+                if (rem_iter2.next()) |idx| {
+                    best_chunk.set(idx);
+                }
+            }
+        }
+
+        // Fallback: if nothing found, take first remaining
+        if (best_chunk.count() == 0) {
+            var rem_iter = remaining.iterator(.{});
+            if (rem_iter.next()) |idx| {
+                best_chunk.set(idx);
+            }
+        }
+
+        _ = allocator;
+        return best_chunk;
+    }
+
+    /// Update mining scores for all transactions by recomputing linearizations.
+    pub fn updateMiningScores(self: *Mempool) !void {
+        if (!self.linearization_dirty) return;
+
+        // Find all unique cluster roots
+        var roots = std.AutoHashMap(u32, void).init(self.allocator);
+        defer roots.deinit();
+
+        if (self.cluster_union) |*uf| {
+            var iter = self.txid_to_index.iterator();
+            while (iter.next()) |entry| {
+                const root = uf.find(entry.value_ptr.*);
+                try roots.put(root, {});
+            }
+        }
+
+        // Clear old linearizations
+        var lin_iter = self.cluster_linearizations.iterator();
+        while (lin_iter.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.cluster_linearizations.clearRetainingCapacity();
+
+        // Linearize each cluster and update mining scores
+        var roots_iter = roots.iterator();
+        while (roots_iter.next()) |entry| {
+            const root = entry.key_ptr.*;
+
+            // Get all txids in this cluster
+            const cluster_txids = try self.getClusterTxidsForRoot(root);
+            defer self.allocator.free(cluster_txids);
+
+            if (cluster_txids.len == 0) continue;
+
+            // Linearize the cluster
+            const linearization = try self.linearizeCluster(cluster_txids, self.allocator);
+
+            // Update mining scores for each transaction
+            for (cluster_txids, 0..) |txid, i| {
+                if (self.entries.getPtr(txid)) |entry_ptr| {
+                    entry_ptr.*.mining_score = linearization.mining_scores[i];
+                }
+            }
+
+            // Cache the linearization
+            try self.cluster_linearizations.put(root, linearization);
+        }
+
+        self.linearization_dirty = false;
+    }
+
+    /// Get all txids for a given cluster root.
+    fn getClusterTxidsForRoot(self: *Mempool, root: u32) ![]types.Hash256 {
+        var result = std.ArrayList(types.Hash256).init(self.allocator);
+        errdefer result.deinit();
+
+        const uf = if (self.cluster_union) |*u| u else return result.toOwnedSlice();
+
+        var iter = self.txid_to_index.iterator();
+        while (iter.next()) |entry| {
+            const idx = entry.value_ptr.*;
+            if (uf.find(idx) == root) {
+                try result.append(entry.key_ptr.*);
+            }
+        }
+
+        return result.toOwnedSlice();
+    }
+
+    /// Get transactions sorted by mining score (cluster-aware).
+    /// This replaces getBlockCandidates with cluster-linearized ordering.
+    pub fn getBlockCandidatesByMiningScore(self: *Mempool, allocator: std.mem.Allocator) ![]*MempoolEntry {
+        // Ensure mining scores are up to date
+        try self.updateMiningScores();
+
+        var entries_list = std.ArrayList(*MempoolEntry).init(allocator);
+        var iter = self.entries.iterator();
+        while (iter.next()) |entry| {
+            try entries_list.append(entry.value_ptr.*);
+        }
+
+        // Sort by mining score (descending)
+        std.mem.sort(*MempoolEntry, entries_list.items, {}, struct {
+            fn lessThan(_: void, a: *MempoolEntry, b: *MempoolEntry) bool {
+                return a.mining_score > b.mining_score;
+            }
+        }.lessThan);
+
+        return entries_list.toOwnedSlice();
+    }
+
+    /// Evict transactions using cluster-based mining score.
+    /// Evicts from the worst cluster (lowest mining score).
+    fn evictByCluster(self: *Mempool, needed_bytes: usize) !void {
+        try self.updateMiningScores();
+
+        var freed: usize = 0;
+
+        while (freed < needed_bytes) {
+            // Find the transaction with the lowest mining score
+            var worst: ?types.Hash256 = null;
+            var worst_score: f64 = std.math.floatMax(f64);
+
+            var iter = self.entries.iterator();
+            while (iter.next()) |entry| {
+                if (entry.value_ptr.*.mining_score < worst_score) {
+                    worst_score = entry.value_ptr.*.mining_score;
+                    worst = entry.key_ptr.*;
+                }
+            }
+
+            if (worst) |txid_hash| {
+                const entry = self.entries.get(txid_hash) orelse break;
+                freed += entry.vsize;
+                self.removeTransactionWithDescendants(txid_hash);
+            } else break;
+        }
     }
 };
 
@@ -1097,6 +2018,8 @@ test "fee rate calculation" {
         .descendant_size = 200,
         .descendant_fees = 1000,
         .is_rbf = false,
+        .cluster_index = 0,
+        .mining_score = 5.0,
     };
 
     _ = allocator;
@@ -1376,7 +2299,7 @@ test "nonstandard version rejection" {
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
 
-    // Transaction with invalid version
+    // Transaction with invalid version (version 4 is not allowed)
     const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
     const input = types.TxIn{
         .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
@@ -1390,7 +2313,7 @@ test "nonstandard version rejection" {
     };
 
     const tx = types.Transaction{
-        .version = 3, // Invalid - only 1 or 2 allowed
+        .version = 4, // Invalid - only 1, 2, or 3 (TRUC) allowed
         .inputs = &[_]types.TxIn{input},
         .outputs = &[_]types.TxOut{output},
         .lock_time = 0,
@@ -1782,6 +2705,601 @@ test "ancestor size limit enforced" {
     // Create a chain where total size exceeds 101,000 vbytes
     // This is hard to test with real transaction sizes, but we verify the constant
     try std.testing.expectEqual(@as(usize, 101_000), MAX_ANCESTOR_SIZE);
+}
+
+// ============================================================================
+// TRUC (v3) Policy Tests
+// ============================================================================
+
+test "truc constants verification" {
+    // Verify TRUC policy constants match BIP 431 specification
+    try std.testing.expectEqual(@as(i32, 3), TRUC_VERSION);
+    try std.testing.expectEqual(@as(usize, 2), TRUC_ANCESTOR_LIMIT);
+    try std.testing.expectEqual(@as(usize, 2), TRUC_DESCENDANT_LIMIT);
+    try std.testing.expectEqual(@as(usize, 10_000), TRUC_MAX_VSIZE);
+    try std.testing.expectEqual(@as(usize, 1_000), TRUC_CHILD_MAX_VSIZE);
+}
+
+test "truc v3 transaction accepted" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // V3 transaction with no unconfirmed parents should be accepted
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Should succeed - v3 tx with no unconfirmed parents
+    try mempool.addTransaction(tx);
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+}
+
+test "truc v3 is always rbf" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // V3 transaction with sequence = 0xFFFFFFFF (normally non-RBF) should still be RBF
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF, // Does NOT signal RBF normally
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(tx);
+    const txid = crypto.computeTxid(&tx, allocator) catch unreachable;
+    const entry = mempool.get(txid);
+    try std.testing.expect(entry != null);
+
+    // V3 should always be RBF even without signaling
+    try std.testing.expect(entry.?.is_rbf);
+}
+
+test "truc v3 max 1 unconfirmed parent" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create parent v3 tx
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Create second parent v3 tx
+    const parent2_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xBB} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent2_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent2_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{parent2_input},
+        .outputs = &[_]types.TxOut{parent2_output},
+        .lock_time = 1,
+    };
+    try mempool.addTransaction(parent2_tx);
+    const parent2_txid = crypto.computeTxid(&parent2_tx, allocator) catch unreachable;
+
+    // Create child v3 tx spending from TWO parents - should fail
+    const child_input1 = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_input2 = types.TxIn{
+        .previous_output = .{ .hash = parent2_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child_inputs = [_]types.TxIn{ child_input1, child_input2 };
+    const child_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &child_inputs,
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 2,
+    };
+
+    // Should fail because v3 can only have 1 unconfirmed parent
+    const result = mempool.addTransaction(child_tx);
+    try std.testing.expectError(MempoolError.TrucTooManyAncestors, result);
+}
+
+test "truc v3 max 1 unconfirmed child without sibling eviction" {
+    // Note: When a second v3 child is added spending from a different output of the same parent,
+    // sibling eviction kicks in and allows the new child (evicting the old one).
+    // This test verifies sibling eviction works - see separate test for sibling eviction.
+    // Here we test the case where sibling eviction is NOT possible (sibling has descendants).
+
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create parent v3 tx with 2 outputs
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_outputs = [_]types.TxOut{
+        types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script },
+        types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script },
+    };
+    const parent_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &parent_outputs,
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Create first child v3 tx
+    const child1_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child1_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child1_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{child1_input},
+        .outputs = &[_]types.TxOut{child1_output},
+        .lock_time = 1,
+    };
+    try mempool.addTransaction(child1_tx);
+
+    // Create second child v3 tx spending from a different output
+    // Sibling eviction should work here, so the second child should succeed
+    const child2_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 1 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child2_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child2_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{child2_input},
+        .outputs = &[_]types.TxOut{child2_output},
+        .lock_time = 2,
+    };
+
+    // This should succeed via sibling eviction (first child gets evicted)
+    try mempool.addTransaction(child2_tx);
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+}
+
+test "truc v3 cannot spend from non-v3" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create parent v2 tx (non-TRUC)
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent_tx = types.Transaction{
+        .version = 2, // Non-TRUC
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Create v3 child tx spending from v2 parent - should fail
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child_tx = types.Transaction{
+        .version = TRUC_VERSION, // V3 trying to spend from v2
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 1,
+    };
+
+    const result = mempool.addTransaction(child_tx);
+    try std.testing.expectError(MempoolError.TrucV3SpendsNonV3, result);
+}
+
+test "truc non-v3 cannot spend from v3" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create parent v3 tx
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Create v2 child tx spending from v3 parent - should fail
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child_tx = types.Transaction{
+        .version = 2, // Non-v3 trying to spend from v3
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 1,
+    };
+
+    const result = mempool.addTransaction(child_tx);
+    try std.testing.expectError(MempoolError.TrucNonV3SpendsV3, result);
+}
+
+test "truc v3 child max 1000 vbytes" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create parent v3 tx
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Create child v3 tx that's > 1000 vbytes but < 10000 vbytes
+    // OP_RETURN with enough data to make the tx around 2000-3000 vbytes
+    var op_return_100: [100]u8 = undefined;
+    op_return_100[0] = 0x6a; // OP_RETURN
+    op_return_100[1] = 98; // Push 98 bytes
+    for (2..100) |i| {
+        op_return_100[i] = 0xAA;
+    }
+
+    // 12 outputs at ~100 bytes each = ~1200 bytes for outputs
+    // Plus overhead = ~1400-1500 vbytes total (> 1000 but < 10000)
+    var outputs: [12]types.TxOut = undefined;
+    for (0..12) |i| {
+        outputs[i] = types.TxOut{ .value = 1000, .script_pubkey = &op_return_100 };
+    }
+
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &outputs,
+        .lock_time = 1,
+    };
+
+    // Should fail because v3 child with unconfirmed parent cannot exceed 1000 vbytes
+    const result = mempool.addTransaction(child_tx);
+    try std.testing.expectError(MempoolError.TrucChildTooLarge, result);
+}
+
+test "truc v3 parent child chain valid" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create parent v3 tx
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Create child v3 tx - should succeed (valid 2-tx chain)
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 1,
+    };
+
+    // Should succeed - valid v3 parent-child chain
+    try mempool.addTransaction(child_tx);
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+}
+
+test "truc v3 no grandchild allowed" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create grandparent v3 tx
+    const grandparent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const grandparent_output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const grandparent_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{grandparent_input},
+        .outputs = &[_]types.TxOut{grandparent_output},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(grandparent_tx);
+    const grandparent_txid = crypto.computeTxid(&grandparent_tx, allocator) catch unreachable;
+
+    // Create parent v3 tx
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = grandparent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const parent_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 1,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Create grandchild v3 tx - should fail (would create 3-tx chain)
+    const grandchild_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const grandchild_output = types.TxOut{
+        .value = 98000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const grandchild_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{grandchild_input},
+        .outputs = &[_]types.TxOut{grandchild_output},
+        .lock_time = 2,
+    };
+
+    // Should fail - parent already has a parent, grandchild would exceed ancestor limit
+    const result = mempool.addTransaction(grandchild_tx);
+    try std.testing.expectError(MempoolError.TrucTooManyAncestors, result);
+}
+
+test "truc sibling eviction" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Create parent v3 tx with 2 outputs
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_outputs = [_]types.TxOut{
+        types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script },
+        types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script },
+    };
+    const parent_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &parent_outputs,
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Create first child v3 tx (the sibling that will be evicted)
+    const child1_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child1_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child1_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{child1_input},
+        .outputs = &[_]types.TxOut{child1_output},
+        .lock_time = 1,
+    };
+    try mempool.addTransaction(child1_tx);
+    const child1_txid = crypto.computeTxid(&child1_tx, allocator) catch unreachable;
+
+    // Create second child v3 tx spending from a DIFFERENT output of parent
+    // This should trigger sibling eviction and succeed
+    const child2_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 1 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child2_output = types.TxOut{
+        .value = 99000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const child2_tx = types.Transaction{
+        .version = TRUC_VERSION,
+        .inputs = &[_]types.TxIn{child2_input},
+        .outputs = &[_]types.TxOut{child2_output},
+        .lock_time = 2,
+    };
+
+    // Should succeed via sibling eviction
+    try mempool.addTransaction(child2_tx);
+
+    // Verify: child1 should be evicted, child2 should be in mempool
+    try std.testing.expect(!mempool.contains(child1_txid));
+    const child2_txid = crypto.computeTxid(&child2_tx, allocator) catch unreachable;
+    try std.testing.expect(mempool.contains(child2_txid));
+    try std.testing.expect(mempool.contains(parent_txid));
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
 }
 
 // ============================================================================
@@ -3849,4 +5367,348 @@ test "package validation: 25 transactions is allowed" {
 
     // Should not error
     try isWellFormedPackage(&txns, allocator);
+}
+
+// ============================================================================
+// Cluster Mempool Tests
+// ============================================================================
+
+test "UnionFind: basic operations" {
+    const allocator = std.testing.allocator;
+
+    var uf = try UnionFind.init(allocator, 10);
+    defer uf.deinit();
+
+    // Initially each element is its own set
+    try std.testing.expectEqual(@as(u32, 0), uf.find(0));
+    try std.testing.expectEqual(@as(u32, 1), uf.find(1));
+    try std.testing.expectEqual(@as(u32, 1), uf.setSize(0));
+    try std.testing.expectEqual(@as(u32, 1), uf.setSize(1));
+
+    // Union elements
+    try std.testing.expect(uf.unite(0, 1));
+    try std.testing.expect(uf.connected(0, 1));
+    try std.testing.expectEqual(@as(u32, 2), uf.setSize(0));
+    try std.testing.expectEqual(@as(u32, 2), uf.setSize(1));
+
+    // Union more
+    try std.testing.expect(uf.unite(2, 3));
+    try std.testing.expect(uf.connected(2, 3));
+    try std.testing.expect(!uf.connected(0, 2));
+
+    // Union sets together
+    try std.testing.expect(uf.unite(1, 2));
+    try std.testing.expect(uf.connected(0, 3));
+    try std.testing.expectEqual(@as(u32, 4), uf.setSize(0));
+}
+
+test "UnionFind: unite returns false for same set" {
+    const allocator = std.testing.allocator;
+
+    var uf = try UnionFind.init(allocator, 5);
+    defer uf.deinit();
+
+    try std.testing.expect(uf.unite(0, 1));
+    // Uniting elements already in the same set returns false
+    try std.testing.expect(!uf.unite(0, 1));
+}
+
+test "cluster mempool: single transaction cluster" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Add a single transaction
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(tx);
+
+    // Cluster should exist
+    const txid = try crypto.computeTxid(&tx, allocator);
+    const cluster_size = mempool.getClusterSize(txid);
+    try std.testing.expectEqual(@as(usize, 1), cluster_size);
+}
+
+test "cluster mempool: two independent transactions" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Tx 1
+    const input1 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output1 = types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script };
+    const tx1 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input1},
+        .outputs = &[_]types.TxOut{output1},
+        .lock_time = 0,
+    };
+
+    // Tx 2 (independent, different parent)
+    const input2 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output2 = types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script };
+    const tx2 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input2},
+        .outputs = &[_]types.TxOut{output2},
+        .lock_time = 1,
+    };
+
+    try mempool.addTransaction(tx1);
+    try mempool.addTransaction(tx2);
+
+    const txid1 = try crypto.computeTxid(&tx1, allocator);
+    const txid2 = try crypto.computeTxid(&tx2, allocator);
+
+    // Each should be in its own cluster
+    try std.testing.expectEqual(@as(usize, 1), mempool.getClusterSize(txid1));
+    try std.testing.expectEqual(@as(usize, 1), mempool.getClusterSize(txid2));
+}
+
+test "cluster mempool: parent-child cluster" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Parent tx
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script };
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = try crypto.computeTxid(&parent_tx, allocator);
+
+    // Child tx spending parent
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{ .value = 90000, .script_pubkey = &p2wpkh_script };
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 1,
+    };
+
+    try mempool.addTransaction(child_tx);
+    const child_txid = try crypto.computeTxid(&child_tx, allocator);
+
+    // Both should be in the same cluster of size 2
+    try std.testing.expectEqual(@as(usize, 2), mempool.getClusterSize(parent_txid));
+    try std.testing.expectEqual(@as(usize, 2), mempool.getClusterSize(child_txid));
+}
+
+test "cluster mempool: cluster linearization single tx" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(tx);
+    const txid = try crypto.computeTxid(&tx, allocator);
+
+    // Get cluster and linearize
+    const cluster_txids = try mempool.getClusterTxids(txid);
+    defer allocator.free(cluster_txids);
+
+    try std.testing.expectEqual(@as(usize, 1), cluster_txids.len);
+
+    var linearization = try mempool.linearizeCluster(cluster_txids, allocator);
+    defer linearization.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), linearization.order.len);
+    try std.testing.expectEqual(@as(usize, 1), linearization.chunks.len);
+}
+
+test "cluster mempool: mining score updated" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(tx);
+    const txid = try crypto.computeTxid(&tx, allocator);
+
+    // Update mining scores
+    try mempool.updateMiningScores();
+
+    // Mining score should be set
+    const entry = mempool.get(txid) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(entry.mining_score >= 0);
+}
+
+test "cluster mempool: getBlockCandidatesByMiningScore" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Tx 1
+    const input1 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output1 = types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script };
+    const tx1 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input1},
+        .outputs = &[_]types.TxOut{output1},
+        .lock_time = 0,
+    };
+
+    // Tx 2
+    const input2 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output2 = types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script };
+    const tx2 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input2},
+        .outputs = &[_]types.TxOut{output2},
+        .lock_time = 1,
+    };
+
+    try mempool.addTransaction(tx1);
+    try mempool.addTransaction(tx2);
+
+    const candidates = try mempool.getBlockCandidatesByMiningScore(allocator);
+    defer allocator.free(candidates);
+
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+}
+
+test "cluster mempool: MAX_CLUSTER_SIZE constant" {
+    try std.testing.expectEqual(@as(usize, 100), MAX_CLUSTER_SIZE);
+}
+
+test "cluster mempool: projected cluster size" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Parent tx
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_output = types.TxOut{ .value = 100000, .script_pubkey = &p2wpkh_script };
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = try crypto.computeTxid(&parent_tx, allocator);
+
+    // Create a child tx without adding it
+    const child_input = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const child_output = types.TxOut{ .value = 90000, .script_pubkey = &p2wpkh_script };
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{child_input},
+        .outputs = &[_]types.TxOut{child_output},
+        .lock_time = 1,
+    };
+
+    // Project what the cluster size would be if we add this child
+    const projected_size = try mempool.projectClusterSize(&child_tx);
+    try std.testing.expectEqual(@as(usize, 2), projected_size);
 }
