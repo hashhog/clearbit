@@ -57,7 +57,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Output descriptors (BIP-380/381/382/383/384/385/386, recursive parser, BCH checksum, WIF/xpub/xprv key derivation, RPCs)
 - [x] Miniscript (AST, type system B/V/K/W, wrappers, script compilation, satisfaction, witness analysis)
 - [x] BIP-133 feefilter (per-peer fee filters, Poisson delay, hysteresis, incremental relay fee)
-- [x] BIP-330 Erlay (set reconciliation for tx relay, Minisketch, SipHash short IDs, negotiation)
+- [x] BIP-330 Erlay (set reconciliation for tx relay, libminisketch FFI @cImport, SipHash short IDs, negotiation)
 - [x] Tor/I2P proxy support (SOCKS5 RFC 1928, Tor control for hidden services, I2P SAM v3.1)
 - [x] Chain management RPCs (invalidateblock, reconsiderblock, preciousblock with BFS descendant marking)
 - [x] PSBT (BIP-174/370 partially signed transactions, Creator/Updater/Signer/Combiner/Finalizer/Extractor roles, Base64, RPCs)
@@ -129,4 +129,5 @@ zig build test --summary all      # run tests with detailed summary
 # Optional tests with external dependencies:
 zig build -Drocksdb=true test     # include RocksDB storage tests
 zig build -Dsecp256k1=true test   # include wallet/crypto tests
+zig build -Dminisketch=true test  # include Erlay/minisketch FFI tests
 ```
