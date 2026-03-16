@@ -36,7 +36,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Mempool (full RBF with BIP-125 rules, ancestor/descendant limits, dust detection, eviction)
 - [x] Package relay (BIP-331 package validation, CPFP fee bumping, child-with-parents)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
-- [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness, locktime validation)
+- [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness, locktime validation, anti-fee-sniping)
 - [x] Regtest mining (generatetoaddress, generatetodescriptor, generateblock RPCs for instant block generation)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic Auth, batch requests, mining, sendrawtransaction, getmempoolentry)
 - [x] Wallet (BIP32 HD keys, P2PKH/P2SH-P2WPKH/P2WPKH/P2TR, BnB+Knapsack coin selection, tx signing)
