@@ -534,7 +534,8 @@ pub fn checkBlock(
     }
 }
 
-/// Connect a block to the chain, performing full validation including sigop counting.
+/// Connect a block to the chain, performing full validation including sigop counting
+/// and BIP-68 sequence lock enforcement.
 /// This function requires UTXO access to count P2SH and witness sigops.
 ///
 /// Returns the total fees collected by the block.
@@ -544,7 +545,9 @@ pub fn connectBlock(
     block: *const types.Block,
     height: u32,
     params: *const consensus.NetworkParams,
-    utxo_view: *const SigopUtxoView,
+    sigop_view: *const SigopUtxoView,
+    sequence_view: ?*const UtxoView,
+    tip: ?*const BlockIndex,
 ) ValidationError!i64 {
     // Get script verification flags for this block height
     const flags = getBlockScriptFlags(height, params);
@@ -560,10 +563,23 @@ pub fn connectBlock(
         // * legacy (always)
         // * p2sh (when P2SH enabled in flags and excludes coinbase)
         // * witness (when witness enabled in flags and excludes coinbase)
-        total_sigops_cost += getTransactionSigOpCost(tx, utxo_view, flags);
+        total_sigops_cost += getTransactionSigOpCost(tx, sigop_view, flags);
 
         if (total_sigops_cost > consensus.MAX_BLOCK_SIGOPS_COST) {
             return ValidationError.TooManySigops;
+        }
+
+        // BIP-68: Check sequence locks for non-coinbase transactions
+        // Reference: Bitcoin Core validation.cpp ConnectBlock() calls SequenceLocks()
+        if (!tx.isCoinbase()) {
+            if (sequence_view) |sv| {
+                if (tip) |t| {
+                    const lock_result = calculateSequenceLocks(tx, sv, height, params);
+                    if (!checkSequenceLocks(lock_result, t)) {
+                        return ValidationError.SequenceLockNotSatisfied;
+                    }
+                }
+            }
         }
 
         // TODO: Add fee calculation here when we have full transaction validation
@@ -1641,6 +1657,230 @@ test "checkSequenceLocks passes with no constraints" {
     };
 
     try std.testing.expect(checkSequenceLocks(result, &tip));
+}
+
+// ============================================================================
+// connectBlock BIP-68 Enforcement Tests
+// ============================================================================
+
+fn emptySigopLookup(_: *anyopaque, _: *const types.OutPoint) ?[]const u8 {
+    return null;
+}
+
+test "connectBlock enforces BIP-68 sequence locks" {
+    var utxos = std.AutoHashMap([36]u8, UtxoInfo).init(std.testing.allocator);
+    defer utxos.deinit();
+
+    // Add UTXO at height 100
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &([_]u8{0x11} ** 32));
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    try utxos.put(key, UtxoInfo{ .height = 100, .mtp = 1000000 });
+
+    const sequence_view = UtxoView{
+        .context = @ptrCast(&utxos),
+        .lookupFn = testUtxoLookup,
+    };
+
+    const sigop_view = SigopUtxoView{
+        .context = undefined,
+        .lookupFn = emptySigopLookup,
+    };
+
+    // Create a coinbase transaction
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const coinbase_output = types.TxOut{
+        .value = 50_000_000_000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+
+    // Create a regular transaction with a 10-block relative lock
+    const regular_input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 10, // 10 block relative lock, BIP-68 active
+        .witness = &[_][]const u8{},
+    };
+
+    const regular_output = types.TxOut{
+        .value = 40_000_000_000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
+    const regular_tx = types.Transaction{
+        .version = 2, // Version 2 enables BIP-68
+        .inputs = &[_]types.TxIn{regular_input},
+        .outputs = &[_]types.TxOut{regular_output},
+        .lock_time = 0,
+    };
+
+    // Build a block with both transactions
+    const block_header = types.BlockHeader{
+        .version = 0x20000000,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1000100,
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+
+    const block = types.Block{
+        .header = block_header,
+        .transactions = &[_]types.Transaction{ coinbase_tx, regular_tx },
+    };
+
+    // Case 1: Block at height 109 (min_height = 100 + 10 - 1 = 109, need > 109)
+    // Should fail because height 109 is not > 109
+    const tip_too_low = BlockIndex{
+        .height = 109,
+        .prev_mtp = 2000000, // High enough for any time constraint
+    };
+
+    // Height 500000 is after CSV activation (419328 on mainnet)
+    const result_fail = connectBlock(&block, 500000, &consensus.MAINNET, &sigop_view, &sequence_view, &tip_too_low);
+    try std.testing.expectError(ValidationError.SequenceLockNotSatisfied, result_fail);
+
+    // Case 2: Block at height 110 (> 109) should pass
+    const tip_ok = BlockIndex{
+        .height = 110,
+        .prev_mtp = 2000000,
+    };
+
+    const result_ok = connectBlock(&block, 500000, &consensus.MAINNET, &sigop_view, &sequence_view, &tip_ok);
+    try std.testing.expect(result_ok != error.SequenceLockNotSatisfied);
+}
+
+test "connectBlock allows coinbase transactions regardless of sequence" {
+    const sigop_view = SigopUtxoView{
+        .context = undefined,
+        .lookupFn = emptySigopLookup,
+    };
+
+    // Coinbase with arbitrary sequence (should be ignored for BIP-68)
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 10, // Would be a lock if this were a normal tx
+        .witness = &[_][]const u8{},
+    };
+
+    const coinbase_output = types.TxOut{
+        .value = 50_000_000_000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
+    const coinbase_tx = types.Transaction{
+        .version = 2, // Even with version 2
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+
+    const block_header = types.BlockHeader{
+        .version = 0x20000000,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1000100,
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+
+    const block = types.Block{
+        .header = block_header,
+        .transactions = &[_]types.Transaction{coinbase_tx},
+    };
+
+    const tip = BlockIndex{
+        .height = 1, // Very low height
+        .prev_mtp = 0,
+    };
+
+    // Should pass - coinbase transactions are exempt from BIP-68
+    // (sequence_view is null, so no BIP-68 check happens at all)
+    _ = try connectBlock(&block, 500000, &consensus.MAINNET, &sigop_view, null, &tip);
+}
+
+test "connectBlock skips BIP-68 when views are null" {
+    const sigop_view = SigopUtxoView{
+        .context = undefined,
+        .lookupFn = emptySigopLookup,
+    };
+
+    // Create a transaction that would fail BIP-68 if checked
+    const regular_input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 10, // Would require 10 blocks
+        .witness = &[_][]const u8{},
+    };
+
+    const regular_output = types.TxOut{
+        .value = 40_000_000_000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
+    const regular_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{regular_input},
+        .outputs = &[_]types.TxOut{regular_output},
+        .lock_time = 0,
+    };
+
+    // Need coinbase as first tx
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const coinbase_output = types.TxOut{
+        .value = 50_000_000_000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+
+    const block_header = types.BlockHeader{
+        .version = 0x20000000,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1000100,
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+
+    const block = types.Block{
+        .header = block_header,
+        .transactions = &[_]types.Transaction{ coinbase_tx, regular_tx },
+    };
+
+    // With null sequence_view and tip, BIP-68 check is skipped
+    _ = try connectBlock(&block, 500000, &consensus.MAINNET, &sigop_view, null, null);
 }
 
 // ============================================================================
