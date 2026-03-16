@@ -33,8 +33,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Block download and IBD (parallel downloads, UTXO updates, timeout handling)
 - [x] UTXO set manager (compact storage, caching, block connect/disconnect)
 - [x] Chain state tracking (reorg support, undo data with rev*.dat file persistence)
-- [x] Mempool (full RBF with BIP-125 rules, ancestor/descendant limits, dust detection, eviction)
-- [x] Package relay (BIP-331 package validation, CPFP fee bumping, child-with-parents)
+- [x] Mempool (full RBF, TRUC v3 policy, cluster linearization, mining score, eviction)
+- [x] Package relay (BIP-331 messages, CPFP, child-with-parents, ancpkginfo/getpkgtxns/pkgtxns)
 - [x] Fee estimation (confirmation tracking, exponential buckets, decay)
 - [x] Block template construction (getblocktemplate, BIP-34 coinbase, BIP-141 witness, locktime validation, anti-fee-sniping)
 - [x] Regtest mining (generatetoaddress, generatetodescriptor, generateblock RPCs for instant block generation)
@@ -61,6 +61,8 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Tor/I2P proxy support (SOCKS5 RFC 1928, Tor control for hidden services, I2P SAM v3.1)
 - [x] Chain management RPCs (invalidateblock, reconsiderblock, preciousblock with BFS descendant marking)
 - [x] PSBT (BIP-174/370 partially signed transactions, Creator/Updater/Signer/Combiner/Finalizer/Extractor roles, Base64, RPCs)
+- [x] assumeUTXO (snapshot loading, verification, fast sync from trusted snapshots)
+- [x] Stale peer eviction (chain sync timeout, block download timeout, ping timeout)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 
 ## Quick start
