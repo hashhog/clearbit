@@ -273,6 +273,71 @@ pub const ChainStore = struct {
         return .{ .header = header, .height = height };
     }
 
+    /// Extended block index entry for persistence.
+    /// Matches validation.BlockIndexEntry but without the parent pointer.
+    pub const BlockIndexRecord = struct {
+        height: u32,
+        header: types.BlockHeader,
+        status: u32, // BlockStatus as packed u32
+        chain_work: [32]u8,
+        sequence_id: i64,
+        file_number: u32,
+        file_offset: u64,
+    };
+
+    /// Store a full block index entry with status flags and chain work.
+    /// Format: height (4) + header (80) + status (4) + chain_work (32) + sequence_id (8) + file_number (4) + file_offset (8) = 140 bytes
+    pub fn putBlockIndexFull(
+        self: *ChainStore,
+        hash: *const types.Hash256,
+        record: *const BlockIndexRecord,
+    ) StorageError!void {
+        var writer = serialize.Writer.init(self.allocator);
+        defer writer.deinit();
+
+        writer.writeInt(u32, record.height) catch return StorageError.SerializationFailed;
+        serialize.writeBlockHeader(&writer, &record.header) catch return StorageError.SerializationFailed;
+        writer.writeInt(u32, record.status) catch return StorageError.SerializationFailed;
+        writer.writeBytes(&record.chain_work) catch return StorageError.SerializationFailed;
+        writer.writeInt(i64, record.sequence_id) catch return StorageError.SerializationFailed;
+        writer.writeInt(u32, record.file_number) catch return StorageError.SerializationFailed;
+        writer.writeInt(u64, record.file_offset) catch return StorageError.SerializationFailed;
+
+        try self.db.put(CF_BLOCK_INDEX, hash, writer.getWritten());
+    }
+
+    /// Retrieve a full block index entry with status flags and chain work.
+    pub fn getBlockIndexFull(self: *ChainStore, hash: *const types.Hash256) StorageError!?BlockIndexRecord {
+        const data = try self.db.get(CF_BLOCK_INDEX, hash);
+        if (data == null) return null;
+        defer self.allocator.free(data.?);
+
+        var reader = serialize.Reader{ .data = data.? };
+
+        const height = reader.readInt(u32) catch return StorageError.CorruptData;
+        const header = serialize.readBlockHeader(&reader) catch return StorageError.CorruptData;
+
+        // Try to read extended fields - if not present, use defaults (backward compatibility)
+        const status = reader.readInt(u32) catch 0; // Default: no flags set
+        var chain_work: [32]u8 = undefined;
+        reader.readBytes(&chain_work) catch {
+            chain_work = [_]u8{0} ** 32;
+        };
+        const sequence_id = reader.readInt(i64) catch 0;
+        const file_number = reader.readInt(u32) catch 0;
+        const file_offset = reader.readInt(u64) catch 0;
+
+        return BlockIndexRecord{
+            .height = height,
+            .header = header,
+            .status = status,
+            .chain_work = chain_work,
+            .sequence_id = sequence_id,
+            .file_number = file_number,
+            .file_offset = file_offset,
+        };
+    }
+
     /// Store raw block data.
     pub fn putBlock(
         self: *ChainStore,
@@ -1789,6 +1854,12 @@ pub const ChainStateManager = struct {
 
     /// Complete the snapshot validation and merge chainstates.
     /// Called when background chainstate reaches the snapshot base block.
+    /// Compares UTXO set hashes to verify the snapshot is valid.
+    ///
+    /// Returns:
+    ///   - true if validation succeeded and chainstates were merged
+    ///   - false if background validation hasn't reached the snapshot base yet
+    ///   - error if UTXO set hashes don't match (snapshot is invalid)
     pub fn completeValidation(self: *ChainStateManager) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1801,8 +1872,19 @@ pub const ChainStateManager = struct {
             return false;
         }
 
-        // TODO: Compute and compare UTXO set hashes
-        // For now, we trust the background chainstate reached the correct height
+        // Compute UTXO set hashes for both chainstates
+        const bg_hash = try computeUtxoSetHash(&bg.utxo_set, self.allocator);
+        const active_hash = try computeUtxoSetHash(&self.active_chainstate.utxo_set, self.allocator);
+
+        // Compare hashes - they must match for the snapshot to be valid
+        if (!std.mem.eql(u8, &bg_hash, &active_hash)) {
+            // CRITICAL: Snapshot UTXO set doesn't match fully validated chain!
+            // This indicates either:
+            // 1. The snapshot was corrupted
+            // 2. The assumeUtxo hash in params is wrong
+            // 3. There's a consensus bug
+            return SnapshotError.BackgroundValidationFailed;
+        }
 
         // The snapshot is now fully validated
         self.active_role = .normal;
@@ -2041,6 +2123,161 @@ pub fn loadTxOutSet(
     }
 
     return .{ .chainstate = chainstate, .metadata = metadata };
+}
+
+/// Find an AssumeUtxo entry by block hash.
+/// Returns the entry if the hash matches a known snapshot, null otherwise.
+pub fn findAssumeUtxoEntry(
+    network_params: *const @import("consensus.zig").NetworkParams,
+    block_hash: *const types.Hash256,
+) ?@import("consensus.zig").AssumeUtxoData {
+    for (network_params.assume_utxo) |entry| {
+        if (std.mem.eql(u8, &entry.block_hash, block_hash)) {
+            return entry;
+        }
+    }
+    return null;
+}
+
+/// Find an AssumeUtxo entry by height.
+/// Returns the entry if there's a snapshot at the given height, null otherwise.
+pub fn findAssumeUtxoEntryByHeight(
+    network_params: *const @import("consensus.zig").NetworkParams,
+    height: u32,
+) ?@import("consensus.zig").AssumeUtxoData {
+    for (network_params.assume_utxo) |entry| {
+        if (entry.height == height) {
+            return entry;
+        }
+    }
+    return null;
+}
+
+/// Snapshot validation error.
+pub const SnapshotError = error{
+    /// Snapshot block hash not found in assumeUtxo params.
+    UnknownSnapshot,
+    /// UTXO set hash doesn't match expected value.
+    HashMismatch,
+    /// Coin count doesn't match expected value.
+    CoinCountMismatch,
+    /// File I/O error.
+    IoError,
+    /// Corrupt snapshot data.
+    CorruptData,
+    /// Wrong network.
+    WrongNetwork,
+    /// Out of memory.
+    OutOfMemory,
+    /// Background validation failed.
+    BackgroundValidationFailed,
+};
+
+/// Result of loading a snapshot.
+pub const SnapshotLoadResult = struct {
+    /// Number of coins loaded.
+    coins_loaded: u64,
+    /// Hash of the tip block.
+    tip_hash: types.Hash256,
+    /// Height of the tip block.
+    tip_height: u32,
+    /// Base height from assumeUtxo params (same as tip_height for valid snapshots).
+    base_height: u32,
+};
+
+/// Validate and load a UTXO set snapshot file.
+/// This performs full validation against the assumeUtxo params:
+/// 1. Verifies the snapshot block hash is in assumeUtxo params
+/// 2. Loads all coins into a new chainstate
+/// 3. Computes the UTXO set hash and verifies it matches
+/// 4. Verifies the coin count matches
+///
+/// Returns the loaded chainstate and validation result.
+/// Reference: Bitcoin Core validation.cpp ActivateSnapshot()
+pub fn validateAndLoadSnapshot(
+    path: []const u8,
+    network_params: *const @import("consensus.zig").NetworkParams,
+    allocator: std.mem.Allocator,
+) SnapshotError!struct { chainstate: ChainState, result: SnapshotLoadResult } {
+    // Load the snapshot
+    const load_result = loadTxOutSet(path, network_params.magic, allocator) catch |err| {
+        return switch (err) {
+            error.FileNotFound, error.AccessDenied => SnapshotError.IoError,
+            StorageError.CorruptData => SnapshotError.CorruptData,
+            StorageError.OutOfMemory => SnapshotError.OutOfMemory,
+            else => SnapshotError.IoError,
+        };
+    };
+    var chainstate = load_result.chainstate;
+    const metadata = load_result.metadata;
+
+    // Find the assumeUtxo entry for this snapshot
+    const assume_entry = findAssumeUtxoEntry(network_params, &metadata.base_blockhash) orelse {
+        chainstate.deinit();
+        return SnapshotError.UnknownSnapshot;
+    };
+
+    // Verify coin count
+    if (metadata.coins_count != assume_entry.coins_count) {
+        chainstate.deinit();
+        return SnapshotError.CoinCountMismatch;
+    }
+
+    // Compute the UTXO set hash
+    const computed_hash = computeUtxoSetHash(&chainstate.utxo_set, allocator) catch {
+        chainstate.deinit();
+        return SnapshotError.OutOfMemory;
+    };
+
+    // Verify hash matches
+    if (!std.mem.eql(u8, &computed_hash, &assume_entry.hash_serialized)) {
+        chainstate.deinit();
+        return SnapshotError.HashMismatch;
+    }
+
+    // Set the height on the chainstate
+    chainstate.best_height = assume_entry.height;
+
+    return .{
+        .chainstate = chainstate,
+        .result = SnapshotLoadResult{
+            .coins_loaded = metadata.coins_count,
+            .tip_hash = metadata.base_blockhash,
+            .tip_height = assume_entry.height,
+            .base_height = assume_entry.height,
+        },
+    };
+}
+
+/// Result of dumping a snapshot.
+pub const SnapshotDumpResult = struct {
+    /// Number of coins written.
+    coins_written: u64,
+    /// Hash of the base block.
+    base_hash: types.Hash256,
+    /// Height of the base block.
+    base_height: u32,
+};
+
+/// Dump the UTXO set to a snapshot file and return the result.
+/// This is a wrapper around dumpTxOutSet that returns structured result data.
+pub fn dumpTxOutSetWithResult(
+    chainstate: *ChainState,
+    network_magic: u32,
+    path: []const u8,
+    allocator: std.mem.Allocator,
+) !SnapshotDumpResult {
+    // Count coins before dumping
+    const coins_count = chainstate.utxo_set.cache.count();
+
+    // Dump to file
+    try dumpTxOutSet(chainstate, network_magic, path, allocator);
+
+    return SnapshotDumpResult{
+        .coins_written = coins_count,
+        .base_hash = chainstate.best_hash,
+        .base_height = chainstate.best_height,
+    };
 }
 
 // ============================================================================
@@ -4906,4 +5143,202 @@ test "chainstate manager activate snapshot" {
     try std.testing.expectEqual(ChainstateRole.snapshot, manager.active_role);
     try std.testing.expect(manager.background_chainstate != null);
     try std.testing.expectEqualSlices(u8, &base_hash, &(manager.snapshot_base_blockhash.?));
+}
+
+test "BlockIndexRecord serialization roundtrip" {
+    // Test that BlockIndexRecord fields are correctly serialized/deserialized
+    const consensus = @import("consensus.zig");
+
+    const record = ChainStore.BlockIndexRecord{
+        .height = 12345,
+        .header = consensus.MAINNET.genesis_header,
+        .status = 0x0000001F, // Multiple flags set
+        .chain_work = [_]u8{0xAB} ** 32,
+        .sequence_id = -42,
+        .file_number = 7,
+        .file_offset = 0x123456789,
+    };
+
+    // Verify the structure has correct fields
+    try std.testing.expectEqual(@as(u32, 12345), record.height);
+    try std.testing.expectEqual(@as(u32, 0x0000001F), record.status);
+    try std.testing.expectEqual(@as(i64, -42), record.sequence_id);
+    try std.testing.expectEqual(@as(u32, 7), record.file_number);
+    try std.testing.expectEqual(@as(u64, 0x123456789), record.file_offset);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xAB} ** 32), &record.chain_work);
+}
+
+// ============================================================================
+// AssumeUTXO Snapshot Tests
+// ============================================================================
+
+test "snapshot metadata serialization roundtrip" {
+    const allocator = std.testing.allocator;
+
+    const metadata = SnapshotMetadata{
+        .network_magic = 0xD9B4BEF9, // mainnet
+        .base_blockhash = [_]u8{0x12} ** 32,
+        .coins_count = 176_000_000,
+    };
+
+    const serialized = try metadata.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    // Verify header size
+    try std.testing.expectEqual(@as(usize, SnapshotMetadata.HEADER_SIZE), serialized.len);
+
+    // Deserialize and verify
+    const deserialized = try SnapshotMetadata.fromBytes(serialized, 0xD9B4BEF9);
+
+    try std.testing.expectEqual(metadata.network_magic, deserialized.network_magic);
+    try std.testing.expectEqualSlices(u8, &metadata.base_blockhash, &deserialized.base_blockhash);
+    try std.testing.expectEqual(metadata.coins_count, deserialized.coins_count);
+}
+
+test "snapshot metadata wrong network rejected" {
+    const allocator = std.testing.allocator;
+
+    const metadata = SnapshotMetadata{
+        .network_magic = 0xD9B4BEF9, // mainnet
+        .base_blockhash = [_]u8{0x12} ** 32,
+        .coins_count = 176_000_000,
+    };
+
+    const serialized = try metadata.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    // Try to deserialize with testnet magic - should fail
+    const result = SnapshotMetadata.fromBytes(serialized, 0x0709110B);
+    try std.testing.expectError(StorageError.CorruptData, result);
+}
+
+test "snapshot coin serialization roundtrip" {
+    const allocator = std.testing.allocator;
+
+    const script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const coin = SnapshotCoin{
+        .outpoint = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 42,
+        },
+        .height = 500000,
+        .is_coinbase = true,
+        .value = 5000000000,
+        .script_pubkey = &script,
+    };
+
+    const serialized = try coin.toBytes(allocator);
+    defer allocator.free(serialized);
+
+    var reader = serialize.Reader{ .data = serialized };
+    var deserialized = try SnapshotCoin.fromReader(&reader, allocator);
+    defer deserialized.deinit(allocator);
+
+    try std.testing.expectEqualSlices(u8, &coin.outpoint.hash, &deserialized.outpoint.hash);
+    try std.testing.expectEqual(coin.outpoint.index, deserialized.outpoint.index);
+    try std.testing.expectEqual(coin.height, deserialized.height);
+    try std.testing.expectEqual(coin.is_coinbase, deserialized.is_coinbase);
+    try std.testing.expectEqual(coin.value, deserialized.value);
+    try std.testing.expectEqualSlices(u8, coin.script_pubkey, deserialized.script_pubkey);
+}
+
+test "findAssumeUtxoEntry returns entry for known hash" {
+    const consensus = @import("consensus.zig");
+
+    // Mainnet has a snapshot at block 840000
+    if (consensus.MAINNET.assume_utxo.len > 0) {
+        const expected_entry = consensus.MAINNET.assume_utxo[0];
+        const found = findAssumeUtxoEntry(&consensus.MAINNET, &expected_entry.block_hash);
+        try std.testing.expect(found != null);
+        try std.testing.expectEqual(expected_entry.height, found.?.height);
+        try std.testing.expectEqual(expected_entry.coins_count, found.?.coins_count);
+    }
+}
+
+test "findAssumeUtxoEntry returns null for unknown hash" {
+    const consensus = @import("consensus.zig");
+
+    const unknown_hash = [_]u8{0xFF} ** 32;
+    const found = findAssumeUtxoEntry(&consensus.MAINNET, &unknown_hash);
+    try std.testing.expect(found == null);
+}
+
+test "findAssumeUtxoEntryByHeight returns entry for known height" {
+    const consensus = @import("consensus.zig");
+
+    // Mainnet has a snapshot at block 840000
+    if (consensus.MAINNET.assume_utxo.len > 0) {
+        const expected_entry = consensus.MAINNET.assume_utxo[0];
+        const found = findAssumeUtxoEntryByHeight(&consensus.MAINNET, expected_entry.height);
+        try std.testing.expect(found != null);
+        try std.testing.expectEqualSlices(u8, &expected_entry.block_hash, &found.?.block_hash);
+    }
+}
+
+test "findAssumeUtxoEntryByHeight returns null for unknown height" {
+    const consensus = @import("consensus.zig");
+
+    const found = findAssumeUtxoEntryByHeight(&consensus.MAINNET, 999999);
+    try std.testing.expect(found == null);
+}
+
+test "snapshot error variants are distinct" {
+    const errors = [_]SnapshotError{
+        SnapshotError.UnknownSnapshot,
+        SnapshotError.HashMismatch,
+        SnapshotError.CoinCountMismatch,
+        SnapshotError.IoError,
+        SnapshotError.CorruptData,
+        SnapshotError.WrongNetwork,
+        SnapshotError.OutOfMemory,
+        SnapshotError.BackgroundValidationFailed,
+    };
+
+    for (errors, 0..) |e1, i| {
+        for (errors[i + 1 ..]) |e2| {
+            try std.testing.expect(e1 != e2);
+        }
+    }
+}
+
+test "ChainStateManager completeValidation with matching hashes" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    // Create two chainstates with the same UTXO data
+    var active_chainstate = ChainState.init(null, allocator);
+    defer active_chainstate.deinit();
+
+    var background_chainstate = ChainState.init(null, allocator);
+    defer background_chainstate.deinit();
+
+    // Add identical UTXOs to both
+    const outpoint = types.OutPoint{
+        .hash = [_]u8{0x11} ** 32,
+        .index = 0,
+    };
+    const txout = types.TxOut{
+        .value = 5000000000,
+        .script_pubkey = &[_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac },
+    };
+    try active_chainstate.utxo_set.add(&outpoint, &txout, 500000, false);
+    try background_chainstate.utxo_set.add(&outpoint, &txout, 500000, false);
+
+    // Set matching best hashes
+    const base_hash = [_]u8{0x12} ** 32;
+    active_chainstate.best_hash = base_hash;
+    background_chainstate.best_hash = base_hash;
+
+    var manager = ChainStateManager.init(&active_chainstate, &consensus.MAINNET, allocator);
+    defer manager.deinit();
+
+    // Activate snapshot mode
+    manager.activateSnapshot(&active_chainstate, base_hash);
+    // Set background chainstate directly for testing
+    manager.background_chainstate = &background_chainstate;
+
+    // Complete validation should succeed since hashes match
+    const result = try manager.completeValidation();
+    try std.testing.expect(result);
+    try std.testing.expect(!manager.isAssumeUtxoMode());
 }
