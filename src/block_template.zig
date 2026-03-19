@@ -18,6 +18,7 @@ const crypto = @import("crypto.zig");
 const mempool_mod = @import("mempool.zig");
 const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
+const validation = @import("validation.zig");
 
 // ============================================================================
 // Block Template
@@ -642,8 +643,22 @@ pub fn submitBlock(
     params: *const consensus.NetworkParams,
     allocator: std.mem.Allocator,
 ) !SubmitResult {
-    _ = allocator;
+    return submitBlockWithIndex(block, chain_state, params, null, allocator);
+}
 
+/// Submit a mined block to the chain, updating both the UTXO set and block index.
+///
+/// When chain_manager is provided, the block header is inserted into the
+/// in-memory block index (and persisted to ChainStore if available).  Without
+/// this step, subsequent RPCs like getblockheader / getblockhash cannot find
+/// the newly-mined block.
+pub fn submitBlockWithIndex(
+    block: *const types.Block,
+    chain_state: *storage.ChainState,
+    params: *const consensus.NetworkParams,
+    chain_manager: ?*validation.ChainManager,
+    allocator: std.mem.Allocator,
+) !SubmitResult {
     // Compute block hash
     const block_hash = crypto.computeBlockHash(&block.header);
 
@@ -666,8 +681,9 @@ pub fn submitBlock(
         };
     }
 
-    // Connect the block to the chain
-    _ = chain_state.connectBlock(block, &block_hash, chain_state.best_height + 1) catch |err| {
+    // Connect the block to the chain (UTXO set + best_hash/best_height)
+    const height = chain_state.best_height + 1;
+    var undo = chain_state.connectBlock(block, &block_hash, height) catch |err| {
         return .{
             .accepted = false,
             .reject_reason = switch (err) {
@@ -677,6 +693,40 @@ pub fn submitBlock(
             .block_hash = block_hash,
         };
     };
+    undo.deinit(chain_state.allocator);
+
+    // Insert into the block index so that getblockheader / getblockhash can
+    // find the block afterwards.
+    if (chain_manager) |cm| {
+        // Look up the parent entry for chain work calculation
+        const parent = cm.getBlock(&block.header.prev_block);
+
+        const entry = allocator.create(validation.BlockIndexEntry) catch {
+            // Non-fatal: the block is already connected to the UTXO chain.
+            return .{ .accepted = true, .reject_reason = null, .block_hash = block_hash };
+        };
+        entry.* = validation.BlockIndexEntry{
+            .hash = block_hash,
+            .header = block.header,
+            .height = height,
+            .status = .{ .valid_header = true, .has_data = true, .has_undo = false, .failed_valid = false, .failed_child = false, ._padding = 0 },
+            .chain_work = if (parent) |p| p.chain_work else [_]u8{0} ** 32,
+            .sequence_id = 0,
+            .parent = parent,
+            .file_number = 0,
+            .file_offset = 0,
+        };
+
+        cm.addBlock(entry) catch {};
+
+        // Update the active tip
+        cm.active_tip = entry;
+
+        // Persist to ChainStore on disk
+        if (cm.chain_store) |cs| {
+            cs.putBlockIndex(&block_hash, &block.header, height) catch {};
+        }
+    }
 
     return .{
         .accepted = true,
@@ -718,6 +768,19 @@ pub fn mineBlock(
     submit_block: bool,
     allocator: std.mem.Allocator,
 ) !?types.Hash256 {
+    return mineBlockWithIndex(template, chain_state, params, max_tries, submit_block, null, allocator);
+}
+
+/// Mine a single block, optionally inserting into the block index.
+pub fn mineBlockWithIndex(
+    template: *BlockTemplate,
+    chain_state: *storage.ChainState,
+    params: *const consensus.NetworkParams,
+    max_tries: u64,
+    submit_block: bool,
+    chain_manager: ?*validation.ChainManager,
+    allocator: std.mem.Allocator,
+) !?types.Hash256 {
     // 1. Compute merkle root
     const merkle_root = try template.computeMerkleRoot();
     template.header.merkle_root = merkle_root;
@@ -744,8 +807,8 @@ pub fn mineBlock(
                     allocator.free(block.transactions);
                 }
 
-                // Submit to chain
-                const result = try submitBlock(&block, chain_state, params, allocator);
+                // Submit to chain (with block index update when chain_manager is available)
+                const result = try submitBlockWithIndex(&block, chain_state, params, chain_manager, allocator);
                 if (!result.accepted) {
                     return null;
                 }
@@ -794,8 +857,10 @@ pub fn generateBlocks(
     payout_script: []const u8,
     n_blocks: u32,
     max_tries: u64,
+    chain_manager: ?*validation.ChainManager,
     allocator: std.mem.Allocator,
 ) !GenerateResult {
+    std.log.info("generateBlocks: n_blocks={d}, best_height={d}", .{ n_blocks, chain_state.best_height });
     var result = GenerateResult{
         .block_hashes = std.ArrayList(types.Hash256).init(allocator),
     };
@@ -803,6 +868,7 @@ pub fn generateBlocks(
 
     var blocks_mined: u32 = 0;
     while (blocks_mined < n_blocks) {
+        std.log.info("generateBlocks: creating template for block {d}", .{blocks_mined});
         // Create block template
         var template = try createBlockTemplate(
             chain_state,
@@ -816,13 +882,15 @@ pub fn generateBlocks(
         );
         defer template.deinit();
 
+        std.log.info("generateBlocks: template created, mining...", .{});
         // Mine the block
-        const block_hash = try mineBlock(
+        const block_hash = try mineBlockWithIndex(
             &template,
             chain_state,
             params,
             max_tries,
             true, // submit to chain
+            chain_manager,
             allocator,
         );
 
@@ -850,6 +918,7 @@ pub fn generateBlockWithTxs(
     transactions: []const types.Transaction,
     max_tries: u64,
     submit_block: bool,
+    chain_manager: ?*validation.ChainManager,
     allocator: std.mem.Allocator,
 ) !struct { hash: types.Hash256, hex: ?[]const u8 } {
     // Create a minimal block template (not using mempool transactions)
@@ -903,12 +972,13 @@ pub fn generateBlockWithTxs(
     }
 
     // Mine the block
-    const block_hash = try mineBlock(
+    const block_hash = try mineBlockWithIndex(
         &template,
         chain_state,
         params,
         max_tries,
         submit_block,
+        chain_manager,
         allocator,
     );
 
@@ -1598,6 +1668,7 @@ test "regtest: mine single block" {
         &payout_script,
         1,
         DEFAULT_MAX_TRIES,
+        null,
         allocator,
     );
     defer result.deinit();
@@ -1629,6 +1700,7 @@ test "regtest: mine multiple blocks" {
         &payout_script,
         10,
         DEFAULT_MAX_TRIES,
+        null,
         allocator,
     );
     defer result.deinit();
@@ -1659,6 +1731,7 @@ test "regtest: blocks chain correctly" {
         &payout_script,
         5,
         DEFAULT_MAX_TRIES,
+        null,
         allocator,
     );
     defer result.deinit();

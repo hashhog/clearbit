@@ -1004,6 +1004,7 @@ pub const Wallet = struct {
             return error.KeyNotFound;
         }
 
+        const mutable_inputs = @constCast(tx.inputs);
         const key = self.keys.items[utxo.key_index];
 
         switch (utxo.address_type) {
@@ -1028,7 +1029,7 @@ pub const Wallet = struct {
 
                 // Update the transaction input
                 const script_sig_slice = try script_sig.toOwnedSlice();
-                tx.inputs[input_index] = types.TxIn{
+                mutable_inputs[input_index] = types.TxIn{
                     .previous_output = tx.inputs[input_index].previous_output,
                     .script_sig = script_sig_slice,
                     .sequence = tx.inputs[input_index].sequence,
@@ -1062,7 +1063,7 @@ pub const Wallet = struct {
                 @memcpy(pubkey_copy, &key.public_key);
                 witness[1] = pubkey_copy;
 
-                tx.inputs[input_index] = types.TxIn{
+                mutable_inputs[input_index] = types.TxIn{
                     .previous_output = tx.inputs[input_index].previous_output,
                     .script_sig = script_sig,
                     .sequence = tx.inputs[input_index].sequence,
@@ -1088,7 +1089,7 @@ pub const Wallet = struct {
                 @memcpy(pubkey_copy, &key.public_key);
                 witness[1] = pubkey_copy;
 
-                tx.inputs[input_index] = types.TxIn{
+                mutable_inputs[input_index] = types.TxIn{
                     .previous_output = tx.inputs[input_index].previous_output,
                     .script_sig = tx.inputs[input_index].script_sig,
                     .sequence = tx.inputs[input_index].sequence,
@@ -1130,7 +1131,7 @@ pub const Wallet = struct {
                     witness[0] = sig_ext;
                 }
 
-                tx.inputs[input_index] = types.TxIn{
+                mutable_inputs[input_index] = types.TxIn{
                     .previous_output = tx.inputs[input_index].previous_output,
                     .script_sig = tx.inputs[input_index].script_sig,
                     .sequence = tx.inputs[input_index].sequence,
@@ -1259,6 +1260,7 @@ pub const Wallet = struct {
         // Derive key using scrypt
         var derived_key: [32]u8 = undefined;
         try std.crypto.pwhash.scrypt.kdf(
+            self.allocator,
             &derived_key,
             passphrase,
             &salt,
@@ -1293,6 +1295,7 @@ pub const Wallet = struct {
         // Derive key using scrypt
         var derived_key: [32]u8 = undefined;
         try std.crypto.pwhash.scrypt.kdf(
+            self.allocator,
             &derived_key,
             passphrase,
             &salt,
@@ -1347,6 +1350,7 @@ pub const Wallet = struct {
         // Derive old key
         var old_key: [32]u8 = undefined;
         try std.crypto.pwhash.scrypt.kdf(
+            self.allocator,
             &old_key,
             old_passphrase,
             &old_salt,
@@ -1361,6 +1365,7 @@ pub const Wallet = struct {
         // Derive new key
         var new_key: [32]u8 = undefined;
         try std.crypto.pwhash.scrypt.kdf(
+            self.allocator,
             &new_key,
             new_passphrase,
             &new_salt,
@@ -1783,6 +1788,634 @@ pub fn computeTaprootSigHash(
     // BIP-341 uses tagged hash with "TapSighash"
     return crypto.taggedHash("TapSighash", data);
 }
+
+// ============================================================================
+// Wallet Options (for createwallet)
+// ============================================================================
+
+pub const WalletOptions = struct {
+    disable_private_keys: bool = false,
+    blank: bool = false,
+    passphrase: ?[]const u8 = null,
+    avoid_reuse: bool = false,
+    descriptors: bool = true,
+    load_on_startup: ?bool = null,
+};
+
+// ============================================================================
+// Wallet Manager - Multi-wallet support
+// ============================================================================
+
+pub const WalletManager = struct {
+    wallets: std.StringHashMap(*Wallet),
+    mutex: std.Thread.Mutex,
+    allocator: std.mem.Allocator,
+    wallets_dir: []const u8,
+    network: Network,
+
+    /// Initialize the wallet manager.
+    pub fn init(allocator: std.mem.Allocator, wallets_dir: []const u8, network: Network) !WalletManager {
+        // Ensure wallets directory exists
+        std.fs.makeDirAbsolute(wallets_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                return error.WalletDirCreationFailed;
+            }
+        };
+
+        // Duplicate the wallets_dir string
+        const dir_copy = try allocator.dupe(u8, wallets_dir);
+
+        return WalletManager{
+            .wallets = std.StringHashMap(*Wallet).init(allocator),
+            .mutex = std.Thread.Mutex{},
+            .allocator = allocator,
+            .wallets_dir = dir_copy,
+            .network = network,
+        };
+    }
+
+    /// Deinitialize the wallet manager, unloading all wallets.
+    pub fn deinit(self: *WalletManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Save and deinit all wallets
+        var it = self.wallets.iterator();
+        while (it.next()) |entry| {
+            const wallet = entry.value_ptr.*;
+            // Save wallet before unloading
+            self.saveWalletInternal(entry.key_ptr.*, wallet) catch {};
+            wallet.deinit();
+            self.allocator.destroy(wallet);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.wallets.deinit();
+        self.allocator.free(self.wallets_dir);
+    }
+
+    /// Create a new wallet with the given name and options.
+    pub fn createWallet(self: *WalletManager, name: []const u8, options: WalletOptions) !*Wallet {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Check if wallet already exists
+        if (self.wallets.contains(name)) {
+            return error.WalletAlreadyExists;
+        }
+
+        // Check if wallet file already exists on disk
+        const wallet_dir = try self.getWalletDir(name);
+        defer self.allocator.free(wallet_dir);
+
+        const wallet_file = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat", .{wallet_dir});
+        defer self.allocator.free(wallet_file);
+
+        if (std.fs.accessAbsolute(wallet_file, .{})) |_| {
+            return error.WalletAlreadyExists;
+        } else |_| {}
+
+        // Create wallet directory
+        std.fs.makeDirAbsolute(wallet_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                return error.WalletDirCreationFailed;
+            }
+        };
+
+        // Create new wallet
+        const wallet = try self.allocator.create(Wallet);
+        errdefer self.allocator.destroy(wallet);
+
+        if (options.blank) {
+            // Blank wallet - no seed
+            wallet.* = try Wallet.init(self.allocator, self.network);
+        } else {
+            // Generate BIP32 seed
+            var seed: [64]u8 = undefined;
+            std.crypto.random.bytes(&seed);
+            wallet.* = try Wallet.initFromSeed(self.allocator, self.network, &seed);
+            @memset(&seed, 0); // Clear seed from memory
+        }
+
+        // Encrypt if passphrase provided
+        if (options.passphrase) |passphrase| {
+            try wallet.encryptWallet(passphrase);
+        }
+
+        // Save wallet to disk
+        try self.saveWalletInternal(name, wallet);
+
+        // Add to loaded wallets
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+
+        try self.wallets.put(name_copy, wallet);
+
+        return wallet;
+    }
+
+    /// Load a wallet from disk.
+    pub fn loadWallet(self: *WalletManager, name: []const u8) !*Wallet {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Check if already loaded
+        if (self.wallets.contains(name)) {
+            return error.WalletAlreadyLoaded;
+        }
+
+        // Load from disk
+        const wallet = try self.loadWalletFromDisk(name);
+        errdefer {
+            wallet.deinit();
+            self.allocator.destroy(wallet);
+        }
+
+        // Add to loaded wallets
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+
+        try self.wallets.put(name_copy, wallet);
+
+        return wallet;
+    }
+
+    /// Unload a wallet from memory (saves to disk first).
+    pub fn unloadWallet(self: *WalletManager, name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const entry = self.wallets.fetchRemove(name) orelse {
+            return error.WalletNotLoaded;
+        };
+
+        // Save before unloading
+        try self.saveWalletInternal(name, entry.value);
+
+        // Clean up
+        entry.value.deinit();
+        self.allocator.destroy(entry.value);
+        self.allocator.free(entry.key);
+    }
+
+    /// Get a loaded wallet by name.
+    pub fn getWallet(self: *WalletManager, name: []const u8) ?*Wallet {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.wallets.get(name);
+    }
+
+    /// Get the default wallet (empty name) or the only loaded wallet.
+    pub fn getDefaultWallet(self: *WalletManager) !*Wallet {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // If empty string wallet exists, return it
+        if (self.wallets.get("")) |wallet| {
+            return wallet;
+        }
+
+        // If exactly one wallet loaded, return it
+        if (self.wallets.count() == 1) {
+            var it = self.wallets.iterator();
+            if (it.next()) |entry| {
+                return entry.value_ptr.*;
+            }
+        }
+
+        if (self.wallets.count() == 0) {
+            return error.WalletNotLoaded;
+        }
+
+        return error.WalletNotSpecified;
+    }
+
+    /// Get the target wallet from HTTP request URL.
+    /// Parses /wallet/<name> from the request path.
+    pub fn getTargetWallet(self: *WalletManager, request_path: []const u8) !*Wallet {
+        // Parse /wallet/<name> from path
+        if (std.mem.startsWith(u8, request_path, "/wallet/")) {
+            const name = request_path[8..]; // Skip "/wallet/"
+            // Remove any trailing path or query string
+            const end = std.mem.indexOfAny(u8, name, "?/") orelse name.len;
+            const wallet_name = name[0..end];
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            return self.wallets.get(wallet_name) orelse error.WalletNotFound;
+        }
+
+        // No wallet specified in URL, use default
+        return self.getDefaultWallet();
+    }
+
+    /// List all loaded wallet names.
+    pub fn listWallets(self: *WalletManager, allocator: std.mem.Allocator) ![][]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var names = std.ArrayList([]const u8).init(allocator);
+        errdefer {
+            for (names.items) |n| {
+                allocator.free(n);
+            }
+            names.deinit();
+        }
+
+        var it = self.wallets.iterator();
+        while (it.next()) |entry| {
+            const name_copy = try allocator.dupe(u8, entry.key_ptr.*);
+            try names.append(name_copy);
+        }
+
+        return names.toOwnedSlice();
+    }
+
+    /// List all wallet directories available on disk.
+    pub fn listWalletDir(self: *WalletManager, allocator: std.mem.Allocator) ![][]const u8 {
+        var names = std.ArrayList([]const u8).init(allocator);
+        errdefer {
+            for (names.items) |n| {
+                allocator.free(n);
+            }
+            names.deinit();
+        }
+
+        // Check for default wallet (empty name)
+        const default_wallet_file = std.fmt.allocPrint(allocator, "{s}/wallet.dat", .{self.wallets_dir}) catch {
+            return names.toOwnedSlice();
+        };
+        defer allocator.free(default_wallet_file);
+
+        if (std.fs.accessAbsolute(default_wallet_file, .{})) |_| {
+            const empty = try allocator.dupe(u8, "");
+            try names.append(empty);
+        } else |_| {}
+
+        // Iterate wallet subdirectories
+        var dir = std.fs.openDirAbsolute(self.wallets_dir, .{ .iterate = true }) catch {
+            return names.toOwnedSlice();
+        };
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .directory) {
+                // Check if this directory contains a wallet.dat
+                const wallet_path = std.fmt.allocPrint(allocator, "{s}/{s}/wallet.dat", .{ self.wallets_dir, entry.name }) catch continue;
+                defer allocator.free(wallet_path);
+
+                if (std.fs.accessAbsolute(wallet_path, .{})) |_| {
+                    const name_copy = try allocator.dupe(u8, entry.name);
+                    try names.append(name_copy);
+                } else |_| {}
+            }
+        }
+
+        return names.toOwnedSlice();
+    }
+
+    /// Get the wallet count.
+    pub fn count(self: *WalletManager) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.wallets.count();
+    }
+
+    // ========================================================================
+    // Internal Methods
+    // ========================================================================
+
+    fn getWalletDir(self: *WalletManager, name: []const u8) ![]const u8 {
+        if (name.len == 0) {
+            // Default wallet is in wallets_dir root
+            return try self.allocator.dupe(u8, self.wallets_dir);
+        } else {
+            return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.wallets_dir, name });
+        }
+    }
+
+    fn saveWalletInternal(self: *WalletManager, name: []const u8, wallet: *Wallet) !void {
+        const wallet_dir = try self.getWalletDir(name);
+        defer self.allocator.free(wallet_dir);
+
+        // Ensure directory exists
+        std.fs.makeDirAbsolute(wallet_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                return error.WalletDirCreationFailed;
+            }
+        };
+
+        const wallet_file = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat", .{wallet_dir});
+        defer self.allocator.free(wallet_file);
+
+        // Serialize wallet to JSON
+        const json = try self.serializeWallet(wallet);
+        defer self.allocator.free(json);
+
+        // Write atomically (write to temp, then rename)
+        const temp_file = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat.tmp", .{wallet_dir});
+        defer self.allocator.free(temp_file);
+
+        const file = std.fs.createFileAbsolute(temp_file, .{}) catch {
+            return error.WalletSaveFailed;
+        };
+        defer file.close();
+
+        file.writeAll(json) catch {
+            return error.WalletSaveFailed;
+        };
+
+        // Rename temp file to final
+        std.fs.renameAbsolute(temp_file, wallet_file) catch {
+            return error.WalletSaveFailed;
+        };
+    }
+
+    fn loadWalletFromDisk(self: *WalletManager, name: []const u8) !*Wallet {
+        const wallet_dir = try self.getWalletDir(name);
+        defer self.allocator.free(wallet_dir);
+
+        const wallet_file = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat", .{wallet_dir});
+        defer self.allocator.free(wallet_file);
+
+        // Read wallet file
+        const file = std.fs.openFileAbsolute(wallet_file, .{}) catch {
+            return error.WalletNotFound;
+        };
+        defer file.close();
+
+        const stat = file.stat() catch {
+            return error.WalletLoadFailed;
+        };
+
+        const content = self.allocator.alloc(u8, stat.size) catch {
+            return error.OutOfMemory;
+        };
+        defer self.allocator.free(content);
+
+        const bytes_read = file.readAll(content) catch {
+            return error.WalletLoadFailed;
+        };
+
+        // Parse JSON and create wallet
+        return self.deserializeWallet(content[0..bytes_read]);
+    }
+
+    fn serializeWallet(self: *WalletManager, wallet: *Wallet) ![]const u8 {
+        var json = std.ArrayList(u8).init(self.allocator);
+        errdefer json.deinit();
+
+        try json.appendSlice("{");
+
+        // Network
+        try json.appendSlice("\"network\":\"");
+        try json.appendSlice(switch (wallet.network) {
+            .mainnet => "mainnet",
+            .testnet => "testnet",
+            .regtest => "regtest",
+        });
+        try json.appendSlice("\",");
+
+        // Encrypted flag
+        try json.appendSlice("\"encrypted\":");
+        try json.appendSlice(if (wallet.encrypted) "true" else "false");
+        try json.appendSlice(",");
+
+        // HD state
+        var buf: [64]u8 = undefined;
+        const ext_idx = std.fmt.bufPrint(&buf, "\"next_external_index\":{d},", .{wallet.next_external_index}) catch return error.SerializationFailed;
+        try json.appendSlice(ext_idx);
+
+        const chg_idx = std.fmt.bufPrint(&buf, "\"next_change_index\":{d},", .{wallet.next_change_index}) catch return error.SerializationFailed;
+        try json.appendSlice(chg_idx);
+
+        // Master key (if present and wallet is not encrypted, or encrypted master key)
+        if (wallet.master_key) |master_key| {
+            try json.appendSlice("\"master_key\":\"");
+            var hex_buf: [128]u8 = undefined;
+            const key_hex = std.fmt.bufPrint(&hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&master_key.key)}) catch return error.SerializationFailed;
+            try json.appendSlice(key_hex);
+            try json.appendSlice("\",");
+
+            try json.appendSlice("\"chain_code\":\"");
+            const cc_hex = std.fmt.bufPrint(&hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&master_key.chain_code)}) catch return error.SerializationFailed;
+            try json.appendSlice(cc_hex);
+            try json.appendSlice("\",");
+        }
+
+        // Encryption salt (if encrypted)
+        if (wallet.encryption_salt) |salt| {
+            try json.appendSlice("\"encryption_salt\":\"");
+            var salt_hex: [32]u8 = undefined;
+            const s_hex = std.fmt.bufPrint(&salt_hex, "{s}", .{std.fmt.fmtSliceHexLower(&salt)}) catch return error.SerializationFailed;
+            try json.appendSlice(s_hex);
+            try json.appendSlice("\",");
+        }
+
+        // Keys array
+        try json.appendSlice("\"keys\":[");
+        for (wallet.keys.items, 0..) |keypair, i| {
+            if (i > 0) try json.append(',');
+            try json.appendSlice("{\"secret\":\"");
+            var key_hex: [64]u8 = undefined;
+            const sk_hex = std.fmt.bufPrint(&key_hex, "{s}", .{std.fmt.fmtSliceHexLower(&keypair.secret_key)}) catch return error.SerializationFailed;
+            try json.appendSlice(sk_hex);
+            try json.appendSlice("\",\"pubkey\":\"");
+            var pk_hex: [66]u8 = undefined;
+            const pub_hex = std.fmt.bufPrint(&pk_hex, "{s}", .{std.fmt.fmtSliceHexLower(&keypair.public_key)}) catch return error.SerializationFailed;
+            try json.appendSlice(pub_hex);
+            try json.appendSlice("\"}");
+        }
+        try json.appendSlice("],");
+
+        // UTXOs
+        try json.appendSlice("\"utxos\":[");
+        for (wallet.utxos.items, 0..) |utxo, i| {
+            if (i > 0) try json.append(',');
+            try json.appendSlice("{\"txid\":\"");
+            var txid_hex: [64]u8 = undefined;
+            // Reverse for display
+            var rev_txid: [32]u8 = undefined;
+            for (utxo.outpoint.hash, 0..) |b, j| {
+                rev_txid[31 - j] = b;
+            }
+            const t_hex = std.fmt.bufPrint(&txid_hex, "{s}", .{std.fmt.fmtSliceHexLower(&rev_txid)}) catch return error.SerializationFailed;
+            try json.appendSlice(t_hex);
+            try json.appendSlice("\",");
+
+            var utxo_buf: [256]u8 = undefined;
+            const utxo_fields = std.fmt.bufPrint(&utxo_buf, "\"vout\":{d},\"value\":{d},\"key_index\":{d},\"confirmations\":{d},\"is_coinbase\":{s},\"height\":{d}", .{
+                utxo.outpoint.index,
+                utxo.output.value,
+                utxo.key_index,
+                utxo.confirmations,
+                if (utxo.is_coinbase) "true" else "false",
+                utxo.height,
+            }) catch return error.SerializationFailed;
+            try json.appendSlice(utxo_fields);
+            try json.append('}');
+        }
+        try json.appendSlice("]");
+
+        // Labels
+        try json.appendSlice(",\"labels\":{");
+        var label_iter = wallet.labels.iterator();
+        var first_label = true;
+        while (label_iter.next()) |entry| {
+            if (!first_label) try json.append(',');
+            first_label = false;
+            try json.append('"');
+            try json.appendSlice(entry.key_ptr.*);
+            try json.appendSlice("\":\"");
+            try json.appendSlice(entry.value_ptr.*);
+            try json.append('"');
+        }
+        try json.appendSlice("}");
+
+        try json.append('}');
+
+        return json.toOwnedSlice();
+    }
+
+    fn deserializeWallet(self: *WalletManager, json: []const u8) !*Wallet {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json, .{}) catch {
+            return error.WalletLoadFailed;
+        };
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+
+        // Get network
+        const network_str = obj.get("network").?.string;
+        const network: Network = if (std.mem.eql(u8, network_str, "mainnet"))
+            .mainnet
+        else if (std.mem.eql(u8, network_str, "testnet"))
+            .testnet
+        else
+            .regtest;
+
+        // Create wallet
+        const wallet = try self.allocator.create(Wallet);
+        errdefer self.allocator.destroy(wallet);
+
+        wallet.* = try Wallet.init(self.allocator, network);
+        errdefer wallet.deinit();
+
+        // Encrypted flag
+        if (obj.get("encrypted")) |enc| {
+            wallet.encrypted = enc.bool;
+        }
+
+        // HD state
+        if (obj.get("next_external_index")) |idx| {
+            wallet.next_external_index = @intCast(idx.integer);
+        }
+        if (obj.get("next_change_index")) |idx| {
+            wallet.next_change_index = @intCast(idx.integer);
+        }
+
+        // Master key
+        if (obj.get("master_key")) |mk| {
+            const mk_str = mk.string;
+            var key_bytes: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&key_bytes, mk_str) catch return error.WalletLoadFailed;
+
+            var chain_code: [32]u8 = undefined;
+            if (obj.get("chain_code")) |cc| {
+                _ = std.fmt.hexToBytes(&chain_code, cc.string) catch return error.WalletLoadFailed;
+            }
+
+            wallet.master_key = ExtendedKey{
+                .key = key_bytes,
+                .chain_code = chain_code,
+                .depth = 0,
+                .parent_fingerprint = [_]u8{ 0, 0, 0, 0 },
+                .child_index = 0,
+                .is_private = true,
+            };
+        }
+
+        // Encryption salt
+        if (obj.get("encryption_salt")) |salt| {
+            var salt_bytes: [16]u8 = undefined;
+            _ = std.fmt.hexToBytes(&salt_bytes, salt.string) catch return error.WalletLoadFailed;
+            wallet.encryption_salt = salt_bytes;
+        }
+
+        // Keys
+        if (obj.get("keys")) |keys_arr| {
+            for (keys_arr.array.items) |key_obj| {
+                const kobj = key_obj.object;
+                var secret: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&secret, kobj.get("secret").?.string) catch return error.WalletLoadFailed;
+
+                var pubkey: [33]u8 = undefined;
+                _ = std.fmt.hexToBytes(&pubkey, kobj.get("pubkey").?.string) catch return error.WalletLoadFailed;
+
+                // Compute x-only pubkey
+                var x_only: [32]u8 = undefined;
+                @memcpy(&x_only, pubkey[1..33]);
+
+                try wallet.keys.append(KeyPair{
+                    .secret_key = secret,
+                    .public_key = pubkey,
+                    .x_only_pubkey = x_only,
+                });
+            }
+        }
+
+        // UTXOs
+        if (obj.get("utxos")) |utxos_arr| {
+            for (utxos_arr.array.items) |utxo_obj| {
+                const uobj = utxo_obj.object;
+
+                // Parse txid (reverse from display)
+                var txid: [32]u8 = undefined;
+                const txid_str = uobj.get("txid").?.string;
+                var temp_txid: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&temp_txid, txid_str) catch return error.WalletLoadFailed;
+                for (temp_txid, 0..) |b, j| {
+                    txid[31 - j] = b;
+                }
+
+                const vout: u32 = @intCast(uobj.get("vout").?.integer);
+                const value: i64 = uobj.get("value").?.integer;
+                const key_index: usize = @intCast(uobj.get("key_index").?.integer);
+                const confirmations: u32 = @intCast(uobj.get("confirmations").?.integer);
+                const is_coinbase = uobj.get("is_coinbase").?.bool;
+                const height: u32 = @intCast(uobj.get("height").?.integer);
+
+                try wallet.utxos.append(OwnedUtxo{
+                    .outpoint = types.OutPoint{
+                        .hash = txid,
+                        .index = vout,
+                    },
+                    .output = types.TxOut{
+                        .value = value,
+                        .script_pubkey = &[_]u8{}, // Empty for now
+                    },
+                    .key_index = key_index,
+                    .address_type = .p2wpkh, // Default
+                    .confirmations = confirmations,
+                    .is_coinbase = is_coinbase,
+                    .height = height,
+                });
+            }
+        }
+
+        // Labels
+        if (obj.get("labels")) |labels_obj| {
+            var label_iter = labels_obj.object.iterator();
+            while (label_iter.next()) |entry| {
+                try wallet.setLabel(entry.key_ptr.*, entry.value_ptr.string);
+            }
+        }
+
+        return wallet;
+    }
+};
 
 // ============================================================================
 // Tests
@@ -2797,4 +3430,313 @@ test "wallet encryption state" {
 
     // Add a key before encrypting
     _ = try wallet.generateKey();
+}
+
+// ============================================================================
+// Multi-Wallet Manager Tests
+// ============================================================================
+
+test "multi_wallet manager init and deinit" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    // Use temp directory
+    const test_dir = "/tmp/clearbit_test_wallets";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    var manager = try WalletManager.init(allocator, test_dir, .regtest);
+    defer manager.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), manager.count());
+
+    // Cleanup
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "createwallet creates new wallet" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets2";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    var manager = try WalletManager.init(allocator, test_dir, .regtest);
+    defer manager.deinit();
+
+    // Create a wallet
+    const wallet = try manager.createWallet("mywallet", .{});
+    try std.testing.expect(wallet.master_key != null); // HD wallet by default
+
+    try std.testing.expectEqual(@as(usize, 1), manager.count());
+
+    // Get the wallet
+    const got = manager.getWallet("mywallet");
+    try std.testing.expect(got != null);
+    try std.testing.expectEqual(wallet, got.?);
+
+    // Cleanup
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "createwallet blank wallet has no master key" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets3";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    var manager = try WalletManager.init(allocator, test_dir, .regtest);
+    defer manager.deinit();
+
+    const wallet = try manager.createWallet("blank", .{ .blank = true });
+    try std.testing.expect(wallet.master_key == null);
+
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "createwallet duplicate name fails" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets4";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    var manager = try WalletManager.init(allocator, test_dir, .regtest);
+    defer manager.deinit();
+
+    _ = try manager.createWallet("dup", .{});
+
+    // Should fail with duplicate
+    const result = manager.createWallet("dup", .{});
+    try std.testing.expectError(error.WalletAlreadyExists, result);
+
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "multi_wallet isolation between wallets" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets5";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    var manager = try WalletManager.init(allocator, test_dir, .regtest);
+    defer manager.deinit();
+
+    // Create two wallets
+    const wallet1 = try manager.createWallet("wallet1", .{});
+    const wallet2 = try manager.createWallet("wallet2", .{});
+
+    // Generate keys in each wallet
+    _ = try wallet1.generateKey();
+    _ = try wallet1.generateKey();
+    _ = try wallet2.generateKey();
+
+    // Verify isolation
+    try std.testing.expectEqual(@as(usize, 2), wallet1.keys.items.len);
+    try std.testing.expectEqual(@as(usize, 1), wallet2.keys.items.len);
+
+    // Add UTXO to wallet1
+    try wallet1.addUtxo(.{
+        .outpoint = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .output = .{ .value = 1_000_000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 10,
+        .is_coinbase = false,
+        .height = 100,
+    });
+
+    // Verify UTXO isolation
+    try std.testing.expectEqual(@as(i64, 1_000_000), wallet1.getBalance());
+    try std.testing.expectEqual(@as(i64, 0), wallet2.getBalance());
+
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "loadwallet and unloadwallet" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets6";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    // Create and save a wallet
+    {
+        var manager = try WalletManager.init(allocator, test_dir, .regtest);
+        defer manager.deinit();
+
+        const wallet = try manager.createWallet("persist", .{});
+        _ = try wallet.generateKey();
+    }
+
+    // Load it in a new manager
+    {
+        var manager = try WalletManager.init(allocator, test_dir, .regtest);
+        defer manager.deinit();
+
+        const wallet = try manager.loadWallet("persist");
+        try std.testing.expectEqual(@as(usize, 1), wallet.keys.items.len);
+
+        // Unload it
+        try manager.unloadWallet("persist");
+        try std.testing.expectEqual(@as(usize, 0), manager.count());
+    }
+
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "listwallets returns loaded wallet names" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets7";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    var manager = try WalletManager.init(allocator, test_dir, .regtest);
+    defer manager.deinit();
+
+    _ = try manager.createWallet("alpha", .{});
+    _ = try manager.createWallet("beta", .{});
+
+    const names = try manager.listWallets(allocator);
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "listwalletdir returns available wallets" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets8";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    // Create wallets
+    {
+        var manager = try WalletManager.init(allocator, test_dir, .regtest);
+        defer manager.deinit();
+
+        _ = try manager.createWallet("saved1", .{});
+        _ = try manager.createWallet("saved2", .{});
+    }
+
+    // List from fresh manager
+    {
+        var manager = try WalletManager.init(allocator, test_dir, .regtest);
+        defer manager.deinit();
+
+        const names = try manager.listWalletDir(allocator);
+        defer {
+            for (names) |n| allocator.free(n);
+            allocator.free(names);
+        }
+
+        try std.testing.expectEqual(@as(usize, 2), names.len);
+    }
+
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "getTargetWallet parses URL path" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets9";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    var manager = try WalletManager.init(allocator, test_dir, .regtest);
+    defer manager.deinit();
+
+    const wallet = try manager.createWallet("targeted", .{});
+
+    // Get wallet via URL path
+    const target = try manager.getTargetWallet("/wallet/targeted");
+    try std.testing.expectEqual(wallet, target);
+
+    // Non-existent wallet should fail
+    const result = manager.getTargetWallet("/wallet/nonexistent");
+    try std.testing.expectError(error.WalletNotFound, result);
+
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+}
+
+test "getDefaultWallet returns single wallet" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const test_dir = "/tmp/clearbit_test_wallets10";
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
+
+    var manager = try WalletManager.init(allocator, test_dir, .regtest);
+    defer manager.deinit();
+
+    // No wallets - should fail
+    try std.testing.expectError(error.WalletNotLoaded, manager.getDefaultWallet());
+
+    // One wallet - should return it
+    const wallet = try manager.createWallet("single", .{});
+    const default = try manager.getDefaultWallet();
+    try std.testing.expectEqual(wallet, default);
+
+    // Two wallets (no empty name) - should fail
+    _ = try manager.createWallet("second", .{});
+    try std.testing.expectError(error.WalletNotSpecified, manager.getDefaultWallet());
+
+    std.fs.deleteTreeAbsolute(test_dir) catch {};
 }

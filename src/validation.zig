@@ -978,6 +978,403 @@ pub fn checkSequenceLocks(result: SequenceLockResult, tip: *const BlockIndex) bo
 }
 
 // ============================================================================
+// Parallel Script Validation
+// ============================================================================
+
+/// A job representing a single script verification to be performed.
+/// These jobs are distributed across worker threads for parallel execution.
+///
+/// Reference: Bitcoin Core validation.h CScriptCheck
+pub const ScriptCheckJob = struct {
+    /// Transaction bytes (serialized for thread safety)
+    tx_bytes: []const u8,
+    /// Index of the input being verified
+    input_index: usize,
+    /// ScriptPubKey of the previous output
+    prev_script_pubkey: []const u8,
+    /// Value of the previous output (satoshis)
+    amount: i64,
+    /// Script verification flags
+    flags: script.ScriptFlags,
+    /// Witness data for this input
+    witness: []const []const u8,
+    /// Result of verification (set by worker thread)
+    result: std.atomic.Value(VerifyResult),
+
+    pub const VerifyResult = enum(u8) {
+        pending = 0,
+        success = 1,
+        failure = 2,
+    };
+
+    /// Initialize a new script check job
+    pub fn init(
+        tx_bytes: []const u8,
+        input_index: usize,
+        prev_script_pubkey: []const u8,
+        amount: i64,
+        flags: script.ScriptFlags,
+        witness: []const []const u8,
+    ) ScriptCheckJob {
+        return .{
+            .tx_bytes = tx_bytes,
+            .input_index = input_index,
+            .prev_script_pubkey = prev_script_pubkey,
+            .amount = amount,
+            .flags = flags,
+            .witness = witness,
+            .result = std.atomic.Value(VerifyResult).init(.pending),
+        };
+    }
+};
+
+/// Thread pool for parallel script verification.
+/// Modeled after Bitcoin Core's CCheckQueue.
+///
+/// The pool maintains N-1 worker threads (where N = CPU count).
+/// The master thread (caller of waitAll) also participates in verification,
+/// making N total threads processing jobs.
+///
+/// Each worker thread has its own secp256k1 context for thread-safe
+/// signature verification.
+pub const ScriptCheckQueue = struct {
+    /// Worker threads
+    workers: []std.Thread,
+    /// Job queue (shared across all threads)
+    jobs: []ScriptCheckJob,
+    /// Atomic index for work stealing
+    next_job: std.atomic.Value(usize),
+    /// Total number of jobs
+    job_count: usize,
+    /// Number of completed jobs (for synchronization)
+    completed_count: std.atomic.Value(usize),
+    /// Signal for workers to start
+    start_event: std.Thread.ResetEvent,
+    /// Signal that all work is done
+    done_event: std.Thread.ResetEvent,
+    /// Flag to stop worker threads
+    stop_flag: std.atomic.Value(bool),
+    /// Allocator for memory management
+    allocator: std.mem.Allocator,
+    /// Number of workers
+    worker_count: usize,
+
+    /// Initialize the script check queue with worker threads.
+    /// Uses std.Thread.getCpuCount() - 1 workers (minimum 1).
+    pub fn init(allocator: std.mem.Allocator) !ScriptCheckQueue {
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        // Use N-1 workers since master thread also participates
+        const worker_count = @max(1, cpu_count -| 1);
+
+        var queue = ScriptCheckQueue{
+            .workers = try allocator.alloc(std.Thread, worker_count),
+            .jobs = &.{},
+            .next_job = std.atomic.Value(usize).init(0),
+            .job_count = 0,
+            .completed_count = std.atomic.Value(usize).init(0),
+            .start_event = .{},
+            .done_event = .{},
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .allocator = allocator,
+            .worker_count = worker_count,
+        };
+
+        // Spawn worker threads
+        for (queue.workers, 0..) |*worker, i| {
+            worker.* = try std.Thread.spawn(.{}, workerLoop, .{ &queue, i });
+        }
+
+        return queue;
+    }
+
+    /// Deinitialize the queue and stop all workers.
+    pub fn deinit(self: *ScriptCheckQueue) void {
+        // Signal workers to stop
+        self.stop_flag.store(true, .release);
+        self.start_event.set();
+
+        // Wait for all workers to finish
+        for (self.workers) |worker| {
+            worker.join();
+        }
+
+        self.allocator.free(self.workers);
+    }
+
+    /// Submit a batch of jobs for parallel verification.
+    /// This replaces any existing jobs.
+    pub fn submit(self: *ScriptCheckQueue, jobs: []ScriptCheckJob) void {
+        self.jobs = jobs;
+        self.job_count = jobs.len;
+        self.next_job.store(0, .release);
+        self.completed_count.store(0, .release);
+        self.done_event.reset();
+    }
+
+    /// Wait for all jobs to complete.
+    /// The calling thread participates in verification while waiting.
+    /// Returns true if all verifications passed, false if any failed.
+    pub fn waitAll(self: *ScriptCheckQueue) bool {
+        if (self.job_count == 0) return true;
+
+        // Wake up workers
+        self.start_event.set();
+
+        // Master thread participates in verification
+        self.processJobs();
+
+        // Wait for all jobs to complete
+        while (self.completed_count.load(.acquire) < self.job_count) {
+            // Spin with backoff
+            std.atomic.spinLoopHint();
+        }
+
+        // Reset for next batch
+        self.start_event.reset();
+
+        // Check all results
+        for (self.jobs[0..self.job_count]) |*job| {
+            if (job.result.load(.acquire) != .success) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// Worker thread loop
+    fn workerLoop(self: *ScriptCheckQueue, _: usize) void {
+        while (!self.stop_flag.load(.acquire)) {
+            // Wait for work
+            self.start_event.wait();
+
+            if (self.stop_flag.load(.acquire)) break;
+
+            // Process jobs
+            self.processJobs();
+        }
+    }
+
+    /// Process jobs from the queue (called by both workers and master)
+    fn processJobs(self: *ScriptCheckQueue) void {
+        while (true) {
+            // Atomically grab the next job
+            const job_idx = self.next_job.fetchAdd(1, .acq_rel);
+            if (job_idx >= self.job_count) break;
+
+            var job = &self.jobs[job_idx];
+
+            // Perform the verification
+            const result = verifyScriptJob(job, self.allocator);
+            job.result.store(
+                if (result) .success else .failure,
+                .release,
+            );
+
+            // Increment completed count
+            _ = self.completed_count.fetchAdd(1, .release);
+        }
+    }
+};
+
+/// Verify a single script job.
+/// This is the core verification function called by worker threads.
+fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator) bool {
+    // Deserialize the transaction
+    var reader = serialize.Reader{ .data = job.tx_bytes };
+    const tx = serialize.readTransaction(&reader, allocator) catch {
+        return false;
+    };
+    defer {
+        // Free allocated transaction data
+        for (tx.inputs) |input| {
+            allocator.free(input.script_sig);
+            for (input.witness) |w| {
+                allocator.free(w);
+            }
+            allocator.free(input.witness);
+        }
+        for (tx.outputs) |output| {
+            allocator.free(output.script_pubkey);
+        }
+        allocator.free(tx.inputs);
+        allocator.free(tx.outputs);
+    }
+
+    // Get the input being verified
+    if (job.input_index >= tx.inputs.len) return false;
+    const input = tx.inputs[job.input_index];
+
+    // Create script engine and verify
+    var engine = script.ScriptEngine.init(
+        allocator,
+        &tx,
+        job.input_index,
+        job.amount,
+        job.flags,
+    );
+    defer engine.deinit();
+
+    const result = engine.verify(
+        input.script_sig,
+        job.prev_script_pubkey,
+        job.witness,
+    );
+
+    if (result) |valid| {
+        return valid;
+    } else |_| {
+        return false;
+    }
+}
+
+/// Configuration for parallel script verification
+pub const ParallelVerifyConfig = struct {
+    /// Minimum number of inputs to use parallel verification
+    /// For blocks with few inputs, single-threaded is faster due to overhead
+    min_inputs_for_parallel: usize = 16,
+
+    /// Whether parallel verification is enabled
+    enabled: bool = true,
+};
+
+/// Verify all scripts in a block using parallel verification.
+/// Returns true if all scripts pass verification.
+///
+/// For blocks with few inputs (< min_inputs_for_parallel), falls back to
+/// single-threaded verification to avoid thread pool overhead.
+///
+/// Reference: Bitcoin Core validation.cpp ConnectBlock() with CCheckQueue
+pub fn verifyBlockScriptsParallel(
+    block: *const types.Block,
+    height: u32,
+    params: *const consensus.NetworkParams,
+    utxo_lookup: *const SigopUtxoView,
+    config: ParallelVerifyConfig,
+    allocator: std.mem.Allocator,
+) ValidationError!bool {
+    const flags = getBlockScriptFlags(height, params);
+
+    // Count total inputs (excluding coinbase)
+    var total_inputs: usize = 0;
+    for (block.transactions[1..]) |*tx| {
+        total_inputs += tx.inputs.len;
+    }
+
+    // Fall back to single-threaded for small blocks
+    if (!config.enabled or total_inputs < config.min_inputs_for_parallel) {
+        return verifyBlockScriptsSingleThreaded(block, flags, utxo_lookup, allocator);
+    }
+
+    // Prepare jobs for parallel verification
+    var jobs = allocator.alloc(ScriptCheckJob, total_inputs) catch {
+        return ValidationError.OutOfMemory;
+    };
+    defer allocator.free(jobs);
+
+    var job_idx: usize = 0;
+
+    // Serialize transactions and create jobs
+    var tx_bytes_list = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (tx_bytes_list.items) |bytes| {
+            allocator.free(bytes);
+        }
+        tx_bytes_list.deinit();
+    }
+
+    for (block.transactions[1..]) |*tx| {
+        // Serialize transaction once for all its inputs
+        var writer = serialize.Writer.init(allocator);
+        defer writer.deinit();
+        serialize.writeTransaction(&writer, tx) catch {
+            return ValidationError.OutOfMemory;
+        };
+        const tx_bytes = writer.toOwnedSlice() catch {
+            return ValidationError.OutOfMemory;
+        };
+        tx_bytes_list.append(tx_bytes) catch {
+            allocator.free(tx_bytes);
+            return ValidationError.OutOfMemory;
+        };
+
+        for (tx.inputs, 0..) |input, input_idx| {
+            // Look up the previous output
+            const prev_script = utxo_lookup.lookup(&input.previous_output) orelse {
+                return ValidationError.MissingInput;
+            };
+
+            jobs[job_idx] = ScriptCheckJob.init(
+                tx_bytes,
+                input_idx,
+                prev_script,
+                0, // Amount needs to be looked up from UTXO
+                flags,
+                input.witness,
+            );
+            job_idx += 1;
+        }
+    }
+
+    // Initialize thread pool
+    var queue = ScriptCheckQueue.init(allocator) catch {
+        return ValidationError.OutOfMemory;
+    };
+    defer queue.deinit();
+
+    // Submit and wait for completion
+    queue.submit(jobs);
+    const all_passed = queue.waitAll();
+
+    return all_passed;
+}
+
+/// Single-threaded script verification fallback.
+fn verifyBlockScriptsSingleThreaded(
+    block: *const types.Block,
+    flags: script.ScriptFlags,
+    utxo_lookup: *const SigopUtxoView,
+    allocator: std.mem.Allocator,
+) ValidationError!bool {
+    // Verify each non-coinbase transaction
+    for (block.transactions[1..]) |*tx| {
+        for (tx.inputs, 0..) |input, input_idx| {
+            const prev_script = utxo_lookup.lookup(&input.previous_output) orelse {
+                return ValidationError.MissingInput;
+            };
+
+            var engine = script.ScriptEngine.init(
+                allocator,
+                tx,
+                input_idx,
+                0, // TODO: Look up actual amount from UTXO
+                flags,
+            );
+            defer engine.deinit();
+
+            const result = engine.verify(
+                input.script_sig,
+                prev_script,
+                input.witness,
+            );
+
+            if (result) |valid| {
+                if (!valid) return false;
+            } else |_| {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+/// Get the number of CPU cores available for parallel verification.
+pub fn getParallelVerifyThreadCount() usize {
+    return std.Thread.getCpuCount() catch 1;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2454,6 +2851,8 @@ pub const ChainManager = struct {
     chain_state: ?*storage.ChainState,
     /// Mempool for evicting conflicting transactions
     mempool: ?*@import("mempool.zig").Mempool,
+    /// ChainStore for persistence (optional)
+    chain_store: ?*storage.ChainStore,
     /// Allocator
     allocator: std.mem.Allocator,
 
@@ -2471,8 +2870,35 @@ pub const ChainManager = struct {
             .last_precious_chainwork = [_]u8{0} ** 32,
             .chain_state = chain_state,
             .mempool = mempool,
+            .chain_store = null,
             .allocator = allocator,
         };
+    }
+
+    /// Initialize with a ChainStore for persistence.
+    pub fn initWithStore(
+        chain_state: ?*storage.ChainState,
+        mempool: ?*@import("mempool.zig").Mempool,
+        chain_store: *storage.ChainStore,
+        allocator: std.mem.Allocator,
+    ) ChainManager {
+        return ChainManager{
+            .block_index = std.AutoHashMap(types.Hash256, *BlockIndexEntry).init(allocator),
+            .chain_tips = std.ArrayList(*BlockIndexEntry).init(allocator),
+            .active_tip = null,
+            .best_invalid = null,
+            .reverse_sequence_id = -1,
+            .last_precious_chainwork = [_]u8{0} ** 32,
+            .chain_state = chain_state,
+            .mempool = mempool,
+            .chain_store = chain_store,
+            .allocator = allocator,
+        };
+    }
+
+    /// Set the chain store for persistence.
+    pub fn setChainStore(self: *ChainManager, store: *storage.ChainStore) void {
+        self.chain_store = store;
     }
 
     pub fn deinit(self: *ChainManager) void {
@@ -2492,6 +2918,53 @@ pub const ChainManager = struct {
     /// Get a block by hash.
     pub fn getBlock(self: *ChainManager, hash: *const types.Hash256) ?*BlockIndexEntry {
         return self.block_index.get(hash.*);
+    }
+
+    /// Persist a block's status to RocksDB.
+    /// Called after invalidateBlock/reconsiderBlock to persist state.
+    pub fn persistBlockStatus(self: *ChainManager, entry: *const BlockIndexEntry) ChainError!void {
+        const store = self.chain_store orelse return; // No persistence if no store
+
+        const record = storage.ChainStore.BlockIndexRecord{
+            .height = entry.height,
+            .header = entry.header,
+            .status = @as(u32, @bitCast(entry.status)),
+            .chain_work = entry.chain_work,
+            .sequence_id = entry.sequence_id,
+            .file_number = entry.file_number,
+            .file_offset = entry.file_offset,
+        };
+
+        store.putBlockIndexFull(&entry.hash, &record) catch return ChainError.OutOfMemory;
+    }
+
+    /// Load a block from RocksDB into the block index.
+    pub fn loadBlockFromStore(self: *ChainManager, hash: *const types.Hash256) ChainError!?*BlockIndexEntry {
+        const store = self.chain_store orelse return null;
+
+        const record = store.getBlockIndexFull(hash) catch return ChainError.OutOfMemory;
+        if (record == null) return null;
+        const rec = record.?;
+
+        const entry = self.allocator.create(BlockIndexEntry) catch return ChainError.OutOfMemory;
+        entry.* = BlockIndexEntry{
+            .hash = hash.*,
+            .header = rec.header,
+            .height = rec.height,
+            .status = @as(BlockStatus, @bitCast(rec.status)),
+            .chain_work = rec.chain_work,
+            .sequence_id = rec.sequence_id,
+            .parent = null, // Parent must be resolved separately
+            .file_number = rec.file_number,
+            .file_offset = rec.file_offset,
+        };
+
+        self.block_index.put(entry.hash, entry) catch {
+            self.allocator.destroy(entry);
+            return ChainError.OutOfMemory;
+        };
+
+        return entry;
     }
 
     // ========================================================================
@@ -2525,10 +2998,11 @@ pub const ChainManager = struct {
             }
         }
 
-        // Phase 2: Mark the target block as failed_valid
+        // Phase 2: Mark the target block as failed_valid and persist
         target.status.failed_valid = true;
+        try self.persistBlockStatus(target);
 
-        // Phase 3: Mark all descendants with failed_child using BFS
+        // Phase 3: Mark all descendants with failed_child using BFS and persist
         try self.markDescendantsInvalid(target);
 
         // Phase 4: Remove from chain_tips if present
@@ -2573,6 +3047,7 @@ pub const ChainManager = struct {
         while (i < queue.items.len) : (i += 1) {
             const block = queue.items[i];
             block.status.failed_child = true;
+            try self.persistBlockStatus(block);
 
             // Find children of this block
             var child_iter = self.block_index.valueIterator();
@@ -2625,10 +3100,11 @@ pub const ChainManager = struct {
     pub fn reconsiderBlock(self: *ChainManager, hash: *const types.Hash256) ChainError!void {
         const target = self.block_index.get(hash.*) orelse return ChainError.BlockNotFound;
 
-        // Phase 1: Clear failed_valid on the target
+        // Phase 1: Clear failed_valid on the target and persist
         target.status.failed_valid = false;
+        try self.persistBlockStatus(target);
 
-        // Phase 2: Clear failed_child on all descendants
+        // Phase 2: Clear failed_child on all descendants and persist
         try self.clearDescendantFailure(target);
 
         // Phase 3: Clear best_invalid if it points to this block
@@ -2682,6 +3158,7 @@ pub const ChainManager = struct {
         while (i < queue.items.len) : (i += 1) {
             const block = queue.items[i];
             block.status.failed_child = false;
+            try self.persistBlockStatus(block);
 
             // Find children
             var child_iter = self.block_index.valueIterator();
@@ -2722,9 +3199,10 @@ pub const ChainManager = struct {
             }
         }
 
-        // Assign a lower (more negative) sequence ID for priority
+        // Assign a lower (more negative) sequence ID for priority and persist
         target.sequence_id = self.reverse_sequence_id;
         self.reverse_sequence_id -= 1;
+        try self.persistBlockStatus(target);
 
         // Update last precious chainwork
         if (self.active_tip) |tip| {
@@ -3149,6 +3627,257 @@ test "ChainManager compareChainWork" {
     try std.testing.expect(manager.compareChainWork(&low, &equal) == 0);
 }
 
+test "ChainManager invalidate active chain block causes reorg" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Create a fork: genesis -> A -> B (active)
+    //                      \-> C -> D (alternative with less work initially)
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    // Main chain: A -> B
+    const blockA = try allocator.create(BlockIndexEntry);
+    blockA.* = BlockIndexEntry{
+        .hash = [_]u8{0x0A} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x02},
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockA);
+
+    const blockB = try allocator.create(BlockIndexEntry);
+    blockB.* = BlockIndexEntry{
+        .hash = [_]u8{0x0B} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 2,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x04},
+        .sequence_id = 2,
+        .parent = blockA,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockB);
+
+    // Alternative chain: C -> D (equal work to main chain)
+    const blockC = try allocator.create(BlockIndexEntry);
+    blockC.* = BlockIndexEntry{
+        .hash = [_]u8{0x0C} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x02},
+        .sequence_id = 3,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockC);
+
+    const blockD = try allocator.create(BlockIndexEntry);
+    blockD.* = BlockIndexEntry{
+        .hash = [_]u8{0x0D} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 2,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x04},
+        .sequence_id = 4,
+        .parent = blockC,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockD);
+
+    // Set active tip to B (main chain)
+    manager.active_tip = blockB;
+    try manager.chain_tips.append(blockB);
+    try manager.chain_tips.append(blockD);
+
+    // Invalidate block A on active chain - should cause reorg to D
+    try manager.invalidateBlock(&blockA.hash);
+
+    // Verify block A and B are marked invalid
+    try std.testing.expect(blockA.status.failed_valid);
+    try std.testing.expect(blockB.status.failed_child);
+
+    // Alternative chain should still be valid
+    try std.testing.expect(!blockC.status.isInvalid());
+    try std.testing.expect(!blockD.status.isInvalid());
+
+    // Active tip should switch to D (the only valid chain now)
+    try std.testing.expectEqual(blockD, manager.active_tip.?);
+}
+
+test "ChainManager reconsider block causes re-reorg" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Create a fork: genesis -> A -> B (was active, then invalidated)
+    //                      \-> C (alternative, less work)
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    // Main chain: A -> B (more work)
+    const blockA = try allocator.create(BlockIndexEntry);
+    blockA.* = BlockIndexEntry{
+        .hash = [_]u8{0x0A} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x02},
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockA);
+
+    const blockB = try allocator.create(BlockIndexEntry);
+    blockB.* = BlockIndexEntry{
+        .hash = [_]u8{0x0B} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 2,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x04},
+        .sequence_id = 2,
+        .parent = blockA,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockB);
+
+    // Alternative chain: C (less work)
+    const blockC = try allocator.create(BlockIndexEntry);
+    blockC.* = BlockIndexEntry{
+        .hash = [_]u8{0x0C} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x01},
+        .sequence_id = 3,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockC);
+
+    // Set active tip to B
+    manager.active_tip = blockB;
+    try manager.chain_tips.append(blockB);
+    try manager.chain_tips.append(blockC);
+
+    // Invalidate block A - causes reorg to C
+    try manager.invalidateBlock(&blockA.hash);
+    try std.testing.expectEqual(blockC, manager.active_tip.?);
+    try std.testing.expect(blockA.status.failed_valid);
+    try std.testing.expect(blockB.status.failed_child);
+
+    // Reconsider block A - should re-reorg back to B (more work)
+    try manager.reconsiderBlock(&blockA.hash);
+
+    // Block A and B should no longer be invalid
+    try std.testing.expect(!blockA.status.failed_valid);
+    try std.testing.expect(!blockB.status.failed_child);
+    try std.testing.expect(!blockB.status.isInvalid());
+
+    // Active tip should switch back to B (more work)
+    try std.testing.expectEqual(blockB, manager.active_tip.?);
+}
+
+test "ChainManager preciousBlock tie-breaker with equal work" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    // Two competing blocks at height 1 with equal work
+    const blockA = try allocator.create(BlockIndexEntry);
+    blockA.* = BlockIndexEntry{
+        .hash = [_]u8{0x0A} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x01},
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockA);
+
+    const blockB = try allocator.create(BlockIndexEntry);
+    blockB.* = BlockIndexEntry{
+        .hash = [_]u8{0x0B} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x01},
+        .sequence_id = 2,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(blockB);
+
+    // Initially A is preferred (lower sequence_id)
+    manager.active_tip = blockA;
+    try manager.chain_tips.append(blockA);
+    try manager.chain_tips.append(blockB);
+
+    // Mark B as precious - should switch to B
+    try manager.preciousBlock(&blockB.hash);
+
+    // B should now have a negative sequence_id (preferred)
+    try std.testing.expect(blockB.sequence_id < 0);
+    try std.testing.expect(blockB.sequence_id < blockA.sequence_id);
+
+    // Active tip should switch to B
+    try std.testing.expectEqual(blockB, manager.active_tip.?);
+}
+
 test "BlockIndexEntry isAncestorOf" {
     const allocator = std.testing.allocator;
 
@@ -3342,4 +4071,172 @@ test "getBlockScriptFlags: taproot activation" {
     // At taproot: TAPROOT enabled
     const at_taproot = getBlockScriptFlags(709_632, &consensus.MAINNET);
     try std.testing.expect(at_taproot.verify_taproot);
+}
+
+// ============================================================================
+// Parallel Script Validation Tests
+// ============================================================================
+
+test "ScriptCheckJob initializes with pending result" {
+    const tx_bytes = [_]u8{0x01} ** 100;
+    const prev_script = [_]u8{0x76, 0xa9, 0x14} ++ [_]u8{0xAB} ** 20 ++ [_]u8{0x88, 0xac};
+    const flags = script.ScriptFlags{};
+
+    const job = ScriptCheckJob.init(
+        &tx_bytes,
+        0,
+        &prev_script,
+        100_000_000,
+        flags,
+        &.{},
+    );
+
+    try std.testing.expectEqual(ScriptCheckJob.VerifyResult.pending, job.result.load(.acquire));
+}
+
+test "ScriptCheckJob result can be atomically updated" {
+    const tx_bytes = [_]u8{0x01} ** 100;
+    const prev_script = [_]u8{0x76, 0xa9, 0x14} ++ [_]u8{0xAB} ** 20 ++ [_]u8{0x88, 0xac};
+    const flags = script.ScriptFlags{};
+
+    var job = ScriptCheckJob.init(
+        &tx_bytes,
+        0,
+        &prev_script,
+        100_000_000,
+        flags,
+        &.{},
+    );
+
+    // Update result atomically
+    job.result.store(.success, .release);
+    try std.testing.expectEqual(ScriptCheckJob.VerifyResult.success, job.result.load(.acquire));
+
+    job.result.store(.failure, .release);
+    try std.testing.expectEqual(ScriptCheckJob.VerifyResult.failure, job.result.load(.acquire));
+}
+
+test "getParallelVerifyThreadCount returns at least 1" {
+    const count = getParallelVerifyThreadCount();
+    try std.testing.expect(count >= 1);
+}
+
+test "ParallelVerifyConfig has sensible defaults" {
+    const config = ParallelVerifyConfig{};
+    try std.testing.expect(config.enabled);
+    try std.testing.expect(config.min_inputs_for_parallel >= 1);
+}
+
+test "ScriptCheckQueue init and deinit" {
+    const allocator = std.testing.allocator;
+
+    var queue = try ScriptCheckQueue.init(allocator);
+    defer queue.deinit();
+
+    // Should have at least 1 worker
+    try std.testing.expect(queue.worker_count >= 1);
+    try std.testing.expectEqual(@as(usize, 0), queue.job_count);
+}
+
+test "ScriptCheckQueue waitAll returns true for empty job list" {
+    const allocator = std.testing.allocator;
+
+    var queue = try ScriptCheckQueue.init(allocator);
+    defer queue.deinit();
+
+    // No jobs submitted
+    const result = queue.waitAll();
+    try std.testing.expect(result);
+}
+
+test "ScriptCheckQueue processes multiple jobs" {
+    const allocator = std.testing.allocator;
+
+    var queue = try ScriptCheckQueue.init(allocator);
+    defer queue.deinit();
+
+    // Create a few dummy jobs (they will fail verification but that's ok for testing)
+    const tx_bytes = [_]u8{0x01} ** 10;
+    const prev_script = [_]u8{0x00};
+
+    var jobs: [3]ScriptCheckJob = undefined;
+    for (&jobs) |*job| {
+        job.* = ScriptCheckJob.init(
+            &tx_bytes,
+            0,
+            &prev_script,
+            0,
+            script.ScriptFlags{},
+            &.{},
+        );
+    }
+
+    queue.submit(&jobs);
+
+    // Wait for completion - should complete (though jobs will fail)
+    const result = queue.waitAll();
+
+    // Verify all jobs were processed (result is either success or failure, not pending)
+    for (&jobs) |*job| {
+        const job_result = job.result.load(.acquire);
+        try std.testing.expect(job_result != .pending);
+    }
+
+    // Result should be false since the jobs have invalid data
+    try std.testing.expect(!result);
+}
+
+test "verifyBlockScriptsSingleThreaded with empty utxo lookup returns missing input" {
+    const allocator = std.testing.allocator;
+
+    // Create a minimal block with one non-coinbase transaction
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x01, 0x01, 0x01 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &.{},
+    };
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    // Non-coinbase tx
+    const tx_input = types.TxIn{
+        .previous_output = types.OutPoint{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 0xFFFFFFFF,
+        .witness = &.{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{tx_input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    const transactions = [_]types.Transaction{ coinbase, tx };
+    const block = types.Block{
+        .header = consensus.MAINNET.genesis_header,
+        .transactions = &transactions,
+    };
+
+    // Empty lookup that always returns null
+    const EmptyContext = struct {
+        fn lookup(_: *anyopaque, _: *const types.OutPoint) ?[]const u8 {
+            return null;
+        }
+    };
+    var empty_ctx: u8 = 0;
+    const utxo_lookup = SigopUtxoView{
+        .context = @ptrCast(&empty_ctx),
+        .lookupFn = &EmptyContext.lookup,
+    };
+
+    const flags = script.ScriptFlags{};
+    const result = verifyBlockScriptsSingleThreaded(&block, flags, &utxo_lookup, allocator);
+
+    try std.testing.expectError(ValidationError.MissingInput, result);
 }

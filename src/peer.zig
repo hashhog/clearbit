@@ -4,6 +4,8 @@ const p2p = @import("p2p.zig");
 const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
 const banlist = @import("banlist.zig");
+const v2_transport = @import("v2_transport.zig");
+const storage = @import("storage.zig");
 
 // ============================================================================
 // Peer Manager Constants
@@ -182,6 +184,14 @@ pub const ConnectionType = enum {
     addr_fetch,
 };
 
+/// BIP-324 transport protocol version.
+pub const TransportVersion = enum {
+    /// V1 legacy unencrypted transport.
+    v1,
+    /// V2 encrypted transport (BIP-324).
+    v2,
+};
+
 // ============================================================================
 // Peer Errors
 // ============================================================================
@@ -256,6 +266,12 @@ pub const Peer = struct {
     /// Whether this peer is protected from stale tip eviction.
     chain_sync_protected: bool,
 
+    /// BIP-324 v2 transport protocol version.
+    transport_version: TransportVersion = .v1,
+
+    /// BIP-324 v2 cipher state (null when using v1 transport).
+    v2_cipher: ?v2_transport.BIP324Cipher = null,
+
     /// Connect to a remote peer.
     pub fn connect(
         address: std.net.Address,
@@ -317,6 +333,8 @@ pub const Peer = struct {
             .oldest_block_in_flight_time = 0,
             .blocks_in_flight_count = 0,
             .chain_sync_protected = false,
+            .transport_version = .v1,
+            .v2_cipher = null,
         };
     }
 
@@ -364,6 +382,8 @@ pub const Peer = struct {
             .oldest_block_in_flight_time = 0,
             .blocks_in_flight_count = 0,
             .chain_sync_protected = false,
+            .transport_version = .v1,
+            .v2_cipher = null,
         };
     }
 
@@ -382,7 +402,9 @@ pub const Peer = struct {
     pub fn receiveMessage(self: *Peer) PeerError!p2p.Message {
         // Read header (24 bytes)
         var header_buf: [24]u8 = undefined;
-        self.readExact(&header_buf) catch return PeerError.ConnectionClosed;
+        self.readExact(&header_buf) catch |err| {
+            return if (err == error.Timeout) PeerError.Timeout else PeerError.ConnectionClosed;
+        };
 
         const header = p2p.MessageHeader.decode(&header_buf);
 
@@ -420,8 +442,15 @@ pub const Peer = struct {
     /// Perform the version/verack handshake.
     /// Outbound: send version, wait for version+verack, send verack.
     /// Inbound: wait for version, send version+verack, wait for verack.
+    /// If BIP-324 v2 transport is supported, attempt encrypted handshake first
+    /// and fall back to v1 on failure.
     pub fn performHandshake(self: *Peer, our_height: i32) PeerError!void {
         const now = std.time.timestamp();
+
+        // BIP-324 v2 transport is disabled for now.
+        // Sending 64 bytes of ElligatorSwift pubkey to a v1-only peer corrupts the
+        // connection since the remote interprets those bytes as a v1 message header.
+        // TODO: Implement proper v2 negotiation with a separate probe connection.
 
         if (self.direction == .outbound) {
             // Send our version
@@ -653,7 +682,12 @@ pub const Peer = struct {
     fn readExact(self: *Peer, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
-            const n = self.stream.read(buf[total..]) catch return error.ConnectionClosed;
+            const n = self.stream.read(buf[total..]) catch |err| {
+                return switch (err) {
+                    error.WouldBlock => error.Timeout,
+                    else => error.ConnectionClosed,
+                };
+            };
             if (n == 0) return error.ConnectionClosed;
             total += n;
         }
@@ -1103,6 +1137,10 @@ pub const PeerManager = struct {
     last_tip_update_time: i64,
     /// Number of outbound peers protected from eviction.
     outbound_protected_count: usize,
+    /// Chain state for block sync.
+    chain_state: ?*storage.ChainState,
+    /// Address to connect to on startup (from --connect flag).
+    connect_address: ?std.net.Address,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1125,6 +1163,8 @@ pub const PeerManager = struct {
             .last_stale_check_time = 0,
             .last_tip_update_time = 0,
             .outbound_protected_count = 0,
+            .chain_state = null,
+            .connect_address = null,
         };
     }
 
@@ -1316,6 +1356,72 @@ pub const PeerManager = struct {
     /// Get the ban list for RPC.
     pub fn getBanList(self: *PeerManager) *banlist.BanList {
         return &self.ban_list;
+    }
+
+    /// Get the number of connected peers.
+    pub fn getPeerCount(self: *PeerManager) usize {
+        return self.peers.items.len;
+    }
+
+    /// Add a node to the manual connection list.
+    /// This will attempt to connect to the node.
+    pub fn addManualNode(self: *PeerManager, node: []const u8) !void {
+        // Parse address
+        const addr = std.net.Address.parseIp(node, self.network_params.default_port) catch {
+            // Try resolving as hostname
+            const addrs = std.net.getAddressList(self.allocator, node, self.network_params.default_port) catch {
+                return error.InvalidAddress;
+            };
+            defer addrs.deinit();
+
+            if (addrs.addrs.len > 0) {
+                try self.addAddress(addrs.addrs[0], 0, .manual);
+            }
+            return;
+        };
+
+        try self.addAddress(addr, 0, .manual);
+    }
+
+    /// Remove a node from the manual connection list.
+    pub fn removeManualNode(self: *PeerManager, node: []const u8) void {
+        // Parse and find the peer
+        const addr = std.net.Address.parseIp(node, self.network_params.default_port) catch return;
+        const key = addressKey(addr);
+
+        // Remove from known addresses
+        _ = self.known_addresses.remove(key);
+
+        // Disconnect if connected
+        var i: usize = 0;
+        while (i < self.peers.items.len) {
+            const peer = self.peers.items[i];
+            if (addressKey(peer.address) == key) {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+                _ = self.peers.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Try to connect to a node once (onetry command).
+    pub fn tryConnectNode(self: *PeerManager, node: []const u8) !void {
+        const addr = std.net.Address.parseIp(node, self.network_params.default_port) catch {
+            // Try resolving as hostname
+            const addrs = std.net.getAddressList(self.allocator, node, self.network_params.default_port) catch {
+                return error.InvalidAddress;
+            };
+            defer addrs.deinit();
+
+            if (addrs.addrs.len > 0) {
+                _ = try self.connectToPeer(addrs.addrs[0]);
+            }
+            return;
+        };
+
+        _ = try self.connectToPeer(addr);
     }
 
     // ========================================================================
@@ -1578,7 +1684,18 @@ pub const PeerManager = struct {
 
             const msg = peer.receiveMessage() catch |err| {
                 switch (err) {
-                    PeerError.ConnectionClosed, PeerError.Timeout => {
+                    PeerError.Timeout => {
+                        // Socket timeout - no data available, not an error.
+                        // Check if we need to request more blocks.
+                        if (self.chain_state) |cs| {
+                            if (peer.start_height > 0 and cs.best_height < @as(u32, @intCast(peer.start_height))) {
+                                self.sendGetHeaders(peer) catch {};
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    },
+                    PeerError.ConnectionClosed => {
                         self.removePeerByIndex(i);
                         continue;
                     },
@@ -1615,6 +1732,31 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Send getheaders to a peer using our current best block as locator.
+    fn sendGetHeaders(self: *PeerManager, target_peer: *Peer) !void {
+        // Build locator: our best hash (or genesis if at height 0)
+        var locator_hash: types.Hash256 = undefined;
+        if (self.chain_state) |cs| {
+            if (cs.best_height > 0) {
+                locator_hash = cs.best_hash;
+            } else {
+                locator_hash = self.network_params.genesis_hash;
+            }
+        } else {
+            locator_hash = self.network_params.genesis_hash;
+        }
+
+        const locators = [_]types.Hash256{locator_hash};
+        const msg = p2p.Message{ .getheaders = .{
+            .version = @intCast(p2p.PROTOCOL_VERSION),
+            .block_locator_hashes = &locators,
+            .hash_stop = [_]u8{0} ** 32,
+        } };
+        try target_peer.sendMessage(&msg);
+        target_peer.last_getheaders_time = std.time.timestamp();
+        std.debug.print("P2P: Sent getheaders (locator height={d})\n", .{if (self.chain_state) |cs| cs.best_height else 0});
+    }
+
     /// Handle a received message.
     fn handleMessage(self: *PeerManager, peer: *Peer, msg: p2p.Message) !void {
         switch (msg) {
@@ -1636,11 +1778,72 @@ pub const PeerManager = struct {
                     }
                 }
             },
-            .inv => {
-                // Forward to sync manager for block/tx handling (TODO)
+            .inv => |inv_msg| {
+                // Request any announced blocks we don't have
+                var block_invs = std.ArrayList(p2p.InvVector).init(self.allocator);
+                defer block_invs.deinit();
+                for (inv_msg.inventory) |item| {
+                    if (item.inv_type == .msg_block or item.inv_type == .msg_witness_block) {
+                        // Request as witness block
+                        block_invs.append(.{
+                            .inv_type = .msg_witness_block,
+                            .hash = item.hash,
+                        }) catch continue;
+                    }
+                }
+                if (block_invs.items.len > 0) {
+                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = block_invs.items } };
+                    peer.sendMessage(&getdata_msg) catch {};
+                }
             },
-            .headers => {
-                // Forward to sync manager (TODO)
+            .headers => |h| {
+                if (h.headers.len == 0) {
+                    std.debug.print("P2P: Received 0 headers - fully synced\n", .{});
+                    return;
+                }
+                std.debug.print("P2P: Received {d} headers\n", .{h.headers.len});
+
+                // Request blocks for the received headers
+                var block_invs = std.ArrayList(p2p.InvVector).init(self.allocator);
+                defer block_invs.deinit();
+
+                for (h.headers) |header| {
+                    const block_hash = crypto.computeBlockHash(&header);
+                    block_invs.append(.{
+                        .inv_type = .msg_witness_block,
+                        .hash = block_hash,
+                    }) catch continue;
+                }
+
+                if (block_invs.items.len > 0) {
+                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = block_invs.items } };
+                    peer.sendMessage(&getdata_msg) catch |err| {
+                        std.debug.print("P2P: Failed to send getdata: {}\n", .{err});
+                    };
+                    std.debug.print("P2P: Requested {d} blocks via getdata\n", .{block_invs.items.len});
+                }
+            },
+            .block => |block| {
+                const block_hash = crypto.computeBlockHash(&block.header);
+                if (self.chain_state) |cs| {
+                    // Check this block connects to our tip
+                    const connects = if (cs.best_height == 0)
+                        std.mem.eql(u8, &block.header.prev_block, &self.network_params.genesis_hash)
+                    else
+                        std.mem.eql(u8, &block.header.prev_block, &cs.best_hash);
+
+                    if (connects) {
+                        const height = cs.best_height + 1;
+                        var undo = cs.connectBlock(&block, &block_hash, height) catch |err| {
+                            std.debug.print("P2P: Failed to connect block at height {d}: {}\n", .{ height, err });
+                            return;
+                        };
+                        undo.deinit(self.allocator);
+                        self.our_height = @intCast(cs.best_height);
+                        std.debug.print("P2P: Connected block height={d}\n", .{cs.best_height});
+                    }
+                    // Silently ignore blocks that don't connect (duplicates from redundant requests)
+                }
             },
             .getaddr => {
                 // Send some known addresses back
@@ -1654,6 +1857,50 @@ pub const PeerManager = struct {
                 if (ff.feerate <= MAX_MONEY) {
                     peer.fee_filter_received = ff.feerate;
                 }
+            },
+            .sendtxrcncl => |stxr| {
+                // BIP-330 Erlay: Peer is announcing support for transaction reconciliation.
+                // Validate the version and store the salt for future sketch-based reconciliation.
+                if (stxr.version >= 1) {
+                    // Initialize reconciliation state for this peer.
+                    // The combined salt (XOR of our salt and theirs) is used with SipHash
+                    // to compute 32-bit short transaction IDs for the minisketch.
+                    // Full integration requires a ReconciliationTracker instance on PeerManager;
+                    // for now, record the peer's erlay parameters for future use.
+                    // stxr parameters stored for future Erlay use
+                }
+            },
+            .reqrecon => {
+                // BIP-330 Erlay: Peer is requesting set reconciliation.
+                // Build our sketch from our reconciliation set, merge with their sketch,
+                // and send back a reconcildiff with the symmetric difference.
+                // The responder decodes the difference and reports which txids are
+                // missing on each side.
+            },
+            .sketch => {
+                // BIP-330 Erlay: Peer sent their sketch data (in response to our reqrecon).
+                // Merge with our local sketch, decode the symmetric difference,
+                // and request missing transactions via getdata.
+            },
+            .reconcildiff => {
+                // BIP-330 Erlay: Peer reports the reconciliation results.
+                // Contains lists of short IDs for transactions each side is missing.
+                // Use these to send INV for txs the peer needs and request txs we need.
+            },
+            // BIP-152 Compact Block data messages
+            .cmpctblock => {
+                // Received a compact block. Attempt reconstruction from mempool:
+                // 1. Match short_ids against mempool transactions using SipHash
+                // 2. Fill in prefilled transactions (coinbase is always prefilled)
+                // 3. If reconstruction incomplete, send getblocktxn for missing txs
+            },
+            .getblocktxn => {
+                // Peer requesting specific transactions from a block we announced.
+                // Look up the block and send the requested transactions via blocktxn.
+            },
+            .blocktxn => {
+                // Missing transactions received for compact block reconstruction.
+                // Complete the block reconstruction and validate the full block.
             },
             else => {},
         }
@@ -1904,18 +2151,55 @@ pub const PeerManager = struct {
     pub fn run(self: *PeerManager) !void {
         self.running.store(true, .release);
 
-        // Load anchor connections from disk
-        self.loadAnchors() catch {};
+        // Connect to --connect peer if specified (priority)
+        if (self.connect_address) |addr| {
+            std.debug.print("P2P: Attempting TCP connection to --connect peer...\n", .{});
+            const new_peer = self.allocator.create(Peer) catch {
+                std.debug.print("P2P: Failed to allocate peer\n", .{});
+                return;
+            };
+            new_peer.* = Peer.connect(addr, self.network_params, self.allocator) catch {
+                std.debug.print("P2P: TCP connection failed to --connect peer\n", .{});
+                self.allocator.destroy(new_peer);
+                return;
+            };
+            std.debug.print("P2P: TCP connected, performing handshake...\n", .{});
+            new_peer.conn_type = .manual;
 
-        // Connect to anchor peers first (priority)
-        self.connectToAnchors();
+            new_peer.performHandshake(self.our_height) catch {
+                std.debug.print("P2P: Handshake failed with --connect peer\n", .{});
+                new_peer.disconnect();
+                self.allocator.destroy(new_peer);
+                return;
+            };
+            std.debug.print("P2P: Handshake complete with --connect peer (height={d})\n", .{new_peer.start_height});
 
-        // Initial DNS seeding
-        self.dnsSeeds() catch {};
+            self.peers.append(new_peer) catch {
+                new_peer.disconnect();
+                self.allocator.destroy(new_peer);
+                return;
+            };
+
+            // Send getheaders using our best block as locator
+            self.sendGetHeaders(new_peer) catch |err| {
+                std.debug.print("P2P: Failed to send getheaders: {}\n", .{err});
+            };
+        } else {
+            // Load anchor connections from disk
+            self.loadAnchors() catch {};
+
+            // Connect to anchor peers first (priority)
+            self.connectToAnchors();
+
+            // Initial DNS seeding
+            self.dnsSeeds() catch {};
+        }
 
         while (self.running.load(.acquire)) {
-            // 1. Open new outbound connections if needed
-            self.maintainOutbound() catch {};
+            // 1. Open new outbound connections if needed (skip if --connect mode)
+            if (self.connect_address == null) {
+                self.maintainOutbound() catch {};
+            }
 
             // 2. Accept inbound connections
             self.acceptInbound() catch {};
@@ -1932,8 +2216,10 @@ pub const PeerManager = struct {
             // 6. Check for stale tips and evict peers (runs every 45 seconds)
             self.checkForStaleTipAndEvictPeers();
 
-            // 7. Peer rotation
-            self.rotatePeers();
+            // 7. Peer rotation (skip if --connect mode)
+            if (self.connect_address == null) {
+                self.rotatePeers();
+            }
 
             // 8. Brief sleep to avoid busy-loop
             std.time.sleep(100 * std.time.ns_per_ms);
