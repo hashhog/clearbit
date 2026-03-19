@@ -3,5 +3,10 @@ zig-cache/
 .zig-cache/
 *.swp
 .env
+*.a
+*.o
+anchors.dat
+banlist.json
+/test_sighash
 
 .claude/skills/
