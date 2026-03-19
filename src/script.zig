@@ -154,6 +154,7 @@ pub const ScriptError = error{
     OpReturnEncountered,
     UnbalancedConditional,
     SigPushOnly, // BIP-16: P2SH scriptSig must be push-only
+    DiscourageOpSuccess, // BIP-342: OP_SUCCESSx found during tapscript pre-scan
 };
 
 // ============================================================================
@@ -173,7 +174,8 @@ pub const ScriptFlags = packed struct {
     verify_checksequenceverify: bool = true,
     verify_taproot: bool = true,
     verify_witness_pubkeytype: bool = true, // BIP-141: witness v0 requires compressed pubkeys
-    _padding: u4 = 0,
+    discourage_op_success: bool = false, // BIP-342: fail on OP_SUCCESSx in tapscript pre-scan
+    _padding: u3 = 0,
 };
 
 // ============================================================================
@@ -362,6 +364,49 @@ pub const SigVersion = enum {
     /// Tapscript (P2TR script path) - BIP 342
     tapscript,
 };
+
+// ============================================================================
+// BIP-342 OP_SUCCESSx Pre-scan
+// ============================================================================
+
+/// Returns true if the opcode is an OP_SUCCESSx opcode per BIP-342.
+/// These are undefined opcodes that cause immediate script success in tapscript.
+fn isOpSuccess(op: u8) bool {
+    return op == 80 or op == 98 or
+        (op >= 126 and op <= 129) or
+        (op >= 131 and op <= 134) or
+        (op >= 137 and op <= 138) or
+        (op >= 141 and op <= 142) or
+        (op >= 149 and op <= 185) or // 0x95-0xb9
+        (op >= 187 and op <= 254); // 0xbb-0xfe
+}
+
+/// Pre-scans a tapscript for OP_SUCCESSx opcodes per BIP-342.
+/// If any OP_SUCCESSx is found, returns the opcode value.
+/// Skips over push data to avoid false positives in data payloads.
+fn preScanTapscript(script: []const u8) ?u8 {
+    var i: usize = 0;
+    while (i < script.len) {
+        const op = script[i];
+        if (isOpSuccess(op)) return op;
+        // Skip push data
+        if (op <= 75) {
+            i += 1 + op;
+        } else if (op == 76) { // OP_PUSHDATA1
+            if (i + 1 >= script.len) break;
+            i += 2 + script[i + 1];
+        } else if (op == 77) { // OP_PUSHDATA2
+            if (i + 2 >= script.len) break;
+            i += 3 + @as(usize, script[i + 1]) + (@as(usize, script[i + 2]) << 8);
+        } else if (op == 78) { // OP_PUSHDATA4
+            if (i + 4 >= script.len) break;
+            i += 5 + @as(usize, std.mem.readInt(u32, script[i + 1 ..][0..4], .little));
+        } else {
+            i += 1;
+        }
+    }
+    return null;
+}
 
 // ============================================================================
 // Script Engine
@@ -665,6 +710,16 @@ pub const ScriptEngine = struct {
                         self.stack.clearRetainingCapacity();
                         for (witness[0 .. witness.len - 2]) |item| {
                             self.stack.append(item) catch return ScriptError.OutOfMemory;
+                        }
+
+                        // BIP-342: Pre-scan tapscript for OP_SUCCESSx opcodes.
+                        // If any is found, the script succeeds immediately
+                        // (unless DISCOURAGE_OP_SUCCESS flag is set).
+                        if (preScanTapscript(tap_script)) |_| {
+                            if (self.flags.discourage_op_success) {
+                                return ScriptError.DiscourageOpSuccess;
+                            }
+                            return true; // Script succeeds immediately
                         }
 
                         // Set sig_version to tapscript for signature verification

@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const serialize = @import("serialize.zig");
+const serialize_mod = @import("serialize.zig");
 const crypto = @import("crypto.zig");
 
 // ============================================================================
@@ -172,6 +172,9 @@ pub const KeyOriginInfo = struct {
     }
 };
 
+/// Key-value pair for unknown/forward-compatible PSBT entries.
+pub const UnknownEntry = struct { key: []const u8, value: []const u8 };
+
 // ============================================================================
 // PSBT Input
 // ============================================================================
@@ -209,7 +212,7 @@ pub const PsbtInput = struct {
     tap_merkle_root: ?[32]u8 = null,
 
     // Unknown key-value pairs (for forward compatibility)
-    unknown: std.AutoHashMap(u64, struct { key: []const u8, value: []const u8 }),
+    unknown: std.AutoHashMap(u64, UnknownEntry),
 
     allocator: std.mem.Allocator,
 
@@ -221,7 +224,7 @@ pub const PsbtInput = struct {
             .sha256_preimages = std.AutoHashMap([32]u8, []const u8).init(allocator),
             .hash160_preimages = std.AutoHashMap([20]u8, []const u8).init(allocator),
             .hash256_preimages = std.AutoHashMap([32]u8, []const u8).init(allocator),
-            .unknown = std.AutoHashMap(u64, struct { key: []const u8, value: []const u8 }).init(allocator),
+            .unknown = std.AutoHashMap(u64, UnknownEntry).init(allocator),
             .allocator = allocator,
         };
     }
@@ -366,14 +369,14 @@ pub const PsbtOutput = struct {
     tap_tree: ?[]const u8 = null,
 
     // Unknown key-value pairs
-    unknown: std.AutoHashMap(u64, struct { key: []const u8, value: []const u8 }),
+    unknown: std.AutoHashMap(u64, UnknownEntry),
 
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) PsbtOutput {
         return PsbtOutput{
             .bip32_derivation = std.AutoHashMap([33]u8, KeyOriginInfo).init(allocator),
-            .unknown = std.AutoHashMap(u64, struct { key: []const u8, value: []const u8 }).init(allocator),
+            .unknown = std.AutoHashMap(u64, UnknownEntry).init(allocator),
             .allocator = allocator,
         };
     }
@@ -445,7 +448,7 @@ pub const Psbt = struct {
     version: u32 = 0,
 
     /// Unknown global key-value pairs
-    unknown: std.AutoHashMap(u64, struct { key: []const u8, value: []const u8 }),
+    unknown: std.AutoHashMap(u64, UnknownEntry),
 
     allocator: std.mem.Allocator,
 
@@ -484,7 +487,7 @@ pub const Psbt = struct {
             .outputs = outputs,
             .xpubs = std.AutoHashMap([78]u8, KeyOriginInfo).init(allocator),
             .version = 0,
-            .unknown = std.AutoHashMap(u64, struct { key: []const u8, value: []const u8 }).init(allocator),
+            .unknown = std.AutoHashMap(u64, UnknownEntry).init(allocator),
             .allocator = allocator,
         };
     }
@@ -542,9 +545,9 @@ pub const Psbt = struct {
 
         // Verify the txid matches
         const prev_outpoint = self.tx.inputs[input_index].previous_output;
-        var writer = serialize.Writer.init(self.allocator);
+        var writer = serialize_mod.Writer.init(self.allocator);
         defer writer.deinit();
-        try serialize.writeTransactionNoWitness(&writer, &tx);
+        try serialize_mod.writeTransactionNoWitness(&writer, &tx);
         const txid = crypto.hash256(writer.getWritten());
 
         // Bitcoin displays txids in reverse byte order
@@ -678,7 +681,7 @@ pub const Psbt = struct {
             .outputs = outputs,
             .xpubs = std.AutoHashMap([78]u8, KeyOriginInfo).init(allocator),
             .version = self.version,
-            .unknown = std.AutoHashMap(u64, struct { key: []const u8, value: []const u8 }).init(allocator),
+            .unknown = std.AutoHashMap(u64, UnknownEntry).init(allocator),
             .allocator = allocator,
         };
     }
@@ -868,7 +871,7 @@ pub const Psbt = struct {
 
     /// Serialize the PSBT to binary format
     pub fn serialize(self: *const Psbt, allocator: std.mem.Allocator) ![]const u8 {
-        var writer = serialize.Writer.init(allocator);
+        var writer = serialize_mod.Writer.init(allocator);
         errdefer writer.deinit();
 
         // Magic bytes
@@ -890,12 +893,12 @@ pub const Psbt = struct {
         return try writer.toOwnedSlice();
     }
 
-    fn serializeGlobalMap(self: *const Psbt, writer: *serialize.Writer) !void {
+    fn serializeGlobalMap(self: *const Psbt, writer: *serialize_mod.Writer) !void {
         // Unsigned TX (required)
         try self.writeKeyValue(writer, PSBT_GLOBAL_UNSIGNED_TX, &[_]u8{}, blk: {
-            var tx_writer = serialize.Writer.init(self.allocator);
+            var tx_writer = serialize_mod.Writer.init(self.allocator);
             defer tx_writer.deinit();
-            try serialize.writeTransactionNoWitness(&tx_writer, &self.tx);
+            try serialize_mod.writeTransactionNoWitness(&tx_writer, &self.tx);
             break :blk tx_writer.getWritten();
         });
 
@@ -912,18 +915,18 @@ pub const Psbt = struct {
         try writer.writeInt(u8, PSBT_SEPARATOR);
     }
 
-    fn serializeInputMap(self: *const Psbt, writer: *serialize.Writer, input: *const PsbtInput) !void {
+    fn serializeInputMap(self: *const Psbt, writer: *serialize_mod.Writer, input: *const PsbtInput) !void {
         // Non-witness UTXO
         if (input.non_witness_utxo) |tx| {
-            var tx_writer = serialize.Writer.init(self.allocator);
+            var tx_writer = serialize_mod.Writer.init(self.allocator);
             defer tx_writer.deinit();
-            try serialize.writeTransaction(&tx_writer, &tx);
+            try serialize_mod.writeTransaction(&tx_writer, &tx);
             try self.writeKeyValue(writer, PSBT_IN_NON_WITNESS_UTXO, &[_]u8{}, tx_writer.getWritten());
         }
 
         // Witness UTXO
         if (input.witness_utxo) |utxo| {
-            var utxo_writer = serialize.Writer.init(self.allocator);
+            var utxo_writer = serialize_mod.Writer.init(self.allocator);
             defer utxo_writer.deinit();
             try utxo_writer.writeInt(i64, utxo.value);
             try utxo_writer.writeCompactSize(utxo.script_pubkey.len);
@@ -958,7 +961,7 @@ pub const Psbt = struct {
             // BIP32 derivations
             var bip32_iter = input.bip32_derivation.iterator();
             while (bip32_iter.next()) |entry| {
-                var value_writer = serialize.Writer.init(self.allocator);
+                var value_writer = serialize_mod.Writer.init(self.allocator);
                 defer value_writer.deinit();
                 try value_writer.writeBytes(&entry.value_ptr.fingerprint);
                 for (entry.value_ptr.path) |idx| {
@@ -975,7 +978,7 @@ pub const Psbt = struct {
 
         // Final scriptWitness
         if (input.final_script_witness) |witness| {
-            var witness_writer = serialize.Writer.init(self.allocator);
+            var witness_writer = serialize_mod.Writer.init(self.allocator);
             defer witness_writer.deinit();
             try witness_writer.writeCompactSize(witness.len);
             for (witness) |item| {
@@ -989,7 +992,7 @@ pub const Psbt = struct {
         try writer.writeInt(u8, PSBT_SEPARATOR);
     }
 
-    fn serializeOutputMap(self: *const Psbt, writer: *serialize.Writer, output: *const PsbtOutput) !void {
+    fn serializeOutputMap(self: *const Psbt, writer: *serialize_mod.Writer, output: *const PsbtOutput) !void {
         // Redeem script
         if (output.redeem_script) |script| {
             try self.writeKeyValue(writer, PSBT_OUT_REDEEMSCRIPT, &[_]u8{}, script);
@@ -1003,7 +1006,7 @@ pub const Psbt = struct {
         // BIP32 derivations
         var bip32_iter = output.bip32_derivation.iterator();
         while (bip32_iter.next()) |entry| {
-            var value_writer = serialize.Writer.init(self.allocator);
+            var value_writer = serialize_mod.Writer.init(self.allocator);
             defer value_writer.deinit();
             try value_writer.writeBytes(&entry.value_ptr.fingerprint);
             for (entry.value_ptr.path) |idx| {
@@ -1018,7 +1021,7 @@ pub const Psbt = struct {
 
     fn writeKeyValue(
         self: *const Psbt,
-        writer: *serialize.Writer,
+        writer: *serialize_mod.Writer,
         key_type: u8,
         key_data: []const u8,
         value: []const u8,
@@ -1046,7 +1049,7 @@ pub const Psbt = struct {
     pub fn deserialize(allocator: std.mem.Allocator, data: []const u8) !Psbt {
         if (data.len < 5) return PsbtError.InvalidMagic;
 
-        var reader = serialize.Reader{ .data = data };
+        var reader = serialize_mod.Reader{ .data = data };
 
         // Check magic
         const magic = try reader.readBytes(5);
@@ -1057,7 +1060,7 @@ pub const Psbt = struct {
         // Parse global map
         var tx: ?types.Transaction = null;
         var version: u32 = 0;
-        var global_unknown = std.AutoHashMap(u64, struct { key: []const u8, value: []const u8 }).init(allocator);
+        var global_unknown = std.AutoHashMap(u64, UnknownEntry).init(allocator);
         var xpubs = std.AutoHashMap([78]u8, KeyOriginInfo).init(allocator);
 
         errdefer {
@@ -1081,8 +1084,8 @@ pub const Psbt = struct {
             switch (key_type) {
                 PSBT_GLOBAL_UNSIGNED_TX => {
                     if (key_data.len != 0) return PsbtError.InvalidKeyLength;
-                    var tx_reader = serialize.Reader{ .data = value };
-                    tx = try serialize.readTransaction(&tx_reader, allocator);
+                    var tx_reader = serialize_mod.Reader{ .data = value };
+                    tx = try serialize_mod.readTransaction(&tx_reader, allocator);
                 },
                 PSBT_GLOBAL_VERSION => {
                     if (value.len != 4) return PsbtError.InvalidValueLength;
@@ -1242,7 +1245,7 @@ pub const Psbt = struct {
 // Helper Functions
 // ============================================================================
 
-fn parseInputMap(allocator: std.mem.Allocator, reader: *serialize.Reader, input: *PsbtInput) !void {
+fn parseInputMap(allocator: std.mem.Allocator, reader: *serialize_mod.Reader, input: *PsbtInput) !void {
     while (true) {
         const key_len = try reader.readCompactSize();
         if (key_len == 0) break; // Separator
@@ -1256,11 +1259,11 @@ fn parseInputMap(allocator: std.mem.Allocator, reader: *serialize.Reader, input:
 
         switch (key_type) {
             PSBT_IN_NON_WITNESS_UTXO => {
-                var tx_reader = serialize.Reader{ .data = value };
-                input.non_witness_utxo = try serialize.readTransaction(&tx_reader, allocator);
+                var tx_reader = serialize_mod.Reader{ .data = value };
+                input.non_witness_utxo = try serialize_mod.readTransaction(&tx_reader, allocator);
             },
             PSBT_IN_WITNESS_UTXO => {
-                var utxo_reader = serialize.Reader{ .data = value };
+                var utxo_reader = serialize_mod.Reader{ .data = value };
                 const utxo_value = try utxo_reader.readInt(i64);
                 const script_len = try utxo_reader.readCompactSize();
                 const script = try utxo_reader.readBytes(@intCast(script_len));
@@ -1312,7 +1315,7 @@ fn parseInputMap(allocator: std.mem.Allocator, reader: *serialize.Reader, input:
                 input.final_script_sig = try allocator.dupe(u8, value);
             },
             PSBT_IN_SCRIPTWITNESS => {
-                var witness_reader = serialize.Reader{ .data = value };
+                var witness_reader = serialize_mod.Reader{ .data = value };
                 const witness_count = try witness_reader.readCompactSize();
                 var witness = try allocator.alloc([]const u8, @intCast(witness_count));
                 for (0..@intCast(witness_count)) |i| {
@@ -1344,7 +1347,7 @@ fn parseInputMap(allocator: std.mem.Allocator, reader: *serialize.Reader, input:
     }
 }
 
-fn parseOutputMap(allocator: std.mem.Allocator, reader: *serialize.Reader, output: *PsbtOutput) !void {
+fn parseOutputMap(allocator: std.mem.Allocator, reader: *serialize_mod.Reader, output: *PsbtOutput) !void {
     while (true) {
         const key_len = try reader.readCompactSize();
         if (key_len == 0) break; // Separator
