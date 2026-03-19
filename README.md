@@ -61,7 +61,7 @@ It leverages comptime for compile-time validation and explicit allocators for me
 - [x] Tor/I2P proxy support (SOCKS5 RFC 1928, Tor control for hidden services, I2P SAM v3.1)
 - [x] Chain management RPCs (invalidateblock, reconsiderblock, preciousblock with BFS descendant marking)
 - [x] PSBT (BIP-174/370 partially signed transactions, Creator/Updater/Signer/Combiner/Finalizer/Extractor roles, Base64, RPCs)
-- [x] assumeUTXO (snapshot loading, verification, fast sync from trusted snapshots)
+- [x] assumeUTXO (snapshot creation/loading, hash verification, dual chainstate, loadtxoutset/dumptxoutset RPCs)
 - [x] Stale peer eviction (chain sync timeout, block download timeout, ping timeout)
 - [ ] Full node integration (P2P + RPC + sync + mempool working together)
 

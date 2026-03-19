@@ -41,12 +41,11 @@ pub fn build(b: *std.Build) void {
         exe.linkLibC();
     }
 
-    // Link libsecp256k1 if enabled
-    if (secp256k1_enabled) {
-        exe.linkSystemLibrary("secp256k1");
-        exe.addIncludePath(.{ .cwd_relative = secp256k1_include });
-        exe.linkLibC();
-    }
+    // Always add secp256k1 include path and link library for @cImport in wallet.zig
+    exe.addIncludePath(.{ .cwd_relative = secp256k1_include });
+    exe.addLibraryPath(.{ .cwd_relative = "/home/max/.local/lib64" });
+    exe.linkSystemLibrary("secp256k1");
+    exe.linkLibC();
 
     // Link libminisketch if enabled
     if (minisketch_enabled) {
@@ -98,6 +97,34 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // Sighash test harness (standalone executable, no secp256k1/rocksdb needed)
+    const sighash_test = b.addExecutable(.{
+        .name = "test_sighash",
+        .root_source_file = b.path("src/test_sighash.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(sighash_test);
+
+    const run_sighash = b.addRunArtifact(sighash_test);
+    run_sighash.step.dependOn(b.getInstallStep());
+    const sighash_step = b.step("test-sighash", "Run sighash test vectors");
+    sighash_step.dependOn(&run_sighash.step);
+
+    // Script test vectors harness (standalone executable, no secp256k1/rocksdb needed)
+    const script_test = b.addExecutable(.{
+        .name = "test_script",
+        .root_source_file = b.path("src/test_script.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(script_test);
+
+    const run_script = b.addRunArtifact(script_test);
+    run_script.step.dependOn(b.getInstallStep());
+    const script_step = b.step("test-script", "Run script test vectors");
+    script_step.dependOn(&run_script.step);
 
     // Add a separate step for RocksDB tests
     if (rocksdb_enabled) {

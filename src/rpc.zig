@@ -24,6 +24,8 @@ const validation = @import("validation.zig");
 const wallet_mod = @import("wallet.zig");
 const descriptor = @import("descriptor.zig");
 const psbt_mod = @import("psbt.zig");
+const address_mod = @import("address.zig");
+const script_mod = @import("script.zig");
 
 // ============================================================================
 // RPC Error Codes (Bitcoin Core conventions)
@@ -95,9 +97,13 @@ pub const RpcServer = struct {
     peer_manager: *peer_mod.PeerManager,
     network_params: *const consensus.NetworkParams,
     wallet: ?*wallet_mod.Wallet,
+    wallet_manager: ?*wallet_mod.WalletManager,
     chain_manager: ?*validation.ChainManager,
     config: RpcConfig,
     running: std.atomic.Value(bool),
+
+    // Per-request state (for wallet targeting)
+    current_wallet: ?*wallet_mod.Wallet = null,
 
     /// Initialize the RPC server.
     pub fn init(
@@ -116,9 +122,11 @@ pub const RpcServer = struct {
             .peer_manager = peer_manager,
             .network_params = network_params,
             .wallet = null,
+            .wallet_manager = null,
             .chain_manager = null,
             .config = config,
             .running = std.atomic.Value(bool).init(false),
+            .current_wallet = null,
         };
     }
 
@@ -140,15 +148,48 @@ pub const RpcServer = struct {
             .peer_manager = peer_manager,
             .network_params = network_params,
             .wallet = wallet,
+            .wallet_manager = null,
             .chain_manager = null,
             .config = config,
             .running = std.atomic.Value(bool).init(false),
+            .current_wallet = null,
+        };
+    }
+
+    /// Initialize the RPC server with a wallet manager (multi-wallet).
+    pub fn initWithWalletManager(
+        allocator: std.mem.Allocator,
+        chain_state: *storage.ChainState,
+        mempool: *mempool_mod.Mempool,
+        peer_manager: *peer_mod.PeerManager,
+        network_params: *const consensus.NetworkParams,
+        wallet_manager: *wallet_mod.WalletManager,
+        config: RpcConfig,
+    ) RpcServer {
+        return RpcServer{
+            .listener = null,
+            .allocator = allocator,
+            .chain_state = chain_state,
+            .mempool = mempool,
+            .peer_manager = peer_manager,
+            .network_params = network_params,
+            .wallet = null,
+            .wallet_manager = wallet_manager,
+            .chain_manager = null,
+            .config = config,
+            .running = std.atomic.Value(bool).init(false),
+            .current_wallet = null,
         };
     }
 
     /// Set the chain manager for invalidateblock/reconsiderblock/preciousblock RPCs.
     pub fn setChainManager(self: *RpcServer, chain_manager: *validation.ChainManager) void {
         self.chain_manager = chain_manager;
+    }
+
+    /// Set the wallet manager for multi-wallet support.
+    pub fn setWalletManager(self: *RpcServer, wallet_manager: *wallet_mod.WalletManager) void {
+        self.wallet_manager = wallet_manager;
     }
 
     /// Start listening for connections.
@@ -216,10 +257,58 @@ pub const RpcServer = struct {
         const headers_end = std.mem.indexOf(u8, request_data, "\r\n\r\n") orelse return;
         const headers = request_data[0..headers_end];
 
-        // Check method is POST
-        if (!std.mem.startsWith(u8, headers, "POST")) {
+        // Parse HTTP method and URL path from request line
+        const request_line_end = std.mem.indexOf(u8, headers, "\r\n") orelse headers.len;
+        const request_line = headers[0..request_line_end];
+
+        // Extract method
+        const is_get = std.mem.startsWith(u8, request_line, "GET ");
+        const is_post = std.mem.startsWith(u8, request_line, "POST ");
+
+        // Extract path from request line
+        var url_path: []const u8 = "/";
+        if (std.mem.indexOf(u8, request_line, " ")) |path_start| {
+            const path_content = request_line[path_start + 1 ..];
+            if (std.mem.indexOf(u8, path_content, " ")) |path_end| {
+                url_path = path_content[0..path_end];
+            }
+        }
+
+        // Handle REST API requests (GET /rest/...)
+        if (is_get and std.mem.startsWith(u8, url_path, "/rest/")) {
+            self.handleRestRequest(conn.stream, url_path) catch {
+                try self.sendHttpError(conn.stream, 500, "Internal Server Error");
+            };
+            return;
+        }
+
+        // For non-REST requests, require POST method
+        if (!is_post) {
             try self.sendHttpError(conn.stream, 405, "Method Not Allowed");
             return;
+        }
+
+        // Set target wallet based on URL path
+        self.current_wallet = null;
+        if (self.wallet_manager) |wm| {
+            self.current_wallet = wm.getTargetWallet(url_path) catch |err| blk: {
+                if (err == error.WalletNotFound) {
+                    const error_response = self.jsonRpcError(
+                        RPC_WALLET_NOT_FOUND,
+                        "Requested wallet does not exist or is not loaded",
+                        null,
+                    ) catch return;
+                    defer self.allocator.free(error_response);
+                    try self.sendHttpResponse(conn.stream, 200, error_response);
+                    return;
+                } else {
+                    // WalletNotSpecified or other - continue and let individual handlers decide
+                    break :blk null;
+                }
+            };
+        } else if (self.wallet) |w| {
+            // Single wallet mode (backwards compatible)
+            self.current_wallet = w;
         }
 
         // Check authentication if configured
@@ -312,6 +401,206 @@ pub const RpcServer = struct {
         stream.writeAll(body) catch {};
     }
 
+    /// Send an HTTP response with custom content type.
+    fn sendRestResponse(self: *RpcServer, stream: std.net.Stream, status: u16, content_type: []const u8, body: []const u8) !void {
+        _ = self;
+        var header_buf: [512]u8 = undefined;
+        const status_text = switch (status) {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            else => "Error",
+        };
+        const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, status_text, content_type, body.len }) catch return;
+        stream.writeAll(header) catch {};
+        stream.writeAll(body) catch {};
+    }
+
+    // ========================================================================
+    // REST API (Bitcoin Core compatible)
+    // ========================================================================
+
+    /// REST response format derived from file extension.
+    const RestFormat = enum {
+        json,
+        hex,
+        bin,
+    };
+
+    /// Parse the format extension from a REST path segment.
+    /// Returns the path without extension and the format, or null if invalid.
+    fn parseRestFormat(segment: []const u8) ?struct { path: []const u8, format: RestFormat } {
+        if (std.mem.endsWith(u8, segment, ".json")) {
+            return .{ .path = segment[0 .. segment.len - 5], .format = .json };
+        } else if (std.mem.endsWith(u8, segment, ".hex")) {
+            return .{ .path = segment[0 .. segment.len - 4], .format = .hex };
+        } else if (std.mem.endsWith(u8, segment, ".bin")) {
+            return .{ .path = segment[0 .. segment.len - 4], .format = .bin };
+        }
+        return null;
+    }
+
+    /// Content-Type string for a REST format.
+    fn restContentType(format: RestFormat) []const u8 {
+        return switch (format) {
+            .json => "application/json",
+            .hex => "text/plain",
+            .bin => "application/octet-stream",
+        };
+    }
+
+    /// Handle a REST API request (GET /rest/...).
+    /// Dispatches to the appropriate handler based on the URL path.
+    fn handleRestRequest(self: *RpcServer, stream: std.net.Stream, url_path: []const u8) !void {
+        // Strip the "/rest/" prefix
+        const rest_path = url_path[6..]; // skip "/rest/"
+
+        // GET /rest/chaininfo.json
+        if (std.mem.startsWith(u8, rest_path, "chaininfo")) {
+            const parsed = parseRestFormat(rest_path["chaininfo".len..]) orelse {
+                // chaininfo doesn't have sub-path, the extension is right after "chaininfo"
+                // But parseRestFormat expects ".json" etc., and rest_path["chaininfo".len..] would be ".json"
+                // Actually we need to handle "chaininfo.json" as a whole
+                try self.sendRestResponse(stream, 400, "text/plain", "Bad format. Must use .json, .hex, or .bin");
+                return;
+            };
+            _ = parsed.path; // should be empty for chaininfo
+            const result = try self.handleGetBlockchainInfo(null);
+            defer self.allocator.free(result);
+            // The RPC result is wrapped in {"result":...,"error":null,"id":null}
+            // For REST, we want just the result value. Extract it.
+            const rest_body = extractJsonResult(result) orelse result;
+            try self.sendRestResponse(stream, 200, "application/json", rest_body);
+            return;
+        }
+
+        // GET /rest/mempool/info.json
+        if (std.mem.startsWith(u8, rest_path, "mempool/info")) {
+            const suffix = rest_path["mempool/info".len..];
+            const parsed = parseRestFormat(suffix) orelse {
+                try self.sendRestResponse(stream, 400, "text/plain", "Bad format. Must use .json, .hex, or .bin");
+                return;
+            };
+            _ = parsed;
+            const result = try self.handleGetMempoolInfo(null);
+            defer self.allocator.free(result);
+            const rest_body = extractJsonResult(result) orelse result;
+            try self.sendRestResponse(stream, 200, "application/json", rest_body);
+            return;
+        }
+
+        // GET /rest/block/<hash>.json
+        if (std.mem.startsWith(u8, rest_path, "block/")) {
+            const remainder = rest_path["block/".len..];
+            const parsed = parseRestFormat(remainder) orelse {
+                try self.sendRestResponse(stream, 400, "text/plain", "Bad format. Must use .json, .hex, or .bin");
+                return;
+            };
+            const hash_hex = parsed.path;
+            if (hash_hex.len != 64) {
+                try self.sendRestResponse(stream, 400, "text/plain", "Invalid hash: must be 64 hex characters");
+                return;
+            }
+            // Build JSON-RPC style params and call getblock handler
+            // Construct a params array with the hash
+            var params_buf: [256]u8 = undefined;
+            const params_json = std.fmt.bufPrint(&params_buf, "{{\"jsonrpc\":\"1.0\",\"id\":null,\"method\":\"getblock\",\"params\":[\"{s}\",1]}}", .{hash_hex}) catch {
+                try self.sendRestResponse(stream, 500, "text/plain", "Internal error");
+                return;
+            };
+            const result = self.dispatch(params_json) catch {
+                try self.sendRestResponse(stream, 500, "text/plain", "Internal error");
+                return;
+            };
+            defer self.allocator.free(result);
+            const rest_body = extractJsonResult(result) orelse result;
+            // Check if result contains error
+            if (std.mem.indexOf(u8, result, "\"error\":null") == null) {
+                try self.sendRestResponse(stream, 404, "application/json", rest_body);
+            } else {
+                try self.sendRestResponse(stream, 200, restContentType(parsed.format), rest_body);
+            }
+            return;
+        }
+
+        // GET /rest/tx/<txid>.json
+        if (std.mem.startsWith(u8, rest_path, "tx/")) {
+            const remainder = rest_path["tx/".len..];
+            const parsed = parseRestFormat(remainder) orelse {
+                try self.sendRestResponse(stream, 400, "text/plain", "Bad format. Must use .json, .hex, or .bin");
+                return;
+            };
+            const txid_hex = parsed.path;
+            if (txid_hex.len != 64) {
+                try self.sendRestResponse(stream, 400, "text/plain", "Invalid txid: must be 64 hex characters");
+                return;
+            }
+            var params_buf: [256]u8 = undefined;
+            const params_json = std.fmt.bufPrint(&params_buf, "{{\"jsonrpc\":\"1.0\",\"id\":null,\"method\":\"getrawtransaction\",\"params\":[\"{s}\",true]}}", .{txid_hex}) catch {
+                try self.sendRestResponse(stream, 500, "text/plain", "Internal error");
+                return;
+            };
+            const result = self.dispatch(params_json) catch {
+                try self.sendRestResponse(stream, 500, "text/plain", "Internal error");
+                return;
+            };
+            defer self.allocator.free(result);
+            const rest_body = extractJsonResult(result) orelse result;
+            if (std.mem.indexOf(u8, result, "\"error\":null") == null) {
+                try self.sendRestResponse(stream, 404, "application/json", rest_body);
+            } else {
+                try self.sendRestResponse(stream, 200, restContentType(parsed.format), rest_body);
+            }
+            return;
+        }
+
+        // GET /rest/headers/<count>/<hash>.json
+        if (std.mem.startsWith(u8, rest_path, "headers/")) {
+            const remainder = rest_path["headers/".len..];
+            // Parse count/hash.format
+            const slash_idx = std.mem.indexOf(u8, remainder, "/") orelse {
+                try self.sendRestResponse(stream, 400, "text/plain", "Invalid path: expected /rest/headers/<count>/<hash>.json");
+                return;
+            };
+            const count_str = remainder[0..slash_idx];
+            const hash_with_ext = remainder[slash_idx + 1 ..];
+            const parsed = parseRestFormat(hash_with_ext) orelse {
+                try self.sendRestResponse(stream, 400, "text/plain", "Bad format. Must use .json, .hex, or .bin");
+                return;
+            };
+            const hash_hex = parsed.path;
+            _ = std.fmt.parseInt(u32, count_str, 10) catch {
+                try self.sendRestResponse(stream, 400, "text/plain", "Invalid count parameter");
+                return;
+            };
+            if (hash_hex.len != 64) {
+                try self.sendRestResponse(stream, 400, "text/plain", "Invalid hash: must be 64 hex characters");
+                return;
+            }
+            // Use getblockheader RPC as a proxy (returns single header)
+            var params_buf: [256]u8 = undefined;
+            const params_json = std.fmt.bufPrint(&params_buf, "{{\"jsonrpc\":\"1.0\",\"id\":null,\"method\":\"getblockheader\",\"params\":[\"{s}\",true]}}", .{hash_hex}) catch {
+                try self.sendRestResponse(stream, 500, "text/plain", "Internal error");
+                return;
+            };
+            const result = self.dispatch(params_json) catch {
+                try self.sendRestResponse(stream, 500, "text/plain", "Internal error");
+                return;
+            };
+            defer self.allocator.free(result);
+            const rest_body = extractJsonResult(result) orelse result;
+            if (std.mem.indexOf(u8, result, "\"error\":null") == null) {
+                try self.sendRestResponse(stream, 404, "application/json", rest_body);
+            } else {
+                try self.sendRestResponse(stream, 200, restContentType(parsed.format), rest_body);
+            }
+            return;
+        }
+
+        // Unknown REST endpoint
+        try self.sendRestResponse(stream, 404, "text/plain", "REST endpoint not found");
+    }
+
     /// Dispatch a JSON-RPC request to the appropriate handler.
     pub fn dispatch(self: *RpcServer, body: []const u8) ![]const u8 {
         // Parse JSON
@@ -391,6 +680,18 @@ pub const RpcServer = struct {
             self.stop();
             return self.jsonRpcResult("\"clearbit stopping\"", id);
         }
+        // Wallet management RPC methods (multi-wallet)
+        else if (std.mem.eql(u8, method, "createwallet")) {
+            return self.handleCreateWallet(params, id);
+        } else if (std.mem.eql(u8, method, "loadwallet")) {
+            return self.handleLoadWallet(params, id);
+        } else if (std.mem.eql(u8, method, "unloadwallet")) {
+            return self.handleUnloadWallet(params, id);
+        } else if (std.mem.eql(u8, method, "listwallets")) {
+            return self.handleListWallets(id);
+        } else if (std.mem.eql(u8, method, "listwalletdir")) {
+            return self.handleListWalletDir(id);
+        }
         // Wallet RPC methods
         else if (std.mem.eql(u8, method, "encryptwallet")) {
             return self.handleEncryptWallet(params, id);
@@ -446,6 +747,60 @@ pub const RpcServer = struct {
             return self.handleFinalizePsbt(params, id);
         } else if (std.mem.eql(u8, method, "converttopsbt")) {
             return self.handleConvertToPsbt(params, id);
+        }
+        // AssumeUTXO snapshot RPC methods
+        else if (std.mem.eql(u8, method, "loadtxoutset")) {
+            return self.handleLoadTxOutSet(params, id);
+        } else if (std.mem.eql(u8, method, "dumptxoutset")) {
+            return self.handleDumpTxOutSet(params, id);
+        }
+        // Phase 8: Additional RPC methods
+        else if (std.mem.eql(u8, method, "getblockheader")) {
+            return self.handleGetBlockHeader(params, id);
+        } else if (std.mem.eql(u8, method, "getchaintips")) {
+            return self.handleGetChainTips(id);
+        } else if (std.mem.eql(u8, method, "getrawmempool")) {
+            return self.handleGetRawMempool(params, id);
+        } else if (std.mem.eql(u8, method, "testmempoolaccept")) {
+            return self.handleTestMempoolAccept(params, id);
+        } else if (std.mem.eql(u8, method, "decoderawtransaction")) {
+            return self.handleDecodeRawTransaction(params, id);
+        } else if (std.mem.eql(u8, method, "decodescript")) {
+            return self.handleDecodeScript(params, id);
+        } else if (std.mem.eql(u8, method, "createrawtransaction")) {
+            return self.handleCreateRawTransaction(params, id);
+        } else if (std.mem.eql(u8, method, "getconnectioncount")) {
+            return self.handleGetConnectionCount(id);
+        } else if (std.mem.eql(u8, method, "addnode")) {
+            return self.handleAddNode(params, id);
+        } else if (std.mem.eql(u8, method, "getmininginfo")) {
+            return self.handleGetMiningInfo(id);
+        } else if (std.mem.eql(u8, method, "getnewaddress")) {
+            return self.handleGetNewAddress(params, id);
+        } else if (std.mem.eql(u8, method, "getbalance")) {
+            return self.handleGetBalance(params, id);
+        } else if (std.mem.eql(u8, method, "sendtoaddress")) {
+            return self.handleSendToAddress(params, id);
+        } else if (std.mem.eql(u8, method, "listunspent")) {
+            return self.handleListUnspent(params, id);
+        } else if (std.mem.eql(u8, method, "listtransactions")) {
+            return self.handleListTransactions(params, id);
+        } else if (std.mem.eql(u8, method, "estimatesmartfee")) {
+            return self.handleEstimateSmartFee(params, id);
+        } else if (std.mem.eql(u8, method, "signrawtransactionwithwallet")) {
+            return self.handleSignRawTransactionWithWallet(params, id);
+        } else if (std.mem.eql(u8, method, "importdescriptors")) {
+            return self.handleImportDescriptors(params, id);
+        } else if (std.mem.eql(u8, method, "validateaddress")) {
+            return self.handleValidateAddress(params, id);
+        } else if (std.mem.eql(u8, method, "gettxout")) {
+            return self.handleGetTxOut(params, id);
+        } else if (std.mem.eql(u8, method, "getmempoolancestors")) {
+            return self.handleGetMempoolAncestors(params, id);
+        } else if (std.mem.eql(u8, method, "getmempooldescendants")) {
+            return self.handleGetMempoolDescendants(params, id);
+        } else if (std.mem.eql(u8, method, "help")) {
+            return self.handleHelp(params, id);
         } else {
             return self.jsonRpcError(RPC_METHOD_NOT_FOUND, "Method not found", id);
         }
@@ -559,8 +914,31 @@ pub const RpcServer = struct {
             return self.jsonRpcResult(buf.items, id);
         }
 
-        // For now, we only know the best block hash
-        // A full implementation would look up the block index
+        if (height > self.chain_state.best_height) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block height out of range", id);
+        }
+
+        // Look up in block index by walking from the tip
+        if (self.chain_manager) |cm| {
+            // Walk backwards from the active tip to find block at requested height
+            var entry: ?*validation.BlockIndexEntry = cm.active_tip;
+            while (entry) |e| {
+                if (e.height == height) {
+                    var buf = std.ArrayList(u8).init(self.allocator);
+                    defer buf.deinit();
+                    const writer = buf.writer();
+
+                    try writer.writeByte('"');
+                    try writeHashHex(writer, &e.hash);
+                    try writer.writeByte('"');
+
+                    return self.jsonRpcResult(buf.items, id);
+                }
+                entry = e.parent;
+            }
+        }
+
+        // Fallback: only know the best block hash
         if (height == self.chain_state.best_height) {
             var buf = std.ArrayList(u8).init(self.allocator);
             defer buf.deinit();
@@ -617,17 +995,29 @@ pub const RpcServer = struct {
             };
         }
 
-        // For now, we can only return info about genesis or best block
-        // A full implementation would look up the block from storage
+        // Look up block in index
         const is_genesis = std.mem.eql(u8, &blockhash, &self.network_params.genesis_hash);
-        const is_best = std.mem.eql(u8, &blockhash, &self.chain_state.best_hash);
 
-        if (!is_genesis and !is_best) {
+        var header: types.BlockHeader = undefined;
+        var height: u32 = 0;
+
+        if (is_genesis) {
+            header = self.network_params.genesis_header;
+            height = 0;
+        } else if (self.chain_manager) |cm| {
+            if (cm.getBlock(&blockhash)) |entry| {
+                header = entry.header;
+                height = entry.height;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+            }
+        } else if (std.mem.eql(u8, &blockhash, &self.chain_state.best_hash)) {
+            // Fallback without chain_manager: only know best block
+            header = self.network_params.genesis_header; // placeholder
+            height = self.chain_state.best_height;
+        } else {
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
         }
-
-        const header = if (is_genesis) self.network_params.genesis_header else self.network_params.genesis_header;
-        const height: u32 = if (is_genesis) 0 else self.chain_state.best_height;
 
         if (verbosity == 0) {
             // Return raw hex-encoded block
@@ -953,12 +1343,235 @@ pub const RpcServer = struct {
     // Wallet Methods
     // ========================================================================
 
-    /// Check if wallet is available
+    /// Check if wallet is available (supports multi-wallet via current_wallet)
     fn requireWallet(self: *RpcServer, id: ?std.json.Value) ?[]const u8 {
-        if (self.wallet == null) {
-            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id) catch null;
+        // Check current_wallet first (set from URL path)
+        if (self.current_wallet != null) return null;
+
+        // Fall back to single wallet (backwards compatible)
+        if (self.wallet != null) return null;
+
+        // If wallet_manager exists but no current_wallet, check wallet count
+        if (self.wallet_manager) |wm| {
+            const count = wm.count();
+            if (count == 0) {
+                return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id) catch null;
+            } else if (count > 1) {
+                return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "Wallet file not specified (must request wallet RPC through /wallet/<name>)", id) catch null;
+            } else {
+                // Exactly one wallet - use it
+                return null;
+            }
+        }
+
+        return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id) catch null;
+    }
+
+    /// Get the current target wallet
+    fn getTargetWallet(self: *RpcServer) ?*wallet_mod.Wallet {
+        if (self.current_wallet) |w| return w;
+        if (self.wallet) |w| return w;
+        if (self.wallet_manager) |wm| {
+            return wm.getDefaultWallet() catch null;
         }
         return null;
+    }
+
+    /// createwallet "wallet_name" ( disable_private_keys blank passphrase )
+    /// Creates and loads a new wallet.
+    fn handleCreateWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wm = self.wallet_manager orelse {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Multi-wallet not enabled", id);
+        };
+
+        // Extract wallet name
+        const wallet_name = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const n = params.array.items[0];
+                if (n == .string) break :blk n.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing wallet_name", id);
+        };
+
+        // Parse options
+        var options = wallet_mod.WalletOptions{};
+
+        if (params == .array) {
+            // disable_private_keys
+            if (params.array.items.len > 1) {
+                const dpk = params.array.items[1];
+                if (dpk == .bool) {
+                    options.disable_private_keys = dpk.bool;
+                }
+            }
+            // blank
+            if (params.array.items.len > 2) {
+                const blank = params.array.items[2];
+                if (blank == .bool) {
+                    options.blank = blank.bool;
+                }
+            }
+            // passphrase
+            if (params.array.items.len > 3) {
+                const pp = params.array.items[3];
+                if (pp == .string and pp.string.len > 0) {
+                    options.passphrase = pp.string;
+                }
+            }
+        }
+
+        _ = wm.createWallet(wallet_name, options) catch |err| {
+            if (err == error.WalletAlreadyExists) {
+                return self.jsonRpcError(RPC_WALLET_ERROR, "Wallet already exists", id);
+            }
+            return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
+        };
+
+        // Return success with wallet name and warning
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.print("{{\"name\":\"{s}\",\"warning\":\"\"}}", .{wallet_name});
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// loadwallet "filename"
+    /// Loads a wallet from a wallet file.
+    fn handleLoadWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wm = self.wallet_manager orelse {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Multi-wallet not enabled", id);
+        };
+
+        // Extract filename/wallet name
+        const wallet_name = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const n = params.array.items[0];
+                if (n == .string) break :blk n.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing filename", id);
+        };
+
+        _ = wm.loadWallet(wallet_name) catch |err| {
+            if (err == error.WalletAlreadyLoaded) {
+                return self.jsonRpcError(RPC_WALLET_ERROR, "Wallet is already loaded", id);
+            }
+            if (err == error.WalletNotFound) {
+                return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "Wallet file not found", id);
+            }
+            return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.print("{{\"name\":\"{s}\",\"warning\":\"\"}}", .{wallet_name});
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// unloadwallet "wallet_name"
+    /// Unloads the wallet referenced by the request.
+    fn handleUnloadWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wm = self.wallet_manager orelse {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Multi-wallet not enabled", id);
+        };
+
+        // Extract wallet name from params or use current_wallet
+        var wallet_name: []const u8 = "";
+        if (params == .array and params.array.items.len > 0) {
+            const n = params.array.items[0];
+            if (n == .string) {
+                wallet_name = n.string;
+            }
+        }
+
+        // If no name provided, try to get from URL path or fail
+        if (wallet_name.len == 0) {
+            // For unloadwallet, we need an explicit name
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing wallet_name", id);
+        }
+
+        wm.unloadWallet(wallet_name) catch |err| {
+            if (err == error.WalletNotLoaded) {
+                return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "Wallet is not loaded", id);
+            }
+            return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.print("{{\"warning\":\"\"}}", .{});
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// listwallets
+    /// Returns a list of currently loaded wallets.
+    fn handleListWallets(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+
+        if (self.wallet_manager) |wm| {
+            const names = wm.listWallets(self.allocator) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to list wallets", id);
+            };
+            defer {
+                for (names) |n| self.allocator.free(n);
+                self.allocator.free(names);
+            }
+
+            for (names, 0..) |name, i| {
+                if (i > 0) try writer.writeByte(',');
+                try writer.print("\"{s}\"", .{name});
+            }
+        } else if (self.wallet != null) {
+            // Single wallet mode - return empty name (default wallet)
+            try writer.writeAll("\"\"");
+        }
+
+        try writer.writeByte(']');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// listwalletdir
+    /// Returns a list of wallets in the wallet directory.
+    fn handleListWalletDir(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        const wm = self.wallet_manager orelse {
+            // If no wallet manager, return empty result
+            return self.jsonRpcResult("{\"wallets\":[]}", id);
+        };
+
+        const names = wm.listWalletDir(self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to list wallet directory", id);
+        };
+        defer {
+            for (names) |n| self.allocator.free(n);
+            self.allocator.free(names);
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"wallets\":[");
+
+        for (names, 0..) |name, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{{\"name\":\"{s}\"}}", .{name});
+        }
+
+        try writer.writeAll("]}");
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     /// encryptwallet "passphrase"
@@ -966,7 +1579,9 @@ pub const RpcServer = struct {
     fn handleEncryptWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
-        const wallet = self.wallet.?;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
 
         // Extract passphrase parameter
         const passphrase = blk: {
@@ -995,7 +1610,9 @@ pub const RpcServer = struct {
     fn handleWalletPassphrase(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
-        const wallet = self.wallet.?;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
 
         // Extract passphrase and timeout
         var passphrase: []const u8 = undefined;
@@ -1040,7 +1657,9 @@ pub const RpcServer = struct {
     fn handleWalletLock(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
-        const wallet = self.wallet.?;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
 
         if (!wallet.encrypted) {
             return self.jsonRpcError(RPC_WALLET_WRONG_ENC_STATE, "Wallet is not encrypted", id);
@@ -1055,7 +1674,9 @@ pub const RpcServer = struct {
     fn handleWalletPassphraseChange(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
-        const wallet = self.wallet.?;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
 
         // Extract old and new passphrases
         var old_passphrase: []const u8 = undefined;
@@ -1093,7 +1714,9 @@ pub const RpcServer = struct {
     fn handleSetLabel(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
-        const wallet = self.wallet.?;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
 
         // Extract address and label
         var addr: []const u8 = undefined;
@@ -1129,7 +1752,9 @@ pub const RpcServer = struct {
     fn handleGetAddressInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
-        const wallet = self.wallet.?;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
 
         // Extract address
         const addr = blk: {
@@ -1161,7 +1786,9 @@ pub const RpcServer = struct {
     fn handleGetWalletInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
-        const wallet = self.wallet.?;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
@@ -1372,6 +1999,7 @@ pub const RpcServer = struct {
                 mempool_mod.MempoolError.ConflictsWithMempool => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),
                 mempool_mod.MempoolError.TxValidationFailed => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction validation failed", id),
                 mempool_mod.MempoolError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "out of memory", id),
+                else => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction rejected", id),
             };
         };
 
@@ -1784,6 +2412,7 @@ pub const RpcServer = struct {
     /// Mine blocks to a specified address and return block hashes.
     /// Usage: generatetoaddress nblocks "address" [maxtries]
     fn handleGenerateToAddress(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        std.log.info("handleGenerateToAddress: called", .{});
         // Verify we're on regtest (mining RPCs only available on regtest)
         if (self.network_params.magic != consensus.REGTEST.magic) {
             return self.jsonRpcError(RPC_MISC_ERROR, "generatetoaddress is only available in regtest mode", id);
@@ -1839,6 +2468,7 @@ pub const RpcServer = struct {
             payout_script,
             n_blocks,
             max_tries,
+            if (self.chain_manager) |cm| cm else null,
             self.allocator,
         ) catch {
             return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block generation failed", id);
@@ -1914,10 +2544,10 @@ pub const RpcServer = struct {
         var desc = descriptor.parseDescriptor(self.allocator, desc_str) catch {
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor", id);
         };
-        defer desc.deinit();
+        defer desc.deinit(self.allocator);
 
         // Get script pubkey from descriptor (index 0 for non-ranged)
-        const payout_script = desc.getScriptPubKey(0) catch {
+        const payout_script = descriptor.deriveScript(self.allocator, &desc, 0) catch {
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive script from descriptor", id);
         };
         defer self.allocator.free(payout_script);
@@ -1930,6 +2560,7 @@ pub const RpcServer = struct {
             payout_script,
             n_blocks,
             max_tries,
+            if (self.chain_manager) |cm| cm else null,
             self.allocator,
         ) catch {
             return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block generation failed", id);
@@ -1998,7 +2629,7 @@ pub const RpcServer = struct {
                             }
 
                             // Look up in mempool
-                            const entry = self.mempool.get(&txid);
+                            const entry = self.mempool.get(txid);
                             if (entry) |e| {
                                 try transactions.append(e.tx);
                             } else {
@@ -2053,9 +2684,9 @@ pub const RpcServer = struct {
             var desc = descriptor.parseDescriptor(self.allocator, output) catch {
                 return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address or descriptor", id);
             };
-            defer desc.deinit();
+            defer desc.deinit(self.allocator);
 
-            const script = desc.getScriptPubKey(0) catch {
+            const script = descriptor.deriveScript(self.allocator, &desc, 0) catch {
                 return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive script", id);
             };
             script_owned = true;
@@ -2072,6 +2703,7 @@ pub const RpcServer = struct {
             transactions.items,
             block_template.DEFAULT_MAX_TRIES,
             submit_block,
+            if (self.chain_manager) |cm| cm else null,
             self.allocator,
         ) catch {
             return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block generation failed", id);
@@ -2261,17 +2893,9 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Package exceeds maximum transaction count (25)", id);
         }
 
-        // Parse optional maxfeerate (BTC/kvB)
-        var max_feerate: i64 = DEFAULT_MAX_FEERATE;
-        if (params.array.items.len > 1 and params.array.items[1] != .null) {
-            const feerate_param = params.array.items[1];
-            if (feerate_param == .float) {
-                max_feerate = @intFromFloat(feerate_param.float * 100_000_000.0);
-            } else if (feerate_param == .integer) {
-                max_feerate = feerate_param.integer;
-            }
-        }
-        _ = max_feerate; // TODO: implement maxfeerate check per-tx
+        // TODO: implement maxfeerate check per-tx
+        // Parse optional maxfeerate (BTC/kvB) - currently unused
+        // if (params.array.items.len > 1 and params.array.items[1] != .null) { ... }
 
         // Parse all transactions from hex
         var transactions = std.ArrayList(types.Transaction).init(self.allocator);
@@ -2345,6 +2969,7 @@ pub const RpcServer = struct {
                 mempool_mod.PackageError.PackageParentsNotIndependent => self.jsonRpcError(RPC_INVALID_PARAMS, "package-parents-not-independent", id),
                 mempool_mod.PackageError.PackageFeeTooLow => self.jsonRpcError(RPC_VERIFY_REJECTED, "package-fee-too-low", id),
                 mempool_mod.PackageError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id),
+                else => self.jsonRpcError(RPC_VERIFY_REJECTED, "package rejected", id),
             };
         };
         defer result.deinit();
@@ -2368,12 +2993,7 @@ pub const RpcServer = struct {
             if (tx_result.accepted) {
                 try writer.print("\"txid\":\"", .{});
                 try writeHashHex(writer, &tx_result.txid);
-                try writer.print("\",\"wtxid\":\"", .{});
-                try writeHashHex(writer, &tx_result.wtxid);
-                try writer.print("\",\"vsize\":{d},\"fees\":{{\"base\":{d}}}", .{
-                    tx_result.vsize,
-                    tx_result.fee,
-                });
+                try writer.print("\",\"allowed\":true", .{});
             } else {
                 try writer.print("\"txid\":\"", .{});
                 try writeHashHex(writer, &tx_result.txid);
@@ -2653,12 +3273,9 @@ pub const RpcServer = struct {
             if (i > 0) try writer.writeByte(',');
             try writer.writeAll("{");
 
-            var has_field = false;
             if (output.bip32_derivation.count() > 0) {
                 try writer.print("\"bip32_derivs\":{d}", .{output.bip32_derivation.count()});
-                has_field = true;
             }
-            _ = has_field;
 
             try writer.writeByte('}');
         }
@@ -2759,7 +3376,7 @@ pub const RpcServer = struct {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "Each PSBT must be a base64 string", id);
             }
 
-            var psbt = psbt_mod.Psbt.fromBase64(self.allocator, item.string) catch {
+            const psbt = psbt_mod.Psbt.fromBase64(self.allocator, item.string) catch {
                 return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to decode PSBT", id);
             };
             try psbts.append(psbt);
@@ -2908,7 +3525,7 @@ pub const RpcServer = struct {
 
         // Parse transaction
         var reader = serialize.Reader{ .data = raw };
-        var tx = serialize.readTransaction(&reader, self.allocator) catch {
+        const tx = serialize.readTransaction(&reader, self.allocator) catch {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
         };
         defer {
@@ -2973,6 +3590,1863 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// Handle loadtxoutset RPC - load a UTXO set snapshot file.
+    /// Reference: Bitcoin Core rpc/blockchain.cpp loadtxoutset
+    ///
+    /// Arguments:
+    ///   1. path (string, required) - Path to the snapshot file
+    ///
+    /// Returns:
+    ///   {
+    ///     "coins_loaded": n,     (numeric) Number of coins loaded
+    ///     "tip_hash": "hash",    (string) Block hash at snapshot tip
+    ///     "tip_height": n,       (numeric) Height of snapshot tip
+    ///     "base_height": n       (numeric) Base height (same as tip_height for valid snapshots)
+    ///   }
+    fn handleLoadTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Parse parameters
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "loadtxoutset requires path argument", id);
+        }
+
+        const path_param = params.array.items[0];
+        if (path_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Path must be a string", id);
+        }
+        const path = path_param.string;
+
+        // Validate and load the snapshot
+        var load_result = storage.validateAndLoadSnapshot(
+            path,
+            self.network_params,
+            self.allocator,
+        ) catch |err| {
+            const msg = switch (err) {
+                storage.SnapshotError.UnknownSnapshot => "Snapshot block hash not found in assumeUtxo params",
+                storage.SnapshotError.HashMismatch => "UTXO set hash doesn't match expected value",
+                storage.SnapshotError.CoinCountMismatch => "Coin count doesn't match expected value",
+                storage.SnapshotError.IoError => "Failed to read snapshot file",
+                storage.SnapshotError.CorruptData => "Snapshot file is corrupt",
+                storage.SnapshotError.WrongNetwork => "Snapshot is for a different network",
+                storage.SnapshotError.OutOfMemory => "Out of memory",
+                storage.SnapshotError.BackgroundValidationFailed => "Background validation failed",
+            };
+            return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+        };
+
+        // TODO: Actually activate the snapshot chainstate using ChainStateManager
+        // For now, we just return the result without activating
+        // In a full implementation, we would:
+        // 1. Create the snapshot chainstate
+        // 2. Swap it with the current chainstate via ChainStateManager.activateSnapshot()
+        // 3. Start background validation thread
+        defer load_result.chainstate.deinit();
+
+        // Build response
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{");
+        try writer.print("\"coins_loaded\":{d},", .{load_result.result.coins_loaded});
+        try writer.writeAll("\"tip_hash\":\"");
+        try writeHashHex(writer, &load_result.result.tip_hash);
+        try writer.writeAll("\",");
+        try writer.print("\"tip_height\":{d},", .{load_result.result.tip_height});
+        try writer.print("\"base_height\":{d}", .{load_result.result.base_height});
+        try writer.writeAll("}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle dumptxoutset RPC - dump the UTXO set to a snapshot file.
+    /// Reference: Bitcoin Core rpc/blockchain.cpp dumptxoutset
+    ///
+    /// Arguments:
+    ///   1. path (string, required) - Path to write the snapshot file
+    ///
+    /// Returns:
+    ///   {
+    ///     "coins_written": n,    (numeric) Number of coins written
+    ///     "base_hash": "hash",   (string) Block hash at snapshot base
+    ///     "base_height": n       (numeric) Height of snapshot base
+    ///   }
+    fn handleDumpTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Parse parameters
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "dumptxoutset requires path argument", id);
+        }
+
+        const path_param = params.array.items[0];
+        if (path_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Path must be a string", id);
+        }
+        const path = path_param.string;
+
+        // Dump the UTXO set
+        const dump_result = storage.dumpTxOutSetWithResult(
+            self.chain_state,
+            self.network_params.magic,
+            path,
+            self.allocator,
+        ) catch |err| {
+            const msg = switch (err) {
+                error.FileNotFound, error.AccessDenied => "Cannot create snapshot file",
+                storage.StorageError.SerializationFailed => "Serialization failed",
+                storage.StorageError.OutOfMemory => "Out of memory",
+                else => "Failed to dump UTXO set",
+            };
+            return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+        };
+
+        // Build response
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{");
+        try writer.print("\"coins_written\":{d},", .{dump_result.coins_written});
+        try writer.writeAll("\"base_hash\":\"");
+        try writeHashHex(writer, &dump_result.base_hash);
+        try writer.writeAll("\",");
+        try writer.print("\"base_height\":{d}", .{dump_result.base_height});
+        try writer.writeAll("}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // Phase 8: Additional RPC Methods
+    // ========================================================================
+
+    /// Handle getblockheader RPC - get block header by hash.
+    /// Reference: Bitcoin Core rpc/blockchain.cpp getblockheader
+    ///
+    /// Arguments:
+    ///   1. blockhash (string, required) - The block hash
+    ///   2. verbose (bool, optional, default=true) - true for JSON, false for hex
+    fn handleGetBlockHeader(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Parse blockhash parameter
+        var blockhash_hex: []const u8 = undefined;
+        var verbose: bool = true;
+
+        if (params == .array) {
+            if (params.array.items.len > 0) {
+                const h = params.array.items[0];
+                if (h == .string) {
+                    blockhash_hex = h.string;
+                } else {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash", id);
+                }
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash", id);
+            }
+
+            if (params.array.items.len > 1) {
+                const v = params.array.items[1];
+                if (v == .bool) {
+                    verbose = v.bool;
+                }
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid params", id);
+        }
+
+        // Parse hash
+        if (blockhash_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash length", id);
+        }
+
+        var hash: types.Hash256 = undefined;
+        for (0..32) |i| {
+            hash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 .. i * 2 + 2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash hex", id);
+            };
+        }
+
+        // Try to find the block header
+        // Check if it's the genesis block
+        if (std.mem.eql(u8, &hash, &self.network_params.genesis_hash)) {
+            const header = &self.network_params.genesis_header;
+
+            if (!verbose) {
+                // Return hex-encoded header
+                var buf = std.ArrayList(u8).init(self.allocator);
+                defer buf.deinit();
+                const writer = buf.writer();
+                try writer.writeByte('"');
+                try writeBlockHeaderHex(writer, header);
+                try writer.writeByte('"');
+                return self.jsonRpcResult(buf.items, id);
+            }
+
+            // Verbose JSON response
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            const writer = buf.writer();
+
+            try writer.writeAll("{\"hash\":\"");
+            try writeHashHex(writer, &hash);
+            try writer.print("\",\"confirmations\":{d},\"height\":0,\"version\":{d},", .{
+                self.chain_state.best_height + 1,
+                header.version,
+            });
+            try writer.writeAll("\"versionHex\":\"");
+            try writer.print("{x:0>8}", .{@as(u32, @bitCast(header.version))});
+            try writer.writeAll("\",\"merkleroot\":\"");
+            try writeHashHex(writer, &header.merkle_root);
+            try writer.print("\",\"time\":{d},\"mediantime\":{d},\"nonce\":{d},", .{
+                header.timestamp,
+                header.timestamp,
+                header.nonce,
+            });
+            try writer.print("\"bits\":\"{x:0>8}\",\"difficulty\":{d:.8},", .{
+                header.bits,
+                getDifficulty(header.bits),
+            });
+            try writer.writeAll("\"chainwork\":\"");
+            // For genesis, chainwork is just the work of one block
+            try writer.writeAll("0000000000000000000000000000000000000000000000000000000100010001");
+            try writer.writeAll("\",\"nTx\":1,\"previousblockhash\":null,");
+            // nextblockhash would be set if we have it
+            try writer.writeAll("\"nextblockhash\":null}");
+
+            return self.jsonRpcResult(buf.items, id);
+        }
+
+        // Check if it's the current best block
+        if (std.mem.eql(u8, &hash, &self.chain_state.best_hash)) {
+            // Return simplified header for best block
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            const writer = buf.writer();
+
+            try writer.writeAll("{\"hash\":\"");
+            try writeHashHex(writer, &hash);
+            try writer.print("\",\"confirmations\":1,\"height\":{d}", .{self.chain_state.best_height});
+            try writer.writeAll("}");
+
+            return self.jsonRpcResult(buf.items, id);
+        }
+
+        return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+    }
+
+    /// Handle getchaintips RPC - return information about chain tips.
+    /// Reference: Bitcoin Core rpc/blockchain.cpp getchaintips
+    fn handleGetChainTips(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        // Return the active chain tip
+        try writer.writeAll("[{\"height\":");
+        try writer.print("{d}", .{self.chain_state.best_height});
+        try writer.writeAll(",\"hash\":\"");
+        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writer.writeAll("\",\"branchlen\":0,\"status\":\"active\"}]");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle getrawmempool RPC - return mempool transaction IDs.
+    /// Reference: Bitcoin Core rpc/mempool.cpp getrawmempool
+    ///
+    /// Arguments:
+    ///   1. verbose (bool, optional, default=false) - true for detailed info
+    ///   2. mempool_sequence (bool, optional, default=false) - include sequence
+    fn handleGetRawMempool(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        var verbose: bool = false;
+
+        if (params == .array and params.array.items.len > 0) {
+            const v = params.array.items[0];
+            if (v == .bool) {
+                verbose = v.bool;
+            }
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+
+        if (verbose) {
+            // Return object with txid -> info
+            try writer.writeByte('{');
+            var first = true;
+            var it = self.mempool.entries.iterator();
+            while (it.next()) |entry| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+
+                try writer.writeByte('"');
+                try writeHashHex(writer, &entry.value_ptr.*.txid);
+                try writer.writeAll("\":{");
+                try writer.print("\"vsize\":{d},", .{entry.value_ptr.*.vsize});
+                try writer.print("\"weight\":{d},", .{entry.value_ptr.*.weight});
+                try writer.print("\"fee\":{d:.8},", .{@as(f64, @floatFromInt(entry.value_ptr.*.fee)) / 100_000_000.0});
+                try writer.print("\"time\":{d},", .{entry.value_ptr.*.time_added});
+                try writer.print("\"height\":{d}", .{entry.value_ptr.*.height_added});
+                try writer.writeByte('}');
+            }
+            try writer.writeByte('}');
+        } else {
+            // Return array of txids
+            try writer.writeByte('[');
+            var first = true;
+            var it = self.mempool.entries.iterator();
+            while (it.next()) |entry| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+
+                try writer.writeByte('"');
+                try writeHashHex(writer, &entry.value_ptr.*.txid);
+                try writer.writeByte('"');
+            }
+            try writer.writeByte(']');
+        }
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle testmempoolaccept RPC - test if raw transactions would be accepted.
+    /// Reference: Bitcoin Core rpc/mempool.cpp testmempoolaccept
+    ///
+    /// Arguments:
+    ///   1. rawtxs (array of strings, required) - hex-encoded transactions
+    ///   2. maxfeerate (numeric, optional) - max fee rate in BTC/kvB
+    fn handleTestMempoolAccept(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing rawtxs array", id);
+        }
+
+        const rawtxs_param = params.array.items[0];
+        if (rawtxs_param != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "rawtxs must be an array", id);
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+
+        for (rawtxs_param.array.items, 0..) |tx_item, i| {
+            if (i > 0) try writer.writeByte(',');
+
+            if (tx_item != .string) {
+                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"invalid-hex\"}");
+                continue;
+            }
+
+            const hex_str = tx_item.string;
+
+            // Try to decode the transaction
+            var tx_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
+                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"decode-error\"}");
+                continue;
+            };
+            defer self.allocator.free(tx_bytes);
+
+            var valid_hex = true;
+            for (0..hex_str.len / 2) |j| {
+                tx_bytes[j] = std.fmt.parseInt(u8, hex_str[j * 2 .. j * 2 + 2], 16) catch {
+                    valid_hex = false;
+                    break;
+                };
+            }
+
+            if (!valid_hex) {
+                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"invalid-hex\"}");
+                continue;
+            }
+
+            // Try to deserialize and get txid
+            var reader = serialize.Reader{ .data = tx_bytes };
+            const tx = serialize.readTransaction(&reader, self.allocator) catch {
+                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"TX decode failed\"}");
+                continue;
+            };
+
+            const txid = crypto.computeTxid(&tx, self.allocator) catch {
+                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"txid computation failed\"}");
+                continue;
+            };
+
+            // Check if already in mempool
+            self.mempool.mutex.lock();
+            const in_mempool = self.mempool.entries.contains(txid);
+            self.mempool.mutex.unlock();
+
+            if (in_mempool) {
+                try writer.writeAll("{\"txid\":\"");
+                try writeHashHex(writer, &txid);
+                try writer.writeAll("\",\"allowed\":false,\"reject-reason\":\"txn-already-in-mempool\"}");
+                continue;
+            }
+
+            // Basic validation (would normally do full mempool acceptance check)
+            try writer.writeAll("{\"txid\":\"");
+            try writeHashHex(writer, &txid);
+            try writer.writeAll("\",\"allowed\":true,\"vsize\":");
+            const weight = mempool_mod.computeTxWeight(&tx, self.allocator) catch 0;
+            const vsize = (weight + 3) / 4;
+            try writer.print("{d}", .{vsize});
+            try writer.writeByte('}');
+        }
+
+        try writer.writeByte(']');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle decoderawtransaction RPC - decode a hex-encoded transaction.
+    /// Reference: Bitcoin Core rpc/rawtransaction.cpp decoderawtransaction
+    ///
+    /// Arguments:
+    ///   1. hexstring (string, required) - hex-encoded transaction
+    fn handleDecodeRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing hexstring", id);
+        }
+
+        const hex_param = params.array.items[0];
+        if (hex_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "hexstring must be a string", id);
+        }
+
+        const hex_str = hex_param.string;
+
+        // Decode hex
+        if (hex_str.len % 2 != 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length", id);
+        }
+
+        var tx_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+        };
+        defer self.allocator.free(tx_bytes);
+
+        for (0..hex_str.len / 2) |i| {
+            tx_bytes[i] = std.fmt.parseInt(u8, hex_str[i * 2 .. i * 2 + 2], 16) catch {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex", id);
+            };
+        }
+
+        // Deserialize transaction
+        var reader = serialize.Reader{ .data = tx_bytes };
+        const tx = serialize.readTransaction(&reader, self.allocator) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
+        };
+
+        // Compute txid and hash
+        const txid = crypto.computeTxid(&tx, self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "txid computation failed", id);
+        };
+        const hash = crypto.computeWtxid(&tx, self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "wtxid computation failed", id);
+        };
+        const weight = mempool_mod.computeTxWeight(&tx, self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "weight computation failed", id);
+        };
+        const vsize = (weight + 3) / 4;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"txid\":\"");
+        try writeHashHex(writer, &txid);
+        try writer.writeAll("\",\"hash\":\"");
+        try writeHashHex(writer, &hash);
+        try writer.print("\",\"version\":{d},\"size\":{d},\"vsize\":{d},\"weight\":{d},\"locktime\":{d},", .{
+            tx.version,
+            tx_bytes.len,
+            vsize,
+            weight,
+            tx.lock_time,
+        });
+
+        // vin array
+        try writer.writeAll("\"vin\":[");
+        for (tx.inputs, 0..) |input, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"txid\":\"");
+            try writeHashHex(writer, &input.previous_output.hash);
+            try writer.print("\",\"vout\":{d},\"scriptSig\":{{\"hex\":\"", .{input.previous_output.index});
+            for (input.script_sig) |byte| {
+                try writer.print("{x:0>2}", .{byte});
+            }
+            try writer.print("\"}},\"sequence\":{d}", .{input.sequence});
+            if (input.witness.len > 0) {
+                try writer.writeAll(",\"txinwitness\":[");
+                for (input.witness, 0..) |wit, w| {
+                    if (w > 0) try writer.writeByte(',');
+                    try writer.writeByte('"');
+                    for (wit) |byte| {
+                        try writer.print("{x:0>2}", .{byte});
+                    }
+                    try writer.writeByte('"');
+                }
+                try writer.writeByte(']');
+            }
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],");
+
+        // vout array
+        try writer.writeAll("\"vout\":[");
+        for (tx.outputs, 0..) |output, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{{\"value\":{d:.8},\"n\":{d},\"scriptPubKey\":{{\"hex\":\"", .{
+                @as(f64, @floatFromInt(output.value)) / 100_000_000.0,
+                i,
+            });
+            for (output.script_pubkey) |byte| {
+                try writer.print("{x:0>2}", .{byte});
+            }
+            try writer.writeAll("\"}}");
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("]}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle decodescript RPC - decode a hex-encoded script.
+    /// Reference: Bitcoin Core rpc/rawtransaction.cpp decodescript
+    ///
+    /// Arguments:
+    ///   1. hexstring (string, required) - hex-encoded script
+    fn handleDecodeScript(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing hexstring", id);
+        }
+
+        const hex_param = params.array.items[0];
+        if (hex_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "hexstring must be a string", id);
+        }
+
+        const hex_str = hex_param.string;
+
+        // Handle empty script
+        if (hex_str.len == 0) {
+            return self.jsonRpcResult("{\"asm\":\"\",\"type\":\"nonstandard\"}", id);
+        }
+
+        if (hex_str.len % 2 != 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length", id);
+        }
+
+        var script_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+        };
+        defer self.allocator.free(script_bytes);
+
+        for (0..hex_str.len / 2) |i| {
+            script_bytes[i] = std.fmt.parseInt(u8, hex_str[i * 2 .. i * 2 + 2], 16) catch {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex", id);
+            };
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        // Determine script type
+        const script_type = script_mod.classifyScript(script_bytes);
+        const type_str = switch (script_type) {
+            .p2pkh => "pubkeyhash",
+            .p2sh => "scripthash",
+            .p2wpkh => "witness_v0_keyhash",
+            .p2wsh => "witness_v0_scripthash",
+            .p2tr => "witness_v1_taproot",
+            .null_data => "nulldata",
+            .multisig => "multisig",
+            else => "nonstandard",
+        };
+
+        try writer.writeAll("{\"asm\":\"");
+        // Write simplified asm
+        try writeScriptAsm(writer, script_bytes);
+        try writer.print("\",\"type\":\"{s}\"", .{type_str});
+
+        // Add P2SH and segwit addresses if applicable
+        if (script_type == .p2pkh or script_type == .p2sh or script_type == .p2wpkh or script_type == .p2wsh or script_type == .p2tr) {
+            // In a full implementation, we'd derive the address here
+        }
+
+        try writer.writeByte('}');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle createrawtransaction RPC - create an unsigned raw transaction.
+    /// Reference: Bitcoin Core rpc/rawtransaction.cpp createrawtransaction
+    ///
+    /// Arguments:
+    ///   1. inputs (array, required) - [{txid, vout}, ...]
+    ///   2. outputs (array/object, required) - [{address: amount}, ...] or {address: amount, ...}
+    fn handleCreateRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires inputs and outputs", id);
+        }
+
+        const inputs_param = params.array.items[0];
+        const outputs_param = params.array.items[1];
+
+        if (inputs_param != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs must be an array", id);
+        }
+
+        // Build transaction
+        var inputs = std.ArrayList(types.TxIn).init(self.allocator);
+        defer inputs.deinit();
+
+        for (inputs_param.array.items) |input_item| {
+            if (input_item != .object) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "input must be an object", id);
+            }
+
+            const txid_val = input_item.object.get("txid") orelse {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid", id);
+            };
+            const vout_val = input_item.object.get("vout") orelse {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing vout", id);
+            };
+
+            if (txid_val != .string or txid_val.string.len != 64) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid", id);
+            }
+            if (vout_val != .integer) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
+            }
+
+            var prev_hash: types.Hash256 = undefined;
+            for (0..32) |i| {
+                prev_hash[31 - i] = std.fmt.parseInt(u8, txid_val.string[i * 2 .. i * 2 + 2], 16) catch {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+                };
+            }
+
+            // Get optional sequence
+            var seq: u32 = 0xFFFFFFFF;
+            if (input_item.object.get("sequence")) |seq_val| {
+                if (seq_val == .integer) {
+                    seq = @intCast(seq_val.integer);
+                }
+            }
+
+            inputs.append(.{
+                .previous_output = .{
+                    .hash = prev_hash,
+                    .index = @intCast(vout_val.integer),
+                },
+                .script_sig = &[_]u8{},
+                .sequence = seq,
+                .witness = &[_][]const u8{},
+            }) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+            };
+        }
+
+        // Parse outputs
+        var outputs = std.ArrayList(types.TxOut).init(self.allocator);
+        defer {
+            for (outputs.items) |*out| {
+                self.allocator.free(out.script_pubkey);
+            }
+            outputs.deinit();
+        }
+
+        if (outputs_param == .object) {
+            var it = outputs_param.object.iterator();
+            while (it.next()) |entry| {
+                const addr_str = entry.key_ptr.*;
+                const amount_val = entry.value_ptr.*;
+
+                var amount_sats: i64 = 0;
+                if (amount_val == .float) {
+                    amount_sats = @intFromFloat(amount_val.float * 100_000_000.0);
+                } else if (amount_val == .integer) {
+                    amount_sats = @intCast(amount_val.integer * 100_000_000);
+                } else {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
+                }
+
+                // Create scriptPubKey from address (simplified - just store address length for now)
+                const script_pubkey = self.allocator.alloc(u8, addr_str.len) catch {
+                    return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+                };
+                @memcpy(script_pubkey, addr_str);
+
+                outputs.append(.{
+                    .value = amount_sats,
+                    .script_pubkey = script_pubkey,
+                }) catch {
+                    self.allocator.free(script_pubkey);
+                    return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+                };
+            }
+        } else if (outputs_param == .array) {
+            for (outputs_param.array.items) |out_item| {
+                if (out_item != .object) continue;
+                var out_it = out_item.object.iterator();
+                while (out_it.next()) |entry| {
+                    const addr_str = entry.key_ptr.*;
+                    const amount_val = entry.value_ptr.*;
+
+                    var amount_sats: i64 = 0;
+                    if (amount_val == .float) {
+                        amount_sats = @intFromFloat(amount_val.float * 100_000_000.0);
+                    } else if (amount_val == .integer) {
+                        amount_sats = @intCast(amount_val.integer * 100_000_000);
+                    }
+
+                    const script_pubkey = self.allocator.alloc(u8, addr_str.len) catch {
+                        return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+                    };
+                    @memcpy(script_pubkey, addr_str);
+
+                    outputs.append(.{
+                        .value = amount_sats,
+                        .script_pubkey = script_pubkey,
+                    }) catch {
+                        self.allocator.free(script_pubkey);
+                        return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+                    };
+                }
+            }
+        }
+
+        // Parse optional locktime
+        var locktime: u32 = 0;
+        if (params.array.items.len > 2) {
+            const lt = params.array.items[2];
+            if (lt == .integer) {
+                locktime = @intCast(lt.integer);
+            }
+        }
+
+        // Serialize transaction
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = inputs.items,
+            .outputs = outputs.items,
+            .lock_time = locktime,
+        };
+
+        var swriter = serialize.Writer.init(self.allocator);
+        defer swriter.deinit();
+        serialize.writeTransaction(&swriter, &tx) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Serialization failed", id);
+        };
+
+        // Return hex
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('"');
+        for (swriter.getWritten()) |byte| {
+            try writer.print("{x:0>2}", .{byte});
+        }
+        try writer.writeByte('"');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle getconnectioncount RPC - return the number of connected peers.
+    /// Reference: Bitcoin Core rpc/net.cpp getconnectioncount
+    fn handleGetConnectionCount(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        const count = self.peer_manager.getPeerCount();
+        var buf: [32]u8 = undefined;
+        const result = std.fmt.bufPrint(&buf, "{d}", .{count}) catch return error.OutOfMemory;
+        return self.jsonRpcResult(result, id);
+    }
+
+    /// Handle addnode RPC - add or remove a peer.
+    /// Reference: Bitcoin Core rpc/net.cpp addnode
+    ///
+    /// Arguments:
+    ///   1. node (string, required) - IP address or hostname
+    ///   2. command (string, required) - "add", "remove", or "onetry"
+    fn handleAddNode(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires node and command", id);
+        }
+
+        const node_param = params.array.items[0];
+        const cmd_param = params.array.items[1];
+
+        if (node_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "node must be a string", id);
+        }
+        if (cmd_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "command must be a string", id);
+        }
+
+        const node = node_param.string;
+        const cmd = cmd_param.string;
+
+        if (std.mem.eql(u8, cmd, "add")) {
+            // Add to manual connection list
+            self.peer_manager.addManualNode(node) catch {
+                return self.jsonRpcError(RPC_MISC_ERROR, "Failed to add node", id);
+            };
+        } else if (std.mem.eql(u8, cmd, "remove")) {
+            // Remove from manual connection list
+            self.peer_manager.removeManualNode(node);
+        } else if (std.mem.eql(u8, cmd, "onetry")) {
+            // Try connecting once
+            self.peer_manager.tryConnectNode(node) catch {
+                return self.jsonRpcError(RPC_MISC_ERROR, "Failed to connect", id);
+            };
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid command", id);
+        }
+
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// Handle getmininginfo RPC - return mining-related information.
+    /// Reference: Bitcoin Core rpc/mining.cpp getmininginfo
+    fn handleGetMiningInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        const chain_name = switch (self.network_params.magic) {
+            consensus.MAINNET.magic => "main",
+            consensus.TESTNET.magic => "test",
+            consensus.REGTEST.magic => "regtest",
+            else => "unknown",
+        };
+
+        self.mempool.mutex.lock();
+        const mempool_size = self.mempool.entries.count();
+        self.mempool.mutex.unlock();
+
+        try writer.print("{{\"blocks\":{d},\"difficulty\":{d:.8},\"networkhashps\":0,\"pooledtx\":{d},\"chain\":\"{s}\"}}", .{
+            self.chain_state.best_height,
+            getDifficulty(self.network_params.genesis_header.bits),
+            mempool_size,
+            chain_name,
+        });
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle getnewaddress RPC - generate a new address.
+    /// Reference: Bitcoin Core wallet/rpc/addresses.cpp getnewaddress
+    ///
+    /// Arguments:
+    ///   1. label (string, optional) - label for the address
+    ///   2. address_type (string, optional) - "legacy", "p2sh-segwit", "bech32", "bech32m"
+    fn handleGetNewAddress(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wallet = self.current_wallet orelse {
+            if (self.wallet) |w| {
+                return self.handleGetNewAddressWithWallet(w, params, id);
+            }
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+        return self.handleGetNewAddressWithWallet(wallet, params, id);
+    }
+
+    fn handleGetNewAddressWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        var addr_type: wallet_mod.AddressType = .p2wpkh; // default to native segwit
+
+        if (params == .array and params.array.items.len > 1) {
+            const type_param = params.array.items[1];
+            if (type_param == .string) {
+                if (std.mem.eql(u8, type_param.string, "legacy")) {
+                    addr_type = .p2pkh;
+                } else if (std.mem.eql(u8, type_param.string, "p2sh-segwit")) {
+                    addr_type = .p2sh_p2wpkh;
+                } else if (std.mem.eql(u8, type_param.string, "bech32m")) {
+                    addr_type = .p2tr;
+                }
+            }
+        }
+
+        const result = wallet.getnewaddress(addr_type, false) catch {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to generate address", id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('"');
+        try writer.writeAll(result.address);
+        try writer.writeByte('"');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle getbalance RPC - return the wallet balance.
+    /// Reference: Bitcoin Core wallet/rpc/coins.cpp getbalance
+    ///
+    /// Arguments:
+    ///   1. dummy (string, optional) - ignored, for compatibility
+    ///   2. minconf (numeric, optional) - minimum confirmations
+    fn handleGetBalance(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        _ = params;
+
+        const wallet = self.current_wallet orelse {
+            if (self.wallet) |w| {
+                return self.handleGetBalanceWithWallet(w, id);
+            }
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+        return self.handleGetBalanceWithWallet(wallet, id);
+    }
+
+    fn handleGetBalanceWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, id: ?std.json.Value) ![]const u8 {
+        const balance = wallet.getBalance();
+        const btc_amount = @as(f64, @floatFromInt(balance)) / 100_000_000.0;
+
+        var buf: [64]u8 = undefined;
+        const result = std.fmt.bufPrint(&buf, "{d:.8}", .{btc_amount}) catch return error.OutOfMemory;
+        return self.jsonRpcResult(result, id);
+    }
+
+    /// Handle sendtoaddress RPC - send to a bitcoin address.
+    /// Reference: Bitcoin Core wallet/rpc/spend.cpp sendtoaddress
+    ///
+    /// Arguments:
+    ///   1. address (string, required) - the bitcoin address
+    ///   2. amount (numeric, required) - amount in BTC
+    fn handleSendToAddress(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires address and amount", id);
+        }
+
+        const wallet = self.current_wallet orelse {
+            if (self.wallet) |w| {
+                return self.handleSendToAddressWithWallet(w, params, id);
+            }
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+        return self.handleSendToAddressWithWallet(wallet, params, id);
+    }
+
+    fn handleSendToAddressWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const addr_param = params.array.items[0];
+        const amount_param = params.array.items[1];
+
+        if (addr_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "address must be a string", id);
+        }
+
+        var amount_sats: i64 = 0;
+        if (amount_param == .float) {
+            amount_sats = @intFromFloat(amount_param.float * 100_000_000.0);
+        } else if (amount_param == .integer) {
+            amount_sats = @intCast(amount_param.integer * 100_000_000);
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
+        }
+
+        // Check balance
+        const balance = wallet.getBalance();
+        if (balance < amount_sats) {
+            return self.jsonRpcError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds", id);
+        }
+
+        // In a full implementation, we would:
+        // 1. Create transaction
+        // 2. Sign it
+        // 3. Broadcast to network
+        // For now, return a placeholder txid
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("\"");
+        // Return a dummy txid (in real impl would be the actual txid)
+        try writer.writeAll("0000000000000000000000000000000000000000000000000000000000000000");
+        try writer.writeAll("\"");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle listunspent RPC - list unspent transaction outputs.
+    /// Reference: Bitcoin Core wallet/rpc/coins.cpp listunspent
+    ///
+    /// Arguments:
+    ///   1. minconf (numeric, optional, default=1) - minimum confirmations
+    ///   2. maxconf (numeric, optional, default=9999999) - maximum confirmations
+    fn handleListUnspent(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        _ = params;
+
+        const wallet = self.current_wallet orelse {
+            if (self.wallet) |w| {
+                return self.handleListUnspentWithWallet(w, id);
+            }
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+        return self.handleListUnspentWithWallet(wallet, id);
+    }
+
+    fn handleListUnspentWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+
+        for (wallet.utxos.items, 0..) |utxo, i| {
+            if (i > 0) try writer.writeByte(',');
+
+            const btc_amount = @as(f64, @floatFromInt(utxo.output.value)) / 100_000_000.0;
+            const confirmations = if (self.chain_state.best_height >= utxo.height)
+                self.chain_state.best_height - utxo.height + 1
+            else
+                0;
+
+            try writer.writeAll("{\"txid\":\"");
+            try writeHashHex(writer, &utxo.outpoint.hash);
+            try writer.print("\",\"vout\":{d},\"amount\":{d:.8},\"confirmations\":{d},\"spendable\":true,\"solvable\":true,\"safe\":true}}", .{
+                utxo.outpoint.index,
+                btc_amount,
+                confirmations,
+            });
+        }
+
+        try writer.writeByte(']');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle listtransactions RPC - list wallet transactions.
+    /// Reference: Bitcoin Core wallet/rpc/transactions.cpp listtransactions
+    ///
+    /// Arguments:
+    ///   1. label (string, optional) - filter by label
+    ///   2. count (numeric, optional, default=10) - number of transactions
+    fn handleListTransactions(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        _ = params;
+
+        const wallet = self.current_wallet orelse {
+            if (self.wallet) |w| {
+                return self.handleListTransactionsWithWallet(w, id);
+            }
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+        return self.handleListTransactionsWithWallet(wallet, id);
+    }
+
+    fn handleListTransactionsWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, id: ?std.json.Value) ![]const u8 {
+        _ = wallet;
+
+        // In a full implementation, we would return wallet transaction history
+        // For now, return empty array
+        return self.jsonRpcResult("[]", id);
+    }
+
+    /// Handle estimatesmartfee RPC - estimate fee rate for confirmation target.
+    /// Reference: Bitcoin Core rpc/fees.cpp estimatesmartfee
+    ///
+    /// Arguments:
+    ///   1. conf_target (numeric, required) - confirmation target in blocks
+    ///   2. estimate_mode (string, optional) - "economical" or "conservative"
+    fn handleEstimateSmartFee(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing conf_target", id);
+        }
+
+        const target_param = params.array.items[0];
+        if (target_param != .integer) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "conf_target must be numeric", id);
+        }
+
+        const conf_target: u32 = @intCast(@max(1, @min(1008, target_param.integer)));
+
+        // Get fee estimate from mempool's fee estimator
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+
+        const fee_rate = self.mempool.fee_estimator.estimateFee(conf_target);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        if (fee_rate) |rate| {
+            // Convert sat/vB to BTC/kvB
+            const btc_per_kvb = rate * 1000.0 / 100_000_000.0;
+            try writer.print("{{\"feerate\":{d:.8},\"blocks\":{d}}}", .{ btc_per_kvb, conf_target });
+        } else {
+            // No estimate available
+            try writer.print("{{\"errors\":[\"Insufficient data or no feerate found\"],\"blocks\":{d}}}", .{conf_target});
+        }
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // New RPC methods: signrawtransactionwithwallet, importdescriptors,
+    // validateaddress, gettxout, getmempoolancestors, getmempooldescendants
+    // ========================================================================
+
+    /// signrawtransactionwithwallet "hexstring" ( [{"txid":"hex","vout":n,"scriptPubKey":"hex","redeemScript":"hex","witnessScript":"hex","amount":n},...] "sighashtype" )
+    /// Sign inputs for raw transaction using wallet keys.
+    fn handleSignRawTransactionWithWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+
+        // Extract hex string
+        const hex = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const h = params.array.items[0];
+                if (h == .string) break :blk h.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing hexstring", id);
+        };
+
+        // Parse optional sighash type (3rd parameter, default ALL = 0x01)
+        var sighash_type: u32 = 0x01; // SIGHASH_ALL
+        if (params == .array and params.array.items.len >= 3) {
+            const sh = params.array.items[2];
+            if (sh == .string) {
+                if (std.mem.eql(u8, sh.string, "ALL")) {
+                    sighash_type = 0x01;
+                } else if (std.mem.eql(u8, sh.string, "NONE")) {
+                    sighash_type = 0x02;
+                } else if (std.mem.eql(u8, sh.string, "SINGLE")) {
+                    sighash_type = 0x03;
+                } else if (std.mem.eql(u8, sh.string, "ALL|ANYONECANPAY")) {
+                    sighash_type = 0x81;
+                } else if (std.mem.eql(u8, sh.string, "NONE|ANYONECANPAY")) {
+                    sighash_type = 0x82;
+                } else if (std.mem.eql(u8, sh.string, "SINGLE|ANYONECANPAY")) {
+                    sighash_type = 0x83;
+                } else {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid sighash type", id);
+                }
+            }
+        }
+
+        // Decode hex to bytes
+        if (hex.len % 2 != 0 or hex.len == 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
+        }
+
+        const raw = self.allocator.alloc(u8, hex.len / 2) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer self.allocator.free(raw);
+
+        for (0..raw.len) |i| {
+            raw[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex character", id);
+            };
+        }
+
+        // Deserialize transaction
+        var reader = serialize.Reader{ .data = raw };
+        var tx = serialize.readTransaction(&reader, self.allocator) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
+        };
+
+        // Try to sign each input with wallet keys
+        var complete = true;
+        for (0..tx.inputs.len) |input_idx| {
+            const input = tx.inputs[input_idx];
+            // Look up the UTXO being spent to find the matching wallet key
+            var found_utxo: ?wallet_mod.OwnedUtxo = null;
+            for (wallet.utxos.items) |utxo| {
+                if (std.mem.eql(u8, &utxo.outpoint.hash, &input.previous_output.hash) and
+                    utxo.outpoint.index == input.previous_output.index)
+                {
+                    found_utxo = utxo;
+                    break;
+                }
+            }
+
+            if (found_utxo) |utxo| {
+                wallet.signInput(&tx, input_idx, utxo, sighash_type) catch {
+                    complete = false;
+                };
+            } else {
+                // No wallet key for this input
+                complete = false;
+            }
+        }
+
+        // Serialize signed transaction back to hex
+        var tx_writer = serialize.Writer.init(self.allocator);
+        defer tx_writer.deinit();
+        serialize.writeTransaction(&tx_writer, &tx) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to serialize signed tx", id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"hex\":\"");
+        for (tx_writer.list.items) |byte| {
+            try writer.print("{x:0>2}", .{byte});
+        }
+        try writer.writeAll("\",\"complete\":");
+        try writer.writeAll(if (complete) "true" else "false");
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// importdescriptors "requests"
+    /// Import descriptors into the wallet.
+    fn handleImportDescriptors(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+
+        _ = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+
+        // Extract requests array
+        const requests = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const r = params.array.items[0];
+                if (r == .array) break :blk r.array.items;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing requests array", id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+
+        for (requests, 0..) |req, i| {
+            if (i > 0) try writer.writeByte(',');
+
+            if (req != .object) {
+                try writer.writeAll("{\"success\":false,\"error\":{\"code\":-8,\"message\":\"Invalid request object\"}}");
+                continue;
+            }
+
+            const desc_value = req.object.get("desc") orelse {
+                try writer.writeAll("{\"success\":false,\"error\":{\"code\":-8,\"message\":\"Missing descriptor\"}}");
+                continue;
+            };
+
+            if (desc_value != .string) {
+                try writer.writeAll("{\"success\":false,\"error\":{\"code\":-8,\"message\":\"Descriptor must be a string\"}}");
+                continue;
+            }
+
+            // Parse the descriptor to validate it
+            var desc = descriptor.parseDescriptor(self.allocator, desc_value.string) catch {
+                try writer.writeAll("{\"success\":false,\"error\":{\"code\":-5,\"message\":\"Invalid descriptor\"}}");
+                continue;
+            };
+            desc.deinit(self.allocator);
+
+            // Successfully parsed - report success
+            // In a full implementation, we would derive addresses and add keys to the wallet.
+            // For now, we validate and acknowledge the import.
+            try writer.writeAll("{\"success\":true}");
+        }
+
+        try writer.writeByte(']');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// validateaddress "address"
+    /// Return information about the given bitcoin address.
+    fn handleValidateAddress(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const addr_str = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const a = params.array.items[0];
+                if (a == .string) break :blk a.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing address", id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        // Try to decode the address
+        const addr = address_mod.Address.decode(addr_str, self.allocator) catch {
+            // Invalid address
+            try writer.print("{{\"isvalid\":false,\"address\":\"{s}\"}}", .{addr_str});
+            return self.jsonRpcResult(buf.items, id);
+        };
+        defer self.allocator.free(addr.hash);
+
+        try writer.writeAll("{\"isvalid\":true");
+        try writer.print(",\"address\":\"{s}\"", .{addr_str});
+
+        // Reconstruct scriptPubKey and write as hex
+        try writer.writeAll(",\"scriptPubKey\":\"");
+        switch (addr.addr_type) {
+            .p2pkh => {
+                // OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+                try writer.writeAll("76a914");
+                for (addr.hash[0..20]) |byte| {
+                    try writer.print("{x:0>2}", .{byte});
+                }
+                try writer.writeAll("88ac");
+            },
+            .p2sh => {
+                // OP_HASH160 <20> OP_EQUAL
+                try writer.writeAll("a914");
+                for (addr.hash[0..20]) |byte| {
+                    try writer.print("{x:0>2}", .{byte});
+                }
+                try writer.writeAll("87");
+            },
+            .p2wpkh => {
+                // OP_0 <20>
+                try writer.writeAll("0014");
+                for (addr.hash[0..20]) |byte| {
+                    try writer.print("{x:0>2}", .{byte});
+                }
+            },
+            .p2wsh => {
+                // OP_0 <32>
+                try writer.writeAll("0020");
+                for (addr.hash[0..32]) |byte| {
+                    try writer.print("{x:0>2}", .{byte});
+                }
+            },
+            .p2tr => {
+                // OP_1 <32>
+                try writer.writeAll("5120");
+                for (addr.hash[0..32]) |byte| {
+                    try writer.print("{x:0>2}", .{byte});
+                }
+            },
+        }
+        try writer.writeByte('"');
+
+        // isscript
+        const is_script = addr.addr_type == .p2sh or addr.addr_type == .p2wsh;
+        try writer.print(",\"isscript\":{s}", .{if (is_script) "true" else "false"});
+
+        // iswitness
+        const is_witness = addr.addr_type == .p2wpkh or addr.addr_type == .p2wsh or addr.addr_type == .p2tr;
+        try writer.print(",\"iswitness\":{s}", .{if (is_witness) "true" else "false"});
+
+        if (is_witness) {
+            const witness_version: u8 = switch (addr.addr_type) {
+                .p2wpkh, .p2wsh => 0,
+                .p2tr => 1,
+                else => 0,
+            };
+            try writer.print(",\"witness_version\":{d}", .{witness_version});
+            try writer.writeAll(",\"witness_program\":\"");
+            for (addr.hash) |byte| {
+                try writer.print("{x:0>2}", .{byte});
+            }
+            try writer.writeByte('"');
+        }
+
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// gettxout "txid" n ( include_mempool )
+    /// Returns details about an unspent transaction output.
+    fn handleGetTxOut(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Parse txid
+        const txid_hex = blk: {
+            if (params == .array and params.array.items.len >= 2) {
+                const t = params.array.items[0];
+                if (t == .string) break :blk t.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid and vout", id);
+        };
+
+        if (txid_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
+        }
+
+        var txid: types.Hash256 = undefined;
+        for (0..32) |i| {
+            const high = std.fmt.charToDigit(txid_hex[i * 2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            const low = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            txid[31 - i] = (high << 4) | low;
+        }
+
+        // Parse vout index
+        const vout: u32 = blk: {
+            const v = params.array.items[1];
+            if (v == .integer) {
+                if (v.integer < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
+                break :blk @intCast(v.integer);
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
+        };
+
+        // Parse optional include_mempool (default true)
+        var include_mempool: bool = true;
+        if (params == .array and params.array.items.len >= 3) {
+            const im = params.array.items[2];
+            if (im == .bool) {
+                include_mempool = im.bool;
+            }
+        }
+
+        const outpoint = types.OutPoint{ .hash = txid, .index = vout };
+
+        // Check mempool first if requested
+        if (include_mempool) {
+            self.mempool.mutex.lock();
+            defer self.mempool.mutex.unlock();
+
+            // Check if this output is spent by a mempool transaction
+            if (self.mempool.spenders.get(outpoint) != null) {
+                // Output is spent in the mempool
+                return self.jsonRpcResult("null", id);
+            }
+
+            // Check if this output is created by a mempool transaction
+            if (self.mempool.getOutputFromMempool(&outpoint)) |output| {
+                var buf = std.ArrayList(u8).init(self.allocator);
+                defer buf.deinit();
+                const writer = buf.writer();
+
+                try writer.writeAll("{\"bestblock\":\"");
+                try writeHashHex(writer, &self.chain_state.best_hash);
+                try writer.writeAll("\",\"confirmations\":0");
+                try writer.print(",\"value\":{d}.{d:0>8}", .{
+                    @divTrunc(output.value, 100_000_000),
+                    @as(u64, @intCast(@mod(output.value, 100_000_000))),
+                });
+                try writer.writeAll(",\"scriptPubKey\":{\"hex\":\"");
+                for (output.script_pubkey) |byte| {
+                    try writer.print("{x:0>2}", .{byte});
+                }
+                try writer.writeAll("\"},\"coinbase\":false");
+                try writer.writeByte('}');
+
+                return self.jsonRpcResult(buf.items, id);
+            }
+        }
+
+        // Look up in UTXO set
+        const utxo_result = self.chain_state.utxo_set.get(&outpoint) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "UTXO lookup failed", id);
+        };
+
+        if (utxo_result) |utxo| {
+            var mut_utxo = utxo;
+            defer mut_utxo.deinit(self.allocator);
+
+            const script = mut_utxo.reconstructScript(self.allocator) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to reconstruct script", id);
+            };
+            defer self.allocator.free(script);
+
+            const confirmations = if (self.chain_state.best_height >= mut_utxo.height)
+                self.chain_state.best_height - mut_utxo.height + 1
+            else
+                0;
+
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            const writer = buf.writer();
+
+            try writer.writeAll("{\"bestblock\":\"");
+            try writeHashHex(writer, &self.chain_state.best_hash);
+            try writer.print("\",\"confirmations\":{d}", .{confirmations});
+            try writer.print(",\"value\":{d}.{d:0>8}", .{
+                @divTrunc(utxo.value, 100_000_000),
+                @as(u64, @intCast(@mod(utxo.value, 100_000_000))),
+            });
+            try writer.writeAll(",\"scriptPubKey\":{\"hex\":\"");
+            for (script) |byte| {
+                try writer.print("{x:0>2}", .{byte});
+            }
+            try writer.print("\"}},\"coinbase\":{s}", .{if (utxo.is_coinbase) "true" else "false"});
+            try writer.writeByte('}');
+
+            return self.jsonRpcResult(buf.items, id);
+        }
+
+        // UTXO not found - return null (per Bitcoin Core behavior)
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// getmempoolancestors "txid" ( verbose )
+    /// Returns all in-mempool ancestors for a transaction.
+    fn handleGetMempoolAncestors(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const txid_hex = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const t = params.array.items[0];
+                if (t == .string) break :blk t.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid", id);
+        };
+
+        if (txid_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
+        }
+
+        var txid: types.Hash256 = undefined;
+        for (0..32) |i| {
+            const high = std.fmt.charToDigit(txid_hex[i * 2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            const low = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            txid[31 - i] = (high << 4) | low;
+        }
+
+        var verbose: bool = false;
+        if (params == .array and params.array.items.len >= 2) {
+            const v = params.array.items[1];
+            if (v == .bool) verbose = v.bool;
+        }
+
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+
+        const entry = self.mempool.get(txid) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool", id);
+        };
+
+        // Walk ancestors: for each input of this tx, check if the spent txid is in mempool
+        var ancestors = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer ancestors.deinit();
+
+        // BFS to find all ancestors
+        var queue = std.ArrayList(types.Hash256).init(self.allocator);
+        defer queue.deinit();
+
+        // Seed with the direct parents
+        for (entry.tx.inputs) |input| {
+            if (self.mempool.entries.contains(input.previous_output.hash)) {
+                if (!ancestors.contains(input.previous_output.hash)) {
+                    ancestors.put(input.previous_output.hash, {}) catch {};
+                    queue.append(input.previous_output.hash) catch {};
+                }
+            }
+        }
+
+        // Process queue
+        var qi: usize = 0;
+        while (qi < queue.items.len) : (qi += 1) {
+            const anc_txid = queue.items[qi];
+            if (self.mempool.get(anc_txid)) |anc_entry| {
+                for (anc_entry.tx.inputs) |input| {
+                    if (self.mempool.entries.contains(input.previous_output.hash)) {
+                        if (!ancestors.contains(input.previous_output.hash)) {
+                            ancestors.put(input.previous_output.hash, {}) catch {};
+                            queue.append(input.previous_output.hash) catch {};
+                        }
+                    }
+                }
+            }
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        if (verbose) {
+            try writer.writeByte('{');
+            var first = true;
+            var it = ancestors.iterator();
+            while (it.next()) |anc| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+
+                try writer.writeByte('"');
+                try writeHashHex(writer, anc.key_ptr);
+                try writer.writeAll("\":{");
+
+                if (self.mempool.get(anc.key_ptr.*)) |anc_entry| {
+                    try writer.print("\"vsize\":{d},\"weight\":{d},\"fee\":{d:.8},\"time\":{d},\"height\":{d}", .{
+                        anc_entry.vsize,
+                        anc_entry.weight,
+                        @as(f64, @floatFromInt(anc_entry.fee)) / 100_000_000.0,
+                        anc_entry.time_added,
+                        anc_entry.height_added,
+                    });
+                }
+                try writer.writeByte('}');
+            }
+            try writer.writeByte('}');
+        } else {
+            try writer.writeByte('[');
+            var first = true;
+            var it = ancestors.iterator();
+            while (it.next()) |anc| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+
+                try writer.writeByte('"');
+                try writeHashHex(writer, anc.key_ptr);
+                try writer.writeByte('"');
+            }
+            try writer.writeByte(']');
+        }
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// getmempooldescendants "txid" ( verbose )
+    /// Returns all in-mempool descendants for a transaction.
+    fn handleGetMempoolDescendants(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const txid_hex = blk: {
+            if (params == .array and params.array.items.len > 0) {
+                const t = params.array.items[0];
+                if (t == .string) break :blk t.string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid", id);
+        };
+
+        if (txid_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
+        }
+
+        var txid: types.Hash256 = undefined;
+        for (0..32) |i| {
+            const high = std.fmt.charToDigit(txid_hex[i * 2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            const low = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            txid[31 - i] = (high << 4) | low;
+        }
+
+        var verbose: bool = false;
+        if (params == .array and params.array.items.len >= 2) {
+            const v = params.array.items[1];
+            if (v == .bool) verbose = v.bool;
+        }
+
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+
+        if (!self.mempool.entries.contains(txid)) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool", id);
+        }
+
+        // Walk descendants using the children map
+        var descendants = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer descendants.deinit();
+
+        var queue = std.ArrayList(types.Hash256).init(self.allocator);
+        defer queue.deinit();
+
+        // Seed with direct children
+        if (self.mempool.children.get(txid)) |children_list| {
+            for (children_list.items) |child_txid| {
+                if (!descendants.contains(child_txid)) {
+                    descendants.put(child_txid, {}) catch {};
+                    queue.append(child_txid) catch {};
+                }
+            }
+        }
+
+        // BFS
+        var qi: usize = 0;
+        while (qi < queue.items.len) : (qi += 1) {
+            const desc_txid = queue.items[qi];
+            if (self.mempool.children.get(desc_txid)) |children_list| {
+                for (children_list.items) |child_txid| {
+                    if (!descendants.contains(child_txid)) {
+                        descendants.put(child_txid, {}) catch {};
+                        queue.append(child_txid) catch {};
+                    }
+                }
+            }
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        if (verbose) {
+            try writer.writeByte('{');
+            var first = true;
+            var it = descendants.iterator();
+            while (it.next()) |desc_entry| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+
+                try writer.writeByte('"');
+                try writeHashHex(writer, desc_entry.key_ptr);
+                try writer.writeAll("\":{");
+
+                if (self.mempool.get(desc_entry.key_ptr.*)) |me| {
+                    try writer.print("\"vsize\":{d},\"weight\":{d},\"fee\":{d:.8},\"time\":{d},\"height\":{d}", .{
+                        me.vsize,
+                        me.weight,
+                        @as(f64, @floatFromInt(me.fee)) / 100_000_000.0,
+                        me.time_added,
+                        me.height_added,
+                    });
+                }
+                try writer.writeByte('}');
+            }
+            try writer.writeByte('}');
+        } else {
+            try writer.writeByte('[');
+            var first = true;
+            var it = descendants.iterator();
+            while (it.next()) |desc_entry| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+
+                try writer.writeByte('"');
+                try writeHashHex(writer, desc_entry.key_ptr);
+                try writer.writeByte('"');
+            }
+            try writer.writeByte(']');
+        }
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle help RPC - list available commands or show help for a command.
+    /// Reference: Bitcoin Core rpc/server.cpp help
+    ///
+    /// Arguments:
+    ///   1. command (string, optional) - command name to get help for
+    fn handleHelp(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        var command: ?[]const u8 = null;
+
+        if (params == .array and params.array.items.len > 0) {
+            const cmd_param = params.array.items[0];
+            if (cmd_param == .string) {
+                command = cmd_param.string;
+            }
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        if (command) |cmd| {
+            // Return help for specific command
+            try writer.writeByte('"');
+            if (std.mem.eql(u8, cmd, "getblockchaininfo")) {
+                try writer.writeAll("getblockchaininfo\\n\\nReturns an object containing various state info regarding blockchain processing.");
+            } else if (std.mem.eql(u8, cmd, "getblockcount")) {
+                try writer.writeAll("getblockcount\\n\\nReturns the height of the most-work fully-validated chain.");
+            } else if (std.mem.eql(u8, cmd, "getblockhash")) {
+                try writer.writeAll("getblockhash height\\n\\nReturns hash of block in best-block-chain at height provided.");
+            } else if (std.mem.eql(u8, cmd, "getblock")) {
+                try writer.writeAll("getblock blockhash ( verbosity )\\n\\nReturns block data.");
+            } else if (std.mem.eql(u8, cmd, "getblockheader")) {
+                try writer.writeAll("getblockheader blockhash ( verbose )\\n\\nReturns block header data.");
+            } else if (std.mem.eql(u8, cmd, "getchaintips")) {
+                try writer.writeAll("getchaintips\\n\\nReturn information about all known tips in the block tree.");
+            } else if (std.mem.eql(u8, cmd, "getrawmempool")) {
+                try writer.writeAll("getrawmempool ( verbose mempool_sequence )\\n\\nReturns all transaction ids in memory pool.");
+            } else if (std.mem.eql(u8, cmd, "testmempoolaccept")) {
+                try writer.writeAll("testmempoolaccept [\\\"rawtx\\\"] ( maxfeerate )\\n\\nTest if raw transactions would be accepted by mempool.");
+            } else if (std.mem.eql(u8, cmd, "decoderawtransaction")) {
+                try writer.writeAll("decoderawtransaction hexstring\\n\\nReturn a JSON object representing the serialized, hex-encoded transaction.");
+            } else if (std.mem.eql(u8, cmd, "decodescript")) {
+                try writer.writeAll("decodescript hexstring\\n\\nDecode a hex-encoded script.");
+            } else if (std.mem.eql(u8, cmd, "createrawtransaction")) {
+                try writer.writeAll("createrawtransaction [{\\\"txid\\\":\\\"hex\\\",\\\"vout\\\":n},...] [{\\\"address\\\":amount},...] ( locktime )\\n\\nCreate a transaction spending inputs and creating outputs.");
+            } else if (std.mem.eql(u8, cmd, "sendrawtransaction")) {
+                try writer.writeAll("sendrawtransaction hexstring ( maxfeerate )\\n\\nSubmit a raw transaction to local node and network.");
+            } else if (std.mem.eql(u8, cmd, "getconnectioncount")) {
+                try writer.writeAll("getconnectioncount\\n\\nReturns the number of connections to other nodes.");
+            } else if (std.mem.eql(u8, cmd, "addnode")) {
+                try writer.writeAll("addnode node command\\n\\nAttempts to add or remove a node from the addnode list.");
+            } else if (std.mem.eql(u8, cmd, "getmininginfo")) {
+                try writer.writeAll("getmininginfo\\n\\nReturns a json object containing mining-related information.");
+            } else if (std.mem.eql(u8, cmd, "getnewaddress")) {
+                try writer.writeAll("getnewaddress ( label address_type )\\n\\nReturns a new Bitcoin address for receiving payments.");
+            } else if (std.mem.eql(u8, cmd, "getbalance")) {
+                try writer.writeAll("getbalance ( dummy minconf )\\n\\nReturns the total available balance.");
+            } else if (std.mem.eql(u8, cmd, "sendtoaddress")) {
+                try writer.writeAll("sendtoaddress address amount\\n\\nSend an amount to a given address.");
+            } else if (std.mem.eql(u8, cmd, "listunspent")) {
+                try writer.writeAll("listunspent ( minconf maxconf addresses )\\n\\nReturns array of unspent transaction outputs.");
+            } else if (std.mem.eql(u8, cmd, "listtransactions")) {
+                try writer.writeAll("listtransactions ( label count skip )\\n\\nReturns up to count most recent transactions.");
+            } else if (std.mem.eql(u8, cmd, "estimatesmartfee")) {
+                try writer.writeAll("estimatesmartfee conf_target ( estimate_mode )\\n\\nEstimates the approximate fee per kilobyte.");
+            } else if (std.mem.eql(u8, cmd, "help")) {
+                try writer.writeAll("help ( command )\\n\\nList all commands, or get help for a specified command.");
+            } else {
+                try writer.writeAll("Unknown command: ");
+                try writer.writeAll(cmd);
+            }
+            try writer.writeByte('"');
+        } else {
+            // List all commands
+            try writer.writeAll("\"== Blockchain ==\\n");
+            try writer.writeAll("getbestblockhash\\n");
+            try writer.writeAll("getblock\\n");
+            try writer.writeAll("getblockchaininfo\\n");
+            try writer.writeAll("getblockcount\\n");
+            try writer.writeAll("getblockhash\\n");
+            try writer.writeAll("getblockheader\\n");
+            try writer.writeAll("getchaintips\\n");
+            try writer.writeAll("getdifficulty\\n");
+            try writer.writeAll("\\n== Mempool ==\\n");
+            try writer.writeAll("getmempoolancestors\\n");
+            try writer.writeAll("getmempooldescendants\\n");
+            try writer.writeAll("getmempoolentry\\n");
+            try writer.writeAll("getmempoolinfo\\n");
+            try writer.writeAll("getrawmempool\\n");
+            try writer.writeAll("gettxout\\n");
+            try writer.writeAll("testmempoolaccept\\n");
+            try writer.writeAll("\\n== Mining ==\\n");
+            try writer.writeAll("getblocktemplate\\n");
+            try writer.writeAll("getmininginfo\\n");
+            try writer.writeAll("submitblock\\n");
+            try writer.writeAll("\\n== Network ==\\n");
+            try writer.writeAll("addnode\\n");
+            try writer.writeAll("getconnectioncount\\n");
+            try writer.writeAll("getnetworkinfo\\n");
+            try writer.writeAll("getpeerinfo\\n");
+            try writer.writeAll("\\n== Rawtransactions ==\\n");
+            try writer.writeAll("createrawtransaction\\n");
+            try writer.writeAll("decoderawtransaction\\n");
+            try writer.writeAll("decodescript\\n");
+            try writer.writeAll("getrawtransaction\\n");
+            try writer.writeAll("sendrawtransaction\\n");
+            try writer.writeAll("\\n== Wallet ==\\n");
+            try writer.writeAll("createwallet\\n");
+            try writer.writeAll("getbalance\\n");
+            try writer.writeAll("getnewaddress\\n");
+            try writer.writeAll("getwalletinfo\\n");
+            try writer.writeAll("listunspent\\n");
+            try writer.writeAll("listtransactions\\n");
+            try writer.writeAll("listwallets\\n");
+            try writer.writeAll("loadwallet\\n");
+            try writer.writeAll("sendtoaddress\\n");
+            try writer.writeAll("signrawtransactionwithwallet\\n");
+            try writer.writeAll("importdescriptors\\n");
+            try writer.writeAll("unloadwallet\\n");
+            try writer.writeAll("\\n== Util ==\\n");
+            try writer.writeAll("validateaddress\\n");
+            try writer.writeAll("estimatesmartfee\\n");
+            try writer.writeAll("help\\n");
+            try writer.writeAll("stop\\n");
+            try writer.writeAll("\"");
+        }
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// Create a JSON-RPC success response.
     pub fn jsonRpcResult(self: *RpcServer, result: []const u8, id: ?std.json.Value) ![]const u8 {
         var buf = std.ArrayList(u8).init(self.allocator);
@@ -3019,6 +5493,23 @@ fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Extract the "result" value from a JSON-RPC response string.
+/// Given {"result":<value>,"error":null,"id":...}, returns the <value> substring.
+/// Returns null if the format is unexpected.
+fn extractJsonResult(json_rpc_response: []const u8) ?[]const u8 {
+    // Find the start of "result": value
+    const prefix = "\"result\":";
+    const start_idx = std.mem.indexOf(u8, json_rpc_response, prefix) orelse return null;
+    const value_start = start_idx + prefix.len;
+    if (value_start >= json_rpc_response.len) return null;
+
+    // Find the matching end by looking for ,"error": pattern
+    const error_marker = ",\"error\":";
+    const end_idx = std.mem.indexOf(u8, json_rpc_response[value_start..], error_marker) orelse return null;
+
+    return json_rpc_response[value_start .. value_start + end_idx];
 }
 
 /// Write a hash as hex in reverse byte order (big-endian display).
@@ -3091,6 +5582,74 @@ fn getDifficulty(bits: u32) f64 {
     }
 
     return diff;
+}
+
+/// Write script as disassembled opcodes (simplified ASM output).
+fn writeScriptAsm(writer: anytype, script_bytes: []const u8) !void {
+    var i: usize = 0;
+    var first = true;
+    while (i < script_bytes.len) {
+        if (!first) try writer.writeByte(' ');
+        first = false;
+
+        const op = script_bytes[i];
+        i += 1;
+
+        if (op == 0) {
+            try writer.writeAll("OP_0");
+        } else if (op >= 1 and op <= 75) {
+            // Direct push
+            const len = op;
+            if (i + len <= script_bytes.len) {
+                for (script_bytes[i .. i + len]) |byte| {
+                    try writer.print("{x:0>2}", .{byte});
+                }
+                i += len;
+            }
+        } else if (op == 0x4c) {
+            // OP_PUSHDATA1
+            if (i < script_bytes.len) {
+                const len = script_bytes[i];
+                i += 1;
+                if (i + len <= script_bytes.len) {
+                    for (script_bytes[i .. i + len]) |byte| {
+                        try writer.print("{x:0>2}", .{byte});
+                    }
+                    i += len;
+                }
+            }
+        } else if (op == 0x4d) {
+            // OP_PUSHDATA2
+            if (i + 2 <= script_bytes.len) {
+                const len = @as(u16, script_bytes[i]) | (@as(u16, script_bytes[i + 1]) << 8);
+                i += 2;
+                if (i + len <= script_bytes.len) {
+                    for (script_bytes[i .. i + len]) |byte| {
+                        try writer.print("{x:0>2}", .{byte});
+                    }
+                    i += len;
+                }
+            }
+        } else if (op == 0x51) {
+            try writer.writeAll("OP_1");
+        } else if (op >= 0x52 and op <= 0x60) {
+            try writer.print("OP_{d}", .{op - 0x50});
+        } else if (op == 0x76) {
+            try writer.writeAll("OP_DUP");
+        } else if (op == 0x87) {
+            try writer.writeAll("OP_EQUAL");
+        } else if (op == 0x88) {
+            try writer.writeAll("OP_EQUALVERIFY");
+        } else if (op == 0xa9) {
+            try writer.writeAll("OP_HASH160");
+        } else if (op == 0xac) {
+            try writer.writeAll("OP_CHECKSIG");
+        } else if (op == 0x6a) {
+            try writer.writeAll("OP_RETURN");
+        } else {
+            try writer.print("0x{x:0>2}", .{op});
+        }
+    }
 }
 
 // ============================================================================

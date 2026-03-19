@@ -511,9 +511,13 @@ pub fn main() !void {
 
     var peer_manager = peer.PeerManager.init(allocator, params);
     defer peer_manager.deinit();
+    peer_manager.chain_state = &chain_state;
 
     const auth_token = computeAuthToken(config.rpc_user, config.rpc_password, allocator) catch null;
     defer if (auth_token) |t| allocator.free(t);
+
+    var chain_manager = validation.ChainManager.init(&chain_state, &mempool_instance, allocator);
+    defer chain_manager.deinit();
 
     var rpc_server = rpc.RpcServer.init(
         allocator,
@@ -528,11 +532,56 @@ pub fn main() !void {
         },
     );
     defer rpc_server.deinit();
+    rpc_server.setChainManager(&chain_manager);
 
     // 8. Install signal handlers
     installSignalHandlers();
 
-    // 9. Start subsystem threads
+    // Initialize chain state with genesis block
+    chain_state.best_hash = params.genesis_hash;
+    chain_state.best_height = 0;
+
+    // 9. Parse --connect address before starting threads
+    if (config.connect) |addr_str| {
+        // Parse "host:port" format
+        if (std.mem.lastIndexOfScalar(u8, addr_str, ':')) |colon_pos| {
+            const host = addr_str[0..colon_pos];
+            const port_str = addr_str[colon_pos + 1 ..];
+            const port = std.fmt.parseInt(u16, port_str, 10) catch {
+                std.debug.print("Invalid port in --connect address: {s}\n", .{addr_str});
+                std.process.exit(1);
+            };
+            // Parse the IPv4 address
+            var ip_bytes: [4]u8 = undefined;
+            var part_idx: usize = 0;
+            var start: usize = 0;
+            for (host, 0..) |c, i| {
+                if (c == '.' or i == host.len - 1) {
+                    const end = if (c == '.') i else i + 1;
+                    if (part_idx >= 4) {
+                        std.debug.print("Invalid IP in --connect address: {s}\n", .{addr_str});
+                        std.process.exit(1);
+                    }
+                    ip_bytes[part_idx] = std.fmt.parseInt(u8, host[start..end], 10) catch {
+                        std.debug.print("Invalid IP in --connect address: {s}\n", .{addr_str});
+                        std.process.exit(1);
+                    };
+                    part_idx += 1;
+                    start = i + 1;
+                }
+            }
+            const connect_addr = std.net.Address.initIp4(ip_bytes, port);
+            peer_manager.connect_address = connect_addr;
+            std.debug.print("Will connect to peer: {s}\n", .{addr_str});
+        } else {
+            std.debug.print("Invalid --connect address (expected host:port): {s}\n", .{addr_str});
+            std.process.exit(1);
+        }
+    } else if (config.dns_seed) {
+        std.debug.print("Discovering peers via DNS seeds\n", .{});
+    }
+
+    // 10. Start subsystem threads
     std.debug.print("P2P listening on port {d}\n", .{config.listen_port});
     std.debug.print("RPC server on {s}:{d}\n", .{ config.rpc_bind, config.rpc_port });
 
@@ -550,15 +599,6 @@ pub fn main() !void {
         std.debug.print("Warning: could not start RPC thread: {}\n", .{err});
         return;
     };
-
-    // 10. Initial block download / peer discovery
-    if (config.connect) |addr_str| {
-        _ = addr_str;
-        // TODO: Connect to specific peer
-        std.debug.print("Connecting to specified peer\n", .{});
-    } else if (config.dns_seed) {
-        std.debug.print("Discovering peers via DNS seeds\n", .{});
-    }
 
     std.debug.print("Node running. Press Ctrl+C to stop.\n", .{});
 

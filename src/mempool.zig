@@ -390,6 +390,12 @@ pub const Mempool = struct {
     /// Whether linearizations need recomputation.
     linearization_dirty: bool,
 
+    /// Mutex for thread-safe access.
+    mutex: std.Thread.Mutex,
+
+    /// Fee estimator for smart fee estimation.
+    fee_estimator: FeeEstimator,
+
     /// Initialize a new mempool.
     pub fn init(
         chain_state: ?*storage.ChainState,
@@ -412,6 +418,8 @@ pub const Mempool = struct {
             .next_cluster_index = 0,
             .cluster_linearizations = std.AutoHashMap(u32, Linearization).init(allocator),
             .linearization_dirty = true,
+            .mutex = std.Thread.Mutex{},
+            .fee_estimator = FeeEstimator.init(allocator),
         };
     }
 
@@ -444,6 +452,7 @@ pub const Mempool = struct {
             entry.value_ptr.deinit();
         }
         self.cluster_linearizations.deinit();
+        self.fee_estimator.deinit();
     }
 
     /// Attempt to add a transaction to the mempool.

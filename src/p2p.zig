@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const serialize = @import("serialize.zig");
 const crypto = @import("crypto.zig");
+const erlay_mod = @import("erlay.zig");
 
 // ============================================================================
 // Protocol Constants
@@ -122,6 +123,15 @@ pub const Message = union(enum) {
     ancpkginfo: AncPkgInfoMessage,
     getpkgtxns: GetPkgTxnsMessage,
     pkgtxns: PkgTxnsMessage,
+    // BIP-330 Erlay transaction reconciliation
+    sendtxrcncl: SendTxRcnclMessage,
+    reqrecon: ReqReconMessage,
+    sketch: SketchMessage,
+    reconcildiff: ReconcilDiffMessage,
+    // BIP-152 Compact Block data messages
+    cmpctblock: CmpctBlockMessage,
+    getblocktxn: GetBlockTxnMessage,
+    blocktxn: BlockTxnMessage,
 };
 
 /// Version message - exchanged during handshake.
@@ -252,6 +262,90 @@ pub const PkgTxnsMessage = struct {
 };
 
 // ============================================================================
+// BIP-330 Erlay Messages
+// ============================================================================
+
+/// sendtxrcncl message - negotiate transaction reconciliation (BIP-330).
+/// Sent during handshake to indicate support for Erlay.
+pub const SendTxRcnclMessage = struct {
+    /// Reconciliation protocol version (currently 1).
+    version: u32,
+    /// Salt for computing short transaction IDs.
+    salt: u64,
+};
+
+/// reqrecon message - request set reconciliation from peer (BIP-330).
+/// Sent by the initiator to start a reconciliation round.
+pub const ReqReconMessage = struct {
+    /// Number of transactions in our local reconciliation set.
+    set_size: u16,
+    /// Requested sketch capacity (number of differences we can handle).
+    q: u16,
+    /// Serialized minisketch of our transaction set.
+    sketch_data: []const u8,
+};
+
+/// sketch message - send minisketch data to peer (BIP-330).
+/// Sent by the responder in response to reqrecon.
+pub const SketchMessage = struct {
+    /// Serialized minisketch data.
+    sketch_data: []const u8,
+};
+
+/// reconcildiff message - report reconciliation differences (BIP-330).
+/// Sent after decoding the combined sketch to report missing/extra txids.
+pub const ReconcilDiffMessage = struct {
+    /// Whether reconciliation succeeded (sketch decoded).
+    success: bool,
+    /// Short IDs of transactions the peer is missing (we have, they don't).
+    missing_short_ids: []const u32,
+    /// Short IDs of transactions we are missing (they have, we don't).
+    extra_short_ids: []const u32,
+};
+
+// ============================================================================
+// BIP-152 Compact Block Data Messages
+// ============================================================================
+
+/// cmpctblock message (BIP-152) - a compact representation of a block.
+/// Contains the header, a nonce for computing short IDs, the short IDs of
+/// transactions, and prefilled transactions (coinbase at minimum).
+pub const CmpctBlockMessage = struct {
+    /// Block header (80 bytes).
+    header: types.BlockHeader,
+    /// Nonce for computing short transaction IDs.
+    nonce: u64,
+    /// Short transaction IDs (6 bytes each, truncated SipHash).
+    short_ids: []const [6]u8,
+    /// Prefilled transactions (index + full transaction).
+    prefilled_txs: []const PrefilledTransaction,
+};
+
+/// A prefilled transaction in a compact block.
+pub const PrefilledTransaction = struct {
+    /// Differentially encoded index in the block.
+    index: u16,
+    /// The full transaction.
+    tx: types.Transaction,
+};
+
+/// getblocktxn message (BIP-152) - request missing transactions for a compact block.
+pub const GetBlockTxnMessage = struct {
+    /// Hash of the block for which transactions are requested.
+    block_hash: types.Hash256,
+    /// Indices of the requested transactions (differentially encoded varints).
+    indexes: []const u16,
+};
+
+/// blocktxn message (BIP-152) - provide missing transactions for compact block reconstruction.
+pub const BlockTxnMessage = struct {
+    /// Hash of the block these transactions belong to.
+    block_hash: types.Hash256,
+    /// The requested transactions.
+    transactions: []const types.Transaction,
+};
+
+// ============================================================================
 // Encoding
 // ============================================================================
 
@@ -291,6 +385,15 @@ pub fn encodeMessage(
         .ancpkginfo => "ancpkginfo",
         .getpkgtxns => "getpkgtxns",
         .pkgtxns => "pkgtxns",
+        // BIP-330 Erlay
+        .sendtxrcncl => "sendtxrcncl",
+        .reqrecon => "reqrecon",
+        .sketch => "sketch",
+        .reconcildiff => "reconcildiff",
+        // BIP-152 Compact Block data messages
+        .cmpctblock => "cmpctblock",
+        .getblocktxn => "getblocktxn",
+        .blocktxn => "blocktxn",
     };
 
     // Encode payload based on message type
@@ -381,6 +484,60 @@ pub fn encodeMessage(
         .pkgtxns => |pkt| {
             try payload_writer.writeCompactSize(pkt.transactions.len);
             for (pkt.transactions) |transaction| {
+                try serialize.writeTransaction(&payload_writer, &transaction);
+            }
+        },
+        // BIP-330 Erlay
+        .sendtxrcncl => |stxr| {
+            try payload_writer.writeInt(u32, stxr.version);
+            try payload_writer.writeInt(u64, stxr.salt);
+        },
+        .reqrecon => |rr| {
+            try payload_writer.writeInt(u16, rr.set_size);
+            try payload_writer.writeInt(u16, rr.q);
+            try payload_writer.writeCompactSize(rr.sketch_data.len);
+            try payload_writer.writeBytes(rr.sketch_data);
+        },
+        .sketch => |sk| {
+            try payload_writer.writeCompactSize(sk.sketch_data.len);
+            try payload_writer.writeBytes(sk.sketch_data);
+        },
+        .reconcildiff => |rd| {
+            try payload_writer.writeBytes(&[_]u8{if (rd.success) 1 else 0});
+            try payload_writer.writeCompactSize(rd.missing_short_ids.len);
+            for (rd.missing_short_ids) |sid| {
+                try payload_writer.writeInt(u32, sid);
+            }
+            try payload_writer.writeCompactSize(rd.extra_short_ids.len);
+            for (rd.extra_short_ids) |sid| {
+                try payload_writer.writeInt(u32, sid);
+            }
+        },
+        // BIP-152 Compact Block data messages
+        .cmpctblock => |cb| {
+            try serialize.writeBlockHeader(&payload_writer, &cb.header);
+            try payload_writer.writeInt(u64, cb.nonce);
+            try payload_writer.writeCompactSize(cb.short_ids.len);
+            for (cb.short_ids) |sid| {
+                try payload_writer.writeBytes(&sid);
+            }
+            try payload_writer.writeCompactSize(cb.prefilled_txs.len);
+            for (cb.prefilled_txs) |ptx| {
+                try payload_writer.writeCompactSize(ptx.index);
+                try serialize.writeTransaction(&payload_writer, &ptx.tx);
+            }
+        },
+        .getblocktxn => |gbt| {
+            try payload_writer.writeBytes(&gbt.block_hash);
+            try payload_writer.writeCompactSize(gbt.indexes.len);
+            for (gbt.indexes) |idx| {
+                try payload_writer.writeCompactSize(idx);
+            }
+        },
+        .blocktxn => |bt| {
+            try payload_writer.writeBytes(&bt.block_hash);
+            try payload_writer.writeCompactSize(bt.transactions.len);
+            for (bt.transactions) |transaction| {
                 try serialize.writeTransaction(&payload_writer, &transaction);
             }
         },
@@ -489,6 +646,90 @@ pub fn decodePayload(
         return Message{ .addr = try decodeAddr(&reader, allocator) };
     } else if (std.mem.eql(u8, command, "reject")) {
         return Message{ .reject = try decodeReject(&reader, allocator) };
+    } else if (std.mem.eql(u8, command, "sendtxrcncl")) {
+        return Message{ .sendtxrcncl = .{
+            .version = try reader.readInt(u32),
+            .salt = try reader.readInt(u64),
+        } };
+    } else if (std.mem.eql(u8, command, "reqrecon")) {
+        const set_size = try reader.readInt(u16);
+        const q = try reader.readInt(u16);
+        const sketch_len = try reader.readCompactSize();
+        const sketch_data = try reader.readBytes(@intCast(sketch_len));
+        return Message{ .reqrecon = .{
+            .set_size = set_size,
+            .q = q,
+            .sketch_data = sketch_data,
+        } };
+    } else if (std.mem.eql(u8, command, "sketch")) {
+        const sketch_len = try reader.readCompactSize();
+        const sketch_data = try reader.readBytes(@intCast(sketch_len));
+        return Message{ .sketch = .{
+            .sketch_data = sketch_data,
+        } };
+    } else if (std.mem.eql(u8, command, "reconcildiff")) {
+        const success = (try reader.readBytes(1))[0] != 0;
+        const missing_count = try reader.readCompactSize();
+        var missing_ids = try allocator.alloc(u32, @intCast(missing_count));
+        for (0..@intCast(missing_count)) |i| {
+            missing_ids[i] = try reader.readInt(u32);
+        }
+        const extra_count = try reader.readCompactSize();
+        var extra_ids = try allocator.alloc(u32, @intCast(extra_count));
+        for (0..@intCast(extra_count)) |i| {
+            extra_ids[i] = try reader.readInt(u32);
+        }
+        return Message{ .reconcildiff = .{
+            .success = success,
+            .missing_short_ids = missing_ids,
+            .extra_short_ids = extra_ids,
+        } };
+    } else if (std.mem.eql(u8, command, "cmpctblock")) {
+        const header = try serialize.readBlockHeader(&reader);
+        const nonce = try reader.readInt(u64);
+        const short_id_count = try reader.readCompactSize();
+        var short_ids = try allocator.alloc([6]u8, @intCast(short_id_count));
+        for (0..@intCast(short_id_count)) |i| {
+            short_ids[i] = (try reader.readBytes(6))[0..6].*;
+        }
+        const prefilled_count = try reader.readCompactSize();
+        var prefilled_txs = try allocator.alloc(PrefilledTransaction, @intCast(prefilled_count));
+        for (0..@intCast(prefilled_count)) |i| {
+            const index = try reader.readCompactSize();
+            const transaction = try serialize.readTransaction(&reader, allocator);
+            prefilled_txs[i] = .{
+                .index = @intCast(index),
+                .tx = transaction,
+            };
+        }
+        return Message{ .cmpctblock = .{
+            .header = header,
+            .nonce = nonce,
+            .short_ids = short_ids,
+            .prefilled_txs = prefilled_txs,
+        } };
+    } else if (std.mem.eql(u8, command, "getblocktxn")) {
+        const block_hash = try reader.readHash();
+        const index_count = try reader.readCompactSize();
+        var indexes = try allocator.alloc(u16, @intCast(index_count));
+        for (0..@intCast(index_count)) |i| {
+            indexes[i] = @intCast(try reader.readCompactSize());
+        }
+        return Message{ .getblocktxn = .{
+            .block_hash = block_hash,
+            .indexes = indexes,
+        } };
+    } else if (std.mem.eql(u8, command, "blocktxn")) {
+        const block_hash = try reader.readHash();
+        const tx_count = try reader.readCompactSize();
+        var transactions = try allocator.alloc(types.Transaction, @intCast(tx_count));
+        for (0..@intCast(tx_count)) |i| {
+            transactions[i] = try serialize.readTransaction(&reader, allocator);
+        }
+        return Message{ .blocktxn = .{
+            .block_hash = block_hash,
+            .transactions = transactions,
+        } };
     }
 
     return ParseError.UnknownCommand;

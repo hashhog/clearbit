@@ -574,35 +574,39 @@ pub const Address = struct {
 
     /// Decode from string representation.
     pub fn decode(addr_str: []const u8, allocator: std.mem.Allocator) !Address {
-        // Check if it's a Bech32/Bech32m address
-        if (addr_str.len >= 4) {
-            const prefix_lower = blk: {
-                var p: [4]u8 = undefined;
-                for (addr_str[0..4], 0..) |c, i| {
-                    p[i] = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
-                }
-                break :blk p;
+        // Check if it's a Bech32/Bech32m address (bc1, tb1, bcrt1)
+        const is_segwit = if (addr_str.len >= 4) blk: {
+            var lower_buf: [5]u8 = undefined;
+            const check_len = @min(addr_str.len, 5);
+            for (addr_str[0..check_len], 0..) |c, i| {
+                lower_buf[i] = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+            }
+            if (check_len >= 3 and (std.mem.eql(u8, lower_buf[0..3], "bc1") or std.mem.eql(u8, lower_buf[0..3], "tb1"))) {
+                break :blk true;
+            }
+            if (check_len >= 5 and std.mem.eql(u8, lower_buf[0..5], "bcrt1")) {
+                break :blk true;
+            }
+            break :blk false;
+        } else false;
+        if (is_segwit) {
+            const result = try segwitDecode(addr_str, allocator);
+            defer allocator.free(result.hrp);
+            errdefer allocator.free(result.program);
+
+            const network: Network = if (std.mem.eql(u8, result.hrp, "bc")) .mainnet else .testnet;
+
+            const addr_type: AddressType = switch (result.version) {
+                0 => if (result.program.len == 20) .p2wpkh else .p2wsh,
+                1 => .p2tr,
+                else => return error.UnsupportedWitnessVersion,
             };
 
-            if (std.mem.eql(u8, prefix_lower[0..3], "bc1") or std.mem.eql(u8, prefix_lower[0..3], "tb1")) {
-                const result = try segwitDecode(addr_str, allocator);
-                defer allocator.free(result.hrp);
-                errdefer allocator.free(result.program);
-
-                const network: Network = if (std.mem.eql(u8, result.hrp, "bc")) .mainnet else .testnet;
-
-                const addr_type: AddressType = switch (result.version) {
-                    0 => if (result.program.len == 20) .p2wpkh else .p2wsh,
-                    1 => .p2tr,
-                    else => return error.UnsupportedWitnessVersion,
-                };
-
-                return .{
-                    .addr_type = addr_type,
-                    .hash = result.program,
-                    .network = network,
-                };
-            }
+            return .{
+                .addr_type = addr_type,
+                .hash = result.program,
+                .network = network,
+            };
         }
 
         // Try Base58Check decode
