@@ -77,12 +77,11 @@ pub fn build(b: *std.Build) void {
         unit_tests.linkLibC();
     }
 
-    // Link libsecp256k1 for tests if enabled
-    if (secp256k1_enabled) {
-        unit_tests.linkSystemLibrary("secp256k1");
-        unit_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
-        unit_tests.linkLibC();
-    }
+    // Link libsecp256k1 for tests (required by crypto.zig)
+    unit_tests.linkSystemLibrary("secp256k1");
+    unit_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+    unit_tests.addLibraryPath(.{ .cwd_relative = "/home/max/.local/lib64" });
+    unit_tests.linkLibC();
 
     // Link libminisketch for tests if enabled
     if (minisketch_enabled) {
@@ -98,13 +97,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // Sighash test harness (standalone executable, no secp256k1/rocksdb needed)
+    // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
         .root_source_file = b.path("src/test_sighash.zig"),
         .target = target,
         .optimize = optimize,
     });
+    sighash_test.addIncludePath(.{ .cwd_relative = secp256k1_include });
+    sighash_test.addLibraryPath(.{ .cwd_relative = "/home/max/.local/lib64" });
+    sighash_test.linkSystemLibrary("secp256k1");
+    sighash_test.linkLibC();
     b.installArtifact(sighash_test);
 
     const run_sighash = b.addRunArtifact(sighash_test);
@@ -112,13 +115,17 @@ pub fn build(b: *std.Build) void {
     const sighash_step = b.step("test-sighash", "Run sighash test vectors");
     sighash_step.dependOn(&run_sighash.step);
 
-    // Script test vectors harness (standalone executable, no secp256k1/rocksdb needed)
+    // Script test vectors harness (links secp256k1 for real signature verification)
     const script_test = b.addExecutable(.{
         .name = "test_script",
         .root_source_file = b.path("src/test_script.zig"),
         .target = target,
         .optimize = optimize,
     });
+    script_test.addIncludePath(.{ .cwd_relative = secp256k1_include });
+    script_test.addLibraryPath(.{ .cwd_relative = "/home/max/.local/lib64" });
+    script_test.linkSystemLibrary("secp256k1");
+    script_test.linkLibC();
     b.installArtifact(script_test);
 
     const run_script = b.addRunArtifact(script_test);
