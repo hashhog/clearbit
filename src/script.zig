@@ -257,6 +257,77 @@ pub fn isCompressedPubkey(pubkey: []const u8) bool {
     return pubkey[0] == 0x02 or pubkey[0] == 0x03;
 }
 
+/// Check if a public key has valid encoding.
+/// Accepts compressed (33 bytes, 0x02/0x03 prefix) or uncompressed (65 bytes, 0x04 prefix).
+pub fn isValidPubkeyEncoding(pubkey: []const u8) bool {
+    if (pubkey.len == 33) {
+        return pubkey[0] == 0x02 or pubkey[0] == 0x03;
+    }
+    if (pubkey.len == 65) {
+        return pubkey[0] == 0x04;
+    }
+    return false;
+}
+
+/// Validate DER signature encoding per BIP-66 (DERSIG).
+/// This is a strict check of the DER format: the signature including hashtype byte.
+/// Reference: Bitcoin Core script/interpreter.cpp IsValidSignatureEncoding()
+pub fn isValidSignatureEncoding(sig: []const u8) bool {
+    // Format: 0x30 [total-len] 0x02 [r-len] [r] 0x02 [s-len] [s] [sighash]
+    // Minimum DER sig: 30 06 02 01 00 02 01 00 + hashtype = 9 bytes
+    if (sig.len < 9) return false;
+    // Maximum DER sig: 30 46 02 21 [33] 02 21 [33] + hashtype = 73 bytes
+    if (sig.len > 73) return false;
+
+    // The actual DER data is everything except the last byte (hashtype)
+    const der = sig[0 .. sig.len - 1];
+
+    // A signature is of type 0x30 (compound)
+    if (der[0] != 0x30) return false;
+
+    // Make sure the length covers the entire signature
+    if (der[1] != der.len - 2) return false;
+
+    // Extract the length of the R element
+    if (der.len < 4) return false;
+    const lenR: usize = der[3];
+
+    // Make sure the length of the S element is still inside the signature
+    if (5 + lenR >= der.len) return false;
+    const lenS: usize = der[5 + lenR];
+
+    // Verify that the length of the signature matches the sum of the length of the elements
+    if (lenR + lenS + 7 != der.len) return false;
+
+    // Check whether the R element is an integer
+    if (der[2] != 0x02) return false;
+
+    // Zero-length integers are not allowed for R
+    if (lenR == 0) return false;
+
+    // Negative numbers are not allowed for R
+    if (der[4] & 0x80 != 0) return false;
+
+    // Null bytes at the start of R are not allowed, unless R would otherwise be
+    // interpreted as a negative number
+    if (lenR > 1 and der[4] == 0x00 and (der[5] & 0x80) == 0) return false;
+
+    // Check whether the S element is an integer
+    if (der[lenR + 4] != 0x02) return false;
+
+    // Zero-length integers are not allowed for S
+    if (lenS == 0) return false;
+
+    // Negative numbers are not allowed for S
+    if (der[lenR + 6] & 0x80 != 0) return false;
+
+    // Null bytes at the start of S are not allowed, unless S would otherwise be
+    // interpreted as a negative number
+    if (lenS > 1 and der[lenR + 6] == 0x00 and (der[lenR + 7] & 0x80) == 0) return false;
+
+    return true;
+}
+
 /// Check if a script contains only push operations.
 /// Per BIP-16, P2SH scriptSig must be push-only (literals only).
 /// Push opcodes include:
@@ -488,6 +559,9 @@ pub const ScriptEngine = struct {
     amount: i64,
     codesep_pos: u32,
     sig_version: SigVersion,
+    /// The scriptPubKey being spent, used as scriptCode for sighash computation.
+    /// Set during verify() to the scriptPubKey (or redeem script for P2SH).
+    script_pubkey_for_sighash: ?[]const u8,
 
     // Memory management for stack elements we allocate
     owned_elements: std.ArrayList([]u8),
@@ -509,6 +583,7 @@ pub const ScriptEngine = struct {
             .amount = amount,
             .codesep_pos = 0xFFFFFFFF,
             .sig_version = .base,
+            .script_pubkey_for_sighash = null,
             .owned_elements = std.ArrayList([]u8).init(allocator),
         };
     }
@@ -664,6 +739,9 @@ pub const ScriptEngine = struct {
         // Clear altstack between scriptSig and scriptPubKey execution
         self.alt_stack.clearRetainingCapacity();
 
+        // Set scriptCode for sighash computation (used by verifySignature)
+        self.script_pubkey_for_sighash = script_pubkey;
+
         // 3. Execute scriptPubKey
         try self.execute(script_pubkey);
 
@@ -690,6 +768,9 @@ pub const ScriptEngine = struct {
             for (saved_stack.items[0 .. saved_stack.items.len - 1]) |item| {
                 self.stack.append(item) catch return ScriptError.OutOfMemory;
             }
+
+            // Set scriptCode for sighash to the redeem script for P2SH
+            self.script_pubkey_for_sighash = redeem_script;
 
             // Execute redeem script
             try self.execute(redeem_script);
@@ -1562,7 +1643,9 @@ pub const ScriptEngine = struct {
                 break;
             }
 
-            const valid = self.verifySignature(sigs[sig_idx], pubkeys[key_idx]) catch false;
+            // Errors from verifySignature (DER/LOW_S/encoding) must propagate,
+            // only treat verification failure (false return) as non-match.
+            const valid = try self.verifySignature(sigs[sig_idx], pubkeys[key_idx]);
             if (valid) {
                 sig_idx += 1;
             }
@@ -1607,20 +1690,33 @@ pub const ScriptEngine = struct {
         const hash_type = sig[sig.len - 1];
         const sig_data = sig[0 .. sig.len - 1];
 
-        // Compute sighash
-        // For a full implementation, we'd need the previous output's scriptPubKey
-        // For now, we use a simplified approach
-        _ = hash_type;
-        _ = sig_data;
-
-        // Full implementation would call crypto.verifyEcdsa
-        if (!crypto.isSecp256k1Available()) {
-            // Without libsecp256k1, we can't verify signatures
-            // Return true for testing purposes (DANGEROUS in production)
-            return true;
+        // DER signature encoding validation
+        if (self.flags.verify_dersig) {
+            if (!isValidSignatureEncoding(sig)) {
+                return ScriptError.CheckSigFailed;
+            }
         }
 
-        return false; // Placeholder
+        // Low-S check (BIP-62 rule 5 / BIP-146)
+        if (self.flags.verify_low_s) {
+            if (!crypto.isLowDERSignature(sig_data)) {
+                return ScriptError.CheckSigFailed;
+            }
+        }
+
+        // Compute sighash using the script_pubkey_for_sighash set during verify()
+        const script_code = self.script_pubkey_for_sighash orelse return false;
+
+        const sighash = legacySignatureHashWithFindAndDelete(
+            self.allocator,
+            self.tx,
+            self.input_index,
+            script_code,
+            sig, // full sig including hashtype byte for FindAndDelete
+            @as(u32, hash_type),
+        ) catch return false;
+
+        return crypto.verifyEcdsa(sig_data, pubkey, &sighash);
     }
 
     fn verifyTaprootSignature(self: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {

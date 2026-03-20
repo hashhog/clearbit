@@ -619,35 +619,43 @@ pub fn computeMerkleRoot(hashes: []const Hash256, allocator: std.mem.Allocator) 
 }
 
 // ============================================================================
-// libsecp256k1 Integration
+// libsecp256k1 Integration (C FFI)
 // ============================================================================
 
-/// Whether libsecp256k1 is available (set via build.zig option)
-pub const has_secp256k1: bool = false;
+const secp256k1 = @cImport({
+    @cInclude("secp256k1.h");
+});
 
-/// Global secp256k1 context state
+/// Whether libsecp256k1 is available at link time
+pub const has_secp256k1: bool = true;
+
+/// Global secp256k1 context
+var secp_ctx: ?*secp256k1.secp256k1_context = null;
 var secp_initialized: bool = false;
 
 /// Initialize the secp256k1 context for signature verification
 /// Returns true if initialization succeeded, false otherwise
 pub fn initSecp256k1() bool {
     if (secp_initialized) return true;
-    // When libsecp256k1 is linked, this would call:
-    // secp256k1.secp256k1_context_create(SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN)
-    secp_initialized = has_secp256k1;
+    secp_ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_VERIFY | secp256k1.SECP256K1_CONTEXT_SIGN,
+    );
+    secp_initialized = (secp_ctx != null);
     return secp_initialized;
 }
 
 /// Deinitialize the secp256k1 context
 pub fn deinitSecp256k1() void {
-    // When libsecp256k1 is linked, this would call:
-    // secp256k1.secp256k1_context_destroy(ctx)
+    if (secp_ctx) |ctx| {
+        secp256k1.secp256k1_context_destroy(ctx);
+        secp_ctx = null;
+    }
     secp_initialized = false;
 }
 
 /// Check if secp256k1 is available and initialized
 pub fn isSecp256k1Available() bool {
-    return has_secp256k1 and secp_initialized;
+    return secp_initialized and secp_ctx != null;
 }
 
 /// Verify an ECDSA signature (DER-encoded) against a public key and message hash.
@@ -659,16 +667,55 @@ pub fn isSecp256k1Available() bool {
 ///
 /// Returns true if signature is valid, false otherwise
 pub fn verifyEcdsa(sig_der: []const u8, pubkey_bytes: []const u8, msg_hash: *const [32]u8) bool {
-    _ = sig_der;
-    _ = pubkey_bytes;
-    _ = msg_hash;
-    // Stub - returns false when library not available
-    // When libsecp256k1 is linked, this would:
-    // 1. Parse the public key with secp256k1_ec_pubkey_parse
-    // 2. Parse the DER signature with secp256k1_ecdsa_signature_parse_der
-    // 3. Normalize to low-S with secp256k1_ecdsa_signature_normalize
-    // 4. Verify with secp256k1_ecdsa_verify
-    return false;
+    const ctx = secp_ctx orelse return false;
+
+    // Parse public key
+    var pubkey: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_ec_pubkey_parse(
+        ctx,
+        &pubkey,
+        pubkey_bytes.ptr,
+        pubkey_bytes.len,
+    ) != 1) {
+        return false;
+    }
+
+    // Parse DER signature
+    var sig: secp256k1.secp256k1_ecdsa_signature = undefined;
+    if (secp256k1.secp256k1_ecdsa_signature_parse_der(
+        ctx,
+        &sig,
+        sig_der.ptr,
+        sig_der.len,
+    ) != 1) {
+        return false;
+    }
+
+    // Normalize to low-S (BIP-62)
+    _ = secp256k1.secp256k1_ecdsa_signature_normalize(ctx, &sig, &sig);
+
+    // Verify
+    return secp256k1.secp256k1_ecdsa_verify(ctx, &sig, msg_hash, &pubkey) == 1;
+}
+
+/// Check if a DER signature has low-S value.
+/// BIP-62 rule 5 / BIP-146: S must be at most half the curve order.
+pub fn isLowDERSignature(sig_der: []const u8) bool {
+    const ctx = secp_ctx orelse return false;
+
+    var sig: secp256k1.secp256k1_ecdsa_signature = undefined;
+    if (secp256k1.secp256k1_ecdsa_signature_parse_der(
+        ctx,
+        &sig,
+        sig_der.ptr,
+        sig_der.len,
+    ) != 1) {
+        return false;
+    }
+
+    // secp256k1_ecdsa_signature_normalize returns 1 if sig was NOT already normalized
+    var normalized: secp256k1.secp256k1_ecdsa_signature = undefined;
+    return secp256k1.secp256k1_ecdsa_signature_normalize(ctx, &normalized, &sig) == 0;
 }
 
 /// Verify a Schnorr signature (BIP-340) for taproot.
@@ -682,10 +729,8 @@ pub fn verifySchnorr(sig: *const [64]u8, msg_hash: *const [32]u8, pubkey_x: *con
     _ = sig;
     _ = msg_hash;
     _ = pubkey_x;
-    // Stub - returns false when library not available
-    // When libsecp256k1 is linked, this would:
-    // 1. Parse the x-only pubkey with secp256k1_xonly_pubkey_parse
-    // 2. Verify with secp256k1_schnorrsig_verify
+    // Schnorr verification requires secp256k1_schnorrsig.h which may not be available
+    // in all builds. For now, return false.
     return false;
 }
 
