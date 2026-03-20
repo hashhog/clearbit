@@ -154,6 +154,9 @@ pub const ScriptError = error{
     OpReturnEncountered,
     UnbalancedConditional,
     SigPushOnly, // BIP-16: P2SH scriptSig must be push-only
+    InvalidSignatureEncoding, // BIP-66: invalid DER signature encoding (SIG_DER)
+    InvalidSigHashType, // STRICTENC: invalid sighash type (SIG_HASHTYPE)
+    InvalidPubkeyType, // STRICTENC: invalid pubkey encoding (PUBKEYTYPE)
     DiscourageOpSuccess, // BIP-342: OP_SUCCESSx found during tapscript pre-scan
     DiscourageUpgradableNops, // NOP1-NOP10 error when discourage flag set
 };
@@ -1701,10 +1704,27 @@ pub const ScriptEngine = struct {
         }
 
         // STRICTENC: check pubkey encoding (must be valid compressed or uncompressed)
-        // Encoding failures are soft - they just make this sig-key pair not match
+        // This is a HARD error - invalid pubkey encoding must be rejected
         if (self.flags.verify_strictenc) {
             if (!isValidPubkeyEncoding(pubkey)) {
-                return false;
+                return ScriptError.InvalidPubkeyType;
+            }
+        }
+
+        // DER signature encoding validation
+        // This is a HARD error - invalid DER encoding must be rejected
+        if (self.flags.verify_dersig or self.flags.verify_low_s or self.flags.verify_strictenc) {
+            if (!isValidSignatureEncoding(sig)) {
+                return ScriptError.InvalidSignatureEncoding;
+            }
+        }
+
+        // Low-S check (BIP-62 rule 5 / BIP-146)
+        // Must come after DER check (needs valid DER to parse)
+        if (self.flags.verify_low_s) {
+            const sig_data_for_low_s = sig[0 .. sig.len - 1];
+            if (!crypto.isLowDERSignature(sig_data_for_low_s)) {
+                return ScriptError.InvalidSignatureEncoding;
             }
         }
 
@@ -1713,24 +1733,10 @@ pub const ScriptEngine = struct {
         const sig_data = sig[0 .. sig.len - 1];
 
         // STRICTENC: check hashtype validity (low bits without SIGHASH_ANYONECANPAY must be 1-3)
+        // This is a HARD error
         if (self.flags.verify_strictenc) {
             if (!isDefinedHashtype(hash_type)) {
-                return false;
-            }
-        }
-
-        // DER signature encoding validation
-        // Encoding failures are soft - the signature just doesn't verify
-        if (self.flags.verify_dersig or self.flags.verify_strictenc) {
-            if (!isValidSignatureEncoding(sig)) {
-                return false;
-            }
-        }
-
-        // Low-S check (BIP-62 rule 5 / BIP-146)
-        if (self.flags.verify_low_s or self.flags.verify_strictenc) {
-            if (!crypto.isLowDERSignature(sig_data)) {
-                return false;
+                return ScriptError.InvalidSigHashType;
             }
         }
 

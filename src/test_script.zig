@@ -314,13 +314,12 @@ fn buildCreditingTx(
 /// Creates: version=1, locktime=0, one input (prevout=hash of crediting tx : 0,
 /// scriptSig=test's scriptSig, sequence=0xFFFFFFFF), one output (empty scriptPubKey, value=0).
 ///
-/// For CLTV tests, the locktime is set to match the test requirements.
-/// For CSV tests, the tx version is 2 and the input sequence is set appropriately.
+/// Bitcoin Core test framework always uses version=1, locktime=0, sequence=0xFFFFFFFF.
 fn buildSpendingTx(
     allocator: std.mem.Allocator,
     credit_tx_hash: [32]u8,
     script_sig: []const u8,
-    flags: script.ScriptFlags,
+    _: script.ScriptFlags,
 ) !struct {
     tx: types.Transaction,
     inputs: []types.TxIn,
@@ -329,25 +328,12 @@ fn buildSpendingTx(
 } {
     const spend_script_pubkey = try allocator.alloc(u8, 0);
 
-    // Determine locktime and sequence for CLTV/CSV compatibility
-    // Bitcoin Core uses: nLockTime=0, nSequence=0xFFFFFFFF by default
-    // For CLTV: sequence must NOT be 0xFFFFFFFF (so locktime is enforceable)
-    // For CSV: version must be >= 2, sequence must not have disable bit set
+    // Bitcoin Core test framework uses: nLockTime=0, nSequence=0xFFFFFFFF, version=1
+    // Tests that need specific values encode them in the expected error.
+    // Do NOT special-case CLTV/CSV - the test vectors expect version=1 and sequence=0xFFFFFFFF.
     const lock_time: u32 = 0;
-    var sequence: u32 = 0xFFFFFFFF;
-    var version: i32 = 1;
-
-    if (flags.verify_checklocktimeverify) {
-        // CLTV requires sequence != 0xFFFFFFFF so locktime is checked
-        sequence = 0;
-    }
-
-    if (flags.verify_checksequenceverify) {
-        // CSV requires version >= 2
-        version = 2;
-        // sequence must not have disable bit; use 0 for compatibility
-        sequence = 0;
-    }
+    const sequence: u32 = 0xFFFFFFFF;
+    const version: i32 = 1;
 
     const inputs = try allocator.alloc(types.TxIn, 1);
     inputs[0] = .{
