@@ -155,6 +155,7 @@ pub const ScriptError = error{
     UnbalancedConditional,
     SigPushOnly, // BIP-16: P2SH scriptSig must be push-only
     DiscourageOpSuccess, // BIP-342: OP_SUCCESSx found during tapscript pre-scan
+    DiscourageUpgradableNops, // NOP1-NOP10 error when discourage flag set
 };
 
 // ============================================================================
@@ -175,7 +176,9 @@ pub const ScriptFlags = packed struct {
     verify_taproot: bool = true,
     verify_witness_pubkeytype: bool = true, // BIP-141: witness v0 requires compressed pubkeys
     discourage_op_success: bool = false, // BIP-342: fail on OP_SUCCESSx in tapscript pre-scan
-    _padding: u3 = 0,
+    discourage_upgradable_nops: bool = false, // NOP1-NOP10 must error when set
+    verify_sigpushonly: bool = false, // scriptSig must be push-only
+    _padding: u1 = 0,
 };
 
 // ============================================================================
@@ -197,6 +200,55 @@ const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 // ============================================================================
 // Public Key Encoding
 // ============================================================================
+
+/// Check if an opcode byte is a disabled opcode that must always fail.
+/// These must error even in unexecuted IF/ELSE branches.
+fn isDisabledOpcode(opcode_byte: u8) bool {
+    return switch (opcode_byte) {
+        0x7e, // OP_CAT
+        0x7f, // OP_SUBSTR
+        0x80, // OP_LEFT
+        0x81, // OP_RIGHT
+        0x83, // OP_INVERT
+        0x84, // OP_AND
+        0x85, // OP_OR
+        0x86, // OP_XOR
+        0x8d, // OP_2MUL
+        0x8e, // OP_2DIV
+        0x95, // OP_MUL
+        0x96, // OP_DIV
+        0x97, // OP_MOD
+        0x98, // OP_LSHIFT
+        0x99, // OP_RSHIFT
+        => true,
+        else => false,
+    };
+}
+
+/// Check minimal push encoding for MINIMALDATA enforcement.
+/// Returns true if the push is minimal, false if a smaller encoding exists.
+fn checkMinimalPush(data: []const u8, opcode_byte: u8) bool {
+    if (data.len == 0) {
+        // Could have used OP_0
+        return opcode_byte == 0x00;
+    } else if (data.len == 1 and data[0] >= 1 and data[0] <= 16) {
+        // Could have used OP_1 through OP_16
+        return opcode_byte == 0x50 + data[0];
+    } else if (data.len == 1 and data[0] == 0x81) {
+        // Could have used OP_1NEGATE
+        return opcode_byte == 0x4f;
+    } else if (data.len <= 75) {
+        // Could have used direct push (opcode = length)
+        return opcode_byte == @as(u8, @intCast(data.len));
+    } else if (data.len <= 255) {
+        // Could have used OP_PUSHDATA1
+        return opcode_byte == 0x4c;
+    } else if (data.len <= 65535) {
+        // Could have used OP_PUSHDATA2
+        return opcode_byte == 0x4d;
+    }
+    return true;
+}
 
 /// Check if a public key is compressed (33 bytes, starting with 0x02 or 0x03).
 /// Per BIP-141, witness v0 programs require compressed public keys.
@@ -287,9 +339,23 @@ pub fn isPushOnly(script: []const u8) bool {
 
 /// Convert a stack element to a script number (CScriptNum).
 /// Little-endian with sign bit in the most significant bit of the last byte.
-fn scriptNumDecode(data: []const u8) ScriptError!i64 {
+fn scriptNumDecode(data: []const u8, require_minimal: bool) ScriptError!i64 {
     if (data.len == 0) return 0;
     if (data.len > MAX_SCRIPT_NUM_LENGTH) return ScriptError.InvalidNumber;
+
+    // Minimal encoding check: the number must use the fewest bytes possible
+    if (require_minimal) {
+        // If the last byte is 0x00 (and not needed for sign), encoding is non-minimal
+        if (data[data.len - 1] & 0x7f == 0) {
+            if (data.len == 1) {
+                // Single byte 0x00 should be empty (OP_0)
+                return ScriptError.InvalidNumber;
+            }
+            if (data[data.len - 2] & 0x80 == 0) {
+                return ScriptError.InvalidNumber;
+            }
+        }
+    }
 
     // Little-endian decode
     var result: i64 = 0;
@@ -476,10 +542,24 @@ pub const ScriptEngine = struct {
                 if (pc + n > script.len) return ScriptError.InvalidScript;
                 if (self.isExecuting(&exec_stack)) {
                     if (n > MAX_PUSH_SIZE) return ScriptError.PushSizeExceeded;
-                    try self.push(script[pc .. pc + n]);
+                    const push_data = script[pc .. pc + n];
+                    if (self.flags.verify_minimaldata and !checkMinimalPush(push_data, opcode_byte)) {
+                        return ScriptError.MinimalData;
+                    }
+                    try self.push(push_data);
                 }
                 pc += n;
                 continue;
+            }
+
+            // OP_VERIF (0x65) and OP_VERNOTIF (0x66) ALWAYS fail, even in unexecuted branches
+            if (opcode_byte == 0x65 or opcode_byte == 0x66) {
+                return ScriptError.InvalidOpcode;
+            }
+
+            // Disabled opcodes ALWAYS fail, even in unexecuted branches
+            if (isDisabledOpcode(opcode_byte)) {
+                return ScriptError.DisabledOpcode;
             }
 
             const opcode: Opcode = @enumFromInt(opcode_byte);
@@ -511,20 +591,21 @@ pub const ScriptEngine = struct {
                 if (pc + n > script.len) return ScriptError.InvalidScript;
                 if (self.isExecuting(&exec_stack)) {
                     if (n > MAX_PUSH_SIZE) return ScriptError.PushSizeExceeded;
-                    try self.push(script[pc .. pc + n]);
+                    const push_data = script[pc .. pc + n];
+                    if (self.flags.verify_minimaldata and !checkMinimalPush(push_data, opcode_byte)) {
+                        return ScriptError.MinimalData;
+                    }
+                    try self.push(push_data);
                 }
                 pc += n;
                 continue;
             }
 
-            // Count ops (except for push opcodes and flow control in non-executing branch)
-            if (opcode != .op_if and opcode != .op_notif and
-                opcode != .op_else and opcode != .op_endif)
-            {
-                if (opcode_byte > 0x60) {
-                    op_count += 1;
-                    if (op_count > MAX_OPS_PER_SCRIPT) return ScriptError.OpCountExceeded;
-                }
+            // Count ops: all opcodes > OP_16 (0x60) count toward the 201 limit
+            // This includes IF/NOTIF/ELSE/ENDIF per Bitcoin Core
+            if (opcode_byte > 0x60) {
+                op_count += 1;
+                if (op_count > MAX_OPS_PER_SCRIPT) return ScriptError.OpCountExceeded;
             }
 
             if (!self.isExecuting(&exec_stack)) {
@@ -549,7 +630,7 @@ pub const ScriptEngine = struct {
             }
 
             // Execute the opcode
-            try self.executeOpcode(opcode, script, &pc, &exec_stack);
+            try self.executeOpcode(opcode, script, &pc, &exec_stack, &op_count);
         }
 
         if (exec_stack.items.len != 0) return ScriptError.UnbalancedConditional;
@@ -562,6 +643,11 @@ pub const ScriptEngine = struct {
         script_pubkey: []const u8,
         witness: []const []const u8,
     ) ScriptError!bool {
+        // 0. SIG_PUSHONLY: scriptSig must be push-only when flag is set
+        if (self.flags.verify_sigpushonly and !isPushOnly(script_sig)) {
+            return ScriptError.SigPushOnly;
+        }
+
         // 1. Execute scriptSig
         try self.execute(script_sig);
 
@@ -574,6 +660,9 @@ pub const ScriptEngine = struct {
                 saved_stack.append(item) catch return ScriptError.OutOfMemory;
             }
         }
+
+        // Clear altstack between scriptSig and scriptPubKey execution
+        self.alt_stack.clearRetainingCapacity();
 
         // 3. Execute scriptPubKey
         try self.execute(script_pubkey);
@@ -760,13 +849,13 @@ pub const ScriptEngine = struct {
     }
 
     fn push(self: *ScriptEngine, data: []const u8) !void {
-        if (self.stack.items.len >= MAX_STACK_SIZE) return ScriptError.StackOverflow;
+        if (self.stack.items.len + self.alt_stack.items.len >= MAX_STACK_SIZE) return ScriptError.StackOverflow;
         if (data.len > MAX_STACK_ELEMENT_SIZE) return ScriptError.PushSizeExceeded;
         self.stack.append(data) catch return ScriptError.OutOfMemory;
     }
 
     fn pushOwned(self: *ScriptEngine, data: []u8) !void {
-        if (self.stack.items.len >= MAX_STACK_SIZE) return ScriptError.StackOverflow;
+        if (self.stack.items.len + self.alt_stack.items.len >= MAX_STACK_SIZE) return ScriptError.StackOverflow;
         if (data.len > MAX_STACK_ELEMENT_SIZE) return ScriptError.PushSizeExceeded;
         self.owned_elements.append(data) catch return ScriptError.OutOfMemory;
         self.stack.append(data) catch return ScriptError.OutOfMemory;
@@ -825,6 +914,7 @@ pub const ScriptEngine = struct {
         script: []const u8,
         pc: *usize,
         exec_stack: *std.ArrayList(bool),
+        op_count: *usize,
     ) ScriptError!void {
         _ = script;
         _ = pc;
@@ -845,7 +935,12 @@ pub const ScriptEngine = struct {
             },
 
             // Flow control
-            .op_nop, .op_nop1, .op_nop4, .op_nop5, .op_nop6, .op_nop7, .op_nop8, .op_nop9, .op_nop10 => {},
+            .op_nop => {},
+            .op_nop1, .op_nop4, .op_nop5, .op_nop6, .op_nop7, .op_nop8, .op_nop9, .op_nop10 => {
+                if (self.flags.discourage_upgradable_nops) {
+                    return ScriptError.DiscourageUpgradableNops;
+                }
+            },
 
             .op_if => {
                 var execute_branch = false;
@@ -994,7 +1089,7 @@ pub const ScriptEngine = struct {
 
             .op_pick => {
                 const n_data = try self.pop();
-                const n = try scriptNumDecode(n_data);
+                const n = try scriptNumDecode(n_data, self.flags.verify_minimaldata);
                 if (n < 0) return ScriptError.InvalidStackOperation;
                 const data = try self.peekAt(@intCast(n));
                 try self.push(data);
@@ -1002,7 +1097,7 @@ pub const ScriptEngine = struct {
 
             .op_roll => {
                 const n_data = try self.pop();
-                const n = try scriptNumDecode(n_data);
+                const n = try scriptNumDecode(n_data, self.flags.verify_minimaldata);
                 if (n < 0) return ScriptError.InvalidStackOperation;
                 const idx: usize = @intCast(n);
                 if (idx >= self.stack.items.len) return ScriptError.StackUnderflow;
@@ -1061,42 +1156,42 @@ pub const ScriptEngine = struct {
             // Arithmetic
             .op_1add => {
                 const data = try self.pop();
-                const n = try scriptNumDecode(data);
+                const n = try scriptNumDecode(data, self.flags.verify_minimaldata);
                 const result = try scriptNumEncode(n + 1, self.allocator);
                 try self.pushOwned(result);
             },
 
             .op_1sub => {
                 const data = try self.pop();
-                const n = try scriptNumDecode(data);
+                const n = try scriptNumDecode(data, self.flags.verify_minimaldata);
                 const result = try scriptNumEncode(n - 1, self.allocator);
                 try self.pushOwned(result);
             },
 
             .op_negate => {
                 const data = try self.pop();
-                const n = try scriptNumDecode(data);
+                const n = try scriptNumDecode(data, self.flags.verify_minimaldata);
                 const result = try scriptNumEncode(-n, self.allocator);
                 try self.pushOwned(result);
             },
 
             .op_abs => {
                 const data = try self.pop();
-                const n = try scriptNumDecode(data);
+                const n = try scriptNumDecode(data, self.flags.verify_minimaldata);
                 const result = try scriptNumEncode(if (n < 0) -n else n, self.allocator);
                 try self.pushOwned(result);
             },
 
             .op_not => {
                 const data = try self.pop();
-                const n = try scriptNumDecode(data);
+                const n = try scriptNumDecode(data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, n == 0);
                 try self.pushOwned(result);
             },
 
             .op_0notequal => {
                 const data = try self.pop();
-                const n = try scriptNumDecode(data);
+                const n = try scriptNumDecode(data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, n != 0);
                 try self.pushOwned(result);
             },
@@ -1104,8 +1199,8 @@ pub const ScriptEngine = struct {
             .op_add => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try scriptNumEncode(a + b, self.allocator);
                 try self.pushOwned(result);
             },
@@ -1113,8 +1208,8 @@ pub const ScriptEngine = struct {
             .op_sub => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try scriptNumEncode(a - b, self.allocator);
                 try self.pushOwned(result);
             },
@@ -1122,8 +1217,8 @@ pub const ScriptEngine = struct {
             .op_booland => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, a != 0 and b != 0);
                 try self.pushOwned(result);
             },
@@ -1131,8 +1226,8 @@ pub const ScriptEngine = struct {
             .op_boolor => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, a != 0 or b != 0);
                 try self.pushOwned(result);
             },
@@ -1140,8 +1235,8 @@ pub const ScriptEngine = struct {
             .op_numequal => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, a == b);
                 try self.pushOwned(result);
             },
@@ -1149,16 +1244,16 @@ pub const ScriptEngine = struct {
             .op_numequalverify => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 if (a != b) return ScriptError.VerifyFailed;
             },
 
             .op_numnotequal => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, a != b);
                 try self.pushOwned(result);
             },
@@ -1166,8 +1261,8 @@ pub const ScriptEngine = struct {
             .op_lessthan => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, a < b);
                 try self.pushOwned(result);
             },
@@ -1175,8 +1270,8 @@ pub const ScriptEngine = struct {
             .op_greaterthan => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, a > b);
                 try self.pushOwned(result);
             },
@@ -1184,8 +1279,8 @@ pub const ScriptEngine = struct {
             .op_lessthanorequal => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, a <= b);
                 try self.pushOwned(result);
             },
@@ -1193,8 +1288,8 @@ pub const ScriptEngine = struct {
             .op_greaterthanorequal => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, a >= b);
                 try self.pushOwned(result);
             },
@@ -1202,8 +1297,8 @@ pub const ScriptEngine = struct {
             .op_min => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try scriptNumEncode(@min(a, b), self.allocator);
                 try self.pushOwned(result);
             },
@@ -1211,8 +1306,8 @@ pub const ScriptEngine = struct {
             .op_max => {
                 const b_data = try self.pop();
                 const a_data = try self.pop();
-                const a = try scriptNumDecode(a_data);
-                const b = try scriptNumDecode(b_data);
+                const a = try scriptNumDecode(a_data, self.flags.verify_minimaldata);
+                const b = try scriptNumDecode(b_data, self.flags.verify_minimaldata);
                 const result = try scriptNumEncode(@max(a, b), self.allocator);
                 try self.pushOwned(result);
             },
@@ -1221,9 +1316,9 @@ pub const ScriptEngine = struct {
                 const max_data = try self.pop();
                 const min_data = try self.pop();
                 const x_data = try self.pop();
-                const x = try scriptNumDecode(x_data);
-                const min_val = try scriptNumDecode(min_data);
-                const max_val = try scriptNumDecode(max_data);
+                const x = try scriptNumDecode(x_data, self.flags.verify_minimaldata);
+                const min_val = try scriptNumDecode(min_data, self.flags.verify_minimaldata);
+                const max_val = try scriptNumDecode(max_data, self.flags.verify_minimaldata);
                 const result = try boolToStack(self.allocator, x >= min_val and x < max_val);
                 try self.pushOwned(result);
             },
@@ -1299,21 +1394,24 @@ pub const ScriptEngine = struct {
             },
 
             .op_checkmultisig => {
-                try self.executeCheckMultisig(false);
+                try self.executeCheckMultisig(false, op_count);
             },
 
             .op_checkmultisigverify => {
-                try self.executeCheckMultisig(true);
+                try self.executeCheckMultisig(true, op_count);
             },
 
             // Locktime
             .op_checklocktimeverify => {
                 if (!self.flags.verify_checklocktimeverify) {
+                    if (self.flags.discourage_upgradable_nops) {
+                        return ScriptError.DiscourageUpgradableNops;
+                    }
                     return; // NOP behavior
                 }
 
                 const data = try self.peek(); // Don't pop
-                const locktime = try scriptNumDecode(data);
+                const locktime = try scriptNumDecode(data, false);
 
                 if (locktime < 0) return ScriptError.NegativeLocktime;
 
@@ -1339,11 +1437,14 @@ pub const ScriptEngine = struct {
 
             .op_checksequenceverify => {
                 if (!self.flags.verify_checksequenceverify) {
+                    if (self.flags.discourage_upgradable_nops) {
+                        return ScriptError.DiscourageUpgradableNops;
+                    }
                     return; // NOP behavior
                 }
 
                 const data = try self.peek(); // Don't pop
-                const sequence = try scriptNumDecode(data);
+                const sequence = try scriptNumDecode(data, false);
 
                 if (sequence < 0) return ScriptError.NegativeLocktime;
 
@@ -1383,7 +1484,7 @@ pub const ScriptEngine = struct {
                 const n_data = try self.pop();
                 const sig = try self.pop();
 
-                const n = try scriptNumDecode(n_data);
+                const n = try scriptNumDecode(n_data, self.flags.verify_minimaldata);
 
                 // Empty sig means failure (add 0)
                 if (sig.len == 0) {
@@ -1405,12 +1506,16 @@ pub const ScriptEngine = struct {
         }
     }
 
-    fn executeCheckMultisig(self: *ScriptEngine, do_verify: bool) ScriptError!void {
+    fn executeCheckMultisig(self: *ScriptEngine, do_verify: bool, op_count: *usize) ScriptError!void {
         // Get number of public keys
         const n_data = try self.pop();
-        const n = try scriptNumDecode(n_data);
+        const n = try scriptNumDecode(n_data, self.flags.verify_minimaldata);
         if (n < 0 or n > 20) return ScriptError.InvalidStackOperation;
         const n_keys: usize = @intCast(n);
+
+        // CHECKMULTISIG adds key count to opcode count
+        op_count.* += n_keys;
+        if (op_count.* > MAX_OPS_PER_SCRIPT) return ScriptError.OpCountExceeded;
 
         // Get public keys
         var pubkeys: [20][]const u8 = undefined;
@@ -1429,7 +1534,7 @@ pub const ScriptEngine = struct {
 
         // Get number of signatures
         const m_data = try self.pop();
-        const m = try scriptNumDecode(m_data);
+        const m = try scriptNumDecode(m_data, self.flags.verify_minimaldata);
         if (m < 0 or m > n) return ScriptError.InvalidStackOperation;
         const n_sigs: usize = @intCast(m);
 
@@ -2356,7 +2461,7 @@ test "scriptNumEncode/Decode round-trip" {
         const encoded = try scriptNumEncode(val, allocator);
         defer allocator.free(encoded);
 
-        const decoded = try scriptNumDecode(encoded);
+        const decoded = try scriptNumDecode(encoded, false);
         try std.testing.expectEqual(val, decoded);
     }
 }
