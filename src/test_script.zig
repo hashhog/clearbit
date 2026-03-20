@@ -240,9 +240,10 @@ fn parseFlags(flags_str: []const u8) script.ScriptFlags {
         } else if (std.mem.eql(u8, flag, "SIGPUSHONLY")) {
             flags.verify_sigpushonly = true;
         } else if (std.mem.eql(u8, flag, "STRICTENC")) {
-            // STRICTENC implies DERSIG + LOW_S (plus pubkey encoding checks)
+            // STRICTENC implies DERSIG + LOW_S + strict pubkey/hashtype encoding checks
             flags.verify_dersig = true;
             flags.verify_low_s = true;
+            flags.verify_strictenc = true;
         }
         // Flags not supported by clearbit ScriptFlags are silently ignored:
         // DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, MINIMALIF, CONST_SCRIPTCODE, etc.

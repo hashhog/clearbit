@@ -385,6 +385,13 @@ pub fn hash256Hw(data: []const u8) Hash256 {
     return sha256Hw(&first_hash);
 }
 
+/// SHA-1 hash (20 bytes) - used by OP_SHA1 in Bitcoin script
+pub fn sha1(data: []const u8) [20]u8 {
+    var result: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(data, &result, .{});
+    return result;
+}
+
 /// RIPEMD-160 - Bitcoin uses this for address generation
 /// Zig stdlib doesn't have RIPEMD160, so we implement it
 pub fn ripemd160(data: []const u8) Hash160 {
@@ -658,8 +665,79 @@ pub fn isSecp256k1Available() bool {
     return secp_initialized and secp_ctx != null;
 }
 
+/// Lax DER signature parsing - extracts R and S values from a loosely-encoded
+/// DER signature and packs them into a 64-byte compact format for libsecp256k1.
+/// This matches Bitcoin Core's ecdsa_signature_parse_der_lax() behavior.
+fn laxDerParse(sig_der: []const u8, compact: *[64]u8) bool {
+    @memset(compact, 0);
+
+    if (sig_der.len < 1) return false;
+    var pos: usize = 0;
+
+    // Sequence tag
+    if (sig_der[pos] != 0x30) return false;
+    pos += 1;
+
+    // Sequence length (skip, don't validate strictly)
+    if (pos >= sig_der.len) return false;
+    if (sig_der[pos] & 0x80 != 0) {
+        // Long form length
+        const len_bytes = sig_der[pos] & 0x7f;
+        pos += 1;
+        pos += @as(usize, len_bytes);
+    } else {
+        pos += 1;
+    }
+
+    // R integer
+    if (pos >= sig_der.len or sig_der[pos] != 0x02) return false;
+    pos += 1;
+
+    if (pos >= sig_der.len) return false;
+    const r_len: usize = sig_der[pos];
+    pos += 1;
+
+    if (pos + r_len > sig_der.len) return false;
+    var r_data = sig_der[pos .. pos + r_len];
+    pos += r_len;
+
+    // Strip leading zeros from R
+    while (r_data.len > 0 and r_data[0] == 0) {
+        r_data = r_data[1..];
+    }
+    if (r_data.len > 32) return false;
+
+    // Copy R right-aligned into first 32 bytes
+    const r_offset = 32 - r_data.len;
+    @memcpy(compact[r_offset .. r_offset + r_data.len], r_data);
+
+    // S integer
+    if (pos >= sig_der.len or sig_der[pos] != 0x02) return false;
+    pos += 1;
+
+    if (pos >= sig_der.len) return false;
+    const s_len: usize = sig_der[pos];
+    pos += 1;
+
+    if (pos + s_len > sig_der.len) return false;
+    var s_data = sig_der[pos .. pos + s_len];
+
+    // Strip leading zeros from S
+    while (s_data.len > 0 and s_data[0] == 0) {
+        s_data = s_data[1..];
+    }
+    if (s_data.len > 32) return false;
+
+    // Copy S right-aligned into last 32 bytes
+    const s_offset = 32 + 32 - s_data.len;
+    @memcpy(compact[s_offset .. s_offset + s_data.len], s_data);
+
+    return true;
+}
+
 /// Verify an ECDSA signature (DER-encoded) against a public key and message hash.
 /// Bitcoin requires low-S normalization for signatures (BIP-62 rule 5).
+/// Uses lax DER parsing to match Bitcoin Core behavior (accepts non-strictly-encoded DER).
 ///
 /// sig_der: DER-encoded ECDSA signature
 /// pubkey_bytes: compressed (33 bytes) or uncompressed (65 bytes) public key
@@ -680,13 +758,18 @@ pub fn verifyEcdsa(sig_der: []const u8, pubkey_bytes: []const u8, msg_hash: *con
         return false;
     }
 
-    // Parse DER signature
+    // Lax DER parse: extract R/S into compact format
+    var compact: [64]u8 = undefined;
+    if (!laxDerParse(sig_der, &compact)) {
+        return false;
+    }
+
+    // Parse compact signature
     var sig: secp256k1.secp256k1_ecdsa_signature = undefined;
-    if (secp256k1.secp256k1_ecdsa_signature_parse_der(
+    if (secp256k1.secp256k1_ecdsa_signature_parse_compact(
         ctx,
         &sig,
-        sig_der.ptr,
-        sig_der.len,
+        &compact,
     ) != 1) {
         return false;
     }
@@ -703,12 +786,17 @@ pub fn verifyEcdsa(sig_der: []const u8, pubkey_bytes: []const u8, msg_hash: *con
 pub fn isLowDERSignature(sig_der: []const u8) bool {
     const ctx = secp_ctx orelse return false;
 
+    // Use lax DER parsing to extract R/S into compact format
+    var compact: [64]u8 = undefined;
+    if (!laxDerParse(sig_der, &compact)) {
+        return false;
+    }
+
     var sig: secp256k1.secp256k1_ecdsa_signature = undefined;
-    if (secp256k1.secp256k1_ecdsa_signature_parse_der(
+    if (secp256k1.secp256k1_ecdsa_signature_parse_compact(
         ctx,
         &sig,
-        sig_der.ptr,
-        sig_der.len,
+        &compact,
     ) != 1) {
         return false;
     }
