@@ -178,7 +178,7 @@ pub const ScriptFlags = packed struct {
     discourage_op_success: bool = false, // BIP-342: fail on OP_SUCCESSx in tapscript pre-scan
     discourage_upgradable_nops: bool = false, // NOP1-NOP10 must error when set
     verify_sigpushonly: bool = false, // scriptSig must be push-only
-    _padding: u1 = 0,
+    verify_strictenc: bool = false, // Strict signature and pubkey encoding checks
 };
 
 // ============================================================================
@@ -269,6 +269,13 @@ pub fn isValidPubkeyEncoding(pubkey: []const u8) bool {
     return false;
 }
 
+/// Check if a hashtype byte is a defined sighash type.
+/// The low 5 bits (without SIGHASH_ANYONECANPAY = 0x80) must be 1, 2, or 3.
+pub fn isDefinedHashtype(hash_type: u8) bool {
+    const base = hash_type & ~@as(u8, 0x80); // strip ANYONECANPAY
+    return base >= 1 and base <= 3;
+}
+
 /// Validate DER signature encoding per BIP-66 (DERSIG).
 /// This is a strict check of the DER format: the signature including hashtype byte.
 /// Reference: Bitcoin Core script/interpreter.cpp IsValidSignatureEncoding()
@@ -297,7 +304,8 @@ pub fn isValidSignatureEncoding(sig: []const u8) bool {
     const lenS: usize = der[5 + lenR];
 
     // Verify that the length of the signature matches the sum of the length of the elements
-    if (lenR + lenS + 7 != der.len) return false;
+    // der = sig without hashtype byte, so total = 6 + lenR + lenS (not 7 like in Bitcoin Core which includes hashtype)
+    if (lenR + lenS + 6 != der.len) return false;
 
     // Check whether the R element is an integer
     if (der[2] != 0x02) return false;
@@ -410,9 +418,9 @@ pub fn isPushOnly(script: []const u8) bool {
 
 /// Convert a stack element to a script number (CScriptNum).
 /// Little-endian with sign bit in the most significant bit of the last byte.
-fn scriptNumDecode(data: []const u8, require_minimal: bool) ScriptError!i64 {
+fn scriptNumDecodeN(data: []const u8, require_minimal: bool, max_len: usize) ScriptError!i64 {
     if (data.len == 0) return 0;
-    if (data.len > MAX_SCRIPT_NUM_LENGTH) return ScriptError.InvalidNumber;
+    if (data.len > max_len) return ScriptError.InvalidNumber;
 
     // Minimal encoding check: the number must use the fewest bytes possible
     if (require_minimal) {
@@ -442,6 +450,10 @@ fn scriptNumDecode(data: []const u8, require_minimal: bool) ScriptError!i64 {
     }
 
     return result;
+}
+
+fn scriptNumDecode(data: []const u8, require_minimal: bool) ScriptError!i64 {
+    return scriptNumDecodeN(data, require_minimal, MAX_SCRIPT_NUM_LENGTH);
 }
 
 /// Encode a number to script number format.
@@ -616,7 +628,6 @@ pub const ScriptEngine = struct {
                 const n = @as(usize, opcode_byte);
                 if (pc + n > script.len) return ScriptError.InvalidScript;
                 if (self.isExecuting(&exec_stack)) {
-                    if (n > MAX_PUSH_SIZE) return ScriptError.PushSizeExceeded;
                     const push_data = script[pc .. pc + n];
                     if (self.flags.verify_minimaldata and !checkMinimalPush(push_data, opcode_byte)) {
                         return ScriptError.MinimalData;
@@ -664,8 +675,9 @@ pub const ScriptEngine = struct {
                 };
 
                 if (pc + n > script.len) return ScriptError.InvalidScript;
+                // Push size limit applies even in unexecuted branches
+                if (n > MAX_PUSH_SIZE) return ScriptError.PushSizeExceeded;
                 if (self.isExecuting(&exec_stack)) {
-                    if (n > MAX_PUSH_SIZE) return ScriptError.PushSizeExceeded;
                     const push_data = script[pc .. pc + n];
                     if (self.flags.verify_minimaldata and !checkMinimalPush(push_data, opcode_byte)) {
                         return ScriptError.MinimalData;
@@ -1413,8 +1425,10 @@ pub const ScriptEngine = struct {
             },
 
             .op_sha1 => {
-                // Zig doesn't have SHA1 in stdlib, so we'll treat this as disabled
-                return ScriptError.DisabledOpcode;
+                const data = try self.pop();
+                const hash = crypto.sha1(data);
+                const result = try self.allocator.dupe(u8, &hash);
+                try self.pushOwned(result);
             },
 
             .op_sha256 => {
@@ -1492,7 +1506,7 @@ pub const ScriptEngine = struct {
                 }
 
                 const data = try self.peek(); // Don't pop
-                const locktime = try scriptNumDecode(data, false);
+                const locktime = try scriptNumDecodeN(data, false, 5);
 
                 if (locktime < 0) return ScriptError.NegativeLocktime;
 
@@ -1525,7 +1539,7 @@ pub const ScriptEngine = struct {
                 }
 
                 const data = try self.peek(); // Don't pop
-                const sequence = try scriptNumDecode(data, false);
+                const sequence = try scriptNumDecodeN(data, false, 5);
 
                 if (sequence < 0) return ScriptError.NegativeLocktime;
 
@@ -1679,10 +1693,18 @@ pub const ScriptEngine = struct {
     fn verifySignature(self: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {
         if (sig.len == 0) return false;
 
-        // BIP-141: witness v0 requires compressed pubkeys
+        // BIP-141: witness v0 requires compressed pubkeys (this IS a hard error)
         if (self.flags.verify_witness_pubkeytype and self.sig_version == .witness_v0) {
             if (!isCompressedPubkey(pubkey)) {
                 return ScriptError.WitnessPubkeyType;
+            }
+        }
+
+        // STRICTENC: check pubkey encoding (must be valid compressed or uncompressed)
+        // Encoding failures are soft - they just make this sig-key pair not match
+        if (self.flags.verify_strictenc) {
+            if (!isValidPubkeyEncoding(pubkey)) {
+                return false;
             }
         }
 
@@ -1690,17 +1712,25 @@ pub const ScriptEngine = struct {
         const hash_type = sig[sig.len - 1];
         const sig_data = sig[0 .. sig.len - 1];
 
+        // STRICTENC: check hashtype validity (low bits without SIGHASH_ANYONECANPAY must be 1-3)
+        if (self.flags.verify_strictenc) {
+            if (!isDefinedHashtype(hash_type)) {
+                return false;
+            }
+        }
+
         // DER signature encoding validation
-        if (self.flags.verify_dersig) {
+        // Encoding failures are soft - the signature just doesn't verify
+        if (self.flags.verify_dersig or self.flags.verify_strictenc) {
             if (!isValidSignatureEncoding(sig)) {
-                return ScriptError.CheckSigFailed;
+                return false;
             }
         }
 
         // Low-S check (BIP-62 rule 5 / BIP-146)
-        if (self.flags.verify_low_s) {
+        if (self.flags.verify_low_s or self.flags.verify_strictenc) {
             if (!crypto.isLowDERSignature(sig_data)) {
-                return ScriptError.CheckSigFailed;
+                return false;
             }
         }
 
