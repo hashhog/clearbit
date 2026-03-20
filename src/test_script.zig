@@ -1,6 +1,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 const script = @import("script.zig");
+const crypto = @import("crypto.zig");
+const serialize = @import("serialize.zig");
 
 /// Decode a hex string into bytes. Caller owns the returned slice.
 fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
@@ -237,11 +239,140 @@ fn parseFlags(flags_str: []const u8) script.ScriptFlags {
             flags.discourage_upgradable_nops = true;
         } else if (std.mem.eql(u8, flag, "SIGPUSHONLY")) {
             flags.verify_sigpushonly = true;
+        } else if (std.mem.eql(u8, flag, "STRICTENC")) {
+            // STRICTENC implies DERSIG + LOW_S (plus pubkey encoding checks)
+            flags.verify_dersig = true;
+            flags.verify_low_s = true;
         }
         // Flags not supported by clearbit ScriptFlags are silently ignored:
-        // STRICTENC, DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, MINIMALIF, CONST_SCRIPTCODE, etc.
+        // DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, MINIMALIF, CONST_SCRIPTCODE, etc.
     }
     return flags;
+}
+
+/// Compute the txid of a transaction (double-SHA256 of non-witness serialization).
+/// Returns hash in internal byte order.
+fn computeTxHash(allocator: std.mem.Allocator, tx: *const types.Transaction) ![32]u8 {
+    var writer = serialize.Writer.init(allocator);
+    defer writer.deinit();
+    try serialize.writeTransactionNoWitness(&writer, tx);
+    const data = writer.getWritten();
+    return crypto.hash256(data);
+}
+
+/// Build the crediting transaction per Bitcoin Core's test framework.
+/// Creates: version=1, locktime=0, one input (null prevout, scriptSig=OP_0 OP_0,
+/// sequence=0xFFFFFFFF), one output (scriptPubKey=test's scriptPubKey, value=0).
+fn buildCreditingTx(
+    allocator: std.mem.Allocator,
+    script_pubkey: []const u8,
+) !struct {
+    tx: types.Transaction,
+    inputs: []types.TxIn,
+    outputs: []types.TxOut,
+    credit_script_sig: []u8,
+    credit_script_pubkey: []u8,
+} {
+    // scriptSig for crediting tx: OP_0 OP_0
+    const credit_script_sig = try allocator.alloc(u8, 2);
+    credit_script_sig[0] = 0x00; // OP_0
+    credit_script_sig[1] = 0x00; // OP_0
+
+    // Copy scriptPubKey
+    const credit_script_pubkey = try allocator.dupe(u8, script_pubkey);
+
+    const inputs = try allocator.alloc(types.TxIn, 1);
+    inputs[0] = .{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0xFFFFFFFF },
+        .script_sig = credit_script_sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const outputs = try allocator.alloc(types.TxOut, 1);
+    outputs[0] = .{
+        .value = 0,
+        .script_pubkey = credit_script_pubkey,
+    };
+
+    return .{
+        .tx = .{
+            .version = 1,
+            .inputs = inputs,
+            .outputs = outputs,
+            .lock_time = 0,
+        },
+        .inputs = inputs,
+        .outputs = outputs,
+        .credit_script_sig = credit_script_sig,
+        .credit_script_pubkey = credit_script_pubkey,
+    };
+}
+
+/// Build the spending transaction per Bitcoin Core's test framework.
+/// Creates: version=1, locktime=0, one input (prevout=hash of crediting tx : 0,
+/// scriptSig=test's scriptSig, sequence=0xFFFFFFFF), one output (empty scriptPubKey, value=0).
+///
+/// For CLTV tests, the locktime is set to match the test requirements.
+/// For CSV tests, the tx version is 2 and the input sequence is set appropriately.
+fn buildSpendingTx(
+    allocator: std.mem.Allocator,
+    credit_tx_hash: [32]u8,
+    script_sig: []const u8,
+    flags: script.ScriptFlags,
+) !struct {
+    tx: types.Transaction,
+    inputs: []types.TxIn,
+    outputs: []types.TxOut,
+    spend_script_pubkey: []u8,
+} {
+    const spend_script_pubkey = try allocator.alloc(u8, 0);
+
+    // Determine locktime and sequence for CLTV/CSV compatibility
+    // Bitcoin Core uses: nLockTime=0, nSequence=0xFFFFFFFF by default
+    // For CLTV: sequence must NOT be 0xFFFFFFFF (so locktime is enforceable)
+    // For CSV: version must be >= 2, sequence must not have disable bit set
+    const lock_time: u32 = 0;
+    var sequence: u32 = 0xFFFFFFFF;
+    var version: i32 = 1;
+
+    if (flags.verify_checklocktimeverify) {
+        // CLTV requires sequence != 0xFFFFFFFF so locktime is checked
+        sequence = 0;
+    }
+
+    if (flags.verify_checksequenceverify) {
+        // CSV requires version >= 2
+        version = 2;
+        // sequence must not have disable bit; use 0 for compatibility
+        sequence = 0;
+    }
+
+    const inputs = try allocator.alloc(types.TxIn, 1);
+    inputs[0] = .{
+        .previous_output = .{ .hash = credit_tx_hash, .index = 0 },
+        .script_sig = script_sig,
+        .sequence = sequence,
+        .witness = &[_][]const u8{},
+    };
+
+    const outputs = try allocator.alloc(types.TxOut, 1);
+    outputs[0] = .{
+        .value = 0,
+        .script_pubkey = spend_script_pubkey,
+    };
+
+    return .{
+        .tx = .{
+            .version = version,
+            .inputs = inputs,
+            .outputs = outputs,
+            .lock_time = lock_time,
+        },
+        .inputs = inputs,
+        .outputs = outputs,
+        .spend_script_pubkey = spend_script_pubkey,
+    };
 }
 
 pub fn main() !void {
@@ -250,6 +381,12 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
+
+    // Initialize secp256k1 for real signature verification
+    if (!crypto.initSecp256k1()) {
+        try stdout.print("WARNING: Failed to initialize secp256k1, signature verification will fail\n", .{});
+    }
+    defer crypto.deinitSecp256k1();
 
     // Load JSON test vectors
     const json_path = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
@@ -332,28 +469,33 @@ pub fn main() !void {
 
         const flags = parseFlags(flags_str);
 
-        // Create dummy transaction
-        const dummy_input = types.TxIn{
-            .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0xffffffff },
-            .script_sig = script_sig,
-            .sequence = 0xffffffff,
-            .witness = &[_][]const u8{},
+        // Build crediting transaction (Bitcoin Core approach)
+        const credit = buildCreditingTx(allocator, script_pubkey) catch {
+            error_count += 1;
+            continue;
         };
-        const dummy_output = types.TxOut{
-            .value = 0,
-            .script_pubkey = &[_]u8{},
-        };
-        const inputs = [_]types.TxIn{dummy_input};
-        const outputs = [_]types.TxOut{dummy_output};
-        const tx = types.Transaction{
-            .version = 1,
-            .inputs = &inputs,
-            .outputs = &outputs,
-            .lock_time = 0,
+        defer allocator.free(credit.inputs);
+        defer allocator.free(credit.outputs);
+        defer allocator.free(credit.credit_script_sig);
+        defer allocator.free(credit.credit_script_pubkey);
+
+        // Compute crediting tx hash
+        const credit_hash = computeTxHash(allocator, &credit.tx) catch {
+            error_count += 1;
+            continue;
         };
 
-        // Run verification
-        var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, flags);
+        // Build spending transaction
+        const spend = buildSpendingTx(allocator, credit_hash, script_sig, flags) catch {
+            error_count += 1;
+            continue;
+        };
+        defer allocator.free(spend.inputs);
+        defer allocator.free(spend.outputs);
+        defer allocator.free(spend.spend_script_pubkey);
+
+        // Run verification with spending transaction
+        var engine = script.ScriptEngine.init(allocator, &spend.tx, 0, 0, flags);
         defer engine.deinit();
 
         const got_ok = if (engine.verify(
