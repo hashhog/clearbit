@@ -233,10 +233,13 @@ fn parseFlags(flags_str: []const u8) script.ScriptFlags {
             flags.verify_taproot = true;
         } else if (std.mem.eql(u8, flag, "DISCOURAGE_OP_SUCCESS")) {
             flags.discourage_op_success = true;
+        } else if (std.mem.eql(u8, flag, "DISCOURAGE_UPGRADABLE_NOPS")) {
+            flags.discourage_upgradable_nops = true;
+        } else if (std.mem.eql(u8, flag, "SIGPUSHONLY")) {
+            flags.verify_sigpushonly = true;
         }
         // Flags not supported by clearbit ScriptFlags are silently ignored:
-        // STRICTENC, SIGPUSHONLY, DISCOURAGE_UPGRADABLE_NOPS,
-        // DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, MINIMALIF, CONST_SCRIPTCODE, etc.
+        // STRICTENC, DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, MINIMALIF, CONST_SCRIPTCODE, etc.
     }
     return flags;
 }
@@ -249,7 +252,7 @@ pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
 
     // Load JSON test vectors
-    const json_path = "../ouroboros/bitcoin/src/test/data/script_tests.json";
+    const json_path = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
     const json_data = try std.fs.cwd().readFileAlloc(allocator, json_path, 50 * 1024 * 1024);
     defer allocator.free(json_data);
 
