@@ -182,6 +182,7 @@ pub const ScriptFlags = packed struct {
     discourage_upgradable_nops: bool = false, // NOP1-NOP10 must error when set
     verify_sigpushonly: bool = false, // scriptSig must be push-only
     verify_strictenc: bool = false, // Strict signature and pubkey encoding checks
+    discourage_upgradable_witness_program: bool = false, // BIP-141: fail on unknown witness versions
 };
 
 // ============================================================================
@@ -796,91 +797,118 @@ pub const ScriptEngine = struct {
 
         // 5. Handle witness
         if (self.flags.verify_witness) {
-            const script_type = classifyScript(script_pubkey);
-            switch (script_type) {
-                .p2wpkh => {
-                    if (witness.len != 2) return false;
+            // Determine the witness program to evaluate.
+            // It could be a native witness scriptPubKey or a P2SH-wrapped witness program.
+            var wit_program_script: ?[]const u8 = null;
+            var had_witness = false;
 
-                    // BIP-141: witness v0 requires compressed pubkeys
-                    // witness[0] = signature, witness[1] = pubkey
-                    const pubkey = witness[1];
-                    if (self.flags.verify_witness_pubkeytype and !isCompressedPubkey(pubkey)) {
-                        return ScriptError.WitnessPubkeyType;
+            if (isWitnessProgram(script_pubkey)) |_| {
+                // Native witness program (scriptPubKey is the witness program directly)
+                wit_program_script = script_pubkey;
+                // BIP-141: scriptSig must be empty for native witness programs
+                if (script_sig.len != 0) {
+                    return ScriptError.WitnessUnexpected;
+                }
+            } else if (self.flags.verify_p2sh and classifyScript(script_pubkey) == .p2sh) {
+                // P2SH-wrapped witness: the redeem script (top of saved stack) may be a witness program
+                // The scriptSig must push exactly one element (the witness program script)
+                // which was already validated as push-only above.
+                // saved_stack has the items from scriptSig execution.
+                if (saved_stack.items.len > 0) {
+                    const redeem = saved_stack.items[saved_stack.items.len - 1];
+                    if (isWitnessProgram(redeem)) |_| {
+                        wit_program_script = redeem;
                     }
+                }
+            }
 
-                    // Build P2PKH script from witness program
-                    const wpkh_hash = script_pubkey[2..22];
-                    var p2pkh_script: [25]u8 = undefined;
-                    p2pkh_script[0] = 0x76; // OP_DUP
-                    p2pkh_script[1] = 0xa9; // OP_HASH160
-                    p2pkh_script[2] = 0x14; // Push 20 bytes
-                    @memcpy(p2pkh_script[3..23], wpkh_hash);
-                    p2pkh_script[23] = 0x88; // OP_EQUALVERIFY
-                    p2pkh_script[24] = 0xac; // OP_CHECKSIG
+            if (wit_program_script) |wp_script| {
+                had_witness = true;
+                const wp = isWitnessProgram(wp_script).?;
 
-                    // Reset stack with witness data (reversed for proper order)
-                    self.stack.clearRetainingCapacity();
-                    // Witness is in wire order (bottom to top), so iterate forward
-                    for (witness) |item| {
-                        self.stack.append(item) catch return ScriptError.OutOfMemory;
+                if (wp.version == 0) {
+                    // Witness v0
+                    if (wp.program.len == WITNESS_V0_KEYHASH_SIZE) {
+                        // P2WPKH
+                        if (witness.len != 2) return ScriptError.WitnessProgramMismatch;
+
+                        // BIP-141: witness v0 requires compressed pubkeys
+                        const pubkey = witness[1];
+                        if (self.flags.verify_witness_pubkeytype and !isCompressedPubkey(pubkey)) {
+                            return ScriptError.WitnessPubkeyType;
+                        }
+
+                        // Build P2PKH script from witness program hash
+                        var p2pkh_script: [25]u8 = undefined;
+                        p2pkh_script[0] = 0x76; // OP_DUP
+                        p2pkh_script[1] = 0xa9; // OP_HASH160
+                        p2pkh_script[2] = 0x14; // Push 20 bytes
+                        @memcpy(p2pkh_script[3..23], wp.program);
+                        p2pkh_script[23] = 0x88; // OP_EQUALVERIFY
+                        p2pkh_script[24] = 0xac; // OP_CHECKSIG
+
+                        // Set scriptCode for BIP-143 sighash (the constructed P2PKH script)
+                        self.script_pubkey_for_sighash = &p2pkh_script;
+
+                        // Reset stack with witness data
+                        self.stack.clearRetainingCapacity();
+                        for (witness) |item| {
+                            self.stack.append(item) catch return ScriptError.OutOfMemory;
+                        }
+
+                        self.sig_version = .witness_v0;
+                        try self.execute(&p2pkh_script);
+
+                        if (self.stack.items.len != 1) return ScriptError.CleanStack;
+                        if (!self.stackToBool(self.stack.items[0])) return false;
+                    } else if (wp.program.len == WITNESS_V0_SCRIPTHASH_SIZE) {
+                        // P2WSH
+                        if (witness.len == 0) return ScriptError.WitnessProgramMismatch;
+                        const witness_script = witness[witness.len - 1];
+                        const witness_hash = crypto.sha256(witness_script);
+
+                        if (!std.mem.eql(u8, &witness_hash, wp.program)) {
+                            return ScriptError.WitnessProgramMismatch;
+                        }
+
+                        // BIP-141: witness script max size is 10,000 bytes
+                        if (witness_script.len > MAX_SCRIPT_SIZE) {
+                            return ScriptError.InvalidScript;
+                        }
+
+                        // Set scriptCode for BIP-143 sighash (the witness script)
+                        self.script_pubkey_for_sighash = witness_script;
+
+                        // Reset stack with witness data (excluding the script)
+                        self.stack.clearRetainingCapacity();
+                        for (witness[0 .. witness.len - 1]) |item| {
+                            self.stack.append(item) catch return ScriptError.OutOfMemory;
+                        }
+
+                        self.sig_version = .witness_v0;
+                        try self.execute(witness_script);
+
+                        if (self.stack.items.len != 1) return ScriptError.CleanStack;
+                        if (!self.stackToBool(self.stack.items[0])) return false;
+                    } else {
+                        // Witness v0 with wrong program length
+                        return ScriptError.WitnessProgramWrongLength;
                     }
-
-                    // Set sig_version to witness_v0 for signature verification
-                    self.sig_version = .witness_v0;
-                    try self.execute(&p2pkh_script);
-
-                    // Witness cleanstack: UNCONDITIONALLY require exactly 1 stack element
-                    // This is NOT flag-gated (unlike legacy CLEANSTACK)
-                    // Reference: Bitcoin Core interpreter.cpp ExecuteWitnessScript()
-                    if (self.stack.items.len != 1) return ScriptError.CleanStack;
-                    if (!self.stackToBool(self.stack.items[0])) return false;
-                },
-                .p2wsh => {
-                    if (witness.len == 0) return false;
-                    const witness_script = witness[witness.len - 1];
-                    const witness_hash = crypto.sha256(witness_script);
-
-                    if (!std.mem.eql(u8, &witness_hash, script_pubkey[2..34])) {
-                        return ScriptError.WitnessProgramMismatch;
-                    }
-
-                    // Reset stack with witness data (excluding the script)
-                    self.stack.clearRetainingCapacity();
-                    for (witness[0 .. witness.len - 1]) |item| {
-                        self.stack.append(item) catch return ScriptError.OutOfMemory;
-                    }
-
-                    // Set sig_version to witness_v0 for signature verification
-                    self.sig_version = .witness_v0;
-                    try self.execute(witness_script);
-
-                    // Witness cleanstack: UNCONDITIONALLY require exactly 1 stack element
-                    // This is NOT flag-gated (unlike legacy CLEANSTACK)
-                    // Reference: Bitcoin Core interpreter.cpp ExecuteWitnessScript()
-                    if (self.stack.items.len != 1) return ScriptError.CleanStack;
-                    if (!self.stackToBool(self.stack.items[0])) return false;
-                },
-                .p2tr => {
-                    // Taproot key path or script path spend
+                } else if (wp.version == 1 and wp.program.len == 32) {
+                    // Taproot (witness v1, 32-byte program)
                     if (witness.len == 0) return false;
 
                     // Key path: single 64 or 65 byte signature (no script execution)
                     if (witness.len == 1 and (witness[0].len == 64 or witness[0].len == 65)) {
-                        // Schnorr signature verification would go here
-                        // For now, we mark this as requiring libsecp256k1
                         if (!crypto.isSecp256k1Available()) {
-                            return false; // Can't verify without library
+                            return false;
                         }
-                        // Key path doesn't involve script execution, so no cleanstack check
-                        // Full taproot verification would call verifySchnorr
                         return true;
                     } else if (witness.len >= 2) {
                         // Script path spending
-                        // Last element is control block, second-to-last is the script
                         const control = witness[witness.len - 1];
                         const tap_script = witness[witness.len - 2];
 
-                        // Validate control block size (min 33, max 33 + 32*128)
                         if (control.len < 33 or control.len > 33 + 32 * 128) {
                             return ScriptError.WitnessProgramMismatch;
                         }
@@ -888,51 +916,37 @@ pub const ScriptEngine = struct {
                             return ScriptError.WitnessProgramMismatch;
                         }
 
-                        // TODO: Verify Merkle path from control block
-                        // TODO: Verify leaf version (control[0] & 0xFE)
-
-                        // Reset stack with witness data (excluding script and control block)
                         self.stack.clearRetainingCapacity();
                         for (witness[0 .. witness.len - 2]) |item| {
                             self.stack.append(item) catch return ScriptError.OutOfMemory;
                         }
 
-                        // BIP-342: Pre-scan tapscript for OP_SUCCESSx opcodes.
-                        // If any is found, the script succeeds immediately
-                        // (unless DISCOURAGE_OP_SUCCESS flag is set).
                         if (preScanTapscript(tap_script)) |_| {
                             if (self.flags.discourage_op_success) {
                                 return ScriptError.DiscourageOpSuccess;
                             }
-                            return true; // Script succeeds immediately
+                            return true;
                         }
 
-                        // Set sig_version to tapscript for signature verification
                         self.sig_version = .tapscript;
                         try self.execute(tap_script);
 
-                        // Witness cleanstack: UNCONDITIONALLY require exactly 1 stack element
-                        // This is NOT flag-gated (same as witness v0)
-                        // Reference: Bitcoin Core interpreter.cpp ExecuteWitnessScript()
                         if (self.stack.items.len != 1) return ScriptError.CleanStack;
                         if (!self.stackToBool(self.stack.items[0])) return false;
                     }
-                },
-                .anchor => {
-                    // P2A (Pay-to-Anchor) is anyone-can-spend.
-                    // Witness must be empty for standard spending.
-                    // Reference: Bitcoin Core script/sign.cpp - ANCHOR case returns immediately.
-                    if (witness.len != 0) {
-                        // Non-empty witness is non-standard but valid in consensus.
-                        // For policy, we reject non-empty witness.
+                } else {
+                    // Unknown witness version
+                    if (self.flags.discourage_upgradable_witness_program) {
+                        return ScriptError.WitnessProgramMismatch;
                     }
-                    // No script execution needed - anyone can spend.
-                    // Push true to satisfy the clean stack check below.
-                    const true_val = [_]u8{0x01};
-                    self.stack.clearRetainingCapacity();
-                    self.stack.append(&true_val) catch return ScriptError.OutOfMemory;
-                },
-                else => {},
+                    // Unknown witness versions are anyone-can-spend (future soft fork)
+                    // BIP-141: if the version byte is 2-16, the script is anyone-can-spend
+                }
+            }
+
+            // BIP-141: witness must be empty for non-witness scripts
+            if (!had_witness and witness.len != 0) {
+                return ScriptError.WitnessUnexpected;
             }
         }
 
@@ -1621,15 +1635,6 @@ pub const ScriptEngine = struct {
             pubkeys[i] = try self.pop();
         }
 
-        // BIP-141: witness v0 requires compressed pubkeys
-        if (self.flags.verify_witness_pubkeytype and self.sig_version == .witness_v0) {
-            for (0..n_keys) |i| {
-                if (!isCompressedPubkey(pubkeys[i])) {
-                    return ScriptError.WitnessPubkeyType;
-                }
-            }
-        }
-
         // Get number of signatures
         const m_data = try self.pop();
         const m = try scriptNumDecode(m_data, self.flags.verify_minimaldata);
@@ -1658,6 +1663,15 @@ pub const ScriptEngine = struct {
             if (key_idx >= n_keys) {
                 success = false;
                 break;
+            }
+
+            // BIP-141: witness v0 requires compressed pubkeys
+            // Check encoding for each key as it's iterated (matching Bitcoin Core behavior).
+            // Keys beyond the last matched signature are NOT checked.
+            if (self.flags.verify_witness_pubkeytype and self.sig_version == .witness_v0) {
+                if (!isCompressedPubkey(pubkeys[key_idx])) {
+                    return ScriptError.WitnessPubkeyType;
+                }
             }
 
             // Errors from verifySignature (DER/LOW_S/encoding) must propagate,
@@ -1742,6 +1756,19 @@ pub const ScriptEngine = struct {
 
         // Compute sighash using the script_pubkey_for_sighash set during verify()
         const script_code = self.script_pubkey_for_sighash orelse return false;
+
+        if (self.sig_version == .witness_v0) {
+            // BIP-143: segwit v0 uses a different sighash algorithm
+            const sighash = crypto.segwitSighash(
+                self.tx,
+                self.input_index,
+                script_code,
+                self.amount,
+                @as(u32, hash_type),
+                self.allocator,
+            ) catch return false;
+            return crypto.verifyEcdsa(sig_data, pubkey, &sighash);
+        }
 
         const sighash = legacySignatureHashWithFindAndDelete(
             self.allocator,
