@@ -50,9 +50,9 @@ pub const STALE_TIP_THRESHOLD: i64 = 30 * 60;
 /// If we sent a ping and no pong within this time, disconnect.
 pub const PING_TIMEOUT: i64 = 20 * 60;
 
-/// Headers response timeout in seconds (2 minutes as per Bitcoin Core HEADERS_RESPONSE_TIME).
-/// If headers requested and no response within this time, misbehave.
-pub const HEADERS_RESPONSE_TIMEOUT: i64 = 2 * 60;
+/// Headers response timeout in seconds.
+/// Testnet4 peers are slower, so use 5 minutes instead of Bitcoin Core's 2 minutes.
+pub const HEADERS_RESPONSE_TIMEOUT: i64 = 5 * 60;
 
 /// Block download timeout in seconds (20 minutes as per Bitcoin Core).
 /// If a block is in-flight and not received within this time, disconnect.
@@ -490,17 +490,18 @@ pub const Peer = struct {
                 else => return PeerError.HandshakeFailed,
             }
 
-            // Send verack
-            const verack = p2p.Message{ .verack = {} };
-            try self.sendMessage(&verack);
-
-            // Send wtxidrelay (BIP-339) before verack is received
+            // Send wtxidrelay (BIP-339) and sendaddrv2 (BIP-155) BEFORE verack.
+            // These must be sent between version and verack per their respective BIPs.
+            // Bitcoin Core disconnects peers that send them after verack.
             const wtxid = p2p.Message{ .wtxidrelay = {} };
             try self.sendMessage(&wtxid);
 
-            // Send sendaddrv2 (BIP-155)
             const addrv2 = p2p.Message{ .sendaddrv2 = {} };
             try self.sendMessage(&addrv2);
+
+            // Send verack (after feature negotiation messages)
+            const verack = p2p.Message{ .verack = {} };
+            try self.sendMessage(&verack);
 
             // Wait for their verack
             while (true) {
@@ -562,7 +563,13 @@ pub const Peer = struct {
             } };
             try self.sendMessage(&version_msg);
 
-            // Send verack
+            // Send wtxidrelay (BIP-339) and sendaddrv2 (BIP-155) before verack
+            const wtxid_in = p2p.Message{ .wtxidrelay = {} };
+            try self.sendMessage(&wtxid_in);
+            const addrv2_in = p2p.Message{ .sendaddrv2 = {} };
+            try self.sendMessage(&addrv2_in);
+
+            // Send verack (after feature negotiation messages)
             const verack = p2p.Message{ .verack = {} };
             try self.sendMessage(&verack);
 
@@ -1550,6 +1557,9 @@ pub const PeerManager = struct {
             };
 
             std.log.info("Connected to anchor peer: {}", .{addr});
+
+            // Initiate header sync with anchor peer
+            self.sendGetHeaders(peer) catch {};
         }
     }
 
@@ -1616,6 +1626,9 @@ pub const PeerManager = struct {
             };
             outbound_count += 1;
             std.log.info("Connected to outbound peer {} (height={d}, {d}/{d} outbound)", .{ addr, peer.start_height, outbound_count, MAX_OUTBOUND_CONNECTIONS });
+
+            // Initiate header sync with newly connected peer
+            self.sendGetHeaders(peer) catch {};
         }
     }
 
@@ -1690,11 +1703,13 @@ pub const PeerManager = struct {
             const msg = peer.receiveMessage() catch |err| {
                 switch (err) {
                     PeerError.Timeout => {
-                        // Socket timeout - no data available, not an error.
-                        // Check if we need to request more blocks.
-                        if (self.chain_state) |cs| {
-                            if (peer.start_height > 0 and cs.best_height < @as(u32, @intCast(peer.start_height))) {
-                                self.sendGetHeaders(peer) catch {};
+                        // Check if we need to request more headers, but only if we don't
+                        // already have an outstanding getheaders request to this peer.
+                        if (peer.last_getheaders_time == 0) {
+                            if (self.chain_state) |cs| {
+                                if (peer.start_height > 0 and cs.best_height < @as(u32, @intCast(peer.start_height))) {
+                                    self.sendGetHeaders(peer) catch {};
+                                }
                             }
                         }
                         i += 1;
@@ -1802,6 +1817,11 @@ pub const PeerManager = struct {
                 }
             },
             .headers => |h| {
+                // Clear getheaders timeout on ALL peers since we got a response
+                for (self.peers.items) |p| {
+                    p.clearGetheadersTimeout();
+                }
+
                 if (h.headers.len == 0) {
                     std.debug.print("P2P: Received 0 headers - fully synced\n", .{});
                     return;
@@ -2021,11 +2041,12 @@ pub const PeerManager = struct {
         }
     }
 
-    /// Check for headers request timeouts. Add misbehavior score (20) for non-responsive peers.
+    /// Check for headers request timeouts. Add misbehavior score (5) for non-responsive peers.
+    /// Uses a low penalty since getheaders is sent to multiple peers but only one typically responds.
     fn checkHeadersTimeouts(self: *PeerManager) void {
         for (self.peers.items) |peer| {
             if (peer.state == .handshake_complete and peer.hasHeadersTimeout()) {
-                peer.misbehaving(20, "headers timeout");
+                peer.misbehaving(5, "headers timeout");
                 // Clear the timeout to avoid repeated scoring
                 peer.last_getheaders_time = 0;
             }
