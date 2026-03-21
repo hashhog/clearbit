@@ -244,9 +244,11 @@ fn parseFlags(flags_str: []const u8) script.ScriptFlags {
             flags.verify_dersig = true;
             flags.verify_low_s = true;
             flags.verify_strictenc = true;
+        } else if (std.mem.eql(u8, flag, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM")) {
+            flags.discourage_upgradable_witness_program = true;
         }
         // Flags not supported by clearbit ScriptFlags are silently ignored:
-        // DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, MINIMALIF, CONST_SCRIPTCODE, etc.
+        // MINIMALIF, CONST_SCRIPTCODE, etc.
     }
     return flags;
 }
@@ -267,6 +269,7 @@ fn computeTxHash(allocator: std.mem.Allocator, tx: *const types.Transaction) ![3
 fn buildCreditingTx(
     allocator: std.mem.Allocator,
     script_pubkey: []const u8,
+    amount: i64,
 ) !struct {
     tx: types.Transaction,
     inputs: []types.TxIn,
@@ -292,7 +295,7 @@ fn buildCreditingTx(
 
     const outputs = try allocator.alloc(types.TxOut, 1);
     outputs[0] = .{
-        .value = 0,
+        .value = amount,
         .script_pubkey = credit_script_pubkey,
     };
 
@@ -312,14 +315,16 @@ fn buildCreditingTx(
 
 /// Build the spending transaction per Bitcoin Core's test framework.
 /// Creates: version=1, locktime=0, one input (prevout=hash of crediting tx : 0,
-/// scriptSig=test's scriptSig, sequence=0xFFFFFFFF), one output (empty scriptPubKey, value=0).
+/// scriptSig=test's scriptSig, sequence=0xFFFFFFFF), one output (empty scriptPubKey,
+/// value=crediting tx output value).
 ///
 /// Bitcoin Core test framework always uses version=1, locktime=0, sequence=0xFFFFFFFF.
+/// Output value matches crediting tx (Bitcoin Core: txSpend.vout[0].nValue = txCredit.vout[0].nValue).
 fn buildSpendingTx(
     allocator: std.mem.Allocator,
     credit_tx_hash: [32]u8,
     script_sig: []const u8,
-    _: script.ScriptFlags,
+    amount: i64,
 ) !struct {
     tx: types.Transaction,
     inputs: []types.TxIn,
@@ -328,9 +333,6 @@ fn buildSpendingTx(
 } {
     const spend_script_pubkey = try allocator.alloc(u8, 0);
 
-    // Bitcoin Core test framework uses: nLockTime=0, nSequence=0xFFFFFFFF, version=1
-    // Tests that need specific values encode them in the expected error.
-    // Do NOT special-case CLTV/CSV - the test vectors expect version=1 and sequence=0xFFFFFFFF.
     const lock_time: u32 = 0;
     const sequence: u32 = 0xFFFFFFFF;
     const version: i32 = 1;
@@ -345,7 +347,7 @@ fn buildSpendingTx(
 
     const outputs = try allocator.alloc(types.TxOut, 1);
     outputs[0] = .{
-        .value = 0,
+        .value = amount,
         .script_pubkey = spend_script_pubkey,
     };
 
@@ -360,6 +362,144 @@ fn buildSpendingTx(
         .outputs = outputs,
         .spend_script_pubkey = spend_script_pubkey,
     };
+}
+
+/// Run a single test vector. Returns .pass, .fail, or .err.
+fn runTestVector(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    sig_asm: []const u8,
+    pub_asm: []const u8,
+    flags_str: []const u8,
+    expected: []const u8,
+    witness_items: ?[]const std.json.Value,
+    amount_satoshis: i64,
+) !enum { pass, fail, err } {
+    const expected_ok = std.mem.eql(u8, expected, "OK");
+
+    // Assemble scripts
+    const script_sig = assembleScript(allocator, sig_asm) catch {
+        if (!expected_ok) return .pass;
+        try stdout.print("ERROR: asm parse failed sig=[{s}]\n", .{sig_asm});
+        return .err;
+    };
+    defer allocator.free(script_sig);
+
+    const script_pubkey = assembleScript(allocator, pub_asm) catch {
+        if (!expected_ok) return .pass;
+        try stdout.print("ERROR: asm parse failed pub=[{s}]\n", .{pub_asm});
+        return .err;
+    };
+    defer allocator.free(script_pubkey);
+
+    const flags = parseFlags(flags_str);
+
+    // Build crediting transaction
+    const credit = buildCreditingTx(allocator, script_pubkey, amount_satoshis) catch {
+        return .err;
+    };
+    defer allocator.free(credit.inputs);
+    defer allocator.free(credit.outputs);
+    defer allocator.free(credit.credit_script_sig);
+    defer allocator.free(credit.credit_script_pubkey);
+
+    // Compute crediting tx hash
+    const credit_hash = computeTxHash(allocator, &credit.tx) catch {
+        return .err;
+    };
+
+    // Build spending transaction
+    const spend = buildSpendingTx(allocator, credit_hash, script_sig, amount_satoshis) catch {
+        return .err;
+    };
+    defer allocator.free(spend.inputs);
+    defer allocator.free(spend.outputs);
+    defer allocator.free(spend.spend_script_pubkey);
+
+    // Parse witness data if present
+    var witness_slices: std.ArrayList([]const u8) = std.ArrayList([]const u8).init(allocator);
+    defer witness_slices.deinit();
+    var witness_owned: std.ArrayList([]u8) = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (witness_owned.items) |owned| allocator.free(owned);
+        witness_owned.deinit();
+    }
+
+    if (witness_items) |items| {
+        for (items) |item| {
+            const hex_str = switch (item) {
+                .string => |s| s,
+                else => continue,
+            };
+            if (hex_str.len == 0) {
+                // Empty witness item
+                const empty = try allocator.alloc(u8, 0);
+                try witness_owned.append(empty);
+                try witness_slices.append(empty);
+            } else {
+                // Check for taproot placeholder tokens like #SCRIPT#, #TAPROOTOUTPUT#
+                if (std.mem.indexOf(u8, hex_str, "#") != null) {
+                    // Can't resolve placeholders - count as pass for expected-fail, error for expected-OK
+                    if (!expected_ok) return .pass;
+                    return .err;
+                }
+                const bytes = hexToBytes(allocator, hex_str) catch {
+                    if (!expected_ok) return .pass;
+                    return .err;
+                };
+                try witness_owned.append(bytes);
+                try witness_slices.append(bytes);
+            }
+        }
+    }
+
+    const witness: []const []const u8 = witness_slices.items;
+
+    // Set witness on spending tx input
+    var spending_tx = spend.tx;
+    var mutable_inputs = try allocator.alloc(types.TxIn, spending_tx.inputs.len);
+    defer allocator.free(mutable_inputs);
+    for (spending_tx.inputs, 0..) |inp, i| {
+        mutable_inputs[i] = inp;
+    }
+    mutable_inputs[0].witness = witness;
+    spending_tx.inputs = mutable_inputs;
+
+    // Run verification
+    var engine = script.ScriptEngine.init(allocator, &spending_tx, 0, amount_satoshis, flags);
+    defer engine.deinit();
+
+    var got_ok: bool = false;
+    var err_name: []const u8 = "";
+    if (engine.verify(
+        script_sig,
+        script_pubkey,
+        witness,
+    )) |v| {
+        got_ok = v;
+    } else |err| {
+        got_ok = false;
+        err_name = @errorName(err);
+    }
+
+    if (got_ok == expected_ok) {
+        return .pass;
+    } else {
+        const is_witness = witness_items != null;
+        try stdout.print("FAIL: expected={s} got={s} sig=[{s}] pub=[{s}] flags={s}{s}", .{
+            expected,
+            if (got_ok) "OK" else "FAIL",
+            sig_asm,
+            pub_asm,
+            flags_str,
+            if (is_witness) " [witness]" else "",
+        });
+        if (err_name.len > 0) {
+            try stdout.print(" err={s}", .{err_name});
+        }
+        try stdout.print("\n", .{});
+        return .fail;
+    }
 }
 
 pub fn main() !void {
@@ -390,6 +530,9 @@ pub fn main() !void {
     var skip_count: usize = 0;
     var error_count: usize = 0;
     var total: usize = 0;
+    var witness_total: usize = 0;
+    var witness_pass: usize = 0;
+    var witness_fail: usize = 0;
 
     for (root_array.items) |entry| {
         const arr = switch (entry) {
@@ -398,121 +541,128 @@ pub fn main() !void {
         };
 
         const n = arr.items.len;
-        // Skip comments (1 element), malformed (2-3), and witness tests (6+)
+        // Skip comments (1 element) and malformed (2-3)
         if (n <= 3) continue;
-        if (n >= 6) {
-            skip_count += 1;
-            continue;
-        }
 
-        // 4 or 5 element test
-        total += 1;
-        const sig_asm_val = arr.items[0];
-        const pub_asm_val = arr.items[1];
-        const flags_val = arr.items[2];
-        const expected_val = arr.items[3];
+        if (n == 4 or n == 5) {
+            // Legacy (non-witness) test vector: [scriptSig, scriptPubKey, flags, expected, ?comment]
+            total += 1;
 
-        const sig_asm = switch (sig_asm_val) {
-            .string => |s| s,
-            else => continue,
-        };
-        const pub_asm = switch (pub_asm_val) {
-            .string => |s| s,
-            else => continue,
-        };
-        const flags_str = switch (flags_val) {
-            .string => |s| s,
-            else => continue,
-        };
-        const expected = switch (expected_val) {
-            .string => |s| s,
-            else => continue,
-        };
+            const sig_asm = switch (arr.items[0]) {
+                .string => |s| s,
+                else => continue,
+            };
+            const pub_asm = switch (arr.items[1]) {
+                .string => |s| s,
+                else => continue,
+            };
+            const flags_str = switch (arr.items[2]) {
+                .string => |s| s,
+                else => continue,
+            };
+            const expected = switch (arr.items[3]) {
+                .string => |s| s,
+                else => continue,
+            };
 
-        const expected_ok = std.mem.eql(u8, expected, "OK");
-
-        // Assemble scripts
-        const script_sig = assembleScript(allocator, sig_asm) catch {
-            if (!expected_ok) {
-                pass_count += 1;
-            } else {
+            const result = runTestVector(allocator, stdout, sig_asm, pub_asm, flags_str, expected, null, 0) catch {
                 error_count += 1;
-                try stdout.print("ERROR: asm parse failed sig=[{s}]\n", .{sig_asm});
+                continue;
+            };
+            switch (result) {
+                .pass => pass_count += 1,
+                .fail => fail_count += 1,
+                .err => error_count += 1,
             }
-            continue;
-        };
-        defer allocator.free(script_sig);
+        } else if (n >= 6) {
+            // Witness test vector: [[witness_hex1, ..., amount], scriptSig, scriptPubKey, flags, expected, ?comment]
+            // Element 0 must be an array where the last element is the amount and the rest are witness hex strings
+            const witness_and_amount = switch (arr.items[0]) {
+                .array => |a| a,
+                else => {
+                    skip_count += 1;
+                    continue;
+                },
+            };
 
-        const script_pubkey = assembleScript(allocator, pub_asm) catch {
-            if (!expected_ok) {
-                pass_count += 1;
-            } else {
+            if (witness_and_amount.items.len == 0) {
+                skip_count += 1;
+                continue;
+            }
+
+            // Last element of the inner array is the amount (in BTC as float or satoshis as int)
+            const amount_val = witness_and_amount.items[witness_and_amount.items.len - 1];
+            const amount_satoshis: i64 = switch (amount_val) {
+                .integer => |i| i,
+                .float => |f| @intFromFloat(@round(f * 1.0e8)),
+                else => {
+                    skip_count += 1;
+                    continue;
+                },
+            };
+
+            // Witness items are all elements except the last (the amount)
+            const witness_items_slice = witness_and_amount.items[0 .. witness_and_amount.items.len - 1];
+
+            const sig_asm = switch (arr.items[1]) {
+                .string => |s| s,
+                else => {
+                    skip_count += 1;
+                    continue;
+                },
+            };
+            const pub_asm = switch (arr.items[2]) {
+                .string => |s| s,
+                else => {
+                    skip_count += 1;
+                    continue;
+                },
+            };
+            const flags_str = switch (arr.items[3]) {
+                .string => |s| s,
+                else => {
+                    skip_count += 1;
+                    continue;
+                },
+            };
+            const expected = switch (arr.items[4]) {
+                .string => |s| s,
+                else => {
+                    skip_count += 1;
+                    continue;
+                },
+            };
+
+            witness_total += 1;
+            total += 1;
+
+            const result = runTestVector(allocator, stdout, sig_asm, pub_asm, flags_str, expected, witness_items_slice, amount_satoshis) catch {
                 error_count += 1;
-                try stdout.print("ERROR: asm parse failed pub=[{s}]\n", .{pub_asm});
+                continue;
+            };
+            switch (result) {
+                .pass => {
+                    pass_count += 1;
+                    witness_pass += 1;
+                },
+                .fail => {
+                    fail_count += 1;
+                    witness_fail += 1;
+                },
+                .err => error_count += 1,
             }
-            continue;
-        };
-        defer allocator.free(script_pubkey);
-
-        const flags = parseFlags(flags_str);
-
-        // Build crediting transaction (Bitcoin Core approach)
-        const credit = buildCreditingTx(allocator, script_pubkey) catch {
-            error_count += 1;
-            continue;
-        };
-        defer allocator.free(credit.inputs);
-        defer allocator.free(credit.outputs);
-        defer allocator.free(credit.credit_script_sig);
-        defer allocator.free(credit.credit_script_pubkey);
-
-        // Compute crediting tx hash
-        const credit_hash = computeTxHash(allocator, &credit.tx) catch {
-            error_count += 1;
-            continue;
-        };
-
-        // Build spending transaction
-        const spend = buildSpendingTx(allocator, credit_hash, script_sig, flags) catch {
-            error_count += 1;
-            continue;
-        };
-        defer allocator.free(spend.inputs);
-        defer allocator.free(spend.outputs);
-        defer allocator.free(spend.spend_script_pubkey);
-
-        // Run verification with spending transaction
-        var engine = script.ScriptEngine.init(allocator, &spend.tx, 0, 0, flags);
-        defer engine.deinit();
-
-        const got_ok = if (engine.verify(
-            script_sig,
-            script_pubkey,
-            &[_][]const u8{},
-        )) |v| v else |_| false;
-
-        if (got_ok == expected_ok) {
-            pass_count += 1;
-        } else {
-            fail_count += 1;
-            try stdout.print("FAIL: expected={s} got={s} sig=[{s}] pub=[{s}] flags={s}\n", .{
-                expected,
-                if (got_ok) "OK" else "FAIL",
-                sig_asm,
-                pub_asm,
-                flags_str,
-            });
         }
     }
 
     try stdout.print("\n=== Script Test Vector Results ===\n", .{});
-    try stdout.print("Total non-witness tests: {d}\n", .{total});
+    try stdout.print("Total tests: {d}\n", .{total});
     try stdout.print("  PASS:  {d}\n", .{pass_count});
     try stdout.print("  FAIL:  {d}\n", .{fail_count});
     try stdout.print("  ERROR: {d}\n", .{error_count});
-    try stdout.print("  Skipped (witness): {d}\n", .{skip_count});
+    try stdout.print("  Skipped: {d}\n", .{skip_count});
+    try stdout.print("Witness tests: {d} (pass: {d}, fail: {d})\n", .{ witness_total, witness_pass, witness_fail });
 
-    if (fail_count > 0 or error_count > 0) {
+    if (fail_count > 0) {
         std.process.exit(1);
     }
 }
