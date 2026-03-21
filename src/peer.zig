@@ -1247,9 +1247,13 @@ pub const PeerManager = struct {
     pub fn dnsSeeds(self: *PeerManager) !void {
         for (self.network_params.dns_seeds) |seed| {
             // Resolve DNS seed to list of addresses
-            const addrs = std.net.getAddressList(self.allocator, seed, self.network_params.default_port) catch continue;
+            const addrs = std.net.getAddressList(self.allocator, seed, self.network_params.default_port) catch |err| {
+                std.log.warn("DNS resolution failed for {s}: {}", .{ seed, err });
+                continue;
+            };
             defer addrs.deinit();
 
+            std.log.info("Resolved {d} addresses from DNS seed {s}", .{ addrs.addrs.len, seed });
             for (addrs.addrs) |addr| {
                 self.addAddress(addr, 0, .dns_seed) catch continue;
             }
@@ -1611,6 +1615,7 @@ pub const PeerManager = struct {
                 break;
             };
             outbound_count += 1;
+            std.log.info("Connected to outbound peer {} (height={d}, {d}/{d} outbound)", .{ addr, peer.start_height, outbound_count, MAX_OUTBOUND_CONNECTIONS });
         }
     }
 

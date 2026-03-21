@@ -436,7 +436,7 @@ pub const TESTNET = TESTNET3;
 
 /// Testnet4 parameters (BIP-94).
 pub const TESTNET4 = NetworkParams{
-    .magic = 0x1c163f28,
+    .magic = 0x283f161c,
     .default_port = 48333,
     .genesis_hash = hexToHash("00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"),
     .genesis_header = types.BlockHeader{
@@ -1353,7 +1353,7 @@ test "network ports" {
 }
 
 test "testnet4 magic bytes" {
-    try std.testing.expectEqual(@as(u32, 0x1c163f28), TESTNET4.magic);
+    try std.testing.expectEqual(@as(u32, 0x283f161c), TESTNET4.magic);
 }
 
 test "difficulty adjustment 4x clamp down" {
