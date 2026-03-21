@@ -631,6 +631,7 @@ pub fn computeMerkleRoot(hashes: []const Hash256, allocator: std.mem.Allocator) 
 
 const secp256k1 = @cImport({
     @cInclude("secp256k1.h");
+    @cInclude("secp256k1_extrakeys.h");
 });
 
 /// Whether libsecp256k1 is available at link time
@@ -1153,6 +1154,92 @@ pub fn taggedHash(tag: []const u8, msg: []const u8) Hash256 {
     var result: Hash256 = undefined;
     hasher.final(&result);
     return result;
+}
+
+/// Verify a taproot script-path control block against the witness program (output key).
+/// Returns true if the control block is valid for the given script and output program.
+///
+/// control: control block bytes (33 + 32*path_len)
+/// tap_script: the leaf script being executed
+/// program: the 32-byte witness program (x-only output key from scriptPubKey)
+pub fn verifyTaprootControlBlock(control: []const u8, tap_script: []const u8, program: []const u8) bool {
+    if (control.len < 33 or program.len != 32) return false;
+    if ((control.len - 33) % 32 != 0) return false;
+
+    const ctx = secp_ctx orelse return false;
+
+    const leaf_version = control[0] & 0xfe;
+    const internal_key = control[1..33];
+
+    // Compute tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script_len) || script)
+    var leaf_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const tap_leaf_tag = sha256("TapLeaf");
+    leaf_hasher.update(&tap_leaf_tag);
+    leaf_hasher.update(&tap_leaf_tag);
+    leaf_hasher.update(&[_]u8{leaf_version});
+
+    // Compact size encoding of script length
+    if (tap_script.len < 0xfd) {
+        leaf_hasher.update(&[_]u8{@truncate(tap_script.len)});
+    } else if (tap_script.len <= 0xffff) {
+        leaf_hasher.update(&[_]u8{0xfd});
+        leaf_hasher.update(&[_]u8{@truncate(tap_script.len & 0xff)});
+        leaf_hasher.update(&[_]u8{@truncate((tap_script.len >> 8) & 0xff)});
+    } else {
+        return false;
+    }
+    leaf_hasher.update(tap_script);
+    var k: Hash256 = undefined;
+    leaf_hasher.final(&k);
+
+    // Walk the merkle path
+    const path_len = (control.len - 33) / 32;
+    for (0..path_len) |i| {
+        const node = control[33 + i * 32 ..][0..32];
+        var branch_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        const tap_branch_tag = sha256("TapBranch");
+        branch_hasher.update(&tap_branch_tag);
+        branch_hasher.update(&tap_branch_tag);
+        // Lexicographic order
+        if (std.mem.order(u8, &k, node) == .lt) {
+            branch_hasher.update(&k);
+            branch_hasher.update(node);
+        } else {
+            branch_hasher.update(node);
+            branch_hasher.update(&k);
+        }
+        branch_hasher.final(&k);
+    }
+
+    // Compute tweak: tagged_hash("TapTweak", internal_key || merkle_root)
+    var tweak_data: [64]u8 = undefined;
+    @memcpy(tweak_data[0..32], internal_key);
+    @memcpy(tweak_data[32..64], &k);
+    const tweak = taggedHash("TapTweak", &tweak_data);
+
+    // Parse internal key and compute tweaked key
+    var internal_xonly: secp256k1.secp256k1_xonly_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_parse(ctx, &internal_xonly, internal_key.ptr) != 1) {
+        return false;
+    }
+
+    var output_pubkey: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_tweak_add(ctx, &output_pubkey, &internal_xonly, &tweak) != 1) {
+        return false;
+    }
+
+    // Verify: check that the tweaked key matches the program and parity
+    if (secp256k1.secp256k1_xonly_pubkey_tweak_add_check(
+        ctx,
+        program.ptr,
+        @intCast(control[0] & 1),
+        &internal_xonly,
+        &tweak,
+    ) != 1) {
+        return false;
+    }
+
+    return true;
 }
 
 // ============================================================================

@@ -159,6 +159,8 @@ pub const ScriptError = error{
     InvalidPubkeyType, // STRICTENC: invalid pubkey encoding (PUBKEYTYPE)
     DiscourageOpSuccess, // BIP-342: OP_SUCCESSx found during tapscript pre-scan
     DiscourageUpgradableNops, // NOP1-NOP10 error when discourage flag set
+    TapscriptEmptyPubkey, // BIP-342: OP_CHECKSIG with empty pubkey in tapscript
+    TapscriptCheckmultisigDisabled, // BIP-342: OP_CHECKMULTISIG disabled in tapscript
 };
 
 // ============================================================================
@@ -530,7 +532,7 @@ fn isOpSuccess(op: u8) bool {
         (op >= 131 and op <= 134) or
         (op >= 137 and op <= 138) or
         (op >= 141 and op <= 142) or
-        (op >= 149 and op <= 185) or // 0x95-0xb9
+        (op >= 149 and op <= 153) or // 0x95-0x99 (MUL, DIV, MOD, LSHIFT, RSHIFT)
         (op >= 187 and op <= 254); // 0xbb-0xfe
 }
 
@@ -913,6 +915,11 @@ pub const ScriptEngine = struct {
                             return ScriptError.WitnessProgramMismatch;
                         }
                         if ((control.len - 33) % 32 != 0) {
+                            return ScriptError.WitnessProgramMismatch;
+                        }
+
+                        // Verify control block against the witness program (output key)
+                        if (!crypto.verifyTaprootControlBlock(control, tap_script, wp.program)) {
                             return ScriptError.WitnessProgramMismatch;
                         }
 
@@ -1479,15 +1486,37 @@ pub const ScriptEngine = struct {
                 const pubkey = try self.pop();
                 const sig = try self.pop();
 
-                const valid = try self.verifySignature(sig, pubkey);
+                if (self.sig_version == .tapscript) {
+                    // BIP-342 tapscript: empty pubkey is an error
+                    if (pubkey.len == 0) return ScriptError.TapscriptEmptyPubkey;
 
-                // BIP-146 NULLFAIL: If verification failed and signature is non-empty, fail
-                if (!valid and self.flags.verify_nullfail and sig.len > 0) {
-                    return ScriptError.NullFail;
+                    if (pubkey.len == 32) {
+                        // 32-byte pubkey: Schnorr verification
+                        const valid = try self.verifyTaprootSignature(sig, pubkey);
+                        if (!valid and sig.len > 0) return ScriptError.NullFail;
+                        const result = try boolToStack(self.allocator, valid);
+                        try self.pushOwned(result);
+                    } else {
+                        // Unknown pubkey type in tapscript: succeed (future soft-fork)
+                        if (sig.len == 0) {
+                            const result = try boolToStack(self.allocator, false);
+                            try self.pushOwned(result);
+                        } else {
+                            const result = try boolToStack(self.allocator, true);
+                            try self.pushOwned(result);
+                        }
+                    }
+                } else {
+                    const valid = try self.verifySignature(sig, pubkey);
+
+                    // BIP-146 NULLFAIL: If verification failed and signature is non-empty, fail
+                    if (!valid and self.flags.verify_nullfail and sig.len > 0) {
+                        return ScriptError.NullFail;
+                    }
+
+                    const result = try boolToStack(self.allocator, valid);
+                    try self.pushOwned(result);
                 }
-
-                const result = try boolToStack(self.allocator, valid);
-                try self.pushOwned(result);
             },
 
             .op_checksigverify => {
@@ -1495,21 +1524,38 @@ pub const ScriptEngine = struct {
                 const pubkey = try self.pop();
                 const sig = try self.pop();
 
-                const valid = try self.verifySignature(sig, pubkey);
+                if (self.sig_version == .tapscript) {
+                    if (pubkey.len == 0) return ScriptError.TapscriptEmptyPubkey;
 
-                // BIP-146 NULLFAIL: If verification failed and signature is non-empty, fail
-                if (!valid and self.flags.verify_nullfail and sig.len > 0) {
-                    return ScriptError.NullFail;
+                    if (pubkey.len == 32) {
+                        const valid = try self.verifyTaprootSignature(sig, pubkey);
+                        if (!valid and sig.len > 0) return ScriptError.NullFail;
+                        if (!valid) return ScriptError.CheckSigFailed;
+                    } else {
+                        // Unknown pubkey type: succeed unless empty sig
+                        if (sig.len == 0) return ScriptError.CheckSigFailed;
+                    }
+                } else {
+                    const valid = try self.verifySignature(sig, pubkey);
+
+                    // BIP-146 NULLFAIL: If verification failed and signature is non-empty, fail
+                    if (!valid and self.flags.verify_nullfail and sig.len > 0) {
+                        return ScriptError.NullFail;
+                    }
+
+                    if (!valid) return ScriptError.CheckSigFailed;
                 }
-
-                if (!valid) return ScriptError.CheckSigFailed;
             },
 
             .op_checkmultisig => {
+                // BIP-342: OP_CHECKMULTISIG is disabled in tapscript
+                if (self.sig_version == .tapscript) return ScriptError.TapscriptCheckmultisigDisabled;
                 try self.executeCheckMultisig(false, op_count);
             },
 
             .op_checkmultisigverify => {
+                // BIP-342: OP_CHECKMULTISIGVERIFY is disabled in tapscript
+                if (self.sig_version == .tapscript) return ScriptError.TapscriptCheckmultisigDisabled;
                 try self.executeCheckMultisig(true, op_count);
             },
 
