@@ -4,6 +4,94 @@ const script = @import("script.zig");
 const crypto = @import("crypto.zig");
 const serialize = @import("serialize.zig");
 
+const secp256k1 = @cImport({
+    @cInclude("secp256k1.h");
+    @cInclude("secp256k1_extrakeys.h");
+});
+
+/// Fixed internal key for taproot test vectors (generator point x-coordinate).
+const INTERNAL_KEY_HEX = "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";
+
+const TaprootData = struct {
+    output_key: [32]u8,
+    control_block: [33]u8,
+};
+
+/// Compute the taproot output key and control block for a single-leaf script path.
+/// Returns TaprootData with output_key (32 bytes x-only) and control_block (33 bytes).
+fn computeTaprootOutputKey(
+    allocator: std.mem.Allocator,
+    leaf_script: []const u8,
+) !TaprootData {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_VERIFY | secp256k1.SECP256K1_CONTEXT_SIGN,
+    ) orelse return error.Secp256k1ContextFailed;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    // Parse internal key
+    const internal_key_bytes = try hexToBytes(allocator, INTERNAL_KEY_HEX);
+    defer allocator.free(internal_key_bytes);
+
+    var internal_xonly: secp256k1.secp256k1_xonly_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_parse(ctx, &internal_xonly, internal_key_bytes.ptr) != 1) {
+        return error.InvalidInternalKey;
+    }
+
+    // Compute tapleaf hash: tagged_hash("TapLeaf", 0xc0 || compact_size(script_len) || script)
+    var leaf_data = std.ArrayList(u8).init(allocator);
+    defer leaf_data.deinit();
+    try leaf_data.append(0xc0); // leaf version
+    // Compact size encoding of script length
+    if (leaf_script.len < 0xfd) {
+        try leaf_data.append(@truncate(leaf_script.len));
+    } else if (leaf_script.len <= 0xffff) {
+        try leaf_data.append(0xfd);
+        try leaf_data.append(@truncate(leaf_script.len & 0xff));
+        try leaf_data.append(@truncate((leaf_script.len >> 8) & 0xff));
+    } else {
+        return error.ScriptTooLong;
+    }
+    try leaf_data.appendSlice(leaf_script);
+
+    const tapleaf_hash = crypto.taggedHash("TapLeaf", leaf_data.items);
+
+    // For single leaf, merkle root = tapleaf hash
+    // Compute tweak: tagged_hash("TapTweak", internal_key || merkle_root)
+    var tweak_data: [64]u8 = undefined;
+    @memcpy(tweak_data[0..32], internal_key_bytes);
+    @memcpy(tweak_data[32..64], &tapleaf_hash);
+    const tweak = crypto.taggedHash("TapTweak", &tweak_data);
+
+    // Tweak the internal key using secp256k1
+    // secp256k1_xonly_pubkey_tweak_add takes an xonly pubkey and produces a full pubkey.
+    var output_pubkey: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_tweak_add(ctx, &output_pubkey, &internal_xonly, &tweak) != 1) {
+        return error.TweakFailed;
+    }
+
+    // Extract x-only output key and parity
+    var output_xonly: secp256k1.secp256k1_xonly_pubkey = undefined;
+    var parity: c_int = 0;
+    if (secp256k1.secp256k1_xonly_pubkey_from_pubkey(ctx, &output_xonly, &parity, &output_pubkey) != 1) {
+        return error.OutputKeyFailed;
+    }
+
+    var output_key: [32]u8 = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_serialize(ctx, &output_key, &output_xonly) != 1) {
+        return error.SerializeFailed;
+    }
+
+    // Build control block: (0xc0 | parity) || internal_key_x_only
+    var control_block: [33]u8 = undefined;
+    control_block[0] = 0xc0 | @as(u8, @intCast(parity));
+    @memcpy(control_block[1..33], internal_key_bytes);
+
+    return .{
+        .output_key = output_key,
+        .control_block = control_block,
+    };
+}
+
 /// Decode a hex string into bytes. Caller owns the returned slice.
 fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     if (hex.len % 2 != 0) return error.InvalidHexLength;
@@ -377,6 +465,66 @@ fn runTestVector(
 ) !enum { pass, fail, err } {
     const expected_ok = std.mem.eql(u8, expected, "OK");
 
+    // Track taproot script-path data for placeholder resolution
+    var taproot_leaf_script: ?[]u8 = null;
+    defer if (taproot_leaf_script) |s| allocator.free(s);
+    var taproot_result: ?TaprootData = null;
+
+    // Pre-scan witness items for #SCRIPT# to compute taproot data before assembling pub_asm
+    if (witness_items) |items| {
+        for (items) |item| {
+            const hex_str = switch (item) {
+                .string => |s| s,
+                else => continue,
+            };
+            if (std.mem.startsWith(u8, hex_str, "#SCRIPT# ")) {
+                const script_asm = hex_str["#SCRIPT# ".len..];
+                taproot_leaf_script = assembleScript(allocator, script_asm) catch {
+                    if (!expected_ok) return .pass;
+                    return .err;
+                };
+                taproot_result = computeTaprootOutputKey(allocator, taproot_leaf_script.?) catch {
+                    if (!expected_ok) return .pass;
+                    return .err;
+                };
+                break;
+            }
+        }
+    }
+
+    // Resolve #TAPROOTOUTPUT# in pub_asm if needed
+    var resolved_pub_asm: ?[]u8 = null;
+    defer if (resolved_pub_asm) |r| allocator.free(r);
+
+    const effective_pub_asm: []const u8 = blk: {
+        if (std.mem.indexOf(u8, pub_asm, "#TAPROOTOUTPUT#")) |pos| {
+            if (taproot_result) |tr| {
+                // Convert output key to hex string
+                var output_hex: [64]u8 = undefined;
+                for (tr.output_key, 0..) |b, i| {
+                    const hex_chars = "0123456789abcdef";
+                    output_hex[i * 2] = hex_chars[b >> 4];
+                    output_hex[i * 2 + 1] = hex_chars[b & 0xf];
+                }
+                // Build resolved string: prefix + "0x" + hex + suffix
+                const prefix = pub_asm[0..pos];
+                const suffix = pub_asm[pos + "#TAPROOTOUTPUT#".len ..];
+                const total_len = prefix.len + 2 + 64 + suffix.len; // "0x" + 64 hex chars
+                resolved_pub_asm = try allocator.alloc(u8, total_len);
+                var out = resolved_pub_asm.?;
+                @memcpy(out[0..prefix.len], prefix);
+                @memcpy(out[prefix.len..][0..2], "0x");
+                @memcpy(out[prefix.len + 2 ..][0..64], &output_hex);
+                @memcpy(out[prefix.len + 66 ..][0..suffix.len], suffix);
+                break :blk out;
+            } else {
+                if (!expected_ok) break :blk pub_asm;
+                break :blk pub_asm;
+            }
+        }
+        break :blk pub_asm;
+    };
+
     // Assemble scripts
     const script_sig = assembleScript(allocator, sig_asm) catch {
         if (!expected_ok) return .pass;
@@ -385,7 +533,7 @@ fn runTestVector(
     };
     defer allocator.free(script_sig);
 
-    const script_pubkey = assembleScript(allocator, pub_asm) catch {
+    const script_pubkey = assembleScript(allocator, effective_pub_asm) catch {
         if (!expected_ok) return .pass;
         try stdout.print("ERROR: asm parse failed pub=[{s}]\n", .{pub_asm});
         return .err;
@@ -436,13 +584,27 @@ fn runTestVector(
                 const empty = try allocator.alloc(u8, 0);
                 try witness_owned.append(empty);
                 try witness_slices.append(empty);
-            } else {
-                // Check for taproot placeholder tokens like #SCRIPT#, #TAPROOTOUTPUT#
-                if (std.mem.indexOf(u8, hex_str, "#") != null) {
-                    // Can't resolve placeholders - count as pass for expected-fail, error for expected-OK
+            } else if (std.mem.startsWith(u8, hex_str, "#SCRIPT# ")) {
+                // Push the assembled leaf script onto witness
+                const script_copy = try allocator.dupe(u8, taproot_leaf_script.?);
+                try witness_owned.append(script_copy);
+                try witness_slices.append(script_copy);
+            } else if (std.mem.eql(u8, hex_str, "#CONTROLBLOCK#")) {
+                // Push the control block
+                if (taproot_result) |tr| {
+                    const cb = try allocator.alloc(u8, 33);
+                    @memcpy(cb, &tr.control_block);
+                    try witness_owned.append(cb);
+                    try witness_slices.append(cb);
+                } else {
                     if (!expected_ok) return .pass;
                     return .err;
                 }
+            } else if (std.mem.indexOf(u8, hex_str, "#") != null) {
+                // Unknown placeholder
+                if (!expected_ok) return .pass;
+                return .err;
+            } else {
                 const bytes = hexToBytes(allocator, hex_str) catch {
                     if (!expected_ok) return .pass;
                     return .err;
