@@ -75,6 +75,7 @@ pub const Config = struct {
     pub const Network = enum {
         mainnet,
         testnet,
+        testnet4,
         regtest,
     };
 
@@ -83,6 +84,7 @@ pub const Config = struct {
         return switch (self.network) {
             .mainnet => &consensus.MAINNET,
             .testnet => &consensus.TESTNET,
+            .testnet4 => &consensus.TESTNET4,
             .regtest => &consensus.REGTEST,
         };
     }
@@ -110,6 +112,10 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             config.network = .testnet;
             config.listen_port = 18333;
             config.rpc_port = 18332;
+        } else if (std.mem.eql(u8, arg, "--testnet4") or std.mem.eql(u8, arg, "-testnet4")) {
+            config.network = .testnet4;
+            config.listen_port = 48333;
+            config.rpc_port = 48332;
         } else if (std.mem.eql(u8, arg, "--regtest") or std.mem.eql(u8, arg, "-regtest")) {
             config.network = .regtest;
             config.listen_port = 18444;
@@ -273,6 +279,7 @@ pub fn getNetworkSubdir(network: Config.Network) []const u8 {
     return switch (network) {
         .mainnet => "",
         .testnet => "testnet3",
+        .testnet4 => "testnet4",
         .regtest => "regtest",
     };
 }
@@ -323,6 +330,10 @@ pub fn loadConfigFile(
                 config.network = .testnet;
                 config.listen_port = 18333;
                 config.rpc_port = 18332;
+            } else if (std.mem.eql(u8, key, "testnet4") and std.mem.eql(u8, value, "1")) {
+                config.network = .testnet4;
+                config.listen_port = 48333;
+                config.rpc_port = 48332;
             } else if (std.mem.eql(u8, key, "regtest") and std.mem.eql(u8, value, "1")) {
                 config.network = .regtest;
                 config.listen_port = 18444;
