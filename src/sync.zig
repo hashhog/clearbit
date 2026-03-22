@@ -884,7 +884,11 @@ pub const BlockDownloader = struct {
     /// Clean up resources.
     pub fn deinit(self: *BlockDownloader) void {
         self.in_flight.deinit();
-        // Note: downloaded_queue blocks should be freed by caller if they allocated them
+        // Free any remaining downloaded blocks that were never connected
+        var iter = self.downloaded_queue.valueIterator();
+        while (iter.next()) |block| {
+            serialize.freeBlock(self.allocator, block);
+        }
         self.downloaded_queue.deinit();
         self.peer_in_flight_counts.deinit();
     }
@@ -1074,6 +1078,8 @@ pub const BlockDownloader = struct {
             const block_entry = self.downloaded_queue.fetchRemove(expected_hash);
             if (block_entry == null) break;
             const block = block_entry.?.value;
+            // Free block data after we're done with it
+            defer serialize.freeBlock(self.allocator, &block);
 
             // Validate the block
             try self.validateAndConnectBlock(&block, self.connect_height);

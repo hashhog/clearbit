@@ -227,6 +227,35 @@ pub fn readBlock(reader: *Reader, allocator: std.mem.Allocator) !types.Block {
     };
 }
 
+/// Free all memory owned by a deserialized transaction.
+/// Call this when a Transaction returned by readTransaction is no longer needed.
+pub fn freeTransaction(allocator: std.mem.Allocator, tx: *const types.Transaction) void {
+    for (tx.inputs) |input| {
+        if (input.script_sig.len > 0) allocator.free(input.script_sig);
+        if (input.witness.len > 0) {
+            for (input.witness) |item| {
+                if (item.len > 0) allocator.free(item);
+            }
+            allocator.free(input.witness);
+        }
+    }
+    allocator.free(tx.inputs);
+
+    for (tx.outputs) |output| {
+        if (output.script_pubkey.len > 0) allocator.free(output.script_pubkey);
+    }
+    allocator.free(tx.outputs);
+}
+
+/// Free all memory owned by a deserialized block.
+/// Call this when a Block returned by readBlock is no longer needed.
+pub fn freeBlock(allocator: std.mem.Allocator, block: *const types.Block) void {
+    for (block.transactions) |*tx| {
+        freeTransaction(allocator, tx);
+    }
+    allocator.free(block.transactions);
+}
+
 /// Write a transaction to the binary stream (full serialization with witness)
 pub fn writeTransaction(writer: *Writer, tx: *const types.Transaction) !void {
     try writer.writeInt(i32, tx.version);

@@ -858,11 +858,46 @@ pub const UtxoSet = struct {
             entry.deinit(self.allocator);
         }
 
+        // Evict old non-dirty entries if cache is too large
+        if (self.cacheMemoryUsage() > self.max_cache_size) {
+            self.evictCache();
+        }
+
         // Store in cache (marked dirty for eventual flush to DB)
         try self.cache.put(key, CacheEntry{ .utxo = compact, .dirty = true });
 
         self.total_utxos += 1;
         self.total_amount += output.value;
+    }
+
+    /// Evict non-dirty (clean) entries from the cache to reduce memory usage.
+    /// Removes up to half of clean entries to amortize eviction cost.
+    fn evictCache(self: *UtxoSet) void {
+        // First, flush dirty entries to DB if possible
+        self.flush() catch {};
+
+        // Now evict clean entries (they exist in DB, safe to remove)
+        var to_remove = std.ArrayList([36]u8).init(self.allocator);
+        defer to_remove.deinit();
+
+        const target_count = self.cache.count() / 2;
+        var removed: usize = 0;
+
+        var iter = self.cache.iterator();
+        while (iter.next()) |entry| {
+            if (removed >= target_count) break;
+            if (!entry.value_ptr.dirty) {
+                to_remove.append(entry.key_ptr.*) catch break;
+                removed += 1;
+            }
+        }
+
+        for (to_remove.items) |key_to_remove| {
+            if (self.cache.fetchRemove(key_to_remove)) |old| {
+                var entry = old.value;
+                entry.deinit(self.allocator);
+            }
+        }
     }
 
     /// Remove a UTXO (spend it). Returns the spent UTXO for undo data.
@@ -950,8 +985,10 @@ pub const UtxoSet = struct {
 
     /// Get approximate cache memory usage.
     pub fn cacheMemoryUsage(self: *const UtxoSet) usize {
-        // Rough estimate: key (36) + value overhead (~50 per entry)
-        return self.cache.count() * 86;
+        // Each entry: key (36 bytes) + CacheEntry header (~32 bytes) + hash_or_script (~20-32 bytes)
+        // Plus HashMap overhead (bucket pointers, metadata ~16 bytes/entry)
+        // Conservative estimate: ~120 bytes per entry
+        return self.cache.count() * 120;
     }
 };
 
