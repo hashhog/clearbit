@@ -6,6 +6,7 @@ const crypto = @import("crypto.zig");
 const banlist = @import("banlist.zig");
 const v2_transport = @import("v2_transport.zig");
 const storage = @import("storage.zig");
+const serialize = @import("serialize.zig");
 
 // ============================================================================
 // Peer Manager Constants
@@ -1786,6 +1787,7 @@ pub const PeerManager = struct {
             },
             .pong => |pp| peer.handlePong(pp.nonce),
             .addr => |a| {
+                defer self.allocator.free(a.addrs);
                 for (a.addrs) |entry| {
                     // Convert TimestampedAddr to std.net.Address
                     // Check if it's an IPv4-mapped IPv6 address
@@ -1799,6 +1801,7 @@ pub const PeerManager = struct {
                 }
             },
             .inv => |inv_msg| {
+                defer self.allocator.free(inv_msg.inventory);
                 // Request any announced blocks we don't have
                 var block_invs = std.ArrayList(p2p.InvVector).init(self.allocator);
                 defer block_invs.deinit();
@@ -1817,6 +1820,7 @@ pub const PeerManager = struct {
                 }
             },
             .headers => |h| {
+                defer self.allocator.free(h.headers);
                 // Clear getheaders timeout on ALL peers since we got a response
                 for (self.peers.items) |p| {
                     p.clearGetheadersTimeout();
@@ -1849,6 +1853,7 @@ pub const PeerManager = struct {
                 }
             },
             .block => |block| {
+                defer serialize.freeBlock(self.allocator, &block);
                 const block_hash = crypto.computeBlockHash(&block.header);
                 if (self.chain_state) |cs| {
                     // Check this block connects to our tip
