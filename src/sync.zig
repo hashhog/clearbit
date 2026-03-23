@@ -1103,6 +1103,13 @@ pub const BlockDownloader = struct {
         const chain_store = self.sync_manager.chain_store;
         const params = self.sync_manager.network_params;
 
+        // Assume-valid: skip script verification for blocks at or below the
+        // assume-valid height. Structural checks (merkle root, UTXO updates,
+        // coinbase value) are still performed.
+        const skip_script_verification = params.assume_valid_height > 0 and
+            height <= params.assume_valid_height;
+        _ = skip_script_verification; // TODO: use when script verification is wired into this path
+
         // Use an arena allocator for per-block temporary allocations
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
