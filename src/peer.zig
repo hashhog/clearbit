@@ -1902,35 +1902,63 @@ pub const PeerManager = struct {
             },
             .reqrecon => {
                 // BIP-330 Erlay: Peer is requesting set reconciliation.
-                // Build our sketch from our reconciliation set, merge with their sketch,
-                // and send back a reconcildiff with the symmetric difference.
-                // The responder decodes the difference and reports which txids are
-                // missing on each side.
+                // No heap allocations in reqrecon (sketch_data is a slice into payload).
             },
             .sketch => {
-                // BIP-330 Erlay: Peer sent their sketch data (in response to our reqrecon).
-                // Merge with our local sketch, decode the symmetric difference,
-                // and request missing transactions via getdata.
+                // BIP-330 Erlay: Peer sent their sketch data.
+                // No heap allocations in sketch (sketch_data is a slice into payload).
             },
-            .reconcildiff => {
+            .reconcildiff => |rd| {
                 // BIP-330 Erlay: Peer reports the reconciliation results.
-                // Contains lists of short IDs for transactions each side is missing.
-                // Use these to send INV for txs the peer needs and request txs we need.
+                // Free allocated short ID arrays.
+                defer self.allocator.free(rd.missing_short_ids);
+                defer self.allocator.free(rd.extra_short_ids);
             },
             // BIP-152 Compact Block data messages
-            .cmpctblock => {
-                // Received a compact block. Attempt reconstruction from mempool:
-                // 1. Match short_ids against mempool transactions using SipHash
-                // 2. Fill in prefilled transactions (coinbase is always prefilled)
-                // 3. If reconstruction incomplete, send getblocktxn for missing txs
+            .cmpctblock => |cb| {
+                // Free compact block allocations.
+                defer self.allocator.free(cb.short_ids);
+                defer {
+                    for (cb.prefilled_txs) |pt| {
+                        var tx = pt.tx;
+                        serialize.freeTransaction(self.allocator, &tx);
+                    }
+                    self.allocator.free(cb.prefilled_txs);
+                }
             },
-            .getblocktxn => {
-                // Peer requesting specific transactions from a block we announced.
-                // Look up the block and send the requested transactions via blocktxn.
+            .getblocktxn => |gbt| {
+                // Free allocated index array.
+                defer self.allocator.free(gbt.indexes);
             },
-            .blocktxn => {
-                // Missing transactions received for compact block reconstruction.
-                // Complete the block reconstruction and validate the full block.
+            .blocktxn => |bt| {
+                // Free allocated transactions.
+                defer {
+                    for (bt.transactions) |*tx| {
+                        serialize.freeTransaction(self.allocator, tx);
+                    }
+                    self.allocator.free(bt.transactions);
+                }
+            },
+            .tx => |tx_msg| {
+                // Free the deserialized transaction.
+                defer serialize.freeTransaction(self.allocator, &tx_msg);
+            },
+            .notfound => |nf| {
+                // Free the allocated inventory array.
+                defer self.allocator.free(nf.inventory);
+            },
+            .getheaders => |gh| {
+                // Free the allocated locator hashes.
+                defer self.allocator.free(gh.block_locator_hashes);
+            },
+            .getblocks => |gb| {
+                // Free the allocated locator hashes.
+                defer self.allocator.free(gb.block_locator_hashes);
+            },
+            .reject => |rj| {
+                // reject message fields are slices into the payload buffer,
+                // which is freed by receiveMessage's defer. No extra free needed.
+                _ = rj;
             },
             else => {},
         }
