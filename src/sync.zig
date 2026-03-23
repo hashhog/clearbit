@@ -1062,7 +1062,11 @@ pub const BlockDownloader = struct {
             }
         }
 
-        // Add to download queue
+        // Add to download queue, freeing any duplicate block already queued
+        if (self.downloaded_queue.fetchRemove(hash)) |old_entry| {
+            var old_block = old_entry.value;
+            serialize.freeBlock(self.allocator, &old_block);
+        }
         try self.downloaded_queue.put(hash, block);
     }
 
