@@ -870,13 +870,18 @@ pub const UtxoSet = struct {
         self.total_amount += output.value;
     }
 
-    /// Evict non-dirty (clean) entries from the cache to reduce memory usage.
-    /// Removes up to half of clean entries to amortize eviction cost.
+    /// Evict entries from the cache to reduce memory usage.
+    /// When a DB backend is available, flushes dirty entries first then evicts clean ones.
+    /// When running in memory-only mode (no DB), evicts dirty entries directly since
+    /// there is nowhere to persist them -- spent UTXOs are already gone and unspent
+    /// ones can be re-fetched from the block chain if needed (though in practice
+    /// memory-only mode accepts the data loss on eviction).
     fn evictCache(self: *UtxoSet) void {
         // First, flush dirty entries to DB if possible
-        self.flush() catch {};
+        if (self.db != null) {
+            self.flush() catch {};
+        }
 
-        // Now evict clean entries (they exist in DB, safe to remove)
         var to_remove = std.ArrayList([36]u8).init(self.allocator);
         defer to_remove.deinit();
 
@@ -886,7 +891,9 @@ pub const UtxoSet = struct {
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             if (removed >= target_count) break;
-            if (!entry.value_ptr.dirty) {
+            // With a DB backend, only evict clean (flushed) entries.
+            // Without a DB backend, evict any entry to prevent OOM.
+            if (self.db == null or !entry.value_ptr.dirty) {
                 to_remove.append(entry.key_ptr.*) catch break;
                 removed += 1;
             }
@@ -897,6 +904,10 @@ pub const UtxoSet = struct {
                 var entry = old.value;
                 entry.deinit(self.allocator);
             }
+        }
+
+        if (to_remove.items.len > 0) {
+            std.debug.print("UTXO cache eviction: removed {d} entries, {d} remaining\n", .{ to_remove.items.len, self.cache.count() });
         }
     }
 
@@ -985,10 +996,10 @@ pub const UtxoSet = struct {
 
     /// Get approximate cache memory usage.
     pub fn cacheMemoryUsage(self: *const UtxoSet) usize {
-        // Each entry: key (36 bytes) + CacheEntry header (~32 bytes) + hash_or_script (~20-32 bytes)
-        // Plus HashMap overhead (bucket pointers, metadata ~16 bytes/entry)
-        // Conservative estimate: ~120 bytes per entry
-        return self.cache.count() * 120;
+        // Each entry: key (36 bytes) + CacheEntry (~40 bytes) + hash_or_script heap (~26 bytes avg)
+        // Plus HashMap overhead (bucket pointers, metadata ~64 bytes/entry)
+        // Estimate: ~170 bytes per entry
+        return self.cache.count() * 170;
     }
 };
 
