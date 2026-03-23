@@ -314,6 +314,9 @@ pub const NetworkParams = struct {
     /// assumeUTXO data: trusted snapshots for fast sync.
     /// Each entry contains a height, block hash, and UTXO set hash.
     assume_utxo: []const AssumeUtxoData,
+    /// assume-valid height: skip script verification for blocks at or below this height.
+    /// Set to 0 to disable (verify all scripts).
+    assume_valid_height: u32,
 };
 
 // ============================================================================
@@ -388,6 +391,7 @@ pub const MAINNET = NetworkParams{
             .coins_count = 176_000_000,
         },
     },
+    .assume_valid_height = 0,
 };
 
 /// Testnet3 parameters.
@@ -429,6 +433,7 @@ pub const TESTNET3 = NetworkParams{
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
     // No assumeUTXO snapshots for testnet3
     .assume_utxo = &[_]AssumeUtxoData{},
+    .assume_valid_height = 0,
 };
 
 /// Alias for backwards compatibility.
@@ -471,6 +476,9 @@ pub const TESTNET4 = NetworkParams{
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
     // No assumeUTXO snapshots for testnet4
     .assume_utxo = &[_]AssumeUtxoData{},
+    // Testnet4 assume-valid: skip script verification up to this height
+    // Hash: 0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a
+    .assume_valid_height = 123613,
 };
 
 /// Signet parameters.
@@ -511,6 +519,7 @@ pub const SIGNET = NetworkParams{
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
     // No assumeUTXO snapshots for signet
     .assume_utxo = &[_]AssumeUtxoData{},
+    .assume_valid_height = 0,
 };
 
 /// Regtest parameters.
@@ -551,6 +560,7 @@ pub const REGTEST = NetworkParams{
     .min_chain_work = [_]u8{0} ** 32,
     // No assumeUTXO snapshots for regtest (create your own)
     .assume_utxo = &[_]AssumeUtxoData{},
+    .assume_valid_height = 0,
 };
 
 // ============================================================================
