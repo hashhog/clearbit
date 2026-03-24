@@ -686,15 +686,45 @@ pub const Peer = struct {
         self.recv_buffer.deinit();
     }
 
+    /// Check if data is available to read on this peer's socket (non-blocking).
+    pub fn hasDataAvailable(self: *Peer) bool {
+        var pollfds = [_]std.posix.pollfd{.{
+            .fd = self.stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        // Poll with 0 timeout = non-blocking check
+        const ready = std.posix.poll(&pollfds, 0) catch return false;
+        return ready > 0 and (pollfds[0].revents & std.posix.POLL.IN) != 0;
+    }
+
+    /// Set the receive timeout on the socket.
+    pub fn setRecvTimeout(self: *Peer, sec: i64, usec: i64) void {
+        const timeout = std.posix.timeval{ .sec = sec, .usec = @intCast(usec) };
+        std.posix.setsockopt(
+            self.stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&timeout),
+        ) catch {};
+    }
+
     /// Read exactly n bytes from the stream.
+    /// If we've read zero bytes and get WouldBlock, returns Timeout (no data available).
+    /// If we've already read some bytes and get WouldBlock, keeps retrying (partial message).
     fn readExact(self: *Peer, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
             const n = self.stream.read(buf[total..]) catch |err| {
-                return switch (err) {
-                    error.WouldBlock => error.Timeout,
-                    else => error.ConnectionClosed,
-                };
+                if (err == error.WouldBlock) {
+                    if (total == 0) {
+                        return error.Timeout; // No data at all - truly no message waiting
+                    }
+                    // Partial read - data is arriving, wait a bit and retry
+                    std.time.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                }
+                return error.ConnectionClosed;
             };
             if (n == 0) return error.ConnectionClosed;
             total += n;
@@ -1150,6 +1180,40 @@ pub const PeerManager = struct {
     /// Address to connect to on startup (from --connect flag).
     connect_address: ?std.net.Address,
 
+    // ========================================================================
+    // Block Download Pipeline (IBD acceleration)
+    // ========================================================================
+
+    /// Buffered blocks waiting to be connected (may arrive out of order).
+    /// Key: block hash, Value: the full block (ownership transferred here).
+    block_buffer: std.AutoHashMap(types.Hash256, types.Block),
+
+    /// Ordered queue of block hashes we expect to connect, by height.
+    /// Index 0 = first block after genesis (height 1 at start of sync).
+    /// We track which height we've queued up to and which we've connected up to.
+    expected_blocks: std.ArrayList(types.Hash256),
+
+    /// Next index to request blocks for (index into expected_blocks).
+    download_cursor: u32,
+
+    /// Next index to connect (index into expected_blocks).
+    connect_cursor: u32,
+
+    /// Number of blocks currently in-flight (requested but not yet received).
+    blocks_in_flight: u32,
+
+    /// Maximum blocks in flight at once.
+    max_blocks_in_flight: u32,
+
+    /// Last time we logged sync progress.
+    last_progress_log: i64,
+
+    /// Total blocks connected since last progress log.
+    blocks_since_log: u32,
+
+    /// Last time we attempted stall recovery.
+    last_stall_recovery: i64,
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
@@ -1173,6 +1237,15 @@ pub const PeerManager = struct {
             .outbound_protected_count = 0,
             .chain_state = null,
             .connect_address = null,
+            .block_buffer = std.AutoHashMap(types.Hash256, types.Block).init(allocator),
+            .expected_blocks = std.ArrayList(types.Hash256).init(allocator),
+            .download_cursor = 0,
+            .connect_cursor = 0,
+            .blocks_in_flight = 0,
+            .max_blocks_in_flight = 1024,
+            .last_progress_log = 0,
+            .blocks_since_log = 0,
+            .last_stall_recovery = 0,
         };
     }
 
@@ -1189,6 +1262,15 @@ pub const PeerManager = struct {
         self.ban_list.deinit();
         self.outbound_netgroups.deinit();
         self.anchor_addresses.deinit();
+        // Free any buffered blocks
+        {
+            var iter = self.block_buffer.valueIterator();
+            while (iter.next()) |blk| {
+                serialize.freeBlock(self.allocator, blk);
+            }
+            self.block_buffer.deinit();
+        }
+        self.expected_blocks.deinit();
         if (self.listener) |*l| l.deinit();
     }
 
@@ -1590,13 +1672,19 @@ pub const PeerManager = struct {
 
     /// Connect to peers until we have MAX_OUTBOUND_CONNECTIONS outbound.
     /// Enforces netgroup diversity by tracking connected netgroups.
+    /// During IBD, only attempts one connection per call to avoid blocking.
     pub fn maintainOutbound(self: *PeerManager) !void {
         var outbound_count: usize = 0;
-        for (self.peers.items) |peer| {
-            if (peer.direction == .outbound) outbound_count += 1;
+        for (self.peers.items) |p| {
+            if (p.direction == .outbound) outbound_count += 1;
         }
 
-        while (outbound_count < MAX_OUTBOUND_CONNECTIONS) {
+        // During IBD, only try one connection per call to avoid blocking the loop
+        var attempts: u32 = 0;
+        const max_attempts: u32 = if (self.isIBD()) 1 else 8;
+
+        while (outbound_count < MAX_OUTBOUND_CONNECTIONS and attempts < max_attempts) {
+            attempts += 1;
             const addr = self.selectPeerToConnect() orelse break;
             const peer = self.allocator.create(Peer) catch break;
             peer.* = Peer.connect(addr, self.network_params, self.allocator) catch {
@@ -1688,76 +1776,141 @@ pub const PeerManager = struct {
         try self.peers.append(peer);
     }
 
-    /// Process messages from all connected peers.
+    /// Process messages from all connected peers using multiplexed I/O.
+    /// Uses poll() to wait for data on ALL peer sockets simultaneously,
+    /// then drains ALL available messages from each ready socket.
     pub fn processAllMessages(self: *PeerManager) !void {
-        var i: usize = 0;
-        while (i < self.peers.items.len) {
-            const peer = self.peers.items[i];
+        // First pass: check for peers that need banning
+        {
+            var i: usize = 0;
+            while (i < self.peers.items.len) {
+                const peer_obj = self.peers.items[i];
+                if (peer_obj.should_ban) {
+                    self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                    self.removePeerByIndex(i);
+                    continue;
+                }
+                i += 1;
+            }
+        }
 
-            // Check if peer should be banned from previous misbehavior
-            if (peer.should_ban) {
-                self.banIP(peer.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+        if (self.peers.items.len == 0) return;
+
+        // Build pollfd array for all connected peers
+        var pollfds: [MAX_TOTAL_CONNECTIONS]std.posix.pollfd = undefined;
+        const num_peers = @min(self.peers.items.len, MAX_TOTAL_CONNECTIONS);
+        for (0..num_peers) |idx| {
+            pollfds[idx] = .{
+                .fd = self.peers.items[idx].stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+        }
+
+        // Poll all sockets at once. During IBD use 10ms timeout, otherwise 100ms.
+        const timeout_ms: i32 = if (self.isIBD()) 10 else 100;
+        const ready = std.posix.poll(pollfds[0..num_peers], timeout_ms) catch 0;
+
+        if (ready == 0) {
+            // No data on any socket - send getheaders to ONE peer if needed
+            // Throttle: only send if last attempt was >5s ago (avoid spam)
+            const now_ts = std.time.timestamp();
+            for (self.peers.items) |peer_obj| {
+                if (now_ts - peer_obj.last_getheaders_time > 5) {
+                    if (self.chain_state) |cs| {
+                        if (peer_obj.start_height > 0 and cs.best_height < @as(u32, @intCast(peer_obj.start_height))) {
+                            self.sendGetHeaders(peer_obj) catch {};
+                            break; // Only send to one peer at a time
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Process each peer that has data available.
+        // We iterate backwards so removePeerByIndex doesn't skip peers.
+        var i: usize = num_peers;
+        while (i > 0) {
+            i -= 1;
+            if (i >= self.peers.items.len) continue;
+
+            const peer_obj = self.peers.items[i];
+
+            // Check if this socket has data (or an error/hangup)
+            const revents = pollfds[i].revents;
+            const has_data = (revents & std.posix.POLL.IN) != 0;
+            const has_error = (revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0;
+
+            if (has_error and !has_data) {
                 self.removePeerByIndex(i);
                 continue;
             }
 
-            const msg = peer.receiveMessage() catch |err| {
-                switch (err) {
-                    PeerError.Timeout => {
-                        // Check if we need to request more headers, but only if we don't
-                        // already have an outstanding getheaders request to this peer.
-                        if (peer.last_getheaders_time == 0) {
-                            if (self.chain_state) |cs| {
-                                if (peer.start_height > 0 and cs.best_height < @as(u32, @intCast(peer.start_height))) {
-                                    self.sendGetHeaders(peer) catch {};
-                                }
-                            }
-                        }
-                        i += 1;
-                        continue;
-                    },
-                    PeerError.ConnectionClosed => {
-                        self.removePeerByIndex(i);
-                        continue;
-                    },
-                    PeerError.BadMagic => {
-                        peer.misbehaving(100, "invalid network magic");
-                    },
-                    PeerError.BadChecksum => {
-                        peer.misbehaving(50, "bad message checksum");
-                    },
-                    PeerError.MessageTooLarge => {
-                        peer.misbehaving(50, "oversized message");
-                    },
-                    PeerError.ProtocolViolation => {
-                        peer.misbehaving(20, "protocol violation");
-                    },
-                    else => {
-                        peer.misbehaving(10, "message receive error");
-                    },
-                }
-
-                // Check if should be banned after misbehavior
-                if (peer.should_ban) {
-                    self.banIP(peer.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
-                    self.removePeerByIndex(i);
-                    continue;
-                }
-
-                i += 1;
+            if (!has_data) {
                 continue;
-            };
+            }
 
-            self.handleMessage(peer, msg) catch {};
-            i += 1;
+            // Socket has data - set a very short timeout for reading and drain ALL messages
+            peer_obj.setRecvTimeout(0, 1_000); // 1ms timeout for drain loop
+
+            var msgs_read: u32 = 0;
+            const max_msgs_per_peer: u32 = 256; // Safety limit per cycle
+
+            while (msgs_read < max_msgs_per_peer) {
+                const msg = peer_obj.receiveMessage() catch |err| {
+                    switch (err) {
+                        PeerError.Timeout => break, // No more data buffered, done draining
+                        PeerError.ConnectionClosed => {
+                            self.removePeerByIndex(i);
+                            break;
+                        },
+                        PeerError.BadMagic => {
+                            peer_obj.misbehaving(100, "invalid network magic");
+                        },
+                        PeerError.BadChecksum => {
+                            peer_obj.misbehaving(50, "bad message checksum");
+                        },
+                        PeerError.MessageTooLarge => {
+                            peer_obj.misbehaving(50, "oversized message");
+                        },
+                        PeerError.ProtocolViolation => {
+                            peer_obj.misbehaving(20, "protocol violation");
+                        },
+                        else => {
+                            peer_obj.misbehaving(10, "message receive error");
+                        },
+                    }
+
+                    // Check if should be banned after misbehavior
+                    if (peer_obj.should_ban) {
+                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                        self.removePeerByIndex(i);
+                        break;
+                    }
+                    break; // Stop draining on any error
+                };
+
+                self.handleMessage(peer_obj, msg) catch {};
+                msgs_read += 1;
+            }
+
+            // Restore long timeout for handshake use
+            if (i < self.peers.items.len and self.peers.items[i] == peer_obj) {
+                peer_obj.setRecvTimeout(30, 0);
+            }
         }
     }
 
     /// Send getheaders to a peer using our current best block as locator.
     fn sendGetHeaders(self: *PeerManager, target_peer: *Peer) !void {
-        // Build locator: our best hash (or genesis if at height 0)
+        // Build locator: use the tip of the header queue if available,
+        // otherwise our best connected hash, or genesis.
         var locator_hash: types.Hash256 = undefined;
-        if (self.chain_state) |cs| {
+        if (self.expected_blocks.items.len > 0) {
+            // Use the last known header hash (end of queue) to avoid duplicate headers
+            locator_hash = self.expected_blocks.items[self.expected_blocks.items.len - 1];
+        } else if (self.chain_state) |cs| {
             if (cs.best_height > 0) {
                 locator_hash = cs.best_hash;
             } else {
@@ -1775,7 +1928,6 @@ pub const PeerManager = struct {
         } };
         try target_peer.sendMessage(&msg);
         target_peer.last_getheaders_time = std.time.timestamp();
-        std.debug.print("P2P: Sent getheaders (locator height={d})\n", .{if (self.chain_state) |cs| cs.best_height else 0});
     }
 
     /// Handle a received message.
@@ -1821,59 +1973,68 @@ pub const PeerManager = struct {
             },
             .headers => |h| {
                 defer self.allocator.free(h.headers);
-                // Clear getheaders timeout on ALL peers since we got a response
-                for (self.peers.items) |p| {
-                    p.clearGetheadersTimeout();
-                }
+                // Don't clear getheaders timeout -- we'll request more below if needed
 
                 if (h.headers.len == 0) {
                     std.debug.print("P2P: Received 0 headers - fully synced\n", .{});
                     return;
                 }
-                std.debug.print("P2P: Received {d} headers\n", .{h.headers.len});
 
-                // Request blocks for the received headers
-                var block_invs = std.ArrayList(p2p.InvVector).init(self.allocator);
-                defer block_invs.deinit();
+                // Deduplicate: only accept headers that chain to our known tip.
+                // The first header's prev_block must match either:
+                // - The last hash in expected_blocks (if any), or
+                // - Our best block hash (genesis or connected tip)
+                const expected_prev = if (self.expected_blocks.items.len > 0)
+                    self.expected_blocks.items[self.expected_blocks.items.len - 1]
+                else if (self.chain_state) |cs|
+                    cs.best_hash
+                else
+                    self.network_params.genesis_hash;
 
+                if (!std.mem.eql(u8, &h.headers[0].prev_block, &expected_prev)) {
+                    // Duplicate/out-of-order headers from another peer - skip
+                    return;
+                }
+
+                std.debug.print("P2P: Received {d} new headers (queue={d})\n", .{
+                    h.headers.len,
+                    self.expected_blocks.items.len + h.headers.len,
+                });
+
+                // Add header hashes to the expected_blocks queue
                 for (h.headers) |header| {
                     const block_hash = crypto.computeBlockHash(&header);
-                    block_invs.append(.{
-                        .inv_type = .msg_witness_block,
-                        .hash = block_hash,
-                    }) catch continue;
+                    self.expected_blocks.append(block_hash) catch continue;
                 }
 
-                if (block_invs.items.len > 0) {
-                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = block_invs.items } };
-                    peer.sendMessage(&getdata_msg) catch |err| {
-                        std.debug.print("P2P: Failed to send getdata: {}\n", .{err});
-                    };
-                    std.debug.print("P2P: Requested {d} blocks via getdata\n", .{block_invs.items.len});
+                // Request more headers from this specific peer if we got a full batch
+                // But limit the queue to avoid too many outstanding blocks
+                const remaining_queue = self.expected_blocks.items.len - self.connect_cursor;
+                if (h.headers.len >= 2000 and remaining_queue < 16000) {
+                    self.sendGetHeaders(peer) catch {};
                 }
+
+                // Pipeline: request blocks up to the download window
+                self.pipelineBlockRequests() catch {};
             },
             .block => |block| {
-                defer serialize.freeBlock(self.allocator, &block);
                 const block_hash = crypto.computeBlockHash(&block.header);
-                if (self.chain_state) |cs| {
-                    // Check this block connects to our tip
-                    const connects = if (cs.best_height == 0)
-                        std.mem.eql(u8, &block.header.prev_block, &self.network_params.genesis_hash)
-                    else
-                        std.mem.eql(u8, &block.header.prev_block, &cs.best_hash);
 
-                    if (connects) {
-                        const height = cs.best_height + 1;
-                        var undo = cs.connectBlock(&block, &block_hash, height) catch |err| {
-                            std.debug.print("P2P: Failed to connect block at height {d}: {}\n", .{ height, err });
-                            return;
-                        };
-                        undo.deinit(self.allocator);
-                        self.our_height = @intCast(cs.best_height);
-                        std.debug.print("P2P: Connected block height={d}\n", .{cs.best_height});
-                    }
-                    // Silently ignore blocks that don't connect (duplicates from redundant requests)
-                }
+                // Decrement in-flight counter
+                if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
+
+                // Buffer the block (transfer ownership - do NOT free here)
+                self.block_buffer.put(block_hash, block) catch {
+                    // If we can't buffer it, free and drop
+                    serialize.freeBlock(self.allocator, &block);
+                    return;
+                };
+
+                // Try to connect as many buffered blocks as possible in order
+                self.drainBlockBuffer();
+
+                // Request more blocks to keep the pipeline full
+                self.pipelineBlockRequests() catch {};
             },
             .getaddr => {
                 // Send some known addresses back
@@ -2206,6 +2367,234 @@ pub const PeerManager = struct {
         self.allocator.destroy(peer);
     }
 
+    // ========================================================================
+    // Block Download Pipeline
+    // ========================================================================
+
+    /// Request blocks from peers to keep the download pipeline full.
+    /// Distributes requests across all connected peers round-robin.
+    fn pipelineBlockRequests(self: *PeerManager) !void {
+        if (self.chain_state == null) return;
+        if (self.download_cursor >= self.expected_blocks.items.len) return;
+
+        // Build list of capable peers
+        var capable_peers: [32]*Peer = undefined;
+        var n_capable: usize = 0;
+        for (self.peers.items) |p| {
+            if (n_capable >= 32) break;
+            if (p.state == .handshake_complete) {
+                capable_peers[n_capable] = p;
+                n_capable += 1;
+            }
+        }
+        if (n_capable == 0) return;
+
+        // Distribute block requests across peers in round-robin.
+        // Each peer gets a batch of up to 16 blocks per getdata message.
+        var peer_idx: usize = 0;
+
+        // Don't download too far ahead of the connection cursor
+        // This prevents accumulating huge buffers when blocks arrive out of order
+        const max_ahead: u32 = 2048;
+        while (self.blocks_in_flight < self.max_blocks_in_flight and
+            self.download_cursor < self.expected_blocks.items.len and
+            self.download_cursor < self.connect_cursor + max_ahead)
+        {
+            const tp = capable_peers[peer_idx % n_capable];
+            peer_idx += 1;
+
+            // Build a batch for this peer
+            var invs = std.ArrayList(p2p.InvVector).init(self.allocator);
+
+            var batch_count: u32 = 0;
+            while (batch_count < 64 and
+                self.blocks_in_flight + batch_count < self.max_blocks_in_flight and
+                self.download_cursor < self.expected_blocks.items.len)
+            {
+                const h = self.expected_blocks.items[self.download_cursor];
+                if (!self.block_buffer.contains(h)) {
+                    invs.append(.{
+                        .inv_type = .msg_witness_block,
+                        .hash = h,
+                    }) catch break;
+                    batch_count += 1;
+                }
+                self.download_cursor += 1;
+            }
+
+            if (invs.items.len > 0) {
+                const getdata_msg = p2p.Message{ .getdata = .{ .inventory = invs.items } };
+                tp.sendMessage(&getdata_msg) catch {
+                    invs.deinit();
+                    continue;
+                };
+                self.blocks_in_flight += batch_count;
+            }
+            invs.deinit();
+
+            // Stop if we've gone through all peers once with no progress
+            if (peer_idx >= n_capable and batch_count == 0) break;
+        }
+    }
+
+    /// Try to connect buffered blocks in order to chain_state.
+    /// Connects as many sequential blocks as possible from the buffer.
+    /// Runs in a tight loop without yielding until the buffer is drained or a gap is hit.
+    fn drainBlockBuffer(self: *PeerManager) void {
+        const cs = self.chain_state orelse return;
+        var connected: u32 = 0;
+        var slow_blocks: u32 = 0;
+        const drain_start = std.time.nanoTimestamp();
+
+        // Stall recovery: if we have pending blocks but can't connect the next one,
+        // re-request the missing block(s) from the connect cursor.
+        // Throttled to once every 5 seconds.
+        if (self.connect_cursor < self.expected_blocks.items.len) {
+            const now_check = std.time.timestamp();
+            if (now_check - self.last_stall_recovery >= 5) {
+                self.last_stall_recovery = now_check;
+                // Re-request any missing blocks near the connect cursor
+                for (self.peers.items) |p| {
+                    if (p.state != .handshake_complete) continue;
+                    var invs = std.ArrayList(p2p.InvVector).init(self.allocator);
+                    var cursor = self.connect_cursor;
+                    // Request up to 128 blocks from the connection front
+                    while (cursor < self.expected_blocks.items.len and invs.items.len < 128) : (cursor += 1) {
+                        const h = self.expected_blocks.items[cursor];
+                        if (!self.block_buffer.contains(h)) {
+                            invs.append(.{
+                                .inv_type = .msg_witness_block,
+                                .hash = h,
+                            }) catch break;
+                        }
+                    }
+                    if (invs.items.len > 0) {
+                        const getdata_msg = p2p.Message{ .getdata = .{ .inventory = invs.items } };
+                        p.sendMessage(&getdata_msg) catch {};
+                    }
+                    invs.deinit();
+                    break; // Only one peer
+                }
+            }
+        }
+
+        while (self.connect_cursor < self.expected_blocks.items.len) {
+            // The next block we need to connect
+            const expected_hash = self.expected_blocks.items[self.connect_cursor];
+
+            // Is it in the buffer?
+            const entry = self.block_buffer.fetchRemove(expected_hash);
+            if (entry == null) break; // Not yet received, stop
+
+            var block = entry.?.value;
+            defer serialize.freeBlock(self.allocator, &block);
+
+            const block_hash = crypto.computeBlockHash(&block.header);
+            const height = cs.best_height + 1;
+
+            // Timing for per-block diagnostics
+            const block_start = std.time.nanoTimestamp();
+
+            // During IBD, skip undo data collection for speed
+            cs.connectBlockFast(&block, &block_hash, height) catch |err| {
+                std.debug.print("P2P: Failed to connect block at height {d}: {}\n", .{ height, err });
+                break;
+            };
+
+            const block_elapsed_ns = std.time.nanoTimestamp() - block_start;
+            const block_elapsed_ms = @divTrunc(block_elapsed_ns, 1_000_000);
+            if (block_elapsed_ms > 50) {
+                slow_blocks += 1;
+                if (slow_blocks <= 3) {
+                    std.debug.print("P2P: SLOW block {d}: {d}ms utxos={d}\n", .{
+                        height,
+                        block_elapsed_ms,
+                        cs.utxo_set.cache.count(),
+                    });
+                }
+            }
+
+            self.our_height = @intCast(cs.best_height);
+            connected += 1;
+            self.blocks_since_log += 1;
+            self.connect_cursor += 1;
+
+            // Periodically compact the expected_blocks list to reclaim memory
+            // when we've connected a large chunk
+            if (self.connect_cursor > 10000) {
+                // Shift remaining items to the front
+                const remaining = self.expected_blocks.items.len - self.connect_cursor;
+                if (remaining > 0) {
+                    std.mem.copyForwards(
+                        types.Hash256,
+                        self.expected_blocks.items[0..remaining],
+                        self.expected_blocks.items[self.connect_cursor..self.expected_blocks.items.len],
+                    );
+                }
+                self.expected_blocks.shrinkRetainingCapacity(remaining);
+                self.download_cursor -= @min(self.download_cursor, self.connect_cursor);
+                self.connect_cursor = 0;
+            }
+        }
+
+        if (connected > 0) {
+            const drain_elapsed_ns = std.time.nanoTimestamp() - drain_start;
+            const drain_elapsed_ms = @divTrunc(drain_elapsed_ns, 1_000_000);
+
+            // Log progress periodically (every 5 seconds)
+            const now = std.time.timestamp();
+            if (now - self.last_progress_log >= 5) {
+                const elapsed = if (now > self.last_progress_log and self.last_progress_log > 0)
+                    @as(u32, @intCast(now - self.last_progress_log))
+                else
+                    5;
+                const rate = if (elapsed > 0) self.blocks_since_log / elapsed else self.blocks_since_log;
+                const remaining = self.expected_blocks.items.len - self.connect_cursor;
+                std.debug.print("P2P: height={d} buffer={d} in_flight={d} queue={d} rate={d} blk/s drain={d}ms utxos={d}\n", .{
+                    cs.best_height,
+                    self.block_buffer.count(),
+                    self.blocks_in_flight,
+                    remaining,
+                    rate,
+                    drain_elapsed_ms,
+                    cs.utxo_set.cache.count(),
+                });
+                if (slow_blocks > 0) {
+                    std.debug.print("P2P: {d} slow blocks (>50ms) in this drain\n", .{slow_blocks});
+                }
+                self.last_progress_log = now;
+                self.blocks_since_log = 0;
+            }
+
+            // Immediately request more headers if we've consumed most of our queue
+            const remaining = self.expected_blocks.items.len - self.connect_cursor;
+            if (remaining < 500) {
+                for (self.peers.items) |p| {
+                    if (p.state == .handshake_complete and p.last_getheaders_time == 0) {
+                        self.sendGetHeaders(p) catch {};
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if we are in Initial Block Download (IBD).
+    fn isIBD(self: *const PeerManager) bool {
+        if (self.chain_state) |cs| {
+            // We're in IBD if we have pending blocks to download or our queue is active
+            if (self.expected_blocks.items.len > 0) return true;
+            if (self.block_buffer.count() > 0) return true;
+            // Also check if any peer is significantly ahead of us
+            for (self.peers.items) |p| {
+                if (p.start_height > 0 and cs.best_height + 10 < @as(u32, @intCast(p.start_height))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /// Main peer management loop.
     pub fn run(self: *PeerManager) !void {
         self.running.store(true, .release);
@@ -2256,8 +2645,12 @@ pub const PeerManager = struct {
 
         while (self.running.load(.acquire)) {
             // 1. Open new outbound connections if needed (skip if --connect mode)
+            // During IBD, skip connection attempts if we already have peers (avoids blocking)
             if (self.connect_address == null) {
-                self.maintainOutbound() catch {};
+                const has_peers = self.peers.items.len > 0;
+                if (!has_peers or !self.isIBD()) {
+                    self.maintainOutbound() catch {};
+                }
             }
 
             // 2. Accept inbound connections
@@ -2265,6 +2658,10 @@ pub const PeerManager = struct {
 
             // 3. Process messages from all peers
             self.processAllMessages() catch {};
+
+            // 3b. Drain block buffer and pipeline more requests
+            self.drainBlockBuffer();
+            self.pipelineBlockRequests() catch {};
 
             // 4. Send pings to idle peers
             self.sendPings() catch {};
@@ -2280,8 +2677,12 @@ pub const PeerManager = struct {
                 self.rotatePeers();
             }
 
-            // 8. Brief sleep to avoid busy-loop
-            std.time.sleep(100 * std.time.ns_per_ms);
+            // 8. Brief sleep to avoid busy-loop.
+            // During IBD, poll() in processAllMessages handles the wait (10ms timeout),
+            // so no additional sleep is needed. Outside IBD, sleep 50ms.
+            if (!self.isIBD()) {
+                std.time.sleep(50 * std.time.ns_per_ms);
+            }
         }
     }
 

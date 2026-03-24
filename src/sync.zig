@@ -1168,9 +1168,8 @@ pub const BlockDownloader = struct {
                 total_fees += input_sum - output_sum;
             }
 
-            // Add new UTXOs for all outputs
-            const tx_hash = crypto.computeTxid(&tx, arena_alloc) catch
-                return BlockDownloadError.OutOfMemory;
+            // Add new UTXOs for all outputs (reuse txid from merkle root computation)
+            const tx_hash = tx_hashes[tx_idx];
             for (tx.outputs, 0..) |output, out_idx| {
                 // Skip unspendable outputs (OP_RETURN)
                 if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) continue;
