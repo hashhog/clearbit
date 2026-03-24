@@ -827,26 +827,143 @@ pub fn verifySchnorr(sig: *const [64]u8, msg_hash: *const [32]u8, pubkey_x: *con
 // Transaction Hashing
 // ============================================================================
 
+/// A writer adapter that feeds bytes directly to a SHA256 hasher.
+/// Eliminates intermediate buffer allocation for hash computation.
+pub const Sha256Writer = struct {
+    hasher: std.crypto.hash.sha2.Sha256,
+
+    pub fn init() Sha256Writer {
+        return .{ .hasher = std.crypto.hash.sha2.Sha256.init(.{}) };
+    }
+
+    /// Write raw bytes
+    pub fn writeBytes(self: *Sha256Writer, data: []const u8) !void {
+        self.hasher.update(data);
+    }
+
+    /// Write a little-endian integer
+    pub fn writeInt(self: *Sha256Writer, comptime T: type, value: T) !void {
+        var buf: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &buf, value, .little);
+        self.hasher.update(&buf);
+    }
+
+    /// Write a CompactSize (variable-length integer)
+    pub fn writeCompactSize(self: *Sha256Writer, value: u64) !void {
+        if (value < 0xFD) {
+            try self.writeInt(u8, @intCast(value));
+        } else if (value <= 0xFFFF) {
+            try self.writeInt(u8, 0xFD);
+            try self.writeInt(u16, @intCast(value));
+        } else if (value <= 0xFFFFFFFF) {
+            try self.writeInt(u8, 0xFE);
+            try self.writeInt(u32, @intCast(value));
+        } else {
+            try self.writeInt(u8, 0xFF);
+            try self.writeInt(u64, value);
+        }
+    }
+
+    /// Finalize and return double-SHA256 hash
+    pub fn finalHash256(self: *Sha256Writer) Hash256 {
+        var first_hash: Hash256 = undefined;
+        self.hasher.final(&first_hash);
+        var result: Hash256 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&first_hash, &result, .{});
+        return result;
+    }
+};
+
+/// Serialize transaction (no witness) directly into a SHA256 hasher.
+fn writeTransactionNoWitnessToHasher(w: *Sha256Writer, tx: *const types.Transaction) void {
+    w.writeInt(i32, tx.version) catch unreachable;
+
+    w.writeCompactSize(tx.inputs.len) catch unreachable;
+    for (tx.inputs) |input| {
+        w.writeBytes(&input.previous_output.hash) catch unreachable;
+        w.writeInt(u32, input.previous_output.index) catch unreachable;
+        w.writeCompactSize(input.script_sig.len) catch unreachable;
+        w.writeBytes(input.script_sig) catch unreachable;
+        w.writeInt(u32, input.sequence) catch unreachable;
+    }
+
+    w.writeCompactSize(tx.outputs.len) catch unreachable;
+    for (tx.outputs) |output| {
+        w.writeInt(i64, output.value) catch unreachable;
+        w.writeCompactSize(output.script_pubkey.len) catch unreachable;
+        w.writeBytes(output.script_pubkey) catch unreachable;
+    }
+
+    w.writeInt(u32, tx.lock_time) catch unreachable;
+}
+
+/// Serialize full transaction (with witness) directly into a SHA256 hasher.
+fn writeTransactionToHasher(w: *Sha256Writer, tx: *const types.Transaction) void {
+    w.writeInt(i32, tx.version) catch unreachable;
+
+    const has_witness = tx.hasWitness();
+
+    if (has_witness) {
+        w.writeBytes(&[_]u8{ 0x00, 0x01 }) catch unreachable; // segwit marker + flag
+    }
+
+    w.writeCompactSize(tx.inputs.len) catch unreachable;
+    for (tx.inputs) |input| {
+        w.writeBytes(&input.previous_output.hash) catch unreachable;
+        w.writeInt(u32, input.previous_output.index) catch unreachable;
+        w.writeCompactSize(input.script_sig.len) catch unreachable;
+        w.writeBytes(input.script_sig) catch unreachable;
+        w.writeInt(u32, input.sequence) catch unreachable;
+    }
+
+    w.writeCompactSize(tx.outputs.len) catch unreachable;
+    for (tx.outputs) |output| {
+        w.writeInt(i64, output.value) catch unreachable;
+        w.writeCompactSize(output.script_pubkey.len) catch unreachable;
+        w.writeBytes(output.script_pubkey) catch unreachable;
+    }
+
+    if (has_witness) {
+        for (tx.inputs) |input| {
+            w.writeCompactSize(input.witness.len) catch unreachable;
+            for (input.witness) |item| {
+                w.writeCompactSize(item.len) catch unreachable;
+                w.writeBytes(item) catch unreachable;
+            }
+        }
+    }
+
+    w.writeInt(u32, tx.lock_time) catch unreachable;
+}
+
 /// Compute the txid (double-SHA256 of the non-witness serialization).
 /// Returns the hash in internal byte order (not display order).
+/// Uses streaming hashing — zero allocations.
 pub fn computeTxid(tx: *const types.Transaction, allocator: std.mem.Allocator) !Hash256 {
-    var writer = serialize.Writer.init(allocator);
-    defer writer.deinit();
-    try serialize.writeTransactionNoWitness(&writer, tx);
-    const data = try writer.toOwnedSlice();
-    defer allocator.free(data);
-    return hash256(data);
+    _ = allocator; // no longer needed, kept for API compatibility
+    return computeTxidStreaming(tx);
+}
+
+/// Compute the txid with zero allocations using streaming SHA256.
+pub fn computeTxidStreaming(tx: *const types.Transaction) Hash256 {
+    var w = Sha256Writer.init();
+    writeTransactionNoWitnessToHasher(&w, tx);
+    return w.finalHash256();
 }
 
 /// Compute the wtxid (double-SHA256 of full serialization including witness).
 /// For non-segwit transactions, wtxid equals txid.
+/// Uses streaming hashing — zero allocations.
 pub fn computeWtxid(tx: *const types.Transaction, allocator: std.mem.Allocator) !Hash256 {
-    var writer = serialize.Writer.init(allocator);
-    defer writer.deinit();
-    try serialize.writeTransaction(&writer, tx);
-    const data = try writer.toOwnedSlice();
-    defer allocator.free(data);
-    return hash256(data);
+    _ = allocator; // no longer needed, kept for API compatibility
+    return computeWtxidStreaming(tx);
+}
+
+/// Compute the wtxid with zero allocations using streaming SHA256.
+pub fn computeWtxidStreaming(tx: *const types.Transaction) Hash256 {
+    var w = Sha256Writer.init();
+    writeTransactionToHasher(&w, tx);
+    return w.finalHash256();
 }
 
 /// Compute the hash of a block header (double-SHA256).

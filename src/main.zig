@@ -7,6 +7,7 @@
 //! - Subsystem initialization and orchestration
 
 const std = @import("std");
+const builtin = @import("builtin");
 pub const types = @import("types.zig");
 pub const crypto = @import("crypto.zig");
 pub const serialize = @import("serialize.zig");
@@ -439,9 +440,16 @@ pub fn installSignalHandlers() void {
 // ============================================================================
 
 pub fn main() !void {
+    // Use c_allocator for release builds (faster, no safety overhead).
+    // GPA is kept for debug builds for leak detection and safety checks.
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    defer if (comptime builtin.mode == .Debug) {
+        _ = gpa.deinit();
+    };
+    const allocator = if (comptime builtin.mode == .Debug)
+        gpa.allocator()
+    else
+        std.heap.c_allocator;
 
     // 1. Parse CLI arguments
     var config = Config{};

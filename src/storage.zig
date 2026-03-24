@@ -731,6 +731,10 @@ pub const UtxoSet = struct {
     hits: u64,
     misses: u64,
 
+    // Batched DB deletes for IBD performance
+    pending_deletes: std.ArrayList([36]u8),
+    adds_since_eviction_check: u32,
+
     /// Cache entry with ownership tracking.
     const CacheEntry = struct {
         utxo: CompactUtxo,
@@ -745,9 +749,12 @@ pub const UtxoSet = struct {
     /// Initialize a new UTXO set.
     /// If db is null, operates in memory-only mode (useful for testing).
     pub fn init(db: ?*Database, max_cache_mb: usize, allocator: std.mem.Allocator) UtxoSet {
+        // Pre-size HashMap for IBD performance (~3M entries expected for testnet4)
+        var cache = std.AutoHashMap([36]u8, CacheEntry).init(allocator);
+        cache.ensureTotalCapacity(1 << 20) catch {}; // 1M slots pre-allocated
         return UtxoSet{
             .db = db,
-            .cache = std.AutoHashMap([36]u8, CacheEntry).init(allocator),
+            .cache = cache,
             .cache_size = 0,
             .max_cache_size = max_cache_mb * 1024 * 1024,
             .allocator = allocator,
@@ -755,10 +762,14 @@ pub const UtxoSet = struct {
             .total_amount = 0,
             .hits = 0,
             .misses = 0,
+            .pending_deletes = std.ArrayList([36]u8).init(allocator),
+            .adds_since_eviction_check = 0,
         };
     }
 
     pub fn deinit(self: *UtxoSet) void {
+        self.flushPendingDeletes() catch {};
+        self.pending_deletes.deinit();
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             var cache_entry = entry.value_ptr.*;
@@ -858,9 +869,13 @@ pub const UtxoSet = struct {
             entry.deinit(self.allocator);
         }
 
-        // Evict old non-dirty entries if cache is too large
-        if (self.cacheMemoryUsage() > self.max_cache_size) {
-            self.evictCache();
+        // Check eviction every 1000 adds instead of every add (saves overhead)
+        self.adds_since_eviction_check += 1;
+        if (self.adds_since_eviction_check >= 1000) {
+            self.adds_since_eviction_check = 0;
+            if (self.cacheMemoryUsage() > self.max_cache_size) {
+                self.evictCache();
+            }
         }
 
         // Store in cache (marked dirty for eventual flush to DB)
@@ -877,10 +892,12 @@ pub const UtxoSet = struct {
     /// ones can be re-fetched from the block chain if needed (though in practice
     /// memory-only mode accepts the data loss on eviction).
     fn evictCache(self: *UtxoSet) void {
-        // First, flush dirty entries to DB if possible
-        if (self.db != null) {
-            self.flush() catch {};
-        }
+        // Without a DB backend, eviction loses data permanently.
+        // Only evict if we have a DB to fall back to.
+        if (self.db == null) return;
+
+        // First, flush dirty entries to DB
+        self.flush() catch {};
 
         var to_remove = std.ArrayList([36]u8).init(self.allocator);
         defer to_remove.deinit();
@@ -920,9 +937,13 @@ pub const UtxoSet = struct {
             self.total_utxos -= 1;
             self.total_amount -= old.value.utxo.value;
 
-            // Delete from DB if we have one
-            if (self.db) |db| {
-                db.delete(CF_UTXO, &key) catch {};
+            // Batch the DB delete instead of doing it synchronously
+            if (self.db != null) {
+                self.pending_deletes.append(key) catch {};
+                // Flush batch when it gets large enough
+                if (self.pending_deletes.items.len >= 10000) {
+                    self.flushPendingDeletes() catch {};
+                }
             }
 
             return old.value.utxo;
@@ -936,8 +957,11 @@ pub const UtxoSet = struct {
 
             const utxo = try CompactUtxo.decode(data.?, self.allocator);
 
-            // Delete from database
-            db.delete(CF_UTXO, &key) catch {};
+            // Batch the DB delete
+            self.pending_deletes.append(key) catch {};
+            if (self.pending_deletes.items.len >= 10000) {
+                self.flushPendingDeletes() catch {};
+            }
 
             self.total_utxos -= 1;
             self.total_amount -= utxo.value;
@@ -951,6 +975,9 @@ pub const UtxoSet = struct {
     /// Flush the dirty cache entries to disk.
     pub fn flush(self: *UtxoSet) !void {
         if (self.db == null) return;
+
+        // Flush pending deletes first
+        try self.flushPendingDeletes();
 
         var batch = std.ArrayList(BatchOp).init(self.allocator);
         defer batch.deinit();
@@ -985,6 +1012,38 @@ pub const UtxoSet = struct {
                 }
             }
         }
+    }
+
+    /// Flush pending DB deletes as a batch operation.
+    pub fn flushPendingDeletes(self: *UtxoSet) !void {
+        if (self.db == null or self.pending_deletes.items.len == 0) return;
+
+        var batch = std.ArrayList(BatchOp).init(self.allocator);
+        defer batch.deinit();
+
+        for (self.pending_deletes.items) |key| {
+            const key_copy = try self.allocator.alloc(u8, 36);
+            @memcpy(key_copy, &key);
+            try batch.append(.{ .delete = .{
+                .cf = CF_UTXO,
+                .key = key_copy,
+            } });
+        }
+
+        if (batch.items.len > 0) {
+            self.db.?.writeBatch(batch.items) catch {};
+            for (batch.items) |op| {
+                switch (op) {
+                    .delete => |d| self.allocator.free(@constCast(d.key)),
+                    .put => |p| {
+                        self.allocator.free(@constCast(p.key));
+                        self.allocator.free(@constCast(p.value));
+                    },
+                }
+            }
+        }
+
+        self.pending_deletes.clearRetainingCapacity();
     }
 
     /// Get cache hit rate.
@@ -1415,7 +1474,7 @@ pub const ChainState = struct {
             .best_hash = [_]u8{0} ** 32,
             .best_height = 0,
             .total_work = [_]u8{0} ** 32,
-            .utxo_set = UtxoSet.init(db, 450, allocator), // 450 MB UTXO cache
+            .utxo_set = UtxoSet.init(db, 4096, allocator), // 4 GB UTXO cache (needed for IBD without DB backend)
             .undo_manager = null,
             .allocator = allocator,
         };
@@ -1427,7 +1486,7 @@ pub const ChainState = struct {
             .best_hash = [_]u8{0} ** 32,
             .best_height = 0,
             .total_work = [_]u8{0} ** 32,
-            .utxo_set = UtxoSet.init(db, 450, allocator),
+            .utxo_set = UtxoSet.init(db, 4096, allocator),
             .undo_manager = UndoFileManager.init(data_dir, allocator),
             .allocator = allocator,
         };
@@ -1437,12 +1496,43 @@ pub const ChainState = struct {
         self.utxo_set.deinit();
     }
 
-    /// Connect a block: spend inputs, create outputs, save undo data.
+    /// Connect a block: spend inputs, create outputs, optionally save undo data.
+    /// When skip_undo is true (IBD mode), no undo data is collected, reducing allocations.
     pub fn connectBlock(
         self: *ChainState,
         block: *const types.Block,
         hash: *const types.Hash256,
         height: u32,
+    ) !BlockUndo {
+        return self.connectBlockInner(block, hash, height, false);
+    }
+
+    /// Connect a block during IBD — skip undo data collection for speed.
+    pub fn connectBlockFast(
+        self: *ChainState,
+        block: *const types.Block,
+        hash: *const types.Hash256,
+        height: u32,
+    ) !void {
+        var undo = try self.connectBlockInner(block, hash, height, true);
+        undo.deinit(self.allocator);
+
+        // Periodically flush pending DB deletes and dirty cache (every 100 blocks)
+        if (height % 100 == 0) {
+            self.utxo_set.flushPendingDeletes() catch {};
+        }
+        // Flush dirty cache to DB every 1000 blocks during IBD
+        if (height % 1000 == 0) {
+            self.utxo_set.flush() catch {};
+        }
+    }
+
+    fn connectBlockInner(
+        self: *ChainState,
+        block: *const types.Block,
+        hash: *const types.Hash256,
+        height: u32,
+        skip_undo: bool,
     ) !BlockUndo {
         const crypto = @import("crypto.zig");
 
@@ -1459,17 +1549,25 @@ pub const ChainState = struct {
         errdefer created_list.deinit();
 
         for (block.transactions, 0..) |tx, tx_idx| {
-            const tx_hash = try crypto.computeTxid(&tx, self.allocator);
+            const tx_hash = crypto.computeTxidStreaming(&tx);
 
             // Spend inputs (skip coinbase)
             if (tx_idx > 0) {
                 for (tx.inputs) |input| {
-                    const spent = try self.utxo_set.spend(&input.previous_output)
-                        orelse return error.MissingInput;
-                    try spent_list.append(.{
-                        .outpoint = input.previous_output,
-                        .utxo = spent,
-                    });
+                    if (skip_undo) {
+                        // Fast path: just delete the UTXO, don't track what was spent
+                        const spent = try self.utxo_set.spend(&input.previous_output)
+                            orelse return error.MissingInput;
+                        var s = spent;
+                        s.deinit(self.allocator);
+                    } else {
+                        const spent = try self.utxo_set.spend(&input.previous_output)
+                            orelse return error.MissingInput;
+                        try spent_list.append(.{
+                            .outpoint = input.previous_output,
+                            .utxo = spent,
+                        });
+                    }
                 }
             }
 
@@ -1483,7 +1581,9 @@ pub const ChainState = struct {
                     .index = @intCast(out_idx),
                 };
                 try self.utxo_set.add(&outpoint, &output, height, tx_idx == 0);
-                try created_list.append(outpoint);
+                if (!skip_undo) {
+                    try created_list.append(outpoint);
+                }
             }
         }
 
@@ -1491,8 +1591,8 @@ pub const ChainState = struct {
         self.best_height = height;
 
         return BlockUndo{
-            .spent_utxos = try spent_list.toOwnedSlice(),
-            .created_outpoints = try created_list.toOwnedSlice(),
+            .spent_utxos = if (skip_undo) &[_]BlockUndo.SpentUtxo{} else try spent_list.toOwnedSlice(),
+            .created_outpoints = if (skip_undo) &[_]types.OutPoint{} else try created_list.toOwnedSlice(),
         };
     }
 
