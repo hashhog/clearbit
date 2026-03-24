@@ -717,10 +717,22 @@ pub const CompactUtxo = struct {
 // ============================================================================
 
 /// UTXO set manager with in-memory caching.
+/// Hash context for UTXO keys that exploits the fact that the first 32 bytes
+/// are already a SHA256d hash (txid), so we can use the first 8 bytes directly
+/// as the hash value with zero computation overhead.
+const UtxoKeyContext = struct {
+    pub fn hash(_: UtxoKeyContext, key: [36]u8) u64 {
+        return std.mem.readInt(u64, key[0..8], .little);
+    }
+    pub fn eql(_: UtxoKeyContext, a: [36]u8, b: [36]u8) bool {
+        return std.mem.eql(u8, &a, &b);
+    }
+};
+
 /// Provides efficient lookups with a configurable cache size for IBD performance.
 pub const UtxoSet = struct {
     db: ?*Database,
-    cache: std.AutoHashMap([36]u8, CacheEntry),
+    cache: std.HashMap([36]u8, CacheEntry, UtxoKeyContext, std.hash_map.default_max_load_percentage),
     cache_size: usize,
     max_cache_size: usize,
     allocator: std.mem.Allocator,
@@ -750,7 +762,7 @@ pub const UtxoSet = struct {
     /// If db is null, operates in memory-only mode (useful for testing).
     pub fn init(db: ?*Database, max_cache_mb: usize, allocator: std.mem.Allocator) UtxoSet {
         // Pre-size HashMap for IBD performance (~3M entries expected for testnet4)
-        var cache = std.AutoHashMap([36]u8, CacheEntry).init(allocator);
+        var cache = std.HashMap([36]u8, CacheEntry, UtxoKeyContext, std.hash_map.default_max_load_percentage).init(allocator);
         cache.ensureTotalCapacity(1 << 20) catch {}; // 1M slots pre-allocated
         return UtxoSet{
             .db = db,
