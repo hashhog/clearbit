@@ -283,7 +283,7 @@ pub const Peer = struct {
             return PeerError.ConnectionFailed;
 
         // Set socket options for timeouts (30 seconds)
-        const timeout = std.posix.timeval{ .sec = 30, .usec = 0 };
+        const timeout = std.posix.timeval{ .tv_sec = 30, .tv_usec = 0 };
         std.posix.setsockopt(
             stream.handle,
             std.posix.SOL.SOCKET,
@@ -700,7 +700,7 @@ pub const Peer = struct {
 
     /// Set the receive timeout on the socket.
     pub fn setRecvTimeout(self: *Peer, sec: i64, usec: i64) void {
-        const timeout = std.posix.timeval{ .sec = sec, .usec = @intCast(usec) };
+        const timeout = std.posix.timeval{ .tv_sec = sec, .tv_usec = @intCast(usec) };
         std.posix.setsockopt(
             self.stream.handle,
             std.posix.SOL.SOCKET,
