@@ -431,8 +431,8 @@ pub fn installSignalHandlers() void {
         .mask = std.posix.empty_sigset,
         .flags = 0,
     };
-    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT, &sa, null) catch {};
+    std.posix.sigaction(std.posix.SIG.TERM, &sa, null) catch {};
 }
 
 // ============================================================================

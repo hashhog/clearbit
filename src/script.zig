@@ -980,7 +980,7 @@ pub const ScriptEngine = struct {
 
     fn pop(self: *ScriptEngine) ScriptError![]const u8 {
         if (self.stack.items.len == 0) return ScriptError.StackUnderflow;
-        return self.stack.pop() orelse return ScriptError.StackUnderflow;
+        return self.stack.pop();
     }
 
     fn peek(self: *ScriptEngine) ![]const u8 {
@@ -1119,7 +1119,7 @@ pub const ScriptEngine = struct {
 
             .op_fromaltstack => {
                 if (self.alt_stack.items.len == 0) return ScriptError.StackUnderflow;
-                const data = self.alt_stack.pop() orelse return ScriptError.StackUnderflow;
+                const data = self.alt_stack.pop();
                 try self.push(data);
             },
 

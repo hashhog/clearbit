@@ -1158,7 +1158,7 @@ pub const Mempool = struct {
         to_visit.append(txid) catch return result.toOwnedSlice() catch &[_]types.Hash256{};
 
         while (to_visit.items.len > 0) {
-            const current = to_visit.pop() orelse break;
+            const current = to_visit.pop();
 
             if (self.children.get(current)) |children_list| {
                 for (children_list.items) |child| {
