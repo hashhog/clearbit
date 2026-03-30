@@ -1976,21 +1976,20 @@ pub const PeerManager = struct {
             },
             .inv => |inv_msg| {
                 defer self.allocator.free(inv_msg.inventory);
-                // Request any announced blocks we don't have
-                var block_invs = std.ArrayList(p2p.InvVector).init(self.allocator);
-                defer block_invs.deinit();
+                // When a peer announces new blocks via inv, request headers
+                // so they enter expected_blocks and can be connected by
+                // drainBlockBuffer.  Directly requesting blocks via getdata
+                // without adding them to expected_blocks causes them to sit
+                // in block_buffer forever (chain tip never advances).
+                var has_block_inv = false;
                 for (inv_msg.inventory) |item| {
                     if (item.inv_type == .msg_block or item.inv_type == .msg_witness_block) {
-                        // Request as witness block
-                        block_invs.append(.{
-                            .inv_type = .msg_witness_block,
-                            .hash = item.hash,
-                        }) catch continue;
+                        has_block_inv = true;
+                        break;
                     }
                 }
-                if (block_invs.items.len > 0) {
-                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = block_invs.items } };
-                    peer.sendMessage(&getdata_msg) catch {};
+                if (has_block_inv) {
+                    self.sendGetHeaders(peer) catch {};
                 }
             },
             .headers => |h| {
