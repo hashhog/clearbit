@@ -1177,6 +1177,9 @@ pub const PeerManager = struct {
     outbound_protected_count: usize,
     /// Chain state for block sync.
     chain_state: ?*storage.ChainState,
+    /// Recently mined blocks cache for serving to peers on getdata.
+    /// Keyed by block hash, stores serialized block data.
+    mined_blocks: std.AutoHashMap(types.Hash256, []const u8),
     /// Address to connect to on startup (from --connect flag).
     connect_address: ?std.net.Address,
 
@@ -1236,6 +1239,7 @@ pub const PeerManager = struct {
             .last_tip_update_time = 0,
             .outbound_protected_count = 0,
             .chain_state = null,
+            .mined_blocks = std.AutoHashMap(types.Hash256, []const u8).init(allocator),
             .connect_address = null,
             .block_buffer = std.AutoHashMap(types.Hash256, types.Block).init(allocator),
             .expected_blocks = std.ArrayList(types.Hash256).init(allocator),
@@ -2113,6 +2117,24 @@ pub const PeerManager = struct {
                 // Free the deserialized transaction.
                 defer serialize.freeTransaction(self.allocator, &tx_msg);
             },
+            .getdata => |gd| {
+                // Serve requested blocks to peers
+                defer self.allocator.free(gd.inventory);
+                for (gd.inventory) |item| {
+                    const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
+                    if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_block))) {
+                        // Look up block from mined blocks cache
+                        if (self.mined_blocks.get(item.hash)) |block_data| {
+                            // Deserialize the block and send it
+                            var reader = serialize.Reader{ .data = block_data };
+                            const block = serialize.readBlock(&reader, self.allocator) catch continue;
+                            const block_msg = p2p.Message{ .block = block };
+                            peer.sendMessage(&block_msg) catch {};
+                            std.debug.print("P2P: served mined block to peer\n", .{});
+                        }
+                    }
+                }
+            },
             .notfound => |nf| {
                 // Free the allocated inventory array.
                 defer self.allocator.free(nf.inventory);
@@ -2763,6 +2785,15 @@ pub const PeerManager = struct {
     /// Disconnect timed-out peers (legacy API).
     pub fn pruneTimedOut(self: *PeerManager) void {
         self.disconnectStale();
+    }
+
+    /// Cache a mined block so it can be served to peers on getdata.
+    pub fn cacheMinedBlock(self: *PeerManager, hash: types.Hash256, block_data: []const u8) void {
+        // Store a copy of the serialized block
+        const data_copy = self.allocator.dupe(u8, block_data) catch return;
+        self.mined_blocks.put(hash, data_copy) catch {
+            self.allocator.free(data_copy);
+        };
     }
 
     /// Broadcast a message to all connected peers.
