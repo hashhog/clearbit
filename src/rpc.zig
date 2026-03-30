@@ -5703,7 +5703,7 @@ fn writeScriptAsm(writer: anytype, script_bytes: []const u8) !void {
 test "JSON-RPC result formatting" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -5732,7 +5732,7 @@ test "JSON-RPC result formatting" {
 test "JSON-RPC error formatting" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -5762,7 +5762,7 @@ test "JSON-RPC error formatting" {
 test "dispatch method not found" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -5792,7 +5792,7 @@ test "dispatch method not found" {
 test "dispatch parse error" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -5822,7 +5822,7 @@ test "dispatch parse error" {
 test "getblockchaininfo returns correct height and hash" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     // Set some chain state
@@ -5857,7 +5857,7 @@ test "getblockchaininfo returns correct height and hash" {
 test "getblockcount returns height" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
     chain_state.best_height = 500000;
 
@@ -5887,7 +5887,7 @@ test "getblockcount returns height" {
 test "getblockhash with height 0 returns genesis" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -5917,7 +5917,7 @@ test "getblockhash with height 0 returns genesis" {
 test "getmempoolinfo returns stats" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -5947,7 +5947,7 @@ test "getmempoolinfo returns stats" {
 test "sendrawtransaction rejects invalid hex" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -5978,7 +5978,7 @@ test "sendrawtransaction rejects invalid hex" {
 test "batch request handling" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -6009,7 +6009,7 @@ test "batch request handling" {
 test "batch request empty array returns error" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -6040,7 +6040,7 @@ test "batch request empty array returns error" {
 test "batch request with mixed success and failure" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -6074,7 +6074,7 @@ test "batch request with mixed success and failure" {
 test "batch request with invalid element type" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -6106,7 +6106,7 @@ test "batch request with invalid element type" {
 test "batch request preserves request order" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -6187,7 +6187,7 @@ test "RPC error codes" {
 test "sendrawtransaction rejects odd-length hex string" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -6219,7 +6219,7 @@ test "sendrawtransaction rejects odd-length hex string" {
 test "sendrawtransaction rejects empty hex string" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -6251,7 +6251,7 @@ test "sendrawtransaction rejects empty hex string" {
 test "sendrawtransaction rejects missing params" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -6289,7 +6289,7 @@ test "sendrawtransaction default maxfeerate constant" {
 test "sendrawtransaction with non-string hex param" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
