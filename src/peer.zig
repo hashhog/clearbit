@@ -1177,9 +1177,10 @@ pub const PeerManager = struct {
     outbound_protected_count: usize,
     /// Chain state for block sync.
     chain_state: ?*storage.ChainState,
-    /// Recently mined blocks cache for serving to peers on getdata.
+    /// Block relay cache for serving blocks to peers on getdata.
     /// Keyed by block hash, stores serialized block data.
-    mined_blocks: std.AutoHashMap(types.Hash256, []const u8),
+    /// Contains both locally mined blocks and recently connected blocks.
+    served_blocks: std.AutoHashMap(types.Hash256, []const u8),
     /// Address to connect to on startup (from --connect flag).
     connect_address: ?std.net.Address,
 
@@ -1239,7 +1240,7 @@ pub const PeerManager = struct {
             .last_tip_update_time = 0,
             .outbound_protected_count = 0,
             .chain_state = null,
-            .mined_blocks = std.AutoHashMap(types.Hash256, []const u8).init(allocator),
+            .served_blocks = std.AutoHashMap(types.Hash256, []const u8).init(allocator),
             .connect_address = null,
             .block_buffer = std.AutoHashMap(types.Hash256, types.Block).init(allocator),
             .expected_blocks = std.ArrayList(types.Hash256).init(allocator),
@@ -1275,6 +1276,14 @@ pub const PeerManager = struct {
             self.block_buffer.deinit();
         }
         self.expected_blocks.deinit();
+        // Free cached block data for relay
+        {
+            var iter = self.served_blocks.valueIterator();
+            while (iter.next()) |data| {
+                self.allocator.free(data.*);
+            }
+            self.served_blocks.deinit();
+        }
         if (self.listener) |*l| l.deinit();
     }
 
@@ -2118,19 +2127,32 @@ pub const PeerManager = struct {
                 defer serialize.freeTransaction(self.allocator, &tx_msg);
             },
             .getdata => |gd| {
-                // Serve requested blocks to peers
+                // Serve requested blocks to peers (check relay cache and pending buffer)
                 defer self.allocator.free(gd.inventory);
                 for (gd.inventory) |item| {
                     const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
                     if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_block))) {
-                        // Look up block from mined blocks cache
-                        if (self.mined_blocks.get(item.hash)) |block_data| {
-                            // Deserialize the block and send it
+                        // 1. Check served_blocks cache (mined + recently connected blocks)
+                        if (self.served_blocks.get(item.hash)) |block_data| {
                             var reader = serialize.Reader{ .data = block_data };
                             const block = serialize.readBlock(&reader, self.allocator) catch continue;
+                            defer serialize.freeBlock(self.allocator, &block);
                             const block_msg = p2p.Message{ .block = block };
                             peer.sendMessage(&block_msg) catch {};
-                            std.debug.print("P2P: served mined block to peer\n", .{});
+                            std.debug.print("P2P: served block from relay cache to peer\n", .{});
+                        } else if (self.block_buffer.get(item.hash)) |buffered_block| {
+                            // 2. Check block_buffer (received but not yet connected)
+                            const block_msg = p2p.Message{ .block = buffered_block };
+                            peer.sendMessage(&block_msg) catch {};
+                            std.debug.print("P2P: served buffered block to peer\n", .{});
+                        } else {
+                            // Block not available — send notfound
+                            const not_found_inv = [_]p2p.InvVector{.{
+                                .inv_type = item.inv_type,
+                                .hash = item.hash,
+                            }};
+                            const nf_msg = p2p.Message{ .notfound = .{ .inventory = &not_found_inv } };
+                            peer.sendMessage(&nf_msg) catch {};
                         }
                     }
                 }
@@ -2550,6 +2572,12 @@ pub const PeerManager = struct {
             self.blocks_since_log += 1;
             self.connect_cursor += 1;
 
+            // Cache the connected block for relay to other peers.
+            // Only cache recent blocks to bound memory (keep last 512).
+            if (self.served_blocks.count() < 512) {
+                self.cacheBlockForRelay(&block_hash, &block);
+            }
+
             // Periodically compact the expected_blocks list to reclaim memory
             // when we've connected a large chunk
             if (self.connect_cursor > 10000) {
@@ -2791,8 +2819,24 @@ pub const PeerManager = struct {
     pub fn cacheMinedBlock(self: *PeerManager, hash: types.Hash256, block_data: []const u8) void {
         // Store a copy of the serialized block
         const data_copy = self.allocator.dupe(u8, block_data) catch return;
-        self.mined_blocks.put(hash, data_copy) catch {
+        self.served_blocks.put(hash, data_copy) catch {
             self.allocator.free(data_copy);
+        };
+    }
+
+    /// Serialize and cache a connected block for relay to other peers.
+    fn cacheBlockForRelay(self: *PeerManager, hash: *const types.Hash256, block: *const types.Block) void {
+        var writer = serialize.Writer.init(self.allocator);
+        serialize.writeBlock(&writer, block) catch {
+            writer.deinit();
+            return;
+        };
+        const data = writer.toOwnedSlice() catch {
+            writer.deinit();
+            return;
+        };
+        self.served_blocks.put(hash.*, data) catch {
+            self.allocator.free(data);
         };
     }
 
