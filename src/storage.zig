@@ -763,7 +763,7 @@ pub const UtxoSet = struct {
     pub fn init(db: ?*Database, max_cache_mb: usize, allocator: std.mem.Allocator) UtxoSet {
         // Pre-size HashMap for IBD performance (~3M entries expected for testnet4)
         var cache = std.HashMap([36]u8, CacheEntry, UtxoKeyContext, std.hash_map.default_max_load_percentage).init(allocator);
-        cache.ensureTotalCapacity(1 << 20) catch {}; // 1M slots pre-allocated
+        cache.ensureTotalCapacity(1 << 17) catch {}; // 128K slots pre-allocated
         return UtxoSet{
             .db = db,
             .cache = cache,
@@ -904,12 +904,10 @@ pub const UtxoSet = struct {
     /// ones can be re-fetched from the block chain if needed (though in practice
     /// memory-only mode accepts the data loss on eviction).
     fn evictCache(self: *UtxoSet) void {
-        // Without a DB backend, eviction loses data permanently.
-        // Only evict if we have a DB to fall back to.
-        if (self.db == null) return;
-
-        // First, flush dirty entries to DB
-        self.flush() catch {};
+        // When a DB backend is available, flush dirty entries before evicting.
+        if (self.db != null) {
+            self.flush() catch {};
+        }
 
         var to_remove = std.ArrayList([36]u8).init(self.allocator);
         defer to_remove.deinit();
@@ -1480,25 +1478,25 @@ pub const ChainState = struct {
 
     /// Initialize chain state.
     /// If db is null, operates in memory-only mode (useful for testing).
-    /// If data_dir is provided, undo data will be persisted to rev*.dat files.
-    pub fn init(db: ?*Database, allocator: std.mem.Allocator) ChainState {
+    /// max_cache_mb controls the UTXO cache size (default: 450 MB, matching Bitcoin Core).
+    pub fn init(db: ?*Database, max_cache_mb: usize, allocator: std.mem.Allocator) ChainState {
         return ChainState{
             .best_hash = [_]u8{0} ** 32,
             .best_height = 0,
             .total_work = [_]u8{0} ** 32,
-            .utxo_set = UtxoSet.init(db, 4096, allocator), // 4 GB UTXO cache (needed for IBD without DB backend)
+            .utxo_set = UtxoSet.init(db, max_cache_mb, allocator),
             .undo_manager = null,
             .allocator = allocator,
         };
     }
 
     /// Initialize chain state with undo file persistence.
-    pub fn initWithUndo(db: ?*Database, data_dir: []const u8, allocator: std.mem.Allocator) ChainState {
+    pub fn initWithUndo(db: ?*Database, max_cache_mb: usize, data_dir: []const u8, allocator: std.mem.Allocator) ChainState {
         return ChainState{
             .best_hash = [_]u8{0} ** 32,
             .best_height = 0,
             .total_work = [_]u8{0} ** 32,
-            .utxo_set = UtxoSet.init(db, 4096, allocator),
+            .utxo_set = UtxoSet.init(db, max_cache_mb, allocator),
             .undo_manager = UndoFileManager.init(data_dir, allocator),
             .allocator = allocator,
         };
@@ -2222,7 +2220,7 @@ pub fn loadTxOutSet(
     const metadata = try SnapshotMetadata.fromBytes(&header_buf, expected_magic);
 
     // Create a new in-memory chainstate for the snapshot
-    var chainstate = ChainState.init(null, allocator);
+    var chainstate = ChainState.init(null, 64, allocator);
     chainstate.best_hash = metadata.base_blockhash;
 
     // Read all coins
@@ -2954,7 +2952,7 @@ test "utxo set hit rate" {
 test "chain state init" {
     const allocator = std.testing.allocator;
 
-    var chain_state = ChainState.init(null, allocator);
+    var chain_state = ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     try std.testing.expectEqual(@as(u32, 0), chain_state.best_height);
@@ -2964,7 +2962,7 @@ test "chain state init" {
 test "chain state connect block creates utxos" {
     const allocator = std.testing.allocator;
 
-    var chain_state = ChainState.init(null, allocator);
+    var chain_state = ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     // Create a simple coinbase transaction
@@ -3021,7 +3019,7 @@ test "chain state connect block creates utxos" {
 test "chain state disconnect block restores state" {
     const allocator = std.testing.allocator;
 
-    var chain_state = ChainState.init(null, allocator);
+    var chain_state = ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     // First connect a coinbase block
@@ -3208,12 +3206,12 @@ test "chain state init with undo manager" {
     const allocator = std.testing.allocator;
 
     // Test regular init (no undo manager)
-    var chain_state1 = ChainState.init(null, allocator);
+    var chain_state1 = ChainState.init(null, 64, allocator);
     defer chain_state1.deinit();
     try std.testing.expect(chain_state1.undo_manager == null);
 
     // Test init with undo (has undo manager)
-    var chain_state2 = ChainState.initWithUndo(null, "/tmp/testdata", allocator);
+    var chain_state2 = ChainState.initWithUndo(null, 450, "/tmp/testdata", allocator);
     defer chain_state2.deinit();
     try std.testing.expect(chain_state2.undo_manager != null);
     try std.testing.expectEqualStrings("/tmp/testdata", chain_state2.undo_manager.?.data_dir);
@@ -3238,7 +3236,7 @@ test "undo file manager path generation" {
 test "block undo to block undo data conversion" {
     const allocator = std.testing.allocator;
 
-    var chain_state = ChainState.init(null, allocator);
+    var chain_state = ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     // Create a block with coinbase + one spending transaction
@@ -5271,7 +5269,7 @@ test "chainstate manager init" {
     const allocator = std.testing.allocator;
     const consensus = @import("consensus.zig");
 
-    var chainstate = ChainState.init(null, allocator);
+    var chainstate = ChainState.init(null, 64, allocator);
     defer chainstate.deinit();
 
     var manager = ChainStateManager.init(&chainstate, &consensus.MAINNET, allocator);
@@ -5286,10 +5284,10 @@ test "chainstate manager activate snapshot" {
     const allocator = std.testing.allocator;
     const consensus = @import("consensus.zig");
 
-    var normal_chainstate = ChainState.init(null, allocator);
+    var normal_chainstate = ChainState.init(null, 64, allocator);
     defer normal_chainstate.deinit();
 
-    var snapshot_chainstate = ChainState.init(null, allocator);
+    var snapshot_chainstate = ChainState.init(null, 64, allocator);
     defer snapshot_chainstate.deinit();
 
     var manager = ChainStateManager.init(&normal_chainstate, &consensus.MAINNET, allocator);
@@ -5466,10 +5464,10 @@ test "ChainStateManager completeValidation with matching hashes" {
     const consensus = @import("consensus.zig");
 
     // Create two chainstates with the same UTXO data
-    var active_chainstate = ChainState.init(null, allocator);
+    var active_chainstate = ChainState.init(null, 64, allocator);
     defer active_chainstate.deinit();
 
-    var background_chainstate = ChainState.init(null, allocator);
+    var background_chainstate = ChainState.init(null, 64, allocator);
     defer background_chainstate.deinit();
 
     // Add identical UTXOs to both

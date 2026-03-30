@@ -1258,7 +1258,7 @@ test "empty mempool produces valid template with only coinbase" {
     const allocator = std.testing.allocator;
 
     // Create a memory-only chain state
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     // Create empty mempool
@@ -1294,7 +1294,7 @@ test "block template total weight does not exceed MAX_BLOCK_WEIGHT" {
     const allocator = std.testing.allocator;
 
     // Create chain state
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     // Create mempool
@@ -1397,7 +1397,7 @@ test "transactions are ordered by fee rate" {
     const allocator = std.testing.allocator;
 
     // Create chain state
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     // Create mempool
@@ -1429,7 +1429,7 @@ test "transactions are ordered by fee rate" {
 test "block merkle root is correctly computed" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -1679,7 +1679,7 @@ test "regtest: mine single block" {
     const allocator = std.testing.allocator;
 
     // Create chain state and mempool
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -1712,7 +1712,7 @@ test "regtest: mine multiple blocks" {
     const allocator = std.testing.allocator;
 
     // Create chain state and mempool
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -1743,7 +1743,7 @@ test "regtest: mine multiple blocks" {
 test "regtest: blocks chain correctly" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -1791,7 +1791,7 @@ test "regtest: subsidy halving at block 150" {
 test "regtest: mineBlock finds valid nonce quickly" {
     const allocator = std.testing.allocator;
 
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
