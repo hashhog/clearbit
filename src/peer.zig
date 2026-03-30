@@ -1726,7 +1726,16 @@ pub const PeerManager = struct {
     pub fn acceptInbound(self: *PeerManager) !void {
         if (self.listener == null) return;
 
-        // Try to accept without blocking
+        // Poll with 0 timeout to check if a connection is pending (non-blocking)
+        var pollfds = [_]std.posix.pollfd{.{
+            .fd = self.listener.?.stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pollfds, 0) catch return;
+        if (ready == 0 or (pollfds[0].revents & std.posix.POLL.IN) == 0) return;
+
+        // A connection is waiting, accept it
         const conn = self.listener.?.accept() catch |err| {
             switch (err) {
                 error.WouldBlock => return,
