@@ -411,6 +411,51 @@ pub fn computeAuthToken(
     return encoded;
 }
 
+/// Generate a .cookie file in datadir for cookie-based RPC auth.
+/// Returns the Base64-encoded "__cookie__:<hex>" token for auth comparison.
+/// Caller owns the returned slice and must free it.
+pub fn generateCookieFile(datadir: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    // Generate 32 random bytes
+    var rand_bytes: [32]u8 = undefined;
+    std.crypto.random.bytes(&rand_bytes);
+
+    // Hex-encode the random bytes (64 hex chars)
+    const hex_chars = "0123456789abcdef";
+    var hex_buf: [64]u8 = undefined;
+    for (rand_bytes, 0..) |byte, i| {
+        hex_buf[i * 2] = hex_chars[byte >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[byte & 0xf];
+    }
+    const hex_password = hex_buf[0..64];
+
+    // Build the cookie file content: __cookie__:<hex>
+    const cookie_content = try std.fmt.allocPrint(allocator, "__cookie__:{s}", .{hex_password});
+    defer allocator.free(cookie_content);
+
+    // Write the cookie file with mode 0o600
+    const cookie_path = try std.fmt.allocPrint(allocator, "{s}/.cookie", .{datadir});
+    defer allocator.free(cookie_path);
+
+    const file = try std.fs.createFileAbsolute(cookie_path, .{ .mode = 0o600 });
+    defer file.close();
+    try file.writeAll(cookie_content);
+
+    std.debug.print("Generated cookie file: {s}\n", .{cookie_path});
+
+    // Compute and return the Base64-encoded token for auth comparison
+    const encoded_len = std.base64.standard.Encoder.calcSize(cookie_content.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.standard.Encoder.encode(encoded, cookie_content);
+    return encoded;
+}
+
+/// Delete the .cookie file from datadir on shutdown.
+pub fn deleteCookieFile(datadir: []const u8, allocator: std.mem.Allocator) void {
+    const cookie_path = std.fmt.allocPrint(allocator, "{s}/.cookie", .{datadir}) catch return;
+    defer allocator.free(cookie_path);
+    std.fs.deleteFileAbsolute(cookie_path) catch {};
+}
+
 // ============================================================================
 // Signal Handling
 // ============================================================================
@@ -535,6 +580,12 @@ pub fn main() !void {
     const auth_token = computeAuthToken(config.rpc_user, config.rpc_password, allocator) catch null;
     defer if (auth_token) |t| allocator.free(t);
 
+    const cookie_token = generateCookieFile(full_datadir, allocator) catch |err| blk: {
+        std.debug.print("Warning: could not write cookie file: {}\n", .{err});
+        break :blk null;
+    };
+    defer if (cookie_token) |t| allocator.free(t);
+
     var chain_manager = validation.ChainManager.init(&chain_state, &mempool_instance, allocator);
     defer chain_manager.deinit();
 
@@ -548,6 +599,7 @@ pub fn main() !void {
             .bind_address = config.rpc_bind,
             .port = config.rpc_port,
             .auth_token = auth_token,
+            .cookie_token = cookie_token,
         },
     );
     defer rpc_server.deinit();
@@ -648,6 +700,9 @@ pub fn main() !void {
     chain_state.flush() catch |err| {
         std.debug.print("Warning: error flushing chain state: {}\n", .{err});
     };
+
+    // Remove cookie file on clean shutdown
+    deleteCookieFile(full_datadir, allocator);
 
     std.debug.print("{s} stopped.\n", .{VERSION_STRING});
 }

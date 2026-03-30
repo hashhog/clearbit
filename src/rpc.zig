@@ -73,6 +73,7 @@ pub const RpcConfig = struct {
     bind_address: []const u8 = "127.0.0.1",
     port: u16 = 8332,
     auth_token: ?[]const u8 = null, // Base64-encoded "user:pass"
+    cookie_token: ?[]const u8 = null, // Base64-encoded "__cookie__:<hex>" from .cookie file
     max_request_size: usize = 1 << 20, // 1 MB
 };
 
@@ -311,8 +312,8 @@ pub const RpcServer = struct {
             self.current_wallet = w;
         }
 
-        // Check authentication if configured
-        if (self.config.auth_token) |expected_token| {
+        // Check authentication if configured (accepts either rpcuser/rpcpassword or cookie token)
+        if (self.config.auth_token != null or self.config.cookie_token != null) {
             const auth_header = findHeader(headers, "Authorization") orelse {
                 try self.sendHttpError(conn.stream, 401, "Unauthorized");
                 return;
@@ -321,7 +322,10 @@ pub const RpcServer = struct {
                 try self.sendHttpError(conn.stream, 401, "Unauthorized");
                 return;
             }
-            if (!std.mem.eql(u8, auth_header[6..], expected_token)) {
+            const provided = auth_header[6..];
+            const user_pass_match = if (self.config.auth_token) |t| std.mem.eql(u8, provided, t) else false;
+            const cookie_match = if (self.config.cookie_token) |t| std.mem.eql(u8, provided, t) else false;
+            if (!user_pass_match and !cookie_match) {
                 try self.sendHttpError(conn.stream, 401, "Unauthorized");
                 return;
             }
@@ -2584,6 +2588,19 @@ pub const RpcServer = struct {
         };
         defer result.deinit();
 
+        // Cache mined blocks and broadcast inv to peers
+        for (result.block_hashes.items, 0..) |hash, idx| {
+            if (idx < result.serialized_blocks.items.len) {
+                self.peer_manager.cacheMinedBlock(hash, result.serialized_blocks.items[idx]);
+            }
+            var inv_items = [_]p2p.InvVector{.{
+                .inv_type = .msg_block,
+                .hash = hash,
+            }};
+            const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
+            self.peer_manager.broadcast(&inv_msg);
+        }
+
         // Format response
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
@@ -2725,6 +2742,16 @@ pub const RpcServer = struct {
         ) catch {
             return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block generation failed", id);
         };
+
+        // Broadcast inv(MSG_BLOCK) to all connected peers
+        {
+            var inv_items = [_]p2p.InvVector{.{
+                .inv_type = .msg_block,
+                .hash = gen_result.hash,
+            }};
+            const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
+            self.peer_manager.broadcast(&inv_msg);
+        }
 
         // Format response
         var buf = std.ArrayList(u8).init(self.allocator);
