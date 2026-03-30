@@ -601,6 +601,11 @@ pub fn main() !void {
     }
 
     // 10. Start subsystem threads
+
+    // Start TCP listener for inbound P2P connections BEFORE spawning the peer thread
+    peer_manager.startListening(config.listen_port) catch |err| {
+        std.debug.print("Warning: could not start P2P listener on port {d}: {}\n", .{ config.listen_port, err });
+    };
     std.debug.print("P2P listening on port {d}\n", .{config.listen_port});
     std.debug.print("RPC server on {s}:{d}\n", .{ config.rpc_bind, config.rpc_port });
 
