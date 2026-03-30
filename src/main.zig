@@ -567,7 +567,7 @@ pub fn main() !void {
     std.debug.print("Data directory: {s}\n", .{full_datadir});
 
     // 7. Initialize subsystems
-    var chain_state = storage.ChainState.init(null, allocator);
+    var chain_state = storage.ChainState.init(null, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
 
     var mempool_instance = mempool.Mempool.init(&chain_state, params, allocator);

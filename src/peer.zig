@@ -1247,7 +1247,7 @@ pub const PeerManager = struct {
             .download_cursor = 0,
             .connect_cursor = 0,
             .blocks_in_flight = 0,
-            .max_blocks_in_flight = 1024,
+            .max_blocks_in_flight = 128,
             .last_progress_log = 0,
             .blocks_since_log = 0,
             .last_stall_recovery = 0,
@@ -2445,12 +2445,13 @@ pub const PeerManager = struct {
         // Each peer gets a batch of up to 16 blocks per getdata message.
         var peer_idx: usize = 0;
 
-        // Don't download too far ahead of the connection cursor
-        // This prevents accumulating huge buffers when blocks arrive out of order
-        const max_ahead: u32 = 2048;
+        // Don't download too far ahead of the connection cursor.
+        // Each buffered block is ~1-2 MB, so 512 blocks ≈ 512 MB-1 GB.
+        const max_ahead: u32 = 512;
         while (self.blocks_in_flight < self.max_blocks_in_flight and
             self.download_cursor < self.expected_blocks.items.len and
-            self.download_cursor < self.connect_cursor + max_ahead)
+            self.download_cursor < self.connect_cursor + max_ahead and
+            self.block_buffer.count() + self.blocks_in_flight < 512)
         {
             const tp = capable_peers[peer_idx % n_capable];
             peer_idx += 1;
@@ -2573,7 +2574,7 @@ pub const PeerManager = struct {
 
             // Cache the connected block for relay to other peers.
             // Only cache recent blocks to bound memory (keep last 512).
-            if (self.served_blocks.count() < 512) {
+            if (self.served_blocks.count() < 64) {
                 self.cacheBlockForRelay(&block_hash, &block);
             }
 
