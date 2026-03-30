@@ -746,8 +746,14 @@ pub const DEFAULT_MAX_TRIES: u64 = 1_000_000;
 pub const GenerateResult = struct {
     /// Block hashes of successfully mined blocks.
     block_hashes: std.ArrayList(types.Hash256),
+    /// Serialized block data for each mined block (for P2P serving).
+    serialized_blocks: std.ArrayList([]const u8),
 
     pub fn deinit(self: *GenerateResult) void {
+        for (self.serialized_blocks.items) |data| {
+            self.block_hashes.allocator.free(data);
+        }
+        self.serialized_blocks.deinit();
         self.block_hashes.deinit();
     }
 };
@@ -863,6 +869,7 @@ pub fn generateBlocks(
     std.log.info("generateBlocks: n_blocks={d}, best_height={d}", .{ n_blocks, chain_state.best_height });
     var result = GenerateResult{
         .block_hashes = std.ArrayList(types.Hash256).init(allocator),
+        .serialized_blocks = std.ArrayList([]const u8).init(allocator),
     };
     errdefer result.deinit();
 
@@ -896,6 +903,27 @@ pub fn generateBlocks(
 
         if (block_hash) |hash| {
             try result.block_hashes.append(hash);
+
+            // Serialize the mined block for P2P serving
+            const block = assembleBlock(&template, allocator) catch null;
+            if (block) |blk| {
+                defer allocator.free(blk.transactions);
+                var writer = serialize.Writer.init(allocator);
+                serialize.writeBlock(&writer, &blk) catch {
+                    writer.deinit();
+                };
+                const written = writer.getWritten();
+                if (written.len > 0) {
+                    const block_data = allocator.dupe(u8, written) catch null;
+                    writer.deinit();
+                    if (block_data) |data| {
+                        try result.serialized_blocks.append(data);
+                    }
+                } else {
+                    writer.deinit();
+                }
+            }
+
             blocks_mined += 1;
         } else {
             // Failed to mine block (exhausted tries)

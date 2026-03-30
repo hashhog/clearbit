@@ -2475,6 +2475,23 @@ pub const RpcServer = struct {
         };
         defer result.deinit();
 
+        // Cache mined blocks for P2P serving and broadcast inv to peers
+        for (result.block_hashes.items, 0..) |hash, idx| {
+            // Cache serialized block data for getdata responses
+            if (idx < result.serialized_blocks.items.len) {
+                self.peer_manager.cacheMinedBlock(hash, result.serialized_blocks.items[idx]);
+            }
+
+            // Broadcast inv(MSG_BLOCK) to all connected peers
+            var inv_items = [_]p2p.InvVector{.{
+                .inv_type = .msg_block,
+                .hash = hash,
+            }};
+            const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
+            self.peer_manager.broadcast(&inv_msg);
+            std.log.info("broadcast block inv to peers", .{});
+        }
+
         // Format response as JSON array of block hashes
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
