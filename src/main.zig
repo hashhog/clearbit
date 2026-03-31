@@ -567,6 +567,8 @@ pub fn main() !void {
     std.debug.print("Data directory: {s}\n", .{full_datadir});
 
     // 7. Initialize subsystems
+    // Memory-only UTXO storage — dbcache determines the maximum size.
+    // Without a RocksDB backend, eviction is disabled to avoid data loss.
     var chain_state = storage.ChainState.init(null, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
 
