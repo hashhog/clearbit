@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 pub const types = @import("types.zig");
 pub const crypto = @import("crypto.zig");
 pub const serialize = @import("serialize.zig");
@@ -567,9 +568,41 @@ pub fn main() !void {
     std.debug.print("Data directory: {s}\n", .{full_datadir});
 
     // 7. Initialize subsystems
-    // Memory-only UTXO storage — dbcache determines the maximum size.
-    // Without a RocksDB backend, eviction is disabled to avoid data loss.
-    var chain_state = storage.ChainState.init(null, @intCast(config.dbcache), allocator);
+    // Open RocksDB for disk-backed UTXO persistence when available.
+    // Falls back to memory-only mode when built without -Drocksdb=true.
+    var db: ?storage.Database = null;
+    var db_ptr: ?*storage.Database = null;
+    if (comptime build_options.rocksdb_enabled) {
+        const chainstate_path = std.fmt.allocPrint(allocator, "{s}/chainstate", .{full_datadir}) catch {
+            std.debug.print("Out of memory\n", .{});
+            std.process.exit(1);
+        };
+        defer allocator.free(chainstate_path);
+
+        std.fs.makeDirAbsolute(chainstate_path) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                std.debug.print("Warning: could not create chainstate directory: {}\n", .{err});
+            }
+        };
+
+        if (storage.Database.open(chainstate_path, allocator)) |opened_db| {
+            db = opened_db;
+        } else |err| {
+            std.debug.print("Failed to open RocksDB at {s}: {}\n", .{ chainstate_path, err });
+            std.debug.print("Falling back to memory-only mode\n", .{});
+        }
+        if (db != null) {
+            db_ptr = &db.?;
+            std.debug.print("RocksDB storage: {s}/chainstate\n", .{full_datadir});
+        }
+    } else {
+        std.debug.print("RocksDB not linked, using memory-only UTXO storage\n", .{});
+    }
+    defer if (db_ptr) |p| {
+        p.close();
+    };
+
+    var chain_state = storage.ChainState.init(db_ptr, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
 
     var mempool_instance = mempool.Mempool.init(&chain_state, params, allocator);

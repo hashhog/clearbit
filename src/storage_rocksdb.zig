@@ -28,10 +28,10 @@ const cf_names = [_][*:0]const u8{
 
 /// Internal database state
 const DbState = struct {
-    db: *c.rocksdb_t,
-    write_options: *c.rocksdb_writeoptions_t,
-    read_options: *c.rocksdb_readoptions_t,
-    cf_handles: [5]*c.rocksdb_column_family_handle_t,
+    db: ?*c.rocksdb_t,
+    write_options: ?*c.rocksdb_writeoptions_t,
+    read_options: ?*c.rocksdb_readoptions_t,
+    cf_handles: [5]?*c.rocksdb_column_family_handle_t,
     allocator: std.mem.Allocator,
 };
 
@@ -55,8 +55,8 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
     c.rocksdb_block_based_options_set_cache_index_and_filter_blocks(block_based_options, 1);
     c.rocksdb_options_set_block_based_table_factory(options, block_based_options);
 
-    const cf_options = [_]*c.rocksdb_options_t{options} ** 5;
-    var cf_handles: [5]*c.rocksdb_column_family_handle_t = undefined;
+    const cf_options = [_]?*c.rocksdb_options_t{options} ** 5;
+    var cf_handles: [5]?*c.rocksdb_column_family_handle_t = undefined;
 
     const path_z = allocator.dupeZ(u8, path) catch return storage.StorageError.OutOfMemory;
     defer allocator.free(path_z);
@@ -115,7 +115,7 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
 
     const state = allocator.create(DbState) catch return storage.StorageError.OutOfMemory;
     state.* = .{
-        .db = db orelse return storage.StorageError.OpenFailed,
+        .db = if (db != null) db else return storage.StorageError.OpenFailed,
         .write_options = c.rocksdb_writeoptions_create(),
         .read_options = c.rocksdb_readoptions_create(),
         .cf_handles = cf_handles,
