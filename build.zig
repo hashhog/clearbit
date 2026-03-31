@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
     // Create build options module that all modules can import
     const build_options = b.addOptions();
     build_options.addOption(bool, "minisketch_enabled", minisketch_enabled);
+    build_options.addOption(bool, "rocksdb_enabled", rocksdb_enabled);
 
     const exe = b.addExecutable(.{
         .name = "clearbit",

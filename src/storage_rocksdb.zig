@@ -408,7 +408,8 @@ test "rocksdb batch write" {
         try std.testing.expect(result != null);
         defer allocator.free(result.?);
 
-        const expected = [_][]const u8{ "value1", "value2", "value3" }[i];
+        const expected_arr = [_][]const u8{ "value1", "value2", "value3" };
+        const expected = expected_arr[i];
         try std.testing.expectEqualStrings(expected, result.?);
     }
 }

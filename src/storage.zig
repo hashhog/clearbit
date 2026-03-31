@@ -119,9 +119,6 @@ pub const Database = struct {
     pub fn open(path: []const u8, allocator: std.mem.Allocator) StorageError!Database {
         _ = path;
         _ = allocator;
-        // RocksDB is not available in this build configuration.
-        // Install rocksdb-devel (Fedora) or librocksdb-dev (Debian/Ubuntu)
-        // and rebuild with: zig build -Drocksdb=true
         return StorageError.RocksDBNotAvailable;
     }
 
@@ -904,10 +901,10 @@ pub const UtxoSet = struct {
     /// ones can be re-fetched from the block chain if needed (though in practice
     /// memory-only mode accepts the data loss on eviction).
     fn evictCache(self: *UtxoSet) void {
-        // When a DB backend is available, flush dirty entries before evicting.
-        if (self.db != null) {
-            self.flush() catch {};
-        }
+        // Without a DB backend, eviction permanently loses UTXO data.
+        // Only evict when we have a database to fall back to.
+        if (self.db == null) return;
+        self.flush() catch {};
 
         var to_remove = std.ArrayList([36]u8).init(self.allocator);
         defer to_remove.deinit();
