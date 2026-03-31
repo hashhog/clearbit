@@ -17,6 +17,9 @@
 const std = @import("std");
 const types = @import("types.zig");
 const serialize = @import("serialize.zig");
+const build_options = @import("build_options");
+const rocksdb_enabled = build_options.rocksdb_enabled;
+const storage_rocksdb = if (rocksdb_enabled) @import("storage_rocksdb.zig") else struct {};
 
 /// Column family indices for organizing data.
 /// Each stores a different type of data with potentially different
@@ -116,59 +119,88 @@ pub const Database = struct {
 
     /// Open or create the database at the given path.
     /// Returns RocksDBNotAvailable if RocksDB is not linked.
-    pub fn open(path: []const u8, allocator: std.mem.Allocator) StorageError!Database {
-        _ = path;
-        _ = allocator;
+    pub const open = if (rocksdb_enabled) openRocksDb else openStub;
+
+    fn openRocksDb(path: []const u8, allocator: std.mem.Allocator) StorageError!Database {
+        return storage_rocksdb.openDatabase(path, allocator);
+    }
+
+    fn openStub(_: []const u8, _: std.mem.Allocator) StorageError!Database {
         return StorageError.RocksDBNotAvailable;
     }
 
     /// Close the database.
-    pub fn close(self: *Database) void {
-        _ = self;
+    pub const close = if (rocksdb_enabled) closeRocksDb else closeStub;
+
+    fn closeRocksDb(self: *Database) void {
+        storage_rocksdb.closeDatabase(self);
     }
 
+    fn closeStub(_: *Database) void {}
+
     /// Get a value by key from a column family.
-    pub fn get(self: *Database, cf_index: usize, key: []const u8) StorageError!?[]const u8 {
-        _ = self;
-        _ = cf_index;
-        _ = key;
+    pub const get = if (rocksdb_enabled) getRocksDb else getStub;
+
+    fn getRocksDb(self: *Database, cf_index: usize, key: []const u8) StorageError!?[]const u8 {
+        return storage_rocksdb.dbGet(self, cf_index, key);
+    }
+
+    fn getStub(_: *Database, _: usize, _: []const u8) StorageError!?[]const u8 {
         return StorageError.RocksDBNotAvailable;
     }
 
     /// Put a key-value pair into a column family.
-    pub fn put(self: *Database, cf_index: usize, key: []const u8, value: []const u8) StorageError!void {
-        _ = self;
-        _ = cf_index;
-        _ = key;
-        _ = value;
+    pub const put = if (rocksdb_enabled) putRocksDb else putStub;
+
+    fn putRocksDb(self: *Database, cf_index: usize, key: []const u8, value: []const u8) StorageError!void {
+        return storage_rocksdb.dbPut(self, cf_index, key, value);
+    }
+
+    fn putStub(_: *Database, _: usize, _: []const u8, _: []const u8) StorageError!void {
         return StorageError.RocksDBNotAvailable;
     }
 
     /// Delete a key from a column family.
-    pub fn delete(self: *Database, cf_index: usize, key: []const u8) StorageError!void {
-        _ = self;
-        _ = cf_index;
-        _ = key;
+    pub const delete = if (rocksdb_enabled) deleteRocksDb else deleteStub;
+
+    fn deleteRocksDb(self: *Database, cf_index: usize, key: []const u8) StorageError!void {
+        return storage_rocksdb.dbDelete(self, cf_index, key);
+    }
+
+    fn deleteStub(_: *Database, _: usize, _: []const u8) StorageError!void {
         return StorageError.RocksDBNotAvailable;
     }
 
     /// Batch write: apply multiple operations atomically.
-    pub fn writeBatch(self: *Database, operations: []const BatchOp) StorageError!void {
-        _ = self;
-        _ = operations;
+    pub const writeBatch = if (rocksdb_enabled) writeBatchRocksDb else writeBatchStub;
+
+    fn writeBatchRocksDb(self: *Database, operations: []const BatchOp) StorageError!void {
+        return storage_rocksdb.dbWriteBatch(self, operations);
+    }
+
+    fn writeBatchStub(_: *Database, _: []const BatchOp) StorageError!void {
         return StorageError.RocksDBNotAvailable;
     }
 
     /// Create an iterator for scanning a column family.
-    pub fn iterator(self: *Database, cf_index: usize) Iterator {
-        _ = self;
-        _ = cf_index;
+    pub const iterator = if (rocksdb_enabled) iteratorRocksDb else iteratorStub;
+
+    fn iteratorRocksDb(self: *Database, cf_index: usize) Iterator {
+        return storage_rocksdb.dbIterator(self, cf_index);
+    }
+
+    fn iteratorStub(_: *Database, _: usize) Iterator {
         return Iterator{};
     }
 
     /// Flush all in-memory data to disk.
-    pub fn flush(self: *Database) StorageError!void {
-        _ = self;
+    pub const flush = if (rocksdb_enabled) flushRocksDb else flushStub;
+
+    fn flushRocksDb(self: *Database) StorageError!void {
+        return storage_rocksdb.dbFlush(self);
+    }
+
+    fn flushStub(_: *Database) StorageError!void {
         return StorageError.RocksDBNotAvailable;
     }
 };

@@ -143,6 +143,7 @@ pub fn build(b: *std.Build) void {
         });
         rocksdb_tests.linkSystemLibrary("rocksdb");
         rocksdb_tests.linkLibC();
+        rocksdb_tests.root_module.addOptions("build_options", build_options);
 
         const run_rocksdb_tests = b.addRunArtifact(rocksdb_tests);
         const rocksdb_test_step = b.step("test-rocksdb", "Run RocksDB-specific tests");
