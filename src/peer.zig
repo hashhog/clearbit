@@ -2044,6 +2044,14 @@ pub const PeerManager = struct {
                 // Decrement in-flight counter
                 if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
 
+                // Bound the buffer to prevent OOM — if too many blocks are
+                // buffered waiting for connection, drop this one. It will
+                // be re-downloaded when the connection cursor catches up.
+                if (self.block_buffer.count() >= 1024) {
+                    serialize.freeBlock(self.allocator, &block);
+                    return;
+                }
+
                 // Buffer the block (transfer ownership - do NOT free here)
                 self.block_buffer.put(block_hash, block) catch {
                     // If we can't buffer it, free and drop
@@ -2447,11 +2455,11 @@ pub const PeerManager = struct {
 
         // Don't download too far ahead of the connection cursor.
         // Each buffered block is ~1-2 MB, so 512 blocks ≈ 512 MB-1 GB.
-        const max_ahead: u32 = 512;
+        const max_ahead: u32 = 256;
         while (self.blocks_in_flight < self.max_blocks_in_flight and
             self.download_cursor < self.expected_blocks.items.len and
             self.download_cursor < self.connect_cursor + max_ahead and
-            self.block_buffer.count() + self.blocks_in_flight < 512)
+            self.block_buffer.count() + self.blocks_in_flight < 256)
         {
             const tp = capable_peers[peer_idx % n_capable];
             peer_idx += 1;
