@@ -1924,6 +1924,23 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Get the best height among all connected peers.
+    fn getBestPeerHeight(self: *PeerManager) u32 {
+        var best: i32 = 0;
+        for (self.peers.items) |p| {
+            if (p.start_height > best) best = p.start_height;
+        }
+        return if (best > 0) @intCast(best) else 0;
+    }
+
+    /// Pick a different sync peer (not the one that just returned 0 headers).
+    fn pickSyncPeer(self: *PeerManager, exclude: *Peer) ?*Peer {
+        for (self.peers.items) |p| {
+            if (p != exclude and p.start_height > 0) return p;
+        }
+        return null;
+    }
+
     /// Send getheaders to a peer using our current best block as locator.
     fn sendGetHeaders(self: *PeerManager, target_peer: *Peer) !void {
         // Build locator: use the tip of the header queue if available,
@@ -1997,7 +2014,22 @@ pub const PeerManager = struct {
                 // Don't clear getheaders timeout -- we'll request more below if needed
 
                 if (h.headers.len == 0) {
-                    std.debug.print("P2P: Received 0 headers - fully synced\n", .{});
+                    // 0 headers from this peer doesn't mean we're synced — the
+                    // peer may not have recognized our locator, or it's behind.
+                    // Check if we're actually caught up by comparing against
+                    // the best peer height. If behind, try another peer.
+                    const our_height = if (self.chain_state) |cs| cs.best_height else 0;
+                    const best_peer_h = self.getBestPeerHeight();
+                    if (our_height + self.expected_blocks.items.len < best_peer_h) {
+                        std.debug.print("P2P: 0 headers but behind peers (ours={d}+{d}, best_peer={d}), retrying\n",
+                            .{ our_height, self.expected_blocks.items.len, best_peer_h });
+                        // Try sending getheaders to a different peer
+                        if (self.pickSyncPeer(peer)) |alt_peer| {
+                            self.sendGetHeaders(alt_peer) catch {};
+                        }
+                    } else {
+                        std.debug.print("P2P: Received 0 headers - fully synced at height {d}\n", .{our_height + self.expected_blocks.items.len});
+                    }
                     return;
                 }
 
