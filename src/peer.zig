@@ -2487,11 +2487,12 @@ pub const PeerManager = struct {
 
         // Don't download too far ahead of the connection cursor.
         // Each buffered block is ~1-2 MB, so 512 blocks ≈ 512 MB-1 GB.
-        const max_ahead: u32 = 256;
+        // Use the distance between download and connect cursors (not buffer count)
+        // to avoid stalling when the buffer has many out-of-order blocks.
+        const max_ahead: u32 = 512;
         while (self.blocks_in_flight < self.max_blocks_in_flight and
             self.download_cursor < self.expected_blocks.items.len and
-            self.download_cursor < self.connect_cursor + max_ahead and
-            self.block_buffer.count() + self.blocks_in_flight < 256)
+            self.download_cursor < self.connect_cursor + max_ahead)
         {
             const tp = capable_peers[peer_idx % n_capable];
             peer_idx += 1;
@@ -2546,13 +2547,23 @@ pub const PeerManager = struct {
             const now_check = std.time.timestamp();
             if (now_check - self.last_stall_recovery >= 5) {
                 self.last_stall_recovery = now_check;
-                // Re-request any missing blocks near the connect cursor
+
+                // Reset download_cursor to connect_cursor so the normal pipeline
+                // will re-request any missing blocks instead of skipping them.
+                if (self.download_cursor > self.connect_cursor and self.blocks_in_flight == 0) {
+                    self.download_cursor = self.connect_cursor;
+                }
+
+                // Re-request any missing blocks near the connect cursor.
+                // Distribute across ALL capable peers for robustness.
+                var peer_round: usize = 0;
                 for (self.peers.items) |p| {
                     if (p.state != .handshake_complete) continue;
+                    peer_round += 1;
                     var invs = std.ArrayList(p2p.InvVector).init(self.allocator);
                     var cursor = self.connect_cursor;
-                    // Request up to 128 blocks from the connection front
-                    while (cursor < self.expected_blocks.items.len and invs.items.len < 128) : (cursor += 1) {
+                    // Request up to 32 missing blocks from the connection front per peer
+                    while (cursor < self.expected_blocks.items.len and invs.items.len < 32) : (cursor += 1) {
                         const h = self.expected_blocks.items[cursor];
                         if (!self.block_buffer.contains(h)) {
                             invs.append(.{
@@ -2566,7 +2577,8 @@ pub const PeerManager = struct {
                         p.sendMessage(&getdata_msg) catch {};
                     }
                     invs.deinit();
-                    break; // Only one peer
+                    // Try up to 3 peers for stall recovery
+                    if (peer_round >= 3) break;
                 }
             }
         }
