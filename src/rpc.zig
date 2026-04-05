@@ -864,10 +864,13 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
+        // Headers height = validated blocks + queued headers not yet validated
+        const headers_height = self.chain_state.best_height +
+            @as(u32, @intCast(self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor));
         try writer.print("{{\"chain\":\"{s}\",\"blocks\":{d},\"headers\":{d},\"bestblockhash\":\"", .{
             chain_name,
             self.chain_state.best_height,
-            self.chain_state.best_height,
+            headers_height,
         });
         try writeHashHex(writer, &self.chain_state.best_hash);
         try writer.print("\",\"difficulty\":{d},\"verificationprogress\":1.0,\"pruned\":false}}", .{

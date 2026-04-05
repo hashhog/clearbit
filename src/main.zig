@@ -74,6 +74,9 @@ pub const Config = struct {
     // Benchmarking
     run_benchmark: bool = false,
 
+    // Block import mode
+    import_blocks: ?[]const u8 = null, // path or "-" for stdin
+
     pub const Network = enum {
         mainnet,
         testnet,
@@ -186,6 +189,12 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         else if (std.mem.eql(u8, arg, "--benchmark") or std.mem.eql(u8, arg, "-benchmark")) {
             config.run_benchmark = true;
         }
+        // Block import
+        else if (std.mem.startsWith(u8, arg, "--import-blocks=")) {
+            config.import_blocks = arg["--import-blocks=".len..];
+        } else if (std.mem.eql(u8, arg, "--import-blocks")) {
+            config.import_blocks = "-"; // default to stdin
+        }
         // Help and version
         else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
@@ -243,6 +252,9 @@ pub fn printUsage() void {
         \\
         \\Performance:
         \\  --benchmark            Run performance benchmarks and exit
+        \\
+        \\Import:
+        \\  --import-blocks=<path> Import blocks from file (- for stdin)
         \\
         \\General:
         \\  --help, -h             Show this help message
@@ -485,6 +497,171 @@ pub fn installSignalHandlers() void {
 // Main Entry Point
 // ============================================================================
 
+// ============================================================================
+// Block Import Mode
+// ============================================================================
+
+/// Import blocks from a file or stdin in the framed format:
+///   [4 bytes height LE] [4 bytes size LE] [size bytes raw block]
+/// Bypasses P2P entirely, feeding blocks directly to ChainState.connectBlockFast.
+fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
+    const import_path = config.import_blocks orelse return;
+
+    // Resolve data directory
+    const datadir = resolveDataDir(config.datadir, allocator) catch |err| {
+        std.debug.print("Error resolving data directory: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(datadir);
+    std.fs.makeDirAbsolute(datadir) catch |err| {
+        if (err != error.PathAlreadyExists)
+            std.debug.print("Warning: could not create data directory: {}\n", .{err});
+    };
+
+    // Network subdirectory
+    const subdir = getNetworkSubdir(config.network);
+    var full_datadir: []const u8 = datadir;
+    if (subdir.len > 0) {
+        full_datadir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ datadir, subdir }) catch {
+            std.debug.print("Out of memory\n", .{});
+            std.process.exit(1);
+        };
+        std.fs.makeDirAbsolute(full_datadir) catch |err| {
+            if (err != error.PathAlreadyExists)
+                std.debug.print("Warning: could not create network directory: {}\n", .{err});
+        };
+    }
+    defer if (subdir.len > 0) allocator.free(full_datadir);
+
+    // Open RocksDB
+    var db: ?storage.Database = null;
+    var db_ptr: ?*storage.Database = null;
+    if (comptime build_options.rocksdb_enabled) {
+        const chainstate_path = std.fmt.allocPrint(allocator, "{s}/chainstate", .{full_datadir}) catch {
+            std.debug.print("Out of memory\n", .{});
+            std.process.exit(1);
+        };
+        defer allocator.free(chainstate_path);
+        std.fs.makeDirAbsolute(chainstate_path) catch |err| {
+            if (err != error.PathAlreadyExists)
+                std.debug.print("Warning: could not create chainstate directory: {}\n", .{err});
+        };
+        if (storage.Database.open(chainstate_path, allocator)) |opened_db| {
+            db = opened_db;
+        } else |err| {
+            std.debug.print("Failed to open RocksDB: {}\n", .{err});
+            std.debug.print("Falling back to memory-only mode\n", .{});
+        }
+        if (db != null) db_ptr = &db.?;
+    }
+    defer if (db_ptr) |p| p.close();
+
+    var chain_state = storage.ChainState.init(db_ptr, @intCast(config.dbcache), allocator);
+    defer chain_state.deinit();
+
+    const params = config.getNetworkParams();
+    chain_state.best_hash = params.genesis_hash;
+    chain_state.best_height = 0;
+
+    // Open input source
+    const input_file: std.fs.File = if (std.mem.eql(u8, import_path, "-"))
+        std.io.getStdIn()
+    else
+        std.fs.openFileAbsolute(import_path, .{}) catch |err| {
+            std.debug.print("Error opening {s}: {}\n", .{ import_path, err });
+            std.process.exit(1);
+        };
+    defer if (!std.mem.eql(u8, import_path, "-")) input_file.close();
+
+    var buf_reader = std.io.bufferedReader(input_file.reader());
+    const reader = buf_reader.reader();
+
+    std.debug.print("clearbit import: reading blocks from {s}\n", .{
+        if (std.mem.eql(u8, import_path, "-")) "stdin" else import_path,
+    });
+
+    const start_time = std.time.milliTimestamp();
+    var count: u64 = 0;
+    var last_height: u32 = 0;
+
+    while (true) {
+        // Read 8-byte frame header
+        var frame_header: [8]u8 = undefined;
+        const bytes_read = reader.readAll(&frame_header) catch |err| {
+            std.debug.print("Read error after {d} blocks: {}\n", .{ count, err });
+            break;
+        };
+        if (bytes_read == 0) break; // EOF
+        if (bytes_read < 8) {
+            std.debug.print("Unexpected EOF reading frame header after {d} blocks\n", .{count});
+            break;
+        }
+
+        const height = std.mem.readInt(u32, frame_header[0..4], .little);
+        const size = std.mem.readInt(u32, frame_header[4..8], .little);
+
+        // Read block data
+        const block_data = allocator.alloc(u8, size) catch {
+            std.debug.print("Out of memory allocating {d} bytes for block at height {d}\n", .{ size, height });
+            break;
+        };
+        defer allocator.free(block_data);
+
+        const data_read = reader.readAll(block_data) catch |err| {
+            std.debug.print("Read error at block {d}: {}\n", .{ height, err });
+            break;
+        };
+        if (data_read < size) {
+            std.debug.print("Unexpected EOF reading block {d} (got {d}/{d} bytes)\n", .{ height, data_read, size });
+            break;
+        }
+
+        // Skip blocks at or below current tip
+        if (height <= chain_state.best_height) continue;
+
+        // Deserialize the block
+        var block_reader = serialize.Reader{ .data = block_data };
+        const block = serialize.readBlock(&block_reader, allocator) catch |err| {
+            std.debug.print("Failed to deserialize block at height {d}: {}\n", .{ height, err });
+            break;
+        };
+        defer {
+            for (block.transactions) |*tx| {
+                serialize.freeTransaction(allocator, tx);
+            }
+            allocator.free(block.transactions);
+        }
+
+        // Compute block hash and connect
+        const block_hash = crypto.computeBlockHash(&block.header);
+        chain_state.connectBlockFast(&block, &block_hash, height) catch |err| {
+            std.debug.print("\nFailed to connect block at height {d}: {}\n", .{ height, err });
+            break;
+        };
+
+        count += 1;
+        last_height = height;
+
+        // Progress every 1000 blocks
+        if (count % 1000 == 0) {
+            const elapsed_ms = std.time.milliTimestamp() - start_time;
+            const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+            const rate = if (elapsed_s > 0) @as(f64, @floatFromInt(count)) / elapsed_s else 0.0;
+            std.debug.print("\rImported {d} blocks (height {d}, {d:.1} blk/s)", .{ count, last_height, rate });
+        }
+    }
+
+    // Final flush
+    chain_state.flush() catch |err| {
+        std.debug.print("Warning: error flushing chain state: {}\n", .{err});
+    };
+
+    const elapsed_ms = @max(1, std.time.milliTimestamp() - start_time);
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+    const rate = @as(f64, @floatFromInt(count)) / elapsed_s;
+    std.debug.print("\nImport complete: {d} blocks in {d:.0}s ({d:.1} blk/s)\n", .{ count, elapsed_s, rate });
+}
+
 pub fn main() !void {
     // Use c_allocator for release builds (faster, no safety overhead).
     // GPA is kept for debug builds for leak detection and safety checks.
@@ -519,6 +696,11 @@ pub fn main() !void {
             std.process.exit(1);
         };
         return;
+    }
+
+    // 1b. Import blocks mode
+    if (config.import_blocks != null) {
+        return importBlocks(&config, allocator);
     }
 
     // 2. Resolve and create data directory
