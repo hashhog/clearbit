@@ -391,7 +391,9 @@ pub const MAINNET = NetworkParams{
             .coins_count = 176_000_000,
         },
     },
-    .assume_valid_height = 0,
+    // Bitcoin Core default assumevalid block (height 938343)
+    // Display: 00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac
+    .assume_valid_height = 938343,
 };
 
 /// Testnet3 parameters.

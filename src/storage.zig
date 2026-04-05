@@ -855,6 +855,15 @@ pub const UtxoSet = struct {
             };
             try self.cache.put(key, CacheEntry{ .utxo = cache_utxo, .dirty = false });
 
+            // Read-throughs also grow the cache; check eviction periodically
+            self.adds_since_eviction_check += 1;
+            if (self.adds_since_eviction_check >= 1000) {
+                self.adds_since_eviction_check = 0;
+                if (self.cacheMemoryUsage() > self.max_cache_size) {
+                    self.evictCache();
+                }
+            }
+
             return utxo;
         }
 
@@ -936,7 +945,11 @@ pub const UtxoSet = struct {
         // Without a DB backend, eviction permanently loses UTXO data.
         // Only evict when we have a database to fall back to.
         if (self.db == null) return;
-        self.flush() catch {};
+        self.flush() catch |err| {
+            // If flush fails, do NOT evict -- entries would be lost
+            std.debug.print("UTXO evictCache: flush failed with {}, skipping eviction to prevent data loss\n", .{err});
+            return;
+        };
 
         var to_remove = std.ArrayList([36]u8).init(self.allocator);
         defer to_remove.deinit();
@@ -1021,6 +1034,10 @@ pub const UtxoSet = struct {
         var batch = std.ArrayList(BatchOp).init(self.allocator);
         defer batch.deinit();
 
+        // Track which keys are dirty so we can mark them clean AFTER successful write
+        var dirty_keys = std.ArrayList([36]u8).init(self.allocator);
+        defer dirty_keys.deinit();
+
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.dirty) {
@@ -1033,12 +1050,33 @@ pub const UtxoSet = struct {
                     .key = key_copy,
                     .value = encoded,
                 } });
-                entry.value_ptr.dirty = false;
+                try dirty_keys.append(entry.key_ptr.*);
             }
         }
 
         if (batch.items.len > 0) {
-            self.db.?.writeBatch(batch.items) catch {};
+            // Write batch to DB - propagate errors instead of silently swallowing
+            self.db.?.writeBatch(batch.items) catch |err| {
+                std.debug.print("UTXO flush: writeBatch failed with {}, {d} entries NOT persisted\n", .{ err, batch.items.len });
+                // Free allocated batch memory before returning error
+                for (batch.items) |op| {
+                    switch (op) {
+                        .put => |p| {
+                            self.allocator.free(@constCast(p.key));
+                            self.allocator.free(@constCast(p.value));
+                        },
+                        .delete => |d| self.allocator.free(@constCast(d.key)),
+                    }
+                }
+                return err;
+            };
+
+            // Only mark entries as clean AFTER successful writeBatch
+            for (dirty_keys.items) |key| {
+                if (self.cache.getPtr(key)) |entry_ptr| {
+                    entry_ptr.dirty = false;
+                }
+            }
 
             // Free the allocated keys and values
             for (batch.items) |op| {
@@ -1070,7 +1108,19 @@ pub const UtxoSet = struct {
         }
 
         if (batch.items.len > 0) {
-            self.db.?.writeBatch(batch.items) catch {};
+            self.db.?.writeBatch(batch.items) catch |err| {
+                std.debug.print("UTXO flushPendingDeletes: writeBatch failed with {}, {d} deletes NOT persisted\n", .{ err, batch.items.len });
+                for (batch.items) |op| {
+                    switch (op) {
+                        .delete => |d| self.allocator.free(@constCast(d.key)),
+                        .put => |p| {
+                            self.allocator.free(@constCast(p.key));
+                            self.allocator.free(@constCast(p.value));
+                        },
+                    }
+                }
+                return err;
+            };
             for (batch.items) |op| {
                 switch (op) {
                     .delete => |d| self.allocator.free(@constCast(d.key)),
@@ -1100,9 +1150,8 @@ pub const UtxoSet = struct {
         //   bytes) + HashMap bucket/tombstone overhead (~256 bytes at load
         //   factors seen in practice).
         // Empirical measurement: ~6 KiB RSS per entry on testnet4 IBD.
-        // Use a conservative 4 KiB to avoid over-eviction while keeping
-        // the cache bounded within the configured --dbcache budget.
-        return self.cache.count() * 4096;
+        // Use 6 KiB to match observed RSS and prevent OOM during IBD.
+        return self.cache.count() * 6144;
     }
 };
 
@@ -1597,11 +1646,24 @@ pub const ChainState = struct {
 
             // Spend inputs (skip coinbase)
             if (tx_idx > 0) {
-                for (tx.inputs) |input| {
+                for (tx.inputs, 0..) |input, input_idx| {
                     if (skip_undo) {
                         // Fast path: just delete the UTXO, don't track what was spent
-                        const spent = try self.utxo_set.spend(&input.previous_output)
-                            orelse return error.MissingInput;
+                        const spent = self.utxo_set.spend(&input.previous_output) catch |err| {
+                            std.debug.print("UTXO spend error at height {d}, tx {d}, input {d}: {}\n", .{ height, tx_idx, input_idx, err });
+                            std.debug.print("  outpoint: ", .{});
+                            for (input.previous_output.hash) |b| std.debug.print("{x:0>2}", .{b});
+                            std.debug.print(":{d}\n", .{input.previous_output.index});
+                            std.debug.print("  cache_count={d}, db={s}\n", .{ self.utxo_set.cache.count(), if (self.utxo_set.db != null) "yes" else "no" });
+                            return err;
+                        } orelse {
+                            std.debug.print("UTXO missing at height {d}, tx {d}, input {d}\n", .{ height, tx_idx, input_idx });
+                            std.debug.print("  outpoint: ", .{});
+                            for (input.previous_output.hash) |b| std.debug.print("{x:0>2}", .{b});
+                            std.debug.print(":{d}\n", .{input.previous_output.index});
+                            std.debug.print("  cache_count={d}, hits={d}, misses={d}\n", .{ self.utxo_set.cache.count(), self.utxo_set.hits, self.utxo_set.misses });
+                            return error.MissingInput;
+                        };
                         var s = spent;
                         s.deinit(self.allocator);
                     } else {

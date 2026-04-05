@@ -279,8 +279,42 @@ pub const Peer = struct {
         params: *const consensus.NetworkParams,
         allocator: std.mem.Allocator,
     ) PeerError!Peer {
-        const stream = std.net.tcpConnectToAddress(address) catch
+        // Non-blocking connect with 5-second timeout to avoid blocking the event loop.
+        // The default tcpConnectToAddress blocks for the kernel's TCP timeout (~75s),
+        // which stalls all peer processing during IBD.
+        const sock = std.posix.socket(
+            address.any.family,
+            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
+            std.posix.IPPROTO.TCP,
+        ) catch return PeerError.ConnectionFailed;
+        errdefer std.posix.close(sock);
+
+        // Initiate non-blocking connect
+        std.posix.connect(sock, &address.any, address.getOsSockLen()) catch |err| {
+            if (err != error.WouldBlock) return PeerError.ConnectionFailed;
+        };
+
+        // Wait for connect to complete (writable) with 5s timeout
+        var pollfds = [_]std.posix.pollfd{.{
+            .fd = sock,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pollfds, 5000) catch return PeerError.ConnectionFailed;
+        if (ready == 0) return PeerError.ConnectionFailed; // timeout
+        if (pollfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0)
             return PeerError.ConnectionFailed;
+
+        // Check SO_ERROR to see if connect actually succeeded
+        std.posix.getsockoptError(sock) catch return PeerError.ConnectionFailed;
+
+        // Switch back to blocking mode for normal I/O
+        const cur_flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch return PeerError.ConnectionFailed;
+        const o_nonblock: usize = @intCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+        _ = std.posix.fcntl(sock, std.posix.F.SETFL, cur_flags & ~o_nonblock) catch
+            return PeerError.ConnectionFailed;
+
+        const stream = std.net.Stream{ .handle = sock };
 
         // Set socket options for timeouts (30 seconds)
         const timeout = std.posix.timeval{ .tv_sec = 30, .tv_usec = 0 };
@@ -2039,9 +2073,12 @@ pub const PeerManager = struct {
                 // - Our best block hash (genesis or connected tip)
                 const expected_prev = if (self.expected_blocks.items.len > 0)
                     self.expected_blocks.items[self.expected_blocks.items.len - 1]
-                else if (self.chain_state) |cs|
-                    cs.best_hash
-                else
+                else if (self.chain_state) |cs| blk: {
+                    // On fresh start best_hash is all zeros; use genesis hash
+                    // so the first batch of headers (whose prev_block is the
+                    // genesis hash) chains correctly.
+                    break :blk if (cs.best_height == 0) self.network_params.genesis_hash else cs.best_hash;
+                } else
                     self.network_params.genesis_hash;
 
                 if (!std.mem.eql(u8, &h.headers[0].prev_block, &expected_prev)) {
@@ -2073,15 +2110,30 @@ pub const PeerManager = struct {
             .block => |block| {
                 const block_hash = crypto.computeBlockHash(&block.header);
 
-                // Decrement in-flight counter
+                // Decrement in-flight counters (global and per-peer)
                 if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
+                peer.recordBlockReceived();
 
                 // Bound the buffer to prevent OOM — if too many blocks are
                 // buffered waiting for connection, drop this one. It will
                 // be re-downloaded when the connection cursor catches up.
+                // BUT: always accept the block at the connect cursor, otherwise
+                // a full buffer creates a deadlock (we need the next block to
+                // advance the cursor and free buffer space, but we drop it).
                 if (self.block_buffer.count() >= 1024) {
-                    serialize.freeBlock(self.allocator, &block);
-                    return;
+                    // Try draining first — if the next block is already buffered
+                    // this will free space.
+                    self.drainBlockBuffer();
+
+                    // If still full, check if this is the critical next block
+                    if (self.block_buffer.count() >= 1024) {
+                        const is_next = self.connect_cursor < self.expected_blocks.items.len and
+                            std.mem.eql(u8, &block_hash, &self.expected_blocks.items[self.connect_cursor]);
+                        if (!is_next) {
+                            serialize.freeBlock(self.allocator, &block);
+                            return;
+                        }
+                    }
                 }
 
                 // Buffer the block (transfer ownership - do NOT free here)
@@ -2455,6 +2507,16 @@ pub const PeerManager = struct {
         const peer = self.peers.swapRemove(index);
         // Untrack netgroup for outbound connections
         self.untrackOutboundNetgroup(peer);
+        // Reclaim in-flight block count for this peer so the global counter
+        // doesn't permanently drift upward, which would block new requests.
+        if (peer.blocks_in_flight_count > 0) {
+            if (self.blocks_in_flight >= peer.blocks_in_flight_count) {
+                self.blocks_in_flight -= peer.blocks_in_flight_count;
+            } else {
+                // Counter already drifted; reset to 0 rather than underflow.
+                self.blocks_in_flight = 0;
+            }
+        }
         peer.disconnect();
         self.allocator.destroy(peer);
     }
@@ -2523,6 +2585,11 @@ pub const PeerManager = struct {
                     continue;
                 };
                 self.blocks_in_flight += batch_count;
+                // Track per-peer so disconnect cleanup and timeout detection work.
+                var bi: u32 = 0;
+                while (bi < batch_count) : (bi += 1) {
+                    tp.recordBlockRequest();
+                }
             }
             invs.deinit();
 
@@ -2548,9 +2615,29 @@ pub const PeerManager = struct {
             if (now_check - self.last_stall_recovery >= 5) {
                 self.last_stall_recovery = now_check;
 
+                // Stall recovery: reset ALL in-flight counters before
+                // re-requesting. The old per-peer counts are stale — blocks
+                // were assigned to peers that may have disconnected or timed
+                // out, and re-requesting from different peers creates a
+                // mismatch between per-peer sums and the global counter.
+                // Zeroing everything and re-tracking the fresh requests
+                // eliminates drift entirely.
+                {
+                    var old_in_flight: u32 = 0;
+                    for (self.peers.items) |p| {
+                        old_in_flight += p.blocks_in_flight_count;
+                        p.blocks_in_flight_count = 0;
+                        p.oldest_block_in_flight_time = 0;
+                    }
+                    if (old_in_flight > 0 or self.blocks_in_flight > 0) {
+                        std.debug.print("P2P: stall recovery: resetting in-flight counters (global={d}, peer_sum={d}) -> 0\n", .{ self.blocks_in_flight, old_in_flight });
+                    }
+                    self.blocks_in_flight = 0;
+                }
+
                 // Reset download_cursor to connect_cursor so the normal pipeline
                 // will re-request any missing blocks instead of skipping them.
-                if (self.download_cursor > self.connect_cursor and self.blocks_in_flight == 0) {
+                if (self.download_cursor > self.connect_cursor) {
                     self.download_cursor = self.connect_cursor;
                 }
 
@@ -2574,7 +2661,18 @@ pub const PeerManager = struct {
                     }
                     if (invs.items.len > 0) {
                         const getdata_msg = p2p.Message{ .getdata = .{ .inventory = invs.items } };
-                        p.sendMessage(&getdata_msg) catch {};
+                        p.sendMessage(&getdata_msg) catch {
+                            invs.deinit();
+                            if (peer_round >= 3) break;
+                            continue;
+                        };
+                        // Track re-requested blocks properly in both counters.
+                        const re_count: u32 = @intCast(invs.items.len);
+                        self.blocks_in_flight += re_count;
+                        var ri: u32 = 0;
+                        while (ri < re_count) : (ri += 1) {
+                            p.recordBlockRequest();
+                        }
                     }
                     invs.deinit();
                     // Try up to 3 peers for stall recovery
@@ -2758,10 +2856,11 @@ pub const PeerManager = struct {
             // 1. Open new outbound connections if needed (skip if --connect mode)
             // During IBD, skip connection attempts if we already have peers (avoids blocking)
             if (self.connect_address == null) {
-                const has_peers = self.peers.items.len > 0;
-                if (!has_peers or !self.isIBD()) {
-                    self.maintainOutbound() catch {};
-                }
+                // During IBD, maintainOutbound already limits to 1 attempt
+                // per call, so it won't block the loop excessively.
+                // Always try to maintain outbound diversity — a single peer
+                // is fragile and will stall if it disconnects.
+                self.maintainOutbound() catch {};
             }
 
             // 2. Accept inbound connections
