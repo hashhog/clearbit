@@ -74,7 +74,7 @@ pub const RpcConfig = struct {
     port: u16 = 8332,
     auth_token: ?[]const u8 = null, // Base64-encoded "user:pass"
     cookie_token: ?[]const u8 = null, // Base64-encoded "__cookie__:<hex>" from .cookie file
-    max_request_size: usize = 1 << 20, // 1 MB
+    max_request_size: usize = 1 << 24, // 16 MB (needed for submitblock with large blocks)
 };
 
 /// RPC Server error set.
@@ -349,28 +349,35 @@ pub const RpcServer = struct {
         // Read body
         const body_start = headers_end + 4;
         var body: []u8 = undefined;
+        var body_allocated = false;
 
         if (body_start + content_length <= total_read) {
-            // Already have full body
+            // Already have full body in stack buffer
             body = @constCast(request_data[body_start .. body_start + content_length]);
         } else {
-            // Need to read more
-            _ = content_length - (total_read - body_start); // remaining bytes needed
-            var body_buf = self.allocator.alloc(u8, content_length) catch {
+            // Need to read more — allocate a buffer for the full body
+            const body_buf = self.allocator.alloc(u8, content_length) catch {
                 try self.sendHttpError(conn.stream, 500, "Internal Server Error");
                 return;
             };
-            defer self.allocator.free(body_buf);
+            body_allocated = true;
 
             @memcpy(body_buf[0 .. total_read - body_start], request_data[body_start..total_read]);
             var offset = total_read - body_start;
             while (offset < content_length) {
-                const n = conn.stream.read(body_buf[offset..]) catch return;
-                if (n == 0) return;
+                const n = conn.stream.read(body_buf[offset..]) catch {
+                    self.allocator.free(body_buf);
+                    return;
+                };
+                if (n == 0) {
+                    self.allocator.free(body_buf);
+                    return;
+                }
                 offset += n;
             }
             body = body_buf;
         }
+        defer if (body_allocated) self.allocator.free(body);
 
         // Process JSON-RPC request
         const response = self.dispatch(body) catch |err| {

@@ -1099,6 +1099,9 @@ pub const BlockDownloader = struct {
     }
 
     /// Validate a block and update the UTXO set.
+    /// All UTXO mutations and the chain tip update are written in a single
+    /// atomic WriteBatch so a crash can never leave the DB with UTXOs from
+    /// block N but a tip pointing at block N-1 (or vice-versa).
     fn validateAndConnectBlock(self: *BlockDownloader, block: *const types.Block, height: u32) BlockDownloadError!void {
         const chain_store = self.sync_manager.chain_store;
         const params = self.sync_manager.network_params;
@@ -1131,7 +1134,12 @@ pub const BlockDownloader = struct {
         const subsidy = consensus.getBlockSubsidy(height, params);
         var total_fees: i64 = 0;
 
-        // 3. Process each transaction: validate inputs, update UTXO set
+        // Collect UTXO creates and spends for atomic batch write
+        const CreateEntry = struct { outpoint: types.OutPoint, txout: types.TxOut, height: u32, is_coinbase: bool };
+        var pending_creates = std.ArrayList(CreateEntry).init(arena_alloc);
+        var pending_spends = std.ArrayList(types.OutPoint).init(arena_alloc);
+
+        // 3. Process each transaction: validate inputs, collect UTXO mutations
         for (block.transactions, 0..) |tx, tx_idx| {
             if (tx_idx == 0) {
                 // Coinbase: only creates outputs, no inputs to validate
@@ -1150,9 +1158,9 @@ pub const BlockDownloader = struct {
 
                         input_sum += utxo.?.value;
 
-                        // Mark UTXO as spent (delete from set)
-                        cs.deleteUtxo(&input.previous_output) catch
-                            return BlockDownloadError.StorageError;
+                        // Collect spend for atomic batch (don't write yet)
+                        pending_spends.append(input.previous_output) catch
+                            return BlockDownloadError.OutOfMemory;
 
                         // Free the script_pubkey we allocated
                         self.allocator.free(utxo.?.script_pubkey);
@@ -1168,7 +1176,7 @@ pub const BlockDownloader = struct {
                 total_fees += input_sum - output_sum;
             }
 
-            // Add new UTXOs for all outputs (reuse txid from merkle root computation)
+            // Collect new UTXOs for all outputs (reuse txid from merkle root computation)
             const tx_hash = tx_hashes[tx_idx];
             for (tx.outputs, 0..) |output, out_idx| {
                 // Skip unspendable outputs (OP_RETURN)
@@ -1178,10 +1186,12 @@ pub const BlockDownloader = struct {
                     .hash = tx_hash,
                     .index = @intCast(out_idx),
                 };
-                if (chain_store) |cs| {
-                    cs.putUtxo(&outpoint, &output, height, tx_idx == 0) catch
-                        return BlockDownloadError.StorageError;
-                }
+                pending_creates.append(.{
+                    .outpoint = outpoint,
+                    .txout = output,
+                    .height = height,
+                    .is_coinbase = tx_idx == 0,
+                }) catch return BlockDownloadError.OutOfMemory;
             }
         }
 
@@ -1193,11 +1203,15 @@ pub const BlockDownloader = struct {
         if (coinbase_value > subsidy + total_fees)
             return BlockDownloadError.ExcessiveCoinbaseValue;
 
-        // 5. Update chain tip
+        // 5. Atomic flush: UTXO creates + spends + chain tip in ONE WriteBatch
         const block_hash = crypto.computeBlockHash(&block.header);
         if (chain_store) |cs| {
-            cs.putChainTip(&block_hash, height) catch
-                return BlockDownloadError.StorageError;
+            cs.applyBlockAtomic(
+                pending_creates.items,
+                pending_spends.items,
+                &block_hash,
+                height,
+            ) catch return BlockDownloadError.StorageError;
         }
     }
 
