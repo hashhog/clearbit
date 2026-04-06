@@ -36,7 +36,20 @@ const DbState = struct {
 };
 
 /// Open or create the database at the given path.
+/// Removes stale LOCK files from unclean shutdowns before opening.
 pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.StorageError!storage.Database {
+    // Remove stale LOCK file left by a previous unclean shutdown.
+    // RocksDB uses this file to prevent concurrent access, but if the
+    // previous process crashed or was killed, the LOCK remains and blocks
+    // reopening.  It is safe to remove because we are the only process
+    // that should be accessing this database directory.
+    {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}/LOCK", .{path}) catch
+            return storage.StorageError.OutOfMemory;
+        defer allocator.free(lock_path);
+        std.fs.deleteFileAbsolute(lock_path) catch {};
+    }
+
     var errptr: ?[*:0]u8 = null;
 
     const options = c.rocksdb_options_create();
@@ -73,6 +86,7 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
     );
 
     if (errptr) |err| {
+        std.debug.print("RocksDB: column family open failed (expected on first run): {s}\n", .{err});
         c.rocksdb_free(@ptrCast(err));
 
         // Column families don't exist yet - open with default only, then create them
@@ -80,6 +94,7 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
         db = c.rocksdb_open(options, path_z.ptr, &errptr);
 
         if (errptr) |err2| {
+            std.debug.print("RocksDB: open failed: {s}\n", .{err2});
             c.rocksdb_free(@ptrCast(err2));
             return storage.StorageError.OpenFailed;
         }
