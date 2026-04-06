@@ -858,6 +858,8 @@ pub const UtxoSet = struct {
     // Batched DB deletes for IBD performance
     pending_deletes: std.ArrayList([36]u8),
     adds_since_eviction_check: u32,
+    // Track dirty keys for O(dirty) flush instead of O(cache) scan
+    dirty_keys: std.ArrayList([36]u8),
 
     /// Cache entry with ownership tracking.
     const CacheEntry = struct {
@@ -888,12 +890,14 @@ pub const UtxoSet = struct {
             .misses = 0,
             .pending_deletes = std.ArrayList([36]u8).init(allocator),
             .adds_since_eviction_check = 0,
+            .dirty_keys = std.ArrayList([36]u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *UtxoSet) void {
         self.flushPendingDeletes() catch {};
         self.pending_deletes.deinit();
+        self.dirty_keys.deinit();
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             var cache_entry = entry.value_ptr.*;
@@ -1015,6 +1019,8 @@ pub const UtxoSet = struct {
 
         // Store in cache (marked dirty for eventual flush to DB)
         try self.cache.put(key, CacheEntry{ .utxo = compact, .dirty = true });
+        // Track dirty key for efficient flush
+        self.dirty_keys.append(key) catch {};
 
         self.total_utxos += 1;
         self.total_amount += output.value;
@@ -1111,34 +1117,43 @@ pub const UtxoSet = struct {
     }
 
     /// Flush the dirty cache entries to disk.
+    /// Uses the dirty_keys tracker for O(dirty) performance instead of
+    /// scanning the entire cache.
     pub fn flush(self: *UtxoSet) !void {
         if (self.db == null) return;
 
         // Flush pending deletes first
         try self.flushPendingDeletes();
 
+        if (self.dirty_keys.items.len == 0) return;
+
         var batch = std.ArrayList(BatchOp).init(self.allocator);
         defer batch.deinit();
 
-        // Track which keys are dirty so we can mark them clean AFTER successful write
-        var dirty_keys = std.ArrayList([36]u8).init(self.allocator);
-        defer dirty_keys.deinit();
+        // Use tracked dirty keys instead of scanning entire cache
+        var actual_dirty = std.ArrayList([36]u8).init(self.allocator);
+        defer actual_dirty.deinit();
 
-        var iter = self.cache.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.dirty) {
-                const encoded = try entry.value_ptr.utxo.encode(self.allocator);
-                const key_copy = try self.allocator.alloc(u8, 36);
-                @memcpy(key_copy, &entry.key_ptr.*);
+        for (self.dirty_keys.items) |key| {
+            if (self.cache.getPtr(key)) |entry_ptr| {
+                if (entry_ptr.dirty) {
+                    const encoded = try entry_ptr.utxo.encode(self.allocator);
+                    const key_copy = try self.allocator.alloc(u8, 36);
+                    @memcpy(key_copy, &key);
 
-                try batch.append(.{ .put = .{
-                    .cf = CF_UTXO,
-                    .key = key_copy,
-                    .value = encoded,
-                } });
-                try dirty_keys.append(entry.key_ptr.*);
+                    try batch.append(.{ .put = .{
+                        .cf = CF_UTXO,
+                        .key = key_copy,
+                        .value = encoded,
+                    } });
+                    try actual_dirty.append(key);
+                }
             }
+            // Key not in cache anymore (evicted/spent) — skip
         }
+
+        // Clear the dirty tracker regardless of batch outcome
+        self.dirty_keys.clearRetainingCapacity();
 
         if (batch.items.len > 0) {
             // Write batch to DB - propagate errors instead of silently swallowing
@@ -1158,7 +1173,7 @@ pub const UtxoSet = struct {
             };
 
             // Only mark entries as clean AFTER successful writeBatch
-            for (dirty_keys.items) |key| {
+            for (actual_dirty.items) |key| {
                 if (self.cache.getPtr(key)) |entry_ptr| {
                     entry_ptr.dirty = false;
                 }
@@ -1847,27 +1862,33 @@ pub const ChainState = struct {
         try self.utxo_set.flushPendingDeletes();
 
         // Build a combined batch: dirty UTXO puts + chain tip
+        // Uses dirty_keys tracker for O(dirty) performance instead of
+        // scanning the entire cache.
         var batch = std.ArrayList(BatchOp).init(self.allocator);
         defer batch.deinit();
 
         var dirty_keys = std.ArrayList([36]u8).init(self.allocator);
         defer dirty_keys.deinit();
 
-        var iter = self.utxo_set.cache.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.dirty) {
-                const encoded = try entry.value_ptr.utxo.encode(self.allocator);
-                const key_copy = try self.allocator.alloc(u8, 36);
-                @memcpy(key_copy, &entry.key_ptr.*);
+        for (self.utxo_set.dirty_keys.items) |key| {
+            if (self.utxo_set.cache.getPtr(key)) |entry_ptr| {
+                if (entry_ptr.dirty) {
+                    const encoded = try entry_ptr.utxo.encode(self.allocator);
+                    const key_copy = try self.allocator.alloc(u8, 36);
+                    @memcpy(key_copy, &key);
 
-                try batch.append(.{ .put = .{
-                    .cf = CF_UTXO,
-                    .key = key_copy,
-                    .value = encoded,
-                } });
-                try dirty_keys.append(entry.key_ptr.*);
+                    try batch.append(.{ .put = .{
+                        .cf = CF_UTXO,
+                        .key = key_copy,
+                        .value = encoded,
+                    } });
+                    try dirty_keys.append(key);
+                }
             }
         }
+
+        // Clear the dirty tracker
+        self.utxo_set.dirty_keys.clearRetainingCapacity();
 
         // Add chain tip to the SAME batch
         var tip_buf: [36]u8 = undefined;
