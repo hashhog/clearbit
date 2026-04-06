@@ -57,7 +57,7 @@ pub const Config = struct {
     // Storage
     datadir: []const u8 = "~/.clearbit",
     prune: u64 = 0, // 0 = no pruning, else target size in MiB
-    dbcache: u64 = 450, // UTXO cache size in MiB
+    dbcache: u64 = 2048, // UTXO cache size in MiB
     txindex: bool = false,
     blockfilterindex: bool = false, // BIP-157/158 compact block filters
     coinstatsindex: bool = false, // Per-block UTXO statistics
@@ -770,8 +770,10 @@ pub fn main() !void {
         if (storage.Database.open(chainstate_path, allocator)) |opened_db| {
             db = opened_db;
         } else |err| {
-            std.debug.print("Failed to open RocksDB at {s}: {}\n", .{ chainstate_path, err });
-            std.debug.print("Falling back to memory-only mode\n", .{});
+            std.debug.print("FATAL: Failed to open RocksDB at {s}: {}\n", .{ chainstate_path, err });
+            std.debug.print("Memory-only mode cannot sustain mainnet sync (UTXO eviction loses data).\n", .{});
+            std.debug.print("Fix the RocksDB issue or remove the chainstate directory and retry.\n", .{});
+            std.process.exit(1);
         }
         if (db != null) {
             db_ptr = &db.?;

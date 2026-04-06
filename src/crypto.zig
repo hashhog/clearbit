@@ -838,11 +838,13 @@ pub const Sha256Writer = struct {
 
     /// Write raw bytes
     pub fn writeBytes(self: *Sha256Writer, data: []const u8) !void {
+        @setRuntimeSafety(true);
         self.hasher.update(data);
     }
 
     /// Write a little-endian integer
     pub fn writeInt(self: *Sha256Writer, comptime T: type, value: T) !void {
+        @setRuntimeSafety(true);
         var buf: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(T, &buf, value, .little);
         self.hasher.update(&buf);
@@ -850,6 +852,7 @@ pub const Sha256Writer = struct {
 
     /// Write a CompactSize (variable-length integer)
     pub fn writeCompactSize(self: *Sha256Writer, value: u64) !void {
+        @setRuntimeSafety(true);
         if (value < 0xFD) {
             try self.writeInt(u8, @intCast(value));
         } else if (value <= 0xFFFF) {
@@ -866,6 +869,7 @@ pub const Sha256Writer = struct {
 
     /// Finalize and return double-SHA256 hash
     pub fn finalHash256(self: *Sha256Writer) Hash256 {
+        @setRuntimeSafety(true);
         var first_hash: Hash256 = undefined;
         self.hasher.final(&first_hash);
         var result: Hash256 = undefined;
@@ -876,6 +880,7 @@ pub const Sha256Writer = struct {
 
 /// Serialize transaction (no witness) directly into a SHA256 hasher.
 fn writeTransactionNoWitnessToHasher(w: *Sha256Writer, tx: *const types.Transaction) void {
+    @setRuntimeSafety(true);
     w.writeInt(i32, tx.version) catch unreachable;
 
     w.writeCompactSize(tx.inputs.len) catch unreachable;
@@ -946,6 +951,7 @@ pub fn computeTxid(tx: *const types.Transaction, allocator: std.mem.Allocator) !
 
 /// Compute the txid with zero allocations using streaming SHA256.
 pub fn computeTxidStreaming(tx: *const types.Transaction) Hash256 {
+    @setRuntimeSafety(true);
     var w = Sha256Writer.init();
     writeTransactionNoWitnessToHasher(&w, tx);
     return w.finalHash256();

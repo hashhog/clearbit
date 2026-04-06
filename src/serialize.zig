@@ -16,6 +16,7 @@ pub const Reader = struct {
 
     /// Read n bytes from the stream
     pub fn readBytes(self: *Reader, n: usize) Error![]const u8 {
+        @setRuntimeSafety(true);
         if (self.pos + n > self.data.len) return Error.EndOfStream;
         const result = self.data[self.pos .. self.pos + n];
         self.pos += n;
@@ -24,6 +25,7 @@ pub const Reader = struct {
 
     /// Read a little-endian integer
     pub fn readInt(self: *Reader, comptime T: type) Error!T {
+        @setRuntimeSafety(true);
         const size = @sizeOf(T);
         const bytes = try self.readBytes(size);
         return std.mem.readInt(T, bytes[0..size], .little);
@@ -31,6 +33,7 @@ pub const Reader = struct {
 
     /// Read a CompactSize (variable-length integer)
     pub fn readCompactSize(self: *Reader) Error!u64 {
+        @setRuntimeSafety(true);
         const first = try self.readInt(u8);
         if (first < 0xFD) {
             return first;
@@ -45,6 +48,7 @@ pub const Reader = struct {
 
     /// Read a 32-byte hash
     pub fn readHash(self: *Reader) Error!types.Hash256 {
+        @setRuntimeSafety(true);
         const bytes = try self.readBytes(32);
         return bytes[0..32].*;
     }
@@ -119,6 +123,7 @@ pub const Writer = struct {
 
 /// Read a transaction from the binary stream
 pub fn readTransaction(reader: *Reader, allocator: std.mem.Allocator) !types.Transaction {
+    @setRuntimeSafety(true);
     const version = try reader.readInt(i32);
 
     // Check for segwit marker (0x00 followed by 0x01)

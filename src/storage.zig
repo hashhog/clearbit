@@ -99,6 +99,7 @@ pub const UtxoEntry = struct {
 
 /// Create the UTXO key from an outpoint: txid (32 bytes) ++ output_index (4 bytes LE).
 pub fn makeUtxoKey(outpoint: *const types.OutPoint) [36]u8 {
+    @setRuntimeSafety(true);
     var key: [36]u8 = undefined;
     @memcpy(key[0..32], &outpoint.hash);
     std.mem.writeInt(u32, key[32..36], outpoint.index, .little);
@@ -539,6 +540,86 @@ pub const ChainStore = struct {
             }
         }
     }
+
+    /// Atomically apply a full block's UTXO changes AND update the chain tip
+    /// in a single WriteBatch. This prevents inconsistency if the process crashes
+    /// between UTXO writes and tip update.
+    pub fn applyBlockAtomic(
+        self: *ChainStore,
+        creates: []const struct { outpoint: types.OutPoint, txout: types.TxOut, height: u32, is_coinbase: bool },
+        spends: []const types.OutPoint,
+        tip_hash: *const types.Hash256,
+        tip_height: u32,
+    ) StorageError!void {
+        var ops = std.ArrayList(BatchOp).init(self.allocator);
+        defer {
+            for (ops.items) |op| {
+                switch (op) {
+                    .put => |p| self.allocator.free(p.value),
+                    .delete => {},
+                }
+            }
+            ops.deinit();
+        }
+
+        // UTXO creates
+        for (creates) |create| {
+            const entry = UtxoEntry{
+                .value = create.txout.value,
+                .script_pubkey = create.txout.script_pubkey,
+                .height = create.height,
+                .is_coinbase = create.is_coinbase,
+            };
+
+            const data = try entry.toBytes(self.allocator);
+            const key = makeUtxoKey(&create.outpoint);
+
+            const key_copy = self.allocator.alloc(u8, 36) catch return StorageError.OutOfMemory;
+            @memcpy(key_copy, &key);
+
+            ops.append(.{
+                .put = .{ .cf = CF_UTXO, .key = key_copy, .value = data },
+            }) catch return StorageError.OutOfMemory;
+        }
+
+        // UTXO spends
+        for (spends) |outpoint| {
+            const key = makeUtxoKey(&outpoint);
+
+            const key_copy = self.allocator.alloc(u8, 36) catch return StorageError.OutOfMemory;
+            @memcpy(key_copy, &key);
+
+            ops.append(.{
+                .delete = .{ .cf = CF_UTXO, .key = key_copy },
+            }) catch return StorageError.OutOfMemory;
+        }
+
+        // Chain tip in the SAME batch
+        var tip_buf: [36]u8 = undefined;
+        @memcpy(tip_buf[0..32], tip_hash);
+        std.mem.writeInt(u32, tip_buf[32..36], tip_height, .little);
+
+        const tip_key = self.allocator.alloc(u8, CHAIN_TIP_KEY.len) catch return StorageError.OutOfMemory;
+        @memcpy(tip_key, CHAIN_TIP_KEY);
+
+        const tip_val = self.allocator.alloc(u8, 36) catch return StorageError.OutOfMemory;
+        @memcpy(tip_val, &tip_buf);
+
+        ops.append(.{
+            .put = .{ .cf = CF_DEFAULT, .key = tip_key, .value = tip_val },
+        }) catch return StorageError.OutOfMemory;
+
+        // Single atomic write
+        try self.db.writeBatch(ops.items);
+
+        // Free allocated keys
+        for (ops.items) |op| {
+            switch (op) {
+                .put => |p| self.allocator.free(@constCast(p.key)),
+                .delete => |d| self.allocator.free(@constCast(d.key)),
+            }
+        }
+    }
 };
 
 // ============================================================================
@@ -751,9 +832,11 @@ pub const CompactUtxo = struct {
 /// as the hash value with zero computation overhead.
 const UtxoKeyContext = struct {
     pub fn hash(_: UtxoKeyContext, key: [36]u8) u64 {
+        @setRuntimeSafety(true);
         return std.mem.readInt(u64, key[0..8], .little);
     }
     pub fn eql(_: UtxoKeyContext, a: [36]u8, b: [36]u8) bool {
+        @setRuntimeSafety(true);
         return std.mem.eql(u8, &a, &b);
     }
 };
@@ -821,6 +904,7 @@ pub const UtxoSet = struct {
 
     /// Look up a UTXO by outpoint.
     pub fn get(self: *UtxoSet, outpoint: *const types.OutPoint) !?CompactUtxo {
+        @setRuntimeSafety(true);
         const key = makeUtxoKey(outpoint);
 
         // Check cache first
@@ -899,6 +983,7 @@ pub const UtxoSet = struct {
         height: u32,
         is_coinbase: bool,
     ) !void {
+        @setRuntimeSafety(true);
         const key = makeUtxoKey(outpoint);
 
         // Classify script for compact storage
@@ -982,6 +1067,7 @@ pub const UtxoSet = struct {
 
     /// Remove a UTXO (spend it). Returns the spent UTXO for undo data.
     pub fn spend(self: *UtxoSet, outpoint: *const types.OutPoint) !?CompactUtxo {
+        @setRuntimeSafety(true);
         const key = makeUtxoKey(outpoint);
 
         // Try to get from cache first
@@ -1476,6 +1562,10 @@ pub const ChainState = struct {
     utxo_set: UtxoSet,
     undo_manager: ?UndoFileManager,
     allocator: std.mem.Allocator,
+    /// Mutex protecting block connection/disconnection.
+    /// Both P2P and RPC (submitblock) can connect blocks concurrently;
+    /// without serialization the UTXO HashMap corrupts.
+    connect_mutex: std.Thread.Mutex = .{},
 
     /// Undo data for a connected block — needed for disconnection during reorgs.
     /// This is the in-memory representation used during block connection.
@@ -1597,6 +1687,8 @@ pub const ChainState = struct {
         hash: *const types.Hash256,
         height: u32,
     ) !BlockUndo {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
         return self.connectBlockInner(block, hash, height, false);
     }
 
@@ -1607,6 +1699,8 @@ pub const ChainState = struct {
         hash: *const types.Hash256,
         height: u32,
     ) !void {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
         var undo = try self.connectBlockInner(block, hash, height, true);
         undo.deinit(self.allocator);
 
@@ -1614,9 +1708,9 @@ pub const ChainState = struct {
         if (height % 100 == 0) {
             self.utxo_set.flushPendingDeletes() catch {};
         }
-        // Flush dirty cache to DB every 1000 blocks during IBD
+        // Flush dirty UTXO cache + tip to DB atomically every 1000 blocks
         if (height % 1000 == 0) {
-            self.utxo_set.flush() catch {};
+            self.flush() catch {};
         }
     }
 
@@ -1627,6 +1721,7 @@ pub const ChainState = struct {
         height: u32,
         skip_undo: bool,
     ) !BlockUndo {
+        @setRuntimeSafety(true);
         const crypto = @import("crypto.zig");
 
         var spent_list = std.ArrayList(BlockUndo.SpentUtxo).init(self.allocator);
@@ -1704,6 +1799,8 @@ pub const ChainState = struct {
 
     /// Disconnect a block (reorg): reverse UTXO changes using undo data.
     pub fn disconnectBlock(self: *ChainState, undo: *const BlockUndo, prev_hash: types.Hash256) !void {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
         // Remove created outputs (in reverse order for consistency)
         var i: usize = undo.created_outpoints.len;
         while (i > 0) {
@@ -1734,9 +1831,94 @@ pub const ChainState = struct {
         self.best_height -= 1;
     }
 
-    /// Flush UTXO set to disk.
+    /// Flush UTXO set and chain tip to disk atomically.
+    /// Builds a single WriteBatch containing all dirty UTXO entries plus the
+    /// current best_hash/best_height so a crash never leaves the tip out of
+    /// sync with the UTXO set.
     pub fn flush(self: *ChainState) !void {
-        try self.utxo_set.flush();
+        if (self.utxo_set.db == null) {
+            // Memory-only mode, nothing to persist
+            return;
+        }
+        const db = self.utxo_set.db.?;
+
+        // Flush pending deletes first (separate batch — these are already-spent
+        // entries that are safe to remove independently).
+        try self.utxo_set.flushPendingDeletes();
+
+        // Build a combined batch: dirty UTXO puts + chain tip
+        var batch = std.ArrayList(BatchOp).init(self.allocator);
+        defer batch.deinit();
+
+        var dirty_keys = std.ArrayList([36]u8).init(self.allocator);
+        defer dirty_keys.deinit();
+
+        var iter = self.utxo_set.cache.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.dirty) {
+                const encoded = try entry.value_ptr.utxo.encode(self.allocator);
+                const key_copy = try self.allocator.alloc(u8, 36);
+                @memcpy(key_copy, &entry.key_ptr.*);
+
+                try batch.append(.{ .put = .{
+                    .cf = CF_UTXO,
+                    .key = key_copy,
+                    .value = encoded,
+                } });
+                try dirty_keys.append(entry.key_ptr.*);
+            }
+        }
+
+        // Add chain tip to the SAME batch
+        var tip_buf: [36]u8 = undefined;
+        @memcpy(tip_buf[0..32], &self.best_hash);
+        std.mem.writeInt(u32, tip_buf[32..36], self.best_height, .little);
+
+        const tip_key = try self.allocator.alloc(u8, ChainStore.CHAIN_TIP_KEY.len);
+        @memcpy(tip_key, ChainStore.CHAIN_TIP_KEY);
+
+        const tip_val = try self.allocator.alloc(u8, 36);
+        @memcpy(tip_val, &tip_buf);
+
+        try batch.append(.{ .put = .{
+            .cf = CF_DEFAULT,
+            .key = tip_key,
+            .value = tip_val,
+        } });
+
+        if (batch.items.len > 0) {
+            db.writeBatch(batch.items) catch |err| {
+                std.debug.print("ChainState flush: writeBatch failed with {}, {d} entries NOT persisted\n", .{ err, batch.items.len });
+                for (batch.items) |op| {
+                    switch (op) {
+                        .put => |p| {
+                            self.allocator.free(@constCast(p.key));
+                            self.allocator.free(@constCast(p.value));
+                        },
+                        .delete => |d| self.allocator.free(@constCast(d.key)),
+                    }
+                }
+                return err;
+            };
+
+            // Mark dirty entries clean AFTER successful write
+            for (dirty_keys.items) |key| {
+                if (self.utxo_set.cache.getPtr(key)) |entry_ptr| {
+                    entry_ptr.dirty = false;
+                }
+            }
+
+            // Free allocated keys and values
+            for (batch.items) |op| {
+                switch (op) {
+                    .put => |p| {
+                        self.allocator.free(@constCast(p.key));
+                        self.allocator.free(@constCast(p.value));
+                    },
+                    .delete => |d| self.allocator.free(@constCast(d.key)),
+                }
+            }
+        }
     }
 
     /// Connect a block and persist undo data to file.
