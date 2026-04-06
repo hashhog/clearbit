@@ -695,6 +695,18 @@ pub fn submitBlockWithIndex(
     };
     undo.deinit(chain_state.allocator);
 
+    // Flush UTXO changes + chain tip to disk atomically.
+    // connectBlock() only updates the in-memory cache; without an explicit
+    // flush, a crash (or cache eviction via UtxoSet.flush which does NOT
+    // include the tip) can leave the DB with UTXOs from block N but the
+    // tip still pointing at N-1, corrupting the chainstate.
+    chain_state.flush() catch |err| {
+        std.debug.print("submitblock: atomic flush failed after connectBlock at height {d}: {}\n", .{ height, err });
+        // The block is connected in memory but not persisted — this is
+        // effectively the same crash-window that existed before, so we
+        // still report success (the node can recover on next flush).
+    };
+
     // Insert into the block index so that getblockheader / getblockhash can
     // find the block afterwards.
     if (chain_manager) |cm| {
