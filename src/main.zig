@@ -161,6 +161,8 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         else if (std.mem.startsWith(u8, arg, "--dbcache=")) {
             config.dbcache = std.fmt.parseInt(u64, arg["--dbcache=".len..], 10) catch
                 return ArgParseError.InvalidCacheSize;
+            // Cap at 8 GiB to prevent runaway memory usage
+            if (config.dbcache > 8192) config.dbcache = 8192;
         } else if (std.mem.startsWith(u8, arg, "--prune=")) {
             config.prune = std.fmt.parseInt(u64, arg["--prune=".len..], 10) catch
                 return ArgParseError.InvalidArgument;
@@ -376,6 +378,7 @@ pub fn loadConfigFile(
             // Storage settings
             else if (std.mem.eql(u8, key, "dbcache")) {
                 config.dbcache = std.fmt.parseInt(u64, value, 10) catch continue;
+                if (config.dbcache > 8192) config.dbcache = 8192;
             } else if (std.mem.eql(u8, key, "prune")) {
                 config.prune = std.fmt.parseInt(u64, value, 10) catch continue;
             } else if (std.mem.eql(u8, key, "txindex")) {
@@ -558,6 +561,7 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
 
     var chain_state = storage.ChainState.init(db_ptr, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
+    chain_state.wireUtxoParent();
 
     const params = config.getNetworkParams();
     chain_state.best_hash = params.genesis_hash;
@@ -788,6 +792,7 @@ pub fn main() !void {
 
     var chain_state = storage.ChainState.init(db_ptr, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
+    chain_state.wireUtxoParent();
 
     var mempool_instance = mempool.Mempool.init(&chain_state, params, allocator);
     defer mempool_instance.deinit();
