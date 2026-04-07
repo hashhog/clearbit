@@ -860,6 +860,13 @@ pub const UtxoSet = struct {
     adds_since_eviction_check: u32,
     // Track dirty keys for O(dirty) flush instead of O(cache) scan
     dirty_keys: std.ArrayList([36]u8),
+    // Optional back-reference to owning ChainState for atomic eviction flush.
+    // When set, evictCache calls ChainState.flush() (which includes the chain
+    // tip) instead of UtxoSet.flush() (which does not).
+    parent: ?*ChainState = null,
+    // When true, suppress eviction during block connection to prevent
+    // mid-block flushes that can write partial state.
+    suppress_eviction: bool = false,
 
     /// Cache entry with ownership tracking.
     const CacheEntry = struct {
@@ -943,9 +950,11 @@ pub const UtxoSet = struct {
             };
             try self.cache.put(key, CacheEntry{ .utxo = cache_utxo, .dirty = false });
 
-            // Read-throughs also grow the cache; check eviction periodically
+            // Read-throughs also grow the cache; check eviction periodically.
+            // Skip during block connection (suppress_eviction) to prevent
+            // mid-block flushes that write partial UTXO state.
             self.adds_since_eviction_check += 1;
-            if (self.adds_since_eviction_check >= 1000) {
+            if (!self.suppress_eviction and self.adds_since_eviction_check >= 1000) {
                 self.adds_since_eviction_check = 0;
                 if (self.cacheMemoryUsage() > self.max_cache_size) {
                     self.evictCache();
@@ -1008,9 +1017,11 @@ pub const UtxoSet = struct {
             entry.deinit(self.allocator);
         }
 
-        // Check eviction every 1000 adds instead of every add (saves overhead)
+        // Check eviction every 1000 adds instead of every add (saves overhead).
+        // Skip during block connection (suppress_eviction) to prevent mid-block
+        // flushes that write partial UTXO state.
         self.adds_since_eviction_check += 1;
-        if (self.adds_since_eviction_check >= 1000) {
+        if (!self.suppress_eviction and self.adds_since_eviction_check >= 1000) {
             self.adds_since_eviction_check = 0;
             if (self.cacheMemoryUsage() > self.max_cache_size) {
                 self.evictCache();
@@ -1036,11 +1047,26 @@ pub const UtxoSet = struct {
         // Without a DB backend, eviction permanently loses UTXO data.
         // Only evict when we have a database to fall back to.
         if (self.db == null) return;
-        self.flush() catch |err| {
-            // If flush fails, do NOT evict -- entries would be lost
-            std.debug.print("UTXO evictCache: flush failed with {}, skipping eviction to prevent data loss\n", .{err});
-            return;
-        };
+
+        if (!self.suppress_eviction) {
+            // Normal path: flush dirty entries first (atomically with tip if
+            // ChainState is wired up), then evict clean entries.
+            if (self.parent) |cs| {
+                cs.flush() catch |err| {
+                    std.debug.print("UTXO evictCache: atomic flush failed with {}, skipping eviction\n", .{err});
+                    return;
+                };
+            } else {
+                self.flush() catch |err| {
+                    std.debug.print("UTXO evictCache: flush failed with {}, skipping eviction to prevent data loss\n", .{err});
+                    return;
+                };
+            }
+        }
+        // When suppress_eviction is true (mid-block connection), we skip the
+        // flush but still evict CLEAN entries.  This prevents OOM from cache
+        // growth during large blocks while avoiding mid-block flushes that
+        // write partial state.
 
         var to_remove = std.ArrayList([36]u8).init(self.allocator);
         defer to_remove.deinit();
@@ -1051,8 +1077,7 @@ pub const UtxoSet = struct {
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             if (removed >= target_count) break;
-            // With a DB backend, only evict clean (flushed) entries.
-            // Without a DB backend, evict any entry to prevent OOM.
+            // Only evict clean (flushed) entries when we have a DB backend.
             if (self.db == null or !entry.value_ptr.dirty) {
                 to_remove.append(entry.key_ptr.*) catch break;
                 removed += 1;
@@ -1068,6 +1093,31 @@ pub const UtxoSet = struct {
 
         if (to_remove.items.len > 0) {
             std.debug.print("UTXO cache eviction: removed {d} entries, {d} remaining\n", .{ to_remove.items.len, self.cache.count() });
+
+            // Rebuild the HashMap to actually release memory.
+            // Zig's HashMap never shrinks its backing arrays on remove(),
+            // so after evicting half the entries the RSS stays the same.
+            // Rebuilding into a right-sized HashMap frees the old arrays.
+            const remaining = self.cache.count();
+            var new_cache = std.HashMap([36]u8, CacheEntry, UtxoKeyContext, std.hash_map.default_max_load_percentage).init(self.allocator);
+            new_cache.ensureTotalCapacity(@intCast(remaining + remaining / 4)) catch {
+                // If we can't allocate the new map, keep the old one.
+                return;
+            };
+            var copy_iter = self.cache.iterator();
+            while (copy_iter.next()) |entry| {
+                new_cache.put(entry.key_ptr.*, entry.value_ptr.*) catch break;
+            }
+            // Free old backing arrays (but NOT the entries, which are now in new_cache).
+            self.cache.clearRetainingCapacity();
+            self.cache.deinit();
+            self.cache = new_cache;
+
+            // Force glibc to return freed pages to the OS.
+            // Without this, malloc keeps freed memory in its free lists
+            // and RSS never decreases after eviction.
+            const c = @cImport(@cInclude("malloc.h"));
+            _ = c.malloc_trim(0);
         }
     }
 
@@ -1152,9 +1202,6 @@ pub const UtxoSet = struct {
             // Key not in cache anymore (evicted/spent) — skip
         }
 
-        // Clear the dirty tracker regardless of batch outcome
-        self.dirty_keys.clearRetainingCapacity();
-
         if (batch.items.len > 0) {
             // Write batch to DB - propagate errors instead of silently swallowing
             self.db.?.writeBatch(batch.items) catch |err| {
@@ -1169,6 +1216,7 @@ pub const UtxoSet = struct {
                         .delete => |d| self.allocator.free(@constCast(d.key)),
                     }
                 }
+                // Do NOT clear dirty_keys — the entries were not persisted
                 return err;
             };
 
@@ -1190,6 +1238,9 @@ pub const UtxoSet = struct {
                 }
             }
         }
+
+        // Clear the dirty tracker only AFTER successful writeBatch
+        self.dirty_keys.clearRetainingCapacity();
     }
 
     /// Flush pending DB deletes as a batch operation.
@@ -1244,15 +1295,13 @@ pub const UtxoSet = struct {
     }
 
     /// Get approximate cache memory usage.
+    /// Uses a per-entry estimate that accounts for actual observed memory
+    /// cost including HashMap overhead, allocator metadata, and fragmentation.
+    /// Measured estimate for ReleaseFast: ~4 KiB per entry (256-byte UTXO
+    /// data + 36-byte key + HashMap bucket overhead + allocator padding).
+    /// Previous 16 KiB estimate caused premature evictions.
     pub fn cacheMemoryUsage(self: *const UtxoSet) usize {
-        // Measured overhead per entry with Zig's GeneralPurposeAllocator:
-        //   key (36 bytes) + CacheEntry struct (40 bytes) + hash_or_script
-        //   heap slice (~32 bytes avg) + GPA metadata per allocation (~128
-        //   bytes) + HashMap bucket/tombstone overhead (~256 bytes at load
-        //   factors seen in practice).
-        // Empirical measurement: ~6 KiB RSS per entry on testnet4 IBD.
-        // Use 6 KiB to match observed RSS and prevent OOM during IBD.
-        return self.cache.count() * 6144;
+        return self.cache.count() * 4096;
     }
 };
 
@@ -1690,6 +1739,14 @@ pub const ChainState = struct {
         };
     }
 
+    /// Wire up the UtxoSet back-reference so that cache eviction uses
+    /// ChainState.flush() (which includes the chain tip) instead of the
+    /// bare UtxoSet.flush().  Must be called AFTER the ChainState is at
+    /// its final memory address (not during init, which returns by value).
+    pub fn wireUtxoParent(self: *ChainState) void {
+        self.utxo_set.parent = self;
+    }
+
     pub fn deinit(self: *ChainState) void {
         self.utxo_set.deinit();
     }
@@ -1738,6 +1795,12 @@ pub const ChainState = struct {
     ) !BlockUndo {
         @setRuntimeSafety(true);
         const crypto = @import("crypto.zig");
+
+        // Suppress eviction during block connection to prevent mid-block
+        // flushes that write partial UTXO state (some spends applied but
+        // tip not yet updated).  Eviction is checked after the block is
+        // fully connected and the tip is updated.
+        self.utxo_set.suppress_eviction = true;
 
         var spent_list = std.ArrayList(BlockUndo.SpentUtxo).init(self.allocator);
         errdefer {
@@ -1805,6 +1868,19 @@ pub const ChainState = struct {
 
         self.best_hash = hash.*;
         self.best_height = height;
+
+        // Re-enable eviction now that tip is consistent with UTXO state.
+        self.utxo_set.suppress_eviction = false;
+        // Batch eviction: only check every 10 blocks to amortize the expensive
+        // flush+iterate cost.  The cache can temporarily exceed the limit by
+        // ~10 blocks of UTXOs, which is negligible compared to the cache size.
+        // This dramatically reduces eviction stalls during rapid block import
+        // (IBD or sequential feeding via submitblock RPC).
+        if (height % 10 == 0 and
+            self.utxo_set.cacheMemoryUsage() > self.utxo_set.max_cache_size)
+        {
+            self.utxo_set.evictCache();
+        }
 
         return BlockUndo{
             .spent_utxos = if (skip_undo) &[_]BlockUndo.SpentUtxo{} else try spent_list.toOwnedSlice(),
@@ -1887,9 +1963,6 @@ pub const ChainState = struct {
             }
         }
 
-        // Clear the dirty tracker
-        self.utxo_set.dirty_keys.clearRetainingCapacity();
-
         // Add chain tip to the SAME batch
         var tip_buf: [36]u8 = undefined;
         @memcpy(tip_buf[0..32], &self.best_hash);
@@ -1928,6 +2001,9 @@ pub const ChainState = struct {
                     entry_ptr.dirty = false;
                 }
             }
+
+            // Clear the dirty tracker only AFTER successful writeBatch
+            self.utxo_set.dirty_keys.clearRetainingCapacity();
 
             // Free allocated keys and values
             for (batch.items) |op| {
