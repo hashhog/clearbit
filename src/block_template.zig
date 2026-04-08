@@ -729,6 +729,19 @@ pub fn submitBlockWithIndex(
                 std.debug.print("submitblock: atomic flush failed after connectBlock at height {d}: {}\n", .{ height, err });
             };
         }
+    } else {
+        // During IBD, still flush periodically to prevent unbounded growth of
+        // dirty_keys and pending_deletes lists.  Without this, memory grows
+        // linearly with chain length since every created/spent UTXO key is
+        // appended to these lists and never cleared until flush().
+        // Flush every 1000 blocks (same as non-IBD) to bound memory usage
+        // while keeping the overhead low.
+        if (height % 1000 == 0) {
+            chain_state.utxo_set.flushPendingDeletes() catch {};
+            chain_state.flush() catch |err| {
+                std.debug.print("submitblock: IBD flush failed at height {d}: {}\n", .{ height, err });
+            };
+        }
     }
 
     // Insert into the block index so that getblockheader / getblockhash can
