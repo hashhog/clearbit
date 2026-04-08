@@ -57,8 +57,15 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
 
     c.rocksdb_options_set_create_if_missing(options, 1);
     c.rocksdb_options_set_create_missing_column_families(options, 1);
-    c.rocksdb_options_set_max_open_files(options, 256);
+    c.rocksdb_options_set_max_open_files(options, -1); // keep all files open (faster lookups)
     c.rocksdb_options_set_compression(options, c.rocksdb_lz4_compression);
+
+    // Larger write buffer: 256 MiB reduces compaction frequency during IBD
+    c.rocksdb_options_set_write_buffer_size(options, 256 * 1024 * 1024);
+    // Allow 4 write buffers before stalling (default 2)
+    c.rocksdb_options_set_max_write_buffer_number(options, 4);
+    // Increase max background jobs for compaction/flush
+    c.rocksdb_options_set_max_background_jobs(options, 4);
 
     // Optimize for point lookups (UTXO set)
     const block_based_options = c.rocksdb_block_based_options_create();
@@ -66,6 +73,15 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
 
     c.rocksdb_block_based_options_set_block_size(block_based_options, 16 * 1024);
     c.rocksdb_block_based_options_set_cache_index_and_filter_blocks(block_based_options, 1);
+
+    // Bloom filter: 10 bits per key, reduces unnecessary disk reads on misses
+    const bloom_filter = c.rocksdb_filterpolicy_create_bloom_full(10);
+    c.rocksdb_block_based_options_set_filter_policy(block_based_options, bloom_filter);
+
+    // Block cache: 512 MiB LRU cache for frequently accessed SST blocks
+    const block_cache = c.rocksdb_cache_create_lru(512 * 1024 * 1024);
+    c.rocksdb_block_based_options_set_block_cache(block_based_options, block_cache);
+
     c.rocksdb_options_set_block_based_table_factory(options, block_based_options);
 
     const cf_options = [_]?*c.rocksdb_options_t{options} ** 5;

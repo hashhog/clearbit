@@ -872,6 +872,7 @@ pub const UtxoSet = struct {
     const CacheEntry = struct {
         utxo: CompactUtxo,
         dirty: bool, // true if modified but not yet flushed to DB
+        fresh: bool, // true if created in cache and never written to DB
 
         fn deinit(self: *CacheEntry, allocator: std.mem.Allocator) void {
             var utxo = self.utxo;
@@ -882,9 +883,12 @@ pub const UtxoSet = struct {
     /// Initialize a new UTXO set.
     /// If db is null, operates in memory-only mode (useful for testing).
     pub fn init(db: ?*Database, max_cache_mb: usize, allocator: std.mem.Allocator) UtxoSet {
-        // Pre-size HashMap for IBD performance (~3M entries expected for testnet4)
+        // Pre-size HashMap for IBD performance.
+        // With the corrected 200 bytes/entry estimate and typical --dbcache=4096,
+        // the cache can hold ~20M entries.  Pre-allocate 4M slots to avoid
+        // repeated rehashing during early IBD.
         var cache = std.HashMap([36]u8, CacheEntry, UtxoKeyContext, std.hash_map.default_max_load_percentage).init(allocator);
-        cache.ensureTotalCapacity(1 << 17) catch {}; // 128K slots pre-allocated
+        cache.ensureTotalCapacity(1 << 22) catch {}; // 4M slots pre-allocated
         return UtxoSet{
             .db = db,
             .cache = cache,
@@ -948,7 +952,7 @@ pub const UtxoSet = struct {
                 .script_type = utxo.script_type,
                 .hash_or_script = try self.allocator.dupe(u8, utxo.hash_or_script),
             };
-            try self.cache.put(key, CacheEntry{ .utxo = cache_utxo, .dirty = false });
+            try self.cache.put(key, CacheEntry{ .utxo = cache_utxo, .dirty = false, .fresh = false });
 
             // Read-throughs also grow the cache; check eviction periodically.
             // Skip during block connection (suppress_eviction) to prevent
@@ -1028,8 +1032,10 @@ pub const UtxoSet = struct {
             }
         }
 
-        // Store in cache (marked dirty for eventual flush to DB)
-        try self.cache.put(key, CacheEntry{ .utxo = compact, .dirty = true });
+        // Store in cache (marked dirty + fresh — FRESH means it was created in
+        // cache and never written to DB, so if it's spent before the next flush
+        // we can skip the DB write entirely).
+        try self.cache.put(key, CacheEntry{ .utxo = compact, .dirty = true, .fresh = true });
         // Track dirty key for efficient flush
         self.dirty_keys.append(key) catch {};
 
@@ -1131,8 +1137,11 @@ pub const UtxoSet = struct {
             self.total_utxos -|= 1;
             self.total_amount -|= old.value.utxo.value;
 
-            // Batch the DB delete instead of doing it synchronously
-            if (self.db != null) {
+            // FRESH optimization: if the entry was created in cache and never
+            // written to DB, we can skip the DB delete entirely.  This is a
+            // huge win during IBD where many UTXOs are created and spent
+            // within the same flush window.
+            if (self.db != null and !old.value.fresh) {
                 self.pending_deletes.append(key) catch {};
                 // Flush batch when it gets large enough.
                 // Skip during block connection (suppress_eviction) to prevent
@@ -1222,10 +1231,12 @@ pub const UtxoSet = struct {
                 return err;
             };
 
-            // Only mark entries as clean AFTER successful writeBatch
+            // Only mark entries as clean AFTER successful writeBatch.
+            // Also clear the FRESH flag since the entry now exists in DB.
             for (actual_dirty.items) |key| {
                 if (self.cache.getPtr(key)) |entry_ptr| {
                     entry_ptr.dirty = false;
+                    entry_ptr.fresh = false;
                 }
             }
 
@@ -1297,13 +1308,21 @@ pub const UtxoSet = struct {
     }
 
     /// Get approximate cache memory usage.
-    /// Uses a per-entry estimate that accounts for actual observed memory
-    /// cost including HashMap overhead, allocator metadata, and fragmentation.
-    /// Measured estimate for ReleaseFast: ~4 KiB per entry (256-byte UTXO
-    /// data + 36-byte key + HashMap bucket overhead + allocator padding).
-    /// Previous 16 KiB estimate caused premature evictions.
+    /// Estimate the memory usage of the UTXO cache.
+    ///
+    /// Per-entry cost breakdown:
+    ///   - CompactUtxo struct: ~48 bytes (height, value, coinbase, script_type, slice)
+    ///   - hash_or_script heap alloc: ~32 bytes (20-32 data + allocator overhead)
+    ///   - CacheEntry wrapper (dirty flag + padding): ~56 bytes
+    ///   - HashMap key [36]u8: 36 bytes
+    ///   - HashMap metadata per slot: ~8 bytes
+    ///   - Allocator padding / fragmentation: ~20 bytes
+    /// Total: ~200 bytes per entry.
+    ///
+    /// The previous estimate of 4096 bytes/entry was ~20x too high, causing
+    /// premature eviction and terrible cache hit rates for large UTXO sets.
     pub fn cacheMemoryUsage(self: *const UtxoSet) usize {
-        return self.cache.count() * 4096;
+        return self.cache.count() * 200;
     }
 };
 
@@ -2018,10 +2037,12 @@ pub const ChainState = struct {
                 return err;
             };
 
-            // Mark dirty entries clean AFTER successful write
+            // Mark dirty entries clean AFTER successful write.
+            // Also clear the FRESH flag since entries now exist in DB.
             for (dirty_keys.items) |key| {
                 if (self.utxo_set.cache.getPtr(key)) |entry_ptr| {
                     entry_ptr.dirty = false;
+                    entry_ptr.fresh = false;
                 }
             }
 
