@@ -28,6 +28,21 @@ const address_mod = @import("address.zig");
 const script_mod = @import("script.zig");
 
 // ============================================================================
+// Hex Decoding Helper
+// ============================================================================
+
+/// Fast hex digit to integer conversion using a lookup table.
+/// Returns null for invalid hex characters.
+fn hexDigitToInt(ch: u8) ?u4 {
+    return switch (ch) {
+        '0'...'9' => @intCast(ch - '0'),
+        'a'...'f' => @intCast(ch - 'a' + 10),
+        'A'...'F' => @intCast(ch - 'A' + 10),
+        else => null,
+    };
+}
+
+// ============================================================================
 // RPC Error Codes (Bitcoin Core conventions)
 // ============================================================================
 
@@ -2252,9 +2267,11 @@ pub const RpcServer = struct {
         defer self.allocator.free(raw);
 
         for (0..raw.len) |i| {
-            raw[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
+            const hi: u8 = hexDigitToInt(hex[i * 2]) orelse
                 return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex", id);
-            };
+            const lo: u8 = hexDigitToInt(hex[i * 2 + 1]) orelse
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex", id);
+            raw[i] = (hi << 4) | lo;
         }
 
         // Deserialize block
