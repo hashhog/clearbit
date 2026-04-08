@@ -1111,7 +1111,7 @@ pub const BlockDownloader = struct {
         // coinbase value) are still performed.
         const skip_script_verification = params.assume_valid_height > 0 and
             height <= params.assume_valid_height;
-        _ = skip_script_verification; // TODO: use when script verification is wired into this path
+        _ = skip_script_verification; // Wire up when script verification is added to this path
 
         // Use an arena allocator for per-block temporary allocations
         var arena = std.heap.ArenaAllocator.init(self.allocator);
