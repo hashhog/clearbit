@@ -734,8 +734,6 @@ pub fn submitBlockWithIndex(
         // dirty_keys and pending_deletes lists.  Without this, memory grows
         // linearly with chain length since every created/spent UTXO key is
         // appended to these lists and never cleared until flush().
-        // Flush every 1000 blocks (same as non-IBD) to bound memory usage
-        // while keeping the overhead low.
         if (height % 1000 == 0) {
             chain_state.utxo_set.flushPendingDeletes() catch {};
             chain_state.flush() catch |err| {
