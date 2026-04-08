@@ -683,29 +683,53 @@ pub fn submitBlockWithIndex(
 
     // Connect the block to the chain (UTXO set + best_hash/best_height)
     const height = chain_state.best_height + 1;
-    var undo = chain_state.connectBlock(block, &block_hash, height) catch |err| {
-        return .{
-            .accepted = false,
-            .reject_reason = switch (err) {
-                error.MissingInput => "bad-txns-inputs-missingorspent",
-                else => "invalid-block",
-            },
-            .block_hash = block_hash,
-        };
-    };
-    undo.deinit(chain_state.allocator);
 
-    // Flush UTXO changes + chain tip to disk atomically.
-    // connectBlock() only updates the in-memory cache; without an explicit
-    // flush, a crash (or cache eviction via UtxoSet.flush which does NOT
-    // include the tip) can leave the DB with UTXOs from block N but the
-    // tip still pointing at N-1, corrupting the chainstate.
-    chain_state.flush() catch |err| {
-        std.debug.print("submitblock: atomic flush failed after connectBlock at height {d}: {}\n", .{ height, err });
-        // The block is connected in memory but not persisted — this is
-        // effectively the same crash-window that existed before, so we
-        // still report success (the node can recover on next flush).
-    };
+    // During IBD (below assume-valid height), use the fast path that skips
+    // undo data collection.  Undo data is only needed for reorgs, and during
+    // sequential feeding we immediately discard it anyway.  This saves
+    // significant allocation overhead for large blocks.
+    const ibd_mode = params.assume_valid_height > 0 and height <= params.assume_valid_height;
+    if (ibd_mode) {
+        chain_state.connectBlockFast(block, &block_hash, height) catch |err| {
+            return .{
+                .accepted = false,
+                .reject_reason = switch (err) {
+                    error.MissingInput => "bad-txns-inputs-missingorspent",
+                    else => "invalid-block",
+                },
+                .block_hash = block_hash,
+            };
+        };
+    } else {
+        var undo = chain_state.connectBlock(block, &block_hash, height) catch |err| {
+            return .{
+                .accepted = false,
+                .reject_reason = switch (err) {
+                    error.MissingInput => "bad-txns-inputs-missingorspent",
+                    else => "invalid-block",
+                },
+                .block_hash = block_hash,
+            };
+        };
+        undo.deinit(chain_state.allocator);
+    }
+
+    // Periodically flush UTXO changes + chain tip to disk atomically.
+    // connectBlock() only updates the in-memory cache.  Cache eviction now
+    // uses ChainState.flush() (via the UtxoSet.parent back-reference) which
+    // writes both dirty UTXOs and the chain tip in one WriteBatch, so
+    // eviction can no longer cause tip/UTXO desync.  We still flush every
+    // 1000 blocks to bound crash recovery window.
+    if (!ibd_mode) {
+        if (height % 100 == 0) {
+            chain_state.utxo_set.flushPendingDeletes() catch {};
+        }
+        if (height % 1000 == 0) {
+            chain_state.flush() catch |err| {
+                std.debug.print("submitblock: atomic flush failed after connectBlock at height {d}: {}\n", .{ height, err });
+            };
+        }
+    }
 
     // Insert into the block index so that getblockheader / getblockhash can
     // find the block afterwards.

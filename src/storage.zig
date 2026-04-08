@@ -1134,8 +1134,10 @@ pub const UtxoSet = struct {
             // Batch the DB delete instead of doing it synchronously
             if (self.db != null) {
                 self.pending_deletes.append(key) catch {};
-                // Flush batch when it gets large enough
-                if (self.pending_deletes.items.len >= 10000) {
+                // Flush batch when it gets large enough.
+                // Skip during block connection (suppress_eviction) to prevent
+                // mid-block DB writes that can interfere with reads.
+                if (!self.suppress_eviction and self.pending_deletes.items.len >= 10000) {
                     self.flushPendingDeletes() catch {};
                 }
             }
@@ -1153,7 +1155,7 @@ pub const UtxoSet = struct {
 
             // Batch the DB delete
             self.pending_deletes.append(key) catch {};
-            if (self.pending_deletes.items.len >= 10000) {
+            if (!self.suppress_eviction and self.pending_deletes.items.len >= 10000) {
                 self.flushPendingDeletes() catch {};
             }
 
@@ -1778,11 +1780,15 @@ pub const ChainState = struct {
 
         // Periodically flush pending DB deletes and dirty cache (every 100 blocks)
         if (height % 100 == 0) {
-            self.utxo_set.flushPendingDeletes() catch {};
+            self.utxo_set.flushPendingDeletes() catch |err| {
+                std.debug.print("connectBlockFast: flushPendingDeletes failed at height {d}: {}\n", .{ height, err });
+            };
         }
         // Flush dirty UTXO cache + tip to DB atomically every 1000 blocks
         if (height % 1000 == 0) {
-            self.flush() catch {};
+            self.flush() catch |err| {
+                std.debug.print("connectBlockFast: flush failed at height {d}: {}\n", .{ height, err });
+            };
         }
     }
 
@@ -1796,11 +1802,28 @@ pub const ChainState = struct {
         @setRuntimeSafety(true);
         const crypto = @import("crypto.zig");
 
+        // Verify the block chains onto the current tip.  This catches race
+        // conditions where both P2P and RPC advance best_height between the
+        // caller reading it and acquiring the connect_mutex.
+        if (height != self.best_height + 1) {
+            std.debug.print("connectBlockInner: height mismatch: expected {d}, got {d}\n", .{ self.best_height + 1, height });
+            return error.HeightMismatch;
+        }
+        // For non-genesis blocks, verify prev_block links to our tip.
+        if (height > 0 and !std.mem.eql(u8, &block.header.prev_block, &self.best_hash)) {
+            std.debug.print("connectBlockInner: prev_block mismatch at height {d}\n", .{height});
+            return error.PrevBlockMismatch;
+        }
+
         // Suppress eviction during block connection to prevent mid-block
         // flushes that write partial UTXO state (some spends applied but
         // tip not yet updated).  Eviction is checked after the block is
         // fully connected and the tip is updated.
         self.utxo_set.suppress_eviction = true;
+        // Ensure suppress_eviction is reset even if block connection fails.
+        // Without this, a failed block leaves suppress_eviction=true which
+        // prevents eviction on subsequent blocks until the next success.
+        errdefer self.utxo_set.suppress_eviction = false;
 
         var spent_list = std.ArrayList(BlockUndo.SpentUtxo).init(self.allocator);
         errdefer {
