@@ -884,11 +884,11 @@ pub const UtxoSet = struct {
     /// If db is null, operates in memory-only mode (useful for testing).
     pub fn init(db: ?*Database, max_cache_mb: usize, allocator: std.mem.Allocator) UtxoSet {
         // Pre-size HashMap for IBD performance.
-        // With the corrected 200 bytes/entry estimate and typical --dbcache=4096,
-        // the cache can hold ~20M entries.  Pre-allocate 4M slots to avoid
+        // With the corrected 500 bytes/entry estimate and typical --dbcache=4096,
+        // the cache can hold ~8M entries.  Pre-allocate 2M slots to avoid
         // repeated rehashing during early IBD.
         var cache = std.HashMap([36]u8, CacheEntry, UtxoKeyContext, std.hash_map.default_max_load_percentage).init(allocator);
-        cache.ensureTotalCapacity(1 << 22) catch {}; // 4M slots pre-allocated
+        cache.ensureTotalCapacity(1 << 21) catch {}; // 2M slots pre-allocated
         return UtxoSet{
             .db = db,
             .cache = cache,
@@ -1316,13 +1316,15 @@ pub const UtxoSet = struct {
     ///   - CacheEntry wrapper (dirty flag + padding): ~56 bytes
     ///   - HashMap key [36]u8: 36 bytes
     ///   - HashMap metadata per slot: ~8 bytes
-    ///   - Allocator padding / fragmentation: ~20 bytes
-    /// Total: ~200 bytes per entry.
+    ///   - Allocator fragmentation / glibc overhead: ~320 bytes
+    /// Total: ~500 bytes per entry (measured empirically during full IBD).
     ///
-    /// The previous estimate of 4096 bytes/entry was ~20x too high, causing
-    /// premature eviction and terrible cache hit rates for large UTXO sets.
+    /// The theoretical minimum is ~200 bytes/entry, but glibc malloc retains
+    /// freed pages due to fragmentation from millions of small hash_or_script
+    /// allocations (20-32 bytes each).  Using 500 bytes ensures eviction
+    /// triggers before RSS grows beyond --dbcache * 2.5x.
     pub fn cacheMemoryUsage(self: *const UtxoSet) usize {
-        return self.cache.count() * 200;
+        return self.cache.count() * 500;
     }
 };
 
