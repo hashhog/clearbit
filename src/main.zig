@@ -77,6 +77,9 @@ pub const Config = struct {
     // Block import mode
     import_blocks: ?[]const u8 = null, // path or "-" for stdin
 
+    // UTXO snapshot import mode
+    import_utxo: ?[]const u8 = null, // path to .hdog snapshot file
+
     pub const Network = enum {
         mainnet,
         testnet,
@@ -197,6 +200,10 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         } else if (std.mem.eql(u8, arg, "--import-blocks")) {
             config.import_blocks = "-"; // default to stdin
         }
+        // UTXO snapshot import
+        else if (std.mem.startsWith(u8, arg, "--import-utxo=")) {
+            config.import_utxo = arg["--import-utxo=".len..];
+        }
         // Help and version
         else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
@@ -257,6 +264,7 @@ pub fn printUsage() void {
         \\
         \\Import:
         \\  --import-blocks=<path> Import blocks from file (- for stdin)
+        \\  --import-utxo=<path>   Import UTXO snapshot from .hdog file
         \\
         \\General:
         \\  --help, -h             Show this help message
@@ -501,6 +509,334 @@ pub fn installSignalHandlers() void {
 // ============================================================================
 
 // ============================================================================
+// UTXO Snapshot Import Mode (HDOG format)
+// ============================================================================
+
+/// Import UTXOs from an HDOG snapshot file directly into RocksDB.
+///
+/// HDOG Binary Format:
+///   Header (52 bytes):
+///     Magic:        4 bytes    "HDOG"
+///     Version:      uint32 LE  (1)
+///     Block Hash:   32 bytes   (little-endian)
+///     Block Height: uint32 LE
+///     UTXO Count:   uint64 LE
+///   Per UTXO (repeated UTXO_COUNT times):
+///     TxID:         32 bytes   (little-endian)
+///     Vout:         uint32 LE
+///     Amount:       int64 LE   (satoshis)
+///     Height+CB:    uint32 LE  (height in bits [31:1], coinbase flag in bit [0])
+///     Script Len:   uint16 LE
+///     Script:       N bytes    (raw scriptPubKey)
+fn importUtxoSnapshot(config: *Config, allocator: std.mem.Allocator) !void {
+    const snapshot_path = config.import_utxo orelse return;
+
+    // Resolve data directory
+    const datadir = resolveDataDir(config.datadir, allocator) catch |err| {
+        std.debug.print("Error resolving data directory: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(datadir);
+    std.fs.makeDirAbsolute(datadir) catch |err| {
+        if (err != error.PathAlreadyExists)
+            std.debug.print("Warning: could not create data directory: {}\n", .{err});
+    };
+
+    // Network subdirectory
+    const subdir = getNetworkSubdir(config.network);
+    var full_datadir: []const u8 = datadir;
+    if (subdir.len > 0) {
+        full_datadir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ datadir, subdir }) catch {
+            std.debug.print("Out of memory\n", .{});
+            std.process.exit(1);
+        };
+        std.fs.makeDirAbsolute(full_datadir) catch |err| {
+            if (err != error.PathAlreadyExists)
+                std.debug.print("Warning: could not create network directory: {}\n", .{err});
+        };
+    }
+    defer if (subdir.len > 0) allocator.free(full_datadir);
+
+    // Open RocksDB
+    if (comptime !build_options.rocksdb_enabled) {
+        std.debug.print("FATAL: UTXO snapshot import requires RocksDB. Build with -Drocksdb=true\n", .{});
+        std.process.exit(1);
+    }
+
+    const chainstate_path = std.fmt.allocPrint(allocator, "{s}/chainstate", .{full_datadir}) catch {
+        std.debug.print("Out of memory\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(chainstate_path);
+    std.fs.makeDirAbsolute(chainstate_path) catch |err| {
+        if (err != error.PathAlreadyExists)
+            std.debug.print("Warning: could not create chainstate directory: {}\n", .{err});
+    };
+
+    var db = storage.Database.open(chainstate_path, allocator) catch |err| {
+        std.debug.print("FATAL: Failed to open RocksDB at {s}: {}\n", .{ chainstate_path, err });
+        std.process.exit(1);
+    };
+    defer db.close();
+
+    // Open the snapshot file
+    const file = std.fs.openFileAbsolute(snapshot_path, .{}) catch |err| {
+        std.debug.print("FATAL: Cannot open snapshot file {s}: {}\n", .{ snapshot_path, err });
+        std.process.exit(1);
+    };
+    defer file.close();
+
+    var buf_reader = std.io.bufferedReaderSize(1 << 20, file.reader());
+    const reader = buf_reader.reader();
+
+    // Read and validate 52-byte HDOG header
+    var header_buf: [52]u8 = undefined;
+    const header_read = reader.readAll(&header_buf) catch |err| {
+        std.debug.print("FATAL: Failed to read snapshot header: {}\n", .{err});
+        std.process.exit(1);
+    };
+    if (header_read < 52) {
+        std.debug.print("FATAL: Snapshot file too small (got {d} bytes, need 52 for header)\n", .{header_read});
+        std.process.exit(1);
+    }
+
+    // Validate magic
+    if (!std.mem.eql(u8, header_buf[0..4], "HDOG")) {
+        std.debug.print("FATAL: Invalid snapshot magic (expected HDOG, got {s})\n", .{header_buf[0..4]});
+        std.process.exit(1);
+    }
+
+    const version = std.mem.readInt(u32, header_buf[4..8], .little);
+    if (version != 1) {
+        std.debug.print("FATAL: Unsupported snapshot version {d} (expected 1)\n", .{version});
+        std.process.exit(1);
+    }
+
+    var block_hash: types.Hash256 = undefined;
+    @memcpy(&block_hash, header_buf[8..40]);
+    const block_height = std.mem.readInt(u32, header_buf[40..44], .little);
+    const utxo_count = std.mem.readInt(u64, header_buf[44..52], .little);
+
+    // Print header info
+    std.debug.print("clearbit UTXO snapshot import\n", .{});
+    std.debug.print("  File:       {s}\n", .{snapshot_path});
+    std.debug.print("  Block hash: ", .{});
+    // Print hash in display order (reversed)
+    for (0..32) |i| {
+        std.debug.print("{x:0>2}", .{block_hash[31 - i]});
+    }
+    std.debug.print("\n", .{});
+    std.debug.print("  Height:     {d}\n", .{block_height});
+    std.debug.print("  UTXOs:      {d}\n", .{utxo_count});
+
+    const start_time = std.time.milliTimestamp();
+
+    // Batch writes: accumulate operations and flush every 100K entries
+    const BATCH_SIZE: u64 = 100_000;
+    var ops = std.ArrayList(storage.BatchOp).init(allocator);
+    defer ops.deinit();
+
+    // Track allocated memory for batch ops so we can free them after each flush
+    var batch_keys = std.ArrayList([]const u8).init(allocator);
+    defer batch_keys.deinit();
+    var batch_values = std.ArrayList([]const u8).init(allocator);
+    defer batch_values.deinit();
+
+    var imported: u64 = 0;
+    var last_report: u64 = 0;
+
+    // Read UTXOs one by one
+    while (imported < utxo_count) {
+        // Read TxID (32 bytes)
+        var txid: [32]u8 = undefined;
+        const txid_read = reader.readAll(&txid) catch |err| {
+            std.debug.print("\nFATAL: Read error at UTXO {d}: {}\n", .{ imported, err });
+            std.process.exit(1);
+        };
+        if (txid_read < 32) {
+            std.debug.print("\nFATAL: Unexpected EOF at UTXO {d} (reading txid)\n", .{imported});
+            std.process.exit(1);
+        }
+
+        // Read Vout (4 bytes LE)
+        var vout_buf: [4]u8 = undefined;
+        const vout_read = reader.readAll(&vout_buf) catch |err| {
+            std.debug.print("\nFATAL: Read error at UTXO {d}: {}\n", .{ imported, err });
+            std.process.exit(1);
+        };
+        if (vout_read < 4) {
+            std.debug.print("\nFATAL: Unexpected EOF at UTXO {d} (reading vout)\n", .{imported});
+            std.process.exit(1);
+        }
+        const vout = std.mem.readInt(u32, &vout_buf, .little);
+
+        // Read Amount (8 bytes LE, signed)
+        var amount_buf: [8]u8 = undefined;
+        const amount_read = reader.readAll(&amount_buf) catch |err| {
+            std.debug.print("\nFATAL: Read error at UTXO {d}: {}\n", .{ imported, err });
+            std.process.exit(1);
+        };
+        if (amount_read < 8) {
+            std.debug.print("\nFATAL: Unexpected EOF at UTXO {d} (reading amount)\n", .{imported});
+            std.process.exit(1);
+        }
+        const amount = std.mem.readInt(i64, &amount_buf, .little);
+
+        // Read Height+CB (4 bytes LE): height in bits [31:1], coinbase in bit [0]
+        var hcb_buf: [4]u8 = undefined;
+        const hcb_read = reader.readAll(&hcb_buf) catch |err| {
+            std.debug.print("\nFATAL: Read error at UTXO {d}: {}\n", .{ imported, err });
+            std.process.exit(1);
+        };
+        if (hcb_read < 4) {
+            std.debug.print("\nFATAL: Unexpected EOF at UTXO {d} (reading height+cb)\n", .{imported});
+            std.process.exit(1);
+        }
+        const height_cb = std.mem.readInt(u32, &hcb_buf, .little);
+        const utxo_height = height_cb >> 1;
+        const is_coinbase = (height_cb & 1) != 0;
+
+        // Read Script Len (2 bytes LE)
+        var slen_buf: [2]u8 = undefined;
+        const slen_read = reader.readAll(&slen_buf) catch |err| {
+            std.debug.print("\nFATAL: Read error at UTXO {d}: {}\n", .{ imported, err });
+            std.process.exit(1);
+        };
+        if (slen_read < 2) {
+            std.debug.print("\nFATAL: Unexpected EOF at UTXO {d} (reading script_len)\n", .{imported});
+            std.process.exit(1);
+        }
+        const script_len = std.mem.readInt(u16, &slen_buf, .little);
+
+        // Read Script bytes
+        const script_pubkey = allocator.alloc(u8, script_len) catch {
+            std.debug.print("\nFATAL: Out of memory at UTXO {d}\n", .{imported});
+            std.process.exit(1);
+        };
+        const script_read = reader.readAll(script_pubkey) catch |err| {
+            allocator.free(script_pubkey);
+            std.debug.print("\nFATAL: Read error at UTXO {d}: {}\n", .{ imported, err });
+            std.process.exit(1);
+        };
+        if (script_read < script_len) {
+            allocator.free(script_pubkey);
+            std.debug.print("\nFATAL: Unexpected EOF at UTXO {d} (reading script)\n", .{imported});
+            std.process.exit(1);
+        }
+
+        // Build UTXO key: txid (32 bytes) ++ vout (4 bytes LE)
+        const key_alloc = allocator.alloc(u8, 36) catch {
+            allocator.free(script_pubkey);
+            std.debug.print("\nFATAL: Out of memory at UTXO {d}\n", .{imported});
+            std.process.exit(1);
+        };
+        @memcpy(key_alloc[0..32], &txid);
+        std.mem.writeInt(u32, key_alloc[32..36], vout, .little);
+
+        // Build UTXO value using the same format as UtxoEntry.toBytes:
+        //   value (i64 LE) + height (u32 LE) + is_coinbase (u8) + compact_size(script_len) + script
+        const entry = storage.UtxoEntry{
+            .value = amount,
+            .script_pubkey = script_pubkey,
+            .height = utxo_height,
+            .is_coinbase = is_coinbase,
+        };
+        const value_data = entry.toBytes(allocator) catch {
+            allocator.free(key_alloc);
+            allocator.free(script_pubkey);
+            std.debug.print("\nFATAL: Serialization failed at UTXO {d}\n", .{imported});
+            std.process.exit(1);
+        };
+        // script_pubkey was copied inside toBytes via writeBytes, so free our copy
+        allocator.free(script_pubkey);
+
+        // Add to batch
+        ops.append(.{
+            .put = .{ .cf = storage.CF_UTXO, .key = key_alloc, .value = value_data },
+        }) catch {
+            allocator.free(key_alloc);
+            allocator.free(value_data);
+            std.debug.print("\nFATAL: Out of memory at UTXO {d}\n", .{imported});
+            std.process.exit(1);
+        };
+        batch_keys.append(key_alloc) catch {
+            std.debug.print("\nFATAL: Out of memory at UTXO {d}\n", .{imported});
+            std.process.exit(1);
+        };
+        batch_values.append(value_data) catch {
+            std.debug.print("\nFATAL: Out of memory at UTXO {d}\n", .{imported});
+            std.process.exit(1);
+        };
+
+        imported += 1;
+
+        // Flush batch every BATCH_SIZE entries
+        if (imported % BATCH_SIZE == 0 or imported == utxo_count) {
+            db.writeBatch(ops.items) catch |err| {
+                std.debug.print("\nFATAL: WriteBatch failed at UTXO {d}: {}\n", .{ imported, err });
+                std.process.exit(1);
+            };
+
+            // Free batch memory
+            for (batch_keys.items) |k| allocator.free(k);
+            for (batch_values.items) |v| allocator.free(v);
+            batch_keys.clearRetainingCapacity();
+            batch_values.clearRetainingCapacity();
+            ops.clearRetainingCapacity();
+        }
+
+        // Progress report every 1M UTXOs
+        if (imported - last_report >= 1_000_000) {
+            last_report = imported;
+            const elapsed_ms = std.time.milliTimestamp() - start_time;
+            const elapsed_s = @as(f64, @floatFromInt(@max(elapsed_ms, 1))) / 1000.0;
+            const rate = @as(f64, @floatFromInt(imported)) / elapsed_s;
+            const pct = @as(f64, @floatFromInt(imported)) / @as(f64, @floatFromInt(utxo_count)) * 100.0;
+            std.debug.print("\r  Progress: {d}/{d} UTXOs ({d:.1}%, {d:.0}/s)      ", .{ imported, utxo_count, pct, rate });
+        }
+    }
+
+    std.debug.print("\r  Progress: {d}/{d} UTXOs (100.0%)                    \n", .{ imported, utxo_count });
+
+    // Set chain tip to snapshot block
+    var tip_buf: [36]u8 = undefined;
+    @memcpy(tip_buf[0..32], &block_hash);
+    std.mem.writeInt(u32, tip_buf[32..36], block_height, .little);
+    db.put(storage.CF_DEFAULT, "chain_tip", &tip_buf) catch |err| {
+        std.debug.print("FATAL: Failed to set chain tip: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    // Persist the UTXO count so the node can initialize total_utxos correctly
+    var count_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_buf, utxo_count, .little);
+    db.put(storage.CF_DEFAULT, "utxo_count", &count_buf) catch {
+        std.debug.print("Warning: Failed to persist UTXO count\n", .{});
+    };
+
+    // Also store the block index entry for the snapshot block so the node
+    // recognises it as a known block.  The entry is: height (u32 LE) + 80-byte
+    // header.  We don't have the real header, so write a minimal 84-byte record
+    // with zeroed header – the node will overwrite it once it fetches headers.
+    var block_index_buf: [84]u8 = [_]u8{0} ** 84;
+    std.mem.writeInt(u32, block_index_buf[0..4], block_height, .little);
+    db.put(storage.CF_BLOCK_INDEX, &block_hash, &block_index_buf) catch |err| {
+        std.debug.print("Warning: Failed to write block index entry: {}\n", .{err});
+    };
+
+    // Flush to disk
+    db.flush() catch |err| {
+        std.debug.print("Warning: RocksDB flush error: {}\n", .{err});
+    };
+
+    const elapsed_ms = @max(1, std.time.milliTimestamp() - start_time);
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+    const rate = @as(f64, @floatFromInt(imported)) / elapsed_s;
+    std.debug.print("Import complete: {d} UTXOs in {d:.1}s ({d:.0} utxo/s)\n", .{ imported, elapsed_s, rate });
+    std.debug.print("Chain tip set to height {d}\n", .{block_height});
+}
+
+// ============================================================================
 // Block Import Mode
 // ============================================================================
 
@@ -707,6 +1043,11 @@ pub fn main() !void {
         return importBlocks(&config, allocator);
     }
 
+    // 1c. UTXO snapshot import mode
+    if (config.import_utxo != null) {
+        return importUtxoSnapshot(&config, allocator);
+    }
+
     // 2. Resolve and create data directory
     const datadir = resolveDataDir(config.datadir, allocator) catch |err| {
         std.debug.print("Error resolving data directory: {}\n", .{err});
@@ -832,9 +1173,33 @@ pub fn main() !void {
     // 8. Install signal handlers
     installSignalHandlers();
 
-    // Initialize chain state with genesis block
-    chain_state.best_hash = params.genesis_hash;
-    chain_state.best_height = 0;
+    // Load persisted chain tip from RocksDB, fall back to genesis
+    if (db_ptr) |dbp| {
+        if (dbp.get(storage.CF_DEFAULT, "chain_tip")) |tip_data| {
+            if (tip_data) |data| {
+                defer allocator.free(data);
+                if (data.len == 36) {
+                    @memcpy(&chain_state.best_hash, data[0..32]);
+                    chain_state.best_height = std.mem.readInt(u32, data[32..36], .little);
+                    std.debug.print("Loaded chain tip from DB: height {d}\n", .{chain_state.best_height});
+                }
+            }
+        } else |_| {}
+        // Load persisted UTXO count (written by --import-utxo)
+        if (dbp.get(storage.CF_DEFAULT, "utxo_count")) |count_data| {
+            if (count_data) |data| {
+                defer allocator.free(data);
+                if (data.len == 8) {
+                    chain_state.utxo_set.total_utxos = std.mem.readInt(u64, data[0..8], .little);
+                    std.debug.print("Loaded UTXO count from DB: {d}\n", .{chain_state.utxo_set.total_utxos});
+                }
+            }
+        } else |_| {}
+    }
+    if (chain_state.best_height == 0) {
+        chain_state.best_hash = params.genesis_hash;
+        chain_state.best_height = 0;
+    }
 
     // 9. Parse --connect address before starting threads
     if (config.connect) |addr_str| {
