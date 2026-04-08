@@ -1128,8 +1128,8 @@ pub const UtxoSet = struct {
 
         // Try to get from cache first
         if (self.cache.fetchRemove(key)) |old| {
-            self.total_utxos -= 1;
-            self.total_amount -= old.value.utxo.value;
+            self.total_utxos -|= 1;
+            self.total_amount -|= old.value.utxo.value;
 
             // Batch the DB delete instead of doing it synchronously
             if (self.db != null) {
@@ -1159,8 +1159,8 @@ pub const UtxoSet = struct {
                 self.flushPendingDeletes() catch {};
             }
 
-            self.total_utxos -= 1;
-            self.total_amount -= utxo.value;
+            self.total_utxos -|= 1;
+            self.total_amount -|= utxo.value;
 
             return utxo;
         }
