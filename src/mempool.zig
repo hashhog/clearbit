@@ -648,6 +648,114 @@ pub const Mempool = struct {
         self.total_size += vsize;
     }
 
+    /// Result of AcceptToMemoryPool, mirroring Bitcoin Core's MempoolAcceptResult.
+    pub const AcceptResult = struct {
+        /// Whether the transaction was accepted.
+        accepted: bool,
+        /// The txid of the transaction (always set).
+        txid: types.Hash256,
+        /// The wtxid of the transaction (set on success).
+        wtxid: types.Hash256,
+        /// Fee in satoshis (set on success).
+        fee: i64,
+        /// Virtual size in vbytes (set on success).
+        vsize: usize,
+        /// Rejection reason (set on failure).
+        reject_reason: ?[]const u8,
+    };
+
+    /// AcceptToMemoryPool validates and adds a transaction to the mempool.
+    /// This is the main entry point matching Bitcoin Core's AcceptToMemoryPool.
+    ///
+    /// Parameters:
+    /// - tx: The transaction to validate and add
+    /// - test_accept: When true, validate but don't actually add to mempool
+    ///
+    /// Returns AcceptResult with acceptance status and details.
+    pub fn acceptToMemoryPool(self: *Mempool, tx: types.Transaction, test_accept: bool) AcceptResult {
+        const tx_hash = crypto.computeTxid(&tx, self.allocator) catch return AcceptResult{
+            .accepted = false,
+            .txid = std.mem.zeroes(types.Hash256),
+            .wtxid = std.mem.zeroes(types.Hash256),
+            .fee = 0,
+            .vsize = 0,
+            .reject_reason = "failed to compute txid",
+        };
+
+        const wtxid = crypto.computeWtxid(&tx, self.allocator) catch tx_hash;
+
+        if (test_accept) {
+            // Dry-run: check if it would be accepted without modifying state.
+            // We check the same conditions as addTransaction but don't persist.
+            if (self.entries.contains(tx_hash)) {
+                return AcceptResult{
+                    .accepted = false,
+                    .txid = tx_hash,
+                    .wtxid = wtxid,
+                    .fee = 0,
+                    .vsize = 0,
+                    .reject_reason = "txn-already-in-mempool",
+                };
+            }
+            // For test_accept, attempt validation via addTransaction on a copy
+            // isn't feasible without snapshot support, so just check basic rules.
+            self.checkStandard(&tx) catch return AcceptResult{
+                .accepted = false,
+                .txid = tx_hash,
+                .wtxid = wtxid,
+                .fee = 0,
+                .vsize = 0,
+                .reject_reason = "non-standard",
+            };
+            return AcceptResult{
+                .accepted = true,
+                .txid = tx_hash,
+                .wtxid = wtxid,
+                .fee = 0,
+                .vsize = 0,
+                .reject_reason = null,
+            };
+        }
+
+        // Full acceptance: validate and add to mempool.
+        self.addTransaction(tx) catch |err| {
+            const reason: []const u8 = switch (err) {
+                MempoolError.AlreadyInMempool => "txn-already-in-mempool",
+                MempoolError.InsufficientFee => "min relay fee not met",
+                MempoolError.MissingInputs => "missing-inputs",
+                MempoolError.NonBIP125Replaceable => "txn-mempool-conflict",
+                MempoolError.ReplacementFeeTooLow => "insufficient fee",
+                MempoolError.TooManyEvictions => "too many potential replacements",
+                MempoolError.MempoolFull => "mempool full",
+                MempoolError.NonStandard => "non-standard",
+                MempoolError.DustOutput => "dust",
+                MempoolError.TooManyAncestors => "too-long-mempool-chain",
+                MempoolError.TooManyDescendants => "too-long-mempool-chain",
+                MempoolError.ClusterSizeLimitExceeded => "cluster-size-exceeded",
+                else => "rejected",
+            };
+            return AcceptResult{
+                .accepted = false,
+                .txid = tx_hash,
+                .wtxid = wtxid,
+                .fee = 0,
+                .vsize = 0,
+                .reject_reason = reason,
+            };
+        };
+
+        // Successfully added — retrieve entry for fee/size info
+        const entry = self.entries.get(tx_hash);
+        return AcceptResult{
+            .accepted = true,
+            .txid = tx_hash,
+            .wtxid = if (entry) |e| e.wtxid else wtxid,
+            .fee = if (entry) |e| e.fee else 0,
+            .vsize = if (entry) |e| e.vsize else 0,
+            .reject_reason = null,
+        };
+    }
+
     /// Remove a transaction from the mempool (e.g., when mined).
     pub fn removeTransaction(self: *Mempool, txid_hash: types.Hash256) void {
         const entry_ptr = self.entries.fetchRemove(txid_hash);
@@ -3502,6 +3610,76 @@ pub const FeeEstimator = struct {
     /// Get the number of tracked (unconfirmed) transactions.
     pub fn trackedCount(self: *const FeeEstimator) usize {
         return self.tracked.count();
+    }
+
+    /// Persist estimator state to a file.
+    pub fn saveToFile(self: *const FeeEstimator, path: []const u8) !void {
+        // Write to a temp file then rename for atomicity
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
+        defer self.allocator.free(tmp_path);
+
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        errdefer file.close();
+        var writer = file.writer();
+
+        // Magic + version
+        try writer.writeAll("CBFE"); // ClearBit Fee Estimator
+        try writer.writeInt(u32, 1, .little); // version
+        try writer.writeInt(u32, self.current_height, .little);
+
+        // Total counts per bucket
+        for (0..NUM_BUCKETS) |b| {
+            try writer.writeInt(u32, self.total_counts[b], .little);
+        }
+
+        // Confirmed counts: [target][bucket]
+        for (0..MAX_CONFIRMATION_TARGET) |t| {
+            for (0..NUM_BUCKETS) |b| {
+                try writer.writeInt(u32, self.confirmed_counts[t][b], .little);
+            }
+        }
+
+        file.close();
+
+        // Atomic rename
+        std.fs.cwd().rename(tmp_path, path) catch |err| {
+            std.fs.cwd().deleteFile(tmp_path) catch {};
+            return err;
+        };
+    }
+
+    /// Load estimator state from a file.
+    pub fn loadFromFile(self: *FeeEstimator, path: []const u8) !void {
+        const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer file.close();
+
+        var reader = file.reader();
+
+        // Check magic
+        var magic: [4]u8 = undefined;
+        const magic_read = try reader.readAll(&magic);
+        if (magic_read != 4 or !std.mem.eql(u8, &magic, "CBFE")) return error.InvalidFormat;
+
+        // Check version
+        const version = try reader.readInt(u32, .little);
+        if (version != 1) return error.InvalidFormat;
+
+        self.current_height = try reader.readInt(u32, .little);
+
+        // Read total counts
+        for (0..NUM_BUCKETS) |b| {
+            self.total_counts[b] = try reader.readInt(u32, .little);
+        }
+
+        // Read confirmed counts
+        for (0..MAX_CONFIRMATION_TARGET) |t| {
+            for (0..NUM_BUCKETS) |b| {
+                self.confirmed_counts[t][b] = try reader.readInt(u32, .little);
+            }
+        }
     }
 };
 
