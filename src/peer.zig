@@ -623,6 +623,11 @@ pub const Peer = struct {
         // Send sendheaders (BIP-130) - request headers announcements
         const sh = p2p.Message{ .sendheaders = {} };
         try self.sendMessage(&sh);
+
+        // Send sendcmpct (BIP-152) - signal compact block relay support
+        // Version 2 = segwit-aware, announce=false = low-bandwidth mode
+        const sc = p2p.Message{ .sendcmpct = .{ .announce = false, .version = 2 } };
+        try self.sendMessage(&sc);
     }
 
     /// Send a ping and record the nonce.
@@ -2082,7 +2087,8 @@ pub const PeerManager = struct {
                     self.network_params.genesis_hash;
 
                 if (!std.mem.eql(u8, &h.headers[0].prev_block, &expected_prev)) {
-                    // Duplicate/out-of-order headers from another peer - skip
+                    // Headers don't connect to our chain - misbehave (+20)
+                    peer_obj.misbehaving(20, "headers don't connect to our chain");
                     return;
                 }
 
@@ -2199,10 +2205,27 @@ pub const PeerManager = struct {
                     }
                     self.allocator.free(cb.prefilled_txs);
                 }
+                // We don't have a mempool, so we can't reconstruct the block
+                // from short IDs. Fall back to requesting the full block via
+                // getdata (MSG_WITNESS_BLOCK).
+                const block_hash = crypto.computeBlockHash(&cb.header);
+                std.debug.print("P2P: received cmpctblock from peer, falling back to full block request (hash={x})\n", .{block_hash});
+                var inv_list = std.ArrayList(p2p.InvVector).init(self.allocator);
+                defer inv_list.deinit();
+                inv_list.append(.{
+                    .inv_type = .msg_witness_block,
+                    .hash = block_hash,
+                }) catch {};
+                if (inv_list.items.len > 0) {
+                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = inv_list.items } };
+                    peer.sendMessage(&getdata_msg) catch {};
+                }
             },
             .getblocktxn => |gbt| {
                 // Free allocated index array.
                 defer self.allocator.free(gbt.indexes);
+                // Peer is requesting missing transactions for compact block
+                // reconstruction. We don't serve compact blocks yet, so ignore.
             },
             .blocktxn => |bt| {
                 // Free allocated transactions.
@@ -2212,6 +2235,8 @@ pub const PeerManager = struct {
                     }
                     self.allocator.free(bt.transactions);
                 }
+                // Response to our getblocktxn request. Since we fall back to
+                // full block download, we shouldn't receive these. Ignore.
             },
             .tx => |tx_msg| {
                 // Free the deserialized transaction.
@@ -2400,6 +2425,7 @@ pub const PeerManager = struct {
                 var addr_buf: [64]u8 = undefined;
                 const addr_str = peer.getAddressString(&addr_buf);
                 std.log.info("Disconnecting peer={s} due to block download timeout (blocks_in_flight={d})", .{ addr_str, peer.blocks_in_flight_count });
+                peer.misbehaving(50, "block download stalling");
                 self.removePeerByIndex(i);
             } else {
                 i += 1;
