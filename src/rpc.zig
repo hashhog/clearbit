@@ -1123,15 +1123,39 @@ pub const RpcServer = struct {
             var addr_buf: [64]u8 = undefined;
             const addr_str = peer.getAddressString(&addr_buf);
 
-            try writer.print("{{\"id\":{d},\"addr\":\"{s}\",\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"startingheight\":{d},\"synced_headers\":{d},\"synced_blocks\":{d}}}", .{
+            const services: u64 = if (peer.version_info) |v| v.services else 0;
+            const is_inbound = peer.direction == .inbound;
+
+            try writer.print("{{\"id\":{d},\"addr\":\"{s}\",\"network\":\"ipv4\",\"services\":\"{x:0>16}\",\"servicesnames\":[", .{
                 i,
                 addr_str,
+                services,
+            });
+
+            // Service names
+            var first_svc = true;
+            if (services & 1 != 0) {
+                try writer.writeAll("\"NETWORK\"");
+                first_svc = false;
+            }
+            if (services & 8 != 0) {
+                if (!first_svc) try writer.writeByte(',');
+                try writer.writeAll("\"WITNESS\"");
+                first_svc = false;
+            }
+            if (services & 1024 != 0) {
+                if (!first_svc) try writer.writeByte(',');
+                try writer.writeAll("\"NETWORK_LIMITED\"");
+            }
+
+            try writer.print("],\"relaytxes\":true,\"lastsend\":0,\"lastrecv\":0,\"bytessent\":0,\"bytesrecv\":0,\"conntime\":0,\"timeoffset\":0,\"pingtime\":0,\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"connection_type\":\"{s}\"}}", .{
                 if (peer.version_info) |v| v.version else 0,
                 if (peer.version_info) |v| v.user_agent else "",
-                peer.direction == .inbound,
+                is_inbound,
                 peer.start_height,
                 self.chain_state.best_height,
                 self.chain_state.best_height,
+                if (is_inbound) "inbound" else "outbound-full-relay",
             });
         }
 
@@ -1144,8 +1168,18 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.print("{{\"version\":10000,\"subversion\":\"/clearbit:0.1.0/\",\"protocolversion\":70016,\"connections\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true}}],\"relayfee\":0.00001,\"localaddresses\":[]}}", .{
-            self.peer_manager.peers.items.len,
+        const total = self.peer_manager.peers.items.len;
+        // Count inbound peers
+        var inbound: usize = 0;
+        for (self.peer_manager.peers.items) |peer| {
+            if (peer.direction == .inbound) inbound += 1;
+        }
+        const outbound = total - inbound;
+
+        try writer.print("{{\"version\":250000,\"subversion\":\"/clearbit:0.1.0/\",\"protocolversion\":70016,\"localservices\":\"0000000000000009\",\"localservicesnames\":[\"NETWORK\",\"WITNESS\"],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":true,\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":0.00001,\"incrementalfee\":0.00001,\"localaddresses\":[],\"warnings\":\"\"}}", .{
+            total,
+            inbound,
+            outbound,
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -1158,7 +1192,7 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"maxmempool\":{d},\"mempoolminfee\":0.00001}}", .{
+        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":0.0,\"maxmempool\":{d},\"mempoolminfee\":0.00001,\"minrelaytxfee\":0.00001,\"incrementalrelayfee\":0.00001,\"unbroadcastcount\":0,\"fullrbf\":true}}", .{
             mempool_stats.count,
             mempool_stats.size,
             mempool_stats.size,
