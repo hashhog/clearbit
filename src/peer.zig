@@ -2355,7 +2355,7 @@ pub const PeerManager = struct {
                     } else {
                         // Send getblocktxn for missing transactions
                         std.debug.print("P2P: compact block {x} missing {} txns (mempool_hits={}), sending getblocktxn\n", .{ block_hash, missing_count, mempool_hits });
-                        var missing_indices = std.ArrayList(u32).init(self.allocator);
+                        var missing_indices = std.ArrayList(u16).init(self.allocator);
                         defer missing_indices.deinit();
                         for (0..total_tx_count) |i| {
                             if (txn_available[i] == null) {
