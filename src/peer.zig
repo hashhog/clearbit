@@ -2109,7 +2109,7 @@ pub const PeerManager = struct {
 
                 if (!std.mem.eql(u8, &h.headers[0].prev_block, &expected_prev)) {
                     // Headers don't connect to our chain - misbehave (+20)
-                    peer_obj.misbehaving(20, "headers don't connect to our chain");
+                    peer.misbehaving(20, "headers don't connect to our chain");
                     return;
                 }
 
