@@ -1,0 +1,13 @@
+services:
+  clearbit:
+    build: .
+    container_name: clearbit
+    restart: unless-stopped
+    volumes:
+      - clearbit-data:/data
+    ports:
+      - "8333:8333"
+      - "8332:8332"
+
+volumes:
+  clearbit-data:
