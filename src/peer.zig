@@ -7,6 +7,7 @@ const banlist = @import("banlist.zig");
 const v2_transport = @import("v2_transport.zig");
 const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
+const mempool_mod = @import("mempool.zig");
 
 // ============================================================================
 // Peer Manager Constants
@@ -1230,6 +1231,9 @@ pub const PeerManager = struct {
     /// Address to connect to on startup (from --connect flag).
     connect_address: ?std.net.Address,
 
+    /// Mempool for transaction relay and acceptance.
+    mempool: ?*mempool_mod.Mempool,
+
     // ========================================================================
     // Block Download Pipeline (IBD acceleration)
     // ========================================================================
@@ -1288,6 +1292,7 @@ pub const PeerManager = struct {
             .chain_state = null,
             .served_blocks = std.AutoHashMap(types.Hash256, []const u8).init(allocator),
             .connect_address = null,
+            .mempool = null,
             .block_buffer = std.AutoHashMap(types.Hash256, types.Block).init(allocator),
             .expected_blocks = std.ArrayList(types.Hash256).init(allocator),
             .download_cursor = 0,
@@ -2059,14 +2064,33 @@ pub const PeerManager = struct {
                 // without adding them to expected_blocks causes them to sit
                 // in block_buffer forever (chain tip never advances).
                 var has_block_inv = false;
+                // Collect tx inv items we want to request (not already in mempool)
+                var tx_requests = std.ArrayList(p2p.InvVector).init(self.allocator);
+                defer tx_requests.deinit();
+
                 for (inv_msg.inventory) |item| {
-                    if (item.inv_type == .msg_block or item.inv_type == .msg_witness_block) {
+                    const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
+                    if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_block))) {
                         has_block_inv = true;
-                        break;
+                    } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
+                        // Transaction announcement: request if not already in mempool
+                        if (self.mempool) |pool| {
+                            if (!pool.entries.contains(item.hash)) {
+                                tx_requests.append(.{
+                                    .inv_type = .msg_witness_tx,
+                                    .hash = item.hash,
+                                }) catch {};
+                            }
+                        }
                     }
                 }
                 if (has_block_inv) {
                     self.sendGetHeaders(peer) catch {};
+                }
+                // Request unknown transactions via getdata
+                if (tx_requests.items.len > 0) {
+                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = tx_requests.items } };
+                    peer.sendMessage(&getdata_msg) catch {};
                 }
             },
             .headers => |h| {
@@ -2226,20 +2250,126 @@ pub const PeerManager = struct {
                     }
                     self.allocator.free(cb.prefilled_txs);
                 }
-                // We don't have a mempool, so we can't reconstruct the block
-                // from short IDs. Fall back to requesting the full block via
-                // getdata (MSG_WITNESS_BLOCK).
                 const block_hash = crypto.computeBlockHash(&cb.header);
-                std.debug.print("P2P: received cmpctblock from peer, falling back to full block request (hash={x})\n", .{block_hash});
-                var inv_list = std.ArrayList(p2p.InvVector).init(self.allocator);
-                defer inv_list.deinit();
-                inv_list.append(.{
-                    .inv_type = .msg_witness_block,
-                    .hash = block_hash,
-                }) catch {};
-                if (inv_list.items.len > 0) {
-                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = inv_list.items } };
-                    peer.sendMessage(&getdata_msg) catch {};
+
+                // BIP 152: Reconstruct block from compact block + mempool.
+                // Derive SipHash key: SHA256(header_bytes || nonce_le)[0:16]
+                var key_data: [88]u8 = undefined;
+                // Serialize header (80 bytes) inline
+                std.mem.writeInt(i32, key_data[0..4], cb.header.version, .little);
+                @memcpy(key_data[4..36], &cb.header.prev_block);
+                @memcpy(key_data[36..68], &cb.header.merkle_root);
+                std.mem.writeInt(u32, key_data[68..72], cb.header.timestamp, .little);
+                std.mem.writeInt(u32, key_data[72..76], cb.header.bits, .little);
+                std.mem.writeInt(u32, key_data[76..80], cb.header.nonce, .little);
+                std.mem.writeInt(u64, key_data[80..88], cb.nonce, .little);
+                const key_hash = crypto.sha256(&key_data);
+                const k0 = std.mem.readInt(u64, key_hash[0..8], .little);
+                const k1 = std.mem.readInt(u64, key_hash[8..16], .little);
+
+                // Build short_id -> slot index map (skipping prefilled positions)
+                const total_tx_count = cb.short_ids.len + cb.prefilled_txs.len;
+                const txn_available = self.allocator.alloc(?types.Transaction, total_tx_count) catch {
+                    std.debug.print("P2P: compact block alloc failed, requesting full block\n", .{});
+                    var inv_list2 = std.ArrayList(p2p.InvVector).init(self.allocator);
+                    defer inv_list2.deinit();
+                    inv_list2.append(.{ .inv_type = .msg_witness_block, .hash = block_hash }) catch {};
+                    if (inv_list2.items.len > 0) {
+                        const getdata_msg2 = p2p.Message{ .getdata = .{ .inventory = inv_list2.items } };
+                        peer.sendMessage(&getdata_msg2) catch {};
+                    }
+                    return;
+                };
+                defer self.allocator.free(txn_available);
+                for (txn_available) |*slot| slot.* = null;
+
+                // Place prefilled transactions
+                for (cb.prefilled_txs) |pt| {
+                    if (pt.index < total_tx_count) {
+                        txn_available[pt.index] = pt.tx;
+                    }
+                }
+
+                // Build short_id -> index map and match against mempool
+                var mempool_hits: usize = 0;
+                var sid_idx: usize = 0;
+                const SipHash = std.crypto.auth.siphash.SipHash64(2, 4);
+                if (self.mempool) |mp| {
+                    mp.mutex.lock();
+                    defer mp.mutex.unlock();
+                    var sid_to_slot = std.AutoHashMap([6]u8, usize).init(self.allocator);
+                    defer sid_to_slot.deinit();
+                    for (0..total_tx_count) |i| {
+                        if (txn_available[i] == null) {
+                            if (sid_idx < cb.short_ids.len) {
+                                sid_to_slot.put(cb.short_ids[sid_idx], i) catch {};
+                                sid_idx += 1;
+                            }
+                        }
+                    }
+                    // Iterate mempool entries and match short IDs
+                    var sip_key: [16]u8 = undefined;
+                    std.mem.writeInt(u64, sip_key[0..8], k0, .little);
+                    std.mem.writeInt(u64, sip_key[8..16], k1, .little);
+                    var it = mp.entries.iterator();
+                    while (it.next()) |kv| {
+                        const entry = kv.value_ptr.*;
+                        // Compute short ID: SipHash24(k0, k1, wtxid)[0:6]
+                        var hasher = SipHash.init(&sip_key);
+                        hasher.update(&entry.wtxid);
+                        const hash_val = hasher.finalInt();
+                        var short_id: [6]u8 = undefined;
+                        // Write lower 6 bytes of hash as little-endian short ID
+                        const hash_le = std.mem.toBytes(hash_val);
+                        @memcpy(&short_id, hash_le[0..6]);
+                        if (sid_to_slot.get(short_id)) |slot_idx| {
+                            if (txn_available[slot_idx] == null) {
+                                txn_available[slot_idx] = entry.tx;
+                                mempool_hits += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Count missing
+                var missing_count: usize = 0;
+                for (txn_available) |slot| {
+                    if (slot == null) missing_count += 1;
+                }
+
+                if (missing_count == 0) {
+                    std.debug.print("P2P: compact block {x} reconstructed from mempool (hits={})\n", .{ block_hash, mempool_hits });
+                    // TODO: assemble full block and pass to validation
+                } else {
+                    const miss_pct = @as(f64, @floatFromInt(missing_count)) / @as(f64, @floatFromInt(total_tx_count)) * 100.0;
+                    if (miss_pct > 50.0) {
+                        // Too many missing — fall back to full block
+                        std.debug.print("P2P: compact block {x} missing {d:.0}% txns, requesting full block\n", .{ block_hash, miss_pct });
+                        var inv_list = std.ArrayList(p2p.InvVector).init(self.allocator);
+                        defer inv_list.deinit();
+                        inv_list.append(.{ .inv_type = .msg_witness_block, .hash = block_hash }) catch {};
+                        if (inv_list.items.len > 0) {
+                            const getdata_msg = p2p.Message{ .getdata = .{ .inventory = inv_list.items } };
+                            peer.sendMessage(&getdata_msg) catch {};
+                        }
+                    } else {
+                        // Send getblocktxn for missing transactions
+                        std.debug.print("P2P: compact block {x} missing {} txns (mempool_hits={}), sending getblocktxn\n", .{ block_hash, missing_count, mempool_hits });
+                        var missing_indices = std.ArrayList(u32).init(self.allocator);
+                        defer missing_indices.deinit();
+                        for (0..total_tx_count) |i| {
+                            if (txn_available[i] == null) {
+                                missing_indices.append(@intCast(i)) catch {};
+                            }
+                        }
+                        if (missing_indices.items.len > 0) {
+                            const gbt_msg = p2p.Message{ .getblocktxn = .{
+                                .block_hash = block_hash,
+                                .indexes = missing_indices.items,
+                            } };
+                            peer.sendMessage(&gbt_msg) catch {};
+                        }
+                    }
                 }
             },
             .getblocktxn => |gbt| {
@@ -2260,8 +2390,32 @@ pub const PeerManager = struct {
                 // full block download, we shouldn't receive these. Ignore.
             },
             .tx => |tx_msg| {
-                // Free the deserialized transaction.
+                // addTransaction copies the tx struct, so we always free the received message.
                 defer serialize.freeTransaction(self.allocator, &tx_msg);
+                if (self.mempool) |pool| {
+                    // Accept transaction into mempool via AcceptToMemoryPool
+                    const result = pool.acceptToMemoryPool(tx_msg, false);
+                    if (result.accepted) {
+                        // Relay to all other peers via inv (BIP 339: use MSG_WITNESS_TX)
+                        const inv_items = [_]p2p.InvVector{.{
+                            .inv_type = .msg_witness_tx,
+                            .hash = result.txid,
+                        }};
+                        const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
+                        for (self.peers.items) |relay_peer| {
+                            if (relay_peer == peer) continue; // Don't relay back to sender
+                            if (!relay_peer.relay_txs) continue; // Respect fRelay
+                            if (relay_peer.state != .connected) continue;
+                            // BIP-133 feefilter: skip peers whose fee filter exceeds tx fee rate
+                            if (relay_peer.fee_filter_received > 0 and result.fee > 0 and result.vsize > 0) {
+                                const fee_rate_per_kvb: u64 = @intCast(@divTrunc(result.fee * 1000, @as(i64, @intCast(result.vsize))));
+                                if (fee_rate_per_kvb < relay_peer.fee_filter_received) continue;
+                            }
+                            relay_peer.sendMessage(&inv_msg) catch {};
+                        }
+                        std.debug.print("MEMPOOL: accepted tx, relaying to peers\n", .{});
+                    }
+                }
             },
             .getdata => |gd| {
                 // Serve requested blocks to peers (check relay cache and pending buffer)
@@ -2290,6 +2444,21 @@ pub const PeerManager = struct {
                             }};
                             const nf_msg = p2p.Message{ .notfound = .{ .inventory = &not_found_inv } };
                             peer.sendMessage(&nf_msg) catch {};
+                        }
+                    } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
+                        // Serve transaction from mempool
+                        if (self.mempool) |pool| {
+                            if (pool.entries.get(item.hash)) |entry| {
+                                const tx_msg = p2p.Message{ .tx = entry.tx };
+                                peer.sendMessage(&tx_msg) catch {};
+                            } else {
+                                const not_found_inv = [_]p2p.InvVector{.{
+                                    .inv_type = item.inv_type,
+                                    .hash = item.hash,
+                                }};
+                                const nf_msg = p2p.Message{ .notfound = .{ .inventory = &not_found_inv } };
+                                peer.sendMessage(&nf_msg) catch {};
+                            }
                         }
                     }
                 }
