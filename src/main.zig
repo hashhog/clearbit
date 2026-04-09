@@ -1138,9 +1138,19 @@ pub fn main() !void {
     var mempool_instance = mempool.Mempool.init(&chain_state, params, allocator);
     defer mempool_instance.deinit();
 
+    // Load persisted fee estimator state
+    const fee_est_path = std.fmt.allocPrint(allocator, "{s}/fee_estimates.dat", .{full_datadir}) catch null;
+    defer if (fee_est_path) |p| allocator.free(p);
+    if (fee_est_path) |path| {
+        mempool_instance.fee_estimator.loadFromFile(path) catch |err| {
+            std.debug.print("Note: could not load fee estimates: {}\n", .{err});
+        };
+    }
+
     var peer_manager = peer.PeerManager.init(allocator, params);
     defer peer_manager.deinit();
     peer_manager.chain_state = &chain_state;
+    peer_manager.mempool = &mempool_instance;
 
     const auth_token = computeAuthToken(config.rpc_user, config.rpc_password, allocator) catch null;
     defer if (auth_token) |t| allocator.free(t);
@@ -1289,6 +1299,13 @@ pub fn main() !void {
     chain_state.flush() catch |err| {
         std.debug.print("Warning: error flushing chain state: {}\n", .{err});
     };
+
+    // Persist fee estimator state
+    if (fee_est_path) |path| {
+        mempool_instance.fee_estimator.saveToFile(path) catch |err| {
+            std.debug.print("Warning: could not save fee estimates: {}\n", .{err});
+        };
+    }
 
     // Remove cookie file on clean shutdown
     deleteCookieFile(full_datadir, allocator);
