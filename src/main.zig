@@ -66,6 +66,9 @@ pub const Config = struct {
     maxmempool: u64 = 300, // Max mempool size in MiB
     mempoolexpiry: u64 = 336, // Hours before expiry
 
+    // Metrics
+    metrics_port: u16 = 9332, // 0 = disabled
+
     // Debug
     debug: bool = false,
     printtoconsole: bool = true,
@@ -147,6 +150,9 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
                 return ArgParseError.InvalidPortNumber;
         } else if (std.mem.startsWith(u8, arg, "--rpcbind=")) {
             config.rpc_bind = arg["--rpcbind=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--metricsport=")) {
+            config.metrics_port = std.fmt.parseInt(u16, arg["--metricsport=".len..], 10) catch
+                return ArgParseError.InvalidPortNumber;
         }
         // P2P settings
         else if (std.mem.startsWith(u8, arg, "--port=")) {
@@ -1275,6 +1281,21 @@ pub fn main() !void {
         return;
     };
 
+    // Start Prometheus metrics server
+    if (config.metrics_port > 0) {
+        const metrics_thread = std.Thread.spawn(.{}, metricsServerThread, .{
+            config.metrics_port,
+            &chain_state,
+            &mempool_instance,
+            &peer_manager,
+        }) catch |err| {
+            std.debug.print("Warning: could not start metrics thread: {}\n", .{err});
+            @as(?std.Thread, null);
+        };
+        _ = metrics_thread;
+        std.debug.print("Prometheus metrics server on port {d}\n", .{config.metrics_port});
+    }
+
     std.debug.print("Node running. Press Ctrl+C to stop.\n", .{});
 
     // 11. Main loop: wait for shutdown signal
@@ -1311,6 +1332,66 @@ pub fn main() !void {
     deleteCookieFile(full_datadir, allocator);
 
     std.debug.print("{s} stopped.\n", .{VERSION_STRING});
+}
+
+// ============================================================================
+// Prometheus Metrics Server
+// ============================================================================
+
+fn metricsServerThread(
+    port: u16,
+    chain_state: *storage.ChainState,
+    mempool_inst: *mempool_mod.Mempool,
+    peer_mgr: *peer_mod.PeerManager,
+) void {
+    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+    var server = std.net.Address.listen(addr, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("Metrics: failed to bind port {d}: {}\n", .{ port, err });
+        return;
+    };
+    defer server.deinit();
+
+    while (!shutdown_requested.load(.acquire)) {
+        const conn = server.accept() catch continue;
+        var stream = conn.stream;
+        defer stream.close();
+
+        // Read request (just consume it)
+        var buf: [4096]u8 = undefined;
+        _ = stream.read(&buf) catch continue;
+
+        // Gather metrics
+        const height = chain_state.best_height;
+        const mstats = mempool_inst.stats();
+        const peers = peer_mgr.getPeerCount();
+
+        // Format response body
+        var body_buf: [1024]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf,
+            "# HELP bitcoin_blocks_total Current block height\n" ++
+            "# TYPE bitcoin_blocks_total gauge\n" ++
+            "bitcoin_blocks_total {d}\n" ++
+            "# HELP bitcoin_peers_connected Number of connected peers\n" ++
+            "# TYPE bitcoin_peers_connected gauge\n" ++
+            "bitcoin_peers_connected {d}\n" ++
+            "# HELP bitcoin_mempool_size Mempool transaction count\n" ++
+            "# TYPE bitcoin_mempool_size gauge\n" ++
+            "bitcoin_mempool_size {d}\n",
+            .{ height, peers, mstats.count },
+        ) catch continue;
+
+        // Format HTTP response
+        var resp_buf: [2048]u8 = undefined;
+        const resp = std.fmt.bufPrint(&resp_buf,
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n{s}",
+            .{ body.len, body },
+        ) catch continue;
+
+        _ = stream.write(resp) catch {};
+    }
 }
 
 // ============================================================================
