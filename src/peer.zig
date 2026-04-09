@@ -628,6 +628,13 @@ pub const Peer = struct {
         // Version 2 = segwit-aware, announce=false = low-bandwidth mode
         const sc = p2p.Message{ .sendcmpct = .{ .announce = false, .version = 2 } };
         try self.sendMessage(&sc);
+
+        // BIP-133: Send initial feefilter after handshake
+        // 100 sat/vbyte = 100,000 sat/kvB to discourage tx relay during sync
+        if (self.relay_txs) {
+            const ff = p2p.Message{ .feefilter = .{ .feerate = 100_000 } };
+            try self.sendMessage(&ff);
+        }
     }
 
     /// Send a ping and record the nonce.
@@ -2027,6 +2034,20 @@ pub const PeerManager = struct {
                             entry.addr.port,
                         );
                         self.addAddress(addr, entry.addr.services, .peer_addr) catch continue;
+                    }
+                }
+            },
+            .addrv2 => |a2| {
+                defer self.allocator.free(a2.entries);
+                // BIP155: Process addrv2 entries — extract IPv4/IPv6 and add to known addresses
+                for (a2.entries) |entry| {
+                    if (entry.network_id == 1 and entry.addr_bytes.len == 4) {
+                        // IPv4
+                        const addr = std.net.Address.initIp4(
+                            entry.addr_bytes[0..4].*,
+                            entry.port,
+                        );
+                        self.addAddress(addr, entry.services, .peer_addr) catch continue;
                     }
                 }
             },
