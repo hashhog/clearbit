@@ -116,6 +116,7 @@ pub const Message = union(enum) {
     feefilter: FeeFilterMessage,
     wtxidrelay: void,
     sendaddrv2: void,
+    addrv2: AddrV2Message,
     reject: RejectMessage,
     mempool: void,
     // BIP-331 Package relay messages
@@ -208,6 +209,20 @@ pub const SendCmpctMessage = struct {
 /// Feefilter message (BIP-133).
 pub const FeeFilterMessage = struct {
     feerate: u64, // Minimum fee rate in sat/kvB
+};
+
+/// BIP155 addrv2 entry.
+pub const AddrV2Entry = struct {
+    timestamp: u32,
+    services: u64,
+    network_id: u8,
+    addr_bytes: []const u8,
+    port: u16,
+};
+
+/// BIP155 addrv2 message.
+pub const AddrV2Message = struct {
+    entries: []const AddrV2Entry,
 };
 
 /// Reject message (deprecated but still sent by some nodes).
@@ -378,6 +393,7 @@ pub fn encodeMessage(
         .feefilter => "feefilter",
         .wtxidrelay => "wtxidrelay",
         .sendaddrv2 => "sendaddrv2",
+        .addrv2 => "addrv2",
         .reject => "reject",
         .mempool => "mempool",
         // BIP-331 Package relay messages
@@ -444,6 +460,20 @@ pub fn encodeMessage(
         },
         .feefilter => |ff| {
             try payload_writer.writeInt(u64, ff.feerate);
+        },
+        .addrv2 => |a2| {
+            try payload_writer.writeCompactSize(a2.entries.len);
+            for (a2.entries) |entry| {
+                try payload_writer.writeInt(u32, entry.timestamp);
+                try payload_writer.writeCompactSize(entry.services);
+                try payload_writer.writeBytes(&[_]u8{entry.network_id});
+                try payload_writer.writeCompactSize(entry.addr_bytes.len);
+                try payload_writer.writeBytes(entry.addr_bytes);
+                // Port is big-endian in addrv2 (network byte order)
+                var port_buf: [2]u8 = undefined;
+                std.mem.writeInt(u16, &port_buf, entry.port, .big);
+                try payload_writer.writeBytes(&port_buf);
+            }
         },
         .block => |blk| {
             try serialize.writeBlock(&payload_writer, &blk);
@@ -638,6 +668,8 @@ pub fn decodePayload(
         return Message{ .wtxidrelay = {} };
     } else if (std.mem.eql(u8, command, "sendaddrv2")) {
         return Message{ .sendaddrv2 = {} };
+    } else if (std.mem.eql(u8, command, "addrv2")) {
+        return Message{ .addrv2 = try decodeAddrV2(&reader, allocator) };
     } else if (std.mem.eql(u8, command, "mempool")) {
         return Message{ .mempool = {} };
     } else if (std.mem.eql(u8, command, "getaddr")) {
@@ -800,6 +832,32 @@ fn decodeAddr(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseErro
         };
     }
     return AddrMessage{ .addrs = addrs };
+}
+
+/// Decode BIP155 addrv2 message.
+fn decodeAddrV2(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseError!AddrV2Message {
+    const count = try reader.readCompactSize();
+    if (count > MAX_ADDR_SIZE) return ParseError.InvalidData;
+    var entries = try allocator.alloc(AddrV2Entry, @intCast(count));
+    for (0..@intCast(count)) |i| {
+        const timestamp = try reader.readInt(u32);
+        const services = try reader.readCompactSize();
+        const network_id = (try reader.readBytes(1))[0];
+        const addr_len = try reader.readCompactSize();
+        if (addr_len > 512) return ParseError.InvalidData;
+        const addr_bytes = try reader.readBytes(@intCast(addr_len));
+        // Port is big-endian in addrv2 (network byte order)
+        const port_bytes = try reader.readBytes(2);
+        const port = std.mem.readInt(u16, port_bytes[0..2], .big);
+        entries[i] = AddrV2Entry{
+            .timestamp = timestamp,
+            .services = services,
+            .network_id = network_id,
+            .addr_bytes = addr_bytes,
+            .port = port,
+        };
+    }
+    return AddrV2Message{ .entries = entries };
 }
 
 /// Decode reject message.
