@@ -1,0 +1,57 @@
+# Clearbit - Bitcoin Full Node (Zig)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+
+[network]
+# Network: mainnet, testnet, testnet4, regtest
+network = "mainnet"
+# Enable DNS seeding
+dns_seed = true
+
+[storage]
+# Data directory
+datadir = "~/.clearbit"
+# UTXO database cache size in MiB
+dbcache = 2048
+# Prune target in MiB (0 = no pruning)
+prune = 0
+# Enable transaction indexing
+txindex = false
+# Enable BIP-157/158 compact block filters
+blockfilterindex = false
+# Enable per-block UTXO statistics
+coinstatsindex = false
+
+[rpc]
+# RPC bind address
+rpc_bind = "127.0.0.1"
+# RPC port (default: 8332 mainnet, 18332 testnet, 48332 testnet4, 18443 regtest)
+rpc_port = 8332
+# RPC authentication
+# rpc_user = ""
+# rpc_password = ""
+
+[p2p]
+# P2P listen port
+listen_port = 8333
+# Maximum connections
+max_connections = 125
+
+[mempool]
+# Maximum mempool size in MiB
+maxmempool = 300
+# Mempool transaction expiry in hours
+mempoolexpiry = 336
+
+[logging]
+# Enable debug logging
+debug = false
+# Print log output to console
+printtoconsole = true
+# Log file path (optional)
+# logfile = ""
+
+[metrics]
+# Prometheus metrics endpoint
+# enabled = true
+# port = 9332
