@@ -8,7 +8,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 pub const types = @import("types.zig");
 pub const crypto = @import("crypto.zig");
 pub const serialize = @import("serialize.zig");
@@ -564,11 +563,6 @@ fn importUtxoSnapshot(config: *Config, allocator: std.mem.Allocator) !void {
     defer if (subdir.len > 0) allocator.free(full_datadir);
 
     // Open RocksDB
-    if (comptime !build_options.rocksdb_enabled) {
-        std.debug.print("FATAL: UTXO snapshot import requires RocksDB. Build with -Drocksdb=true\n", .{});
-        std.process.exit(1);
-    }
-
     const chainstate_path = std.fmt.allocPrint(allocator, "{s}/chainstate", .{full_datadir}) catch {
         std.debug.print("Out of memory\n", .{});
         std.process.exit(1);
@@ -881,7 +875,7 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
     // Open RocksDB
     var db: ?storage.Database = null;
     var db_ptr: ?*storage.Database = null;
-    if (comptime build_options.rocksdb_enabled) {
+    {
         const chainstate_path = std.fmt.allocPrint(allocator, "{s}/chainstate", .{full_datadir}) catch {
             std.debug.print("Out of memory\n", .{});
             std.process.exit(1);
@@ -1101,11 +1095,10 @@ pub fn main() !void {
     std.debug.print("Data directory: {s}\n", .{full_datadir});
 
     // 7. Initialize subsystems
-    // Open RocksDB for disk-backed UTXO persistence when available.
-    // Falls back to memory-only mode when built without -Drocksdb=true.
+    // Open RocksDB for disk-backed UTXO persistence.
     var db: ?storage.Database = null;
     var db_ptr: ?*storage.Database = null;
-    if (comptime build_options.rocksdb_enabled) {
+    {
         const chainstate_path = std.fmt.allocPrint(allocator, "{s}/chainstate", .{full_datadir}) catch {
             std.debug.print("Out of memory\n", .{});
             std.process.exit(1);
@@ -1122,7 +1115,6 @@ pub fn main() !void {
             db = opened_db;
         } else |err| {
             std.debug.print("FATAL: Failed to open RocksDB at {s}: {}\n", .{ chainstate_path, err });
-            std.debug.print("Memory-only mode cannot sustain mainnet sync (UTXO eviction loses data).\n", .{});
             std.debug.print("Fix the RocksDB issue or remove the chainstate directory and retry.\n", .{});
             std.process.exit(1);
         }
@@ -1130,8 +1122,6 @@ pub fn main() !void {
             db_ptr = &db.?;
             std.debug.print("RocksDB storage: {s}/chainstate\n", .{full_datadir});
         }
-    } else {
-        std.debug.print("RocksDB not linked, using memory-only UTXO storage\n", .{});
     }
     defer if (db_ptr) |p| {
         p.close();
@@ -1283,16 +1273,15 @@ pub fn main() !void {
 
     // Start Prometheus metrics server
     if (config.metrics_port > 0) {
-        const metrics_thread = std.Thread.spawn(.{}, metricsServerThread, .{
+        _ = std.Thread.spawn(.{}, metricsServerThread, .{
             config.metrics_port,
             &chain_state,
             &mempool_instance,
             &peer_manager,
         }) catch |err| {
             std.debug.print("Warning: could not start metrics thread: {}\n", .{err});
-            @as(?std.Thread, null);
+            return;
         };
-        _ = metrics_thread;
         std.debug.print("Prometheus metrics server on port {d}\n", .{config.metrics_port});
     }
 
@@ -1341,8 +1330,8 @@ pub fn main() !void {
 fn metricsServerThread(
     port: u16,
     chain_state: *storage.ChainState,
-    mempool_inst: *mempool_mod.Mempool,
-    peer_mgr: *peer_mod.PeerManager,
+    mempool_inst: *mempool.Mempool,
+    peer_mgr: *peer.PeerManager,
 ) void {
     const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
     var server = std.net.Address.listen(addr, .{ .reuse_address = true }) catch |err| {
