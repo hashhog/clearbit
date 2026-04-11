@@ -359,8 +359,9 @@ test "MINIMALIF: OP_IF with 0x02 fails in witness v0" {
     engine.sig_version = .witness_v0;
 
     // Push 0x02 (invalid MINIMALIF value), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
-    // Script: <0x02> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
-    const s = [_]u8{ 0x01, 0x02, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    // Use OP_2 (0x52) — the minimal encoding for integer 2 — so MinimalData does not
+    // fire before MinimalIf. Script: OP_2 OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x52, 0x63, 0x51, 0x67, 0x00, 0x68 };
     const result = engine.execute(&s);
     try testing.expectError(script.ScriptError.MinimalIf, result);
 }
@@ -381,8 +382,9 @@ test "MINIMALIF: OP_IF with 0x01 passes in witness v0" {
     engine.sig_version = .witness_v0;
 
     // Push 0x01 (valid MINIMALIF true value), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
-    // Script: <0x01> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
-    const s = [_]u8{ 0x01, 0x01, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    // Use OP_1 (0x51) — the minimal encoding for integer 1 — so MinimalData does not
+    // fire. Script: OP_1 OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x51, 0x63, 0x51, 0x67, 0x00, 0x68 };
     try engine.execute(&s);
 
     // Should have taken the true branch and pushed OP_1
@@ -453,8 +455,9 @@ test "MINIMALIF: OP_NOTIF with 0x02 fails in witness v0" {
     engine.sig_version = .witness_v0;
 
     // Push 0x02 (invalid MINIMALIF value), then OP_NOTIF OP_1 OP_ELSE OP_0 OP_ENDIF
-    // Script: <0x02> OP_NOTIF OP_1 OP_ELSE OP_0 OP_ENDIF
-    const s = [_]u8{ 0x01, 0x02, 0x64, 0x51, 0x67, 0x00, 0x68 };
+    // Use OP_2 (0x52) — the minimal encoding for integer 2 — so MinimalData does not
+    // fire before MinimalIf. Script: OP_2 OP_NOTIF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x52, 0x64, 0x51, 0x67, 0x00, 0x68 };
     const result = engine.execute(&s);
     try testing.expectError(script.ScriptError.MinimalIf, result);
 }
@@ -495,8 +498,9 @@ test "MINIMALIF: OP_IF with 0x02 allowed in legacy (base) mode" {
 
     // Default is base mode (legacy), MINIMALIF not enforced
     // Push 0x02 (truthy in legacy), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
-    // Script: <0x02> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
-    const s = [_]u8{ 0x01, 0x02, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    // Use OP_2 (0x52) — the minimal encoding for integer 2.
+    // Script: OP_2 OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x52, 0x63, 0x51, 0x67, 0x00, 0x68 };
     try engine.execute(&s);
 
     // Should have taken the true branch since 0x02 is truthy in legacy
@@ -520,7 +524,9 @@ test "MINIMALIF: enforced in tapscript mode" {
     engine.sig_version = .tapscript;
 
     // Push 0x02 (invalid MINIMALIF value), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
-    const s = [_]u8{ 0x01, 0x02, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    // Use OP_2 (0x52) — the minimal encoding for integer 2 — so MinimalData does not
+    // fire before MinimalIf. Script: OP_2 OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+    const s = [_]u8{ 0x52, 0x63, 0x51, 0x67, 0x00, 0x68 };
     const result = engine.execute(&s);
     try testing.expectError(script.ScriptError.MinimalIf, result);
 }
