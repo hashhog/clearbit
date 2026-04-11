@@ -783,6 +783,8 @@ pub const RpcServer = struct {
         // Phase 8: Additional RPC methods
         else if (std.mem.eql(u8, method, "getblockheader")) {
             return self.handleGetBlockHeader(params, id);
+        } else if (std.mem.eql(u8, method, "getdeploymentinfo")) {
+            return self.handleGetDeploymentInfo(params, id);
         } else if (std.mem.eql(u8, method, "getchaintips")) {
             return self.handleGetChainTips(id);
         } else if (std.mem.eql(u8, method, "getrawmempool")) {
@@ -3944,6 +3946,161 @@ pub const RpcServer = struct {
         return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
     }
 
+    /// Handle getdeploymentinfo RPC - return deployment/softfork status.
+    /// Reference: Bitcoin Core rpc/blockchain.cpp getdeploymentinfo
+    ///
+    /// Arguments:
+    ///   1. blockhash (string, optional) - hash of block to query; defaults to chain tip
+    ///
+    /// Returns an object with "hash", "height", and "deployments" fields.
+    /// Deployments include buried (bip34, bip65, bip66) and bip9-style (csv, segwit, taproot, testdummy).
+    /// Because clearbit has no BIP9 state machine, bip9-type deployments that have
+    /// activation heights in NetworkParams are reported as buried-style with type="buried".
+    /// testdummy is reported with type="bip9" and status="defined" since it is never activated.
+    ///
+    /// Follow-up issue: implement a full BIP9 versionbits state machine so that
+    /// in-progress deployments can report started/locked_in/active/failed status.
+    fn handleGetDeploymentInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Determine the query height.  If a blockhash is provided we look it up;
+        // otherwise we use the current chain tip.
+        var query_height: u32 = self.chain_state.best_height;
+        var query_hash: types.Hash256 = self.chain_state.best_hash;
+
+        if (params == .array and params.array.items.len > 0) {
+            const h = params.array.items[0];
+            if (h != .null) {
+                if (h != .string) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be a string", id);
+                }
+                const blockhash_hex = h.string;
+                if (blockhash_hex.len != 64) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash length", id);
+                }
+                // Parse hex → bytes (display order → internal LE order)
+                var parsed_hash: types.Hash256 = undefined;
+                for (0..32) |i| {
+                    parsed_hash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 .. i * 2 + 2], 16) catch {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash hex", id);
+                    };
+                }
+                // Resolve to a height.  We support the genesis hash and the
+                // current best hash; everything else returns "Block not found".
+                if (std.mem.eql(u8, &parsed_hash, &self.network_params.genesis_hash)) {
+                    query_height = 0;
+                    query_hash = parsed_hash;
+                } else if (std.mem.eql(u8, &parsed_hash, &self.chain_state.best_hash)) {
+                    query_height = self.chain_state.best_height;
+                    query_hash = parsed_hash;
+                } else if (self.chain_manager) |cm| {
+                    // Walk the active chain looking for the requested hash.
+                    var entry: ?*validation.BlockIndexEntry = cm.active_tip;
+                    var found = false;
+                    while (entry) |e| {
+                        if (std.mem.eql(u8, &e.hash, &parsed_hash)) {
+                            query_height = e.height;
+                            query_hash = parsed_hash;
+                            found = true;
+                            break;
+                        }
+                        entry = e.parent;
+                    }
+                    if (!found) {
+                        return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+                    }
+                } else {
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+                }
+            }
+        }
+
+        const np = self.network_params;
+
+        // Helper: is a buried deployment active at query_height?
+        // A buried deployment is considered active after (height-1), i.e. active when
+        // query_height >= activation_height.  This matches Bitcoin Core semantics:
+        // "active from when the chain height is one below the activation height".
+        // For activation_height == 0 (regtest csv/segwit/taproot) it is always active.
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"hash\":\"");
+        try writeHashHex(writer, &query_hash);
+        try writer.print("\",\"height\":{d},\"deployments\":{{", .{query_height});
+
+        // ---- bip34 (buried) ----
+        {
+            const act_height = np.bip34_height;
+            const active = query_height >= act_height;
+            try writer.print("\"bip34\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- bip65 (buried) ----
+        {
+            const act_height = np.bip65_height;
+            const active = query_height >= act_height;
+            try writer.print("\"bip65\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- bip66 (buried) ----
+        {
+            const act_height = np.bip66_height;
+            const active = query_height >= act_height;
+            try writer.print("\"bip66\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- csv (buried — activation height stored in NetworkParams) ----
+        {
+            const act_height = np.csv_height;
+            const active = query_height >= act_height;
+            try writer.print("\"csv\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- segwit (buried) ----
+        {
+            const act_height = np.segwit_height;
+            const active = query_height >= act_height;
+            try writer.print("\"segwit\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- taproot (buried) ----
+        {
+            const act_height = np.taproot_height;
+            const active = query_height >= act_height;
+            try writer.print("\"taproot\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- testdummy (bip9-style, never activated on any real network) ----
+        // clearbit does not have a BIP9 state machine.  We report testdummy with
+        // type="bip9", status="defined", since=0, bit=28, start_time=-1 (always),
+        // timeout=9223372036854775807 (never).
+        // Follow-up: wire up a proper BIP9 versionbits cache.
+        try writer.writeAll("\"testdummy\":{\"type\":\"bip9\",\"active\":false,\"bip9\":{\"bit\":28,\"start_time\":-1,\"timeout\":9223372036854775807,\"min_activation_height\":0,\"status\":\"defined\",\"since\":0}}");
+
+        try writer.writeAll("}}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// Handle getchaintips RPC - return information about chain tips.
     /// Reference: Bitcoin Core rpc/blockchain.cpp getchaintips
     fn handleGetChainTips(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
@@ -5462,6 +5619,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("getblock blockhash ( verbosity )\\n\\nReturns block data.");
             } else if (std.mem.eql(u8, cmd, "getblockheader")) {
                 try writer.writeAll("getblockheader blockhash ( verbose )\\n\\nReturns block header data.");
+            } else if (std.mem.eql(u8, cmd, "getdeploymentinfo")) {
+                try writer.writeAll("getdeploymentinfo ( blockhash )\\n\\nReturns an object containing deployment state info for softforks.");
             } else if (std.mem.eql(u8, cmd, "getchaintips")) {
                 try writer.writeAll("getchaintips\\n\\nReturn information about all known tips in the block tree.");
             } else if (std.mem.eql(u8, cmd, "getrawmempool")) {
@@ -5510,6 +5669,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getblockcount\\n");
             try writer.writeAll("getblockhash\\n");
             try writer.writeAll("getblockheader\\n");
+            try writer.writeAll("getdeploymentinfo\\n");
             try writer.writeAll("getchaintips\\n");
             try writer.writeAll("getdifficulty\\n");
             try writer.writeAll("\\n== Mempool ==\\n");
@@ -6465,4 +6625,149 @@ test "sendrawtransaction with non-string hex param" {
     // Should return invalid params error
     try std.testing.expect(std.mem.indexOf(u8, result, "-32602") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Invalid hex string") != null);
+}
+
+test "getdeploymentinfo regtest returns non-empty deployments with segwit and taproot" {
+    // Verifies that getdeploymentinfo on regtest:
+    //   - returns a valid JSON-RPC result (no error field populated)
+    //   - includes "segwit" and "taproot" keys in the deployments object
+    //   - marks both segwit and taproot as active (they activate at height 0 on regtest)
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.REGTEST,
+        .{},
+    );
+    defer server.deinit();
+
+    // No blockhash param — defaults to chain tip (height 0 on a fresh chain).
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getdeploymentinfo\",\"params\":[]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Must be a success response
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\":null") != null);
+
+    // deployments object must not be empty
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"deployments\":{") != null);
+
+    // segwit and taproot must be present
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"segwit\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"taproot\":{") != null);
+
+    // On regtest both activate at height 0, so active=true at any height
+    // We match the substring that appears inside the segwit object.
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"segwit\":{\"type\":\"buried\",\"active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"taproot\":{\"type\":\"buried\",\"active\":true") != null);
+}
+
+test "getdeploymentinfo mainnet segwit and taproot not yet active at height 0" {
+    // On mainnet at height 0, segwit (481824) and taproot (709632) are not yet
+    // active.  The deployment objects must still be present but active=false.
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getdeploymentinfo\",\"params\":[]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"segwit\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"taproot\":{") != null);
+    // At height 0 neither is active on mainnet
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"segwit\":{\"type\":\"buried\",\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"taproot\":{\"type\":\"buried\",\"active\":false") != null);
+}
+
+test "getdeploymentinfo testdummy has bip9 type and defined status" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.REGTEST,
+        .{},
+    );
+    defer server.deinit();
+
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getdeploymentinfo\",\"params\":[]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"testdummy\":{\"type\":\"bip9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"defined\"") != null);
+}
+
+test "getdeploymentinfo invalid blockhash returns error" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.REGTEST,
+        .{},
+    );
+    defer server.deinit();
+
+    // 63-char hash (too short)
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getdeploymentinfo\",\"params\":[\"000000000000000000000000000000000000000000000000000000000000abc\"]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Invalid block hash length") != null);
 }
