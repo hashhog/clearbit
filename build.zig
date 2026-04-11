@@ -4,10 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // RocksDB is required for full functionality but optional for basic testing
-    // When RocksDB is available, use: zig build -Drocksdb=true
-    const rocksdb_enabled = b.option(bool, "rocksdb", "Enable RocksDB support (requires librocksdb-dev)") orelse false;
-
     // libsecp256k1 is required for wallet functionality and BIP324 v2 transport
     // When available, use: zig build -Dsecp256k1=true
     const secp256k1_enabled = b.option(bool, "secp256k1", "Enable libsecp256k1 support (requires libsecp256k1-dev)") orelse false;
@@ -27,7 +23,6 @@ pub fn build(b: *std.Build) void {
     // Create build options module that all modules can import
     const build_options = b.addOptions();
     build_options.addOption(bool, "minisketch_enabled", minisketch_enabled);
-    build_options.addOption(bool, "rocksdb_enabled", rocksdb_enabled);
 
     const exe = b.addExecutable(.{
         .name = "clearbit",
@@ -36,11 +31,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Link RocksDB if enabled
-    if (rocksdb_enabled) {
-        exe.linkSystemLibrary("rocksdb");
-        exe.linkLibC();
-    }
+    // RocksDB is always linked (required for persistent chain state)
+    exe.linkSystemLibrary("rocksdb");
 
     // Always add secp256k1 include path and link library for @cImport in wallet.zig
     exe.addIncludePath(.{ .cwd_relative = secp256k1_include });
@@ -72,11 +64,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Link RocksDB for tests if enabled
-    if (rocksdb_enabled) {
-        unit_tests.linkSystemLibrary("rocksdb");
-        unit_tests.linkLibC();
-    }
+    // RocksDB is always linked for tests
+    unit_tests.linkSystemLibrary("rocksdb");
 
     // Link libsecp256k1 for tests (required by crypto.zig)
     unit_tests.linkSystemLibrary("secp256k1");
@@ -134,8 +123,8 @@ pub fn build(b: *std.Build) void {
     const script_step = b.step("test-script", "Run script test vectors");
     script_step.dependOn(&run_script.step);
 
-    // Add a separate step for RocksDB tests
-    if (rocksdb_enabled) {
+    // RocksDB storage tests
+    {
         const rocksdb_tests = b.addTest(.{
             .root_source_file = b.path("src/storage_rocksdb.zig"),
             .target = target,
@@ -143,7 +132,6 @@ pub fn build(b: *std.Build) void {
         });
         rocksdb_tests.linkSystemLibrary("rocksdb");
         rocksdb_tests.linkLibC();
-        rocksdb_tests.root_module.addOptions("build_options", build_options);
 
         const run_rocksdb_tests = b.addRunArtifact(rocksdb_tests);
         const rocksdb_test_step = b.step("test-rocksdb", "Run RocksDB-specific tests");
