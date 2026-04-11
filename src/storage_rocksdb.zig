@@ -117,16 +117,13 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
 
         if (db == null) return storage.StorageError.OpenFailed;
 
-        // Create the column families
-        cf_handles[0] = c.rocksdb_get_default_column_family_handle(db);
-        if (cf_handles[0] == null) {
-            c.rocksdb_close(db);
-            return storage.StorageError.OpenFailed;
-        }
-
+        // Create the non-default column families on the freshly opened DB.
+        // We do NOT need a handle for the default CF here because we will
+        // close this DB and immediately reopen it via rocksdb_open_column_families
+        // below, which returns handles for ALL CFs including "default".
         for (1..5) |i| {
             errptr = null;
-            cf_handles[i] = c.rocksdb_create_column_family(
+            const handle = c.rocksdb_create_column_family(
                 db,
                 options,
                 cf_names[i],
@@ -134,14 +131,37 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
             );
             if (errptr) |err3| {
                 c.rocksdb_free(@ptrCast(err3));
-                // Clean up already created handles
+                // Destroy already created handles and close
                 for (1..i) |j| {
-                    c.rocksdb_column_family_handle_destroy(cf_handles[j]);
+                    if (cf_handles[j] != null) {
+                        c.rocksdb_column_family_handle_destroy(cf_handles[j]);
+                    }
                 }
                 c.rocksdb_close(db);
                 return storage.StorageError.OpenFailed;
             }
+            // Destroy the handle immediately — we will reopen with all CFs below.
+            if (handle != null) c.rocksdb_column_family_handle_destroy(handle);
         }
+        c.rocksdb_close(db);
+
+        // Reopen with all five column families so we get proper handles.
+        errptr = null;
+        db = c.rocksdb_open_column_families(
+            options,
+            path_z.ptr,
+            5,
+            &cf_names,
+            &cf_options,
+            @ptrCast(&cf_handles),
+            &errptr,
+        );
+        if (errptr) |err2| {
+            std.debug.print("RocksDB: reopen with column families failed: {s}\n", .{err2});
+            c.rocksdb_free(@ptrCast(err2));
+            return storage.StorageError.OpenFailed;
+        }
+        if (db == null) return storage.StorageError.OpenFailed;
     }
 
     const state = allocator.create(DbState) catch return storage.StorageError.OutOfMemory;
