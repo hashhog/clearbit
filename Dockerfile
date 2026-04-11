@@ -1,7 +1,7 @@
 # Stage 1: Build
 FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates xz-utils librocksdb-dev libsecp256k1-dev curl && \
+    ca-certificates xz-utils librocksdb-dev libsnappy-dev libsecp256k1-dev curl && \
     rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
     | tar -xJ -C /usr/local && \

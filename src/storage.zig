@@ -2908,11 +2908,13 @@ test "column family constants" {
     try std.testing.expectEqual(@as(usize, 4), CF_TX_INDEX);
 }
 
-test "database returns RocksDBNotAvailable" {
-    // Without RocksDB linked, Database.open should return an error
+test "database opens successfully with RocksDB" {
+    // RocksDB is always linked unconditionally; Database.open must succeed.
+    // This test was previously "returns RocksDBNotAvailable" when storage had an
+    // optional stub path, but that path was removed (see commit c0f03cc).
     const allocator = std.testing.allocator;
-    const result = Database.open("/tmp/test", allocator);
-    try std.testing.expectError(StorageError.RocksDBNotAvailable, result);
+    var db = try Database.open("/tmp/clearbit_test_db", allocator);
+    defer db.close();
 }
 
 // ============================================================================
