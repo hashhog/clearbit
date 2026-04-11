@@ -26,9 +26,6 @@ zig build -Doptimize=ReleaseFast
 ### Build with Optional Features
 
 ```bash
-# With RocksDB storage support
-zig build -Drocksdb=true
-
 # With wallet/secp256k1 support
 zig build -Dsecp256k1=true
 
@@ -271,11 +268,10 @@ resources/
 ## Running Tests
 
 ```bash
-zig build test                    # run all tests
+zig build test                    # run all tests (includes RocksDB storage tests)
 zig build test --summary all      # run tests with detailed summary
 
 # Optional tests with external dependencies:
-zig build -Drocksdb=true test     # include RocksDB storage tests
 zig build -Dsecp256k1=true test   # include wallet/crypto tests
 zig build -Dminisketch=true test  # include Erlay/minisketch FFI tests
 ```
