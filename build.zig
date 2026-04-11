@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // RocksDB is always linked (required for persistent chain state).
+    // Accept -Drocksdb=true/false for CI/Docker compatibility; the flag is
+    // informational only — RocksDB is always compiled in.
+    _ = b.option(bool, "rocksdb", "Enable RocksDB storage backend (always on; flag accepted for compatibility)") orelse true;
+
     // libsecp256k1 is required for wallet functionality and BIP324 v2 transport
     // When available, use: zig build -Dsecp256k1=true
     const secp256k1_enabled = b.option(bool, "secp256k1", "Enable libsecp256k1 support (requires libsecp256k1-dev)") orelse false;
@@ -36,7 +41,6 @@ pub fn build(b: *std.Build) void {
 
     // Always add secp256k1 include path and link library for @cImport in wallet.zig
     exe.addIncludePath(.{ .cwd_relative = secp256k1_include });
-    exe.addLibraryPath(.{ .cwd_relative = "/home/max/.local/lib64" });
     exe.linkSystemLibrary("secp256k1");
     exe.linkLibC();
 
@@ -70,7 +74,6 @@ pub fn build(b: *std.Build) void {
     // Link libsecp256k1 for tests (required by crypto.zig)
     unit_tests.linkSystemLibrary("secp256k1");
     unit_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
-    unit_tests.addLibraryPath(.{ .cwd_relative = "/home/max/.local/lib64" });
     unit_tests.linkLibC();
 
     // Link libminisketch for tests if enabled
@@ -95,7 +98,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     sighash_test.addIncludePath(.{ .cwd_relative = secp256k1_include });
-    sighash_test.addLibraryPath(.{ .cwd_relative = "/home/max/.local/lib64" });
     sighash_test.linkSystemLibrary("secp256k1");
     sighash_test.linkLibC();
     b.installArtifact(sighash_test);
@@ -113,7 +115,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     script_test.addIncludePath(.{ .cwd_relative = secp256k1_include });
-    script_test.addLibraryPath(.{ .cwd_relative = "/home/max/.local/lib64" });
     script_test.linkSystemLibrary("secp256k1");
     script_test.linkLibC();
     b.installArtifact(script_test);

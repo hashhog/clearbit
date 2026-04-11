@@ -1060,13 +1060,19 @@ pub const ScriptCheckQueue = struct {
     worker_count: usize,
 
     /// Initialize the script check queue with worker threads.
+    /// Returns a heap-allocated queue so worker threads always hold a stable
+    /// pointer (returning by value would move the struct and invalidate the
+    /// pointer passed to the worker threads).
     /// Uses std.Thread.getCpuCount() - 1 workers (minimum 1).
-    pub fn init(allocator: std.mem.Allocator) !ScriptCheckQueue {
+    pub fn init(allocator: std.mem.Allocator) !*ScriptCheckQueue {
         const cpu_count = std.Thread.getCpuCount() catch 1;
         // Use N-1 workers since master thread also participates
         const worker_count = @max(1, cpu_count -| 1);
 
-        var queue = ScriptCheckQueue{
+        const queue = try allocator.create(ScriptCheckQueue);
+        errdefer allocator.destroy(queue);
+
+        queue.* = ScriptCheckQueue{
             .workers = try allocator.alloc(std.Thread, worker_count),
             .jobs = &.{},
             .next_job = std.atomic.Value(usize).init(0),
@@ -1079,9 +1085,9 @@ pub const ScriptCheckQueue = struct {
             .worker_count = worker_count,
         };
 
-        // Spawn worker threads
+        // Spawn worker threads — safe because queue lives on the heap.
         for (queue.workers, 0..) |*worker, i| {
-            worker.* = try std.Thread.spawn(.{}, workerLoop, .{ &queue, i });
+            worker.* = try std.Thread.spawn(.{}, workerLoop, .{ queue, i });
         }
 
         return queue;
@@ -1099,6 +1105,7 @@ pub const ScriptCheckQueue = struct {
         }
 
         self.allocator.free(self.workers);
+        self.allocator.destroy(self);
     }
 
     /// Submit a batch of jobs for parallel verification.
