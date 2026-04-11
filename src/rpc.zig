@@ -889,14 +889,21 @@ pub const RpcServer = struct {
         // Headers height = validated blocks + queued headers not yet validated
         const headers_height = self.chain_state.best_height +
             @as(u32, @intCast(self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor));
+
+        // Calculate initialblockdownload status
+        // IBD = true if chainwork < minimum chain work OR tip age > 24 hours
+        // Once cleared, it latches to false (cannot flip back to true)
+        const ibd = self.isInitialBlockDownload();
+
         try writer.print("{{\"chain\":\"{s}\",\"blocks\":{d},\"headers\":{d},\"bestblockhash\":\"", .{
             chain_name,
             self.chain_state.best_height,
             headers_height,
         });
         try writeHashHex(writer, &self.chain_state.best_hash);
-        try writer.print("\",\"difficulty\":{d},\"verificationprogress\":1.0,\"pruned\":false}}", .{
+        try writer.print("\",\"difficulty\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"pruned\":false}}", .{
             getDifficulty(self.network_params.genesis_header.bits),
+            ibd,
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -5577,6 +5584,50 @@ pub const RpcServer = struct {
 
         return buf.toOwnedSlice();
     }
+
+    /// Check if the node is in Initial Block Download (IBD) mode.
+    /// IBD is true if:
+    /// 1. Total chain work < minimum chain work (anti-DoS), OR
+    /// 2. Tip timestamp < current time - 24 hours
+    /// Once cleared, it latches to false and cannot flip back to true.
+    /// Reference: Bitcoin Core validation.cpp ChainstateManager::UpdateIBDStatus()
+    fn isInitialBlockDownload(self: *const RpcServer) bool {
+        // Check if total chain work is below minimum
+        if (self.compareChainWork(&self.chain_state.total_work, &self.network_params.min_chain_work) < 0) {
+            return true;
+        }
+
+        // Check if we have a chain tip with timestamp information
+        if (self.chain_manager) |cm| {
+            if (cm.active_tip) |tip| {
+                // Get current time
+                const now = std.time.timestamp();
+                const tip_time = tip.header.timestamp;
+
+                // Max tip age is 24 hours (86400 seconds)
+                const max_tip_age_seconds: i64 = 24 * 60 * 60;
+
+                // If tip is older than 24 hours, we're in IBD
+                if (now - @as(i64, @intCast(tip_time)) > max_tip_age_seconds) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Compare two 256-bit chain work values (little-endian representation).
+    /// Returns: positive if a > b, negative if a < b, zero if a == b
+    fn compareChainWork(self: *const RpcServer, a: *const [32]u8, b: *const [32]u8) i32 {
+        _ = self;
+        // Compare as big-endian integers (most significant byte first)
+        for (0..32) |i| {
+            if (a[i] > b[i]) return 1;
+            if (a[i] < b[i]) return -1;
+        }
+        return 0;
+    }
 };
 
 // ============================================================================
@@ -5913,6 +5964,43 @@ test "getblockchaininfo returns correct height and hash" {
     // Should contain correct height
     try std.testing.expect(std.mem.indexOf(u8, result, "\"blocks\":100") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"chain\":\"main\"") != null);
+}
+
+test "getblockchaininfo includes initialblockdownload field" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    // Set chain state with low chain work (should indicate IBD)
+    chain_state.best_height = 100;
+    chain_state.best_hash = [_]u8{0xAB} ** 32;
+    chain_state.total_work = [_]u8{0x00} ** 32; // Zero work
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockchaininfo\",\"params\":[]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Should contain the initialblockdownload field
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"initialblockdownload\"") != null);
+    // With zero work, should be in IBD (true)
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"initialblockdownload\":true") != null);
 }
 
 test "getblockcount returns height" {
