@@ -423,6 +423,94 @@ pub fn requiresCheckpointValidation(height: u32, network: consensus.Network) boo
 }
 
 // ============================================================================
+// Assumevalid: ancestor-check skip-script decision
+// ============================================================================
+
+/// Decide whether script verification can be SKIPPED for a block being
+/// connected during IBD.  This implements Bitcoin Core v28.0
+/// validation.cpp ConnectBlock() lines 2345-2383.
+///
+/// ALL SIX conditions must hold for scripts to be skipped:
+///   1. params.assumed_valid_hash is set (non-null).
+///   2. The assumed-valid block is present in the block index
+///      (we have received its header).
+///   3. The block being connected is an ancestor of the assumed-valid block
+///      on the active chain:
+///        active_chain[block_height] == block_hash
+///        AND active_chain[assumed_valid_height] == assumed_valid_hash
+///   4. The block is an ancestor of the best known header
+///      (already implied by condition 3 when active_chain is the best chain).
+///   5. The best-known-header's chainwork >= params.min_chain_work.
+///   6. The best header is at least TWO_WEEKS_SECONDS (1_209_600 s) of
+///      equivalent elapsed time past the block being connected.  We
+///      approximate this as: best_tip_timestamp > block_timestamp + 1_209_600.
+///
+/// NON-script validation (merkle root, coinbase, PoW, BIP30, block size)
+/// is NEVER skipped regardless of the return value.
+///
+/// Parameters:
+///   block_hash          - hash of the block being connected
+///   block_height        - height of the block being connected
+///   block_timestamp     - Unix timestamp of the block header
+///   params              - network params (contains assumed_valid_hash, min_chain_work)
+///   active_chain        - slice of hashes indexed by height (active_chain[h] = hash at h)
+///   best_tip_chain_work - cumulative work of the best known header
+///   best_tip_timestamp  - Unix timestamp of the best known header
+///
+/// Returns true if scripts may be skipped, false if they must run.
+pub fn shouldSkipScripts(
+    block_hash: *const [32]u8,
+    block_height: u32,
+    block_timestamp: u32,
+    params: *const consensus.NetworkParams,
+    active_chain: []const [32]u8,
+    best_tip_chain_work: [32]u8,
+    best_tip_timestamp: u32,
+) bool {
+    const TWO_WEEKS_SECONDS: u64 = 60 * 60 * 24 * 7 * 2; // 1_209_600
+
+    // Condition 1: assumed_valid_hash must be set.
+    const av_hash = params.assumed_valid_hash orelse return false;
+
+    // Condition 2: the assumed-valid block must be in our active chain.
+    // We use params.assume_valid_height as the expected height.
+    const av_height = params.assume_valid_height;
+    if (av_height == 0) return false; // Regtest / testnet3: no assumevalid
+    if (av_height >= active_chain.len) return false; // Haven't synced that far
+    if (!std.mem.eql(u8, &active_chain[av_height], &av_hash)) return false;
+
+    // Condition 3: block being connected must be at or below assumevalid height
+    // AND must be the block at that height in our active chain (ancestor check).
+    if (block_height > av_height) return false; // Above assumevalid: run scripts
+    if (block_height >= active_chain.len) return false;
+    if (!std.mem.eql(u8, &active_chain[block_height], block_hash)) return false;
+
+    // Condition 4 is implied by condition 3 (block is on active chain).
+
+    // Condition 5: best-known-header chainwork >= min_chain_work.
+    // Compare as big-endian 256-bit integers.
+    const min_work = params.min_chain_work;
+    const has_enough_work = blk: {
+        for (0..32) |i| {
+            if (best_tip_chain_work[i] > min_work[i]) break :blk true;
+            if (best_tip_chain_work[i] < min_work[i]) break :blk false;
+        }
+        break :blk true; // Equal: also sufficient
+    };
+    if (!has_enough_work) return false;
+
+    // Condition 6: best header must be at least TWO_WEEKS_SECONDS past this block.
+    // Prevents an attacker with a shallow manufactured best-header from
+    // unlocking the script-skip path.
+    if (best_tip_timestamp <= block_timestamp) return false;
+    const elapsed: u64 = best_tip_timestamp - block_timestamp;
+    if (elapsed <= TWO_WEEKS_SECONDS) return false;
+
+    // All six conditions satisfied: skip script verification for this block.
+    return true;
+}
+
+// ============================================================================
 // Full Block Validation
 // ============================================================================
 
@@ -2754,6 +2842,244 @@ test "checkpoints are sorted by height" {
     for (0..checkpoints.len - 1) |i| {
         try std.testing.expect(checkpoints[i].height < checkpoints[i + 1].height);
     }
+}
+
+// ============================================================================
+// shouldSkipScripts — ancestor-check assumevalid tests
+// Test matrix from ASSUMEVALID-REFERENCE.md
+// ============================================================================
+
+// Helper: build a fake NetworkParams with a known assumed_valid_hash.
+fn makeTestParams(av_hash: ?[32]u8, av_height: u32, min_chain_work_val: u8) consensus.NetworkParams {
+    // Start from REGTEST and override the assumevalid fields.
+    var p = consensus.REGTEST;
+    p.assumed_valid_hash = av_hash;
+    p.assume_valid_height = av_height;
+    // min_chain_work: fill all bytes with min_chain_work_val (big-endian).
+    @memset(&p.min_chain_work, min_chain_work_val);
+    return p;
+}
+
+// A timestamp 3 weeks in the past, so best_tip_timestamp can be "now" and
+// satisfy the 2-week gap condition.
+const THREE_WEEKS_S: u32 = 3 * 7 * 24 * 60 * 60; // 1_814_400
+
+test "shouldSkipScripts: assumed_valid absent => always verify" {
+    // Test case 1: no assumed_valid hash configured => scripts always run.
+    const params = makeTestParams(null, 0, 0x00);
+
+    const av_hash: [32]u8 = [_]u8{0xAA} ** 32;
+    const block_hash: [32]u8 = [_]u8{0x01} ** 32;
+    // Build a tiny active chain with one entry at height 0.
+    var active_chain = [_][32]u8{block_hash};
+
+    const result = shouldSkipScripts(
+        &block_hash,
+        0,
+        1000,
+        &params,
+        &active_chain,
+        av_hash, // best_tip_chain_work (irrelevant here)
+        1000 + THREE_WEEKS_S,
+    );
+    try std.testing.expect(!result);
+}
+
+test "shouldSkipScripts: block is ancestor of assumevalid => skip fires" {
+    // Test case 2: all six conditions hold => skip.
+    const block_hash_arr: [32]u8 = [_]u8{0x01} ** 32;
+    const av_hash: [32]u8 = [_]u8{0xAA} ** 32;
+
+    // Active chain: [genesis, block_at_1, ..., block_at_av_height]
+    // We only need heights 0 (block), 1 (assumevalid), and can fake the rest.
+    const block_height: u32 = 0;
+    const av_height: u32 = 1;
+
+    var active_chain = [_][32]u8{ block_hash_arr, av_hash };
+    const params = makeTestParams(av_hash, av_height, 0x00); // min_chain_work = 0
+
+    // best_tip_chain_work: any value >= min_chain_work (which is 0)
+    const best_work: [32]u8 = [_]u8{0x01} ** 32;
+    const block_ts: u32 = 1000;
+    const best_ts: u32 = block_ts + THREE_WEEKS_S + 1;
+
+    const result = shouldSkipScripts(
+        &block_hash_arr,
+        block_height,
+        block_ts,
+        &params,
+        &active_chain,
+        best_work,
+        best_ts,
+    );
+    try std.testing.expect(result);
+}
+
+test "shouldSkipScripts: block NOT in assumevalid chain at same height => run" {
+    // Test case 3: block is at the right height but its hash doesn't match
+    // the active chain at that height => scripts run.
+    const block_hash_real: [32]u8 = [_]u8{0x01} ** 32;
+    const block_hash_fork: [32]u8 = [_]u8{0x02} ** 32; // different block same height
+    const av_hash: [32]u8 = [_]u8{0xAA} ** 32;
+
+    const block_height: u32 = 0;
+    const av_height: u32 = 1;
+
+    // active_chain contains the real chain, not the fork
+    var active_chain = [_][32]u8{ block_hash_real, av_hash };
+    const params = makeTestParams(av_hash, av_height, 0x00);
+    const best_work: [32]u8 = [_]u8{0x01} ** 32;
+    const block_ts: u32 = 1000;
+    const best_ts: u32 = block_ts + THREE_WEEKS_S + 1;
+
+    // block_hash_fork is not on the active chain at height 0
+    const result = shouldSkipScripts(
+        &block_hash_fork,
+        block_height,
+        block_ts,
+        &params,
+        &active_chain,
+        best_work,
+        best_ts,
+    );
+    try std.testing.expect(!result);
+}
+
+test "shouldSkipScripts: block height above assumevalid => run" {
+    // Test case 4: block_height > av_height => no skip.
+    const av_hash: [32]u8 = [_]u8{0xAA} ** 32;
+    const above_hash: [32]u8 = [_]u8{0x03} ** 32;
+
+    const av_height: u32 = 1;
+    const block_height: u32 = 2; // above
+
+    // active chain has 3 entries (heights 0, 1, 2)
+    var active_chain = [_][32]u8{
+        [_]u8{0x00} ** 32,
+        av_hash,
+        above_hash,
+    };
+    const params = makeTestParams(av_hash, av_height, 0x00);
+    const best_work: [32]u8 = [_]u8{0x01} ** 32;
+    const block_ts: u32 = 1000;
+    const best_ts: u32 = block_ts + THREE_WEEKS_S + 1;
+
+    const result = shouldSkipScripts(
+        &above_hash,
+        block_height,
+        block_ts,
+        &params,
+        &active_chain,
+        best_work,
+        best_ts,
+    );
+    try std.testing.expect(!result);
+}
+
+test "shouldSkipScripts: assumevalid hash not yet in block index => run" {
+    // Test case 5: assumed_valid_hash is set but active_chain doesn't yet
+    // contain it (we haven't synced that far => chain too short).
+    const av_hash: [32]u8 = [_]u8{0xAA} ** 32;
+    const block_hash_arr: [32]u8 = [_]u8{0x01} ** 32;
+
+    const av_height: u32 = 1000; // far in the future
+    const block_height: u32 = 0;
+
+    // active_chain has only 1 entry (height 0); av_height unreachable
+    var active_chain = [_][32]u8{block_hash_arr};
+    const params = makeTestParams(av_hash, av_height, 0x00);
+    const best_work: [32]u8 = [_]u8{0x01} ** 32;
+    const block_ts: u32 = 1000;
+    const best_ts: u32 = block_ts + THREE_WEEKS_S + 1;
+
+    const result = shouldSkipScripts(
+        &block_hash_arr,
+        block_height,
+        block_ts,
+        &params,
+        &active_chain,
+        best_work,
+        best_ts,
+    );
+    try std.testing.expect(!result);
+}
+
+test "shouldSkipScripts: chainwork below minimumChainWork => run" {
+    // Test case (part of condition 5): scripts run if best-header chainwork
+    // is below the minimum.
+    const av_hash: [32]u8 = [_]u8{0xAA} ** 32;
+    const block_hash_arr: [32]u8 = [_]u8{0x01} ** 32;
+
+    const av_height: u32 = 1;
+    const block_height: u32 = 0;
+
+    var active_chain = [_][32]u8{ block_hash_arr, av_hash };
+    // Set min_chain_work to 0xFF (very high)
+    const params = makeTestParams(av_hash, av_height, 0xFF);
+
+    // best_tip_chain_work is all zeros: below minimum
+    const best_work: [32]u8 = [_]u8{0x00} ** 32;
+    const block_ts: u32 = 1000;
+    const best_ts: u32 = block_ts + THREE_WEEKS_S + 1;
+
+    const result = shouldSkipScripts(
+        &block_hash_arr,
+        block_height,
+        block_ts,
+        &params,
+        &active_chain,
+        best_work,
+        best_ts,
+    );
+    try std.testing.expect(!result);
+}
+
+test "shouldSkipScripts: best header too recent (< 2 weeks gap) => run" {
+    // Test case (part of condition 6): best header is only 1 week past the
+    // block being connected => cannot skip.
+    const av_hash: [32]u8 = [_]u8{0xAA} ** 32;
+    const block_hash_arr: [32]u8 = [_]u8{0x01} ** 32;
+
+    const av_height: u32 = 1;
+    const block_height: u32 = 0;
+
+    var active_chain = [_][32]u8{ block_hash_arr, av_hash };
+    const params = makeTestParams(av_hash, av_height, 0x00);
+    const best_work: [32]u8 = [_]u8{0x01} ** 32;
+
+    const block_ts: u32 = 1_000_000;
+    // Only 1 week later: well within the 2-week threshold
+    const best_ts: u32 = block_ts + (7 * 24 * 60 * 60);
+
+    const result = shouldSkipScripts(
+        &block_hash_arr,
+        block_height,
+        block_ts,
+        &params,
+        &active_chain,
+        best_work,
+        best_ts,
+    );
+    try std.testing.expect(!result);
+}
+
+test "shouldSkipScripts: regtest always verifies (assumed_valid_hash is null)" {
+    // Test case 7 (integration surrogate): regtest has null assumed_valid_hash,
+    // so shouldSkipScripts always returns false, meaning every block runs scripts.
+    const block_hash_arr: [32]u8 = [_]u8{0x01} ** 32;
+    var active_chain = [_][32]u8{block_hash_arr};
+    const best_work: [32]u8 = [_]u8{0x01} ** 32;
+
+    const result = shouldSkipScripts(
+        &block_hash_arr,
+        0,
+        1000,
+        &consensus.REGTEST,
+        &active_chain,
+        best_work,
+        1000 + THREE_WEEKS_S + 1,
+    );
+    try std.testing.expect(!result);
 }
 
 // ============================================================================

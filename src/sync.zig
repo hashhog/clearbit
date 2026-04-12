@@ -1108,11 +1108,23 @@ pub const BlockDownloader = struct {
         const chain_store = self.sync_manager.chain_store;
         const params = self.sync_manager.network_params;
 
-        // Assume-valid: skip script verification for blocks at or below the
-        // assume-valid height. Structural checks (merkle root, UTXO updates,
-        // coinbase value) are still performed.
-        const skip_script_verification = params.assume_valid_height > 0 and
-            height <= params.assume_valid_height;
+        // Assumevalid: skip script verification when the block is an ancestor
+        // of the hardcoded assumed-valid hash AND all six safety conditions from
+        // Bitcoin Core validation.cpp ConnectBlock() hold.  This is an ANCESTOR
+        // CHECK, not a height check.  Non-script validation (merkle root,
+        // coinbase, PoW) always runs regardless.
+        const block_hash = crypto.computeBlockHash(&block.header);
+        const best_tip_chain_work = if (self.sync_manager.best_tip) |tip| tip.chain_work else [_]u8{0} ** 32;
+        const best_tip_timestamp = if (self.sync_manager.best_tip) |tip| tip.header.timestamp else 0;
+        const skip_script_verification = validation.shouldSkipScripts(
+            &block_hash,
+            height,
+            block.header.timestamp,
+            params,
+            self.sync_manager.active_chain.items,
+            best_tip_chain_work,
+            best_tip_timestamp,
+        );
 
         // Use an arena allocator for per-block temporary allocations
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1271,7 +1283,7 @@ pub const BlockDownloader = struct {
         }
 
         // 6. Atomic flush: UTXO creates + spends + chain tip in ONE WriteBatch
-        const block_hash = crypto.computeBlockHash(&block.header);
+        // (block_hash was already computed above for the assumevalid check)
         if (chain_store) |cs| {
             cs.applyBlockAtomic(
                 pending_creates.items,
