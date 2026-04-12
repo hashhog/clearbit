@@ -6,6 +6,7 @@ const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
 const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
+const validation = @import("validation.zig");
 
 // ============================================================================
 // Block Download Constants
@@ -816,6 +817,7 @@ pub const BlockDownloadError = error{
     ImmatureCoinbase,
     InsufficientFunds,
     ExcessiveCoinbaseValue,
+    ScriptVerificationFailed,
     InvalidBlock,
     NoBestTip,
     OutOfMemory,
@@ -1111,7 +1113,6 @@ pub const BlockDownloader = struct {
         // coinbase value) are still performed.
         const skip_script_verification = params.assume_valid_height > 0 and
             height <= params.assume_valid_height;
-        _ = skip_script_verification; // Wire up when script verification is added to this path
 
         // Use an arena allocator for per-block temporary allocations
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1134,10 +1135,19 @@ pub const BlockDownloader = struct {
         const subsidy = consensus.getBlockSubsidy(height, params);
         var total_fees: i64 = 0;
 
-        // Collect UTXO creates and spends for atomic batch write
+        // Collect UTXO creates and spends for atomic batch write.
+        // We also keep script_pubkeys alive for the script verification phase below.
         const CreateEntry = struct { outpoint: types.OutPoint, txout: types.TxOut, height: u32, is_coinbase: bool };
         var pending_creates = std.ArrayList(CreateEntry).init(arena_alloc);
         var pending_spends = std.ArrayList(types.OutPoint).init(arena_alloc);
+
+        // Script-check UTXO view: maps OutPoint key → script_pubkey.
+        // Built during pass 1 so that the parallel script check in pass 2
+        // can resolve all inputs (including intra-block spends) without a
+        // second DB round-trip.
+        // Key layout: 32-byte hash || 4-byte LE index (matches OutPoint on-wire).
+        const OutpointKey = [36]u8;
+        var script_pubkey_map = std.AutoHashMap(OutpointKey, []const u8).init(arena_alloc);
 
         // 3. Process each transaction: validate inputs, collect UTXO mutations
         for (block.transactions, 0..) |tx, tx_idx| {
@@ -1158,12 +1168,22 @@ pub const BlockDownloader = struct {
 
                         input_sum += utxo.?.value;
 
+                        // Keep script_pubkey alive for script-check phase (transferred to arena).
+                        var key: OutpointKey = undefined;
+                        @memcpy(key[0..32], &input.previous_output.hash);
+                        const idx_le = std.mem.nativeToLittle(u32, @intCast(input.previous_output.index));
+                        @memcpy(key[32..36], std.mem.asBytes(&idx_le));
+                        // Transfer ownership of script_pubkey to arena so it stays alive.
+                        const script_copy = arena_alloc.dupe(u8, utxo.?.script_pubkey) catch
+                            return BlockDownloadError.OutOfMemory;
+                        // Free original allocation from chain_store.
+                        self.allocator.free(utxo.?.script_pubkey);
+                        script_pubkey_map.put(key, script_copy) catch
+                            return BlockDownloadError.OutOfMemory;
+
                         // Collect spend for atomic batch (don't write yet)
                         pending_spends.append(input.previous_output) catch
                             return BlockDownloadError.OutOfMemory;
-
-                        // Free the script_pubkey we allocated
-                        self.allocator.free(utxo.?.script_pubkey);
                     }
                 }
 
@@ -1176,7 +1196,8 @@ pub const BlockDownloader = struct {
                 total_fees += input_sum - output_sum;
             }
 
-            // Collect new UTXOs for all outputs (reuse txid from merkle root computation)
+            // Collect new UTXOs for all outputs (reuse txid from merkle root computation).
+            // Also add to script_pubkey_map so intra-block spends are resolved.
             const tx_hash = tx_hashes[tx_idx];
             for (tx.outputs, 0..) |output, out_idx| {
                 // Skip unspendable outputs (OP_RETURN)
@@ -1192,6 +1213,14 @@ pub const BlockDownloader = struct {
                     .height = height,
                     .is_coinbase = tx_idx == 0,
                 }) catch return BlockDownloadError.OutOfMemory;
+
+                // Register in script map for potential intra-block consumers
+                var key: OutpointKey = undefined;
+                @memcpy(key[0..32], &tx_hash);
+                const idx_le = std.mem.nativeToLittle(u32, @intCast(out_idx));
+                @memcpy(key[32..36], std.mem.asBytes(&idx_le));
+                script_pubkey_map.put(key, output.script_pubkey) catch
+                    return BlockDownloadError.OutOfMemory;
             }
         }
 
@@ -1203,7 +1232,45 @@ pub const BlockDownloader = struct {
         if (coinbase_value > subsidy + total_fees)
             return BlockDownloadError.ExcessiveCoinbaseValue;
 
-        // 5. Atomic flush: UTXO creates + spends + chain tip in ONE WriteBatch
+        // 5. Parallel script verification.
+        // UTXO apply (step 3) collected all script_pubkeys into script_pubkey_map.
+        // Scripts are embarrassingly parallel — each input check is independent.
+        // We use validation.verifyBlockScriptsParallel (CCheckQueue pattern):
+        //   N-1 worker threads + caller participates as Nth thread.
+        // For blocks below assume-valid height we skip to match Bitcoin Core.
+        if (!skip_script_verification) {
+            // Build a SigopUtxoView that resolves outpoints via script_pubkey_map.
+            const MapContext = struct {
+                map: *std.AutoHashMap(OutpointKey, []const u8),
+
+                fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?[]const u8 {
+                    const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                    var key: OutpointKey = undefined;
+                    @memcpy(key[0..32], &outpoint.hash);
+                    const idx_le = std.mem.nativeToLittle(u32, @intCast(outpoint.index));
+                    @memcpy(key[32..36], std.mem.asBytes(&idx_le));
+                    return ctx.map.get(key);
+                }
+            };
+            var map_ctx = MapContext{ .map = &script_pubkey_map };
+            const utxo_view = validation.SigopUtxoView{
+                .context = @ptrCast(&map_ctx),
+                .lookupFn = MapContext.lookup,
+            };
+
+            const script_ok = validation.verifyBlockScriptsParallel(
+                block,
+                height,
+                params,
+                &utxo_view,
+                .{},
+                arena_alloc,
+            ) catch return BlockDownloadError.OutOfMemory;
+
+            if (!script_ok) return BlockDownloadError.ScriptVerificationFailed;
+        }
+
+        // 6. Atomic flush: UTXO creates + spends + chain tip in ONE WriteBatch
         const block_hash = crypto.computeBlockHash(&block.header);
         if (chain_store) |cs| {
             cs.applyBlockAtomic(
