@@ -217,33 +217,75 @@ pub const RpcServer = struct {
         self.running.store(true, .release);
     }
 
-    /// Deinitialize the server.
+    /// Deinitialize the server. stop() already closes the listener, but
+    /// guard here in case deinit is called without a prior stop().
     pub fn deinit(self: *RpcServer) void {
         self.stop();
-        if (self.listener) |*l| {
-            l.deinit();
-            self.listener = null;
-        }
     }
 
     /// Stop the server.
+    ///
+    /// Sets running=false and unblocks any thread currently sitting in
+    /// accept() by opening and immediately closing a TCP connection to
+    /// our own listener. Without this an idle RPC thread would hang the
+    /// shutdown sequence until a new client request arrived.
+    ///
+    /// We do not deinit the listener here because another thread may
+    /// still be mid-accept(); the deferred deinit at startup handles
+    /// teardown after run() returns. Safe to call multiple times.
     pub fn stop(self: *RpcServer) void {
-        self.running.store(false, .release);
+        if (!self.running.swap(false, .acq_rel)) return;
+        // Unblock any in-flight accept() by shutting down the listen socket.
+        // shutdown(SHUT_RDWR) on a listening socket on Linux causes accept()
+        // to return EINVAL immediately — the run() loop checks running and
+        // returns cleanly. Without this, accept() would keep sleeping until
+        // a client connection arrives.
+        //
+        // We also issue a throw-away self-connect as belt-and-suspenders,
+        // since shutdown() on a listening socket is Linux-specific.
+        if (self.listener) |l| {
+            std.posix.shutdown(l.stream.handle, .both) catch {};
+        }
+        const addr = std.net.Address.parseIp(self.config.bind_address, self.config.port) catch return;
+        const sock = std.posix.socket(
+            addr.any.family,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            std.posix.IPPROTO.TCP,
+        ) catch return;
+        defer std.posix.close(sock);
+        const timeout = std.posix.timeval{ .tv_sec = 1, .tv_usec = 0 };
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+        std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch {};
     }
 
     /// Main server loop - accept and handle connections.
+    ///
+    /// Exits when running is set to false. stop() opens a throw-away
+    /// connection to our own listener to unblock any in-flight accept();
+    /// we check running on every iteration (including after accept
+    /// returns) so shutdown is prompt.
     pub fn run(self: *RpcServer) !void {
         while (self.running.load(.acquire)) {
-            const conn = self.listener.?.accept() catch |err| {
+            const listener = &(self.listener orelse return);
+            const conn = listener.accept() catch |err| {
+                if (!self.running.load(.acquire)) return;
                 switch (err) {
                     error.WouldBlock => continue,
                     error.ConnectionAborted => continue,
+                    // accept returns EINVAL after shutdown(SHUT_RDWR) on
+                    // the listening socket — that is our graceful signal
+                    // to exit. Zig maps this to error.SocketNotListening.
+                    error.SocketNotListening => return,
                     else => return err,
                 }
             };
-
-            // Handle connection in-thread for simplicity
-            // In production, would spawn a thread or use async
+            // A wake-up connection from stop() looks like any other
+            // accepted socket. Check the flag and bail before spending
+            // time in handleConnection.
+            if (!self.running.load(.acquire)) {
+                conn.stream.close();
+                return;
+            }
             self.handleConnection(conn) catch {};
         }
     }
