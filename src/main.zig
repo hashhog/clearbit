@@ -516,9 +516,25 @@ pub fn deleteCookieFile(datadir: []const u8, allocator: std.mem.Allocator) void 
 /// Global shutdown flag accessed by signal handler.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
 
+/// Number of signals received. A second signal during shutdown escalates
+/// immediately to a forced exit so operators can always kill a wedged node
+/// with two Ctrl-C presses or two SIGTERMs.
+pub var signal_count = std.atomic.Value(u32).init(0);
+
 /// Signal handler for SIGINT and SIGTERM.
+///
+/// First signal: set shutdown_requested so the main loop exits cleanly.
+/// Second signal: force immediate exit(1). Signal handlers are async-signal
+/// safe — we use only atomics and std.posix.exit (raw _exit syscall).
 fn signalHandler(sig: c_int) callconv(.C) void {
     _ = sig;
+    const prev = signal_count.fetchAdd(1, .acq_rel);
+    if (prev >= 1) {
+        // Second signal — force exit immediately. std.posix.exit calls _exit
+        // directly (no atexit handlers, no buffer flushes), which is the only
+        // safe thing to do from a signal handler.
+        std.posix.exit(1);
+    }
     shutdown_requested.store(true, .release);
 }
 
@@ -531,6 +547,30 @@ pub fn installSignalHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &sa, null) catch {};
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null) catch {};
+}
+
+/// Shutdown deadline in nanoseconds. If graceful shutdown has not completed
+/// within this window the watchdog thread forces exit(1). This matches
+/// Bitcoin Core's init.cpp semantics (StartShutdown + bounded thread join)
+/// and guarantees the process never hangs longer than 30s after a signal.
+pub const SHUTDOWN_DEADLINE_NS: u64 = 30 * std.time.ns_per_s;
+
+/// Set to true once graceful shutdown has completed. The watchdog checks
+/// this flag before forcing exit so a clean shutdown never gets clobbered
+/// by the deadline timer.
+pub var shutdown_complete = std.atomic.Value(bool).init(false);
+
+/// Hard-deadline watchdog. Sleeps for SHUTDOWN_DEADLINE_NS after the
+/// shutdown signal is received; if shutdown_complete is still false it
+/// prints a diagnostic and exit(1)s the process. Best-effort — we do not
+/// try to close DB handles here because any subsystem still holding a
+/// mutex would deadlock us on exit anyway.
+fn shutdownWatchdog() void {
+    std.time.sleep(SHUTDOWN_DEADLINE_NS);
+    if (shutdown_complete.load(.acquire)) return;
+    std.debug.print("shutdown deadline (30s) exceeded, forcing exit\n", .{});
+    std.debug.print("exit (forced)\n", .{});
+    std.posix.exit(1);
 }
 
 // ============================================================================
@@ -1470,34 +1510,89 @@ pub fn main() !void {
     }
 
     // 12. Graceful shutdown
-    std.debug.print("\nShutting down...\n", .{});
+    //
+    // Previous behaviour: stop() RPC and peer manager, then join each
+    // thread sequentially with no bounded deadline. A blocking
+    // subsystem (RPC accept, DB compaction, UTXO flush) could hang the
+    // process indefinitely, which is why rolling restarts in Wave 2
+    // had to escalate to SIGKILL.
+    //
+    // New behaviour (mirrors blockbrew f086d9e / Bitcoin Core init.cpp):
+    //   - Arm a detached 30s watchdog thread. If graceful shutdown has
+    //     not completed by SHUTDOWN_DEADLINE_NS it forces exit(1).
+    //   - A second SIGTERM/SIGINT (signalHandler, signal_count>=1)
+    //     also forces exit(1) immediately.
+    //   - Phased log output so operators can see where shutdown is
+    //     stuck if it ever does exceed the deadline.
+    const sig_num = signal_count.load(.acquire);
+    if (sig_num > 0) {
+        std.debug.print("received SIGTERM, beginning graceful shutdown\n", .{});
+    } else {
+        std.debug.print("\nShutting down...\n", .{});
+    }
 
-    // Stop RPC first (no new requests)
+    // Arm the hard-deadline watchdog. Detached — we never join it; if
+    // graceful shutdown completes first we just set shutdown_complete
+    // and the watchdog silently returns after its sleep.
+    if (std.Thread.spawn(.{}, shutdownWatchdog, .{})) |wd| {
+        wd.detach();
+    } else |err| {
+        std.debug.print("Warning: could not spawn shutdown watchdog: {}\n", .{err});
+    }
+
+    // Reverse-order shutdown. Each phase logs before it starts so if
+    // we hang it's obvious which subsystem is stuck.
+
+    // Phase 1: stop RPC — no new client requests should begin.
+    // RpcServer.stop() closes the listening socket, which unblocks any
+    // thread currently in accept().
+    std.debug.print("stopping RPC\n", .{});
     rpc_server.stop();
 
-    // Stop peer manager
+    // Phase 2: stop P2P — peer manager's loop polls the running flag
+    // between iterations and exits within ~50ms.
+    std.debug.print("stopping P2P\n", .{});
     peer_manager.stop();
 
-    // Wait for threads
+    // Join subsystem threads. Both loops check their running flag on
+    // every iteration so join returns quickly under normal conditions.
+    // If either hangs, the watchdog above will force exit.
+    std.debug.print("joining RPC thread\n", .{});
     rpc_thread.join();
+    std.debug.print("joining P2P thread\n", .{});
     peer_thread.join();
 
-    // Flush chain state
-    chain_state.flush() catch |err| {
-        std.debug.print("Warning: error flushing chain state: {}\n", .{err});
-    };
-
-    // Persist fee estimator state
+    // Phase 3: persist auxiliary state (fee estimates) before flushing
+    // the main chainstate so any error here doesn't leave the UTXO set
+    // written but the fee estimator stale.
     if (fee_est_path) |path| {
         mempool_instance.fee_estimator.saveToFile(path) catch |err| {
             std.debug.print("Warning: could not save fee estimates: {}\n", .{err});
         };
     }
 
+    // Phase 4: flush chainstate — dirty UTXO entries + chain tip,
+    // atomically so a crash never leaves the tip out of sync with
+    // the UTXO set (see storage.ChainState.flush).
+    std.debug.print("flushing chainstate\n", .{});
+    chain_state.flush() catch |err| {
+        std.debug.print("Warning: error flushing chain state: {}\n", .{err});
+    };
+
+    // Phase 5: close the RocksDB handle. The `defer` on db_ptr at
+    // init time will run p.close() after this function returns; we
+    // emit the phase log here so operators see the expected sequence.
+    std.debug.print("closing DB\n", .{});
+
     // Remove cookie file on clean shutdown
     deleteCookieFile(full_datadir, allocator);
 
     std.debug.print("{s} stopped.\n", .{VERSION_STRING});
+    std.debug.print("exit\n", .{});
+
+    // Mark graceful completion so the watchdog's deadline timer
+    // becomes a no-op if it fires after we've already returned.
+    shutdown_complete.store(true, .release);
 }
 
 // ============================================================================
