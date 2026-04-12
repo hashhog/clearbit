@@ -314,8 +314,18 @@ pub const NetworkParams = struct {
     /// assumeUTXO data: trusted snapshots for fast sync.
     /// Each entry contains a height, block hash, and UTXO set hash.
     assume_utxo: []const AssumeUtxoData,
-    /// assume-valid height: skip script verification for blocks at or below this height.
-    /// Set to 0 to disable (verify all scripts).
+    /// assumed-valid hash (Bitcoin Core v28.0 defaultAssumeValid).
+    /// Script verification is SKIPPED for blocks that are ancestors of this
+    /// hardcoded hash, provided the six safety conditions from Bitcoin Core
+    /// validation.cpp ConnectBlock() all hold.  Null means "always verify
+    /// scripts" (used for regtest and testnet3).
+    ///
+    /// This is an ANCESTOR CHECK, not a height check.  See
+    /// shouldSkipScripts() in validation.zig.
+    assumed_valid_hash: ?[32]u8,
+    /// assumed-valid height (height of the assumed_valid_hash block).
+    /// Used only as a hint for the UTXO-undo-data optimisation in
+    /// block_template.zig; NOT used for script-skip decisions.
     assume_valid_height: u32,
 };
 
@@ -391,8 +401,10 @@ pub const MAINNET = NetworkParams{
             .coins_count = 176_000_000,
         },
     },
-    // Bitcoin Core default assumevalid block (height 938343)
+    // Bitcoin Core v28.0 defaultAssumeValid for mainnet (height 938343).
     // Display: 00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac
+    // Ancestor check implemented in validation.shouldSkipScripts().
+    .assumed_valid_hash = hexToHash("00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"),
     .assume_valid_height = 938343,
 };
 
@@ -435,6 +447,8 @@ pub const TESTNET3 = NetworkParams{
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
     // No assumeUTXO snapshots for testnet3
     .assume_utxo = &[_]AssumeUtxoData{},
+    // Testnet3 has no active assumevalid; scripts always run.
+    .assumed_valid_hash = null,
     .assume_valid_height = 0,
 };
 
@@ -478,9 +492,10 @@ pub const TESTNET4 = NetworkParams{
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
     // No assumeUTXO snapshots for testnet4
     .assume_utxo = &[_]AssumeUtxoData{},
-    // Testnet4 assume-valid: skip script verification up to this height
-    // Hash: 0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a
-    .assume_valid_height = 123613,
+    // Bitcoin Core v28.0 defaultAssumeValid for testnet4 (height 4842348).
+    // Display: 000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4
+    .assumed_valid_hash = hexToHash("000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"),
+    .assume_valid_height = 4842348,
 };
 
 /// Signet parameters.
@@ -521,7 +536,10 @@ pub const SIGNET = NetworkParams{
     .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
     // No assumeUTXO snapshots for signet
     .assume_utxo = &[_]AssumeUtxoData{},
-    .assume_valid_height = 0,
+    // Bitcoin Core v28.0 defaultAssumeValid for signet (height 293175).
+    // Display: 00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329
+    .assumed_valid_hash = hexToHash("00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"),
+    .assume_valid_height = 293175,
 };
 
 /// Regtest parameters.
@@ -562,6 +580,8 @@ pub const REGTEST = NetworkParams{
     .min_chain_work = [_]u8{0} ** 32,
     // No assumeUTXO snapshots for regtest (create your own)
     .assume_utxo = &[_]AssumeUtxoData{},
+    // Regtest has no assumevalid — every script check runs for test determinism.
+    .assumed_valid_hash = null,
     .assume_valid_height = 0,
 };
 
