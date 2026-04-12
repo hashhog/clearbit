@@ -876,6 +876,95 @@ pub const RpcServer = struct {
     // Blockchain Info Methods
     // ========================================================================
 
+    /// Write the canonical deployment/softfork state as a JSON object to `writer`.
+    ///
+    /// This is the single source of truth for deployment state used by BOTH
+    /// getblockchaininfo (as "softforks") and getdeploymentinfo (as "deployments").
+    /// Both RPCs project different JSON shapes from this same helper; neither reads
+    /// from a stale cache or a hard-coded table.
+    ///
+    /// The output is a JSON object whose keys are softfork names and whose values
+    /// are deployment descriptors derived exclusively from NetworkParams activation
+    /// heights and the provided query_height.
+    ///
+    /// Reference: Bitcoin Core src/rpc/blockchain.cpp DeploymentInfo() /
+    /// SoftForkDescPushBack() helpers — both getblockchaininfo and getdeploymentinfo
+    /// call into the same helpers there.
+    fn writeDeploymentsJson(
+        self: *RpcServer,
+        writer: anytype,
+        query_height: u32,
+    ) !void {
+        const np = self.network_params;
+
+        // ---- bip34 (buried) ----
+        {
+            const act_height = np.bip34_height;
+            const active = query_height >= act_height;
+            try writer.print("\"bip34\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- bip65 (buried) ----
+        {
+            const act_height = np.bip65_height;
+            const active = query_height >= act_height;
+            try writer.print("\"bip65\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- bip66 (buried) ----
+        {
+            const act_height = np.bip66_height;
+            const active = query_height >= act_height;
+            try writer.print("\"bip66\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- csv (buried — activation height stored in NetworkParams) ----
+        {
+            const act_height = np.csv_height;
+            const active = query_height >= act_height;
+            try writer.print("\"csv\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- segwit (buried) ----
+        {
+            const act_height = np.segwit_height;
+            const active = query_height >= act_height;
+            try writer.print("\"segwit\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- taproot (buried) ----
+        {
+            const act_height = np.taproot_height;
+            const active = query_height >= act_height;
+            try writer.print("\"taproot\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
+                active, act_height, act_height,
+            });
+        }
+        try writer.writeByte(',');
+
+        // ---- testdummy (bip9-style, never activated on any real network) ----
+        // clearbit does not have a BIP9 state machine.  We report testdummy with
+        // type="bip9", status="defined", since=0, bit=28, start_time=-1 (always),
+        // timeout=9223372036854775807 (never).
+        // Follow-up: wire up a proper BIP9 versionbits cache.
+        try writer.writeAll("\"testdummy\":{\"type\":\"bip9\",\"active\":false,\"bip9\":{\"bit\":28,\"start_time\":-1,\"timeout\":9223372036854775807,\"min_activation_height\":0,\"status\":\"defined\",\"since\":0}}");
+    }
+
     fn handleGetBlockchainInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         const chain_name = switch (self.network_params.magic) {
             consensus.MAINNET.magic => "main",
@@ -903,10 +992,14 @@ pub const RpcServer = struct {
             headers_height,
         });
         try writeHashHex(writer, &self.chain_state.best_hash);
-        try writer.print("\",\"difficulty\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"pruned\":false}}", .{
+        try writer.print("\",\"difficulty\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"pruned\":false,\"softforks\":{{", .{
             getDifficulty(self.network_params.genesis_header.bits),
             ibd,
         });
+        // softforks uses the same canonical deployment helper as getdeploymentinfo,
+        // queried at the current best height.
+        try self.writeDeploymentsJson(writer, self.chain_state.best_height);
+        try writer.writeAll("}}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -3958,6 +4051,9 @@ pub const RpcServer = struct {
     /// activation heights in NetworkParams are reported as buried-style with type="buried".
     /// testdummy is reported with type="bip9" and status="defined" since it is never activated.
     ///
+    /// Both getdeploymentinfo and getblockchaininfo.softforks are derived from the
+    /// same writeDeploymentsJson helper; they share one source of truth.
+    ///
     /// Follow-up issue: implement a full BIP9 versionbits state machine so that
     /// in-progress deployments can report started/locked_in/active/failed status.
     fn handleGetDeploymentInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
@@ -4013,14 +4109,6 @@ pub const RpcServer = struct {
             }
         }
 
-        const np = self.network_params;
-
-        // Helper: is a buried deployment active at query_height?
-        // A buried deployment is considered active after (height-1), i.e. active when
-        // query_height >= activation_height.  This matches Bitcoin Core semantics:
-        // "active from when the chain height is one below the activation height".
-        // For activation_height == 0 (regtest csv/segwit/taproot) it is always active.
-
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
@@ -4029,72 +4117,9 @@ pub const RpcServer = struct {
         try writeHashHex(writer, &query_hash);
         try writer.print("\",\"height\":{d},\"deployments\":{{", .{query_height});
 
-        // ---- bip34 (buried) ----
-        {
-            const act_height = np.bip34_height;
-            const active = query_height >= act_height;
-            try writer.print("\"bip34\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
-                active, act_height, act_height,
-            });
-        }
-        try writer.writeByte(',');
-
-        // ---- bip65 (buried) ----
-        {
-            const act_height = np.bip65_height;
-            const active = query_height >= act_height;
-            try writer.print("\"bip65\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
-                active, act_height, act_height,
-            });
-        }
-        try writer.writeByte(',');
-
-        // ---- bip66 (buried) ----
-        {
-            const act_height = np.bip66_height;
-            const active = query_height >= act_height;
-            try writer.print("\"bip66\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
-                active, act_height, act_height,
-            });
-        }
-        try writer.writeByte(',');
-
-        // ---- csv (buried — activation height stored in NetworkParams) ----
-        {
-            const act_height = np.csv_height;
-            const active = query_height >= act_height;
-            try writer.print("\"csv\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
-                active, act_height, act_height,
-            });
-        }
-        try writer.writeByte(',');
-
-        // ---- segwit (buried) ----
-        {
-            const act_height = np.segwit_height;
-            const active = query_height >= act_height;
-            try writer.print("\"segwit\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
-                active, act_height, act_height,
-            });
-        }
-        try writer.writeByte(',');
-
-        // ---- taproot (buried) ----
-        {
-            const act_height = np.taproot_height;
-            const active = query_height >= act_height;
-            try writer.print("\"taproot\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
-                active, act_height, act_height,
-            });
-        }
-        try writer.writeByte(',');
-
-        // ---- testdummy (bip9-style, never activated on any real network) ----
-        // clearbit does not have a BIP9 state machine.  We report testdummy with
-        // type="bip9", status="defined", since=0, bit=28, start_time=-1 (always),
-        // timeout=9223372036854775807 (never).
-        // Follow-up: wire up a proper BIP9 versionbits cache.
-        try writer.writeAll("\"testdummy\":{\"type\":\"bip9\",\"active\":false,\"bip9\":{\"bit\":28,\"start_time\":-1,\"timeout\":9223372036854775807,\"min_activation_height\":0,\"status\":\"defined\",\"since\":0}}");
+        // Use the shared canonical helper so both getdeploymentinfo and
+        // getblockchaininfo.softforks always read from the same source of truth.
+        try self.writeDeploymentsJson(writer, query_height);
 
         try writer.writeAll("}}");
 
@@ -6770,4 +6795,104 @@ test "getdeploymentinfo invalid blockhash returns error" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Invalid block hash length") != null);
+}
+
+test "regtest: getblockchaininfo.softforks and getdeploymentinfo.deployments are consistent" {
+    // Regtest round-trip test: both RPCs must read from the same shared helper
+    // (writeDeploymentsJson) so that every deployment's active/height values are
+    // identical in both responses.  Any field-level divergence would be a consensus
+    // audit blocker (see L2-SOFTFORKS-BRIDGE task).
+    //
+    // What this test verifies:
+    //   - getblockchaininfo includes a "softforks" field (new, bridged from shared helper)
+    //   - getdeploymentinfo includes a "deployments" field
+    //   - For each of the 7 tracked deployments (bip34, bip65, bip66, csv, segwit,
+    //     taproot, testdummy) the "active" state matches between the two RPCs.
+    //   - On regtest at height 0: csv, segwit, taproot are active (activation_height=0);
+    //     bip34 is inactive (activation_height=500); bip65 is inactive (1351);
+    //     bip66 is inactive (1251).
+    //   - testdummy is inactive (bip9, never activated).
+    //
+    // Both RPCs must return "error":null.
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    // height 0, genesis hash — default after init
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.REGTEST,
+        .{},
+    );
+    defer server.deinit();
+
+    // Fetch getblockchaininfo
+    const gbi_req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockchaininfo\",\"params\":[]}";
+    const gbi_result = try server.dispatch(gbi_req);
+    defer allocator.free(gbi_result);
+
+    // Fetch getdeploymentinfo
+    const gdi_req = "{\"jsonrpc\":\"1.0\",\"id\":2,\"method\":\"getdeploymentinfo\",\"params\":[]}";
+    const gdi_result = try server.dispatch(gdi_req);
+    defer allocator.free(gdi_result);
+
+    // Both must succeed
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"error\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"error\":null") != null);
+
+    // getblockchaininfo must now include "softforks"
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"softforks\":{") != null);
+
+    // getdeploymentinfo must include "deployments"
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"deployments\":{") != null);
+
+    // --- Per-deployment consistency checks ---
+    // On regtest at height 0:
+    //   csv, segwit, taproot activate at height 0 → active:true
+    //   bip34(500), bip65(1351), bip66(1251) → active:false
+    //   testdummy (bip9) → active:false
+
+    // csv: active on regtest (csv_height=0)
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"csv\":{\"type\":\"buried\",\"active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"csv\":{\"type\":\"buried\",\"active\":true") != null);
+
+    // segwit: active on regtest (segwit_height=0)
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"segwit\":{\"type\":\"buried\",\"active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"segwit\":{\"type\":\"buried\",\"active\":true") != null);
+
+    // taproot: active on regtest (taproot_height=0)
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true") != null);
+
+    // bip34: inactive at height 0 on regtest (bip34_height=500)
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"bip34\":{\"type\":\"buried\",\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip34\":{\"type\":\"buried\",\"active\":false") != null);
+
+    // bip65: inactive at height 0 on regtest (bip65_height=1351)
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"bip65\":{\"type\":\"buried\",\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip65\":{\"type\":\"buried\",\"active\":false") != null);
+
+    // bip66: inactive at height 0 on regtest (bip66_height=1251)
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"bip66\":{\"type\":\"buried\",\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip66\":{\"type\":\"buried\",\"active\":false") != null);
+
+    // testdummy: always inactive (bip9, never activated)
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"testdummy\":{\"type\":\"bip9\",\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"testdummy\":{\"type\":\"bip9\",\"active\":false") != null);
+
+    // Both RPCs must contain the same activation-height sentinel for taproot on regtest
+    // (height=0, min_activation_height=0) — confirms both read from NetworkParams, not a
+    // hard-coded table.
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true,\"height\":0,\"min_activation_height\":0}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true,\"height\":0,\"min_activation_height\":0}") != null);
 }
