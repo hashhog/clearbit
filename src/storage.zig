@@ -1104,12 +1104,14 @@ pub const UtxoSet = struct {
             // within the same flush window.
             if (self.db != null and !old.value.fresh) {
                 self.pending_deletes.append(key) catch {};
-                // Flush batch when it gets large enough.
-                // Skip during block connection (suppress_eviction) to prevent
-                // mid-block DB writes that can interfere with reads.
-                if (!self.suppress_eviction and self.pending_deletes.items.len >= 10000) {
-                    self.flushPendingDeletes() catch {};
-                }
+                // Pending deletes are flushed atomically with the chain tip
+                // in ChainState.flush() (called every 100 blocks from
+                // connectBlockFast).  Do NOT flush here — an independent
+                // flush would commit deletes to disk ahead of the tip, and
+                // a crash between would corrupt the chainstate (see
+                // stuck-at-370001 bug).  At ~8000 deletes/block that's
+                // ~800k entries × 36 bytes = ~29 MB between flushes, well
+                // within budget.
             }
 
             return old.value.utxo;
@@ -1123,11 +1125,9 @@ pub const UtxoSet = struct {
 
             const utxo = try CompactUtxo.decode(data.?, self.allocator);
 
-            // Batch the DB delete
+            // Batch the DB delete.  Flush is deferred to ChainState.flush()
+            // so that deletes are atomic with the chain tip.
             self.pending_deletes.append(key) catch {};
-            if (!self.suppress_eviction and self.pending_deletes.items.len >= 10000) {
-                self.flushPendingDeletes() catch {};
-            }
 
             self.total_utxos -|= 1;
             self.total_amount -|= utxo.value;
@@ -1760,14 +1760,12 @@ pub const ChainState = struct {
         var undo = try self.connectBlockInner(block, hash, height, true);
         undo.deinit(self.allocator);
 
-        // Periodically flush pending DB deletes and dirty cache (every 100 blocks)
+        // Every 100 blocks, flush pending_deletes + dirty UTXOs + tip
+        // ATOMICALLY as a single writeBatch via ChainState.flush().  The old
+        // split (flushPendingDeletes every 100, tip flush every 1000) left a
+        // window where deletes were on disk but the tip was stale — on crash,
+        // the node re-processed blocks whose inputs had already been deleted.
         if (height % 100 == 0) {
-            self.utxo_set.flushPendingDeletes() catch |err| {
-                std.debug.print("connectBlockFast: flushPendingDeletes failed at height {d}: {}\n", .{ height, err });
-            };
-        }
-        // Flush dirty UTXO cache + tip to DB atomically every 1000 blocks
-        if (height % 1000 == 0) {
             self.flush() catch |err| {
                 std.debug.print("connectBlockFast: flush failed at height {d}: {}\n", .{ height, err });
             };
@@ -1931,6 +1929,17 @@ pub const ChainState = struct {
     /// Builds a single WriteBatch containing all dirty UTXO entries plus the
     /// current best_hash/best_height so a crash never leaves the tip out of
     /// sync with the UTXO set.
+    /// Flush all pending state to RocksDB as a single atomic batch:
+    ///   - Pending UTXO deletes (spent outputs)
+    ///   - Dirty UTXO puts (new/modified outputs)
+    ///   - Chain tip (best_hash + best_height)
+    ///
+    /// All three must be in the same writeBatch to prevent corruption on
+    /// crash.  Previously, pending_deletes were flushed in a separate batch
+    /// before the tip, creating a window where a crash could leave the
+    /// deletions applied but the tip stale — on restart, the node would
+    /// re-process a block whose inputs had already been deleted, hitting
+    /// error.MissingInput (the stuck-at-370001 bug).
     pub fn flush(self: *ChainState) !void {
         if (self.utxo_set.db == null) {
             // Memory-only mode, nothing to persist
@@ -1938,19 +1947,27 @@ pub const ChainState = struct {
         }
         const db = self.utxo_set.db.?;
 
-        // Flush pending deletes first (separate batch — these are already-spent
-        // entries that are safe to remove independently).
-        try self.utxo_set.flushPendingDeletes();
-
-        // Build a combined batch: dirty UTXO puts + chain tip
-        // Uses dirty_keys tracker for O(dirty) performance instead of
-        // scanning the entire cache.
+        // Build a single atomic batch: pending deletes + dirty UTXO puts +
+        // chain tip.  Uses dirty_keys tracker for O(dirty) performance.
         var batch = std.ArrayList(BatchOp).init(self.allocator);
         defer batch.deinit();
 
         var dirty_keys = std.ArrayList([36]u8).init(self.allocator);
         defer dirty_keys.deinit();
 
+        // 1. Pending UTXO deletes (spent outputs to remove from DB).
+        //    Previously flushed as a SEPARATE batch before this function's
+        //    main batch, which was not atomic with the tip update.
+        for (self.utxo_set.pending_deletes.items) |key| {
+            const key_copy = try self.allocator.alloc(u8, 36);
+            @memcpy(key_copy, &key);
+            try batch.append(.{ .delete = .{
+                .cf = CF_UTXO,
+                .key = key_copy,
+            } });
+        }
+
+        // 2. Dirty UTXO puts (new/modified outputs).
         for (self.utxo_set.dirty_keys.items) |key| {
             if (self.utxo_set.cache.getPtr(key)) |entry_ptr| {
                 if (entry_ptr.dirty) {
@@ -1968,7 +1985,8 @@ pub const ChainState = struct {
             }
         }
 
-        // Add chain tip to the SAME batch
+        // 3. Chain tip — must be in the SAME batch so that the on-disk tip
+        //    always reflects exactly the UTXOs present on disk.
         var tip_buf: [36]u8 = undefined;
         @memcpy(tip_buf[0..32], &self.best_hash);
         std.mem.writeInt(u32, tip_buf[32..36], self.best_height, .little);
@@ -2009,8 +2027,11 @@ pub const ChainState = struct {
                 }
             }
 
-            // Clear the dirty tracker only AFTER successful writeBatch
+            // Clear trackers only AFTER successful writeBatch — if the write
+            // failed above we kept them so the next flush retries the same
+            // set of mutations.
             self.utxo_set.dirty_keys.clearRetainingCapacity();
+            self.utxo_set.pending_deletes.clearRetainingCapacity();
 
             // Free allocated keys and values
             for (batch.items) |op| {
