@@ -1034,8 +1034,18 @@ pub const UtxoSet = struct {
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             if (removed >= target_count) break;
-            // Only evict clean (flushed) entries when we have a DB backend.
-            if (self.db == null or !entry.value_ptr.dirty) {
+            // Evict only entries that are (a) clean — not pending a DB write —
+            // AND (b) not fresh — already exist in DB.  Evicting a fresh entry
+            // (created in cache, never flushed) would permanently lose it: not
+            // in cache, not on disk.  Under the current call graph evictCache
+            // is always invoked post-flush (when no entries should be fresh),
+            // but this check is defense-in-depth against future refactors that
+            // might call eviction with dirty_keys partially flushed, or where
+            // the flush call at the top of this function silently skipped
+            // some entries.  Matches CCoinsViewCache semantics in Bitcoin Core.
+            if (self.db == null or
+                (!entry.value_ptr.dirty and !entry.value_ptr.fresh))
+            {
                 to_remove.append(entry.key_ptr.*) catch break;
                 removed += 1;
             }
