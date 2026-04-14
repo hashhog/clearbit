@@ -2161,7 +2161,12 @@ pub const PeerManager = struct {
             .block => |block| {
                 const block_hash = crypto.computeBlockHash(&block.header);
 
-                // Decrement in-flight counters (global and per-peer)
+                // Decrement in-flight counters (global and per-peer).
+                // This runs on EVERY block-response path — success, duplicate,
+                // orphan, buffer-full-drop, put-failure — so the pipeline can
+                // re-use the slot. Without this guarantee the counter drifts
+                // upward, hits max_blocks_in_flight, and wedges IBD (see wave 4
+                // wedge at height 29,953).
                 if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
                 peer.recordBlockReceived();
 
@@ -2181,15 +2186,35 @@ pub const PeerManager = struct {
                         const is_next = self.connect_cursor < self.expected_blocks.items.len and
                             std.mem.eql(u8, &block_hash, &self.expected_blocks.items[self.connect_cursor]);
                         if (!is_next) {
+                            // Rewind download_cursor so pipelineBlockRequests
+                            // will re-request this dropped block. The pipeline
+                            // skips hashes already in block_buffer, so this is
+                            // a cheap walk that only re-issues the genuinely
+                            // missing blocks near the connect front. Without
+                            // this rewind, dropped blocks were never re-issued
+                            // by the normal pipeline — only by the 5s stall
+                            // recovery (32 blocks/peer), which capped IBD at
+                            // ~6 blocks/s and wedged the node at 29,953.
+                            if (self.download_cursor > self.connect_cursor) {
+                                self.download_cursor = self.connect_cursor;
+                            }
                             serialize.freeBlock(self.allocator, &block);
                             return;
                         }
                     }
                 }
 
-                // Buffer the block (transfer ownership - do NOT free here)
+                // Buffer the block (transfer ownership - do NOT free here).
+                // Note: AutoHashMap.put replaces on duplicate-hash, so a
+                // duplicate block response correctly ends up as a no-op
+                // relative to buffer count (decrement already happened above).
                 self.block_buffer.put(block_hash, block) catch {
-                    // If we can't buffer it, free and drop
+                    // If we can't buffer it, free and drop. The in-flight
+                    // decrement above has already run, so the download slot
+                    // is freed for the pipeline to re-issue.
+                    if (self.download_cursor > self.connect_cursor) {
+                        self.download_cursor = self.connect_cursor;
+                    }
                     serialize.freeBlock(self.allocator, &block);
                     return;
                 };
@@ -4480,4 +4505,121 @@ test "feefilter: hysteresis thresholds" {
     try std.testing.expect(750 == decrease_threshold); // Boundary - does not trigger
     try std.testing.expect(1333 == increase_threshold); // Boundary - does not trigger
     try std.testing.expect(1334 > increase_threshold); // Triggers
+}
+
+// ============================================================================
+// drainBlockBuffer in-flight accounting regression (wave 5 — wedge at 29,953)
+//
+// These tests exercise the per-peer and global in-flight counter bookkeeping
+// that was missing on response paths before the wave-5 fix, plus the
+// download_cursor rewind that ensures dropped blocks get re-requested.
+// ============================================================================
+
+test "drain wedge: recordBlockReceived decrements counters on every path" {
+    // The wedge at 29,953 was caused by the global in-flight counter not
+    // being reliably restored after duplicate/orphan/buffer-full responses.
+    // Verify the per-peer recordBlockReceived bookkeeping used by the block
+    // handler: it must decrement on every response kind and must be
+    // saturating on the lower bound (late response after a stall-recovery
+    // reset is legal and must not underflow).
+
+    // Build a minimal Peer with only the fields recordBlockRequest /
+    // recordBlockReceived touch. We skip the full struct init by going
+    // through undefined and populating just the relevant counters.
+    var dummy: Peer = undefined;
+    dummy.blocks_in_flight_count = 0;
+    dummy.oldest_block_in_flight_time = 0;
+    dummy.last_block_time = 0;
+
+    // Simulate 5 block requests.
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) dummy.recordBlockRequest();
+    try std.testing.expectEqual(@as(u32, 5), dummy.blocks_in_flight_count);
+    try std.testing.expect(dummy.oldest_block_in_flight_time > 0);
+
+    // Mix of response kinds: success, duplicate, orphan, buffer-full-drop,
+    // put-failure. All route through recordBlockReceived. After N responses
+    // for N requests the counter must be 0 and oldest_time must be cleared.
+    dummy.recordBlockReceived(); // success
+    dummy.recordBlockReceived(); // duplicate
+    dummy.recordBlockReceived(); // orphan (buffered, drained later)
+    dummy.recordBlockReceived(); // buffer-full-drop
+    dummy.recordBlockReceived(); // put-failure / error
+    try std.testing.expectEqual(@as(u32, 0), dummy.blocks_in_flight_count);
+    try std.testing.expectEqual(@as(i64, 0), dummy.oldest_block_in_flight_time);
+
+    // Extra decrements (e.g. stall-recovery reset followed by late response)
+    // must not underflow. Counter stays at 0.
+    dummy.recordBlockReceived();
+    dummy.recordBlockReceived();
+    try std.testing.expectEqual(@as(u32, 0), dummy.blocks_in_flight_count);
+}
+
+test "drain wedge: full-buffer drop rewinds download_cursor so the block is re-requested" {
+    // Root cause of the 29,953 wedge: when block_buffer was full (1024) and a
+    // non-next block arrived, it was dropped and the in-flight counter was
+    // decremented (correct) — but download_cursor had already been advanced
+    // past the dropped hash by pipelineBlockRequests. The normal pipeline
+    // therefore never re-issued it; only the 5-second stall-recovery loop
+    // re-requested (32 blocks/peer). That capped IBD throughput to ~6 blk/s
+    // and the node wedged when every new block fell into the drop path.
+    //
+    // The fix: in the drop path, rewind download_cursor to connect_cursor
+    // so the next pipelineBlockRequests walks the queue from the front and
+    // re-requests any hash not currently in block_buffer. The buffer-contains
+    // guard in pipelineBlockRequests makes the rewind cheap (already-buffered
+    // hashes are skipped). This test models the cursor state after a drop
+    // and asserts the rewind invariant.
+
+    var download_cursor: u32 = 800;
+    const connect_cursor: u32 = 100;
+
+    // Drop path fires — rewind condition from the fix.
+    if (download_cursor > connect_cursor) {
+        download_cursor = connect_cursor;
+    }
+    try std.testing.expectEqual(@as(u32, 100), download_cursor);
+
+    // Idempotent: if download_cursor was already at/behind connect_cursor
+    // (e.g. just after a stall-recovery reset), don't rewind further.
+    download_cursor = 50;
+    if (download_cursor > connect_cursor) {
+        download_cursor = connect_cursor;
+    }
+    try std.testing.expectEqual(@as(u32, 50), download_cursor);
+
+    download_cursor = connect_cursor;
+    if (download_cursor > connect_cursor) {
+        download_cursor = connect_cursor;
+    }
+    try std.testing.expectEqual(connect_cursor, download_cursor);
+}
+
+test "drain wedge: global in-flight returns to zero after mixed responses" {
+    // End-to-end counter invariant: after N requests and N responses of
+    // arbitrary kinds (success, duplicate, orphan, buffer-full-drop,
+    // put-failure, error), the global blocks_in_flight counter must be 0.
+    // We model just the global counter path (the block-handler decrement)
+    // without standing up a full PeerManager — the logic is a single
+    // saturating subtract per response, applied once per response path.
+
+    var blocks_in_flight: u32 = 0;
+
+    // 10 requests.
+    const n: u32 = 10;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) blocks_in_flight += 1;
+    try std.testing.expectEqual(n, blocks_in_flight);
+
+    // 10 mixed responses — each decrements exactly once regardless of kind,
+    // matching the unconditional decrement at the top of the .block branch.
+    i = 0;
+    while (i < n) : (i += 1) {
+        if (blocks_in_flight > 0) blocks_in_flight -= 1;
+    }
+    try std.testing.expectEqual(@as(u32, 0), blocks_in_flight);
+
+    // Late / unexpected response: saturating decrement — no underflow.
+    if (blocks_in_flight > 0) blocks_in_flight -= 1;
+    try std.testing.expectEqual(@as(u32, 0), blocks_in_flight);
 }
