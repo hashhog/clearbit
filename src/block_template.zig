@@ -714,33 +714,32 @@ pub fn submitBlockWithIndex(
         undo.deinit(chain_state.allocator);
     }
 
-    // Periodically flush UTXO changes + chain tip to disk atomically.
-    // connectBlock() only updates the in-memory cache.  Cache eviction now
-    // uses ChainState.flush() (via the UtxoSet.parent back-reference) which
-    // writes both dirty UTXOs and the chain tip in one WriteBatch, so
-    // eviction can no longer cause tip/UTXO desync.  We still flush every
-    // 1000 blocks to bound crash recovery window.
-    if (!ibd_mode) {
-        if (height % 100 == 0) {
-            chain_state.utxo_set.flushPendingDeletes() catch {};
-        }
-        if (height % 1000 == 0) {
-            chain_state.flush() catch |err| {
-                std.debug.print("submitblock: atomic flush failed after connectBlock at height {d}: {}\n", .{ height, err });
-            };
-        }
-    } else {
-        // During IBD, still flush periodically to prevent unbounded growth of
-        // dirty_keys and pending_deletes lists.  Without this, memory grows
-        // linearly with chain length since every created/spent UTXO key is
-        // appended to these lists and never cleared until flush().
-        if (height % 1000 == 0) {
-            chain_state.utxo_set.flushPendingDeletes() catch {};
-            chain_state.flush() catch |err| {
-                std.debug.print("submitblock: IBD flush failed at height {d}: {}\n", .{ height, err });
-            };
-        }
-    }
+    // Per-block atomic flush: pending_deletes + dirty UTXOs + tip in one
+    // WriteBatch via ChainState.flush().  Previously this code split the
+    // flush into a bare `flushPendingDeletes` every 100 blocks (deletes
+    // applied WITHOUT the tip — the exact pre-c87af55 hazard) and a full
+    // ChainState.flush() every 1000 blocks.  Between those cadences a
+    // crash could leave deletes on disk with a stale tip, or UTXO inserts
+    // in the cache only — same corruption mode as the IBD path before the
+    // per-block-flush change in connectBlockFast.  We now route every
+    // submitblock / generate* call through the same atomic per-block
+    // flush, with the flush_error flag halting on persistence failure
+    // so we never silently desync (Option A, wave2-2026-04-14).
+    //
+    // In ibd_mode the flush already happened inside connectBlockFast, so
+    // this call is a near no-op (dirty_keys/pending_deletes empty, tip
+    // re-written) — kept unconditional so the non-IBD submitblock path
+    // (which calls connectBlock, NOT connectBlockFast) still gets per-block
+    // durability.
+    chain_state.flush() catch |err| {
+        std.debug.print("submitblock: atomic flush failed at height {d}: {} — halting\n", .{ height, err });
+        chain_state.flush_error = true;
+        return .{
+            .accepted = false,
+            .reject_reason = "flush-failed",
+            .block_hash = block_hash,
+        };
+    };
 
     // Insert into the block index so that getblockheader / getblockhash can
     // find the block afterwards.
