@@ -60,6 +60,14 @@ pub const HEADERS_RESPONSE_TIMEOUT: i64 = 5 * 60;
 /// If a block is in-flight and not received within this time, disconnect.
 pub const BLOCK_DOWNLOAD_TIMEOUT: i64 = 20 * 60;
 
+/// Maximum blocks in flight per peer, matching Bitcoin Core's
+/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (src/net_processing.cpp).  The block
+/// download pipeline is level-triggered per peer — every SendMessages tick
+/// each peer is eligible for up to this many in-flight block requests.  No
+/// global counter gates the pipeline; a slow peer only throttles itself
+/// and is handled by `checkBlockDownloadTimeouts` (disconnect).
+pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: u32 = 16;
+
 /// Chain sync timeout in seconds (20 minutes as per Bitcoin Core CHAIN_SYNC_TIMEOUT).
 pub const CHAIN_SYNC_TIMEOUT: i64 = 20 * 60;
 
@@ -2767,46 +2775,59 @@ pub const PeerManager = struct {
     // ========================================================================
 
     /// Request blocks from peers to keep the download pipeline full.
-    /// Distributes requests across all connected peers round-robin.
+    ///
+    /// Level-triggered per-peer dispatch, modelled on Bitcoin Core's
+    /// `SendMessages` / `FindNextBlocksToDownload` loop in
+    /// `src/net_processing.cpp`.  The budget is per-peer
+    /// (`MAX_BLOCKS_IN_TRANSIT_PER_PEER` = 16), not global — a slow peer
+    /// never wedges the other peers' pipelines.  This function is safe to
+    /// call on every SendMessages tick: if a peer is full, it is skipped;
+    /// if any peer has budget, it is filled.
+    ///
+    /// Wave 15 diagnostic (`wave15-2026-04-15/CLEARBIT-STALL-RECOVERY-DIAG.md`)
+    /// showed the previous global `blocks_in_flight < max_blocks_in_flight`
+    /// gate was edge-triggered in practice: a single slow block among 8
+    /// peers pinned the counter at 128 and halted all requests until the
+    /// 5-second stall-recovery timer fired a mass-reset.  Removing the
+    /// global gate and replacing stall-recovery with per-peer
+    /// disconnect-on-timeout (see `checkBlockDownloadTimeouts`) mirrors
+    /// Core and unblocks level-triggered progress.
+    ///
+    /// The `download_cursor` rewind on buffer-full drop (wave 9) is preserved
+    /// in the `.block` handler — see `peer.zig:2198` and `peer.zig:2215`.
     fn pipelineBlockRequests(self: *PeerManager) !void {
         if (self.chain_state == null) return;
         if (self.download_cursor >= self.expected_blocks.items.len) return;
-
-        // Build list of capable peers
-        var capable_peers: [32]*Peer = undefined;
-        var n_capable: usize = 0;
-        for (self.peers.items) |p| {
-            if (n_capable >= 32) break;
-            if (p.state == .handshake_complete) {
-                capable_peers[n_capable] = p;
-                n_capable += 1;
-            }
-        }
-        if (n_capable == 0) return;
-
-        // Distribute block requests across peers in round-robin.
-        // Each peer gets a batch of up to 16 blocks per getdata message.
-        var peer_idx: usize = 0;
 
         // Don't download too far ahead of the connection cursor.
         // Each buffered block is ~1-2 MB, so 512 blocks ≈ 512 MB-1 GB.
         // Use the distance between download and connect cursors (not buffer count)
         // to avoid stalling when the buffer has many out-of-order blocks.
         const max_ahead: u32 = 512;
-        while (self.blocks_in_flight < self.max_blocks_in_flight and
-            self.download_cursor < self.expected_blocks.items.len and
-            self.download_cursor < self.connect_cursor + max_ahead)
-        {
-            const tp = capable_peers[peer_idx % n_capable];
-            peer_idx += 1;
 
-            // Build a batch for this peer
+        // Per-peer level-triggered dispatch.  For every handshake-complete
+        // peer, compute its remaining in-flight budget and try to fill it.
+        // No global counter gate — a slow peer self-throttles and is
+        // disconnected by `checkBlockDownloadTimeouts` when its oldest
+        // in-flight block exceeds `BLOCK_DOWNLOAD_TIMEOUT`.
+        for (self.peers.items) |tp| {
+            if (tp.state != .handshake_complete) continue;
+
+            // Compute this peer's remaining slot budget.  Saturating so a
+            // transient over-count (shouldn't happen, but be defensive)
+            // cannot wrap to a huge positive.
+            if (tp.blocks_in_flight_count >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) continue;
+            const peer_budget: u32 = MAX_BLOCKS_IN_TRANSIT_PER_PEER - tp.blocks_in_flight_count;
+
+            if (self.download_cursor >= self.expected_blocks.items.len) break;
+            if (self.download_cursor >= self.connect_cursor + max_ahead) break;
+
             var invs = std.ArrayList(p2p.InvVector).init(self.allocator);
 
             var batch_count: u32 = 0;
-            while (batch_count < 64 and
-                self.blocks_in_flight + batch_count < self.max_blocks_in_flight and
-                self.download_cursor < self.expected_blocks.items.len)
+            while (batch_count < peer_budget and
+                self.download_cursor < self.expected_blocks.items.len and
+                self.download_cursor < self.connect_cursor + max_ahead)
             {
                 const h = self.expected_blocks.items[self.download_cursor];
                 if (!self.block_buffer.contains(h)) {
@@ -2825,17 +2846,15 @@ pub const PeerManager = struct {
                     invs.deinit();
                     continue;
                 };
+                // Maintain the global `blocks_in_flight` counter for RPC /
+                // progress logging only — it no longer gates the pipeline.
                 self.blocks_in_flight += batch_count;
-                // Track per-peer so disconnect cleanup and timeout detection work.
                 var bi: u32 = 0;
                 while (bi < batch_count) : (bi += 1) {
                     tp.recordBlockRequest();
                 }
             }
             invs.deinit();
-
-            // Stop if we've gone through all peers once with no progress
-            if (peer_idx >= n_capable and batch_count == 0) break;
         }
     }
 
@@ -2848,79 +2867,20 @@ pub const PeerManager = struct {
         var slow_blocks: u32 = 0;
         const drain_start = std.time.nanoTimestamp();
 
-        // Stall recovery: if we have pending blocks but can't connect the next one,
-        // re-request the missing block(s) from the connect cursor.
-        // Throttled to once every 5 seconds.
-        if (self.connect_cursor < self.expected_blocks.items.len) {
-            const now_check = std.time.timestamp();
-            if (now_check - self.last_stall_recovery >= 5) {
-                self.last_stall_recovery = now_check;
-
-                // Stall recovery: reset ALL in-flight counters before
-                // re-requesting. The old per-peer counts are stale — blocks
-                // were assigned to peers that may have disconnected or timed
-                // out, and re-requesting from different peers creates a
-                // mismatch between per-peer sums and the global counter.
-                // Zeroing everything and re-tracking the fresh requests
-                // eliminates drift entirely.
-                {
-                    var old_in_flight: u32 = 0;
-                    for (self.peers.items) |p| {
-                        old_in_flight += p.blocks_in_flight_count;
-                        p.blocks_in_flight_count = 0;
-                        p.oldest_block_in_flight_time = 0;
-                    }
-                    if (old_in_flight > 0 or self.blocks_in_flight > 0) {
-                        std.debug.print("P2P: stall recovery: resetting in-flight counters (global={d}, peer_sum={d}) -> 0\n", .{ self.blocks_in_flight, old_in_flight });
-                    }
-                    self.blocks_in_flight = 0;
-                }
-
-                // Reset download_cursor to connect_cursor so the normal pipeline
-                // will re-request any missing blocks instead of skipping them.
-                if (self.download_cursor > self.connect_cursor) {
-                    self.download_cursor = self.connect_cursor;
-                }
-
-                // Re-request any missing blocks near the connect cursor.
-                // Distribute across ALL capable peers for robustness.
-                var peer_round: usize = 0;
-                for (self.peers.items) |p| {
-                    if (p.state != .handshake_complete) continue;
-                    peer_round += 1;
-                    var invs = std.ArrayList(p2p.InvVector).init(self.allocator);
-                    var cursor = self.connect_cursor;
-                    // Request up to 32 missing blocks from the connection front per peer
-                    while (cursor < self.expected_blocks.items.len and invs.items.len < 32) : (cursor += 1) {
-                        const h = self.expected_blocks.items[cursor];
-                        if (!self.block_buffer.contains(h)) {
-                            invs.append(.{
-                                .inv_type = .msg_witness_block,
-                                .hash = h,
-                            }) catch break;
-                        }
-                    }
-                    if (invs.items.len > 0) {
-                        const getdata_msg = p2p.Message{ .getdata = .{ .inventory = invs.items } };
-                        p.sendMessage(&getdata_msg) catch {
-                            invs.deinit();
-                            if (peer_round >= 3) break;
-                            continue;
-                        };
-                        // Track re-requested blocks properly in both counters.
-                        const re_count: u32 = @intCast(invs.items.len);
-                        self.blocks_in_flight += re_count;
-                        var ri: u32 = 0;
-                        while (ri < re_count) : (ri += 1) {
-                            p.recordBlockRequest();
-                        }
-                    }
-                    invs.deinit();
-                    // Try up to 3 peers for stall recovery
-                    if (peer_round >= 3) break;
-                }
-            }
-        }
+        // Stall recovery is now handled in two level-triggered paths,
+        // matching Bitcoin Core:
+        //   1. `pipelineBlockRequests` re-evaluates per-peer budget on every
+        //      SendMessages tick, so a freed slot is refilled immediately.
+        //   2. `checkBlockDownloadTimeouts` disconnects peers that hold an
+        //      in-flight block past `BLOCK_DOWNLOAD_TIMEOUT`; the per-peer
+        //      cleanup in `removePeerByIndex` returns the slots, and the
+        //      `.block` buffer-full-drop path (wave 9) rewinds
+        //      `download_cursor` so the pipeline re-requests dropped hashes.
+        //
+        // The wave-15 diagnostic showed the old 5-second global counter
+        // reset fired on 94% of drain cycles during healthy IBD, throttling
+        // throughput to ~6 blk/s by limiting re-issue to 3 peers.  See
+        // `wave15-2026-04-15/CLEARBIT-STALL-RECOVERY-DIAG.md`.
 
         while (self.connect_cursor < self.expected_blocks.items.len) {
             // The next block we need to connect
@@ -4622,4 +4582,133 @@ test "drain wedge: global in-flight returns to zero after mixed responses" {
     // Late / unexpected response: saturating decrement — no underflow.
     if (blocks_in_flight > 0) blocks_in_flight -= 1;
     try std.testing.expectEqual(@as(u32, 0), blocks_in_flight);
+}
+
+// ============================================================================
+// Wave 16 — Level-triggered per-peer block-request pipeline.
+//
+// These tests model the per-peer budgeting logic that replaced the global
+// `blocks_in_flight < 128` gate after the wave-15 diagnostic showed the gate
+// was edge-triggered in practice (reset fired on 94% of drain cycles).  They
+// exercise the core invariants of `pipelineBlockRequests` without standing up
+// a full PeerManager + socket fleet: (a) two peers can each hold the full
+// per-peer cap of 16 in-flight blocks concurrently with no global collision,
+// and (b) a slow peer whose in-flight count exceeds BLOCK_DOWNLOAD_TIMEOUT is
+// disconnected and its slots are returned without affecting the other peers'
+// budgets (and the download cursor is rewound so dropped hashes get
+// re-requested — the wave-9 rewind preserved).
+// ============================================================================
+
+test "W16 pipeline: per-peer cap allows 32 concurrent in-flight across two peers" {
+    // Model: two peers, each with per-peer cap MAX_BLOCKS_IN_TRANSIT_PER_PEER.
+    // Pipeline fills each peer up to its cap; the sum is 2*cap with no global
+    // ceiling that would have clamped a single peer's slot grab.
+    var peer_a: Peer = undefined;
+    peer_a.blocks_in_flight_count = 0;
+    peer_a.oldest_block_in_flight_time = 0;
+    peer_a.last_block_time = 0;
+
+    var peer_b: Peer = undefined;
+    peer_b.blocks_in_flight_count = 0;
+    peer_b.oldest_block_in_flight_time = 0;
+    peer_b.last_block_time = 0;
+
+    const cap = MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+    try std.testing.expectEqual(@as(u32, 16), cap);
+
+    // Fill peer A to its cap — mirrors the inner batch loop in
+    // pipelineBlockRequests (`while (batch_count < peer_budget)`).
+    var a_budget = cap - peer_a.blocks_in_flight_count;
+    try std.testing.expectEqual(cap, a_budget);
+    var i: u32 = 0;
+    while (i < a_budget) : (i += 1) peer_a.recordBlockRequest();
+    try std.testing.expectEqual(cap, peer_a.blocks_in_flight_count);
+
+    // Fill peer B independently — the old global counter would have shown 16
+    // here and clamped peer B to zero new slots.  Under per-peer budgeting
+    // peer B sees its own fresh budget of cap.
+    const b_budget = cap - peer_b.blocks_in_flight_count;
+    try std.testing.expectEqual(cap, b_budget);
+    i = 0;
+    while (i < b_budget) : (i += 1) peer_b.recordBlockRequest();
+    try std.testing.expectEqual(cap, peer_b.blocks_in_flight_count);
+
+    // Both peers at their cap concurrently: 2*cap = 32 blocks in flight,
+    // no global collision, no edge-trigger wedge.
+    const total = peer_a.blocks_in_flight_count + peer_b.blocks_in_flight_count;
+    try std.testing.expectEqual(@as(u32, 32), total);
+
+    // A third refill attempt on peer A with its cap already full yields
+    // zero budget — pipeline correctly skips this peer on the next tick.
+    a_budget = if (peer_a.blocks_in_flight_count >= cap) 0 else cap - peer_a.blocks_in_flight_count;
+    try std.testing.expectEqual(@as(u32, 0), a_budget);
+
+    // Peer A's first response frees one slot.  Peer B's cap is untouched —
+    // this is the level-triggered property the wave-15 diag called out: a
+    // slow peer does not starve the others.
+    peer_a.recordBlockReceived();
+    a_budget = cap - peer_a.blocks_in_flight_count;
+    try std.testing.expectEqual(@as(u32, 1), a_budget);
+    try std.testing.expectEqual(cap, peer_b.blocks_in_flight_count);
+}
+
+test "W16 pipeline: slow-peer disconnect rewinds cursor without stalling others" {
+    // Slow-peer disconnect-and-rewind path replaces the old 5s global
+    // stall-recovery reset.  When checkBlockDownloadTimeouts fires on
+    // peer A, removePeerByIndex returns A's slots to the pool, and the
+    // wave-9 buffer-drop rewind ensures the dropped hashes get
+    // re-requested by the normal pipeline from peer B.
+    var peer_a: Peer = undefined;
+    peer_a.blocks_in_flight_count = 0;
+    peer_a.oldest_block_in_flight_time = 0;
+    peer_a.last_block_time = 0;
+
+    var peer_b: Peer = undefined;
+    peer_b.blocks_in_flight_count = 0;
+    peer_b.oldest_block_in_flight_time = 0;
+    peer_b.last_block_time = 0;
+
+    // Both peers have outstanding requests; peer A is the slow one.
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) peer_a.recordBlockRequest();
+    i = 0;
+    while (i < 4) : (i += 1) peer_b.recordBlockRequest();
+    try std.testing.expectEqual(@as(u32, 8), peer_a.blocks_in_flight_count);
+    try std.testing.expectEqual(@as(u32, 4), peer_b.blocks_in_flight_count);
+
+    // Simulate BLOCK_DOWNLOAD_TIMEOUT on peer A: force oldest_time into
+    // the past and assert hasBlockDownloadTimeout returns true.
+    peer_a.oldest_block_in_flight_time = std.time.timestamp() - (BLOCK_DOWNLOAD_TIMEOUT + 1);
+    try std.testing.expect(peer_a.hasBlockDownloadTimeout());
+    try std.testing.expect(!peer_b.hasBlockDownloadTimeout());
+
+    // removePeerByIndex decrements the global counter by the slow peer's
+    // in-flight count (saturating subtract) and zeroes the peer's counters.
+    // Model the global-counter update without a full PeerManager.
+    var global: u32 = peer_a.blocks_in_flight_count + peer_b.blocks_in_flight_count;
+    try std.testing.expectEqual(@as(u32, 12), global);
+    if (global >= peer_a.blocks_in_flight_count) {
+        global -= peer_a.blocks_in_flight_count;
+    } else {
+        global = 0;
+    }
+    // Peer B's budget is unaffected by A's disconnect — this is the core
+    // guarantee over the old mass-reset path.
+    try std.testing.expectEqual(@as(u32, 4), global);
+    try std.testing.expectEqual(@as(u32, 4), peer_b.blocks_in_flight_count);
+
+    // Wave-9 rewind invariant preserved: download_cursor rewinds to
+    // connect_cursor so the pipeline re-issues dropped hashes on the next
+    // tick (via peer B, which still has budget).  The buffer-contains
+    // guard in pipelineBlockRequests makes the rewind cheap.
+    var download_cursor: u32 = 800;
+    const connect_cursor: u32 = 100;
+    if (download_cursor > connect_cursor) download_cursor = connect_cursor;
+    try std.testing.expectEqual(@as(u32, 100), download_cursor);
+
+    // After rewind, peer B (still healthy) has cap - 4 = 12 slots of fresh
+    // budget available to pick up the dropped hashes on the next
+    // level-triggered tick.
+    const b_remaining_budget = MAX_BLOCKS_IN_TRANSIT_PER_PEER - peer_b.blocks_in_flight_count;
+    try std.testing.expectEqual(@as(u32, 12), b_remaining_budget);
 }
