@@ -2765,6 +2765,20 @@ pub const PeerManager = struct {
                 // Counter already drifted; reset to 0 rather than underflow.
                 self.blocks_in_flight = 0;
             }
+            // W19 fix: rewind download_cursor so the pipeline re-requests the
+            // blocks that were in-flight to this peer and are now lost.  Without
+            // this rewind, download_cursor stays at connect_cursor + max_ahead
+            // (the window ceiling) while connect_cursor is stuck waiting for the
+            // first missing block.  pipelineBlockRequests() then sees
+            // download_cursor >= connect_cursor + max_ahead and issues no new
+            // getdata — a permanent wedge until a full restart.
+            //
+            // Rewinding to connect_cursor is safe: pipelineBlockRequests() skips
+            // hashes already in block_buffer, so blocks that were received and
+            // buffered before this peer disconnected are not re-requested.
+            if (self.download_cursor > self.connect_cursor) {
+                self.download_cursor = self.connect_cursor;
+            }
         }
         peer.disconnect();
         self.allocator.destroy(peer);
