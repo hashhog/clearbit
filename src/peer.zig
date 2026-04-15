@@ -2874,12 +2874,19 @@ pub const PeerManager = struct {
 
     /// Try to connect buffered blocks in order to chain_state.
     /// Connects as many sequential blocks as possible from the buffer.
-    /// Runs in a tight loop without yielding until the buffer is drained or a gap is hit.
+    /// Runs a tight loop; emits heartbeat every 5 s during long drains so
+    /// operators can distinguish a slow-UTXO-flush from a true freeze (W21
+    /// third-stall pattern: large-header-batch + slow blocks = silent drain).
+    /// Also re-arms the block download pipeline every 32 blocks so that peer
+    /// slots freed during the drain are refilled without waiting for the full
+    /// drain to complete.
     fn drainBlockBuffer(self: *PeerManager) void {
         const cs = self.chain_state orelse return;
         var connected: u32 = 0;
         var slow_blocks: u32 = 0;
         const drain_start = std.time.nanoTimestamp();
+        // Heartbeat: track last time we emitted an in-drain progress line.
+        var last_heartbeat: i64 = std.time.timestamp();
 
         // Stall recovery is now handled in two level-triggered paths,
         // matching Bitcoin Core:
@@ -2923,13 +2930,53 @@ pub const PeerManager = struct {
             const block_elapsed_ms = @divTrunc(block_elapsed_ns, 1_000_000);
             if (block_elapsed_ms > 50) {
                 slow_blocks += 1;
-                if (slow_blocks <= 3) {
+                // W21 fix: log all slow blocks (not just first 3 per drain).
+                // Blocks >50ms are always logged; >1000ms get a VERY-SLOW tag.
+                // This prevents the operator-visible "600s silence" that occurs
+                // when many multi-second flushes run back-to-back: previously
+                // only the first 3 were printed, leaving the log dark for the
+                // entire remainder of the drain.
+                if (block_elapsed_ms > 1000) {
+                    std.debug.print("P2P: VERY-SLOW block {d}: {d}ms utxos={d}\n", .{
+                        height,
+                        block_elapsed_ms,
+                        cs.utxo_set.cache.count(),
+                    });
+                } else {
                     std.debug.print("P2P: SLOW block {d}: {d}ms utxos={d}\n", .{
                         height,
                         block_elapsed_ms,
                         cs.utxo_set.cache.count(),
                     });
                 }
+            }
+
+            // W21 fix: heartbeat every 5 s during long drains.  With large
+            // UTXO sets (>1.7 M entries) individual flushes take 50ms-3 s,
+            // so a 134-block drain is 43 s of silence.  The heartbeat lets
+            // operators distinguish "slow but alive" from "frozen".
+            const now_hb = std.time.timestamp();
+            if (now_hb - last_heartbeat >= 5) {
+                const remaining_q = self.expected_blocks.items.len - self.connect_cursor;
+                std.debug.print("P2P: drain-heartbeat height={d} connected={d} slow={d} buffer={d} in_flight={d} queue={d} utxos={d}\n", .{
+                    cs.best_height,
+                    connected,
+                    slow_blocks,
+                    self.block_buffer.count(),
+                    self.blocks_in_flight,
+                    remaining_q,
+                    cs.utxo_set.cache.count(),
+                });
+                last_heartbeat = now_hb;
+
+                // W21 fix: re-arm the download pipeline inside the drain loop
+                // every 5 s.  Peer slots freed by block receipts during the
+                // drain are not refilled until the drain completes; with a
+                // 43-second drain and only 14 in-flight slots at start, the
+                // pipeline goes cold and then only has 1-2 active peers after
+                // drain.  Re-arming here keeps all peer budgets filled even
+                // during a long drain.
+                self.pipelineBlockRequests() catch {};
             }
 
             self.our_height = @intCast(cs.best_height);
