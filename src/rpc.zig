@@ -1091,6 +1091,21 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block height out of range", id);
         }
 
+        // First: consult the H:{height}→hash index written atomically with
+        // the chain tip in ChainState.flush().  This is the only path that
+        // works post-restart for blocks connected via peer.zig's fast IBD path.
+        if (self.chain_state.getBlockHashByHeight(height)) |h| {
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            const writer = buf.writer();
+
+            try writer.writeByte('"');
+            try writeHashHex(writer, &h);
+            try writer.writeByte('"');
+
+            return self.jsonRpcResult(buf.items, id);
+        }
+
         // Look up in block index by walking from the tip
         if (self.chain_manager) |cm| {
             // Walk backwards from the active tip to find block at requested height
