@@ -2125,7 +2125,23 @@ pub const PeerManager = struct {
                             self.sendGetHeaders(alt_peer) catch {};
                         }
                     } else {
-                        std.debug.print("P2P: Received 0 headers - fully synced at height {d}\n", .{our_height + self.expected_blocks.items.len});
+                        // Headers are caught up to the network tip.  Only emit
+                        // "fully synced" and skip further work when blocks have
+                        // also caught up (connect_cursor == expected_blocks.len).
+                        // During IBD the header queue fills far ahead of the
+                        // block connection cursor; returning early here suppressed
+                        // the pipelineBlockRequests() call that keeps block
+                        // download progressing (W28 mid-IBD header stall fix).
+                        const blocks_caught_up = self.connect_cursor >= self.expected_blocks.items.len;
+                        if (blocks_caught_up) {
+                            std.debug.print("P2P: Received 0 headers - fully synced at height {d}\n", .{our_height});
+                            return;
+                        }
+                        // Headers synced but blocks still behind: keep the block
+                        // download pipeline running.
+                        std.debug.print("P2P: headers synced at height {d}, blocks at {d} (queue={d}), continuing block download\n",
+                            .{ our_height + self.expected_blocks.items.len, our_height, self.expected_blocks.items.len - self.connect_cursor });
+                        self.pipelineBlockRequests() catch {};
                     }
                     return;
                 }
@@ -3010,6 +3026,29 @@ pub const PeerManager = struct {
                 self.expected_blocks.shrinkRetainingCapacity(remaining);
                 self.download_cursor -= @min(self.download_cursor, self.connect_cursor);
                 self.connect_cursor = 0;
+            }
+        }
+
+        // Gap-stall recovery (W28): if the block at connect_cursor is missing
+        // from the buffer AND download_cursor has already advanced past it
+        // (meaning the block was "requested" but never arrived or was dropped),
+        // AND no blocks are currently in-flight (so the block timeout path will
+        // never fire to trigger the usual rewind), rewind download_cursor to
+        // connect_cursor so pipelineBlockRequests() will re-issue the missing
+        // block.  This prevents a permanent stall when blocks_in_flight_count == 0
+        // for all peers but a gap block sits between connect_cursor and
+        // download_cursor.
+        if (self.blocks_in_flight == 0 and
+            self.connect_cursor < self.expected_blocks.items.len and
+            self.download_cursor > self.connect_cursor)
+        {
+            const gap_hash = self.expected_blocks.items[self.connect_cursor];
+            if (!self.block_buffer.contains(gap_hash)) {
+                // The block at the connection front is missing and was already
+                // "requested" (download_cursor passed it) — rewind to re-request.
+                std.debug.print("P2P: gap-stall recovery: block at connect_cursor={d} missing, rewinding download_cursor\n",
+                    .{self.connect_cursor});
+                self.download_cursor = self.connect_cursor;
             }
         }
 
