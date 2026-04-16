@@ -209,6 +209,23 @@ pub const ChainStore = struct {
     /// Key used for storing chain tip in the default CF.
     const CHAIN_TIP_KEY = "chain_tip";
 
+    /// Prefix for height→hash index keys in CF_DEFAULT.
+    /// Key layout: "H:" ++ u32_LE(height) (6 bytes total).
+    /// Value: 32-byte block hash at that height on the active chain.
+    /// Written atomically with the chain tip in `ChainState.flush()` so a
+    /// backward walk via getblockhash is always possible without keeping the
+    /// whole BlockIndexEntry chain resident post-restart.
+    pub const HEIGHT_HASH_PREFIX = "H:";
+    pub const HEIGHT_HASH_KEY_LEN: usize = 6;
+
+    pub fn buildHeightHashKey(height: u32) [HEIGHT_HASH_KEY_LEN]u8 {
+        var key: [HEIGHT_HASH_KEY_LEN]u8 = undefined;
+        key[0] = 'H';
+        key[1] = ':';
+        std.mem.writeInt(u32, key[2..6], height, .little);
+        return key;
+    }
+
     pub fn init(datadir: []const u8, allocator: std.mem.Allocator) StorageError!ChainStore {
         const db = try Database.open(datadir, allocator);
         return ChainStore{
@@ -1743,6 +1760,23 @@ pub const ChainState = struct {
         self.utxo_set.deinit();
     }
 
+    /// Look up the block hash at a given active-chain height via the
+    /// H:{height}→hash index in CF_DEFAULT.  Returns null if the key is
+    /// missing (height above tip, DB-less mode, or a pre-fix blockheight
+    /// that was connected before the W37 index was introduced).  Caller
+    /// owns lifetime-free semantics: the returned Hash256 is copied out.
+    pub fn getBlockHashByHeight(self: *ChainState, height: u32) ?types.Hash256 {
+        const db = self.utxo_set.db orelse return null;
+        const key_bytes = ChainStore.buildHeightHashKey(height);
+        const data = db.get(CF_DEFAULT, &key_bytes) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        if (bytes.len != 32) return null;
+        var hash: types.Hash256 = undefined;
+        @memcpy(&hash, bytes);
+        return hash;
+    }
+
     /// Connect a block: spend inputs, create outputs, optionally save undo data.
     /// When skip_undo is true (IBD mode), no undo data is collected, reducing allocations.
     pub fn connectBlock(
@@ -2022,6 +2056,24 @@ pub const ChainState = struct {
             .cf = CF_DEFAULT,
             .key = tip_key,
             .value = tip_val,
+        } });
+
+        // 4. Height→hash index for getblockhash RPC.  Writes one entry per
+        //    flush for the current tip height, atomic with the tip update.
+        //    Without this, IBD connects blocks via peer.zig's fast path which
+        //    never persists hash-keyed CF_BLOCK_INDEX entries; handleGetBlockHash
+        //    falls back to walking active_tip in memory, which is null until a
+        //    new block arrives post-restart, producing "Block height out of
+        //    range" for every historical query (W36 root cause).
+        const hh_key_bytes = ChainStore.buildHeightHashKey(self.best_height);
+        const hh_key = try self.allocator.alloc(u8, ChainStore.HEIGHT_HASH_KEY_LEN);
+        @memcpy(hh_key, &hh_key_bytes);
+        const hh_val = try self.allocator.alloc(u8, 32);
+        @memcpy(hh_val, &self.best_hash);
+        try batch.append(.{ .put = .{
+            .cf = CF_DEFAULT,
+            .key = hh_key,
+            .value = hh_val,
         } });
 
         if (batch.items.len > 0) {
