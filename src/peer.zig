@@ -1751,9 +1751,14 @@ pub const PeerManager = struct {
             if (p.direction == .outbound) outbound_count += 1;
         }
 
-        // During IBD, only try one connection per call to avoid blocking the loop
+        // During IBD, only try one connection per call to avoid blocking the loop.
+        // Exception: if we have zero outbound peers (post-eviction peer wipeout),
+        // allow up to MAX_OUTBOUND_CONNECTIONS attempts so we recover quickly
+        // instead of waiting for the loop to cycle once per peer slot.
         var attempts: u32 = 0;
-        const max_attempts: u32 = if (self.isIBD()) 1 else 8;
+        const max_attempts: u32 = if (!self.isIBD()) 8
+                                  else if (outbound_count == 0) MAX_OUTBOUND_CONNECTIONS
+                                  else 1;
 
         while (outbound_count < MAX_OUTBOUND_CONNECTIONS and attempts < max_attempts) {
             attempts += 1;
