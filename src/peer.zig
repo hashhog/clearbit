@@ -766,16 +766,34 @@ pub const Peer = struct {
 
     /// Read exactly n bytes from the stream.
     /// If we've read zero bytes and get WouldBlock, returns Timeout (no data available).
-    /// If we've already read some bytes and get WouldBlock, keeps retrying (partial message).
+    /// If we've already read some bytes and get WouldBlock, sleeps briefly and retries.
+    ///
+    /// W53: the partial-read retry path must not spin forever — a peer that
+    /// opens a payload (sends the 24-byte header) and then stalls mid-stream
+    /// will return EAGAIN indefinitely, and because PeerManager drives ALL
+    /// peers from a single thread, any stuck readExact wedges the entire
+    /// node (no drain, no timeout checks, no heartbeats — exactly the silent
+    /// stall observed at block 479,888 on 2026-04-17). Bound the total time
+    /// spent in partial-read retries and give up as ConnectionClosed so the
+    /// peer is disconnected and the download slots are reclaimed.
+    pub const READ_EXACT_PARTIAL_TIMEOUT_MS: i64 = 30_000;
     fn readExact(self: *Peer, buf: []u8) !void {
         var total: usize = 0;
+        var partial_deadline_ms: i64 = 0;
         while (total < buf.len) {
             const n = self.stream.read(buf[total..]) catch |err| {
                 if (err == error.WouldBlock) {
                     if (total == 0) {
                         return error.Timeout; // No data at all - truly no message waiting
                     }
-                    // Partial read - data is arriving, wait a bit and retry
+                    // Partial read — data may be arriving. Bound retry time
+                    // so a mid-payload stall doesn't wedge the peer thread.
+                    const now_ms = std.time.milliTimestamp();
+                    if (partial_deadline_ms == 0) {
+                        partial_deadline_ms = now_ms + READ_EXACT_PARTIAL_TIMEOUT_MS;
+                    } else if (now_ms >= partial_deadline_ms) {
+                        return error.ConnectionClosed;
+                    }
                     std.time.sleep(1 * std.time.ns_per_ms);
                     continue;
                 }
@@ -783,6 +801,9 @@ pub const Peer = struct {
             };
             if (n == 0) return error.ConnectionClosed;
             total += n;
+            // Progress resets the partial-read deadline so a slow-but-live
+            // peer is still allowed to finish a large payload.
+            if (partial_deadline_ms != 0) partial_deadline_ms = 0;
         }
     }
 
