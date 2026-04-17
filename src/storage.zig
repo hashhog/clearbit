@@ -1777,6 +1777,17 @@ pub const ChainState = struct {
         return hash;
     }
 
+    /// Persist an H:{height}→hash index entry.  Idempotent (same height
+    /// always maps to the same hash on the active chain), so races between
+    /// the RPC thread's lazy-backfill path and ChainState.flush() are
+    /// benign.  Silently no-ops on DB-less mode or write failure — this
+    /// is a best-effort cache, not a correctness requirement.  W47.
+    pub fn putBlockHashByHeight(self: *ChainState, height: u32, hash: *const types.Hash256) void {
+        const db = self.utxo_set.db orelse return;
+        const key_bytes = ChainStore.buildHeightHashKey(height);
+        db.put(CF_DEFAULT, &key_bytes, hash) catch return;
+    }
+
     /// Connect a block: spend inputs, create outputs, optionally save undo data.
     /// When skip_undo is true (IBD mode), no undo data is collected, reducing allocations.
     pub fn connectBlock(
