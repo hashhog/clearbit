@@ -1112,6 +1112,14 @@ pub const RpcServer = struct {
             var entry: ?*validation.BlockIndexEntry = cm.active_tip;
             while (entry) |e| {
                 if (e.height == height) {
+                    // W47: lazy-backfill the H:{height}→hash index so the next
+                    // query for this height hits the fast path.  Pre-W37
+                    // heights have no index entry because the atomic-flush
+                    // write was only added in W37; walking active_tip is
+                    // O(tip_height) and would be a DoS vector for sequential
+                    // scans.  Writing on first hit amortises the walk.
+                    self.chain_state.putBlockHashByHeight(e.height, &e.hash);
+
                     var buf = std.ArrayList(u8).init(self.allocator);
                     defer buf.deinit();
                     const writer = buf.writer();
