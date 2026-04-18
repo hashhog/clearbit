@@ -44,6 +44,14 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("secp256k1");
     exe.linkLibC();
 
+    // SHA-NI accelerated SHA-256 transform (x86_64 only). The transform itself
+    // is gated at runtime via CPUID; the object always compiles in on x86_64
+    // because the intrinsics require -msha / -msse4.1 / -mssse3 at the TU level.
+    const shani_cflags = &[_][]const u8{ "-msha", "-msse4.1", "-mssse3", "-O2" };
+    if (target.result.cpu.arch == .x86_64) {
+        exe.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+    }
+
     // Link libminisketch if enabled
     if (minisketch_enabled) {
         exe.linkSystemLibrary("minisketch");
@@ -76,6 +84,11 @@ pub fn build(b: *std.Build) void {
     unit_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
     unit_tests.linkLibC();
 
+    // SHA-NI C transform (same shim as the main exe) — required by crypto.zig tests.
+    if (target.result.cpu.arch == .x86_64) {
+        unit_tests.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+    }
+
     // Link libminisketch for tests if enabled
     if (minisketch_enabled) {
         unit_tests.linkSystemLibrary("minisketch");
@@ -100,6 +113,9 @@ pub fn build(b: *std.Build) void {
     sighash_test.addIncludePath(.{ .cwd_relative = secp256k1_include });
     sighash_test.linkSystemLibrary("secp256k1");
     sighash_test.linkLibC();
+    if (target.result.cpu.arch == .x86_64) {
+        sighash_test.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+    }
     b.installArtifact(sighash_test);
 
     const run_sighash = b.addRunArtifact(sighash_test);
@@ -117,6 +133,9 @@ pub fn build(b: *std.Build) void {
     script_test.addIncludePath(.{ .cwd_relative = secp256k1_include });
     script_test.linkSystemLibrary("secp256k1");
     script_test.linkLibC();
+    if (target.result.cpu.arch == .x86_64) {
+        script_test.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+    }
     b.installArtifact(script_test);
 
     const run_script = b.addRunArtifact(script_test);
