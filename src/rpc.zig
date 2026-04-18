@@ -720,6 +720,8 @@ pub const RpcServer = struct {
             return self.handleGetBlock(params, id);
         } else if (std.mem.eql(u8, method, "getbestblockhash")) {
             return self.handleGetBestBlockHash(id);
+        } else if (std.mem.eql(u8, method, "getsyncstate")) {
+            return self.handleGetSyncState(id);
         } else if (std.mem.eql(u8, method, "getpeerinfo")) {
             return self.handleGetPeerInfo(id);
         } else if (std.mem.eql(u8, method, "getnetworkinfo")) {
@@ -1060,6 +1062,60 @@ pub const RpcServer = struct {
         try writer.writeByte('"');
         try writeHashHex(writer, &self.chain_state.best_hash);
         try writer.writeByte('"');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// hashhog W70: uniform fleet-wide sync-state report.
+    /// Spec: meta-repo `spec/getsyncstate.md`.
+    ///
+    /// SHOULD fields return JSON `null` (not omitted) so consumer
+    /// parsers can index by key without presence checks. clearbit
+    /// doesn't track blocks_in_flight / blocks_pending_connect /
+    /// last_block_received_time on chain_state in v1 — all null.
+    fn handleGetSyncState(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        const chain_name = switch (self.network_params.magic) {
+            consensus.MAINNET.magic => "main",
+            consensus.TESTNET.magic => "test",
+            consensus.TESTNET4.magic => "testnet4",
+            consensus.REGTEST.magic => "regtest",
+            else => "unknown",
+        };
+
+        const tip_height = self.chain_state.best_height;
+        // Same shape as getblockchaininfo: headers >= tip by construction.
+        const pm = self.peer_manager;
+        const queued = if (pm.expected_blocks.items.len > pm.connect_cursor)
+            pm.expected_blocks.items.len - pm.connect_cursor
+        else
+            0;
+        const header_height = tip_height + @as(u32, @intCast(queued));
+        const ibd = self.isInitialBlockDownload();
+        const num_peers: u32 = @intCast(pm.peers.items.len);
+        const progress: f64 = if (header_height == 0)
+            0.0
+        else blk: {
+            const p = @as(f64, @floatFromInt(tip_height)) / @as(f64, @floatFromInt(header_height));
+            break :blk if (p > 1.0) 1.0 else p;
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.print("{{\"tip_height\":{d},\"tip_hash\":\"", .{tip_height});
+        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writer.print("\",\"best_header_height\":{d},\"best_header_hash\":\"", .{header_height});
+        // clearbit doesn't track a distinct header-tip hash in
+        // chain_state; return the block-tip hash as a pragmatic v1
+        // answer (invariant best_header_height >= tip_height holds).
+        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writer.print("\",\"initial_block_download\":{},\"num_peers\":{d},\"verification_progress\":{d},\"blocks_in_flight\":null,\"blocks_pending_connect\":null,\"last_block_received_time\":null,\"chain\":\"{s}\",\"protocol_version\":70016}}", .{
+            ibd,
+            num_peers,
+            progress,
+            chain_name,
+        });
 
         return self.jsonRpcResult(buf.items, id);
     }
