@@ -1180,18 +1180,25 @@ pub const BlockDownloader = struct {
 
                         input_sum += utxo.?.value;
 
-                        // Keep script_pubkey alive for script-check phase (transferred to arena).
-                        var key: OutpointKey = undefined;
-                        @memcpy(key[0..32], &input.previous_output.hash);
-                        const idx_le = std.mem.nativeToLittle(u32, @intCast(input.previous_output.index));
-                        @memcpy(key[32..36], std.mem.asBytes(&idx_le));
-                        // Transfer ownership of script_pubkey to arena so it stays alive.
-                        const script_copy = arena_alloc.dupe(u8, utxo.?.script_pubkey) catch
-                            return BlockDownloadError.OutOfMemory;
-                        // Free original allocation from chain_store.
+                        // W67a: only populate script_pubkey_map when scripts will
+                        // actually be verified. Under assumevalid the dupe + map
+                        // insert is pure waste (10-20% of per-block CPU at 500K).
+                        if (!skip_script_verification) {
+                            var key: OutpointKey = undefined;
+                            @memcpy(key[0..32], &input.previous_output.hash);
+                            const idx_le = std.mem.nativeToLittle(u32, @intCast(input.previous_output.index));
+                            @memcpy(key[32..36], std.mem.asBytes(&idx_le));
+                            // Transfer ownership of script_pubkey to arena so it
+                            // outlives the chain_store free below.
+                            const script_copy = arena_alloc.dupe(u8, utxo.?.script_pubkey) catch
+                                return BlockDownloadError.OutOfMemory;
+                            script_pubkey_map.put(key, script_copy) catch
+                                return BlockDownloadError.OutOfMemory;
+                        }
+                        // Free original allocation from chain_store (always — the
+                        // script_pubkey is owned by getUtxo's allocator regardless
+                        // of whether we dupe it above).
                         self.allocator.free(utxo.?.script_pubkey);
-                        script_pubkey_map.put(key, script_copy) catch
-                            return BlockDownloadError.OutOfMemory;
 
                         // Collect spend for atomic batch (don't write yet)
                         pending_spends.append(input.previous_output) catch
@@ -1226,13 +1233,16 @@ pub const BlockDownloader = struct {
                     .is_coinbase = tx_idx == 0,
                 }) catch return BlockDownloadError.OutOfMemory;
 
-                // Register in script map for potential intra-block consumers
-                var key: OutpointKey = undefined;
-                @memcpy(key[0..32], &tx_hash);
-                const idx_le = std.mem.nativeToLittle(u32, @intCast(out_idx));
-                @memcpy(key[32..36], std.mem.asBytes(&idx_le));
-                script_pubkey_map.put(key, output.script_pubkey) catch
-                    return BlockDownloadError.OutOfMemory;
+                // W67a: intra-block consumer resolution only matters when scripts
+                // will run. Skip the map insert under assumevalid.
+                if (!skip_script_verification) {
+                    var key: OutpointKey = undefined;
+                    @memcpy(key[0..32], &tx_hash);
+                    const idx_le = std.mem.nativeToLittle(u32, @intCast(out_idx));
+                    @memcpy(key[32..36], std.mem.asBytes(&idx_le));
+                    script_pubkey_map.put(key, output.script_pubkey) catch
+                        return BlockDownloadError.OutOfMemory;
+                }
             }
         }
 
