@@ -269,14 +269,34 @@ fn sha256TransformSoftware(state: *[8]u32, chunk: *const [64]u8) void {
 // Hardware-Accelerated SHA-256 Transform
 // ============================================================================
 
-/// SHA-256 block transform - uses best available implementation
-/// For now, we use the software implementation which is well-optimized.
-/// Hardware acceleration via SHA-NI or ARM SHA2 can be added via libcrypto or
-/// direct assembly in a future version.
+/// Intel SHA Extensions (SHA-NI) single-block transform, implemented in
+/// `src/sha256_shani.c` using `_mm_sha256rnds2_epu32` / `_mm_sha256msg1_epu32`
+/// / `_mm_sha256msg2_epu32` intrinsics. The C translation unit is compiled
+/// with `-msha -msse4.1 -mssse3`, so callers MUST gate on runtime CPUID.
+///
+/// Declared extern only on x86_64 builds; on other arches this symbol is not
+/// emitted and the Zig code below never references it.
+extern fn clearbit_sha256_shani_transform(
+    state: [*]u32,
+    chunk: [*]const u8,
+    blocks: usize,
+) callconv(.C) void;
+
+/// Runtime-dispatched SHA-256 block transform. If the host CPU supports
+/// SHA-NI (x86_64) we call the C intrinsic shim; otherwise we fall through
+/// to the pure-Zig software transform. Callers must supply `blocks` complete
+/// 64-byte message blocks at `data`.
 fn sha256TransformHw(state: *[8]u32, data: [*]const u8, blocks: usize) void {
+    if (builtin.cpu.arch == .x86_64) {
+        const features = detectCpuFeatures();
+        if (features.has_sha_ni and blocks > 0) {
+            clearbit_sha256_shani_transform(@ptrCast(state), data, blocks);
+            return;
+        }
+    }
+
     var remaining = blocks;
     var chunk = data;
-
     while (remaining > 0) : ({
         remaining -= 1;
         chunk += 64;
@@ -291,11 +311,11 @@ fn sha256TransformHw(state: *[8]u32, data: [*]const u8, blocks: usize) void {
 
 /// Optimized double-SHA256 for exactly 64 bytes of input.
 /// This is used for Merkle tree internal nodes: hash256(left_child || right_child)
-/// where each child is a 32-byte hash.
+/// where each child is a 32-byte hash. Routes through the HW transform when
+/// SHA-NI is available, which is the dominant cost of block-connect for
+/// wide-transaction blocks.
 pub fn sha256d64(out: *[32]u8, in: *const [64]u8) void {
-    // First SHA256: hash the 64 bytes input
     const first_hash = sha256(in);
-    // Second SHA256: hash the result
     const second_hash = sha256(&first_hash);
     out.* = second_hash;
 }
@@ -312,57 +332,41 @@ pub fn sha256d64Batch(out: [][32]u8, in: [][64]u8) void {
 // Hashing Functions (Public API)
 // ============================================================================
 
-/// Single SHA-256 hash
-pub fn sha256(data: []const u8) Hash256 {
-    var result: Hash256 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &result, .{});
-    return result;
-}
-
-/// Single SHA-256 hash using hardware acceleration if available
-pub fn sha256Hw(data: []const u8) Hash256 {
+/// Low-level SHA-256 of a byte slice using our block transform dispatcher.
+/// Always goes through `sha256TransformHw`, which selects the SHA-NI path at
+/// runtime if the CPU supports it, else falls back to the pure-Zig software
+/// path. Kept separate from the stdlib entry point so tests can assert that
+/// the HW and software paths agree.
+fn sha256Dispatch(data: []const u8) Hash256 {
     var state = H_INIT;
 
-    // Process complete 64-byte blocks
-    var offset: usize = 0;
-    while (offset + 64 <= data.len) : (offset += 64) {
-        if (comptime_features.has_sha_ni) {
-            sha256TransformHw(&state, data.ptr + offset, 1);
-        } else {
-            sha256TransformSoftware(&state, data[offset..][0..64]);
-        }
+    // Process all complete 64-byte blocks in bulk — with SHA-NI this amortises
+    // the Shuffle/Unshuffle across blocks inside the C transform.
+    const full_blocks = data.len / 64;
+    if (full_blocks > 0) {
+        sha256TransformHw(&state, data.ptr, full_blocks);
     }
 
-    // Handle remaining bytes with padding
-    var final_block: [64]u8 = undefined;
-    const remaining = data.len - offset;
-    @memcpy(final_block[0..remaining], data[offset..]);
+    // Pad the tail. SHA-256 appends 0x80, then zero pad, then 64-bit big-endian
+    // bit length, reaching the next 64-byte boundary. If the remainder after
+    // the 0x80 doesn't leave room for the length (>=56 bytes used), pad to two
+    // final blocks instead of one.
+    var final_block: [128]u8 = undefined;
+    const tail_off = full_blocks * 64;
+    const remaining = data.len - tail_off;
+    @memcpy(final_block[0..remaining], data[tail_off..]);
     final_block[remaining] = 0x80;
 
-    if (remaining >= 56) {
-        // Need two blocks for padding
-        @memset(final_block[remaining + 1 ..], 0);
-        if (comptime_features.has_sha_ni) {
-            sha256TransformHw(&state, &final_block, 1);
-        } else {
-            sha256TransformSoftware(&state, &final_block);
-        }
-        @memset(&final_block, 0);
-    } else {
-        @memset(final_block[remaining + 1 .. 56], 0);
-    }
+    const pad_blocks: usize = if (remaining < 56) 1 else 2;
+    const total_pad_bytes = pad_blocks * 64;
+    @memset(final_block[remaining + 1 .. total_pad_bytes], 0);
 
-    // Append length in bits (big-endian)
     const bit_len: u64 = @as(u64, data.len) * 8;
-    std.mem.writeInt(u64, final_block[56..64], bit_len, .big);
+    std.mem.writeInt(u64, final_block[total_pad_bytes - 8 ..][0..8], bit_len, .big);
 
-    if (comptime_features.has_sha_ni) {
-        sha256TransformHw(&state, &final_block, 1);
-    } else {
-        sha256TransformSoftware(&state, &final_block);
-    }
+    sha256TransformHw(&state, &final_block, pad_blocks);
 
-    // Write output
+    // Write state out as big-endian u32s.
     var result: Hash256 = undefined;
     for (0..8) |i| {
         std.mem.writeInt(u32, result[i * 4 ..][0..4], state[i], .big);
@@ -370,16 +374,41 @@ pub fn sha256Hw(data: []const u8) Hash256 {
     return result;
 }
 
-/// Double SHA-256 (Bitcoin's standard hash for blocks, txids, etc.)
-pub fn hash256(data: []const u8) Hash256 {
-    var first_hash: Hash256 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &first_hash, .{});
+/// Single SHA-256 hash. Uses the best available backend (SHA-NI when the CPU
+/// advertises it, software fallback otherwise). This is the primary entry
+/// point for all callers.
+pub fn sha256(data: []const u8) Hash256 {
+    if (builtin.cpu.arch == .x86_64) {
+        // On x86_64 always prefer our dispatcher so CPUs with SHA-NI get the
+        // hardware path. The dispatcher itself degrades to software if CPUID
+        // reports no sha_ni, so this is safe for non-native builds too.
+        return sha256Dispatch(data);
+    }
+    // On other architectures (e.g. aarch64 without ARM-SHA2 wired up yet),
+    // defer to Zig stdlib's optimised software implementation.
     var result: Hash256 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&first_hash, &result, .{});
+    std.crypto.hash.sha2.Sha256.hash(data, &result, .{});
     return result;
 }
 
-/// Double SHA-256 using hardware acceleration if available
+/// Single SHA-256 hash using hardware acceleration if available.
+/// Kept as a public entry point for tests and benchmarks that want to force
+/// the HW/software-dispatch code path (vs stdlib). Behaviour is identical
+/// to `sha256()` on x86_64.
+pub fn sha256Hw(data: []const u8) Hash256 {
+    return sha256Dispatch(data);
+}
+
+/// Double SHA-256 (Bitcoin's standard hash for blocks, txids, etc.).
+/// Routes through `sha256`, so it picks up SHA-NI acceleration automatically.
+pub fn hash256(data: []const u8) Hash256 {
+    const first_hash = sha256(data);
+    return sha256(&first_hash);
+}
+
+/// Double SHA-256 using hardware acceleration if available.
+/// Retained for API symmetry with `sha256Hw`; identical to `hash256()` now
+/// that the primary entry point also dispatches to the HW backend.
 pub fn hash256Hw(data: []const u8) Hash256 {
     const first_hash = sha256Hw(data);
     return sha256Hw(&first_hash);
@@ -1400,22 +1429,117 @@ test "sha256 hello" {
     try std.testing.expectEqualSlices(u8, &expected, &result);
 }
 
-test "sha256Hw matches stdlib" {
-    // Test empty string
-    const hw_empty = sha256Hw("");
-    const std_empty = sha256("");
-    try std.testing.expectEqualSlices(u8, &std_empty, &hw_empty);
+/// Helper: run Zig stdlib's software SHA-256 over `data`. Used by the HW
+/// equivalence tests below as the reference oracle.
+fn sha256Stdlib(data: []const u8) Hash256 {
+    var out: Hash256 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &out, .{});
+    return out;
+}
 
-    // Test "hello"
-    const hw_hello = sha256Hw("hello");
-    const std_hello = sha256("hello");
-    try std.testing.expectEqualSlices(u8, &std_hello, &hw_hello);
+test "sha256 FIPS 180-2 vector: abc" {
+    // Standard NIST short-message vector.
+    const expected = [_]u8{
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, &sha256("abc"));
+    try std.testing.expectEqualSlices(u8, &expected, &sha256Hw("abc"));
+}
 
-    // Test longer input (multi-block)
+test "sha256 FIPS 180-2 vector: 448-bit message" {
+    // NIST FIPS 180-2 test vector 2: the 56-byte input exactly fills a single
+    // block once the 0x80 padding byte is appended, forcing a second block
+    // solely for the length field. This is the canonical "padding crosses a
+    // block boundary" test.
+    const msg = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    const expected = [_]u8{
+        0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8,
+        0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39,
+        0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67,
+        0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb, 0x06, 0xc1,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, &sha256(msg));
+    try std.testing.expectEqualSlices(u8, &expected, &sha256Hw(msg));
+}
+
+test "sha256Hw matches stdlib: smoke cases" {
+    // Empty string.
+    try std.testing.expectEqualSlices(u8, &sha256Stdlib(""), &sha256Hw(""));
+
+    // Short single-block inputs.
+    try std.testing.expectEqualSlices(u8, &sha256Stdlib("hello"), &sha256Hw("hello"));
+    try std.testing.expectEqualSlices(u8, &sha256Stdlib("abc"), &sha256Hw("abc"));
+
+    // Multi-block (~430 bytes).
     const long_input = "The quick brown fox jumps over the lazy dog" ** 10;
-    const hw_long = sha256Hw(long_input);
-    const std_long = sha256(long_input);
-    try std.testing.expectEqualSlices(u8, &std_long, &hw_long);
+    try std.testing.expectEqualSlices(u8, &sha256Stdlib(long_input), &sha256Hw(long_input));
+}
+
+test "sha256Hw matches stdlib: padding boundary sweep" {
+    // Input lengths near the 55/56 boundary are the trickiest — they're where
+    // the padding schema decides whether to emit one or two final blocks.
+    var buf: [200]u8 = undefined;
+    for (0..buf.len) |i| buf[i] = @intCast(i & 0xFF);
+
+    var len: usize = 0;
+    while (len <= buf.len) : (len += 1) {
+        const data = buf[0..len];
+        const expected = sha256Stdlib(data);
+        const got_hw = sha256Hw(data);
+        const got_primary = sha256(data);
+        try std.testing.expectEqualSlices(u8, &expected, &got_hw);
+        try std.testing.expectEqualSlices(u8, &expected, &got_primary);
+    }
+}
+
+test "sha256Hw matches stdlib: 1 KB block-exact" {
+    // Exact multiple of 64 — exercises the bulk-blocks path with no tail data.
+    var buf: [1024]u8 = undefined;
+    for (0..buf.len) |i| buf[i] = @intCast((i * 31 + 7) & 0xFF);
+    try std.testing.expectEqualSlices(u8, &sha256Stdlib(&buf), &sha256Hw(&buf));
+}
+
+test "sha256Hw matches stdlib: random fuzz" {
+    // Random sweep: 200 inputs with lengths uniform in [0, 4096]. Asserts
+    // byte-for-byte equality against the stdlib software implementation.
+    var rng = std.Random.DefaultPrng.init(0xC0FFEE_C0DE_F001);
+    const rnd = rng.random();
+
+    var buf: [4096]u8 = undefined;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const len = rnd.intRangeAtMost(usize, 0, buf.len);
+        rnd.bytes(buf[0..len]);
+        const data = buf[0..len];
+        const expected = sha256Stdlib(data);
+        const got_hw = sha256Hw(data);
+        const got_primary = sha256(data);
+        try std.testing.expectEqualSlices(u8, &expected, &got_hw);
+        try std.testing.expectEqualSlices(u8, &expected, &got_primary);
+    }
+}
+
+test "sha256d64 matches stdlib hash256 (Merkle-node hot path)" {
+    // `sha256d64` is the fast-path double-SHA for Merkle tree internal nodes.
+    // Compare against an unambiguous stdlib-only reference.
+    var rng = std.Random.DefaultPrng.init(0xDEADBEEFCAFEBABE);
+    const rnd = rng.random();
+
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var input: [64]u8 = undefined;
+        rnd.bytes(&input);
+
+        var got: [32]u8 = undefined;
+        sha256d64(&got, &input);
+
+        const first = sha256Stdlib(&input);
+        const expected = sha256Stdlib(&first);
+        try std.testing.expectEqualSlices(u8, &expected, &got);
+    }
 }
 
 test "hash256 empty" {
