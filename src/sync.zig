@@ -1135,8 +1135,10 @@ pub const BlockDownloader = struct {
         const tx_hashes = arena_alloc.alloc(types.Hash256, block.transactions.len) catch
             return BlockDownloadError.OutOfMemory;
         for (block.transactions, 0..) |tx, i| {
-            tx_hashes[i] = crypto.computeTxid(&tx, arena_alloc) catch
-                return BlockDownloadError.OutOfMemory;
+            // W67b: use streaming SHA-256 txid directly — it's alloc-free,
+            // can't fail, and the wrapper computeTxid already forwards here
+            // anyway. Drops the dead allocator arg and the bogus error path.
+            tx_hashes[i] = crypto.computeTxidStreaming(&tx);
         }
         const computed_root = crypto.computeMerkleRoot(tx_hashes, arena_alloc) catch
             return BlockDownloadError.OutOfMemory;
