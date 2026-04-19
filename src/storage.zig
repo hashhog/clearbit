@@ -2132,6 +2132,23 @@ pub const ChainState = struct {
         var dirty_keys = std.ArrayList([36]u8).init(self.allocator);
         defer dirty_keys.deinit();
 
+        // W73: sort keys by byte-order before append. RocksDB's memtable is an
+        // ordered SkipList; sorted inserts reduce per-op comparison cost and
+        // align with downstream LSM compaction. Safe in-place sort — semantics
+        // are unchanged because (a) deletes always batch before puts regardless
+        // of iteration order, (b) RocksDB writeBatch applies ops in array order
+        // so last-write-wins for duplicate keys is preserved, (c) a key cannot
+        // appear in both pending_deletes and dirty_keys within one flush window
+        // in the normal add/spend flow (only in BIP-30 duplicate-coinbase, which
+        // is past activation height).
+        const KeyLess = struct {
+            fn lt(_: void, a: [36]u8, b: [36]u8) bool {
+                return std.mem.lessThan(u8, &a, &b);
+            }
+        };
+        std.mem.sort([36]u8, self.utxo_set.pending_deletes.items, {}, KeyLess.lt);
+        std.mem.sort([36]u8, self.utxo_set.dirty_keys.items, {}, KeyLess.lt);
+
         // 1. Pending UTXO deletes (spent outputs to remove from DB).
         //    Previously flushed as a SEPARATE batch before this function's
         //    main batch, which was not atomic with the tip update.
