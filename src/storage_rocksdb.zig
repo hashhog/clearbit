@@ -228,6 +228,86 @@ pub fn dbGet(db: *storage.Database, cf_index: usize, key: []const u8) storage.St
     return result;
 }
 
+/// Batch point-lookup across a single column family.  results[i] corresponds
+/// to keys[i]: null on miss, allocated slice on hit (caller owns via the
+/// Database.allocator and must free each non-null result).  Per-key FFI
+/// errors are squashed into `null` results — RocksDB's errs array tends to
+/// signal things like corrupt SSTs per key; treating as miss is safe because
+/// UTXO callers fall through to cache-miss semantics anyway.
+pub fn dbMultiGet(
+    db: *storage.Database,
+    cf_index: usize,
+    keys: []const []const u8,
+    results: []?[]u8,
+) storage.StorageError!void {
+    std.debug.assert(results.len == keys.len);
+    if (keys.len == 0) return;
+
+    const state: *DbState = @ptrCast(@alignCast(db.handle));
+    const a = state.allocator;
+
+    const cfs = a.alloc(?*c.rocksdb_column_family_handle_t, keys.len) catch
+        return storage.StorageError.OutOfMemory;
+    defer a.free(cfs);
+    const key_ptrs = a.alloc([*c]const u8, keys.len) catch
+        return storage.StorageError.OutOfMemory;
+    defer a.free(key_ptrs);
+    const key_sizes = a.alloc(usize, keys.len) catch
+        return storage.StorageError.OutOfMemory;
+    defer a.free(key_sizes);
+    const val_ptrs = a.alloc([*c]u8, keys.len) catch
+        return storage.StorageError.OutOfMemory;
+    defer a.free(val_ptrs);
+    const val_sizes = a.alloc(usize, keys.len) catch
+        return storage.StorageError.OutOfMemory;
+    defer a.free(val_sizes);
+    const errs = a.alloc(?[*:0]u8, keys.len) catch
+        return storage.StorageError.OutOfMemory;
+    defer a.free(errs);
+
+    for (keys, 0..) |k, i| {
+        cfs[i] = state.cf_handles[cf_index];
+        key_ptrs[i] = k.ptr;
+        key_sizes[i] = k.len;
+        val_ptrs[i] = null;
+        val_sizes[i] = 0;
+        errs[i] = null;
+    }
+
+    c.rocksdb_multi_get_cf(
+        state.db,
+        state.read_options,
+        @ptrCast(cfs.ptr),
+        keys.len,
+        @ptrCast(key_ptrs.ptr),
+        key_sizes.ptr,
+        @ptrCast(val_ptrs.ptr),
+        val_sizes.ptr,
+        @ptrCast(errs.ptr),
+    );
+
+    for (0..keys.len) |i| {
+        if (errs[i]) |err| {
+            c.rocksdb_free(@ptrCast(err));
+            if (val_ptrs[i] != null) c.rocksdb_free(@ptrCast(val_ptrs[i]));
+            results[i] = null;
+            continue;
+        }
+        if (val_ptrs[i] == null) {
+            results[i] = null;
+            continue;
+        }
+        const copy = a.alloc(u8, val_sizes[i]) catch {
+            c.rocksdb_free(@ptrCast(val_ptrs[i]));
+            results[i] = null;
+            continue;
+        };
+        @memcpy(copy, val_ptrs[i][0..val_sizes[i]]);
+        c.rocksdb_free(@ptrCast(val_ptrs[i]));
+        results[i] = copy;
+    }
+}
+
 /// Put a key-value pair into a column family.
 pub fn dbPut(db: *storage.Database, cf_index: usize, key: []const u8, value: []const u8) storage.StorageError!void {
     const state: *DbState = @ptrCast(@alignCast(db.handle));
