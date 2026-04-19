@@ -276,6 +276,11 @@ pub const Peer = struct {
     /// Whether this peer is protected from stale tip eviction.
     chain_sync_protected: bool,
 
+    /// Clock offset (seconds) from the peer's VERSION message timestamp:
+    /// peer_version_timestamp - our_time_at_receipt.  Matches Bitcoin Core's
+    /// CNode::nTimeOffset.  Zero until VERSION has been received.
+    time_offset: i64 = 0,
+
     /// BIP-324 v2 transport protocol version.
     transport_version: TransportVersion = .v1,
 
@@ -530,6 +535,7 @@ pub const Peer = struct {
                     self.services = v.services;
                     self.start_height = v.start_height;
                     self.is_witness_capable = (v.services & p2p.NODE_WITNESS) != 0;
+                    self.time_offset = v.timestamp - std.time.timestamp();
                 },
                 else => return PeerError.HandshakeFailed,
             }
@@ -581,6 +587,7 @@ pub const Peer = struct {
                     self.services = v.services;
                     self.start_height = v.start_height;
                     self.is_witness_capable = (v.services & p2p.NODE_WITNESS) != 0;
+                    self.time_offset = v.timestamp - std.time.timestamp();
                 },
                 else => return PeerError.HandshakeFailed,
             }
