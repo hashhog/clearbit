@@ -821,6 +821,13 @@ const UtxoKeyContext = struct {
     }
 };
 
+/// Matches Bitcoin Core's LargeCoinsCacheThreshold() at
+/// `bitcoin-core/src/validation.h:518`: the UTXO cache is considered "large"
+/// when usage is within `LARGE_THRESHOLD_HEADROOM` of the configured cap.
+/// At that point Core calls `CCoinsViewCache::Flush()` (write dirty, wipe
+/// cache); we mirror that in `evictCache` below.
+const LARGE_THRESHOLD_HEADROOM: usize = 10 * 1024 * 1024; // 10 MiB
+
 /// Provides efficient lookups with a configurable cache size for IBD performance.
 pub const UtxoSet = struct {
     db: ?*Database,
@@ -940,7 +947,7 @@ pub const UtxoSet = struct {
             self.adds_since_eviction_check += 1;
             if (!self.suppress_eviction and self.adds_since_eviction_check >= 1000) {
                 self.adds_since_eviction_check = 0;
-                if (self.cacheMemoryUsage() > self.max_cache_size) {
+                if (self.cacheMemoryUsage() > self.max_cache_size -| LARGE_THRESHOLD_HEADROOM) {
                     self.evictCache();
                 }
             }
@@ -1102,7 +1109,7 @@ pub const UtxoSet = struct {
         self.adds_since_eviction_check += 1;
         if (!self.suppress_eviction and self.adds_since_eviction_check >= 1000) {
             self.adds_since_eviction_check = 0;
-            if (self.cacheMemoryUsage() > self.max_cache_size) {
+            if (self.cacheMemoryUsage() > self.max_cache_size -| LARGE_THRESHOLD_HEADROOM) {
                 self.evictCache();
             }
         }
@@ -1118,97 +1125,85 @@ pub const UtxoSet = struct {
         self.total_amount += output.value;
     }
 
-    /// Evict entries from the cache to reduce memory usage.
-    /// When a DB backend is available, flushes dirty entries first then evicts clean ones.
-    /// When running in memory-only mode (no DB), evicts dirty entries directly since
-    /// there is nowhere to persist them -- spent UTXOs are already gone and unspent
-    /// ones can be re-fetched from the block chain if needed (though in practice
-    /// memory-only mode accepts the data loss on eviction).
+    /// Evict cache entries when memory usage approaches `max_cache_size`.
+    ///
+    /// Mirrors Bitcoin Core's `CCoinsViewCache::Flush()` at
+    /// `bitcoin-core/src/coins.cpp:279-299`: write all dirty entries to the
+    /// backing database, then wipe the entire cache.  Callers are expected
+    /// to fire eviction once usage crosses `max_cache_size - LARGE_THRESHOLD_HEADROOM`
+    /// (the Core `LargeCoinsCacheThreshold` at `validation.h:518`).
+    ///
+    /// When `suppress_eviction` is set (mid-block connection), we cannot
+    /// safely flush partial state, so the fallback `evictCleanOnly` drops
+    /// only clean non-fresh entries.
     fn evictCache(self: *UtxoSet) void {
         // Without a DB backend, eviction permanently loses UTXO data.
         // Only evict when we have a database to fall back to.
         if (self.db == null) return;
 
-        if (!self.suppress_eviction) {
-            // Normal path: flush dirty entries first (atomically with tip if
-            // ChainState is wired up), then evict clean entries.
-            if (self.parent) |cs| {
-                cs.flush() catch |err| {
-                    std.debug.print("UTXO evictCache: atomic flush failed with {}, skipping eviction\n", .{err});
-                    return;
-                };
-            } else {
-                self.flush() catch |err| {
-                    std.debug.print("UTXO evictCache: flush failed with {}, skipping eviction to prevent data loss\n", .{err});
-                    return;
-                };
-            }
+        if (self.suppress_eviction) {
+            self.evictCleanOnly();
+            return;
         }
-        // When suppress_eviction is true (mid-block connection), we skip the
-        // flush but still evict CLEAN entries.  This prevents OOM from cache
-        // growth during large blocks while avoiding mid-block flushes that
-        // write partial state.
 
+        // Flush all dirty entries to DB (atomically with tip via ChainState
+        // when wired up) before wiping the cache.
+        if (self.parent) |cs| {
+            cs.flush() catch |err| {
+                std.debug.print("UTXO evictCache: atomic flush failed with {}, skipping eviction\n", .{err});
+                return;
+            };
+        } else {
+            self.flush() catch |err| {
+                std.debug.print("UTXO evictCache: flush failed with {}, skipping eviction to prevent data loss\n", .{err});
+                return;
+            };
+        }
+
+        const count_before = self.cache.count();
+
+        // Deinit every entry to free its variable-length script bytes.
+        var iter = self.cache.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+
+        // Matches `CCoinsMap::clear()` in Bitcoin Core: drop the contents
+        // but retain the bucket array.  Next block's inserts skip the
+        // initial rehash; the memory is returned to the allocator's pool
+        // as subsequent blocks cycle through it.
+        self.cache.clearRetainingCapacity();
+
+        if (count_before > 0) {
+            std.debug.print("UTXO cache flush-and-wipe: {d} entries cleared\n", .{count_before});
+        }
+    }
+
+    /// Defense-in-depth fallback used when `suppress_eviction` is set (we
+    /// are mid-block-connect and cannot flush partial state).  Drops only
+    /// clean non-fresh entries — dropping a fresh entry would permanently
+    /// lose a UTXO that exists only in the cache, and dropping a dirty one
+    /// would lose a pending DB write.
+    fn evictCleanOnly(self: *UtxoSet) void {
         var to_remove = std.ArrayList([36]u8).init(self.allocator);
         defer to_remove.deinit();
 
-        const target_count = self.cache.count() / 2;
-        var removed: usize = 0;
-
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
-            if (removed >= target_count) break;
-            // Evict only entries that are (a) clean — not pending a DB write —
-            // AND (b) not fresh — already exist in DB.  Evicting a fresh entry
-            // (created in cache, never flushed) would permanently lose it: not
-            // in cache, not on disk.  Under the current call graph evictCache
-            // is always invoked post-flush (when no entries should be fresh),
-            // but this check is defense-in-depth against future refactors that
-            // might call eviction with dirty_keys partially flushed, or where
-            // the flush call at the top of this function silently skipped
-            // some entries.  Matches CCoinsViewCache semantics in Bitcoin Core.
-            if (self.db == null or
-                (!entry.value_ptr.dirty and !entry.value_ptr.fresh))
-            {
+            if (!entry.value_ptr.dirty and !entry.value_ptr.fresh) {
                 to_remove.append(entry.key_ptr.*) catch break;
-                removed += 1;
             }
         }
 
         for (to_remove.items) |key_to_remove| {
             if (self.cache.fetchRemove(key_to_remove)) |old| {
-                var entry = old.value;
-                entry.deinit(self.allocator);
+                var e = old.value;
+                e.deinit(self.allocator);
             }
         }
 
         if (to_remove.items.len > 0) {
-            std.debug.print("UTXO cache eviction: removed {d} entries, {d} remaining\n", .{ to_remove.items.len, self.cache.count() });
-
-            // Rebuild the HashMap to actually release memory.
-            // Zig's HashMap never shrinks its backing arrays on remove(),
-            // so after evicting half the entries the RSS stays the same.
-            // Rebuilding into a right-sized HashMap frees the old arrays.
-            const remaining = self.cache.count();
-            var new_cache = std.HashMap([36]u8, CacheEntry, UtxoKeyContext, std.hash_map.default_max_load_percentage).init(self.allocator);
-            new_cache.ensureTotalCapacity(@intCast(remaining + remaining / 4)) catch {
-                // If we can't allocate the new map, keep the old one.
-                return;
-            };
-            var copy_iter = self.cache.iterator();
-            while (copy_iter.next()) |entry| {
-                new_cache.put(entry.key_ptr.*, entry.value_ptr.*) catch break;
-            }
-            // Free old backing arrays (but NOT the entries, which are now in new_cache).
-            self.cache.clearRetainingCapacity();
-            self.cache.deinit();
-            self.cache = new_cache;
-
-            // Force glibc to return freed pages to the OS.
-            // Without this, malloc keeps freed memory in its free lists
-            // and RSS never decreases after eviction.
-            const c = @cImport(@cInclude("malloc.h"));
-            _ = c.malloc_trim(0);
+            std.debug.print("UTXO cache clean-only eviction: dropped {d} entries (suppress_eviction=true)\n", .{to_remove.items.len});
         }
     }
 
@@ -2179,7 +2174,7 @@ pub const ChainState = struct {
         var evict_ns_block: u64 = 0;
         var evict_fired: bool = false;
         if (height % 10 == 0 and
-            self.utxo_set.cacheMemoryUsage() > self.utxo_set.max_cache_size)
+            self.utxo_set.cacheMemoryUsage() > self.utxo_set.max_cache_size -| LARGE_THRESHOLD_HEADROOM)
         {
             const t_evict_start = std.time.nanoTimestamp();
             self.utxo_set.evictCache();
