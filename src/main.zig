@@ -56,7 +56,10 @@ pub const Config = struct {
     // Storage
     datadir: []const u8 = "~/.clearbit",
     prune: u64 = 0, // 0 = no pruning, else target size in MiB
-    dbcache: u64 = 2048, // UTXO cache size in MiB
+    // Match Bitcoin Core's DEFAULT_KERNEL_CACHE (450 MiB) so clearbit runs
+    // well on modest-RAM machines without an explicit --dbcache flag. Users
+    // with more RAM can raise it freely; no upper clamp (see parse paths).
+    dbcache: u64 = 450, // UTXO cache size in MiB
     txindex: bool = false,
     blockfilterindex: bool = false, // BIP-157/158 compact block filters
     coinstatsindex: bool = false, // Per-block UTXO statistics
@@ -188,8 +191,10 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         else if (std.mem.startsWith(u8, arg, "--dbcache=")) {
             config.dbcache = std.fmt.parseInt(u64, arg["--dbcache=".len..], 10) catch
                 return ArgParseError.InvalidCacheSize;
-            // Cap at 8 GiB to prevent runaway memory usage
-            if (config.dbcache > 8192) config.dbcache = 8192;
+            // No upper clamp: matches Bitcoin Core (src/node/caches.cpp) which
+            // accepts any value on 64-bit and warns only if > 75% of total RAM.
+            // The old 8 GiB ceiling capped a 128-GB box's UTXO cache at 6% of
+            // RAM for no principled reason.
         } else if (std.mem.startsWith(u8, arg, "--prune=")) {
             config.prune = std.fmt.parseInt(u64, arg["--prune=".len..], 10) catch
                 return ArgParseError.InvalidArgument;
@@ -415,7 +420,7 @@ pub fn loadConfigFile(
             // Storage settings
             else if (std.mem.eql(u8, key, "dbcache")) {
                 config.dbcache = std.fmt.parseInt(u64, value, 10) catch continue;
-                if (config.dbcache > 8192) config.dbcache = 8192;
+                // No upper clamp; see CLI parse path above.
             } else if (std.mem.eql(u8, key, "prune")) {
                 config.prune = std.fmt.parseInt(u64, value, 10) catch continue;
             } else if (std.mem.eql(u8, key, "txindex")) {
