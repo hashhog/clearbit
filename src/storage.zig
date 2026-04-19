@@ -1640,6 +1640,30 @@ pub const ChainState = struct {
     /// stuck-at-370001 corruption mode (Option A, wave2-2026-04-14).
     flush_error: bool = false,
 
+    // W73 phase profiling — populated under connect_mutex so no atomics.
+    // Summary line emitted every 100 blocks in connectBlockFast. Targets
+    // the actual mainnet IBD bottleneck (UTXO ops + flush), not script
+    // verify (which peer.zig's drainBlockBuffer path bypasses entirely).
+    profile_blocks: u64 = 0,
+    profile_spend_ns_sum: u64 = 0,
+    profile_spend_ns_max: u64 = 0,
+    profile_create_ns_sum: u64 = 0,
+    profile_create_ns_max: u64 = 0,
+    profile_evict_ns_sum: u64 = 0,
+    profile_evict_count: u64 = 0,
+    profile_flush_ns_sum: u64 = 0,
+    profile_flush_ns_max: u64 = 0,
+    profile_total_ns_sum: u64 = 0,
+    profile_total_ns_max: u64 = 0,
+    profile_input_count: u64 = 0,
+    profile_output_count: u64 = 0,
+    // Scratch fields for connectBlockInner → connectBlockFast handoff.
+    // Holds the current block's per-phase ns; connectBlockFast reads
+    // and rolls them into the 100-block running sums/maxes above.
+    profile_cur_spend_ns: u64 = 0,
+    profile_cur_create_ns: u64 = 0,
+    profile_cur_evict_ns: u64 = 0,
+
     /// Undo data for a connected block — needed for disconnection during reorgs.
     /// This is the in-memory representation used during block connection.
     pub const BlockUndo = struct {
@@ -1821,6 +1845,7 @@ pub const ChainState = struct {
             return error.FlushError;
         }
 
+        const t_block_start = std.time.nanoTimestamp();
         var undo = try self.connectBlockInner(block, hash, height, true);
         undo.deinit(self.allocator);
 
@@ -1831,11 +1856,68 @@ pub const ChainState = struct {
         // outputs were never persisted (the stuck-at-370001 bug).
         // Flushing every block makes SIGKILL self-healing because tip and
         // UTXOs advance lock-step (Option A, wave2-2026-04-14).
+        const t_flush_start = std.time.nanoTimestamp();
         self.flush() catch |err| {
             std.debug.print("connectBlockFast: flush failed at height {d}: {} — halting IBD\n", .{ height, err });
             self.flush_error = true;
             return error.FlushError;
         };
+        const t_flush_end = std.time.nanoTimestamp();
+
+        // W73 phase profiling — roll up this block's times into 100-block
+        // running sums/maxes, emit summary every 100 blocks, and reset.
+        const spend_ns = self.profile_cur_spend_ns;
+        const create_ns = self.profile_cur_create_ns;
+        const evict_ns = self.profile_cur_evict_ns;
+        const flush_ns = @as(u64, @intCast(t_flush_end - t_flush_start));
+        const total_ns = @as(u64, @intCast(t_flush_end - t_block_start));
+
+        self.profile_blocks += 1;
+        self.profile_spend_ns_sum += spend_ns;
+        if (spend_ns > self.profile_spend_ns_max) self.profile_spend_ns_max = spend_ns;
+        self.profile_create_ns_sum += create_ns;
+        if (create_ns > self.profile_create_ns_max) self.profile_create_ns_max = create_ns;
+        self.profile_evict_ns_sum += evict_ns;
+        self.profile_flush_ns_sum += flush_ns;
+        if (flush_ns > self.profile_flush_ns_max) self.profile_flush_ns_max = flush_ns;
+        self.profile_total_ns_sum += total_ns;
+        if (total_ns > self.profile_total_ns_max) self.profile_total_ns_max = total_ns;
+
+        if (self.profile_blocks >= 100) {
+            const n = self.profile_blocks;
+            std.debug.print(
+                "[W73-PROF] block={d} n={d} spend={d}us/avg {d}us/max create={d}us/avg {d}us/max flush={d}us/avg {d}us/max evict={d}fires {d}us/sum total={d}us/avg {d}us/max ins/blk={d} outs/blk={d}\n",
+                .{
+                    height,
+                    n,
+                    self.profile_spend_ns_sum / n / 1000,
+                    self.profile_spend_ns_max / 1000,
+                    self.profile_create_ns_sum / n / 1000,
+                    self.profile_create_ns_max / 1000,
+                    self.profile_flush_ns_sum / n / 1000,
+                    self.profile_flush_ns_max / 1000,
+                    self.profile_evict_count,
+                    self.profile_evict_ns_sum / 1000,
+                    self.profile_total_ns_sum / n / 1000,
+                    self.profile_total_ns_max / 1000,
+                    self.profile_input_count / n,
+                    self.profile_output_count / n,
+                },
+            );
+            self.profile_blocks = 0;
+            self.profile_spend_ns_sum = 0;
+            self.profile_spend_ns_max = 0;
+            self.profile_create_ns_sum = 0;
+            self.profile_create_ns_max = 0;
+            self.profile_evict_ns_sum = 0;
+            self.profile_evict_count = 0;
+            self.profile_flush_ns_sum = 0;
+            self.profile_flush_ns_max = 0;
+            self.profile_total_ns_sum = 0;
+            self.profile_total_ns_max = 0;
+            self.profile_input_count = 0;
+            self.profile_output_count = 0;
+        }
     }
 
     fn connectBlockInner(
@@ -1883,11 +1965,19 @@ pub const ChainState = struct {
         var created_list = std.ArrayList(types.OutPoint).init(self.allocator);
         errdefer created_list.deinit();
 
+        // W73 per-block phase accumulators.  Written to ChainState scratch
+        // fields on success; connectBlockFast reads them.
+        var spend_ns_block: u64 = 0;
+        var create_ns_block: u64 = 0;
+        var input_count_block: u64 = 0;
+        var output_count_block: u64 = 0;
+
         for (block.transactions, 0..) |tx, tx_idx| {
             const tx_hash = crypto.computeTxidStreaming(&tx);
 
             // Spend inputs (skip coinbase)
             if (tx_idx > 0) {
+                const t_spend_start = std.time.nanoTimestamp();
                 for (tx.inputs, 0..) |input, input_idx| {
                     if (skip_undo) {
                         // Fast path: just delete the UTXO, don't track what was spent
@@ -1917,9 +2007,13 @@ pub const ChainState = struct {
                         });
                     }
                 }
+                const t_spend_end = std.time.nanoTimestamp();
+                spend_ns_block += @as(u64, @intCast(t_spend_end - t_spend_start));
+                input_count_block += @as(u64, @intCast(tx.inputs.len));
             }
 
             // Create outputs
+            const t_create_start = std.time.nanoTimestamp();
             for (tx.outputs, 0..) |output, out_idx| {
                 // Skip OP_RETURN outputs (unspendable)
                 if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) continue;
@@ -1933,6 +2027,9 @@ pub const ChainState = struct {
                     try created_list.append(outpoint);
                 }
             }
+            const t_create_end = std.time.nanoTimestamp();
+            create_ns_block += @as(u64, @intCast(t_create_end - t_create_start));
+            output_count_block += @as(u64, @intCast(tx.outputs.len));
         }
 
         self.best_hash = hash.*;
@@ -1945,11 +2042,25 @@ pub const ChainState = struct {
         // ~10 blocks of UTXOs, which is negligible compared to the cache size.
         // This dramatically reduces eviction stalls during rapid block import
         // (IBD or sequential feeding via submitblock RPC).
+        var evict_ns_block: u64 = 0;
+        var evict_fired: bool = false;
         if (height % 10 == 0 and
             self.utxo_set.cacheMemoryUsage() > self.utxo_set.max_cache_size)
         {
+            const t_evict_start = std.time.nanoTimestamp();
             self.utxo_set.evictCache();
+            const t_evict_end = std.time.nanoTimestamp();
+            evict_ns_block = @as(u64, @intCast(t_evict_end - t_evict_start));
+            evict_fired = true;
         }
+
+        // W73: stash per-block phase totals for connectBlockFast to roll up.
+        self.profile_cur_spend_ns = spend_ns_block;
+        self.profile_cur_create_ns = create_ns_block;
+        self.profile_cur_evict_ns = evict_ns_block;
+        self.profile_input_count += input_count_block;
+        self.profile_output_count += output_count_block;
+        if (evict_fired) self.profile_evict_count += 1;
 
         return BlockUndo{
             .spent_utxos = if (skip_undo) &[_]BlockUndo.SpentUtxo{} else try spent_list.toOwnedSlice(),
