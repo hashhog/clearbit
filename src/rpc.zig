@@ -1372,13 +1372,14 @@ pub const RpcServer = struct {
             }
 
             const ping_display: i64 = if (peer.min_ping_time == std.math.maxInt(i64)) 0 else peer.min_ping_time;
-            try writer.print("],\"relaytxes\":{},\"lastsend\":{d},\"lastrecv\":{d},\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":0,\"pingtime\":{d},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"connection_type\":\"{s}\"}}", .{
+            try writer.print("],\"relaytxes\":{},\"lastsend\":{d},\"lastrecv\":{d},\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"connection_type\":\"{s}\"}}", .{
                 peer.relay_txs,
                 peer.last_message_time,
                 peer.last_message_time,
                 peer.bytes_sent,
                 peer.bytes_received,
                 peer.connect_time,
+                peer.time_offset,
                 ping_display,
                 if (peer.version_info) |v| v.version else 0,
                 if (peer.version_info) |v| v.user_agent else "",
