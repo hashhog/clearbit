@@ -131,6 +131,18 @@ pub const Database = struct {
         return storage_rocksdb.dbGet(self, cf_index, key);
     }
 
+    /// Batch point-lookup across a single column family.  results[i]
+    /// corresponds to keys[i]: null on miss, allocated slice on hit.
+    /// Caller owns each non-null result (must free via self.allocator).
+    pub fn multiGet(
+        self: *Database,
+        cf_index: usize,
+        keys: []const []const u8,
+        results: []?[]u8,
+    ) StorageError!void {
+        return storage_rocksdb.dbMultiGet(self, cf_index, keys, results);
+    }
+
     /// Put a key-value pair into a column family.
     pub fn put(self: *Database, cf_index: usize, key: []const u8, value: []const u8) StorageError!void {
         return storage_rocksdb.dbPut(self, cf_index, key, value);
@@ -960,6 +972,101 @@ pub const UtxoSet = struct {
         return false;
     }
 
+    /// W73 Fix 1 — batch-prefetch all cache-missing inputs of a block into
+    /// the cache before the per-tx spend loop runs.  Cuts N one-by-one
+    /// RocksDB round-trips per block down to a single `rocksdb_multi_get_cf`.
+    ///
+    /// Contract:
+    ///   - Read-only w.r.t. the DB; only mutates the in-memory cache.
+    ///   - Skips coinbase (tx 0 has no real inputs).
+    ///   - Skips inputs already in cache (created in earlier block, or
+    ///     intra-block outputs created by a prior tx — neither needs a DB
+    ///     round-trip, and intra-block creates would not yet be on disk
+    ///     so the multi-get would return null for them anyway).
+    ///   - A miss (multi-get returns null) is fine: subsequent `spend()`
+    ///     falls through its existing cache-miss → DB path.  Prefetch is
+    ///     pure warming; it can never cause a spend to fail that would
+    ///     otherwise have succeeded.
+    ///   - Returns count of DB hits added to cache (for W73-PROF stats).
+    ///
+    /// Safety: the UTXO entries populated here are marked `dirty=false,
+    /// fresh=false`.  If a later intra-block spend removes them, pending
+    /// _deletes picks them up correctly (fresh=false path).  If they
+    /// survive the block, they stay in cache without polluting the dirty
+    /// set.  Cache size accounting falls out of evictCache's existing
+    /// sizing, so no new footgun vs. the read-through path in `get()`.
+    pub fn prefetchBlockInputs(self: *UtxoSet, block: *const types.Block) !usize {
+        if (self.db == null) return 0;
+        if (block.transactions.len <= 1) return 0;
+
+        // Collect cache-miss keys.  Stable backing store: keys are stored
+        // by value in miss_keys, and key_slices points into that storage
+        // — so we must finalize miss_keys (no appends) before slicing.
+        var miss_keys = std.ArrayList([36]u8).init(self.allocator);
+        defer miss_keys.deinit();
+        // Reserve capacity: upper bound is sum of tx.inputs.len across
+        // non-coinbase txs.  Avoids growth-realloc invalidating slices.
+        var upper: usize = 0;
+        for (block.transactions[1..]) |tx| upper += tx.inputs.len;
+        try miss_keys.ensureTotalCapacity(upper);
+
+        for (block.transactions[1..]) |tx| {
+            for (tx.inputs) |input| {
+                const key = makeUtxoKey(&input.previous_output);
+                if (self.cache.contains(key)) continue;
+                miss_keys.appendAssumeCapacity(key);
+            }
+        }
+
+        if (miss_keys.items.len == 0) return 0;
+
+        const key_slices = try self.allocator.alloc([]const u8, miss_keys.items.len);
+        defer self.allocator.free(key_slices);
+        for (miss_keys.items, 0..) |*k, i| {
+            key_slices[i] = k[0..];
+        }
+
+        const results = try self.allocator.alloc(?[]u8, miss_keys.items.len);
+        defer {
+            // Any result we did NOT move into the cache (e.g. decode error
+            // or cache.put OOM) is freed here.  Entries that landed in the
+            // cache have already been swapped to null in the loop below.
+            for (results) |r| if (r) |v| self.allocator.free(v);
+            self.allocator.free(results);
+        }
+
+        try self.db.?.multiGet(CF_UTXO, key_slices, results);
+
+        var hits: usize = 0;
+        for (miss_keys.items, 0..) |key, i| {
+            const data = results[i] orelse continue;
+            const utxo = CompactUtxo.decode(data, self.allocator) catch {
+                // Corrupt record — leave in results[i] so defer frees it.
+                continue;
+            };
+            // Entry is clean, not fresh (came from DB).  Same shape as the
+            // read-through branch in `get()` at line ~935.
+            self.cache.put(key, CacheEntry{
+                .utxo = utxo,
+                .dirty = false,
+                .fresh = false,
+            }) catch {
+                var u = utxo;
+                u.deinit(self.allocator);
+                continue;
+            };
+            // Transfer ownership: data (results[i]) is still allocated; we
+            // freed the decoded utxo from it but the original slice is our
+            // job to free.  Null it so the defer doesn't double-free.
+            self.allocator.free(data);
+            results[i] = null;
+            self.misses += 1; // account as a miss (read-through filled it)
+            hits += 1;
+        }
+
+        return hits;
+    }
+
     /// Add a UTXO to the set.
     pub fn add(
         self: *UtxoSet,
@@ -1657,12 +1764,19 @@ pub const ChainState = struct {
     profile_total_ns_max: u64 = 0,
     profile_input_count: u64 = 0,
     profile_output_count: u64 = 0,
+    // W73 Fix 1 — prefetch phase (batched UTXO multi-get before per-tx
+    // spend loop).  Both per-block scratch and 100-block rollup.
+    profile_prefetch_ns_sum: u64 = 0,
+    profile_prefetch_ns_max: u64 = 0,
+    profile_prefetch_hits_sum: u64 = 0,
     // Scratch fields for connectBlockInner → connectBlockFast handoff.
     // Holds the current block's per-phase ns; connectBlockFast reads
     // and rolls them into the 100-block running sums/maxes above.
     profile_cur_spend_ns: u64 = 0,
     profile_cur_create_ns: u64 = 0,
     profile_cur_evict_ns: u64 = 0,
+    profile_cur_prefetch_ns: u64 = 0,
+    profile_cur_prefetch_hits: u64 = 0,
 
     /// Undo data for a connected block — needed for disconnection during reorgs.
     /// This is the in-memory representation used during block connection.
@@ -1869,6 +1983,8 @@ pub const ChainState = struct {
         const spend_ns = self.profile_cur_spend_ns;
         const create_ns = self.profile_cur_create_ns;
         const evict_ns = self.profile_cur_evict_ns;
+        const prefetch_ns = self.profile_cur_prefetch_ns;
+        const prefetch_hits = self.profile_cur_prefetch_hits;
         const flush_ns = @as(u64, @intCast(t_flush_end - t_flush_start));
         const total_ns = @as(u64, @intCast(t_flush_end - t_block_start));
 
@@ -1878,6 +1994,9 @@ pub const ChainState = struct {
         self.profile_create_ns_sum += create_ns;
         if (create_ns > self.profile_create_ns_max) self.profile_create_ns_max = create_ns;
         self.profile_evict_ns_sum += evict_ns;
+        self.profile_prefetch_ns_sum += prefetch_ns;
+        if (prefetch_ns > self.profile_prefetch_ns_max) self.profile_prefetch_ns_max = prefetch_ns;
+        self.profile_prefetch_hits_sum += prefetch_hits;
         self.profile_flush_ns_sum += flush_ns;
         if (flush_ns > self.profile_flush_ns_max) self.profile_flush_ns_max = flush_ns;
         self.profile_total_ns_sum += total_ns;
@@ -1886,10 +2005,13 @@ pub const ChainState = struct {
         if (self.profile_blocks >= 100) {
             const n = self.profile_blocks;
             std.debug.print(
-                "[W73-PROF] block={d} n={d} spend={d}us/avg {d}us/max create={d}us/avg {d}us/max flush={d}us/avg {d}us/max evict={d}fires {d}us/sum total={d}us/avg {d}us/max ins/blk={d} outs/blk={d}\n",
+                "[W73-PROF] block={d} n={d} prefetch={d}us/avg {d}us/max hits/blk={d} spend={d}us/avg {d}us/max create={d}us/avg {d}us/max flush={d}us/avg {d}us/max evict={d}fires {d}us/sum total={d}us/avg {d}us/max ins/blk={d} outs/blk={d}\n",
                 .{
                     height,
                     n,
+                    self.profile_prefetch_ns_sum / n / 1000,
+                    self.profile_prefetch_ns_max / 1000,
+                    self.profile_prefetch_hits_sum / n,
                     self.profile_spend_ns_sum / n / 1000,
                     self.profile_spend_ns_max / 1000,
                     self.profile_create_ns_sum / n / 1000,
@@ -1911,6 +2033,9 @@ pub const ChainState = struct {
             self.profile_create_ns_max = 0;
             self.profile_evict_ns_sum = 0;
             self.profile_evict_count = 0;
+            self.profile_prefetch_ns_sum = 0;
+            self.profile_prefetch_ns_max = 0;
+            self.profile_prefetch_hits_sum = 0;
             self.profile_flush_ns_sum = 0;
             self.profile_flush_ns_max = 0;
             self.profile_total_ns_sum = 0;
@@ -1971,6 +2096,15 @@ pub const ChainState = struct {
         var create_ns_block: u64 = 0;
         var input_count_block: u64 = 0;
         var output_count_block: u64 = 0;
+
+        // W73 Fix 1 — batch-prefetch cache-missing inputs before the per-tx
+        // spend loop.  Pure cache-warm; no correctness effect on spend().
+        // Errors here are non-fatal: prefetch failure just means spend()
+        // falls through to its existing one-at-a-time DB path.
+        const t_prefetch_start = std.time.nanoTimestamp();
+        const prefetch_hits = self.utxo_set.prefetchBlockInputs(block) catch 0;
+        const t_prefetch_end = std.time.nanoTimestamp();
+        const prefetch_ns_block = @as(u64, @intCast(t_prefetch_end - t_prefetch_start));
 
         for (block.transactions, 0..) |tx, tx_idx| {
             const tx_hash = crypto.computeTxidStreaming(&tx);
@@ -2058,6 +2192,8 @@ pub const ChainState = struct {
         self.profile_cur_spend_ns = spend_ns_block;
         self.profile_cur_create_ns = create_ns_block;
         self.profile_cur_evict_ns = evict_ns_block;
+        self.profile_cur_prefetch_ns = prefetch_ns_block;
+        self.profile_cur_prefetch_hits = @as(u64, @intCast(prefetch_hits));
         self.profile_input_count += input_count_block;
         self.profile_output_count += output_count_block;
         if (evict_fired) self.profile_evict_count += 1;
