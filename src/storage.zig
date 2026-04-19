@@ -1772,6 +1772,23 @@ pub const ChainState = struct {
     profile_cur_evict_ns: u64 = 0,
     profile_cur_prefetch_ns: u64 = 0,
     profile_cur_prefetch_hits: u64 = 0,
+    // W73 Fix 3 — flush sub-phase split.  Per W73-FIX2-ALT-POST-DEPLOY-FINDINGS
+    // §5: flush dominates the tail (avg 588-864 ms, max 3-6 s per window).
+    // Before touching any batching change, we need to know which of
+    // sort / batch-build / rocksdb-write / cleanup is the cost.  Same
+    // scratch → connectBlockFast rollup pattern as the other phases above.
+    profile_cur_flush_sort_ns: u64 = 0,
+    profile_cur_flush_build_ns: u64 = 0,
+    profile_cur_flush_write_ns: u64 = 0,
+    profile_cur_flush_cleanup_ns: u64 = 0,
+    profile_flush_sort_ns_sum: u64 = 0,
+    profile_flush_sort_ns_max: u64 = 0,
+    profile_flush_build_ns_sum: u64 = 0,
+    profile_flush_build_ns_max: u64 = 0,
+    profile_flush_write_ns_sum: u64 = 0,
+    profile_flush_write_ns_max: u64 = 0,
+    profile_flush_cleanup_ns_sum: u64 = 0,
+    profile_flush_cleanup_ns_max: u64 = 0,
 
     /// Undo data for a connected block — needed for disconnection during reorgs.
     /// This is the in-memory representation used during block connection.
@@ -1982,6 +1999,11 @@ pub const ChainState = struct {
         const prefetch_hits = self.profile_cur_prefetch_hits;
         const flush_ns = @as(u64, @intCast(t_flush_end - t_flush_start));
         const total_ns = @as(u64, @intCast(t_flush_end - t_block_start));
+        // W73 Fix 3 — flush sub-phase snapshot for this block.
+        const flush_sort_ns = self.profile_cur_flush_sort_ns;
+        const flush_build_ns = self.profile_cur_flush_build_ns;
+        const flush_write_ns = self.profile_cur_flush_write_ns;
+        const flush_cleanup_ns = self.profile_cur_flush_cleanup_ns;
 
         self.profile_blocks += 1;
         self.profile_spend_ns_sum += spend_ns;
@@ -1996,6 +2018,14 @@ pub const ChainState = struct {
         if (flush_ns > self.profile_flush_ns_max) self.profile_flush_ns_max = flush_ns;
         self.profile_total_ns_sum += total_ns;
         if (total_ns > self.profile_total_ns_max) self.profile_total_ns_max = total_ns;
+        self.profile_flush_sort_ns_sum += flush_sort_ns;
+        if (flush_sort_ns > self.profile_flush_sort_ns_max) self.profile_flush_sort_ns_max = flush_sort_ns;
+        self.profile_flush_build_ns_sum += flush_build_ns;
+        if (flush_build_ns > self.profile_flush_build_ns_max) self.profile_flush_build_ns_max = flush_build_ns;
+        self.profile_flush_write_ns_sum += flush_write_ns;
+        if (flush_write_ns > self.profile_flush_write_ns_max) self.profile_flush_write_ns_max = flush_write_ns;
+        self.profile_flush_cleanup_ns_sum += flush_cleanup_ns;
+        if (flush_cleanup_ns > self.profile_flush_cleanup_ns_max) self.profile_flush_cleanup_ns_max = flush_cleanup_ns;
 
         if (self.profile_blocks >= 100) {
             const n = self.profile_blocks;
@@ -2021,6 +2051,24 @@ pub const ChainState = struct {
                     self.profile_output_count / n,
                 },
             );
+            // W73 Fix 3 — flush sub-phase rollup.  Same 100-block cadence
+            // as [W73-PROF] so operators can correlate the two lines by
+            // matching `block=` height.
+            std.debug.print(
+                "[W73-FLUSH] block={d} n={d} sort={d}us/avg {d}us/max build={d}us/avg {d}us/max write={d}us/avg {d}us/max cleanup={d}us/avg {d}us/max\n",
+                .{
+                    height,
+                    n,
+                    self.profile_flush_sort_ns_sum / n / 1000,
+                    self.profile_flush_sort_ns_max / 1000,
+                    self.profile_flush_build_ns_sum / n / 1000,
+                    self.profile_flush_build_ns_max / 1000,
+                    self.profile_flush_write_ns_sum / n / 1000,
+                    self.profile_flush_write_ns_max / 1000,
+                    self.profile_flush_cleanup_ns_sum / n / 1000,
+                    self.profile_flush_cleanup_ns_max / 1000,
+                },
+            );
             self.profile_blocks = 0;
             self.profile_spend_ns_sum = 0;
             self.profile_spend_ns_max = 0;
@@ -2037,6 +2085,14 @@ pub const ChainState = struct {
             self.profile_total_ns_max = 0;
             self.profile_input_count = 0;
             self.profile_output_count = 0;
+            self.profile_flush_sort_ns_sum = 0;
+            self.profile_flush_sort_ns_max = 0;
+            self.profile_flush_build_ns_sum = 0;
+            self.profile_flush_build_ns_max = 0;
+            self.profile_flush_write_ns_sum = 0;
+            self.profile_flush_write_ns_max = 0;
+            self.profile_flush_cleanup_ns_sum = 0;
+            self.profile_flush_cleanup_ns_max = 0;
         }
     }
 
@@ -2255,6 +2311,15 @@ pub const ChainState = struct {
         }
         const db = self.utxo_set.db.?;
 
+        // W73 Fix 3 — flush sub-phase timing.  Split flush() into sort /
+        // build / write / cleanup so the [W73-FLUSH] rollup can point at
+        // the real tail offender.  Scratch fields are written once at
+        // function end so connectBlockFast sees a consistent snapshot.
+        var flush_sort_ns: u64 = 0;
+        var flush_build_ns: u64 = 0;
+        var flush_write_ns: u64 = 0;
+        var flush_cleanup_ns: u64 = 0;
+
         // Build a single atomic batch: pending deletes + dirty UTXO puts +
         // chain tip.  Uses dirty_keys tracker for O(dirty) performance.
         var batch = std.ArrayList(BatchOp).init(self.allocator);
@@ -2277,8 +2342,11 @@ pub const ChainState = struct {
                 return std.mem.lessThan(u8, &a, &b);
             }
         };
+        const t_sort_start = std.time.nanoTimestamp();
         std.mem.sort([36]u8, self.utxo_set.pending_deletes.items, {}, KeyLess.lt);
         std.mem.sort([36]u8, self.utxo_set.dirty_keys.items, {}, KeyLess.lt);
+        flush_sort_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_sort_start));
+        const t_build_start = std.time.nanoTimestamp();
 
         // 1. Pending UTXO deletes (spent outputs to remove from DB).
         //    Previously flushed as a SEPARATE batch before this function's
@@ -2346,7 +2414,10 @@ pub const ChainState = struct {
             .value = hh_val,
         } });
 
+        flush_build_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_build_start));
+
         if (batch.items.len > 0) {
+            const t_write_start = std.time.nanoTimestamp();
             db.writeBatch(batch.items) catch |err| {
                 std.debug.print("ChainState flush: writeBatch failed with {}, {d} entries NOT persisted — setting flush_error\n", .{ err, batch.items.len });
                 // Sticky flush_error so connectBlockFast / submitBlock refuse
@@ -2367,7 +2438,9 @@ pub const ChainState = struct {
                 }
                 return err;
             };
+            flush_write_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_write_start));
 
+            const t_cleanup_start = std.time.nanoTimestamp();
             // Mark dirty entries clean AFTER successful write.
             // Also clear the FRESH flag since entries now exist in DB.
             for (dirty_keys.items) |key| {
@@ -2393,7 +2466,13 @@ pub const ChainState = struct {
                     .delete => |d| self.allocator.free(@constCast(d.key)),
                 }
             }
+            flush_cleanup_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_cleanup_start));
         }
+
+        self.profile_cur_flush_sort_ns = flush_sort_ns;
+        self.profile_cur_flush_build_ns = flush_build_ns;
+        self.profile_cur_flush_write_ns = flush_write_ns;
+        self.profile_cur_flush_cleanup_ns = flush_cleanup_ns;
     }
 
     /// Connect a block and persist undo data to file.
