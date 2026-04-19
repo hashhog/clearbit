@@ -3000,6 +3000,28 @@ pub const PeerManager = struct {
                 }
             }
 
+            // W73 Fix 2 — compaction-aware backoff.  When prefetch exceeds
+            // 500 ms the RocksDB compaction mutex was almost certainly
+            // blocking our multi_get.  Yield briefly so in-flight compaction
+            // can drain before the next block's prefetch hits the same lock.
+            //
+            // Per wave47-2026-04-16/W73-FIX1-POST-DEPLOY-FINDINGS.md §4,
+            // observed slow-prefetch tails run 2-4 s while the happy path is
+            // 23-280 ms; 500 ms separates the tail cleanly.  Gate telemetry:
+            // the existing [W73-PROF] 100-block rollup already emits
+            // prefetch avg/max; compare pre/post restart windows to decide
+            // if the backoff helps.  100 ms sleep is capped to <20% of the
+            // smallest observed tail so cost is bounded even on false hits.
+            const prefetch_ns = cs.profile_cur_prefetch_ns;
+            if (prefetch_ns > 500 * std.time.ns_per_ms) {
+                std.debug.print("[W73-STALL] block={d} prefetch={d}ms hits={d} — backoff 100ms\n", .{
+                    height,
+                    @divTrunc(prefetch_ns, std.time.ns_per_ms),
+                    cs.profile_cur_prefetch_hits,
+                });
+                std.time.sleep(100 * std.time.ns_per_ms);
+            }
+
             // W21 fix: heartbeat every 5 s during long drains.  With large
             // UTXO sets (>1.7 M entries) individual flushes take 50ms-3 s,
             // so a 134-block drain is 43 s of silence.  The heartbeat lets
