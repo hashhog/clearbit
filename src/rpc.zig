@@ -1371,13 +1371,21 @@ pub const RpcServer = struct {
                 try writer.writeAll("\"NETWORK_LIMITED\"");
             }
 
-            try writer.print("],\"relaytxes\":true,\"lastsend\":0,\"lastrecv\":0,\"bytessent\":0,\"bytesrecv\":0,\"conntime\":0,\"timeoffset\":0,\"pingtime\":0,\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"connection_type\":\"{s}\"}}", .{
+            const ping_display: i64 = if (peer.min_ping_time == std.math.maxInt(i64)) 0 else peer.min_ping_time;
+            try writer.print("],\"relaytxes\":{},\"lastsend\":{d},\"lastrecv\":{d},\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":0,\"pingtime\":{d},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"connection_type\":\"{s}\"}}", .{
+                peer.relay_txs,
+                peer.last_message_time,
+                peer.last_message_time,
+                peer.bytes_sent,
+                peer.bytes_received,
+                peer.connect_time,
+                ping_display,
                 if (peer.version_info) |v| v.version else 0,
                 if (peer.version_info) |v| v.user_agent else "",
                 is_inbound,
                 peer.start_height,
-                self.chain_state.best_height,
-                self.chain_state.best_height,
+                peer.best_known_height,
+                peer.best_known_height,
                 if (is_inbound) "inbound" else "outbound-full-relay",
             });
         }
