@@ -37,7 +37,8 @@ const DbState = struct {
 
 /// Open or create the database at the given path.
 /// Removes stale LOCK files from unclean shutdowns before opening.
-pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.StorageError!storage.Database {
+/// `block_cache_mib` sizes the RocksDB LRU block cache in MiB.
+pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.Allocator) storage.StorageError!storage.Database {
     // Remove stale LOCK file left by a previous unclean shutdown.
     // RocksDB uses this file to prevent concurrent access, but if the
     // previous process crashed or was killed, the LOCK remains and blocks
@@ -78,8 +79,10 @@ pub fn openDatabase(path: []const u8, allocator: std.mem.Allocator) storage.Stor
     const bloom_filter = c.rocksdb_filterpolicy_create_bloom_full(10);
     c.rocksdb_block_based_options_set_filter_policy(block_based_options, bloom_filter);
 
-    // Block cache: 512 MiB LRU cache for frequently accessed SST blocks
-    const block_cache = c.rocksdb_cache_create_lru(512 * 1024 * 1024);
+    // Block cache: LRU cache for frequently accessed SST blocks (sized via --dbcache).
+    // Was previously hardcoded 512 MiB regardless of --dbcache; with high-RAM machines
+    // and a 4+ GiB UTXO CF this saturated and forced disk reads (~89% miss rate).
+    const block_cache = c.rocksdb_cache_create_lru(block_cache_mib * 1024 * 1024);
     c.rocksdb_block_based_options_set_block_cache(block_based_options, block_cache);
 
     c.rocksdb_options_set_block_based_table_factory(options, block_based_options);
@@ -446,11 +449,11 @@ test "rocksdb database open and close" {
     defer allocator.free(db_path);
 
     // Open database
-    var db = try openDatabase(db_path, allocator);
+    var db = try openDatabase(db_path, 64, allocator);
     closeDatabase(&db);
 
     // Re-open to verify persistence
-    var db2 = try openDatabase(db_path, allocator);
+    var db2 = try openDatabase(db_path, 64, allocator);
     closeDatabase(&db2);
 }
 
@@ -466,7 +469,7 @@ test "rocksdb put and get" {
     const db_path = try std.fmt.allocPrint(allocator, "{s}/testdb", .{path});
     defer allocator.free(db_path);
 
-    var db = try openDatabase(db_path, allocator);
+    var db = try openDatabase(db_path, 64, allocator);
     defer closeDatabase(&db);
 
     // Put a key-value pair
@@ -494,7 +497,7 @@ test "rocksdb delete" {
     const db_path = try std.fmt.allocPrint(allocator, "{s}/testdb", .{path});
     defer allocator.free(db_path);
 
-    var db = try openDatabase(db_path, allocator);
+    var db = try openDatabase(db_path, 64, allocator);
     defer closeDatabase(&db);
 
     const key = "delete_test";
@@ -521,7 +524,7 @@ test "rocksdb batch write" {
     const db_path = try std.fmt.allocPrint(allocator, "{s}/testdb", .{path});
     defer allocator.free(db_path);
 
-    var db = try openDatabase(db_path, allocator);
+    var db = try openDatabase(db_path, 64, allocator);
     defer closeDatabase(&db);
 
     // Create batch operations
@@ -557,7 +560,7 @@ test "rocksdb column families" {
     const db_path = try std.fmt.allocPrint(allocator, "{s}/testdb", .{path});
     defer allocator.free(db_path);
 
-    var db = try openDatabase(db_path, allocator);
+    var db = try openDatabase(db_path, 64, allocator);
     defer closeDatabase(&db);
 
     // Store same key in different column families
