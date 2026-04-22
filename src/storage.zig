@@ -117,8 +117,10 @@ pub const Database = struct {
     allocator: std.mem.Allocator,
 
     /// Open or create the database at the given path.
-    pub fn open(path: []const u8, allocator: std.mem.Allocator) StorageError!Database {
-        return storage_rocksdb.openDatabase(path, allocator);
+    /// `block_cache_mib` sizes the RocksDB LRU block cache in MiB
+    /// (typically the same value as the user's `--dbcache` flag).
+    pub fn open(path: []const u8, block_cache_mib: u64, allocator: std.mem.Allocator) StorageError!Database {
+        return storage_rocksdb.openDatabase(path, block_cache_mib, allocator);
     }
 
     /// Close the database.
@@ -239,7 +241,9 @@ pub const ChainStore = struct {
     }
 
     pub fn init(datadir: []const u8, allocator: std.mem.Allocator) StorageError!ChainStore {
-        const db = try Database.open(datadir, allocator);
+        // Default block cache (64 MiB) — callers that want larger should
+        // construct the Database directly via Database.open with their --dbcache value.
+        const db = try Database.open(datadir, 64, allocator);
         return ChainStore{
             .db = db,
             .allocator = allocator,
@@ -3373,7 +3377,7 @@ test "database opens successfully with RocksDB" {
     // This test was previously "returns RocksDBNotAvailable" when storage had an
     // optional stub path, but that path was removed (see commit c0f03cc).
     const allocator = std.testing.allocator;
-    var db = try Database.open("/tmp/clearbit_test_db", allocator);
+    var db = try Database.open("/tmp/clearbit_test_db", 64, allocator);
     defer db.close();
 }
 
@@ -3955,7 +3959,7 @@ test "connectBlockFast flushes tip + UTXOs every block (per-block cadence)" {
     const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
     defer allocator.free(path);
 
-    var db = try Database.open(path, allocator);
+    var db = try Database.open(path, 64, allocator);
     defer db.close();
 
     var chain_state = ChainState.init(&db, 64, allocator);

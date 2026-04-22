@@ -642,7 +642,7 @@ fn importUtxoSnapshot(config: *Config, allocator: std.mem.Allocator) !void {
             std.debug.print("Warning: could not create chainstate directory: {}\n", .{err});
     };
 
-    var db = storage.Database.open(chainstate_path, allocator) catch |err| {
+    var db = storage.Database.open(chainstate_path, config.dbcache, allocator) catch |err| {
         std.debug.print("FATAL: Failed to open RocksDB at {s}: {}\n", .{ chainstate_path, err });
         std.process.exit(1);
     };
@@ -956,7 +956,7 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
             if (err != error.PathAlreadyExists)
                 std.debug.print("Warning: could not create chainstate directory: {}\n", .{err});
         };
-        if (storage.Database.open(chainstate_path, allocator)) |opened_db| {
+        if (storage.Database.open(chainstate_path, config.dbcache, allocator)) |opened_db| {
             db = opened_db;
         } else |err| {
             std.debug.print("Failed to open RocksDB: {}\n", .{err});
@@ -1333,7 +1333,7 @@ pub fn main() !void {
             }
         };
 
-        if (storage.Database.open(chainstate_path, allocator)) |opened_db| {
+        if (storage.Database.open(chainstate_path, config.dbcache, allocator)) |opened_db| {
             db = opened_db;
         } else |err| {
             std.debug.print("FATAL: Failed to open RocksDB at {s}: {}\n", .{ chainstate_path, err });
