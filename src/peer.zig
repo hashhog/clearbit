@@ -1623,9 +1623,11 @@ pub const PeerManager = struct {
     }
 
     /// Try to connect to a node once (onetry command).
+    /// The resulting peer is tagged `.manual` so rotation/eviction skip it.
     pub fn tryConnectNode(self: *PeerManager, node: []const u8) !void {
         const addr = try self.resolveNodeAddress(node);
-        _ = try self.connectToPeer(addr);
+        const peer = try self.connectToPeer(addr);
+        peer.conn_type = .manual;
     }
 
     // ========================================================================
@@ -2785,11 +2787,14 @@ pub const PeerManager = struct {
         if (now - self.last_rotation_time < PEER_ROTATION_INTERVAL) return;
         self.last_rotation_time = now;
 
-        // Find the oldest outbound peer
+        // Find the oldest outbound peer.  Manual peers (set via addnode RPC
+        // or --connect) are exempt: rotation would silently break the
+        // localhost IBD mesh.  Matches Bitcoin Core net.cpp ThreadOpenConnections.
         var oldest_idx: ?usize = null;
         var oldest_time: i64 = now;
 
         for (self.peers.items, 0..) |peer, i| {
+            if (peer.conn_type == .manual) continue;
             if (peer.direction == .outbound and peer.state == .handshake_complete) {
                 // Use last_message_time as a proxy for connection age
                 if (peer.last_message_time < oldest_time) {
