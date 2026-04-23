@@ -1557,30 +1557,52 @@ pub const PeerManager = struct {
         return self.peers.items.len;
     }
 
-    /// Add a node to the manual connection list.
-    /// This will attempt to connect to the node.
-    pub fn addManualNode(self: *PeerManager, node: []const u8) !void {
-        // Parse address
-        const addr = std.net.Address.parseIp(node, self.network_params.default_port) catch {
-            // Try resolving as hostname
-            const addrs = std.net.getAddressList(self.allocator, node, self.network_params.default_port) catch {
+    /// Resolve a "host" or "host:port" string to a single `std.net.Address`.
+    /// Accepts: `127.0.0.1`, `127.0.0.1:8333`, `example.com`, `example.com:8333`.
+    /// IPv6 bracket notation (`[::1]:8333`) is NOT supported — callers that
+    /// need IPv6 must pre-parse. Localhost mesh / addnode RPC only uses IPv4.
+    fn resolveNodeAddress(self: *PeerManager, node: []const u8) !std.net.Address {
+        const default_port = self.network_params.default_port;
+        // Split on the last ':' — everything after is the port, before is host.
+        if (std.mem.lastIndexOfScalar(u8, node, ':')) |colon| {
+            const host = node[0..colon];
+            const port_str = node[colon + 1 ..];
+            const port = std.fmt.parseInt(u16, port_str, 10) catch {
+                return error.InvalidAddress;
+            };
+            if (std.net.Address.parseIp(host, port)) |addr| {
+                return addr;
+            } else |_| {}
+            // Not a literal IP — try DNS resolution with the parsed port.
+            const addrs = std.net.getAddressList(self.allocator, host, port) catch {
                 return error.InvalidAddress;
             };
             defer addrs.deinit();
-
-            if (addrs.addrs.len > 0) {
-                try self.addAddress(addrs.addrs[0], 0, .manual);
-            }
-            return;
+            if (addrs.addrs.len == 0) return error.InvalidAddress;
+            return addrs.addrs[0];
+        }
+        // No colon — try as bare IP, then as bare hostname, both on default_port.
+        if (std.net.Address.parseIp(node, default_port)) |addr| {
+            return addr;
+        } else |_| {}
+        const addrs = std.net.getAddressList(self.allocator, node, default_port) catch {
+            return error.InvalidAddress;
         };
+        defer addrs.deinit();
+        if (addrs.addrs.len == 0) return error.InvalidAddress;
+        return addrs.addrs[0];
+    }
 
+    /// Add a node to the manual connection list.
+    /// This will attempt to connect to the node.
+    pub fn addManualNode(self: *PeerManager, node: []const u8) !void {
+        const addr = try self.resolveNodeAddress(node);
         try self.addAddress(addr, 0, .manual);
     }
 
     /// Remove a node from the manual connection list.
     pub fn removeManualNode(self: *PeerManager, node: []const u8) void {
-        // Parse and find the peer
-        const addr = std.net.Address.parseIp(node, self.network_params.default_port) catch return;
+        const addr = self.resolveNodeAddress(node) catch return;
         const key = addressKey(addr);
 
         // Remove from known addresses
@@ -1602,19 +1624,7 @@ pub const PeerManager = struct {
 
     /// Try to connect to a node once (onetry command).
     pub fn tryConnectNode(self: *PeerManager, node: []const u8) !void {
-        const addr = std.net.Address.parseIp(node, self.network_params.default_port) catch {
-            // Try resolving as hostname
-            const addrs = std.net.getAddressList(self.allocator, node, self.network_params.default_port) catch {
-                return error.InvalidAddress;
-            };
-            defer addrs.deinit();
-
-            if (addrs.addrs.len > 0) {
-                _ = try self.connectToPeer(addrs.addrs[0]);
-            }
-            return;
-        };
-
+        const addr = try self.resolveNodeAddress(node);
         _ = try self.connectToPeer(addr);
     }
 
