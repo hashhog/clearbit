@@ -34,6 +34,12 @@ pub const DEFAULT_BAN_DURATION: i64 = 24 * 60 * 60;
 /// Minimum time between connection attempts to the same address (10 minutes).
 pub const MIN_RECONNECT_INTERVAL: i64 = 10 * 60;
 
+/// Reconnect interval for manual peers (`addnode <ip> add`). Must be
+/// much shorter than MIN_RECONNECT_INTERVAL — when a remote at-tip node
+/// evicts our IBD-state peer ("behind our tip"), we want to re-establish
+/// within seconds, not 10 minutes.
+pub const MANUAL_RECONNECT_INTERVAL: i64 = 30;
+
 /// Ping interval for idle peers (2 minutes).
 pub const PING_INTERVAL: i64 = 2 * 60;
 
@@ -1497,6 +1503,12 @@ pub const PeerManager = struct {
             // Skip already connected addresses
             if (self.isConnected(info.address)) continue;
 
+            // Skip manual addresses — those are owned by maintainManualConnections,
+            // which uses a shorter throttle and tags .manual on success so
+            // rotatePeers doesn't evict them. Letting the outbound path
+            // pick them up would silently demote them to .outbound_full_relay.
+            if (info.source == .manual) continue;
+
             // Skip recently tried addresses
             if (info.last_tried > 0 and now - info.last_tried < MIN_RECONNECT_INTERVAL) continue;
 
@@ -1597,7 +1609,18 @@ pub const PeerManager = struct {
     /// This will attempt to connect to the node.
     pub fn addManualNode(self: *PeerManager, node: []const u8) !void {
         const addr = try self.resolveNodeAddress(node);
-        try self.addAddress(addr, 0, .manual);
+        // addAddress is a no-op if the key already exists, so it would never
+        // upgrade an existing AddressInfo from .dns_seed/.peer to .manual.
+        // Force the .manual source either way so maintainManualConnections
+        // owns the reconnect lifecycle.
+        const key = addressKey(addr);
+        if (self.known_addresses.getPtr(key)) |info| {
+            info.source = .manual;
+            info.last_tried = 0;
+            info.attempts = 0;
+        } else {
+            try self.addAddress(addr, 0, .manual);
+        }
     }
 
     /// Remove a node from the manual connection list.
@@ -1628,6 +1651,37 @@ pub const PeerManager = struct {
         const addr = try self.resolveNodeAddress(node);
         const peer = try self.connectToPeer(addr);
         peer.conn_type = .manual;
+    }
+
+    /// Reconnect dropped manual peers (`addnode <ip> add`).
+    /// `addManualNode` only registers the address in `known_addresses` with
+    /// `source = .manual`.  This function is the other half: on every main-
+    /// loop tick it scans for `.manual` addresses that aren't currently
+    /// connected and attempts to reconnect, throttled by
+    /// `MANUAL_RECONNECT_INTERVAL`.  Matches Bitcoin Core
+    /// `ThreadOpenConnections` periodic manual-peer reconnect.
+    pub fn maintainManualConnections(self: *PeerManager) void {
+        const now = std.time.timestamp();
+
+        var iter = self.known_addresses.iterator();
+        while (iter.next()) |entry| {
+            const info = entry.value_ptr;
+            if (info.source != .manual) continue;
+            if (self.isConnected(info.address)) continue;
+            if (info.last_tried > 0 and now - info.last_tried < MANUAL_RECONNECT_INTERVAL) continue;
+            if (self.peers.items.len >= MAX_TOTAL_CONNECTIONS) break;
+
+            info.last_tried = now;
+            info.attempts += 1;
+
+            // Use connectToPeer (matches tryConnectNode/onetry path) so the
+            // message loop drives the handshake.  Calling performHandshake
+            // synchronously here was racing the loop and silently failing.
+            const peer = self.connectToPeer(info.address) catch continue;
+            peer.conn_type = .manual;
+            info.success = true;
+            info.last_seen = now;
+        }
     }
 
     // ========================================================================
@@ -3224,6 +3278,11 @@ pub const PeerManager = struct {
         }
 
         while (self.running.load(.acquire)) {
+            // 0. Reconnect dropped manual peers first (addnode <ip> add).
+            // Separate from maintainOutbound so it runs even in --connect mode
+            // and isn't starved by the 1-attempt-per-tick IBD throttle.
+            self.maintainManualConnections();
+
             // 1. Open new outbound connections if needed (skip if --connect mode)
             // During IBD, skip connection attempts if we already have peers (avoids blocking)
             if (self.connect_address == null) {
