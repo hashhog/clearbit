@@ -1310,6 +1310,11 @@ pub const PeerManager = struct {
     /// Last time we attempted stall recovery.
     last_stall_recovery: i64,
 
+    /// True while drainBlockBuffer is executing.  Guards the `.block` handler's
+    /// nested drain calls so the drain-heartbeat → processAllMessages → `.block`
+    /// path can't recurse into drainBlockBuffer.  W101 (2026-04-24).
+    in_drain: bool,
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
@@ -1344,6 +1349,7 @@ pub const PeerManager = struct {
             .last_progress_log = 0,
             .blocks_since_log = 0,
             .last_stall_recovery = 0,
+            .in_drain = false,
         };
     }
 
@@ -2302,7 +2308,10 @@ pub const PeerManager = struct {
                 if (self.block_buffer.count() >= 1024) {
                     // Try draining first — if the next block is already buffered
                     // this will free space.
-                    self.drainBlockBuffer();
+                    // W101: skip when already inside a drain (reached via the
+                    // heartbeat's processAllMessages).  The outer drain is
+                    // doing this work on every while iteration anyway.
+                    if (!self.in_drain) self.drainBlockBuffer();
 
                     // If still full, check if this is the critical next block
                     if (self.block_buffer.count() >= 1024) {
@@ -2342,8 +2351,11 @@ pub const PeerManager = struct {
                     return;
                 };
 
-                // Try to connect as many buffered blocks as possible in order
-                self.drainBlockBuffer();
+                // Try to connect as many buffered blocks as possible in order.
+                // W101: skip when already inside a drain (reached via the
+                // heartbeat's processAllMessages).  The outer drain will
+                // consume this newly-buffered block on its next iteration.
+                if (!self.in_drain) self.drainBlockBuffer();
 
                 // Request more blocks to keep the pipeline full
                 self.pipelineBlockRequests() catch {};
@@ -2692,6 +2704,21 @@ pub const PeerManager = struct {
         var i: usize = 0;
         while (i < self.peers.items.len) {
             if (self.peers.items[i].isTimedOut()) {
+                // W101: log before eviction.  Previously silent; made it
+                // easy to miss the 20-min last_message_time path that was
+                // evicting blk-replay every ~25 min during long drains.
+                var addr_buf: [64]u8 = undefined;
+                const addr_str = self.peers.items[i].getAddressString(&addr_buf);
+                const now = std.time.timestamp();
+                const peer = self.peers.items[i];
+                const subver: []const u8 = if (peer.version_info) |v| v.user_agent else "?";
+                std.log.info("Disconnecting stale peer={s} idle={d}s last_ping={d}s last_pong={d}s subver={s}", .{
+                    addr_str,
+                    now - peer.last_message_time,
+                    if (peer.last_ping_time > 0) now - peer.last_ping_time else 0,
+                    if (peer.last_pong_time > 0) now - peer.last_pong_time else 0,
+                    subver,
+                });
                 self.removePeerByIndex(i);
             } else {
                 i += 1;
@@ -3000,6 +3027,12 @@ pub const PeerManager = struct {
     /// drain to complete.
     fn drainBlockBuffer(self: *PeerManager) void {
         const cs = self.chain_state orelse return;
+        // W101: mark drain active so nested drain calls from the `.block`
+        // handler (invoked transitively by processAllMessages in the
+        // heartbeat) become no-ops instead of recursing.  The outer while
+        // will consume any newly-buffered blocks on its next iteration.
+        self.in_drain = true;
+        defer self.in_drain = false;
         var connected: u32 = 0;
         var slow_blocks: u32 = 0;
         const drain_start = std.time.nanoTimestamp();
@@ -3126,6 +3159,24 @@ pub const PeerManager = struct {
                 // polls non-blocking; handshake with an inbound v1 peer is
                 // sub-millisecond on localhost.
                 self.acceptInbound() catch {};
+
+                // W101: service existing peers during long drains.  Without
+                // this, reactive-only peers (blk-replay sends nothing unless
+                // we pinged or requested a block) hit the 20-min
+                // last_message_time threshold in isTimedOut and get silently
+                // evicted by disconnectStale.  sendPings keeps pongs flowing
+                // (and pongs update last_message_time); processAllMessages
+                // drains the recv buffer so inbound pongs, ack-less replies
+                // and incoming getdata/getblocks are handled.
+                //
+                // Recursion note: processAllMessages → `.block` handler
+                // normally calls drainBlockBuffer, but the in_drain guard
+                // turns those nested calls into no-ops.  Blocks accepted by
+                // the inner loop land in block_buffer and are consumed by
+                // the outer while on its next iteration — so throughput is
+                // unaffected.
+                self.sendPings() catch {};
+                self.processAllMessages() catch {};
             }
 
             self.our_height = @intCast(cs.best_height);
