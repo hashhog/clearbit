@@ -3117,6 +3117,15 @@ pub const PeerManager = struct {
                 // drain.  Re-arming here keeps all peer budgets filled even
                 // during a long drain.
                 self.pipelineBlockRequests() catch {};
+
+                // W100: service pending inbound connections during long
+                // drains.  Without this, a blk-replay (or any other inbound)
+                // peer's TCP SYN is accepted by the kernel but its userspace
+                // handshake waits for the drain to complete — observed 10-11
+                // min gaps against blk-replay on localhost.  acceptInbound
+                // polls non-blocking; handshake with an inbound v1 peer is
+                // sub-millisecond on localhost.
+                self.acceptInbound() catch {};
             }
 
             self.our_height = @intCast(cs.best_height);
