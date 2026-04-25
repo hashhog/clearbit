@@ -3281,6 +3281,32 @@ pub const PeerManager = struct {
             }
         }
 
+        // Cursor-inversion fix: the drain advances connect_cursor for every
+        // buffered block consumed, but never touches download_cursor. After a
+        // W19/W28/buffer-full rewind sets download_cursor = connect_cursor,
+        // the very next drain pass can consume hundreds of buffered blocks
+        // queued before the rewind — surging connect_cursor past
+        // download_cursor and leaving the cursors inverted. Once inverted,
+        // pipelineBlockRequests starts iterating from a stale download_cursor
+        // and re-requests already-passed hashes (those come back as orphans
+        // that drain can't use), and the three existing rewind sites
+        // (peer.zig:~2339, ~2366, ~2943, ~3303) all guard with
+        // `if (download_cursor > connect_cursor)` so they can't repair the
+        // inverted state. The 2026-04-25 wedge at h=905,696 captured exactly
+        // this via the DRAIN-BREAK-WEDGE log:
+        //   connect_cursor=1259 download_cursor=752 buffer=1 in_flight=0
+        // Force-restore the invariant here so pipelineBlockRequests starts
+        // at connect_cursor on the next call. Pipeline naturally skips
+        // hashes already in block_buffer, so re-requesting from
+        // connect_cursor is cheap.
+        if (self.download_cursor < self.connect_cursor) {
+            std.debug.print(
+                "P2P: cursor-inversion-fix download_cursor={d} -> connect_cursor={d}\n",
+                .{ self.download_cursor, self.connect_cursor },
+            );
+            self.download_cursor = self.connect_cursor;
+        }
+
         // Gap-stall recovery (W28): if the block at connect_cursor is missing
         // from the buffer AND download_cursor has already advanced past it
         // (meaning the block was "requested" but never arrived or was dropped),
