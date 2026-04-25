@@ -2340,10 +2340,20 @@ pub const PeerManager = struct {
                 // Note: AutoHashMap.put replaces on duplicate-hash, so a
                 // duplicate block response correctly ends up as a no-op
                 // relative to buffer count (decrement already happened above).
-                self.block_buffer.put(block_hash, block) catch {
+                self.block_buffer.put(block_hash, block) catch |err| {
                     // If we can't buffer it, free and drop. The in-flight
                     // decrement above has already run, so the download slot
-                    // is freed for the pipeline to re-issue.
+                    // is freed for the pipeline to re-issue. Log every drop
+                    // — the 2026-04-25 wedge at h=892,306 left buffer=28 /
+                    // in_flight=0 / queue=54k for 7h with zero log evidence
+                    // of why height stopped advancing; this is the only
+                    // place blocks can be silently lost in the receive
+                    // path, and a high drop rate here would explain it.
+                    std.log.err("P2P: BUFFER-PUT-DROP block height={} buffer_size={} err={s}", .{
+                        self.connect_cursor,
+                        self.block_buffer.count(),
+                        @errorName(err),
+                    });
                     if (self.download_cursor > self.connect_cursor) {
                         self.download_cursor = self.connect_cursor;
                     }
