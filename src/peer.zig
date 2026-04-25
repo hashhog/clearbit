@@ -1295,6 +1295,12 @@ pub const PeerManager = struct {
     /// Next index to connect (index into expected_blocks).
     connect_cursor: u32,
 
+    /// Diagnostic state for the drain-break wedge log (peer.zig:~3073).
+    /// Rate-limits DRAIN-BREAK-WEDGE to one line per second per stuck
+    /// connect_cursor so the log doesn't drown during a multi-hour wedge.
+    last_drain_break_log_ts: i64,
+    last_drain_break_cursor: u32,
+
     /// Number of blocks currently in-flight (requested but not yet received).
     blocks_in_flight: u32,
 
@@ -1344,6 +1350,8 @@ pub const PeerManager = struct {
             .expected_blocks = std.ArrayList(types.Hash256).init(allocator),
             .download_cursor = 0,
             .connect_cursor = 0,
+            .last_drain_break_log_ts = 0,
+            .last_drain_break_cursor = 0,
             .blocks_in_flight = 0,
             .max_blocks_in_flight = 128,
             .last_progress_log = 0,
@@ -3070,7 +3078,62 @@ pub const PeerManager = struct {
 
             // Is it in the buffer?
             const entry = self.block_buffer.fetchRemove(expected_hash);
-            if (entry == null) break; // Not yet received, stop
+            if (entry == null) {
+                // Wedge diagnostic: when the expected next block is missing
+                // but the buffer is NON-empty, the drain has stalled because
+                // the pipeline got out of sync — blocks are in the buffer
+                // but not the one we need next. The 2026-04-25 wedges at
+                // h=892,306 and h=905,696 sat with buffer=15-28 / in_flight=0
+                // for hours producing no log explanation. This line fires
+                // exactly in that condition. Rate-limit to once per second
+                // per stuck height so steady-state lookahead doesn't flood.
+                if (self.block_buffer.count() > 0) {
+                    const now = std.time.timestamp();
+                    if (now != self.last_drain_break_log_ts or
+                        self.connect_cursor != self.last_drain_break_cursor)
+                    {
+                        self.last_drain_break_log_ts = now;
+                        self.last_drain_break_cursor = self.connect_cursor;
+                        // Sample first few buffered hashes' positions so we
+                        // can see how far ahead the pipeline ran.
+                        var min_ahead: i64 = std.math.maxInt(i64);
+                        var max_ahead: i64 = -1;
+                        var sample_count: u32 = 0;
+                        var it = self.block_buffer.iterator();
+                        while (it.next()) |kv| {
+                            sample_count += 1;
+                            // Find which expected_blocks index the buffered
+                            // hash corresponds to — bounded scan to keep
+                            // this cheap during the wedge spin loop.
+                            const scan_max = @min(self.expected_blocks.items.len,
+                                self.connect_cursor + 4096);
+                            var i = self.connect_cursor;
+                            while (i < scan_max) : (i += 1) {
+                                if (std.mem.eql(u8, &self.expected_blocks.items[i], &kv.key_ptr.*)) {
+                                    const ahead: i64 = @as(i64, @intCast(i)) -
+                                        @as(i64, @intCast(self.connect_cursor));
+                                    if (ahead < min_ahead) min_ahead = ahead;
+                                    if (ahead > max_ahead) max_ahead = ahead;
+                                    break;
+                                }
+                            }
+                            if (sample_count >= 16) break;
+                        }
+                        std.debug.print(
+                            "P2P: DRAIN-BREAK-WEDGE connect_cursor={d} download_cursor={d} buffer={d} sampled_ahead_min={d} sampled_ahead_max={d} expected_total={d}\n",
+                            .{
+                                self.connect_cursor,
+                                self.download_cursor,
+                                self.block_buffer.count(),
+                                min_ahead,
+                                max_ahead,
+                                self.expected_blocks.items.len,
+                            },
+                        );
+                    }
+                }
+                break; // Not yet received, stop
+            }
 
             var block = entry.?.value;
             defer serialize.freeBlock(self.allocator, &block);
