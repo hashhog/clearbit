@@ -235,13 +235,22 @@ pub fn checkTransactionContextual(
 // Sigop Counting
 // ============================================================================
 
-/// UTXO information needed for sigop cost calculation.
-/// Contains the scriptPubKey of the previous output being spent.
+/// UTXO data exposed to script verification: the spent output's
+/// scriptPubKey and amount. Both are needed for BIP-341 Taproot
+/// (sha_amounts + sha_scriptpubkeys) and for SegWit-v0 sighash
+/// (BIP-143 commits to amount).
+pub const SigopUtxoEntry = struct {
+    script_pubkey: []const u8,
+    amount: i64,
+};
+
+/// View interface for resolving spent outpoints during block-level
+/// script verification.
 pub const SigopUtxoView = struct {
     context: *anyopaque,
-    lookupFn: *const fn (ctx: *anyopaque, outpoint: *const types.OutPoint) ?[]const u8,
+    lookupFn: *const fn (ctx: *anyopaque, outpoint: *const types.OutPoint) ?SigopUtxoEntry,
 
-    pub fn lookup(self: *const SigopUtxoView, outpoint: *const types.OutPoint) ?[]const u8 {
+    pub fn lookup(self: *const SigopUtxoView, outpoint: *const types.OutPoint) ?SigopUtxoEntry {
         return self.lookupFn(self.context, outpoint);
     }
 };
@@ -283,8 +292,9 @@ pub fn getP2SHSigOpCount(
     var n: u32 = 0;
 
     for (tx.inputs) |input| {
-        // Look up the previous output's scriptPubKey
-        const prev_script_pubkey = utxo_view.lookup(&input.previous_output) orelse continue;
+        // Look up the previous output
+        const entry = utxo_view.lookup(&input.previous_output) orelse continue;
+        const prev_script_pubkey = entry.script_pubkey;
 
         if (script.isPayToScriptHash(prev_script_pubkey)) {
             n += script.getP2SHSigOpCount(prev_script_pubkey, input.script_sig);
@@ -323,11 +333,11 @@ pub fn getTransactionSigOpCost(
 
     // Add witness sigops (no scaling - witness discount)
     for (tx.inputs) |input| {
-        const prev_script_pubkey = utxo_view.lookup(&input.previous_output) orelse continue;
+        const entry = utxo_view.lookup(&input.previous_output) orelse continue;
 
         cost += @as(u64, script.countWitnessSigOps(
             input.script_sig,
-            prev_script_pubkey,
+            entry.script_pubkey,
             input.witness,
             flags,
         ));
@@ -1453,6 +1463,23 @@ pub fn verifyBlockScriptsParallel(
         tx_bytes_list.deinit();
     }
 
+    // Per-tx prevouts (BIP-341 sha_amounts + sha_scriptpubkeys). Each
+    // tx's inputs share the same `amounts` and `scripts` slices, which
+    // must outlive the worker threads — kept alive in `prevouts_list`
+    // until queue.waitAll() returns.
+    const PerTxPrevouts = struct {
+        amounts: []i64,
+        scripts: [][]const u8,
+    };
+    var prevouts_list = std.ArrayList(PerTxPrevouts).init(allocator);
+    defer {
+        for (prevouts_list.items) |pt| {
+            allocator.free(pt.amounts);
+            allocator.free(pt.scripts);
+        }
+        prevouts_list.deinit();
+    }
+
     for (block.transactions[1..]) |*tx| {
         // Serialize transaction once for all its inputs
         var writer = serialize.Writer.init(allocator);
@@ -1468,19 +1495,38 @@ pub fn verifyBlockScriptsParallel(
             return ValidationError.OutOfMemory;
         };
 
-        for (tx.inputs, 0..) |input, input_idx| {
-            // Look up the previous output
-            const prev_script = utxo_lookup.lookup(&input.previous_output) orelse {
+        // Pre-collect this tx's per-input prevouts so all inputs of
+        // this tx see the same `spent_amounts` / `spent_scripts`
+        // slices (required by BIP-341).
+        var pt = PerTxPrevouts{
+            .amounts = allocator.alloc(i64, tx.inputs.len) catch return ValidationError.OutOfMemory,
+            .scripts = allocator.alloc([]const u8, tx.inputs.len) catch return ValidationError.OutOfMemory,
+        };
+        for (tx.inputs, 0..) |input, i| {
+            const entry = utxo_lookup.lookup(&input.previous_output) orelse {
+                allocator.free(pt.amounts);
+                allocator.free(pt.scripts);
                 return ValidationError.MissingInput;
             };
+            pt.amounts[i] = entry.amount;
+            pt.scripts[i] = entry.script_pubkey;
+        }
+        prevouts_list.append(pt) catch {
+            allocator.free(pt.amounts);
+            allocator.free(pt.scripts);
+            return ValidationError.OutOfMemory;
+        };
 
-            jobs[job_idx] = ScriptCheckJob.init(
+        for (tx.inputs, 0..) |input, input_idx| {
+            jobs[job_idx] = ScriptCheckJob.initWithPrevouts(
                 tx_bytes,
                 input_idx,
-                prev_script,
-                0, // Amount needs to be looked up from UTXO
+                pt.scripts[input_idx],
+                pt.amounts[input_idx],
                 flags,
                 input.witness,
+                pt.amounts,
+                pt.scripts,
             );
             job_idx += 1;
         }
@@ -1508,23 +1554,37 @@ fn verifyBlockScriptsSingleThreaded(
 ) ValidationError!bool {
     // Verify each non-coinbase transaction
     for (block.transactions[1..]) |*tx| {
-        for (tx.inputs, 0..) |input, input_idx| {
-            const prev_script = utxo_lookup.lookup(&input.previous_output) orelse {
+        // Per-tx prevouts for BIP-341 sha_amounts + sha_scriptpubkeys.
+        const spent_amounts = allocator.alloc(i64, tx.inputs.len) catch
+            return ValidationError.OutOfMemory;
+        defer allocator.free(spent_amounts);
+        const spent_scripts = allocator.alloc([]const u8, tx.inputs.len) catch
+            return ValidationError.OutOfMemory;
+        defer allocator.free(spent_scripts);
+
+        for (tx.inputs, 0..) |input, i| {
+            const entry = utxo_lookup.lookup(&input.previous_output) orelse {
                 return ValidationError.MissingInput;
             };
+            spent_amounts[i] = entry.amount;
+            spent_scripts[i] = entry.script_pubkey;
+        }
 
-            var engine = script.ScriptEngine.init(
+        for (tx.inputs, 0..) |input, input_idx| {
+            var engine = script.ScriptEngine.initWithPrevouts(
                 allocator,
                 tx,
                 input_idx,
-                0, // TODO: Look up actual amount from UTXO
+                spent_amounts[input_idx],
                 flags,
+                spent_amounts,
+                spent_scripts,
             );
             defer engine.deinit();
 
             const result = engine.verify(
                 input.script_sig,
-                prev_script,
+                spent_scripts[input_idx],
                 input.witness,
             );
 
@@ -2230,7 +2290,7 @@ test "checkSequenceLocks passes with no constraints" {
 // connectBlock BIP-68 Enforcement Tests
 // ============================================================================
 
-fn emptySigopLookup(_: *anyopaque, _: *const types.OutPoint) ?[]const u8 {
+fn emptySigopLookup(_: *anyopaque, _: *const types.OutPoint) ?SigopUtxoEntry {
     return null;
 }
 
@@ -2548,7 +2608,7 @@ test "getTransactionSigOpCost applies witness scale factor" {
     const empty_view = SigopUtxoView{
         .context = undefined,
         .lookupFn = struct {
-            fn lookup(_: *anyopaque, _: *const types.OutPoint) ?[]const u8 {
+            fn lookup(_: *anyopaque, _: *const types.OutPoint) ?SigopUtxoEntry {
                 return null;
             }
         }.lookup,
@@ -2558,12 +2618,17 @@ test "getTransactionSigOpCost applies witness scale factor" {
     try std.testing.expectEqual(@as(u64, 4), cost);
 }
 
-fn testSigopUtxoLookup(ctx: *anyopaque, outpoint: *const types.OutPoint) ?[]const u8 {
+fn testSigopUtxoLookup(ctx: *anyopaque, outpoint: *const types.OutPoint) ?SigopUtxoEntry {
     const utxos = @as(*const std.AutoHashMap([36]u8, []const u8), @ptrCast(@alignCast(ctx)));
     var key: [36]u8 = undefined;
     @memcpy(key[0..32], &outpoint.hash);
     std.mem.writeInt(u32, key[32..36], outpoint.index, .little);
-    return utxos.get(key);
+    if (utxos.get(key)) |spk| {
+        // Sigop-counting tests don't exercise Taproot, so a zero amount is
+        // safe; the structure just needs to satisfy the new lookup type.
+        return SigopUtxoEntry{ .script_pubkey = spk, .amount = 0 };
+    }
+    return null;
 }
 
 test "getTransactionSigOpCost counts P2SH sigops" {
@@ -4620,7 +4685,7 @@ test "verifyBlockScriptsSingleThreaded with empty utxo lookup returns missing in
 
     // Empty lookup that always returns null
     const EmptyContext = struct {
-        fn lookup(_: *anyopaque, _: *const types.OutPoint) ?[]const u8 {
+        fn lookup(_: *anyopaque, _: *const types.OutPoint) ?SigopUtxoEntry {
             return null;
         }
     };
