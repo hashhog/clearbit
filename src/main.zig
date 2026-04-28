@@ -1122,7 +1122,7 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
             const arena_alloc = arena.allocator();
 
             const OutpointKey = [36]u8;
-            var script_map = std.AutoHashMap(OutpointKey, []const u8).init(arena_alloc);
+            var script_map = std.AutoHashMap(OutpointKey, validation.SigopUtxoEntry).init(arena_alloc);
 
             // Pre-fetch input script_pubkeys and outputs for intra-block spends.
             var any_missing = false;
@@ -1140,9 +1140,13 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
                                 any_missing = true;
                                 break;
                             };
+                            const cu_value = cu.value;
                             // Free the temporary CompactUtxo copy using utxo_set's allocator
                             cu.deinit(chain_state.utxo_set.allocator);
-                            script_map.put(key, script_pk) catch {};
+                            script_map.put(key, .{
+                                .script_pubkey = script_pk,
+                                .amount = cu_value,
+                            }) catch {};
                         }
                         // Also register intra-block outputs already in script_map from prior txs.
                     }
@@ -1154,14 +1158,17 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
                     var key: OutpointKey = undefined;
                     @memcpy(key[0..32], &tx_hash);
                     std.mem.writeInt(u32, key[32..36], @intCast(out_idx), .little);
-                    script_map.put(key, output.script_pubkey) catch {};
+                    script_map.put(key, .{
+                        .script_pubkey = output.script_pubkey,
+                        .amount = output.value,
+                    }) catch {};
                 }
             }
 
             if (!any_missing) {
                 const MapCtx = struct {
-                    map: *std.AutoHashMap(OutpointKey, []const u8),
-                    fn lookup(ctx_ptr: *anyopaque, op: *const types.OutPoint) ?[]const u8 {
+                    map: *std.AutoHashMap(OutpointKey, validation.SigopUtxoEntry),
+                    fn lookup(ctx_ptr: *anyopaque, op: *const types.OutPoint) ?validation.SigopUtxoEntry {
                         const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
                         const k = storage.makeUtxoKey(op);
                         return ctx.map.get(k);
