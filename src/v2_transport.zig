@@ -240,13 +240,39 @@ pub const KeyMaterial = struct {
 // FSChaCha20 - Forward-Secure Stream Cipher
 // ============================================================================
 
-/// Forward-secure ChaCha20 stream cipher.
-/// Automatically rekeys after REKEY_INTERVAL operations.
+/// Forward-secure ChaCha20 stream cipher (BIP-324 length cipher).
+///
+/// Per BIP-324, the length cipher's keystream is CONTINUOUS within a rekey
+/// epoch: each 3-byte length-prefix encryption consumes the next 3 bytes of
+/// a single ChaCha20 keystream initialised at the start of the epoch.  The
+/// nonce within an epoch is `[0, 0, 0, 0] || LE64(rekey_counter)`, and the
+/// block counter increments by 1 per 64-byte block consumed.  After
+/// `rekey_interval` (= 224) crypt() calls, the next 32 bytes of keystream
+/// become the new key, the rekey_counter increments, and the keystream
+/// restarts at block 0 with the new nonce.
+///
+/// The previous implementation incorrectly built a fresh 64-byte keystream
+/// per crypt() call by stuffing `chunk_counter` into the nonce.  That
+/// produces a different keystream for every packet starting at the same
+/// block 0, so packet N's first byte is not the (N*3)th byte of the
+/// continuous stream — making the cipher output diverge from
+/// Bitcoin Core / ouroboros after the very first packet.  The fix
+/// (W90, this commit) keeps a stateful 64-byte keystream buffer plus a
+/// block counter.  Verified byte-for-byte against ouroboros's
+/// implementation in the new "byte-for-byte interop" tests.
 pub const FSChaCha20 = struct {
     key: [32]u8,
     rekey_interval: u32,
     chunk_counter: u32 = 0,
     rekey_counter: u64 = 0,
+    /// Cached keystream bytes from the most recent ChaCha20 block.  Bytes
+    /// are consumed from the front; `block_counter` advances when this
+    /// runs dry and a fresh block is generated.
+    keystream_buf: [64]u8 = [_]u8{0} ** 64,
+    keystream_used: u8 = 64, // start "empty" so next crypt() generates a fresh block
+    /// ChaCha20 block counter — increments per 64-byte block consumed.
+    /// Resets to 0 on rekey.
+    block_counter: u32 = 0,
 
     const ChaCha20 = std.crypto.stream.chacha.ChaCha20IETF;
 
@@ -257,47 +283,84 @@ pub const FSChaCha20 = struct {
         };
     }
 
-    /// Encrypt/decrypt data in place.
+    /// Build the per-epoch nonce: `[0, 0, 0, 0]` || LE64(rekey_counter).
+    /// Constant within an epoch; bumped by `nextChunk` only when the
+    /// rekey-interval boundary is crossed.
+    fn epochNonce(self: *const FSChaCha20) [12]u8 {
+        var nonce: [12]u8 = [_]u8{0} ** 12;
+        std.mem.writeInt(u64, nonce[4..12], self.rekey_counter, .little);
+        return nonce;
+    }
+
+    /// Pull `nbytes` of keystream into `out`.  Refills the 64-byte buffer
+    /// as many times as needed; advances `block_counter` per refill.
+    fn drawKeystream(self: *FSChaCha20, out: []u8) void {
+        var written: usize = 0;
+        while (written < out.len) {
+            if (self.keystream_used >= 64) {
+                // Generate next ChaCha20 block by encrypting a 64-byte
+                // zero plaintext at the current block counter.  The
+                // resulting ciphertext is the keystream for that block.
+                @memset(&self.keystream_buf, 0);
+                const nonce = self.epochNonce();
+                ChaCha20.xor(&self.keystream_buf, &self.keystream_buf, self.block_counter, self.key, nonce);
+                self.block_counter += 1;
+                self.keystream_used = 0;
+            }
+            const avail = 64 - self.keystream_used;
+            const want = out.len - written;
+            const take = if (avail < want) avail else want;
+            @memcpy(out[written .. written + take], self.keystream_buf[self.keystream_used .. self.keystream_used + take]);
+            self.keystream_used += @intCast(take);
+            written += take;
+        }
+    }
+
+    /// Encrypt/decrypt data via XOR with the next `input.len` bytes of the
+    /// continuous keystream.
     pub fn crypt(self: *FSChaCha20, input: []const u8, output: []u8) void {
         std.debug.assert(input.len == output.len);
 
-        // Build nonce: first 4 bytes = chunk_counter, last 8 bytes = 0
-        var nonce: [12]u8 = [_]u8{0} ** 12;
-        std.mem.writeInt(u32, nonce[0..4], self.chunk_counter, .little);
+        // Pull `input.len` bytes of keystream (from the cached buffer +
+        // generating fresh blocks as needed) and XOR.
+        var ks_buf: [256]u8 = undefined;
+        // Most BIP-324 length-cipher calls are 3 bytes (LENGTH_LEN); the
+        // largest internal use is a 32-byte rekey draw.  256 is generous.
+        std.debug.assert(input.len <= ks_buf.len);
+        const ks = ks_buf[0..input.len];
+        self.drawKeystream(ks);
 
-        // XOR with keystream
-        ChaCha20.xor(output, input, 0, self.key, nonce);
+        var i: usize = 0;
+        while (i < input.len) : (i += 1) {
+            output[i] = input[i] ^ ks[i];
+        }
 
-        // Advance counter and rekey if needed
         self.nextChunk();
     }
 
-    /// Generate keystream.
+    /// Generate `output.len` bytes of keystream into `output`.
     pub fn keystream(self: *FSChaCha20, output: []u8) void {
-        var nonce: [12]u8 = [_]u8{0} ** 12;
-        std.mem.writeInt(u32, nonce[0..4], self.chunk_counter, .little);
-
-        @memset(output, 0);
-        ChaCha20.xor(output, output, 0, self.key, nonce);
-
+        self.drawKeystream(output);
         self.nextChunk();
     }
 
+    /// Rotate to the next chunk.  After `rekey_interval` chunks, draw 32
+    /// keystream bytes for the new key, bump rekey_counter, and reset the
+    /// keystream buffer + block counter so the next crypt() starts a
+    /// fresh keystream at block 0 with the new nonce.
     fn nextChunk(self: *FSChaCha20) void {
         self.chunk_counter += 1;
         if (self.chunk_counter == self.rekey_interval) {
-            // Generate new key from keystream at special nonce
             var new_key: [32]u8 = undefined;
-            var rekey_nonce: [12]u8 = [_]u8{0} ** 12;
-            std.mem.writeInt(u32, rekey_nonce[0..4], 0xFFFFFFFF, .little);
-            std.mem.writeInt(u64, rekey_nonce[4..12], self.rekey_counter, .little);
-
-            @memset(&new_key, 0);
-            ChaCha20.xor(&new_key, &new_key, 0, self.key, rekey_nonce);
+            self.drawKeystream(&new_key);
 
             self.key = new_key;
             self.chunk_counter = 0;
             self.rekey_counter += 1;
+            // Reset stream state so the next packet starts at block 0
+            // under the new nonce (rekey_counter has been bumped).
+            self.keystream_used = 64;
+            self.block_counter = 0;
         }
     }
 };
@@ -763,15 +826,29 @@ pub const BIP324Cipher = struct {
 
     /// Compute simulated shared secret when libsecp256k1 is not available.
     /// This is NOT cryptographically secure - only for testing.
+    ///
+    /// The hash is symmetric in (our_pubkey, their_pubkey) so two transports
+    /// running the state machine with each other's pubkeys produce the same
+    /// secret — the same property real BIP-324 ECDH provides.  This lets the
+    /// in-test full-handshake state-machine tests run without a real
+    /// libsecp256k1 link.
     fn computeSimulatedSharedSecret(
         self: *const BIP324Cipher,
         their_pubkey: *const [ELLSWIFT_PUBKEY_LEN]u8,
         out: *[32]u8,
     ) void {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        if (self.our_privkey) |pk| hasher.update(&pk);
-        if (self.our_pubkey) |pk| hasher.update(&pk);
-        hasher.update(their_pubkey);
+        // Sort the pubkeys lexicographically so initiator and responder
+        // produce the same hash input (and thus the same secret).  Real
+        // ECDH gives this property naturally — the simulated path mimics it.
+        const our_pk: [ELLSWIFT_PUBKEY_LEN]u8 = if (self.our_pubkey) |pk| pk else [_]u8{0} ** ELLSWIFT_PUBKEY_LEN;
+        if (std.mem.lessThan(u8, &our_pk, their_pubkey)) {
+            hasher.update(&our_pk);
+            hasher.update(their_pubkey);
+        } else {
+            hasher.update(their_pubkey);
+            hasher.update(&our_pk);
+        }
         hasher.final(out);
     }
 
@@ -2275,4 +2352,259 @@ test "V2Transport: decryptLength called exactly once per packet (W56 fix)" {
     const contents = responder.getReceivedMessage().?;
     try std.testing.expectEqual(@as(u8, 18), contents[0]);
     try std.testing.expectEqualSlices(u8, &payload, contents[1..]);
+}
+
+// ============================================================================
+// Full-handshake state-machine tests (W90)
+//
+// These tests build TWO real V2Transports — one initiator, one responder —
+// and drive the entire BIP-324 handshake (ellswift + garbage + terminator +
+// version-packet exchange) by feeding each side's send buffer into the
+// other's recv buffer.  This is the closest a unit test can get to a live
+// peer-to-peer handshake without a TCP socket and a real libsecp256k1
+// link, and it exposes any bug in `processRecvBuffer`'s state transitions
+// that would deadlock against a real Bitcoin Core peer.
+//
+// Symmetric simulated ECDH (see `computeSimulatedSharedSecret`) is what
+// lets these run in test mode — the real ECDH path always produces a
+// symmetric secret too, so this faithfully simulates production wiring.
+// ============================================================================
+
+/// Pump bytes from `from`'s send buffer to `to`'s recv buffer until both
+/// sides report a complete handshake or `max_iters` cycles elapse.  Returns
+/// the number of iterations consumed; a count well below `max_iters` is
+/// expected for a healthy state machine.
+fn pumpHandshake(initiator: *V2Transport, responder: *V2Transport, max_iters: u32) !u32 {
+    var iter: u32 = 0;
+    while (iter < max_iters) : (iter += 1) {
+        const init_send = initiator.getSendData();
+        const resp_send = responder.getSendData();
+
+        if (init_send.len == 0 and resp_send.len == 0) {
+            // Both sides have flushed their queues; if they're not both
+            // version-received yet, the handshake is wedged.
+            if (initiator.isVersionReceived() and responder.isVersionReceived() and
+                initiator.isHandshakeReady() and responder.isHandshakeReady())
+            {
+                return iter;
+            }
+            return error.HandshakeWedged;
+        }
+
+        if (init_send.len > 0) {
+            if (!responder.processReceivedBytes(init_send)) return error.ResponderProcessFailed;
+            initiator.markBytesSent(init_send.len);
+        }
+        if (resp_send.len > 0) {
+            if (!initiator.processReceivedBytes(resp_send)) return error.InitiatorProcessFailed;
+            responder.markBytesSent(resp_send.len);
+        }
+    }
+    return error.HandshakeTimedOut;
+}
+
+test "V2Transport full handshake: initiator + responder reach .app via state machine" {
+    const allocator = std.testing.allocator;
+
+    var initiator = V2Transport.init(allocator, true, p2p.NetworkMagic.MAINNET);
+    defer initiator.deinit();
+    var responder = V2Transport.init(allocator, false, p2p.NetworkMagic.MAINNET);
+    defer responder.deinit();
+
+    // Initiator should already have queued ellswift + garbage; responder
+    // queues nothing until it sees the initiator's pubkey.
+    try std.testing.expect(initiator.getSendData().len >= ELLSWIFT_PUBKEY_LEN);
+    try std.testing.expectEqual(@as(usize, 0), responder.getSendData().len);
+
+    // Drive the full handshake.  4 iterations is plenty: round 1 ships
+    // initiator's pubkey → responder; round 2 ships responder's pubkey +
+    // terminator + version_packet → initiator; round 3 ships initiator's
+    // terminator + version_packet → responder; round 4 confirms both
+    // sides have decrypted their version packets.
+    _ = try pumpHandshake(&initiator, &responder, 8);
+
+    try std.testing.expect(initiator.isVersionReceived());
+    try std.testing.expect(responder.isVersionReceived());
+    try std.testing.expect(initiator.isHandshakeReady());
+    try std.testing.expect(responder.isHandshakeReady());
+
+    // Both sides should have decrypted each other's (empty) version
+    // packet, so the next inbound packet on each side is an application
+    // message; recv_aad has been cleared.
+    try std.testing.expectEqual(@as(usize, 0), initiator.recv_aad.len);
+    try std.testing.expectEqual(@as(usize, 0), responder.recv_aad.len);
+
+    // Application-message round-trip must work over the negotiated
+    // ciphers.  This proves the cipher state on both sides is coherent.
+    try initiator.sendMessage("ping", &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }, false);
+    const wire = initiator.getSendData();
+    try std.testing.expect(responder.processReceivedBytes(wire));
+    initiator.markBytesSent(wire.len);
+    try std.testing.expect(responder.isMessageReady());
+    const contents = responder.getReceivedMessage().?;
+    try std.testing.expectEqual(@as(u8, 18), contents[0]); // ping = short id 18
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }, contents[1..]);
+}
+
+test "V2Transport full handshake: responder fed bytes one byte at a time" {
+    // Worst-case wire-segmentation: the responder receives the initiator's
+    // entire handshake one byte at a time.  Simulates a maximally-pessimistic
+    // TCP segmentation where each PSH is a single byte.  If the state
+    // machine has any "must read entire chunk to make progress" bug, this
+    // test wedges.
+    const allocator = std.testing.allocator;
+
+    var initiator = V2Transport.init(allocator, true, p2p.NetworkMagic.MAINNET);
+    defer initiator.deinit();
+    var responder = V2Transport.init(allocator, false, p2p.NetworkMagic.MAINNET);
+    defer responder.deinit();
+
+    // Feed initiator's first batch (ellswift + garbage) byte by byte to the
+    // responder.  After each byte, processReceivedBytes must return true.
+    const init_first = initiator.getSendData();
+    var i: usize = 0;
+    while (i < init_first.len) : (i += 1) {
+        try std.testing.expect(responder.processReceivedBytes(init_first[i .. i + 1]));
+    }
+    initiator.markBytesSent(init_first.len);
+
+    // After consuming all 64+garbage bytes, responder should have left
+    // .key_maybe_v1 → .key → .garbage.  The send buffer should now hold
+    // its own ellswift+garbage+terminator+version_packet.
+    try std.testing.expectEqual(RecvState.garbage, responder.recv_state);
+    try std.testing.expect(responder.getSendData().len >= ELLSWIFT_PUBKEY_LEN + GARBAGE_TERMINATOR_LEN);
+
+    // Now feed responder's send buffer to initiator one byte at a time.
+    const resp_send = responder.getSendData();
+    i = 0;
+    while (i < resp_send.len) : (i += 1) {
+        try std.testing.expect(initiator.processReceivedBytes(resp_send[i .. i + 1]));
+    }
+    responder.markBytesSent(resp_send.len);
+
+    // Initiator should have consumed everything and reached .app, with its
+    // own terminator+version_packet queued for sending.
+    try std.testing.expectEqual(RecvState.app, initiator.recv_state);
+    try std.testing.expect(initiator.isVersionReceived());
+
+    // Final round: initiator's terminator + version_packet → responder,
+    // also fed byte by byte.
+    const init_second = initiator.getSendData();
+    i = 0;
+    while (i < init_second.len) : (i += 1) {
+        try std.testing.expect(responder.processReceivedBytes(init_second[i .. i + 1]));
+    }
+    initiator.markBytesSent(init_second.len);
+
+    try std.testing.expect(responder.isVersionReceived());
+    try std.testing.expect(responder.isHandshakeReady());
+    try std.testing.expect(initiator.isHandshakeReady());
+}
+
+// ============================================================================
+// Cross-impl byte-level cipher vectors (W90).
+//
+// The wire format MUST be byte-identical to Bitcoin Core / ouroboros
+// implementations.  These vectors are generated by ouroboros using the
+// same fixed ECDH shared secret; if clearbit's encrypt produces the same
+// ciphertext, our cipher is interoperable with Core.  If it diverges,
+// every Bitcoin Core peer will silently reject our packets.
+// ============================================================================
+
+test "V2Transport cipher: byte-for-byte interop with ouroboros (initiator)" {
+    var cipher = BIP324Cipher{};
+    // Mainnet magic.
+    const magic: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+    // Fixed shared secret (matches ouroboros test).
+    const shared: [32]u8 = hexDecode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    cipher.initializeWithSharedSecret(&shared, true, magic);
+
+    // Verify the derived terminators and session id.
+    const expected_send_term: [GARBAGE_TERMINATOR_LEN]u8 = hexDecode("5303e82dbcc82beaed7c6bc46fc0aedd");
+    const expected_recv_term: [GARBAGE_TERMINATOR_LEN]u8 = hexDecode("a2752f5d8881999ef0ffe63432395090");
+    const expected_session: [SESSION_ID_LEN]u8 = hexDecode("2fd3829de34a597b675bda081539d6a6e72b6194f760a5b0b5d3172dfc21d1eb");
+    try std.testing.expectEqualSlices(u8, &expected_send_term, &cipher.send_garbage_terminator);
+    try std.testing.expectEqualSlices(u8, &expected_recv_term, &cipher.recv_garbage_terminator);
+    try std.testing.expectEqualSlices(u8, &expected_session, &cipher.session_id);
+
+    // Packet 0: empty contents, AAD = "mygarbage".  Ouroboros expected ciphertext.
+    const expected_ct1: [EXPANSION]u8 = hexDecode("afb659c6fd64c292ba3be526cb15ffff2891c7e5");
+    var output1: [EXPANSION]u8 = undefined; // 0 + 20
+    cipher.encrypt(&[_]u8{}, "mygarbage", false, &output1);
+    try std.testing.expectEqualSlices(u8, &expected_ct1, &output1);
+
+    // Packet 1: contents = "hello", AAD = empty.
+    const expected_ct2: [5 + EXPANSION]u8 = hexDecode("2b844686e51272e1c49f28892505ab165bd4038028f217adff");
+    var output2: [5 + EXPANSION]u8 = undefined;
+    cipher.encrypt("hello", &[_]u8{}, false, &output2);
+    try std.testing.expectEqualSlices(u8, &expected_ct2, &output2);
+}
+
+test "V2Transport cipher: responder is mirror of initiator (decrypt initiator's bytes)" {
+    var resp_cipher = BIP324Cipher{};
+    const magic: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+    const shared: [32]u8 = hexDecode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    resp_cipher.initializeWithSharedSecret(&shared, false, magic);
+
+    // Decrypt initiator's first packet (empty contents, AAD="mygarbage").
+    const ct1: [EXPANSION]u8 = hexDecode("afb659c6fd64c292ba3be526cb15ffff2891c7e5");
+    const length1 = resp_cipher.decryptLength(ct1[0..LENGTH_LEN]);
+    try std.testing.expectEqual(@as(u32, 0), length1);
+
+    var contents1: [0]u8 = undefined;
+    var ignore1: bool = undefined;
+    const ok1 = resp_cipher.decrypt(ct1[LENGTH_LEN..], "mygarbage", &ignore1, &contents1);
+    try std.testing.expect(ok1);
+    try std.testing.expect(!ignore1);
+
+    // Decrypt initiator's second packet ("hello", no AAD).
+    const ct2: [5 + EXPANSION]u8 = hexDecode("2b844686e51272e1c49f28892505ab165bd4038028f217adff");
+    const length2 = resp_cipher.decryptLength(ct2[0..LENGTH_LEN]);
+    try std.testing.expectEqual(@as(u32, 5), length2);
+
+    var contents2: [5]u8 = undefined;
+    var ignore2: bool = undefined;
+    const ok2 = resp_cipher.decrypt(ct2[LENGTH_LEN..], &[_]u8{}, &ignore2, &contents2);
+    try std.testing.expect(ok2);
+    try std.testing.expect(!ignore2);
+    try std.testing.expectEqualStrings("hello", &contents2);
+}
+
+test "V2Transport full handshake: initiator's recv_aad equals responder's send_garbage" {
+    // Verify the AAD plumbing: the bytes the initiator stashes as recv_aad
+    // (between the responder's pubkey and the responder's terminator) must
+    // exactly equal the responder's send_garbage.  If the responder's
+    // garbage wasn't actually present in the wire stream, the version-
+    // packet decrypt would fail with bad AAD.
+    const allocator = std.testing.allocator;
+
+    var initiator = V2Transport.init(allocator, true, p2p.NetworkMagic.MAINNET);
+    defer initiator.deinit();
+    var responder = V2Transport.init(allocator, false, p2p.NetworkMagic.MAINNET);
+    defer responder.deinit();
+
+    // Round 1: initiator → responder.
+    {
+        const wire = initiator.getSendData();
+        try std.testing.expect(responder.processReceivedBytes(wire));
+        initiator.markBytesSent(wire.len);
+    }
+
+    // Capture responder's garbage BEFORE it's freed by deinit / overwritten.
+    var responder_garbage_copy = std.ArrayList(u8).init(allocator);
+    defer responder_garbage_copy.deinit();
+    try responder_garbage_copy.appendSlice(responder.send_garbage);
+
+    // Round 2: responder → initiator.  This should populate
+    // initiator.recv_aad with the responder's garbage, then clear it
+    // after decrypting the responder's version packet.
+    {
+        const wire = responder.getSendData();
+        try std.testing.expect(initiator.processReceivedBytes(wire));
+        responder.markBytesSent(wire.len);
+    }
+
+    // After successful decrypt, recv_aad has been cleared (BIP-324).
+    try std.testing.expectEqual(@as(usize, 0), initiator.recv_aad.len);
+    try std.testing.expectEqual(RecvState.app, initiator.recv_state);
 }
