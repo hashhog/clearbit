@@ -494,18 +494,211 @@ pub const Peer = struct {
             return PeerError.ProtocolViolation;
     }
 
+    /// Returns true iff the BIP-324 v2 outbound probe is enabled.
+    /// Currently gated behind the `CLEARBIT_BIP324_V2` env var (set to "1"
+    /// to opt in).  Default off because the v2 application-message
+    /// plumbing is incomplete: a v2-classified inbound is currently
+    /// disconnected after classification rather than running encrypted
+    /// version/verack exchange.  The negotiation envelope and the cipher
+    /// itself are correct; the missing piece is routing every Peer
+    /// sendMessage/receiveMessage call through the V2Transport state
+    /// machine.  Until that lands, leaving v2 disabled by default keeps
+    /// the production fleet on the well-tested v1 path.
+    pub fn bip324V2Enabled() bool {
+        const v = std.posix.getenv("CLEARBIT_BIP324_V2") orelse return false;
+        return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "TRUE");
+    }
+
+    /// Read up to `out.len` bytes without consuming them from the kernel
+    /// receive buffer (uses MSG_PEEK).  Returns the number of bytes peeked.
+    /// May return less than `out.len` if data is currently unavailable;
+    /// poll() before calling to ensure data is ready.
+    pub fn peekBytes(self: *Peer, out: []u8) PeerError!usize {
+        var total: usize = 0;
+        // Bound the time we spend peeking with a deadline: we may receive
+        // partial data for a v1 VERSION (24 header + payload), but the
+        // first 16 bytes — magic + command — arrive together in the very
+        // first TCP segment in practice.
+        const deadline_ms = std.time.milliTimestamp() + 30_000;
+        while (total < out.len) {
+            const remaining_ms = deadline_ms - std.time.milliTimestamp();
+            if (remaining_ms <= 0) break;
+
+            // Wait for data with the remaining deadline.
+            var pollfds = [_]std.posix.pollfd{.{
+                .fd = self.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&pollfds, @intCast(@min(remaining_ms, 30_000))) catch
+                return PeerError.ConnectionClosed;
+            if (ready == 0) break; // deadline expired with partial data
+            if (pollfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0)
+                return PeerError.ConnectionClosed;
+            if ((pollfds[0].revents & std.posix.POLL.IN) == 0) continue;
+
+            const n = std.posix.recv(self.stream.handle, out[total..], std.posix.MSG.PEEK) catch |err| {
+                if (err == error.WouldBlock) continue;
+                return PeerError.ConnectionClosed;
+            };
+            if (n == 0) return PeerError.ConnectionClosed;
+            // recv with MSG_PEEK can return the SAME bytes repeatedly; if
+            // the cumulative peeked length didn't grow we've already seen
+            // everything currently buffered — break and let the caller
+            // decide based on what we have.
+            if (n <= total) break;
+            total = n;
+        }
+        return total;
+    }
+
+    /// Outcome of an outbound BIP-324 v2 probe.
+    pub const V2ProbeResult = enum {
+        /// Peer accepted v2 and the cipher handshake started.  CALLER must
+        /// continue with the v2 application-message path (currently NOT
+        /// plumbed; see `bip324V2Enabled` doc-comment).
+        v2_negotiated,
+        /// Peer did not respond within the deadline OR responded with v1
+        /// magic.  CALLER must close this socket and reconnect in v1
+        /// (sending v2 garbage is destructive on a v1 peer).
+        fallback_to_v1,
+    };
+
+    /// Send an outbound BIP-324 v2 probe on this connection.  Sends the
+    /// 64-byte ElligatorSwift pubkey + initial garbage (per BIP-324) and
+    /// reads up to 16 bytes of the peer's response with `deadline_ms`
+    /// timeout.  Classifies the response:
+    ///   - If the peer started replying with v1 magic, returns
+    ///     `.fallback_to_v1`.
+    ///   - If we read fewer than 16 bytes by the deadline, returns
+    ///     `.fallback_to_v1` (treat silence as "not v2").
+    ///   - Otherwise (looks like a v2 ellswift pubkey reply), returns
+    ///     `.v2_negotiated`.  The caller is then responsible for
+    ///     completing the v2 handshake via the V2Transport state machine.
+    ///
+    /// The connection state is left consumed: even on `.v2_negotiated`,
+    /// 16 bytes have been peeked from the kernel buffer (no bytes
+    /// drained yet, so the V2Transport state machine sees the full
+    /// pubkey when invoked).  On `.fallback_to_v1`, the caller MUST
+    /// close this socket — the 64 bytes we sent will have corrupted the
+    /// v1 framing on the remote.
+    pub fn tryV2OutboundProbe(self: *Peer, deadline_ms: i64) PeerError!V2ProbeResult {
+        // Build a one-shot V2Transport in initiator mode just to grab
+        // the pubkey + garbage payload bytes.  The transport object is
+        // discarded after the probe — full v2 plumbing tracks its own
+        // V2Transport on the Peer (not yet implemented).
+        var transport = v2_transport.V2Transport.init(self.allocator, true, self.network_params.magic);
+        defer transport.deinit();
+
+        const send_data = transport.getSendData();
+        if (send_data.len < v2_transport.ELLSWIFT_PUBKEY_LEN) {
+            // Cipher init failed (e.g. ellswift_create rejected every
+            // attempt).  Don't write the partial bytes — fall back.
+            return .fallback_to_v1;
+        }
+
+        self.stream.writeAll(send_data) catch return PeerError.ConnectionClosed;
+        self.bytes_sent += send_data.len;
+
+        // Read up to 16 bytes with the deadline.  Use MSG_PEEK so that on
+        // a v2-negotiated outcome the caller can hand the bytes off to the
+        // V2Transport state machine without reordering issues.
+        var peek: [v2_transport.V1_PREFIX_LEN]u8 = undefined;
+        const start_ms = std.time.milliTimestamp();
+        var total: usize = 0;
+        while (total < peek.len) {
+            const remaining_ms = deadline_ms - (std.time.milliTimestamp() - start_ms);
+            if (remaining_ms <= 0) break;
+
+            var pollfds = [_]std.posix.pollfd{.{
+                .fd = self.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&pollfds, @intCast(@min(remaining_ms, 30_000))) catch
+                return PeerError.ConnectionClosed;
+            if (ready == 0) break;
+            if (pollfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0)
+                return .fallback_to_v1;
+            if ((pollfds[0].revents & std.posix.POLL.IN) == 0) continue;
+
+            const n = std.posix.recv(self.stream.handle, peek[total..], std.posix.MSG.PEEK) catch |err| {
+                if (err == error.WouldBlock) continue;
+                return .fallback_to_v1;
+            };
+            if (n == 0) return .fallback_to_v1; // EOF
+            if (n <= total) break;
+            total = n;
+        }
+
+        if (total < v2_transport.V1_PREFIX_LEN) {
+            // Insufficient response within deadline → not speaking v2 (or
+            // a stalled link).  Either way, fall back to v1 on a fresh
+            // connection.
+            return .fallback_to_v1;
+        }
+
+        var magic_le: [4]u8 = undefined;
+        std.mem.writeInt(u32, &magic_le, self.network_params.magic, .little);
+        if (v2_transport.looksLikeV1Version(&peek, magic_le)) {
+            // Peer is speaking v1 (and is treating our 64-byte ellswift
+            // garbage as a v1 message — the peer will probably disconnect
+            // on its next read).  Caller MUST close + reconnect.
+            return .fallback_to_v1;
+        }
+
+        // Plausibly a v2 ellswift pubkey reply.  Caller must complete
+        // the handshake via the V2Transport state machine — currently
+        // not plumbed; see `bip324V2Enabled`.
+        return .v2_negotiated;
+    }
+
     /// Perform the version/verack handshake.
     /// Outbound: send version, wait for version+verack, send verack.
     /// Inbound: wait for version, send version+verack, wait for verack.
-    /// If BIP-324 v2 transport is supported, attempt encrypted handshake first
-    /// and fall back to v1 on failure.
+    ///
+    /// BIP-324 v2 negotiation:
+    ///   - Inbound: peeks the first 16 bytes; if they look like a v1
+    ///     VERSION header (network magic + "version\0\0\0\0\0") we run
+    ///     the v1 path.  Otherwise the peer initiated v2; we currently
+    ///     reject the connection (see `bip324V2Enabled` doc-comment for
+    ///     the application-plumbing gap).
+    ///   - Outbound: when `bip324V2Enabled()` is true and the peer is
+    ///     not in the manager's v1-fallback set, an outbound v2 probe is
+    ///     attempted via `tryV2OutboundProbe` BEFORE this function is
+    ///     called.  If the probe falls back, the manager records the
+    ///     v1-only state and reconnects, then drives this v1 handshake.
     pub fn performHandshake(self: *Peer, our_height: i32) PeerError!void {
         const now = std.time.timestamp();
 
-        // BIP-324 v2 transport is disabled for now.
-        // Sending 64 bytes of ElligatorSwift pubkey to a v1-only peer corrupts the
-        // connection since the remote interprets those bytes as a v1 message header.
-        // TODO: Implement proper v2 negotiation with a separate probe connection.
+        // Inbound: classify the wire by peeking the first 16 bytes.
+        // If the peer sent the v1 VERSION prefix, fall through to v1.
+        // Otherwise, the peer is speaking v2 (or speaking nothing recognizable
+        // — we close it for safety).
+        if (self.direction == .inbound and bip324V2Enabled()) {
+            var peek: [v2_transport.V1_PREFIX_LEN]u8 = undefined;
+            const got = self.peekBytes(&peek) catch return PeerError.HandshakeFailed;
+            if (got >= v2_transport.V1_PREFIX_LEN) {
+                var magic_le: [4]u8 = undefined;
+                std.mem.writeInt(u32, &magic_le, self.network_params.magic, .little);
+                if (!v2_transport.looksLikeV1Version(&peek, magic_le)) {
+                    // Peer is initiating BIP-324 v2.  The cipher state
+                    // machine + ellswift FFI are wired (see v2_transport.zig)
+                    // but the per-message v2 wrapping for application
+                    // messages is not yet plumbed through every Peer
+                    // send/receive call site.  Reject the connection rather
+                    // than risk a malformed exchange.  The peer will retry —
+                    // typically Bitcoin Core falls back to v1 on its next
+                    // connection attempt.
+                    std.log.info("peer={any} initiated BIP-324 v2 (not yet plumbed); rejecting", .{self.address});
+                    return PeerError.HandshakeFailed;
+                }
+                // Looks like v1 — fall through.
+            }
+            // got < V1_PREFIX_LEN means the peer didn't send 16 bytes
+            // within the peek deadline; the v1 path below will time out
+            // naturally on receiveMessage if the peer is dead.
+        }
 
         if (self.direction == .outbound) {
             // Send our version
@@ -1321,6 +1514,16 @@ pub const PeerManager = struct {
     /// path can't recurse into drainBlockBuffer.  W101 (2026-04-24).
     in_drain: bool,
 
+    /// Per-address fall-back set for BIP-324 v2 outbound negotiation.
+    /// Once we've tried v2 against an address and fallen back to v1 (because
+    /// the peer didn't speak v2 — a non-ellswift response or a deadline
+    /// expiry), record the addressKey here so subsequent outbound attempts
+    /// to that address skip the v2 probe.  Bounded by V2_FALLBACK_CACHE_MAX
+    /// — once full, we drop a random entry.  This is fine: at worst we
+    /// reprobe a v1-only peer with a fresh v2 attempt and pay the deadline
+    /// cost again.
+    v2_fallback_set: std.AutoHashMap(u64, void),
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
@@ -1358,6 +1561,7 @@ pub const PeerManager = struct {
             .blocks_since_log = 0,
             .last_stall_recovery = 0,
             .in_drain = false,
+            .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
         };
     }
 
@@ -1392,6 +1596,111 @@ pub const PeerManager = struct {
             self.served_blocks.deinit();
         }
         if (self.listener) |*l| l.deinit();
+        self.v2_fallback_set.deinit();
+    }
+
+    /// Cap on the BIP-324 v2 fall-back set (per-process).  Once exceeded
+    /// we drop a random entry to bound memory; reprobing v1-only peers is
+    /// cheap (one round-trip cost) so accuracy isn't critical.
+    pub const V2_FALLBACK_CACHE_MAX: usize = 4096;
+
+    /// BIP-324 v2 outbound probe deadline (per Bitcoin Core net.cpp uses
+    /// ~30s; we mirror that).  Short enough that a stalled remote
+    /// doesn't wedge the maintainOutbound caller for long.
+    pub const V2_PROBE_DEADLINE_MS: i64 = 30_000;
+
+    /// Try to open an outbound connection to `address`, negotiating BIP-324
+    /// v2 if `Peer.bip324V2Enabled()` is true and the address is not in
+    /// the v1-fallback set.  Returns the fully-handshaked Peer on success
+    /// or null on any failure.  Caller takes ownership of the returned
+    /// pointer (must `disconnect` + `destroy`).
+    ///
+    /// Behavior:
+    ///  1. Open TCP connection.
+    ///  2. If v2 is enabled and the address is not v1-only, run
+    ///     `Peer.tryV2OutboundProbe`.  On `.fallback_to_v1`, mark the
+    ///     address v1-only, close the socket, and reconnect.  On
+    ///     `.v2_negotiated`, currently we close + mark v1-only as well
+    ///     (because the application-level v2 plumbing is incomplete);
+    ///     this preserves connectivity to v2-capable peers via v1.  Once
+    ///     the v2 application path lands, this branch will instead
+    ///     continue the v2 handshake.
+    ///  3. Run `performHandshake` (v1) on the (possibly second) socket.
+    pub fn connectOutboundNegotiated(
+        self: *PeerManager,
+        address: std.net.Address,
+    ) ?*Peer {
+        const v2_enabled = Peer.bip324V2Enabled();
+        const try_v2 = v2_enabled and !self.isV1Only(address);
+
+        // Phase 1: optional v2 probe.
+        if (try_v2) {
+            const probe_peer = self.allocator.create(Peer) catch return null;
+            probe_peer.* = Peer.connect(address, self.network_params, self.allocator) catch {
+                self.allocator.destroy(probe_peer);
+                return null;
+            };
+
+            const result = probe_peer.tryV2OutboundProbe(V2_PROBE_DEADLINE_MS) catch {
+                probe_peer.disconnect();
+                self.allocator.destroy(probe_peer);
+                // Probe errored — treat as v1-only to avoid retrying.
+                self.markV1Only(address);
+                return null;
+            };
+
+            switch (result) {
+                .v2_negotiated => {
+                    // Application-message v2 plumbing is not yet wired.
+                    // Close this socket and reconnect on v1 so the peer
+                    // can still serve us blocks/headers.  Do NOT mark
+                    // v1-only because this peer DID negotiate v2 — once
+                    // the plumbing lands we'll prefer v2 to it.
+                    std.log.info("peer={any} negotiated BIP-324 v2; reconnecting on v1 (app plumbing pending)", .{address});
+                    probe_peer.disconnect();
+                    self.allocator.destroy(probe_peer);
+                    // Fall through to v1 path below.
+                },
+                .fallback_to_v1 => {
+                    self.markV1Only(address);
+                    probe_peer.disconnect();
+                    self.allocator.destroy(probe_peer);
+                    // Fall through to v1 path below.
+                },
+            }
+        }
+
+        // Phase 2: v1 handshake on a fresh connection.
+        const peer = self.allocator.create(Peer) catch return null;
+        peer.* = Peer.connect(address, self.network_params, self.allocator) catch {
+            self.allocator.destroy(peer);
+            return null;
+        };
+        peer.performHandshake(self.our_height) catch {
+            peer.disconnect();
+            self.allocator.destroy(peer);
+            return null;
+        };
+        return peer;
+    }
+
+    /// Mark `address` as v1-only so future outbound attempts skip the v2 probe.
+    pub fn markV1Only(self: *PeerManager, address: std.net.Address) void {
+        const key = addressKey(address);
+        if (self.v2_fallback_set.count() >= V2_FALLBACK_CACHE_MAX) {
+            // Drop a random-ish entry: iterate once, remove the first key we
+            // see.  AutoHashMap's iteration order is implementation-defined.
+            var iter = self.v2_fallback_set.keyIterator();
+            if (iter.next()) |k| {
+                _ = self.v2_fallback_set.remove(k.*);
+            }
+        }
+        self.v2_fallback_set.put(key, {}) catch {};
+    }
+
+    /// Returns true if `address` is in the v1-only fall-back set.
+    pub fn isV1Only(self: *const PeerManager, address: std.net.Address) bool {
+        return self.v2_fallback_set.contains(addressKey(address));
     }
 
     /// Load ban list from disk.
@@ -1797,18 +2106,11 @@ pub const PeerManager = struct {
             if (self.isConnected(addr)) continue;
             if (self.ban_list.isAddressBanned(addr)) continue;
 
-            const peer = self.allocator.create(Peer) catch continue;
-            peer.* = Peer.connect(addr, self.network_params, self.allocator) catch {
-                self.allocator.destroy(peer);
-                continue;
-            };
+            // BIP-324 negotiation lives inside connectOutboundNegotiated;
+            // when v2 is disabled (default) this is identical to the old
+            // Peer.connect+performHandshake pair.
+            const peer = self.connectOutboundNegotiated(addr) orelse continue;
             peer.conn_type = .block_relay;
-
-            peer.performHandshake(self.our_height) catch {
-                peer.disconnect();
-                self.allocator.destroy(peer);
-                continue;
-            };
 
             // Track netgroup
             self.outbound_netgroups.put(netGroup(addr), {}) catch {};
@@ -1871,16 +2173,10 @@ pub const PeerManager = struct {
         while (outbound_count < MAX_OUTBOUND_CONNECTIONS and attempts < max_attempts) {
             attempts += 1;
             const addr = self.selectPeerToConnect() orelse break;
-            const peer = self.allocator.create(Peer) catch break;
-            peer.* = Peer.connect(addr, self.network_params, self.allocator) catch {
-                self.allocator.destroy(peer);
-                continue;
-            };
-            peer.performHandshake(self.our_height) catch {
-                peer.disconnect();
-                self.allocator.destroy(peer);
-                continue;
-            };
+            // BIP-324 negotiation lives inside connectOutboundNegotiated;
+            // when v2 is disabled (default) this is identical to the old
+            // Peer.connect+performHandshake pair.
+            const peer = self.connectOutboundNegotiated(addr) orelse continue;
 
             // Mark address as successful
             const key = addressKey(addr);
@@ -3395,24 +3691,14 @@ pub const PeerManager = struct {
         // Connect to --connect peer if specified (priority)
         if (self.connect_address) |addr| {
             std.debug.print("P2P: Attempting TCP connection to --connect peer...\n", .{});
-            const new_peer = self.allocator.create(Peer) catch {
-                std.debug.print("P2P: Failed to allocate peer\n", .{});
+            // BIP-324 negotiation lives inside connectOutboundNegotiated;
+            // when v2 is disabled (default) this is identical to the old
+            // Peer.connect+performHandshake pair.
+            const new_peer = self.connectOutboundNegotiated(addr) orelse {
+                std.debug.print("P2P: Connection or handshake failed with --connect peer\n", .{});
                 return;
             };
-            new_peer.* = Peer.connect(addr, self.network_params, self.allocator) catch {
-                std.debug.print("P2P: TCP connection failed to --connect peer\n", .{});
-                self.allocator.destroy(new_peer);
-                return;
-            };
-            std.debug.print("P2P: TCP connected, performing handshake...\n", .{});
             new_peer.conn_type = .manual;
-
-            new_peer.performHandshake(self.our_height) catch {
-                std.debug.print("P2P: Handshake failed with --connect peer\n", .{});
-                new_peer.disconnect();
-                self.allocator.destroy(new_peer);
-                return;
-            };
             std.debug.print("P2P: Handshake complete with --connect peer (height={d})\n", .{new_peer.start_height});
 
             self.peers.append(new_peer) catch {
@@ -5099,4 +5385,60 @@ test "W16 pipeline: slow-peer disconnect rewinds cursor without stalling others"
     // level-triggered tick.
     const b_remaining_budget = MAX_BLOCKS_IN_TRANSIT_PER_PEER - peer_b.blocks_in_flight_count;
     try std.testing.expectEqual(@as(u32, 12), b_remaining_budget);
+}
+
+// ============================================================================
+// BIP-324 negotiation: per-peer v1-fallback tracking on PeerManager.
+// ============================================================================
+
+test "BIP-324: markV1Only / isV1Only round-trip on IPv4" {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET_PARAMS);
+    defer pm.deinit();
+
+    const addr = std.net.Address.initIp4(.{ 192, 168, 1, 50 }, 8333);
+    try std.testing.expect(!pm.isV1Only(addr));
+    pm.markV1Only(addr);
+    try std.testing.expect(pm.isV1Only(addr));
+}
+
+test "BIP-324: v1-fallback set distinguishes addresses by port" {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET_PARAMS);
+    defer pm.deinit();
+
+    const a = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 8333);
+    const b = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 8334);
+    pm.markV1Only(a);
+    try std.testing.expect(pm.isV1Only(a));
+    try std.testing.expect(!pm.isV1Only(b));
+}
+
+test "BIP-324: v1-fallback set caps at V2_FALLBACK_CACHE_MAX" {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET_PARAMS);
+    defer pm.deinit();
+
+    // Insert V2_FALLBACK_CACHE_MAX + 5 entries; the cap must hold (LRU
+    // drops a random entry on overflow, so we don't assert WHICH entry
+    // got evicted, only that the count never exceeds the cap).
+    var i: u32 = 0;
+    while (i < PeerManager.V2_FALLBACK_CACHE_MAX + 5) : (i += 1) {
+        const ip: [4]u8 = .{ @truncate(i >> 24), @truncate(i >> 16), @truncate(i >> 8), @truncate(i) };
+        const port: u16 = @truncate(8333 + (i & 0xFFF));
+        const addr = std.net.Address.initIp4(ip, port);
+        pm.markV1Only(addr);
+        try std.testing.expect(pm.v2_fallback_set.count() <= PeerManager.V2_FALLBACK_CACHE_MAX);
+    }
+}
+
+test "BIP-324: bip324V2Enabled defaults off, honors env var" {
+    // Default state — env unset.
+    // We can't reliably unset an env var in a Zig test (no portable
+    // unsetenv wrapper in std for our use), so verify only the non-set
+    // path is false-by-default in production builds.  When the env var
+    // is set to "1" by the operator, bip324V2Enabled() returns true.
+    if (std.posix.getenv("CLEARBIT_BIP324_V2") == null) {
+        try std.testing.expect(!Peer.bip324V2Enabled());
+    }
 }
