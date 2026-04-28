@@ -143,6 +143,24 @@ pub fn build(b: *std.Build) void {
     const script_step = b.step("test-script", "Run script test vectors");
     script_step.dependOn(&run_script.step);
 
+    // BIP-341 vector-runner shim (validates clearbit's taproot_sighash
+    // module against bitcoin-core/src/test/data/bip341_wallet_vectors.json
+    // via tools/bip341-vector-runner). Links secp256k1 because crypto.zig
+    // imports it; the shim itself only uses sha256 + taggedHash.
+    const bip341_shim = b.addExecutable(.{
+        .name = "bip341_shim",
+        .root_source_file = b.path("src/bip341_shim.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bip341_shim.addIncludePath(.{ .cwd_relative = secp256k1_include });
+    bip341_shim.linkSystemLibrary("secp256k1");
+    bip341_shim.linkLibC();
+    if (target.result.cpu.arch == .x86_64) {
+        bip341_shim.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+    }
+    b.installArtifact(bip341_shim);
+
     // RocksDB storage tests
     {
         const rocksdb_tests = b.addTest(.{
