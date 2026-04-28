@@ -1889,7 +1889,11 @@ pub const PeerManager = struct {
             peer.v2_transport = t;
 
             peer.performV2Handshake(Peer.V2_HANDSHAKE_DEADLINE_MS) catch |err| {
-                std.log.info("peer={any} BIP-324 v2 outbound handshake failed ({any}); falling back to v1", .{ address, err });
+                // Use std.debug.print so the line is visible in ReleaseFast
+                // (Zig 0.13's default `log_level` for ReleaseFast is `.err`,
+                // so std.log.info is silently dropped — and the v2 wiring
+                // probe needs to be observable in production logs).
+                std.debug.print("P2P: BIP-324 v2 outbound handshake failed peer={any} err={any}; falling back to v1\n", .{ address, err });
                 self.markV1Only(address);
                 peer.disconnect();
                 self.allocator.destroy(peer);
@@ -1904,7 +1908,8 @@ pub const PeerManager = struct {
                 self.allocator.destroy(peer);
                 return null;
             };
-            std.log.info("peer={any} BIP-324 v2 connected (encrypted)", .{address});
+            // Visible in ReleaseFast — see comment above.
+            std.debug.print("P2P: BIP-324 v2 connected (encrypted) peer={any}\n", .{address});
             return peer;
         }
 
@@ -4027,14 +4032,25 @@ pub const PeerManager = struct {
     // ========================================================================
 
     /// Connect to a new peer (legacy API).
+    ///
+    /// Delegates to `connectOutboundNegotiated` so the v2/v1 selection logic
+    /// (BIP-324 when `CLEARBIT_BIP324_V2=1`) is honored on every outbound
+    /// path — `tryConnectNode` (`onetry`/`addnode`) and
+    /// `maintainManualConnections` reach the wire through here.  Without
+    /// this delegation those paths were silently v1-only even with the
+    /// env var enabled.  Preserves the legacy `!*Peer` signature and
+    /// auto-append-to-peers contract that callers rely on.
     pub fn connectToPeer(self: *PeerManager, address: std.net.Address) !*Peer {
         if (self.peers.items.len >= MAX_TOTAL_CONNECTIONS) {
             return error.TooManyPeers;
         }
 
-        const peer = try self.allocator.create(Peer);
-        peer.* = try Peer.connect(address, self.network_params, self.allocator);
-        try self.peers.append(peer);
+        const peer = self.connectOutboundNegotiated(address) orelse return error.ConnectFailed;
+        self.peers.append(peer) catch |err| {
+            peer.disconnect();
+            self.allocator.destroy(peer);
+            return err;
+        };
         return peer;
     }
 
