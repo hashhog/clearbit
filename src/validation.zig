@@ -164,39 +164,52 @@ pub fn checkTransactionContextual(
 
     var total_in: i64 = 0;
 
-    for (tx.inputs, 0..) |input, input_index| {
-        // Look up the UTXO being spent
+    // Two-pass: collect all spent UTXOs first so per-input prevouts
+    // (BIP-341 sha_amounts / sha_scriptpubkeys) are available throughout
+    // script verification. The previous single-pass `defer .deinit()` per
+    // iteration freed each scriptPubKey before the next input ran, which
+    // was fine for legacy/SegWit-v0 but cannot satisfy Taproot's all-input
+    // commitment requirement.
+    var utxos = try allocator.alloc(storage.UtxoEntry, tx.inputs.len);
+    defer {
+        for (utxos) |*u| u.deinit(chain_store.allocator);
+        allocator.free(utxos);
+    }
+
+    var spent_amounts = try allocator.alloc(i64, tx.inputs.len);
+    defer allocator.free(spent_amounts);
+    var spent_scripts = try allocator.alloc([]const u8, tx.inputs.len);
+    defer allocator.free(spent_scripts);
+
+    for (tx.inputs, 0..) |input, i| {
         const utxo_result = chain_store.getUtxo(&input.previous_output) catch {
             return ValidationError.MissingInput;
         };
+        utxos[i] = utxo_result orelse return ValidationError.MissingInput;
 
-        const utxo = utxo_result orelse return ValidationError.MissingInput;
-        defer {
-            // Free the UTXO's script_pubkey since getUtxo allocates it
-            var mutable_utxo = utxo;
-            mutable_utxo.deinit(chain_store.allocator);
-        }
-
-        // Check coinbase maturity
-        if (utxo.is_coinbase and height < utxo.height + consensus.COINBASE_MATURITY) {
+        if (utxos[i].is_coinbase and height < utxos[i].height + consensus.COINBASE_MATURITY) {
             return ValidationError.ImmatureCoinbase;
         }
+        total_in += utxos[i].value;
+        spent_amounts[i] = utxos[i].value;
+        spent_scripts[i] = utxos[i].script_pubkey;
+    }
 
-        total_in += utxo.value;
-
-        // Verify script
-        var engine = script.ScriptEngine.init(
+    for (tx.inputs, 0..) |input, input_index| {
+        var engine = script.ScriptEngine.initWithPrevouts(
             allocator,
             tx,
             input_index,
-            utxo.value,
+            utxos[input_index].value,
             script.ScriptFlags{},
+            spent_amounts,
+            spent_scripts,
         );
         defer engine.deinit();
 
         const result = engine.verify(
             input.script_sig,
-            utxo.script_pubkey,
+            utxos[input_index].script_pubkey,
             input.witness,
         );
 
@@ -1110,6 +1123,11 @@ pub const ScriptCheckJob = struct {
     flags: script.ScriptFlags,
     /// Witness data for this input
     witness: []const []const u8,
+    /// Per-input prevouts for BIP-341 Taproot sighash. spent_amounts[i]
+    /// and spent_scripts[i] correspond to tx.inputs[i]'s prevout.
+    /// Empty slices `&.{}` if Taproot won't be exercised.
+    spent_amounts: []const i64 = &.{},
+    spent_scripts: []const []const u8 = &.{},
     /// Result of verification (set by worker thread)
     result: std.atomic.Value(VerifyResult),
 
@@ -1119,7 +1137,8 @@ pub const ScriptCheckJob = struct {
         failure = 2,
     };
 
-    /// Initialize a new script check job
+    /// Initialize a new script check job (legacy / SegWit-v0 only).
+    /// Use `initWithPrevouts` for Taproot inputs.
     pub fn init(
         tx_bytes: []const u8,
         input_index: usize,
@@ -1135,6 +1154,33 @@ pub const ScriptCheckJob = struct {
             .amount = amount,
             .flags = flags,
             .witness = witness,
+            .result = std.atomic.Value(VerifyResult).init(.pending),
+        };
+    }
+
+    /// Initialize a script check job carrying per-input prevouts for
+    /// BIP-341 Taproot. The slices must remain valid for the job's
+    /// lifetime — typically owned by a per-tx context allocated for
+    /// the duration of `connectBlock`.
+    pub fn initWithPrevouts(
+        tx_bytes: []const u8,
+        input_index: usize,
+        prev_script_pubkey: []const u8,
+        amount: i64,
+        flags: script.ScriptFlags,
+        witness: []const []const u8,
+        spent_amounts: []const i64,
+        spent_scripts: []const []const u8,
+    ) ScriptCheckJob {
+        return .{
+            .tx_bytes = tx_bytes,
+            .input_index = input_index,
+            .prev_script_pubkey = prev_script_pubkey,
+            .amount = amount,
+            .flags = flags,
+            .witness = witness,
+            .spent_amounts = spent_amounts,
+            .spent_scripts = spent_scripts,
             .result = std.atomic.Value(VerifyResult).init(.pending),
         };
     }
@@ -1324,13 +1370,18 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator) boo
     if (job.input_index >= tx.inputs.len) return false;
     const input = tx.inputs[job.input_index];
 
-    // Create script engine and verify
-    var engine = script.ScriptEngine.init(
+    // Create script engine and verify. spent_amounts/spent_scripts are
+    // empty slices for legacy / SegWit-v0; for Taproot inputs the caller
+    // (connectBlock script-check submission) populates them via
+    // ScriptCheckJob.initWithPrevouts.
+    var engine = script.ScriptEngine.initWithPrevouts(
         allocator,
         &tx,
         job.input_index,
         job.amount,
         job.flags,
+        job.spent_amounts,
+        job.spent_scripts,
     );
     defer engine.deinit();
 
