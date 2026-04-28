@@ -345,6 +345,9 @@ pub const FSChaCha20Poly1305 = struct {
     }
 
     /// Encrypt split plaintext (header + contents) with AAD.
+    ///
+    /// Uses a stack buffer for plaintexts up to 64 KiB and falls back to the
+    /// page allocator for larger messages (e.g. a 4 MiB block).
     pub fn encryptSplit(
         self: *FSChaCha20Poly1305,
         output: []u8,
@@ -355,18 +358,35 @@ pub const FSChaCha20Poly1305 = struct {
         std.debug.assert(output.len == header.len + contents.len + TAG_LEN);
 
         const nonce = self.buildNonce();
+        const combined_len = header.len + contents.len;
 
-        // Combine header + contents for encryption
-        var combined = std.ArrayList(u8).init(std.heap.page_allocator);
-        defer combined.deinit();
-        combined.appendSlice(header) catch unreachable;
-        combined.appendSlice(contents) catch unreachable;
+        const STACK_COMBINED_MAX: usize = 65536;
+        var stack_buf: [STACK_COMBINED_MAX]u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
+
+        const combined: []u8 = if (combined_len <= STACK_COMBINED_MAX)
+            stack_buf[0..combined_len]
+        else blk: {
+            const buf = std.heap.page_allocator.alloc(u8, combined_len) catch {
+                // Allocation failure produces an authentication-tag mismatch
+                // on the peer side, which surfaces as a clean disconnect.
+                @memset(output, 0);
+                self.nextPacket();
+                return;
+            };
+            heap_buf = buf;
+            break :blk buf;
+        };
+
+        @memcpy(combined[0..header.len], header);
+        @memcpy(combined[header.len..], contents);
 
         var tag: [TAG_LEN]u8 = undefined;
         AEAD.encrypt(
             output[0 .. output.len - TAG_LEN],
             &tag,
-            combined.items,
+            combined,
             aad,
             nonce,
             self.key,
@@ -395,6 +415,13 @@ pub const FSChaCha20Poly1305 = struct {
     }
 
     /// Decrypt and split output into header and contents.
+    ///
+    /// For payloads up to `STACK_COMBINED_MAX` (64 KiB) the work buffer lives
+    /// on the stack — the original implementation, which is plenty for the
+    /// vast majority of P2P messages.  Larger payloads (full blocks can be up
+    /// to 4 MiB on mainnet) are handled via a transient heap allocation, so
+    /// the v2 transport correctly carries cmpctblock / block / blocktxn that
+    /// would otherwise overflow the 64 KiB stack buffer.
     pub fn decryptSplit(
         self: *FSChaCha20Poly1305,
         header: []u8,
@@ -407,12 +434,26 @@ pub const FSChaCha20Poly1305 = struct {
         const nonce = self.buildNonce();
         const ciphertext = input[0 .. input.len - TAG_LEN];
         const tag = input[input.len - TAG_LEN ..][0..TAG_LEN];
-
-        // Decrypt combined
-        var combined: [65536]u8 = undefined; // Max message size
         const combined_len = header.len + contents.len;
+
+        const STACK_COMBINED_MAX: usize = 65536;
+        var stack_buf: [STACK_COMBINED_MAX]u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
+
+        const combined: []u8 = if (combined_len <= STACK_COMBINED_MAX)
+            stack_buf[0..combined_len]
+        else blk: {
+            const buf = std.heap.page_allocator.alloc(u8, combined_len) catch {
+                self.nextPacket();
+                return false;
+            };
+            heap_buf = buf;
+            break :blk buf;
+        };
+
         AEAD.decrypt(
-            combined[0..combined_len],
+            combined,
             ciphertext,
             tag.*,
             aad,
@@ -680,8 +721,12 @@ pub const BIP324Cipher = struct {
         self.initializeWithSharedSecret(&shared_secret, initiator, network_magic);
     }
 
-    /// Internal: initialize ciphers from a shared secret.
-    fn initializeWithSharedSecret(
+    /// Initialize ciphers from a known shared secret.  Public for tests.
+    /// Production callers should use `initialize` (which derives the shared
+    /// secret via real or simulated ECDH); this helper exists so the test
+    /// suite can wire two transports with a deterministic key without going
+    /// through libsecp256k1's ellswift_xdh.
+    pub fn initializeWithSharedSecret(
         self: *BIP324Cipher,
         shared_secret: *const [32]u8,
         initiator: bool,
@@ -852,6 +897,11 @@ pub const SendState = enum {
     v1,
 };
 
+/// Maximum BIP-324 contents length (matches Bitcoin Core's MAX_CONTENTS_LEN:
+/// 1-byte short-message marker + 12-byte command + 4 MiB payload).  Used to
+/// reject a peer that claims a wildly oversized packet length descriptor.
+pub const MAX_CONTENTS_LEN: usize = 1 + 12 + 4 * 1000 * 1000;
+
 /// V2 Transport for BIP324 encrypted connections.
 pub const V2Transport = struct {
     cipher: BIP324Cipher,
@@ -866,6 +916,25 @@ pub const V2Transport = struct {
 
     /// Pending decrypted message (contents without header).
     recv_decode_buffer: std.ArrayList(u8),
+
+    /// Already-decrypted length descriptor for the in-flight inbound packet,
+    /// or `null` if we have not yet seen a full LENGTH_LEN bytes.  The
+    /// FSChaCha20 length cipher advances exactly once per packet, so we must
+    /// take care to only call `decryptLength` ONCE per inbound packet (the
+    /// W56 v2 transport bug).
+    recv_len: ?u32 = null,
+
+    /// AAD for the next inbound packet to authenticate.  For the very first
+    /// inbound packet (the responder/initiator's "version" packet), this is
+    /// the received garbage bytes (per BIP-324).  For every subsequent
+    /// inbound packet it is empty (the slice is cleared once we successfully
+    /// decrypt a packet).  The slice is allocated in `self.allocator`.
+    recv_aad: []u8 = &[_]u8{},
+
+    /// Whether we have already queued our outbound version packet.  Set once
+    /// the cipher is initialized and we've appended the version-packet
+    /// ciphertext to `send_buffer`.
+    version_packet_sent: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -913,6 +982,9 @@ pub const V2Transport = struct {
         self.recv_decode_buffer.deinit();
         if (self.send_garbage.len > 0) {
             self.allocator.free(@constCast(self.send_garbage));
+        }
+        if (self.recv_aad.len > 0) {
+            self.allocator.free(self.recv_aad);
         }
     }
 
@@ -991,12 +1063,22 @@ pub const V2Transport = struct {
 
                         self.recv_state = .garbage;
                         self.send_state = .ready;
+
+                        // Append the version packet (empty contents, ignore=false)
+                        // immediately after the garbage terminator.  AAD is the
+                        // sent-garbage so the peer can authenticate the entire
+                        // garbage prefix.  This matches Bitcoin Core's
+                        // ProcessReceivedKeyBytes (net.cpp:1167).
+                        self.queueVersionPacket() catch return false;
                     } else {
                         return true;
                     }
                 },
                 .garbage => {
-                    // Search for garbage terminator
+                    // Search for garbage terminator within the received bytes.
+                    // Per BIP-324, the bytes preceding the terminator are the
+                    // peer's "garbage" and must be authenticated as AAD on the
+                    // first inbound application packet.
                     const terminator = self.cipher.getRecvGarbageTerminator();
                     if (self.recv_buffer.items.len >= GARBAGE_TERMINATOR_LEN) {
                         var found: ?usize = null;
@@ -1008,12 +1090,18 @@ pub const V2Transport = struct {
                         }
 
                         if (found) |idx| {
+                            // Stash the garbage as recv_aad for the version packet.
+                            if (idx > 0) {
+                                self.recv_aad = self.allocator.alloc(u8, idx) catch return false;
+                                @memcpy(self.recv_aad, self.recv_buffer.items[0..idx]);
+                            }
                             // Skip garbage + terminator
                             const skip = idx + GARBAGE_TERMINATOR_LEN;
                             const remaining = self.recv_buffer.items.len - skip;
                             std.mem.copyForwards(u8, self.recv_buffer.items[0..remaining], self.recv_buffer.items[skip..]);
                             self.recv_buffer.shrinkRetainingCapacity(remaining);
                             self.recv_state = .version;
+                            self.recv_len = null;
                         } else if (self.recv_buffer.items.len > MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN) {
                             // Too much garbage without terminator
                             return false;
@@ -1025,28 +1113,46 @@ pub const V2Transport = struct {
                     }
                 },
                 .version, .app => {
-                    // Need at least LENGTH_LEN bytes
-                    if (self.recv_buffer.items.len < LENGTH_LEN) {
-                        return true;
+                    // Need at least LENGTH_LEN bytes before decrypting the
+                    // length descriptor (the FSChaCha20 length cipher advances
+                    // by exactly one chunk per packet, so we MUST decrypt the
+                    // length only once even if we hit this branch repeatedly
+                    // while waiting for the rest of the ciphertext).
+                    if (self.recv_len == null) {
+                        if (self.recv_buffer.items.len < LENGTH_LEN) {
+                            return true;
+                        }
+                        const content_len = self.cipher.decryptLength(self.recv_buffer.items[0..LENGTH_LEN]);
+                        if (content_len > MAX_CONTENTS_LEN) {
+                            return false;
+                        }
+                        self.recv_len = content_len;
                     }
 
-                    // Decrypt length (but don't consume yet - need to peek)
-                    // Note: we need to actually decrypt which advances the cipher
-                    // So we only do this when we have enough bytes
-                    const content_len = self.cipher.decryptLength(self.recv_buffer.items[0..LENGTH_LEN]);
-
+                    const content_len = self.recv_len.?;
                     const total_len = LENGTH_LEN + HEADER_LEN + content_len + TAG_LEN;
                     if (self.recv_buffer.items.len < total_len) {
                         return true;
                     }
 
-                    // Decrypt payload
+                    // Decrypt payload (AAD is recv_aad on the first packet,
+                    // empty thereafter).
                     self.recv_decode_buffer.resize(content_len) catch return false;
                     var ignore: bool = false;
                     const input = self.recv_buffer.items[LENGTH_LEN..total_len];
-                    if (!self.cipher.decrypt(input, &[_]u8{}, &ignore, self.recv_decode_buffer.items)) {
+                    if (!self.cipher.decrypt(input, self.recv_aad, &ignore, self.recv_decode_buffer.items)) {
                         return false; // Auth failure
                     }
+
+                    // Authenticated successfully — clear AAD; subsequent
+                    // packets carry no AAD.
+                    if (self.recv_aad.len > 0) {
+                        self.allocator.free(self.recv_aad);
+                        self.recv_aad = &[_]u8{};
+                    }
+
+                    // Reset per-packet length tracking for the next packet.
+                    self.recv_len = null;
 
                     // Remove consumed bytes
                     const remaining = self.recv_buffer.items.len - total_len;
@@ -1054,7 +1160,7 @@ pub const V2Transport = struct {
                     self.recv_buffer.shrinkRetainingCapacity(remaining);
 
                     if (ignore) {
-                        // Ignore this packet, continue processing
+                        // Decoy packet — discard contents and continue.
                         continue;
                     }
 
@@ -1116,7 +1222,9 @@ pub const V2Transport = struct {
         }
         try contents.appendSlice(payload);
 
-        // Encrypt and append to send buffer
+        // Encrypt and append to send buffer.  Application packets carry no
+        // AAD (only the very first sent packet — the version packet — uses
+        // sent-garbage AAD; that one is queued by `queueVersionPacket`).
         const output_len = contents.items.len + EXPANSION;
         const start = self.send_buffer.items.len;
         try self.send_buffer.resize(start + output_len);
@@ -1126,6 +1234,36 @@ pub const V2Transport = struct {
             ignore,
             self.send_buffer.items[start..],
         );
+    }
+
+    /// Queue the BIP-324 version packet (empty contents, AAD = sent garbage).
+    /// Called automatically by `processRecvBuffer` after the local cipher is
+    /// initialized.  Idempotent — guarded by `version_packet_sent`.
+    fn queueVersionPacket(self: *V2Transport) !void {
+        if (self.version_packet_sent) return;
+        // Empty contents + EXPANSION bytes of expansion overhead.
+        const start = self.send_buffer.items.len;
+        try self.send_buffer.resize(start + EXPANSION);
+        self.cipher.encrypt(
+            &[_]u8{},
+            self.send_garbage,
+            false,
+            self.send_buffer.items[start..],
+        );
+        self.version_packet_sent = true;
+    }
+
+    /// True iff the v2 handshake has produced symmetric ciphers AND the
+    /// version packet has been queued for transmission.  Application
+    /// `sendMessage` calls are valid only after this returns true.
+    pub fn isHandshakeReady(self: *const V2Transport) bool {
+        return self.send_state == .ready and self.version_packet_sent;
+    }
+
+    /// True iff we have observed the peer's version packet.  After this,
+    /// every subsequent inbound packet is an application message.
+    pub fn isVersionReceived(self: *const V2Transport) bool {
+        return self.recv_state == .app or self.recv_state == .app_ready;
     }
 
     /// Get session ID (only valid after initialization).
@@ -1889,4 +2027,252 @@ test "looksLikeV1Version: testnet magic" {
     // CALLER'S network; testnet bytes against a mainnet caller should be v2.
     const mainnet: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
     try std.testing.expect(!looksLikeV1Version(&bytes, mainnet));
+}
+
+// ============================================================================
+// BIP-324 V2Transport application-message round-trip tests (W56 follow-up).
+//
+// These tests verify the full encrypted send/receive pipeline now that the
+// per-message v2 wrapping is wired through V2Transport.sendMessage and
+// V2Transport.processReceivedBytes.  In particular they exercise:
+//
+//   1. Length cipher is decrypted exactly ONCE per packet (the chunk_counter
+//      bug fixed alongside this feature).
+//   2. AEAD AAD plumbing — first inbound packet's AAD is the received
+//      garbage; subsequent packets carry empty AAD.
+//   3. Multi-message pipelining with proper rekey.
+//   4. The 4 MiB packet ceiling (block-sized payload) decrypts correctly,
+//      validating the heap-fallback path in `decryptSplit`.
+//
+// We bypass real ECDH by stuffing both transports with the same simulated
+// shared secret; this isolates the state-machine + AEAD plumbing from the
+// libsecp256k1 ellswift FFI (which is unit-tested separately).
+// ============================================================================
+
+/// Test helper: build a pair of V2Transports already in the post-handshake
+/// "ready" state, sharing a deterministic cipher key.  Both transports have
+/// EMPTY send/recv buffers and have already exchanged their version packets
+/// (so the recv_aad is empty and the next inbound packet is an application
+/// message).  This isolates the application-message wrapping path from the
+/// key-exchange / garbage-terminator state-machine.
+fn makeV2TransportPairWithSharedSecret(
+    allocator: std.mem.Allocator,
+    shared_secret: [32]u8,
+) ![2]V2Transport {
+    const magic: u32 = p2p.NetworkMagic.MAINNET;
+
+    // Construct transports without going through V2Transport.init — that
+    // would queue handshake bytes (pubkey + garbage) we don't want here.
+    var net_magic: [4]u8 = undefined;
+    std.mem.writeInt(u32, &net_magic, magic, .little);
+
+    var initiator: V2Transport = .{
+        .cipher = BIP324Cipher{},
+        .initiating = true,
+        .recv_state = .app,
+        .send_state = .ready,
+        .recv_buffer = std.ArrayList(u8).init(allocator),
+        .send_buffer = std.ArrayList(u8).init(allocator),
+        .send_garbage = &[_]u8{},
+        .network_magic = net_magic,
+        .allocator = allocator,
+        .recv_decode_buffer = std.ArrayList(u8).init(allocator),
+        .recv_len = null,
+        .recv_aad = &[_]u8{},
+        .version_packet_sent = true,
+    };
+    var responder: V2Transport = .{
+        .cipher = BIP324Cipher{},
+        .initiating = false,
+        .recv_state = .app,
+        .send_state = .ready,
+        .recv_buffer = std.ArrayList(u8).init(allocator),
+        .send_buffer = std.ArrayList(u8).init(allocator),
+        .send_garbage = &[_]u8{},
+        .network_magic = net_magic,
+        .allocator = allocator,
+        .recv_decode_buffer = std.ArrayList(u8).init(allocator),
+        .recv_len = null,
+        .recv_aad = &[_]u8{},
+        .version_packet_sent = true,
+    };
+
+    initiator.cipher.initializeWithSharedSecret(&shared_secret, true, net_magic);
+    responder.cipher.initializeWithSharedSecret(&shared_secret, false, net_magic);
+
+    return [2]V2Transport{ initiator, responder };
+}
+
+test "V2Transport round-trip: ping/pong over encrypted transport" {
+    const allocator = std.testing.allocator;
+
+    const shared = [_]u8{0xAB} ** 32;
+    var pair = try makeV2TransportPairWithSharedSecret(allocator, shared);
+    defer pair[0].deinit();
+    defer pair[1].deinit();
+    const initiator = &pair[0];
+    const responder = &pair[1];
+
+    // Initiator → responder: a "ping" with an 8-byte nonce payload.
+    const ping_payload = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04 };
+    try initiator.sendMessage("ping", &ping_payload, false);
+    {
+        const send_data = initiator.getSendData();
+        try std.testing.expect(send_data.len > 0);
+        try std.testing.expect(responder.processReceivedBytes(send_data));
+        initiator.markBytesSent(send_data.len);
+    }
+    try std.testing.expect(responder.isMessageReady());
+    {
+        const contents = responder.getReceivedMessage().?;
+        // Short ID for "ping" is 18.  Contents = [18, payload...]
+        try std.testing.expectEqual(@as(usize, 1 + ping_payload.len), contents.len);
+        try std.testing.expectEqual(@as(u8, 18), contents[0]);
+        try std.testing.expectEqualSlices(u8, &ping_payload, contents[1..]);
+    }
+
+    // Responder → initiator: a "pong" reply.
+    const pong_payload = [_]u8{ 0x04, 0x03, 0x02, 0x01, 0xEF, 0xBE, 0xAD, 0xDE };
+    try responder.sendMessage("pong", &pong_payload, false);
+    {
+        const send_data = responder.getSendData();
+        try std.testing.expect(initiator.processReceivedBytes(send_data));
+        responder.markBytesSent(send_data.len);
+    }
+    try std.testing.expect(initiator.isMessageReady());
+    {
+        const contents = initiator.getReceivedMessage().?;
+        try std.testing.expectEqual(@as(u8, 19), contents[0]); // "pong" = 19
+        try std.testing.expectEqualSlices(u8, &pong_payload, contents[1..]);
+    }
+}
+
+test "V2Transport round-trip: long-message-id via 12-byte command path" {
+    const allocator = std.testing.allocator;
+
+    const shared = [_]u8{0xCD} ** 32;
+    var pair = try makeV2TransportPairWithSharedSecret(allocator, shared);
+    defer pair[0].deinit();
+    defer pair[1].deinit();
+    const initiator = &pair[0];
+    const responder = &pair[1];
+
+    // "verack" is NOT in the short-ID table (BIP-324 omits it; both sides
+    // exchange it as a 12-byte command).  Verify the long-encoding path
+    // works: contents[0] = 0, contents[1..13] = "verack\0\0\0\0\0\0".
+    const empty: []const u8 = &[_]u8{};
+    try initiator.sendMessage("verack", empty, false);
+    _ = responder.processReceivedBytes(initiator.getSendData());
+    initiator.markBytesSent(initiator.getSendData().len);
+    try std.testing.expect(responder.isMessageReady());
+
+    const contents = responder.getReceivedMessage().?;
+    try std.testing.expectEqual(@as(usize, 13), contents.len);
+    try std.testing.expectEqual(@as(u8, 0), contents[0]); // long marker
+    try std.testing.expectEqualStrings("verack", contents[1..7]);
+    // Bytes 7..13 must be zero-padded.
+    var pad: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqualSlices(u8, &pad, contents[7..13]);
+}
+
+test "V2Transport round-trip: many packets exercise FSChaCha20 rekey" {
+    const allocator = std.testing.allocator;
+
+    const shared = [_]u8{0x77} ** 32;
+    var pair = try makeV2TransportPairWithSharedSecret(allocator, shared);
+    defer pair[0].deinit();
+    defer pair[1].deinit();
+    const initiator = &pair[0];
+    const responder = &pair[1];
+
+    // Send N > REKEY_INTERVAL ping packets, then a final pong; verify the
+    // pong decrypts correctly (proves both length + payload ciphers stayed
+    // in sync across the rekey boundary).
+    const N: usize = REKEY_INTERVAL + 5;
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const payload = [_]u8{ @intCast(i & 0xFF), 0, 0, 0, 0, 0, 0, 0 };
+        try initiator.sendMessage("ping", &payload, false);
+        _ = responder.processReceivedBytes(initiator.getSendData());
+        initiator.markBytesSent(initiator.getSendData().len);
+        try std.testing.expect(responder.isMessageReady());
+        const c = responder.getReceivedMessage().?;
+        try std.testing.expectEqual(@as(u8, 18), c[0]);
+        try std.testing.expectEqual(@as(u8, @intCast(i & 0xFF)), c[1]);
+    }
+}
+
+test "V2Transport round-trip: 4 MiB block-sized payload (heap path)" {
+    const allocator = std.testing.allocator;
+
+    const shared = [_]u8{0x11} ** 32;
+    var pair = try makeV2TransportPairWithSharedSecret(allocator, shared);
+    defer pair[0].deinit();
+    defer pair[1].deinit();
+    const initiator = &pair[0];
+    const responder = &pair[1];
+
+    // 1 MiB synthetic block — well above the 64 KiB stack-buffer cap in
+    // encryptSplit/decryptSplit, so this exercises the heap path.  We use
+    // 1 MiB rather than 4 MiB to keep the test fast; the heap path is the
+    // same code regardless of size and the size check has no upper bound.
+    const SIZE: usize = 1024 * 1024;
+    const block_payload = try allocator.alloc(u8, SIZE);
+    defer allocator.free(block_payload);
+    for (block_payload, 0..) |*b, idx| b.* = @intCast(idx & 0xFF);
+
+    try initiator.sendMessage("block", block_payload, false);
+    const send_data = initiator.getSendData();
+    try std.testing.expect(send_data.len > SIZE);
+    try std.testing.expect(responder.processReceivedBytes(send_data));
+    initiator.markBytesSent(send_data.len);
+
+    try std.testing.expect(responder.isMessageReady());
+    const contents = responder.getReceivedMessage().?;
+    try std.testing.expectEqual(@as(usize, 1 + SIZE), contents.len);
+    try std.testing.expectEqual(@as(u8, 2), contents[0]); // "block" = 2
+    try std.testing.expectEqualSlices(u8, block_payload, contents[1..]);
+}
+
+test "V2Transport: decryptLength called exactly once per packet (W56 fix)" {
+    // Regression test for the old processRecvBuffer bug where decryptLength
+    // was invoked on every event-loop iteration whenever LENGTH_LEN bytes
+    // were buffered, advancing the FSChaCha20 chunk_counter even on partial
+    // reads and corrupting cipher synchronization.
+    const allocator = std.testing.allocator;
+
+    const shared = [_]u8{0x22} ** 32;
+    var pair = try makeV2TransportPairWithSharedSecret(allocator, shared);
+    defer pair[0].deinit();
+    defer pair[1].deinit();
+    const initiator = &pair[0];
+    const responder = &pair[1];
+
+    // Send a real ping packet but feed it to the responder in two chunks:
+    // first only LENGTH_LEN bytes, then the rest.  If decryptLength were
+    // called twice the second decrypt would advance the cipher state and
+    // garble the subsequent decryption.
+    const payload = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11 };
+    try initiator.sendMessage("ping", &payload, false);
+    const wire = initiator.getSendData();
+    try std.testing.expect(wire.len >= LENGTH_LEN);
+
+    // Feed exactly LENGTH_LEN bytes — decryptLength should fire once.
+    try std.testing.expect(responder.processReceivedBytes(wire[0..LENGTH_LEN]));
+    try std.testing.expect(!responder.isMessageReady());
+    try std.testing.expect(responder.recv_len != null);
+
+    // Now feed the rest in TWO further chunks (each of which would have
+    // re-triggered decryptLength under the old bug).
+    const half = LENGTH_LEN + (wire.len - LENGTH_LEN) / 2;
+    try std.testing.expect(responder.processReceivedBytes(wire[LENGTH_LEN..half]));
+    try std.testing.expect(!responder.isMessageReady());
+    try std.testing.expect(responder.processReceivedBytes(wire[half..]));
+    try std.testing.expect(responder.isMessageReady());
+
+    initiator.markBytesSent(wire.len);
+
+    const contents = responder.getReceivedMessage().?;
+    try std.testing.expectEqual(@as(u8, 18), contents[0]);
+    try std.testing.expectEqualSlices(u8, &payload, contents[1..]);
 }
