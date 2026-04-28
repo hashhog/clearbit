@@ -661,6 +661,7 @@ pub fn computeMerkleRoot(hashes: []const Hash256, allocator: std.mem.Allocator) 
 const secp256k1 = @cImport({
     @cInclude("secp256k1.h");
     @cInclude("secp256k1_extrakeys.h");
+    @cInclude("secp256k1_schnorrsig.h");
 });
 
 /// Whether libsecp256k1 is available at link time
@@ -844,12 +845,23 @@ pub fn isLowDERSignature(sig_der: []const u8) bool {
 ///
 /// Returns true if signature is valid, false otherwise
 pub fn verifySchnorr(sig: *const [64]u8, msg_hash: *const [32]u8, pubkey_x: *const [32]u8) bool {
-    _ = sig;
-    _ = msg_hash;
-    _ = pubkey_x;
-    // Schnorr verification requires secp256k1_schnorrsig.h which may not be available
-    // in all builds. For now, return false.
-    return false;
+    const ctx = secp_ctx orelse return false;
+
+    // Parse the 32-byte x-only pubkey.
+    var xonly: secp256k1.secp256k1_xonly_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_parse(ctx, &xonly, pubkey_x) != 1) {
+        return false;
+    }
+
+    // BIP-340: schnorrsig_verify takes the 64-byte sig, the 32-byte
+    // message digest, and the parsed x-only pubkey.
+    return secp256k1.secp256k1_schnorrsig_verify(
+        ctx,
+        sig,
+        msg_hash,
+        32,
+        &xonly,
+    ) == 1;
 }
 
 // ============================================================================
@@ -1313,6 +1325,36 @@ pub fn taggedHash(tag: []const u8, msg: []const u8) Hash256 {
 ///
 /// control: control block bytes (33 + 32*path_len)
 /// tap_script: the leaf script being executed
+/// Compute the BIP-341 TapLeaf hash for a tapscript leaf.
+///
+/// `leaf_version` should be the leaf_version byte from the control block
+/// with the parity bit masked off (i.e. `control[0] & 0xfe`). For
+/// standard tapscript leaves this is 0xc0.
+///
+/// Returns `null` if the script length is too large to encode in
+/// CompactSize (>0xFFFF), which never happens in practice (Taproot
+/// scripts are bounded well under that).
+pub fn computeTapleafHash(tap_script: []const u8, leaf_version: u8) ?Hash256 {
+    var leaf_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const tap_leaf_tag = sha256("TapLeaf");
+    leaf_hasher.update(&tap_leaf_tag);
+    leaf_hasher.update(&tap_leaf_tag);
+    leaf_hasher.update(&[_]u8{leaf_version});
+    if (tap_script.len < 0xfd) {
+        leaf_hasher.update(&[_]u8{@truncate(tap_script.len)});
+    } else if (tap_script.len <= 0xffff) {
+        leaf_hasher.update(&[_]u8{0xfd});
+        leaf_hasher.update(&[_]u8{@truncate(tap_script.len & 0xff)});
+        leaf_hasher.update(&[_]u8{@truncate((tap_script.len >> 8) & 0xff)});
+    } else {
+        return null;
+    }
+    leaf_hasher.update(tap_script);
+    var k: Hash256 = undefined;
+    leaf_hasher.final(&k);
+    return k;
+}
+
 /// program: the 32-byte witness program (x-only output key from scriptPubKey)
 pub fn verifyTaprootControlBlock(control: []const u8, tap_script: []const u8, program: []const u8) bool {
     if (control.len < 33 or program.len != 32) return false;
