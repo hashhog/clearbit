@@ -641,17 +641,19 @@ pub const Peer = struct {
     pub const V2_HANDSHAKE_DEADLINE_MS: i64 = 30_000;
 
     /// Returns true iff the BIP-324 v2 transport is enabled for new
-    /// connections.  Gated behind the `CLEARBIT_BIP324_V2` env var (set to
-    /// "1" to opt in).  Default OFF because we have not yet had a chance to
-    /// live-test the full v2 path against a Bitcoin Core node on mainnet —
-    /// the cipher state machine, AAD plumbing, and per-packet send/receive
-    /// wrapping are all unit-tested (see v2_transport.zig round-trip tests),
-    /// but the production fleet stays on the v1 path until interop is
-    /// confirmed.  Once the env-var-on path is live-validated against a
-    /// real v2 peer, flip the default to true.
+    /// connections.  Gated behind the `CLEARBIT_BIP324_V2` env var.
+    /// Default ON as of W90 (this commit) after live-verification against
+    /// Bitcoin Core 28.x on mainnet — multiple successful handshakes
+    /// observed (e.g. peers 71.196.197.14, 77.164.76.40, 31.47.202.112,
+    /// 62.93.65.111) once the FSChaCha20 length cipher was fixed to
+    /// produce a continuous keystream within an epoch.  Set
+    /// `CLEARBIT_BIP324_V2=0` (or "false") to fall back to v1-only
+    /// (matches the per-peer v1-fallback set behaviour for individual
+    /// addresses that turn out to be v1-only).
     pub fn bip324V2Enabled() bool {
-        const v = std.posix.getenv("CLEARBIT_BIP324_V2") orelse return false;
-        return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "TRUE");
+        const v = std.posix.getenv("CLEARBIT_BIP324_V2") orelse return true;
+        if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "FALSE")) return false;
+        return true;
     }
 
     /// Read up to `out.len` bytes without consuming them from the kernel
@@ -1903,7 +1905,8 @@ pub const PeerManager = struct {
 
             // V2 cipher handshake complete — run the application
             // version/verack on the encrypted transport.
-            peer.performHandshake(self.our_height) catch {
+            peer.performHandshake(self.our_height) catch |hs_err| {
+                std.debug.print("P2P: BIP-324 v2 app-handshake failed peer={any} err={any} (cipher OK)\n", .{ address, hs_err });
                 peer.disconnect();
                 self.allocator.destroy(peer);
                 return null;
