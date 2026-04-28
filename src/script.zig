@@ -1,6 +1,7 @@
 const std = @import("std");
 const crypto = @import("crypto.zig");
 const types = @import("types.zig");
+const taproot_sighash = @import("taproot_sighash.zig");
 
 // ============================================================================
 // Opcode Definitions
@@ -581,6 +582,24 @@ pub const ScriptEngine = struct {
     /// Set during verify() to the scriptPubKey (or redeem script for P2SH).
     script_pubkey_for_sighash: ?[]const u8,
 
+    /// Per-input prevouts for BIP-341 Taproot sighash. `spent_amounts[i]`
+    /// and `spent_scripts[i]` are the value and scriptPubKey of the output
+    /// being spent by `tx.inputs[i]`. Required by `sha_amounts` and
+    /// `sha_scriptpubkeys` which commit to ALL inputs, not just the one
+    /// being verified. Empty slices for legacy / non-Taproot scripts.
+    spent_amounts: []const i64,
+    spent_scripts: []const []const u8,
+
+    /// Tapleaf hash for the currently executing tapscript leaf
+    /// (BIP-341 ext_flag=1 sighash). Set by the script-path entry
+    /// before `execute(tap_script)`; null otherwise.
+    tapleaf_hash: ?[32]u8 = null,
+
+    /// Witness annex (the original last witness item, including the
+    /// 0x50 prefix byte) when present. Used by both key-path and
+    /// tapscript sighash via the sha_annex field.
+    taproot_annex: ?[]const u8 = null,
+
     // Memory management for stack elements we allocate
     owned_elements: std.ArrayList([]u8),
 
@@ -590,6 +609,20 @@ pub const ScriptEngine = struct {
         input_index: usize,
         amount: i64,
         flags: ScriptFlags,
+    ) ScriptEngine {
+        return initWithPrevouts(allocator, tx, input_index, amount, flags, &.{}, &.{});
+    }
+
+    /// Initialize with per-input prevouts; required for Taproot key-path
+    /// and tapscript verification. Pass empty slices for legacy use.
+    pub fn initWithPrevouts(
+        allocator: std.mem.Allocator,
+        tx: *const types.Transaction,
+        input_index: usize,
+        amount: i64,
+        flags: ScriptFlags,
+        spent_amounts: []const i64,
+        spent_scripts: []const []const u8,
     ) ScriptEngine {
         return .{
             .stack = std.ArrayList([]const u8).init(allocator),
@@ -602,6 +635,8 @@ pub const ScriptEngine = struct {
             .codesep_pos = 0xFFFFFFFF,
             .sig_version = .base,
             .script_pubkey_for_sighash = null,
+            .spent_amounts = spent_amounts,
+            .spent_scripts = spent_scripts,
             .owned_elements = std.ArrayList([]u8).init(allocator),
         };
     }
@@ -900,16 +935,69 @@ pub const ScriptEngine = struct {
                     // Taproot (witness v1, 32-byte program)
                     if (witness.len == 0) return false;
 
+                    // BIP-341: detect annex (last witness item starting with 0x50,
+                    // only if witness has ≥ 2 elements). Strip from effective
+                    // witness; commit via sha_annex in the BIP-341 sighash.
+                    var effective_witness = witness;
+                    if (witness.len >= 2 and witness[witness.len - 1].len > 0
+                        and witness[witness.len - 1][0] == 0x50)
+                    {
+                        self.taproot_annex = witness[witness.len - 1];
+                        effective_witness = witness[0 .. witness.len - 1];
+                    }
+
                     // Key path: single 64 or 65 byte signature (no script execution)
-                    if (witness.len == 1 and (witness[0].len == 64 or witness[0].len == 65)) {
-                        if (!crypto.isSecp256k1Available()) {
+                    if (effective_witness.len == 1 and
+                        (effective_witness[0].len == 64 or effective_witness[0].len == 65))
+                    {
+                        // BIP-341 key-path: signature verified against the witness
+                        // program (the tweaked output key Q) directly. No on-the-fly
+                        // tweak math needed by the verifier.
+                        const sig_bytes = effective_witness[0];
+
+                        // Sig is 64B (SIGHASH_DEFAULT) or 65B (with hash_type byte).
+                        var sig: [64]u8 = undefined;
+                        @memcpy(&sig, sig_bytes[0..64]);
+                        var hash_type: u8 = taproot_sighash.SIGHASH_DEFAULT;
+                        if (sig_bytes.len == 65) {
+                            hash_type = sig_bytes[64];
+                            // Strict: explicit SIGHASH_DEFAULT byte invalid.
+                            if (hash_type == taproot_sighash.SIGHASH_DEFAULT) return false;
+                        }
+
+                        // Need full prevouts for BIP-341 sha_amounts + sha_scriptpubkeys.
+                        if (self.spent_amounts.len != self.tx.inputs.len or
+                            self.spent_scripts.len != self.tx.inputs.len)
+                        {
                             return false;
                         }
-                        return true;
-                    } else if (witness.len >= 2) {
+
+                        const prevouts = taproot_sighash.TaprootPrevouts{
+                            .amounts = self.spent_amounts,
+                            .scripts = self.spent_scripts,
+                        };
+
+                        const sighash = taproot_sighash.computeTaprootSighash(
+                            self.allocator,
+                            self.tx,
+                            self.input_index,
+                            prevouts,
+                            hash_type,
+                            self.taproot_annex,
+                            null, // ext_flag = 0 (key-path)
+                        ) catch return false;
+
+                        var xonly: [32]u8 = undefined;
+                        @memcpy(&xonly, wp.program[0..32]);
+
+                        if (crypto.verifySchnorr(&sig, &sighash, &xonly)) {
+                            return true;
+                        }
+                        return false;
+                    } else if (effective_witness.len >= 2) {
                         // Script path spending
-                        const control = witness[witness.len - 1];
-                        const tap_script = witness[witness.len - 2];
+                        const control = effective_witness[effective_witness.len - 1];
+                        const tap_script = effective_witness[effective_witness.len - 2];
 
                         if (control.len < 33 or control.len > 33 + 32 * 128) {
                             return ScriptError.WitnessProgramMismatch;
@@ -923,8 +1011,17 @@ pub const ScriptEngine = struct {
                             return ScriptError.WitnessProgramMismatch;
                         }
 
+                        // Compute tapleaf hash for ext_flag=1 sighash inside
+                        // OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKSIGADD.
+                        const leaf_version = control[0] & 0xfe;
+                        if (crypto.computeTapleafHash(tap_script, leaf_version)) |tlh| {
+                            self.tapleaf_hash = tlh;
+                        } else {
+                            return ScriptError.WitnessProgramMismatch;
+                        }
+
                         self.stack.clearRetainingCapacity();
-                        for (witness[0 .. witness.len - 2]) |item| {
+                        for (effective_witness[0 .. effective_witness.len - 2]) |item| {
                             self.stack.append(item) catch return ScriptError.OutOfMemory;
                         }
 
@@ -1829,16 +1926,55 @@ pub const ScriptEngine = struct {
     }
 
     fn verifyTaprootSignature(self: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {
-        _ = self;
+        // Tapscript OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKSIGADD path:
+        // BIP-341 ext_flag=1 sighash + BIP-340 Schnorr verify.
         if (sig.len != 64 and sig.len != 65) return false;
         if (pubkey.len != 32) return false;
 
-        // Full implementation would call crypto.verifySchnorr
-        if (!crypto.isSecp256k1Available()) {
-            return true; // For testing
+        // Tapscript context (tapleaf_hash) must have been set by the
+        // script-path entry before invoking execute(tap_script).
+        const tlh = self.tapleaf_hash orelse return false;
+
+        // Sig is 64B (SIGHASH_DEFAULT) or 65B (with hash_type byte).
+        var sig_bytes: [64]u8 = undefined;
+        @memcpy(&sig_bytes, sig[0..64]);
+        var hash_type: u8 = taproot_sighash.SIGHASH_DEFAULT;
+        if (sig.len == 65) {
+            hash_type = sig[64];
+            if (hash_type == taproot_sighash.SIGHASH_DEFAULT) return false;
         }
 
-        return false; // Placeholder
+        // Need full prevouts for BIP-341 sha_amounts + sha_scriptpubkeys.
+        if (self.spent_amounts.len != self.tx.inputs.len or
+            self.spent_scripts.len != self.tx.inputs.len)
+        {
+            return false;
+        }
+
+        const prevouts = taproot_sighash.TaprootPrevouts{
+            .amounts = self.spent_amounts,
+            .scripts = self.spent_scripts,
+        };
+
+        const tapscript_ctx = taproot_sighash.TapscriptContext{
+            .tapleaf_hash = &tlh,
+            .codesep_pos = self.codesep_pos,
+        };
+
+        const sighash = taproot_sighash.computeTaprootSighash(
+            self.allocator,
+            self.tx,
+            self.input_index,
+            prevouts,
+            hash_type,
+            self.taproot_annex,
+            tapscript_ctx,
+        ) catch return false;
+
+        var xonly: [32]u8 = undefined;
+        @memcpy(&xonly, pubkey[0..32]);
+
+        return crypto.verifySchnorr(&sig_bytes, &sighash, &xonly);
     }
 };
 
