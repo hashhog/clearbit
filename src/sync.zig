@@ -1161,7 +1161,7 @@ pub const BlockDownloader = struct {
         // second DB round-trip.
         // Key layout: 32-byte hash || 4-byte LE index (matches OutPoint on-wire).
         const OutpointKey = [36]u8;
-        var script_pubkey_map = std.AutoHashMap(OutpointKey, []const u8).init(arena_alloc);
+        var script_pubkey_map = std.AutoHashMap(OutpointKey, validation.SigopUtxoEntry).init(arena_alloc);
 
         // 3. Process each transaction: validate inputs, collect UTXO mutations
         for (block.transactions, 0..) |tx, tx_idx| {
@@ -1191,11 +1191,14 @@ pub const BlockDownloader = struct {
                             const idx_le = std.mem.nativeToLittle(u32, @intCast(input.previous_output.index));
                             @memcpy(key[32..36], std.mem.asBytes(&idx_le));
                             // Transfer ownership of script_pubkey to arena so it
-                            // outlives the chain_store free below.
+                            // outlives the chain_store free below. Amount is
+                            // recorded alongside for BIP-341 sha_amounts.
                             const script_copy = arena_alloc.dupe(u8, utxo.?.script_pubkey) catch
                                 return BlockDownloadError.OutOfMemory;
-                            script_pubkey_map.put(key, script_copy) catch
-                                return BlockDownloadError.OutOfMemory;
+                            script_pubkey_map.put(key, .{
+                                .script_pubkey = script_copy,
+                                .amount = utxo.?.value,
+                            }) catch return BlockDownloadError.OutOfMemory;
                         }
                         // Free original allocation from chain_store (always — the
                         // script_pubkey is owned by getUtxo's allocator regardless
@@ -1242,8 +1245,10 @@ pub const BlockDownloader = struct {
                     @memcpy(key[0..32], &tx_hash);
                     const idx_le = std.mem.nativeToLittle(u32, @intCast(out_idx));
                     @memcpy(key[32..36], std.mem.asBytes(&idx_le));
-                    script_pubkey_map.put(key, output.script_pubkey) catch
-                        return BlockDownloadError.OutOfMemory;
+                    script_pubkey_map.put(key, .{
+                        .script_pubkey = output.script_pubkey,
+                        .amount = output.value,
+                    }) catch return BlockDownloadError.OutOfMemory;
                 }
             }
         }
@@ -1263,11 +1268,12 @@ pub const BlockDownloader = struct {
         //   N-1 worker threads + caller participates as Nth thread.
         // For blocks below assume-valid height we skip to match Bitcoin Core.
         if (!skip_script_verification) {
-            // Build a SigopUtxoView that resolves outpoints via script_pubkey_map.
+            // Build a SigopUtxoView that resolves outpoints via the
+            // per-block prevouts map (script + amount).
             const MapContext = struct {
-                map: *std.AutoHashMap(OutpointKey, []const u8),
+                map: *std.AutoHashMap(OutpointKey, validation.SigopUtxoEntry),
 
-                fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?[]const u8 {
+                fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.SigopUtxoEntry {
                     const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
                     var key: OutpointKey = undefined;
                     @memcpy(key[0..32], &outpoint.hash);
