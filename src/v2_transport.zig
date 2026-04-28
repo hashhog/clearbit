@@ -8,33 +8,63 @@ const builtin = @import("builtin");
 // ElligatorSwift FFI (libsecp256k1)
 // ============================================================================
 //
-// To use real ElligatorSwift ECDH, build with: zig build -Dsecp256k1=true
-// This requires libsecp256k1-dev to be installed with ellswift module enabled.
-//
-// Without -Dsecp256k1=true, the code uses a simulated ECDH (NOT secure,
-// only for testing the transport layer logic).
+// libsecp256k1 with ellswift support is always linked into the clearbit
+// executable (see build.zig: exe.linkSystemLibrary("secp256k1") +
+// addIncludePath secp256k1_include, where the default include points at
+// bitcoin-core/src/secp256k1/include which carries secp256k1_ellswift.h).
+// We therefore always import the real C bindings when not running unit
+// tests.  Unit tests use a stub because the test binary may not have
+// the C symbols available in every environment (and the cipher unit
+// tests exercise the state machine with fixed test vectors, not real ECDH).
 // ============================================================================
 
 /// libsecp256k1 C bindings for ElligatorSwift.
-/// Only defined when building with -Dsecp256k1=true (via @cImport).
-pub const secp256k1 = if (builtin.is_test or !@hasDecl(@import("root"), "secp256k1_enabled"))
-    // Stub implementation for testing without libsecp256k1
+/// In tests we use a minimal stub so the cipher state-machine tests can run
+/// without depending on the live secp256k1 library; the runtime build always
+/// gets the real C symbols.
+///
+/// Note on type names: the real C header declares `secp256k1_context` (lower-
+/// snake-case).  Our stub declares the same name plus a friendly `Context`
+/// alias used by older internal call sites (initWithSecp256k1 / initialize-
+/// WithSecp256k1).  The runtime cimport carries `secp256k1_context` so we
+/// always reference that name in new code.
+pub const secp256k1 = if (builtin.is_test)
+    // Stub for unit tests.
     struct {
-        pub const Context = opaque {};
+        pub const secp256k1_context = opaque {};
+        pub const Context = secp256k1_context;
         pub const EllswiftXdhHashFn = *const fn ([*]u8, [*]const u8, [*]const u8, [*]const u8, ?*anyopaque) callconv(.C) c_int;
     }
 else
-    // Real implementation via @cImport when secp256k1 is linked
+    // Runtime: real implementation via @cImport (libsecp256k1 always linked).
     @cImport({
         @cInclude("secp256k1.h");
         @cInclude("secp256k1_ellswift.h");
     });
 
-/// Get or create the global secp256k1 context.
-/// Returns null if libsecp256k1 is not available or not enabled.
-pub fn getSecp256k1Context() ?*secp256k1.Context {
-    // In test mode or without secp256k1 linked, always return null
-    // The callers handle this by falling back to simulated ECDH
+/// Process-global secp256k1 context for ellswift_create / ellswift_xdh.
+/// Lazily allocated on first use.  We use a verify+sign context because
+/// ellswift_create (private-key derivation) requires SECP256K1_CONTEXT_SIGN
+/// in the legacy context flag interpretation.
+var ellswift_ctx: ?*secp256k1.secp256k1_context = null;
+var ellswift_ctx_lock: std.Thread.Mutex = .{};
+
+/// Get or create the global secp256k1 context for ellswift operations.
+/// Returns null only in test mode (or in the unlikely event of an allocation
+/// failure inside libsecp256k1).
+pub fn getSecp256k1Context() ?*secp256k1.secp256k1_context {
+    if (builtin.is_test) return null;
+    ellswift_ctx_lock.lock();
+    defer ellswift_ctx_lock.unlock();
+    if (ellswift_ctx) |ctx| return ctx;
+    if (@hasDecl(secp256k1, "secp256k1_context_create")) {
+        // SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN
+        const flags: c_uint = secp256k1.SECP256K1_CONTEXT_VERIFY | secp256k1.SECP256K1_CONTEXT_SIGN;
+        const ctx = secp256k1.secp256k1_context_create(flags);
+        if (ctx == null) return null;
+        ellswift_ctx = ctx;
+        return ellswift_ctx;
+    }
     return null;
 }
 
@@ -71,6 +101,28 @@ pub const IGNORE_BIT: u8 = 0x80;
 
 /// ElligatorSwift public key size (64 bytes).
 pub const ELLSWIFT_PUBKEY_LEN: usize = 64;
+
+/// Length of the v1 detection prefix: 4-byte network magic + 12-byte command.
+/// Bitcoin Core's V2Transport::ReceivedBytes peeks the first 16 bytes of an
+/// inbound TCP stream; if they look like the start of a v1 VERSION message
+/// (magic + "version\0\0\0\0\0") we treat the connection as v1.  Everything
+/// else is treated as the start of a v2 ElligatorSwift pubkey (which begins
+/// the v2 handshake).
+pub const V1_PREFIX_LEN: usize = 4 + 12;
+
+/// 12-byte v1 command for VERSION ("version" plus 5 NUL bytes).
+pub const V1_VERSION_COMMAND: [12]u8 = [_]u8{ 'v', 'e', 'r', 's', 'i', 'o', 'n', 0, 0, 0, 0, 0 };
+
+/// Classify the first 16 bytes of an inbound TCP stream.  Returns true iff
+/// the bytes look like the leading bytes of a v1 VERSION message (network
+/// magic followed by the 12-byte "version" command).  Caller is responsible
+/// for ensuring `bytes.len >= V1_PREFIX_LEN` and for passing the network
+/// magic in little-endian form (matching the wire layout).
+pub fn looksLikeV1Version(bytes: []const u8, network_magic: [4]u8) bool {
+    if (bytes.len < V1_PREFIX_LEN) return false;
+    if (!std.mem.eql(u8, bytes[0..4], &network_magic)) return false;
+    return std.mem.eql(u8, bytes[4..16], &V1_VERSION_COMMAND);
+}
 
 // ============================================================================
 // V2 Short Message IDs (BIP324)
@@ -428,7 +480,11 @@ pub const BIP324Cipher = struct {
     our_pubkey: ?[ELLSWIFT_PUBKEY_LEN]u8 = null,
 
     /// Initialize a BIP324 cipher with a random keypair.
-    /// Uses libsecp256k1's ElligatorSwift when available, falls back to simulation otherwise.
+    /// In a real (non-test) build this uses libsecp256k1's
+    /// secp256k1_ellswift_create so the keypair is a genuine ElligatorSwift
+    /// encoding.  In test builds (where the secp256k1 namespace is stubbed)
+    /// this falls back to random bytes — fine for state-machine tests but
+    /// NOT cryptographically valid.
     pub fn init(allocator: std.mem.Allocator) BIP324Cipher {
         _ = allocator;
         var cipher = BIP324Cipher{};
@@ -436,15 +492,38 @@ pub const BIP324Cipher = struct {
         // Generate random private key
         var privkey: [32]u8 = undefined;
         std.crypto.random.bytes(&privkey);
-        cipher.our_privkey = privkey;
 
-        // Generate ElligatorSwift public key
         var pubkey: [ELLSWIFT_PUBKEY_LEN]u8 = undefined;
 
-        // Fallback: use random bytes as placeholder (for testing without secp256k1)
-        // When libsecp256k1 is linked, this would use secp256k1_ellswift_create
-        std.crypto.random.bytes(&pubkey);
+        if (!builtin.is_test and @hasDecl(secp256k1, "secp256k1_ellswift_create")) {
+            const ctx_opt = getSecp256k1Context();
+            if (ctx_opt) |ctx| {
+                var auxrnd: [32]u8 = undefined;
+                var attempts: u8 = 0;
+                while (attempts < 16) : (attempts += 1) {
+                    std.crypto.random.bytes(&auxrnd);
+                    const result = secp256k1.secp256k1_ellswift_create(
+                        ctx,
+                        &pubkey,
+                        &privkey,
+                        &auxrnd,
+                    );
+                    if (result == 1) {
+                        cipher.our_privkey = privkey;
+                        cipher.our_pubkey = pubkey;
+                        return cipher;
+                    }
+                    // Bad privkey — generate a fresh one and retry.
+                    std.crypto.random.bytes(&privkey);
+                }
+                // Exhausted attempts — fall through to placeholder (the
+                // caller will see ECDH failure and fall back to v1).
+            }
+        }
 
+        // Test-mode / no-secp fallback: random placeholder.
+        std.crypto.random.bytes(&pubkey);
+        cipher.our_privkey = privkey;
         cipher.our_pubkey = pubkey;
         return cipher;
     }
@@ -509,7 +588,11 @@ pub const BIP324Cipher = struct {
 
     /// Initialize encryption after receiving the other party's public key.
     /// `initiator` should be true if we initiated the connection.
-    /// Uses simulated ECDH (NOT secure - for testing only without libsecp256k1).
+    /// In a real build, uses secp256k1_ellswift_xdh (BIP-324 hash function)
+    /// for a genuine shared secret.  In test builds (or if the C call fails)
+    /// falls back to a simulated SHA-256-based shared secret which is
+    /// adequate for the state-machine tests but not interoperable with a
+    /// real Bitcoin Core peer.
     pub fn initialize(
         self: *BIP324Cipher,
         their_pubkey: *const [ELLSWIFT_PUBKEY_LEN]u8,
@@ -518,9 +601,39 @@ pub const BIP324Cipher = struct {
     ) void {
         var shared_secret: [32]u8 = undefined;
 
-        // Use simulated ECDH (for testing without libsecp256k1)
-        self.computeSimulatedSharedSecret(their_pubkey, &shared_secret);
+        if (!builtin.is_test and @hasDecl(secp256k1, "secp256k1_ellswift_xdh")) {
+            const ctx_opt = getSecp256k1Context();
+            if (ctx_opt) |ctx| {
+                if (self.our_privkey) |privkey| {
+                    if (self.our_pubkey) |our_pk| {
+                        const ell_a64: *const [ELLSWIFT_PUBKEY_LEN]u8 = if (initiator) &our_pk else their_pubkey;
+                        const ell_b64: *const [ELLSWIFT_PUBKEY_LEN]u8 = if (initiator) their_pubkey else &our_pk;
+                        const party: c_int = if (initiator) 0 else 1;
+                        const result = secp256k1.secp256k1_ellswift_xdh(
+                            ctx,
+                            &shared_secret,
+                            ell_a64,
+                            ell_b64,
+                            &privkey,
+                            party,
+                            secp256k1.secp256k1_ellswift_xdh_hash_function_bip324,
+                            null,
+                        );
+                        if (result == 1) {
+                            self.initializeWithSharedSecret(&shared_secret, initiator, network_magic);
+                            return;
+                        }
+                        // Real ECDH failed — fall through to simulated so the
+                        // peer thread doesn't crash; the v2 handshake will
+                        // then fail to authenticate and the transport will
+                        // close, prompting v1 reconnect at the call site.
+                    }
+                }
+            }
+        }
 
+        // Test mode or fallback: simulated ECDH (NOT interoperable).
+        self.computeSimulatedSharedSecret(their_pubkey, &shared_secret);
         self.initializeWithSharedSecret(&shared_secret, initiator, network_magic);
     }
 
@@ -1730,4 +1843,50 @@ test "BIP324 cipher synchronization over multiple packets" {
         try std.testing.expect(ok);
         try std.testing.expectEqualStrings(msg, decrypted[0..msg.len]);
     }
+}
+
+// ============================================================================
+// V2 negotiation peek-and-classify tests (BIP-324 outbound/inbound dispatch)
+// ============================================================================
+
+test "looksLikeV1Version: real v1 VERSION prefix on mainnet" {
+    const magic: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+    // Real v1 VERSION header start: 4-byte mainnet magic + "version\0\0\0\0\0".
+    var bytes: [16]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9, 'v', 'e', 'r', 's', 'i', 'o', 'n', 0, 0, 0, 0, 0 };
+    try std.testing.expect(looksLikeV1Version(&bytes, magic));
+}
+
+test "looksLikeV1Version: 64-byte ellswift pubkey looks like v2" {
+    const magic: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+    // Use deterministic non-magic bytes for the first 16 bytes of an
+    // ellswift pubkey.  The first 4 bytes must NOT match the network magic.
+    var bytes: [16]u8 = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    try std.testing.expect(!looksLikeV1Version(&bytes, magic));
+}
+
+test "looksLikeV1Version: magic match but wrong command (e.g. inv) is not v1 VERSION" {
+    // Same magic but a different command — Core only treats VERSION as the
+    // unambiguous v1 marker because every connection's first message is
+    // VERSION; any other command means we're already past the handshake
+    // (which is impossible here) or it's bogus garbage that we can ignore.
+    const magic: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+    var bytes: [16]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9, 'i', 'n', 'v', 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expect(!looksLikeV1Version(&bytes, magic));
+}
+
+test "looksLikeV1Version: short slice returns false" {
+    const magic: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+    var short: [8]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9, 'v', 'e', 'r', 's' };
+    try std.testing.expect(!looksLikeV1Version(&short, magic));
+}
+
+test "looksLikeV1Version: testnet magic" {
+    // Testnet3 magic 0x0709110B in LE wire order.
+    const magic: [4]u8 = .{ 0x0b, 0x11, 0x09, 0x07 };
+    var bytes: [16]u8 = .{ 0x0b, 0x11, 0x09, 0x07, 'v', 'e', 'r', 's', 'i', 'o', 'n', 0, 0, 0, 0, 0 };
+    try std.testing.expect(looksLikeV1Version(&bytes, magic));
+    // Wrong magic should still be recognized as v1 only when it matches the
+    // CALLER'S network; testnet bytes against a mainnet caller should be v2.
+    const mainnet: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+    try std.testing.expect(!looksLikeV1Version(&bytes, mainnet));
 }
