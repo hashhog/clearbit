@@ -324,8 +324,10 @@ pub const Peer = struct {
 
     /// Whether we advertise NODE_BLOOM (BIP-37/BIP-35 service flag) in our
     /// VERSION message and serve `mempool` requests.  Mirrored from
-    /// `PeerManager.peerbloomfilters` at peer-creation time.  Default true.
-    advertise_node_bloom: bool = true,
+    /// `PeerManager.peerbloomfilters` at peer-creation time.  Default false
+    /// to match Bitcoin Core's `DEFAULT_PEERBLOOMFILTERS = false`
+    /// (net_processing.h:44).
+    advertise_node_bloom: bool = false,
 
     /// BIP-324 v2 transport protocol version.
     transport_version: TransportVersion = .v1,
@@ -435,7 +437,7 @@ pub const Peer = struct {
             .oldest_block_in_flight_time = 0,
             .blocks_in_flight_count = 0,
             .chain_sync_protected = false,
-            .advertise_node_bloom = true,
+            .advertise_node_bloom = false,
             .transport_version = .v1,
             .v2_cipher = null,
         };
@@ -485,7 +487,7 @@ pub const Peer = struct {
             .oldest_block_in_flight_time = 0,
             .blocks_in_flight_count = 0,
             .chain_sync_protected = false,
-            .advertise_node_bloom = true,
+            .advertise_node_bloom = false,
             .transport_version = .v1,
             .v2_cipher = null,
         };
@@ -980,7 +982,8 @@ pub const Peer = struct {
 
         // Bitcoin Core builds the advertised services bitmap from the
         // local services config; we do the same so NODE_BLOOM is gated
-        // on the `peerbloomfilters` config (default true).
+        // on the `peerbloomfilters` config (default false, matching
+        // Core's DEFAULT_PEERBLOOMFILTERS in net_processing.h:44).
         const our_services: u64 = blk: {
             var s: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
             if (self.advertise_node_bloom) s |= p2p.NODE_BLOOM;
@@ -1808,8 +1811,9 @@ pub const PeerManager = struct {
 
     /// Whether to advertise NODE_BLOOM (BIP-37/BIP-35) in outgoing
     /// VERSION messages and serve `mempool` requests.  Plumbed from
-    /// the `peerbloomfilters` CLI flag.  Default true.
-    peerbloomfilters: bool = true,
+    /// the `peerbloomfilters` CLI flag.  Default false to match Bitcoin
+    /// Core's `DEFAULT_PEERBLOOMFILTERS = false` (net_processing.h:44).
+    peerbloomfilters: bool = false,
 
     /// Per-address fall-back set for BIP-324 v2 outbound negotiation.
     /// Once we've tried v2 against an address and fallen back to v1 (because
@@ -1858,7 +1862,7 @@ pub const PeerManager = struct {
             .blocks_since_log = 0,
             .last_stall_recovery = 0,
             .in_drain = false,
-            .peerbloomfilters = true,
+            .peerbloomfilters = false,
             .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
         };
     }
