@@ -1097,6 +1097,19 @@ pub const V2Transport = struct {
         return self.processRecvBuffer();
     }
 
+    /// Try to advance the receive state machine using already-buffered bytes,
+    /// without reading more from the socket.  Returns false on unrecoverable
+    /// error.  Used by callers that just consumed an `app_ready` packet via
+    /// `getReceivedMessage()` to drain any remaining packets the kernel
+    /// delivered alongside it (e.g. WTXIDRELAY+SENDADDRV2+VERACK arriving in
+    /// a single TCP segment).  Without this, the next `receiveMessage` would
+    /// block on `stream.read` even though a complete packet is already in
+    /// `recv_buffer` — that's the "v2 app-handshake VERACK never arrives"
+    /// asymmetry seen against rustoshi.
+    pub fn processBuffered(self: *V2Transport) bool {
+        return self.processRecvBuffer();
+    }
+
     fn processRecvBuffer(self: *V2Transport) bool {
         while (true) {
             switch (self.recv_state) {

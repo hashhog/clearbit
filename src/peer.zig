@@ -622,10 +622,18 @@ pub const Peer = struct {
         // packet (or we hit a non-recoverable error).
         var read_buf: [16384]u8 = undefined;
         while (!t.isMessageReady()) {
-            // Try to make forward progress against the existing buffer first
-            // — V2Transport may have already cached enough bytes from a prior
-            // call.  If processing yields a v1 fallback or a hard error, we
-            // surface it.
+            if (t.isV1Fallback()) return PeerError.ProtocolViolation;
+
+            // First, try to drain bytes already buffered from a previous read.
+            // Multiple BIP-324 packets can arrive in a single TCP segment
+            // (e.g. WTXIDRELAY + SENDADDRV2 + VERACK during the application
+            // handshake against rustoshi), and `processRecvBuffer` exits
+            // after it advances to .app_ready — leaving any trailing packets
+            // sitting in `recv_buffer`.  Without this drain, the next
+            // `receiveMessage` would call `stream.read` and block waiting for
+            // bytes that already arrived, causing a 30s SO_RCVTIMEO timeout.
+            if (!t.processBuffered()) return PeerError.ProtocolViolation;
+            if (t.isMessageReady()) break;
             if (t.isV1Fallback()) return PeerError.ProtocolViolation;
 
             const n = self.stream.read(&read_buf) catch |err| {
