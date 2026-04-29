@@ -921,6 +921,13 @@ pub const Peer = struct {
                         std.log.info("peer={any} BIP-324 v2 inbound handshake failed: {any}", .{ self.address, err });
                         return PeerError.HandshakeFailed;
                     };
+                    // Mirror the outbound success log (peer.zig:1915) so the
+                    // BIP-324 interop matrix harness can classify
+                    // clearbit-as-listener pairs as v2 instead of "unknown".
+                    // Use std.debug.print so the line surfaces in
+                    // ReleaseFast (Zig 0.13's default log_level for
+                    // ReleaseFast is .err; std.log.info is dropped).
+                    std.debug.print("P2P: BIP-324 v2 inbound connected (encrypted) peer={any}\n", .{self.address});
                 }
                 // Looks like v1 — fall through.
             }
