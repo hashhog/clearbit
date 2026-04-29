@@ -5697,13 +5697,14 @@ test "BIP-324: v1-fallback set caps at V2_FALLBACK_CACHE_MAX" {
     }
 }
 
-test "BIP-324: bip324V2Enabled defaults off, honors env var" {
-    // Default state — env unset.
-    // We can't reliably unset an env var in a Zig test (no portable
-    // unsetenv wrapper in std for our use), so verify only the non-set
-    // path is false-by-default in production builds.  When the env var
-    // is set to "1" by the operator, bip324V2Enabled() returns true.
+test "BIP-324: bip324V2Enabled defaults on, honors env var off-toggles" {
+    // Default state — env unset → returns true (default ON since W90,
+    // matching Bitcoin Core 26+ `-v2transport=1`).  We can't reliably
+    // unset an env var in a Zig test (no portable unsetenv wrapper in
+    // std for our use), so verify only the non-set path is true-by-
+    // default.  When the operator sets CLEARBIT_BIP324_V2=0 (or "false"
+    // / "FALSE"), bip324V2Enabled() returns false; otherwise true.
     if (std.posix.getenv("CLEARBIT_BIP324_V2") == null) {
-        try std.testing.expect(!Peer.bip324V2Enabled());
+        try std.testing.expect(Peer.bip324V2Enabled());
     }
 }
