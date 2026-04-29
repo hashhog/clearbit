@@ -15,6 +15,7 @@ const consensus = @import("consensus.zig");
 const storage = @import("storage.zig");
 const script = @import("script.zig");
 const serialize = @import("serialize.zig");
+const p2p = @import("p2p.zig");
 
 // ============================================================================
 // Mempool Constants
@@ -2027,6 +2028,45 @@ pub const Mempool = struct {
         }
     }
 };
+
+// ============================================================================
+// BIP-35 inventory builder
+// ============================================================================
+
+/// Build the BIP-35 inventory list a peer would receive in response to a
+/// `mempool` message, **without** sending it.  Selects MSG_WTX for
+/// witness-capable peers (BIP-339, mirroring Core's `peer.m_wtxid_relay`
+/// at net_processing.cpp:6007) and MSG_TX otherwise.  Honors the peer's
+/// BIP-133 fee filter (a value of 0 means "no filter").
+///
+/// Caller owns the returned slice.
+pub fn buildMempoolInventory(
+    pool: *const Mempool,
+    is_witness_capable: bool,
+    fee_filter_received: u64,
+    allocator: std.mem.Allocator,
+) ![]p2p.InvVector {
+    var inv = std.ArrayList(p2p.InvVector).init(allocator);
+    errdefer inv.deinit();
+    try inv.ensureTotalCapacity(pool.entries.count());
+
+    var iter = pool.entries.iterator();
+    while (iter.next()) |kv| {
+        const entry = kv.value_ptr.*;
+        // Honor peer's BIP-133 fee filter (Core net_processing.cpp:6013).
+        if (fee_filter_received > 0 and entry.vsize > 0) {
+            const fee_rate_kvb: u64 = @intCast(@max(@as(i64, 0),
+                @divTrunc(entry.fee * 1000, @as(i64, @intCast(entry.vsize)))));
+            if (fee_rate_kvb < fee_filter_received) continue;
+        }
+        const item = if (is_witness_capable)
+            p2p.InvVector{ .inv_type = .msg_witness_tx, .hash = entry.wtxid }
+        else
+            p2p.InvVector{ .inv_type = .msg_tx, .hash = entry.txid };
+        inv.appendAssumeCapacity(item);
+    }
+    return inv.toOwnedSlice();
+}
 
 // ============================================================================
 // Helper Functions

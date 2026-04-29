@@ -68,6 +68,13 @@ pub const Config = struct {
     maxmempool: u64 = 300, // Max mempool size in MiB
     mempoolexpiry: u64 = 336, // Hours before expiry
 
+    // BIP-35 / BIP-37 bloom-filter support.  When true, advertise the
+    // NODE_BLOOM service flag in our version message and serve the
+    // `mempool` message.  Mirrors Bitcoin Core's `-peerbloomfilters`
+    // (Core default is false; clearbit defaults true so BIP-35
+    // mempool queries work out of the box for ops tooling).
+    peerbloomfilters: bool = true,
+
     // Metrics
     metrics_port: u16 = 9332, // 0 = disabled
 
@@ -212,6 +219,20 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         } else if (std.mem.startsWith(u8, arg, "--mempoolexpiry=")) {
             config.mempoolexpiry = std.fmt.parseInt(u64, arg["--mempoolexpiry=".len..], 10) catch
                 return ArgParseError.InvalidArgument;
+        }
+        // BIP-35/BIP-37 bloom-filter / mempool support
+        else if (std.mem.eql(u8, arg, "--peerbloomfilters") or
+            std.mem.eql(u8, arg, "-peerbloomfilters") or
+            std.mem.eql(u8, arg, "--peerbloomfilters=1") or
+            std.mem.eql(u8, arg, "-peerbloomfilters=1"))
+        {
+            config.peerbloomfilters = true;
+        } else if (std.mem.eql(u8, arg, "--peerbloomfilters=0") or
+            std.mem.eql(u8, arg, "-peerbloomfilters=0") or
+            std.mem.eql(u8, arg, "--nopeerbloomfilters") or
+            std.mem.eql(u8, arg, "-nopeerbloomfilters"))
+        {
+            config.peerbloomfilters = false;
         }
         // Debug settings
         else if (std.mem.eql(u8, arg, "--debug") or std.mem.eql(u8, arg, "-debug")) {
@@ -1376,6 +1397,7 @@ pub fn main() !void {
     defer peer_manager.deinit();
     peer_manager.chain_state = &chain_state;
     peer_manager.mempool = &mempool_instance;
+    peer_manager.peerbloomfilters = config.peerbloomfilters;
 
     const auth_token = computeAuthToken(config.rpc_user, config.rpc_password, allocator) catch null;
     defer if (auth_token) |t| allocator.free(t);

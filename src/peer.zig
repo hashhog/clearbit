@@ -166,6 +166,41 @@ pub fn sameNetGroup(addr1: std.net.Address, addr2: std.net.Address) bool {
 }
 
 // ============================================================================
+// BIP-35 mempool inventory helpers
+//
+// `buildMempoolInventory` lives in mempool.zig (it is a mempool query) and
+// takes raw bool/u64 args so it doesn't need the Peer struct.  We thin-wrap
+// it here only to drive `Peer.sendMessage`.
+// ============================================================================
+
+/// BIP-35 mempool handler: walk the mempool and emit chunked `inv` messages
+/// to `peer`.  Mirrors Bitcoin Core's loop in `SendMessages`
+/// (`net_processing.cpp:5996`).  Caller has already verified that we
+/// advertised NODE_BLOOM (otherwise the peer should be disconnected).
+pub fn sendMempoolInventory(
+    peer: *Peer,
+    pool: *const mempool_mod.Mempool,
+    allocator: std.mem.Allocator,
+) !void {
+    const inv = try mempool_mod.buildMempoolInventory(
+        pool,
+        peer.is_witness_capable,
+        peer.fee_filter_received,
+        allocator,
+    );
+    defer allocator.free(inv);
+
+    var i: usize = 0;
+    while (i < inv.len) {
+        const end = @min(i + p2p.MAX_INV_SIZE, inv.len);
+        const chunk = inv[i..end];
+        const inv_msg = p2p.Message{ .inv = .{ .inventory = chunk } };
+        peer.sendMessage(&inv_msg) catch {};
+        i = end;
+    }
+}
+
+// ============================================================================
 // Peer State Machine
 // ============================================================================
 
@@ -266,26 +301,31 @@ pub const Peer = struct {
     connect_time: i64,
     /// Fee filter received from this peer (BIP-133). Minimum fee rate in sat/kvB.
     /// We should not relay transactions below this rate to this peer.
-    fee_filter_received: u64,
+    fee_filter_received: u64 = 0,
     /// Fee filter we last sent to this peer (BIP-133). In sat/kvB.
-    fee_filter_sent: u64,
+    fee_filter_sent: u64 = 0,
     /// Next time (microseconds since epoch) to send a feefilter message.
-    next_send_feefilter: i64,
+    next_send_feefilter: i64 = 0,
     /// Best known block height from this peer (from headers or blocks).
-    best_known_height: u32,
+    best_known_height: u32 = 0,
     /// Time when we last sent a getheaders request to this peer.
-    last_getheaders_time: i64,
+    last_getheaders_time: i64 = 0,
     /// Time when the oldest block-in-flight was requested (0 if no blocks in flight).
-    oldest_block_in_flight_time: i64,
+    oldest_block_in_flight_time: i64 = 0,
     /// Number of blocks currently in flight from this peer.
-    blocks_in_flight_count: u32,
+    blocks_in_flight_count: u32 = 0,
     /// Whether this peer is protected from stale tip eviction.
-    chain_sync_protected: bool,
+    chain_sync_protected: bool = false,
 
     /// Clock offset (seconds) from the peer's VERSION message timestamp:
     /// peer_version_timestamp - our_time_at_receipt.  Matches Bitcoin Core's
     /// CNode::nTimeOffset.  Zero until VERSION has been received.
     time_offset: i64 = 0,
+
+    /// Whether we advertise NODE_BLOOM (BIP-37/BIP-35 service flag) in our
+    /// VERSION message and serve `mempool` requests.  Mirrored from
+    /// `PeerManager.peerbloomfilters` at peer-creation time.  Default true.
+    advertise_node_bloom: bool = true,
 
     /// BIP-324 v2 transport protocol version.
     transport_version: TransportVersion = .v1,
@@ -395,6 +435,7 @@ pub const Peer = struct {
             .oldest_block_in_flight_time = 0,
             .blocks_in_flight_count = 0,
             .chain_sync_protected = false,
+            .advertise_node_bloom = true,
             .transport_version = .v1,
             .v2_cipher = null,
         };
@@ -444,6 +485,7 @@ pub const Peer = struct {
             .oldest_block_in_flight_time = 0,
             .blocks_in_flight_count = 0,
             .chain_sync_protected = false,
+            .advertise_node_bloom = true,
             .transport_version = .v1,
             .v2_cipher = null,
         };
@@ -936,11 +978,20 @@ pub const Peer = struct {
             // naturally on receiveMessage if the peer is dead.
         }
 
+        // Bitcoin Core builds the advertised services bitmap from the
+        // local services config; we do the same so NODE_BLOOM is gated
+        // on the `peerbloomfilters` config (default true).
+        const our_services: u64 = blk: {
+            var s: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
+            if (self.advertise_node_bloom) s |= p2p.NODE_BLOOM;
+            break :blk s;
+        };
+
         if (self.direction == .outbound) {
             // Send our version
             const version_msg = p2p.Message{ .version = p2p.VersionMessage{
                 .version = p2p.PROTOCOL_VERSION,
-                .services = p2p.NODE_NETWORK | p2p.NODE_WITNESS,
+                .services = our_services,
                 .timestamp = now,
                 .addr_recv = types.NetworkAddress{
                     .services = 0,
@@ -948,7 +999,7 @@ pub const Peer = struct {
                     .port = 0,
                 },
                 .addr_from = types.NetworkAddress{
-                    .services = p2p.NODE_NETWORK | p2p.NODE_WITNESS,
+                    .services = our_services,
                     .ip = [_]u8{0} ** 16,
                     .port = 0,
                 },
@@ -1030,7 +1081,7 @@ pub const Peer = struct {
             // Send our version
             const version_msg = p2p.Message{ .version = p2p.VersionMessage{
                 .version = p2p.PROTOCOL_VERSION,
-                .services = p2p.NODE_NETWORK | p2p.NODE_WITNESS,
+                .services = our_services,
                 .timestamp = now,
                 .addr_recv = types.NetworkAddress{
                     .services = self.services,
@@ -1038,7 +1089,7 @@ pub const Peer = struct {
                     .port = 0,
                 },
                 .addr_from = types.NetworkAddress{
-                    .services = p2p.NODE_NETWORK | p2p.NODE_WITNESS,
+                    .services = our_services,
                     .ip = [_]u8{0} ** 16,
                     .port = 0,
                 },
@@ -1755,6 +1806,11 @@ pub const PeerManager = struct {
     /// path can't recurse into drainBlockBuffer.  W101 (2026-04-24).
     in_drain: bool,
 
+    /// Whether to advertise NODE_BLOOM (BIP-37/BIP-35) in outgoing
+    /// VERSION messages and serve `mempool` requests.  Plumbed from
+    /// the `peerbloomfilters` CLI flag.  Default true.
+    peerbloomfilters: bool = true,
+
     /// Per-address fall-back set for BIP-324 v2 outbound negotiation.
     /// Once we've tried v2 against an address and fallen back to v1 (because
     /// the peer didn't speak v2 — a non-ellswift response or a deadline
@@ -1802,6 +1858,7 @@ pub const PeerManager = struct {
             .blocks_since_log = 0,
             .last_stall_recovery = 0,
             .in_drain = false,
+            .peerbloomfilters = true,
             .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
         };
     }
@@ -1881,6 +1938,7 @@ pub const PeerManager = struct {
                 self.allocator.destroy(peer);
                 return null;
             };
+            peer.advertise_node_bloom = self.peerbloomfilters;
 
             // Attach an initiator-mode V2Transport to the peer and let it
             // drive the cipher handshake.  The transport's init() already
@@ -1937,6 +1995,7 @@ pub const PeerManager = struct {
             self.allocator.destroy(peer);
             return null;
         };
+        peer.advertise_node_bloom = self.peerbloomfilters;
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -2551,6 +2610,7 @@ pub const PeerManager = struct {
 
         const peer = try self.allocator.create(Peer);
         peer.* = Peer.accept(conn.stream, conn.address, self.network_params, self.allocator);
+        peer.advertise_node_bloom = self.peerbloomfilters;
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -3246,6 +3306,21 @@ pub const PeerManager = struct {
                 // reject message fields are slices into the payload buffer,
                 // which is freed by receiveMessage's defer. No extra free needed.
                 _ = rj;
+            },
+            .mempool => {
+                // BIP-35: serve our mempool inventory to the requesting peer.
+                // Bitcoin Core gates this on whether *we* advertised NODE_BLOOM
+                // (`peer.m_our_services & NODE_BLOOM`) — see
+                // bitcoin-core/src/net_processing.cpp:4852.  If we did not,
+                // disconnect the peer for protocol violation.
+                if (!peer.advertise_node_bloom) {
+                    std.log.debug("mempool request with bloom filters disabled, disconnecting peer={any}", .{peer.address});
+                    peer.should_ban = false;
+                    peer.disconnect();
+                    return;
+                }
+                const pool = self.mempool orelse return;
+                try sendMempoolInventory(peer, pool, self.allocator);
             },
             else => {},
         }
@@ -5697,7 +5772,7 @@ test "W16 pipeline: slow-peer disconnect rewinds cursor without stalling others"
 
 test "BIP-324: markV1Only / isV1Only round-trip on IPv4" {
     const allocator = std.testing.allocator;
-    var pm = PeerManager.init(allocator, &consensus.MAINNET_PARAMS);
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
     defer pm.deinit();
 
     const addr = std.net.Address.initIp4(.{ 192, 168, 1, 50 }, 8333);
@@ -5708,7 +5783,7 @@ test "BIP-324: markV1Only / isV1Only round-trip on IPv4" {
 
 test "BIP-324: v1-fallback set distinguishes addresses by port" {
     const allocator = std.testing.allocator;
-    var pm = PeerManager.init(allocator, &consensus.MAINNET_PARAMS);
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
     defer pm.deinit();
 
     const a = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 8333);
@@ -5720,7 +5795,7 @@ test "BIP-324: v1-fallback set distinguishes addresses by port" {
 
 test "BIP-324: v1-fallback set caps at V2_FALLBACK_CACHE_MAX" {
     const allocator = std.testing.allocator;
-    var pm = PeerManager.init(allocator, &consensus.MAINNET_PARAMS);
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
     defer pm.deinit();
 
     // Insert V2_FALLBACK_CACHE_MAX + 5 entries; the cap must hold (LRU
