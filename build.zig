@@ -103,6 +103,39 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // BIP-35 / NODE_BLOOM advertisement tests live in a dedicated test root
+    // (tests_bip35.zig) so they can import peer.zig without dragging in the
+    // pre-existing eclipse-protection tests in peer.zig (which have drifted
+    // from the implementation and are unrelated to BIP-35).
+    {
+        const bip35_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_bip35.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        bip35_tests.linkSystemLibrary("rocksdb");
+        bip35_tests.linkSystemLibrary("secp256k1");
+        bip35_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        bip35_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            bip35_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            bip35_tests.linkSystemLibrary("minisketch");
+            bip35_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        bip35_tests.root_module.addOptions("build_options", build_options);
+
+        const run_bip35_tests = b.addRunArtifact(bip35_tests);
+        const bip35_test_step = b.step("test-bip35", "Run BIP-35 (mempool) + NODE_BLOOM tests");
+        bip35_test_step.dependOn(&run_bip35_tests.step);
+        // Also fold into the main `test` step so CI exercises BIP-35.
+        test_step.dependOn(&run_bip35_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
