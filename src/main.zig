@@ -71,9 +71,10 @@ pub const Config = struct {
     // BIP-35 / BIP-37 bloom-filter support.  When true, advertise the
     // NODE_BLOOM service flag in our version message and serve the
     // `mempool` message.  Mirrors Bitcoin Core's `-peerbloomfilters`
-    // (Core default is false; clearbit defaults true so BIP-35
-    // mempool queries work out of the box for ops tooling).
-    peerbloomfilters: bool = true,
+    // (DEFAULT_PEERBLOOMFILTERS = false in net_processing.h:44).
+    // Operators can opt back in with `--peerbloomfilters` /
+    // `--peerbloomfilters=1` for BIP-35 mempool queries.
+    peerbloomfilters: bool = false,
 
     // Metrics
     metrics_port: u16 = 9332, // 0 = disabled
