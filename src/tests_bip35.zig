@@ -25,16 +25,24 @@ test "BIP-35: NODE_BLOOM constant equals 4 per BIP-37" {
     try testing.expectEqual(@as(u64, 4), p2p.NODE_BLOOM);
 }
 
+test "BIP-35: advertised services bitmap omits NODE_BLOOM by default (peerbloomfilters=false)" {
+    // Mirror peer.zig:performHandshake's services builder. With
+    // peerbloomfilters=false (Core's DEFAULT_PEERBLOOMFILTERS), NODE_BLOOM
+    // is NOT or'd into the advertised services bitmap.
+    const default_bitmap: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
+    try testing.expect((default_bitmap & p2p.NODE_BLOOM) == 0);
+    try testing.expect((default_bitmap & p2p.NODE_NETWORK) != 0);
+    try testing.expect((default_bitmap & p2p.NODE_WITNESS) != 0);
+}
+
 test "BIP-35: advertised services bitmap includes NODE_BLOOM when peerbloomfilters=true" {
-    // Mirror peer.zig:performHandshake's services builder.
+    // Operator-opt-in case: --peerbloomfilters flips advertise_node_bloom
+    // true and the bitmap or's NODE_BLOOM in.
     var advertised: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
     advertised |= p2p.NODE_BLOOM;
     try testing.expect((advertised & p2p.NODE_BLOOM) != 0);
     try testing.expect((advertised & p2p.NODE_NETWORK) != 0);
     try testing.expect((advertised & p2p.NODE_WITNESS) != 0);
-
-    const opt_out: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
-    try testing.expect((opt_out & p2p.NODE_BLOOM) == 0);
 }
 
 test "BIP-35: buildMempoolInventory returns wtxid inv for witness-capable peer" {
