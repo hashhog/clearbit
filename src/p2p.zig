@@ -11,6 +11,9 @@ const erlay_mod = @import("erlay.zig");
 pub const PROTOCOL_VERSION: i32 = 70016;
 pub const MIN_PROTOCOL_VERSION: i32 = 70001;
 pub const NODE_NETWORK: u64 = 1;
+/// BIP-37 / BIP-35: signals that the node supports bloom-filtered mempool
+/// queries.  Required for serving the `mempool` message per BIP-35.
+pub const NODE_BLOOM: u64 = 4;
 pub const NODE_WITNESS: u64 = 8;
 pub const NODE_NETWORK_LIMITED: u64 = 1024;
 pub const USER_AGENT: []const u8 = "/clearbit:0.1.0/";
