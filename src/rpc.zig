@@ -4794,8 +4794,16 @@ pub const RpcServer = struct {
     /// Reference: Bitcoin Core rpc/net.cpp addnode
     ///
     /// Arguments:
-    ///   1. node (string, required) - IP address or hostname
+    ///   1. node (string, required) - IP address or hostname (optionally :port)
     ///   2. command (string, required) - "add", "remove", or "onetry"
+    ///
+    /// Returns `null` on success.  Per Bitcoin Core semantics, "onetry" is
+    /// fire-and-forget: the dial is attempted but the RPC always succeeds
+    /// (the connection itself happens asynchronously and is observable via
+    /// `getpeerinfo`).  This matches `OpenNetworkConnection` returning bool
+    /// while `addnode` always returns `VNULL` in `rpc/net.cpp`.  Returning
+    /// an error JSON when the dial/handshake fails synchronously caused
+    /// false-positive `fail-addnode` rows in the BIP-324 interop matrix.
     fn handleAddNode(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (params != .array or params.array.items.len < 2) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires node and command", id);
@@ -4823,9 +4831,28 @@ pub const RpcServer = struct {
             // Remove from manual connection list
             self.peer_manager.removeManualNode(node);
         } else if (std.mem.eql(u8, cmd, "onetry")) {
-            // Try connecting once
-            self.peer_manager.tryConnectNode(node) catch {
-                return self.jsonRpcError(RPC_MISC_ERROR, "Failed to connect", id);
+            // Fire-and-forget dial.  Per Bitcoin Core (rpc/net.cpp::addnode)
+            // we always return null on success-shaped JSON-RPC even if the
+            // synchronous dial+handshake fails — the connection itself is
+            // an asynchronous event and `getpeerinfo` is the source of
+            // truth for whether it succeeded.  We still want to report
+            // syntactically invalid `node` strings as RPC_INVALID_PARAMS
+            // (Core does the same — `LookupHost` failure surfaces as
+            // RPC_CLIENT_INVALID_IP_OR_SUBNET on the equivalent path).
+            self.peer_manager.tryConnectNode(node) catch |err| switch (err) {
+                error.InvalidAddress => {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid node address", id);
+                },
+                else => {
+                    // tryConnectNode is fire-and-forget: it only validates
+                    // the node string and registers a `.manual` address
+                    // (the actual dial happens off-thread in
+                    // maintainManualConnections), so the only non-parse
+                    // error path here is OOM during addAddress.  Log and
+                    // fall through to a success-shaped reply — Core never
+                    // surfaces dial outcomes via this RPC either.
+                    std.log.info("addnode onetry: registration for {s} failed: {any}", .{ node, err });
+                },
             };
         } else {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid command", id);

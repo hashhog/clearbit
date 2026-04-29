@@ -2230,11 +2230,43 @@ pub const PeerManager = struct {
     }
 
     /// Try to connect to a node once (onetry command).
-    /// The resulting peer is tagged `.manual` so rotation/eviction skip it.
+    ///
+    /// Fire-and-forget semantics matching Bitcoin Core's
+    /// `OpenNetworkConnection` (called by `rpc/net.cpp::addnode`):
+    /// register the address as `.manual` and let the peer-thread loop
+    /// pick it up on its next iteration via `maintainManualConnections`.
+    /// The actual TCP + BIP-324/v1 handshake then happens off the RPC
+    /// thread so the RPC reply lands in milliseconds rather than after
+    /// a multi-second handshake.  Keeps the BIP-324 interop matrix
+    /// (`tools/bip324-interop-matrix.sh`, `--max-time 8` curl) from
+    /// false-failing on `clearbit → *` rows with `fail-addnode`.
+    ///
+    /// The peer-loop dial tags the connected peer `.manual` (so
+    /// rotation/eviction skip it).  Whether the dial actually
+    /// succeeds is observable via `getpeerinfo`; the RPC always
+    /// succeeds.
+    ///
+    /// Caveat vs Bitcoin Core: `onetry` here ends up reusing the
+    /// `add`-style reconnect lifecycle (the address stays in
+    /// `known_addresses` with `source = .manual`).  Core's `onetry`
+    /// is strictly one-shot.  The behavioural difference is small
+    /// — a remote-side eviction will trigger a 30s-throttled
+    /// reconnect — and is the simplest way to drive the dial off
+    /// the RPC thread without introducing cross-thread mutation of
+    /// `peers.items` (existing code is single-writer on the peer
+    /// thread).
     pub fn tryConnectNode(self: *PeerManager, node: []const u8) !void {
         const addr = try self.resolveNodeAddress(node);
-        const peer = try self.connectToPeer(addr);
-        peer.conn_type = .manual;
+        const key = addressKey(addr);
+        if (self.known_addresses.getPtr(key)) |info| {
+            info.source = .manual;
+            // Reset bookkeeping so maintainManualConnections dials on the
+            // very next peer-loop tick (no MANUAL_RECONNECT_INTERVAL gate).
+            info.last_tried = 0;
+            info.attempts = 0;
+        } else {
+            try self.addAddress(addr, 0, .manual);
+        }
     }
 
     /// Reconnect dropped manual peers (`addnode <ip> add`).
