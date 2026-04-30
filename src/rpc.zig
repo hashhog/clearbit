@@ -1271,6 +1271,20 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
         }
 
+        // Pruning: if the block's height is at or below the prune watermark,
+        // CF_BLOCKS no longer holds its body. We can still answer header-only
+        // queries (verbosity ≥ 1 reuses fields from the in-memory block index),
+        // but verbosity 0 (raw block hex) is unanswerable. Match Bitcoin Core's
+        // rpc/blockchain.cpp getblock(): error code -1 / RPC_MISC_ERROR with
+        // "Block not available (pruned data)".
+        if (verbosity == 0 and self.chain_state.isHeightPruned(height)) {
+            return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "Block not available (pruned data)",
+                id,
+            );
+        }
+
         if (verbosity == 0) {
             // Return raw hex-encoded block
             // For simplicity, just return header hex for now
