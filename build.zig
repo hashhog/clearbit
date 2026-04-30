@@ -25,9 +25,17 @@ pub fn build(b: *std.Build) void {
     // Default to Bitcoin Core's bundled version
     const minisketch_include = b.option([]const u8, "minisketch-include", "Path to libminisketch include directory") orelse "../bitcoin/src/minisketch/include";
 
+    // libzmq publishing (rawblock / hashblock / rawtx / hashtx / sequence).
+    // libzmq.so.5 is shipped by Debian's `libzmq5` runtime package; the C
+    // ABI is declared inline in src/zmq.zig so libzmq-dev is NOT required to
+    // build. Set -Dzmq=true to actually link the library and let the
+    // operator pass --zmqpub<topic>=tcp://...
+    const zmq_enabled = b.option(bool, "zmq", "Enable ZMQ publishing (links libzmq at runtime)") orelse false;
+
     // Create build options module that all modules can import
     const build_options = b.addOptions();
     build_options.addOption(bool, "minisketch_enabled", minisketch_enabled);
+    build_options.addOption(bool, "zmq_enabled", zmq_enabled);
 
     const exe = b.addExecutable(.{
         .name = "clearbit",
@@ -56,6 +64,28 @@ pub fn build(b: *std.Build) void {
     if (minisketch_enabled) {
         exe.linkSystemLibrary("minisketch");
         exe.addIncludePath(.{ .cwd_relative = minisketch_include });
+        exe.linkLibC();
+    }
+
+    // Link libzmq if enabled. We don't need libzmq-dev to build because the
+    // ABI is declared inline in src/zmq.zig — only the runtime symbols are
+    // needed at link time. On Debian without libzmq-dev, the linker can use
+    // `-l:libzmq.so.5` against the runtime SONAME directly. We do that via
+    // addObjectFile when `linkSystemLibrary("zmq")` fails (no .so symlink).
+    if (zmq_enabled) {
+        // Prefer the dev-package symlink if it exists, otherwise fall through
+        // to the runtime SONAME. linkSystemLibrary("zmq") would fail at
+        // build-graph eval if the .so symlink is missing.
+        const zmq_so_path = "/usr/lib/x86_64-linux-gnu/libzmq.so";
+        if (std.fs.cwd().access(zmq_so_path, .{})) |_| {
+            exe.linkSystemLibrary("zmq");
+        } else |_| {
+            // libzmq.so.5 is the SONAME shipped by Debian's libzmq5 runtime
+            // package. Linking the absolute path works because ld.lld resolves
+            // the DT_NEEDED to the SONAME, which the dynamic loader finds at
+            // run time via the ld cache.
+            exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libzmq.so.5" });
+        }
         exe.linkLibC();
     }
 
@@ -96,12 +126,59 @@ pub fn build(b: *std.Build) void {
         unit_tests.linkLibC();
     }
 
+    // Link libzmq for tests if enabled. Same fallback as for the main exe:
+    // accept either the dev-package .so symlink or the runtime SONAME.
+    if (zmq_enabled) {
+        const zmq_so_path_t = "/usr/lib/x86_64-linux-gnu/libzmq.so";
+        if (std.fs.cwd().access(zmq_so_path_t, .{})) |_| {
+            unit_tests.linkSystemLibrary("zmq");
+        } else |_| {
+            unit_tests.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libzmq.so.5" });
+        }
+        unit_tests.linkLibC();
+    }
+
     // Add build options module to tests
     unit_tests.root_module.addOptions("build_options", build_options);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // Operational-parity tests (daemon/PID/SIGHUP/--debug=cat/zmq).
+    // Lives at src/tests_ops.zig — links libzmq if -Dzmq=true so the no-op
+    // path (default) and the real-bind path can both be exercised.
+    {
+        const ops_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_ops.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        ops_tests.linkSystemLibrary("rocksdb");
+        ops_tests.linkSystemLibrary("secp256k1");
+        ops_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        ops_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            ops_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (zmq_enabled) {
+            const zmq_so_path_o = "/usr/lib/x86_64-linux-gnu/libzmq.so";
+            if (std.fs.cwd().access(zmq_so_path_o, .{})) |_| {
+                ops_tests.linkSystemLibrary("zmq");
+            } else |_| {
+                ops_tests.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libzmq.so.5" });
+            }
+        }
+        ops_tests.root_module.addOptions("build_options", build_options);
+        const run_ops_tests = b.addRunArtifact(ops_tests);
+        const ops_test_step = b.step("test-ops", "Run operational-parity tests (daemon/PID/SIGHUP/--debug=cat/zmq)");
+        ops_test_step.dependOn(&run_ops_tests.step);
+        // Fold into the main `test` step so CI exercises ops parity.
+        test_step.dependOn(&run_ops_tests.step);
+    }
 
     // BIP-35 / NODE_BLOOM advertisement tests live in a dedicated test root
     // (tests_bip35.zig) so they can import peer.zig without dragging in the

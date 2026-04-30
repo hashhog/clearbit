@@ -7,6 +7,7 @@ const crypto = @import("crypto.zig");
 const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
 const validation = @import("validation.zig");
+const zmq = @import("zmq.zig");
 
 // ============================================================================
 // Block Download Constants
@@ -1309,6 +1310,20 @@ pub const BlockDownloader = struct {
                 &block_hash,
                 height,
             ) catch return BlockDownloadError.StorageError;
+        }
+
+        // 7. ZMQ publish: hashblock + rawblock + sequence (block-connected).
+        //    No-op when ZMQ is built out or not configured (zmq.global checks
+        //    initialized + per-topic socket presence). We only encode the raw
+        //    bytes when at least one rawblock subscriber is bound — saves a
+        //    full-block serialize during plain IBD.
+        if (zmq.global.initialized) {
+            var raw_alloc: ?[]const u8 = null;
+            defer if (raw_alloc) |b| self.allocator.free(b);
+            if (zmq.global.findSocket(zmq.TOPIC_RAWBLOCK) != null) {
+                raw_alloc = zmq.encodeBlockAlloc(self.allocator, block) catch null;
+            }
+            zmq.global.publishBlock(&block_hash, raw_alloc);
         }
     }
 
