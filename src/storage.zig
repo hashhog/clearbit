@@ -1843,6 +1843,33 @@ pub const ChainState = struct {
     /// Heights ≤ prune_height are not retrievable via getblock RPC.
     prune_height: u32 = 0,
 
+    // ----------------------------------------------------------------------
+    // CF_BLOCKS populator (Bitcoin Core analog:
+    // BlockManager::SaveBlockToDisk / WriteBlockToDisk in node/blockstorage.cpp,
+    // called from validation.cpp before CheckBlock so the bytes are durable
+    // before validation begins).
+    //
+    // peer.zig's drainBlockBuffer used to advance UTXOs straight from the
+    // in-memory `types.Block` and discard the bytes — leaving CF_BLOCKS
+    // empty across the entire IBD chain. That made `getblock` unanswerable
+    // for any block below tip and made the --prune path (00a4ea7) a no-op.
+    //
+    // The fix queues `(hash, raw_bytes)` here just before connectBlockFast,
+    // and flush() appends a CF_BLOCKS put for each entry into the SAME
+    // WriteBatch as the UTXO mutations and tip update. This makes the
+    // body-on-disk semantics atomic with the chainstate advance: a crash
+    // either leaves the body+tip pair both committed or neither.
+    //
+    // Bytes are owned by ChainState until flush() succeeds, at which point
+    // the cleanup loop frees them via the standard BatchOp free. On
+    // flush_error / process exit, deinit() drains the queue.
+    pending_block_writes: std.ArrayList(PendingBlockWrite) = undefined,
+
+    pub const PendingBlockWrite = struct {
+        hash: types.Hash256,
+        bytes: []u8,
+    };
+
     /// Undo data for a connected block — needed for disconnection during reorgs.
     /// This is the in-memory representation used during block connection.
     pub const BlockUndo = struct {
@@ -1936,6 +1963,7 @@ pub const ChainState = struct {
             .utxo_set = UtxoSet.init(db, max_cache_mb, allocator),
             .undo_manager = null,
             .allocator = allocator,
+            .pending_block_writes = std.ArrayList(PendingBlockWrite).init(allocator),
         };
     }
 
@@ -1948,6 +1976,7 @@ pub const ChainState = struct {
             .utxo_set = UtxoSet.init(db, max_cache_mb, allocator),
             .undo_manager = UndoFileManager.init(data_dir, allocator),
             .allocator = allocator,
+            .pending_block_writes = std.ArrayList(PendingBlockWrite).init(allocator),
         };
     }
 
@@ -1960,7 +1989,67 @@ pub const ChainState = struct {
     }
 
     pub fn deinit(self: *ChainState) void {
+        // Drain any unflushed block bodies. On a clean shutdown
+        // these were committed in the last flush()'s cleanup loop;
+        // anything still queued here belongs to a flush_error path
+        // (we kept the queue across the failed write so the next
+        // flush could retry).
+        for (self.pending_block_writes.items) |entry| {
+            self.allocator.free(entry.bytes);
+        }
+        self.pending_block_writes.deinit();
         self.utxo_set.deinit();
+    }
+
+    /// Queue a raw block body for inclusion in the next flush() WriteBatch.
+    ///
+    /// Called from peer.zig drainBlockBuffer (and block_template.zig
+    /// submitBlock) BEFORE connectBlockFast / connectBlock — analog of
+    /// Bitcoin Core's BlockManager::SaveBlockToDisk being invoked before
+    /// validation in validation.cpp. The bytes commit atomically with
+    /// the UTXO mutations and tip update; a crash either leaves both
+    /// the body and the tip advanced, or neither.
+    ///
+    /// Honors `prune_height`: skips queuing if the new height would be
+    /// pruned immediately anyway (i.e. height ≤ prune_height — defensive
+    /// only; pruneToTarget bounds prune_height ≤ best_height − 288, so
+    /// a freshly-connecting block is normally well above the watermark).
+    ///
+    /// Takes ownership of `bytes` on success (caller must NOT free).
+    /// On any error, the caller retains ownership.
+    ///
+    /// Acquires `connect_mutex` so the queue is serialized with flush()
+    /// (which also holds connect_mutex through its connectBlockFast
+    /// caller).  The two callers — peer.zig drainBlockBuffer and
+    /// block_template.zig submitBlock — never recurse into this method
+    /// while the lock is already held, so deadlock is impossible.
+    pub fn queueBlockWrite(
+        self: *ChainState,
+        hash: *const types.Hash256,
+        bytes: []u8,
+        height: u32,
+    ) !void {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
+        // Memory-only mode: nothing to persist.
+        if (self.utxo_set.db == null) {
+            self.allocator.free(bytes);
+            return;
+        }
+        // Skip if this height is already at-or-below the prune watermark.
+        // Defensive: pruneToTarget caps prune_height at best_height − 288,
+        // so a connecting block at best_height + 1 should not normally hit
+        // this. But if an operator lowers --prune mid-run, the watermark
+        // could overlap; honoring it keeps the populator and pruner
+        // complementary instead of fighting each other.
+        if (self.prune_target_mib > 0 and height <= self.prune_height) {
+            self.allocator.free(bytes);
+            return;
+        }
+        try self.pending_block_writes.append(.{
+            .hash = hash.*,
+            .bytes = bytes,
+        });
     }
 
     /// Look up the block hash at a given active-chain height via the
@@ -2568,6 +2657,32 @@ pub const ChainState = struct {
             .value = hh_val,
         } });
 
+        // 5. Pending raw-block bodies (CF_BLOCKS).  Bytes were queued by
+        //    queueBlockWrite() before connectBlockFast — putting the put into
+        //    THIS batch makes the body-on-disk semantics atomic with the
+        //    UTXO mutations and tip advance, matching Bitcoin Core's
+        //    SaveBlockToDisk-before-CheckBlock ordering in validation.cpp.
+        //
+        //    Without this section, peer.zig's drainBlockBuffer drained
+        //    incoming blocks straight into the UTXO set and discarded the
+        //    bytes — leaving CF_BLOCKS empty across the entire chain. That
+        //    made `getblock` unanswerable for any block below tip and made
+        //    the --prune path (00a4ea7) a no-op.  Keys are 32-byte block
+        //    hashes; values are the consensus-serialized block (header +
+        //    compact-size tx count + transactions).
+        for (self.pending_block_writes.items) |entry| {
+            const k = try self.allocator.alloc(u8, 32);
+            @memcpy(k, &entry.hash);
+            // bytes ownership transfers to the BatchOp cleanup loop below
+            // on successful writeBatch. On failure we keep the queue intact
+            // so the next flush retries the same bodies.
+            try batch.append(.{ .put = .{
+                .cf = CF_BLOCKS,
+                .key = k,
+                .value = entry.bytes,
+            } });
+        }
+
         flush_build_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_build_start));
 
         if (batch.items.len > 0) {
@@ -2585,7 +2700,12 @@ pub const ChainState = struct {
                     switch (op) {
                         .put => |p| {
                             self.allocator.free(@constCast(p.key));
-                            self.allocator.free(@constCast(p.value));
+                            // CF_BLOCKS values are still owned by
+                            // pending_block_writes for the next retry;
+                            // do NOT free them here.
+                            if (p.cf != CF_BLOCKS) {
+                                self.allocator.free(@constCast(p.value));
+                            }
                         },
                         .delete => |d| self.allocator.free(@constCast(d.key)),
                     }
@@ -2610,12 +2730,26 @@ pub const ChainState = struct {
             self.utxo_set.dirty_keys.clearRetainingCapacity();
             self.utxo_set.pending_deletes.clearRetainingCapacity();
 
+            // CF_BLOCKS bodies committed: free the queued bytes and clear
+            // the queue. Done before the batch-cleanup loop so the bytes
+            // are freed exactly once (the BatchOp cleanup skips CF_BLOCKS
+            // values by cf-tag below, mirroring the failure path).
+            for (self.pending_block_writes.items) |entry| {
+                self.allocator.free(entry.bytes);
+            }
+            self.pending_block_writes.clearRetainingCapacity();
+
             // Free allocated keys and values
             for (batch.items) |op| {
                 switch (op) {
                     .put => |p| {
                         self.allocator.free(@constCast(p.key));
-                        self.allocator.free(@constCast(p.value));
+                        // CF_BLOCKS values were freed above via
+                        // pending_block_writes — skip here to avoid
+                        // double-free.
+                        if (p.cf != CF_BLOCKS) {
+                            self.allocator.free(@constCast(p.value));
+                        }
                     },
                     .delete => |d| self.allocator.free(@constCast(d.key)),
                 }
@@ -4342,6 +4476,137 @@ test "connectBlockFast halts when flush_error is sticky" {
 
     // Tip MUST NOT have advanced.
     try std.testing.expectEqual(@as(u32, 0), chain_state.best_height);
+}
+
+test "queueBlockWrite + flush persists raw bodies to CF_BLOCKS" {
+    // Mirrors the IBD acceptance flow: serialize each block, queue its
+    // bytes via queueBlockWrite, then connectBlockFast (which calls
+    // flush() under its connect_mutex).  After every block the bytes
+    // must be readable from CF_BLOCKS keyed by hash, and must round-trip
+    // through serialize.readBlock back to a structurally equal block.
+    //
+    // This is the regression guard for the "CF_BLOCKS empty across the
+    // chain" bug (00a4ea7 prune watermark was a no-op because of it).
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    var prev_hash: [32]u8 = [_]u8{0} ** 32;
+    var hashes: [5]types.Hash256 = undefined;
+    var serialized_lens: [5]usize = undefined;
+
+    var h: u32 = 1;
+    while (h <= 5) : (h += 1) {
+        const block = makeFlushTestBlock(prev_hash, @intCast(h));
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        hashes[h - 1] = bh;
+
+        // Serialize → queue → connect.  This is exactly what peer.zig's
+        // drainBlockBuffer does (post-fix): the queue is consumed by
+        // ChainState.flush() inside connectBlockFast.
+        var writer = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&writer, &block);
+        const owned_const = try writer.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        serialized_lens[h - 1] = owned.len;
+        try chain_state.queueBlockWrite(&bh, owned, h);
+
+        // Pre-flush: queue holds this block, CF_BLOCKS does not yet.
+        try std.testing.expectEqual(@as(usize, 1), chain_state.pending_block_writes.items.len);
+        const pre = try db.get(CF_BLOCKS, &bh);
+        try std.testing.expect(pre == null);
+
+        try chain_state.connectBlockFast(&block, &bh, h);
+
+        // Post-flush: queue empty, CF_BLOCKS has the bytes.
+        try std.testing.expectEqual(@as(usize, 0), chain_state.pending_block_writes.items.len);
+
+        const stored = (try db.get(CF_BLOCKS, &bh)) orelse {
+            std.debug.print("CF_BLOCKS missing at height {d}\n", .{h});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(stored);
+        try std.testing.expectEqual(serialized_lens[h - 1], stored.len);
+
+        prev_hash = bh;
+    }
+
+    // All five blocks must still be retrievable post-loop.  This is the
+    // exact path `getblock` verbosity-0 uses in rpc.zig.
+    for (hashes, 0..) |hash, idx| {
+        const stored = (try db.get(CF_BLOCKS, &hash)) orelse {
+            std.debug.print("CF_BLOCKS missing block {d}\n", .{idx + 1});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(stored);
+        try std.testing.expectEqual(serialized_lens[idx], stored.len);
+
+        // Round-trip: the stored bytes must deserialize back to a block
+        // whose first transaction count is 1 (single coinbase) — proves
+        // the populator path is consensus-faithful, not just preserving
+        // "some" bytes.
+        var reader = serialize.Reader{ .data = stored };
+        var decoded = try serialize.readBlock(&reader, allocator);
+        defer serialize.freeBlock(allocator, &decoded);
+        try std.testing.expectEqual(@as(usize, 1), decoded.transactions.len);
+    }
+}
+
+test "queueBlockWrite skips heights at or below prune watermark" {
+    // When --prune is active and the watermark already covers a height,
+    // queuing that height's body would be wasted work — the next prune
+    // tick would delete it immediately.  queueBlockWrite must short-
+    // circuit and free the bytes itself.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.prune_target_mib = ChainState.MIN_PRUNE_TARGET_MIB;
+    chain_state.prune_height = 100;
+
+    // Below watermark: skipped + freed by queueBlockWrite.
+    const bytes_below = try allocator.alloc(u8, 64);
+    @memset(bytes_below, 0xAB);
+    const hash_below = [_]u8{0x11} ** 32;
+    try chain_state.queueBlockWrite(&hash_below, bytes_below, 50);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_block_writes.items.len);
+
+    // Above watermark: queued for the next flush.
+    const bytes_above = try allocator.alloc(u8, 64);
+    @memset(bytes_above, 0xCD);
+    const hash_above = [_]u8{0x22} ** 32;
+    try chain_state.queueBlockWrite(&hash_above, bytes_above, 200);
+    try std.testing.expectEqual(@as(usize, 1), chain_state.pending_block_writes.items.len);
+}
+
+test "queueBlockWrite is a no-op in memory-only mode" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    const bytes = try allocator.alloc(u8, 32);
+    @memset(bytes, 0xFE);
+    const hash = [_]u8{0x33} ** 32;
+    try chain_state.queueBlockWrite(&hash, bytes, 1);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_block_writes.items.len);
 }
 
 // ============================================================================
