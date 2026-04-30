@@ -684,6 +684,35 @@ pub fn submitBlockWithIndex(
     // Connect the block to the chain (UTXO set + best_hash/best_height)
     const height = chain_state.best_height + 1;
 
+    // Persist the raw block body to CF_BLOCKS BEFORE applying UTXO
+    // mutations.  Same semantics as the peer.zig drainBlockBuffer path —
+    // the queue is consumed by ChainState.flush() so the body and tip
+    // commit atomically (Bitcoin Core analog: SaveBlockToDisk before
+    // CheckBlock in validation.cpp).  Failure here is non-fatal; the
+    // block still connects, CF_BLOCKS just misses this entry.
+    {
+        var writer = serialize.Writer.init(chain_state.allocator);
+        const queued = blk: {
+            serialize.writeBlock(&writer, block) catch {
+                writer.deinit();
+                break :blk false;
+            };
+            const owned_const = writer.toOwnedSlice() catch {
+                writer.deinit();
+                break :blk false;
+            };
+            const owned: []u8 = @constCast(owned_const);
+            chain_state.queueBlockWrite(&block_hash, owned, height) catch {
+                chain_state.allocator.free(owned);
+                break :blk false;
+            };
+            break :blk true;
+        };
+        if (!queued) {
+            std.debug.print("submitblock: queueBlockWrite skipped at height {d}\n", .{height});
+        }
+    }
+
     // During IBD (below assume-valid height), use the fast path that skips
     // undo data collection.  Undo data is only needed for reorgs, and during
     // sequential feeding we immediately discard it anyway.  This saves

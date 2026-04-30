@@ -1286,15 +1286,37 @@ pub const RpcServer = struct {
         }
 
         if (verbosity == 0) {
-            // Return raw hex-encoded block
-            // For simplicity, just return header hex for now
+            // Return raw hex-encoded block. Source: CF_BLOCKS (populated by
+            // peer.zig's drainBlockBuffer + block_template.zig's submitblock,
+            // both of which queue raw bytes for inclusion in the next
+            // ChainState.flush() WriteBatch — atomic with UTXO + tip).
+            //
+            // Genesis is handled specially because it never flows through
+            // either populator path: synthesize the header-only response,
+            // which matches the legacy fallback below.
             var buf = std.ArrayList(u8).init(self.allocator);
             defer buf.deinit();
             const writer = buf.writer();
 
+            if (!is_genesis) {
+                if (self.chain_state.utxo_set.db) |db| {
+                    if (db.get(storage.CF_BLOCKS, &blockhash) catch null) |raw| {
+                        defer self.allocator.free(raw);
+                        try writer.writeByte('"');
+                        for (raw) |byte| {
+                            try writer.print("{x:0>2}", .{byte});
+                        }
+                        try writer.writeByte('"');
+                        return self.jsonRpcResult(buf.items, id);
+                    }
+                }
+            }
+
+            // Fallback: bytes not on disk (genesis, pre-populator history,
+            // or memory-only mode).  Header-only hex preserves the prior
+            // behaviour for those edge cases.
             try writer.writeByte('"');
             try writeBlockHeaderHex(writer, &header);
-            // A full implementation would append transaction data here
             try writer.writeByte('"');
 
             return self.jsonRpcResult(buf.items, id);

@@ -3820,6 +3820,27 @@ pub const PeerManager = struct {
             // Timing for per-block diagnostics
             const block_start = std.time.nanoTimestamp();
 
+            // Persist the raw block body to CF_BLOCKS BEFORE applying UTXO
+            // mutations.  Bitcoin Core analog: BlockManager::SaveBlockToDisk
+            // is invoked before CheckBlock in validation.cpp's block
+            // acceptance flow, so the bytes are durable on disk before
+            // validation begins.  The queue is consumed by ChainState.flush()
+            // — the CF_BLOCKS put commits in the SAME WriteBatch as the
+            // UTXO mutations and tip update, so a crash leaves both the
+            // body and the tip advanced or neither.
+            //
+            // Without this, every block accepted via the IBD fast path
+            // was discarded after UTXO update, leaving CF_BLOCKS empty
+            // across the whole chain — `getblock` unanswerable below tip,
+            // and the --prune watermark (00a4ea7) had no bytes to delete.
+            //
+            // Failures here (OOM during serialize / queue) are non-fatal:
+            // the block still connects; CF_BLOCKS just misses this entry.
+            // We log so an operator can correlate gaps with the cause.
+            queueRawBlock(self.allocator, cs, &block, &block_hash, height) catch |err| {
+                std.debug.print("P2P: queueBlockWrite failed at height {d}: {}\n", .{ height, err });
+            };
+
             // During IBD, skip undo data collection for speed
             cs.connectBlockFast(&block, &block_hash, height) catch |err| {
                 std.debug.print("P2P: Failed to connect block at height {d}: {}\n", .{ height, err });
@@ -4266,6 +4287,34 @@ pub const PeerManager = struct {
         }
     }
 };
+
+/// Serialize a block body and hand it to ChainState's pending_block_writes
+/// queue so the next flush() commits CF_BLOCKS atomically with the chain
+/// advance. Free-standing rather than a method on PeerManager so the
+/// drainBlockBuffer hot path doesn't have to reach back through `self`.
+fn queueRawBlock(
+    allocator: std.mem.Allocator,
+    cs: *storage.ChainState,
+    block: *const types.Block,
+    hash: *const types.Hash256,
+    height: u32,
+) !void {
+    var writer = serialize.Writer.init(allocator);
+    errdefer writer.deinit();
+    try serialize.writeBlock(&writer, block);
+    const owned_const = try writer.toOwnedSlice();
+    // toOwnedSlice returns []const u8; the allocator-free / RocksDB API
+    // path expects []u8. The bytes are freshly allocated so the cast is
+    // safe.
+    const owned: []u8 = @constCast(owned_const);
+    // queueBlockWrite takes ownership on success and frees on its own
+    // skip-paths (memory-only mode, height ≤ prune_height). On failure
+    // (OOM during ArrayList.append) ownership stays with us.
+    cs.queueBlockWrite(hash, owned, height) catch |err| {
+        allocator.free(owned);
+        return err;
+    };
+}
 
 // ============================================================================
 // Tests
