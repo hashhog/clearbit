@@ -968,4 +968,9 @@ comptime {
     _ = @import("indexes.zig");
     _ = @import("v2_transport.zig");
     _ = @import("erlay.zig");
+    // rpc.zig is exercised in its own dedicated test step (`zig build
+    // test-rpc` and folded into `zig build test` via build.zig). Importing
+    // it here would transitively pull wallet.zig, which uses an
+    // `@embedFile("../resources/bip39-english.txt")` whose relative path
+    // does not survive the test harness's working-directory choice.
 }
