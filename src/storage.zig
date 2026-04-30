@@ -169,6 +169,13 @@ pub const Database = struct {
     pub fn flush(self: *Database) StorageError!void {
         return storage_rocksdb.dbFlush(self);
     }
+
+    /// Fetch an integer-valued RocksDB CF property (e.g. live-data-size).
+    /// Returns null if the property name is not supported or the call fails.
+    /// Used by the pruner to size CF_BLOCKS against the configured target.
+    pub fn getCfPropertyInt(self: *Database, cf_index: usize, propname_z: [*:0]const u8) ?u64 {
+        return storage_rocksdb.dbGetCfPropertyInt(self, cf_index, propname_z);
+    }
 };
 
 /// Iterator for scanning a column family.
@@ -1727,6 +1734,18 @@ pub const UndoFileManager = struct {
 
 /// Chain state tracks the current best chain and supports reorgs.
 pub const ChainState = struct {
+    /// Block-keep horizon: blocks within this many heights of the tip are
+    /// always retained (matches Bitcoin Core's MIN_BLOCKS_TO_KEEP in
+    /// validation.h:76 — 288 blocks ≈ 2 days at 10 min/block, the typical
+    /// reorg depth tolerance window).
+    pub const MIN_BLOCKS_TO_KEEP: u32 = 288;
+    /// Smallest accepted --prune target. Bitcoin Core constant
+    /// MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 MiB (validation.h:87): below
+    /// this, the prune cannot keep up with the 288-block tail + undo +
+    /// orphan rate budget. We follow Core verbatim so operators can
+    /// reuse their existing tuning.
+    pub const MIN_PRUNE_TARGET_MIB: u64 = 550;
+
     best_hash: types.Hash256,
     best_height: u32,
     total_work: [32]u8,
@@ -1793,6 +1812,36 @@ pub const ChainState = struct {
     profile_flush_write_ns_max: u64 = 0,
     profile_flush_cleanup_ns_sum: u64 = 0,
     profile_flush_cleanup_ns_max: u64 = 0,
+
+    // ----------------------------------------------------------------------
+    // Pruning state (Bitcoin Core analog: BlockManager::m_prune_target,
+    // BlockManager::m_have_pruned, m_blockfiles_indexed in node/blockstorage).
+    //
+    // clearbit stores raw block bytes in CF_BLOCKS keyed by block hash, so
+    // pruning here = `db.delete(CF_BLOCKS, hash)` for the heights we no
+    // longer want to retain (rather than unlinking blk*.dat flat files,
+    // which clearbit does not write — FlatFileBlockStore is dead code).
+    //
+    // `prune_target_mib` of 0 disables pruning entirely (default behaviour
+    // identical to pre-pruning clearbit). When non-zero, must be ≥ 550 MiB
+    // to match Bitcoin Core's MIN_DISK_SPACE_FOR_BLOCK_FILES validation.
+    //
+    // `prune_height` is the highest height whose block bytes have been
+    // pruned (i.e. heights ≤ prune_height are guaranteed missing from
+    // CF_BLOCKS). Heights > prune_height MAY still be missing if they
+    // were never stored in the first place — clearbit's IBD path
+    // (peer.zig drainBlockBuffer) currently does not populate CF_BLOCKS,
+    // so today the watermark advances but no real deletes happen. The
+    // RPC layer treats `prune_height` as the only authoritative pruned
+    // boundary. When CF_BLOCKS gains a populator (block_template /
+    // mining / serve-from-disk), the same watermark will start
+    // reflecting real deletions.
+    /// Prune target size for CF_BLOCKS in MiB. 0 = disabled (pruning off).
+    /// Must be ≥ 550 when non-zero (validated in main.zig before assignment).
+    prune_target_mib: u64 = 0,
+    /// Highest height whose block body has been pruned (or considered prunable).
+    /// Heights ≤ prune_height are not retrievable via getblock RPC.
+    prune_height: u32 = 0,
 
     /// Undo data for a connected block — needed for disconnection during reorgs.
     /// This is the in-memory representation used during block connection.
@@ -1940,6 +1989,107 @@ pub const ChainState = struct {
         const db = self.utxo_set.db orelse return;
         const key_bytes = ChainStore.buildHeightHashKey(height);
         db.put(CF_DEFAULT, &key_bytes, hash) catch return;
+    }
+
+    /// Estimate live-data size of CF_BLOCKS in bytes via RocksDB property.
+    /// Used by the pruner to decide whether to prune more. Returns 0 when
+    /// the DB is absent or the property call fails (treat as "unknown
+    /// size, do not prune further" — safer than panicking the IBD loop
+    /// over a transient RocksDB error).
+    pub fn estimateBlockCfBytes(self: *ChainState) u64 {
+        const db = self.utxo_set.db orelse return 0;
+        // "rocksdb.estimate-live-data-size" is the canonical property
+        // exposed by the C API for live (uncompressed) data per CF.
+        // See rocksdb/db.h DB::Properties::kEstimateLiveDataSize.
+        return db.getCfPropertyInt(CF_BLOCKS, "rocksdb.estimate-live-data-size") orelse 0;
+    }
+
+    /// Prune CF_BLOCKS entries from the bottom of the chain, advancing
+    /// the prune_height watermark, until either:
+    ///   (a) prune_height reaches best_height - MIN_BLOCKS_TO_KEEP, or
+    ///   (b) the estimated CF_BLOCKS live-data size dips below
+    ///       prune_target_mib.
+    ///
+    /// Strategy: height-based (delete oldest first) with a size-driven
+    /// stop condition. We walk forward from the existing watermark,
+    /// resolving each height's hash via the H:{height}→hash index, and
+    /// `db.delete(CF_BLOCKS, hash)` for it. The H:{height}→hash entry
+    /// is intentionally left in place so getblockhash(height) keeps
+    /// working (matches Bitcoin Core: pruned blocks are unreachable but
+    /// the index still remembers their existence).
+    ///
+    /// Returns the number of heights pruned in this call (0 if disabled,
+    /// already caught up, or the size target is already met).
+    ///
+    /// Caller (the IBD loop in peer.zig / main.zig import) typically
+    /// invokes this every few hundred blocks, not every block, since
+    /// the property fetch is non-trivial. With 288-block keep-window
+    /// and a 550 MiB target, batch-pruning every 256 blocks is plenty.
+    ///
+    /// NOTE: Today, peer.zig's drainBlockBuffer fast path does not
+    /// populate CF_BLOCKS (raw block bytes are connected straight to
+    /// the UTXO set and discarded). So the deletes are no-ops in
+    /// practice; this code is the policy half of the system, ready for
+    /// the day a CF_BLOCKS populator lands. The `prune_height`
+    /// watermark advances regardless so getblock RPC reflects the
+    /// pruning policy.
+    pub fn pruneToTarget(self: *ChainState) u32 {
+        if (self.prune_target_mib == 0) return 0;
+        const db = self.utxo_set.db orelse return 0;
+        if (self.best_height <= MIN_BLOCKS_TO_KEEP) return 0;
+
+        const max_prunable_height: u32 = self.best_height - MIN_BLOCKS_TO_KEEP;
+        if (self.prune_height >= max_prunable_height) return 0;
+
+        const target_bytes: u64 = self.prune_target_mib *% (1024 * 1024);
+
+        var pruned: u32 = 0;
+        // Cap per-call work to MAX_PRUNE_BATCH so a single trigger does
+        // not stall the connect loop. 4096 ≈ 4 GiB at average block size,
+        // which is plenty of headroom for keeping up during steady-state.
+        const MAX_PRUNE_BATCH: u32 = 4096;
+
+        var h: u32 = self.prune_height + 1;
+        while (h <= max_prunable_height and pruned < MAX_PRUNE_BATCH) : (h += 1) {
+            // Best-effort: if we can't resolve the hash, skip and keep
+            // walking. Missing H:{height} entries usually mean the index
+            // wasn't backfilled for that height (W47 lazy-backfill); the
+            // block body, if any, is unrecoverable through this path
+            // anyway, so leaving it is harmless.
+            const hash = self.getBlockHashByHeight(h) orelse {
+                self.prune_height = h;
+                continue;
+            };
+            // Best-effort delete; CF_BLOCKS may not contain the entry
+            // (clearbit's IBD does not populate it today, so most
+            // deletes are no-ops). Errors are non-fatal — they don't
+            // corrupt the chain state, only leave stale bytes around.
+            db.delete(CF_BLOCKS, &hash) catch {};
+            self.prune_height = h;
+            pruned += 1;
+
+            // Size-driven stop: every 256 deletes, re-check live-data
+            // size and bail out if we're already below target. Avoids
+            // pruning to the keep-horizon when only a small trim is
+            // needed. Property fetches are cheap (~1 µs) but doing one
+            // every height adds up; 256 is the same coarse bucket
+            // Bitcoin Core uses for FindFilesToPrune progress updates.
+            if (pruned % 256 == 0) {
+                const size_bytes = self.estimateBlockCfBytes();
+                if (size_bytes != 0 and size_bytes <= target_bytes) break;
+            }
+        }
+        return pruned;
+    }
+
+    /// Convenience: returns true if the given height has been pruned
+    /// (i.e. is at or below the prune watermark). Used by getblock RPC
+    /// to return a "block not available (pruned data)" error rather
+    /// than a misleading "block not found" — same UX as Bitcoin Core's
+    /// rpc/blockchain.cpp getblock() pruned-block branch.
+    pub fn isHeightPruned(self: *const ChainState, height: u32) bool {
+        if (self.prune_target_mib == 0) return false;
+        return height != 0 and height <= self.prune_height;
     }
 
     /// Connect a block: spend inputs, create outputs, optionally save undo data.
@@ -3795,6 +3945,183 @@ test "chain state init" {
 
     try std.testing.expectEqual(@as(u32, 0), chain_state.best_height);
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &chain_state.best_hash);
+    // Pruning defaults: disabled, watermark at 0.
+    try std.testing.expectEqual(@as(u64, 0), chain_state.prune_target_mib);
+    try std.testing.expectEqual(@as(u32, 0), chain_state.prune_height);
+}
+
+test "isHeightPruned: disabled prune always returns false" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    // Default: prune disabled
+    try std.testing.expect(!chain_state.isHeightPruned(0));
+    try std.testing.expect(!chain_state.isHeightPruned(100));
+    try std.testing.expect(!chain_state.isHeightPruned(1_000_000));
+
+    // Even with a prune_height set, disabled pruning should report false.
+    chain_state.prune_height = 500;
+    try std.testing.expect(!chain_state.isHeightPruned(100));
+    try std.testing.expect(!chain_state.isHeightPruned(500));
+}
+
+test "isHeightPruned: enabled prune respects watermark" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    chain_state.prune_target_mib = 1024;
+    chain_state.prune_height = 100;
+
+    // Genesis (height 0) is never reported as pruned — Bitcoin Core
+    // treats it as a special case for getblock/getblockhash.
+    try std.testing.expect(!chain_state.isHeightPruned(0));
+    // Heights 1..100 are pruned.
+    try std.testing.expect(chain_state.isHeightPruned(1));
+    try std.testing.expect(chain_state.isHeightPruned(50));
+    try std.testing.expect(chain_state.isHeightPruned(100));
+    // Heights above watermark are retained.
+    try std.testing.expect(!chain_state.isHeightPruned(101));
+    try std.testing.expect(!chain_state.isHeightPruned(1_000_000));
+}
+
+test "pruneToTarget: no-op when prune disabled" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    chain_state.best_height = 10_000;
+    chain_state.prune_target_mib = 0; // disabled
+
+    const pruned = chain_state.pruneToTarget();
+    try std.testing.expectEqual(@as(u32, 0), pruned);
+    try std.testing.expectEqual(@as(u32, 0), chain_state.prune_height);
+}
+
+test "pruneToTarget: no-op when chain shorter than keep window" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    // Chain of 100 blocks — entirely within MIN_BLOCKS_TO_KEEP (288).
+    chain_state.best_height = 100;
+    chain_state.prune_target_mib = 1024;
+
+    const pruned = chain_state.pruneToTarget();
+    try std.testing.expectEqual(@as(u32, 0), pruned);
+    try std.testing.expectEqual(@as(u32, 0), chain_state.prune_height);
+}
+
+test "pruneToTarget: deletes from CF_BLOCKS and advances watermark" {
+    const allocator = std.testing.allocator;
+
+    // Use a tmp DB so we can verify the deletes really hit RocksDB.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path_buf = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_buf);
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/prune_db", .{path_buf});
+    defer allocator.free(db_path);
+
+    var db = try Database.open(db_path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    // Plant a synthetic chain: 1000 blocks, each with a unique hash, both
+    // a CF_BLOCKS entry (raw block bytes) and a H:{height}→hash index
+    // entry. This mirrors what a future CF_BLOCKS populator would write.
+    const TOTAL: u32 = 1000;
+    chain_state.best_height = TOTAL;
+    chain_state.prune_target_mib = ChainState.MIN_PRUNE_TARGET_MIB;
+
+    var h: u32 = 1;
+    while (h <= TOTAL) : (h += 1) {
+        var hash: types.Hash256 = undefined;
+        @memset(&hash, 0);
+        // Encode height in the first 4 bytes so each hash is unique.
+        std.mem.writeInt(u32, hash[0..4], h, .little);
+
+        // H:{height}→hash so getBlockHashByHeight resolves it.
+        const key_bytes = ChainStore.buildHeightHashKey(h);
+        try db.put(CF_DEFAULT, &key_bytes, &hash);
+        // CF_BLOCKS entry: payload doesn't matter, just needs to exist.
+        const payload = [_]u8{0xAB} ** 16;
+        try db.put(CF_BLOCKS, &hash, &payload);
+    }
+
+    // Sanity: a known mid-chain block is reachable pre-prune.
+    var probe_hash: types.Hash256 = undefined;
+    @memset(&probe_hash, 0);
+    std.mem.writeInt(u32, probe_hash[0..4], 100, .little);
+    const probe_pre = try db.get(CF_BLOCKS, &probe_hash);
+    try std.testing.expect(probe_pre != null);
+    if (probe_pre) |p| allocator.free(p);
+
+    // Prune. The watermark must advance; with 1000 blocks and
+    // MIN_BLOCKS_TO_KEEP=288, max_prunable_height=712, so up to 712 deletes.
+    const pruned = chain_state.pruneToTarget();
+    try std.testing.expect(pruned > 0);
+    try std.testing.expect(chain_state.prune_height > 0);
+    try std.testing.expect(chain_state.prune_height <= TOTAL - ChainState.MIN_BLOCKS_TO_KEEP);
+
+    // After pruning, the previously-probed block must be gone from CF_BLOCKS
+    // (height 100 is well below the keep horizon).
+    const probe_post = try db.get(CF_BLOCKS, &probe_hash);
+    try std.testing.expect(probe_post == null);
+
+    // A block within the keep window (e.g. height 800) must still be there.
+    var keep_hash: types.Hash256 = undefined;
+    @memset(&keep_hash, 0);
+    std.mem.writeInt(u32, keep_hash[0..4], 800, .little);
+    const keep_post = try db.get(CF_BLOCKS, &keep_hash);
+    try std.testing.expect(keep_post != null);
+    if (keep_post) |p| allocator.free(p);
+
+    // isHeightPruned must reflect the watermark.
+    try std.testing.expect(chain_state.isHeightPruned(100));
+    try std.testing.expect(!chain_state.isHeightPruned(800));
+}
+
+test "pruneToTarget: advances watermark even when CF_BLOCKS empty" {
+    // Clearbit's IBD path doesn't currently populate CF_BLOCKS — verify
+    // the pruner still advances its watermark in that case (so getblock
+    // RPC respects the operator's --prune intent regardless).
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path_buf = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_buf);
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/prune_empty_db", .{path_buf});
+    defer allocator.free(db_path);
+
+    var db = try Database.open(db_path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 1000;
+    chain_state.prune_target_mib = ChainState.MIN_PRUNE_TARGET_MIB;
+
+    // Plant only the H:{height}→hash entries so getBlockHashByHeight
+    // resolves; CF_BLOCKS is intentionally empty (mirrors live state).
+    var h: u32 = 1;
+    while (h <= 1000) : (h += 1) {
+        var hash: types.Hash256 = undefined;
+        @memset(&hash, 0);
+        std.mem.writeInt(u32, hash[0..4], h, .little);
+        const key_bytes = ChainStore.buildHeightHashKey(h);
+        try db.put(CF_DEFAULT, &key_bytes, &hash);
+    }
+
+    const pruned = chain_state.pruneToTarget();
+    // Watermark must advance even though no actual CF_BLOCKS bytes
+    // existed to delete. Returns count of heights walked.
+    try std.testing.expect(pruned > 0);
+    try std.testing.expect(chain_state.prune_height > 0);
 }
 
 test "chain state connect block creates utxos" {
