@@ -406,6 +406,33 @@ pub fn dbFlush(db: *storage.Database) storage.StorageError!void {
     }
 }
 
+/// Fetch an integer-valued RocksDB property for a specific column family.
+/// Used by the pruner to estimate live-data size of CF_BLOCKS so it can
+/// decide whether to delete more blocks. Returns null if the property is
+/// not supported (older RocksDB) or the underlying call fails.
+///
+/// Common property names:
+///   - "rocksdb.estimate-live-data-size" — uncompressed live-data estimate
+///   - "rocksdb.total-sst-files-size"   — sum of all SST file sizes (incl.
+///     obsolete-but-not-yet-deleted files)
+///   - "rocksdb.cur-size-active-mem-table" — current memtable size
+pub fn dbGetCfPropertyInt(
+    db: *storage.Database,
+    cf_index: usize,
+    propname_z: [*:0]const u8,
+) ?u64 {
+    const state: *DbState = @ptrCast(@alignCast(db.handle));
+    var out_val: u64 = 0;
+    const rc = c.rocksdb_property_int_cf(
+        state.db,
+        state.cf_handles[cf_index],
+        propname_z,
+        &out_val,
+    );
+    if (rc != 0) return null;
+    return out_val;
+}
+
 /// Internal iterator state
 const IterState = struct {
     inner: *c.rocksdb_iterator_t,

@@ -277,6 +277,28 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
     return false; // Continue execution
 }
 
+/// Validate the parsed `--prune` target. Mirrors Bitcoin Core's
+/// AppInitParameterInteraction (init.cpp:1093):
+///   * 0  → pruning disabled (default)
+///   * 1≤N<MIN_PRUNE_TARGET_MIB (550) → rejected, target too small to keep
+///     up with MIN_BLOCKS_TO_KEEP × ~average block size + undo + orphan
+///     budget. (Core gives identical wording.)
+///   * N≥550 → accepted as a target size in MiB.
+///
+/// Returns the validated value (unchanged) on success, or
+/// ArgParseError.InvalidArgument on a non-zero too-small target.
+pub fn validatePruneTarget(prune_mib: u64) ArgParseError!u64 {
+    if (prune_mib == 0) return 0;
+    if (prune_mib < storage.ChainState.MIN_PRUNE_TARGET_MIB) {
+        std.debug.print(
+            "Error: Prune target must be at least {d} MiB (got {d} MiB).\n",
+            .{ storage.ChainState.MIN_PRUNE_TARGET_MIB, prune_mib },
+        );
+        return ArgParseError.InvalidArgument;
+    }
+    return prune_mib;
+}
+
 /// Print usage information.
 pub fn printUsage() void {
     const usage =
@@ -1279,6 +1301,14 @@ pub fn main() !void {
         return; // --help or --version was specified
     }
 
+    // Validate --prune target (1 ≤ N < 550 MiB is rejected per Bitcoin Core
+    // semantics). The early check, before any RocksDB / network init, gives
+    // operators a fast-fail config error rather than a delayed surprise.
+    config.prune = validatePruneTarget(config.prune) catch |err| {
+        std.debug.print("Invalid --prune value: {}\n", .{err});
+        std.process.exit(1);
+    };
+
     // Run benchmarks if requested
     if (config.run_benchmark) {
         const stdout = std.io.getStdOut().writer();
@@ -1381,6 +1411,17 @@ pub fn main() !void {
     var chain_state = storage.ChainState.init(db_ptr, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
     chain_state.wireUtxoParent();
+
+    // Plumb pruning policy from CLI/config-file into the chain state. The
+    // pruner runs lazily from the IBD loop / RPC tip-update path; this just
+    // configures the watermark + target. 0 = disabled (default).
+    chain_state.prune_target_mib = config.prune;
+    if (config.prune != 0) {
+        std.debug.print(
+            "Pruning enabled: target {d} MiB (CF_BLOCKS), keep {d} blocks behind tip\n",
+            .{ config.prune, storage.ChainState.MIN_BLOCKS_TO_KEEP },
+        );
+    }
 
     var mempool_instance = mempool.Mempool.init(&chain_state, params, allocator);
     defer mempool_instance.deinit();
@@ -1539,9 +1580,28 @@ pub fn main() !void {
 
     std.debug.print("Node running. Press Ctrl+C to stop.\n", .{});
 
-    // 11. Main loop: wait for shutdown signal
+    // 11. Main loop: wait for shutdown signal. Also drives the lazy
+    // pruner: every PRUNE_TICK_MS (when pruning is enabled), call
+    // chain_state.pruneToTarget() so the watermark advances + CF_BLOCKS
+    // bytes are reclaimed if the size estimate exceeds the target.
+    // Bounded MAX_PRUNE_BATCH per call keeps tail latency in check.
+    const PRUNE_TICK_MS: u64 = 60 * 1000; // every 60 s
+    var last_prune_ms: i64 = std.time.milliTimestamp();
     while (!shutdown_requested.load(.acquire)) {
         std.time.sleep(100 * std.time.ns_per_ms);
+        if (chain_state.prune_target_mib != 0) {
+            const now_ms = std.time.milliTimestamp();
+            if (now_ms - last_prune_ms >= @as(i64, @intCast(PRUNE_TICK_MS))) {
+                last_prune_ms = now_ms;
+                const pruned = chain_state.pruneToTarget();
+                if (pruned > 0) {
+                    std.debug.print(
+                        "[prune] watermark={d} pruned={d} cfblocks_estimate_bytes={d}\n",
+                        .{ chain_state.prune_height, pruned, chain_state.estimateBlockCfBytes() },
+                    );
+                }
+            }
+        }
     }
 
     // 12. Graceful shutdown
@@ -1730,6 +1790,46 @@ test "default config values" {
     try std.testing.expect(config.rpc_user == null);
     try std.testing.expect(config.rpc_password == null);
     try std.testing.expect(config.connect == null);
+}
+
+// ============================================================================
+// Prune CLI validation
+// ============================================================================
+
+test "validatePruneTarget accepts 0 (disabled)" {
+    try std.testing.expectEqual(@as(u64, 0), try validatePruneTarget(0));
+}
+
+test "validatePruneTarget accepts 550 (minimum)" {
+    try std.testing.expectEqual(@as(u64, 550), try validatePruneTarget(550));
+}
+
+test "validatePruneTarget accepts large values" {
+    try std.testing.expectEqual(@as(u64, 1024), try validatePruneTarget(1024));
+    try std.testing.expectEqual(@as(u64, 100_000), try validatePruneTarget(100_000));
+}
+
+test "validatePruneTarget rejects 1 (below minimum)" {
+    try std.testing.expectError(ArgParseError.InvalidArgument, validatePruneTarget(1));
+}
+
+test "validatePruneTarget rejects 549 (one below minimum)" {
+    try std.testing.expectError(ArgParseError.InvalidArgument, validatePruneTarget(549));
+}
+
+test "validatePruneTarget rejects 100" {
+    try std.testing.expectError(ArgParseError.InvalidArgument, validatePruneTarget(100));
+}
+
+test "MIN_PRUNE_TARGET_MIB matches Bitcoin Core" {
+    // MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 * 1024 * 1024 in
+    // bitcoin-core/src/validation.h:87.
+    try std.testing.expectEqual(@as(u64, 550), storage.ChainState.MIN_PRUNE_TARGET_MIB);
+}
+
+test "MIN_BLOCKS_TO_KEEP matches Bitcoin Core" {
+    // MIN_BLOCKS_TO_KEEP = 288 in bitcoin-core/src/validation.h:76.
+    try std.testing.expectEqual(@as(u32, 288), storage.ChainState.MIN_BLOCKS_TO_KEEP);
 }
 
 test "testnet config values" {
