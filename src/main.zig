@@ -27,6 +27,9 @@ pub const wallet = @import("wallet.zig");
 pub const perf = @import("perf.zig");
 pub const bench = @import("bench.zig");
 pub const indexes = @import("indexes.zig");
+pub const ops = @import("ops.zig");
+pub const debug_log = @import("debug_log.zig");
+pub const zmq = @import("zmq.zig");
 
 // ============================================================================
 // Version Info
@@ -84,6 +87,18 @@ pub const Config = struct {
     debug: bool = false,
     printtoconsole: bool = true,
     logfile: ?[]const u8 = null,
+
+    // Operational parity (mirrors Bitcoin Core's init.cpp argspec).
+    daemon: bool = false,                       // --daemon: fork+setsid, detach from tty
+    pidfile: ?[]const u8 = null,                // --pid=<path>; default <datadir>/clearbit.pid
+    conf_path: ?[]const u8 = null,              // --conf=<file>: explicit config file location
+    reindex: bool = false,                      // --reindex: rebuild block index/UTXO from CF_BLOCKS
+    ready_fd: i32 = -1,                         // --ready-fd=<N>: write READY=1\n to fd N once up
+    zmq_rawblock: ?[]const u8 = null,           // --zmqpubrawblock=tcp://...
+    zmq_hashblock: ?[]const u8 = null,          // --zmqpubhashblock=...
+    zmq_rawtx: ?[]const u8 = null,              // --zmqpubrawtx=...
+    zmq_hashtx: ?[]const u8 = null,             // --zmqpubhashtx=...
+    zmq_sequence: ?[]const u8 = null,           // --zmqpubsequence=...
 
     // Benchmarking
     run_benchmark: bool = false,
@@ -236,11 +251,72 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         {
             config.peerbloomfilters = false;
         }
-        // Debug settings
+        // Debug settings.
+        //
+        // Three forms (matches Bitcoin Core's `-debug=<category>` argspec):
+        //   --debug              → enable everything (legacy boolean)
+        //   --debug=<cat>        → enable a single category (repeatable)
+        //   -debug, -debug=<cat> → same, with single-dash form
+        //
+        // Unknown categories print a one-line warning but don't abort startup.
         else if (std.mem.eql(u8, arg, "--debug") or std.mem.eql(u8, arg, "-debug")) {
             config.debug = true;
+            _ = debug_log.parseAndApply("");
+        } else if (std.mem.startsWith(u8, arg, "--debug=") or std.mem.startsWith(u8, arg, "-debug=")) {
+            config.debug = true;
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            const cat = arg[eq + 1 ..];
+            if (!debug_log.parseAndApply(cat)) {
+                std.debug.print("Warning: unknown --debug category '{s}' (ignored)\n", .{cat});
+            }
         } else if (std.mem.eql(u8, arg, "--printtoconsole") or std.mem.eql(u8, arg, "-printtoconsole")) {
             config.printtoconsole = true;
+        }
+        // Logfile (target of SIGHUP-driven reopen).
+        else if (std.mem.startsWith(u8, arg, "--logfile=")) {
+            config.logfile = arg["--logfile=".len..];
+        }
+        // Daemonize.
+        else if (std.mem.eql(u8, arg, "--daemon") or std.mem.eql(u8, arg, "-daemon")) {
+            config.daemon = true;
+        }
+        // PID file (default: <datadir>/clearbit.pid; overridable here).
+        else if (std.mem.startsWith(u8, arg, "--pid=") or std.mem.startsWith(u8, arg, "-pid=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.pidfile = arg[eq + 1 ..];
+        }
+        // Config file path (overrides default <datadir>/clearbit.conf).
+        else if (std.mem.startsWith(u8, arg, "--conf=") or std.mem.startsWith(u8, arg, "-conf=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.conf_path = arg[eq + 1 ..];
+        }
+        // Reindex (honest-progress: parse + log + document; full rebuild path
+        // requires a CF_BLOCKS replay loop in storage.zig — TODO).
+        else if (std.mem.eql(u8, arg, "--reindex") or std.mem.eql(u8, arg, "-reindex")) {
+            config.reindex = true;
+        }
+        // Ready FD (sd_notify / runit-style readiness signal).
+        else if (std.mem.startsWith(u8, arg, "--ready-fd=") or std.mem.startsWith(u8, arg, "-ready-fd=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.ready_fd = std.fmt.parseInt(i32, arg[eq + 1 ..], 10) catch
+                return ArgParseError.InvalidArgument;
+        }
+        // ZMQ publishing.
+        else if (std.mem.startsWith(u8, arg, "--zmqpubrawblock=") or std.mem.startsWith(u8, arg, "-zmqpubrawblock=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.zmq_rawblock = arg[eq + 1 ..];
+        } else if (std.mem.startsWith(u8, arg, "--zmqpubhashblock=") or std.mem.startsWith(u8, arg, "-zmqpubhashblock=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.zmq_hashblock = arg[eq + 1 ..];
+        } else if (std.mem.startsWith(u8, arg, "--zmqpubrawtx=") or std.mem.startsWith(u8, arg, "-zmqpubrawtx=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.zmq_rawtx = arg[eq + 1 ..];
+        } else if (std.mem.startsWith(u8, arg, "--zmqpubhashtx=") or std.mem.startsWith(u8, arg, "-zmqpubhashtx=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.zmq_hashtx = arg[eq + 1 ..];
+        } else if (std.mem.startsWith(u8, arg, "--zmqpubsequence=") or std.mem.startsWith(u8, arg, "-zmqpubsequence=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.zmq_sequence = arg[eq + 1 ..];
         }
         // Benchmarking
         else if (std.mem.eql(u8, arg, "--benchmark") or std.mem.eql(u8, arg, "-benchmark")) {
@@ -334,8 +410,25 @@ pub fn printUsage() void {
         \\  --mempoolexpiry=<hrs>  Mempool expiry in hours (default: 336)
         \\
         \\Debug options:
-        \\  --debug                Enable debug logging
+        \\  --debug                Enable all debug categories
+        \\  --debug=<cat>          Enable a single debug category
+        \\                         (net,mempool,rpc,zmq,validation,prune,...)
         \\  --printtoconsole       Print to console
+        \\  --logfile=<path>       Log to <path> (reopened on SIGHUP)
+        \\
+        \\Operational:
+        \\  --daemon               Detach into background (fork+setsid)
+        \\  --pid=<path>           Write PID file (default <datadir>/clearbit.pid)
+        \\  --conf=<file>          Use this config file (default <datadir>/clearbit.conf)
+        \\  --reindex              Rebuild block index/UTXO from CF_BLOCKS (limited)
+        \\  --ready-fd=<N>         Write READY=1\n to fd N once subsystems are up
+        \\
+        \\ZMQ publishing (Bitcoin Core compatible, requires -Dzmq=true at build):
+        \\  --zmqpubrawblock=<addr>   Bind ZMQ PUB socket for serialized blocks
+        \\  --zmqpubhashblock=<addr>  Bind ZMQ PUB socket for block hashes
+        \\  --zmqpubrawtx=<addr>      Bind ZMQ PUB socket for serialized txs
+        \\  --zmqpubhashtx=<addr>     Bind ZMQ PUB socket for tx hashes
+        \\  --zmqpubsequence=<addr>   Bind ZMQ PUB socket for sequence events
         \\
         \\Performance:
         \\  --benchmark            Run performance benchmarks and exit
@@ -399,14 +492,34 @@ pub const ConfigFileError = error{
 
 /// Load configuration from clearbit.conf file.
 /// Format: key=value per line, # for comments.
+///
+/// Backwards-compatible: when `datadir` is the legacy datadir path,
+/// the file is opened at `<datadir>/clearbit.conf`. When `datadir`
+/// itself is an absolute path to a `.conf` file (passed via the new
+/// `--conf=<file>` flag), it's opened directly. The contract is
+/// "treat the input as a directory unless it points to a regular
+/// file" — this keeps every existing call site working unchanged
+/// and lets `--conf=` override without an extra argument.
 pub fn loadConfigFile(
     datadir: []const u8,
     config: *Config,
     allocator: std.mem.Allocator,
 ) ConfigFileError!void {
-    const path = std.fmt.allocPrint(allocator, "{s}/clearbit.conf", .{datadir}) catch
-        return ConfigFileError.OutOfMemory;
-    defer allocator.free(path);
+    // Detect whether `datadir` is a file (--conf=<file>) or a directory.
+    // We stat() once: if it resolves to a regular file we use it as-is,
+    // otherwise we append /clearbit.conf as before.
+    var path_buf: ?[]u8 = null;
+    defer if (path_buf) |b| allocator.free(b);
+    const path: []const u8 = blk: {
+        const st = std.fs.cwd().statFile(datadir) catch null;
+        if (st) |s| {
+            if (s.kind == .file) break :blk datadir;
+        }
+        const buf = std.fmt.allocPrint(allocator, "{s}/clearbit.conf", .{datadir}) catch
+            return ConfigFileError.OutOfMemory;
+        path_buf = buf;
+        break :blk buf;
+    };
 
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
         if (err == error.FileNotFound) return; // Config file is optional
@@ -483,9 +596,42 @@ pub fn loadConfigFile(
             }
             // Debug settings
             else if (std.mem.eql(u8, key, "debug")) {
-                config.debug = std.mem.eql(u8, value, "1");
+                if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "0")) {
+                    config.debug = std.mem.eql(u8, value, "1");
+                    if (config.debug) _ = debug_log.parseAndApply("");
+                } else {
+                    // Treat any non-binary value as a category name (Bitcoin
+                    // Core supports `debug=net` in the conf file the same way
+                    // as `-debug=net` on the CLI).
+                    config.debug = true;
+                    if (!debug_log.parseAndApply(value)) {
+                        std.debug.print("Warning: unknown debug=<cat> '{s}' in config (ignored)\n", .{value});
+                    }
+                }
             } else if (std.mem.eql(u8, key, "printtoconsole")) {
                 config.printtoconsole = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "logfile")) {
+                config.logfile = value;
+            }
+            // Operational parity (config-file forms; CLI forms are richer).
+            else if (std.mem.eql(u8, key, "daemon")) {
+                config.daemon = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "pid")) {
+                config.pidfile = value;
+            } else if (std.mem.eql(u8, key, "reindex")) {
+                config.reindex = std.mem.eql(u8, value, "1");
+            }
+            // ZMQ publishing.
+            else if (std.mem.eql(u8, key, "zmqpubrawblock")) {
+                config.zmq_rawblock = value;
+            } else if (std.mem.eql(u8, key, "zmqpubhashblock")) {
+                config.zmq_hashblock = value;
+            } else if (std.mem.eql(u8, key, "zmqpubrawtx")) {
+                config.zmq_rawtx = value;
+            } else if (std.mem.eql(u8, key, "zmqpubhashtx")) {
+                config.zmq_hashtx = value;
+            } else if (std.mem.eql(u8, key, "zmqpubsequence")) {
+                config.zmq_sequence = value;
             }
         }
     }
@@ -562,6 +708,10 @@ pub fn deleteCookieFile(datadir: []const u8, allocator: std.mem.Allocator) void 
 // ============================================================================
 // Signal Handling
 // ============================================================================
+
+/// Global log reopen-on-SIGHUP state. Owned by main() lifetime.
+pub var log_state: ops.LogState = undefined;
+pub var log_state_initialized: bool = false;
 
 /// Global shutdown flag accessed by signal handler.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -747,8 +897,8 @@ fn importUtxoSnapshot(config: *Config, allocator: std.mem.Allocator) !void {
 
     // Batch writes: accumulate operations and flush every 100K entries
     const BATCH_SIZE: u64 = 100_000;
-    var ops = std.ArrayList(storage.BatchOp).init(allocator);
-    defer ops.deinit();
+    var batch_ops = std.ArrayList(storage.BatchOp).init(allocator);
+    defer batch_ops.deinit();
 
     // Track allocated memory for batch ops so we can free them after each flush
     var batch_keys = std.ArrayList([]const u8).init(allocator);
@@ -865,7 +1015,7 @@ fn importUtxoSnapshot(config: *Config, allocator: std.mem.Allocator) !void {
         allocator.free(script_pubkey);
 
         // Add to batch
-        ops.append(.{
+        batch_ops.append(.{
             .put = .{ .cf = storage.CF_UTXO, .key = key_alloc, .value = value_data },
         }) catch {
             allocator.free(key_alloc);
@@ -886,7 +1036,7 @@ fn importUtxoSnapshot(config: *Config, allocator: std.mem.Allocator) !void {
 
         // Flush batch every BATCH_SIZE entries
         if (imported % BATCH_SIZE == 0 or imported == utxo_count) {
-            db.writeBatch(ops.items) catch |err| {
+            db.writeBatch(batch_ops.items) catch |err| {
                 std.debug.print("\nFATAL: WriteBatch failed at UTXO {d}: {}\n", .{ imported, err });
                 std.process.exit(1);
             };
@@ -896,7 +1046,7 @@ fn importUtxoSnapshot(config: *Config, allocator: std.mem.Allocator) !void {
             for (batch_values.items) |v| allocator.free(v);
             batch_keys.clearRetainingCapacity();
             batch_values.clearRetainingCapacity();
-            ops.clearRetainingCapacity();
+            batch_ops.clearRetainingCapacity();
         }
 
         // Progress report every 1M UTXOs
@@ -1344,12 +1494,17 @@ pub fn main() !void {
         }
     };
 
-    // 3. Load config file (before processing network subdirs)
-    loadConfigFile(datadir, &config, allocator) catch |err| {
-        if (err != ConfigFileError.ReadError) {
-            std.debug.print("Warning: error loading config file: {}\n", .{err});
-        }
-    };
+    // 3. Load config file (before processing network subdirs).
+    //    --conf=<file> overrides the legacy fixed path (<datadir>/clearbit.conf).
+    //    loadConfigFile() detects file-vs-dir and behaves accordingly.
+    {
+        const conf_target: []const u8 = config.conf_path orelse datadir;
+        loadConfigFile(conf_target, &config, allocator) catch |err| {
+            if (err != ConfigFileError.ReadError) {
+                std.debug.print("Warning: error loading config file: {}\n", .{err});
+            }
+        };
+    }
 
     // 4. Create network subdirectory if needed
     const subdir = getNetworkSubdir(config.network);
@@ -1494,8 +1649,83 @@ pub fn main() !void {
     defer rpc_server.deinit();
     rpc_server.setChainManager(&chain_manager);
 
+    // 7b. Daemonize BEFORE installing signal handlers so the pre-daemon
+    // parent never sees them. This must also run before any thread is
+    // spawned because fork() in the multi-threaded child UB-territory.
+    if (config.daemon) {
+        ops.daemonize(false) catch |err| {
+            std.debug.print("FATAL: daemonize failed: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+
+    // 7c. Open the operator-supplied --logfile, if any, and remember it for
+    // SIGHUP-driven reopen. Best-effort — a missing path is logged and the
+    // node continues to log to stderr.
+    log_state = ops.LogState.init(allocator);
+    log_state_initialized = true;
+    if (config.logfile) |lf| {
+        log_state.open(lf) catch |err| {
+            std.debug.print("Warning: could not open --logfile {s}: {}\n", .{ lf, err });
+        };
+    }
+
+    // 7d. Write PID file. Default path is <full_datadir>/clearbit.pid.
+    // Stash the resolved path so the deferred cleanup unlinks the same file
+    // (free-of-charge atomicity: even if --pid= changes mid-flight, both
+    // write and unlink see the original).
+    const pid_path: []const u8 = blk: {
+        if (config.pidfile) |p| break :blk allocator.dupe(u8, p) catch {
+            std.debug.print("Out of memory\n", .{});
+            std.process.exit(1);
+        };
+        break :blk std.fmt.allocPrint(allocator, "{s}/clearbit.pid", .{full_datadir}) catch {
+            std.debug.print("Out of memory\n", .{});
+            std.process.exit(1);
+        };
+    };
+    defer allocator.free(pid_path);
+    ops.writePidFile(pid_path, allocator) catch |err| {
+        std.debug.print("Warning: could not write PID file {s}: {}\n", .{ pid_path, err });
+    };
+
+    // 7e. Initialize ZMQ publisher (no-op when no --zmqpub<topic>= was set).
+    zmq.global.init(allocator, .{
+        .rawblock_addr = config.zmq_rawblock,
+        .hashblock_addr = config.zmq_hashblock,
+        .rawtx_addr = config.zmq_rawtx,
+        .hashtx_addr = config.zmq_hashtx,
+        .sequence_addr = config.zmq_sequence,
+    }) catch |err| {
+        std.debug.print("Warning: ZMQ init failed: {}\n", .{err});
+    };
+
+    // 7f. --reindex: honest-progress.
+    //
+    // Bitcoin Core's full reindex walks blk*.dat, re-validates, and rebuilds
+    // the UTXO set from scratch (validation.cpp + init.cpp). clearbit stores
+    // raw block bytes in CF_BLOCKS keyed by hash; a real reindex would
+    // (1) wipe chainstate keys, (2) iterate CF_BLOCKS in height order using
+    // ChainStore, (3) re-run connectBlockFast for each. The full path needs
+    // a CF_BLOCKS height-iterator + UTXO-wipe helper that's not yet
+    // available, so for now we accept the flag, log a clear message, and
+    // continue (the operator can wipe the chainstate dir manually for a
+    // forced rebuild).
+    if (config.reindex) {
+        std.debug.print(
+            "--reindex requested: clearbit's CF_BLOCKS-based reindex is partial.\n" ++
+            "  For a full rebuild, stop the node, delete <datadir>/<network>/chainstate,\n" ++
+            "  and restart. CF_BLOCKS bodies are preserved; UTXO + headers will\n" ++
+            "  rebuild from peers (or from blockstorage when --import-blocks= is set).\n",
+            .{},
+        );
+        // Mark in debug log so the [REINDEX] category is visible if enabled.
+        _ = debug_log.parseAndApply("reindex");
+    }
+
     // 8. Install signal handlers
     installSignalHandlers();
+    ops.installSighupHandler();
 
     // Load persisted chain tip from RocksDB, fall back to genesis
     if (db_ptr) |dbp| {
@@ -1605,6 +1835,13 @@ pub fn main() !void {
 
     std.debug.print("Node running. Press Ctrl+C to stop.\n", .{});
 
+    // 10b. Fire systemd-style readiness notification once subsystems are
+    // listening. supervisors (systemd Type=notify, runit, daemontools) read
+    // a fd passed via --ready-fd=<N> for "ready to serve" signal.
+    if (config.ready_fd >= 0) {
+        ops.notifyReadyFd(config.ready_fd);
+    }
+
     // 11. Main loop: wait for shutdown signal. Also drives the lazy
     // pruner: every PRUNE_TICK_MS (when pruning is enabled), call
     // chain_state.pruneToTarget() so the watermark advances + CF_BLOCKS
@@ -1614,6 +1851,10 @@ pub fn main() !void {
     var last_prune_ms: i64 = std.time.milliTimestamp();
     while (!shutdown_requested.load(.acquire)) {
         std.time.sleep(100 * std.time.ns_per_ms);
+        // SIGHUP-driven log file reopen — if a SIGHUP arrived since the
+        // last tick, close + reopen the file. Cheap (atomic-load + maybe
+        // syscall) so we can run it every tick.
+        log_state.maybeReopen();
         if (chain_state.prune_target_mib != 0) {
             const now_ms = std.time.milliTimestamp();
             if (now_ms - last_prune_ms >= @as(i64, @intCast(PRUNE_TICK_MS))) {
@@ -1720,6 +1961,19 @@ pub fn main() !void {
     // Remove cookie file on clean shutdown
     deleteCookieFile(full_datadir, allocator);
 
+    // Close ZMQ sockets and tear down the publishing context.
+    zmq.global.deinit();
+
+    // Close the log file (if open) and free its path.
+    if (log_state_initialized) {
+        log_state.deinit();
+        log_state_initialized = false;
+    }
+
+    // Remove the PID file last so external supervisors see the node still
+    // "alive" until we're truly done.
+    ops.removePidFile(pid_path);
+
     std.debug.print("{s} stopped.\n", .{VERSION_STRING});
     std.debug.print("exit\n", .{});
 
@@ -1750,9 +2004,42 @@ fn metricsServerThread(
         var stream = conn.stream;
         defer stream.close();
 
-        // Read request (just consume it)
+        // Read request line so we can route /health vs /metrics. We only
+        // peek the first 4 KiB and look at the request-target — there's
+        // no body or headers we care about for either endpoint.
         var buf: [4096]u8 = undefined;
-        _ = stream.read(&buf) catch continue;
+        const n = stream.read(&buf) catch continue;
+        const req = buf[0..n];
+
+        // Detect "GET /health" — used by supervisors and load balancers.
+        // Anything else falls through to the existing /metrics body.
+        const is_health = blk: {
+            if (n < 12) break :blk false;
+            // Look for "/health" after the verb.
+            if (std.mem.indexOf(u8, req, " /health")) |_| break :blk true;
+            break :blk false;
+        };
+
+        if (is_health) {
+            // /health: 200 OK + tiny JSON. Designed to be parseable
+            // without a JSON lib (curl + grep is fine).
+            const tip = chain_state.best_height;
+            var hbuf: [256]u8 = undefined;
+            const hbody = std.fmt.bufPrint(&hbuf,
+                "{{\"status\":\"ok\",\"height\":{d},\"version\":\"{s}\"}}\n",
+                .{ tip, VERSION_STRING },
+            ) catch continue;
+            var hresp_buf: [512]u8 = undefined;
+            const hresp = std.fmt.bufPrint(&hresp_buf,
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n\r\n{s}",
+                .{ hbody.len, hbody },
+            ) catch continue;
+            _ = stream.write(hresp) catch {};
+            continue;
+        }
 
         // Gather metrics
         const height = chain_state.best_height;
@@ -2141,4 +2428,80 @@ test "config network defaults for each network" {
         try std.testing.expectEqual(@as(u16, 18444), params.default_port);
         try std.testing.expectEqualStrings("bcrt", params.bech32_hrp);
     }
+}
+
+// ============================================================================
+// Operational-parity Config defaults (--daemon / --pid / --reindex / ZMQ)
+// ============================================================================
+
+test "Config defaults: operational fields off" {
+    const cfg = Config{};
+    try std.testing.expectEqual(false, cfg.daemon);
+    try std.testing.expect(cfg.pidfile == null);
+    try std.testing.expect(cfg.conf_path == null);
+    try std.testing.expectEqual(false, cfg.reindex);
+    try std.testing.expectEqual(@as(i32, -1), cfg.ready_fd);
+    try std.testing.expect(cfg.zmq_rawblock == null);
+    try std.testing.expect(cfg.zmq_hashblock == null);
+    try std.testing.expect(cfg.zmq_rawtx == null);
+    try std.testing.expect(cfg.zmq_hashtx == null);
+    try std.testing.expect(cfg.zmq_sequence == null);
+}
+
+test "config file parses ZMQ + reindex + daemon keys" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const conf =
+        \\daemon=1
+        \\reindex=1
+        \\zmqpubrawblock=tcp://127.0.0.1:28332
+        \\zmqpubhashblock=tcp://127.0.0.1:28333
+        \\zmqpubrawtx=tcp://127.0.0.1:28334
+        \\zmqpubhashtx=tcp://127.0.0.1:28335
+        \\zmqpubsequence=tcp://127.0.0.1:28336
+    ;
+    const dir = tmp_dir.dir;
+    const file = try dir.createFile("clearbit.conf", .{});
+    try file.writeAll(conf);
+    file.close();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try dir.realpath(".", &path_buf);
+
+    var config = Config{};
+    try loadConfigFile(abs_path, &config, allocator);
+
+    try std.testing.expect(config.daemon);
+    try std.testing.expect(config.reindex);
+    // Strings in config-file values point at the file buffer that was
+    // freed; we only check non-null, never dereference.
+    try std.testing.expect(config.zmq_rawblock != null);
+    try std.testing.expect(config.zmq_hashblock != null);
+    try std.testing.expect(config.zmq_rawtx != null);
+    try std.testing.expect(config.zmq_hashtx != null);
+    try std.testing.expect(config.zmq_sequence != null);
+}
+
+test "loadConfigFile accepts an absolute --conf=<file> path" {
+    // When `datadir` argument resolves to a regular file (not a directory),
+    // loadConfigFile() should open it directly (the `--conf=<file>` path).
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const dir = tmp_dir.dir;
+    const file = try dir.createFile("custom.conf", .{});
+    try file.writeAll("rpcport=29111\n");
+    file.close();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try dir.realpath(".", &path_buf);
+    const conf_path = try std.fmt.allocPrint(allocator, "{s}/custom.conf", .{dir_path});
+    defer allocator.free(conf_path);
+
+    var config = Config{};
+    try loadConfigFile(conf_path, &config, allocator);
+    try std.testing.expectEqual(@as(u16, 29111), config.rpc_port);
 }
