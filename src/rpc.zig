@@ -13,6 +13,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const storage = @import("storage.zig");
 const mempool_mod = @import("mempool.zig");
+const mempool_persist = @import("mempool_persist.zig");
 const peer_mod = @import("peer.zig");
 const p2p = @import("p2p.zig");
 const banlist = @import("banlist.zig");
@@ -90,6 +91,10 @@ pub const RpcConfig = struct {
     auth_token: ?[]const u8 = null, // Base64-encoded "user:pass"
     cookie_token: ?[]const u8 = null, // Base64-encoded "__cookie__:<hex>" from .cookie file
     max_request_size: usize = 1 << 24, // 16 MB (needed for submitblock with large blocks)
+    /// Absolute path to the node's data directory. Used by RPCs that read or
+    /// write auxiliary files (mempool.dat, etc) in the datadir without
+    /// touching the chainstate. Empty string disables those RPCs.
+    datadir: []const u8 = "",
 };
 
 /// RPC Server error set.
@@ -730,6 +735,10 @@ pub const RpcServer = struct {
             return self.handleGetMempoolInfo(id);
         } else if (std.mem.eql(u8, method, "getmempoolentry")) {
             return self.handleGetMempoolEntry(params, id);
+        } else if (std.mem.eql(u8, method, "dumpmempool")) {
+            return self.handleDumpMempool(params, id);
+        } else if (std.mem.eql(u8, method, "loadmempool")) {
+            return self.handleLoadMempool(params, id);
         } else if (std.mem.eql(u8, method, "sendrawtransaction")) {
             return self.handleSendRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "getrawtransaction")) {
@@ -1558,6 +1567,104 @@ pub const RpcServer = struct {
             mining_score_frac,
         });
 
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `dumpmempool` — write the mempool to disk in Bitcoin Core mempool.dat
+    /// format (XOR-obfuscated v2). On success returns
+    /// `{"filename":"<path>"}` matching Bitcoin Core's response shape.
+    /// Optional positional arg #1 (string): override path; defaults to
+    /// `<datadir>/mempool.dat`.
+    fn handleDumpMempool(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Optional override path. If absent, default to <datadir>/mempool.dat.
+        var path_buf: ?[]u8 = null;
+        defer if (path_buf) |p| self.allocator.free(p);
+
+        var path: []const u8 = "";
+        if (params) |p| {
+            if (p == .array and p.array.items.len > 0) {
+                if (p.array.items[0] == .string) {
+                    path = p.array.items[0].string;
+                }
+            }
+        }
+        if (path.len == 0) {
+            if (self.config.datadir.len == 0) {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "datadir not configured", id);
+            }
+            path_buf = try std.fmt.allocPrint(self.allocator, "{s}/mempool.dat", .{self.config.datadir});
+            path = path_buf.?;
+        }
+
+        const written = mempool_persist.dumpMempool(self.mempool, path, self.allocator) catch |err| {
+            // Best-effort allocate a detailed message; fall back to a fixed
+            // string if the allocPrint itself fails (low-memory path).
+            if (std.fmt.allocPrint(self.allocator, "dumpmempool failed: {}", .{err})) |msg| {
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, msg, id);
+            } else |_| {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "dumpmempool failed", id);
+            }
+        };
+        _ = written;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const w = buf.writer();
+        // Match Bitcoin Core's "filename" response field for compatibility.
+        try w.writeAll("{\"filename\":\"");
+        // Crude JSON-string escape: '\\' and '"' only; datadir paths in the
+        // wild rarely contain anything more exotic.
+        for (path) |c| switch (c) {
+            '\\' => try w.writeAll("\\\\"),
+            '"' => try w.writeAll("\\\""),
+            else => try w.writeByte(c),
+        };
+        try w.writeAll("\"}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `loadmempool` — load a Bitcoin Core mempool.dat from disk and feed
+    /// each transaction through the normal mempool accept path. Returns
+    /// `{"loaded":N, "expired":N, "failed":N, "total":N}`.
+    /// Optional positional arg #1 (string): override path; defaults to
+    /// `<datadir>/mempool.dat`.
+    fn handleLoadMempool(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        var path_buf: ?[]u8 = null;
+        defer if (path_buf) |p| self.allocator.free(p);
+
+        var path: []const u8 = "";
+        if (params) |p| {
+            if (p == .array and p.array.items.len > 0) {
+                if (p.array.items[0] == .string) {
+                    path = p.array.items[0].string;
+                }
+            }
+        }
+        if (path.len == 0) {
+            if (self.config.datadir.len == 0) {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "datadir not configured", id);
+            }
+            path_buf = try std.fmt.allocPrint(self.allocator, "{s}/mempool.dat", .{self.config.datadir});
+            path = path_buf.?;
+        }
+
+        const result = mempool_persist.loadMempool(self.mempool, path, self.allocator) catch |err| {
+            if (std.fmt.allocPrint(self.allocator, "loadmempool failed: {}", .{err})) |msg| {
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, msg, id);
+            } else |_| {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "loadmempool failed", id);
+            }
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        try buf.writer().print(
+            "{{\"loaded\":{d},\"expired\":{d},\"failed\":{d},\"total\":{d}}}",
+            .{ result.accepted, result.expired, result.failed, result.total },
+        );
         return self.jsonRpcResult(buf.items, id);
     }
 
