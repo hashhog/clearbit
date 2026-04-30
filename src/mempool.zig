@@ -16,6 +16,7 @@ const storage = @import("storage.zig");
 const script = @import("script.zig");
 const serialize = @import("serialize.zig");
 const p2p = @import("p2p.zig");
+const zmq = @import("zmq.zig");
 
 // ============================================================================
 // Mempool Constants
@@ -650,6 +651,17 @@ pub const Mempool = struct {
         self.linearization_dirty = true;
 
         self.total_size += vsize;
+
+        // ZMQ publish (no-op when not initialized or no operator subscriber).
+        // We encode raw tx bytes lazily — only if a rawtx subscriber is bound.
+        if (zmq.global.initialized) {
+            var raw_alloc: ?[]const u8 = null;
+            defer if (raw_alloc) |b| self.allocator.free(b);
+            if (zmq.global.findSocket(zmq.TOPIC_RAWTX) != null) {
+                raw_alloc = zmq.encodeTxAlloc(self.allocator, &tx) catch null;
+            }
+            zmq.global.publishTx(&tx_hash, raw_alloc);
+        }
     }
 
     /// Result of AcceptToMemoryPool, mirroring Bitcoin Core's MempoolAcceptResult.
