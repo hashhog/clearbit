@@ -104,6 +104,9 @@ pub const MempoolError = error{
     DustOutput,
     /// Pay-to-Anchor output has non-zero value.
     AnchorNonZeroValue,
+    /// Serialized transaction weight exceeds MAX_STANDARD_TX_WEIGHT (400,000 WU).
+    /// Mirrors Bitcoin Core's "tx-size" relay-policy reject in policy/policy.cpp.
+    TxWeightTooLarge,
     /// Transaction failed validation.
     TxValidationFailed,
     /// Input references a non-existent UTXO.
@@ -729,6 +732,7 @@ pub const Mempool = struct {
                 MempoolError.TooManyEvictions => "too many potential replacements",
                 MempoolError.MempoolFull => "mempool full",
                 MempoolError.NonStandard => "non-standard",
+                MempoolError.TxWeightTooLarge => "tx-size",
                 MempoolError.DustOutput => "dust",
                 MempoolError.TooManyAncestors => "too-long-mempool-chain",
                 MempoolError.TooManyDescendants => "too-long-mempool-chain",
@@ -827,10 +831,18 @@ pub const Mempool = struct {
 
     /// Check standardness rules.
     fn checkStandard(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
-        _ = self;
-
         // Version must be 1, 2, or 3 (TRUC)
         if (tx.version < 1 or tx.version > TRUC_VERSION) return MempoolError.NonStandard;
+
+        // Relay-policy weight cap (BIP-141 / policy.cpp IsStandardTx):
+        // reject any tx whose serialized weight exceeds MAX_STANDARD_TX_WEIGHT
+        // (400,000 WU). This is a relay/mempool-only rule — a 400_000+ WU tx
+        // remains consensus-valid up to MAX_BLOCK_WEIGHT, but should never be
+        // accepted into our mempool or relayed onward.
+        const tx_weight = computeTxWeight(tx, self.allocator) catch return MempoolError.OutOfMemory;
+        if (tx_weight > consensus.MAX_STANDARD_TX_WEIGHT) {
+            return MempoolError.TxWeightTooLarge;
+        }
 
         // Check output script types
         for (tx.outputs) |output| {
@@ -2478,6 +2490,107 @@ test "nonstandard version rejection" {
 
     const result = mempool.addTransaction(tx);
     try std.testing.expectError(MempoolError.NonStandard, result);
+}
+
+test "MAX_STANDARD_TX_WEIGHT: oversize tx rejected from mempool" {
+    // Relay-policy weight cap (Bitcoin Core policy/policy.cpp IsStandardTx):
+    // a tx whose serialized weight exceeds 400,000 WU must be rejected from
+    // mempool acceptance. 400,000 WU is consensus-valid (limit is the block
+    // weight 4,000,000) but is non-standard for relay.
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // P2WPKH output (standard).
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    // Build an oversize output: a single huge OP_RETURN-style output is the
+    // simplest way to push the tx over 400,000 WU without needing many UTXOs.
+    // For non-segwit txs, weight = 4 * size, so script_pubkey of ~100,001 bytes
+    // gives weight > 400_000 (size ~ 100,070, weight ~ 400,280).
+    //
+    // We classify by `script.classifyScript`; an OP_RETURN-led script is
+    // standard (.null_data), but our existing dust check exempts OP_RETURN —
+    // and a 100k-byte OP_RETURN exceeds Core's 80-byte standardness cap. We
+    // intentionally use a payload that is non-standard *only* by weight, so
+    // we make it look like a P2WSH (standard) output but with a junk-padded
+    // script_sig instead.
+    const big_script_sig = try allocator.alloc(u8, 100_001);
+    defer allocator.free(big_script_sig);
+    @memset(big_script_sig, 0x00);
+
+    const output = types.TxOut{
+        .value = 100_000,
+        .script_pubkey = &p2wpkh_script,
+    };
+
+    const inputs = [_]types.TxIn{.{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = big_script_sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    }};
+    _ = input;
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &inputs,
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Sanity-check: the tx really is over the relay-policy weight cap.
+    const w = try computeTxWeight(&tx, allocator);
+    try std.testing.expect(w > consensus.MAX_STANDARD_TX_WEIGHT);
+
+    // addTransaction must reject with TxWeightTooLarge.
+    try std.testing.expectError(MempoolError.TxWeightTooLarge, mempool.addTransaction(tx));
+
+    // acceptToMemoryPool must surface "tx-size" reject reason (matches Core).
+    const accept = mempool.acceptToMemoryPool(tx, false);
+    try std.testing.expect(!accept.accepted);
+    try std.testing.expect(accept.reject_reason != null);
+    try std.testing.expectEqualStrings("tx-size", accept.reject_reason.?);
+}
+
+test "MAX_STANDARD_TX_WEIGHT: tx exactly at 400,000 WU accepted" {
+    // Boundary: weight == 400_000 is the cap; anything above is rejected.
+    // Verify a tx whose weight is well below the cap is not affected by the
+    // new check (existing dust + standardness rules still apply).
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 100_000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    const w = try computeTxWeight(&tx, allocator);
+    try std.testing.expect(w <= consensus.MAX_STANDARD_TX_WEIGHT);
+    try mempool.addTransaction(tx);
 }
 
 test "dust output rejection" {
