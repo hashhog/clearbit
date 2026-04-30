@@ -22,8 +22,11 @@ const secp256k1 = @cImport({
 /// BIP-39 English wordlist (2048 words), embedded at compile time
 const BIP39_WORDLIST: []const u8 = @embedFile("../resources/bip39-english.txt");
 
-/// Parse the embedded BIP-39 wordlist into an array of words
+/// Parse the embedded BIP-39 wordlist into an array of words.
+/// Runs at comptime; the default backwards-branch budget (1000) is too low
+/// for splitting 2048 newline-separated lines, so we bump it explicitly.
 fn getBip39Words() [2048][]const u8 {
+    @setEvalBranchQuota(50_000);
     var words: [2048][]const u8 = undefined;
     var lines = std.mem.splitScalar(u8, BIP39_WORDLIST, '\n');
     var i: usize = 0;
@@ -614,13 +617,21 @@ pub const Wallet = struct {
         min_change: i64 = 546, // minimum change to avoid dust
     };
 
+    /// Result of a coin-selection call. Named (rather than per-function
+    /// anonymous) so that `selectCoins`, `selectCoinsWithOptions`,
+    /// `selectCoinsBnB`, and `knapsackSolver` can return the same nominal
+    /// type and pass each other's results through without an awkward
+    /// cast (Zig anonymous structs at distinct source positions are
+    /// distinct nominal types even when structurally identical).
+    pub const CoinSelectResult = struct { selected: []OwnedUtxo, change: i64 };
+
     /// Select coins to fund a transaction (BnB with Knapsack fallback).
     /// This matches Bitcoin Core's coin selection strategy.
     pub fn selectCoins(
         self: *Wallet,
         target_value: i64,
         fee_rate: u64, // sat/vB
-    ) !struct { selected: []OwnedUtxo, change: i64 } {
+    ) !CoinSelectResult {
         return self.selectCoinsWithOptions(target_value, .{ .fee_rate = fee_rate });
     }
 
@@ -630,7 +641,7 @@ pub const Wallet = struct {
         self: *Wallet,
         target_value: i64,
         options: CoinSelectOptions,
-    ) !struct { selected: []OwnedUtxo, change: i64 } {
+    ) !CoinSelectResult {
         if (self.utxos.items.len == 0) {
             return error.InsufficientFunds;
         }
@@ -711,7 +722,7 @@ pub const Wallet = struct {
         effective_values: []const i64,
         target_value: i64,
         options: CoinSelectOptions,
-    ) !?struct { selected: []OwnedUtxo, change: i64 } {
+    ) !?CoinSelectResult {
         const max_iterations: usize = 100_000;
         const cost_of_change = options.cost_of_change;
 
@@ -852,7 +863,7 @@ pub const Wallet = struct {
         effective_values: []const i64,
         target_value: i64,
         options: CoinSelectOptions,
-    ) !struct { selected: []OwnedUtxo, change: i64 } {
+    ) !CoinSelectResult {
         const change_cost = options.cost_of_change;
 
         // Separate UTXOs into categories
