@@ -737,6 +737,10 @@ pub const RpcServer = struct {
             return self.handleGetMempoolEntry(params, id);
         } else if (std.mem.eql(u8, method, "dumpmempool")) {
             return self.handleDumpMempool(params, id);
+        } else if (std.mem.eql(u8, method, "savemempool")) {
+            // Bitcoin Core: savemempool is the canonical name; dumpmempool is
+            // an alias. Both go through the same handler.
+            return self.handleDumpMempool(params, id);
         } else if (std.mem.eql(u8, method, "loadmempool")) {
             return self.handleLoadMempool(params, id);
         } else if (std.mem.eql(u8, method, "sendrawtransaction")) {
@@ -868,6 +872,14 @@ pub const RpcServer = struct {
             return self.handleListTransactions(params, id);
         } else if (std.mem.eql(u8, method, "estimatesmartfee")) {
             return self.handleEstimateSmartFee(params, id);
+        } else if (std.mem.eql(u8, method, "estimaterawfee")) {
+            return self.handleEstimateRawFee(params, id);
+        } else if (std.mem.eql(u8, method, "signmessage")) {
+            return self.handleSignMessage(params, id);
+        } else if (std.mem.eql(u8, method, "signmessagewithprivkey")) {
+            return self.handleSignMessageWithPrivKey(params, id);
+        } else if (std.mem.eql(u8, method, "verifymessage")) {
+            return self.handleVerifyMessage(params, id);
         } else if (std.mem.eql(u8, method, "signrawtransactionwithwallet")) {
             return self.handleSignRawTransactionWithWallet(params, id);
         } else if (std.mem.eql(u8, method, "importdescriptors")) {
@@ -5279,6 +5291,269 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// `estimaterawfee conf_target ( threshold )` — advanced/hidden fee
+    /// estimation RPC. Bitcoin Core surfaces per-horizon (short / medium /
+    /// long) bucket diagnostics; clearbit's `FeeEstimator` only tracks a
+    /// single horizon, so we report the same numbers under all three keys
+    /// the caller may inspect. Reference: `bitcoin-core/src/rpc/fees.cpp`
+    /// `estimaterawfee`.
+    ///
+    /// Arguments:
+    ///   1. conf_target (numeric, required) - confirmation target in blocks
+    ///   2. threshold   (numeric, optional, default 0.95) - minimum success rate
+    fn handleEstimateRawFee(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params == null or params.? != .array or params.?.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing conf_target", id);
+        }
+
+        const target_param = params.?.array.items[0];
+        const conf_target_i: i64 = switch (target_param) {
+            .integer => target_param.integer,
+            .float => @intFromFloat(target_param.float),
+            else => return self.jsonRpcError(RPC_INVALID_PARAMS, "conf_target must be numeric", id),
+        };
+        if (conf_target_i < 1 or conf_target_i > 1008) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid conf_target", id);
+        }
+        const conf_target: u32 = @intCast(conf_target_i);
+
+        var threshold: f64 = 0.95;
+        if (params.?.array.items.len >= 2) {
+            const t = params.?.array.items[1];
+            switch (t) {
+                .float => threshold = t.float,
+                .integer => threshold = @floatFromInt(t.integer),
+                .null => {},
+                else => return self.jsonRpcError(RPC_INVALID_PARAMS, "threshold must be numeric", id),
+            }
+        }
+        if (threshold < 0.0 or threshold > 1.0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid threshold", id);
+        }
+
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+        const target_clamped: usize = @intCast(@min(@as(u32, mempool_mod.FeeEstimator.MAX_CONFIRMATION_TARGET - 1), conf_target));
+        const fee_rate_opt = self.mempool.fee_estimator.estimateFee(target_clamped);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const w = buf.writer();
+
+        // The three Bitcoin Core fee-estimate horizons. clearbit collapses
+        // them to a single estimator, so each horizon block reports the same
+        // numbers. Callers that read any single horizon get a meaningful
+        // result; callers that diff them get an honest answer (no data).
+        try w.writeByte('{');
+        const horizons = [_][]const u8{ "short", "medium", "long" };
+        for (horizons, 0..) |horizon, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("\"{s}\":{{", .{horizon});
+            try w.writeAll("\"decay\":0.998,\"scale\":1");
+            if (fee_rate_opt) |rate| {
+                const btc_per_kvb = rate * 1000.0 / 100_000_000.0;
+                try w.print(",\"feerate\":{d:.8}", .{btc_per_kvb});
+                try w.writeAll(",\"pass\":{");
+                try w.print("\"startrange\":{d:.0},\"endrange\":{d:.0}", .{ rate, rate });
+                try w.writeAll(",\"withintarget\":0,\"totalconfirmed\":0,\"inmempool\":0,\"leftmempool\":0}");
+            } else {
+                try w.writeAll(",\"fail\":{");
+                try w.writeAll("\"startrange\":0,\"endrange\":0,\"withintarget\":0,\"totalconfirmed\":0,\"inmempool\":0,\"leftmempool\":0}");
+                try w.writeAll(",\"errors\":[\"Insufficient data or no feerate found which meets threshold\"]");
+            }
+            try w.writeByte('}');
+        }
+        try w.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // signmessage / signmessagewithprivkey / verifymessage
+    // Reference: bitcoin-core/src/common/signmessage.cpp +
+    //            bitcoin-core/src/rpc/signmessage.cpp +
+    //            bitcoin-core/src/wallet/rpc/signmessage.cpp
+    // ========================================================================
+
+    /// Decode a Bitcoin WIF private key. Returns the 32-byte secret plus a
+    /// flag indicating whether the corresponding pubkey is compressed.
+    fn decodeWifPrivkey(
+        self: *RpcServer,
+        wif: []const u8,
+    ) ?struct { secret: [32]u8, compressed: bool } {
+        const decoded = address_mod.base58CheckDecode(wif, self.allocator) catch return null;
+        defer self.allocator.free(decoded.data);
+
+        // Mainnet (0x80) and testnet/regtest (0xEF) WIF version bytes.
+        if (decoded.version != 0x80 and decoded.version != 0xEF) return null;
+
+        var secret: [32]u8 = undefined;
+        var compressed = false;
+        if (decoded.data.len == 32) {
+            @memcpy(&secret, decoded.data);
+        } else if (decoded.data.len == 33 and decoded.data[32] == 0x01) {
+            @memcpy(&secret, decoded.data[0..32]);
+            compressed = true;
+        } else {
+            return null;
+        }
+        return .{ .secret = secret, .compressed = compressed };
+    }
+
+    /// Encode a 65-byte compact-recoverable signature as a Base64 JSON string.
+    fn formatSignatureBase64Result(self: *RpcServer, sig65: *const [65]u8, id: ?std.json.Value) ![]const u8 {
+        var b64_buf: [128]u8 = undefined;
+        const b64_len = std.base64.standard.Encoder.calcSize(65);
+        const enc = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], sig65);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        try buf.append('"');
+        try buf.appendSlice(enc);
+        try buf.append('"');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `signmessage "address" "message"` — sign `message` using the wallet
+    /// key associated with `address`. Address must resolve to a P2PKH (legacy)
+    /// destination, matching Bitcoin Core's restriction (legacy-style signed
+    /// messages only commit to a public-key hash, so segwit/taproot addresses
+    /// would not survive `verifymessage`).
+    fn handleSignMessage(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+
+        if (params == null or params.? != .array or params.?.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "signmessage requires address and message", id);
+        }
+        const addr_param = params.?.array.items[0];
+        const msg_param = params.?.array.items[1];
+        if (addr_param != .string or msg_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "address and message must be strings", id);
+        }
+        const addr_str = addr_param.string;
+        const message = msg_param.string;
+
+        // Decode the address — must be P2PKH for compatibility with the
+        // legacy compact-recoverable signature format.
+        const addr = address_mod.Address.decode(addr_str, self.allocator) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        };
+        defer addr.deinit(self.allocator);
+        if (addr.addr_type != .p2pkh) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Address does not refer to key", id);
+        }
+        if (addr.hash.len != 20) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        }
+
+        // Find a wallet key whose hash160(pubkey) matches the address.
+        var found_key: ?wallet_mod.KeyPair = null;
+        for (wallet.keys.items) |k| {
+            const h = crypto.hash160(&k.public_key);
+            if (std.mem.eql(u8, &h, addr.hash)) {
+                found_key = k;
+                break;
+            }
+        }
+        const key = found_key orelse {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Private key not available", id);
+        };
+
+        const h = crypto.messageHash(message);
+        const sig = crypto.signMessageCompact(&h, &key.secret_key, true) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Sign failed", id);
+        };
+
+        return self.formatSignatureBase64Result(&sig, id);
+    }
+
+    /// `signmessagewithprivkey "privkey" "message"` — sign `message` using
+    /// the WIF-encoded private key. Stateless; no wallet required. Mirrors
+    /// Bitcoin Core's util-namespace RPC.
+    fn handleSignMessageWithPrivKey(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params == null or params.? != .array or params.?.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "signmessagewithprivkey requires privkey and message", id);
+        }
+        const pk_param = params.?.array.items[0];
+        const msg_param = params.?.array.items[1];
+        if (pk_param != .string or msg_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "privkey and message must be strings", id);
+        }
+
+        const decoded = self.decodeWifPrivkey(pk_param.string) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key", id);
+        };
+
+        const h = crypto.messageHash(msg_param.string);
+        const sig = crypto.signMessageCompact(&h, &decoded.secret, decoded.compressed) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Sign failed", id);
+        };
+
+        return self.formatSignatureBase64Result(&sig, id);
+    }
+
+    /// `verifymessage "address" "signature" "message"` — verify that a
+    /// signed message was produced by the holder of the private key behind
+    /// `address`. Recovers the public key from the compact-recoverable
+    /// signature and compares hash160(pubkey) to the address's pubkey hash.
+    fn handleVerifyMessage(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params == null or params.? != .array or params.?.array.items.len < 3) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "verifymessage requires address, signature, and message", id);
+        }
+        const addr_param = params.?.array.items[0];
+        const sig_param = params.?.array.items[1];
+        const msg_param = params.?.array.items[2];
+        if (addr_param != .string or sig_param != .string or msg_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "address, signature, and message must be strings", id);
+        }
+
+        const addr = address_mod.Address.decode(addr_param.string, self.allocator) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        };
+        defer addr.deinit(self.allocator);
+        if (addr.addr_type != .p2pkh) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Address does not refer to key", id);
+        }
+        if (addr.hash.len != 20) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        }
+
+        // Decode the Base64 signature. Bitcoin Core compact signatures are
+        // exactly 65 bytes; reject anything else as malformed (matches
+        // `MessageVerificationResult::ERR_MALFORMED_SIGNATURE`).
+        var sig_buf: [128]u8 = undefined;
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(sig_param.string) catch {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Malformed base64 encoding", id);
+        };
+        if (decoded_len > sig_buf.len) {
+            return self.jsonRpcResult("false", id);
+        }
+        std.base64.standard.Decoder.decode(sig_buf[0..decoded_len], sig_param.string) catch {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Malformed base64 encoding", id);
+        };
+        if (decoded_len != 65) return self.jsonRpcResult("false", id);
+
+        var sig65: [65]u8 = undefined;
+        @memcpy(&sig65, sig_buf[0..65]);
+
+        const h = crypto.messageHash(msg_param.string);
+        var pub_buf: [65]u8 = undefined;
+        const publen = crypto.recoverMessagePubkey(&h, &sig65, &pub_buf) orelse {
+            return self.jsonRpcResult("false", id);
+        };
+
+        // Compare hash160(recovered_pubkey) to the address's hash. Header
+        // byte's compressed flag drives the serialized pubkey length, which
+        // in turn determines the resulting hash160 — mismatched flags
+        // simply produce a different hash and verification returns false.
+        const h160 = crypto.hash160(pub_buf[0..publen]);
+        const ok = std.mem.eql(u8, &h160, addr.hash);
+        return self.jsonRpcResult(if (ok) "true" else "false", id);
+    }
+
     // ========================================================================
     // New RPC methods: signrawtransactionwithwallet, importdescriptors,
     // validateaddress, gettxout, getmempoolancestors, getmempooldescendants
@@ -5978,6 +6253,16 @@ pub const RpcServer = struct {
                 try writer.writeAll("listtransactions ( label count skip )\\n\\nReturns up to count most recent transactions.");
             } else if (std.mem.eql(u8, cmd, "estimatesmartfee")) {
                 try writer.writeAll("estimatesmartfee conf_target ( estimate_mode )\\n\\nEstimates the approximate fee per kilobyte.");
+            } else if (std.mem.eql(u8, cmd, "estimaterawfee")) {
+                try writer.writeAll("estimaterawfee conf_target ( threshold )\\n\\nWARNING: unstable. Per-horizon raw fee estimation diagnostics.");
+            } else if (std.mem.eql(u8, cmd, "signmessage")) {
+                try writer.writeAll("signmessage \"address\" \"message\"\\n\\nSign a message with the wallet key for an address. Returns base64.");
+            } else if (std.mem.eql(u8, cmd, "signmessagewithprivkey")) {
+                try writer.writeAll("signmessagewithprivkey \"privkey\" \"message\"\\n\\nSign a message with a WIF private key. Returns base64.");
+            } else if (std.mem.eql(u8, cmd, "verifymessage")) {
+                try writer.writeAll("verifymessage \"address\" \"signature\" \"message\"\\n\\nVerify a signed message.");
+            } else if (std.mem.eql(u8, cmd, "savemempool")) {
+                try writer.writeAll("savemempool ( \"path\" )\\n\\nDump the mempool to disk in Bitcoin Core mempool.dat format. Alias of dumpmempool.");
             } else if (std.mem.eql(u8, cmd, "help")) {
                 try writer.writeAll("help ( command )\\n\\nList all commands, or get help for a specified command.");
             } else {
@@ -6004,6 +6289,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getmempoolinfo\\n");
             try writer.writeAll("getrawmempool\\n");
             try writer.writeAll("gettxout\\n");
+            try writer.writeAll("savemempool\\n");
             try writer.writeAll("testmempoolaccept\\n");
             try writer.writeAll("\\n== Mining ==\\n");
             try writer.writeAll("getblocktemplate\\n");
@@ -6030,12 +6316,16 @@ pub const RpcServer = struct {
             try writer.writeAll("listwallets\\n");
             try writer.writeAll("loadwallet\\n");
             try writer.writeAll("sendtoaddress\\n");
+            try writer.writeAll("signmessage\\n");
             try writer.writeAll("signrawtransactionwithwallet\\n");
             try writer.writeAll("importdescriptors\\n");
             try writer.writeAll("unloadwallet\\n");
             try writer.writeAll("\\n== Util ==\\n");
             try writer.writeAll("validateaddress\\n");
+            try writer.writeAll("estimaterawfee\\n");
             try writer.writeAll("estimatesmartfee\\n");
+            try writer.writeAll("signmessagewithprivkey\\n");
+            try writer.writeAll("verifymessage\\n");
             try writer.writeAll("help\\n");
             try writer.writeAll("stop\\n");
             try writer.writeAll("\"");
@@ -7195,4 +7485,316 @@ test "regtest: getblockchaininfo.softforks and getdeploymentinfo.deployments are
     // hard-coded table.
     try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true,\"height\":0,\"min_activation_height\":0}") != null);
     try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true,\"height\":0,\"min_activation_height\":0}") != null);
+}
+
+// ============================================================================
+// signmessage / verifymessage / estimaterawfee / savemempool tests
+// ============================================================================
+
+test "estimaterawfee with no data returns errors per horizon" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Empty estimator — every horizon should report an "errors" array.
+    const result = try server.dispatch(
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"estimaterawfee\",\"params\":[6]}",
+    );
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"short\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"medium\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"long\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Insufficient data") != null);
+}
+
+test "estimaterawfee rejects out-of-range threshold" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const r = try server.dispatch(
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"estimaterawfee\",\"params\":[6,1.5]}",
+    );
+    defer allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "Invalid threshold") != null);
+}
+
+test "savemempool aliases dumpmempool" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    // Use a tmp dir for the dump path so the RPC has somewhere to write.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try tmp.dir.realpath(".", &path_buf);
+    const dump_path = try std.fmt.allocPrint(allocator, "{s}/mempool.dat", .{path});
+    defer allocator.free(dump_path);
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"savemempool\",\"params\":[\"{s}\"]}}",
+        .{dump_path},
+    );
+    defer allocator.free(req);
+
+    const result = try server.dispatch(req);
+    defer allocator.free(result);
+
+    // Both savemempool and dumpmempool must accept the same params and
+    // return the same {"filename":...} response shape. Empty mempool is OK.
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"filename\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\":null") != null);
+}
+
+test "verifymessage rejects malformed base64 signature" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Valid mainnet P2PKH address ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" -- Genesis miner)
+    // with a bogus signature.
+    const result = try server.dispatch(
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"verifymessage\",\"params\":[\"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa\",\"!!!not-base64!!!\",\"hello\"]}",
+    );
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Malformed base64 encoding") != null);
+}
+
+test "signmessage/verifymessage round-trip via RPC" {
+    if (!crypto.initSecp256k1()) return error.SkipZigTest;
+    defer crypto.deinitSecp256k1();
+
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    // Wallet with a known privkey (privkey = 0x000...01) on mainnet so we
+    // can derive a deterministic P2PKH address and exercise the full
+    // signmessage -> verifymessage round trip.
+    var wallet = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+    var sk: [32]u8 = [_]u8{0} ** 32;
+    sk[31] = 0x01;
+    const key_idx = try wallet.importKey(sk);
+    const addr = try wallet.getAddress(key_idx, .p2pkh);
+    defer allocator.free(addr);
+
+    var server = RpcServer.initWithWallet(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        &wallet,
+        .{},
+    );
+    defer server.deinit();
+
+    // Sign
+    const sign_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"signmessage\",\"params\":[\"{s}\",\"hello clearbit\"]}}",
+        .{addr},
+    );
+    defer allocator.free(sign_req);
+    const sign_resp = try server.dispatch(sign_req);
+    defer allocator.free(sign_resp);
+    try std.testing.expect(std.mem.indexOf(u8, sign_resp, "\"error\":null") != null);
+
+    // Extract base64 signature from the JSON `"result":"<sig>",` envelope.
+    const result_marker = "\"result\":\"";
+    const rs = std.mem.indexOf(u8, sign_resp, result_marker) orelse return error.NoResult;
+    const sig_start = rs + result_marker.len;
+    const sig_end = std.mem.indexOfPos(u8, sign_resp, sig_start, "\"") orelse return error.NoResult;
+    const sig_b64 = sign_resp[sig_start..sig_end];
+
+    // Verify (correct message)
+    const verify_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"verifymessage\",\"params\":[\"{s}\",\"{s}\",\"hello clearbit\"]}}",
+        .{ addr, sig_b64 },
+    );
+    defer allocator.free(verify_req);
+    const verify_resp = try server.dispatch(verify_req);
+    defer allocator.free(verify_resp);
+    try std.testing.expect(std.mem.indexOf(u8, verify_resp, "\"result\":true") != null);
+
+    // Verify with tampered message must return false.
+    const tamper_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"verifymessage\",\"params\":[\"{s}\",\"{s}\",\"goodbye clearbit\"]}}",
+        .{ addr, sig_b64 },
+    );
+    defer allocator.free(tamper_req);
+    const tamper_resp = try server.dispatch(tamper_req);
+    defer allocator.free(tamper_resp);
+    try std.testing.expect(std.mem.indexOf(u8, tamper_resp, "\"result\":false") != null);
+}
+
+test "signmessage rejects non-P2PKH address" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var wallet = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    var server = RpcServer.initWithWallet(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        &wallet,
+        .{},
+    );
+    defer server.deinit();
+
+    // bc1q... segwit P2WPKH address; signmessage should reject it as
+    // "Address does not refer to key" (Bitcoin Core parity).
+    const result = try server.dispatch(
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"signmessage\",\"params\":[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\",\"msg\"]}",
+    );
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Address does not refer to key") != null);
+}
+
+test "signmessagewithprivkey + verifymessage round-trip (no wallet)" {
+    if (!crypto.initSecp256k1()) return error.SkipZigTest;
+    defer crypto.deinitSecp256k1();
+
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Build a mainnet WIF (compressed) for privkey = 1.
+    var wif_payload: [33]u8 = undefined;
+    @memset(wif_payload[0..32], 0);
+    wif_payload[31] = 0x01;
+    wif_payload[32] = 0x01; // compressed flag
+    const wif = try address_mod.base58CheckEncode(0x80, &wif_payload, allocator);
+    defer allocator.free(wif);
+
+    // Derive matching mainnet P2PKH address from compressed pubkey of 1.
+    var w = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+    var sk: [32]u8 = [_]u8{0} ** 32;
+    sk[31] = 0x01;
+    const idx = try w.importKey(sk);
+    const addr = try w.getAddress(idx, .p2pkh);
+    defer allocator.free(addr);
+
+    // signmessagewithprivkey
+    const sign_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"signmessagewithprivkey\",\"params\":[\"{s}\",\"hi\"]}}",
+        .{wif},
+    );
+    defer allocator.free(sign_req);
+    const sign_resp = try server.dispatch(sign_req);
+    defer allocator.free(sign_resp);
+    try std.testing.expect(std.mem.indexOf(u8, sign_resp, "\"error\":null") != null);
+
+    const result_marker = "\"result\":\"";
+    const rs = std.mem.indexOf(u8, sign_resp, result_marker) orelse return error.NoResult;
+    const sig_start = rs + result_marker.len;
+    const sig_end = std.mem.indexOfPos(u8, sign_resp, sig_start, "\"") orelse return error.NoResult;
+    const sig_b64 = sign_resp[sig_start..sig_end];
+
+    const verify_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"verifymessage\",\"params\":[\"{s}\",\"{s}\",\"hi\"]}}",
+        .{ addr, sig_b64 },
+    );
+    defer allocator.free(verify_req);
+    const verify_resp = try server.dispatch(verify_req);
+    defer allocator.free(verify_resp);
+    try std.testing.expect(std.mem.indexOf(u8, verify_resp, "\"result\":true") != null);
 }

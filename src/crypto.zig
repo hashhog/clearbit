@@ -662,6 +662,7 @@ const secp256k1 = @cImport({
     @cInclude("secp256k1.h");
     @cInclude("secp256k1_extrakeys.h");
     @cInclude("secp256k1_schnorrsig.h");
+    @cInclude("secp256k1_recovery.h");
 });
 
 /// Whether libsecp256k1 is available at link time
@@ -862,6 +863,160 @@ pub fn verifySchnorr(sig: *const [64]u8, msg_hash: *const [32]u8, pubkey_x: *con
         32,
         &xonly,
     ) == 1;
+}
+
+// ============================================================================
+// BIP-137 / signmessage helpers
+// ============================================================================
+//
+// Bitcoin Core's MessageHash (common/signmessage.cpp) hashes:
+//
+//   compactsize(MAGIC_LEN) || MAGIC || compactsize(message_len) || message
+//
+// then double-SHA256s it. MAGIC = "Bitcoin Signed Message:\n".
+// The compact-size encoding follows Bitcoin's serialize-protocol VarInt,
+// which is single-byte for values < 0xFD.
+
+/// Bitcoin Core's signed-message magic. The leading newline-and-length is
+/// added at hash time via the compact-size length prefix.
+pub const MESSAGE_MAGIC = "Bitcoin Signed Message:\n";
+
+/// Append a Bitcoin compact-size (varint) encoding of `value` to `writer`.
+fn writeCompactSize(writer: anytype, value: u64) !void {
+    if (value < 0xFD) {
+        try writer.writeByte(@intCast(value));
+    } else if (value <= 0xFFFF) {
+        try writer.writeByte(0xFD);
+        try writer.writeInt(u16, @intCast(value), .little);
+    } else if (value <= 0xFFFF_FFFF) {
+        try writer.writeByte(0xFE);
+        try writer.writeInt(u32, @intCast(value), .little);
+    } else {
+        try writer.writeByte(0xFF);
+        try writer.writeInt(u64, value, .little);
+    }
+}
+
+/// Compute Bitcoin Core's signed-message hash for `message`. Matches
+/// `MessageHash()` in `bitcoin-core/src/common/signmessage.cpp`.
+pub fn messageHash(message: []const u8) Hash256 {
+    var first = std.crypto.hash.sha2.Sha256.init(.{});
+    var lenbuf: [9]u8 = undefined;
+
+    // compactsize(MAGIC.len) || MAGIC
+    var fbs1 = std.io.fixedBufferStream(&lenbuf);
+    writeCompactSize(fbs1.writer(), MESSAGE_MAGIC.len) catch unreachable;
+    first.update(fbs1.getWritten());
+    first.update(MESSAGE_MAGIC);
+
+    // compactsize(message.len) || message
+    var fbs2 = std.io.fixedBufferStream(&lenbuf);
+    writeCompactSize(fbs2.writer(), message.len) catch unreachable;
+    first.update(fbs2.getWritten());
+    first.update(message);
+
+    var inner: [32]u8 = undefined;
+    first.final(&inner);
+
+    var second = std.crypto.hash.sha2.Sha256.init(.{});
+    second.update(&inner);
+    var out: Hash256 = undefined;
+    second.final(&out);
+    return out;
+}
+
+/// Sign a 32-byte hash with `seckey`, producing a 65-byte Bitcoin Core-format
+/// compact-recoverable signature: header byte (27 + recid + 4 if compressed)
+/// followed by 64 bytes of compact-encoded R||S.
+///
+/// `compressed` should be `true` for keys whose corresponding public key is
+/// compressed (the only modern case; matches Bitcoin Core's
+/// `CKey::SignCompact`).
+///
+/// Returns null on initialisation/sign failure.
+pub fn signMessageCompact(
+    msg_hash: *const [32]u8,
+    seckey: *const [32]u8,
+    compressed: bool,
+) ?[65]u8 {
+    const ctx = secp_ctx orelse return null;
+
+    var rsig: secp256k1.secp256k1_ecdsa_recoverable_signature = undefined;
+    if (secp256k1.secp256k1_ecdsa_sign_recoverable(
+        ctx,
+        &rsig,
+        msg_hash,
+        seckey,
+        null,
+        null,
+    ) != 1) {
+        return null;
+    }
+
+    var compact: [64]u8 = undefined;
+    var recid: c_int = -1;
+    if (secp256k1.secp256k1_ecdsa_recoverable_signature_serialize_compact(
+        ctx,
+        &compact,
+        &recid,
+        &rsig,
+    ) != 1) {
+        return null;
+    }
+    if (recid < 0 or recid > 3) return null;
+
+    var out: [65]u8 = undefined;
+    out[0] = 27 + @as(u8, @intCast(recid)) + (if (compressed) @as(u8, 4) else 0);
+    @memcpy(out[1..65], &compact);
+    return out;
+}
+
+/// Recover the signer's public key from a 65-byte compact-recoverable
+/// signature over `msg_hash`. Matches `CPubKey::RecoverCompact`.
+///
+/// Returns the serialised public key (33 bytes if `compressed` flag was set
+/// in the signature header, else 65 bytes), or null on parse / recovery
+/// failure.
+pub fn recoverMessagePubkey(
+    msg_hash: *const [32]u8,
+    sig65: *const [65]u8,
+    out_pubkey: *[65]u8,
+) ?usize {
+    const ctx = secp_ctx orelse return null;
+
+    const header = sig65[0];
+    if (header < 27 or header > 34) return null;
+    const recid: c_int = @intCast((header - 27) & 3);
+    const fcomp: bool = ((header - 27) & 4) != 0;
+
+    var rsig: secp256k1.secp256k1_ecdsa_recoverable_signature = undefined;
+    var compact: [64]u8 = undefined;
+    @memcpy(&compact, sig65[1..65]);
+    if (secp256k1.secp256k1_ecdsa_recoverable_signature_parse_compact(
+        ctx,
+        &rsig,
+        &compact,
+        recid,
+    ) != 1) {
+        return null;
+    }
+
+    var pubkey: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_ecdsa_recover(ctx, &pubkey, &rsig, msg_hash) != 1) {
+        return null;
+    }
+
+    var publen: usize = if (fcomp) 33 else 65;
+    if (secp256k1.secp256k1_ec_pubkey_serialize(
+        ctx,
+        out_pubkey,
+        &publen,
+        &pubkey,
+        if (fcomp) secp256k1.SECP256K1_EC_COMPRESSED else secp256k1.SECP256K1_EC_UNCOMPRESSED,
+    ) != 1) {
+        return null;
+    }
+    return publen;
 }
 
 // ============================================================================
@@ -1776,4 +1931,66 @@ test "secp256k1 init/deinit" {
         deinitSecp256k1();
         try std.testing.expect(!isSecp256k1Available());
     }
+}
+
+test "signMessageCompact + recoverMessagePubkey round-trip" {
+    if (!initSecp256k1()) return error.SkipZigTest;
+    defer deinitSecp256k1();
+
+    // Deterministic 32-byte secret key (1).
+    var seckey: [32]u8 = [_]u8{0} ** 32;
+    seckey[31] = 0x01;
+
+    const msg = "hello clearbit";
+    const h = messageHash(msg);
+
+    const sig = signMessageCompact(&h, &seckey, true) orelse
+        return error.SignFailed;
+
+    // Header should encode compressed-flag (>= 27 + 4 = 31) and recid in [0,3].
+    try std.testing.expect(sig[0] >= 31 and sig[0] <= 34);
+
+    var pub_buf: [65]u8 = undefined;
+    const publen = recoverMessagePubkey(&h, &sig, &pub_buf) orelse
+        return error.RecoverFailed;
+    try std.testing.expectEqual(@as(usize, 33), publen);
+
+    // Recovered pubkey must match secp256k1_ec_pubkey_create(seckey).
+    const ctx = secp_ctx orelse return error.NoSecpCtx;
+    var expected: secp256k1.secp256k1_pubkey = undefined;
+    try std.testing.expectEqual(@as(c_int, 1), secp256k1.secp256k1_ec_pubkey_create(ctx, &expected, &seckey));
+    var expected_compressed: [33]u8 = undefined;
+    var expected_len: usize = 33;
+    try std.testing.expectEqual(@as(c_int, 1), secp256k1.secp256k1_ec_pubkey_serialize(
+        ctx,
+        &expected_compressed,
+        &expected_len,
+        &expected,
+        secp256k1.SECP256K1_EC_COMPRESSED,
+    ));
+    try std.testing.expectEqualSlices(u8, &expected_compressed, pub_buf[0..33]);
+
+    // Tampering a single byte of the message must change the recovered key.
+    const h2 = messageHash("hello CLEARBIT");
+    var pub_buf2: [65]u8 = undefined;
+    if (recoverMessagePubkey(&h2, &sig, &pub_buf2)) |publen2| {
+        try std.testing.expect(!std.mem.eql(u8, pub_buf[0..publen], pub_buf2[0..publen2]));
+    }
+}
+
+test "messageHash matches Bitcoin Core formatting" {
+    // Spot-check: empty message should be the double-SHA256 of
+    // "\x18Bitcoin Signed Message:\n\x00".
+    const got = messageHash("");
+    var inner = std.crypto.hash.sha2.Sha256.init(.{});
+    inner.update(&[_]u8{0x18}); // compactsize(24)
+    inner.update("Bitcoin Signed Message:\n");
+    inner.update(&[_]u8{0x00}); // compactsize(0)
+    var inner_out: [32]u8 = undefined;
+    inner.final(&inner_out);
+    var outer = std.crypto.hash.sha2.Sha256.init(.{});
+    outer.update(&inner_out);
+    var outer_out: [32]u8 = undefined;
+    outer.final(&outer_out);
+    try std.testing.expectEqualSlices(u8, &outer_out, &got);
 }
