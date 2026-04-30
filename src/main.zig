@@ -20,6 +20,7 @@ pub const p2p = @import("p2p.zig");
 pub const peer = @import("peer.zig");
 pub const sync = @import("sync.zig");
 pub const mempool = @import("mempool.zig");
+pub const mempool_persist = @import("mempool_persist.zig");
 pub const block_template = @import("block_template.zig");
 pub const rpc = @import("rpc.zig");
 pub const wallet = @import("wallet.zig");
@@ -1435,6 +1436,29 @@ pub fn main() !void {
         };
     }
 
+    // Load persisted mempool (Bitcoin Core-compatible mempool.dat).
+    // Best-effort: a missing or malformed file is logged and skipped — we
+    // never block startup on mempool persistence.
+    const mempool_dat_path = std.fmt.allocPrint(allocator, "{s}/mempool.dat", .{full_datadir}) catch null;
+    defer if (mempool_dat_path) |p| allocator.free(p);
+    if (mempool_dat_path) |path| {
+        const r = mempool_persist.loadMempool(&mempool_instance, path, allocator) catch |err| blk: {
+            std.debug.print("Note: could not load mempool.dat: {}\n", .{err});
+            break :blk mempool_persist.LoadResult{
+                .total = 0,
+                .accepted = 0,
+                .expired = 0,
+                .failed = 0,
+            };
+        };
+        if (r.total > 0) {
+            std.debug.print(
+                "Loaded mempool.dat: {d} accepted, {d} expired, {d} failed (of {d} total)\n",
+                .{ r.accepted, r.expired, r.failed, r.total },
+            );
+        }
+    }
+
     var peer_manager = peer.PeerManager.init(allocator, params);
     defer peer_manager.deinit();
     peer_manager.chain_state = &chain_state;
@@ -1464,6 +1488,7 @@ pub fn main() !void {
             .port = config.rpc_port,
             .auth_token = auth_token,
             .cookie_token = cookie_token,
+            .datadir = full_datadir,
         },
     );
     defer rpc_server.deinit();
@@ -1657,13 +1682,26 @@ pub fn main() !void {
     std.debug.print("joining P2P thread\n", .{});
     peer_thread.join();
 
-    // Phase 3: persist auxiliary state (fee estimates) before flushing
-    // the main chainstate so any error here doesn't leave the UTXO set
-    // written but the fee estimator stale.
+    // Phase 3: persist auxiliary state (fee estimates + mempool.dat) before
+    // flushing the main chainstate so any error here doesn't leave the
+    // UTXO set written but the auxiliary state stale.
     if (fee_est_path) |path| {
         mempool_instance.fee_estimator.saveToFile(path) catch |err| {
             std.debug.print("Warning: could not save fee estimates: {}\n", .{err});
         };
+    }
+
+    // Dump mempool.dat in Bitcoin Core v2 format (XOR-obfuscated, atomic
+    // <path>.new -> rename(path) write). Best-effort: a write failure is
+    // logged but does not block shutdown.
+    if (mempool_dat_path) |path| {
+        const written = mempool_persist.dumpMempool(&mempool_instance, path, allocator) catch |err| blk: {
+            std.debug.print("Warning: could not dump mempool.dat: {}\n", .{err});
+            break :blk @as(usize, 0);
+        };
+        if (written > 0) {
+            std.debug.print("Dumped mempool.dat: {d} transactions\n", .{written});
+        }
     }
 
     // Phase 4: flush chainstate — dirty UTXO entries + chain tip,
