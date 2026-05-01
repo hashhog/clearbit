@@ -4224,24 +4224,39 @@ pub const RpcServer = struct {
     ///
     /// Implementation note (clearbit-specific):
     ///   Bitcoin Core does this via TemporaryRollback (invalidate descendants,
-    ///   reverse-walk via DisconnectBlock, dump, reconnect). clearbit's
-    ///   ChainManager has invalidateBlock/disconnectToBlock primitives, but
-    ///   the disconnect path requires reading the actual block from CF_BLOCKS
-    ///   to feed `disconnectBlockFromFile` — and CF_BLOCKS is only populated
-    ///   for blocks accepted post-`cdd9e20` (2026-04-29). Pre-`cdd9e20`
-    ///   blocks have no body in either CF_BLOCKS or blk*.dat, so the
-    ///   rollback dance can't reach them. Until the populator backfills
-    ///   history (or we add a peer-fetch-by-hash path), the rollback dance
-    ///   only works in the degenerate case where the requested target equals
-    ///   the current tip, which is what `latest` already does.
+    ///   reverse-walk via DisconnectBlock, dump, reconnect). This handler
+    ///   does the same shape on clearbit, with two pre-flight coverage
+    ///   checks before any state mutation:
+    ///     1. CF_BLOCKS has bodies for every block on the disconnect path
+    ///        (target+1..tip). CF_BLOCKS is populated post-`cdd9e20`
+    ///        (2026-04-29); blocks accepted before then are not on disk
+    ///        and the rollback cannot proceed without re-fetching them
+    ///        from peers (not yet implemented).
+    ///     2. Undo data is readable from rev*.dat for every block on the
+    ///        disconnect path. The IBD fast path (peer.zig drainBlockBuffer
+    ///        → connectBlockFast with skip_undo=true) does NOT currently
+    ///        write undo files, so on a live mainnet datadir this check
+    ///        will fail and the RPC errors cleanly without rewinding.
+    ///        Regtest tests that go through `connectBlockWithUndo` do
+    ///        produce undo files and exercise the full rewind→dump→
+    ///        reconnect dance.
     ///
-    ///   When the target differs from the current tip, return an
-    ///   RPC_MISC_ERROR explaining the limitation rather than corrupting the
-    ///   chainstate. This matches the spirit of Core's failure-mode log
-    ///   ("dumptxoutset failed to roll back to requested height, reverting
-    ///   to tip" — rpc/blockchain.cpp:3208) but converted to a hard error so
-    ///   the caller doesn't get a tip-dump silently labelled as a
-    ///   rollback dump.
+    ///   If both checks pass, the handler:
+    ///     a. Acquires `chain_state.connect_mutex` for the duration —
+    ///        peer.zig's drainBlockBuffer also goes through this mutex,
+    ///        so no peer-delivered block can race the rollback. Equivalent
+    ///        to Core's NetworkDisable guard but cheaper (no socket churn).
+    ///     b. Walks down via `disconnectBlockByHash` from tip → target.
+    ///     c. Writes the snapshot at target via `dumpTxOutSetWithResult`.
+    ///     d. Walks back up via `connectBlockLocked`, restoring the
+    ///        original tip.
+    ///     e. Calls `flush()` once at the end so on-disk state matches
+    ///        in-memory state.
+    ///
+    ///   On any failure mid-dance, the handler attempts best-effort
+    ///   reconnect of any blocks already disconnected. If reconnect
+    ///   itself fails, the chainstate is left at the lower tip and a
+    ///   loud error is returned so the operator can investigate.
     ///
     /// Returns:
     ///   {
@@ -4250,6 +4265,45 @@ pub const RpcServer = struct {
     ///     "base_height":   n,
     ///     "txoutset_hash": "hash"   (SHA256d HashWriter; Core HASH_SERIALIZED)
     ///   }
+    /// Replay-connect a slice of disconnected blocks (in tip-down order, i.e.
+    /// disconnect_chain[0] = tip, disconnect_chain[N-1] = target+1) by
+    /// walking the slice in reverse and calling `connectBlockLocked` for
+    /// each. Caller must already hold `chain_state.connect_mutex`. Used by
+    /// the rollback dance in `handleDumpTxOutSet` to restore the chain to
+    /// its original tip after the snapshot is written.
+    ///
+    /// Errors propagate immediately — partial replay leaves the chainstate
+    /// at whatever intermediate height the failure hit. The caller is
+    /// expected to surface a loud error so the operator knows the chain
+    /// is stuck and a restart is required.
+    fn replayReconnect(
+        self: *RpcServer,
+        disconnect_chain: []*validation.BlockIndexEntry,
+        cm: *validation.ChainManager,
+    ) !void {
+        // Walk in reverse: target+1 first, ..., tip last.
+        var i: usize = disconnect_chain.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = disconnect_chain[i];
+            const body_opt = try self.chain_state.getBlockBytes(&entry.hash);
+            const body = body_opt orelse return error.BlockBodyNotFound;
+            defer self.allocator.free(body);
+
+            var reader = serialize.Reader{ .data = body };
+            var block = try serialize.readBlock(&reader, self.allocator);
+            defer serialize.freeBlock(self.allocator, &block);
+
+            var undo = try self.chain_state.connectBlockLocked(&block, &entry.hash, entry.height);
+            // We don't need the in-memory undo for replay; free immediately.
+            undo.deinit(self.allocator);
+
+            // Update active_tip as we go — keeps invariants consistent if a
+            // later block in the replay fails.
+            cm.active_tip = entry;
+        }
+    }
+
     fn handleDumpTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Parse parameters
         if (params != .array or params.array.items.len == 0) {
@@ -4403,26 +4457,207 @@ pub const RpcServer = struct {
         const need_rollback = target_resolved and target_height != tip_height;
 
         if (need_rollback) {
-            // clearbit's reorg primitives can't yet reach historical block
-            // bodies for the disconnect dance (see header docstring). Fail
-            // loudly rather than corrupt state or silently dump the wrong
-            // height.
-            //
-            // TODO(rollback-dance): once CF_BLOCKS is backfilled (or we add
-            //   a peer-fetch-by-hash path) and `disconnectBlockFromFile`
-            //   takes a hash instead of a `*const types.Block`, drive
-            //   ChainManager.invalidateBlock(target.next) followed by a
-            //   matching reconsiderBlock to walk the chainstate down and
-            //   back up. Mirror Core's TemporaryRollback / NetworkDisable
-            //   guard — suspend peer ingest for the duration so newly
-            //   arriving blocks don't get classified as invalid in the
-            //   transient state. Also flush before snapshotting so the
-            //   on-disk cursor matches the in-memory state.
-            return self.jsonRpcError(
-                RPC_MISC_ERROR,
-                "dumptxoutset rollback to a non-tip height is not yet supported on clearbit (TODO: reorg dance requires CF_BLOCKS backfill; see src/rpc.zig handleDumpTxOutSet docstring)",
-                id,
+            // The non-tip rollback path requires:
+            //   * a ChainManager (to walk active_tip → target via
+            //     BlockIndexEntry parent pointers)
+            //   * an undo manager configured on chain_state (rev*.dat)
+            //   * CF_BLOCKS bodies for every block on the disconnect path
+            //   * undo data for every block on the disconnect path
+            const cm = self.chain_manager orelse {
+                return self.jsonRpcError(
+                    RPC_MISC_ERROR,
+                    "dumptxoutset rollback requires a chain manager (none configured)",
+                    id,
+                );
+            };
+            if (self.chain_state.undo_manager == null) {
+                return self.jsonRpcError(
+                    RPC_MISC_ERROR,
+                    "dumptxoutset rollback requires undo data; this datadir has no undo manager configured",
+                    id,
+                );
+            }
+
+            // Resolve the target's BlockIndexEntry — must be on the active
+            // chain (an ancestor of, or equal to, active_tip).
+            const target_entry = cm.getBlock(&target_hash) orelse {
+                return self.jsonRpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "rollback target hash not found in block index",
+                    id,
+                );
+            };
+            const tip_entry = cm.active_tip orelse {
+                return self.jsonRpcError(
+                    RPC_MISC_ERROR,
+                    "rollback requested but chain manager has no active tip",
+                    id,
+                );
+            };
+            const target_is_ancestor = std.mem.eql(u8, &target_entry.hash, &tip_entry.hash) or
+                target_entry.isAncestorOf(tip_entry);
+            if (!target_is_ancestor) {
+                return self.jsonRpcError(
+                    RPC_INVALID_PARAMETER,
+                    "rollback target is not on the active chain",
+                    id,
+                );
+            }
+
+            // Capture the BlockIndexEntry chain for [target+1 .. tip] in
+            // descending order (tip first). We hold these pointers for the
+            // duration of the dance — block_index entries are not freed
+            // unless the chain manager is deinit'd, which we control.
+            var disconnect_chain = std.ArrayList(*validation.BlockIndexEntry).init(self.allocator);
+            defer disconnect_chain.deinit();
+            {
+                var cursor: ?*validation.BlockIndexEntry = tip_entry;
+                while (cursor) |c| {
+                    if (std.mem.eql(u8, &c.hash, &target_entry.hash)) break;
+                    disconnect_chain.append(c) catch return self.jsonRpcError(
+                        RPC_MISC_ERROR,
+                        "out of memory capturing disconnect chain",
+                        id,
+                    );
+                    cursor = c.parent;
+                }
+                if (cursor == null) {
+                    // Shouldn't happen — we already confirmed target is an
+                    // ancestor — but defend against parent-chain corruption.
+                    return self.jsonRpcError(
+                        RPC_MISC_ERROR,
+                        "internal: walk from tip to target hit null before target",
+                        id,
+                    );
+                }
+            }
+
+            // Pre-flight coverage check: every block on the disconnect
+            // path must have its body in CF_BLOCKS AND its undo data
+            // readable. Doing this BEFORE any disconnect avoids tearing
+            // down a chain we can't restore.
+            for (disconnect_chain.items) |entry| {
+                const body_opt = self.chain_state.getBlockBytes(&entry.hash) catch return self.jsonRpcError(
+                    RPC_MISC_ERROR,
+                    "rollback aborted: error reading CF_BLOCKS body",
+                    id,
+                );
+                if (body_opt) |b| self.allocator.free(b) else {
+                    const msg = std.fmt.allocPrint(self.allocator, "rollback aborted: CF_BLOCKS missing body for block at height {d} (clearbit only persists bodies post-cdd9e20, 2026-04-29)", .{entry.height}) catch "rollback aborted: CF_BLOCKS missing body";
+                    defer if (!std.mem.eql(u8, msg, "rollback aborted: CF_BLOCKS missing body")) self.allocator.free(msg);
+                    return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+                }
+                // Probe undo data — we don't need the bytes, just whether
+                // the file lookup succeeds.
+                if (self.chain_state.undo_manager) |um| {
+                    const undo_opt = um.readUndoData(entry.file_number, entry.file_offset, &entry.header.prev_block) catch {
+                        const msg = std.fmt.allocPrint(self.allocator, "rollback aborted: undo data unreadable for block at height {d} (likely IBD fast-path skip — see TODO in handleDumpTxOutSet)", .{entry.height}) catch "rollback aborted: undo data unreadable";
+                        defer if (!std.mem.eql(u8, msg, "rollback aborted: undo data unreadable")) self.allocator.free(msg);
+                        return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+                    };
+                    if (undo_opt) |u| {
+                        var ud = u;
+                        ud.deinit(self.allocator);
+                    } else {
+                        const msg = std.fmt.allocPrint(self.allocator, "rollback aborted: undo data missing for block at height {d} (IBD fast-path skips connectBlockWithUndo — see TODO in handleDumpTxOutSet)", .{entry.height}) catch "rollback aborted: undo data missing";
+                        defer if (!std.mem.eql(u8, msg, "rollback aborted: undo data missing")) self.allocator.free(msg);
+                        return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+                    }
+                }
+            }
+
+            // ----- Mutation phase: hold connect_mutex throughout -----
+            // peer.zig's drainBlockBuffer fast path acquires this mutex
+            // before each connectBlockFast, so no peer-delivered block can
+            // race the rollback. Equivalent to Core's NetworkDisable guard
+            // but free.
+            self.chain_state.connect_mutex.lock();
+            defer self.chain_state.connect_mutex.unlock();
+
+            // Phase A — Disconnect from tip down to target. We track the
+            // number of blocks actually disconnected so that on a partial
+            // failure we can attempt best-effort reconnect of just those.
+            var disconnected: usize = 0;
+            const disconnect_err: ?anyerror = blk: {
+                for (disconnect_chain.items) |entry| {
+                    const prev_hash = entry.header.prev_block;
+                    self.chain_state.disconnectBlockByHash(
+                        &entry.hash,
+                        entry.file_number,
+                        entry.file_offset,
+                        prev_hash,
+                    ) catch |e| break :blk e;
+                    cm.active_tip = entry.parent;
+                    disconnected += 1;
+                }
+                break :blk null;
+            };
+
+            if (disconnect_err) |de| {
+                // Partial-rewind: try to reconnect what we already disconnected
+                // so we don't leave the chainstate at a lower tip. Best-effort.
+                self.replayReconnect(disconnect_chain.items[0..disconnected], cm) catch {};
+                self.chain_state.flush() catch {};
+                const msg = std.fmt.allocPrint(self.allocator, "rollback failed during disconnect: {s} (best-effort reconnect attempted)", .{@errorName(de)}) catch "rollback failed during disconnect";
+                defer if (!std.mem.eql(u8, msg, "rollback failed during disconnect")) self.allocator.free(msg);
+                return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+            }
+
+            // Phase B — Dump snapshot at target.
+            const dump_result_or_err = storage.dumpTxOutSetWithResult(
+                self.chain_state,
+                self.network_params.magic,
+                path,
+                self.allocator,
             );
+
+            // Phase C — Reconnect from target+1 back up to tip, regardless
+            // of whether the dump succeeded. Always restore the chain.
+            const reconnect_err = self.replayReconnect(disconnect_chain.items, cm);
+
+            // Single flush at the end — peers were blocked on connect_mutex
+            // for the duration so a crash before this point would leave the
+            // on-disk tip stale relative to the original; the rollback was
+            // a transient in-memory mutation. After flush, on-disk state
+            // matches in-memory restored tip.
+            const flush_err = self.chain_state.flush();
+
+            if (reconnect_err) {} else |re| {
+                const msg = std.fmt.allocPrint(self.allocator, "rollback dumped snapshot but failed to reconnect chain: {s}; chainstate is at lower tip until restart", .{@errorName(re)}) catch "rollback dumped snapshot but failed to reconnect chain";
+                defer if (!std.mem.eql(u8, msg, "rollback dumped snapshot but failed to reconnect chain")) self.allocator.free(msg);
+                return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+            }
+            if (flush_err) {} else |fe| {
+                const msg = std.fmt.allocPrint(self.allocator, "rollback restored chain in memory but flush failed: {s}", .{@errorName(fe)}) catch "rollback restored chain in memory but flush failed";
+                defer if (!std.mem.eql(u8, msg, "rollback restored chain in memory but flush failed")) self.allocator.free(msg);
+                return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+            }
+
+            const dump_result = dump_result_or_err catch |err| {
+                const msg = switch (err) {
+                    error.FileNotFound, error.AccessDenied => "Cannot create snapshot file",
+                    storage.StorageError.SerializationFailed => "Serialization failed",
+                    storage.StorageError.OutOfMemory => "Out of memory",
+                    else => "Failed to dump UTXO set",
+                };
+                return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
+            };
+
+            // Build response.
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            const writer = buf.writer();
+            try writer.writeAll("{");
+            try writer.print("\"coins_written\":{d},", .{dump_result.coins_written});
+            try writer.writeAll("\"base_hash\":\"");
+            try writeHashHex(writer, &dump_result.base_hash);
+            try writer.writeAll("\",");
+            try writer.print("\"base_height\":{d},", .{dump_result.base_height});
+            try writer.writeAll("\"txoutset_hash\":\"");
+            try writeHashHex(writer, &dump_result.txoutset_hash);
+            try writer.writeAll("\"");
+            try writer.writeAll("}");
+            return self.jsonRpcResult(buf.items, id);
         }
 
         // Fast path: target == current tip. This is also the path Core
@@ -8202,26 +8437,24 @@ test "dumptxoutset rollback height equal to tip dumps current UTXO set" {
     try std.testing.expectEqualSlices(u8, &chain_state.best_hash, &meta.base_blockhash);
 }
 
-test "dumptxoutset rollback to non-tip height returns TODO error (does not corrupt state)" {
+test "dumptxoutset rollback to non-tip height fails coverage check (does not corrupt state)" {
     const allocator = std.testing.allocator;
 
+    // No DB, no undo manager — rollback must fail at the coverage check
+    // (cannot load block bodies from CF_BLOCKS) and leave the chainstate
+    // untouched. This also verifies the failure path before the
+    // mutation phase so we don't tear down state we can't restore.
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
     chain_state.best_hash = [_]u8{0x33} ** 32;
     chain_state.best_height = 800_000;
 
-    // Wire a ChainManager carrying a synthetic ancestor at height 700_000 so
-    // the hash-form rollback request resolves past the block-index lookup
-    // (the height index used by `getBlockHashByHeight` is RocksDB-backed and
-    // a no-op without a DB; the in-memory ChainManager.block_index is the
-    // hash-keyed substitute we use here).
-    //
-    // Entry is heap-allocated because ChainManager.deinit destroys every
-    // value pointer with its own allocator; a stack-allocated entry would
-    // free a bogus pointer.
-    var cm = validation.ChainManager.init(null, null, allocator);
+    var cm = validation.ChainManager.init(&chain_state, null, allocator);
     defer cm.deinit();
 
+    // Build a tiny synthetic chain: ancestor (700000) → tip (800000).
+    // Both heap-allocated because ChainManager.deinit destroys every
+    // value pointer with its own allocator.
     const ancestor: types.Hash256 = [_]u8{0x44} ** 32;
     const ancestor_entry = try allocator.create(validation.BlockIndexEntry);
     ancestor_entry.* = .{
@@ -8237,6 +8470,26 @@ test "dumptxoutset rollback to non-tip height returns TODO error (does not corru
     };
     try cm.block_index.put(ancestor_entry.hash, ancestor_entry);
 
+    const tip_hash: types.Hash256 = [_]u8{0x33} ** 32;
+    const tip_entry = try allocator.create(validation.BlockIndexEntry);
+    tip_entry.* = .{
+        .hash = tip_hash,
+        .header = blk: {
+            var h = std.mem.zeroes(types.BlockHeader);
+            h.prev_block = ancestor;
+            break :blk h;
+        },
+        .height = 800_000,
+        .status = .{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = ancestor_entry,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try cm.block_index.put(tip_entry.hash, tip_entry);
+    cm.active_tip = tip_entry;
+
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();
     var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
@@ -8247,16 +8500,21 @@ test "dumptxoutset rollback to non-tip height returns TODO error (does not corru
     server.setChainManager(&cm);
 
     // Hash-form rollback request resolves to the synthetic ancestor (height
-    // 700_000), which differs from the tip (800_000), so we must hit the
-    // TODO branch — not the height-index miss.
+    // 700_000), which differs from the tip (800_000), so we hit the
+    // rollback branch. With no undo manager configured we must fail at
+    // the early-out check — NOT silently dump the wrong height.
     const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"/tmp/clearbit-dumptxoutset-rollback-prev.dat\",\"\",{\"rollback\":\"4444444444444444444444444444444444444444444444444444444444444444\"}]}";
     const resp = try server.dispatch(req);
     defer allocator.free(resp);
 
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "not yet supported") != null);
+    // Either the no-undo-manager bail or the CF_BLOCKS coverage bail —
+    // both are acceptable failure modes for the no-undo-manager fixture.
+    const has_no_undo = std.mem.indexOf(u8, resp, "no undo manager") != null;
+    const has_cf_blocks_miss = std.mem.indexOf(u8, resp, "CF_BLOCKS missing body") != null;
+    try std.testing.expect(has_no_undo or has_cf_blocks_miss);
 
-    // Tip is unchanged.
+    // Tip is unchanged — pre-flight check fired before any state mutation.
     try std.testing.expectEqual(@as(u32, 800_000), chain_state.best_height);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x33} ** 32), &chain_state.best_hash);
 }
@@ -8302,4 +8560,197 @@ test "dumptxoutset rejects unknown snapshot type" {
     const resp = try server.dispatch(req);
     defer allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "Invalid snapshot type") != null);
+}
+
+// End-to-end rewind→dump→reconnect: this is the regtest exerciser for
+// the rollback dance. We seed a 3-block in-memory chain backed by a real
+// RocksDB datadir + undo manager, populate CF_BLOCKS via queueBlockWrite
+// so the coverage check passes, write undo data via the on-file path
+// so disconnectBlockByHash has data to reverse, then issue
+// `dumptxoutset rollback=1`. The test verifies:
+//   * dispatch returns no error and reports `base_height=1`
+//   * chain_state.best_height matches the pre-rollback tip after replay
+//   * UTXO count is back to its pre-rollback value
+//
+// This is the positive companion to the "non-tip rollback fails coverage"
+// negative test above. It's the only place in the test suite that exercises
+// disconnectBlockByHash + connectBlockLocked end-to-end, including the
+// connect_mutex hold and the post-replay flush.
+test "dumptxoutset rollback rewinds, dumps, and reconnects" {
+    const allocator = std.testing.allocator;
+
+    // Real datadir for CF_BLOCKS + rev*.dat persistence.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const datadir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(datadir);
+
+    var db = try storage.Database.open(datadir, 64, allocator);
+    defer db.close();
+
+    var chain_state = storage.ChainState.initWithUndo(&db, 64, datadir, allocator);
+    defer chain_state.deinit();
+
+    // Build and connect three sequential blocks via the connect-with-undo
+    // path so rev*.dat ends up populated. We use file_number=0 for all
+    // three; writeUndoData appends sequentially so file_offset advances.
+    var prev_hash: [32]u8 = [_]u8{0} ** 32;
+    var hashes: [3]types.Hash256 = undefined;
+    var file_offsets: [3]u64 = undefined;
+
+    // Compute the path of rev00000.dat the same way UndoFileManager does.
+    const undo_path = try std.fmt.allocPrint(allocator, "{s}/rev00000.dat", .{datadir});
+    defer allocator.free(undo_path);
+
+    // Each iteration is unrolled with a comptime marker so the block's
+    // inner slices live in the data segment, not on the stack of
+    // makeRollbackTestBlock.
+    inline for (.{ @as(u8, 1), @as(u8, 2), @as(u8, 3) }) |marker| {
+        const h: u32 = marker;
+        const block = makeRollbackTestBlock(prev_hash, marker);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = marker;
+        bh[1] = 0xAA;
+        hashes[h - 1] = bh;
+
+        // CF_BLOCKS body. queueBlockWrite takes ownership of the bytes.
+        var writer = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&writer, &block);
+        const body_const = try writer.toOwnedSlice();
+        const body: []u8 = @constCast(body_const);
+        try chain_state.queueBlockWrite(&bh, body, h);
+
+        // Capture the rev*.dat tail offset BEFORE writing undo for this
+        // block — that's the file_offset readUndoData will seek to.
+        const file_offset: u64 = blk: {
+            const f = std.fs.cwd().openFile(undo_path, .{}) catch break :blk 0;
+            defer f.close();
+            const stat = try f.stat();
+            break :blk stat.size;
+        };
+        file_offsets[h - 1] = file_offset;
+
+        // Connect with undo (writes rev00000.dat + appends to undo manager,
+        // and flushes CF_BLOCKS via the queued bytes from queueBlockWrite).
+        var undo = try chain_state.connectBlockWithUndo(&block, &bh, h, 0);
+        undo.deinit(allocator);
+        try chain_state.flush();
+
+        prev_hash = bh;
+    }
+
+    // Sanity: tip is at 3, all three CF_BLOCKS bodies present.
+    try std.testing.expectEqual(@as(u32, 3), chain_state.best_height);
+    for (hashes) |bh| {
+        const body = (try db.get(storage.CF_BLOCKS, &bh)) orelse return error.MissingCfBlocksBody;
+        defer allocator.free(body);
+    }
+
+    const utxo_count_pre = chain_state.utxo_set.total_utxos;
+
+    // Build the BlockIndexEntry chain in the ChainManager. The dance walks
+    // up via the parent pointers, so we must wire them.
+    var cm = validation.ChainManager.init(&chain_state, null, allocator);
+    defer cm.deinit();
+
+    var entries: [3]*validation.BlockIndexEntry = undefined;
+    for (hashes, 0..) |bh, idx| {
+        const e = try allocator.create(validation.BlockIndexEntry);
+        var prev: [32]u8 = [_]u8{0} ** 32;
+        if (idx > 0) prev = hashes[idx - 1];
+        e.* = .{
+            .hash = bh,
+            .header = blk: {
+                var hdr = std.mem.zeroes(types.BlockHeader);
+                hdr.prev_block = prev;
+                break :blk hdr;
+            },
+            .height = @intCast(idx + 1),
+            .status = .{},
+            .chain_work = [_]u8{0} ** 32,
+            .sequence_id = 0,
+            .parent = if (idx == 0) null else entries[idx - 1],
+            .file_number = 0,
+            .file_offset = file_offsets[idx],
+        };
+        try cm.block_index.put(e.hash, e);
+        entries[idx] = e;
+    }
+    cm.active_tip = entries[2];
+
+    // Wire up an RPC server pointing at this datadir.
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = makeDumpTestServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    const tmp_path = "/tmp/clearbit-dumptxoutset-rewind-end-to-end.dat";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Issue rollback=1 (target = block 1, two blocks above).
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"{s}\",\"\",{{\"rollback\":1}}]}}",
+        .{tmp_path},
+    );
+    defer allocator.free(req);
+
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    // Snapshot was written for height=1 and chainstate restored to height=3.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"base_height\":1") != null);
+    try std.testing.expectEqual(@as(u32, 3), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &hashes[2], &chain_state.best_hash);
+    try std.testing.expectEqual(utxo_count_pre, chain_state.utxo_set.total_utxos);
+
+    // Snapshot file is non-empty.
+    const stat = try std.fs.cwd().statFile(tmp_path);
+    try std.testing.expect(stat.size > 0);
+}
+
+// Build a test block whose coinbase produces a P2WPKH output with comptime-
+// constant scripts. The marker is comptime because Zig's anonymous-array
+// literals only get static (data-segment) lifetime when their elements are
+// comptime — passing a runtime u8 forces stack allocation and the returned
+// Block's inner slices dangle. Used by the rewind→dump→reconnect end-to-end
+// test, which calls this with comptime literals 1, 2, 3.
+fn makeRollbackTestBlock(prev_hash: [32]u8, comptime marker: u8) types.Block {
+    const cb_sig: *const [4]u8 = comptime &.{ 0x03, 0x01, 0x00, marker };
+    const script: *const [22]u8 = comptime &([_]u8{ 0x00, 0x14 } ++ [_]u8{marker} ** 20);
+    return types.Block{
+        .header = types.BlockHeader{
+            .version = 1,
+            .prev_block = prev_hash,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 0,
+            .bits = 0,
+            .nonce = 0,
+        },
+        .transactions = comptime &[_]types.Transaction{
+            .{
+                .version = 1,
+                .inputs = &[_]types.TxIn{
+                    .{
+                        .previous_output = types.OutPoint.COINBASE,
+                        .script_sig = cb_sig,
+                        .sequence = 0xFFFFFFFF,
+                        .witness = &[_][]const u8{},
+                    },
+                },
+                .outputs = &[_]types.TxOut{
+                    .{
+                        .value = 5000000000,
+                        .script_pubkey = script,
+                    },
+                },
+                .lock_time = 0,
+            },
+        },
+    };
 }
