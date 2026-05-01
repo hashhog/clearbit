@@ -18,6 +18,7 @@ comptime {
     _ = @import("ops.zig");
     _ = @import("debug_log.zig");
     _ = @import("zmq.zig");
+    _ = @import("muhash.zig");
 }
 
 // ============================================================
