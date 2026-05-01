@@ -3435,6 +3435,12 @@ pub fn findAssumeUtxoEntryByHeight(
 /// Snapshot validation error.
 pub const SnapshotError = error{
     /// Snapshot block hash not found in assumeUtxo params.
+    /// Mirrors Core's `"Assumeutxo height in snapshot metadata not recognized
+    /// (%d) - refusing to load snapshot"` rejection path
+    /// (validation.cpp:5775-5780). Callers that want to format the
+    /// Core-style diagnostic should pass `out_rejected_hash` to
+    /// `validateAndLoadSnapshot` so they can render the offending
+    /// `base_blockhash` in the JSON-RPC error string.
     UnknownSnapshot,
     /// UTXO set hash doesn't match expected value.
     HashMismatch,
@@ -3466,10 +3472,24 @@ pub const SnapshotLoadResult = struct {
 
 /// Validate and load a UTXO set snapshot file.
 /// This performs full validation against the assumeUtxo params:
-/// 1. Verifies the snapshot block hash is in assumeUtxo params
-/// 2. Loads all coins into a new chainstate
-/// 3. Computes the UTXO set hash and verifies it matches
-/// 4. Verifies the coin count matches
+/// 1. STRICT WHITELIST: rejects any snapshot whose `base_blockhash` is not
+///    one of the entries in `network_params.assume_utxo` (Core's
+///    `m_assumeutxo_data`). Core does this with a height lookup
+///    (validation.cpp:5775-5780) after first resolving the block index;
+///    clearbit's `AssumeUtxoData` pairs `(height, block_hash)` 1:1, so
+///    matching by hash is equivalent to matching by height.
+/// 2. Loads all coins into a new chainstate.
+/// 3. TODO(snapshot-strict-hash): MuHash3072 verification of the loaded
+///    UTXO set against `au_data.hash_serialized` (Core
+///    validation.cpp:5912-5914). Not implemented — clearbit has no
+///    `kernel/coinstats.cpp::ComputeUTXOStats` analog yet, so the
+///    integrity check is currently whitelist-only.
+///
+/// `out_rejected_hash` (optional): when non-null and the snapshot is
+/// rejected by the whitelist, the offending `metadata.base_blockhash`
+/// is copied here so callers can format Core's diagnostic
+/// `"Assumeutxo height in snapshot metadata not recognized (...) -
+/// refusing to load snapshot"`.
 ///
 /// Returns the loaded chainstate and validation result.
 /// Reference: Bitcoin Core validation.cpp ActivateSnapshot()
@@ -3477,6 +3497,7 @@ pub fn validateAndLoadSnapshot(
     path: []const u8,
     network_params: *const @import("consensus.zig").NetworkParams,
     allocator: std.mem.Allocator,
+    out_rejected_hash: ?*types.Hash256,
 ) SnapshotError!struct { chainstate: ChainState, result: SnapshotLoadResult } {
     // Load the snapshot
     const load_result = loadTxOutSet(path, network_params.magic, allocator) catch |err| {
@@ -3490,36 +3511,28 @@ pub fn validateAndLoadSnapshot(
     var chainstate = load_result.chainstate;
     const metadata = load_result.metadata;
 
-    // Find the assumeUtxo entry for this snapshot.
+    // STRICT WHITELIST: refuse any snapshot whose base_blockhash is not in
+    // m_assumeutxo_data. Mirrors Core validation.cpp:5775-5780 — Core
+    // resolves base_height via the block index then calls
+    // `AssumeutxoForHeight(base_height)`; clearbit's `AssumeUtxoData`
+    // pairs hash and height 1:1, so a hash miss is exactly a height miss.
     const assume_entry = findAssumeUtxoEntry(network_params, &metadata.base_blockhash) orelse {
+        if (out_rejected_hash) |dst| dst.* = metadata.base_blockhash;
         chainstate.deinit();
         return SnapshotError.UnknownSnapshot;
     };
 
-    // Verify the UTXO set hash against the hardcoded `hash_serialized`
-    // value from chainparams. This is the integrity check Core performs
-    // (Core does NOT cross-check `coins_count` against any chainparams
-    // value — `m_chain_tx_count` is the cumulative *transaction* count,
-    // not the unspent-coin count). See
-    // bitcoin-core/src/validation.cpp ChainstateManager::PopulateAndValidateSnapshot.
-    //
-    // NOTE: clearbit's `computeUtxoSetHash` is a placeholder that uses the
-    // wire-coin format directly; it does NOT match Core's MuHash3072. The
-    // assumeutxo `hash_serialized` values hardcoded in consensus.zig are
-    // therefore Core-format and will mismatch clearbit's local hash. A
-    // separate plan-W82-style task is needed to port Core's MuHash3072
-    // (kernel/coinstats.cpp) before this validation gate becomes useful.
-    // For now we still compute and compare so a future MuHash3072 swap is
-    // a single-call change.
-    const computed_hash = computeUtxoSetHash(&chainstate.utxo_set, allocator) catch {
-        chainstate.deinit();
-        return SnapshotError.OutOfMemory;
-    };
-
-    if (!std.mem.eql(u8, &computed_hash, &assume_entry.hash_serialized)) {
-        chainstate.deinit();
-        return SnapshotError.HashMismatch;
-    }
+    // TODO(snapshot-strict-hash): port Core's MuHash3072
+    // (kernel/coinstats.cpp::ComputeUTXOStats with
+    // CoinStatsHashType::HASH_SERIALIZED) and verify the loaded UTXO set
+    // against `assume_entry.hash_serialized`. Core asserts
+    //   AssumeutxoHash{stats->hashSerialized} == au_data.hash_serialized
+    // at validation.cpp:5912-5914 and rejects with
+    //   "Bad snapshot content hash: expected %s, got %s".
+    // Without MuHash3072, the prior `computeUtxoSetHash` placeholder
+    // would always mismatch the Core-format hardcoded
+    // `hash_serialized`, so the integrity gate is whitelist-only for
+    // now. Reinstate the hash comparison once MuHash3072 lands.
 
     // Set the height on the chainstate
     chainstate.best_height = assume_entry.height;
@@ -7085,6 +7098,78 @@ test "snapshot error variants are distinct" {
         for (errors[i + 1 ..]) |e2| {
             try std.testing.expect(e1 != e2);
         }
+    }
+}
+
+test "validateAndLoadSnapshot rejects regtest-genesis snapshot under mainnet params" {
+    // Core-strict whitelist gate: any snapshot whose `base_blockhash`
+    // (and therefore height) is not one of the entries in
+    // `m_assumeutxo_data` must be refused with the
+    // "Assumeutxo height in snapshot metadata not recognized ... -
+    // refusing to load snapshot" diagnostic. Mirrors
+    // bitcoin-core/src/validation.cpp:5775-5780.
+    //
+    // Constructed snapshot uses the regtest genesis hash as
+    // `base_blockhash` against MAINNET params. The regtest genesis hash
+    // (0f9188...) is not in mainnet's 4-entry whitelist
+    // (840k/880k/910k/935k), so the load must fail with
+    // SnapshotError.UnknownSnapshot and populate `out_rejected_hash`.
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    // Build a minimal Core-format snapshot file with a single coin and
+    // a `base_blockhash` of regtest genesis.
+    var chainstate = ChainState.init(null, 64, allocator);
+    defer chainstate.deinit();
+    chainstate.best_hash = consensus.REGTEST.genesis_hash;
+    chainstate.best_height = 0;
+
+    // P2PKH (compressible) so the dump path is exercised.
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xCC);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
+
+    const txid: types.Hash256 = [_]u8{0xAB} ** 32;
+    const op = types.OutPoint{ .hash = txid, .index = 0 };
+    try chainstate.utxo_set.add(
+        &op,
+        &types.TxOut{ .value = 5_000_000_000, .script_pubkey = &p2pkh },
+        0,
+        true,
+    );
+
+    const tmp_path = "/tmp/clearbit-snapshot-strict-reject.dat";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    // Dump under MAINNET magic so the wire-format network check passes
+    // and the rejection is unambiguously the assumeutxo-whitelist gate.
+    try dumpTxOutSet(&chainstate, consensus.MAINNET.magic, tmp_path, allocator);
+
+    var rejected_hash: types.Hash256 = undefined;
+    const result = validateAndLoadSnapshot(
+        tmp_path,
+        &consensus.MAINNET,
+        allocator,
+        &rejected_hash,
+    );
+    try std.testing.expectError(SnapshotError.UnknownSnapshot, result);
+
+    // The captured hash must be regtest genesis — same byte order as
+    // stored in `consensus.REGTEST.genesis_hash` (internal little-endian).
+    try std.testing.expectEqualSlices(
+        u8,
+        &consensus.REGTEST.genesis_hash,
+        &rejected_hash,
+    );
+
+    // Sanity: each of the 4 mainnet whitelist entries differs from
+    // regtest genesis (defensive — guards against a future copy-paste
+    // accident in chainparams).
+    for (consensus.MAINNET.assume_utxo) |e| {
+        try std.testing.expect(!std.mem.eql(u8, &e.block_hash, &consensus.REGTEST.genesis_hash));
     }
 }
 
