@@ -335,16 +335,22 @@ pub const NetworkParams = struct {
 
 /// assumeUTXO snapshot data: a trusted UTXO set snapshot at a specific height.
 /// Used for fast initial sync by loading a pre-validated UTXO set.
-/// Reference: Bitcoin Core chainparams.cpp m_assumeutxo_data
+/// Reference: Bitcoin Core kernel/chainparams.h AssumeutxoData (and
+/// kernel/chainparams.cpp m_assumeutxo_data for mainnet/testnet/signet values).
 pub const AssumeUtxoData = struct {
     /// Height of the snapshot block.
     height: u32,
     /// Hash of the snapshot block (the tip when snapshot was created).
     block_hash: types.Hash256,
-    /// SHA256d hash of the serialized UTXO set (for verification).
+    /// SHA256-style hash of the serialized UTXO set (for verification).
+    /// Mirrors Core's `AssumeutxoHash hash_serialized`.
     hash_serialized: types.Hash256,
-    /// Number of coins in the UTXO set (for progress display).
-    coins_count: u64,
+    /// Cumulative chain tx count at this height. Mirrors Core's
+    /// `m_chain_tx_count`; used to populate block-index tx counts after
+    /// snapshot load and for progress display. Note: this is the total
+    /// number of *transactions* up to this height, not the number of
+    /// unspent coins in the UTXO set.
+    chain_tx_count: u64,
 };
 
 /// Mainnet parameters.
@@ -391,14 +397,34 @@ pub const MAINNET = NetworkParams{
     // This is approximately the work at block ~870,000
     // Stored as little-endian 256-bit integer
     .min_chain_work = hexToHash("00000000000000000000000000000000000000009c68c8e19c0c2e0b00000000"),
-    // Mainnet assumeUTXO snapshots (from Bitcoin Core chainparams.cpp)
-    // Block 840000 is the most recent snapshot as of Bitcoin Core v28
+    // Mainnet assumeUTXO snapshots — verbatim from Bitcoin Core
+    // kernel/chainparams.cpp (CMainParams::CMainParams::m_assumeutxo_data).
+    // Bytes are in Core's display (big-endian) hex; hexToHash flips them
+    // to internal little-endian storage at compile time.
     .assume_utxo = &[_]AssumeUtxoData{
         .{
-            .height = 840000,
+            .height = 840_000,
             .block_hash = hexToHash("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
-            .hash_serialized = hexToHash("51c8d11d8b5c1de51543c5e49e7e3c9c3c3f7e1f8b5e8a5a5e8e5d5e5a5e5c5d"),
-            .coins_count = 176_000_000,
+            .hash_serialized = hexToHash("a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"),
+            .chain_tx_count = 991_032_194,
+        },
+        .{
+            .height = 880_000,
+            .block_hash = hexToHash("000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"),
+            .hash_serialized = hexToHash("dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"),
+            .chain_tx_count = 1_145_604_538,
+        },
+        .{
+            .height = 910_000,
+            .block_hash = hexToHash("0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"),
+            .hash_serialized = hexToHash("4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"),
+            .chain_tx_count = 1_226_586_151,
+        },
+        .{
+            .height = 935_000,
+            .block_hash = hexToHash("0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"),
+            .hash_serialized = hexToHash("e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"),
+            .chain_tx_count = 1_305_397_408,
         },
     },
     // Bitcoin Core v28.0 defaultAssumeValid for mainnet (height 938343).
