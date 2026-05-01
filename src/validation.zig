@@ -3522,6 +3522,15 @@ pub const ChainManager = struct {
     }
 
     /// Disconnect blocks from the active chain until we reach the target block.
+    ///
+    /// Uses `ChainState.disconnectBlockByHash` to load each block body from
+    /// CF_BLOCKS before disconnecting — replaces the pre-d35797b pattern of
+    /// passing `undefined` for the block, which was a Zig pre-init footgun
+    /// (disconnectBlockFromFile reads block.transactions immediately). If
+    /// CF_BLOCKS is missing the body for a block on the disconnect path we
+    /// surface DisconnectFailed rather than corrupt state. The caller is
+    /// expected to have run a CF_BLOCKS coverage check first
+    /// (see `handleDumpTxOutSet` in rpc.zig).
     fn disconnectToBlock(self: *ChainManager, target: ?*BlockIndexEntry) ChainError!void {
         const chain_state = self.chain_state orelse return;
 
@@ -3534,10 +3543,11 @@ pub const ChainManager = struct {
                 break;
             }
 
-            // Disconnect the tip using undo data
+            // Disconnect the tip: load block bytes from CF_BLOCKS, deserialize,
+            // and apply undo via the file-based undo manager.
             const prev_hash = tip.header.prev_block;
-            chain_state.disconnectBlockFromFile(
-                undefined, // We don't have the full block here
+            chain_state.disconnectBlockByHash(
+                &tip.hash,
                 tip.file_number,
                 tip.file_offset,
                 prev_hash,
