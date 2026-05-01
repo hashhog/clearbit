@@ -4113,11 +4113,15 @@ pub const RpcServer = struct {
         // recognized ... - refusing to load snapshot",
         // validation.cpp:5775-5780).
         var rejected_hash: types.Hash256 = undefined;
+        var actual_hash: types.Hash256 = undefined;
+        var expected_hash: types.Hash256 = undefined;
         var load_result = storage.validateAndLoadSnapshot(
             path,
             self.network_params,
             self.allocator,
             &rejected_hash,
+            &actual_hash,
+            &expected_hash,
         ) catch |err| {
             // Format Core-strict whitelist rejection with the
             // unrecognized base_blockhash. clearbit has no
@@ -4140,9 +4144,31 @@ pub const RpcServer = struct {
                 };
                 return self.jsonRpcError(RPC_MISC_ERROR, msg_buf.items, id);
             }
+            // STRICT CONTENT HASH: render Core's
+            // `"Bad snapshot content hash: expected X, got Y"` verbatim,
+            // using the MuHash3072 we computed and the value pinned in
+            // `assume_utxo`. Reference: validation.cpp:5912-5914.
+            if (err == storage.SnapshotError.HashMismatch) {
+                var msg_buf = std.ArrayList(u8).init(self.allocator);
+                defer msg_buf.deinit();
+                const msg_writer = msg_buf.writer();
+                msg_writer.writeAll("Bad snapshot content hash: expected ") catch {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash", id);
+                };
+                writeHashHex(msg_writer, &expected_hash) catch {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash", id);
+                };
+                msg_writer.writeAll(", got ") catch {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash", id);
+                };
+                writeHashHex(msg_writer, &actual_hash) catch {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash", id);
+                };
+                return self.jsonRpcError(RPC_MISC_ERROR, msg_buf.items, id);
+            }
             const msg = switch (err) {
                 storage.SnapshotError.UnknownSnapshot => unreachable, // handled above
-                storage.SnapshotError.HashMismatch => "UTXO set hash doesn't match expected value",
+                storage.SnapshotError.HashMismatch => unreachable, // handled above
                 storage.SnapshotError.CoinCountMismatch => "Coin count doesn't match expected value",
                 storage.SnapshotError.IoError => "Failed to read snapshot file",
                 storage.SnapshotError.CorruptData => "Snapshot file is corrupt",
@@ -4228,7 +4254,12 @@ pub const RpcServer = struct {
         try writer.writeAll("\"base_hash\":\"");
         try writeHashHex(writer, &dump_result.base_hash);
         try writer.writeAll("\",");
-        try writer.print("\"base_height\":{d}", .{dump_result.base_height});
+        try writer.print("\"base_height\":{d},", .{dump_result.base_height});
+        // MuHash3072 over the dumped UTXO set — Core reports this as
+        // `txoutset_hash` (rpc/blockchain.cpp dumptxoutset).
+        try writer.writeAll("\"txoutset_hash\":\"");
+        try writeHashHex(writer, &dump_result.txoutset_hash);
+        try writer.writeAll("\"");
         try writer.writeAll("}");
 
         return self.jsonRpcResult(buf.items, id);

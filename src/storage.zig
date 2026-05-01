@@ -3190,6 +3190,74 @@ pub const ChainStateManager = struct {
     }
 };
 
+/// Compute the Bitcoin Core `hash_serialized` value (MuHash3072) over a
+/// UTXO set. The algorithm:
+///
+///   * For every coin in the set, build a per-coin byte string equal to
+///     `TxOutSer(outpoint, coin)`:
+///       - 32-byte txid (internal byte order)
+///       - 4-byte LE vout
+///       - 4-byte LE `(height << 1) | coinbase` packed code
+///       - 8-byte LE i64 value
+///       - CompactSize-prefixed scriptPubKey
+///     This matches the unfortunately Core-specific format defined by
+///     `bitcoin-core/src/kernel/coinstats.cpp::TxOutSer`. It is *NOT*
+///     `compressor.writeCoin`'s VARINT-based wire layout — that one is
+///     used for snapshot serialization, not for the MuHash commitment.
+///   * Insert each per-coin byte string into a `MuHash3072` accumulator.
+///   * Finalize: returns SHA256(numerator_LE_384_bytes).
+///
+/// The result is byte-equal to the value Core stores in
+/// `AssumeUtxoData::hash_serialized` and to what
+/// `gettxoutsetinfo hash_serialized=muhash` reports.
+///
+/// Reference: `bitcoin-core/src/kernel/coinstats.cpp:46` (`TxOutSer`) +
+/// `bitcoin-core/src/crypto/muhash.{h,cpp}`.
+pub fn computeMuHashTxOutSet(utxo_set: *UtxoSet, allocator: std.mem.Allocator) !types.Hash256 {
+    const muhash = @import("muhash.zig");
+
+    var acc = muhash.MuHash3072.init();
+
+    var keys = std.ArrayList([36]u8).init(allocator);
+    defer keys.deinit();
+    var iter = utxo_set.cache.iterator();
+    while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
+
+    // MuHash is order-independent, so iteration order is irrelevant for
+    // correctness; we don't sort here.
+
+    var per_coin = serialize.Writer.init(allocator);
+    defer per_coin.deinit();
+
+    for (keys.items) |key| {
+        const entry = utxo_set.cache.get(key) orelse continue;
+
+        per_coin.list.clearRetainingCapacity();
+        const txid = key[0..32];
+        const vout = std.mem.readInt(u32, key[32..36], .little);
+
+        // COutPoint: txid || LE32 vout
+        try per_coin.writeBytes(txid);
+        try per_coin.writeInt(u32, vout);
+
+        // (height << 1) | coinbase, written as LE32 (Core does
+        // `static_cast<uint32_t>(...)` then default LE serialization).
+        const code: u32 = (@as(u32, entry.utxo.height) << 1) | (if (entry.utxo.is_coinbase) @as(u32, 1) else 0);
+        try per_coin.writeInt(u32, code);
+
+        // CTxOut: i64 value LE + CompactSize(script.len) + script bytes.
+        try per_coin.writeInt(i64, entry.utxo.value);
+        const script = try entry.utxo.reconstructScript(allocator);
+        defer allocator.free(script);
+        try per_coin.writeCompactSize(script.len);
+        try per_coin.writeBytes(script);
+
+        acc.insert(per_coin.getWritten());
+    }
+
+    return acc.finalize();
+}
+
 /// Compute a deterministic hash of a UTXO set for snapshot verification.
 ///
 /// **PLACEHOLDER**: Core's `kernel/coinstats.cpp` computes `hashSerialized`
@@ -3442,7 +3510,11 @@ pub const SnapshotError = error{
     /// `validateAndLoadSnapshot` so they can render the offending
     /// `base_blockhash` in the JSON-RPC error string.
     UnknownSnapshot,
-    /// UTXO set hash doesn't match expected value.
+    /// UTXO set MuHash3072 doesn't match `assume_utxo.hash_serialized`.
+    /// Mirrors Core `validation.cpp:5912-5914` rejection
+    /// `"Bad snapshot content hash: expected %s, got %s"`. Callers that
+    /// want to format the diagnostic should pass `out_actual_hash` /
+    /// `out_expected_hash` to `validateAndLoadSnapshot`.
     HashMismatch,
     /// Coin count doesn't match expected value.
     CoinCountMismatch,
@@ -3479,17 +3551,24 @@ pub const SnapshotLoadResult = struct {
 ///    clearbit's `AssumeUtxoData` pairs `(height, block_hash)` 1:1, so
 ///    matching by hash is equivalent to matching by height.
 /// 2. Loads all coins into a new chainstate.
-/// 3. TODO(snapshot-strict-hash): MuHash3072 verification of the loaded
-///    UTXO set against `au_data.hash_serialized` (Core
-///    validation.cpp:5912-5914). Not implemented — clearbit has no
-///    `kernel/coinstats.cpp::ComputeUTXOStats` analog yet, so the
-///    integrity check is currently whitelist-only.
+/// 3. STRICT CONTENT HASH: computes the MuHash3072 over the loaded UTXO
+///    set (`computeMuHashTxOutSet`) and compares it byte-for-byte against
+///    `au_data.hash_serialized`. Mirrors Core
+///    `validation.cpp:5912-5914`'s `AssumeutxoHash{stats->hashSerialized}
+///    == au_data.hash_serialized` rejection
+///    (`"Bad snapshot content hash: expected %s, got %s"`).
 ///
 /// `out_rejected_hash` (optional): when non-null and the snapshot is
 /// rejected by the whitelist, the offending `metadata.base_blockhash`
 /// is copied here so callers can format Core's diagnostic
 /// `"Assumeutxo height in snapshot metadata not recognized (...) -
 /// refusing to load snapshot"`.
+///
+/// `out_actual_hash` / `out_expected_hash` (optional): when non-null and
+/// the snapshot fails the content-hash check, these are populated with the
+/// MuHash3072 we computed and the value pinned in `assume_utxo`, so the
+/// caller can render Core's `"Bad snapshot content hash: expected X,
+/// got Y"` diagnostic verbatim.
 ///
 /// Returns the loaded chainstate and validation result.
 /// Reference: Bitcoin Core validation.cpp ActivateSnapshot()
@@ -3498,6 +3577,8 @@ pub fn validateAndLoadSnapshot(
     network_params: *const @import("consensus.zig").NetworkParams,
     allocator: std.mem.Allocator,
     out_rejected_hash: ?*types.Hash256,
+    out_actual_hash: ?*types.Hash256,
+    out_expected_hash: ?*types.Hash256,
 ) SnapshotError!struct { chainstate: ChainState, result: SnapshotLoadResult } {
     // Load the snapshot
     const load_result = loadTxOutSet(path, network_params.magic, allocator) catch |err| {
@@ -3522,17 +3603,21 @@ pub fn validateAndLoadSnapshot(
         return SnapshotError.UnknownSnapshot;
     };
 
-    // TODO(snapshot-strict-hash): port Core's MuHash3072
-    // (kernel/coinstats.cpp::ComputeUTXOStats with
-    // CoinStatsHashType::HASH_SERIALIZED) and verify the loaded UTXO set
-    // against `assume_entry.hash_serialized`. Core asserts
+    // STRICT CONTENT HASH: MuHash3072 over the loaded UTXO set must equal
+    // the value pinned in `assume_utxo.hash_serialized`. Mirrors Core
+    // validation.cpp:5912-5914:
     //   AssumeutxoHash{stats->hashSerialized} == au_data.hash_serialized
-    // at validation.cpp:5912-5914 and rejects with
-    //   "Bad snapshot content hash: expected %s, got %s".
-    // Without MuHash3072, the prior `computeUtxoSetHash` placeholder
-    // would always mismatch the Core-format hardcoded
-    // `hash_serialized`, so the integrity gate is whitelist-only for
-    // now. Reinstate the hash comparison once MuHash3072 lands.
+    // and the `"Bad snapshot content hash: expected X, got Y"` diagnostic.
+    const actual_hash = computeMuHashTxOutSet(&chainstate.utxo_set, allocator) catch {
+        chainstate.deinit();
+        return SnapshotError.OutOfMemory;
+    };
+    if (!std.mem.eql(u8, &actual_hash, &assume_entry.hash_serialized)) {
+        if (out_actual_hash) |dst| dst.* = actual_hash;
+        if (out_expected_hash) |dst| dst.* = assume_entry.hash_serialized;
+        chainstate.deinit();
+        return SnapshotError.HashMismatch;
+    }
 
     // Set the height on the chainstate
     chainstate.best_height = assume_entry.height;
@@ -3556,6 +3641,10 @@ pub const SnapshotDumpResult = struct {
     base_hash: types.Hash256,
     /// Height of the base block.
     base_height: u32,
+    /// MuHash3072 of the UTXO set (Core: `hashSerialized` /
+    /// `gettxoutsetinfo hash_serialized=muhash` / the JSON
+    /// `txoutset_hash` field of `dumptxoutset`).
+    txoutset_hash: types.Hash256,
 };
 
 /// Dump the UTXO set to a snapshot file and return the result.
@@ -3572,10 +3661,15 @@ pub fn dumpTxOutSetWithResult(
     // Dump to file
     try dumpTxOutSet(chainstate, network_magic, path, allocator);
 
+    // MuHash3072 over the same UTXO set we just dumped — Core also computes
+    // this and reports it as `txoutset_hash` in the dumptxoutset response.
+    const txoutset_hash = try computeMuHashTxOutSet(&chainstate.utxo_set, allocator);
+
     return SnapshotDumpResult{
         .coins_written = coins_count,
         .base_hash = chainstate.best_hash,
         .base_height = chainstate.best_height,
+        .txoutset_hash = txoutset_hash,
     };
 }
 
@@ -7154,6 +7248,8 @@ test "validateAndLoadSnapshot rejects regtest-genesis snapshot under mainnet par
         &consensus.MAINNET,
         allocator,
         &rejected_hash,
+        null,
+        null,
     );
     try std.testing.expectError(SnapshotError.UnknownSnapshot, result);
 
