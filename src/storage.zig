@@ -3579,6 +3579,30 @@ pub fn findAssumeUtxoEntryByHeight(
     return null;
 }
 
+/// Find the highest-height AssumeUtxo entry at or below `tip_height`.
+/// Returns the entry with the largest `height` such that `height <= tip_height`,
+/// or null if no entry qualifies (or the network has no entries).
+///
+/// Mirrors Bitcoin Core's `dumptxoutset rollback` (no target) selection in
+/// rpc/blockchain.cpp:3121-3125, which pulls the max value from
+/// `GetAvailableSnapshotHeights()`. clearbit only knows about hardcoded
+/// chainparams entries, so "available" here is "below current tip".
+pub fn findLatestAssumeUtxoEntryAtOrBelow(
+    network_params: *const @import("consensus.zig").NetworkParams,
+    tip_height: u32,
+) ?@import("consensus.zig").AssumeUtxoData {
+    var best: ?@import("consensus.zig").AssumeUtxoData = null;
+    for (network_params.assume_utxo) |entry| {
+        if (entry.height > tip_height) continue;
+        if (best) |b| {
+            if (entry.height > b.height) best = entry;
+        } else {
+            best = entry;
+        }
+    }
+    return best;
+}
+
 /// Snapshot validation error.
 pub const SnapshotError = error{
     /// Snapshot block hash not found in assumeUtxo params.
@@ -7176,6 +7200,42 @@ test "findAssumeUtxoEntryByHeight returns null for unknown height" {
     const consensus = @import("consensus.zig");
 
     const found = findAssumeUtxoEntryByHeight(&consensus.MAINNET, 999999);
+    try std.testing.expect(found == null);
+}
+
+test "findLatestAssumeUtxoEntryAtOrBelow picks the highest qualifying entry" {
+    const consensus = @import("consensus.zig");
+
+    // Tip below the lowest entry (840k) → no qualifying entry.
+    const before_first = findLatestAssumeUtxoEntryAtOrBelow(&consensus.MAINNET, 100_000);
+    try std.testing.expect(before_first == null);
+
+    // Exactly at the lowest entry's height → that entry.
+    const at_first = findLatestAssumeUtxoEntryAtOrBelow(&consensus.MAINNET, 840_000);
+    try std.testing.expect(at_first != null);
+    try std.testing.expectEqual(@as(u32, 840_000), at_first.?.height);
+
+    // Between 880k and 910k → 880k.
+    const between = findLatestAssumeUtxoEntryAtOrBelow(&consensus.MAINNET, 900_000);
+    try std.testing.expect(between != null);
+    try std.testing.expectEqual(@as(u32, 880_000), between.?.height);
+
+    // Way past the highest (935k) → 935k (the latest).
+    const after_last = findLatestAssumeUtxoEntryAtOrBelow(&consensus.MAINNET, 2_000_000);
+    try std.testing.expect(after_last != null);
+    try std.testing.expectEqual(@as(u32, 935_000), after_last.?.height);
+
+    // Tip exactly at the highest → highest.
+    const at_last = findLatestAssumeUtxoEntryAtOrBelow(&consensus.MAINNET, 935_000);
+    try std.testing.expect(at_last != null);
+    try std.testing.expectEqual(@as(u32, 935_000), at_last.?.height);
+}
+
+test "findLatestAssumeUtxoEntryAtOrBelow returns null on a network with no entries" {
+    const consensus = @import("consensus.zig");
+    // Testnet3/testnet4/signet/regtest all carry an empty assume_utxo array
+    // in `consensus.zig`. Use TESTNET3 as the canary.
+    const found = findLatestAssumeUtxoEntryAtOrBelow(&consensus.TESTNET3, 1_000_000);
     try std.testing.expect(found == null);
 }
 
