@@ -4146,8 +4146,10 @@ pub const RpcServer = struct {
             }
             // STRICT CONTENT HASH: render Core's
             // `"Bad snapshot content hash: expected X, got Y"` verbatim,
-            // using the MuHash3072 we computed and the value pinned in
-            // `assume_utxo`. Reference: validation.cpp:5912-5914.
+            // using the `hash_serialized` (SHA256d via HashWriter) we
+            // computed and the value pinned in `assume_utxo`. Reference:
+            // validation.cpp:5912-5914 (and kernel/coinstats.cpp:161
+            // which selects HASH_SERIALIZED, not MuHash, for this gate).
             if (err == storage.SnapshotError.HashMismatch) {
                 var msg_buf = std.ArrayList(u8).init(self.allocator);
                 defer msg_buf.deinit();
@@ -4255,8 +4257,10 @@ pub const RpcServer = struct {
         try writeHashHex(writer, &dump_result.base_hash);
         try writer.writeAll("\",");
         try writer.print("\"base_height\":{d},", .{dump_result.base_height});
-        // MuHash3072 over the dumped UTXO set — Core reports this as
-        // `txoutset_hash` (rpc/blockchain.cpp dumptxoutset).
+        // `hash_serialized` (SHA256d via HashWriter) of the UTXO set —
+        // Core reports this as `txoutset_hash` (rpc/blockchain.cpp:3345 +
+        // PrepareUTXOSnapshot:3259, which selects
+        // CoinStatsHashType::HASH_SERIALIZED — not MuHash3072).
         try writer.writeAll("\"txoutset_hash\":\"");
         try writeHashHex(writer, &dump_result.txoutset_hash);
         try writer.writeAll("\"");
