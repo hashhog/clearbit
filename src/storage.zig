@@ -2952,8 +2952,12 @@ pub const SnapshotMetadata = struct {
     pub const HEADER_SIZE: usize = 5 + 2 + 4 + 32 + 8; // 51 bytes
 };
 
-/// Serialized coin entry in a snapshot.
-/// Format: txid(32) + vout(4) + packed_height_coinbase(4) + value(8) + script_len(varint) + script
+/// In-memory representation of a single UTXO entry in a Core-compatible
+/// snapshot. The wire format is **not** "txid+vout+coin" per entry — Core
+/// groups coins by txid (see `WriteUTXOSnapshot` in
+/// `bitcoin-core/src/rpc/blockchain.cpp`). Use `writeCoinGrouped` /
+/// `readCoinGrouped` below for I/O; `SnapshotCoin` is the post-decode
+/// shape passed to chainstate-population code.
 pub const SnapshotCoin = struct {
     outpoint: types.OutPoint,
     height: u32,
@@ -2961,64 +2965,52 @@ pub const SnapshotCoin = struct {
     value: i64,
     script_pubkey: []const u8,
 
-    /// Serialize a coin to snapshot format.
-    /// Reference: Bitcoin Core kernel/coinstats.cpp TxOutSer
-    pub fn toBytes(self: *const SnapshotCoin, allocator: std.mem.Allocator) StorageError![]const u8 {
-        var writer = serialize.Writer.init(allocator);
-        errdefer writer.deinit();
-
-        // Write outpoint: txid + index
-        writer.writeBytes(&self.outpoint.hash) catch return StorageError.SerializationFailed;
-        writer.writeInt(u32, self.outpoint.index) catch return StorageError.SerializationFailed;
-
-        // Pack height and coinbase: height << 1 | is_coinbase
-        const packed_code: u32 = (self.height << 1) | @as(u32, if (self.is_coinbase) 1 else 0);
-        writer.writeInt(u32, packed_code) catch return StorageError.SerializationFailed;
-
-        // Write value
-        writer.writeInt(i64, self.value) catch return StorageError.SerializationFailed;
-
-        // Write script with length prefix
-        writer.writeCompactSize(self.script_pubkey.len) catch return StorageError.SerializationFailed;
-        writer.writeBytes(self.script_pubkey) catch return StorageError.SerializationFailed;
-
-        return writer.toOwnedSlice() catch return StorageError.OutOfMemory;
-    }
-
-    /// Deserialize a coin from snapshot format.
-    pub fn fromReader(reader: *serialize.Reader, allocator: std.mem.Allocator) StorageError!SnapshotCoin {
-        // Read outpoint
-        const txid_bytes = reader.readBytes(32) catch return StorageError.CorruptData;
-        var txid: types.Hash256 = undefined;
-        @memcpy(&txid, txid_bytes);
-        const vout = reader.readInt(u32) catch return StorageError.CorruptData;
-
-        // Unpack height and coinbase
-        const packed_code = reader.readInt(u32) catch return StorageError.CorruptData;
-        const height = packed_code >> 1;
-        const is_coinbase = (packed_code & 1) != 0;
-
-        // Read value
-        const value = reader.readInt(i64) catch return StorageError.CorruptData;
-
-        // Read script
-        const script_len = reader.readCompactSize() catch return StorageError.CorruptData;
-        const script_bytes = reader.readBytes(@intCast(script_len)) catch return StorageError.CorruptData;
-        const script_pubkey = allocator.dupe(u8, script_bytes) catch return StorageError.OutOfMemory;
-
-        return SnapshotCoin{
-            .outpoint = types.OutPoint{ .hash = txid, .index = vout },
-            .height = height,
-            .is_coinbase = is_coinbase,
-            .value = value,
-            .script_pubkey = script_pubkey,
-        };
-    }
-
     pub fn deinit(self: *SnapshotCoin, allocator: std.mem.Allocator) void {
         allocator.free(self.script_pubkey);
     }
 };
+
+/// Serialize a single (vout, coin) pair using Core's exact wire format.
+/// The caller is responsible for emitting the leading txid + coins_per_txid
+/// header; this helper handles only the per-coin payload.
+///
+/// Wire format (per coin, after the per-txid header):
+///   * `compactsize(vout)`
+///   * `VARINT(code)` where `code = (height << 1) | coinbase`
+///   * `VARINT(CompressAmount(value))`
+///   * `ScriptCompression(scriptPubKey)` — see `compressor.zig`.
+///
+/// Reference: bitcoin-core/src/rpc/blockchain.cpp `WriteUTXOSnapshot`.
+pub fn writeSnapshotCoinPayload(
+    writer: *serialize.Writer,
+    vout: u32,
+    coin: *const SnapshotCoin,
+) !void {
+    const compressor = @import("compressor.zig");
+    try writer.writeCompactSize(@as(u64, vout));
+    try compressor.writeCoin(writer, coin.height, coin.is_coinbase, coin.value, coin.script_pubkey);
+}
+
+/// Read the per-coin payload (vout + Coin) for the current txid group.
+/// Caller owns `script_pubkey`.
+pub fn readSnapshotCoinPayload(
+    reader: *serialize.Reader,
+    txid: *const types.Hash256,
+    allocator: std.mem.Allocator,
+) !SnapshotCoin {
+    const compressor = @import("compressor.zig");
+    const vout_u64 = try reader.readCompactSize();
+    if (vout_u64 >= std.math.maxInt(u32)) return StorageError.CorruptData;
+    const vout: u32 = @intCast(vout_u64);
+    const c = try compressor.readCoin(reader, allocator);
+    return SnapshotCoin{
+        .outpoint = types.OutPoint{ .hash = txid.*, .index = vout },
+        .height = c.height,
+        .is_coinbase = c.is_coinbase,
+        .value = c.value,
+        .script_pubkey = c.script_pubkey,
+    };
+}
 
 /// Role of a chainstate in dual-chainstate mode.
 /// Reference: Bitcoin Core kernel/types.h ChainstateRole
@@ -3198,78 +3190,74 @@ pub const ChainStateManager = struct {
     }
 };
 
-/// Compute the hash of a UTXO set for snapshot verification.
-/// This is SHA256d of all serialized coins in deterministic order.
-/// Reference: Bitcoin Core kernel/coinstats.cpp ComputeUTXOStats
+/// Compute a deterministic hash of a UTXO set for snapshot verification.
+///
+/// **PLACEHOLDER**: Core's `kernel/coinstats.cpp` computes `hashSerialized`
+/// as MuHash3072 (a multiplicative hash over Coin serializations). This
+/// function instead returns SHA256d over a concatenated stream of
+/// `outpoint || compressor.writeCoin(...)` payloads, in lexicographic
+/// outpoint order. It is therefore **NOT** byte-equal to Core's
+/// `hashSerialized` and the assumeutxo `hash_serialized` validation gate
+/// will fail until MuHash3072 is ported. This is tracked as a TODO at the
+/// `validateAndLoadSnapshot` call site.
 pub fn computeUtxoSetHash(utxo_set: *UtxoSet, allocator: std.mem.Allocator) !types.Hash256 {
     const crypto = @import("crypto.zig");
+    const compressor = @import("compressor.zig");
 
-    // For now, we iterate the cache (in-memory UTXOs)
-    // A full implementation would iterate the database in sorted order
-
-    // Collect all keys for sorting
     var keys = std.ArrayList([36]u8).init(allocator);
     defer keys.deinit();
-
     var iter = utxo_set.cache.iterator();
-    while (iter.next()) |entry| {
-        try keys.append(entry.key_ptr.*);
-    }
-
-    // Sort keys lexicographically
+    while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
     std.mem.sort([36]u8, keys.items, {}, struct {
         fn lessThan(_: void, a: [36]u8, b: [36]u8) bool {
             return std.mem.order(u8, &a, &b) == .lt;
         }
     }.lessThan);
 
-    // Hash all coins in sorted order
-    var hasher_data = std.ArrayList(u8).init(allocator);
-    defer hasher_data.deinit();
+    var hasher_buf = serialize.Writer.init(allocator);
+    defer hasher_buf.deinit();
 
     for (keys.items) |key| {
         if (utxo_set.cache.get(key)) |entry| {
-            // Serialize this coin
-            const coin = SnapshotCoin{
-                .outpoint = types.OutPoint{
-                    .hash = key[0..32].*,
-                    .index = std.mem.readInt(u32, key[32..36], .little),
-                },
-                .height = entry.utxo.height,
-                .is_coinbase = entry.utxo.is_coinbase,
-                .value = entry.utxo.value,
-                .script_pubkey = entry.utxo.hash_or_script,
-            };
-
-            const coin_bytes = try coin.toBytes(allocator);
-            defer allocator.free(coin_bytes);
-            try hasher_data.appendSlice(coin_bytes);
+            try hasher_buf.writeBytes(&key);
+            const script = try entry.utxo.reconstructScript(allocator);
+            defer allocator.free(script);
+            try compressor.writeCoin(&hasher_buf, entry.utxo.height, entry.utxo.is_coinbase, entry.utxo.value, script);
         }
     }
 
-    // Compute SHA256d
-    return crypto.hash256(hasher_data.items);
+    return crypto.hash256(hasher_buf.getWritten());
 }
 
-/// Write a UTXO set snapshot to a file.
-/// Format: metadata header + serialized coins
+/// Write a UTXO set snapshot in Bitcoin Core's exact wire format.
+///
+/// Layout:
+///   * 51-byte SnapshotMetadata header (`SnapshotMetadata.toBytes`).
+///   * For each unique txid, in lexicographic key order:
+///       * txid (32 bytes, internal byte order — `key[0..32]`)
+///       * compactsize(N) where N is the number of unspent outputs of this tx
+///       * For each of the N coins, in ascending vout order:
+///           * compactsize(vout)
+///           * VARINT(code = (height << 1) | coinbase)
+///           * VARINT(CompressAmount(value))
+///           * ScriptCompression(scriptPubKey)
+///
+/// Reference: bitcoin-core/src/rpc/blockchain.cpp `WriteUTXOSnapshot`.
 pub fn dumpTxOutSet(
     chainstate: *ChainState,
     network_magic: u32,
     path: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    // Create the file
     const file = try std.fs.cwd().createFile(path, .{});
     defer file.close();
 
     var buffered = std.io.bufferedWriter(file.writer());
-    const writer = buffered.writer();
+    const out = buffered.writer();
 
-    // Count coins
     const coins_count = chainstate.utxo_set.cache.count();
 
-    // Write metadata header
+    // 1. Metadata header.
     const metadata = SnapshotMetadata{
         .network_magic = network_magic,
         .base_blockhash = chainstate.best_hash,
@@ -3277,52 +3265,90 @@ pub fn dumpTxOutSet(
     };
     const header = try metadata.toBytes(allocator);
     defer allocator.free(header);
-    try writer.writeAll(header);
+    try out.writeAll(header);
 
-    // Collect and sort keys
+    // 2. Collect and sort UTXO keys lexicographically. This is what Core's
+    //    LevelDB cursor iteration produces, and it has the property that
+    //    coins for the same txid appear contiguously (since the key is
+    //    `txid || vout_le` and the txid prefix dominates the comparison).
     var keys = std.ArrayList([36]u8).init(allocator);
     defer keys.deinit();
-
     var iter = chainstate.utxo_set.cache.iterator();
-    while (iter.next()) |entry| {
-        try keys.append(entry.key_ptr.*);
-    }
-
+    while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
     std.mem.sort([36]u8, keys.items, {}, struct {
         fn lessThan(_: void, a: [36]u8, b: [36]u8) bool {
             return std.mem.order(u8, &a, &b) == .lt;
         }
     }.lessThan);
 
-    // Write each coin
+    // 3. Walk the sorted key list, grouping by leading 32-byte txid.
+    //    For each group, buffer the per-coin payloads, then emit
+    //    {txid, compactsize(N), payloads...} as a single contiguous chunk.
+    var group_writer = serialize.Writer.init(allocator);
+    defer group_writer.deinit();
+    var coins_in_group: u64 = 0;
+    var current_txid: types.Hash256 = undefined;
+    var have_group: bool = false;
+
+    var written_coins: u64 = 0;
+
     for (keys.items) |key| {
-        if (chainstate.utxo_set.cache.get(key)) |entry| {
-            // Reconstruct full script for serialization
-            const script = try entry.utxo.reconstructScript(allocator);
-            defer allocator.free(script);
+        const txid_slice = key[0..32];
+        const vout = std.mem.readInt(u32, key[32..36], .little);
 
-            const coin = SnapshotCoin{
-                .outpoint = types.OutPoint{
-                    .hash = key[0..32].*,
-                    .index = std.mem.readInt(u32, key[32..36], .little),
-                },
-                .height = entry.utxo.height,
-                .is_coinbase = entry.utxo.is_coinbase,
-                .value = entry.utxo.value,
-                .script_pubkey = script,
-            };
-
-            const coin_bytes = try coin.toBytes(allocator);
-            defer allocator.free(coin_bytes);
-            try writer.writeAll(coin_bytes);
+        if (!have_group or !std.mem.eql(u8, &current_txid, txid_slice)) {
+            if (have_group) {
+                // Flush previous group.
+                try out.writeAll(&current_txid);
+                var hdr_buf = serialize.Writer.init(allocator);
+                defer hdr_buf.deinit();
+                try hdr_buf.writeCompactSize(coins_in_group);
+                try out.writeAll(hdr_buf.getWritten());
+                try out.writeAll(group_writer.getWritten());
+                group_writer.list.clearRetainingCapacity();
+                coins_in_group = 0;
+            }
+            current_txid = txid_slice.*;
+            have_group = true;
         }
+
+        const entry = chainstate.utxo_set.cache.get(key) orelse continue;
+        const script = try entry.utxo.reconstructScript(allocator);
+        defer allocator.free(script);
+
+        const coin = SnapshotCoin{
+            .outpoint = types.OutPoint{ .hash = current_txid, .index = vout },
+            .height = entry.utxo.height,
+            .is_coinbase = entry.utxo.is_coinbase,
+            .value = entry.utxo.value,
+            .script_pubkey = script,
+        };
+        try writeSnapshotCoinPayload(&group_writer, vout, &coin);
+        coins_in_group += 1;
+        written_coins += 1;
     }
 
+    if (have_group and coins_in_group > 0) {
+        try out.writeAll(&current_txid);
+        var hdr_buf = serialize.Writer.init(allocator);
+        defer hdr_buf.deinit();
+        try hdr_buf.writeCompactSize(coins_in_group);
+        try out.writeAll(hdr_buf.getWritten());
+        try out.writeAll(group_writer.getWritten());
+    }
+
+    std.debug.assert(written_coins == coins_count);
     try buffered.flush();
 }
 
-/// Load a UTXO set snapshot from a file.
-/// Returns a new ChainState populated with the snapshot data.
+/// Load a UTXO set snapshot in Core's wire format. The reader expects the
+/// same layout produced by `dumpTxOutSet` / Core's `WriteUTXOSnapshot`.
+///
+/// Returns a chainstate populated with the snapshot UTXOs and the parsed
+/// metadata. The caller owns the chainstate.
+///
+/// Reference: bitcoin-core/src/validation.cpp `PopulateAndValidateSnapshot`
+/// (the reading loop, lines 5797-5862 in the v28 tree).
 pub fn loadTxOutSet(
     path: []const u8,
     expected_magic: u32,
@@ -3331,73 +3357,48 @@ pub fn loadTxOutSet(
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
-    var buffered = std.io.bufferedReader(file.reader());
-    const reader = buffered.reader();
+    // Slurp the entire file into memory and parse with the in-memory
+    // serialize.Reader. UTXO snapshots at mainnet height 935k are ~10 GB
+    // and consumers should expect that — Core does this in a streaming
+    // fashion via AutoFile, but the variable-length coin format makes a
+    // streaming Reader awkward in Zig (we'd need a buffered byte-stream
+    // wrapper). For testing-sized snapshots this is fine; the
+    // `--load-snapshot` CLI path uses `importLoadSnapshotFile` below
+    // which does *not* slurp.
+    const stat = try file.stat();
+    const buf = try allocator.alloc(u8, @intCast(stat.size));
+    defer allocator.free(buf);
+    try file.reader().readNoEof(buf);
 
-    // Read metadata header
-    var header_buf: [SnapshotMetadata.HEADER_SIZE]u8 = undefined;
-    try reader.readNoEof(&header_buf);
-    const metadata = try SnapshotMetadata.fromBytes(&header_buf, expected_magic);
+    if (buf.len < SnapshotMetadata.HEADER_SIZE) return StorageError.CorruptData;
+    const metadata = try SnapshotMetadata.fromBytes(buf[0..SnapshotMetadata.HEADER_SIZE], expected_magic);
 
-    // Create a new in-memory chainstate for the snapshot
+    var reader = serialize.Reader{ .data = buf[SnapshotMetadata.HEADER_SIZE..] };
+
     var chainstate = ChainState.init(null, 64, allocator);
     chainstate.best_hash = metadata.base_blockhash;
 
-    // Read all coins
-    var coins_loaded: u64 = 0;
-    while (coins_loaded < metadata.coins_count) {
-        // Read one coin at a time
-        // We need to read variable-length data, so we'll read field by field
-        var coin_data = std.ArrayList(u8).init(allocator);
-        defer coin_data.deinit();
+    var coins_left = metadata.coins_count;
+    while (coins_left > 0) {
+        const txid_bytes = reader.readBytes(32) catch return StorageError.CorruptData;
+        var txid: types.Hash256 = undefined;
+        @memcpy(&txid, txid_bytes);
 
-        // Read fixed part: txid(32) + vout(4) + packed(4) + value(8) = 48 bytes
-        var fixed: [48]u8 = undefined;
-        reader.readNoEof(&fixed) catch break;
-        try coin_data.appendSlice(&fixed);
+        const coins_per_txid_u64 = reader.readCompactSize() catch return StorageError.CorruptData;
+        if (coins_per_txid_u64 > coins_left) return StorageError.CorruptData;
+        const coins_per_txid: usize = @intCast(coins_per_txid_u64);
 
-        // Read script length (varint)
-        const first_byte = reader.readByte() catch break;
-        try coin_data.append(first_byte);
-
-        const script_len: usize = if (first_byte < 0xFD) blk: {
-            break :blk first_byte;
-        } else if (first_byte == 0xFD) blk: {
-            var len_bytes: [2]u8 = undefined;
-            reader.readNoEof(&len_bytes) catch break;
-            try coin_data.appendSlice(&len_bytes);
-            break :blk std.mem.readInt(u16, &len_bytes, .little);
-        } else if (first_byte == 0xFE) blk: {
-            var len_bytes: [4]u8 = undefined;
-            reader.readNoEof(&len_bytes) catch break;
-            try coin_data.appendSlice(&len_bytes);
-            break :blk std.mem.readInt(u32, &len_bytes, .little);
-        } else blk: {
-            var len_bytes: [8]u8 = undefined;
-            reader.readNoEof(&len_bytes) catch break;
-            try coin_data.appendSlice(&len_bytes);
-            break :blk @intCast(std.mem.readInt(u64, &len_bytes, .little));
-        };
-
-        // Read script bytes
-        const script_bytes = try allocator.alloc(u8, script_len);
-        defer allocator.free(script_bytes);
-        reader.readNoEof(script_bytes) catch break;
-        try coin_data.appendSlice(script_bytes);
-
-        // Parse the coin
-        var coin_reader = serialize.Reader{ .data = coin_data.items };
-        var coin = try SnapshotCoin.fromReader(&coin_reader, allocator);
-        defer coin.deinit(allocator);
-
-        // Add to chainstate
-        const txout = types.TxOut{
-            .value = coin.value,
-            .script_pubkey = coin.script_pubkey,
-        };
-        try chainstate.utxo_set.add(&coin.outpoint, &txout, coin.height, coin.is_coinbase);
-
-        coins_loaded += 1;
+        var i: usize = 0;
+        while (i < coins_per_txid) : (i += 1) {
+            var coin = readSnapshotCoinPayload(&reader, &txid, allocator) catch return StorageError.CorruptData;
+            defer coin.deinit(allocator);
+            const txout = types.TxOut{
+                .value = coin.value,
+                .script_pubkey = coin.script_pubkey,
+            };
+            try chainstate.utxo_set.add(&coin.outpoint, &txout, coin.height, coin.is_coinbase);
+            coins_left -= 1;
+        }
     }
 
     return .{ .chainstate = chainstate, .metadata = metadata };
@@ -3489,25 +3490,32 @@ pub fn validateAndLoadSnapshot(
     var chainstate = load_result.chainstate;
     const metadata = load_result.metadata;
 
-    // Find the assumeUtxo entry for this snapshot
+    // Find the assumeUtxo entry for this snapshot.
     const assume_entry = findAssumeUtxoEntry(network_params, &metadata.base_blockhash) orelse {
         chainstate.deinit();
         return SnapshotError.UnknownSnapshot;
     };
 
-    // Verify coin count
-    if (metadata.coins_count != assume_entry.coins_count) {
-        chainstate.deinit();
-        return SnapshotError.CoinCountMismatch;
-    }
-
-    // Compute the UTXO set hash
+    // Verify the UTXO set hash against the hardcoded `hash_serialized`
+    // value from chainparams. This is the integrity check Core performs
+    // (Core does NOT cross-check `coins_count` against any chainparams
+    // value — `m_chain_tx_count` is the cumulative *transaction* count,
+    // not the unspent-coin count). See
+    // bitcoin-core/src/validation.cpp ChainstateManager::PopulateAndValidateSnapshot.
+    //
+    // NOTE: clearbit's `computeUtxoSetHash` is a placeholder that uses the
+    // wire-coin format directly; it does NOT match Core's MuHash3072. The
+    // assumeutxo `hash_serialized` values hardcoded in consensus.zig are
+    // therefore Core-format and will mismatch clearbit's local hash. A
+    // separate plan-W82-style task is needed to port Core's MuHash3072
+    // (kernel/coinstats.cpp) before this validation gate becomes useful.
+    // For now we still compute and compare so a future MuHash3072 swap is
+    // a single-call change.
     const computed_hash = computeUtxoSetHash(&chainstate.utxo_set, allocator) catch {
         chainstate.deinit();
         return SnapshotError.OutOfMemory;
     };
 
-    // Verify hash matches
     if (!std.mem.eql(u8, &computed_hash, &assume_entry.hash_serialized)) {
         chainstate.deinit();
         return SnapshotError.HashMismatch;
@@ -6720,27 +6728,25 @@ test "snapshot metadata wrong network" {
     try std.testing.expectError(StorageError.CorruptData, result);
 }
 
-test "snapshot coin serialization" {
+test "snapshot coin payload — Core wire format round-trip" {
     const allocator = std.testing.allocator;
 
     const script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAA} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const txid: types.Hash256 = [_]u8{0x11} ** 32;
     const coin = SnapshotCoin{
-        .outpoint = types.OutPoint{
-            .hash = [_]u8{0x11} ** 32,
-            .index = 5,
-        },
+        .outpoint = types.OutPoint{ .hash = txid, .index = 5 },
         .height = 500000,
         .is_coinbase = true,
         .value = 5000000000,
         .script_pubkey = &script,
     };
 
-    const serialized = try coin.toBytes(allocator);
-    defer allocator.free(serialized);
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try writeSnapshotCoinPayload(&w, coin.outpoint.index, &coin);
 
-    // Deserialize
-    var reader = serialize.Reader{ .data = serialized };
-    var deserialized = try SnapshotCoin.fromReader(&reader, allocator);
+    var reader = serialize.Reader{ .data = w.getWritten() };
+    var deserialized = try readSnapshotCoinPayload(&reader, &txid, allocator);
     defer deserialized.deinit(allocator);
 
     try std.testing.expectEqualSlices(u8, &coin.outpoint.hash, &deserialized.outpoint.hash);
@@ -6749,49 +6755,48 @@ test "snapshot coin serialization" {
     try std.testing.expectEqual(coin.is_coinbase, deserialized.is_coinbase);
     try std.testing.expectEqual(coin.value, deserialized.value);
     try std.testing.expectEqualSlices(u8, coin.script_pubkey, deserialized.script_pubkey);
+    try std.testing.expect(reader.isAtEnd());
 }
 
-test "snapshot coin height and coinbase packing" {
+test "snapshot coin payload — height and coinbase packing" {
     const allocator = std.testing.allocator;
 
-    const script = [_]u8{0x51}; // OP_TRUE
+    const script = [_]u8{0x51}; // OP_TRUE — uncompressible, hits the raw branch.
+    const txid: types.Hash256 = [_]u8{0x22} ** 32;
 
-    // Test non-coinbase
+    // Non-coinbase, max height.
     const non_cb = SnapshotCoin{
-        .outpoint = types.OutPoint{ .hash = [_]u8{0x22} ** 32, .index = 0 },
-        .height = 0x7FFFFFFF, // Max height
+        .outpoint = types.OutPoint{ .hash = txid, .index = 0 },
+        .height = 0x7FFFFFFF,
         .is_coinbase = false,
         .value = 1000,
         .script_pubkey = &script,
     };
-
-    const serialized_non_cb = try non_cb.toBytes(allocator);
-    defer allocator.free(serialized_non_cb);
-
-    var reader1 = serialize.Reader{ .data = serialized_non_cb };
-    var decoded_non_cb = try SnapshotCoin.fromReader(&reader1, allocator);
+    var w1 = serialize.Writer.init(allocator);
+    defer w1.deinit();
+    try writeSnapshotCoinPayload(&w1, non_cb.outpoint.index, &non_cb);
+    var r1 = serialize.Reader{ .data = w1.getWritten() };
+    var decoded_non_cb = try readSnapshotCoinPayload(&r1, &txid, allocator);
     defer decoded_non_cb.deinit(allocator);
-
     try std.testing.expectEqual(@as(u32, 0x7FFFFFFF), decoded_non_cb.height);
     try std.testing.expect(!decoded_non_cb.is_coinbase);
 
-    // Test coinbase
+    // Coinbase, regular height.
+    const txid2: types.Hash256 = [_]u8{0x33} ** 32;
     const cb = SnapshotCoin{
-        .outpoint = types.OutPoint{ .hash = [_]u8{0x33} ** 32, .index = 0 },
-        .height = 100000,
+        .outpoint = types.OutPoint{ .hash = txid2, .index = 0 },
+        .height = 100_000,
         .is_coinbase = true,
-        .value = 5000000000,
+        .value = 5_000_000_000,
         .script_pubkey = &script,
     };
-
-    const serialized_cb = try cb.toBytes(allocator);
-    defer allocator.free(serialized_cb);
-
-    var reader2 = serialize.Reader{ .data = serialized_cb };
-    var decoded_cb = try SnapshotCoin.fromReader(&reader2, allocator);
+    var w2 = serialize.Writer.init(allocator);
+    defer w2.deinit();
+    try writeSnapshotCoinPayload(&w2, cb.outpoint.index, &cb);
+    var r2 = serialize.Reader{ .data = w2.getWritten() };
+    var decoded_cb = try readSnapshotCoinPayload(&r2, &txid2, allocator);
     defer decoded_cb.deinit(allocator);
-
-    try std.testing.expectEqual(@as(u32, 100000), decoded_cb.height);
+    try std.testing.expectEqual(@as(u32, 100_000), decoded_cb.height);
     try std.testing.expect(decoded_cb.is_coinbase);
 }
 
@@ -6907,28 +6912,26 @@ test "snapshot metadata wrong network rejected" {
     try std.testing.expectError(StorageError.CorruptData, result);
 }
 
-test "snapshot coin serialization roundtrip" {
+test "snapshot coin payload — round-trip across multiple types" {
     const allocator = std.testing.allocator;
 
+    const txid: types.Hash256 = [_]u8{0x11} ** 32;
+
+    // P2PKH (compressible).
     const script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
     const coin = SnapshotCoin{
-        .outpoint = types.OutPoint{
-            .hash = [_]u8{0x11} ** 32,
-            .index = 42,
-        },
-        .height = 500000,
+        .outpoint = types.OutPoint{ .hash = txid, .index = 42 },
+        .height = 500_000,
         .is_coinbase = true,
-        .value = 5000000000,
+        .value = 5_000_000_000,
         .script_pubkey = &script,
     };
-
-    const serialized = try coin.toBytes(allocator);
-    defer allocator.free(serialized);
-
-    var reader = serialize.Reader{ .data = serialized };
-    var deserialized = try SnapshotCoin.fromReader(&reader, allocator);
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try writeSnapshotCoinPayload(&w, coin.outpoint.index, &coin);
+    var reader = serialize.Reader{ .data = w.getWritten() };
+    var deserialized = try readSnapshotCoinPayload(&reader, &txid, allocator);
     defer deserialized.deinit(allocator);
-
     try std.testing.expectEqualSlices(u8, &coin.outpoint.hash, &deserialized.outpoint.hash);
     try std.testing.expectEqual(coin.outpoint.index, deserialized.outpoint.index);
     try std.testing.expectEqual(coin.height, deserialized.height);
@@ -6940,13 +6943,13 @@ test "snapshot coin serialization roundtrip" {
 test "findAssumeUtxoEntry returns entry for known hash" {
     const consensus = @import("consensus.zig");
 
-    // Mainnet has a snapshot at block 840000
+    // Mainnet has 4 snapshots (840k, 880k, 910k, 935k).
     if (consensus.MAINNET.assume_utxo.len > 0) {
         const expected_entry = consensus.MAINNET.assume_utxo[0];
         const found = findAssumeUtxoEntry(&consensus.MAINNET, &expected_entry.block_hash);
         try std.testing.expect(found != null);
         try std.testing.expectEqual(expected_entry.height, found.?.height);
-        try std.testing.expectEqual(expected_entry.coins_count, found.?.coins_count);
+        try std.testing.expectEqual(expected_entry.chain_tx_count, found.?.chain_tx_count);
     }
 }
 
@@ -6975,6 +6978,95 @@ test "findAssumeUtxoEntryByHeight returns null for unknown height" {
 
     const found = findAssumeUtxoEntryByHeight(&consensus.MAINNET, 999999);
     try std.testing.expect(found == null);
+}
+
+test "snapshot dump/load round-trip — Core wire format" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    // Build a small chainstate with three coins across two txids, including
+    // a P2PKH (compressible) and a P2WPKH (non-compressible / raw branch)
+    // so both legs of ScriptCompression are exercised.
+    var chainstate = ChainState.init(null, 64, allocator);
+    defer chainstate.deinit();
+
+    chainstate.best_hash = [_]u8{0xAA} ** 32;
+    chainstate.best_height = 800_000;
+
+    const txid_a: types.Hash256 = [_]u8{0x01} ** 32;
+    const txid_b: types.Hash256 = [_]u8{0x02} ** 32;
+
+    // P2PKH (25 bytes): OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG.
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xCC);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
+
+    // P2WPKH (22 bytes): OP_0 <20>. Not in CompressScript's special set.
+    var p2wpkh: [22]u8 = undefined;
+    p2wpkh[0] = 0x00;
+    p2wpkh[1] = 20;
+    @memset(p2wpkh[2..22], 0x77);
+
+    const op0 = types.OutPoint{ .hash = txid_a, .index = 0 };
+    try chainstate.utxo_set.add(&op0, &types.TxOut{ .value = 6_250_000_000, .script_pubkey = &p2pkh }, 800_000, true);
+    const op1 = types.OutPoint{ .hash = txid_a, .index = 7 };
+    try chainstate.utxo_set.add(&op1, &types.TxOut{ .value = 1_234_567, .script_pubkey = &p2wpkh }, 700_000, false);
+    const op2 = types.OutPoint{ .hash = txid_b, .index = 0 };
+    try chainstate.utxo_set.add(&op2, &types.TxOut{ .value = 100, .script_pubkey = &p2pkh }, 750_000, false);
+
+    // Dump.
+    const tmp_path = "/tmp/clearbit-snapshot-roundtrip.dat";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    try dumpTxOutSet(&chainstate, consensus.MAINNET.magic, tmp_path, allocator);
+
+    // Verify the on-disk file starts with Core's magic + version=2.
+    const file = try std.fs.cwd().openFile(tmp_path, .{});
+    defer file.close();
+    var hdr: [SnapshotMetadata.HEADER_SIZE]u8 = undefined;
+    try file.reader().readNoEof(&hdr);
+    try std.testing.expectEqualSlices(u8, &SNAPSHOT_MAGIC_BYTES, hdr[0..5]);
+    try std.testing.expectEqual(@as(u16, SNAPSHOT_VERSION), std.mem.readInt(u16, hdr[5..7], .little));
+    try std.testing.expectEqual(consensus.MAINNET.magic, std.mem.readInt(u32, hdr[7..11], .little));
+
+    // Load.
+    var loaded = try loadTxOutSet(tmp_path, consensus.MAINNET.magic, allocator);
+    defer loaded.chainstate.deinit();
+    try std.testing.expectEqualSlices(u8, &chainstate.best_hash, &loaded.metadata.base_blockhash);
+    try std.testing.expectEqual(@as(u64, 3), loaded.metadata.coins_count);
+    try std.testing.expectEqual(@as(usize, 3), loaded.chainstate.utxo_set.cache.count());
+}
+
+test "mainnet has all 4 assumeutxo entries from Bitcoin Core v28" {
+    const consensus = @import("consensus.zig");
+    try std.testing.expectEqual(@as(usize, 4), consensus.MAINNET.assume_utxo.len);
+    // Spot-check the first and last entry against
+    // bitcoin-core/src/kernel/chainparams.cpp `m_assumeutxo_data`.
+    const e0 = consensus.MAINNET.assume_utxo[0];
+    try std.testing.expectEqual(@as(u32, 840_000), e0.height);
+    try std.testing.expectEqual(@as(u64, 991_032_194), e0.chain_tx_count);
+    // hash_serialized for 840k is a2a5521b... (display order). hexToHash
+    // flips, so internal byte 0 = display byte 31 = 0x96.
+    try std.testing.expectEqual(@as(u8, 0x96), e0.hash_serialized[0]);
+    try std.testing.expectEqual(@as(u8, 0xa2), e0.hash_serialized[31]);
+
+    const e3 = consensus.MAINNET.assume_utxo[3];
+    try std.testing.expectEqual(@as(u32, 935_000), e3.height);
+    try std.testing.expectEqual(@as(u64, 1_305_397_408), e3.chain_tx_count);
+
+    // None of the 4 may carry the placeholder 51c8d1... pattern that used
+    // to live at 840k.
+    for (consensus.MAINNET.assume_utxo) |e| {
+        try std.testing.expect(!std.mem.eql(u8, &e.hash_serialized, &[_]u8{
+            0x5d, 0x5c, 0x5e, 0x5a, 0x5e, 0x5d, 0x5e, 0x5e,
+            0x5a, 0x5e, 0xa5, 0xe8, 0x5e, 0x8b, 0x1f, 0x7e,
+            0x3f, 0x3c, 0x9c, 0x3c, 0x7e, 0x9e, 0x49, 0xc5,
+            0x43, 0x15, 0xe5, 0x1d, 0x5c, 0x8b, 0x1d, 0xc8,
+        }));
+    }
 }
 
 test "snapshot error variants are distinct" {
