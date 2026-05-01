@@ -4107,14 +4107,41 @@ pub const RpcServer = struct {
         }
         const path = path_param.string;
 
-        // Validate and load the snapshot
+        // Validate and load the snapshot. Capture the offending base
+        // blockhash on whitelist rejection so we can format Core's
+        // diagnostic ("Assumeutxo height in snapshot metadata not
+        // recognized ... - refusing to load snapshot",
+        // validation.cpp:5775-5780).
+        var rejected_hash: types.Hash256 = undefined;
         var load_result = storage.validateAndLoadSnapshot(
             path,
             self.network_params,
             self.allocator,
+            &rejected_hash,
         ) catch |err| {
+            // Format Core-strict whitelist rejection with the
+            // unrecognized base_blockhash. clearbit has no
+            // hash→height index for unknown snapshots, so we render
+            // "(blockhash <hex>)" in lieu of the height integer Core
+            // prints — the semantic ("not in m_assumeutxo_data") is
+            // preserved.
+            if (err == storage.SnapshotError.UnknownSnapshot) {
+                var msg_buf = std.ArrayList(u8).init(self.allocator);
+                defer msg_buf.deinit();
+                const msg_writer = msg_buf.writer();
+                msg_writer.writeAll("Assumeutxo height in snapshot metadata not recognized (blockhash ") catch {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "Assumeutxo height in snapshot metadata not recognized - refusing to load snapshot", id);
+                };
+                writeHashHex(msg_writer, &rejected_hash) catch {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "Assumeutxo height in snapshot metadata not recognized - refusing to load snapshot", id);
+                };
+                msg_writer.writeAll(") - refusing to load snapshot") catch {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "Assumeutxo height in snapshot metadata not recognized - refusing to load snapshot", id);
+                };
+                return self.jsonRpcError(RPC_MISC_ERROR, msg_buf.items, id);
+            }
             const msg = switch (err) {
-                storage.SnapshotError.UnknownSnapshot => "Snapshot block hash not found in assumeUtxo params",
+                storage.SnapshotError.UnknownSnapshot => unreachable, // handled above
                 storage.SnapshotError.HashMismatch => "UTXO set hash doesn't match expected value",
                 storage.SnapshotError.CoinCountMismatch => "Coin count doesn't match expected value",
                 storage.SnapshotError.IoError => "Failed to read snapshot file",
