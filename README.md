@@ -104,7 +104,7 @@ zig build -Dminisketch=true
 | `--printtoconsole` | Print logs to console | disabled |
 | `--benchmark` | Run performance benchmarks and exit | |
 | `--import-blocks=<path>` | Import blocks from file (`-` for stdin) | |
-| `--import-utxo=<path>` | Import UTXO snapshot from .hdog file | |
+| `--load-snapshot=<path>` | Load a Bitcoin Core-format UTXO snapshot (as produced by Core's `dumptxoutset` RPC) | |
 
 ## RPC API
 

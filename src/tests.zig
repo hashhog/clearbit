@@ -966,6 +966,7 @@ comptime {
     _ = @import("mempool.zig");
     _ = @import("mempool_persist.zig"); // mempool.dat dump/load (Bitcoin Core-compatible)
     _ = @import("storage.zig"); // undo data, UTXO set, chain state, flat file storage
+    _ = @import("compressor.zig"); // CompressAmount / CompressScript (Coin wire format)
     _ = @import("perf.zig");
     _ = @import("bench.zig");
     _ = @import("indexes.zig");

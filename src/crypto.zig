@@ -841,6 +841,48 @@ pub fn isLowDERSignature(sig_der: []const u8) bool {
 /// Verify a Schnorr signature (BIP-340) for taproot.
 ///
 /// sig: 64-byte Schnorr signature
+/// Validate a 65-byte uncompressed secp256k1 public key. Required by
+/// `compressor.compressScript` to gate the legacy (uncompressed P2PK)
+/// compression branch (Core's `IsToPubKey` calls `pubkey.IsFullyValid()`,
+/// which delegates to libsecp256k1).
+///
+/// Returns the parsed pubkey bytes if valid, null otherwise.
+pub fn parseUncompressedPubkey65(pubkey_bytes: *const [65]u8) ?[65]u8 {
+    const ctx = secp_ctx orelse return null;
+    var pk: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_ec_pubkey_parse(ctx, &pk, pubkey_bytes, 65) != 1) {
+        return null;
+    }
+    return pubkey_bytes.*;
+}
+
+/// Decompress a 33-byte (compressed) secp256k1 public key to its 65-byte
+/// uncompressed form. Used by `compressor.decompressScript` for the
+/// uncompressed-P2PK special-script branch (tags 4 and 5).
+///
+/// Returns the 65-byte serialization on success, null if the input does
+/// not decode to a valid curve point.
+pub fn decompressPubkey33(pubkey_bytes: *const [33]u8) ?[65]u8 {
+    const ctx = secp_ctx orelse return null;
+    var pk: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_ec_pubkey_parse(ctx, &pk, pubkey_bytes, 33) != 1) {
+        return null;
+    }
+    var out: [65]u8 = undefined;
+    var out_len: usize = 65;
+    if (secp256k1.secp256k1_ec_pubkey_serialize(
+        ctx,
+        &out,
+        &out_len,
+        &pk,
+        secp256k1.SECP256K1_EC_UNCOMPRESSED,
+    ) != 1) {
+        return null;
+    }
+    if (out_len != 65) return null;
+    return out;
+}
+
 /// msg_hash: 32-byte message hash
 /// pubkey_x: 32-byte x-only public key
 ///

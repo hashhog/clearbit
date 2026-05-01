@@ -46,6 +46,26 @@ pub const Reader = struct {
         }
     }
 
+    /// Read a VARINT (Bitcoin Core's special MSB-continuation encoding,
+    /// distinct from CompactSize). Used for Coin::code and CompressAmount.
+    /// Reference: bitcoin-core/src/serialize.h ReadVarInt.
+    pub fn readVarInt(self: *Reader) Error!u64 {
+        @setRuntimeSafety(true);
+        var n: u64 = 0;
+        while (true) {
+            const ch = try self.readInt(u8);
+            // Saturate-on-overflow check (matches Core's "size too large" guard).
+            if (n > (std.math.maxInt(u64) >> 7)) return Error.InvalidCompactSize;
+            n = (n << 7) | @as(u64, ch & 0x7F);
+            if ((ch & 0x80) != 0) {
+                if (n == std.math.maxInt(u64)) return Error.InvalidCompactSize;
+                n += 1;
+            } else {
+                return n;
+            }
+        }
+    }
+
     /// Read a 32-byte hash
     pub fn readHash(self: *Reader) Error!types.Hash256 {
         @setRuntimeSafety(true);
@@ -107,6 +127,29 @@ pub const Writer = struct {
         } else {
             try self.writeInt(u8, 0xFF);
             try self.writeInt(u64, value);
+        }
+    }
+
+    /// Write a VARINT (Bitcoin Core's MSB-continuation encoding, distinct
+    /// from CompactSize). Used for Coin::code (height|coinbase) and the
+    /// VARINT-wrapped output of CompressAmount.
+    /// Reference: bitcoin-core/src/serialize.h WriteVarInt.
+    pub fn writeVarInt(self: *Writer, value: u64) !void {
+        // sizeof(u64) * 8 = 64 bits, ceil(64/7) = 10 bytes max.
+        var tmp: [10]u8 = undefined;
+        var len: usize = 0;
+        var n = value;
+        while (true) {
+            tmp[len] = @intCast((n & 0x7F) | (if (len != 0) @as(u64, 0x80) else 0));
+            if (n <= 0x7F) break;
+            n = (n >> 7) - 1;
+            len += 1;
+        }
+        // Emit in reverse: high-order group first, low-order group last.
+        var i: usize = len + 1;
+        while (i > 0) {
+            i -= 1;
+            try self.writeInt(u8, tmp[i]);
         }
     }
 
