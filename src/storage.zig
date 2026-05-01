@@ -1626,12 +1626,15 @@ pub const UndoFileManager = struct {
         const path_buf = try self.getUndoFilePath(file_number);
         const path_slice = std.mem.sliceTo(&path_buf, 0);
 
-        // Open file for writing (append mode)
-        const file = std.fs.cwd().createFile(path_slice, .{ .truncate = false }) catch |err| {
-            return switch (err) {
-                error.FileNotFound => std.fs.cwd().createFile(path_slice, .{}) catch error.WriteFailed,
-                else => error.WriteFailed,
-            };
+        // Open file for writing (append mode). createFile with truncate=false
+        // both creates and opens, so the FileNotFound retry below is normally
+        // unreachable; kept as a defensive belt-and-suspenders for filesystems
+        // that surface the missing-file error before applying creation flags.
+        const file = std.fs.cwd().createFile(path_slice, .{ .truncate = false }) catch |err| blk: {
+            switch (err) {
+                error.FileNotFound => break :blk std.fs.cwd().createFile(path_slice, .{}) catch return error.WriteFailed,
+                else => return error.WriteFailed,
+            }
         };
         defer file.close();
 
@@ -2191,6 +2194,20 @@ pub const ChainState = struct {
     ) !BlockUndo {
         self.connect_mutex.lock();
         defer self.connect_mutex.unlock();
+        return self.connectBlockInner(block, hash, height, false);
+    }
+
+    /// Connect a block while the caller already holds `connect_mutex`.
+    /// Used by the rollback-dance in handleDumpTxOutSet so the entire
+    /// disconnect→dump→reconnect sequence can hold the mutex once and
+    /// stay coherent with peer ingest. Does NOT flush — caller is
+    /// responsible for one final flush() at the end of the sequence.
+    pub fn connectBlockLocked(
+        self: *ChainState,
+        block: *const types.Block,
+        hash: *const types.Hash256,
+        height: u32,
+    ) !BlockUndo {
         return self.connectBlockInner(block, hash, height, false);
     }
 
@@ -2788,6 +2805,47 @@ pub const ChainState = struct {
         }
 
         return undo;
+    }
+
+    /// Look up the raw consensus-serialized bytes for a block in CF_BLOCKS.
+    /// Returned slice is heap-allocated; caller must free with self.allocator.
+    /// Returns null if the block hash isn't in CF_BLOCKS (either pre-W87
+    /// populator commit `cdd9e20`, pruned, or never stored). Used by the
+    /// rollback dance in handleDumpTxOutSet to load disconnect-target bodies.
+    pub fn getBlockBytes(self: *ChainState, hash: *const types.Hash256) !?[]const u8 {
+        const db = self.utxo_set.db orelse return null;
+        const data = (try db.get(CF_BLOCKS, hash)) orelse return null;
+        return data;
+    }
+
+    /// Disconnect the block at `hash` from the active chain using file-based
+    /// undo data. Loads the block body from CF_BLOCKS (caller is responsible
+    /// for the upstream coverage check — this function returns
+    /// `error.BlockBodyNotFound` if the body is missing rather than panicking
+    /// on a half-loaded block).
+    ///
+    /// Replaces the previous pattern of passing `undefined` for the block
+    /// argument in `ChainManager.disconnectToBlock` (validation.zig pre-d35797b),
+    /// which was a Zig pre-init footgun: `disconnectBlockFromFile` reads
+    /// `block.transactions` first thing and would Undefined-Behaviour at
+    /// runtime if the caller passed `undefined`. The fix is to load the
+    /// real bytes here so the Block struct is fully initialised before
+    /// the disconnect path touches it.
+    pub fn disconnectBlockByHash(
+        self: *ChainState,
+        hash: *const types.Hash256,
+        file_number: u32,
+        file_offset: u64,
+        prev_hash: types.Hash256,
+    ) !void {
+        const block_bytes = (try self.getBlockBytes(hash)) orelse return error.BlockBodyNotFound;
+        defer self.allocator.free(block_bytes);
+
+        var reader = serialize.Reader{ .data = block_bytes };
+        var block = serialize.readBlock(&reader, self.allocator) catch return error.CorruptBlockBytes;
+        defer serialize.freeBlock(self.allocator, &block);
+
+        try self.disconnectBlockFromFile(&block, file_number, file_offset, prev_hash);
     }
 
     /// Disconnect a block using file-based undo data.
