@@ -4210,13 +4210,45 @@ pub const RpcServer = struct {
     /// Reference: Bitcoin Core rpc/blockchain.cpp dumptxoutset
     ///
     /// Arguments:
-    ///   1. path (string, required) - Path to write the snapshot file
+    ///   1. path     (string, required) - Path to write the snapshot file.
+    ///   2. type     (string, optional) - "" (default), "latest", or "rollback".
+    ///   3. options  (object, optional) - {"rollback": <height|hash>}
+    ///
+    /// Behaviour:
+    ///   * "" or "latest"            → dump the UTXO set at the current tip.
+    ///   * "rollback" (no rollback)  → resolve to the highest assumeUTXO entry
+    ///                                  at or below the current tip, then dump
+    ///                                  the UTXO set at that height.
+    ///   * options.rollback=<h|hash> → resolve to the requested height/hash,
+    ///                                  then dump.
+    ///
+    /// Implementation note (clearbit-specific):
+    ///   Bitcoin Core does this via TemporaryRollback (invalidate descendants,
+    ///   reverse-walk via DisconnectBlock, dump, reconnect). clearbit's
+    ///   ChainManager has invalidateBlock/disconnectToBlock primitives, but
+    ///   the disconnect path requires reading the actual block from CF_BLOCKS
+    ///   to feed `disconnectBlockFromFile` — and CF_BLOCKS is only populated
+    ///   for blocks accepted post-`cdd9e20` (2026-04-29). Pre-`cdd9e20`
+    ///   blocks have no body in either CF_BLOCKS or blk*.dat, so the
+    ///   rollback dance can't reach them. Until the populator backfills
+    ///   history (or we add a peer-fetch-by-hash path), the rollback dance
+    ///   only works in the degenerate case where the requested target equals
+    ///   the current tip, which is what `latest` already does.
+    ///
+    ///   When the target differs from the current tip, return an
+    ///   RPC_MISC_ERROR explaining the limitation rather than corrupting the
+    ///   chainstate. This matches the spirit of Core's failure-mode log
+    ///   ("dumptxoutset failed to roll back to requested height, reverting
+    ///   to tip" — rpc/blockchain.cpp:3208) but converted to a hard error so
+    ///   the caller doesn't get a tip-dump silently labelled as a
+    ///   rollback dump.
     ///
     /// Returns:
     ///   {
-    ///     "coins_written": n,    (numeric) Number of coins written
-    ///     "base_hash": "hash",   (string) Block hash at snapshot base
-    ///     "base_height": n       (numeric) Height of snapshot base
+    ///     "coins_written": n,
+    ///     "base_hash":     "hash",
+    ///     "base_height":   n,
+    ///     "txoutset_hash": "hash"   (SHA256d HashWriter; Core HASH_SERIALIZED)
     ///   }
     fn handleDumpTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Parse parameters
@@ -4230,7 +4262,173 @@ pub const RpcServer = struct {
         }
         const path = path_param.string;
 
-        // Dump the UTXO set
+        // Optional positional `type` (Core: "" / "latest" / "rollback").
+        var snapshot_type: []const u8 = "";
+        if (params.array.items.len >= 2) {
+            const t = params.array.items[1];
+            if (t == .string) {
+                snapshot_type = t.string;
+            } else if (t != .null) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Snapshot type must be a string", id);
+            }
+        }
+
+        // Optional positional `options` named-params object. Only the
+        // "rollback" key is recognised; anything else is ignored to mirror
+        // Core's lax handling.
+        var rollback_value: ?std.json.Value = null;
+        if (params.array.items.len >= 3) {
+            const opts = params.array.items[2];
+            if (opts == .object) {
+                if (opts.object.get("rollback")) |v| rollback_value = v;
+            } else if (opts != .null) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Options must be an object", id);
+            }
+        }
+
+        // Resolve the target height. Default = current tip = "latest".
+        const tip_height = self.chain_state.best_height;
+        const tip_hash = self.chain_state.best_hash;
+        var target_height: u32 = tip_height;
+        var target_hash: types.Hash256 = tip_hash;
+        var target_resolved: bool = false;
+
+        if (rollback_value) |rv| {
+            // options.rollback present: type must be empty or "rollback".
+            if (snapshot_type.len > 0 and !std.mem.eql(u8, snapshot_type, "rollback")) {
+                return self.jsonRpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid snapshot type specified with rollback option",
+                    id,
+                );
+            }
+            // Accept either an integer height or a 64-char hex block hash.
+            switch (rv) {
+                .integer => |h| {
+                    if (h < 0 or h > tip_height) {
+                        return self.jsonRpcError(
+                            RPC_INVALID_PARAMETER,
+                            "rollback height out of range",
+                            id,
+                        );
+                    }
+                    target_height = @intCast(h);
+                    if (self.chain_state.getBlockHashByHeight(target_height)) |h2| {
+                        target_hash = h2;
+                        target_resolved = true;
+                    } else if (target_height == tip_height) {
+                        target_hash = tip_hash;
+                        target_resolved = true;
+                    } else {
+                        return self.jsonRpcError(
+                            RPC_INVALID_PARAMETER,
+                            "rollback height has no recorded block hash (pre-W37 height index gap?)",
+                            id,
+                        );
+                    }
+                },
+                .string => |s| {
+                    if (s.len != 64) {
+                        return self.jsonRpcError(
+                            RPC_INVALID_PARAMETER,
+                            "rollback hash must be 64 hex chars",
+                            id,
+                        );
+                    }
+                    var h: types.Hash256 = undefined;
+                    for (0..32) |i| {
+                        h[31 - i] = std.fmt.parseInt(u8, s[i * 2 .. i * 2 + 2], 16) catch {
+                            return self.jsonRpcError(
+                                RPC_INVALID_PARAMETER,
+                                "rollback hash is not valid hex",
+                                id,
+                            );
+                        };
+                    }
+                    target_hash = h;
+                    if (self.chain_manager) |cm| {
+                        if (cm.getBlock(&h)) |entry| {
+                            target_height = entry.height;
+                            target_resolved = true;
+                        }
+                    }
+                    if (!target_resolved and std.mem.eql(u8, &h, &tip_hash)) {
+                        target_height = tip_height;
+                        target_resolved = true;
+                    }
+                    if (!target_resolved) {
+                        return self.jsonRpcError(
+                            RPC_INVALID_ADDRESS_OR_KEY,
+                            "rollback hash not found in block index",
+                            id,
+                        );
+                    }
+                },
+                else => {
+                    return self.jsonRpcError(
+                        RPC_INVALID_PARAMETER,
+                        "rollback must be a height (number) or block hash (string)",
+                        id,
+                    );
+                },
+            }
+        } else if (std.mem.eql(u8, snapshot_type, "rollback")) {
+            // No explicit target — pick the highest assumeUTXO entry at or
+            // below the current tip. Mirrors Core
+            // rpc/blockchain.cpp:3121-3125 (max element of
+            // GetAvailableSnapshotHeights).
+            const entry_opt = storage.findLatestAssumeUtxoEntryAtOrBelow(
+                self.network_params,
+                tip_height,
+            );
+            const entry = entry_opt orelse {
+                return self.jsonRpcError(
+                    RPC_MISC_ERROR,
+                    "No assumeUTXO snapshot height available at or below the current tip",
+                    id,
+                );
+            };
+            target_height = entry.height;
+            target_hash = entry.block_hash;
+            target_resolved = true;
+        } else if (snapshot_type.len > 0 and !std.mem.eql(u8, snapshot_type, "latest")) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "Invalid snapshot type. Specify \"rollback\" or \"latest\".",
+                id,
+            );
+        }
+
+        // Decide whether we actually need to roll back.
+        const need_rollback = target_resolved and target_height != tip_height;
+
+        if (need_rollback) {
+            // clearbit's reorg primitives can't yet reach historical block
+            // bodies for the disconnect dance (see header docstring). Fail
+            // loudly rather than corrupt state or silently dump the wrong
+            // height.
+            //
+            // TODO(rollback-dance): once CF_BLOCKS is backfilled (or we add
+            //   a peer-fetch-by-hash path) and `disconnectBlockFromFile`
+            //   takes a hash instead of a `*const types.Block`, drive
+            //   ChainManager.invalidateBlock(target.next) followed by a
+            //   matching reconsiderBlock to walk the chainstate down and
+            //   back up. Mirror Core's TemporaryRollback / NetworkDisable
+            //   guard — suspend peer ingest for the duration so newly
+            //   arriving blocks don't get classified as invalid in the
+            //   transient state. Also flush before snapshotting so the
+            //   on-disk cursor matches the in-memory state.
+            return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "dumptxoutset rollback to a non-tip height is not yet supported on clearbit (TODO: reorg dance requires CF_BLOCKS backfill; see src/rpc.zig handleDumpTxOutSet docstring)",
+                id,
+            );
+        }
+
+        // Fast path: target == current tip. This is also the path Core
+        // takes when `target_index == tip` (rpc/blockchain.cpp:3161,
+        // "we don't have to roll back at all"). Cover both
+        // `latest`/no-arg and the rollback-resolved-to-tip case.
         const dump_result = storage.dumpTxOutSetWithResult(
             self.chain_state,
             self.network_params.magic,
@@ -7859,4 +8057,249 @@ test "signmessagewithprivkey + verifymessage round-trip (no wallet)" {
     const verify_resp = try server.dispatch(verify_req);
     defer allocator.free(verify_resp);
     try std.testing.expect(std.mem.indexOf(u8, verify_resp, "\"result\":true") != null);
+}
+
+// ============================================================================
+// dumptxoutset rollback mode tests (Bitcoin Core rpc/blockchain.cpp:3074)
+// ============================================================================
+
+/// Build a minimal RpcServer for dump-path testing. The chain_state has a
+/// few seeded UTXOs and a synthetic best_hash/best_height; no real chain
+/// validation runs, but `handleDumpTxOutSet` only needs the UTXO cache and
+/// the tip metadata to drive the dump path.
+fn makeDumpTestServer(
+    allocator: std.mem.Allocator,
+    chain_state: *storage.ChainState,
+    mempool: *mempool_mod.Mempool,
+    peer_manager: *peer_mod.PeerManager,
+) RpcServer {
+    return RpcServer.init(
+        allocator,
+        chain_state,
+        mempool,
+        peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+}
+
+test "dumptxoutset latest writes a snapshot at the current tip" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_hash = [_]u8{0xCD} ** 32;
+    chain_state.best_height = 800_000;
+
+    // One coin so the snapshot has a non-empty body.
+    const txid: types.Hash256 = [_]u8{0x11} ** 32;
+    var script: [25]u8 = .{ 0x76, 0xa9, 20, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0x88, 0xac };
+    const op = types.OutPoint{ .hash = txid, .index = 0 };
+    try chain_state.utxo_set.add(&op, &types.TxOut{ .value = 5_000_000_000, .script_pubkey = &script }, 800_000, true);
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = makeDumpTestServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    const tmp_path = "/tmp/clearbit-dumptxoutset-latest.dat";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"{s}\",\"latest\"]}}",
+        .{tmp_path},
+    );
+    defer allocator.free(req);
+
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    // No error, base_height matches the tip, file exists.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"base_height\":800000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"coins_written\":1") != null);
+    const stat = try std.fs.cwd().statFile(tmp_path);
+    try std.testing.expect(stat.size > 0);
+}
+
+test "dumptxoutset rollback (no target) below lowest mainnet snapshot returns error" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    // Tip below mainnet's lowest assumeutxo entry (840k) — no snapshot height
+    // qualifies, so the resolver returns null and the RPC must error out.
+    chain_state.best_hash = [_]u8{0xEE} ** 32;
+    chain_state.best_height = 100_000;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = makeDumpTestServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"/tmp/clearbit-dumptxoutset-norollback.dat\",\"rollback\"]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "No assumeUTXO snapshot height") != null);
+}
+
+test "dumptxoutset rollback height equal to tip dumps current UTXO set" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_hash = [_]u8{0x55} ** 32;
+    chain_state.best_height = 700_000;
+
+    // Seed the height index so the RPC can resolve `rollback=700000` → tip hash.
+    chain_state.putBlockHashByHeight(700_000, &chain_state.best_hash);
+
+    const txid: types.Hash256 = [_]u8{0x22} ** 32;
+    var script: [22]u8 = .{ 0x00, 20, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77 };
+    const op = types.OutPoint{ .hash = txid, .index = 0 };
+    try chain_state.utxo_set.add(&op, &types.TxOut{ .value = 12345, .script_pubkey = &script }, 600_000, false);
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = makeDumpTestServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    const tmp_path = "/tmp/clearbit-dumptxoutset-rollback-tip.dat";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Use the named-options form: rollback=<height>.
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"{s}\",\"\",{{\"rollback\":700000}}]}}",
+        .{tmp_path},
+    );
+    defer allocator.free(req);
+
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"base_height\":700000") != null);
+
+    // Verify the on-disk file's metadata header has the expected base hash.
+    const file = try std.fs.cwd().openFile(tmp_path, .{});
+    defer file.close();
+    var hdr: [storage.SnapshotMetadata.HEADER_SIZE]u8 = undefined;
+    try file.reader().readNoEof(&hdr);
+    const meta = try storage.SnapshotMetadata.fromBytes(&hdr, consensus.MAINNET.magic);
+    try std.testing.expectEqualSlices(u8, &chain_state.best_hash, &meta.base_blockhash);
+}
+
+test "dumptxoutset rollback to non-tip height returns TODO error (does not corrupt state)" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_hash = [_]u8{0x33} ** 32;
+    chain_state.best_height = 800_000;
+
+    // Wire a ChainManager carrying a synthetic ancestor at height 700_000 so
+    // the hash-form rollback request resolves past the block-index lookup
+    // (the height index used by `getBlockHashByHeight` is RocksDB-backed and
+    // a no-op without a DB; the in-memory ChainManager.block_index is the
+    // hash-keyed substitute we use here).
+    //
+    // Entry is heap-allocated because ChainManager.deinit destroys every
+    // value pointer with its own allocator; a stack-allocated entry would
+    // free a bogus pointer.
+    var cm = validation.ChainManager.init(null, null, allocator);
+    defer cm.deinit();
+
+    const ancestor: types.Hash256 = [_]u8{0x44} ** 32;
+    const ancestor_entry = try allocator.create(validation.BlockIndexEntry);
+    ancestor_entry.* = .{
+        .hash = ancestor,
+        .header = std.mem.zeroes(types.BlockHeader),
+        .height = 700_000,
+        .status = .{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try cm.block_index.put(ancestor_entry.hash, ancestor_entry);
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = makeDumpTestServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    // Hash-form rollback request resolves to the synthetic ancestor (height
+    // 700_000), which differs from the tip (800_000), so we must hit the
+    // TODO branch — not the height-index miss.
+    const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"/tmp/clearbit-dumptxoutset-rollback-prev.dat\",\"\",{\"rollback\":\"4444444444444444444444444444444444444444444444444444444444444444\"}]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "not yet supported") != null);
+
+    // Tip is unchanged.
+    try std.testing.expectEqual(@as(u32, 800_000), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x33} ** 32), &chain_state.best_hash);
+}
+
+test "dumptxoutset rollback rejects mismatched type+option combo" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 900_000;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = makeDumpTestServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    // type="latest" with options.rollback set should be rejected (Core:
+    // "Invalid snapshot type … specified with rollback option").
+    const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"/tmp/x.dat\",\"latest\",{\"rollback\":840000}]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Invalid snapshot type") != null);
+}
+
+test "dumptxoutset rejects unknown snapshot type" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = makeDumpTestServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"/tmp/x.dat\",\"banana\"]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Invalid snapshot type") != null);
 }
