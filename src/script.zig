@@ -713,7 +713,13 @@ pub const ScriptEngine = struct {
 
     /// Execute a script (series of opcodes/data pushes).
     pub fn execute(self: *ScriptEngine, script: []const u8) ScriptError!void {
-        if (script.len > MAX_SCRIPT_SIZE) return ScriptError.InvalidScript;
+        // BIP-342 (tapscript) does NOT enforce MAX_SCRIPT_SIZE — tapscript
+        // leaves are bounded only by the 4M-weight block cap and the
+        // per-input validation-weight budget.  Core gates this check on
+        // `sigversion == BASE || WITNESS_V0` (interpreter.cpp:428).
+        if (self.sig_version != .tapscript and script.len > MAX_SCRIPT_SIZE) {
+            return ScriptError.InvalidScript;
+        }
 
         var pc: usize = 0;
         var op_count: usize = 0;
@@ -801,8 +807,15 @@ pub const ScriptEngine = struct {
             }
 
             // Count ops: all opcodes > OP_16 (0x60) count toward the 201 limit
-            // This includes IF/NOTIF/ELSE/ENDIF per Bitcoin Core
-            if (opcode_byte > 0x60) {
+            // This includes IF/NOTIF/ELSE/ENDIF per Bitcoin Core.
+            //
+            // BIP-342 (tapscript) does NOT enforce MAX_OPS_PER_SCRIPT — the
+            // tapscript validation-weight budget is the only ops limit. Core
+            // gates this counter on `sigversion == BASE || WITNESS_V0`
+            // (interpreter.cpp:450-455).  Without this gate, tapscript inputs
+            // with > MAX_OPS_PER_SCRIPT non-push ops that respect the weight
+            // budget are wrongly rejected.
+            if (opcode_byte > 0x60 and self.sig_version != .tapscript) {
                 op_count += 1;
                 if (op_count > MAX_OPS_PER_SCRIPT) return ScriptError.OpCountExceeded;
             }
@@ -4689,4 +4702,117 @@ test "tapscript validation-weight: legacy CHECKSIG unaffected" {
 
     // OP_CHECKSIG = 0xac. Should NOT error on the budget gate.
     try engine.execute(&[_]u8{0xac});
+}
+
+// ============================================================================
+// BIP-342 tapscript MAX_OPS / MAX_SCRIPT_SIZE gating (P1-1, P1-2 — 2026-05-02)
+// ============================================================================
+// Per Core interpreter.cpp:428,450, MAX_SCRIPT_SIZE and MAX_OPS_PER_SCRIPT are
+// gated on `sigversion == BASE || WITNESS_V0`. Tapscript is bounded only by
+// the BIP-342 validation-weight budget and the 4M-weight block cap.
+
+test "tapscript: MAX_OPS_PER_SCRIPT NOT enforced (P1-1)" {
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    // Generous validation-weight budget so the op-count gate is the only
+    // possible failure mode.
+    engine.validation_weight_left = 1_000_000;
+    engine.validation_weight_init = true;
+
+    // Build a script with 250 OP_NOP ops (250 > MAX_OPS_PER_SCRIPT=201).
+    // OP_NOP = 0x61.  Under the legacy gate this would trip OpCountExceeded;
+    // under tapscript it must pass.
+    var script_buf: [250]u8 = undefined;
+    @memset(&script_buf, 0x61);
+
+    // Should NOT error on op count.  No stack interaction needed for OP_NOP.
+    try engine.execute(&script_buf);
+}
+
+test "tapscript: MAX_SCRIPT_SIZE NOT enforced (P1-2)" {
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 1_000_000;
+    engine.validation_weight_init = true;
+
+    // 11k bytes of OP_NOP — exceeds MAX_SCRIPT_SIZE=10000 but should be
+    // allowed under tapscript.
+    const big_script = try allocator.alloc(u8, 11_000);
+    defer allocator.free(big_script);
+    @memset(big_script, 0x61);
+
+    // Should NOT error on size gate.
+    try engine.execute(big_script);
+}
+
+test "legacy (BASE): MAX_OPS_PER_SCRIPT still enforced" {
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+    // Default sig_version = .base — gate active.
+
+    var script_buf: [250]u8 = undefined;
+    @memset(&script_buf, 0x61); // OP_NOP
+
+    try std.testing.expectError(ScriptError.OpCountExceeded, engine.execute(&script_buf));
+}
+
+test "legacy (BASE): MAX_SCRIPT_SIZE still enforced" {
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+
+    const big_script = try allocator.alloc(u8, 11_000);
+    defer allocator.free(big_script);
+    @memset(big_script, 0x61); // OP_NOP
+
+    try std.testing.expectError(ScriptError.InvalidScript, engine.execute(big_script));
+}
+
+test "witness_v0: MAX_OPS_PER_SCRIPT still enforced" {
+    // BIP-141 v0 witness scripts ARE subject to the same op-count gate as
+    // legacy. Only tapscript is exempt.
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+    engine.sig_version = .witness_v0;
+
+    var script_buf: [250]u8 = undefined;
+    @memset(&script_buf, 0x61);
+
+    try std.testing.expectError(ScriptError.OpCountExceeded, engine.execute(&script_buf));
 }
