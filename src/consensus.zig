@@ -327,6 +327,12 @@ pub const NetworkParams = struct {
     /// Used only as a hint for the UTXO-undo-data optimisation in
     /// block_template.zig; NOT used for script-skip decisions.
     assume_valid_height: u32,
+    /// BIP-30 exception heights: blocks permanently exempt from the
+    /// duplicate-UTXO check.  On mainnet these are h=91842 and h=91880,
+    /// which predate BIP-30 and intentionally duplicate earlier coinbase txids.
+    /// All other networks use an empty slice.
+    /// Reference: Bitcoin Core validation.cpp IsBIP30Repeat().
+    bip30_exception_heights: []const u32,
 };
 
 // ============================================================================
@@ -432,6 +438,9 @@ pub const MAINNET = NetworkParams{
     // Ancestor check implemented in validation.shouldSkipScripts().
     .assumed_valid_hash = hexToHash("00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"),
     .assume_valid_height = 938343,
+    // BIP-30: h=91842 and h=91880 predate BIP-30 and are permanently exempt.
+    // Reference: Bitcoin Core validation.cpp IsBIP30Repeat().
+    .bip30_exception_heights = &[_]u32{ 91842, 91880 },
 };
 
 /// Testnet3 parameters.
@@ -476,6 +485,7 @@ pub const TESTNET3 = NetworkParams{
     // Testnet3 has no active assumevalid; scripts always run.
     .assumed_valid_hash = null,
     .assume_valid_height = 0,
+    .bip30_exception_heights = &[_]u32{}, // No BIP-30 exceptions on testnet3
 };
 
 /// Alias for backwards compatibility.
@@ -522,6 +532,7 @@ pub const TESTNET4 = NetworkParams{
     // Display: 000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4
     .assumed_valid_hash = hexToHash("000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"),
     .assume_valid_height = 4842348,
+    .bip30_exception_heights = &[_]u32{}, // No BIP-30 exceptions on testnet4
 };
 
 /// Signet parameters.
@@ -566,6 +577,7 @@ pub const SIGNET = NetworkParams{
     // Display: 00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329
     .assumed_valid_hash = hexToHash("00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"),
     .assume_valid_height = 293175,
+    .bip30_exception_heights = &[_]u32{}, // No BIP-30 exceptions on signet
 };
 
 /// Regtest parameters.
@@ -609,6 +621,7 @@ pub const REGTEST = NetworkParams{
     // Regtest has no assumevalid — every script check runs for test determinism.
     .assumed_valid_hash = null,
     .assume_valid_height = 0,
+    .bip30_exception_heights = &[_]u32{}, // No BIP-30 exceptions on regtest
 };
 
 // ============================================================================
