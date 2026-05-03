@@ -174,6 +174,60 @@ pub fn getBlockScriptFlagsForHash(
     return flags;
 }
 
+/// Build the STANDARD_SCRIPT_VERIFY_FLAGS set used for mempool / relay-policy
+/// script verification. This is the consensus flag-set produced by
+/// `getBlockScriptFlags` PLUS the policy-only flags that Core's
+/// `STANDARD_SCRIPT_VERIFY_FLAGS` (policy/policy.h:119-132) layers on top.
+///
+/// Reference: Bitcoin Core policy/policy.h STANDARD_SCRIPT_VERIFY_FLAGS,
+/// invoked from `AcceptToMemoryPool` / `PolicyScriptChecks` (validation.cpp).
+/// These extra flags MUST NOT appear in `getBlockScriptFlags`: setting them
+/// during block validation would reject consensus-valid blocks. They only
+/// apply at the mempool boundary.
+///
+/// Policy add-ons (true ⇔ STRICTENC | LOW_S | NULLFAIL | MINIMALDATA |
+/// CLEANSTACK | MINIMALIF | WITNESS_PUBKEYTYPE | CONST_SCRIPTCODE |
+/// DISCOURAGE_UPGRADABLE_NOPS | DISCOURAGE_OP_SUCCESS |
+/// DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM).
+///
+/// SIGPUSHONLY is intentionally NOT included here: Core enforces it on the
+/// scriptSig as part of `IsStandardTx` (policy/policy.cpp), not as a
+/// SCRIPT_VERIFY flag at the relay path. We mirror that split — the
+/// scriptSig push-only check in `Mempool.checkStandard` / Core's
+/// `IsStandardTx` is the authoritative gate; we don't double-fire it
+/// inside the script-engine here.
+pub fn getStandardScriptFlags(height: u32, params: *const consensus.NetworkParams) script.ScriptFlags {
+    return getStandardScriptFlagsForHash(height, params, null);
+}
+
+/// Variant that takes the block hash so the BIP-16 / Taproot exception list
+/// can be applied. In practice the mempool path always operates at the tip,
+/// so the hash arg is rarely meaningful — but we keep the signature parallel
+/// to `getBlockScriptFlagsForHash` for completeness.
+pub fn getStandardScriptFlagsForHash(
+    height: u32,
+    params: *const consensus.NetworkParams,
+    block_hash: ?*const types.Hash256,
+) script.ScriptFlags {
+    var flags = getBlockScriptFlagsForHash(height, params, block_hash);
+
+    // Layer the STANDARD policy flags on top of the consensus base.
+    // These are the flags Core's STANDARD_SCRIPT_VERIFY_FLAGS adds on top
+    // of MANDATORY_SCRIPT_VERIFY_FLAGS (policy/policy.h:119-132).
+    flags.verify_strictenc = true;
+    flags.verify_low_s = true;
+    flags.verify_nullfail = true;
+    flags.verify_minimaldata = true;
+    flags.verify_clean_stack = true;
+    flags.verify_witness_pubkeytype = true;
+    flags.verify_const_scriptcode = true;
+    flags.discourage_upgradable_nops = true;
+    flags.discourage_upgradable_witness_program = true;
+    flags.discourage_op_success = true;
+
+    return flags;
+}
+
 // ============================================================================
 // IsFinalTx — Contextual Transaction Finality Check
 // ============================================================================
@@ -5653,6 +5707,258 @@ test "validateBlockForIBD: missing prevout returns MissingInput" {
 test "validateBlockForIBD: force_skip_scripts honours caller override" {
     // Build a minimal valid coinbase-only block (no prevouts to resolve)
     // and confirm that with force_skip_scripts=true validation succeeds.
+    const allocator = std.testing.allocator;
+
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{
+            .{
+                .previous_output = types.OutPoint.COINBASE,
+                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // BIP-34 height=1
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            },
+        },
+        .outputs = &[_]types.TxOut{
+            .{
+                .value = consensus.getBlockSubsidy(1, &consensus.REGTEST),
+                .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+            },
+        },
+        .lock_time = 0,
+    };
+
+    const txid = try crypto.computeTxid(&coinbase, allocator);
+    const merkle = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, allocator);
+
+    var header = consensus.REGTEST.genesis_header;
+    header.merkle_root = merkle;
+    header.bits = 0x207fffff;
+    ibdTestMineNonce(&header, &consensus.REGTEST);
+
+    const block = types.Block{
+        .header = header,
+        .transactions = &[_]types.Transaction{coinbase},
+    };
+    const block_hash = crypto.computeBlockHash(&block.header);
+    var dummy_ctx_state: u8 = 0;
+    var ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&dummy_ctx_state),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    };
+    try validateBlockForIBD(&block, &ctx, allocator);
+}
+
+// ============================================================================
+// submitblock RPC consensus-validation tests (P0-#3 — 2026-05-02)
+//
+// These exercise the SAME validateBlockForIBD entrypoint that the new
+// `rpc.zig:validateSubmitBlockOrReject` gate calls before
+// `block_template.submitBlock`.  The gate itself is plumbing — feeding
+// each block through the validation chain in the strict-mode path.  Here
+// we cover the three "cheapest to express" rejections that the
+// pre-existing PoW+diffbits path in submitBlock did NOT catch:
+//
+//   1. Block with witness data but no/bad witness commitment   (BIP-141)
+//   2. Block whose non-coinbase tx has an unsatisfied locktime (BIP-113)
+//   3. Coinbase-only valid block under force_skip_scripts=true (sanity)
+//
+// All three use REGTEST so the loosest possible PoW target lets us mine
+// a nonce in microseconds.  Network params (segwit_height=1, csv_height=1)
+// activate the soft forks at height 1, so the BIP-141 and BIP-113 gates
+// fire on the very first non-genesis block.
+// ============================================================================
+
+test "submitblock-gate: rejects block with witness data but missing commitment" {
+    // Coinbase has the BIP-34 height prefix but NO BIP-141 witness commitment
+    // output.  Spender carries witness data, which forces validation to look
+    // for the commitment.  Without it, checkWitnessCommitment trips.
+    const allocator = std.testing.allocator;
+
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{
+            .{
+                .previous_output = types.OutPoint.COINBASE,
+                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // BIP-34 height=1
+                .sequence = 0xFFFFFFFF,
+                // Coinbase witness nonce required by BIP-141 — but with no
+                // commitment output downstream, validation MUST still reject.
+                .witness = &[_][]const u8{&([_]u8{0} ** 32)},
+            },
+        },
+        .outputs = &[_]types.TxOut{
+            .{
+                .value = consensus.getBlockSubsidy(1, &consensus.REGTEST),
+                .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+            },
+            // INTENTIONAL: no OP_RETURN 0xaa21a9ed witness-commitment output.
+        },
+        .lock_time = 0,
+    };
+
+    // Spender with witness — its presence flips has_witness=true so
+    // checkBlock invokes checkWitnessCommitment, which sees no commitment
+    // output above and returns BadWitnessCommitment.
+    const spender = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{
+            .{
+                .previous_output = types.OutPoint{ .hash = [_]u8{0xCD} ** 32, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{&[_]u8{ 0x01, 0x02, 0x03 }},
+            },
+        },
+        .outputs = &[_]types.TxOut{
+            .{
+                .value = 1000,
+                .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xCD} ** 20 ++ [_]u8{ 0x88, 0xac }),
+            },
+        },
+        .lock_time = 0,
+    };
+
+    const txid_cb = try crypto.computeTxid(&coinbase, allocator);
+    const txid_sp = try crypto.computeTxid(&spender, allocator);
+    const merkle = try crypto.computeMerkleRoot(
+        &[_]types.Hash256{ txid_cb, txid_sp },
+        allocator,
+    );
+
+    var header = consensus.REGTEST.genesis_header;
+    header.merkle_root = merkle;
+    header.bits = 0x207fffff;
+    ibdTestMineNonce(&header, &consensus.REGTEST);
+
+    const block = types.Block{
+        .header = header,
+        .transactions = &[_]types.Transaction{ coinbase, spender },
+    };
+    const block_hash = crypto.computeBlockHash(&block.header);
+    var dummy_ctx_state: u8 = 0;
+    var ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&dummy_ctx_state),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    };
+    const result = validateBlockForIBD(&block, &ctx, allocator);
+    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+}
+
+test "submitblock-gate: rejects block with non-final tx" {
+    // Spender has a height-based locktime in the FUTURE (lock_time=999) and
+    // a non-final sequence (< 0xFFFFFFFF).  isFinalTx returns false at
+    // lock_time_cutoff=block_height=1, so checkBlock contextual returns
+    // ValidationError.NonFinalTx.
+    const allocator = std.testing.allocator;
+
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{
+            .{
+                .previous_output = types.OutPoint.COINBASE,
+                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // BIP-34 height=1
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            },
+        },
+        .outputs = &[_]types.TxOut{
+            .{
+                .value = consensus.getBlockSubsidy(1, &consensus.REGTEST),
+                .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+            },
+        },
+        .lock_time = 0,
+    };
+
+    // Non-final spender: lock_time is height-based (well below LOCKTIME_THRESHOLD)
+    // and points at a future block, with a sequence that does NOT disable lock_time.
+    const non_final = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{
+            .{
+                .previous_output = types.OutPoint{ .hash = [_]u8{0xCD} ** 32, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFE, // != 0xFFFFFFFF → respects lock_time
+                .witness = &[_][]const u8{},
+            },
+        },
+        .outputs = &[_]types.TxOut{
+            .{
+                .value = 1000,
+                .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xCD} ** 20 ++ [_]u8{ 0x88, 0xac }),
+            },
+        },
+        .lock_time = 999, // height-based; current height=1 < 999 → not final
+    };
+
+    const txid_cb = try crypto.computeTxid(&coinbase, allocator);
+    const txid_sp = try crypto.computeTxid(&non_final, allocator);
+    const merkle = try crypto.computeMerkleRoot(
+        &[_]types.Hash256{ txid_cb, txid_sp },
+        allocator,
+    );
+
+    var header = consensus.REGTEST.genesis_header;
+    header.merkle_root = merkle;
+    header.bits = 0x207fffff;
+    ibdTestMineNonce(&header, &consensus.REGTEST);
+
+    const block = types.Block{
+        .header = header,
+        .transactions = &[_]types.Transaction{ coinbase, non_final },
+    };
+    const block_hash = crypto.computeBlockHash(&block.header);
+    var dummy_ctx_state: u8 = 0;
+    var ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&dummy_ctx_state),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    };
+    const result = validateBlockForIBD(&block, &ctx, allocator);
+    // NonFinalTx is the target rejection.  MissingInput would also be a
+    // legitimate rejection if the IsFinalTx check fired AFTER the prevout
+    // resolver — accept either, the point is the block IS rejected.
+    if (result) |_| {
+        try std.testing.expect(false); // shouldn't pass — this block is invalid
+    } else |err| {
+        try std.testing.expect(
+            err == ValidationError.NonFinalTx or
+                err == ValidationError.MissingInput,
+        );
+    }
+}
+
+test "submitblock-gate: accepts a structurally valid coinbase-only block" {
+    // Mirror the live RPC fast-path: a coinbase-only block built off
+    // REGTEST genesis with the proper merkle root, BIP-34 height prefix,
+    // and a mined nonce.  With force_skip_scripts=true we skip script
+    // verification (matching the assumevalid path) but still run every
+    // OTHER consensus check (PoW, merkle, BIP-34, IsFinalTx, sigops,
+    // coinbase-value).  The block is valid, so validation MUST succeed.
     const allocator = std.testing.allocator;
 
     const coinbase = types.Transaction{

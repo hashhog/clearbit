@@ -84,6 +84,12 @@ pub const RPC_WALLET_NOT_SPECIFIED: i32 = -19;
 // RPC Server
 // ============================================================================
 
+/// One-shot WARN flag for submitblock running without consensus validation.
+/// Mirrors `peer.zig:ibd_validation_warn_emitted` for the RPC submitblock path
+/// (P0-#3, 2026-05-02).  Set true on the first call to validateSubmitBlockOrReject
+/// in `off` mode so the warning emits exactly once per process lifetime.
+var submit_block_validation_warn_emitted: bool = false;
+
 /// JSON-RPC server configuration.
 pub const RpcConfig = struct {
     bind_address: []const u8 = "127.0.0.1",
@@ -2701,6 +2707,23 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Block decode failed", id);
         };
 
+        // P0-#3 (2026-05-02): full consensus validation BEFORE block_template.submitBlock.
+        // The pre-existing block_template.submitBlock path checks ONLY PoW + diffbits
+        // (see block_template.zig:665-682) — no merkle root, no witness commitment,
+        // no script verification, no sigop budget, no fee accounting.  Without this
+        // gate a miner could submit a block that fails Core's CheckBlock+ConnectBlock
+        // and clearbit would happily connect it to chainstate.
+        //
+        // The gate is env-controlled via CLEARBIT_VALIDATE_IBD with the same
+        // "off" / "warn" / "strict" semantics as the IBD path in peer.zig — so
+        // operators flip both paths together.  See doc-comment on
+        // validateSubmitBlockOrReject below.
+        const block_hash = crypto.computeBlockHash(&block_data.header);
+        const submit_height = self.chain_state.best_height + 1;
+        if (!self.validateSubmitBlockOrReject(&block_data, &block_hash, submit_height)) {
+            return self.jsonRpcError(RPC_VERIFY_REJECTED, "Block failed consensus validation", id);
+        }
+
         // Submit block
         const result = block_template.submitBlock(&block_data, self.chain_state, self.network_params, self.allocator) catch {
             return self.jsonRpcError(RPC_VERIFY_ERROR, "Block verification failed", id);
@@ -2713,6 +2736,113 @@ pub const RpcServer = struct {
             // Rejection
             return self.jsonRpcError(RPC_VERIFY_REJECTED, result.reject_reason orelse "Block rejected", id);
         }
+    }
+
+    /// submitblock-time consensus validation gate.  Mirrors
+    /// `peer.zig:validateBlockForIBDOrReject` so the RPC path runs the same
+    /// `validateBlockForIBD` chain (CheckBlock + per-input UTXO + sigops +
+    /// fees + ContextualCheckBlock + scripts) the IBD path runs before
+    /// `connectBlockFast`.  Returns true when the block is safe to submit.
+    ///
+    /// Mode selection (env var CLEARBIT_VALIDATE_IBD — shared with the IBD path):
+    ///   - "0" / unset (default): legacy behaviour — emit a one-shot WARN and
+    ///     accept (matches Core "shadow + log" rollout pattern).  Returns true.
+    ///   - "warn":  run validation, log on failure, but RETURN TRUE so the
+    ///     block is still submitted.  Soak-monitoring mode.
+    ///   - "1" / "strict": run validation, REJECT on failure (returns false;
+    ///     caller surfaces -26 RPC_VERIFY_REJECTED).  Steady-state target.
+    fn validateSubmitBlockOrReject(
+        self: *RpcServer,
+        block: *const types.Block,
+        block_hash: *const types.Hash256,
+        height: u32,
+    ) bool {
+        // Mode selection: same env knob as the IBD gate so operators flip
+        // both paths in lockstep.
+        const mode_env = std.posix.getenv("CLEARBIT_VALIDATE_IBD");
+        const mode: enum { off, warn, strict } = blk: {
+            if (mode_env) |s| {
+                if (std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "strict"))
+                    break :blk .strict;
+                if (std.mem.eql(u8, s, "warn"))
+                    break :blk .warn;
+            }
+            break :blk .off;
+        };
+
+        if (mode == .off) {
+            if (!submit_block_validation_warn_emitted) {
+                submit_block_validation_warn_emitted = true;
+                std.debug.print(
+                    "RPC: WARN clearbit submitblock is running WITHOUT consensus validation. " ++
+                        "Set CLEARBIT_VALIDATE_IBD=strict to enforce PoW/scripts/sigops/fees " ++
+                        "(audit P0-#3, 2026-05-02).\n",
+                    .{},
+                );
+            }
+            return true;
+        }
+
+        // Per-call adapter: closes over chain state's utxo_set and dupes the
+        // reconstructed scriptPubKey onto the heap so the caller-side arena
+        // can adopt it. Identical pattern to peer.zig::validateBlockForIBDOrReject.
+        const Adapter = struct {
+            cs_ptr: *storage.ChainState,
+            alloc: std.mem.Allocator,
+
+            fn lookup(
+                ctx_ptr: *anyopaque,
+                outpoint: *const types.OutPoint,
+            ) ?validation.PrevOutInfo {
+                const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                const compact_opt = me.cs_ptr.utxo_set.get(outpoint) catch return null;
+                var compact = compact_opt orelse return null;
+                defer compact.deinit(me.alloc);
+                const script = compact.reconstructScript(me.alloc) catch return null;
+                return .{
+                    .script_pubkey = script,
+                    .amount = compact.value,
+                    .height = compact.height,
+                    .is_coinbase = compact.is_coinbase,
+                    .owner_allocator = me.alloc,
+                };
+            }
+        };
+        var adapter = Adapter{ .cs_ptr = self.chain_state, .alloc = self.allocator };
+
+        // Same assumevalid-by-construction shortcut peer.zig uses: at submit
+        // time the block at `height` is descended from headers we already
+        // chained back to genesis, so if height <= assume_valid_height we
+        // honour the script-skip.  Non-script consensus checks (PoW, merkle,
+        // sigops, fees, witness commitment, IsFinalTx) are NEVER skipped.
+        const av_height = self.network_params.assume_valid_height;
+        const skip_via_height = (height <= av_height) and (av_height != 0) and
+            (self.network_params.assumed_valid_hash != null);
+
+        var ctx = validation.IBDValidationContext{
+            .block_hash = block_hash.*,
+            .height = height,
+            .params = self.network_params,
+            .prevout_lookup_ctx = @ptrCast(&adapter),
+            .prevout_lookupFn = Adapter.lookup,
+            .active_chain = null,
+            .best_tip_chain_work = [_]u8{0} ** 32,
+            .best_tip_timestamp = 0,
+            .prev_mtp = 0,
+            .force_skip_scripts = skip_via_height,
+        };
+
+        validation.validateBlockForIBD(block, &ctx, self.allocator) catch |err| {
+            std.debug.print(
+                "RPC: REJECT submitblock height={d} validation={} mode={s}\n",
+                .{ height, err, @tagName(mode) },
+            );
+            // .warn accepts the block anyway (so soak monitoring doesn't
+            // break a borderline-valid mining workflow); .strict rejects.
+            if (mode == .warn) return true;
+            return false;
+        };
+        return true;
     }
 
     // ========================================================================
