@@ -25,6 +25,21 @@ pub const MAX_INBOUND_CONNECTIONS: usize = 117;
 /// "running without consensus validation" warning emits exactly once.
 var ibd_validation_warn_emitted: bool = false;
 
+/// One-shot announce flag for the CLEARBIT_REORG=1 opt-in path.  Set
+/// true on the first drain after the env var is detected so the
+/// "undo capture enabled" line emits exactly once per process.
+var reorg_announce_emitted: bool = false;
+
+/// Returns true if `CLEARBIT_REORG` env var is set to "1" or "strict".
+/// This gates the reorg-safe IBD path: with the flag on, drainBlockBuffer
+/// uses connectBlockFastWithUndo (captures + persists per-block undo
+/// data); reorg detection in the headers handler is also active.  Off
+/// = legacy single-fork fast path (current live-node behaviour).
+fn isReorgEnabled() bool {
+    const v = std.posix.getenv("CLEARBIT_REORG") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "strict");
+}
+
 /// Maximum total connections (125 as per Bitcoin Core).
 pub const MAX_TOTAL_CONNECTIONS: usize = MAX_OUTBOUND_CONNECTIONS + MAX_INBOUND_CONNECTIONS;
 
@@ -3899,6 +3914,22 @@ pub const PeerManager = struct {
         // Heartbeat: track last time we emitted an in-drain progress line.
         var last_heartbeat: i64 = std.time.timestamp();
 
+        // CLEARBIT_REORG opt-in: enables undo capture during IBD so the node
+        // can disconnect blocks during a chain reorganization.  Default off
+        // — the legacy fast path remains the live node's behaviour until an
+        // operator soaks the reorg path on a non-production datadir.  Set
+        // via env var to avoid a build flag day churn.  See
+        // `connectBlockFastWithUndo` (storage.zig) for the per-block cost
+        // and `disconnectBlockByHashCF` for the disconnect side.
+        const reorg_enabled = isReorgEnabled();
+        if (reorg_enabled and !reorg_announce_emitted) {
+            reorg_announce_emitted = true;
+            std.debug.print(
+                "P2P: CLEARBIT_REORG=1 — IBD will capture undo data for reorg support\n",
+                .{},
+            );
+        }
+
         // Stall recovery is now handled in two level-triggered paths,
         // matching Bitcoin Core:
         //   1. `pipelineBlockRequests` re-evaluates per-peer budget on every
@@ -4032,11 +4063,31 @@ pub const PeerManager = struct {
                 std.debug.print("P2P: queueBlockWrite failed at height {d}: {}\n", .{ height, err });
             };
 
-            // During IBD, skip undo data collection for speed
-            cs.connectBlockFast(&block, &block_hash, height) catch |err| {
-                std.debug.print("P2P: Failed to connect block at height {d}: {}\n", .{ height, err });
-                break;
-            };
+            // CLEARBIT_REORG=1 opts the IBD path into reorg-safe undo
+            // capture: connectBlockFastWithUndo collects the spent-coin
+            // records as the block is applied and writes serialized undo
+            // bytes to CF_BLOCK_UNDO atomically with the UTXO/tip advance.
+            // Without the flag we keep the legacy fast path (no undo;
+            // single-fork operation only).  Default off so the live node
+            // keeps its current behaviour until soak.
+            //
+            // The slow path's overhead is only the CompactUtxo allocation
+            // for spent inputs and the serialized-undo bytes (~100-200B
+            // per non-coinbase input × ~2 KiB per typical block).  No
+            // additional consensus checks beyond what validateBlockForIBD
+            // already runs; the choice is purely about reorg readiness.
+            if (reorg_enabled) {
+                cs.connectBlockFastWithUndo(&block, &block_hash, height) catch |err| {
+                    std.debug.print("P2P: Failed to connect block (with undo) at height {d}: {}\n", .{ height, err });
+                    break;
+                };
+            } else {
+                // During IBD, skip undo data collection for speed
+                cs.connectBlockFast(&block, &block_hash, height) catch |err| {
+                    std.debug.print("P2P: Failed to connect block at height {d}: {}\n", .{ height, err });
+                    break;
+                };
+            }
 
             const block_elapsed_ns = std.time.nanoTimestamp() - block_start;
             const block_elapsed_ms = @divTrunc(block_elapsed_ns, 1_000_000);
