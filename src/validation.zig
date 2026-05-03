@@ -58,6 +58,9 @@ pub const ValidationError = error{
     CheckpointMismatch,
     ForkBelowCheckpoint,
 
+    // Consensus locktime errors
+    NonFinalTx,
+
     // General errors
     OutOfMemory,
 };
@@ -74,32 +77,71 @@ pub const ValidationError = error{
 /// CRITICAL: Only 7 flags are consensus (enforced during block validation):
 /// - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, TAPROOT
 ///
-/// BIP-146 NULLFAIL and BIP-147 NULLDUMMY are activated with SegWit (BIP-141).
-/// Note: In Bitcoin Core, NULLFAIL is technically policy-only and not set in
-/// GetBlockScriptFlags(). However, clearbit enforces it at consensus level
-/// for additional safety.
+/// BIP-147 NULLDUMMY is activated with SegWit (BIP-141).
+/// All other flags (LOW_S, MINIMALDATA, CLEANSTACK, NULLFAIL,
+/// WITNESS_PUBKEYTYPE, STRICTENC, SIGPUSHONLY, MINIMALIF, etc.) are
+/// policy-only (STANDARD_SCRIPT_VERIFY_FLAGS in Bitcoin Core policy/policy.h)
+/// and MUST NOT appear here.  Adding them rejects consensus-valid blocks.
 pub fn getBlockScriptFlags(height: u32, params: *const consensus.NetworkParams) script.ScriptFlags {
     var flags = script.ScriptFlags{};
 
-    // Disable flags that should only be enabled at specific heights
-    // Start with minimal flags and enable based on activation heights
+    // Start with minimal flags and enable based on activation heights.
+    // Only Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS are set here.
     flags.verify_p2sh = height >= params.bip34_height;
     flags.verify_dersig = height >= params.bip66_height;
     flags.verify_checklocktimeverify = height >= params.bip65_height;
     flags.verify_checksequenceverify = height >= params.csv_height;
     flags.verify_witness = height >= params.segwit_height;
     flags.verify_nulldummy = height >= params.segwit_height;
-    flags.verify_nullfail = height >= params.segwit_height;
     flags.verify_taproot = height >= params.taproot_height;
 
-    // Policy flags that are always enabled for consensus
-    // (these are not height-dependent in Bitcoin Core either)
-    flags.verify_low_s = true;
-    flags.verify_minimaldata = true;
-    flags.verify_clean_stack = true;
-    flags.verify_witness_pubkeytype = height >= params.segwit_height;
+    // Explicitly disable all policy-only flags — ScriptFlags defaults many
+    // fields to `true`, so we must override them here.
+    // These are STANDARD_SCRIPT_VERIFY_FLAGS per Bitcoin Core policy/policy.h:119-132.
+    flags.verify_nullfail = false;
+    flags.verify_witness_pubkeytype = false;
+    flags.verify_low_s = false;
+    flags.verify_minimaldata = false;
+    flags.verify_clean_stack = false;
+    flags.verify_sigpushonly = false;
+    flags.verify_strictenc = false;
+    flags.discourage_upgradable_nops = false;
+    flags.discourage_upgradable_witness_program = false;
+    flags.discourage_op_success = false;
 
     return flags;
+}
+
+// ============================================================================
+// IsFinalTx — Contextual Transaction Finality Check
+// ============================================================================
+
+/// Check whether a transaction is final at a given block height and time.
+///
+/// A transaction is final if:
+/// 1. nLockTime == 0, OR
+/// 2. nLockTime < threshold (height if < 500_000_000, time if >= 500_000_000), OR
+/// 3. All inputs have sequence == 0xFFFFFFFF (SEQUENCE_FINAL)
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp IsFinalTx()
+/// Called from ContextualCheckBlock (Core validation.cpp:4146)
+/// Values below this threshold are block heights; values >= are Unix timestamps.
+const LOCKTIME_THRESHOLD: u32 = 500_000_000;
+
+pub fn isFinalTx(tx: *const types.Transaction, block_height: u32, lock_time_cutoff: u32) bool {
+    if (tx.lock_time == 0) return true;
+
+    const threshold: u32 = if (tx.lock_time < LOCKTIME_THRESHOLD)
+        block_height
+    else
+        lock_time_cutoff;
+
+    if (tx.lock_time < threshold) return true;
+
+    for (tx.inputs) |input| {
+        if (input.sequence != 0xFFFF_FFFF) return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -667,6 +709,22 @@ pub fn connectBlock(
 ) ValidationError!i64 {
     // Get script verification flags for this block height
     const flags = getBlockScriptFlags(height, params);
+
+    // ContextualCheckBlock: enforce IsFinalTx for every transaction
+    // (Bitcoin Core validation.cpp:4146). Consensus rule that runs even
+    // under assumevalid — assumevalid only skips script verification.
+    // lock_time_cutoff = MTP when BIP-113/CSV is active, block timestamp otherwise.
+    const csv_active = height >= params.csv_height;
+    const lock_time_cutoff: u32 = if (csv_active) blk: {
+        if (tip) |t| break :blk t.prev_mtp;
+        break :blk block.header.timestamp;
+    } else block.header.timestamp;
+
+    for (block.transactions) |*tx| {
+        if (!isFinalTx(tx, height, lock_time_cutoff)) {
+            return ValidationError.NonFinalTx;
+        }
+    }
 
     // Track total sigop cost and fees
     var total_sigops_cost: u64 = 0;
@@ -4455,26 +4513,41 @@ test "BlockIndexEntry getAncestor" {
 // Script Flag Tests (BIP-146 NULLFAIL, BIP-147 NULLDUMMY)
 // ============================================================================
 
-test "getBlockScriptFlags: NULLFAIL disabled before segwit activation" {
-    // Before segwit height, NULLFAIL should be disabled
-    const flags = getBlockScriptFlags(consensus.MAINNET.segwit_height - 1, &consensus.MAINNET);
-    try std.testing.expect(!flags.verify_nullfail);
+test "getBlockScriptFlags: NULLFAIL is policy-only, never set in consensus path" {
+    // NULLFAIL (BIP-146) is a STANDARD_SCRIPT_VERIFY_FLAG (policy only).
+    // It must NOT appear in the consensus block-script-flag computer at any height.
+    // Ref: Bitcoin Core policy/policy.h:126 + validation.cpp:2250-2289.
+    const pre_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height - 1, &consensus.MAINNET);
+    const at_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height, &consensus.MAINNET);
+    const post_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height + 1000, &consensus.MAINNET);
+    try std.testing.expect(!pre_segwit.verify_nullfail);
+    try std.testing.expect(!at_segwit.verify_nullfail);
+    try std.testing.expect(!post_segwit.verify_nullfail);
 }
 
-test "getBlockScriptFlags: NULLFAIL enabled at segwit activation height" {
-    // At segwit activation height (481824 mainnet), NULLFAIL should be enabled
-    const flags = getBlockScriptFlags(consensus.MAINNET.segwit_height, &consensus.MAINNET);
-    try std.testing.expect(flags.verify_nullfail);
+test "getBlockScriptFlags: WITNESS_PUBKEYTYPE is policy-only, never set in consensus path" {
+    // WITNESS_PUBKEYTYPE is a STANDARD_SCRIPT_VERIFY_FLAG (policy only).
+    const at_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height, &consensus.MAINNET);
+    const post_taproot = getBlockScriptFlags(consensus.MAINNET.taproot_height + 1000, &consensus.MAINNET);
+    try std.testing.expect(!at_segwit.verify_witness_pubkeytype);
+    try std.testing.expect(!post_taproot.verify_witness_pubkeytype);
 }
 
-test "getBlockScriptFlags: NULLFAIL enabled after segwit activation" {
-    // After segwit activation, NULLFAIL should remain enabled
-    const flags = getBlockScriptFlags(consensus.MAINNET.segwit_height + 1000, &consensus.MAINNET);
-    try std.testing.expect(flags.verify_nullfail);
+test "getBlockScriptFlags: LOW_S MINIMALDATA CLEANSTACK are policy-only" {
+    // These BIP-62 family flags are policy-only and must never appear in the
+    // consensus block-script-flag computer at any height.
+    const at_genesis = getBlockScriptFlags(0, &consensus.MAINNET);
+    const at_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height, &consensus.MAINNET);
+    try std.testing.expect(!at_genesis.verify_low_s);
+    try std.testing.expect(!at_genesis.verify_minimaldata);
+    try std.testing.expect(!at_genesis.verify_clean_stack);
+    try std.testing.expect(!at_segwit.verify_low_s);
+    try std.testing.expect(!at_segwit.verify_minimaldata);
+    try std.testing.expect(!at_segwit.verify_clean_stack);
 }
 
-test "getBlockScriptFlags: NULLDUMMY follows NULLFAIL activation" {
-    // NULLDUMMY (BIP-147) is also activated with segwit
+test "getBlockScriptFlags: NULLDUMMY (BIP-147) activates with SegWit" {
+    // NULLDUMMY IS a consensus rule — activated with segwit.
     const pre_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height - 1, &consensus.MAINNET);
     const at_segwit = getBlockScriptFlags(consensus.MAINNET.segwit_height, &consensus.MAINNET);
 
@@ -4482,10 +4555,15 @@ test "getBlockScriptFlags: NULLDUMMY follows NULLFAIL activation" {
     try std.testing.expect(at_segwit.verify_nulldummy);
 }
 
-test "getBlockScriptFlags: regtest has NULLFAIL enabled from block 0" {
-    // Regtest has segwit_height = 0, so NULLFAIL is always enabled
+test "getBlockScriptFlags: regtest has consensus flags from block 0, not policy flags" {
+    // Regtest has segwit_height = 0, so WITNESS+NULLDUMMY are active from genesis.
+    // Policy flags (NULLFAIL, WITNESS_PUBKEYTYPE, LOW_S, etc.) must still be absent.
     const flags = getBlockScriptFlags(0, &consensus.REGTEST);
-    try std.testing.expect(flags.verify_nullfail);
+    try std.testing.expect(!flags.verify_nullfail);
+    try std.testing.expect(!flags.verify_witness_pubkeytype);
+    try std.testing.expect(!flags.verify_low_s);
+    try std.testing.expect(!flags.verify_minimaldata);
+    try std.testing.expect(!flags.verify_clean_stack);
     try std.testing.expect(flags.verify_nulldummy);
     try std.testing.expect(flags.verify_witness);
 }
@@ -4709,4 +4787,89 @@ test "verifyBlockScriptsSingleThreaded with empty utxo lookup returns missing in
     const result = verifyBlockScriptsSingleThreaded(&block, flags, &utxo_lookup, allocator);
 
     try std.testing.expectError(ValidationError.MissingInput, result);
+}
+
+// ============================================================================
+// isFinalTx tests (Core ContextualCheckBlock parity, validation.cpp:4146)
+// ============================================================================
+
+test "isFinalTx: zero locktime is always final" {
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000, // non-final sequence
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0, // always final
+    };
+    try std.testing.expect(isFinalTx(&tx, 1000, 900_000_001));
+}
+
+test "isFinalTx: height-based locktime satisfied" {
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100, // height-based: 100 < 101 (height) → satisfied
+    };
+    try std.testing.expect(isFinalTx(&tx, 101, 900_000_001));
+}
+
+test "isFinalTx: height-based locktime not satisfied, non-final sequence → non-final" {
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000001, // not SEQUENCE_FINAL
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 200, // 200 >= 100 (height) → not satisfied
+    };
+    try std.testing.expect(!isFinalTx(&tx, 100, 900_000_001));
+}
+
+test "isFinalTx: SEQUENCE_FINAL on all inputs overrides unsatisfied locktime" {
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF, // SEQUENCE_FINAL
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 999_999_999, // unsatisfied
+    };
+    try std.testing.expect(isFinalTx(&tx, 100, 900_000_001));
+}
+
+test "isFinalTx: time-based locktime not satisfied → non-final" {
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000001, // not SEQUENCE_FINAL
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 500_000_002, // time-based: >= LOCKTIME_THRESHOLD
+    };
+    // lock_time_cutoff = 500_000_001 < lock_time → not satisfied; sequence not FINAL
+    try std.testing.expect(!isFinalTx(&tx, 100, 500_000_001));
 }
