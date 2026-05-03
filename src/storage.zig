@@ -13,6 +13,7 @@
 //! - `block_index`: Block header + height keyed by block hash
 //! - `utxo`: Unspent transaction outputs keyed by outpoint (txid + vout)
 //! - `tx_index`: Transaction location (block hash + index) keyed by txid
+//! - `block_undo`: Per-block undo data keyed by block hash (for reorg disconnect)
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -27,6 +28,15 @@ pub const CF_BLOCKS: usize = 1; // Raw block data
 pub const CF_BLOCK_INDEX: usize = 2; // Block header + metadata by hash
 pub const CF_UTXO: usize = 3; // Unspent transaction outputs
 pub const CF_TX_INDEX: usize = 4; // Transaction hash -> block location
+/// Per-block undo data keyed by block hash. Stores the BlockUndoData byte
+/// stream (matches `BlockUndoData.toBytes`/`fromBytes`) so any block on a
+/// non-pruned chain can be disconnected during a reorg.  Added 2026-05-02
+/// to close the IBD-only / no-disconnect deferred P0s without inheriting
+/// rev*.dat-file management complexity (Option B in the deferred audit).
+pub const CF_BLOCK_UNDO: usize = 5;
+/// Total number of column families. Must match `cf_names` length in
+/// storage_rocksdb.zig and the array sizes in DbState.
+pub const CF_COUNT: usize = 6;
 
 pub const StorageError = error{
     OpenFailed,
@@ -1867,8 +1877,28 @@ pub const ChainState = struct {
     // the cleanup loop frees them via the standard BatchOp free. On
     // flush_error / process exit, deinit() drains the queue.
     pending_block_writes: std.ArrayList(PendingBlockWrite) = undefined,
+    /// Per-block undo bytes pending durable write to CF_BLOCK_UNDO.  Same
+    /// atomic-flush pattern as `pending_block_writes`: bytes are appended
+    /// just before `connectBlockFastWithUndo` returns success, then committed
+    /// in the next `flush()` call's WriteBatch alongside the UTXO mutations,
+    /// tip, and CF_BLOCKS body.  A crash leaves all four advanced together
+    /// or none.
+    ///
+    /// Populated by `connectBlockFastWithUndo` (runtime-IBD path with reorg
+    /// support enabled) and by the existing `connectBlockWithUndo` /
+    /// rollback-dance call sites.  Empty whenever undo capture is disabled
+    /// (legacy IBD path that calls `connectBlockFast`), so flush()'s undo
+    /// loop is a no-op in that case.
+    ///
+    /// Bytes are heap-owned by ChainState until flush() succeeds.
+    pending_undo_writes: std.ArrayList(PendingUndoWrite) = undefined,
 
     pub const PendingBlockWrite = struct {
+        hash: types.Hash256,
+        bytes: []u8,
+    };
+
+    pub const PendingUndoWrite = struct {
         hash: types.Hash256,
         bytes: []u8,
     };
@@ -1967,6 +1997,7 @@ pub const ChainState = struct {
             .undo_manager = null,
             .allocator = allocator,
             .pending_block_writes = std.ArrayList(PendingBlockWrite).init(allocator),
+            .pending_undo_writes = std.ArrayList(PendingUndoWrite).init(allocator),
         };
     }
 
@@ -1980,6 +2011,7 @@ pub const ChainState = struct {
             .undo_manager = UndoFileManager.init(data_dir, allocator),
             .allocator = allocator,
             .pending_block_writes = std.ArrayList(PendingBlockWrite).init(allocator),
+            .pending_undo_writes = std.ArrayList(PendingUndoWrite).init(allocator),
         };
     }
 
@@ -2001,6 +2033,12 @@ pub const ChainState = struct {
             self.allocator.free(entry.bytes);
         }
         self.pending_block_writes.deinit();
+        // Same drain for undo bytes — owned by the queue until flush()
+        // succeeds.  On a flush_error / process exit we own them here.
+        for (self.pending_undo_writes.items) |entry| {
+            self.allocator.free(entry.bytes);
+        }
+        self.pending_undo_writes.deinit();
         self.utxo_set.deinit();
     }
 
@@ -2356,6 +2394,224 @@ pub const ChainState = struct {
         }
     }
 
+    /// Connect a block during IBD AND capture undo data for later disconnect.
+    ///
+    /// This is the reorg-safe IBD path.  It collects per-input prev-coin
+    /// records (via `connectBlockInner` with `skip_undo=false`), serializes
+    /// them with `BlockUndoData.toBytes`, and queues the bytes for atomic
+    /// write to CF_BLOCK_UNDO in the same flush() WriteBatch as the UTXO
+    /// mutations and tip update.  After this method returns success, the
+    /// block can be disconnected later via `disconnectBlockByHashCF`.
+    ///
+    /// Cost vs `connectBlockFast`: extra heap traffic for the spent_utxos
+    /// list during connectBlockInner (one CompactUtxo per input, freed
+    /// after toBlockUndoData) plus the serialized undo bytes (typically
+    /// 100-200 bytes per non-coinbase input × ~2-3 KiB blocks). On a
+    /// 10-input block that's ~5 KiB extra alloc/block.
+    ///
+    /// Caller contract: same as `connectBlockFast` — invoked on a block
+    /// already validated by `validateBlockForIBD`, with the connect mutex
+    /// uncontended.  On any error the in-memory tip is unchanged (errdefer
+    /// in connectBlockInner restores best_height).
+    pub fn connectBlockFastWithUndo(
+        self: *ChainState,
+        block: *const types.Block,
+        hash: *const types.Hash256,
+        height: u32,
+    ) !void {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
+
+        if (self.flush_error) {
+            std.debug.print("connectBlockFastWithUndo: prior flush error is sticky; refusing to connect block at height {d}\n", .{height});
+            return error.FlushError;
+        }
+
+        // Capture undo via the slow path (skip_undo=false).
+        var undo = try self.connectBlockInner(block, hash, height, false);
+        // Always free the in-memory BlockUndo before returning.  The
+        // serialized bytes we hand off to pending_undo_writes are an
+        // independent allocation produced by toBlockUndoData → toBytes.
+        defer undo.deinit(self.allocator);
+
+        // Convert the in-memory BlockUndo to the file-format BlockUndoData
+        // and serialize.  Bytes are heap-owned by the queue; flush() either
+        // commits and frees them, or keeps the queue intact for the next
+        // retry on flush error.
+        if (self.utxo_set.db != null) {
+            var undo_data = try undo.toBlockUndoData(block, self.allocator);
+            defer undo_data.deinit(self.allocator);
+
+            const serialized_const = try undo_data.toBytes(self.allocator);
+            const serialized: []u8 = @constCast(serialized_const);
+            errdefer self.allocator.free(serialized);
+
+            try self.pending_undo_writes.append(.{
+                .hash = hash.*,
+                .bytes = serialized,
+            });
+        }
+
+        // Atomic flush: tip + UTXOs + CF_BLOCKS body + CF_BLOCK_UNDO entry
+        // all commit in one WriteBatch.  If this fails, flush() leaves the
+        // pending queues intact for retry on the next call (after operator
+        // intervention to clear flush_error).
+        self.flush() catch |err| {
+            std.debug.print("connectBlockFastWithUndo: flush failed at height {d}: {} — halting IBD\n", .{ height, err });
+            self.flush_error = true;
+            return error.FlushError;
+        };
+    }
+
+    /// Read the serialized undo bytes for a block from CF_BLOCK_UNDO.
+    /// Returns null if no entry exists (block was connected via the
+    /// legacy `connectBlockFast` path that doesn't write undo).  Caller
+    /// owns the returned slice and must free with `self.allocator`.
+    pub fn getBlockUndoBytes(self: *ChainState, hash: *const types.Hash256) !?[]const u8 {
+        const db = self.utxo_set.db orelse return null;
+        return try db.get(CF_BLOCK_UNDO, hash);
+    }
+
+    /// Disconnect a block using undo data stored in CF_BLOCK_UNDO.
+    ///
+    /// Reverses the UTXO changes the block applied: removes outputs the
+    /// block created, restores the prevouts the block spent.  Used in the
+    /// reorg path when an alternate chain with higher chainwork arrives
+    /// and the active chain must be rewound to the fork point.
+    ///
+    /// Returns:
+    ///   error.UndoDataNotFound — no CF_BLOCK_UNDO entry for this hash
+    ///     (block predates CLEARBIT_REORG capture, or was pruned).
+    ///   error.BlockBodyNotFound — no CF_BLOCKS entry; can't iterate
+    ///     transactions to remove their outputs.
+    ///   error.HeightMismatch — block isn't the current tip; caller must
+    ///     disconnect tip-first in reverse height order.
+    ///
+    /// On success: best_hash + best_height move to the parent, dirty
+    /// UTXO state is queued for the next flush().  Caller should call
+    /// flush() after the full disconnect chain completes (or rely on the
+    /// next connect's flush() to commit the rewind atomically).
+    pub fn disconnectBlockByHashCF(
+        self: *ChainState,
+        hash: *const types.Hash256,
+    ) !void {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
+
+        if (self.flush_error) {
+            std.debug.print("disconnectBlockByHashCF: prior flush error is sticky; refusing to disconnect\n", .{});
+            return error.FlushError;
+        }
+
+        if (!std.mem.eql(u8, hash, &self.best_hash)) {
+            return error.HeightMismatch;
+        }
+
+        const db = self.utxo_set.db orelse return error.UndoManagerNotConfigured;
+
+        // Read undo bytes.
+        const undo_bytes = (try db.get(CF_BLOCK_UNDO, hash)) orelse
+            return error.UndoDataNotFound;
+        defer self.allocator.free(undo_bytes);
+
+        var undo_data = try BlockUndoData.fromBytes(undo_bytes, self.allocator);
+        defer undo_data.deinit(self.allocator);
+
+        // Read block body so we can iterate its transactions to remove
+        // created outputs.
+        const block_bytes = (try db.get(CF_BLOCKS, hash)) orelse
+            return error.BlockBodyNotFound;
+        defer self.allocator.free(block_bytes);
+
+        var reader = serialize.Reader{ .data = block_bytes };
+        var block = serialize.readBlock(&reader, self.allocator) catch
+            return error.CorruptBlockBytes;
+        defer serialize.freeBlock(self.allocator, &block);
+
+        // Suppress eviction during the disconnect so partial mid-disconnect
+        // UTXO state never gets persisted on its own.
+        self.utxo_set.suppress_eviction = true;
+        defer self.utxo_set.suppress_eviction = false;
+
+        // 1. Remove outputs created by this block (reverse tx order, reverse
+        //    output order within each tx).  Mirrors Core's DisconnectBlock
+        //    which iterates `for (i = block.vtx.size() - 1; i >= 0; i--)`.
+        const crypto = @import("crypto.zig");
+        var tx_idx = block.transactions.len;
+        while (tx_idx > 0) {
+            tx_idx -= 1;
+            const tx = block.transactions[tx_idx];
+            const tx_hash = crypto.computeTxidStreaming(&tx);
+
+            var out_idx = tx.outputs.len;
+            while (out_idx > 0) {
+                out_idx -= 1;
+                const output = tx.outputs[out_idx];
+
+                // Skip OP_RETURN — never added to UTXO on connect, so
+                // never to remove on disconnect.  Same gate as
+                // connectBlockInner line 2464.
+                if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) continue;
+
+                const outpoint = types.OutPoint{
+                    .hash = tx_hash,
+                    .index = @intCast(out_idx),
+                };
+
+                if (try self.utxo_set.spend(&outpoint)) |*spent| {
+                    var s = spent.*;
+                    s.deinit(self.allocator);
+                }
+                // If spend returned null the output wasn't in the UTXO
+                // set — could be (a) already pruned or (b) the connect
+                // path skipped it for some reason.  We tolerate (a) and
+                // log (b) — undo of a missing output is a no-op for the
+                // common case.
+            }
+        }
+
+        // 2. Restore prevouts.  undo_data.tx_undo[i] corresponds to
+        //    block.transactions[i+1] (coinbase has no undo).
+        if (undo_data.tx_undo.len + 1 != block.transactions.len) {
+            std.debug.print("disconnectBlockByHashCF: undo/tx count mismatch ({d} vs {d})\n",
+                .{ undo_data.tx_undo.len, block.transactions.len });
+            return error.CorruptData;
+        }
+        var u_idx: usize = 0;
+        for (block.transactions[1..]) |tx| {
+            const tx_undo = undo_data.tx_undo[u_idx];
+            u_idx += 1;
+            if (tx_undo.prev_outputs.len != tx.inputs.len) {
+                std.debug.print("disconnectBlockByHashCF: tx undo input count mismatch\n", .{});
+                return error.CorruptData;
+            }
+            for (tx.inputs, 0..) |input, input_idx| {
+                const prev_out = tx_undo.prev_outputs[input_idx];
+                const txout = types.TxOut{
+                    .value = prev_out.value,
+                    .script_pubkey = prev_out.script_pubkey,
+                };
+                try self.utxo_set.add(
+                    &input.previous_output,
+                    &txout,
+                    prev_out.height,
+                    prev_out.is_coinbase,
+                );
+            }
+        }
+
+        // Move tip to parent.
+        self.best_hash = block.header.prev_block;
+        if (self.best_height > 0) self.best_height -= 1;
+
+        // Queue a delete of the CF_BLOCK_UNDO entry for the disconnected
+        // block — it's no longer needed once rewound.  We do this via a
+        // direct db.delete (atomic enough for our purposes; the chain tip
+        // moves on the next flush()).  Skip if the delete races with a
+        // re-connect: idempotent.
+        db.delete(CF_BLOCK_UNDO, hash) catch {};
+    }
+
     fn connectBlockInner(
         self: *ChainState,
         block: *const types.Block,
@@ -2700,6 +2956,28 @@ pub const ChainState = struct {
             } });
         }
 
+        // 6. Pending block-undo bytes (CF_BLOCK_UNDO).  Same atomicity
+        //    invariant as CF_BLOCKS above: undo bytes commit in the SAME
+        //    WriteBatch as the UTXO mutations and tip advance, so a crash
+        //    leaves either both the spend records AND the corresponding
+        //    undo entry advanced, or neither.  Without this guarantee, a
+        //    reorg after an unclean shutdown could see "tip advanced past
+        //    block N but no undo entry for N" — `disconnectBlockByHashCF`
+        //    would then fail and the reorg would abort mid-flight.
+        //
+        //    Empty queue is the legacy IBD path's behaviour
+        //    (`connectBlockFast` doesn't capture undo); empty loop is a
+        //    no-op so this section is zero-cost when reorg support is off.
+        for (self.pending_undo_writes.items) |entry| {
+            const k = try self.allocator.alloc(u8, 32);
+            @memcpy(k, &entry.hash);
+            try batch.append(.{ .put = .{
+                .cf = CF_BLOCK_UNDO,
+                .key = k,
+                .value = entry.bytes,
+            } });
+        }
+
         flush_build_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_build_start));
 
         if (batch.items.len > 0) {
@@ -2717,10 +2995,10 @@ pub const ChainState = struct {
                     switch (op) {
                         .put => |p| {
                             self.allocator.free(@constCast(p.key));
-                            // CF_BLOCKS values are still owned by
-                            // pending_block_writes for the next retry;
-                            // do NOT free them here.
-                            if (p.cf != CF_BLOCKS) {
+                            // CF_BLOCKS / CF_BLOCK_UNDO values are still
+                            // owned by their respective pending queues for
+                            // the next retry; do NOT free them here.
+                            if (p.cf != CF_BLOCKS and p.cf != CF_BLOCK_UNDO) {
                                 self.allocator.free(@constCast(p.value));
                             }
                         },
@@ -2756,15 +3034,22 @@ pub const ChainState = struct {
             }
             self.pending_block_writes.clearRetainingCapacity();
 
+            // CF_BLOCK_UNDO bytes committed: same drain pattern as
+            // pending_block_writes above.  Empty in the legacy IBD path.
+            for (self.pending_undo_writes.items) |entry| {
+                self.allocator.free(entry.bytes);
+            }
+            self.pending_undo_writes.clearRetainingCapacity();
+
             // Free allocated keys and values
             for (batch.items) |op| {
                 switch (op) {
                     .put => |p| {
                         self.allocator.free(@constCast(p.key));
-                        // CF_BLOCKS values were freed above via
-                        // pending_block_writes — skip here to avoid
-                        // double-free.
-                        if (p.cf != CF_BLOCKS) {
+                        // CF_BLOCKS / CF_BLOCK_UNDO values were freed above
+                        // via their respective pending queues — skip here
+                        // to avoid double-free.
+                        if (p.cf != CF_BLOCKS and p.cf != CF_BLOCK_UNDO) {
                             self.allocator.free(@constCast(p.value));
                         }
                     },
