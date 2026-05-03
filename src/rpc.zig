@@ -4316,6 +4316,25 @@ pub const RpcServer = struct {
         }
         const path = path_param.string;
 
+        // Refuse to clobber an existing destination — matches Core's
+        // "<path> already exists" guard in rpc/blockchain.cpp::dumptxoutset.
+        // The .incomplete temp is fine to overwrite (left over from a
+        // previous crashed dump).
+        if (std.fs.cwd().access(path, .{})) |_| {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMS,
+                "path already exists. If you are sure this is what you want, move it out of the way first.",
+                id,
+            );
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "could not stat snapshot output path",
+                id,
+            ),
+        }
+
         // Optional positional `type` (Core: "" / "latest" / "rollback").
         var snapshot_type: []const u8 = "";
         if (params.array.items.len >= 2) {
@@ -4455,6 +4474,14 @@ pub const RpcServer = struct {
 
         // Decide whether we actually need to roll back.
         const need_rollback = target_resolved and target_height != tip_height;
+
+        // Pruned-mode pre-check (Core: rpc/blockchain.cpp:dumptxoutset,
+        // `IsPruneMode() && target_index->nHeight < GetFirstBlock()->nHeight`).
+        // Clearbit does not implement block pruning today (Cat C audit
+        // `project_storage_parity_category_c` — Pruning MISSING in clearbit).
+        // Every block from genesis is in CF_BLOCKS, so any rollback target is
+        // reachable and the check is a no-op. Documented gap: revisit if
+        // `--prune` lands.
 
         if (need_rollback) {
             // The non-tip rollback path requires:
@@ -8359,6 +8386,57 @@ test "dumptxoutset latest writes a snapshot at the current tip" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"coins_written\":1") != null);
     const stat = try std.fs.cwd().statFile(tmp_path);
     try std.testing.expect(stat.size > 0);
+
+    // Atomic-write invariant: after a successful dump the .incomplete temp
+    // must NOT be left on disk. Mirrors Core's
+    // rpc/blockchain.cpp::dumptxoutset which renames temppath → path.
+    const incomplete_path = "/tmp/clearbit-dumptxoutset-latest.dat.incomplete";
+    if (std.fs.cwd().access(incomplete_path, .{})) |_| {
+        std.fs.cwd().deleteFile(incomplete_path) catch {};
+        try std.testing.expect(false); // .incomplete should not exist
+    } else |_| {
+        // Expected: file not found.
+    }
+}
+
+test "dumptxoutset refuses to overwrite an existing path" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_hash = [_]u8{0xCD} ** 32;
+    chain_state.best_height = 800_000;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = makeDumpTestServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    const tmp_path = "/tmp/clearbit-dumptxoutset-clobber.dat";
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    // Pre-create the destination so the RPC's "already exists" guard fires.
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        try f.writeAll("preexisting");
+        f.close();
+    }
+
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"{s}\",\"latest\"]}}",
+        .{tmp_path},
+    );
+    defer allocator.free(req);
+
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "already exists") != null);
 }
 
 test "dumptxoutset rollback (no target) below lowest mainnet snapshot returns error" {
