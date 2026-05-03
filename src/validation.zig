@@ -993,10 +993,17 @@ pub fn validateBlockForIBD(
     const params = ctx.params;
     const height = ctx.height;
 
-    // 1. Header PoW.  Note: timestamp checks (MTP, 2h future) are not
-    // enforced here because ChainState doesn't expose the previous-11
-    // header timestamps yet; that gap is logged in the Cat A audit.
+    // 1. Header PoW.
     try checkBlockHeader(&block.header, params);
+
+    // 1a. BIP-113 MTP-of-11 check (ContextualCheckBlockHeader in Core).
+    // block.header.timestamp must be strictly greater than the median-time-past
+    // of the previous 11 blocks.  ctx.prev_mtp is populated by peer.zig from the
+    // header_index walk; 0 means genesis / not-yet-available, skip the check.
+    // Reference: bitcoin-core/src/validation.cpp:4092-4093.
+    if (ctx.prev_mtp != 0 and block.header.timestamp <= ctx.prev_mtp) {
+        return ValidationError.BadTimestamp;
+    }
 
     // 2. Per-block sanity: coinbase position, merkle root, weight, BIP-34,
     // witness commitment, legacy sigop budget.
@@ -6007,4 +6014,135 @@ test "submitblock-gate: accepts a structurally valid coinbase-only block" {
         .force_skip_scripts = true,
     };
     try validateBlockForIBD(&block, &ctx, allocator);
+}
+
+// ============================================================================
+// BIP-113 MTP-of-11 regression tests (Cat J fix -- 2026-05-03)
+// Reference: bitcoin-core/src/validation.cpp:4092-4093
+// ============================================================================
+
+test "validateBlockForIBD: rejects block with timestamp == MTP (BIP-113)" {
+    // Core: block.GetBlockTime() <= pindexPrev->GetMedianTimePast() => INVALID.
+    const alloc = std.testing.allocator;
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.getBlockSubsidy(1, &consensus.REGTEST),
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }},
+        .lock_time = 0,
+    };
+    const tid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{tid}, alloc);
+    const test_mtp: u32 = 1_296_688_602;
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    hdr.timestamp = test_mtp; // == MTP must be rejected
+    ibdTestMineNonce(&hdr, &consensus.REGTEST);
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const res = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = test_mtp,
+        .force_skip_scripts = true,
+    }, alloc);
+    try std.testing.expectError(ValidationError.BadTimestamp, res);
+}
+
+test "validateBlockForIBD: accepts block with timestamp = MTP + 1 (BIP-113)" {
+    // timestamp strictly greater than MTP passes the gate.
+    const alloc = std.testing.allocator;
+    const cb2 = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.getBlockSubsidy(1, &consensus.REGTEST),
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }},
+        .lock_time = 0,
+    };
+    const tid2 = try crypto.computeTxid(&cb2, alloc);
+    const mr2 = try crypto.computeMerkleRoot(&[_]types.Hash256{tid2}, alloc);
+    const test_mtp2: u32 = 1_296_688_602;
+    var hdr2 = consensus.REGTEST.genesis_header;
+    hdr2.merkle_root = mr2;
+    hdr2.bits = 0x207fffff;
+    hdr2.timestamp = test_mtp2 + 1; // strictly greater -> pass
+    ibdTestMineNonce(&hdr2, &consensus.REGTEST);
+    const blk2 = types.Block{ .header = hdr2, .transactions = &[_]types.Transaction{cb2} };
+    const bhash2 = crypto.computeBlockHash(&blk2.header);
+    var d2: u8 = 0;
+    try validateBlockForIBD(&blk2, &IBDValidationContext{
+        .block_hash = bhash2,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&d2),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = test_mtp2,
+        .force_skip_scripts = true,
+    }, alloc);
+}
+
+test "validateBlockForIBD: prev_mtp=0 skips MTP check (genesis-adjacent)" {
+    // When prev_mtp=0 the gate is skipped - genesis has no prior blocks.
+    const alloc = std.testing.allocator;
+    const cb3 = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.getBlockSubsidy(1, &consensus.REGTEST),
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }},
+        .lock_time = 0,
+    };
+    const tid3 = try crypto.computeTxid(&cb3, alloc);
+    const mr3 = try crypto.computeMerkleRoot(&[_]types.Hash256{tid3}, alloc);
+    var hdr3 = consensus.REGTEST.genesis_header;
+    hdr3.merkle_root = mr3;
+    hdr3.bits = 0x207fffff;
+    hdr3.timestamp = 1; // very old - skipped when prev_mtp=0
+    ibdTestMineNonce(&hdr3, &consensus.REGTEST);
+    const blk3 = types.Block{ .header = hdr3, .transactions = &[_]types.Transaction{cb3} };
+    const bhash3 = crypto.computeBlockHash(&blk3.header);
+    var d3: u8 = 0;
+    try validateBlockForIBD(&blk3, &IBDValidationContext{
+        .block_hash = bhash3,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&d3),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
 }

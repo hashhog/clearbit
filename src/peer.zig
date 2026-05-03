@@ -4528,6 +4528,26 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Compute the Median-Time-Past (BIP-113) for a block identified by its
+    /// prev_hash, walking back up to 11 ancestors via the in-memory header_index.
+    /// Returns 0 when fewer than 1 ancestor is known (genesis / not-yet-fetched),
+    /// which causes the caller to skip the MTP check.
+    ///
+    /// Reference: Bitcoin Core pindexPrev->GetMedianTimePast() (chain.h).
+    fn computePrevMtp(self: *PeerManager, prev_hash: *const types.Hash256) u32 {
+        var timestamps: [11]u32 = undefined;
+        var n: usize = 0;
+        var cursor = prev_hash.*;
+        while (n < 11) {
+            const entry = self.header_index.get(cursor) orelse break;
+            timestamps[n] = entry.timestamp;
+            n += 1;
+            cursor = entry.prev_hash;
+        }
+        if (n == 0) return 0;
+        return validation.medianTimePast(timestamps[0..n]);
+    }
+
     /// IBD-time consensus validation gate.  Returns true when the block is
     /// safe to apply via `connectBlockFast`, false on any consensus rule
     /// violation or unrecoverable lookup error.  See
@@ -4661,6 +4681,10 @@ pub const PeerManager = struct {
         // shouldSkipScripts will return false; we then post-process by
         // turning on script-skip if `skip_via_height` is true.  This
         // requires teaching validateBlockForIBD a "force skip" override.
+        // BIP-113: compute MTP-of-11 for the block's parent so validateBlockForIBD
+        // can enforce header.timestamp > MTP (ContextualCheckBlockHeader in Core).
+        const prev_mtp = self.computePrevMtp(&block.header.prev_block);
+
         var ctx = validation.IBDValidationContext{
             .block_hash = block_hash.*,
             .height = height,
@@ -4670,7 +4694,7 @@ pub const PeerManager = struct {
             .active_chain = null,
             .best_tip_chain_work = [_]u8{0} ** 32,
             .best_tip_timestamp = 0,
-            .prev_mtp = 0,
+            .prev_mtp = prev_mtp,
             .force_skip_scripts = skip_via_height,
         };
 
