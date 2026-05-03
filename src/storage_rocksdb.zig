@@ -24,6 +24,7 @@ const cf_names = [_][*:0]const u8{
     "block_index",
     "utxo",
     "tx_index",
+    "block_undo",
 };
 
 /// Internal database state
@@ -31,7 +32,7 @@ const DbState = struct {
     db: ?*c.rocksdb_t,
     write_options: ?*c.rocksdb_writeoptions_t,
     read_options: ?*c.rocksdb_readoptions_t,
-    cf_handles: [5]?*c.rocksdb_column_family_handle_t,
+    cf_handles: [6]?*c.rocksdb_column_family_handle_t,
     allocator: std.mem.Allocator,
 };
 
@@ -87,8 +88,9 @@ pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.A
 
     c.rocksdb_options_set_block_based_table_factory(options, block_based_options);
 
-    const cf_options = [_]?*c.rocksdb_options_t{options} ** 5;
-    var cf_handles: [5]?*c.rocksdb_column_family_handle_t = undefined;
+    const N_CF: usize = cf_names.len; // 6 as of 2026-05-02 (CF_BLOCK_UNDO added)
+    const cf_options = [_]?*c.rocksdb_options_t{options} ** N_CF;
+    var cf_handles: [N_CF]?*c.rocksdb_column_family_handle_t = undefined;
 
     const path_z = allocator.dupeZ(u8, path) catch return storage.StorageError.OutOfMemory;
     defer allocator.free(path_z);
@@ -97,7 +99,7 @@ pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.A
     var db = c.rocksdb_open_column_families(
         options,
         path_z.ptr,
-        5,
+        @intCast(N_CF),
         &cf_names,
         &cf_options,
         @ptrCast(&cf_handles),
@@ -108,52 +110,139 @@ pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.A
         std.debug.print("RocksDB: column family open failed (expected on first run): {s}\n", .{err});
         c.rocksdb_free(@ptrCast(err));
 
-        // Column families don't exist yet - open with default only, then create them
+        // Column family open failed.  Two cases handled here:
+        //  (1) Brand-new DB: no CFs exist except "default".  We open
+        //      default-only and create every non-default CF.
+        //  (2) Existing legacy DB: a previous build had fewer CFs (e.g.
+        //      pre-2026-05-02 builds had 5).  We discover existing CFs via
+        //      rocksdb_list_column_families, open with that smaller set,
+        //      then create just the missing ones.  This makes adding a new
+        //      CF backwards-compatible without forcing a re-IBD.
         errptr = null;
-        db = c.rocksdb_open(options, path_z.ptr, &errptr);
-
-        if (errptr) |err2| {
-            std.debug.print("RocksDB: open failed: {s}\n", .{err2});
-            c.rocksdb_free(@ptrCast(err2));
-            return storage.StorageError.OpenFailed;
-        }
-
-        if (db == null) return storage.StorageError.OpenFailed;
-
-        // Create the non-default column families on the freshly opened DB.
-        // We do NOT need a handle for the default CF here because we will
-        // close this DB and immediately reopen it via rocksdb_open_column_families
-        // below, which returns handles for ALL CFs including "default".
-        for (1..5) |i| {
+        var num_existing: usize = 0;
+        const existing_raw = c.rocksdb_list_column_families(
+            options,
+            path_z.ptr,
+            &num_existing,
+            &errptr,
+        );
+        if (errptr) |err_list| {
+            // Listing failed → assume brand-new path (DB doesn't exist yet).
+            c.rocksdb_free(@ptrCast(err_list));
             errptr = null;
-            const handle = c.rocksdb_create_column_family(
-                db,
-                options,
-                cf_names[i],
-                &errptr,
-            );
-            if (errptr) |err3| {
-                c.rocksdb_free(@ptrCast(err3));
-                // Destroy already created handles and close
-                for (1..i) |j| {
-                    if (cf_handles[j] != null) {
-                        c.rocksdb_column_family_handle_destroy(cf_handles[j]);
-                    }
-                }
-                c.rocksdb_close(db);
+            db = c.rocksdb_open(options, path_z.ptr, &errptr);
+            if (errptr) |err2| {
+                std.debug.print("RocksDB: open failed: {s}\n", .{err2});
+                c.rocksdb_free(@ptrCast(err2));
                 return storage.StorageError.OpenFailed;
             }
-            // Destroy the handle immediately — we will reopen with all CFs below.
-            if (handle != null) c.rocksdb_column_family_handle_destroy(handle);
-        }
-        c.rocksdb_close(db);
+            if (db == null) return storage.StorageError.OpenFailed;
 
-        // Reopen with all five column families so we get proper handles.
+            // Create all non-default CFs.
+            for (1..N_CF) |i| {
+                errptr = null;
+                const handle = c.rocksdb_create_column_family(
+                    db,
+                    options,
+                    cf_names[i],
+                    &errptr,
+                );
+                if (errptr) |err3| {
+                    c.rocksdb_free(@ptrCast(err3));
+                    c.rocksdb_close(db);
+                    return storage.StorageError.OpenFailed;
+                }
+                if (handle != null) c.rocksdb_column_family_handle_destroy(handle);
+            }
+            c.rocksdb_close(db);
+        } else {
+            // Existing DB.  Open with whichever CFs the DB knows about (the
+            // intersection of what's on disk + what's compiled in), then add
+            // the missing ones.  We must pass the EXACT set of existing CFs
+            // to rocksdb_open_column_families — passing extras fails.
+            defer c.rocksdb_list_column_families_destroy(existing_raw, num_existing);
+
+            // Build a name list from the existing CFs.  We don't need to
+            // map them to indices yet — just use them verbatim.
+            const existing_names = allocator.alloc([*:0]const u8, num_existing) catch
+                return storage.StorageError.OutOfMemory;
+            defer allocator.free(existing_names);
+            const existing_opts = allocator.alloc(?*c.rocksdb_options_t, num_existing) catch
+                return storage.StorageError.OutOfMemory;
+            defer allocator.free(existing_opts);
+            const existing_handles = allocator.alloc(?*c.rocksdb_column_family_handle_t, num_existing) catch
+                return storage.StorageError.OutOfMemory;
+            defer allocator.free(existing_handles);
+            for (0..num_existing) |i| {
+                existing_names[i] = existing_raw[i];
+                existing_opts[i] = options;
+            }
+
+            errptr = null;
+            db = c.rocksdb_open_column_families(
+                options,
+                path_z.ptr,
+                @intCast(num_existing),
+                @ptrCast(existing_names.ptr),
+                existing_opts.ptr,
+                @ptrCast(existing_handles.ptr),
+                &errptr,
+            );
+            if (errptr) |err_open| {
+                std.debug.print("RocksDB: open with existing CFs failed: {s}\n", .{err_open});
+                c.rocksdb_free(@ptrCast(err_open));
+                return storage.StorageError.OpenFailed;
+            }
+            if (db == null) return storage.StorageError.OpenFailed;
+
+            // For each compiled CF, create it on disk if not already present.
+            for (1..N_CF) |i| {
+                var found = false;
+                for (0..num_existing) |j| {
+                    if (std.mem.orderZ(u8, cf_names[i], existing_names[j]) == .eq) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) continue;
+
+                errptr = null;
+                const handle = c.rocksdb_create_column_family(
+                    db,
+                    options,
+                    cf_names[i],
+                    &errptr,
+                );
+                if (errptr) |err3| {
+                    std.debug.print("RocksDB: create CF '{s}' failed: {s}\n",
+                        .{ cf_names[i], err3 });
+                    c.rocksdb_free(@ptrCast(err3));
+                    for (0..num_existing) |k| {
+                        if (existing_handles[k] != null) {
+                            c.rocksdb_column_family_handle_destroy(existing_handles[k]);
+                        }
+                    }
+                    c.rocksdb_close(db);
+                    return storage.StorageError.OpenFailed;
+                }
+                if (handle != null) c.rocksdb_column_family_handle_destroy(handle);
+            }
+
+            // Close so we can reopen with all CFs and get fresh handles.
+            for (0..num_existing) |k| {
+                if (existing_handles[k] != null) {
+                    c.rocksdb_column_family_handle_destroy(existing_handles[k]);
+                }
+            }
+            c.rocksdb_close(db);
+        }
+
+        // Reopen with all column families so we get proper handles.
         errptr = null;
         db = c.rocksdb_open_column_families(
             options,
             path_z.ptr,
-            5,
+            @intCast(N_CF),
             &cf_names,
             &cf_options,
             @ptrCast(&cf_handles),
