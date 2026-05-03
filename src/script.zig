@@ -162,6 +162,7 @@ pub const ScriptError = error{
     DiscourageUpgradableNops, // NOP1-NOP10 error when discourage flag set
     TapscriptEmptyPubkey, // BIP-342: OP_CHECKSIG with empty pubkey in tapscript
     TapscriptCheckmultisigDisabled, // BIP-342: OP_CHECKMULTISIG disabled in tapscript
+    TapscriptValidationWeight, // BIP-342: validation-weight budget exhausted
 };
 
 // ============================================================================
@@ -537,6 +538,32 @@ fn isOpSuccess(op: u8) bool {
         (op >= 187 and op <= 254); // 0xbb-0xfe
 }
 
+/// Compute the serialized byte length of a Bitcoin compact-size encoding
+/// for `n`. Mirrors Core's `GetSizeOfCompactSize` (serialize.h):
+///   < 0xfd            -> 1 byte
+///   <= 0xffff         -> 3 bytes (0xfd || u16)
+///   <= 0xffffffff     -> 5 bytes (0xfe || u32)
+///   else              -> 9 bytes (0xff || u64)
+pub fn compactSizeLen(n: u64) u64 {
+    if (n < 0xfd) return 1;
+    if (n <= 0xffff) return 3;
+    if (n <= 0xffffffff) return 5;
+    return 9;
+}
+
+/// Compute the on-the-wire serialized size of a witness stack the way
+/// Core's `::GetSerializeSize(witness.stack)` does it: a compact-size
+/// item count followed by, for each item, its compact-size length
+/// prefix and the item bytes themselves. Used to seed the BIP-342
+/// tapscript validation-weight budget at the leaf entry point.
+pub fn serializedWitnessStackSize(items: []const []const u8) u64 {
+    var total: u64 = compactSizeLen(items.len);
+    for (items) |it| {
+        total += compactSizeLen(it.len) + it.len;
+    }
+    return total;
+}
+
 /// Pre-scans a tapscript for OP_SUCCESSx opcodes per BIP-342.
 /// If any OP_SUCCESSx is found, returns the opcode value.
 /// Skips over push data to avoid false positives in data payloads.
@@ -600,6 +627,19 @@ pub const ScriptEngine = struct {
     /// tapscript sighash via the sha_annex field.
     taproot_annex: ?[]const u8 = null,
 
+    /// BIP-342 tapscript validation-weight budget. Mirrors Core's
+    /// `ScriptExecutionData::m_validation_weight_left` (interpreter.cpp:362).
+    /// Initialized at the tapscript leaf entry to
+    /// `GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET (50)`,
+    /// then decremented by `VALIDATION_WEIGHT_PER_SIGOP_PASSED (50)` for
+    /// every non-empty CHECKSIG / CHECKSIGVERIFY / CHECKSIGADD. Negative
+    /// residue aborts with `TapscriptValidationWeight`.
+    validation_weight_left: i64 = 0,
+    /// Whether `validation_weight_left` has been initialized. Defensive
+    /// guard mirroring Core's `m_validation_weight_left_init`. False on
+    /// legacy / SegWit-v0 paths where the budget is not consulted.
+    validation_weight_init: bool = false,
+
     // Memory management for stack elements we allocate
     owned_elements: std.ArrayList([]u8),
 
@@ -649,6 +689,24 @@ pub const ScriptEngine = struct {
         self.owned_elements.deinit();
         self.stack.deinit();
         self.alt_stack.deinit();
+    }
+
+    /// Decrement the BIP-342 validation-weight counter by 50 (one
+    /// `VALIDATION_WEIGHT_PER_SIGOP_PASSED`). Returns
+    /// `TapscriptValidationWeight` if the residue would go negative,
+    /// matching Core's `m_validation_weight_left -= 50; if (... < 0) ...`
+    /// at interpreter.cpp:362-365.
+    ///
+    /// Caller must only invoke this on the tapscript path with a
+    /// non-empty signature; callers above the OP_CHECKSIG-family
+    /// branches gate on `sig.len > 0`.
+    fn consumeValidationWeight(self: *ScriptEngine) ScriptError!void {
+        // Defensive guard mirroring Core's `assert(m_validation_weight_left_init)`
+        // at interpreter.cpp:361. If we ever get here without the budget
+        // initialized, fail closed rather than silently underflow.
+        if (!self.validation_weight_init) return ScriptError.TapscriptValidationWeight;
+        self.validation_weight_left -= 50;
+        if (self.validation_weight_left < 0) return ScriptError.TapscriptValidationWeight;
     }
 
     /// Execute a script (series of opcodes/data pushes).
@@ -1031,6 +1089,16 @@ pub const ScriptEngine = struct {
                             }
                             return true;
                         }
+
+                        // BIP-342 validation-weight budget (interpreter.cpp:1981):
+                        //   m_validation_weight_left = GetSerializeSize(witness.stack)
+                        //                              + VALIDATION_WEIGHT_OFFSET (50)
+                        // 'witness.stack' is the ORIGINAL pre-pop witness (annex
+                        // INCLUDED, control block + script INCLUDED, args INCLUDED).
+                        // We pass the original `witness` here (not effective_witness).
+                        const ws = serializedWitnessStackSize(witness);
+                        self.validation_weight_left = @intCast(ws + 50);
+                        self.validation_weight_init = true;
 
                         self.sig_version = .tapscript;
                         try self.execute(tap_script);
@@ -1584,6 +1652,13 @@ pub const ScriptEngine = struct {
                 const sig = try self.pop();
 
                 if (self.sig_version == .tapscript) {
+                    // BIP-342 validation-weight budget: decrement by 50 BEFORE
+                    // pubkey inspection, gated on !sig.empty(). Mirrors Core's
+                    // success = !sig.empty() check at interpreter.cpp:357-366.
+                    // Per Core's comment, "Passing with an upgradable public
+                    // key version is also counted", so the deduction fires
+                    // before the 32-byte vs unknown branching below.
+                    if (sig.len > 0) try self.consumeValidationWeight();
                     // BIP-342 tapscript: empty pubkey is an error
                     if (pubkey.len == 0) return ScriptError.TapscriptEmptyPubkey;
 
@@ -1622,6 +1697,10 @@ pub const ScriptEngine = struct {
                 const sig = try self.pop();
 
                 if (self.sig_version == .tapscript) {
+                    // BIP-342 validation-weight budget: see op_checksig above.
+                    // CHECKSIGVERIFY shares the same EvalChecksigTapscript
+                    // path as CHECKSIG in Core.
+                    if (sig.len > 0) try self.consumeValidationWeight();
                     if (pubkey.len == 0) return ScriptError.TapscriptEmptyPubkey;
 
                     if (pubkey.len == 32) {
@@ -1741,12 +1820,18 @@ pub const ScriptEngine = struct {
 
                 const n = try scriptNumDecode(n_data, self.flags.verify_minimaldata);
 
-                // Empty sig means failure (add 0)
+                // Empty sig means failure (add 0). Empty sigs do NOT consume
+                // the BIP-342 validation-weight budget — Core only decrements
+                // when `success = !sig.empty()` (interpreter.cpp:357-366).
                 if (sig.len == 0) {
                     const result = try scriptNumEncode(n, self.allocator);
                     try self.pushOwned(result);
                     return;
                 }
+
+                // BIP-342 validation-weight budget: decrement by 50 BEFORE
+                // pubkey inspection / Schnorr verify. Same gate as CHECKSIG.
+                try self.consumeValidationWeight();
 
                 // Verify Schnorr signature
                 const valid = try self.verifyTaprootSignature(sig, pubkey);
@@ -4410,4 +4495,166 @@ test "countWitnessSigOps: witness version 1 returns 0" {
     // Taproot/witness v1 sigop counting is not defined (returns 0)
     const count = countWitnessSigOps(&[_]u8{}, &script_pubkey, witness, flags);
     try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+// ===========================================================================
+// BIP-342 tapscript validation-weight budget (interpreter.cpp:362)
+// ===========================================================================
+
+test "compactSizeLen: matches Core" {
+    try std.testing.expectEqual(@as(u64, 1), compactSizeLen(0));
+    try std.testing.expectEqual(@as(u64, 1), compactSizeLen(0xfc));
+    try std.testing.expectEqual(@as(u64, 3), compactSizeLen(0xfd));
+    try std.testing.expectEqual(@as(u64, 3), compactSizeLen(0xffff));
+    try std.testing.expectEqual(@as(u64, 5), compactSizeLen(0x10000));
+    try std.testing.expectEqual(@as(u64, 5), compactSizeLen(0xffffffff));
+    try std.testing.expectEqual(@as(u64, 9), compactSizeLen(0x100000000));
+}
+
+test "serializedWitnessStackSize: matches Core GetSerializeSize" {
+    try std.testing.expectEqual(@as(u64, 1), serializedWitnessStackSize(&.{}));
+
+    const single_64 = [_][]const u8{&[_]u8{0} ** 64};
+    // 1 (count) + 1 (item len prefix) + 64 (bytes)
+    try std.testing.expectEqual(@as(u64, 66), serializedWitnessStackSize(&single_64));
+
+    const two_items = [_][]const u8{
+        &[_]u8{0} ** 100,
+        &[_]u8{0} ** 33,
+    };
+    // 1 (count) + (1+100) + (1+33)
+    try std.testing.expectEqual(@as(u64, 1 + 101 + 34), serializedWitnessStackSize(&two_items));
+}
+
+test "tapscript validation-weight: exhausted budget aborts CHECKSIG" {
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 49;
+    engine.validation_weight_init = true;
+
+    // Push sig (deeper) then pubkey (top of stack).
+    const sig_buf = try allocator.dupe(u8, &([_]u8{0x42} ** 64));
+    try engine.pushOwned(sig_buf);
+    const pk_buf = try allocator.dupe(u8, &([_]u8{0x02} ** 32));
+    try engine.pushOwned(pk_buf);
+
+    // OP_CHECKSIG = 0xac
+    const result = engine.execute(&[_]u8{0xac});
+    try std.testing.expectError(ScriptError.TapscriptValidationWeight, result);
+}
+
+test "tapscript validation-weight: empty sig consumes no budget" {
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    // Budget = 0: only an empty sig should NOT trip the gate.
+    engine.validation_weight_left = 0;
+    engine.validation_weight_init = true;
+
+    // Push empty sig then pubkey (top of stack).
+    const sig_buf = try allocator.dupe(u8, "");
+    try engine.pushOwned(sig_buf);
+    const pk_buf = try allocator.dupe(u8, &([_]u8{0x02} ** 32));
+    try engine.pushOwned(pk_buf);
+
+    // OP_CHECKSIG = 0xac. Empty sig + 32-byte pubkey just pushes false;
+    // the budget should NOT be touched.
+    try engine.execute(&[_]u8{0xac});
+    // Budget unchanged.
+    try std.testing.expectEqual(@as(i64, 0), engine.validation_weight_left);
+}
+
+test "tapscript validation-weight: unknown pubkey type consumes budget" {
+    // Per Core's comment "Passing with an upgradable public key version
+    // is also counted." A non-32-byte pubkey on the CHECKSIG path with a
+    // non-empty sig MUST decrement the budget.
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 0;
+    engine.validation_weight_init = true;
+
+    const sig_buf = try allocator.dupe(u8, &([_]u8{0x42} ** 64));
+    try engine.pushOwned(sig_buf);
+    // 33-byte unknown pubkey type
+    const pk_buf = try allocator.dupe(u8, &([_]u8{0x02} ** 33));
+    try engine.pushOwned(pk_buf);
+
+    const result = engine.execute(&[_]u8{0xac});
+    try std.testing.expectError(ScriptError.TapscriptValidationWeight, result);
+}
+
+test "tapscript validation-weight: exhausted budget aborts CHECKSIGADD" {
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, .{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 0;
+    engine.validation_weight_init = true;
+
+    // Stack (top-down): pubkey, num, sig.
+    const sig_buf = try allocator.dupe(u8, &([_]u8{0x42} ** 64));
+    try engine.pushOwned(sig_buf);
+    const num_buf = try allocator.dupe(u8, ""); // 0
+    try engine.pushOwned(num_buf);
+    const pk_buf = try allocator.dupe(u8, &([_]u8{0x02} ** 32));
+    try engine.pushOwned(pk_buf);
+
+    // OP_CHECKSIGADD = 0xba
+    const result = engine.execute(&[_]u8{0xba});
+    try std.testing.expectError(ScriptError.TapscriptValidationWeight, result);
+}
+
+test "tapscript validation-weight: legacy CHECKSIG unaffected" {
+    // SegWit-v0 / legacy paths must NOT consult the budget. Verify by
+    // running a CHECKSIG with the budget uninitialized; the legacy
+    // branch should never call consumeValidationWeight.
+    const allocator = std.testing.allocator;
+    const dummy_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_nullfail = false; // permit empty sig push false on legacy path
+    var engine = ScriptEngine.init(allocator, &dummy_tx, 0, 0, flags);
+    defer engine.deinit();
+    engine.sig_version = .witness_v0; // not tapscript
+    // Empty sig + valid pubkey: legacy path pushes false.
+    const sig_buf = try allocator.dupe(u8, "");
+    try engine.pushOwned(sig_buf);
+    const pk_buf = try allocator.dupe(u8, &([_]u8{0x02} ** 33));
+    try engine.pushOwned(pk_buf);
+
+    // OP_CHECKSIG = 0xac. Should NOT error on the budget gate.
+    try engine.execute(&[_]u8{0xac});
 }
