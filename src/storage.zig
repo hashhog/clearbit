@@ -1849,6 +1849,22 @@ pub const ChainState = struct {
     // boundary. When CF_BLOCKS gains a populator (block_template /
     // mining / serve-from-disk), the same watermark will start
     // reflecting real deletions.
+    // BIP-113 MTP ring buffer — populated by connectBlockInner so that
+    // the submitblock RPC path can enforce the BIP-113 timestamp rule without
+    // accessing CF_BLOCK_INDEX (which the fast connect path does not populate).
+    //
+    // Invariant: `recent_timestamps[i]` holds the timestamp of the block at
+    // height (best_height - i), i.e. slot 0 is the current tip, slot 1 is
+    // its parent, etc.  Up to 11 entries stored; `computeMTP()` sorts them.
+    //
+    // The genesis block's timestamp is stored in slot 0 during chain init
+    // (via initGenesisTimestamp) so that blocks at height 1..10 get the
+    // correct 3..11 ancestor window.
+    //
+    // Reset to all-zeros on init; the count tracks how many are valid.
+    recent_timestamps: [11]u32 = [_]u32{0} ** 11,
+    recent_ts_count: u32 = 0,
+
     /// Prune target size for CF_BLOCKS in MiB. 0 = disabled (pruning off).
     /// Must be ≥ 550 when non-zero (validated in main.zig before assignment).
     prune_target_mib: u64 = 0,
@@ -2015,6 +2031,24 @@ pub const ChainState = struct {
         };
     }
 
+    /// Seed the BIP-113 MTP ring buffer with the genesis block's timestamp.
+    ///
+    /// Must be called once, after `ChainState` is at its final address
+    /// (i.e. after `wireUtxoParent`) so the ring buffer is warm before the
+    /// first block is submitted.  Safe to call multiple times (idempotent
+    /// when count is already >= 1).
+    ///
+    /// Without this, blocks at heights 1..10 would see an MTP window that
+    /// is shorter than the actual ancestor window (missing genesis), causing
+    /// spurious time-too-old rejections for any block whose timestamp
+    /// equals the timestamp of the highest known ancestor.
+    pub fn initGenesisTimestamp(self: *ChainState, genesis_ts: u32) void {
+        if (self.recent_ts_count == 0) {
+            self.recent_timestamps[0] = genesis_ts;
+            self.recent_ts_count = 1;
+        }
+    }
+
     /// Wire up the UtxoSet back-reference so that cache eviction uses
     /// ChainState.flush() (which includes the chain tip) instead of the
     /// bare UtxoSet.flush().  Must be called AFTER the ChainState is at
@@ -2108,6 +2142,37 @@ pub const ChainState = struct {
         var hash: types.Hash256 = undefined;
         @memcpy(&hash, bytes);
         return hash;
+    }
+
+    /// Compute the median-time-past for the active chain tip.
+    ///
+    /// Returns the median timestamp of the last min(recent_ts_count, 11) blocks
+    /// ending at `best_height` (i.e. the MTP that the NEXT block must exceed
+    /// — matching Core's `pindexPrev->GetMedianTimePast()` semantics in
+    /// `validation.cpp::ContextualCheckBlockHeader`).
+    ///
+    /// Uses the in-memory `recent_timestamps` ring buffer populated by
+    /// `connectBlockInner`.  Returns 0 when fewer than 1 timestamp is available
+    /// (genesis / fresh start), matching Core's genesis-adjacent skip.
+    ///
+    /// Reference: bitcoin-core/src/chain.h CBlockIndex::GetMedianTimePast.
+    pub fn computeMTP(self: *const ChainState) u32 {
+        const n = self.recent_ts_count;
+        if (n == 0) return 0;
+
+        // Copy and sort the valid portion (n <= 11, insertion sort is fine)
+        var tmp: [11]u32 = undefined;
+        @memcpy(tmp[0..n], self.recent_timestamps[0..n]);
+        // Insertion sort
+        for (1..n) |i| {
+            const key = tmp[i];
+            var j: usize = i;
+            while (j > 0 and tmp[j - 1] > key) : (j -= 1) {
+                tmp[j] = tmp[j - 1];
+            }
+            tmp[j] = key;
+        }
+        return tmp[n / 2];
     }
 
     /// Returns true if the chain has ever connected a block with the given
@@ -2880,6 +2945,21 @@ pub const ChainState = struct {
 
         self.best_hash = hash.*;
         self.best_height = height;
+
+        // BIP-113: push the new block's timestamp into the ring buffer so
+        // computeMTP() can serve the correct MTP for the NEXT submitted block
+        // without hitting CF_BLOCK_INDEX (which the fast path does not populate).
+        // Shift entries: slot 0 = most-recent, slot 1 = second-most-recent, …
+        // (insertion at the front; shift the rest down; cap at 11).
+        {
+            const n = @min(self.recent_ts_count, 10); // shift up to 10 existing entries
+            var i: u32 = n;
+            while (i > 0) : (i -= 1) {
+                self.recent_timestamps[i] = self.recent_timestamps[i - 1];
+            }
+            self.recent_timestamps[0] = block.header.timestamp;
+            if (self.recent_ts_count < 11) self.recent_ts_count += 1;
+        }
 
         // Re-enable eviction now that tip is consistent with UTXO state.
         self.utxo_set.suppress_eviction = false;
