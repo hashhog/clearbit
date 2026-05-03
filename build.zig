@@ -213,6 +213,48 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_bip35_tests.step);
     }
 
+    // Competing-fork detection + reorg-trigger tests (CLEARBIT_REORG=1).
+    // Filter directly to "tests_reorg_p2p" so the test runner skips the
+    // pre-existing peer.zig eclipse-protection tests that have drifted
+    // from the implementation (same root cause as the BIP-35 isolation
+    // workaround above; without the filter, importing peer.zig pulls
+    // those failing tests into our run).  The filter is a substring
+    // match against the fully-qualified test name; our tests live in
+    // `tests_reorg_p2p.test.<name>`, so the substring matches all of
+    // them and nothing in peer.zig.
+    {
+        const reorg_p2p_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_reorg_p2p.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_reorg_p2p"},
+        });
+        reorg_p2p_tests.linkSystemLibrary("rocksdb");
+        reorg_p2p_tests.linkSystemLibrary("secp256k1");
+        reorg_p2p_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        reorg_p2p_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            reorg_p2p_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            reorg_p2p_tests.linkSystemLibrary("minisketch");
+            reorg_p2p_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        reorg_p2p_tests.root_module.addOptions("build_options", build_options);
+
+        const run_reorg_p2p_tests = b.addRunArtifact(reorg_p2p_tests);
+        const reorg_p2p_test_step = b.step(
+            "test-reorg-p2p",
+            "Run competing-fork detection + reorg-trigger tests (CLEARBIT_REORG=1)",
+        );
+        reorg_p2p_test_step.dependOn(&run_reorg_p2p_tests.step);
+        // Fold into the main `test` step so CI exercises the trigger.
+        test_step.dependOn(&run_reorg_p2p_tests.step);
+    }
+
     // RPC tests run via `tests_rpc.zig` at the project root. The main
     // `tests.zig` root cannot pull in `rpc.zig` because doing so transitively
     // imports `wallet.zig`, whose `@embedFile("../resources/bip39-english.txt")`

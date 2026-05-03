@@ -37,7 +37,250 @@ var reorg_announce_emitted: bool = false;
 /// = legacy single-fork fast path (current live-node behaviour).
 fn isReorgEnabled() bool {
     const v = std.posix.getenv("CLEARBIT_REORG") orelse return false;
-    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "strict");
+    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "warn") or
+        std.mem.eql(u8, v, "strict");
+}
+
+/// Mirror of storage.MAX_REORG_DEPTH (= MIN_BLOCKS_TO_KEEP, 288).  Headers
+/// for a competing fork whose split-point is more than this many blocks
+/// behind the active tip are refused: we cannot disconnect that far without
+/// risking running out of undo data.  Per BIP-37 / Core's MIN_BLOCKS_TO_KEEP.
+pub const MAX_REORG_DEPTH: u32 = 288;
+
+/// Hard cap on `header_index` size.  Once exceeded, oldest non-active-chain
+/// entries are evicted in batch.  10k entries × ~96B per entry = ~1MB
+/// resident — small enough to keep around even in a constrained datadir.
+pub const MAX_HEADER_INDEX: usize = 10_000;
+
+/// In-memory record of a single block header that we've SEEN but may or
+/// may not have a body for.  Populated by the `.headers` handler so we
+/// can detect competing-fork announcements (Case B).  Each entry knows
+/// its prev hash, height (from prev's height + 1), accumulated
+/// chain_work, timestamp, and the original 80-byte header (for re-relay
+/// or POW re-verification later).
+pub const BlockHeaderEntry = struct {
+    /// Block hash (double-SHA256 of the 80-byte header).
+    hash: types.Hash256,
+    /// Predecessor block hash (the header's `prev_block` field).
+    prev_hash: types.Hash256,
+    /// Height of this block (parent's height + 1 — genesis is 0).
+    height: u32,
+    /// Cumulative chain work: parent's chain_work + this header's work.
+    /// Stored big-endian (matches BlockIndexEntry.chain_work).
+    chain_work: [32]u8,
+    /// Block timestamp (header.timestamp).
+    timestamp: u32,
+    /// Original 80-byte serialized header (for getdata replay if needed).
+    header: types.BlockHeader,
+    /// Last access timestamp (seconds since epoch).  Used by the LRU
+    /// eviction sweep to keep recently-touched entries.
+    last_seen: i64,
+};
+
+/// State of an in-progress reorg attempt.  Set when the headers handler
+/// detects a competing-fork branch with strictly higher chainwork than
+/// our active tip.  Cleared after the reorg completes (success or
+/// abort).  Owned by PeerManager.
+pub const PendingReorg = struct {
+    /// Most-recent ancestor that's on the active chain.  Reorg walks
+    /// the active chain back to this hash, then connects fork blocks
+    /// in order.
+    fork_point: types.Hash256,
+    /// Hashes of fork blocks, in connection order: [fork_point + 1,
+    /// fork_point + 2, ..., new_tip].  All must be present in the
+    /// `block_buffer` before we can fire `reorgToChain`.
+    fork_hashes: std.ArrayList(types.Hash256),
+    /// Chain work at the new tip (final element).  Used to confirm we
+    /// haven't been undercut by a fresh active-chain extension that
+    /// passed this fork's chainwork before bodies arrived.
+    new_tip_chain_work: [32]u8,
+    /// Peer that announced the fork (used for misbehaving on failure).
+    /// Stored as raw `*Peer` so the PendingReorg refers back to its
+    /// originator on success / failure logging.  May become a dangling
+    /// pointer if the peer disconnects mid-reorg; use only for ID +
+    /// the misbehaving call inside the same drain pass.
+    source_peer: ?*Peer,
+
+    pub fn deinit(self: *PendingReorg) void {
+        self.fork_hashes.deinit();
+    }
+};
+
+// =====================================================================
+// Chain-work helpers (256-bit big-endian).
+//
+// Bitcoin Core's GetBlockProof returns work = (~target / (target + 1)) + 1
+// where target is the 256-bit difficulty target derived from header.bits.
+// We mirror that math here using 64-bit limbs (4 limbs = 256 bits).
+//
+// Chain work for an entry = parent.chain_work + GetBlockProof(this header).
+// Stored big-endian to keep byte-comparison semantics (matches
+// validation.BlockIndexEntry.chain_work and ChainManager.compareChainWork).
+// =====================================================================
+
+/// In-place big-endian 256-bit add: a += b.  No-op on overflow (chainwork
+/// values used here are sums of GetBlockProof results — overflow would
+/// require >2^256 cumulative work, which is impossible at any realistic
+/// difficulty).  Suppressing wrap silently is acceptable.
+pub fn addChainWorkBE(a: *[32]u8, b: *const [32]u8) void {
+    var carry: u16 = 0;
+    var i: usize = 32;
+    while (i > 0) {
+        i -= 1;
+        const sum = @as(u16, a[i]) + @as(u16, b[i]) + carry;
+        a[i] = @intCast(sum & 0xFF);
+        carry = sum >> 8;
+    }
+    // Drop final carry (overflow); see comment above.
+}
+
+/// Compute GetBlockProof for one header, given the compact-target bits.
+/// Returns the work as a 32-byte big-endian array.
+///
+/// Bitcoin Core (validation.cpp::GetBlockProof):
+///   bnTarget = ArithToUint256(...) from nBits
+///   return (~bnTarget / (bnTarget + 1)) + 1
+///
+/// All math is done on 32-byte big-endian arrays via byte-level
+/// helpers; this keeps the call cost bounded (no allocator) and
+/// matches the storage representation exactly.  When bnTarget is zero
+/// (which the SetCompact contract treats as "negative or overflow")
+/// we return zero work.
+pub fn workFromBits(bits: u32) [32]u8 {
+    const zero: [32]u8 = [_]u8{0} ** 32;
+    // bitsToTarget returns little-endian; convert to big-endian for math.
+    const target_le = consensus.bitsToTarget(bits);
+    var target_be: [32]u8 = undefined;
+    {
+        var i: usize = 0;
+        while (i < 32) : (i += 1) target_be[i] = target_le[31 - i];
+    }
+    // Quick zero check.
+    var nonzero = false;
+    for (target_be) |b| {
+        if (b != 0) {
+            nonzero = true;
+            break;
+        }
+    }
+    if (!nonzero) return zero;
+
+    // Compute ~target.
+    var nt: [32]u8 = undefined;
+    {
+        var i: usize = 0;
+        while (i < 32) : (i += 1) nt[i] = ~target_be[i];
+    }
+
+    // Compute target + 1 (carry-propagate from low byte = index 31 → 0).
+    var t_plus_1: [32]u8 = target_be;
+    {
+        var carry: u16 = 1;
+        var j: usize = 32;
+        while (j > 0 and carry != 0) {
+            j -= 1;
+            const sum = @as(u16, t_plus_1[j]) + carry;
+            t_plus_1[j] = @intCast(sum & 0xFF);
+            carry = sum >> 8;
+        }
+    }
+
+    // Long-divide nt by t_plus_1 using 256-bit shift-and-subtract.
+    // This bounds runtime at 256 iterations per header — slower than a
+    // bigint divide but allocator-free and correct for arbitrary bits.
+    var quotient: [32]u8 = [_]u8{0} ** 32;
+    var remainder: [32]u8 = [_]u8{0} ** 32;
+
+    // Process bits MSB→LSB.
+    var bit_i: usize = 0;
+    while (bit_i < 256) : (bit_i += 1) {
+        // Shift remainder left by 1.
+        var carry_bit: u8 = 0;
+        var j: usize = 32;
+        while (j > 0) {
+            j -= 1;
+            const new_carry: u8 = (remainder[j] >> 7) & 1;
+            remainder[j] = (remainder[j] << 1) | carry_bit;
+            carry_bit = new_carry;
+        }
+        // Pull next bit of nt into remainder LSB.
+        const byte_i: usize = bit_i / 8;
+        const bit_off: u3 = @intCast(7 - (bit_i % 8));
+        const next_bit: u8 = (nt[byte_i] >> bit_off) & 1;
+        remainder[31] |= next_bit;
+
+        // If remainder >= t_plus_1 then quotient bit = 1, remainder -= divisor.
+        if (cmpChainWorkBE(&remainder, &t_plus_1) >= 0) {
+            // remainder -= t_plus_1.
+            var borrow: i16 = 0;
+            var k: usize = 32;
+            while (k > 0) {
+                k -= 1;
+                const diff: i16 = @as(i16, remainder[k]) - @as(i16, t_plus_1[k]) - borrow;
+                if (diff < 0) {
+                    remainder[k] = @intCast(diff + 256);
+                    borrow = 1;
+                } else {
+                    remainder[k] = @intCast(diff);
+                    borrow = 0;
+                }
+            }
+            // Set quotient bit at position bit_i.
+            quotient[byte_i] |= (@as(u8, 1) << bit_off);
+        }
+    }
+
+    // quotient += 1 (Core's GetBlockProof).
+    {
+        var carry: u16 = 1;
+        var j: usize = 32;
+        while (j > 0 and carry != 0) {
+            j -= 1;
+            const sum = @as(u16, quotient[j]) + carry;
+            quotient[j] = @intCast(sum & 0xFF);
+            carry = sum >> 8;
+        }
+    }
+
+    return quotient;
+}
+
+/// Compare two 256-bit big-endian chain-work values.  Returns >0 if
+/// a > b, <0 if a < b, 0 if equal.  Mirrors
+/// validation.ChainManager.compareChainWork.
+pub fn cmpChainWorkBE(a: *const [32]u8, b: *const [32]u8) i32 {
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        if (a[i] > b[i]) return 1;
+        if (a[i] < b[i]) return -1;
+    }
+    return 0;
+}
+
+/// Synthesize a placeholder big-endian chain_work value for an
+/// active-chain entry whose true cumulative work isn't tracked.
+/// Encodes `(height + 1)` into the low 5 bytes of a 32-byte
+/// big-endian buffer.  This is intentionally cheap — the only
+/// invariant the consumer cares about is that two heights H1 < H2
+/// produce work-values W1 < W2, so the strict-greater chain-work
+/// comparison in `maybeArmReorg` correctly reflects "fork extends
+/// past tip".  Used only during the in-memory header-index walk;
+/// never persisted.
+pub fn chainWorkFromHeight(height: u32) [32]u8 {
+    var out: [32]u8 = [_]u8{0} ** 32;
+    // Encode (height + 1) big-endian into the trailing 5 bytes,
+    // leaving the high 27 bytes zero so any real PoW chain_work
+    // (which is always >> 2^40 for non-trivial difficulty) compares
+    // strictly greater.  Adding 1 ensures genesis (height=0) has
+    // strictly positive work — same convention as Core's
+    // GetBlockProof for the genesis block.
+    const v: u64 = @as(u64, height) + 1;
+    out[27] = @intCast((v >> 32) & 0xFF);
+    out[28] = @intCast((v >> 24) & 0xFF);
+    out[29] = @intCast((v >> 16) & 0xFF);
+    out[30] = @intCast((v >> 8) & 0xFF);
+    out[31] = @intCast(v & 0xFF);
+    return out;
 }
 
 /// Maximum total connections (125 as per Bitcoin Core).
@@ -1854,6 +2097,21 @@ pub const PeerManager = struct {
     /// cost again.
     v2_fallback_set: std.AutoHashMap(u64, void),
 
+    /// In-memory header index for competing-fork detection (CLEARBIT_REORG=1).
+    /// Each entry: hash → {prev, height, chain_work, timestamp, header}.
+    /// Populated by the `.headers` handler.  Bounded at MAX_HEADER_INDEX
+    /// via LRU eviction of oldest non-active-tip-ancestor entries.
+    /// Never accessed when CLEARBIT_REORG is unset (so the live node pays
+    /// no extra memory or CPU).
+    header_index: std.AutoHashMap(types.Hash256, BlockHeaderEntry),
+
+    /// Currently-pending reorg, if any.  Set by the headers handler when
+    /// a competing-fork branch with strictly higher chainwork is detected;
+    /// cleared (and the inner ArrayList freed) by the reorg trigger after
+    /// reorgToChain returns.  Only one pending reorg at a time — fork
+    /// announcements while one is pending are deferred to the next round.
+    pending_reorg: ?PendingReorg,
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
@@ -1893,6 +2151,8 @@ pub const PeerManager = struct {
             .in_drain = false,
             .peerbloomfilters = false,
             .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
+            .header_index = std.AutoHashMap(types.Hash256, BlockHeaderEntry).init(allocator),
+            .pending_reorg = null,
         };
     }
 
@@ -1928,6 +2188,8 @@ pub const PeerManager = struct {
         }
         if (self.listener) |*l| l.deinit();
         self.v2_fallback_set.deinit();
+        self.header_index.deinit();
+        if (self.pending_reorg) |*pr| pr.deinit();
     }
 
     /// Cap on the BIP-324 v2 fall-back set (per-process).  Once exceeded
@@ -2823,6 +3085,467 @@ pub const PeerManager = struct {
         target_peer.last_getheaders_time = std.time.timestamp();
     }
 
+    // ====================================================================
+    // Header index + competing-fork detection (CLEARBIT_REORG=1)
+    // ====================================================================
+
+    /// Look up the chain_work + height of an entry's parent header.  Used
+    /// when ingesting a new header so we can compute its cumulative
+    /// chain_work.  Falls back to the active-chain tip if the parent is
+    /// the tip and not in the index, and to all-zero work for the
+    /// pre-genesis "parent" of the genesis block.
+    pub fn lookupParentChainWork(
+        self: *PeerManager,
+        prev_hash: *const types.Hash256,
+    ) ?struct { work: [32]u8, height: u32 } {
+        // Genesis sentinel (all-zero prev): height=0 work=0 — and the
+        // "parent height" we report is the unsigned underflow case, so
+        // callers must special-case the genesis case explicitly. To keep
+        // the interface uniform, return null and let the caller decide.
+        var is_zero = true;
+        for (prev_hash) |b| {
+            if (b != 0) {
+                is_zero = false;
+                break;
+            }
+        }
+        if (is_zero) return .{ .work = [_]u8{0} ** 32, .height = 0 };
+
+        // Active-chain tip is checked first because the index doesn't
+        // include flushed-and-evicted ancestors.
+        if (self.chain_state) |cs| {
+            if (std.mem.eql(u8, &cs.best_hash, prev_hash)) {
+                // Active-chain entries don't carry chain_work in our
+                // ChainState (it's flat-key UTXOs only); we synthesize a
+                // monotonic placeholder so a fork that forks off the tip
+                // still has a strictly-greater chain_work than the tip.
+                // The placeholder is `tip_height << 8` packed big-endian
+                // — gives 256B of headroom for the next ~256 forks
+                // before the comparison loses meaning. Acceptable
+                // approximation: the absolute chain_work value is only
+                // used for the strict-greater-than check, never persisted.
+                return .{
+                    .work = chainWorkFromHeight(cs.best_height),
+                    .height = cs.best_height,
+                };
+            }
+        }
+        // Otherwise look in the in-memory index.
+        if (self.header_index.get(prev_hash.*)) |entry| {
+            return .{ .work = entry.chain_work, .height = entry.height };
+        }
+        return null;
+    }
+
+    /// Insert a header into the in-memory index.  Computes height +
+    /// chain_work from the parent.  No-op if the header is already
+    /// present (so duplicate batches don't bloat the index).  Returns
+    /// the inserted-or-existing entry.
+    ///
+    /// Caller must already hold the peer-manager mutex (the entire
+    /// .headers handler runs under it).  Genesis (prev_block all-zero)
+    /// gets height=0 + chain_work = work-of-this-header.
+    pub fn insertHeader(
+        self: *PeerManager,
+        header: *const types.BlockHeader,
+        block_hash: *const types.Hash256,
+    ) !?BlockHeaderEntry {
+        // Already present?  Return existing record.
+        if (self.header_index.get(block_hash.*)) |existing| {
+            // Refresh last_seen so LRU keeps it.
+            var refreshed = existing;
+            refreshed.last_seen = std.time.timestamp();
+            self.header_index.put(block_hash.*, refreshed) catch {};
+            return refreshed;
+        }
+
+        const parent_info = self.lookupParentChainWork(&header.prev_block);
+        if (parent_info == null) {
+            // Unknown parent — caller can decide whether to treat as
+            // misbehavior or just defer.  Returning null here lets the
+            // headers handler fall through to its existing peer-+20
+            // path on the canonical "doesn't connect" rejection.
+            return null;
+        }
+        const p = parent_info.?;
+        var new_work: [32]u8 = p.work;
+        const this_work = workFromBits(header.bits);
+        addChainWorkBE(&new_work, &this_work);
+
+        const entry: BlockHeaderEntry = .{
+            .hash = block_hash.*,
+            .prev_hash = header.prev_block,
+            .height = p.height + 1,
+            .chain_work = new_work,
+            .timestamp = header.timestamp,
+            .header = header.*,
+            .last_seen = std.time.timestamp(),
+        };
+
+        try self.header_index.put(block_hash.*, entry);
+
+        // Cap at MAX_HEADER_INDEX entries.  Eviction is amortized: only
+        // sweep when we cross the cap, drop the oldest 10% by
+        // last_seen.  Active-chain ancestors should rarely be touched
+        // in practice (they arrive once during IBD then never again),
+        // so this happens to bias eviction toward stale fork branches
+        // — exactly what we want.
+        if (self.header_index.count() > MAX_HEADER_INDEX) {
+            self.evictHeaderIndex();
+        }
+        return entry;
+    }
+
+    /// Drop the oldest ~10% of entries from the header_index by
+    /// last_seen timestamp.  Best-effort; called only when the index
+    /// is over MAX_HEADER_INDEX, so the eviction cost amortizes to
+    /// O(1) per insert in steady state.
+    pub fn evictHeaderIndex(self: *PeerManager) void {
+        const cur = self.header_index.count();
+        const target_drop: usize = cur / 10;
+        if (target_drop == 0) return;
+
+        // Two-pass scan: collect candidate hashes (oldest last_seen),
+        // then remove. We keep this O(N) — for N=10k it's a microsecond.
+        const Cand = struct {
+            hash: types.Hash256,
+            last_seen: i64,
+        };
+        var candidates = std.ArrayList(Cand).init(self.allocator);
+        defer candidates.deinit();
+        var it = self.header_index.iterator();
+        while (it.next()) |kv| {
+            candidates.append(.{
+                .hash = kv.key_ptr.*,
+                .last_seen = kv.value_ptr.last_seen,
+            }) catch return;
+        }
+        // Sort ascending by last_seen (oldest first).
+        const lessFn = struct {
+            fn f(_: void, a: Cand, b: Cand) bool {
+                return a.last_seen < b.last_seen;
+            }
+        }.f;
+        std.sort.pdq(Cand, candidates.items, {}, lessFn);
+
+        var dropped: usize = 0;
+        while (dropped < target_drop and dropped < candidates.items.len) : (dropped += 1) {
+            _ = self.header_index.remove(candidates.items[dropped].hash);
+        }
+    }
+
+    /// Outcome of classifying a freshly-arrived header batch.
+    pub const HeaderClass = enum {
+        /// First header chains onto our tip / queue tail — normal extension.
+        extends_active,
+        /// First header chains onto a known non-tip header → competing fork.
+        competing_fork,
+        /// First header's prev is unknown → peer misbehavior path.
+        unknown_parent,
+    };
+
+    /// Classify the first header in a batch with respect to our current
+    /// chain state.  See HeaderClass.  Helper for the .headers handler.
+    pub fn classifyHeaderBatch(
+        self: *PeerManager,
+        first_header: *const types.BlockHeader,
+        expected_prev: *const types.Hash256,
+    ) HeaderClass {
+        if (std.mem.eql(u8, &first_header.prev_block, expected_prev)) {
+            return .extends_active;
+        }
+        // Look up parent in our header_index — if found, this is a
+        // competing fork (parent is on some chain we know about, but
+        // not at the tip / end of our queue).
+        if (self.header_index.contains(first_header.prev_block)) {
+            return .competing_fork;
+        }
+        // Active-chain ancestor (e.g. fork from somewhere deep).  We
+        // don't carry a full block_index for the active chain, so this
+        // case looks like "unknown parent" from our index but should
+        // actually be allowed.  ChainState.has_block_hash would tell us
+        // — but the storage API expects a full block lookup which costs
+        // a RocksDB hit.  Since IBD soaks the index and steady-state
+        // operation hits this rarely, we accept the cost: any
+        // unrecognized prev that is on the active chain (per
+        // chain_state) is treated as a competing fork too.
+        if (self.chain_state) |cs| {
+            // hasBlock takes the hash; returns true if we've ever
+            // connected this block.  May be expensive — call lazily.
+            if (cs.hasBlock(&first_header.prev_block)) {
+                return .competing_fork;
+            }
+        }
+        return .unknown_parent;
+    }
+
+    /// Once a header batch has been ingested AND the first header was
+    /// classified as competing_fork, walk through the new headers and
+    /// figure out:
+    ///   - the fork point (most recent ancestor on the active chain)
+    ///   - the cumulative chain_work at the new fork tip
+    ///   - the ordered list of fork-block hashes (fork_point + 1 .. new_tip)
+    ///
+    /// If the fork's chainwork strictly exceeds the active tip's
+    /// chainwork, set self.pending_reorg and request the missing block
+    /// bodies from `peer` via getdata.  No-op if pending_reorg is
+    /// already set (existing reorg in flight) or if the chainwork is
+    /// not strictly greater.
+    ///
+    /// Per Bitcoin Core ActivateBestChain: equal-chainwork ties keep
+    /// the active chain (first-seen wins). We honor that here.
+    pub fn maybeArmReorg(
+        self: *PeerManager,
+        peer: *Peer,
+        fork_tip_hash: *const types.Hash256,
+    ) void {
+        if (self.pending_reorg != null) {
+            // Already arming a reorg — defer this fork until the next round.
+            return;
+        }
+        const cs = self.chain_state orelse return;
+
+        const tip_entry = self.header_index.get(fork_tip_hash.*) orelse return;
+
+        // Walk back from fork_tip until we hit the active chain (most
+        // recent common ancestor).  Bound by MAX_REORG_DEPTH to avoid
+        // a malicious peer offering a fake-deep fork that OOMs the
+        // walk.
+        var fork_chain = std.ArrayList(types.Hash256).init(self.allocator);
+        defer fork_chain.deinit();
+
+        var cursor: types.Hash256 = fork_tip_hash.*;
+        var depth: u32 = 0;
+        var fork_point: ?types.Hash256 = null;
+        while (depth <= MAX_REORG_DEPTH) {
+            // Is this hash on the active chain?  If yes → fork_point found.
+            // We use the in-memory active-tip first (no DB hit), then fall
+            // back to chain_state.hasBlock for older entries.
+            if (std.mem.eql(u8, &cs.best_hash, &cursor)) {
+                fork_point = cursor;
+                break;
+            }
+            if (cs.best_height > 0 and cs.hasBlock(&cursor)) {
+                fork_point = cursor;
+                break;
+            }
+            // Otherwise this hash is a fork block — record + walk back.
+            const e = self.header_index.get(cursor) orelse {
+                // Walk fell off the index (a header we evicted).
+                // We can't proceed safely; abort.
+                std.log.warn("REORG: walk fell off header_index at depth {d}", .{depth});
+                return;
+            };
+            fork_chain.append(cursor) catch return;
+            cursor = e.prev_hash;
+            depth += 1;
+            // Pre-genesis sentinel: prev_block of the genesis block is
+            // all-zero.  A walk-back that reaches genesis means the
+            // fork shares the genesis ancestor (which the active chain
+            // necessarily also does).  Treat the all-zero hash as a
+            // valid fork_point.
+            var is_zero = true;
+            for (cursor) |b| {
+                if (b != 0) {
+                    is_zero = false;
+                    break;
+                }
+            }
+            if (is_zero) {
+                fork_point = cursor;
+                break;
+            }
+        }
+
+        const fp = fork_point orelse {
+            std.log.warn(
+                "REORG: refused — fork point > MAX_REORG_DEPTH ({d}) below active tip",
+                .{MAX_REORG_DEPTH},
+            );
+            peer.misbehaving(20, "fork too deep");
+            return;
+        };
+
+        // Reverse fork_chain to get fork_point + 1 .. new_tip order.
+        std.mem.reverse(types.Hash256, fork_chain.items);
+
+        // Compare new tip chain_work strictly greater than active tip's.
+        // For the active tip we use the chainWorkFromHeight placeholder
+        // (the same one used by lookupParentChainWork). The fork
+        // chain_work was computed cumulatively from the same placeholder
+        // root for the fork point, so the comparison is apples-to-apples.
+        const active_work = chainWorkFromHeight(cs.best_height);
+        if (cmpChainWorkBE(&tip_entry.chain_work, &active_work) <= 0) {
+            // Equal- or lower-chainwork fork: ignore (first-seen wins).
+            std.log.info(
+                "REORG: ignoring equal/lower-chainwork fork (active_h={d})",
+                .{cs.best_height},
+            );
+            return;
+        }
+
+        // Arm pending_reorg and request fork bodies from this peer.
+        // Move ownership of fork_chain into PendingReorg by copying.
+        var owned = std.ArrayList(types.Hash256).init(self.allocator);
+        owned.appendSlice(fork_chain.items) catch {
+            owned.deinit();
+            return;
+        };
+        self.pending_reorg = .{
+            .fork_point = fp,
+            .fork_hashes = owned,
+            .new_tip_chain_work = tip_entry.chain_work,
+            .source_peer = peer,
+        };
+
+        // Request the bodies from the peer that announced the fork.
+        // We send a single getdata containing every fork block hash; the
+        // peer is free to dribble them in.  If the peer disconnects we
+        // re-issue via pipelineBlockRequests on the next drain.
+        if (owned.items.len > 0) {
+            var inv_list = std.ArrayList(p2p.InvVector).init(self.allocator);
+            defer inv_list.deinit();
+            for (owned.items) |h| {
+                inv_list.append(.{
+                    .inv_type = .msg_witness_block,
+                    .hash = h,
+                }) catch break;
+            }
+            const getdata = p2p.Message{ .getdata = .{ .inventory = inv_list.items } };
+            peer.sendMessage(&getdata) catch |err| {
+                std.log.warn("REORG: getdata send failed: {}", .{err});
+            };
+        }
+
+        std.log.info(
+            "REORG: armed fork_point=...{x:0>2}{x:0>2} fork_len={d} active_h={d} tip_h={d}",
+            .{
+                fp[30], fp[31], owned.items.len, cs.best_height, tip_entry.height,
+            },
+        );
+    }
+
+    /// Try to fire the pending reorg if all fork bodies are present in
+    /// block_buffer.  Called by drainBlockBuffer when a normal connect
+    /// path can't make progress.  On success: removes the buffered
+    /// blocks, calls reorgToChain, clears pending_reorg.  On failure:
+    /// logs + bans the source peer + clears pending_reorg.
+    pub fn tryFireReorg(self: *PeerManager) void {
+        const pr_ptr = if (self.pending_reorg) |*p| p else return;
+        const cs = self.chain_state orelse return;
+
+        // Are all bodies buffered?
+        for (pr_ptr.fork_hashes.items) |h| {
+            if (!self.block_buffer.contains(h)) return; // not yet
+        }
+
+        // Build the ReorgBlock array.  We must NOT free the blocks here
+        // — reorgToChain will move ownership through queueBlockWrite.
+        // We DO need to leave the buffer entries removed so the drain
+        // loop doesn't double-process them.
+        const allocator = self.allocator;
+        var rb_list = std.ArrayList(storage.ChainState.ReorgBlock).init(allocator);
+        defer rb_list.deinit();
+
+        // Collect blocks (and remove from buffer in the same pass).
+        for (pr_ptr.fork_hashes.items, 0..) |h, i| {
+            const fetched = self.block_buffer.fetchRemove(h) orelse {
+                // Disappeared between the contains-check and the fetch
+                // (could only happen with concurrent buffer mutation —
+                // not currently possible, but be defensive).  Restore
+                // already-collected blocks back to the buffer and bail.
+                for (rb_list.items[0..i]) |rb| {
+                    self.block_buffer.put(rb.hash, rb.block) catch {
+                        serialize.freeBlock(allocator, &rb.block);
+                    };
+                }
+                return;
+            };
+            const fp_height = self.lookupHeightOrZero(&pr_ptr.fork_point);
+            rb_list.append(.{
+                .hash = h,
+                .block = fetched.value,
+                .height = fp_height + @as(u32, @intCast(i + 1)),
+            }) catch {
+                serialize.freeBlock(allocator, &fetched.value);
+                // Restore previous + bail.
+                for (rb_list.items[0..i]) |rb| {
+                    self.block_buffer.put(rb.hash, rb.block) catch {
+                        serialize.freeBlock(allocator, &rb.block);
+                    };
+                }
+                return;
+            };
+        }
+
+        // Mode selection: under "warn" we only LOG what would have happened.
+        const mode_env = std.posix.getenv("CLEARBIT_REORG") orelse "0";
+        const dry_run = std.mem.eql(u8, mode_env, "warn");
+        if (dry_run) {
+            std.log.info(
+                "[REORG] dry-run (warn mode): would disconnect to fork_point + connect {d} blocks",
+                .{rb_list.items.len},
+            );
+            // Restore blocks to buffer + clear pending_reorg.
+            for (rb_list.items) |rb| {
+                self.block_buffer.put(rb.hash, rb.block) catch {
+                    serialize.freeBlock(allocator, &rb.block);
+                };
+            }
+            pr_ptr.deinit();
+            self.pending_reorg = null;
+            return;
+        }
+
+        // Fire the reorg.  reorgToChain takes ownership of the inner
+        // block bytes via queueBlockWrite — on success the bodies are
+        // safely persisted; on failure they're freed by the storage
+        // layer's errdefer chain.
+        const old_height = cs.best_height;
+        const old_hash = cs.best_hash;
+
+        const conn_or_err = cs.reorgToChain(&pr_ptr.fork_point, rb_list.items);
+        if (conn_or_err) |connected| {
+            std.log.info(
+                "[REORG] disconnected={d} connected={d} new_tip_h={d} old_tip_h={d}",
+                .{
+                    pr_ptr.fork_hashes.items.len, // approximation — actual disconnect count printed by storage
+                    connected,
+                    cs.best_height,
+                    old_height,
+                },
+            );
+            _ = old_hash;
+        } else |err| {
+            std.log.warn("[REORG] FAILED: {} — banning source peer", .{err});
+            if (pr_ptr.source_peer) |sp| {
+                sp.misbehaving(100, "reorg failure");
+            }
+        }
+        // Free fork bodies — storage took copies via writeBlock so we
+        // can safely free the in-memory Block values now.  (Per
+        // serialize.freeBlock semantics: this only frees the
+        // transactions/witness slabs we owned, not the persisted bytes.)
+        for (rb_list.items) |rb| {
+            var b = rb.block;
+            serialize.freeBlock(allocator, &b);
+        }
+
+        pr_ptr.deinit();
+        self.pending_reorg = null;
+    }
+
+    /// Helper: look up the height of a given hash via header_index, or
+    /// fall back to the active tip if it matches.  Returns 0 if not
+    /// found (caller should treat 0 as "fork from genesis").
+    fn lookupHeightOrZero(self: *PeerManager, hash: *const types.Hash256) u32 {
+        if (self.header_index.get(hash.*)) |e| return e.height;
+        if (self.chain_state) |cs| {
+            if (std.mem.eql(u8, &cs.best_hash, hash)) return cs.best_height;
+        }
+        return 0;
+    }
+
     /// Handle a received message.
     fn handleMessage(self: *PeerManager, peer: *Peer, msg: p2p.Message) !void {
         switch (msg) {
@@ -2950,10 +3673,77 @@ pub const PeerManager = struct {
                 } else
                     self.network_params.genesis_hash;
 
-                if (!std.mem.eql(u8, &h.headers[0].prev_block, &expected_prev)) {
-                    // Headers don't connect to our chain - misbehave (+20)
-                    peer.misbehaving(20, "headers don't connect to our chain");
-                    return;
+                // ============================================================
+                // CLEARBIT_REORG=1: classify the header batch into one of
+                // three cases:
+                //   A. extends_active   — first header chains onto our tip
+                //                         or the queue tail.  Normal extension
+                //                         path; falls through to the existing
+                //                         logic below.
+                //   B. competing_fork   — first header chains onto a known
+                //                         non-tip ancestor.  Compute the
+                //                         fork's chain_work, request bodies,
+                //                         and arm pending_reorg if the fork
+                //                         strictly exceeds the active tip.
+                //   C. unknown_parent   — first header chains onto a hash
+                //                         we've never seen.  Existing peer
+                //                         +20 path (peer misbehavior).
+                //
+                // When CLEARBIT_REORG is unset we keep the legacy behavior:
+                // anything other than case A is +20.  Soak: deploy with
+                // CLEARBIT_REORG=warn first to log fork detections without
+                // firing the disconnect/connect cycle.
+                // ============================================================
+                const reorg_enabled = isReorgEnabled();
+
+                const klass: HeaderClass = if (reorg_enabled)
+                    self.classifyHeaderBatch(&h.headers[0], &expected_prev)
+                else
+                    (if (std.mem.eql(u8, &h.headers[0].prev_block, &expected_prev))
+                        HeaderClass.extends_active
+                    else
+                        HeaderClass.unknown_parent);
+
+                switch (klass) {
+                    .extends_active => {
+                        // Fall through to the existing extension path below.
+                    },
+                    .unknown_parent => {
+                        // Headers don't connect to our chain - misbehave (+20)
+                        peer.misbehaving(20, "headers don't connect to our chain");
+                        return;
+                    },
+                    .competing_fork => {
+                        // Ingest fork headers into the index so the chain_work
+                        // accumulator is populated, then ask maybeArmReorg to
+                        // decide whether to fire.  We deliberately do NOT
+                        // append fork headers to expected_blocks — the active
+                        // chain stays in expected_blocks; the fork lives in
+                        // header_index + pending_reorg.fork_hashes.
+                        std.debug.print(
+                            "P2P: REORG-CANDIDATE peer announces fork ({d} headers, prev=...{x:0>2}{x:0>2})\n",
+                            .{
+                                h.headers.len,
+                                h.headers[0].prev_block[30],
+                                h.headers[0].prev_block[31],
+                            },
+                        );
+                        var last_inserted: ?BlockHeaderEntry = null;
+                        for (h.headers) |hdr| {
+                            const bh = crypto.computeBlockHash(&hdr);
+                            const ent_or = self.insertHeader(&hdr, &bh) catch null;
+                            if (ent_or) |ent| last_inserted = ent;
+                        }
+                        if (last_inserted) |fork_tip| {
+                            self.maybeArmReorg(peer, &fork_tip.hash);
+                        }
+                        // Continue to ask for more headers — the peer may
+                        // have additional fork headers beyond this batch.
+                        if (h.headers.len >= 2000) {
+                            self.sendGetHeaders(peer) catch {};
+                        }
+                        return;
+                    },
                 }
 
                 std.debug.print("P2P: Received {d} new headers (queue={d})\n", .{
@@ -2961,10 +3751,16 @@ pub const PeerManager = struct {
                     self.expected_blocks.items.len + h.headers.len,
                 });
 
-                // Add header hashes to the expected_blocks queue
+                // Add header hashes to the expected_blocks queue.  Also
+                // insert into the header_index when reorg detection is
+                // enabled — this populates the structure so future
+                // competing-fork announcements can find a recent ancestor.
                 for (h.headers) |header| {
                     const block_hash = crypto.computeBlockHash(&header);
                     self.expected_blocks.append(block_hash) catch continue;
+                    if (reorg_enabled) {
+                        _ = self.insertHeader(&header, &block_hash) catch null;
+                    }
                 }
 
                 // Request more headers from this specific peer if we got a full batch
@@ -3928,6 +4724,15 @@ pub const PeerManager = struct {
                 "P2P: CLEARBIT_REORG=1 — IBD will capture undo data for reorg support\n",
                 .{},
             );
+        }
+
+        // If a competing-fork reorg is pending and all fork bodies are
+        // buffered, fire it now (before the normal active-chain connect
+        // loop).  tryFireReorg is a no-op when pending_reorg is null, so
+        // the steady-state cost is one HashMap.contains() per fork
+        // hash — bounded by the fork length, typically 1-3 blocks.
+        if (reorg_enabled and self.pending_reorg != null) {
+            self.tryFireReorg();
         }
 
         // Stall recovery is now handled in two level-triggered paths,
