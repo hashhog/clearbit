@@ -1604,6 +1604,11 @@ pub fn main() !void {
     var chain_state = storage.ChainState.init(db_ptr, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
     chain_state.wireUtxoParent();
+    // Seed the BIP-113 MTP ring buffer with the genesis timestamp so that
+    // blocks at heights 1..10 see the correct MTP window (which includes
+    // genesis).  connectBlockInner pushes subsequent block timestamps into
+    // the buffer as blocks are connected.
+    chain_state.initGenesisTimestamp(params.genesis_header.timestamp);
 
     // Plumb pruning policy from CLI/config-file into the chain state. The
     // pruner runs lazily from the IBD loop / RPC tip-update path; this just

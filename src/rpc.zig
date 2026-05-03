@@ -2720,6 +2720,25 @@ pub const RpcServer = struct {
         // validateSubmitBlockOrReject below.
         const block_hash = crypto.computeBlockHash(&block_data.header);
         const submit_height = self.chain_state.best_height + 1;
+
+        // BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
+        // block.nTime must be strictly greater than the median-time-past of
+        // the previous 11 blocks.  This check is unconditional — it is NOT
+        // gated by CLEARBIT_VALIDATE_IBD — so that the consensus rule is
+        // enforced even when the full-validation env knob is off.  `prev_mtp`
+        // is computed from the in-memory header_index (same data source as
+        // the IBD path in peer.zig:computePrevMtp).  Returns 0 near genesis
+        // (fewer than 11 ancestors reachable), matching Core's
+        // CBlockIndex::GetMedianTimePast skip behaviour.
+        //
+        // Reference: bitcoin-core/src/validation.cpp:4092-4093
+        //   if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
+        //       return state.Invalid(..., "time-too-old", ...)
+        const mtp = self.computeSubmitBlockMtp(&block_data.header.prev_block);
+        if (mtp != 0 and block_data.header.timestamp <= mtp) {
+            return self.jsonRpcResult("\"time-too-old\"", id);
+        }
+
         if (!self.validateSubmitBlockOrReject(&block_data, &block_hash, submit_height)) {
             // Return BIP-22 string result (not a JSON-RPC error) for consensus
             // rejections.  Per BIP-22 and Bitcoin Core BIP22ValidationResult()
@@ -2749,6 +2768,25 @@ pub const RpcServer = struct {
             try std.fmt.format(buf.writer(), "\"{s}\"", .{reason});
             return self.jsonRpcResult(buf.items, id);
         }
+    }
+
+    /// Compute the median-time-past for BIP-113 header validation in submitblock.
+    ///
+    /// Delegates to `ChainState.computeMTP()` which reads the DB-backed block
+    /// index (CF_BLOCK_INDEX, keyed by hash).  This is correct for the submitblock
+    /// path because every context block has already been connected and persisted to
+    /// the block index before the candidate block is submitted.  Returns 0 near
+    /// genesis (best_height == 0) or when the DB is absent, matching Core's
+    /// `CBlockIndex::GetMedianTimePast` genesis-adjacent skip.
+    ///
+    /// The `prev_hash` argument is not used — the canonical chain state tip IS
+    /// the correct parent of the next submitted block (submitblock rejects
+    /// non-sequential submissions at the `best_height + 1` check upstream).
+    ///
+    /// Reference: bitcoin-core/src/chain.h CBlockIndex::GetMedianTimePast.
+    fn computeSubmitBlockMtp(self: *RpcServer, prev_hash: *const types.Hash256) u32 {
+        _ = prev_hash; // parent is always chain_state.best_hash for submitblock
+        return self.chain_state.computeMTP();
     }
 
     /// submitblock-time consensus validation gate.  Mirrors
