@@ -163,6 +163,7 @@ pub const ScriptError = error{
     TapscriptEmptyPubkey, // BIP-342: OP_CHECKSIG with empty pubkey in tapscript
     TapscriptCheckmultisigDisabled, // BIP-342: OP_CHECKMULTISIG disabled in tapscript
     TapscriptValidationWeight, // BIP-342: validation-weight budget exhausted
+    ConstScriptCode, // CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy (BASE) script
 };
 
 // ============================================================================
@@ -187,6 +188,7 @@ pub const ScriptFlags = packed struct {
     verify_sigpushonly: bool = false, // scriptSig must be push-only
     verify_strictenc: bool = false, // Strict signature and pubkey encoding checks
     discourage_upgradable_witness_program: bool = false, // BIP-141: fail on unknown witness versions
+    verify_const_scriptcode: bool = false, // CONST_SCRIPTCODE: reject OP_CODESEPARATOR in legacy scripts
 };
 
 // ============================================================================
@@ -715,12 +717,23 @@ pub const ScriptEngine = struct {
 
         var pc: usize = 0;
         var op_count: usize = 0;
+        // BIP-341: opcode counter (0-based index of each opcode in this script).
+        // Mirrors Core's `opcode_pos` (interpreter.cpp:433, incremented at the
+        // top of the for-loop).  Used by OP_CODESEPARATOR to record the position
+        // committed to the tapscript sigmsg (Core interpreter.cpp:1055, 1565).
+        // Every opcode — including push-data ops — increments this counter once.
+        var opcode_pos: u32 = 0;
         var exec_stack = std.ArrayList(bool).init(self.allocator);
         defer exec_stack.deinit();
 
         while (pc < script.len) {
             const opcode_byte = script[pc];
             pc += 1;
+            // Capture the index of this opcode and advance the counter.
+            // Placed here — before any `continue` — so push-data handlers
+            // also advance the counter, matching Core's `++opcode_pos`.
+            const current_opcode_pos = opcode_pos;
+            opcode_pos += 1;
 
             // Data push: opcodes 0x01-0x4b push that many bytes
             if (opcode_byte >= 0x01 and opcode_byte <= 0x4b) {
@@ -794,6 +807,18 @@ pub const ScriptEngine = struct {
                 if (op_count > MAX_OPS_PER_SCRIPT) return ScriptError.OpCountExceeded;
             }
 
+            // CONST_SCRIPTCODE: OP_CODESEPARATOR in BASE (legacy non-segwit)
+            // scripts is rejected even in unexecuted branches when the flag is
+            // set.  Mirrors Core interpreter.cpp:474-476, which fires BEFORE
+            // the fExec gate.  Core checks `sigversion == SigVersion::BASE` —
+            // not witness — because OP_CODESEPARATOR is valid in witness scripts.
+            if (opcode == .op_codeseparator and
+                self.sig_version == .base and
+                self.flags.verify_const_scriptcode)
+            {
+                return ScriptError.ConstScriptCode;
+            }
+
             if (!self.isExecuting(&exec_stack)) {
                 // Skip non-executing branch but track if/else/endif
                 switch (opcode) {
@@ -816,7 +841,7 @@ pub const ScriptEngine = struct {
             }
 
             // Execute the opcode
-            try self.executeOpcode(opcode, script, &pc, &exec_stack, &op_count);
+            try self.executeOpcode(opcode, script, &pc, &exec_stack, &op_count, current_opcode_pos);
         }
 
         if (exec_stack.items.len != 0) return ScriptError.UnbalancedConditional;
@@ -1197,6 +1222,7 @@ pub const ScriptEngine = struct {
         pc: *usize,
         exec_stack: *std.ArrayList(bool),
         op_count: *usize,
+        opcode_pos: u32,
     ) ScriptError!void {
         _ = script;
         _ = pc;
@@ -1642,8 +1668,14 @@ pub const ScriptEngine = struct {
             },
 
             .op_codeseparator => {
-                // Just update the position - no stack operation
-                // pc points to next instruction already
+                // BIP-341: record the OPCODE INDEX, not the byte position.
+                // Core stores `opcode_pos` (interpreter.cpp:1055), the 0-based
+                // counter of opcodes seen so far, committed to the tapscript
+                // sigmsg at interpreter.cpp:1565.
+                // CONST_SCRIPTCODE: Core rejects OP_CODESEPARATOR in legacy
+                // (BASE) scripts when this flag is set — checked ABOVE the
+                // fExec gate in the main execute() loop, not here.
+                self.codesep_pos = opcode_pos;
             },
 
             .op_checksig => {
