@@ -3447,6 +3447,15 @@ pub fn computeUtxoSetHash(utxo_set: *UtxoSet, allocator: std.mem.Allocator) !typ
 ///           * VARINT(CompressAmount(value))
 ///           * ScriptCompression(scriptPubKey)
 ///
+/// Atomic write protocol: the bytes go to "<path>.incomplete", we sync the
+/// fd, then rename to <path>. Mirrors Bitcoin Core's
+/// `temppath = path + ".incomplete"` flow in
+/// rpc/blockchain.cpp::dumptxoutset so that operators copying mid-dump never
+/// see a torn file, and a SIGKILL during dump leaves only the .incomplete
+/// artifact behind for cleanup. The caller pre-checks that <path> doesn't
+/// already exist (RpcServer.handleDumpTxOutSet emits the explicit
+/// "already exists" error).
+///
 /// Reference: bitcoin-core/src/rpc/blockchain.cpp `WriteUTXOSnapshot`.
 pub fn dumpTxOutSet(
     chainstate: *ChainState,
@@ -3454,8 +3463,23 @@ pub fn dumpTxOutSet(
     path: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
+    // Compute the .incomplete temp path. Best-effort cleanup of any
+    // leftover temp from a previous crashed dump (truncate=true on
+    // createFile would do this for us, but having an explicit removal
+    // handle simplifies the on-error cleanup below).
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.incomplete", .{path});
+    defer allocator.free(tmp_path);
+
+    const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    var file_open = true;
+    // Best-effort cleanup on any error past createFile. We have to
+    // capture the path because `errdefer` runs after locals go out of
+    // scope; tmp_path is allocator-owned and lives until the outer
+    // defer above frees it, so referencing it here is fine.
+    errdefer {
+        if (file_open) file.close();
+        std.fs.cwd().deleteFile(tmp_path) catch {};
+    }
 
     var buffered = std.io.bufferedWriter(file.writer());
     const out = buffered.writer();
@@ -3544,6 +3568,24 @@ pub fn dumpTxOutSet(
 
     std.debug.assert(written_coins == coins_count);
     try buffered.flush();
+
+    // Durability barrier: fsync the bytes before the atomic rename. A
+    // power loss after rename but before page-cache flush could otherwise
+    // leave <path> visible with zero-length / torn contents.
+    try file.sync();
+
+    // Close before rename. POSIX allows renaming an open fd, but Windows
+    // (where rename-over-existing fails on a held fd) is the conservative
+    // case; close first to keep the call portable.
+    file.close();
+    file_open = false;
+
+    // Atomic rename: temp -> final. After this point the snapshot is
+    // visible to any concurrent reader.
+    std.fs.cwd().rename(tmp_path, path) catch |e| {
+        std.fs.cwd().deleteFile(tmp_path) catch {};
+        return e;
+    };
 }
 
 /// Load a UTXO set snapshot in Core's wire format. The reader expects the
