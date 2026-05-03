@@ -17,6 +17,7 @@ const script = @import("script.zig");
 const serialize = @import("serialize.zig");
 const p2p = @import("p2p.zig");
 const zmq = @import("zmq.zig");
+const validation = @import("validation.zig");
 
 // ============================================================================
 // Mempool Constants
@@ -128,6 +129,11 @@ pub const MempoolError = error{
     TrucNonV3SpendsV3,
     /// Cluster would exceed maximum size limit.
     ClusterSizeLimitExceeded,
+    /// Script verification failed for one of the inputs (Core
+    /// "mandatory-script-verify-flag-failed" / "non-mandatory-script-verify-flag-failed").
+    /// Mirrors AcceptToMemoryPool's `PolicyScriptChecks` and
+    /// `ConsensusScriptChecks` rejects in validation.cpp.
+    ScriptVerifyFailed,
 };
 
 // ============================================================================
@@ -530,6 +536,16 @@ pub const Mempool = struct {
             return MempoolError.InsufficientFee;
         }
 
+        // 6b. Script verification (STANDARD_SCRIPT_VERIFY_FLAGS).
+        //
+        // This is the gate Core's `MemPoolAccept::PolicyScriptChecks` /
+        // `ConsensusScriptChecks` enforces inside AcceptToMemoryPool. Without
+        // it, a peer can flood the mempool with txs whose signatures don't
+        // verify — silent acceptance until a miner tries to mine them. We
+        // run this BEFORE any mutation (RBF removal / TRUC checks) so a
+        // failing tx leaves mempool state untouched.
+        try self.verifyInputScripts(&tx);
+
         // 7. Handle RBF conflicts
         if (conflicting_txids.items.len > 0) {
             try self.checkRBFRules(&tx, tx_hash, fee, vsize, conflicting_txids.items);
@@ -749,6 +765,7 @@ pub const Mempool = struct {
                 MempoolError.TooManyAncestors => "too-long-mempool-chain",
                 MempoolError.TooManyDescendants => "too-long-mempool-chain",
                 MempoolError.ClusterSizeLimitExceeded => "cluster-size-exceeded",
+                MempoolError.ScriptVerifyFailed => "mandatory-script-verify-flag-failed",
                 else => "rejected",
             };
             return AcceptResult{
@@ -839,6 +856,118 @@ pub const Mempool = struct {
             if (input.sequence < 0xFFFFFFFF - 1) return true;
         }
         return false;
+    }
+
+    /// Run script verification on every input of a transaction using
+    /// STANDARD_SCRIPT_VERIFY_FLAGS (consensus + policy). Mirrors Bitcoin
+    /// Core's `PolicyScriptChecks` invocation inside `AcceptToMemoryPool`
+    /// (validation.cpp `MemPoolAccept::PolicyScriptChecks`).
+    ///
+    /// Without this gate, a peer can flood the mempool with transactions
+    /// whose signatures don't actually verify and they'll only be rejected
+    /// later when a miner tries to assemble a block — i.e. an unbounded DoS
+    /// vector. Core has run this check unconditionally since 2010.
+    ///
+    /// Behaviour:
+    ///  - When `chain_state` is `null` (memory-only test mempool with no
+    ///    UTXO source) we skip the check, matching the existing test-mode
+    ///    contract used by `addTransaction` step 3 ("No chain state - for
+    ///    testing, assume inputs exist").
+    ///  - Coinbase txs are never accepted to the mempool, so we treat
+    ///    them as a NonStandard reject up-front rather than try to script-
+    ///    verify the coinbase placeholder input.
+    ///  - For each non-coinbase input we resolve the spent scriptPubKey
+    ///    and amount from (a) the in-memory mempool (parent tx) or (b) the
+    ///    UTXO set, then run `script.ScriptEngine.verify` with the
+    ///    STANDARD flag set. Any error or `false` return → reject.
+    ///
+    /// Reference: Bitcoin Core src/validation.cpp
+    ///   MemPoolAccept::PolicyScriptChecks (~line 1170+) and
+    ///   MemPoolAccept::ConsensusScriptChecks (~line 1230+).
+    fn verifyInputScripts(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
+        // No chain_state → unit-test path, skip script verify (parity with
+        // the "assume inputs exist" branch a few lines up the call stack).
+        const cs = self.chain_state orelse return;
+
+        // Coinbase transactions are not relayed; reject up-front.
+        if (tx.isCoinbase()) return MempoolError.NonStandard;
+
+        // Build the STANDARD flag set for the current chain height. Use
+        // the configured network params if present, falling back to mainnet
+        // (which is what `Mempool.init` defaults to in production).
+        const params = self.params orelse &consensus.MAINNET;
+        const flags = validation.getStandardScriptFlags(cs.best_height, params);
+
+        // Two-pass: collect all spent UTXOs first so per-input prevouts
+        // (BIP-341 sha_amounts / sha_scriptpubkeys) are available throughout
+        // script verification — Taproot commits to ALL inputs' amounts and
+        // scripts, not just the input being verified. Mirror the layout
+        // used in `validation.checkTransactionContextual`.
+        var spent_amounts = self.allocator.alloc(i64, tx.inputs.len) catch
+            return MempoolError.OutOfMemory;
+        defer self.allocator.free(spent_amounts);
+        var spent_scripts = self.allocator.alloc([]const u8, tx.inputs.len) catch
+            return MempoolError.OutOfMemory;
+        defer self.allocator.free(spent_scripts);
+
+        // Some scriptPubKeys are owned (reconstructed from CompactUtxo); track
+        // and free at the end. Mempool-resolved prevouts are slices into the
+        // parent tx and must NOT be freed here.
+        var owned_scripts = std.ArrayList([]const u8).init(self.allocator);
+        defer {
+            for (owned_scripts.items) |s| self.allocator.free(s);
+            owned_scripts.deinit();
+        }
+
+        for (tx.inputs, 0..) |input, i| {
+            if (self.getOutputFromMempool(&input.previous_output)) |mempool_output| {
+                spent_amounts[i] = mempool_output.value;
+                spent_scripts[i] = mempool_output.script_pubkey;
+            } else {
+                // Pull from UTXO set; this returns a CompactUtxo whose
+                // scriptPubKey we must reconstruct (and own).
+                const utxo_opt = cs.utxo_set.get(&input.previous_output) catch
+                    return MempoolError.MissingInputs;
+                const utxo = utxo_opt orelse return MempoolError.MissingInputs;
+                defer {
+                    var mut_u = utxo;
+                    mut_u.deinit(self.allocator);
+                }
+                const script_bytes = utxo.reconstructScript(self.allocator) catch
+                    return MempoolError.OutOfMemory;
+                owned_scripts.append(script_bytes) catch {
+                    self.allocator.free(script_bytes);
+                    return MempoolError.OutOfMemory;
+                };
+                spent_amounts[i] = utxo.value;
+                spent_scripts[i] = script_bytes;
+            }
+        }
+
+        // Now actually run the script engine against each input.
+        for (tx.inputs, 0..) |input, input_index| {
+            var engine = script.ScriptEngine.initWithPrevouts(
+                self.allocator,
+                tx,
+                input_index,
+                spent_amounts[input_index],
+                flags,
+                spent_amounts,
+                spent_scripts,
+            );
+            defer engine.deinit();
+
+            const result = engine.verify(
+                input.script_sig,
+                spent_scripts[input_index],
+                input.witness,
+            );
+            if (result) |ok| {
+                if (!ok) return MempoolError.ScriptVerifyFailed;
+            } else |_| {
+                return MempoolError.ScriptVerifyFailed;
+            }
+        }
     }
 
     /// Check standardness rules.
@@ -1478,6 +1607,10 @@ pub const Mempool = struct {
         if (total_in > 0 and package_fee_rate < min_fee_rate) {
             return MempoolError.InsufficientFee;
         }
+
+        // 6b. Script verification (STANDARD_SCRIPT_VERIFY_FLAGS) — same gate
+        // as `addTransaction`. See that function's comment for the why.
+        try self.verifyInputScripts(&tx);
 
         // 7. Handle RBF conflicts
         if (conflicting_txids.items.len > 0) {
@@ -6063,4 +6196,249 @@ test "cluster mempool: projected cluster size" {
     // Project what the cluster size would be if we add this child
     const projected_size = try mempool.projectClusterSize(&child_tx);
     try std.testing.expectEqual(@as(usize, 2), projected_size);
+}
+
+// ============================================================================
+// Script Verification on AcceptToMemoryPool
+// ============================================================================
+//
+// Regression tests for the Cat-D P0 fix: `addTransaction` must script-verify
+// every input under STANDARD_SCRIPT_VERIFY_FLAGS (consensus + policy). Prior
+// to this gate, a peer could flood the mempool with txs whose signatures
+// don't actually verify (silent acceptance until a miner mined them).
+//
+// Reference: Bitcoin Core validation.cpp `MemPoolAccept::PolicyScriptChecks`.
+
+/// Build a P2WPKH-shaped output script we can use as a "standard" output on
+/// the SPENDING tx (so `Mempool.checkStandard` is happy and we can observe
+/// the script-verify gate downstream of standardness).
+fn testP2wpkhScript() [22]u8 {
+    return [22]u8{
+        0x00, 0x14, // witness v0, push 20 bytes
+        0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+        0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    };
+}
+
+test "addTransaction: rejects tx with bad signature (script verify enforced)" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 800_000; // post-segwit / post-taproot
+
+    var mempool = Mempool.init(&chain_state, &consensus.MAINNET, allocator);
+    defer mempool.deinit();
+
+    // Pre-populate the UTXO set with a bare-pubkey output:
+    //   <33-byte pubkey> OP_CHECKSIG
+    // This is a P2PK script — spending it requires a valid ECDSA sig.
+    const prev_outpoint = types.OutPoint{
+        .hash = [_]u8{0x42} ** 32,
+        .index = 0,
+    };
+    var prev_script: [35]u8 = undefined;
+    prev_script[0] = 0x21; // push 33 bytes
+    @memset(prev_script[1..34], 0x02); // pubkey starts with 0x02 (compressed-shaped)
+    // Make the rest of the pubkey nominally distinct from 0x02 to look pubkey-ish.
+    var i: usize = 2;
+    while (i < 34) : (i += 1) prev_script[i] = 0xAA;
+    prev_script[34] = 0xAC; // OP_CHECKSIG
+
+    const prev_output = types.TxOut{
+        .value = 100_000,
+        .script_pubkey = &prev_script,
+    };
+    try chain_state.utxo_set.add(&prev_outpoint, &prev_output, 700_000, false);
+
+    // Build a tx that spends the above with a non-empty BUT INVALID signature.
+    // Strategy: push something that is non-DER. With STRICTENC / DERSIG (both
+    // in STANDARD), the script engine will error on the malformed sig long
+    // before any libsecp call.  That trips ScriptVerifyFailed.
+    var bogus_script_sig: [37]u8 = undefined;
+    bogus_script_sig[0] = 0x24; // push 36 bytes
+    bogus_script_sig[1] = 0x30; // 0x30 (DER tag) but the rest is junk
+    bogus_script_sig[2] = 0x22; // claimed length
+    var j: usize = 3;
+    while (j < 37) : (j += 1) bogus_script_sig[j] = 0xCC;
+
+    const spending_input = types.TxIn{
+        .previous_output = prev_outpoint,
+        .script_sig = &bogus_script_sig,
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const out_script = testP2wpkhScript();
+    const spending_output = types.TxOut{
+        .value = 90_000, // pays 10k sat fee on ~10 vB → plenty above min relay
+        .script_pubkey = &out_script,
+    };
+    const spending_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{spending_input},
+        .outputs = &[_]types.TxOut{spending_output},
+        .lock_time = 0,
+    };
+
+    // The whole point: this MUST be rejected with ScriptVerifyFailed.
+    const result = mempool.addTransaction(spending_tx);
+    try std.testing.expectError(MempoolError.ScriptVerifyFailed, result);
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+
+    // And the AcceptResult variant must surface Core's
+    // "mandatory-script-verify-flag-failed" reject reason.
+    const accept = mempool.acceptToMemoryPool(spending_tx, false);
+    try std.testing.expect(!accept.accepted);
+    try std.testing.expect(accept.reject_reason != null);
+    try std.testing.expectEqualStrings(
+        "mandatory-script-verify-flag-failed",
+        accept.reject_reason.?,
+    );
+}
+
+test "addTransaction: rejects tx with high-S signature (LOW_S policy enforced)" {
+    // BIP-146 / BIP-62 rule 5: relay-policy LOW_S — S must be at most
+    // half the curve order. Mempool-only policy; not consensus. This test
+    // proves the STANDARD policy flags (not just the consensus subset) are
+    // wired into the mempool gate.
+    if (!crypto.isSecp256k1Available()) {
+        // isLowDERSignature short-circuits to `false` without secp256k1,
+        // which would still trip the test (any sig parses as "not low-S"),
+        // but the assertion would be meaningless. Skip cleanly instead.
+        return;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 800_000;
+
+    var mempool = Mempool.init(&chain_state, &consensus.MAINNET, allocator);
+    defer mempool.deinit();
+
+    // Bare-pubkey scriptPubKey, same as the bad-sig test.
+    const prev_outpoint = types.OutPoint{
+        .hash = [_]u8{0x55} ** 32,
+        .index = 0,
+    };
+    var prev_script: [35]u8 = undefined;
+    prev_script[0] = 0x21; // push 33 bytes
+    prev_script[1] = 0x02; // pubkey prefix (compressed, even-y)
+    // Use the secp256k1 generator G's x coordinate for a real curve point.
+    const G_X = [_]u8{
+        0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC,
+        0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B, 0x07,
+        0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9,
+        0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98,
+    };
+    @memcpy(prev_script[2..34], &G_X);
+    prev_script[34] = 0xAC; // OP_CHECKSIG
+
+    const prev_output = types.TxOut{
+        .value = 100_000,
+        .script_pubkey = &prev_script,
+    };
+    try chain_state.utxo_set.add(&prev_outpoint, &prev_output, 700_000, false);
+
+    // Build a DER-valid signature with HIGH S = (curve_order - 1).
+    // R = 1 (1 byte), S = N-1 (33 bytes incl. leading 0x00 because top bit
+    // of N-1 is set). Total DER body: 0x30 [38] 0x02 [01] 01 0x02 [21] 00 [N-1]
+    // + hashtype byte = 41 bytes.
+    var high_s_sig: [41]u8 = undefined;
+    high_s_sig[0] = 0x30; // SEQUENCE
+    high_s_sig[1] = 0x26; // length: 38 bytes following (R block + S block)
+    // R = 0x01
+    high_s_sig[2] = 0x02; // INTEGER tag
+    high_s_sig[3] = 0x01; // length 1
+    high_s_sig[4] = 0x01; // value
+    // S = N-1 (high)
+    high_s_sig[5] = 0x02; // INTEGER tag
+    high_s_sig[6] = 0x21; // length 33 (with leading 0x00 because top bit set)
+    high_s_sig[7] = 0x00; // leading zero
+    const N_MINUS_1 = [_]u8{
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+        0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+        0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x40,
+    };
+    @memcpy(high_s_sig[8..40], &N_MINUS_1);
+    high_s_sig[40] = 0x01; // SIGHASH_ALL
+
+    // scriptSig pushes the 41-byte high-S sig onto the stack.
+    var script_sig: [42]u8 = undefined;
+    script_sig[0] = 0x29; // push 41 bytes
+    @memcpy(script_sig[1..42], &high_s_sig);
+
+    const spending_input = types.TxIn{
+        .previous_output = prev_outpoint,
+        .script_sig = &script_sig,
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const out_script = testP2wpkhScript();
+    const spending_output = types.TxOut{
+        .value = 90_000,
+        .script_pubkey = &out_script,
+    };
+    const spending_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{spending_input},
+        .outputs = &[_]types.TxOut{spending_output},
+        .lock_time = 0,
+    };
+
+    // LOW_S is policy-only, so it is set in STANDARD but not in CONSENSUS.
+    // The mempool path must enforce it → ScriptVerifyFailed.
+    const result = mempool.addTransaction(spending_tx);
+    try std.testing.expectError(MempoolError.ScriptVerifyFailed, result);
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+}
+
+test "addTransaction: accepts tx whose inputs script-verify" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 800_000;
+
+    var mempool = Mempool.init(&chain_state, &consensus.MAINNET, allocator);
+    defer mempool.deinit();
+
+    // The simplest "always satisfies" scriptPubKey: OP_TRUE (0x51) — pushes
+    // 1 onto the stack with no scriptSig needed. This verifies cleanly
+    // under STANDARD (clean stack of [TRUE], no sig encoding to police).
+    const prev_outpoint = types.OutPoint{
+        .hash = [_]u8{0x77} ** 32,
+        .index = 0,
+    };
+    const prev_script = [_]u8{0x51}; // OP_TRUE
+    const prev_output = types.TxOut{
+        .value = 100_000,
+        .script_pubkey = &prev_script,
+    };
+    try chain_state.utxo_set.add(&prev_outpoint, &prev_output, 700_000, false);
+
+    const spending_input = types.TxIn{
+        .previous_output = prev_outpoint,
+        .script_sig = &[_]u8{}, // empty; OP_TRUE alone satisfies
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const out_script = testP2wpkhScript();
+    const spending_output = types.TxOut{
+        .value = 90_000,
+        .script_pubkey = &out_script,
+    };
+    const spending_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{spending_input},
+        .outputs = &[_]types.TxOut{spending_output},
+        .lock_time = 0,
+    };
+
+    // Should be accepted: the OP_TRUE input verifies under STANDARD flags,
+    // the output is a standard P2WPKH, fee is well above min-relay.
+    try mempool.addTransaction(spending_tx);
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
 }
