@@ -720,22 +720,25 @@ pub fn submitBlockWithIndex(
     const ibd_mode = params.assume_valid_height > 0 and height <= params.assume_valid_height;
     if (ibd_mode) {
         chain_state.connectBlockFast(block, &block_hash, height) catch |err| {
+            // Map to BIP-22 canonical strings (Bitcoin Core BIP22ValidationResult).
+            // connectBlockFast propagates errors from connectBlockInner + flush.
             return .{
                 .accepted = false,
                 .reject_reason = switch (err) {
                     error.MissingInput => "bad-txns-inputs-missingorspent",
-                    else => "invalid-block",
+                    else => "rejected",
                 },
                 .block_hash = block_hash,
             };
         };
     } else {
         var undo = chain_state.connectBlock(block, &block_hash, height) catch |err| {
+            // Map to BIP-22 canonical strings (Bitcoin Core BIP22ValidationResult).
             return .{
                 .accepted = false,
                 .reject_reason = switch (err) {
                     error.MissingInput => "bad-txns-inputs-missingorspent",
-                    else => "invalid-block",
+                    else => "rejected",
                 },
                 .block_hash = block_hash,
             };
@@ -765,7 +768,8 @@ pub fn submitBlockWithIndex(
         chain_state.flush_error = true;
         return .{
             .accepted = false,
-            .reject_reason = "flush-failed",
+            // BIP-22 has no specific string for flush failure; "rejected" is the catch-all.
+            .reject_reason = "rejected",
             .block_hash = block_hash,
         };
     };
