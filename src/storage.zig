@@ -2110,6 +2110,22 @@ pub const ChainState = struct {
         return hash;
     }
 
+    /// Returns true if the chain has ever connected a block with the given
+    /// hash.  Used by the headers handler's competing-fork detector to
+    /// decide whether a "non-tip" prev_block names a real ancestor on the
+    /// active chain (case B = competing fork) vs an unknown branch
+    /// (case C = peer misbehavior).  Looks up CF_BLOCKS keyed by hash.
+    /// O(1) DB hit; tolerates DB-less mode (returns false).
+    pub fn hasBlock(self: *ChainState, hash: *const types.Hash256) bool {
+        const db = self.utxo_set.db orelse return false;
+        const data = db.get(CF_BLOCKS, hash) catch return false;
+        if (data) |d| {
+            self.allocator.free(d);
+            return true;
+        }
+        return false;
+    }
+
     /// Persist an H:{height}→hash index entry.  Idempotent (same height
     /// always maps to the same hash on the active chain), so races between
     /// the RPC thread's lazy-backfill path and ChainState.flush() are
