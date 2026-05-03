@@ -837,33 +837,49 @@ fn compactSizeLen(value: usize) u64 {
     return 9;
 }
 
+/// Encode block height as the canonical BIP-34 byte sequence.
+/// Mirrors Bitcoin Core's CScript() << nHeight (script.h:433-448):
+///   height == 0  → OP_0 (0x00), single byte
+///   1..16        → OP_1..OP_16 (0x51..0x60), single byte
+///   otherwise    → length-prefixed sign-magnitude CScriptNum
+/// The returned slice is valid for the lifetime of `buf` (max 6 bytes).
+fn encodeBip34Height(height: u32, buf: *[6]u8) []u8 {
+    if (height == 0) {
+        buf[0] = 0x00; // OP_0
+        return buf[0..1];
+    }
+    if (height <= 16) {
+        buf[0] = @intCast(0x50 + height); // OP_1..OP_16
+        return buf[0..1];
+    }
+    // CScriptNum: minimal little-endian sign-magnitude.
+    var le: [5]u8 = undefined;
+    var n: u8 = 0;
+    var h = height;
+    while (h > 0) : (n += 1) {
+        le[n] = @intCast(h & 0xff);
+        h >>= 8;
+    }
+    // If high bit of last byte is set, append zero sign byte.
+    if (le[n - 1] & 0x80 != 0) {
+        le[n] = 0x00;
+        n += 1;
+    }
+    buf[0] = n; // length prefix
+    @memcpy(buf[1..][0..n], le[0..n]);
+    return buf[0 .. 1 + n];
+}
+
 /// Validate that the coinbase scriptSig correctly encodes the block height (BIP-34).
+/// Implements Bitcoin Core's byte-exact PREFIX match:
+///   CScript expect = CScript() << nHeight;
+///   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
+/// (validation.cpp:4151-4159, script.h:433-448)
 fn validateCoinbaseHeight(cb_script: []const u8, height: u32) bool {
-    if (cb_script.len < 1) return false;
-
-    const push_size = cb_script[0];
-
-    // Height is encoded as a CScriptNum push at the beginning
-    // The push opcode gives the length (1-4 bytes for typical heights)
-    if (push_size == 0) {
-        // OP_0 means height 0
-        return height == 0;
-    }
-
-    if (push_size > 4) {
-        // Heights don't need more than 4 bytes (covers billions of blocks)
-        return false;
-    }
-
-    if (cb_script.len < 1 + push_size) return false;
-
-    // Decode little-endian height
-    var encoded_height: u32 = 0;
-    for (0..push_size) |bi| {
-        encoded_height |= @as(u32, cb_script[1 + bi]) << @intCast(8 * bi);
-    }
-
-    return encoded_height == height;
+    var buf: [6]u8 = undefined;
+    const expect = encodeBip34Height(height, &buf);
+    if (cb_script.len < expect.len) return false;
+    return std.mem.eql(u8, cb_script[0..expect.len], expect);
 }
 
 /// Check the segwit witness commitment (BIP-141).
@@ -1925,19 +1941,52 @@ test "medianTimePast returns 0 for empty array" {
     try std.testing.expectEqual(@as(u32, 0), mtp);
 }
 
-test "validateCoinbaseHeight correctly validates height encoding" {
-    // Height 1 encoded as push 1 byte with value 1
-    const script_h1 = [_]u8{ 0x01, 0x01 };
-    try std.testing.expect(validateCoinbaseHeight(&script_h1, 1));
-    try std.testing.expect(!validateCoinbaseHeight(&script_h1, 2));
+test "validateCoinbaseHeight byte-prefix match (Core ContextualCheckBlock parity)" {
+    // --- Canonical forms: must pass ---
+    // height 0: OP_0
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{0x00}, 0));
+    // height 1: OP_1 (0x51)
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{0x51}, 1));
+    // height 16: OP_16 (0x60)
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{0x60}, 16));
+    // height 17: 1-byte push (0x01 0x11)
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x01, 0x11 }, 17));
+    // height 127: no sign pad
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x01, 0x7f }, 127));
+    // height 128: sign pad at 0x80 → 0x02 0x80 0x00
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x02, 0x80, 0x00 }, 128));
+    // height 32768: sign pad at 0x8000 → 0x03 0x00 0x80 0x00
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x03, 0x00, 0x80, 0x00 }, 32768));
+    // height 500000 (0x07A120 LE)
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x03, 0x20, 0xA1, 0x07 }, 500000));
+    // prefix match: extra bytes after canonical are OK
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x60, 0xde, 0xad }, 16));
 
-    // Height 256 encoded as push 2 bytes little-endian
-    const script_h256 = [_]u8{ 0x02, 0x00, 0x01 };
-    try std.testing.expect(validateCoinbaseHeight(&script_h256, 256));
+    // --- Non-canonical / rejected forms ---
+    // wrong height
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{ 0x01, 0x01 }, 2));
+    // length-prefixed 0x01 0x01 for height 1 (must be OP_1)
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{ 0x01, 0x01 }, 1));
+    // length-prefixed 0x01 0x10 for height 16 (must be OP_16)
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{ 0x01, 0x10 }, 16));
+    // zero-padded height 100 (non-canonical)
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{ 0x02, 0x64, 0x00 }, 100));
+    // OP_PUSHDATA1 prefix for height 1
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{ 0x4c, 0x01, 0x01 }, 1));
+    // too short
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{}, 100));
+}
 
-    // Height 500000 (0x07A120) encoded as 3 bytes
-    const script_h500k = [_]u8{ 0x03, 0x20, 0xA1, 0x07 };
-    try std.testing.expect(validateCoinbaseHeight(&script_h500k, 500000));
+test "encodeBip34Height canonical vectors" {
+    var buf: [6]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &[_]u8{0x00}, encodeBip34Height(0, &buf));
+    try std.testing.expectEqualSlices(u8, &[_]u8{0x51}, encodeBip34Height(1, &buf));
+    try std.testing.expectEqualSlices(u8, &[_]u8{0x60}, encodeBip34Height(16, &buf));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x11 }, encodeBip34Height(17, &buf));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x7f }, encodeBip34Height(127, &buf));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x80, 0x00 }, encodeBip34Height(128, &buf));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x00, 0x80, 0x00 }, encodeBip34Height(32768, &buf));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x20, 0xa1, 0x07 }, encodeBip34Height(500000, &buf));
 }
 
 test "checkBlockHeader validates proof of work" {
