@@ -20,11 +20,6 @@ pub const MAX_OUTBOUND_CONNECTIONS: usize = 8;
 /// Maximum number of inbound connections.
 pub const MAX_INBOUND_CONNECTIONS: usize = 117;
 
-/// One-shot WARN flag for the IBD validation disabled-by-default path.
-/// Set true on the first call to validateBlockForIBDOrReject so the
-/// "running without consensus validation" warning emits exactly once.
-var ibd_validation_warn_emitted: bool = false;
-
 /// One-shot announce flag for the CLEARBIT_REORG=1 opt-in path.  Set
 /// true on the first drain after the env var is detected so the
 /// "undo capture enabled" line emits exactly once per process.
@@ -4550,23 +4545,22 @@ pub const PeerManager = struct {
 
     /// IBD-time consensus validation gate.  Returns true when the block is
     /// safe to apply via `connectBlockFast`, false on any consensus rule
-    /// violation or unrecoverable lookup error.  See
-    /// `validation.zig:validateBlockForIBD` for the full check list.
+    /// violation or unrecoverable lookup error.
     ///
-    /// Mode selection (env var CLEARBIT_VALIDATE_IBD):
-    ///   - "0" / "off": legacy trust-the-peer behaviour. Logs a one-shot WARN
-    ///     at first call so operators see the node is consensus-uncritical.
-    ///     Returns true (block accepted).
-    ///   - "warn":  run validation, log on failure, but RETURN TRUE so the
-    ///     block is still applied. Used for soak monitoring without risking
-    ///     IBD progress on first deploy.
-    ///   - "1" / "strict" / unset (default): run validation, REJECT on failure.
-    ///     This is the intended steady-state behaviour and the default as of
-    ///     2026-05-04 (audit closure: submitblock-vs-IBD-audit).  Previously
-    ///     defaulted to off during the W104+ soak period; the soak has confirmed
-    ///     stable behaviour across mainnet up to the tested height.
-    ///     Set CLEARBIT_VALIDATE_IBD=off to revert to the legacy non-validating
-    ///     mode (e.g. for emergency bulk-IBD performance recovery).
+    /// Routes through `validation.acceptBlock` — the unified entry point
+    /// that mirrors Bitcoin Core's ProcessNewBlock pipeline (CheckBlock +
+    /// ContextualCheckBlock + ConnectBlock-equivalent validation minus UTXO
+    /// mutations).  Previously duplicated IBDValidationContext construction
+    /// here; now that logic lives in acceptBlock so the submitblock RPC path
+    /// and the legacy sync.zig path share identical validation semantics.
+    ///
+    /// The CLEARBIT_VALIDATE_IBD env-gate ("off"/"warn"/"strict") has been
+    /// removed.  It had no performance justification — "off" was a pure
+    /// bypass mechanism for testing convenience with zero CPU savings over
+    /// the "strict" path (the adapter and ctx are cheap; validateBlockForIBD
+    /// is where the work happens).  Validation now runs unconditionally,
+    /// matching Bitcoin Core's behaviour.  The previous wave-8 / wave-15
+    /// holding patches that added the gate are superseded by this refactor.
     ///
     /// On a false return the caller should:
     ///   - rewind `download_cursor` to `connect_cursor` so the slot is
@@ -4579,35 +4573,6 @@ pub const PeerManager = struct {
         height: u32,
     ) bool {
         const cs = self.chain_state orelse return false;
-
-        // Mode selection.  std.posix.getenv is a non-allocating env lookup.
-        // Default changed from "off" to "strict" (2026-05-04: submitblock-vs-IBD
-        // audit closure — IBD path must enforce the same checks as submitblock).
-        // Set CLEARBIT_VALIDATE_IBD=off to revert to non-validating mode if needed
-        // for bulk-IBD performance recovery.
-        const mode_env = std.posix.getenv("CLEARBIT_VALIDATE_IBD");
-        const mode: enum { off, warn, strict } = blk: {
-            if (mode_env) |s| {
-                if (std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off"))
-                    break :blk .off;
-                if (std.mem.eql(u8, s, "warn"))
-                    break :blk .warn;
-            }
-            break :blk .strict;
-        };
-
-        if (mode == .off) {
-            if (!ibd_validation_warn_emitted) {
-                ibd_validation_warn_emitted = true;
-                std.debug.print(
-                    "P2P: WARN clearbit IBD is running WITHOUT consensus validation. " ++
-                        "Set CLEARBIT_VALIDATE_IBD=strict (or unset) to enforce " ++
-                        "PoW/scripts/sigops/fees (default since 2026-05-04).\n",
-                    .{},
-                );
-            }
-            return true;
-        }
 
         // Per-call lookup adapter: closes over the chain state's utxo_set
         // and dupes the reconstructed scriptPubKey onto the heap so the
@@ -4638,82 +4603,32 @@ pub const PeerManager = struct {
         };
         var adapter = Adapter{ .cs_ptr = cs, .alloc = self.allocator };
 
-        // Active-chain wiring: peer.zig doesn't directly own the
-        // height->hash index, but ChainState exposes getBlockHashByHeight.
-        // For the assumevalid skip we ONLY need the entry at
-        // params.assume_valid_height, plus the entry at this block's height
-        // (implicitly equal to block_hash.*). Build a minimal 2-element
-        // slice so shouldSkipScripts can do the ancestor check without us
-        // having to materialize the whole chain.
-        //
-        // We allocate a height+1 sized scratch slice on the validation
-        // call's arena lifetime — but since the adapter's allocator is
-        // self.allocator, the scratch needs that same lifetime.  Use a
-        // small stack-resident array sized for the worst case (height up
-        // to mainnet tip ~940k); allocate the per-call slice on heap.
+        // Assumevalid script-skip: if the block height is at or below the
+        // assumed-valid height AND we have a valid assumed-valid hash, skip
+        // script verification (but not any other consensus check).  This
+        // matches Core's intent — scripts are skipped for ancestors of the
+        // assumed-valid block once the headers-first sync invariant holds.
         const av_height = self.network_params.assume_valid_height;
-        const chain_len: u32 = if (av_height >= height) av_height + 1 else height + 1;
-
-        // For mainnet IBD this slice is up to ~940k entries (30 MB).  We
-        // synthesise just the two relevant indices and leave the rest
-        // zeroed — shouldSkipScripts only consults [block_height] and
-        // [av_height].  Allocating 30 MB per block is wasteful, so we
-        // build a sparse impl: a struct-backed slice would force us to
-        // touch shouldSkipScripts.  For the immediate fix we use a
-        // hash-based shortcut:  if assume_valid_height > block height AND
-        // block height is below assume_valid_height, we trust the headers
-        // chain back to genesis came from getheaders — i.e. the block IS
-        // an ancestor of params.assumed_valid_hash by construction.
-        //
-        // This matches Core's intent (validation.cpp comment: scripts are
-        // skipped for ancestors of the assumed-valid block) once the
-        // headers-first sync invariant holds.  Headers from peers are
-        // chained back to our tip in peer.zig:2932, so by the time a
-        // block at height h is being connected, headers up to that height
-        // are already on a single linear chain.
-        _ = chain_len;
         const skip_via_height = (height <= av_height) and (av_height != 0) and
             (self.network_params.assumed_valid_hash != null);
 
-        // Build a synthetic active_chain that satisfies shouldSkipScripts.
-        // Two-element slice: index 0 = block_hash, index 1 = assumed_valid.
-        // We point block_height at index 0 and av_height at index 1 by
-        // ALSO faking those indices.  But shouldSkipScripts indexes by
-        // block_height/av_height directly; we can't fake indices without
-        // allocating the full slice.
-        //
-        // Cleanest fix that keeps the code reviewable: skip the
-        // assumevalid path inside this helper entirely and gate scripts
-        // on `skip_via_height` directly.  We pass active_chain=null below;
-        // shouldSkipScripts will return false; we then post-process by
-        // turning on script-skip if `skip_via_height` is true.  This
-        // requires teaching validateBlockForIBD a "force skip" override.
-        // BIP-113: compute MTP-of-11 for the block's parent so validateBlockForIBD
-        // can enforce header.timestamp > MTP (ContextualCheckBlockHeader in Core).
+        // BIP-113: compute MTP-of-11 for the block's parent.
         const prev_mtp = self.computePrevMtp(&block.header.prev_block);
 
-        var ctx = validation.IBDValidationContext{
-            .block_hash = block_hash.*,
-            .height = height,
-            .params = self.network_params,
-            .prevout_lookup_ctx = @ptrCast(&adapter),
-            .prevout_lookupFn = Adapter.lookup,
-            .active_chain = null,
-            .best_tip_chain_work = [_]u8{0} ** 32,
-            .best_tip_timestamp = 0,
-            .prev_mtp = prev_mtp,
-            .force_skip_scripts = skip_via_height,
-        };
-
-        validation.validateBlockForIBD(block, &ctx, self.allocator) catch |err| {
+        validation.acceptBlock(
+            block,
+            block_hash,
+            height,
+            self.network_params,
+            @ptrCast(&adapter),
+            Adapter.lookup,
+            self.allocator,
+            .{ .prev_mtp = prev_mtp, .force_skip_scripts = skip_via_height },
+        ) catch |err| {
             std.debug.print(
-                "P2P: REJECT block height={d} validation={} mode={s}\n",
-                .{ height, err, @tagName(mode) },
+                "P2P: REJECT block height={d} validation={}\n",
+                .{ height, err },
             );
-            // In .warn mode we accept the block anyway so soak monitoring
-            // doesn't break IBD on a false positive.  In .strict mode we
-            // reject and the pipeline rewinds.
-            if (mode == .warn) return true;
             return false;
         };
         return true;

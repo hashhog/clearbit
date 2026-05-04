@@ -1242,6 +1242,88 @@ pub fn validateBlockForIBD(
     }
 }
 
+// ============================================================================
+// acceptBlock — unified block-acceptance helper (Core ProcessNewBlock parity)
+// ============================================================================
+//
+// All block-acceptance entry points (IBD/P2P path, submitblock RPC, and the
+// legacy sync.zig BlockDownloader) must route through this single function
+// rather than each duplicating adapter construction + IBDValidationContext
+// assembly.  This closes the recurring-offender pattern audited in waves 3,
+// 7, 8, 11, 15, 22, and 23 of the 2026-05-03 P0 session.
+//
+// Mirrors Bitcoin Core's Chainstate::ProcessNewBlock pipeline:
+//   ProcessNewBlock → AcceptBlockHeader → AcceptBlock (CheckBlock)
+//                   → ActivateBestChain (ContextualCheckBlock + ConnectBlock)
+//
+// The function performs ONLY the validation phase — UTXO mutations and chain
+// tip advancement are NOT performed here; they remain the caller's
+// responsibility (connectBlockFast / connectBlock / applyBlockAtomic).
+//
+// Reference: bitcoin-core/src/validation.cpp::Chainstate::ProcessNewBlock
+
+/// Options for acceptBlock.  Controls the two legitimate caller-side
+/// performance knobs that have a consensus justification:
+///
+/// - `prev_mtp`: Median-time-past of the 11 blocks before `block`.
+///   Used by BIP-113 (timestamp > MTP) and BIP-68/CSV sequence locks.
+///   Pass 0 near genesis (fewer than 11 reachable ancestors), matching
+///   Core's CBlockIndex::GetMedianTimePast genesis skip behaviour.
+///
+/// - `force_skip_scripts`: Override for the assumevalid script-skip
+///   decision.  Set true when the caller knows by construction that this
+///   block is an ancestor of `params.assumed_valid_hash` (e.g. during
+///   headers-first IBD when height <= assume_valid_height and the chain
+///   has been chained back to genesis).  Non-script consensus checks
+///   (PoW, merkle, sigops, fees, witness commitment, IsFinalTx) are
+///   NEVER skipped regardless of this flag.
+pub const AcceptBlockOptions = struct {
+    prev_mtp: u32 = 0,
+    force_skip_scripts: bool = false,
+};
+
+/// Unified block consensus-validation entry point.
+///
+/// Runs the full CheckBlock + ContextualCheckBlock + ConnectBlock-equivalent
+/// validation chain (minus UTXO mutations) before the caller may apply the
+/// block to chainstate.  Called by:
+///   - peer.zig::validateBlockForIBDOrReject (IBD/P2P path)
+///   - rpc.zig::validateSubmitBlockOrReject  (submitblock RPC)
+///   - sync.zig::validateAndConnectBlock     (legacy BlockDownloader path)
+///
+/// On success: block is safe to apply via connectBlockFast/connectBlock.
+/// On failure: block is consensus-invalid; caller must reject it.
+///
+/// The `prevout_lookup_ctx` + `prevout_lookupFn` pair is a closure over
+/// the caller's UTXO store (ChainState.utxo_set or equivalent).  The
+/// lookup must return `PrevOutInfo` with `owner_allocator` set if the
+/// script_pubkey was heap-allocated (so `validateBlockForIBD` can free it
+/// via the arena), or null if the script lifetime is managed externally.
+pub fn acceptBlock(
+    block: *const types.Block,
+    block_hash: *const types.Hash256,
+    height: u32,
+    params: *const consensus.NetworkParams,
+    prevout_lookup_ctx: *anyopaque,
+    prevout_lookupFn: *const fn (*anyopaque, *const types.OutPoint) ?PrevOutInfo,
+    allocator: std.mem.Allocator,
+    options: AcceptBlockOptions,
+) ValidationError!void {
+    const ctx = IBDValidationContext{
+        .block_hash = block_hash.*,
+        .height = height,
+        .params = params,
+        .prevout_lookup_ctx = prevout_lookup_ctx,
+        .prevout_lookupFn = prevout_lookupFn,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = options.prev_mtp,
+        .force_skip_scripts = options.force_skip_scripts,
+    };
+    return validateBlockForIBD(block, &ctx, allocator);
+}
+
 /// Calculate block weight per BIP-141.
 /// Weight = (non_witness_bytes * 3) + total_bytes
 /// NOTE: This is NOT non_witness_bytes * 4. The formula is:
