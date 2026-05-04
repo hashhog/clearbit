@@ -2820,6 +2820,8 @@ pub const RpcServer = struct {
             error.MissingInput, error.InputAlreadySpent => "bad-txns-inputs-missingorspent",
             error.BadBlockWeight, error.BadBlockSize => "bad-blk-weight",
             error.ScriptVerificationFailed => "mandatory-script-verify-flag-failed",
+            // Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
+            error.NegativeOutput => "bad-txns-vout-negative",
             else => "rejected",
         };
     }
