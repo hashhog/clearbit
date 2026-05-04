@@ -1257,6 +1257,21 @@ pub const UtxoSet = struct {
             return old.value.utxo;
         }
 
+        // CVE-2012-2459 / dup-txid double-spend guard: if this key is in
+        // pending_deletes it was already spent by an earlier tx in the same
+        // block but the DB delete has not been flushed yet (deletes are
+        // batched for atomicity with the chain tip in ChainState.flush()).
+        // Without this check a block containing [coinbase, tx, tx] (same
+        // non-coinbase tx twice) would be incorrectly accepted: the second
+        // tx's prevout is gone from cache (first tx removed it) but is still
+        // readable from the DB, so spend() would succeed a second time.
+        // Core rejects via bad-txns-inputs-missingorspent in ConnectBlock
+        // (validation.cpp) when the in-place CCoinsViewCache finds the coin
+        // already marked spent.  Reference: dup-txid-merkle-malleation corpus.
+        for (self.pending_deletes.items) |pd_key| {
+            if (std.mem.eql(u8, &pd_key, &key)) return null;
+        }
+
         // Not in cache, try database
         if (self.db) |db| {
             const data = db.get(CF_UTXO, &key) catch return null;
