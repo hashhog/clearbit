@@ -2822,6 +2822,8 @@ pub const RpcServer = struct {
             error.ScriptVerificationFailed => "mandatory-script-verify-flag-failed",
             // Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
             error.NegativeOutput => "bad-txns-vout-negative",
+            // Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
+            error.OutputTooLarge => "bad-txns-vout-toolarge",
             else => "rejected",
         };
     }
