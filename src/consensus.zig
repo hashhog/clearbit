@@ -595,9 +595,9 @@ pub const REGTEST = NetworkParams{
     },
     .dns_seeds = &[_][]const u8{},
     .bip34_height = 1, // Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1
-    .bip65_height = 1351,
-    .bip66_height = 1251,
-    .csv_height = 0,
+    .bip65_height = 1, // Bitcoin Core kernel/chainparams.cpp:538: consensus.BIP65Height = 1
+    .bip66_height = 1, // Bitcoin Core kernel/chainparams.cpp:539: consensus.BIP66Height = 1
+    .csv_height = 1, // Bitcoin Core kernel/chainparams.cpp:540: consensus.CSVHeight = 1
     .segwit_height = 0,
     .taproot_height = 0,
     .address_prefix = 0x6f,
