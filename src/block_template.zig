@@ -684,6 +684,31 @@ pub fn submitBlockWithIndex(
     // Connect the block to the chain (UTXO set + best_hash/best_height)
     const height = chain_state.best_height + 1;
 
+    // Context-free block sanity check: coinbase position, merkle root, weight,
+    // BIP-34 height, BIP-141 witness commitment recomputation (bad-witness-merkle-match),
+    // and coinbase scriptSig length cap (bad-cb-length).
+    // Mirrors Bitcoin Core CheckBlock() (validation.cpp) which runs before
+    // ConnectBlock().  Both checks are consensus-critical:
+    //   - coinbase scriptSig 2..100 bytes: consensus/tx_check.cpp:49
+    //   - witness commitment recompute: validation.cpp:3870-3901 CheckWitnessMalleation
+    validation.checkBlock(block, height, params, allocator) catch |err| {
+        return .{
+            .accepted = false,
+            .reject_reason = switch (err) {
+                error.CoinbaseScriptSize => "bad-cb-length",
+                error.BadWitnessCommitment => "bad-witness-merkle-match",
+                error.BadMerkleRoot => "bad-txnmrklroot",
+                error.BadCoinbaseHeight => "bad-cb-height",
+                error.TooManySigops => "bad-blk-sigops",
+                error.BadBlockWeight => "bad-blk-weight",
+                error.BadBlockSize => "bad-blk-length",
+                error.BadProofOfWork => "high-hash",
+                else => "rejected",
+            },
+            .block_hash = block_hash,
+        };
+    };
+
     // Persist the raw block body to CF_BLOCKS BEFORE applying UTXO
     // mutations.  Same semantics as the peer.zig drainBlockBuffer path —
     // the queue is consumed by ChainState.flush() so the body and tip
