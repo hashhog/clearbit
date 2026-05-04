@@ -5505,7 +5505,7 @@ test "validateBlockForIBD: rejects bad merkle root" {
         .inputs = &[_]types.TxIn{
             .{
                 .previous_output = types.OutPoint.COINBASE,
-                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // height=1 BIP-34
+                .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
                 .sequence = 0xFFFFFFFF,
                 .witness = &[_][]const u8{},
             },
@@ -5565,7 +5565,7 @@ test "validateBlockForIBD: rejects coinbase value > subsidy + fees (no inputs)" 
         .inputs = &[_]types.TxIn{
             .{
                 .previous_output = types.OutPoint.COINBASE,
-                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // BIP-34 height=1
+                .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
                 .sequence = 0xFFFFFFFF,
                 .witness = &[_][]const u8{},
             },
@@ -5649,7 +5649,7 @@ test "validateBlockForIBD: bad BIP-34 coinbase height" {
     };
     const block_hash = crypto.computeBlockHash(&block.header);
     var dummy_ctx_state: u8 = 0;
-    // REGTEST has bip34_height=500; use height >= 500 so the rule fires.
+    // REGTEST has bip34_height=1 (Core parity); height 600 is well above that.
     var ctx = IBDValidationContext{
         .block_hash = block_hash,
         .height = 600,
@@ -5693,7 +5693,7 @@ test "validateBlockForIBD: missing prevout returns MissingInput" {
         .inputs = &[_]types.TxIn{
             .{
                 .previous_output = types.OutPoint.COINBASE,
-                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+                .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
                 .sequence = 0xFFFFFFFF,
                 .witness = &[_][]const u8{},
             },
@@ -5770,7 +5770,7 @@ test "validateBlockForIBD: force_skip_scripts honours caller override" {
         .inputs = &[_]types.TxIn{
             .{
                 .previous_output = types.OutPoint.COINBASE,
-                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // BIP-34 height=1
+                .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
                 .sequence = 0xFFFFFFFF,
                 .witness = &[_][]const u8{},
             },
@@ -5844,7 +5844,7 @@ test "submitblock-gate: rejects block with witness data but missing commitment" 
         .inputs = &[_]types.TxIn{
             .{
                 .previous_output = types.OutPoint.COINBASE,
-                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // BIP-34 height=1
+                .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
                 .sequence = 0xFFFFFFFF,
                 // Coinbase witness nonce required by BIP-141 — but with no
                 // commitment output downstream, validation MUST still reject.
@@ -5929,7 +5929,7 @@ test "submitblock-gate: rejects block with non-final tx" {
         .inputs = &[_]types.TxIn{
             .{
                 .previous_output = types.OutPoint.COINBASE,
-                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // BIP-34 height=1
+                .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
                 .sequence = 0xFFFFFFFF,
                 .witness = &[_][]const u8{},
             },
@@ -6022,7 +6022,7 @@ test "submitblock-gate: accepts a structurally valid coinbase-only block" {
         .inputs = &[_]types.TxIn{
             .{
                 .previous_output = types.OutPoint.COINBASE,
-                .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 }, // BIP-34 height=1
+                .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
                 .sequence = 0xFFFFFFFF,
                 .witness = &[_][]const u8{},
             },
@@ -6077,7 +6077,7 @@ test "validateBlockForIBD: rejects block with timestamp == MTP (BIP-113)" {
         .version = 1,
         .inputs = &[_]types.TxIn{.{
             .previous_output = types.OutPoint.COINBASE,
-            .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+            .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
             .sequence = 0xFFFFFFFF,
             .witness = &[_][]const u8{},
         }},
@@ -6120,7 +6120,7 @@ test "validateBlockForIBD: accepts block with timestamp = MTP + 1 (BIP-113)" {
         .version = 1,
         .inputs = &[_]types.TxIn{.{
             .previous_output = types.OutPoint.COINBASE,
-            .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+            .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
             .sequence = 0xFFFFFFFF,
             .witness = &[_][]const u8{},
         }},
@@ -6162,7 +6162,7 @@ test "validateBlockForIBD: prev_mtp=0 skips MTP check (genesis-adjacent)" {
         .version = 1,
         .inputs = &[_]types.TxIn{.{
             .previous_output = types.OutPoint.COINBASE,
-            .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+            .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
             .sequence = 0xFFFFFFFF,
             .witness = &[_][]const u8{},
         }},
@@ -6227,30 +6227,58 @@ fn bip30HitLookup(ctx: *anyopaque, outpoint: *const types.OutPoint) ?PrevOutInfo
     return null;
 }
 
-/// Build a minimal coinbase tx with a given BIP-34 height prefix so
-/// checkBlock accepts it.  The PoW bits are set to 0x207fffff (regtest-loose).
-fn bip30MakeCoinbase(height: u32) types.Transaction {
-    // Encode height as BIP-34 scriptSig: 0x03 + 3 LE bytes (covers 0..0xFFFFFF).
-    // For h < 0x80 a 1-byte push is fine; for simplicity always use 3-byte form.
-    const h = height;
-    const cb_script = &[_]u8{
-        0x03,
-        @intCast(h & 0xFF),
-        @intCast((h >> 8) & 0xFF),
-        @intCast((h >> 16) & 0xFF),
+/// Bip30CoinbaseBufs: caller-owned storage for bip30MakeCoinbase.
+/// All fields are initialised by the function; the Transaction returned
+/// borrows slices from these buffers so it must not outlive this struct.
+const Bip30CoinbaseBufs = struct {
+    script: [8]u8 = [_]u8{0} ** 8,
+    script_len: usize = 0,
+    input: [1]types.TxIn = undefined,
+    output: [1]types.TxOut = undefined,
+};
+
+/// Build a minimal coinbase tx with a canonical BIP-34 height prefix so
+/// checkBlock accepts it at heights where BIP-34 is active (regtest: h >= 1).
+/// Uses `encodeBip34Height` for byte-exact Core parity.
+///
+/// All storage lives in `bufs` (caller-owned); the returned Transaction borrows
+/// slices from it.  The transaction must not outlive `bufs`.
+fn bip30MakeCoinbase(height: u32, bufs: *Bip30CoinbaseBufs) types.Transaction {
+    // Canonical BIP-34 encoding (Core CScript() << nHeight, script.h:433-448):
+    //   h == 0   → [0x00]             (OP_0)
+    //   1..16    → [0x51..0x60]       (OP_N, single byte)
+    //   >= 17    → [len, LE-bytes...] (CScriptNum, no trailing zeros)
+    // Previously used a 3-byte zero-padded form; that was fine when
+    // bip34_height=500 (pre-BIP34 tests ran at h<500), but with bip34_height=1
+    // (Core parity) any non-canonical encoding fails checkBlock.
+    var enc_buf: [6]u8 = undefined;
+    const canonical = encodeBip34Height(height, &enc_buf);
+
+    @memcpy(bufs.script[0..canonical.len], canonical);
+    bufs.script_len = canonical.len;
+
+    // coinbase scriptSig must be 2..100 bytes (consensus/tx_check.cpp:49).
+    // Append an OP_1 filler if the canonical encoding is only 1 byte.
+    if (bufs.script_len < 2) {
+        bufs.script[bufs.script_len] = 0x51; // OP_1 — arbitrary extra byte
+        bufs.script_len += 1;
+    }
+
+    bufs.input[0] = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = bufs.script[0..bufs.script_len],
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
     };
+    bufs.output[0] = types.TxOut{
+        .value = 0,
+        .script_pubkey = &[_]u8{0x51},
+    };
+
     return types.Transaction{
         .version = 1,
-        .inputs = &[_]types.TxIn{.{
-            .previous_output = types.OutPoint.COINBASE,
-            .script_sig = cb_script,
-            .sequence = 0xFFFFFFFF,
-            .witness = &[_][]const u8{},
-        }},
-        .outputs = &[_]types.TxOut{.{
-            .value = 0,
-            .script_pubkey = &[_]u8{0x51},
-        }},
+        .inputs = &bufs.input,
+        .outputs = &bufs.output,
         .lock_time = 0,
     };
 }
@@ -6266,11 +6294,12 @@ fn bip30Mine(block: *types.Block, alloc: std.mem.Allocator) void {
 }
 
 test "validateBlockForIBD: BIP-30 rejects duplicate UTXO (pre-BIP34 height)" {
-    // At height 1000 (pre-BIP34 = 227,931) a block whose coinbase txid already
-    // exists in the UTXO set must be rejected with Bip30DuplicateOutput.
-    // Height 100 is pre-BIP34 for REGTEST (bip34_height = 500).
+    // At mainnet height 100 (pre-BIP34 = 227,931) a block whose coinbase txid
+    // already exists in the UTXO set must be rejected with Bip30DuplicateOutput.
+    // We use mainnet params (bip34_height=227931) so height 100 is pre-BIP34.
     const alloc = std.testing.allocator;
-    var cb = bip30MakeCoinbase(100);
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(100, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
     bip30Mine(&blk, alloc);
 
@@ -6279,10 +6308,20 @@ test "validateBlockForIBD: BIP-30 rejects duplicate UTXO (pre-BIP34 height)" {
     var hit_ctx = Bip30LookupCtx{ .target_txid = coinbase_txid };
     const block_hash = crypto.computeBlockHash(&blk.header);
 
+    // Use mainnet params with relaxed PoW + regtest pow_limit so height 100 is
+    // pre-BIP34 (bip34_height=227931).  Regtest params now have bip34_height=1
+    // (Core parity), so regtest height 100 is inside the BIP-34 range and BIP-30
+    // is skipped.  Mainnet's bip34_height=227931 keeps height 100 as pre-BIP34
+    // and exercises the BIP-30 rejection path.
+    var mainnet_regtest_pow = consensus.MAINNET;
+    mainnet_regtest_pow.genesis_header.bits = 0x207fffff;
+    mainnet_regtest_pow.pow_limit = consensus.REGTEST.pow_limit; // allow regtest-loose target
+    mainnet_regtest_pow.pow_no_retarget = true; // no difficulty adjustment needed for this test
+
     const result = validateBlockForIBD(&blk, &IBDValidationContext{
         .block_hash = block_hash,
         .height = 100,
-        .params = &consensus.REGTEST,
+        .params = &mainnet_regtest_pow,
         .prevout_lookup_ctx = @ptrCast(&hit_ctx),
         .prevout_lookupFn = bip30HitLookup,
         .active_chain = null,
@@ -6298,7 +6337,8 @@ test "validateBlockForIBD: BIP-30 exempt at h=91842" {
     // h=91842 is the first BIP-30 exception block.  Even with a pre-existing UTXO
     // at the coinbase txid, the block must NOT be rejected with Bip30DuplicateOutput.
     const alloc = std.testing.allocator;
-    var cb = bip30MakeCoinbase(91842);
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(91842, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
     bip30Mine(&blk, alloc);
 
@@ -6332,7 +6372,8 @@ test "validateBlockForIBD: BIP-30 exempt at h=91842" {
 test "validateBlockForIBD: BIP-30 exempt at h=91880" {
     // h=91880 is the second BIP-30 exception block.
     const alloc = std.testing.allocator;
-    var cb = bip30MakeCoinbase(91880);
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(91880, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
     bip30Mine(&blk, alloc);
 
@@ -6364,7 +6405,8 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range (h=250000)" {
     // At h=250000, BIP-34 is active (>= 227,931) and h < 1,983,702.
     // The duplicate-UTXO check is skipped → no Bip30DuplicateOutput even with a hit.
     const alloc = std.testing.allocator;
-    var cb = bip30MakeCoinbase(250000);
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(250000, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
     bip30Mine(&blk, alloc);
 
