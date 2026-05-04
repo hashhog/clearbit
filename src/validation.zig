@@ -862,8 +862,11 @@ pub fn connectBlock(
             return ValidationError.TooManySigops;
         }
 
-        // BIP-68: Check sequence locks for non-coinbase transactions
+        // BIP-68: Check sequence locks for non-coinbase transactions.
         // Reference: Bitcoin Core validation.cpp ConnectBlock() calls SequenceLocks()
+        // before CheckInputScripts (script-eval).  sequence_view is optional here
+        // because connectBlock() is a legacy/mining path; the IBD path uses
+        // validateBlockForIBD() which has its own BIP-68 check (step 7b below).
         if (!tx.isCoinbase()) {
             if (sequence_view) |sv| {
                 if (tip) |t| {
@@ -1072,6 +1075,12 @@ pub fn validateBlockForIBD(
     // Track the spent prevout's (height, is_coinbase) for the maturity check.
     const PrevHeightInfo = struct { height: u32, is_coinbase: bool };
     var prevout_meta = std.AutoHashMap(OutpointKey, PrevHeightInfo).init(arena_alloc);
+    // Track UTXO heights (and mtp) for BIP-68 SequenceLocks check.
+    // Populated for both external UTXOs (from prevout_meta) and intra-block
+    // outputs (height = current block height, mtp = 0).
+    // mtp=0 is permissive for time-based relative locks; TODO: wire a
+    // getMtpAtHeight callback into IBDValidationContext for full correctness.
+    var seq_lock_utxo_info = std.AutoHashMap(OutpointKey, UtxoInfo).init(arena_alloc);
 
     // Collect tx hashes upfront for intra-block stitching (output -> tx hash).
     const tx_hashes = arena_alloc.alloc(types.Hash256, block.transactions.len) catch
@@ -1126,6 +1135,10 @@ pub fn validateBlockForIBD(
                     .height = info.height,
                     .is_coinbase = info.is_coinbase,
                 }) catch return ValidationError.OutOfMemory;
+                seq_lock_utxo_info.put(key, .{
+                    .height = info.height,
+                    .mtp = 0, // TODO: pass getMtpAtHeight callback for time-based lock correctness
+                }) catch return ValidationError.OutOfMemory;
 
                 input_sum += info.amount;
             }
@@ -1154,6 +1167,14 @@ pub fn validateBlockForIBD(
             prevouts.put(key, .{
                 .script_pubkey = script_copy,
                 .amount = out.value,
+            }) catch return ValidationError.OutOfMemory;
+            // BIP-68: intra-block outputs have height = current block height
+            // (0 effective confirmations relative to this block).
+            // Reference: Core's view.AccessCoin().nHeight returns the containing
+            // block's height, giving 0 relative confirmations for same-block spends.
+            seq_lock_utxo_info.put(key, .{
+                .height = height,
+                .mtp = ctx.prev_mtp, // intra-block MTP = prev block MTP
             }) catch return ValidationError.OutOfMemory;
         }
     }
@@ -1208,6 +1229,48 @@ pub fn validateBlockForIBD(
     for (block.transactions) |*tx| {
         if (!isFinalTx(tx, height, lock_time_cutoff)) {
             return ValidationError.NonFinalTx;
+        }
+    }
+
+    // 7b. BIP-68 SequenceLocks: check relative lock-times for every non-coinbase
+    //     transaction BEFORE script verification.
+    //     Reference: Bitcoin Core validation.cpp ConnectBlock() ~line 2549:
+    //       prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
+    //       if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex))
+    //         state.Invalid(..., "bad-txns-nonfinal", ...)
+    //     This must fire BEFORE CheckInputScripts (script-eval) so that impls
+    //     return "bad-txns-nonfinal" (not "block-script-verify-flag-failed")
+    //     when BIP-68 preconditions are violated.  The CSV opcode (BIP-112)
+    //     would also catch this at script-eval level, but Core fires here first.
+    if (csv_active) {
+        // Build a UtxoView adapter over seq_lock_utxo_info.
+        const SeqLockCtx = struct {
+            map: *std.AutoHashMap(OutpointKey, UtxoInfo),
+
+            fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?UtxoInfo {
+                const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                var key: OutpointKey = undefined;
+                @memcpy(key[0..32], &outpoint.hash);
+                const idx_le = std.mem.nativeToLittle(u32, @intCast(outpoint.index));
+                @memcpy(key[32..36], std.mem.asBytes(&idx_le));
+                return me.map.get(key);
+            }
+        };
+        var seq_lock_ctx = SeqLockCtx{ .map = &seq_lock_utxo_info };
+        const seq_view = UtxoView{
+            .context = @ptrCast(&seq_lock_ctx),
+            .lookupFn = SeqLockCtx.lookup,
+        };
+        const tip_index = BlockIndex{
+            .height = height,
+            .prev_mtp = ctx.prev_mtp,
+        };
+        for (block.transactions) |*tx| {
+            if (tx.isCoinbase()) continue;
+            const lock_result = calculateSequenceLocks(tx, &seq_view, height, params);
+            if (!checkSequenceLocks(lock_result, &tip_index)) {
+                return ValidationError.SequenceLockNotSatisfied;
+            }
         }
     }
 
