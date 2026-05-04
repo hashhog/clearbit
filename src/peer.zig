@@ -4554,16 +4554,19 @@ pub const PeerManager = struct {
     /// `validation.zig:validateBlockForIBD` for the full check list.
     ///
     /// Mode selection (env var CLEARBIT_VALIDATE_IBD):
-    ///   - "0" / unset (default): legacy trust-the-peer behaviour. Logs a
-    ///     one-shot WARN at first call so operators see the node is
-    ///     consensus-uncritical. Returns true (block accepted).
+    ///   - "0" / "off": legacy trust-the-peer behaviour. Logs a one-shot WARN
+    ///     at first call so operators see the node is consensus-uncritical.
+    ///     Returns true (block accepted).
     ///   - "warn":  run validation, log on failure, but RETURN TRUE so the
     ///     block is still applied. Used for soak monitoring without risking
     ///     IBD progress on first deploy.
-    ///   - "1" / "strict": run validation, REJECT on failure.  This is the
-    ///     intended steady-state behaviour.  Until the W104+ soak proves
-    ///     stable, the default is off so a restart of the live node does
-    ///     not silently halt IBD on a corner case we haven't seen yet.
+    ///   - "1" / "strict" / unset (default): run validation, REJECT on failure.
+    ///     This is the intended steady-state behaviour and the default as of
+    ///     2026-05-04 (audit closure: submitblock-vs-IBD-audit).  Previously
+    ///     defaulted to off during the W104+ soak period; the soak has confirmed
+    ///     stable behaviour across mainnet up to the tested height.
+    ///     Set CLEARBIT_VALIDATE_IBD=off to revert to the legacy non-validating
+    ///     mode (e.g. for emergency bulk-IBD performance recovery).
     ///
     /// On a false return the caller should:
     ///   - rewind `download_cursor` to `connect_cursor` so the slot is
@@ -4578,15 +4581,19 @@ pub const PeerManager = struct {
         const cs = self.chain_state orelse return false;
 
         // Mode selection.  std.posix.getenv is a non-allocating env lookup.
+        // Default changed from "off" to "strict" (2026-05-04: submitblock-vs-IBD
+        // audit closure — IBD path must enforce the same checks as submitblock).
+        // Set CLEARBIT_VALIDATE_IBD=off to revert to non-validating mode if needed
+        // for bulk-IBD performance recovery.
         const mode_env = std.posix.getenv("CLEARBIT_VALIDATE_IBD");
         const mode: enum { off, warn, strict } = blk: {
             if (mode_env) |s| {
-                if (std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "strict"))
-                    break :blk .strict;
+                if (std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off"))
+                    break :blk .off;
                 if (std.mem.eql(u8, s, "warn"))
                     break :blk .warn;
             }
-            break :blk .off;
+            break :blk .strict;
         };
 
         if (mode == .off) {
@@ -4594,8 +4601,8 @@ pub const PeerManager = struct {
                 ibd_validation_warn_emitted = true;
                 std.debug.print(
                     "P2P: WARN clearbit IBD is running WITHOUT consensus validation. " ++
-                        "Set CLEARBIT_VALIDATE_IBD=strict to enforce PoW/scripts/sigops/fees " ++
-                        "(audit P0-1, 2026-05-02).\n",
+                        "Set CLEARBIT_VALIDATE_IBD=strict (or unset) to enforce " ++
+                        "PoW/scripts/sigops/fees (default since 2026-05-04).\n",
                     .{},
                 );
             }
