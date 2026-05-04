@@ -709,6 +709,31 @@ pub fn submitBlockWithIndex(
         };
     };
 
+    // ContextualCheckBlock: enforce IsFinalTx for every transaction in the
+    // submitted block (Bitcoin Core validation.cpp:4146 ContextualCheckBlock).
+    // This is a consensus rule — NOT skipped under assumevalid (Core only
+    // skips script verification, never locktime finality).
+    // lock_time_cutoff = MTP-of-11 of the parent once BIP-113/CSV is active
+    // (post-activation), else the block's own header timestamp (pre-activation).
+    // Reference: consensus/tx_verify.cpp:IsFinalTx, BIP-113.
+    {
+        const csv_active = height >= params.csv_height;
+        const prev_mtp: u32 = if (csv_active) chain_state.computeMTP() else 0;
+        const lock_time_cutoff: u32 = if (csv_active and prev_mtp != 0)
+            prev_mtp
+        else
+            block.header.timestamp;
+        for (block.transactions) |*tx| {
+            if (!validation.isFinalTx(tx, height, lock_time_cutoff)) {
+                return .{
+                    .accepted = false,
+                    .reject_reason = "bad-txns-nonfinal",
+                    .block_hash = block_hash,
+                };
+            }
+        }
+    }
+
     // Persist the raw block body to CF_BLOCKS BEFORE applying UTXO
     // mutations.  Same semantics as the peer.zig drainBlockBuffer path —
     // the queue is consumed by ChainState.flush() so the body and tip
