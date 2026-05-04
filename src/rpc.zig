@@ -2819,7 +2819,8 @@ pub const RpcServer = struct {
             error.DuplicateTx, error.Bip30DuplicateOutput => "bad-txns-duplicate",
             error.MissingInput, error.InputAlreadySpent => "bad-txns-inputs-missingorspent",
             error.BadBlockWeight, error.BadBlockSize => "bad-blk-weight",
-            error.ScriptVerificationFailed => "mandatory-script-verify-flag-failed",
+            // Connect-block stage: Core validation.cpp:2122 "block-script-verify-flag-failed (%s)"
+            error.ScriptVerificationFailed => "block-script-verify-flag-failed",
             // Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
             error.NegativeOutput => "bad-txns-vout-negative",
             // Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
