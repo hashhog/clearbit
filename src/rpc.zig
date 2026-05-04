@@ -2739,14 +2739,16 @@ pub const RpcServer = struct {
             return self.jsonRpcResult("\"time-too-old\"", id);
         }
 
-        if (!self.validateSubmitBlockOrReject(&block_data, &block_hash, submit_height)) {
+        if (self.validateSubmitBlockOrReject(&block_data, &block_hash, submit_height)) |bip22_str| {
             // Return BIP-22 string result (not a JSON-RPC error) for consensus
             // rejections.  Per BIP-22 and Bitcoin Core BIP22ValidationResult()
             // in src/rpc/mining.cpp, the caller-visible result field carries the
             // short ASCII rejection token; JSON-RPC errors are reserved for
-            // parameter / deserialization problems.  "rejected" is the catch-all
-            // for failures we cannot classify more finely at this gate.
-            return self.jsonRpcResult("\"rejected\"", id);
+            // parameter / deserialization problems.
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            try std.fmt.format(buf.writer(), "\"{s}\"", .{bip22_str});
+            return self.jsonRpcResult(buf.items, id);
         }
 
         // Submit block
@@ -2802,23 +2804,58 @@ pub const RpcServer = struct {
     ///     block is still submitted.  Soak-monitoring mode.
     ///   - "1" / "strict": run validation, REJECT on failure (returns false;
     ///     caller surfaces -26 RPC_VERIFY_REJECTED).  Steady-state target.
+    /// Map a ValidationError to the canonical BIP-22 submitblock rejection string.
+    /// Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp.
+    fn validationErrToBip22(err: validation.ValidationError) []const u8 {
+        return switch (err) {
+            error.BadCoinbaseValue => "bad-cb-amount",
+            error.CoinbaseScriptSize => "bad-cb-length",
+            error.BadCoinbaseHeight => "bad-cb-height",
+            error.BadMerkleRoot => "bad-txnmrklroot",
+            error.BadWitnessCommitment => "bad-witness-merkle-match",
+            error.TooManySigops => "bad-blk-sigops",
+            error.BadProofOfWork, error.BadDifficulty => "high-hash",
+            error.NonFinalTx => "bad-txns-nonfinal",
+            error.DuplicateTx, error.Bip30DuplicateOutput => "bad-txns-duplicate",
+            error.MissingInput, error.InputAlreadySpent => "bad-txns-inputs-missingorspent",
+            error.BadBlockWeight, error.BadBlockSize => "bad-blk-weight",
+            error.ScriptVerificationFailed => "mandatory-script-verify-flag-failed",
+            else => "rejected",
+        };
+    }
+
+    /// submitblock-time consensus validation gate.  Mirrors
+    /// `peer.zig:validateBlockForIBDOrReject` so the RPC path runs the same
+    /// `validateBlockForIBD` chain (CheckBlock + per-input UTXO + sigops +
+    /// fees + ContextualCheckBlock + scripts) the IBD path runs before
+    /// `connectBlockFast`.  Returns null when the block is valid, or a
+    /// BIP-22 rejection string on failure.
+    ///
+    /// Mode selection (env var CLEARBIT_VALIDATE_IBD — shared with the IBD path):
+    ///   - "0": legacy behaviour — emit a one-shot WARN and accept (null).
+    ///   - "warn":  run validation, log on failure, but return null so the
+    ///     block is still submitted.  Soak-monitoring mode.
+    ///   - unset / "1" / "strict" (default): run validation, REJECT on failure.
     fn validateSubmitBlockOrReject(
         self: *RpcServer,
         block: *const types.Block,
         block_hash: *const types.Hash256,
         height: u32,
-    ) bool {
+    ) ?[]const u8 {
         // Mode selection: same env knob as the IBD gate so operators flip
-        // both paths in lockstep.
+        // both paths in lockstep.  Default is now .strict — previously .off,
+        // which caused the submitblock path to skip coinbase-value, sigop,
+        // and other consensus checks (corpus entry coinbase-overpay, 2026-05-03).
+        // Reference: Bitcoin Core validation.cpp ConnectBlock (bad-cb-amount).
         const mode_env = std.posix.getenv("CLEARBIT_VALIDATE_IBD");
         const mode: enum { off, warn, strict } = blk: {
             if (mode_env) |s| {
-                if (std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "strict"))
-                    break :blk .strict;
+                if (std.mem.eql(u8, s, "0"))
+                    break :blk .off;
                 if (std.mem.eql(u8, s, "warn"))
                     break :blk .warn;
             }
-            break :blk .off;
+            break :blk .strict;
         };
 
         if (mode == .off) {
@@ -2826,12 +2863,12 @@ pub const RpcServer = struct {
                 submit_block_validation_warn_emitted = true;
                 std.debug.print(
                     "RPC: WARN clearbit submitblock is running WITHOUT consensus validation. " ++
-                        "Set CLEARBIT_VALIDATE_IBD=strict to enforce PoW/scripts/sigops/fees " ++
-                        "(audit P0-#3, 2026-05-02).\n",
+                        "Unset CLEARBIT_VALIDATE_IBD or set to 'strict' to enforce " ++
+                        "PoW/scripts/sigops/fees (bad-cb-amount etc).\n",
                     .{},
                 );
             }
-            return true;
+            return null;
         }
 
         // Per-call adapter: closes over chain state's utxo_set and dupes the
@@ -2884,16 +2921,17 @@ pub const RpcServer = struct {
         };
 
         validation.validateBlockForIBD(block, &ctx, self.allocator) catch |err| {
+            const bip22 = validationErrToBip22(err);
             std.debug.print(
-                "RPC: REJECT submitblock height={d} validation={} mode={s}\n",
-                .{ height, err, @tagName(mode) },
+                "RPC: REJECT submitblock height={d} validation={} bip22={s} mode={s}\n",
+                .{ height, err, bip22, @tagName(mode) },
             );
             // .warn accepts the block anyway (so soak monitoring doesn't
             // break a borderline-valid mining workflow); .strict rejects.
-            if (mode == .warn) return true;
-            return false;
+            if (mode == .warn) return null;
+            return bip22;
         };
-        return true;
+        return null;
     }
 
     // ========================================================================
