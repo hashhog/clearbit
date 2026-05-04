@@ -1564,26 +1564,6 @@ pub fn medianTimePast(timestamps: []const u32) u32 {
     return sorted[n / 2];
 }
 
-/// Check that block timestamp is valid:
-/// 1. Greater than median time past of previous 11 blocks
-/// 2. Not more than 2 hours in the future
-pub fn checkBlockTimestamp(
-    header: *const types.BlockHeader,
-    prev_timestamps: []const u32,
-    current_time: u32,
-) ValidationError!void {
-    // Must be greater than MTP
-    const mtp = medianTimePast(prev_timestamps);
-    if (header.timestamp <= mtp) {
-        return ValidationError.BadTimestamp;
-    }
-
-    // Must not be more than 2 hours in the future
-    if (header.timestamp > current_time + consensus.MAX_FUTURE_BLOCK_TIME) {
-        return ValidationError.BadTimestamp;
-    }
-}
-
 // ============================================================================
 // BIP-68 Sequence Lock Validation
 // ============================================================================

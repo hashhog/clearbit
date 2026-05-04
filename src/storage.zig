@@ -2319,7 +2319,15 @@ pub const ChainState = struct {
     }
 
     /// Connect a block: spend inputs, create outputs, optionally save undo data.
-    /// When skip_undo is true (IBD mode), no undo data is collected, reducing allocations.
+    ///
+    /// NOTE (wave-33b dead-symbol audit): this variant is DEAD in production.
+    /// The IBD path uses connectBlockFast / connectBlockFastWithUndo; mining
+    /// uses connectBlockFast; the dumptxoutset rollback path uses
+    /// connectBlockLocked.  Only storage.zig test harnesses call this directly.
+    ///
+    /// Delegates to connectBlockInner so the return type contract is satisfied
+    /// without diverging from the live paths. Fixes for block-connect logic
+    /// belong in connectBlockInner, which all live variants call through.
     pub fn connectBlock(
         self: *ChainState,
         block: *const types.Block,
