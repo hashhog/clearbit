@@ -2811,6 +2811,10 @@ pub const RpcServer = struct {
             error.NegativeOutput => "bad-txns-vout-negative",
             // Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
             error.OutputTooLarge => "bad-txns-vout-toolarge",
+            // Non-coinbase tx where sum(inputs) < sum(outputs).
+            // Core consensus/tx_verify.cpp::CheckTxInputs:
+            //   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+            error.InsufficientFunds => "bad-txns-in-belowout",
             else => "rejected",
         };
     }
