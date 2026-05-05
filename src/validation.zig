@@ -1860,8 +1860,10 @@ pub const ScriptCheckJob = struct {
 /// The master thread (caller of waitAll) also participates in verification,
 /// making N total threads processing jobs.
 ///
-/// Each worker thread has its own secp256k1 context for thread-safe
-/// signature verification.
+/// Each worker invocation allocates via its own per-job ArenaAllocator (backed
+/// by std.heap.c_allocator) rather than the shared block-level arena.  This
+/// eliminates the data race on ArenaAllocator.state that caused SIGSEGV when
+/// ~30 workers concurrently modified state.buffer_list (wave-46a).
 pub const ScriptCheckQueue = struct {
     /// Worker threads
     workers: []std.Thread,
@@ -2011,27 +2013,33 @@ pub const ScriptCheckQueue = struct {
 
 /// Verify a single script job.
 /// This is the core verification function called by worker threads.
+///
+/// Each call constructs its own ArenaAllocator backed by std.heap.c_allocator
+/// (libc malloc — thread-safe).  The shared outer arena passed via `allocator`
+/// is intentionally NOT used for any allocation here: Zig's ArenaAllocator is
+/// not thread-safe (createNode/alignedAlloc race on state.buffer_list.first and
+/// state.end_index without synchronisation), so sharing it across ~30 concurrent
+/// workers produces torn writes and SIGSEGV.  See wave-46a forensic memo
+/// (CORE-PARITY-AUDIT/_clearbit-crash-investigation-2026-05-05.md, commit 47d689c).
+///
+/// The `allocator` parameter is intentionally unused here; it is kept in the
+/// signature only because processJobs passes self.allocator for API consistency.
 fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator) bool {
-    // Deserialize the transaction
+    // Per-worker arena backed by libc malloc (thread-safe).
+    // All per-job allocations (tx deserialisation, script engine internals)
+    // live here and are freed atomically on return via arena.deinit().
+    _ = allocator; // not used; see doc-comment above
+    var per_job_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer per_job_arena.deinit();
+    const job_alloc = per_job_arena.allocator();
+
+    // Deserialize the transaction into the per-job arena.
     var reader = serialize.Reader{ .data = job.tx_bytes };
-    const tx = serialize.readTransaction(&reader, allocator) catch {
+    const tx = serialize.readTransaction(&reader, job_alloc) catch {
         return false;
     };
-    defer {
-        // Free allocated transaction data
-        for (tx.inputs) |input| {
-            allocator.free(input.script_sig);
-            for (input.witness) |w| {
-                allocator.free(w);
-            }
-            allocator.free(input.witness);
-        }
-        for (tx.outputs) |output| {
-            allocator.free(output.script_pubkey);
-        }
-        allocator.free(tx.inputs);
-        allocator.free(tx.outputs);
-    }
+    // No manual defer-free needed: per_job_arena.deinit() above reclaims
+    // the entire arena (tx.inputs, tx.outputs, script_sig, witness items, etc.)
 
     // Get the input being verified
     if (job.input_index >= tx.inputs.len) return false;
@@ -2042,7 +2050,7 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator) boo
     // (connectBlock script-check submission) populates them via
     // ScriptCheckJob.initWithPrevouts.
     var engine = script.ScriptEngine.initWithPrevouts(
-        allocator,
+        job_alloc,
         &tx,
         job.input_index,
         job.amount,
