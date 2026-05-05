@@ -903,6 +903,18 @@ pub const RpcServer = struct {
             return self.handleGetMempoolDescendants(params, id);
         } else if (std.mem.eql(u8, method, "help")) {
             return self.handleHelp(params, id);
+        }
+        // Wave-47b P2 RPCs
+        else if (std.mem.eql(u8, method, "gettxoutsetinfo")) {
+            return self.handleGetTxOutSetInfo(id);
+        } else if (std.mem.eql(u8, method, "getnetworkhashps")) {
+            return self.handleGetNetworkHashPS(params, id);
+        } else if (std.mem.eql(u8, method, "gettxoutproof")) {
+            return self.handleGetTxOutProof(params, id);
+        } else if (std.mem.eql(u8, method, "verifytxoutproof")) {
+            return self.handleVerifyTxOutProof(params, id);
+        } else if (std.mem.eql(u8, method, "getrpcinfo")) {
+            return self.handleGetRPCInfo(id);
         } else {
             return self.jsonRpcError(RPC_METHOD_NOT_FOUND, "Method not found", id);
         }
@@ -7203,6 +7215,289 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    // ========================================================================
+    // Wave-47b P2 RPCs
+    //   gettxoutsetinfo, getnetworkhashps, gettxoutproof, verifytxoutproof,
+    //   getrpcinfo
+    // Reference: Bitcoin Core src/rpc/blockchain.cpp + src/rpc/mining.cpp
+    // ========================================================================
+
+    fn handleGetTxOutSetInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        const height = self.chain_state.best_height;
+        const txouts = self.chain_state.utxo_set.total_utxos;
+
+        try writer.writeAll("{\"height\":");
+        try writer.print("{d}", .{height});
+        try writer.writeAll(",\"bestblock\":\"");
+        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writer.print("\",\"txouts\":{d},\"bogosize\":0,\"hash_serialized_3\":\"\",\"muhash\":\"\",\"total_amount\":0.0,\"disk_size\":0}}",
+            .{txouts});
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    fn handleGetNetworkHashPS(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Parse optional [nblocks, height]
+        var nblocks: i64 = 120;
+        var target_height: i64 = -1;
+
+        if (params == .array) {
+            if (params.array.items.len >= 1) {
+                const p0 = params.array.items[0];
+                if (p0 == .integer) nblocks = p0.integer
+                else if (p0 == .float) nblocks = @intFromFloat(p0.float);
+            }
+            if (params.array.items.len >= 2) {
+                const p1 = params.array.items[1];
+                if (p1 == .integer) target_height = p1.integer
+                else if (p1 == .float) target_height = @intFromFloat(p1.float);
+            }
+        }
+
+        const best_height = self.chain_state.best_height;
+        var tip_h: u32 = best_height;
+        if (target_height >= 0 and @as(u32, @intCast(target_height)) <= best_height) {
+            tip_h = @intCast(target_height);
+        }
+
+        if (nblocks <= 0) {
+            nblocks = @intCast(tip_h % 2016);
+            if (nblocks == 0) nblocks = 1;
+        }
+        if (@as(u64, @intCast(nblocks)) > tip_h) {
+            nblocks = @intCast(tip_h);
+        }
+        if (nblocks == 0 or tip_h == 0) {
+            return self.jsonRpcResult("0", id);
+        }
+
+        const start_h = tip_h - @as(u32, @intCast(nblocks));
+
+        const cm = self.chain_manager orelse return self.jsonRpcResult("0", id);
+
+        // Get tip and start block index entries
+        const tip_hash_opt = self.chain_state.getBlockHashByHeight(tip_h);
+        const start_hash_opt = self.chain_state.getBlockHashByHeight(start_h);
+        if (tip_hash_opt == null or start_hash_opt == null) return self.jsonRpcResult("0", id);
+
+        const tip_entry = cm.getBlock(&tip_hash_opt.?) orelse return self.jsonRpcResult("0", id);
+        const start_entry = cm.getBlock(&start_hash_opt.?) orelse return self.jsonRpcResult("0", id);
+
+        const time_diff: i64 = @as(i64, @intCast(tip_entry.header.timestamp)) -
+            @as(i64, @intCast(start_entry.header.timestamp));
+        if (time_diff <= 0) return self.jsonRpcResult("0", id);
+
+        // Compute chainwork diff from big-endian [32]u8 arrays.
+        // Extract lower 128 bits (bytes [16..32]) which is sufficient for Bitcoin.
+        const tip_work = std.mem.readInt(u128, tip_entry.chain_work[16..][0..16], .big);
+        const start_work = std.mem.readInt(u128, start_entry.chain_work[16..][0..16], .big);
+        if (tip_work <= start_work) return self.jsonRpcResult("0", id);
+
+        const work_diff = tip_work - start_work;
+        const hashps: f64 = @as(f64, @floatFromInt(work_diff)) / @as(f64, @floatFromInt(time_diff));
+
+        var result_buf: [64]u8 = undefined;
+        const result_str = std.fmt.bufPrint(&result_buf, "{d}", .{hashps}) catch return error.OutOfMemory;
+        return self.jsonRpcResult(result_str, id);
+    }
+
+    fn handleGetTxOutProof(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Expected [txids, (blockhash)]", id);
+        }
+
+        const txids_val = params.array.items[0];
+        if (txids_val != .array or txids_val.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "txids must be a non-empty array", id);
+        }
+
+        // Parse target txids (display order → LE)
+        var target_txids = std.ArrayList(types.Hash256).init(self.allocator);
+        defer target_txids.deinit();
+        for (txids_val.array.items) |item| {
+            if (item != .string or item.string.len != 64)
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "txid must be 64-char hex string", id);
+            var h: types.Hash256 = undefined;
+            for (0..32) |i| {
+                h[31 - i] = std.fmt.parseInt(u8, item.string[i * 2 ..][0..2], 16) catch
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            }
+            try target_txids.append(h);
+        }
+
+        const db = self.chain_state.utxo_set.db orelse
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block database not available", id);
+
+        var block_bytes_opt: ?[]const u8 = null;
+        var block_header: types.BlockHeader = undefined;
+        defer if (block_bytes_opt) |b| self.allocator.free(b);
+
+        if (params.array.items.len >= 2) {
+            // Caller specified blockhash
+            const bh_val = params.array.items[1];
+            if (bh_val != .string or bh_val.string.len != 64)
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be 64-char hex string", id);
+            var bh: types.Hash256 = undefined;
+            for (0..32) |i| {
+                bh[31 - i] = std.fmt.parseInt(u8, bh_val.string[i * 2 ..][0..2], 16) catch
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
+            }
+            const entry_opt = if (self.chain_manager) |cm| cm.getBlock(&bh) else null;
+            if (entry_opt == null)
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+            block_header = entry_opt.?.header;
+            block_bytes_opt = (db.get(storage.CF_BLOCKS, &bh) catch null) orelse
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block body not found", id);
+        } else {
+            // Search last 100 blocks for any containing the target txids
+            const tip_h = self.chain_state.best_height;
+            const search_start: u32 = if (tip_h >= 100) tip_h - 100 else 0;
+            var found_hash: ?types.Hash256 = null;
+            var h: u32 = tip_h;
+            search: while (h >= search_start) : (h -= 1) {
+                const hash_opt = self.chain_state.getBlockHashByHeight(h);
+                const hash = hash_opt orelse { if (h == 0) break; continue; };
+                const raw = (db.get(storage.CF_BLOCKS, &hash) catch null) orelse { if (h == 0) break; continue; };
+                defer self.allocator.free(raw);
+                // Parse block and check txids
+                var reader = serialize.Reader{ .data = raw };
+                const blk = serialize.readBlock(&reader, self.allocator) catch { if (h == 0) break; continue; };
+                defer serialize.freeBlock(self.allocator, &blk);
+                for (blk.transactions) |*tx| {
+                    const txid = crypto.computeTxidStreaming(tx);
+                    for (target_txids.items) |target| {
+                        if (std.mem.eql(u8, &txid, &target)) {
+                            found_hash = hash;
+                            block_header = blk.header;
+                            break :search;
+                        }
+                    }
+                }
+                if (h == 0) break;
+            }
+            if (found_hash == null)
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not found in recent blocks", id);
+            block_bytes_opt = (db.get(storage.CF_BLOCKS, &found_hash.?) catch null) orelse
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block body unavailable", id);
+        }
+
+        // Parse block to get all txids
+        var reader = serialize.Reader{ .data = block_bytes_opt.? };
+        const block = serialize.readBlock(&reader, self.allocator) catch
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to parse block", id);
+        defer serialize.freeBlock(self.allocator, &block);
+
+        const n_tx = block.transactions.len;
+        var all_txids = try self.allocator.alloc(types.Hash256, n_tx);
+        defer self.allocator.free(all_txids);
+        var matches = try self.allocator.alloc(bool, n_tx);
+        defer self.allocator.free(matches);
+
+        for (block.transactions, 0..) |*tx, i| {
+            all_txids[i] = crypto.computeTxidStreaming(tx);
+            matches[i] = false;
+        }
+
+        // Verify all target txids are in this block
+        for (target_txids.items) |target| {
+            var found = false;
+            for (all_txids, 0..) |txid, i| {
+                if (std.mem.eql(u8, &txid, &target)) {
+                    matches[i] = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return self.jsonRpcError(RPC_INVALID_PARAMS, "Transaction not found in block", id);
+        }
+
+        // Serialize 80-byte header
+        var header_bytes: [80]u8 = undefined;
+        var hstream = std.io.fixedBufferStream(&header_bytes);
+        const hw = hstream.writer();
+        std.mem.writeInt(i32, header_bytes[0..4], block_header.version, .little);
+        @memcpy(header_bytes[4..36], &block_header.prev_block);
+        @memcpy(header_bytes[36..68], &block_header.merkle_root);
+        std.mem.writeInt(u32, header_bytes[68..72], block_header.timestamp, .little);
+        std.mem.writeInt(u32, header_bytes[72..76], block_header.bits, .little);
+        std.mem.writeInt(u32, header_bytes[76..80], block_header.nonce, .little);
+        _ = hw;
+
+        // Build partial merkle tree
+        const proof_bytes = try w47bBuildPartialMerkleTree(self.allocator, &header_bytes, all_txids, matches);
+        defer self.allocator.free(proof_bytes);
+
+        var result_buf = std.ArrayList(u8).init(self.allocator);
+        defer result_buf.deinit();
+        try result_buf.append('"');
+        for (proof_bytes) |byte| try result_buf.writer().print("{x:0>2}", .{byte});
+        try result_buf.append('"');
+        return self.jsonRpcResult(result_buf.items, id);
+    }
+
+    fn handleVerifyTxOutProof(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 1 or params.array.items[0] != .string)
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Expected [proof_hex]", id);
+
+        const hex_str = params.array.items[0].string;
+        if (hex_str.len < 168 or hex_str.len % 2 != 0) // 84 bytes min = 168 hex chars
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Proof too short", id);
+
+        const proof_len = hex_str.len / 2;
+        const proof_bytes = try self.allocator.alloc(u8, proof_len);
+        defer self.allocator.free(proof_bytes);
+        for (0..proof_len) |i| {
+            proof_bytes[i] = std.fmt.parseInt(u8, hex_str[i * 2 ..][0..2], 16) catch
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid hex", id);
+        }
+
+        if (proof_len < 84)
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Proof too short", id);
+
+        // Verify block is known (check CM block index)
+        const block_hash: types.Hash256 = crypto.hash256(proof_bytes[0..80]);
+
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(&block_hash) == null)
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not in chain", id);
+        }
+
+        // merkle_root in header at bytes 36..68 (LE)
+        const merkle_root_in_header = proof_bytes[36..68];
+
+        const parse_result = w47bParsePartialMerkleTree(self.allocator, proof_bytes[80..]) catch
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to parse proof", id);
+        defer self.allocator.free(parse_result.matched);
+
+        if (!std.mem.eql(u8, &parse_result.computed_root, merkle_root_in_header))
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Merkle root mismatch", id);
+
+        // Return matched txids in display order (reversed)
+        var result_buf = std.ArrayList(u8).init(self.allocator);
+        defer result_buf.deinit();
+        const writer = result_buf.writer();
+        try writer.writeByte('[');
+        for (parse_result.matched, 0..) |txid, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            // Display order = reverse of internal LE
+            var display: [32]u8 = txid;
+            std.mem.reverse(u8, &display);
+            for (display) |b| try writer.print("{x:0>2}", .{b});
+            try writer.writeByte('"');
+        }
+        try writer.writeByte(']');
+        return self.jsonRpcResult(result_buf.items, id);
+    }
+
+    fn handleGetRPCInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        return self.jsonRpcResult("{\"active_commands\":[],\"logpath\":\"\"}", id);
+    }
+
     /// Create a JSON-RPC success response.
     pub fn jsonRpcResult(self: *RpcServer, result: []const u8, id: ?std.json.Value) ![]const u8 {
         var buf = std.ArrayList(u8).init(self.allocator);
@@ -7273,6 +7568,272 @@ pub const RpcServer = struct {
         return 0;
     }
 };
+
+// ============================================================================
+// Wave-47b: Partial Merkle Tree helpers (CMerkleBlock wire format)
+// Mirrors Bitcoin Core src/merkleblock.cpp
+// ============================================================================
+
+fn w47bDsha256(data: []const u8) [32]u8 {
+    return crypto.hash256(data);
+}
+
+fn w47bDsha256Pair(a: *const [32]u8, b: *const [32]u8) [32]u8 {
+    var combined: [64]u8 = undefined;
+    @memcpy(combined[0..32], a);
+    @memcpy(combined[32..64], b);
+    return w47bDsha256(&combined);
+}
+
+fn w47bTreeWidth(n_tx: usize, height: u5) usize {
+    return (n_tx + (@as(usize, 1) << height) - 1) >> height;
+}
+
+fn w47bCalcTreeHash(txids: []const types.Hash256, n_tx: usize, height: u5, pos: usize) [32]u8 {
+    if (height == 0) {
+        if (pos < n_tx) return txids[pos];
+        return [_]u8{0} ** 32;
+    }
+    const left = w47bCalcTreeHash(txids, n_tx, height - 1, pos * 2);
+    const right_pos = pos * 2 + 1;
+    const right = if (right_pos < w47bTreeWidth(n_tx, height - 1))
+        w47bCalcTreeHash(txids, n_tx, height - 1, right_pos)
+    else
+        left;
+    return w47bDsha256Pair(&left, &right);
+}
+
+fn w47bEncodeVarInt(allocator: std.mem.Allocator, n: usize) ![]u8 {
+    if (n < 0xFD) {
+        const b = try allocator.alloc(u8, 1);
+        b[0] = @intCast(n);
+        return b;
+    } else if (n <= 0xFFFF) {
+        const b = try allocator.alloc(u8, 3);
+        b[0] = 0xFD;
+        std.mem.writeInt(u16, b[1..3], @intCast(n), .little);
+        return b;
+    } else if (n <= 0xFFFFFFFF) {
+        const b = try allocator.alloc(u8, 5);
+        b[0] = 0xFE;
+        std.mem.writeInt(u32, b[1..5], @intCast(n), .little);
+        return b;
+    } else {
+        const b = try allocator.alloc(u8, 9);
+        b[0] = 0xFF;
+        std.mem.writeInt(u64, b[1..9], n, .little);
+        return b;
+    }
+}
+
+fn w47bBuildPartialMerkleTree(
+    allocator: std.mem.Allocator,
+    header_bytes: *const [80]u8,
+    txids: []const types.Hash256,
+    matches: []const bool,
+) ![]u8 {
+    const n = txids.len;
+    var height: u5 = 0;
+    while ((@as(usize, 1) << height) < n) : (height += 1) {}
+
+    var hashes = std.ArrayList([32]u8).init(allocator);
+    defer hashes.deinit();
+    var bits = std.ArrayList(bool).init(allocator);
+    defer bits.deinit();
+
+    // Recursive traversal — use an explicit stack to avoid Zig comptime recursion limits
+    const Frame = struct { h: u5, pos: usize };
+    var stack = std.ArrayList(Frame).init(allocator);
+    defer stack.deinit();
+    try stack.append(.{ .h = height, .pos = 0 });
+
+    while (stack.items.len > 0) {
+        const frame = stack.pop();
+        const h = frame.h;
+        const pos = frame.pos;
+
+        const start = pos << h;
+        const end_raw = (pos + 1) << h;
+        const end = if (end_raw > n) n else end_raw;
+        var parent_match = false;
+        var k: usize = start;
+        while (k < end) : (k += 1) {
+            if (matches[k]) { parent_match = true; break; }
+        }
+        try bits.append(parent_match);
+
+        if (h == 0 or !parent_match) {
+            if (h == 0) {
+                const hash: [32]u8 = if (pos < n) txids[pos] else [_]u8{0} ** 32;
+                try hashes.append(hash);
+            } else {
+                const hash = w47bCalcTreeHash(txids, n, h, pos);
+                try hashes.append(hash);
+            }
+        } else {
+            // Push right child first (so left is processed first from stack)
+            const right_pos = pos * 2 + 1;
+            if (right_pos < w47bTreeWidth(n, h - 1)) {
+                try stack.append(.{ .h = h - 1, .pos = right_pos });
+            }
+            try stack.append(.{ .h = h - 1, .pos = pos * 2 });
+        }
+    }
+
+    var result = std.ArrayList(u8).init(allocator);
+    try result.appendSlice(header_bytes);
+    var ntx_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ntx_buf, @intCast(n), .little);
+    try result.appendSlice(&ntx_buf);
+    const varint_hashes = try w47bEncodeVarInt(allocator, hashes.items.len);
+    defer allocator.free(varint_hashes);
+    try result.appendSlice(varint_hashes);
+    for (hashes.items) |h32| try result.appendSlice(&h32);
+    const flag_count = (bits.items.len + 7) / 8;
+    const varint_flags = try w47bEncodeVarInt(allocator, flag_count);
+    defer allocator.free(varint_flags);
+    try result.appendSlice(varint_flags);
+    var flag_bytes = try allocator.alloc(u8, flag_count);
+    defer allocator.free(flag_bytes);
+    @memset(flag_bytes, 0);
+    for (bits.items, 0..) |b, i| {
+        if (b) flag_bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    }
+    try result.appendSlice(flag_bytes);
+    return result.toOwnedSlice();
+}
+
+const W47bParseResult = struct {
+    matched: []types.Hash256,
+    computed_root: [32]u8,
+};
+
+fn w47bReadVarInt(data: []const u8, offset: usize) struct { val: usize, next: usize } {
+    if (offset >= data.len) return .{ .val = 0, .next = offset };
+    switch (data[offset]) {
+        0xFD => {
+            if (offset + 3 > data.len) return .{ .val = 0, .next = data.len };
+            return .{ .val = std.mem.readInt(u16, data[offset + 1 ..][0..2], .little), .next = offset + 3 };
+        },
+        0xFE => {
+            if (offset + 5 > data.len) return .{ .val = 0, .next = data.len };
+            return .{ .val = std.mem.readInt(u32, data[offset + 1 ..][0..4], .little), .next = offset + 5 };
+        },
+        0xFF => {
+            if (offset + 9 > data.len) return .{ .val = 0, .next = data.len };
+            return .{ .val = @intCast(std.mem.readInt(u64, data[offset + 1 ..][0..8], .little)), .next = offset + 9 };
+        },
+        else => return .{ .val = data[offset], .next = offset + 1 },
+    }
+}
+
+fn w47bParsePartialMerkleTree(allocator: std.mem.Allocator, data: []const u8) !W47bParseResult {
+    if (data.len < 4) return error.TooShort;
+    const n_tx = std.mem.readInt(u32, data[0..4], .little);
+    var offset: usize = 4;
+
+    const vh = w47bReadVarInt(data, offset);
+    offset = vh.next;
+    const n_hashes = vh.val;
+
+    var hashes = try allocator.alloc([32]u8, n_hashes);
+    defer allocator.free(hashes);
+    for (0..n_hashes) |i| {
+        if (offset + 32 > data.len) return error.Truncated;
+        @memcpy(&hashes[i], data[offset..][0..32]);
+        offset += 32;
+    }
+
+    const vf = w47bReadVarInt(data, offset);
+    offset = vf.next;
+    const n_flag_bytes = vf.val;
+    if (offset + n_flag_bytes > data.len) return error.Truncated;
+    const flag_bytes_raw = data[offset .. offset + n_flag_bytes];
+    const all_bits_len = n_flag_bytes * 8;
+    var all_bits = try allocator.alloc(bool, all_bits_len);
+    defer allocator.free(all_bits);
+    for (0..all_bits_len) |i| {
+        all_bits[i] = (flag_bytes_raw[i / 8] & (@as(u8, 1) << @intCast(i % 8))) != 0;
+    }
+
+    var height: u5 = 0;
+    while ((@as(usize, 1) << height) < n_tx) : (height += 1) {}
+
+    var hash_idx: usize = 0;
+    var bit_idx: usize = 0;
+    var matched = std.ArrayList(types.Hash256).init(allocator);
+    errdefer matched.deinit();
+
+    const ConsumeResult = struct { hash: [32]u8 };
+    // Use explicit stack to avoid recursion
+    const SFrame = struct { h: u5, pos: usize, phase: u2, left_hash: [32]u8 };
+    var cstack = std.ArrayList(SFrame).init(allocator);
+    defer cstack.deinit();
+    var result_hash: [32]u8 = [_]u8{0} ** 32;
+
+    // Iterative DFS — push root, process until empty
+    try cstack.append(.{ .h = height, .pos = 0, .phase = 0, .left_hash = [_]u8{0} ** 32 });
+    var return_val: ?ConsumeResult = null;
+
+    while (cstack.items.len > 0) {
+        const frame = &cstack.items[cstack.items.len - 1];
+
+        if (frame.phase == 0) {
+            // First visit: read bit
+            if (bit_idx >= all_bits_len) return error.BitsExhausted;
+            const parent_match = all_bits[bit_idx];
+            bit_idx += 1;
+
+            if (frame.h == 0) {
+                // Leaf
+                const cur: [32]u8 = if (hash_idx < hashes.len) hashes[hash_idx] else [_]u8{0} ** 32;
+                hash_idx += 1;
+                if (parent_match) try matched.append(cur);
+                return_val = .{ .hash = cur };
+                _ = cstack.pop();
+            } else if (!parent_match) {
+                // Non-matching subtree: consume one hash
+                const cur: [32]u8 = if (hash_idx < hashes.len) hashes[hash_idx] else [_]u8{0} ** 32;
+                hash_idx += 1;
+                return_val = .{ .hash = cur };
+                _ = cstack.pop();
+            } else {
+                // Matching subtree: recurse left
+                frame.phase = 1;
+                try cstack.append(.{ .h = frame.h - 1, .pos = frame.pos * 2, .phase = 0, .left_hash = [_]u8{0} ** 32 });
+                return_val = null;
+            }
+        } else if (frame.phase == 1) {
+            // Back from left child
+            frame.left_hash = return_val.?.hash;
+            const right_pos = frame.pos * 2 + 1;
+            if (right_pos < w47bTreeWidth(@intCast(n_tx), frame.h - 1)) {
+                frame.phase = 2;
+                try cstack.append(.{ .h = frame.h - 1, .pos = right_pos, .phase = 0, .left_hash = [_]u8{0} ** 32 });
+                return_val = null;
+            } else {
+                // No right child — duplicate left
+                const combined = w47bDsha256Pair(&frame.left_hash, &frame.left_hash);
+                return_val = .{ .hash = combined };
+                _ = cstack.pop();
+            }
+        } else {
+            // Back from right child
+            const combined = w47bDsha256Pair(&frame.left_hash, &return_val.?.hash);
+            return_val = .{ .hash = combined };
+            _ = cstack.pop();
+        }
+    }
+
+    if (return_val) |rv| {
+        result_hash = rv.hash;
+    }
+
+    return W47bParseResult{
+        .matched = try matched.toOwnedSlice(),
+        .computed_root = result_hash,
+    };
+}
 
 // ============================================================================
 // Helper Functions
