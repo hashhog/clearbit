@@ -134,6 +134,15 @@ pub const MempoolError = error{
     /// Mirrors AcceptToMemoryPool's `PolicyScriptChecks` and
     /// `ConsensusScriptChecks` rejects in validation.cpp.
     ScriptVerifyFailed,
+    /// Transaction nLockTime is not satisfied (BIP-113 / IsFinalTx).
+    /// Core reject code: "bad-txns-nonfinal".
+    NonFinal,
+    /// Coinbase output spend before 100 confirmations.
+    /// Core reject code: "bad-txns-premature-spend-of-coinbase".
+    ImmatureCoinbase,
+    /// BIP-68 relative sequence lock is not yet satisfied.
+    /// Core reject code: "non-BIP68-final".
+    SequenceLockNotSatisfied,
 };
 
 // ============================================================================
@@ -478,15 +487,43 @@ pub const Mempool = struct {
         // 2. Check standardness
         try self.checkStandard(&tx);
 
-        // 3. Validate inputs exist (in UTXO set or in mempool) and compute fee
+        // 2b. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
+        //     Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp ~line 819).
+        //     nextHeight = tipHeight + 1; lockTimeCutoff = chain MTP (BIP-113).
+        if (self.chain_state) |cs| {
+            const p = self.params orelse &consensus.MAINNET;
+            const next_height: u32 = cs.best_height + 1;
+            const mtp: u32 = cs.computeMTP();
+            const lock_time_cutoff: u32 = if (cs.best_height >= p.csv_height)
+                mtp
+            else
+                next_height;
+            if (!validation.isFinalTx(&tx, next_height, lock_time_cutoff)) {
+                return MempoolError.NonFinal;
+            }
+        }
+
+        // 3. Validate inputs exist (in UTXO set or in mempool) and compute fee.
+        //    Also collect per-input UTXO info for BIP-68 sequence lock checks (step 3b).
         var total_in: i64 = 0;
         var conflicting_txids = std.ArrayList(types.Hash256).init(self.allocator);
         defer conflicting_txids.deinit();
+
+        // Per-input UTXO info for BIP-68 sequence lock calculation.
+        // Mempool-parent inputs use synthetic height tipHeight+1 (Core convention).
+        var seq_utxo_infos = std.ArrayList(validation.UtxoInfo).init(self.allocator);
+        defer seq_utxo_infos.deinit();
 
         for (tx.inputs) |input| {
             // Check mempool first for unconfirmed parent outputs
             if (self.getOutputFromMempool(&input.previous_output)) |mempool_output| {
                 total_in += mempool_output.value;
+                // Mempool-parent: synthetic confirmed height = tipHeight + 1 (Core PreChecks).
+                const synthetic_height: u32 = if (self.chain_state) |cs2| cs2.best_height + 1 else 1;
+                seq_utxo_infos.append(validation.UtxoInfo{
+                    .height = synthetic_height,
+                    .mtp = if (self.chain_state) |cs2| cs2.computeMTP() else 0,
+                }) catch return MempoolError.OutOfMemory;
             } else if (self.chain_state) |cs| {
                 // Then check UTXO set
                 const utxo = cs.utxo_set.get(&input.previous_output) catch null;
@@ -496,12 +533,30 @@ pub const Mempool = struct {
                         mut_u.deinit(self.allocator);
                     }
                     total_in += u.value;
+
+                    // Coinbase maturity check: coinbase outputs require 100 confirmations.
+                    // Reference: Bitcoin Core CheckTxInputs() in consensus/tx_verify.cpp.
+                    if (u.is_coinbase) {
+                        const age: u32 = cs.best_height -| u.height;
+                        if (age < consensus.COINBASE_MATURITY) {
+                            return MempoolError.ImmatureCoinbase;
+                        }
+                    }
+
+                    // Collect per-input UTXO info for BIP-68 checks.
+                    // Use tip MTP conservatively for the coin's MTP (may false-reject
+                    // time-locked txs near the boundary but never false-admits).
+                    seq_utxo_infos.append(validation.UtxoInfo{
+                        .height = u.height,
+                        .mtp = cs.computeMTP(),
+                    }) catch return MempoolError.OutOfMemory;
                 } else {
                     return MempoolError.MissingInputs;
                 }
             } else {
                 // No chain state - for testing, assume inputs exist
                 // In production this would return MissingInputs
+                seq_utxo_infos.append(validation.UtxoInfo{ .height = 0, .mtp = 0 }) catch {};
             }
 
             // Check if another mempool tx spends this outpoint (potential RBF conflict)
@@ -521,6 +576,50 @@ pub const Mempool = struct {
         if (total_in > 0) {
             fee = total_in - total_out;
             if (fee < 0) return MempoolError.InsufficientFee;
+        }
+
+        // 5b. BIP-68 SequenceLocks: per-input relative locktimes (CSV).
+        //     Reference: Bitcoin Core CheckSequenceLocksAtTip() (validation.cpp ~line 887).
+        //     Only enforced when CSV height is active and tx.version >= 2.
+        if (self.chain_state) |cs| {
+            const p2 = self.params orelse &consensus.MAINNET;
+            const next_height: u32 = cs.best_height + 1;
+            const mtp: u32 = cs.computeMTP();
+            if (cs.best_height >= p2.csv_height and
+                tx.version >= 2 and
+                seq_utxo_infos.items.len == tx.inputs.len)
+            {
+                // Build a UtxoView backed by the collected infos (indexed by input position).
+                const SeqView = struct {
+                    infos: []const validation.UtxoInfo,
+                    inputs: []const types.TxIn,
+
+                    fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.UtxoInfo {
+                        const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                        for (me.inputs, 0..) |inp, i| {
+                            if (std.mem.eql(u8, &inp.previous_output.hash, &outpoint.hash) and
+                                inp.previous_output.index == outpoint.index)
+                            {
+                                return me.infos[i];
+                            }
+                        }
+                        return null;
+                    }
+                };
+                var sv = SeqView{ .infos = seq_utxo_infos.items, .inputs = tx.inputs };
+                const utxo_view = validation.UtxoView{
+                    .context = @ptrCast(&sv),
+                    .lookupFn = SeqView.lookup,
+                };
+                const tip_index = validation.BlockIndex{
+                    .height = next_height,
+                    .prev_mtp = mtp,
+                };
+                const lock_result = validation.calculateSequenceLocks(&tx, &utxo_view, next_height, p2);
+                if (!validation.checkSequenceLocks(lock_result, &tip_index)) {
+                    return MempoolError.SequenceLockNotSatisfied;
+                }
+            }
         }
 
         // 6. Compute size and check minimum fee
@@ -766,6 +865,9 @@ pub const Mempool = struct {
                 MempoolError.TooManyDescendants => "too-long-mempool-chain",
                 MempoolError.ClusterSizeLimitExceeded => "cluster-size-exceeded",
                 MempoolError.ScriptVerifyFailed => "mandatory-script-verify-flag-failed",
+                MempoolError.NonFinal => "bad-txns-nonfinal",
+                MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
+                MempoolError.SequenceLockNotSatisfied => "non-BIP68-final",
                 else => "rejected",
             };
             return AcceptResult{
