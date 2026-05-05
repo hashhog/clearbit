@@ -1052,13 +1052,33 @@ pub const RpcServer = struct {
         const writer = buf.writer();
 
         // Headers height = validated blocks + queued headers not yet validated
+        const queued_count: usize = if (self.peer_manager.expected_blocks.items.len > self.peer_manager.connect_cursor)
+            self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor
+        else
+            0;
         const headers_height = self.chain_state.best_height +
-            @as(u32, @intCast(self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor));
+            @as(u32, @intCast(queued_count));
 
         // Calculate initialblockdownload status
         // IBD = true if chainwork < minimum chain work OR tip age > 24 hours
         // Once cleared, it latches to false (cannot flip back to true)
         const ibd = self.isInitialBlockDownload();
+
+        // Get tip bits, time, chainwork from chain_manager when available.
+        var tip_bits: u32 = self.network_params.genesis_header.bits;
+        var tip_time: u32 = self.network_params.genesis_header.timestamp;
+        var tip_chain_work: [32]u8 = self.chain_state.total_work;
+
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
+                tip_bits = entry.header.bits;
+                tip_time = entry.header.timestamp;
+                tip_chain_work = entry.chain_work;
+            }
+        }
+
+        const mtp = self.chain_state.computeMTP();
+        const difficulty = getDifficulty(tip_bits);
 
         try writer.print("{{\"chain\":\"{s}\",\"blocks\":{d},\"headers\":{d},\"bestblockhash\":\"", .{
             chain_name,
@@ -1066,16 +1086,22 @@ pub const RpcServer = struct {
             headers_height,
         });
         try writeHashHex(writer, &self.chain_state.best_hash);
-        const mtp = self.chain_state.computeMTP();
-        try writer.print("\",\"difficulty\":{d},\"mediantime\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"pruned\":false,\"softforks\":{{", .{
-            getDifficulty(self.network_params.genesis_header.bits),
+        try writer.print("\",\"bits\":\"{x:0>8}\",\"target\":\"", .{tip_bits});
+        try writeTargetHex(writer, tip_bits);
+        try writer.print("\",\"difficulty\":{d},\"time\":{d},\"mediantime\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"chainwork\":\"", .{
+            difficulty,
+            tip_time,
             mtp,
             ibd,
         });
+        for (tip_chain_work) |byte| {
+            try writer.print("{x:0>2}", .{byte});
+        }
+        try writer.writeAll("\",\"size_on_disk\":0,\"pruned\":false,\"softforks\":{");
         // softforks uses the same canonical deployment helper as getdeploymentinfo,
         // queried at the current best height.
         try self.writeDeploymentsJson(writer, self.chain_state.best_height);
-        try writer.writeAll("}}");
+        try writer.writeAll("},\"warnings\":\"\"}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -1367,10 +1393,13 @@ pub const RpcServer = struct {
             header.version,
         });
         try writeHashHex(writer, &header.merkle_root);
-        try writer.print("\",\"time\":{d},\"nonce\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":{d},\"previousblockhash\":\"", .{
+        try writer.print("\",\"time\":{d},\"nonce\":{d},\"bits\":\"{x:0>8}\",\"target\":\"", .{
             header.timestamp,
             header.nonce,
             header.bits,
+        });
+        try writeTargetHex(writer, header.bits);
+        try writer.print("\",\"difficulty\":{d},\"previousblockhash\":\"", .{
             getDifficulty(header.bits),
         });
         try writeHashHex(writer, &header.prev_block);
@@ -1386,7 +1415,69 @@ pub const RpcServer = struct {
             try writer.print("\"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b\"", .{});
         }
 
-        try writer.print("]}}", .{});
+        // coinbase_tx: for blocks whose body we have on disk, read the coinbase.
+        // For header-only entries (height > 0, body not yet loaded), emit null.
+        // Reference: bitcoin-core/src/rpc/blockchain.cpp coinbaseTxToJSON()
+        var coinbase_tx_appended = false;
+        if (is_genesis) {
+            // Genesis coinbase: known scriptSig from BIP-0 / chain params.
+            // "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+            try writer.writeAll("],\"coinbase_tx\":{\"version\":1,\"locktime\":0,\"sequence\":4294967295,\"coinbase\":\"04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f6620736563636f6e64206261696c6f757420666f722062616e6b73\"}");
+            coinbase_tx_appended = true;
+        } else if (self.chain_state.utxo_set.db) |db| {
+            if (db.get(storage.CF_BLOCKS, &blockhash) catch null) |raw| {
+                defer self.allocator.free(raw);
+                // Parse the raw block to extract coinbase scriptSig.
+                // Wire format: 4-byte version, varint tx_count, then first tx.
+                // First tx: 4-byte version, then vin (varint count + inputs).
+                // Coinbase input scriptSig follows the outpoint (36 bytes) + varint length.
+                if (raw.len > 80 + 4 + 1 + 4 + 1 + 36) {
+                    var pos: usize = 80; // skip 80-byte header
+                    // tx count varint (skip)
+                    const tx_count_byte = raw[pos];
+                    pos += if (tx_count_byte < 0xfd) @as(usize, 1)
+                           else if (tx_count_byte == 0xfd) @as(usize, 3)
+                           else @as(usize, 5);
+                    if (pos + 4 < raw.len) {
+                        const cb_version = std.mem.readInt(i32, raw[pos..][0..4], .little);
+                        pos += 4;
+                        // vin count (skip — coinbase always has 1 input)
+                        pos += 1;
+                        // outpoint: 36 bytes (txid 32 + vout 4)
+                        pos += 36;
+                        if (pos < raw.len) {
+                            // scriptSig length varint
+                            const ss_len_byte = raw[pos];
+                            const ss_varint_size: usize = if (ss_len_byte < 0xfd) 1
+                                                          else if (ss_len_byte == 0xfd) 3
+                                                          else 5;
+                            const ss_len: usize = if (ss_len_byte < 0xfd) @intCast(ss_len_byte)
+                                                  else if (ss_len_byte == 0xfd and pos + 3 <= raw.len)
+                                                      @intCast(std.mem.readInt(u16, raw[pos+1..][0..2], .little))
+                                                  else 0;
+                            pos += ss_varint_size;
+                            if (pos + ss_len + 4 <= raw.len) {
+                                const ss = raw[pos .. pos + ss_len];
+                                const seq_bytes = raw[pos + ss_len ..][0..4];
+                                const sequence = std.mem.readInt(u32, seq_bytes, .little);
+                                try writer.writeAll("],\"coinbase_tx\":{\"version\":");
+                                try writer.print("{d}", .{cb_version});
+                                try writer.writeAll(",\"locktime\":0,\"sequence\":");
+                                try writer.print("{d}", .{sequence});
+                                try writer.writeAll(",\"coinbase\":\"");
+                                for (ss) |b| try writer.print("{x:0>2}", .{b});
+                                try writer.writeAll("\"}");
+                                coinbase_tx_appended = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!coinbase_tx_appended) {
+            try writer.writeAll("],\"coinbase_tx\":null");
+        }
+        try writer.writeByte('}');
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -1440,7 +1531,8 @@ pub const RpcServer = struct {
             }
 
             const ping_display: i64 = if (peer.min_ping_time == std.math.maxInt(i64)) 0 else peer.min_ping_time;
-            try writer.print("],\"relaytxes\":{},\"lastsend\":{d},\"lastrecv\":{d},\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"connection_type\":\"{s}\"}}", .{
+            const ping_f64: f64 = @as(f64, @floatFromInt(ping_display)) / 1000.0;
+            try writer.print("],\"relaytxes\":{},\"lastsend\":{d},\"lastrecv\":{d},\"last_transaction\":0,\"last_block\":0,\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d:.6},\"minping\":{d:.6},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"presynced_headers\":-1,\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"addr_relay_enabled\":true,\"addr_processed\":0,\"addr_rate_limited\":0,\"permissions\":[],\"minfeefilter\":0.0,\"bytessent_per_msg\":{{}},\"bytesrecv_per_msg\":{{}},\"connection_type\":\"{s}\",\"transport_protocol_type\":\"v1\",\"session_id\":\"\"}}", .{
                 peer.relay_txs,
                 peer.last_message_time,
                 peer.last_message_time,
@@ -1448,7 +1540,8 @@ pub const RpcServer = struct {
                 peer.bytes_received,
                 peer.connect_time,
                 peer.time_offset,
-                ping_display,
+                ping_f64,
+                ping_f64,
                 if (peer.version_info) |v| v.version else 0,
                 if (peer.version_info) |v| v.user_agent else "",
                 is_inbound,
@@ -5786,12 +5879,30 @@ pub const RpcServer = struct {
         const mempool_size = self.mempool.entries.count();
         self.mempool.mutex.unlock();
 
-        try writer.print("{{\"blocks\":{d},\"difficulty\":{d:.8},\"networkhashps\":0,\"pooledtx\":{d},\"chain\":\"{s}\"}}", .{
+        // Get tip bits from chain_manager or fall back to genesis.
+        var tip_bits: u32 = self.network_params.genesis_header.bits;
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
+                tip_bits = entry.header.bits;
+            }
+        }
+        const difficulty = getDifficulty(tip_bits);
+
+        try writer.print("{{\"blocks\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":{d:.8},\"target\":\"", .{
             self.chain_state.best_height,
-            getDifficulty(self.network_params.genesis_header.bits),
+            tip_bits,
+            difficulty,
+        });
+        try writeTargetHex(writer, tip_bits);
+        try writer.print("\",\"networkhashps\":0,\"pooledtx\":{d},\"blockmintxfee\":0.00001,\"chain\":\"{s}\",\"next\":{{\"height\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":{d:.8},\"target\":\"", .{
             mempool_size,
             chain_name,
+            self.chain_state.best_height + 1,
+            tip_bits,
+            difficulty,
         });
+        try writeTargetHex(writer, tip_bits);
+        try writer.writeAll("\"},\"warnings\":\"\"}");
 
         return self.jsonRpcResult(buf.items, id);
     }
