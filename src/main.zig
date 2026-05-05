@@ -1149,6 +1149,13 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
 fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
     const import_path = config.import_blocks orelse return;
 
+    // Initialize secp256k1 for signature verification during block import.
+    if (!crypto.initSecp256k1()) {
+        std.debug.print("FATAL: Failed to initialize secp256k1 context\n", .{});
+        std.process.exit(1);
+    }
+    defer crypto.deinitSecp256k1();
+
     // Resolve data directory
     const datadir = resolveDataDir(config.datadir, allocator) catch |err| {
         std.debug.print("Error resolving data directory: {}\n", .{err});
@@ -1569,6 +1576,14 @@ pub fn main() !void {
     std.debug.print("Data directory: {s}\n", .{full_datadir});
 
     // 7. Initialize subsystems
+    // Initialize secp256k1 context for ECDSA and Schnorr signature verification.
+    // Must be done before any block or transaction validation.
+    if (!crypto.initSecp256k1()) {
+        std.debug.print("FATAL: Failed to initialize secp256k1 context\n", .{});
+        std.process.exit(1);
+    }
+    defer crypto.deinitSecp256k1();
+
     // Open RocksDB for disk-backed UTXO persistence.
     var db: ?storage.Database = null;
     var db_ptr: ?*storage.Database = null;
