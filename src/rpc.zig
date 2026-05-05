@@ -6477,62 +6477,57 @@ pub const RpcServer = struct {
 
     /// importdescriptors "requests"
     /// Import descriptors into the wallet.
+    /// Handle importdescriptors RPC.
+    ///
+    /// Refused with `RPC_WALLET_ERROR` (-4). The pre-fix handler walked the
+    /// `requests` array, parsed each descriptor via
+    /// `descriptor.parseDescriptor`, then returned `{"success": true}`
+    /// per descriptor without ever deriving addresses, adding keys to the
+    /// wallet, or persisting state. Pre-fix code self-documented at
+    /// L6527-6530:
+    ///
+    ///     // In a full implementation, we would derive addresses and add
+    ///     // keys to the wallet. For now, we validate and acknowledge the
+    ///     // import.
+    ///
+    /// Operators got a successful JSON-RPC response; nothing actually
+    /// landed in the wallet. Same lying-RPC pattern as the
+    /// 2026-05-05 `loadtxoutset` audit (rustoshi 1d0a325 / hotbuns
+    /// e355cd7 / clearbit c8866ef wave): refuse the RPC at the gate
+    /// rather than continue to mislead callers.
+    ///
+    /// Wiring real descriptor-wallet support (descriptor → address
+    /// derivation → wallet DB write → blockchain rescan) is a multi-day
+    /// project per impl. The honest gate is the fix; the real
+    /// implementation is a follow-up.
+    ///
+    /// The gate fires AFTER cheap parameter-shape validation but BEFORE
+    /// any wallet state read or write, so a refused call leaves the
+    /// wallet untouched. Same JSON-RPC error code semantics as Core's
+    /// `RPC_WALLET_ERROR` (`bitcoin-core/src/rpc/protocol.h`).
+    ///
+    /// Cross-impl audit:
+    /// `CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md`.
     fn handleImportDescriptors(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (self.requireWallet(id)) |err| return err;
-
-        _ = self.getTargetWallet() orelse {
-            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
-        };
-
-        // Extract requests array
-        const requests = blk: {
-            if (params == .array and params.array.items.len > 0) {
-                const r = params.array.items[0];
-                if (r == .array) break :blk r.array.items;
-            }
+        // Validate parameter shape only; never touch the wallet.
+        if (params != .array or params.array.items.len == 0) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing requests array", id);
-        };
-
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
-        const writer = buf.writer();
-
-        try writer.writeByte('[');
-
-        for (requests, 0..) |req, i| {
-            if (i > 0) try writer.writeByte(',');
-
-            if (req != .object) {
-                try writer.writeAll("{\"success\":false,\"error\":{\"code\":-8,\"message\":\"Invalid request object\"}}");
-                continue;
-            }
-
-            const desc_value = req.object.get("desc") orelse {
-                try writer.writeAll("{\"success\":false,\"error\":{\"code\":-8,\"message\":\"Missing descriptor\"}}");
-                continue;
-            };
-
-            if (desc_value != .string) {
-                try writer.writeAll("{\"success\":false,\"error\":{\"code\":-8,\"message\":\"Descriptor must be a string\"}}");
-                continue;
-            }
-
-            // Parse the descriptor to validate it
-            var desc = descriptor.parseDescriptor(self.allocator, desc_value.string) catch {
-                try writer.writeAll("{\"success\":false,\"error\":{\"code\":-5,\"message\":\"Invalid descriptor\"}}");
-                continue;
-            };
-            desc.deinit(self.allocator);
-
-            // Successfully parsed - report success
-            // In a full implementation, we would derive addresses and add keys to the wallet.
-            // For now, we validate and acknowledge the import.
-            try writer.writeAll("{\"success\":true}");
+        }
+        const requests_param = params.array.items[0];
+        if (requests_param != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing requests array", id);
         }
 
-        try writer.writeByte(']');
-
-        return self.jsonRpcResult(buf.items, id);
+        return self.jsonRpcError(
+            RPC_WALLET_ERROR,
+            "importdescriptors not implemented in clearbit; descriptor-wallet "
+                ++ "support is not wired (no descriptor→address derivation, no "
+                ++ "wallet DB write, no blockchain rescan). The pre-fix handler "
+                ++ "returned success without persisting anything. Operator-managed "
+                ++ "key import via `importprivkey` / `importaddress` is the "
+                ++ "supported path until descriptor wallets are wired end-to-end.",
+            id,
+        );
     }
 
     /// validateaddress "address"
@@ -9870,4 +9865,93 @@ test "loadtxoutset RPC still rejects malformed params before the gate" {
     const resp = try server.dispatch(req);
     defer allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "-32602") != null);
+}
+
+// importdescriptors RPC is gated to refuse-and-direct-at-operator-managed-keys
+// in this build, per the cross-impl lying-RPC audit at
+// CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md. Same option-B refusal
+// pattern as the 2026-05-05 loadtxoutset wave (clearbit c8866ef, rustoshi
+// 1d0a325, hotbuns e355cd7). The gate must:
+//
+//   1. Refuse with RPC_WALLET_ERROR (-4).
+//   2. Direct the operator at the lack of descriptor-wallet wiring.
+//   3. NOT touch wallet state (no descriptor parse, no DB write).
+//
+// Pre-fix the handler walked the requests array, parsed each descriptor via
+// `descriptor.parseDescriptor`, and returned {"success": true} per
+// descriptor without ever updating the wallet. Operators got a successful
+// JSON-RPC response; nothing actually landed.
+test "importdescriptors RPC is refused with wallet-error gate" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    // A well-formed requests array with one descriptor object. Pre-fix code
+    // would have parsed the descriptor and returned [{"success":true}].
+    const req = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[[{\"desc\":\"wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)\"}]]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    // Must be a JSON-RPC error response.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\"") != null);
+    // -4 is RPC_WALLET_ERROR. (Match `"code":-4` to avoid colliding with
+    // any other -4-suffixed numeric in the response.)
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-4") != null);
+    // Message must mention the impl/feature so the operator knows why.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "importdescriptors not implemented") != null);
+    // Must NOT contain any `"success":true` (pre-fix behaviour).
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"success\":true") == null);
+}
+
+test "importdescriptors RPC gate fires before any wallet state read" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    // No wallet is configured on this server. Pre-fix handler called
+    // requireWallet and would have returned RPC_WALLET_NOT_FOUND (-18).
+    // Post-fix gate must short-circuit to RPC_WALLET_ERROR (-4) regardless,
+    // because the gate is impl-gap signalling, not "wallet missing".
+    const req = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[[{\"desc\":\"wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)\"}]]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-4") != null);
+    // Must NOT report wallet-not-found (-18); the gate fires first.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-18") == null);
+}
+
+test "importdescriptors RPC still rejects malformed params before the gate" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    // Empty params array → invalid-params -32602, NOT wallet-error.
+    const req_empty = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[]}";
+    const resp_empty = try server.dispatch(req_empty);
+    defer allocator.free(resp_empty);
+    try std.testing.expect(std.mem.indexOf(u8, resp_empty, "-32602") != null);
+
+    // First param not an array → invalid-params, NOT wallet-error.
+    const req_bad = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[\"not-an-array\"]}";
+    const resp_bad = try server.dispatch(req_bad);
+    defer allocator.free(resp_bad);
+    try std.testing.expect(std.mem.indexOf(u8, resp_bad, "-32602") != null);
 }
