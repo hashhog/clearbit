@@ -1676,6 +1676,10 @@ pub fn main() !void {
     peer_manager.chain_state = &chain_state;
     peer_manager.mempool = &mempool_instance;
     peer_manager.peerbloomfilters = config.peerbloomfilters;
+    // BIP-159: when prune mode is enabled (-prune > 0), advertise
+    // NODE_NETWORK_LIMITED so peers know we serve only the recent-288
+    // keep window.  Mirrors Core's init.cpp `IsPruneMode()` gate.
+    peer_manager.advertise_node_network_limited = chain_state.prune_target_mib > 0;
 
     const auth_token = computeAuthToken(config.rpc_user, config.rpc_password, allocator) catch null;
     defer if (auth_token) |t| allocator.free(t);
