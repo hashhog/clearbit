@@ -4375,128 +4375,59 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
-    /// Handle loadtxoutset RPC - load a UTXO set snapshot file.
-    /// Reference: Bitcoin Core rpc/blockchain.cpp loadtxoutset
+    /// Handle loadtxoutset RPC.
     ///
-    /// Arguments:
-    ///   1. path (string, required) - Path to the snapshot file
+    /// Refused with `RPC_INTERNAL_ERROR`. The handler used to call
+    /// `storage.validateAndLoadSnapshot(path, ...)` which streamed coins
+    /// into a transient chainstate, then `defer load_result.chainstate.deinit()`
+    /// destroyed that chainstate before returning — so on the RPC path no
+    /// coins ever made it to the active chainstate. The pre-fix code even
+    /// self-documented the gap with a TODO:
     ///
-    /// Returns:
-    ///   {
-    ///     "coins_loaded": n,     (numeric) Number of coins loaded
-    ///     "tip_hash": "hash",    (string) Block hash at snapshot tip
-    ///     "tip_height": n,       (numeric) Height of snapshot tip
-    ///     "base_height": n       (numeric) Base height (same as tip_height for valid snapshots)
-    ///   }
+    ///   // TODO: Actually activate the snapshot chainstate using ChainStateManager
+    ///   // For now, we just return the result without activating
+    ///   // In a full implementation, we would:
+    ///   // 1. Create the snapshot chainstate
+    ///   // 2. Swap it with the current chainstate via ChainStateManager.activateSnapshot()
+    ///   // 3. Start background validation thread
+    ///
+    /// Wiring `ChainStateManager.activateSnapshot` (option A) requires
+    /// exposing the live `ChainStateManager` to `RpcServer` and stopping the
+    /// running header-sync / block-download components atomically across the
+    /// swap; that's an invasive refactor and out of scope here.
+    ///
+    /// Fix is option (B) from rustoshi 1d0a325 / hotbuns e355cd7: refuse the
+    /// RPC at the gate, leave the datadir untouched, point the operator at
+    /// the CLI flag (`--load-snapshot=<path>` per `src/main.zig:892-1138`).
+    /// Same JSON-RPC error code Bitcoin Core uses in
+    /// `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset` when
+    /// `ActivateSnapshot` cannot proceed.
+    ///
+    /// The gate fires before any file I/O so a refused call leaves the
+    /// datadir untouched.
+    ///
+    /// Cross-impl audit:
+    /// `CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md`.
     fn handleLoadTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // Parse parameters
+        // Validate parameter shape only; never open or stat the snapshot file.
         if (params != .array or params.array.items.len == 0) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "loadtxoutset requires path argument", id);
         }
-
         const path_param = params.array.items[0];
         if (path_param != .string) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Path must be a string", id);
         }
-        const path = path_param.string;
 
-        // Validate and load the snapshot. Capture the offending base
-        // blockhash on whitelist rejection so we can format Core's
-        // diagnostic ("Assumeutxo height in snapshot metadata not
-        // recognized ... - refusing to load snapshot",
-        // validation.cpp:5775-5780).
-        var rejected_hash: types.Hash256 = undefined;
-        var actual_hash: types.Hash256 = undefined;
-        var expected_hash: types.Hash256 = undefined;
-        var load_result = storage.validateAndLoadSnapshot(
-            path,
-            self.network_params,
-            self.allocator,
-            &rejected_hash,
-            &actual_hash,
-            &expected_hash,
-        ) catch |err| {
-            // Format Core-strict whitelist rejection with the
-            // unrecognized base_blockhash. clearbit has no
-            // hash→height index for unknown snapshots, so we render
-            // "(blockhash <hex>)" in lieu of the height integer Core
-            // prints — the semantic ("not in m_assumeutxo_data") is
-            // preserved.
-            if (err == storage.SnapshotError.UnknownSnapshot) {
-                var msg_buf = std.ArrayList(u8).init(self.allocator);
-                defer msg_buf.deinit();
-                const msg_writer = msg_buf.writer();
-                msg_writer.writeAll("Assumeutxo height in snapshot metadata not recognized (blockhash ") catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Assumeutxo height in snapshot metadata not recognized - refusing to load snapshot", id);
-                };
-                writeHashHex(msg_writer, &rejected_hash) catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Assumeutxo height in snapshot metadata not recognized - refusing to load snapshot", id);
-                };
-                msg_writer.writeAll(") - refusing to load snapshot") catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Assumeutxo height in snapshot metadata not recognized - refusing to load snapshot", id);
-                };
-                return self.jsonRpcError(RPC_MISC_ERROR, msg_buf.items, id);
-            }
-            // STRICT CONTENT HASH: render Core's
-            // `"Bad snapshot content hash: expected X, got Y"` verbatim,
-            // using the `hash_serialized` (SHA256d via HashWriter) we
-            // computed and the value pinned in `assume_utxo`. Reference:
-            // validation.cpp:5912-5914 (and kernel/coinstats.cpp:161
-            // which selects HASH_SERIALIZED, not MuHash, for this gate).
-            if (err == storage.SnapshotError.HashMismatch) {
-                var msg_buf = std.ArrayList(u8).init(self.allocator);
-                defer msg_buf.deinit();
-                const msg_writer = msg_buf.writer();
-                msg_writer.writeAll("Bad snapshot content hash: expected ") catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash", id);
-                };
-                writeHashHex(msg_writer, &expected_hash) catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash", id);
-                };
-                msg_writer.writeAll(", got ") catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash", id);
-                };
-                writeHashHex(msg_writer, &actual_hash) catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash", id);
-                };
-                return self.jsonRpcError(RPC_MISC_ERROR, msg_buf.items, id);
-            }
-            const msg = switch (err) {
-                storage.SnapshotError.UnknownSnapshot => unreachable, // handled above
-                storage.SnapshotError.HashMismatch => unreachable, // handled above
-                storage.SnapshotError.CoinCountMismatch => "Coin count doesn't match expected value",
-                storage.SnapshotError.IoError => "Failed to read snapshot file",
-                storage.SnapshotError.CorruptData => "Snapshot file is corrupt",
-                storage.SnapshotError.WrongNetwork => "Snapshot is for a different network",
-                storage.SnapshotError.OutOfMemory => "Out of memory",
-                storage.SnapshotError.BackgroundValidationFailed => "Background validation failed",
-            };
-            return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
-        };
-
-        // TODO: Actually activate the snapshot chainstate using ChainStateManager
-        // For now, we just return the result without activating
-        // In a full implementation, we would:
-        // 1. Create the snapshot chainstate
-        // 2. Swap it with the current chainstate via ChainStateManager.activateSnapshot()
-        // 3. Start background validation thread
-        defer load_result.chainstate.deinit();
-
-        // Build response
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
-        const writer = buf.writer();
-
-        try writer.writeAll("{");
-        try writer.print("\"coins_loaded\":{d},", .{load_result.result.coins_loaded});
-        try writer.writeAll("\"tip_hash\":\"");
-        try writeHashHex(writer, &load_result.result.tip_hash);
-        try writer.writeAll("\",");
-        try writer.print("\"tip_height\":{d},", .{load_result.result.tip_height});
-        try writer.print("\"base_height\":{d}", .{load_result.result.base_height});
-        try writer.writeAll("}");
-
-        return self.jsonRpcResult(buf.items, id);
+        return self.jsonRpcError(
+            RPC_INTERNAL_ERROR,
+            "loadtxoutset RPC is disabled in this build because the live daemon "
+                ++ "cannot atomically activate a UTXO snapshot once the header-sync "
+                ++ "and block-download components have started. Use the CLI flag "
+                ++ "--load-snapshot=<path> at startup instead — that path imports "
+                ++ "the snapshot, pins the chain tip, and writes the block index "
+                ++ "before any P2P/sync components are constructed.",
+            id,
+        );
     }
 
     /// Handle dumptxoutset RPC - dump the UTXO set to a snapshot file.
@@ -9862,4 +9793,81 @@ test "submitblock missing params returns error" {
     defer allocator.free(resp);
     // Missing hex → invalid-params JSON-RPC error
     try std.testing.expect(std.mem.indexOf(u8, resp, "error") != null);
+}
+
+// loadtxoutset RPC is gated to refuse-and-direct-at-CLI in this build, per
+// the cross-impl audit at
+// CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md and the
+// rustoshi 1d0a325 / hotbuns e355cd7 reference fixes. The gate must:
+//
+//   1. Refuse with RPC_INTERNAL_ERROR (-32603).
+//   2. Direct the operator at the --load-snapshot CLI flag.
+//   3. NOT touch the filesystem (no validateAndLoadSnapshot call).
+test "loadtxoutset RPC is refused with internal-error gate" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const req = "{\"id\":1,\"method\":\"loadtxoutset\",\"params\":[\"/some/snapshot.dat\"]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    // Must be a JSON-RPC error response (has "error" object, no "result" key).
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\"") != null);
+    // -32603 is RPC_INTERNAL_ERROR.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "-32603") != null);
+    // Must direct the operator at the CLI flag.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "--load-snapshot") != null);
+    // Must NOT contain coins_loaded (pre-fix would have returned that field
+    // even on the no-op path because it serialized load_result.result).
+    try std.testing.expect(std.mem.indexOf(u8, resp, "coins_loaded") == null);
+}
+
+test "loadtxoutset RPC gate fires before any file I/O" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    // Path does NOT exist. Pre-fix code would have called
+    // storage.validateAndLoadSnapshot which opens the file and would have
+    // returned SnapshotError.IoError → "Failed to read snapshot file".
+    // Post-fix gate must short-circuit to the gate message instead.
+    const req = "{\"id\":1,\"method\":\"loadtxoutset\",\"params\":[\"/nonexistent/path/snapshot.dat\"]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "-32603") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "--load-snapshot") != null);
+    // Must NOT have surfaced any file-I/O error from the (pre-fix) opener.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Failed to read snapshot file") == null);
+}
+
+test "loadtxoutset RPC still rejects malformed params before the gate" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    // Empty params array → invalid-params -32602, NOT internal-error.
+    const req = "{\"id\":1,\"method\":\"loadtxoutset\",\"params\":[]}";
+    const resp = try server.dispatch(req);
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "-32602") != null);
 }
