@@ -2804,6 +2804,9 @@ pub const RpcServer = struct {
             error.BadBlockWeight, error.BadBlockSize => "bad-blk-weight",
             // Connect-block stage: Core validation.cpp:2122 "block-script-verify-flag-failed (%s)"
             error.ScriptVerificationFailed => "block-script-verify-flag-failed",
+            // Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
+            // Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase")
+            error.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
             // Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
             error.NegativeOutput => "bad-txns-vout-negative",
             // Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
