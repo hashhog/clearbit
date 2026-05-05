@@ -2261,6 +2261,14 @@ pub const ChainState = struct {
     /// pruning policy.
     pub fn pruneToTarget(self: *ChainState) u32 {
         if (self.prune_target_mib == 0) return 0;
+        // Bitcoin Core `-prune=1` manual-only mode (init.cpp:524 /
+        // blockmanager_args.cpp:27): prune mode is on (NODE_NETWORK_LIMITED
+        // advertised, getblockchaininfo.pruned=true) but the auto-prune
+        // trigger does NOT fire. Only the pruneblockchain RPC (not yet
+        // shipped here) may delete data. Maps to Core's
+        // PRUNE_TARGET_MANUAL = uint64::MAX sentinel — the "target
+        // unreachable" branch.
+        if (self.prune_target_mib == 1) return 0;
         const db = self.utxo_set.db orelse return 0;
         if (self.best_height <= MIN_BLOCKS_TO_KEEP) return 0;
 
@@ -4994,6 +5002,25 @@ test "pruneToTarget: no-op when prune disabled" {
 
     const pruned = chain_state.pruneToTarget();
     try std.testing.expectEqual(@as(u32, 0), pruned);
+    try std.testing.expectEqual(@as(u32, 0), chain_state.prune_height);
+}
+
+test "pruneToTarget: no-op in -prune=1 manual mode" {
+    // Bitcoin Core init.cpp:524 / blockmanager_args.cpp:27: -prune=1
+    // means "manual via pruneblockchain RPC only"; auto-prune trigger
+    // never fires. We map this to the literal sentinel value 1 in
+    // prune_target_mib (camlcoin's approach).
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    chain_state.best_height = 10_000;
+    chain_state.prune_target_mib = 1; // manual-mode sentinel
+
+    const pruned = chain_state.pruneToTarget();
+    try std.testing.expectEqual(@as(u32, 0), pruned);
+    // Watermark must NOT advance in manual mode — only the RPC path
+    // (when shipped) may move it.
     try std.testing.expectEqual(@as(u32, 0), chain_state.prune_height);
 }
 
