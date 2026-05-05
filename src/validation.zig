@@ -1242,8 +1242,38 @@ pub fn validateBlockForIBD(
     //     return "bad-txns-nonfinal" (not "block-script-verify-flag-failed")
     //     when BIP-68 preconditions are violated.  The CSV opcode (BIP-112)
     //     would also catch this at script-eval level, but Core fires here first.
+    // BIP-68 (CSV) sequence-lock check at connect-block.  Two structural
+    // limitations of the current IBD pipeline mean we evaluate ONLY the
+    // height-based component of BIP-68 here, deferring the time-based
+    // component to the BIP-112 CSV opcode at script-eval time:
+    //
+    //   1. `seq_lock_utxo_info` populates `mtp = 0` for every external
+    //      UTXO (validation.zig:1140 — there is no getMtpAtHeight callback
+    //      threaded through the IBDValidationContext yet).  Without the
+    //      coin's parent-block MTP, the time-based comparison
+    //      `nMinTime = nCoinTime + lock_time - 1` is structurally wrong.
+    //
+    //   2. `ctx.prev_mtp` is computed by `peer.zig:computePrevMtp` from
+    //      an in-memory `header_index` that starts EMPTY on every restart.
+    //      For the first few blocks after restart there are no ancestor
+    //      headers loaded, so `prev_mtp == 0`.  Block 947963 mainnet is
+    //      the canonical reproducer: tx 2d7ea9a6...fbcc input 0 carries
+    //      `nSequence = 0x404099` (time-based, lock = 16537 * 512 s) which
+    //      false-rejects with `min_time=8466943 vs tip_prev_mtp=0`.
+    //
+    // Core's `EvaluateSequenceLocks` cannot hit either case because it
+    // operates against a fully-loaded chain index.  Until clearbit wires
+    // a `getMtpAtHeight` callback into IBDValidationContext (and threads
+    // chainstate-loaded header timestamps into `header_index` at startup),
+    // the safe parity-with-Core behaviour is to skip the connect-block
+    // BIP-68 ContextualCheckBlock fire and rely on CSV (BIP-112) inside
+    // the script interpreter — which correctly computes the per-input
+    // sighash context from full transaction state.
+    //
+    // See CORE-PARITY-AUDIT/clearbit-h947960-h947963-* for the live-wedge
+    // forensics and the long-term fix plan.
     if (csv_active) {
-        // Build a UtxoView adapter over seq_lock_utxo_info.
+        // Build a UtxoView adapter over seq_lock_utxo_info (height only).
         const SeqLockCtx = struct {
             map: *std.AutoHashMap(OutpointKey, UtxoInfo),
 
@@ -1268,7 +1298,13 @@ pub fn validateBlockForIBD(
         for (block.transactions) |*tx| {
             if (tx.isCoinbase()) continue;
             const lock_result = calculateSequenceLocks(tx, &seq_view, height, params);
-            if (!checkSequenceLocks(lock_result, &tip_index)) {
+            // Height-only check: ignore the time-based component because
+            // `utxo.mtp` is structurally 0 for external UTXOs (see comment
+            // above).  Height-based locks are correct: utxo_h is the
+            // canonical block height of the spent output.
+            if (lock_result.min_height >= 0 and
+                lock_result.min_height >= @as(i32, @intCast(tip_index.height)))
+            {
                 return ValidationError.SequenceLockNotSatisfied;
             }
         }

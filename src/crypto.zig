@@ -1537,19 +1537,42 @@ pub fn computeTapleafHash(tap_script: []const u8, leaf_version: u8) ?Hash256 {
     leaf_hasher.update(&tap_leaf_tag);
     leaf_hasher.update(&tap_leaf_tag);
     leaf_hasher.update(&[_]u8{leaf_version});
-    if (tap_script.len < 0xfd) {
-        leaf_hasher.update(&[_]u8{@truncate(tap_script.len)});
-    } else if (tap_script.len <= 0xffff) {
-        leaf_hasher.update(&[_]u8{0xfd});
-        leaf_hasher.update(&[_]u8{@truncate(tap_script.len & 0xff)});
-        leaf_hasher.update(&[_]u8{@truncate((tap_script.len >> 8) & 0xff)});
-    } else {
-        return null;
-    }
+    // Full BIP-341 / Core CompactSize encoding for the script length.
+    // Pre-fix this stopped at <= 0xFFFF and returned null for any tapscript
+    // > 65535 bytes, which is well below the BIP-342 validation-weight ceiling
+    // (Ordinals inscriptions routinely produce tapscripts of 70-400 KB).
+    // That falsely failed verifyTaprootControlBlock on mainnet block 947960
+    // (tx c0c2df86...f200f input 1) — a 69836-byte tapscript inscription.
+    // Reference: bitcoin-core/src/serialize.h::WriteCompactSize.
+    appendCompactSize(&leaf_hasher, tap_script.len);
     leaf_hasher.update(tap_script);
     var k: Hash256 = undefined;
     leaf_hasher.final(&k);
     return k;
+}
+
+/// Append a Bitcoin CompactSize-encoded length to a SHA-256 hasher.
+/// Matches the byte stream produced by Core's WriteCompactSize in
+/// `serialize.h` (used by the `<<` operator on HashWriter for std::span).
+fn appendCompactSize(hasher: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    if (value < 0xfd) {
+        hasher.update(&[_]u8{@truncate(value)});
+    } else if (value <= 0xffff) {
+        var buf: [3]u8 = undefined;
+        buf[0] = 0xfd;
+        std.mem.writeInt(u16, buf[1..3], @intCast(value), .little);
+        hasher.update(&buf);
+    } else if (value <= 0xffff_ffff) {
+        var buf: [5]u8 = undefined;
+        buf[0] = 0xfe;
+        std.mem.writeInt(u32, buf[1..5], @intCast(value), .little);
+        hasher.update(&buf);
+    } else {
+        var buf: [9]u8 = undefined;
+        buf[0] = 0xff;
+        std.mem.writeInt(u64, buf[1..9], value, .little);
+        hasher.update(&buf);
+    }
 }
 
 /// program: the 32-byte witness program (x-only output key from scriptPubKey)
@@ -1563,22 +1586,17 @@ pub fn verifyTaprootControlBlock(control: []const u8, tap_script: []const u8, pr
     const internal_key = control[1..33];
 
     // Compute tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script_len) || script)
+    // Uses the full 4-byte / 8-byte CompactSize encoding via appendCompactSize
+    // so tapscripts > 65535 bytes (e.g. Ordinals inscription envelopes) are
+    // hashed identically to Core. The pre-fix code returned `false` for any
+    // such script, falsely rejecting mainnet block 947960 (Taproot script-path
+    // input with 69836-byte tapscript). See computeTapleafHash above.
     var leaf_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     const tap_leaf_tag = sha256("TapLeaf");
     leaf_hasher.update(&tap_leaf_tag);
     leaf_hasher.update(&tap_leaf_tag);
     leaf_hasher.update(&[_]u8{leaf_version});
-
-    // Compact size encoding of script length
-    if (tap_script.len < 0xfd) {
-        leaf_hasher.update(&[_]u8{@truncate(tap_script.len)});
-    } else if (tap_script.len <= 0xffff) {
-        leaf_hasher.update(&[_]u8{0xfd});
-        leaf_hasher.update(&[_]u8{@truncate(tap_script.len & 0xff)});
-        leaf_hasher.update(&[_]u8{@truncate((tap_script.len >> 8) & 0xff)});
-    } else {
-        return false;
-    }
+    appendCompactSize(&leaf_hasher, tap_script.len);
     leaf_hasher.update(tap_script);
     var k: Hash256 = undefined;
     leaf_hasher.final(&k);
