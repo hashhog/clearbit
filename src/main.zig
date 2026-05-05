@@ -357,20 +357,27 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
 }
 
 /// Validate the parsed `--prune` target. Mirrors Bitcoin Core's
-/// AppInitParameterInteraction (init.cpp:1093):
+/// AppInitParameterInteraction (init.cpp:524 / blockmanager_args.cpp:22-34):
 ///   * 0  → pruning disabled (default)
-///   * 1≤N<MIN_PRUNE_TARGET_MIB (550) → rejected, target too small to keep
+///   * 1  → manual mode: in prune mode but auto-prune does not fire;
+///         only the pruneblockchain RPC (when shipped) triggers a sweep.
+///   * 2≤N<MIN_PRUNE_TARGET_MIB (550) → rejected, target too small to keep
 ///     up with MIN_BLOCKS_TO_KEEP × ~average block size + undo + orphan
 ///     budget. (Core gives identical wording.)
 ///   * N≥550 → accepted as a target size in MiB.
 ///
 /// Returns the validated value (unchanged) on success, or
-/// ArgParseError.InvalidArgument on a non-zero too-small target.
+/// ArgParseError.InvalidArgument on a too-small target.
+/// Manual mode is represented by the literal value 1 (in MiB), matching
+/// camlcoin's sentinel approach. ChainState.pruneToTarget short-circuits
+/// when prune_target_mib == 1 so the auto-prune trigger is effectively
+/// disabled in manual mode.
 pub fn validatePruneTarget(prune_mib: u64) ArgParseError!u64 {
     if (prune_mib == 0) return 0;
+    if (prune_mib == 1) return 1; // manual-mode sentinel (Core init.cpp:524)
     if (prune_mib < storage.ChainState.MIN_PRUNE_TARGET_MIB) {
         std.debug.print(
-            "Error: Prune target must be at least {d} MiB (got {d} MiB).\n",
+            "Error: Prune target must be 0 (off), 1 (manual mode), or at least {d} MiB (got {d} MiB).\n",
             .{ storage.ChainState.MIN_PRUNE_TARGET_MIB, prune_mib },
         );
         return ArgParseError.InvalidArgument;
@@ -1496,9 +1503,10 @@ pub fn main() !void {
         return; // --help or --version was specified
     }
 
-    // Validate --prune target (1 ≤ N < 550 MiB is rejected per Bitcoin Core
-    // semantics). The early check, before any RocksDB / network init, gives
-    // operators a fast-fail config error rather than a delayed surprise.
+    // Validate --prune target (Core init.cpp:524): 0=off, 1=manual mode,
+    // 2..549 rejected, ≥550 automatic with N MiB target. The early check,
+    // before any RocksDB / network init, gives operators a fast-fail
+    // config error rather than a delayed surprise.
     config.prune = validatePruneTarget(config.prune) catch |err| {
         std.debug.print("Invalid --prune value: {}\n", .{err});
         std.process.exit(1);
@@ -2195,8 +2203,14 @@ test "validatePruneTarget accepts large values" {
     try std.testing.expectEqual(@as(u64, 100_000), try validatePruneTarget(100_000));
 }
 
-test "validatePruneTarget rejects 1 (below minimum)" {
-    try std.testing.expectError(ArgParseError.InvalidArgument, validatePruneTarget(1));
+test "validatePruneTarget accepts 1 (manual mode sentinel)" {
+    // Bitcoin Core init.cpp:524: -prune=1 means "operator-managed only"
+    // (auto-prune disabled; manual via pruneblockchain RPC).
+    try std.testing.expectEqual(@as(u64, 1), try validatePruneTarget(1));
+}
+
+test "validatePruneTarget rejects 2 (below minimum, above manual sentinel)" {
+    try std.testing.expectError(ArgParseError.InvalidArgument, validatePruneTarget(2));
 }
 
 test "validatePruneTarget rejects 549 (one below minimum)" {
