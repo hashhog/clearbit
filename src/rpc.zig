@@ -125,6 +125,8 @@ pub const RpcServer = struct {
 
     // Per-request state (for wallet targeting)
     current_wallet: ?*wallet_mod.Wallet = null,
+    /// Unix timestamp (seconds) when this server was created; used by `uptime`.
+    start_time: i64 = 0,
 
     /// Initialize the RPC server.
     pub fn init(
@@ -148,6 +150,7 @@ pub const RpcServer = struct {
             .config = config,
             .running = std.atomic.Value(bool).init(false),
             .current_wallet = null,
+            .start_time = std.time.timestamp(),
         };
     }
 
@@ -174,6 +177,7 @@ pub const RpcServer = struct {
             .config = config,
             .running = std.atomic.Value(bool).init(false),
             .current_wallet = null,
+            .start_time = std.time.timestamp(),
         };
     }
 
@@ -200,6 +204,7 @@ pub const RpcServer = struct {
             .config = config,
             .running = std.atomic.Value(bool).init(false),
             .current_wallet = null,
+            .start_time = std.time.timestamp(),
         };
     }
 
@@ -858,6 +863,10 @@ pub const RpcServer = struct {
             return self.handleGetConnectionCount(id);
         } else if (std.mem.eql(u8, method, "addnode")) {
             return self.handleAddNode(params, id);
+        } else if (std.mem.eql(u8, method, "disconnectnode")) {
+            return self.handleDisconnectNode(params, id);
+        } else if (std.mem.eql(u8, method, "uptime")) {
+            return self.handleUptime(id);
         } else if (std.mem.eql(u8, method, "getmininginfo")) {
             return self.handleGetMiningInfo(id);
         } else if (std.mem.eql(u8, method, "getnewaddress")) {
@@ -1057,8 +1066,10 @@ pub const RpcServer = struct {
             headers_height,
         });
         try writeHashHex(writer, &self.chain_state.best_hash);
-        try writer.print("\",\"difficulty\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"pruned\":false,\"softforks\":{{", .{
+        const mtp = self.chain_state.computeMTP();
+        try writer.print("\",\"difficulty\":{d},\"mediantime\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"pruned\":false,\"softforks\":{{", .{
             getDifficulty(self.network_params.genesis_header.bits),
+            mtp,
             ibd,
         });
         // softforks uses the same canonical deployment helper as getdeploymentinfo,
@@ -5715,6 +5726,48 @@ pub const RpcServer = struct {
         return self.jsonRpcResult("null", id);
     }
 
+    /// disconnectnode — force-disconnect a connected peer by address.
+    /// Reference: Bitcoin Core src/rpc/net.cpp::disconnectnode
+    fn handleDisconnectNode(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires address parameter", id);
+        }
+
+        const addr_param = params.array.items[0];
+        if (addr_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "address must be a string", id);
+        }
+        const addr_str = addr_param.string;
+
+        // Walk connected peers and disconnect the first that matches addr:port
+        var found = false;
+        for (self.peer_manager.peers.items) |peer| {
+            var addr_buf: [64]u8 = undefined;
+            const peer_addr = peer.getAddressString(&addr_buf);
+            if (std.mem.eql(u8, peer_addr, addr_str)) {
+                peer.disconnect();
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Node not found in connected nodes", id);
+        }
+
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// uptime — return server uptime in seconds.
+    /// Reference: Bitcoin Core src/rpc/server.cpp::uptime
+    fn handleUptime(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        const now = std.time.timestamp();
+        const elapsed = now - self.start_time;
+        var buf: [32]u8 = undefined;
+        const result = std.fmt.bufPrint(&buf, "{d}", .{elapsed}) catch return error.OutOfMemory;
+        return self.jsonRpcResult(result, id);
+    }
+
     /// Handle getmininginfo RPC - return mining-related information.
     /// Reference: Bitcoin Core rpc/mining.cpp getmininginfo
     fn handleGetMiningInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
@@ -6938,6 +6991,10 @@ pub const RpcServer = struct {
                 try writer.writeAll("getconnectioncount\\n\\nReturns the number of connections to other nodes.");
             } else if (std.mem.eql(u8, cmd, "addnode")) {
                 try writer.writeAll("addnode node command\\n\\nAttempts to add or remove a node from the addnode list.");
+            } else if (std.mem.eql(u8, cmd, "disconnectnode")) {
+                try writer.writeAll("disconnectnode \\\"address\\\"\\n\\nImmediately disconnects from the specified peer node.");
+            } else if (std.mem.eql(u8, cmd, "uptime")) {
+                try writer.writeAll("uptime\\n\\nReturns the total uptime of the server.");
             } else if (std.mem.eql(u8, cmd, "getmininginfo")) {
                 try writer.writeAll("getmininginfo\\n\\nReturns a json object containing mining-related information.");
             } else if (std.mem.eql(u8, cmd, "getnewaddress")) {
@@ -6996,6 +7053,7 @@ pub const RpcServer = struct {
             try writer.writeAll("submitblock\\n");
             try writer.writeAll("\\n== Network ==\\n");
             try writer.writeAll("addnode\\n");
+            try writer.writeAll("disconnectnode\\n");
             try writer.writeAll("getconnectioncount\\n");
             try writer.writeAll("getnetworkinfo\\n");
             try writer.writeAll("getpeerinfo\\n");
@@ -7027,6 +7085,7 @@ pub const RpcServer = struct {
             try writer.writeAll("verifymessage\\n");
             try writer.writeAll("help\\n");
             try writer.writeAll("stop\\n");
+            try writer.writeAll("uptime\\n");
             try writer.writeAll("\"");
         }
 
@@ -7212,6 +7271,29 @@ fn getDifficulty(bits: u32) f64 {
     }
 
     return diff;
+}
+
+/// Write the full-precision 64-char hex target derived from compact bits.
+/// Matches Bitcoin Core GetTarget() / DeriveTarget() logic.
+fn writeTargetHex(writer: anytype, bits: u32) !void {
+    const exponent: usize = (bits >> 24) & 0xFF;
+    const mantissa: u32 = bits & 0x007F_FFFF;
+
+    var target: [32]u8 = [_]u8{0} ** 32;
+
+    if (exponent >= 1 and exponent <= 32) {
+        const byte2: u8 = @intCast((mantissa >> 16) & 0xff);
+        const byte1: u8 = @intCast((mantissa >> 8) & 0xff);
+        const byte0: u8 = @intCast(mantissa & 0xff);
+        const pos: usize = 32 - exponent;
+        if (pos < 32) target[pos] = byte2;
+        if (pos + 1 < 32) target[pos + 1] = byte1;
+        if (pos + 2 < 32) target[pos + 2] = byte0;
+    }
+
+    for (target) |byte| {
+        try writer.print("{x:0>2}", .{byte});
+    }
 }
 
 /// Write script as disassembled opcodes (simplified ASM output).
