@@ -588,6 +588,14 @@ pub const Peer = struct {
     /// (net_processing.h:44).
     advertise_node_bloom: bool = false,
 
+    /// BIP-159: when true, OR `NODE_NETWORK_LIMITED` (1<<10) into the
+    /// outbound `services` bitfield in the version handshake.  Set when
+    /// prune mode is enabled (`-prune > 0`).  Mirrors Core's
+    /// `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
+    /// `IsPruneMode()` is true).  Peers seeing this bit must not request
+    /// blocks below the recent-`MIN_BLOCKS_TO_KEEP` (288) keep window.
+    advertise_node_network_limited: bool = false,
+
     /// BIP-324 v2 transport protocol version.
     transport_version: TransportVersion = .v1,
 
@@ -1254,6 +1262,11 @@ pub const Peer = struct {
         const our_services: u64 = blk: {
             var s: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
             if (self.advertise_node_bloom) s |= p2p.NODE_BLOOM;
+            // BIP-159: signal limited-archive serving when prune mode is on.
+            // Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in
+            // the auto-prune case (the node still has the recent-288 window),
+            // so we keep NODE_NETWORK set as well.
+            if (self.advertise_node_network_limited) s |= p2p.NODE_NETWORK_LIMITED;
             break :blk s;
         };
 
@@ -2082,6 +2095,12 @@ pub const PeerManager = struct {
     /// Core's `DEFAULT_PEERBLOOMFILTERS = false` (net_processing.h:44).
     peerbloomfilters: bool = false,
 
+    /// BIP-159: when true, advertise NODE_NETWORK_LIMITED (1<<10) in
+    /// outgoing VERSION messages.  Wired from `chain_state.prune_target_mib > 0`
+    /// at peer-creation time so peers know we serve only the recent
+    /// `MIN_BLOCKS_TO_KEEP` (288) keep window.
+    advertise_node_network_limited: bool = false,
+
     /// Per-address fall-back set for BIP-324 v2 outbound negotiation.
     /// Once we've tried v2 against an address and fallen back to v1 (because
     /// the peer didn't speak v2 — a non-ellswift response or a deadline
@@ -2145,6 +2164,7 @@ pub const PeerManager = struct {
             .last_stall_recovery = 0,
             .in_drain = false,
             .peerbloomfilters = false,
+            .advertise_node_network_limited = false,
             .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
             .header_index = std.AutoHashMap(types.Hash256, BlockHeaderEntry).init(allocator),
             .pending_reorg = null,
@@ -2229,6 +2249,7 @@ pub const PeerManager = struct {
                 return null;
             };
             peer.advertise_node_bloom = self.peerbloomfilters;
+            peer.advertise_node_network_limited = self.advertise_node_network_limited;
 
             // Attach an initiator-mode V2Transport to the peer and let it
             // drive the cipher handshake.  The transport's init() already
@@ -2286,6 +2307,7 @@ pub const PeerManager = struct {
             return null;
         };
         peer.advertise_node_bloom = self.peerbloomfilters;
+        peer.advertise_node_network_limited = self.advertise_node_network_limited;
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -2901,6 +2923,7 @@ pub const PeerManager = struct {
         const peer = try self.allocator.create(Peer);
         peer.* = Peer.accept(conn.stream, conn.address, self.network_params, self.allocator);
         peer.advertise_node_bloom = self.peerbloomfilters;
+        peer.advertise_node_network_limited = self.advertise_node_network_limited;
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -4069,7 +4092,16 @@ pub const PeerManager = struct {
                 }
             },
             .getdata => |gd| {
-                // Serve requested blocks to peers (check relay cache and pending buffer)
+                // Serve requested blocks to peers (check relay cache and pending buffer).
+                //
+                // BIP-159 peer-served-blocks gate: when prune mode is on, an
+                // honest peer respecting our NODE_NETWORK_LIMITED bit will not
+                // request blocks below tip-288.  If a peer ignores that bit
+                // and asks for a pre-prune block, the served_blocks /
+                // block_buffer caches won't contain it (they hold only the
+                // most recent connected blocks) and the existing else-branch
+                // below already replies with `notfound`, matching Core's
+                // ProcessGetBlockData behaviour for pruned-block requests.
                 defer self.allocator.free(gd.inventory);
                 for (gd.inventory) |item| {
                     const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
