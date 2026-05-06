@@ -2825,7 +2825,26 @@ pub const RpcServer = struct {
         // validateSubmitBlockOrReject routes through validation.acceptBlock
         // (the unified entry point, Core ProcessNewBlock parity).
         const block_hash = crypto.computeBlockHash(&block_data.header);
-        const submit_height = self.chain_state.best_height + 1;
+
+        // Pattern X (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md):
+        // Derive submit_height from the BLOCK'S parent in the block index,
+        // not from the active tip. Core's ContextualCheckBlockHeader uses
+        // `pindexPrev->nHeight + 1` (validation.cpp:4072) which is the
+        // parent in the block index — NOT the active tip — so that
+        // BIP-34 height enforcement works correctly for side-branch
+        // blocks during a reorg-via-submitblock. Without this, a B1 that
+        // forks off A0 (h=110) and encodes coinbase height 111 is
+        // mis-rejected with bad-cb-height when the active tip has
+        // already advanced to A2 (h=112), because the validator would
+        // expect height 113.
+        //
+        // Falls back to active-tip-relative arithmetic when the parent
+        // is not in the block index. See block_template.deriveSubmitHeight.
+        const submit_height: u32 = block_template.deriveSubmitHeight(
+            &block_data.header.prev_block,
+            self.chain_manager,
+            self.chain_state.best_height,
+        );
 
         // BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
         // block.nTime must be strictly greater than the median-time-past of
@@ -2850,8 +2869,17 @@ pub const RpcServer = struct {
             return self.jsonRpcResult(buf.items, id);
         }
 
-        // Submit block
-        const result = block_template.submitBlock(&block_data, self.chain_state, self.network_params, self.allocator) catch {
+        // Submit block. Pass chain_manager so submitBlockWithIndex can
+        // derive height parent-relative (Pattern X — see rpc.zig
+        // submit_height blk above and block_template.submitBlockWithIndex
+        // doc-comment).
+        const result = block_template.submitBlockWithIndex(
+            &block_data,
+            self.chain_state,
+            self.network_params,
+            self.chain_manager,
+            self.allocator,
+        ) catch {
             // Unexpected Zig error (allocator / I/O) — use "rejected" catch-all.
             return self.jsonRpcResult("\"rejected\"", id);
         };
