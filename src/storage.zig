@@ -126,6 +126,14 @@ pub const Database = struct {
     handle: *anyopaque,
     allocator: std.mem.Allocator,
 
+    /// Pattern D (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-
+    /// 2026-05-05.md) — monotonic counter of writeBatch invocations.
+    /// Used by the multi-block atomicity tests to assert that an N+M
+    /// reorg produces exactly ONE writeBatch call.  Cheap (single u64
+    /// increment) and unconditionally enabled — observability only,
+    /// no behavior change.
+    write_batch_calls: u64 = 0,
+
     /// Open or create the database at the given path.
     /// `block_cache_mib` sizes the RocksDB LRU block cache in MiB
     /// (typically the same value as the user's `--dbcache` flag).
@@ -167,6 +175,7 @@ pub const Database = struct {
 
     /// Batch write: apply multiple operations atomically.
     pub fn writeBatch(self: *Database, operations: []const BatchOp) StorageError!void {
+        self.write_batch_calls += 1;
         return storage_rocksdb.dbWriteBatch(self, operations);
     }
 
@@ -1964,6 +1973,31 @@ pub const ChainState = struct {
     /// preserves last-write-wins semantics).
     pending_tx_index_deletes: std.ArrayList(types.Hash256) = undefined,
 
+    // ----------------------------------------------------------------------
+    // Pattern D (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-
+    // 2026-05-05.md): multi-block reorg disconnect+reconnect must commit in
+    // ONE atomic RocksDB WriteBatch.  Previously (3f3ba26-and-prior),
+    // disconnectBlockByHashCF and connectBlockFastWithUndo each invoked
+    // flush() per block — an N+M reorg = N+M separate batches; a crash
+    // between two batches left the chainstate at an intermediate
+    // mid-reorg height.  Now reorgToChain accumulates ALL pending writes
+    // (UTXO mutations, undo bytes, undo deletes, tx-index, block bodies,
+    // tip) across all N+M blocks into a single flush() at the end.
+    //
+    // pending_undo_deletes tracks the CF_BLOCK_UNDO entries that need to
+    // be removed when their block is disconnected.  Pre-Pattern-D the
+    // delete was an out-of-batch `db.delete(CF_BLOCK_UNDO, hash)` (the
+    // direct call at storage.zig:2886 — which was inherently non-atomic
+    // with the rest of the disconnect's flush WriteBatch); Pattern D
+    // moves it into the batch so the single-batch invariant holds for
+    // every column family touched by a reorg.
+    /// Per-block CF_BLOCK_UNDO deletes pending durable commit. Populated
+    /// by disconnectBlockByHashCFNoFlush; drained in flush() into the
+    /// batch alongside the UTXO restores + tip rewind so a crash mid-
+    /// flush leaves either both sides committed or neither.  Empty when
+    /// no disconnect is pending.
+    pending_undo_deletes: std.ArrayList(types.Hash256) = undefined,
+
     pub const PendingBlockWrite = struct {
         hash: types.Hash256,
         bytes: []u8,
@@ -2081,6 +2115,7 @@ pub const ChainState = struct {
             .pending_undo_writes = std.ArrayList(PendingUndoWrite).init(allocator),
             .pending_tx_index_writes = std.ArrayList(PendingTxIndexWrite).init(allocator),
             .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
+            .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
         };
     }
 
@@ -2097,6 +2132,7 @@ pub const ChainState = struct {
             .pending_undo_writes = std.ArrayList(PendingUndoWrite).init(allocator),
             .pending_tx_index_writes = std.ArrayList(PendingTxIndexWrite).init(allocator),
             .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
+            .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
         };
     }
 
@@ -2150,6 +2186,11 @@ pub const ChainState = struct {
         // resyncs from a `-reindex-chainstate` walk).
         self.pending_tx_index_writes.deinit();
         self.pending_tx_index_deletes.deinit();
+        // Pattern D: pending CF_BLOCK_UNDO deletes hold inline 32-byte
+        // hashes (no heap), so a plain deinit() is sufficient.  Drop the
+        // queue on a flush_error path — the on-disk undo entries are
+        // still resident and a restart-from-disk recovers cleanly.
+        self.pending_undo_deletes.deinit();
         self.utxo_set.deinit();
     }
 
@@ -2679,6 +2720,32 @@ pub const ChainState = struct {
         hash: *const types.Hash256,
         height: u32,
     ) !void {
+        return self.connectBlockFastWithUndoInner(block, hash, height, true);
+    }
+
+    /// Pattern D no-flush variant of connectBlockFastWithUndo.  Same per-
+    /// block connect work — tip advance, UTXO mutations, undo+txindex+body
+    /// queue — but does NOT call flush() at the end.  Used by
+    /// `reorgToChain` to accumulate M connects (after N disconnects) into a
+    /// single shared WriteBatch.  Callers MUST call flush() (success path)
+    /// or set flush_error + drop queues (failure path) before any other
+    /// state-modifying call.
+    pub fn connectBlockFastWithUndoNoFlush(
+        self: *ChainState,
+        block: *const types.Block,
+        hash: *const types.Hash256,
+        height: u32,
+    ) !void {
+        return self.connectBlockFastWithUndoInner(block, hash, height, false);
+    }
+
+    fn connectBlockFastWithUndoInner(
+        self: *ChainState,
+        block: *const types.Block,
+        hash: *const types.Hash256,
+        height: u32,
+        do_flush: bool,
+    ) !void {
         self.connect_mutex.lock();
         defer self.connect_mutex.unlock();
 
@@ -2712,15 +2779,19 @@ pub const ChainState = struct {
             });
         }
 
-        // Atomic flush: tip + UTXOs + CF_BLOCKS body + CF_BLOCK_UNDO entry
-        // all commit in one WriteBatch.  If this fails, flush() leaves the
-        // pending queues intact for retry on the next call (after operator
-        // intervention to clear flush_error).
-        self.flush() catch |err| {
-            std.debug.print("connectBlockFastWithUndo: flush failed at height {d}: {} — halting IBD\n", .{ height, err });
-            self.flush_error = true;
-            return error.FlushError;
-        };
+        if (do_flush) {
+            // Atomic flush: tip + UTXOs + CF_BLOCKS body + CF_BLOCK_UNDO entry
+            // all commit in one WriteBatch.  If this fails, flush() leaves the
+            // pending queues intact for retry on the next call (after operator
+            // intervention to clear flush_error).
+            self.flush() catch |err| {
+                std.debug.print("connectBlockFastWithUndo: flush failed at height {d}: {} — halting IBD\n", .{ height, err });
+                self.flush_error = true;
+                return error.FlushError;
+            };
+        }
+        // do_flush == false: caller (reorgToChain) is batching multiple
+        // connects under a single shared flush() at the end.
     }
 
     /// Read the serialized undo bytes for a block from CF_BLOCK_UNDO.
@@ -2754,6 +2825,31 @@ pub const ChainState = struct {
     pub fn disconnectBlockByHashCF(
         self: *ChainState,
         hash: *const types.Hash256,
+    ) !void {
+        return self.disconnectBlockByHashCFInner(hash, true);
+    }
+
+    /// Pattern D (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-
+    /// 2026-05-05.md): no-flush variant of disconnectBlockByHashCF.  Same
+    /// per-block disconnect work — UTXO rewind, tip move, undo-bytes
+    /// queue — but does NOT call flush() at the end and does NOT issue a
+    /// direct `db.delete(CF_BLOCK_UNDO, hash)`; instead the undo-delete
+    /// is queued in `pending_undo_deletes` and flush() drains it into the
+    /// shared WriteBatch.  Used by `reorgToChain` to accumulate N
+    /// disconnects into the same single-batch envelope as the M connects
+    /// that follow.  Callers MUST call flush() (success path) or drop
+    /// the queues (failure path) before any other state-modifying call.
+    pub fn disconnectBlockByHashCFNoFlush(
+        self: *ChainState,
+        hash: *const types.Hash256,
+    ) !void {
+        return self.disconnectBlockByHashCFInner(hash, false);
+    }
+
+    fn disconnectBlockByHashCFInner(
+        self: *ChainState,
+        hash: *const types.Hash256,
+        do_flush: bool,
     ) !void {
         self.connect_mutex.lock();
         defer self.connect_mutex.unlock();
@@ -2878,26 +2974,38 @@ pub const ChainState = struct {
         self.best_hash = block.header.prev_block;
         if (self.best_height > 0) self.best_height -= 1;
 
-        // Queue a delete of the CF_BLOCK_UNDO entry for the disconnected
-        // block — it's no longer needed once rewound.  We do this via a
-        // direct db.delete; the next flush() commits the tip rewind and
-        // any UTXO mutations atomically.  Idempotent if the delete races
-        // with a re-connect.
-        db.delete(CF_BLOCK_UNDO, hash) catch {};
+        // Pattern D: queue the CF_BLOCK_UNDO delete into pending_undo_deletes
+        // so flush() drains it inside the same WriteBatch as the UTXO
+        // restores + tip rewind + CF_TX_INDEX deletes.  Pre-Pattern-D
+        // (3f3ba26 and earlier) this was a direct `db.delete(CF_BLOCK_UNDO,
+        // hash)` outside the batch — non-atomic with the rest of the
+        // disconnect, and worse: in the multi-block reorg path, each
+        // disconnect issued its own batch, so a crash between two
+        // disconnects could leave the chain rolled back N-k blocks but with
+        // the next-disconnect's undo entry still resident on disk.  Now the
+        // delete commits in the single reorg batch, atomic with everything
+        // else.  Idempotent if the delete races with a re-connect (RocksDB
+        // delete-of-missing-key is a no-op).
+        try self.pending_undo_deletes.append(hash.*);
 
-        // Flush so the tip rewind + UTXO mutations land on disk
-        // immediately.  Without this, a caller that runs disconnect
-        // followed by `get()` would still see the spent outputs in DB
-        // because the per-output `spend()` only queues a pending_delete.
-        // Critically: a reorg loop that disconnects N blocks back to a
-        // fork point and immediately tries to connect N' blocks forward
-        // must not race a partial-flush window where DB shows tip=N but
-        // UTXOs reflect tip=K (K = fork point).
-        self.flush() catch |err| {
-            std.debug.print("disconnectBlockByHashCF: flush failed: {}\n", .{err});
-            self.flush_error = true;
-            return error.FlushError;
-        };
+        if (do_flush) {
+            // Flush so the tip rewind + UTXO mutations land on disk
+            // immediately.  Without this, a caller that runs disconnect
+            // followed by `get()` would still see the spent outputs in DB
+            // because the per-output `spend()` only queues a pending_delete.
+            // Critically: a reorg loop that disconnects N blocks back to a
+            // fork point and immediately tries to connect N' blocks forward
+            // must not race a partial-flush window where DB shows tip=N but
+            // UTXOs reflect tip=K (K = fork point).
+            self.flush() catch |err| {
+                std.debug.print("disconnectBlockByHashCF: flush failed: {}\n", .{err});
+                self.flush_error = true;
+                return error.FlushError;
+            };
+        }
+        // do_flush == false: caller (reorgToChain) is accumulating multiple
+        // blocks' worth of mutations into the same flush() WriteBatch.
+        // Queues persist until that flush.
     }
 
     /// One block on the new chain in a reorg: header parent + serialized
@@ -2907,6 +3015,20 @@ pub const ChainState = struct {
         block: types.Block,
         height: u32,
     };
+
+    /// Pattern D — multi-block reorg atomicity.  CORE-PARITY-AUDIT/
+    /// _post-reorg-consistency-fleet-result-2026-05-05.md flagged clearbit
+    /// (and 8 other impls) as D-AT-RISK: per-block disconnect+connect was
+    /// already atomic, but a multi-block reorg = N+M *separate* batches.
+    /// A crash between batches left the on-disk chainstate at an
+    /// intermediate mid-reorg height.  This bound matches the worst-case
+    /// reorg the wiretap accepts today and gives an upper bound on the
+    /// in-memory queue allocations the single-batch path holds onto
+    /// before commit.  Above this depth the reorg is rejected as
+    /// "ReorgTooDeep" — the operator is expected to investigate (a 100-
+    /// block reorg in the wild would be a major chain-split incident,
+    /// not something to silently apply).
+    pub const MAX_REORG_DEPTH: u32 = 100;
 
     /// Switch the active chain to the new branch ending at `new_tip_hash`.
     ///
@@ -2918,35 +3040,77 @@ pub const ChainState = struct {
     /// previous element's hash, with the first element's prev_block ==
     /// fork_point_hash).
     ///
+    /// Pattern D atomicity (CORE-PARITY-AUDIT/_post-reorg-consistency-
+    /// fleet-result-2026-05-05.md): the disconnect+connect sequence
+    /// commits in ONE shared RocksDB WriteBatch via the no-flush
+    /// variants of `disconnectBlockByHashCF` and
+    /// `connectBlockFastWithUndo`.  A crash mid-reorg therefore lands
+    /// on either the pre-reorg state (no batch committed) or the
+    /// post-reorg state (batch committed atomically by RocksDB) — never
+    /// the partial-mid-reorg state that the per-block loop produced.
+    ///
     /// Algorithm (Bitcoin Core ActivateBestChain analog):
     ///   1. While tip != fork_point: disconnect current tip via
-    ///      disconnectBlockByHashCF.  The undo data for each disconnect
-    ///      MUST be present in CF_BLOCK_UNDO (i.e. the original connect
-    ///      went through the reorg-safe path).  If undo is missing for
-    ///      any block on the disconnect path the reorg aborts and the
-    ///      chain stays on its original tip.
+    ///      `disconnectBlockByHashCFNoFlush`.  Each disconnect's UTXO
+    ///      restores, tip rewind, CF_BLOCK_UNDO delete, and CF_TX_INDEX
+    ///      deletes are appended to the shared pending queues without
+    ///      hitting the disk.  Capped at `MAX_REORG_DEPTH = 100` to bound
+    ///      in-memory queue allocations for an attacker-supplied bad
+    ///      fork_point.  The undo data for each disconnect MUST be
+    ///      present in CF_BLOCK_UNDO (i.e. the original connect went
+    ///      through the reorg-safe path).  If undo is missing for any
+    ///      block on the disconnect path the reorg aborts before any
+    ///      flush and the chain stays on its original on-disk tip.
     ///   2. For each block in new_chain (in order): validate the
-    ///      prev_block linkage against the live tip, then call
-    ///      connectBlockFastWithUndo.  Stops at the first failure with
-    ///      the chain in a partially-applied state — the caller is
-    ///      expected to bail-and-retry rather than try to roll back
-    ///      mid-reorg.
+    ///      prev_block linkage against the (in-memory) tip, queue the
+    ///      body, then call `connectBlockFastWithUndoNoFlush`.  Per-tx
+    ///      UTXO mutations, undo bytes, txindex puts, and tip advance
+    ///      go into the shared pending queues alongside the
+    ///      disconnect-side state from step 1.
+    ///   3. Single `flush()` commits the whole sequence atomically.
+    ///      On flush failure, queues are dropped and `flush_error` is
+    ///      set sticky — operator must restart, on-disk state =
+    ///      pre-reorg.
+    ///
+    /// On any per-block failure (read undo bytes, decode, height
+    /// mismatch, etc.) before the final flush, we set `flush_error`
+    /// sticky and drop all pending queues.  The on-disk chain is still
+    /// at the pre-reorg tip; on restart we resume from there.  In-memory
+    /// state IS divergent at that point (tip already partially advanced/
+    /// rewound) — flush_error blocks any further state mutation, so the
+    /// only path forward is restart.
     ///
     /// Returns the number of blocks connected on the new chain on
     /// success.  Errors are propagated from the underlying
-    /// disconnectBlockByHashCF / connectBlockFastWithUndo paths.
+    /// per-block helpers.
     pub fn reorgToChain(
         self: *ChainState,
         fork_point_hash: *const types.Hash256,
         new_chain: []const ReorgBlock,
     ) !u32 {
+        // Pattern D bound: reject any reorg whose new-chain segment alone
+        // would exceed the in-memory queue cap, before even starting the
+        // disconnect walk.  Saves the operator from a wasted disconnect
+        // pass in the "fat new chain, bad fork_point" misuse.
+        if (new_chain.len > MAX_REORG_DEPTH) {
+            std.debug.print(
+                "reorgToChain: new_chain.len={d} exceeds MAX_REORG_DEPTH={d} — aborting\n",
+                .{ new_chain.len, MAX_REORG_DEPTH },
+            );
+            return error.ReorgTooDeep;
+        }
+
         // Walk back to the fork point, disconnecting each block along the
-        // way.  Bound the work by some max reasonable depth to prevent
-        // an attacker who supplies a "fork point" that ISN'T actually on
-        // the active chain from spinning the loop forever.  288 (Core's
-        // MIN_BLOCKS_TO_KEEP) is the standard reorg depth tolerance.
+        // way.  Bound the work to MAX_REORG_DEPTH = 100.
         var disconnect_count: u32 = 0;
-        const MAX_REORG_DEPTH: u32 = MIN_BLOCKS_TO_KEEP;
+
+        // Pattern D: errdefer drops pending queues on any failure path
+        // before the final flush.  The on-disk state is unchanged
+        // (no flush yet) and the in-memory tip is now divergent — set
+        // flush_error sticky to block further mutation.  Deliberately
+        // does NOT reset best_hash / best_height: a restart loads the
+        // on-disk pre-reorg tip, which is the correct recovery state.
+        errdefer self.abortReorgInProgress();
 
         while (!std.mem.eql(u8, &self.best_hash, fork_point_hash)) {
             if (disconnect_count >= MAX_REORG_DEPTH) {
@@ -2970,13 +3134,15 @@ pub const ChainState = struct {
                 return error.ForkPointNotOnChain;
             }
             const tip_hash_copy = self.best_hash;
-            try self.disconnectBlockByHashCF(&tip_hash_copy);
+            try self.disconnectBlockByHashCFNoFlush(&tip_hash_copy);
             disconnect_count += 1;
         }
 
         // Connect new_chain forward.  Each block must chain to the
         // previous one; serialize the body and queue it before connect
-        // so CF_BLOCKS gets the bytes too.
+        // so CF_BLOCKS gets the bytes too.  All connect-side mutations
+        // accumulate in the same pending queues as the disconnect-side
+        // state from above, so the final flush() commits one giant batch.
         var connect_count: u32 = 0;
         for (new_chain) |entry| {
             // Linkage check: caller is supposed to guarantee this, but
@@ -3004,8 +3170,26 @@ pub const ChainState = struct {
             const owned: []u8 = @constCast(owned_const);
             try self.queueBlockWrite(&entry.hash, owned, entry.height);
 
-            try self.connectBlockFastWithUndo(&entry.block, &entry.hash, entry.height);
+            try self.connectBlockFastWithUndoNoFlush(&entry.block, &entry.hash, entry.height);
             connect_count += 1;
+        }
+
+        // Pattern D single-batch commit: every disconnect-side and
+        // connect-side mutation accumulated since reorgToChain entry
+        // lands in this one WriteBatch.  RocksDB guarantees atomicity:
+        // all-or-nothing.  Crash before this returns = pre-reorg state
+        // on disk.  Crash after this returns = post-reorg state on
+        // disk.  Never an intermediate.
+        if (self.utxo_set.db != null) {
+            self.flush() catch |err| {
+                std.debug.print("reorgToChain: final flush failed: {}\n", .{err});
+                // flush() already set flush_error and freed batch keys;
+                // the pending queues are kept around for a retry slot
+                // that won't come (flush_error is sticky).  Drop them
+                // here so the eventual deinit() path is clean.
+                self.abortReorgInProgress();
+                return error.FlushError;
+            };
         }
 
         std.debug.print(
@@ -3013,6 +3197,46 @@ pub const ChainState = struct {
             .{ disconnect_count, connect_count, self.best_height },
         );
         return connect_count;
+    }
+
+    /// Pattern D abort path — drop all pending queues populated during a
+    /// reorg, set flush_error sticky.  Called on any error before the
+    /// final reorgToChain flush() and on flush failure.  Frees heap-
+    /// owned bytes (block bodies + undo bytes) so the eventual deinit()
+    /// path is clean.
+    ///
+    /// Does NOT roll back the in-memory tip — the disconnect/connect
+    /// loop has already mutated `best_hash`/`best_height` and the
+    /// `utxo_set` cache state.  flush_error sticky-blocks any further
+    /// mutation; restart loads the on-disk pre-reorg tip and resumes
+    /// from there.
+    fn abortReorgInProgress(self: *ChainState) void {
+        // Free heap-owned bytes so deinit() doesn't double-free or leak.
+        for (self.pending_block_writes.items) |entry| {
+            self.allocator.free(entry.bytes);
+        }
+        self.pending_block_writes.clearRetainingCapacity();
+
+        for (self.pending_undo_writes.items) |entry| {
+            self.allocator.free(entry.bytes);
+        }
+        self.pending_undo_writes.clearRetainingCapacity();
+
+        self.pending_tx_index_writes.clearRetainingCapacity();
+        self.pending_tx_index_deletes.clearRetainingCapacity();
+        self.pending_undo_deletes.clearRetainingCapacity();
+
+        // utxo_set's pending_deletes / dirty_keys are NOT freed here:
+        // they hold tracker entries pointing into the cache hashmap
+        // (which still owns the byte buffers).  Drop the trackers so
+        // flush() doesn't try to commit them; the cache itself is
+        // sticky-divergent until restart, but flush_error blocks all
+        // further reads-after-write through chain_state so the
+        // divergence is unobservable to callers.
+        self.utxo_set.pending_deletes.clearRetainingCapacity();
+        self.utxo_set.dirty_keys.clearRetainingCapacity();
+
+        self.flush_error = true;
     }
 
     fn connectBlockInner(
@@ -3411,16 +3635,33 @@ pub const ChainState = struct {
         // 7. Pending CF_TX_INDEX deletes (Pattern C revert) — append BEFORE
         //    the puts so a delete-then-write within a single flush window
         //    preserves last-write-wins (the put would land last in the
-        //    array).  In practice connect and disconnect within a single
-        //    flush window do not occur on the same txid (reorgToChain
-        //    flushes between disconnect and connect), but this ordering
-        //    matches the existing pending_deletes-before-dirty_keys
-        //    convention in section 1+2 above.
+        //    array).  In a multi-block reorg (Pattern D, single shared
+        //    flush) a tx may be both deleted (from the disconnected block)
+        //    and re-written (in a new-chain block at the same height) in
+        //    the same flush window — RocksDB applies batch ops in array
+        //    order so the put wins, exactly the desired semantics.
         for (self.pending_tx_index_deletes.items) |txid| {
             const k = try self.allocator.alloc(u8, 32);
             @memcpy(k, &txid);
             try batch.append(.{ .delete = .{
                 .cf = CF_TX_INDEX,
+                .key = k,
+            } });
+        }
+
+        // 7b. Pending CF_BLOCK_UNDO deletes (Pattern D — see CORE-PARITY-
+        //     AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+        //     Populated by `disconnectBlockByHashCFInner` for the undo
+        //     entry of every disconnected block.  Pre-Pattern-D this was
+        //     a direct out-of-batch `db.delete(CF_BLOCK_UNDO, hash)` per
+        //     disconnect; pulling it into the shared batch is what makes
+        //     a multi-block reorg fully atomic across all column families
+        //     it touches.  Empty queue for any non-reorg flush.
+        for (self.pending_undo_deletes.items) |bh| {
+            const k = try self.allocator.alloc(u8, 32);
+            @memcpy(k, &bh);
+            try batch.append(.{ .delete = .{
+                .cf = CF_BLOCK_UNDO,
                 .key = k,
             } });
         }
@@ -3512,6 +3753,11 @@ pub const ChainState = struct {
             // copies allocated above.
             self.pending_tx_index_writes.clearRetainingCapacity();
             self.pending_tx_index_deletes.clearRetainingCapacity();
+
+            // Pattern D: CF_BLOCK_UNDO deletes committed.  Inline Hash256
+            // values, no heap to free; the BatchOp cleanup loop handles
+            // the per-op key copies.
+            self.pending_undo_deletes.clearRetainingCapacity();
 
             // Free allocated keys and values
             for (batch.items) |op| {
@@ -6438,6 +6684,357 @@ test "Pattern C0: connect→disconnect→reconnect preserves indexed entry" {
     try std.testing.expectEqualSlices(u8, &bh1, &re_entry.block_hash);
     try std.testing.expectEqual(@as(u32, 1), re_entry.block_height);
     try std.testing.expectEqual(@as(u32, 0), re_entry.tx_index_in_block);
+}
+
+// ============================================================================
+// Pattern D Tests — multi-block reorg atomicity (single shared WriteBatch)
+// ============================================================================
+//
+// Spec: CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md
+// Companion: 3f3ba26 (Pattern C0 single-block atomic flush queue).
+//
+// What's being tested:
+//
+//   1. Single-batch property — a 3-deep reorg accumulates ALL N+M blocks'
+//      worth of CF_UTXO + CF_BLOCK_UNDO + CF_TX_INDEX + CHAIN_TIP +
+//      CF_BLOCKS mutations into ONE flush() WriteBatch.  Asserted by
+//      gating db.writeBatch through a counter and verifying exactly one
+//      call across the reorg.
+//
+//   2. Crash-pre-commit — if reorgToChain fails before the final flush
+//      (we simulate by injecting an unreachable fork_point that takes
+//      the disconnect path past genesis), the on-disk pre-reorg tip is
+//      still intact: zero new tip writes, zero CF_BLOCK_UNDO deletes,
+//      zero CF_TX_INDEX deletes committed.
+//
+//   3. Memory cap — a synthesized new_chain longer than MAX_REORG_DEPTH
+//      = 100 is rejected up front with error.ReorgTooDeep before any
+//      disconnect is attempted.
+
+test "Pattern D: multi-block reorg commits in a single shared WriteBatch" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    chain_state.txindex_enabled = true;
+
+    // Build chain A: 3 blocks (genesis → A1 → A2 → A3) via per-block
+    // connectBlockFastWithUndo.  Each connect calls flush() once — by
+    // the end of this loop we've issued exactly 3 batches (one per
+    // block).  We don't measure that; the test focus is on the
+    // SUBSEQUENT reorg's batch count.
+    var hashes_a: [3]types.Hash256 = undefined;
+    var prev: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        const block = makeReorgTestBlock(prev, @intCast(h), 0xAD);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        bh[1] = 0xAD;
+        hashes_a[h - 1] = bh;
+
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh, owned, h);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev = bh;
+    }
+    try std.testing.expectEqual(@as(u32, 3), chain_state.best_height);
+
+    // Build chain B: 5 blocks from genesis.  Forces a 3-disconnect +
+    // 5-connect reorg.
+    var blocks_b: [5]types.Block = undefined;
+    var hashes_b: [5]types.Hash256 = undefined;
+    var prev_b: [32]u8 = [_]u8{0} ** 32;
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        blocks_b[i] = makeReorgTestBlock(prev_b, @intCast(i + 1), 0xBD);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(i + 1);
+        bh[1] = 0xBD;
+        hashes_b[i] = bh;
+        prev_b = bh;
+    }
+
+    var new_chain: [5]ChainState.ReorgBlock = undefined;
+    var j: usize = 0;
+    while (j < 5) : (j += 1) {
+        new_chain[j] = .{
+            .hash = hashes_b[j],
+            .block = blocks_b[j],
+            .height = @intCast(j + 1),
+        };
+    }
+
+    // Capture pending-queue state RIGHT BEFORE the reorg fires.  After
+    // a clean per-block flush above, all queues should be empty.
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_block_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_undo_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_undo_deletes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_deletes.items.len);
+
+    // Take a baseline of writeBatch invocations BEFORE the reorg.
+    const writes_before = db.write_batch_calls;
+
+    // Fire the reorg.  Pattern D: the disconnect+connect sequence MUST
+    // commit in exactly one writeBatch.
+    const fork_point: types.Hash256 = [_]u8{0} ** 32;
+    const connected = try chain_state.reorgToChain(&fork_point, &new_chain);
+    try std.testing.expectEqual(@as(u32, 5), connected);
+
+    // Single-batch property: exactly one writeBatch call across the
+    // entire reorg (all 3 disconnects + all 5 connects + tip + height
+    // index + CF_BLOCKS bodies + CF_BLOCK_UNDO writes + CF_BLOCK_UNDO
+    // deletes for the 3 orphaned blocks + CF_TX_INDEX writes + deletes).
+    const writes_after = db.write_batch_calls;
+    const reorg_writes = writes_after - writes_before;
+    if (reorg_writes != 1) {
+        std.debug.print(
+            "Pattern D atomicity broken: reorgToChain issued {d} writeBatch calls (expected 1)\n",
+            .{reorg_writes},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    // Tip is on chain B's tip.
+    try std.testing.expectEqual(@as(u32, 5), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &hashes_b[4], &chain_state.best_hash);
+
+    // Pending queues drained by the single shared flush().
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_block_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_undo_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_undo_deletes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_deletes.items.len);
+
+    // CF_BLOCK_UNDO entries for the disconnected chain-A blocks must be
+    // gone (Pattern D: undo deletes commit in the shared batch).
+    for (hashes_a) |bh| {
+        const u = try db.get(CF_BLOCK_UNDO, &bh);
+        if (u) |bytes| {
+            defer allocator.free(bytes);
+            std.debug.print(
+                "Pattern D: CF_BLOCK_UNDO entry for orphaned chain-A block {x} still present after reorg\n",
+                .{bh[0]},
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // CF_BLOCK_UNDO entries for the new chain-B blocks must be present.
+    for (hashes_b) |bh| {
+        const u = (try db.get(CF_BLOCK_UNDO, &bh)) orelse {
+            std.debug.print(
+                "Pattern D: CF_BLOCK_UNDO missing for chain-B block {x} after reorg\n",
+                .{bh[0]},
+            );
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(u);
+    }
+}
+
+test "Pattern D: failure before final flush leaves pre-reorg state on disk" {
+    // Crash-pre-commit invariant: if reorgToChain hits an error AFTER
+    // some disconnects but BEFORE the final flush, the on-disk tip
+    // and CF_BLOCK_UNDO entries must reflect the pre-reorg state
+    // (i.e. exactly what the last successful per-block flush wrote
+    // before the reorg started).
+    //
+    // We trigger the failure by feeding reorgToChain a new_chain whose
+    // FIRST entry's prev_block doesn't link to the current tip post-
+    // disconnect.  reorgToChain detects this in the connect loop's
+    // linkage check and returns error.PrevBlockMismatch.  Before
+    // Pattern D, the disconnect-side flushes had already landed; now
+    // the abort path drops queues and the on-disk state is unchanged.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // Build chain A: 3 blocks.
+    var hashes_a: [3]types.Hash256 = undefined;
+    var prev: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        const block = makeReorgTestBlock(prev, @intCast(h), 0xD0);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        bh[1] = 0xD0;
+        hashes_a[h - 1] = bh;
+
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh, owned, h);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev = bh;
+    }
+
+    // Snapshot the on-disk pre-reorg tip + verify CF_BLOCK_UNDO entries
+    // for all 3 chain-A blocks are present.
+    const pre_reorg_tip = (try db.get(CF_DEFAULT, ChainStore.CHAIN_TIP_KEY)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(pre_reorg_tip);
+    try std.testing.expectEqual(@as(usize, 36), pre_reorg_tip.len);
+    const pre_height = std.mem.readInt(u32, pre_reorg_tip[32..36], .little);
+    try std.testing.expectEqual(@as(u32, 3), pre_height);
+
+    for (hashes_a) |bh| {
+        const u = (try db.get(CF_BLOCK_UNDO, &bh)) orelse {
+            std.debug.print("Pattern D pre-snapshot: CF_BLOCK_UNDO missing for {x}\n", .{bh[0]});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(u);
+    }
+
+    // Build a "new chain" whose first entry has a prev_block that does
+    // NOT match genesis (the fork_point we'll request).  The disconnect
+    // walk will tear down all 3 chain-A blocks IN MEMORY (and queue
+    // their mutations), but the connect loop will fail on linkage check
+    // BEFORE any flush — abortReorgInProgress drops queues, sets
+    // flush_error.  On-disk state stays at chain-A tip.
+    const broken_prev: [32]u8 = [_]u8{0xFF} ** 32;
+    const blockB = makeReorgTestBlock(broken_prev, 1, 0xDB);
+    const bhB: [32]u8 = [_]u8{0xDB} ** 32;
+    var new_chain: [1]ChainState.ReorgBlock = undefined;
+    new_chain[0] = .{ .hash = bhB, .block = blockB, .height = 1 };
+
+    const fork_point: types.Hash256 = [_]u8{0} ** 32;
+    const writes_before = db.write_batch_calls;
+    const result = chain_state.reorgToChain(&fork_point, &new_chain);
+    try std.testing.expectError(error.PrevBlockMismatch, result);
+    const writes_after = db.write_batch_calls;
+
+    // CRUCIAL: zero writeBatch calls.  No partial state landed.
+    try std.testing.expectEqual(@as(usize, 0), writes_after - writes_before);
+
+    // flush_error sticky-blocks any further mutation; queues are clean.
+    try std.testing.expect(chain_state.flush_error);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_block_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_undo_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_undo_deletes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_deletes.items.len);
+
+    // On-disk tip still reflects the pre-reorg state.
+    const post_reorg_tip = (try db.get(CF_DEFAULT, ChainStore.CHAIN_TIP_KEY)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(post_reorg_tip);
+    try std.testing.expectEqualSlices(u8, pre_reorg_tip, post_reorg_tip);
+
+    // CF_BLOCK_UNDO entries for chain-A still on disk (the would-have-
+    // been-batched deletes never landed because the batch never
+    // committed).
+    for (hashes_a) |bh| {
+        const u = (try db.get(CF_BLOCK_UNDO, &bh)) orelse {
+            std.debug.print(
+                "Pattern D crash-pre-commit: CF_BLOCK_UNDO for chain-A block {x} was incorrectly deleted\n",
+                .{bh[0]},
+            );
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(u);
+    }
+}
+
+test "Pattern D: new_chain longer than MAX_REORG_DEPTH=100 is rejected up front" {
+    // Memory cap: synthesize a 101-block new_chain and assert
+    // reorgToChain returns error.ReorgTooDeep before any disconnect
+    // walk runs (i.e. the fork-side state is untouched).
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // Connect a single block so best_height = 1 (avoids the
+    // walk-past-genesis short-circuit firing first).
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xE0);
+    const bh1: [32]u8 = [_]u8{0xE0} ** 32;
+    {
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block1);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh1, owned, 1);
+        try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+    }
+
+    // Synthesize a 101-entry new_chain.  The blocks themselves are
+    // throwaway — the cap fires before any of them is inspected.
+    const N: usize = 101;
+    try std.testing.expect(N > ChainState.MAX_REORG_DEPTH);
+    var blocks = try allocator.alloc(types.Block, N);
+    defer allocator.free(blocks);
+    var hashes = try allocator.alloc(types.Hash256, N);
+    defer allocator.free(hashes);
+    var rb = try allocator.alloc(ChainState.ReorgBlock, N);
+    defer allocator.free(rb);
+
+    var prev_h: [32]u8 = [_]u8{0} ** 32;
+    var k: usize = 0;
+    while (k < N) : (k += 1) {
+        blocks[k] = makeReorgTestBlock(prev_h, @intCast(k % 256), 0xE1);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        // Cheap unique hash per-entry — load only the low 4 bytes.
+        std.mem.writeInt(u32, bh[0..4], @intCast(k + 1), .little);
+        bh[31] = 0xE1;
+        hashes[k] = bh;
+        rb[k] = .{
+            .hash = bh,
+            .block = blocks[k],
+            .height = @intCast(k + 1),
+        };
+        prev_h = bh;
+    }
+
+    const writes_before = db.write_batch_calls;
+    const fork_point: types.Hash256 = [_]u8{0} ** 32;
+    const result = chain_state.reorgToChain(&fork_point, rb);
+    try std.testing.expectError(error.ReorgTooDeep, result);
+    const writes_after = db.write_batch_calls;
+
+    // The cap fires BEFORE any disconnect — zero writeBatch calls.
+    try std.testing.expectEqual(@as(usize, 0), writes_after - writes_before);
+
+    // Tip unchanged: we never started disconnecting.
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &bh1, &chain_state.best_hash);
+
+    // No flush_error: this is a pre-flight rejection, not a mid-reorg
+    // abort.
+    try std.testing.expect(!chain_state.flush_error);
 }
 
 // ============================================================================
