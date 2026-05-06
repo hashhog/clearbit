@@ -830,3 +830,345 @@ test "Pattern X: 2-chain A+B fork — derives correct heights for B1 and A2-exte
     const h_a3 = block_template.deriveSubmitHeight(&a2_hash, &manager, active_best_height);
     try testing.expectEqual(@as(u32, 113), h_a3);
 }
+
+// ====================================================================
+// Pattern Y: side-branch storage decoupling
+// ====================================================================
+//
+// Pattern X (commit 546c57a) closed the height-derivation gate so that
+// a side-branch block's BIP-34 coinbase-height check resolves correctly.
+// Pattern Y closes the downstream connect gate: when a block validates
+// but its parent is NOT the active tip (a sibling fork or competing
+// chain), submitBlockWithIndex must store body + index entry without
+// disturbing the active tip — and trigger a reorg if the new branch's
+// cumulative chain_work strictly exceeds the active tip's.
+//
+// Pre-fix the connect gate fired a generic "rejected" / PrevBlockMismatch
+// for any non-tip-extending block, the same shape the camlcoin /
+// blockbrew / rustoshi Pattern Y closures fixed in their respective
+// repos. The diff-test corpus entry `reorg-via-submitblock` exercises
+// the full A1+A2 → B1+B2 → B3 reorg flow against bitcoin-core; these
+// unit tests cover the structural invariants beneath that.
+//
+// Bitcoin Core reference: src/validation.cpp::BlockManager::AcceptBlock
+// (writes HAVE_DATA on every accepted block regardless of best-chain
+// position) + ActivateBestChain (selects heaviest valid leaf as new tip).
+
+test "Pattern Y: side-branch storage preserves active tip when chain_work <= active" {
+    // Setup: chain_state at active tip A2 (height 112). chain_manager
+    // index has A0 (h=110), A1 (h=111), A2 (h=112). active_tip = A2
+    // with strictly-positive chain_work.
+    //
+    // Action: processSideBranchSubmission(B1) where B1's parent is A0
+    // (h=110) and B1's chain_work equals A1's (single block past the
+    // common ancestor). With equal-or-lesser work the function must:
+    //   * persist B1's BlockIndexEntry to cm.block_index
+    //   * NOT touch cm.active_tip (still A2)
+    //   * NOT advance chain_state.best_height / .best_hash
+    //   * return reject_reason = "inconclusive"
+    const allocator = testing.allocator;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    var manager = validation.ChainManager.init(&cs, null, allocator);
+    defer manager.deinit();
+
+    // Seed cm.block_index with A0, A1, A2.  Each entry's chain_work is
+    // parent.chain_work + workFromBits(REGTEST difficulty bits).
+    const reg_bits: u32 = 0x207fffff;
+    const per_block_work = peer_mod.workFromBits(reg_bits);
+
+    const a0_hash: types.Hash256 = [_]u8{0xA0} ** 32;
+    var a0_work: [32]u8 = [_]u8{0} ** 32;
+    peer_mod.addChainWorkBE(&a0_work, &per_block_work);
+    const a0 = try makePatternXEntryWithWork(allocator, a0_hash, 110, null, a0_work);
+    try manager.addBlock(a0);
+
+    const a1_hash: types.Hash256 = [_]u8{0xA1} ** 32;
+    var a1_work: [32]u8 = a0_work;
+    peer_mod.addChainWorkBE(&a1_work, &per_block_work);
+    const a1 = try makePatternXEntryWithWork(allocator, a1_hash, 111, a0, a1_work);
+    try manager.addBlock(a1);
+
+    const a2_hash: types.Hash256 = [_]u8{0xA2} ** 32;
+    var a2_work: [32]u8 = a1_work;
+    peer_mod.addChainWorkBE(&a2_work, &per_block_work);
+    const a2 = try makePatternXEntryWithWork(allocator, a2_hash, 112, a1, a2_work);
+    try manager.addBlock(a2);
+    manager.active_tip = a2;
+
+    // Mirror chain_state best_hash/height with A2.
+    cs.best_hash = a2_hash;
+    cs.best_height = 112;
+
+    // Build B1 sharing parent A0.  Coinbase-only block, regtest diff
+    // bits → trivially-PoW-valid (PoW is irrelevant at the structural
+    // gate level — we're testing the side-branch storage arm, not
+    // checkBlockHeader).
+    const b1_blk = try makeForkTestBlock(allocator, a0_hash, 0xB1, reg_bits, 200);
+    defer freeTestBlock(allocator, b1_blk.block);
+
+    const before_active_tip = manager.active_tip;
+    const before_best_hash = cs.best_hash;
+    const before_best_height = cs.best_height;
+    const before_index_count = manager.block_index.count();
+
+    const result = try block_template.processSideBranchSubmission(
+        &b1_blk.block,
+        &b1_blk.hash,
+        111, // Pattern X height = parent.height + 1
+        &cs,
+        &manager,
+        a0,
+        allocator,
+    );
+
+    // Side-branch storage convention: BIP-22 "inconclusive".
+    try testing.expect(!result.accepted);
+    try testing.expect(result.reject_reason != null);
+    try testing.expectEqualStrings("inconclusive", result.reject_reason.?);
+
+    // Active tip is preserved.
+    try testing.expect(manager.active_tip == before_active_tip);
+    try testing.expectEqualSlices(u8, &before_best_hash, &cs.best_hash);
+    try testing.expectEqual(before_best_height, cs.best_height);
+
+    // B1's entry IS in cm.block_index.
+    try testing.expectEqual(before_index_count + 1, manager.block_index.count());
+    const b1_entry = manager.getBlock(&b1_blk.hash) orelse
+        return error.SideBranchEntryMissing;
+    try testing.expectEqual(@as(u32, 111), b1_entry.height);
+    try testing.expect(b1_entry.parent == a0);
+
+    // B1's chain_work = A0's chain_work + per-block work (matches A1's work).
+    try testing.expectEqualSlices(u8, &a1_work, &b1_entry.chain_work);
+}
+
+test "Pattern Y: side-branch parent lookup succeeds for B2's submission off B1" {
+    // Setup: same as above (active chain A0..A2). After B1 has been
+    // accepted as a side-branch (storage decoupled from selection),
+    // submitting B2 with parent=B1 must find B1 in cm.block_index.
+    //
+    // This is the structural reason Pattern X alone wasn't enough:
+    // without B1 stored, B2's parent lookup would fall back to the
+    // active tip and re-trip bad-cb-height. With Pattern Y storing B1,
+    // B2's parent lookup resolves to B1 (h=111) and Pattern X's height
+    // derivation gives B2 the correct h=112.
+    const allocator = testing.allocator;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    var manager = validation.ChainManager.init(&cs, null, allocator);
+    defer manager.deinit();
+
+    const reg_bits: u32 = 0x207fffff;
+    const per_block_work = peer_mod.workFromBits(reg_bits);
+
+    // Seed A0, A1, A2 (as above).
+    const a0_hash: types.Hash256 = [_]u8{0xA0} ** 32;
+    var a0_work: [32]u8 = [_]u8{0} ** 32;
+    peer_mod.addChainWorkBE(&a0_work, &per_block_work);
+    const a0 = try makePatternXEntryWithWork(allocator, a0_hash, 110, null, a0_work);
+    try manager.addBlock(a0);
+
+    const a1_hash: types.Hash256 = [_]u8{0xA1} ** 32;
+    var a1_work: [32]u8 = a0_work;
+    peer_mod.addChainWorkBE(&a1_work, &per_block_work);
+    const a1 = try makePatternXEntryWithWork(allocator, a1_hash, 111, a0, a1_work);
+    try manager.addBlock(a1);
+
+    const a2_hash: types.Hash256 = [_]u8{0xA2} ** 32;
+    var a2_work: [32]u8 = a1_work;
+    peer_mod.addChainWorkBE(&a2_work, &per_block_work);
+    const a2 = try makePatternXEntryWithWork(allocator, a2_hash, 112, a1, a2_work);
+    try manager.addBlock(a2);
+    manager.active_tip = a2;
+
+    cs.best_hash = a2_hash;
+    cs.best_height = 112;
+
+    // Submit B1 as side-branch — registers entry (verified by previous
+    // test). For this test we just want B1 in the index.
+    const b1_blk = try makeForkTestBlock(allocator, a0_hash, 0xB1, reg_bits, 200);
+    defer freeTestBlock(allocator, b1_blk.block);
+    _ = try block_template.processSideBranchSubmission(
+        &b1_blk.block,
+        &b1_blk.hash,
+        111,
+        &cs,
+        &manager,
+        a0,
+        allocator,
+    );
+
+    // B2's parent lookup: cm.getBlock(B1.hash) MUST succeed and return
+    // a B1 entry whose height is 111.  Pre-Pattern-Y this was null
+    // (B1 was rejected before being stored; B2's parent lookup fell
+    // through to the active-tip shortcut).
+    const b1_lookup = manager.getBlock(&b1_blk.hash) orelse
+        return error.B1NotFoundInIndex;
+    try testing.expectEqual(@as(u32, 111), b1_lookup.height);
+    try testing.expect(b1_lookup.parent == a0);
+
+    // Pattern X derivation: B2's submit height = B1.height + 1 = 112.
+    const b2_height = block_template.deriveSubmitHeight(&b1_blk.hash, &manager, cs.best_height);
+    try testing.expectEqual(@as(u32, 112), b2_height);
+}
+
+test "Pattern Y: side-branch with strictly-greater chain_work flips active_tip via reorg" {
+    // Smallest possible reorg-via-submitblock invariant test: simulate
+    // a heavier-branch arrival without the full submitBlock validation
+    // gauntlet (which requires PoW + UTXO-aware acceptBlock).  We
+    // construct the chain_state with two committed A blocks (so that
+    // their bodies + undo are persisted; reorgToChain can disconnect
+    // them), then drive processSideBranchSubmission with a synthetic
+    // B-side entry whose chain_work is bumped to strictly exceed the
+    // active tip.
+    //
+    // NB: this test cannot use the full chain_state.reorgToChain path
+    // because makeForkTestBlock blocks have no real PoW + no real
+    // coinbase script; the corpus diff-test entry exercises the full
+    // path against Bitcoin Core's regtest miner.  Here we exercise
+    // the chain_work comparison + index registration only.
+    const allocator = testing.allocator;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    var manager = validation.ChainManager.init(&cs, null, allocator);
+    defer manager.deinit();
+
+    const reg_bits: u32 = 0x207fffff;
+    const per_block_work = peer_mod.workFromBits(reg_bits);
+
+    // Active tip at height 1 with chain_work = per_block_work.
+    const a1_hash: types.Hash256 = [_]u8{0xA1} ** 32;
+    const a1 = try makePatternXEntryWithWork(allocator, a1_hash, 1, null, per_block_work);
+    try manager.addBlock(a1);
+    manager.active_tip = a1;
+    cs.best_hash = a1_hash;
+    cs.best_height = 1;
+
+    // Synthetic B1 sibling at height 1 (parent = genesis, equal work).
+    // Then build B2 (parent B1, height 2, work = 2 * per_block_work),
+    // strictly heavier than A1.
+    const b1_hash: types.Hash256 = [_]u8{0xB1} ** 32;
+    const b1 = try makePatternXEntryWithWork(allocator, b1_hash, 1, null, per_block_work);
+    try manager.addBlock(b1);
+
+    // Construct a B2 block whose hash we can register, then submit it
+    // via processSideBranchSubmission. The function will:
+    //   1. compute chain_work = b1.chain_work + workFromBits = 2x per_block_work
+    //   2. compare against active_tip (a1) chain_work = 1x per_block_work
+    //   3. find that b2_work > a1_work → fire reorg
+    //   4. reorgToChain walks back: a1 -> genesis (b1's hash is NOT
+    //      reachable via chain_state.hasBlock, so the fork-point walk
+    //      stops at the genesis-as-parent-of-b1 ancestor only if genesis
+    //      is on the active chain. Since we set best_hash to a1_hash
+    //      and never committed any blocks, the disconnect path will
+    //      try to disconnectBlockByHashCF(a1) which fails because
+    //      no body is in CF_BLOCKS — error.BlockBodyNotFound).
+    //
+    // For this unit test we DON'T require the reorgToChain to succeed
+    // — we require processSideBranchSubmission to:
+    //   * register B2 in cm.block_index with the correct (heavier)
+    //     chain_work
+    //   * recognize this as a strictly-greater-work branch (i.e.
+    //     attempt the reorg path, NOT return "inconclusive")
+    // The specific failure mode (rejected for storage-not-present
+    // reasons) is acceptable here because the corpus diff-test
+    // exercises the happy reorg path against Core's miner.
+    const b2_blk = try makeForkTestBlock(allocator, b1_hash, 0xB2, reg_bits, 300);
+    defer freeTestBlock(allocator, b2_blk.block);
+
+    const result = try block_template.processSideBranchSubmission(
+        &b2_blk.block,
+        &b2_blk.hash,
+        2, // height
+        &cs,
+        &manager,
+        b1,
+        allocator,
+    );
+
+    // Whether the reorg actually fired depends on body availability.
+    // Two valid outcomes:
+    //   * accept (reorg succeeded, active_tip flipped to B2)
+    //   * reject:rejected (reorg was attempted but storage failed
+    //     mid-rewind because A1's body wasn't on disk).
+    //
+    // The forbidden outcome is "inconclusive" — that means the fix
+    // mis-classified a strictly-heavier branch as equal/lighter.
+    if (result.reject_reason) |reason| {
+        // Defensive: must NOT be "inconclusive".
+        try testing.expect(!std.mem.eql(u8, reason, "inconclusive"));
+    } else {
+        // accepted — reorg fired through to completion.
+        try testing.expect(result.accepted);
+    }
+
+    // Regardless of the reorg's terminal outcome, B2 should be in the
+    // index with the heavier chain_work.
+    const b2_entry = manager.getBlock(&b2_blk.hash) orelse
+        return error.B2NotInIndex;
+    var expected_b2_work: [32]u8 = per_block_work; // b1's work
+    peer_mod.addChainWorkBE(&expected_b2_work, &per_block_work);
+    try testing.expectEqualSlices(u8, &expected_b2_work, &b2_entry.chain_work);
+    // expected_b2_work > a1.chain_work strictly.
+    try testing.expect(peer_mod.cmpChainWorkBE(&b2_entry.chain_work, &a1.chain_work) > 0);
+}
+
+/// Helper: like makePatternXEntry but lets the test pin chain_work
+/// explicitly. Pattern Y tests need this so the comparison logic in
+/// processSideBranchSubmission gets realistic inputs.
+fn makePatternXEntryWithWork(
+    allocator: std.mem.Allocator,
+    hash: types.Hash256,
+    height: u32,
+    parent: ?*validation.BlockIndexEntry,
+    chain_work: [32]u8,
+) !*validation.BlockIndexEntry {
+    const entry = try allocator.create(validation.BlockIndexEntry);
+    entry.* = validation.BlockIndexEntry{
+        .hash = hash,
+        .header = consensus.REGTEST.genesis_header,
+        .height = height,
+        .status = validation.BlockStatus{
+            .valid_header = true,
+            .has_data = true,
+            .has_undo = false,
+            .failed_valid = false,
+            .failed_child = false,
+            ._padding = 0,
+        },
+        .chain_work = chain_work,
+        .sequence_id = 0,
+        .parent = parent,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    return entry;
+}
