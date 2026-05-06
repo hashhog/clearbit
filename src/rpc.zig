@@ -43,6 +43,36 @@ fn hexDigitToInt(ch: u8) ?u4 {
     };
 }
 
+/// Announce a freshly-mined block to the peer fleet, honouring BIP-130
+/// `sendheaders` per-peer.  Parses the 80-byte header from the start of
+/// `serialized_blocks[idx]` (best-effort) and routes through
+/// `PeerManager.announceBlock`.  Falls back to an inv(MSG_BLOCK) broadcast
+/// when the cached block bytes are missing or unparseable, preserving the
+/// pre-Pattern-A behaviour as a safety net.
+fn announceMinedBlock(
+    pm: *peer_mod.PeerManager,
+    hash: *const types.Hash256,
+    idx: usize,
+    serialized_blocks: []const []const u8,
+) void {
+    // Try to parse the header from the cached block bytes.
+    if (idx < serialized_blocks.len and serialized_blocks[idx].len >= 80) {
+        var reader = serialize.Reader{ .data = serialized_blocks[idx] };
+        if (serialize.readBlockHeader(&reader)) |header| {
+            pm.announceBlock(&header, hash);
+            return;
+        } else |_| {}
+    }
+    // Fallback: legacy inv(MSG_BLOCK) broadcast.  Loses the BIP-130 latency
+    // win for sendheaders peers but preserves correctness.
+    var inv_items = [_]p2p.InvVector{.{
+        .inv_type = .msg_block,
+        .hash = hash.*,
+    }};
+    const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
+    pm.broadcast(&inv_msg);
+}
+
 // ============================================================================
 // RPC Error Codes (Bitcoin Core conventions)
 // ============================================================================
@@ -3352,21 +3382,18 @@ pub const RpcServer = struct {
         };
         defer result.deinit();
 
-        // Cache mined blocks for P2P serving and broadcast inv to peers
+        // Cache mined blocks for P2P serving and announce to peers (BIP-130).
         for (result.block_hashes.items, 0..) |hash, idx| {
             // Cache serialized block data for getdata responses
             if (idx < result.serialized_blocks.items.len) {
                 self.peer_manager.cacheMinedBlock(hash, result.serialized_blocks.items[idx]);
             }
 
-            // Broadcast inv(MSG_BLOCK) to all connected peers
-            var inv_items = [_]p2p.InvVector{.{
-                .inv_type = .msg_block,
-                .hash = hash,
-            }};
-            const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
-            self.peer_manager.broadcast(&inv_msg);
-            std.log.info("broadcast block inv to peers", .{});
+            // Pattern A: announce via headers to peers that sent us
+            // sendheaders, otherwise via inv(MSG_BLOCK).  See
+            // PeerManager.announceBlock + camlcoin reference impl.
+            announceMinedBlock(self.peer_manager, &hash, idx, result.serialized_blocks.items);
+            std.log.info("announced block to peers (BIP-130 sendheaders honored)", .{});
         }
 
         // Format response as JSON array of block hashes
@@ -3461,17 +3488,12 @@ pub const RpcServer = struct {
         };
         defer result.deinit();
 
-        // Cache mined blocks and broadcast inv to peers
+        // Cache mined blocks and announce to peers (BIP-130 sendheaders honored).
         for (result.block_hashes.items, 0..) |hash, idx| {
             if (idx < result.serialized_blocks.items.len) {
                 self.peer_manager.cacheMinedBlock(hash, result.serialized_blocks.items[idx]);
             }
-            var inv_items = [_]p2p.InvVector{.{
-                .inv_type = .msg_block,
-                .hash = hash,
-            }};
-            const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
-            self.peer_manager.broadcast(&inv_msg);
+            announceMinedBlock(self.peer_manager, &hash, idx, result.serialized_blocks.items);
         }
 
         // Format response
@@ -3616,14 +3638,41 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block generation failed", id);
         };
 
-        // Broadcast inv(MSG_BLOCK) to all connected peers
+        // Announce the generated block to peers (BIP-130 sendheaders honored).
+        // generateblock returns only {hash, hex} so we synthesise a 1-element
+        // serialized-block slice when the hex is available; otherwise the
+        // helper falls back to an inv(MSG_BLOCK) broadcast.
         {
-            var inv_items = [_]p2p.InvVector{.{
-                .inv_type = .msg_block,
-                .hash = gen_result.hash,
-            }};
-            const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
-            self.peer_manager.broadcast(&inv_msg);
+            if (gen_result.hex) |hex| {
+                // Best-effort: decode the hex back to bytes for header parse.
+                const bytes = self.allocator.alloc(u8, hex.len / 2) catch null;
+                if (bytes) |b| {
+                    defer self.allocator.free(b);
+                    var ok = true;
+                    var i: usize = 0;
+                    while (i < b.len) : (i += 1) {
+                        const hi = hexDigitToInt(hex[i * 2]) orelse {
+                            ok = false;
+                            break;
+                        };
+                        const lo = hexDigitToInt(hex[i * 2 + 1]) orelse {
+                            ok = false;
+                            break;
+                        };
+                        b[i] = (@as(u8, hi) << 4) | @as(u8, lo);
+                    }
+                    if (ok) {
+                        const slices = [_][]const u8{b};
+                        announceMinedBlock(self.peer_manager, &gen_result.hash, 0, &slices);
+                    } else {
+                        announceMinedBlock(self.peer_manager, &gen_result.hash, 0, &[_][]const u8{});
+                    }
+                } else {
+                    announceMinedBlock(self.peer_manager, &gen_result.hash, 0, &[_][]const u8{});
+                }
+            } else {
+                announceMinedBlock(self.peer_manager, &gen_result.hash, 0, &[_][]const u8{});
+            }
         }
 
         // Format response
