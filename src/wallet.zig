@@ -288,6 +288,13 @@ pub const Wallet = struct {
     // Labels: address -> label mapping
     labels: std.StringHashMap([]const u8),
 
+    /// In-memory locked UTXO set (cleared on process exit, matching Core's
+    /// non-persistent default). Key is a 36-byte packed outpoint
+    /// (32 little-endian txid + 4 LE vout). Locked UTXOs are skipped by
+    /// `selectCoinsWithOptions` and reported by `listlockunspent`.
+    /// Reference: bitcoin-core/src/wallet/rpc/coins.cpp::lockunspent.
+    locked_outpoints: std.AutoHashMap([36]u8, void),
+
     pub fn init(allocator: std.mem.Allocator, network: Network) !Wallet {
         const ctx = secp256k1.secp256k1_context_create(
             secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
@@ -308,6 +315,7 @@ pub const Wallet = struct {
             .encryption_salt = null,
             .unlock_until = null,
             .labels = std.StringHashMap([]const u8).init(allocator),
+            .locked_outpoints = std.AutoHashMap([36]u8, void).init(allocator),
         };
     }
 
@@ -330,6 +338,8 @@ pub const Wallet = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.labels.deinit();
+
+        self.locked_outpoints.deinit();
 
         // Clear encryption key from memory
         if (self.encryption_key) |*key| {
@@ -609,6 +619,50 @@ pub const Wallet = struct {
         return total;
     }
 
+    /// Pack an outpoint (txid + vout) into a 36-byte hashmap key. The key is
+    /// the raw little-endian txid bytes followed by the 4-byte LE vout.
+    pub fn packOutpoint(outpoint: types.OutPoint) [36]u8 {
+        var key: [36]u8 = undefined;
+        @memcpy(key[0..32], &outpoint.hash);
+        std.mem.writeInt(u32, key[32..36], outpoint.index, .little);
+        return key;
+    }
+
+    /// Mark an outpoint as locked (in-memory only, matching Core's default
+    /// non-persistent semantics). A locked UTXO is excluded from automatic
+    /// coin selection. Returns true if the outpoint transitioned from
+    /// unlocked to locked, false if it was already locked.
+    pub fn lockCoin(self: *Wallet, outpoint: types.OutPoint) !bool {
+        const key = packOutpoint(outpoint);
+        const gop = try self.locked_outpoints.getOrPut(key);
+        return !gop.found_existing;
+    }
+
+    /// Remove the lock on an outpoint. Returns true if the outpoint was
+    /// previously locked (i.e. removal happened), false if it was not in the
+    /// locked set.
+    pub fn unlockCoin(self: *Wallet, outpoint: types.OutPoint) bool {
+        const key = packOutpoint(outpoint);
+        return self.locked_outpoints.remove(key);
+    }
+
+    /// Check whether an outpoint is currently locked.
+    pub fn isLockedCoin(self: *const Wallet, outpoint: types.OutPoint) bool {
+        const key = packOutpoint(outpoint);
+        return self.locked_outpoints.contains(key);
+    }
+
+    /// Clear all locks. Used by `lockunspent true` with no outpoints.
+    pub fn unlockAllCoins(self: *Wallet) void {
+        self.locked_outpoints.clearRetainingCapacity();
+    }
+
+    /// Number of currently locked outpoints. Helper for `listlockunspent`
+    /// callers + tests; the dispatch RPC walks the iterator directly.
+    pub fn lockedCoinCount(self: *const Wallet) usize {
+        return self.locked_outpoints.count();
+    }
+
     /// Coin selection options
     pub const CoinSelectOptions = struct {
         fee_rate: u64 = 1, // sat/vB
@@ -660,6 +714,10 @@ pub const Wallet = struct {
                     continue; // Skip immature coinbase
                 }
             }
+            // Skip locked outputs (lockunspent / listlockunspent). Locked
+            // UTXOs are not chosen by automatic coin selection per Core's
+            // `lockunspent` documentation.
+            if (self.isLockedCoin(utxo.outpoint)) continue;
             try mature_utxos.append(utxo);
         }
 
