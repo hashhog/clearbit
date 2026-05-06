@@ -596,6 +596,15 @@ pub const Peer = struct {
     /// blocks below the recent-`MIN_BLOCKS_TO_KEEP` (288) keep window.
     advertise_node_network_limited: bool = false,
 
+    /// BIP-130: peer requested header-style block announcements via the
+    /// `sendheaders` message.  When true, this node MUST announce new
+    /// blocks to this peer with a `headers` message containing the new
+    /// header(s) instead of an `inv` containing the block hash(es).
+    /// Default false until the peer opts in.  Reference:
+    /// bitcoin-core/src/net_processing.cpp (PeerManagerImpl: `m_sendheaders`).
+    /// Reference impl: camlcoin lib/peer_manager.ml::announce_block.
+    send_headers: bool = false,
+
     /// BIP-324 v2 transport protocol version.
     transport_version: TransportVersion = .v1,
 
@@ -3746,8 +3755,25 @@ pub const PeerManager = struct {
                                 h.headers[0].prev_block[31],
                             },
                         );
+                        // BIP-113 / future-time gate: reject any fork header
+                        // whose timestamp falls outside the contextual bounds
+                        // BEFORE inserting into header_index.  Misbehave the
+                        // peer on rejection — same severity as Core's
+                        // bad-header DoS handling.
+                        const now_fork: i64 = std.time.timestamp();
                         var last_inserted: ?BlockHeaderEntry = null;
                         for (h.headers) |hdr| {
+                            switch (self.validateHeaderContextual(&hdr, now_fork)) {
+                                .ok => {},
+                                .future_time => {
+                                    peer.misbehaving(50, "header timestamp too far in the future");
+                                    return;
+                                },
+                                .mtp_violation => {
+                                    peer.misbehaving(50, "header timestamp violates MTP (BIP-113)");
+                                    return;
+                                },
+                            }
                             const bh = crypto.computeBlockHash(&hdr);
                             const ent_or = self.insertHeader(&hdr, &bh) catch null;
                             if (ent_or) |ent| last_inserted = ent;
@@ -3768,6 +3794,31 @@ pub const PeerManager = struct {
                     h.headers.len,
                     self.expected_blocks.items.len + h.headers.len,
                 });
+
+                // BIP-113 / future-time gate at header acceptance.  Each
+                // header is checked against:
+                //   - now + MAX_FUTURE_BLOCK_TIME (7200s) [always-on]
+                //   - median-time-past of last 11 ancestors [skipped when
+                //     fewer than 1 ancestor is in header_index]
+                // Reference: bitcoin-core/src/validation.cpp
+                // (CheckBlockHeader + ContextualCheckBlockHeader).
+                // Reject the entire batch on the first violation and
+                // misbehave the peer; mirrors Core's "bad-time" /
+                // "time-too-new" handling.
+                const now_hdr: i64 = std.time.timestamp();
+                for (h.headers) |hdr| {
+                    switch (self.validateHeaderContextual(&hdr, now_hdr)) {
+                        .ok => {},
+                        .future_time => {
+                            peer.misbehaving(50, "header timestamp too far in the future");
+                            return;
+                        },
+                        .mtp_violation => {
+                            peer.misbehaving(50, "header timestamp violates MTP (BIP-113)");
+                            return;
+                        },
+                    }
+                }
 
                 // Add header hashes to the expected_blocks queue.  Also
                 // insert into the header_index when reorg detection is
@@ -4196,6 +4247,14 @@ pub const PeerManager = struct {
                 const pool = self.mempool orelse return;
                 try sendMempoolInventory(peer, pool, self.allocator);
             },
+            .sendheaders => {
+                // BIP-130: peer requests that we announce new blocks via the
+                // `headers` message instead of `inv`.  Latch the per-peer
+                // flag; `announceBlock` consults it on each new tip.
+                // Reference: bitcoin-core/src/net_processing.cpp
+                // (PeerManagerImpl::ProcessMessage NetMsgType::SENDHEADERS).
+                peer.send_headers = true;
+            },
             else => {},
         }
     }
@@ -4597,6 +4656,54 @@ pub const PeerManager = struct {
         }
         if (n == 0) return 0;
         return validation.medianTimePast(timestamps[0..n]);
+    }
+
+    /// Header-time validation result.
+    pub const HeaderTimeReject = enum {
+        ok,
+        /// Header timestamp <= median-time-past of last 11 ancestors (BIP-113
+        /// applied at header receive time, mirroring Bitcoin Core's
+        /// `ContextualCheckBlockHeader`).
+        mtp_violation,
+        /// Header timestamp > now + MAX_FUTURE_BLOCK_TIME (7200s).  Reference:
+        /// `bitcoin-core/src/validation.cpp::CheckBlockHeader`.
+        future_time,
+    };
+
+    /// Contextual header-time validation, run at header *acceptance* (not just
+    /// when the block body arrives).  Implements:
+    ///   - BIP-113 median-time-past: header.timestamp must strictly exceed
+    ///     the MTP of its 11 most-recent ancestors (when known).
+    ///   - Future-time bound: header.timestamp must not exceed `now + 7200s`.
+    ///
+    /// References:
+    ///   - bitcoin-core/src/validation.cpp::CheckBlockHeader (future-time)
+    ///   - bitcoin-core/src/validation.cpp::ContextualCheckBlockHeader (MTP)
+    ///
+    /// MTP is skipped when fewer than 1 ancestor is in `header_index`
+    /// (e.g. headers received before any prior batch landed in the index).
+    /// This matches the behaviour of `validateBlockForIBDOrReject`'s MTP
+    /// path: the body-validation pipeline still re-checks MTP once the
+    /// block lands.  The future-time bound has no ancestor dependency and
+    /// is always enforced.
+    pub fn validateHeaderContextual(
+        self: *PeerManager,
+        header: *const types.BlockHeader,
+        now: i64,
+    ) HeaderTimeReject {
+        // Future-time bound (always-on).
+        const max_future: i64 = now + @as(i64, consensus.MAX_FUTURE_BLOCK_TIME);
+        if (@as(i64, header.timestamp) > max_future) {
+            return .future_time;
+        }
+
+        // BIP-113 MTP (skipped when fewer than 1 ancestor is known).
+        const prev_mtp = self.computePrevMtp(&header.prev_block);
+        if (prev_mtp != 0 and header.timestamp <= prev_mtp) {
+            return .mtp_violation;
+        }
+
+        return .ok;
     }
 
     /// IBD-time consensus validation gate.  Returns true when the block is
@@ -5332,6 +5439,44 @@ pub const PeerManager = struct {
         for (self.peers.items) |peer| {
             if (peer.state == .handshake_complete) {
                 peer.sendMessage(msg) catch continue;
+            }
+        }
+    }
+
+    /// BIP-130 block announcement.  For each connected peer:
+    ///   - If the peer has sent us `sendheaders`, announce via a `headers`
+    ///     message containing the new header.
+    ///   - Otherwise, fall back to the legacy `inv(MSG_BLOCK)` announcement.
+    ///
+    /// This is the Pattern A wiring: clearbit previously stored no
+    /// inbound-sendheaders state and announced every new block via `inv`,
+    /// which costs a `getheaders` round-trip on the peer side and degrades
+    /// new-block latency.  Reference impl:
+    /// camlcoin lib/peer_manager.ml::announce_block.
+    pub fn announceBlock(
+        self: *PeerManager,
+        header: *const types.BlockHeader,
+        hash: *const types.Hash256,
+    ) void {
+        // Reuse the inv message (allocated on the stack) for non-opt-in peers.
+        var inv_items = [_]p2p.InvVector{.{
+            .inv_type = .msg_block,
+            .hash = hash.*,
+        }};
+        const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
+
+        // Reuse the headers message (single-element array, on the stack) for
+        // sendheaders peers.  Note: encodeMessage walks the slice and copies
+        // the bytes, so the lifetime ends with this function.
+        var hdrs = [_]types.BlockHeader{header.*};
+        const hdrs_msg = p2p.Message{ .headers = .{ .headers = &hdrs } };
+
+        for (self.peers.items) |peer| {
+            if (peer.state != .handshake_complete) continue;
+            if (peer.send_headers) {
+                peer.sendMessage(&hdrs_msg) catch continue;
+            } else {
+                peer.sendMessage(&inv_msg) catch continue;
             }
         }
     }
@@ -6931,4 +7076,168 @@ test "BIP-324: bip324V2Enabled defaults on, honors env var off-toggles" {
     if (std.posix.getenv("CLEARBIT_BIP324_V2") == null) {
         try std.testing.expect(Peer.bip324V2Enabled());
     }
+}
+
+// ---------------------------------------------------------------------------
+// HSync wave: header-sync DoS resistance + BIP-130 sendheaders regression
+// tests.
+// Reference: bitcoin-core/src/validation.cpp (CheckBlockHeader,
+//            ContextualCheckBlockHeader)
+// Reference: bitcoin-core/src/net_processing.cpp (NetMsgType::SENDHEADERS)
+// Audit doc: CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+// ---------------------------------------------------------------------------
+
+test "HSync: validateHeaderContextual rejects future-time header" {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    defer pm.deinit();
+
+    const now: i64 = 2_000_000_000; // Fixed, deterministic "now" for the test.
+    const header = types.BlockHeader{
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        // 1 day past `now` — well over the 7200s allowance.
+        .timestamp = @intCast(now + 86_400),
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+
+    const verdict = pm.validateHeaderContextual(&header, now);
+    try std.testing.expectEqual(PeerManager.HeaderTimeReject.future_time, verdict);
+}
+
+test "HSync: validateHeaderContextual enforces BIP-113 MTP at acceptance" {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    defer pm.deinit();
+
+    // Seed header_index with 11 ancestors, all stamped at t=1000..1010.
+    // MTP of those is the median = 1005.  A new header chained onto the
+    // tip must have timestamp > 1005.
+    var prev: types.Hash256 = [_]u8{0xAA} ** 32;
+    var i: u32 = 0;
+    while (i < 11) : (i += 1) {
+        const this_hash: types.Hash256 = blk: {
+            var h: types.Hash256 = [_]u8{0} ** 32;
+            h[0] = @intCast(i + 1);
+            break :blk h;
+        };
+        const ts: u32 = 1000 + i;
+        try pm.header_index.put(this_hash, .{
+            .hash = this_hash,
+            .prev_hash = prev,
+            .height = i,
+            .chain_work = [_]u8{0} ** 32,
+            .timestamp = ts,
+            .header = types.BlockHeader{
+                .version = 1,
+                .prev_block = prev,
+                .merkle_root = [_]u8{0} ** 32,
+                .timestamp = ts,
+                .bits = 0x1d00ffff,
+                .nonce = 0,
+            },
+            .last_seen = std.time.timestamp(),
+        });
+        prev = this_hash;
+    }
+
+    // MTP of the 11 ancestors is 1005.
+    // Test 1: timestamp == MTP → rejected.
+    const at_mtp = types.BlockHeader{
+        .version = 1,
+        .prev_block = prev,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1005,
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+    // Use a "now" comfortably in the future relative to header.timestamp so
+    // future-time isn't the rejecting axis.
+    const now: i64 = 2_000_000_000;
+    try std.testing.expectEqual(
+        PeerManager.HeaderTimeReject.mtp_violation,
+        pm.validateHeaderContextual(&at_mtp, now),
+    );
+
+    // Test 2: timestamp == MTP + 1 → accepted.
+    const above_mtp = types.BlockHeader{
+        .version = 1,
+        .prev_block = prev,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1006,
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+    try std.testing.expectEqual(
+        PeerManager.HeaderTimeReject.ok,
+        pm.validateHeaderContextual(&above_mtp, now),
+    );
+}
+
+test "HSync: validateHeaderContextual skips MTP when no ancestors known" {
+    // Genesis-relative case: header_index is empty, so MTP cannot be
+    // computed.  The function must skip MTP and only enforce future-time.
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    defer pm.deinit();
+
+    const now: i64 = 2_000_000_000;
+    const header = types.BlockHeader{
+        .version = 1,
+        .prev_block = [_]u8{0xFF} ** 32, // Unknown parent — no ancestors.
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1_000_000, // Way in the past, but no MTP to compare to.
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+
+    try std.testing.expectEqual(
+        PeerManager.HeaderTimeReject.ok,
+        pm.validateHeaderContextual(&header, now),
+    );
+}
+
+test "HSync: BIP-130 send_headers flag defaults false on fresh Peer" {
+    // A newly-initialised Peer must default to send_headers=false so the
+    // Pattern A announce path falls back to inv until the peer explicitly
+    // opts in.  Reference: bitcoin-core/src/net_processing.cpp
+    // (PeerManagerImpl::m_sendheaders default false).
+    const allocator = std.testing.allocator;
+    var recv_buffer = std.ArrayList(u8).init(allocator);
+    defer recv_buffer.deinit();
+
+    const dummy = Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8333),
+        .state = .connecting,
+        .direction = .outbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = &consensus.MAINNET,
+        .allocator = allocator,
+        .recv_buffer = recv_buffer,
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = 0,
+        .relay_txs = false,
+        .is_protected = false,
+        .connect_time = 0,
+        .v2_cipher = null,
+    };
+
+    try std.testing.expect(!dummy.send_headers);
 }
