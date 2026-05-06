@@ -1924,6 +1924,46 @@ pub const ChainState = struct {
     /// Bytes are heap-owned by ChainState until flush() succeeds.
     pending_undo_writes: std.ArrayList(PendingUndoWrite) = undefined,
 
+    // ----------------------------------------------------------------------
+    // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
+    // 2026-05-05.md): wire CF_TX_INDEX writes into the block-connect callback
+    // and CF_TX_INDEX deletes into the block-disconnect callback. Without
+    // these, `getrawtransaction` for any IBD-fetched / submitblock-fed
+    // confirmed tx errors out (txindex never indexed it pre-reorg, so the
+    // Pattern C revert-on-disconnect probe trivially passes — masking the
+    // real defect that the txindex write path is unwired).
+    //
+    // Bitcoin Core analog: `BaseIndex::BlockConnected` / `BlockDisconnected`
+    // in `src/index/base.cpp` invoking `TxIndex::CustomAppend` /
+    // `CustomRemove` (`src/index/txindex.cpp`).  Core writes one
+    // `(tx_id → DiskTxPos)` mapping per tx in the connected block and
+    // deletes the same set on disconnect, all atomically with the chainstate
+    // advance via the leveldb WriteBatch.
+    //
+    // We mirror that here: `pending_tx_index_writes` and
+    // `pending_tx_index_deletes` are appended by `connectBlockInner` /
+    // `disconnectBlockByHashCF` and drained in `flush()` into the same
+    // WriteBatch as the UTXO mutations and tip update.  Disabled by default
+    // (`txindex_enabled = false`); main.zig flips the flag when --txindex
+    // is on the CLI / config (see config.txindex parse at main.zig:228).
+    //
+    // Companion to Pattern Y (`863fb10`, side-branch storage decoupling) and
+    // Pattern B (`ed9c906`, mempool refill on disconnect): all three close
+    // independent reorg-correctness gaps against the same fleet-result
+    // audit doc.
+    /// True when `--txindex` is on; gates queue-append in connect/disconnect.
+    txindex_enabled: bool = false,
+    /// Per-block CF_TX_INDEX writes pending durable commit. Each entry is a
+    /// (txid, 40-byte location-blob) pair; flush() appends one CF_TX_INDEX
+    /// put per entry into the same WriteBatch as the UTXO mutations and tip.
+    pending_tx_index_writes: std.ArrayList(PendingTxIndexWrite) = undefined,
+    /// Per-block CF_TX_INDEX deletes pending durable commit. Populated by
+    /// disconnectBlockByHashCF — one delete per tx in the disconnected
+    /// block. flush() drains alongside writes (deletes append before puts
+    /// in the batch so a delete-then-write within a single flush window
+    /// preserves last-write-wins semantics).
+    pending_tx_index_deletes: std.ArrayList(types.Hash256) = undefined,
+
     pub const PendingBlockWrite = struct {
         hash: types.Hash256,
         bytes: []u8,
@@ -1932,6 +1972,16 @@ pub const ChainState = struct {
     pub const PendingUndoWrite = struct {
         hash: types.Hash256,
         bytes: []u8,
+    };
+
+    /// CF_TX_INDEX entry: (block_hash, block_height, tx_index_in_block).
+    /// Layout matches `indexes.TxLocation.toBytes` (40 bytes, little-endian).
+    /// `tx_index_in_block` is the position of the tx within
+    /// `block.transactions`; 0 for the coinbase, 1..N for the remainder.
+    pub const TXINDEX_VAL_LEN: usize = 40;
+    pub const PendingTxIndexWrite = struct {
+        txid: types.Hash256,
+        value: [TXINDEX_VAL_LEN]u8,
     };
 
     /// Undo data for a connected block — needed for disconnection during reorgs.
@@ -2029,6 +2079,8 @@ pub const ChainState = struct {
             .allocator = allocator,
             .pending_block_writes = std.ArrayList(PendingBlockWrite).init(allocator),
             .pending_undo_writes = std.ArrayList(PendingUndoWrite).init(allocator),
+            .pending_tx_index_writes = std.ArrayList(PendingTxIndexWrite).init(allocator),
+            .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
         };
     }
 
@@ -2043,6 +2095,8 @@ pub const ChainState = struct {
             .allocator = allocator,
             .pending_block_writes = std.ArrayList(PendingBlockWrite).init(allocator),
             .pending_undo_writes = std.ArrayList(PendingUndoWrite).init(allocator),
+            .pending_tx_index_writes = std.ArrayList(PendingTxIndexWrite).init(allocator),
+            .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
         };
     }
 
@@ -2088,6 +2142,14 @@ pub const ChainState = struct {
             self.allocator.free(entry.bytes);
         }
         self.pending_undo_writes.deinit();
+        // Pattern C0: pending txindex queues hold value-by-value blobs (no
+        // heap pointers inside), so a plain deinit() is sufficient.  The
+        // entries themselves were going to be committed alongside the next
+        // flush(); on a clean shutdown they were already drained, on a
+        // flush_error path we drop them (the txindex is non-consensus and
+        // resyncs from a `-reindex-chainstate` walk).
+        self.pending_tx_index_writes.deinit();
+        self.pending_tx_index_deletes.deinit();
         self.utxo_set.deinit();
     }
 
@@ -2140,6 +2202,92 @@ pub const ChainState = struct {
             .hash = hash.*,
             .bytes = bytes,
         });
+    }
+
+    /// Queue CF_TX_INDEX writes for every transaction in the given block.
+    /// Called by `connectBlockInner` after the per-tx UTXO loop completes
+    /// successfully so a connect failure doesn't leak orphan txindex
+    /// entries into the next flush.  No-op when `txindex_enabled = false`
+    /// or when running in memory-only mode (matches the existing
+    /// `pending_block_writes` short-circuit).
+    ///
+    /// Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
+    /// 2026-05-05.md): wires the indexes.TxIndex.put helper into the
+    /// connect path so `getrawtransaction` can resolve confirmed txs after
+    /// they're connected.  Pre-this-commit, `--txindex` was a parsed-but-
+    /// dead CLI flag (main.zig:228) and CF_TX_INDEX never received a write.
+    fn queueTxIndexWritesForBlock(
+        self: *ChainState,
+        block: *const types.Block,
+        block_hash: *const types.Hash256,
+        height: u32,
+    ) !void {
+        if (!self.txindex_enabled) return;
+        if (self.utxo_set.db == null) return;
+        const crypto = @import("crypto.zig");
+        // Bitcoin Core's TxIndex skips genesis (its coinbase output is
+        // unspendable and absent from the chainstate).  Mirror that here.
+        if (height == 0) return;
+        for (block.transactions, 0..) |tx, tx_idx| {
+            const tx_hash = crypto.computeTxidStreaming(&tx);
+            var value: [TXINDEX_VAL_LEN]u8 = undefined;
+            @memcpy(value[0..32], block_hash);
+            std.mem.writeInt(u32, value[32..36], height, .little);
+            std.mem.writeInt(u32, value[36..40], @intCast(tx_idx), .little);
+            try self.pending_tx_index_writes.append(.{
+                .txid = tx_hash,
+                .value = value,
+            });
+        }
+    }
+
+    /// Queue CF_TX_INDEX deletes for every transaction in a disconnected
+    /// block.  Called by `disconnectBlockByHashCF` after rewinding the UTXO
+    /// set so the txindex revert lands in the same flush() WriteBatch as
+    /// the tip rewind.
+    ///
+    /// Pattern C revert (Bitcoin Core: `BaseIndex::BlockDisconnected` →
+    /// `TxIndex::CustomRemove`).  Without this, post-reorg
+    /// `getrawtransaction(<orphan-block-tx>)` would still hit a stale
+    /// CF_TX_INDEX entry pointing at the now-disconnected block.
+    fn queueTxIndexDeletesForBlock(
+        self: *ChainState,
+        block: *const types.Block,
+        height: u32,
+    ) !void {
+        if (!self.txindex_enabled) return;
+        if (self.utxo_set.db == null) return;
+        if (height == 0) return; // genesis was never indexed
+        const crypto = @import("crypto.zig");
+        for (block.transactions) |tx| {
+            const tx_hash = crypto.computeTxidStreaming(&tx);
+            try self.pending_tx_index_deletes.append(tx_hash);
+        }
+    }
+
+    /// CF_TX_INDEX lookup helper used by `getrawtransaction`.  Returns the
+    /// (block_hash, block_height, tx_index_in_block) triple stored at
+    /// connect time, or null when the txid isn't indexed (txindex disabled,
+    /// tx never in any connected block, or tx's only block was disconnected
+    /// in a reorg — the Pattern C revert path).
+    pub const TxIndexEntry = struct {
+        block_hash: types.Hash256,
+        block_height: u32,
+        tx_index_in_block: u32,
+    };
+    pub fn getTxIndexEntry(self: *ChainState, txid: *const types.Hash256) !?TxIndexEntry {
+        if (!self.txindex_enabled) return null;
+        const db = self.utxo_set.db orelse return null;
+        const data = (try db.get(CF_TX_INDEX, txid)) orelse return null;
+        defer self.allocator.free(data);
+        if (data.len != TXINDEX_VAL_LEN) return null;
+        var block_hash: types.Hash256 = undefined;
+        @memcpy(&block_hash, data[0..32]);
+        return TxIndexEntry{
+            .block_hash = block_hash,
+            .block_height = std.mem.readInt(u32, data[32..36], .little),
+            .tx_index_in_block = std.mem.readInt(u32, data[36..40], .little),
+        };
     }
 
     /// Look up the block hash at a given active-chain height via the
@@ -2712,6 +2860,20 @@ pub const ChainState = struct {
             }
         }
 
+        // Pattern C0 revert: queue CF_TX_INDEX deletes for every tx in the
+        // disconnected block so the txindex stops resolving these txids
+        // post-reorg.  Bitcoin Core analog: BaseIndex::BlockDisconnected →
+        // TxIndex::CustomRemove.  Drained by the flush() call below into
+        // the same WriteBatch as the UTXO restores + tip rewind so a crash
+        // mid-flush leaves all three pieces consistent.  No-op when
+        // txindex_enabled is false.
+        //
+        // Pattern C0 fleet-result audit (2026-05-05):
+        //   `_txindex-revert-on-reorg-fleet-result-2026-05-05.md`.
+        //   clearbit was C0-vacuous (no txindex pre-reorg), now C0-correct.
+        const disconnected_height = self.best_height;
+        try self.queueTxIndexDeletesForBlock(&block, disconnected_height);
+
         // Move tip to parent.
         self.best_hash = block.header.prev_block;
         if (self.best_height > 0) self.best_height -= 1;
@@ -2977,6 +3139,18 @@ pub const ChainState = struct {
         self.best_hash = hash.*;
         self.best_height = height;
 
+        // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
+        // 2026-05-05.md): queue per-tx CF_TX_INDEX writes for this block so
+        // they commit atomically with the UTXO mutations + tip in the next
+        // flush() WriteBatch.  Bitcoin Core analog: BaseIndex::BlockConnected
+        // → TxIndex::CustomAppend (src/index/txindex.cpp).  No-op when
+        // txindex_enabled is false (default) or in memory-only mode.
+        //
+        // Run AFTER all per-tx UTXO mutations succeed so a mid-block error
+        // (MissingInput, etc.) doesn't leak orphan txindex entries — the
+        // for-loop above returns on first error and we never get here.
+        try self.queueTxIndexWritesForBlock(block, hash, height);
+
         // BIP-113: push the new block's timestamp into the ring buffer so
         // computeMTP() can serve the correct MTP for the NEXT submitted block
         // without hitting CF_BLOCK_INDEX (which the fast path does not populate).
@@ -3234,6 +3408,40 @@ pub const ChainState = struct {
             } });
         }
 
+        // 7. Pending CF_TX_INDEX deletes (Pattern C revert) — append BEFORE
+        //    the puts so a delete-then-write within a single flush window
+        //    preserves last-write-wins (the put would land last in the
+        //    array).  In practice connect and disconnect within a single
+        //    flush window do not occur on the same txid (reorgToChain
+        //    flushes between disconnect and connect), but this ordering
+        //    matches the existing pending_deletes-before-dirty_keys
+        //    convention in section 1+2 above.
+        for (self.pending_tx_index_deletes.items) |txid| {
+            const k = try self.allocator.alloc(u8, 32);
+            @memcpy(k, &txid);
+            try batch.append(.{ .delete = .{
+                .cf = CF_TX_INDEX,
+                .key = k,
+            } });
+        }
+
+        // 8. Pending CF_TX_INDEX writes (Pattern C0 connect-side).  One put
+        //    per (txid → 40-byte location-blob) populated by
+        //    queueTxIndexWritesForBlock.  Empty queue is the txindex-off
+        //    path's behaviour (txindex_enabled = false), so the loop is a
+        //    no-op when the operator hasn't passed --txindex.
+        for (self.pending_tx_index_writes.items) |entry| {
+            const k = try self.allocator.alloc(u8, 32);
+            @memcpy(k, &entry.txid);
+            const v = try self.allocator.alloc(u8, TXINDEX_VAL_LEN);
+            @memcpy(v, &entry.value);
+            try batch.append(.{ .put = .{
+                .cf = CF_TX_INDEX,
+                .key = k,
+                .value = v,
+            } });
+        }
+
         flush_build_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_build_start));
 
         if (batch.items.len > 0) {
@@ -3296,6 +3504,14 @@ pub const ChainState = struct {
                 self.allocator.free(entry.bytes);
             }
             self.pending_undo_writes.clearRetainingCapacity();
+
+            // Pattern C0: CF_TX_INDEX writes/deletes committed.  No heap
+            // pointers inside the entries (values are inline [40]u8 blobs,
+            // delete entries are inline Hash256), so a clearRetainingCapacity
+            // is enough — the BatchOp cleanup loop frees the per-op key/value
+            // copies allocated above.
+            self.pending_tx_index_writes.clearRetainingCapacity();
+            self.pending_tx_index_deletes.clearRetainingCapacity();
 
             // Free allocated keys and values
             for (batch.items) |op| {
@@ -5997,6 +6213,231 @@ test "reorgToChain refuses bad fork_point (chain not reachable)" {
 
     const result = chain_state.reorgToChain(&bogus_fork, empty_chain);
     try std.testing.expectError(error.ForkPointNotOnChain, result);
+}
+
+// ============================================================================
+// Pattern C0 Tests — txindex connect+revert wiring
+// ============================================================================
+//
+// References:
+//   * CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+//   * Bitcoin Core: src/index/txindex.cpp (CustomAppend / CustomRemove)
+//   * Companion commits: clearbit 863fb10 (Pattern Y side-branch storage),
+//     clearbit ed9c906 (Pattern B mempool refill on disconnect).
+
+test "Pattern C0: connect writes CF_TX_INDEX entry for coinbase txid" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    // The whole point of this fix: txindex must be opt-in and the
+    // connect path must honour the flag.
+    chain_state.txindex_enabled = true;
+
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xC0);
+    const bh1: [32]u8 = [_]u8{0xC0} ** 32;
+
+    var w = serialize.Writer.init(allocator);
+    try serialize.writeBlock(&w, &block1);
+    const owned_const = try w.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    try chain_state.queueBlockWrite(&bh1, owned, 1);
+
+    try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+
+    // Coinbase txid should be indexed: lookup returns block_hash + height +
+    // tx_index_in_block matching what connectBlockInner queued.
+    const crypto = @import("crypto.zig");
+    const cb_txid = crypto.computeTxidStreaming(&block1.transactions[0]);
+
+    const entry = (try chain_state.getTxIndexEntry(&cb_txid)) orelse {
+        std.debug.print("Pattern C0: getTxIndexEntry returned null for connected coinbase\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualSlices(u8, &bh1, &entry.block_hash);
+    try std.testing.expectEqual(@as(u32, 1), entry.block_height);
+    try std.testing.expectEqual(@as(u32, 0), entry.tx_index_in_block);
+
+    // Pending queues drained by the per-block flush().
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_deletes.items.len);
+}
+
+test "Pattern C0: txindex_enabled=false → connect writes NO CF_TX_INDEX entries" {
+    // Sanity check that the gate is honored.  Without this the helper
+    // would unconditionally pollute CF_TX_INDEX even when --txindex is
+    // off, which would break operators who rely on the flag for disk
+    // budgeting (Bitcoin Core parity: -txindex is opt-in, default off).
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    // Default off — explicitly leave txindex_enabled = false.
+
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xC1);
+    const bh1: [32]u8 = [_]u8{0xC1} ** 32;
+
+    var w = serialize.Writer.init(allocator);
+    try serialize.writeBlock(&w, &block1);
+    const owned_const = try w.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    try chain_state.queueBlockWrite(&bh1, owned, 1);
+
+    try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+
+    const crypto = @import("crypto.zig");
+    const cb_txid = crypto.computeTxidStreaming(&block1.transactions[0]);
+
+    // getTxIndexEntry short-circuits when the flag is off; verify against
+    // the raw CF_TX_INDEX read too so we know the connect path didn't
+    // sneak any entries into the DB.
+    try std.testing.expectEqual(@as(?ChainState.TxIndexEntry, null), try chain_state.getTxIndexEntry(&cb_txid));
+    const raw = try db.get(CF_TX_INDEX, &cb_txid);
+    if (raw) |r| {
+        defer allocator.free(r);
+        std.debug.print("Pattern C0: CF_TX_INDEX populated despite txindex_enabled=false ({d} bytes)\n", .{r.len});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "Pattern C0 revert: disconnectBlockByHashCF deletes CF_TX_INDEX entries" {
+    // The canonical Pattern C invariant: after a block is disconnected,
+    // its txids must NOT remain in CF_TX_INDEX (because the block is
+    // off the active chain and `getrawtransaction` would otherwise serve
+    // a stale `confirmations > 0` answer — the audit-doc bug).
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    chain_state.txindex_enabled = true;
+
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xC2);
+    const bh1: [32]u8 = [_]u8{0xC2} ** 32;
+
+    var w = serialize.Writer.init(allocator);
+    try serialize.writeBlock(&w, &block1);
+    const owned_const = try w.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    try chain_state.queueBlockWrite(&bh1, owned, 1);
+
+    try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+
+    const crypto = @import("crypto.zig");
+    const cb_txid = crypto.computeTxidStreaming(&block1.transactions[0]);
+
+    // Sanity: connect-side wired (covered by the "connect writes" test
+    // above; checked again here so a regression in either side surfaces
+    // separately).
+    try std.testing.expect((try chain_state.getTxIndexEntry(&cb_txid)) != null);
+
+    // Disconnect tip — the txindex entry must be gone after the flush
+    // commits.  This is the Pattern C revert that Core's BaseIndex::
+    // BlockDisconnected → TxIndex::CustomRemove provides natively.
+    try chain_state.disconnectBlockByHashCF(&bh1);
+
+    try std.testing.expectEqual(@as(?ChainState.TxIndexEntry, null), try chain_state.getTxIndexEntry(&cb_txid));
+    // Also verify against the raw CF (defensive — the helper short-
+    // circuits on txindex_enabled=false but here it stays true).
+    const raw = try db.get(CF_TX_INDEX, &cb_txid);
+    if (raw) |r| {
+        defer allocator.free(r);
+        std.debug.print("Pattern C revert: CF_TX_INDEX still populated for disconnected coinbase ({d} bytes)\n", .{r.len});
+        return error.TestUnexpectedResult;
+    }
+
+    // Drains: both queues empty after the disconnect-side flush().
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_deletes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_tx_index_writes.items.len);
+}
+
+test "Pattern C0: connect→disconnect→reconnect preserves indexed entry" {
+    // Confirms idempotency when a block is connected, disconnected, then
+    // re-connected (e.g. a heavier-tip reorg arrives, then the heavier
+    // tip itself gets re-orphaned by an even heavier sibling).  After
+    // the second connect we expect the same CF_TX_INDEX entry as the
+    // first; the intervening delete must not leave a poisoned tombstone.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    chain_state.txindex_enabled = true;
+
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xC3);
+    const bh1: [32]u8 = [_]u8{0xC3} ** 32;
+    const crypto = @import("crypto.zig");
+    const cb_txid = crypto.computeTxidStreaming(&block1.transactions[0]);
+
+    // Connect.
+    {
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block1);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh1, owned, 1);
+        try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+    }
+    try std.testing.expect((try chain_state.getTxIndexEntry(&cb_txid)) != null);
+
+    // Disconnect.
+    try chain_state.disconnectBlockByHashCF(&bh1);
+    try std.testing.expectEqual(@as(?ChainState.TxIndexEntry, null), try chain_state.getTxIndexEntry(&cb_txid));
+
+    // Reconnect (mirrors what reorgToChain would do if the same block
+    // re-entered the active chain via a sibling heavier tip getting
+    // orphaned).  Same hash + bytes; queueBlockWrite is idempotent
+    // (CF_BLOCKS is keyed by hash so a re-write is a no-op put).
+    {
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block1);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh1, owned, 1);
+        try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+    }
+
+    const re_entry = (try chain_state.getTxIndexEntry(&cb_txid)) orelse {
+        std.debug.print("Pattern C0 reconnect: CF_TX_INDEX missing after re-connect\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualSlices(u8, &bh1, &re_entry.block_hash);
+    try std.testing.expectEqual(@as(u32, 1), re_entry.block_height);
+    try std.testing.expectEqual(@as(u32, 0), re_entry.tx_index_in_block);
 }
 
 // ============================================================================

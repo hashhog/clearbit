@@ -2700,7 +2700,102 @@ pub const RpcServer = struct {
             return self.jsonRpcResult(buf.items, id);
         }
 
-        // TODO: Check block storage for confirmed transactions
+        // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
+        // 2026-05-05.md): consult CF_TX_INDEX for confirmed txs.  Bitcoin
+        // Core analog: rpc/rawtransaction.cpp::getrawtransaction →
+        // GetTransaction(txid) → g_txindex->FindTx(...) → block bytes →
+        // tx body.
+        //
+        // Confirmations gate (Pattern C invariant — see
+        // bitcoin-core/src/rpc/rawtransaction.cpp lines around the
+        // GetAncestor() check): we additionally verify the indexed
+        // block_hash equals the canonical block hash at the indexed
+        // height (chain_state.getBlockHashByHeight).  When they differ
+        // the indexed block is no longer on the active chain (a reorg
+        // disconnected it before the txindex revert flushed, or the
+        // txindex revert is racing this lookup), so we report
+        // confirmations=0 — matching Core's `tip->GetAncestor(...) ==
+        // blockindex` else-branch in CRawTransaction.
+        //
+        // Disconnect-side coverage: disconnectBlockByHashCF queues a
+        // CF_TX_INDEX delete for every tx in the disconnected block, so
+        // a successful reorg returns "no such tx" (RPC_INVALID_ADDRESS_
+        // OR_KEY) rather than a stale confs>0 entry — exercising the
+        // canonical Pattern C revert.
+        if (try self.chain_state.getTxIndexEntry(&txid)) |entry| {
+            const db_opt = self.chain_state.utxo_set.db;
+            if (db_opt) |db| {
+                if (try db.get(storage.CF_BLOCKS, &entry.block_hash)) |block_bytes| {
+                    defer self.allocator.free(block_bytes);
+
+                    var block_reader = serialize.Reader{ .data = block_bytes };
+                    var block_data = serialize.readBlock(&block_reader, self.allocator) catch {
+                        return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block decode failed", id);
+                    };
+                    defer serialize.freeBlock(self.allocator, &block_data);
+
+                    if (entry.tx_index_in_block >= block_data.transactions.len) {
+                        return self.jsonRpcError(RPC_INTERNAL_ERROR, "Tx index out of range", id);
+                    }
+                    const tx = block_data.transactions[entry.tx_index_in_block];
+
+                    // Compute confirmations.  If the indexed block_hash
+                    // matches the canonical hash at the indexed height,
+                    // confirmations = tip_height - block_height + 1.
+                    // Otherwise confirmations=0 (block disconnected; the
+                    // txindex CF_TX_INDEX entry is stale, e.g. a flush()
+                    // race window between disconnect and the delete
+                    // hitting durable storage).
+                    var confirmations: u32 = 0;
+                    if (self.chain_state.getBlockHashByHeight(entry.block_height)) |canonical_hash| {
+                        if (std.mem.eql(u8, &canonical_hash, &entry.block_hash)) {
+                            if (self.chain_state.best_height >= entry.block_height) {
+                                confirmations = self.chain_state.best_height - entry.block_height + 1;
+                            }
+                        }
+                    }
+
+                    var buf = std.ArrayList(u8).init(self.allocator);
+                    defer buf.deinit();
+                    const writer = buf.writer();
+
+                    if (verbose) {
+                        // Compute txid (matches what we looked up by) +
+                        // emit confirmations + blockhash so the corpus
+                        // probe can read both fields.
+                        try writer.print("{{\"txid\":\"", .{});
+                        try writeHashHex(writer, &txid);
+                        try writer.print("\",\"version\":{d},\"locktime\":{d}", .{
+                            tx.version,
+                            tx.lock_time,
+                        });
+                        try writer.print(",\"blockhash\":\"", .{});
+                        try writeHashHex(writer, &entry.block_hash);
+                        try writer.print("\",\"confirmations\":{d}", .{confirmations});
+                        try writer.print(",\"in_active_chain\":{s}}}", .{
+                            if (confirmations > 0) "true" else "false",
+                        });
+                    } else {
+                        // Return raw hex.
+                        var tx_writer = serialize.Writer.init(self.allocator);
+                        defer tx_writer.deinit();
+                        serialize.writeTransaction(&tx_writer, &tx) catch {
+                            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Serialization failed", id);
+                        };
+                        const tx_bytes = tx_writer.getWritten();
+
+                        try writer.writeByte('"');
+                        for (tx_bytes) |byte| {
+                            try writer.print("{x:0>2}", .{byte});
+                        }
+                        try writer.writeByte('"');
+                    }
+
+                    return self.jsonRpcResult(buf.items, id);
+                }
+            }
+        }
+
         return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "No such mempool or blockchain transaction", id);
     }
 
