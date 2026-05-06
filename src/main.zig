@@ -1627,6 +1627,18 @@ pub fn main() !void {
     var chain_state = storage.ChainState.init(db_ptr, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
     chain_state.wireUtxoParent();
+    // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
+    // 2026-05-05.md): plumb --txindex from CLI/config into ChainState so
+    // connectBlockInner queues CF_TX_INDEX writes and disconnectBlockByHashCF
+    // queues the corresponding deletes, both atomic with the chainstate
+    // advance via the flush() WriteBatch.  Pre-this-commit `--txindex` was
+    // a parsed-but-dead flag (config.txindex never reached the storage
+    // layer) and CF_TX_INDEX never received a put / delete.  Bitcoin Core
+    // analog: -txindex toggling TxIndex base-index registration in init.cpp.
+    chain_state.txindex_enabled = config.txindex;
+    if (config.txindex) {
+        std.debug.print("Transaction index enabled (--txindex)\n", .{});
+    }
     // Seed the BIP-113 MTP ring buffer with the genesis timestamp so that
     // blocks at heights 1..10 see the correct MTP window (which includes
     // genesis).  connectBlockInner pushes subsequent block timestamps into
