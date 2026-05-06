@@ -19,6 +19,7 @@ const mempool_mod = @import("mempool.zig");
 const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
 const validation = @import("validation.zig");
+const peer = @import("peer.zig");
 
 // ============================================================================
 // Block Template
@@ -783,6 +784,47 @@ pub fn submitBlockWithIndex(
         }
     }
 
+    // Pattern Y (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md):
+    // decouple block storage from best-chain selection. Bitcoin Core's
+    // `BlockManager::AcceptBlock` (validation.cpp) writes
+    // `pindexNew->nChainWork` and sets `BLOCK_HAVE_DATA` on every accepted
+    // block — best-chain or side-branch — with `ConnectBlock` deferred to
+    // a later `ActivateBestChain`. Three paths from here:
+    //
+    //   * extends_active_tip: block.prev == chain_state.best_hash. This is
+    //     the happy path — connect to the active chain via
+    //     `connectBlockFastWithUndo` so undo data is persisted (a future
+    //     reorg can disconnect this block).
+    //   * side_branch: block.prev != active tip but parent IS in the
+    //     chain_manager block_index. Persist body + index entry; if the
+    //     new chain's chain_work strictly exceeds the active tip's, fire
+    //     `chain_state.reorgToChain` (disconnects active chain to fork
+    //     point, connects the new chain in order); otherwise return BIP-22
+    //     "inconclusive" (Core convention from rpc/mining.cpp::submitblock).
+    //   * unknown_parent: parent isn't in the index. Reject — same shape
+    //     as Pattern X's downstream BIP-22 rejection for an orphan block.
+    //
+    // Cross-impl reference closures: rustoshi 68a422b, blockbrew 4e51e8b,
+    // camlcoin 22667c2, nimrod 7196d41, beamchain fcbb4b7, lunarblock 462f23b.
+    // Counterpart to Pattern X commit 546c57a (height derivation).
+
+    const extends_active_tip = std.mem.eql(u8, &block.header.prev_block, &chain_state.best_hash);
+
+    const parent_in_cm: ?*validation.BlockIndexEntry =
+        if (chain_manager) |cm| cm.getBlock(&block.header.prev_block) else null;
+
+    if (!extends_active_tip and parent_in_cm != null) {
+        return processSideBranchSubmission(
+            block,
+            &block_hash,
+            height,
+            chain_state,
+            chain_manager.?,
+            parent_in_cm.?,
+            allocator,
+        );
+    }
+
     // Persist the raw block body to CF_BLOCKS BEFORE applying UTXO
     // mutations.  Same semantics as the peer.zig drainBlockBuffer path —
     // the queue is consumed by ChainState.flush() so the body and tip
@@ -816,6 +858,15 @@ pub fn submitBlockWithIndex(
     // undo data collection.  Undo data is only needed for reorgs, and during
     // sequential feeding we immediately discard it anyway.  This saves
     // significant allocation overhead for large blocks.
+    //
+    // Pattern Y note: outside of ibd_mode the connect path now persists
+    // undo data via `connectBlockFastWithUndo`. Without per-block undo on
+    // the happy path, a future reorg-via-submitblock that needs to
+    // disconnect a happy-path-mined A1/A2 would fail with
+    // "UndoDataNotFound" (storage.zig:2595). Mirrors the IBD reorg-safe
+    // path in peer.zig::drainBlockBuffer (CLEARBIT_REORG=1) and the same
+    // change in camlcoin Pattern Y (lib/mining.ml ::submit_block, store
+    // undo on every accepted block).
     const ibd_mode = params.assume_valid_height > 0 and height <= params.assume_valid_height;
     if (ibd_mode) {
         chain_state.connectBlockFast(block, &block_hash, height) catch |err| {
@@ -831,37 +882,32 @@ pub fn submitBlockWithIndex(
             };
         };
     } else {
-        var undo = chain_state.connectBlock(block, &block_hash, height) catch |err| {
+        chain_state.connectBlockFastWithUndo(block, &block_hash, height) catch |err| {
             // Map to BIP-22 canonical strings (Bitcoin Core BIP22ValidationResult).
             return .{
                 .accepted = false,
                 .reject_reason = switch (err) {
                     error.MissingInput => "bad-txns-inputs-missingorspent",
+                    error.PrevBlockMismatch, error.HeightMismatch =>
+                    // The active-tip pre-check at the top of submitBlockWithIndex
+                    // should have routed prev-block mismatch into the side-branch
+                    // arm. If we land here it means the block looked like a
+                    // best-chain extension but raced with another submission —
+                    // surface as "rejected" rather than corrupting state.
+                    "rejected",
                     else => "rejected",
                 },
                 .block_hash = block_hash,
             };
         };
-        undo.deinit(chain_state.allocator);
     }
 
-    // Per-block atomic flush: pending_deletes + dirty UTXOs + tip in one
-    // WriteBatch via ChainState.flush().  Previously this code split the
-    // flush into a bare `flushPendingDeletes` every 100 blocks (deletes
-    // applied WITHOUT the tip — the exact pre-c87af55 hazard) and a full
-    // ChainState.flush() every 1000 blocks.  Between those cadences a
-    // crash could leave deletes on disk with a stale tip, or UTXO inserts
-    // in the cache only — same corruption mode as the IBD path before the
-    // per-block-flush change in connectBlockFast.  We now route every
-    // submitblock / generate* call through the same atomic per-block
-    // flush, with the flush_error flag halting on persistence failure
-    // so we never silently desync (Option A, wave2-2026-04-14).
-    //
-    // In ibd_mode the flush already happened inside connectBlockFast, so
-    // this call is a near no-op (dirty_keys/pending_deletes empty, tip
-    // re-written) — kept unconditional so the non-IBD submitblock path
-    // (which calls connectBlock, NOT connectBlockFast) still gets per-block
-    // durability.
+    // Per-block atomic flush: pending_deletes + dirty UTXOs + tip + bodies +
+    // undo all commit in one WriteBatch via ChainState.flush() (already
+    // invoked inside connectBlockFastWithUndo / connectBlockFast).  This
+    // additional flush is a near no-op kept for symmetry with the legacy
+    // path; the flush_error sticky-flag halts on persistence failure so we
+    // never silently desync (Option A, wave2-2026-04-14).
     chain_state.flush() catch |err| {
         std.debug.print("submitblock: atomic flush failed at height {d}: {} — halting\n", .{ height, err });
         chain_state.flush_error = true;
@@ -874,10 +920,15 @@ pub fn submitBlockWithIndex(
     };
 
     // Insert into the block index so that getblockheader / getblockhash can
-    // find the block afterwards.
+    // find the block afterwards.  Pattern Y: chain_work is parent.chain_work
+    // + workFromBits(this header) — was previously copied straight from
+    // the parent (no work increment), which broke the strict-greater
+    // comparison in the side-branch arm.
     if (chain_manager) |cm| {
-        // Look up the parent entry for chain work calculation
         const parent = cm.getBlock(&block.header.prev_block);
+        var new_work: [32]u8 = if (parent) |p| p.chain_work else [_]u8{0} ** 32;
+        const this_work = peer.workFromBits(block.header.bits);
+        peer.addChainWorkBE(&new_work, &this_work);
 
         const entry = allocator.create(validation.BlockIndexEntry) catch {
             // Non-fatal: the block is already connected to the UTXO chain.
@@ -887,8 +938,8 @@ pub fn submitBlockWithIndex(
             .hash = block_hash,
             .header = block.header,
             .height = height,
-            .status = .{ .valid_header = true, .has_data = true, .has_undo = false, .failed_valid = false, .failed_child = false, ._padding = 0 },
-            .chain_work = if (parent) |p| p.chain_work else [_]u8{0} ** 32,
+            .status = .{ .valid_header = true, .has_data = true, .has_undo = !ibd_mode, .failed_valid = false, .failed_child = false, ._padding = 0 },
+            .chain_work = new_work,
             .sequence_id = 0,
             .parent = parent,
             .file_number = 0,
@@ -897,7 +948,8 @@ pub fn submitBlockWithIndex(
 
         cm.addBlock(entry) catch {};
 
-        // Update the active tip
+        // Update the active tip — this is the best-chain extension arm
+        // (extends_active_tip), so the new block IS the new active tip.
         cm.active_tip = entry;
 
         // Persist to ChainStore on disk
@@ -910,6 +962,305 @@ pub fn submitBlockWithIndex(
         .accepted = true,
         .reject_reason = null,
         .block_hash = block_hash,
+    };
+}
+
+/// Pattern Y side-branch arm of submitBlockWithIndex.
+///
+/// Called when `block.prev != chain_state.best_hash` BUT the parent is in
+/// `chain_manager.block_index`. Three sub-cases:
+///
+///   * Strict-greater chain_work → fire reorg via
+///     `chain_state.reorgToChain` (disconnects active chain to fork
+///     point, connects this branch's blocks). New tip = this block.
+///     Returns "accept" (BIP-22 null result).
+///   * Equal/lesser chain_work → store body + BlockIndexEntry but do NOT
+///     touch active tip. Returns "inconclusive" (BIP-22 side-branch
+///     storage convention from rpc/mining.cpp::submitblock).
+///   * reorg failure → returns "rejected" with logging.
+///
+/// Reference: bitcoin-core/src/validation.cpp::AcceptBlock (writes
+/// HAVE_DATA on every accepted block) + ActivateBestChain (selects the
+/// heaviest valid leaf as new tip). Storage and best-chain selection are
+/// decoupled in Core; this function brings clearbit's submitblock path
+/// into parity.
+pub fn processSideBranchSubmission(
+    block: *const types.Block,
+    block_hash: *const types.Hash256,
+    height: u32,
+    chain_state: *storage.ChainState,
+    cm: *validation.ChainManager,
+    parent_entry: *validation.BlockIndexEntry,
+    allocator: std.mem.Allocator,
+) !SubmitResult {
+    // Compute new chain_work = parent.chain_work + workFromBits(this header).
+    var new_work: [32]u8 = parent_entry.chain_work;
+    const this_work = peer.workFromBits(block.header.bits);
+    peer.addChainWorkBE(&new_work, &this_work);
+
+    // Persist the raw block body to CF_BLOCKS so a future reorg-connect
+    // can replay this block from disk. Same path as the active-tip arm
+    // (queueBlockWrite + flush). Failure here is non-fatal at the
+    // body-write level; we still register the index entry so a later
+    // resubmission can fill in the gap.
+    var body_persisted = false;
+    {
+        var writer = serialize.Writer.init(chain_state.allocator);
+        const queued = blk: {
+            serialize.writeBlock(&writer, block) catch {
+                writer.deinit();
+                break :blk false;
+            };
+            const owned_const = writer.toOwnedSlice() catch {
+                writer.deinit();
+                break :blk false;
+            };
+            const owned: []u8 = @constCast(owned_const);
+            chain_state.queueBlockWrite(block_hash, owned, height) catch {
+                chain_state.allocator.free(owned);
+                break :blk false;
+            };
+            break :blk true;
+        };
+        if (queued) {
+            chain_state.flush() catch |err| {
+                std.debug.print(
+                    "submitblock side-branch: body flush failed at h={d}: {}\n",
+                    .{ height, err },
+                );
+            };
+            body_persisted = true;
+        } else {
+            std.debug.print(
+                "submitblock side-branch: queueBlockWrite skipped at h={d}\n",
+                .{height},
+            );
+        }
+    }
+
+    // Register the side-branch entry in the chain_manager block_index
+    // BEFORE deciding reorg vs. inconclusive: we want the entry to exist
+    // even if the chain_work comparison says "stay on active". Skip
+    // duplicates (a re-submission of an already-known side-branch block
+    // is a no-op + return "duplicate-inconclusive" per Core convention).
+    if (cm.getBlock(block_hash)) |_| {
+        return .{
+            .accepted = false,
+            .reject_reason = "duplicate-inconclusive",
+            .block_hash = block_hash.*,
+        };
+    }
+
+    const entry = allocator.create(validation.BlockIndexEntry) catch {
+        return .{
+            .accepted = false,
+            .reject_reason = "rejected",
+            .block_hash = block_hash.*,
+        };
+    };
+    entry.* = validation.BlockIndexEntry{
+        .hash = block_hash.*,
+        .header = block.header,
+        .height = height,
+        .status = .{
+            .valid_header = true,
+            .has_data = body_persisted,
+            .has_undo = false, // side-branch hasn't been connected yet
+            .failed_valid = false,
+            .failed_child = false,
+            ._padding = 0,
+        },
+        .chain_work = new_work,
+        .sequence_id = 0,
+        .parent = parent_entry,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    cm.addBlock(entry) catch {
+        allocator.destroy(entry);
+        return .{
+            .accepted = false,
+            .reject_reason = "rejected",
+            .block_hash = block_hash.*,
+        };
+    };
+
+    // Persist header to disk so getblockheader / getblockhash sees it.
+    if (cm.chain_store) |cs| {
+        cs.putBlockIndex(block_hash, &block.header, height) catch {};
+    }
+
+    // Compare chain_work: do we have strictly more work than the active
+    // tip?  Core's `ActivateBestChain` uses strict-greater (first-seen
+    // wins on ties, validation.cpp:CBlockIndexWorkComparator).
+    const active_tip_work: [32]u8 = if (cm.active_tip) |at|
+        at.chain_work
+    else
+        peer.chainWorkFromHeight(chain_state.best_height);
+
+    if (peer.cmpChainWorkBE(&new_work, &active_tip_work) <= 0) {
+        // Side-branch with insufficient work — store + return BIP-22
+        // "inconclusive" (Core convention). The block stays in the
+        // index; if a heavier descendant arrives later, this block is
+        // a reorg-replay candidate.
+        return .{
+            .accepted = false,
+            .reject_reason = "inconclusive",
+            .block_hash = block_hash.*,
+        };
+    }
+
+    // Heavier branch — trigger reorg. Walk back from this block's parent
+    // to the most recent ancestor on the active chain (fork point), then
+    // collect the chain forward [fork_point + 1 .. this block] in
+    // connection order. Each block's body is read from CF_BLOCKS via
+    // chain_state.getBlockBytes (they were stored when each B-block was
+    // submitted as a side-branch).
+    const reorg_result = fireReorgFromSideBranch(
+        block,
+        block_hash,
+        height,
+        chain_state,
+        cm,
+        entry,
+        allocator,
+    ) catch |err| {
+        std.debug.print(
+            "submitblock side-branch: reorg failed at h={d}: {} — keeping active tip\n",
+            .{ height, err },
+        );
+        return .{
+            .accepted = false,
+            .reject_reason = "rejected",
+            .block_hash = block_hash.*,
+        };
+    };
+    return reorg_result;
+}
+
+/// Walk back from `new_tip_entry` to the most recent ancestor on the
+/// active chain (the fork point), then drive `chain_state.reorgToChain`
+/// with the in-order list of fork blocks. On success: updates
+/// `cm.active_tip` to `new_tip_entry`. On failure: returns the storage
+/// error for the caller to map.
+fn fireReorgFromSideBranch(
+    new_tip_block: *const types.Block,
+    new_tip_hash: *const types.Hash256,
+    new_tip_height: u32,
+    chain_state: *storage.ChainState,
+    cm: *validation.ChainManager,
+    new_tip_entry: *validation.BlockIndexEntry,
+    allocator: std.mem.Allocator,
+) !SubmitResult {
+    // Walk up the parent chain from new_tip_entry back to the active chain.
+    // The walk stops at the first ancestor whose hash equals the active
+    // tip hash OR whose hash is reachable via chain_state.hasBlock (a
+    // historical active-chain block).
+    var fork_chain = std.ArrayList(*validation.BlockIndexEntry).init(allocator);
+    defer fork_chain.deinit();
+
+    // The new tip is the deepest block in the fork chain.
+    try fork_chain.append(new_tip_entry);
+
+    var cursor: *validation.BlockIndexEntry = new_tip_entry;
+    var fork_point_hash: ?types.Hash256 = null;
+    const MAX_DEPTH: u32 = 288;
+    var depth: u32 = 0;
+
+    while (depth < MAX_DEPTH) : (depth += 1) {
+        const parent_ptr = cursor.parent orelse {
+            // No parent in the index — fork falls off our knowledge.
+            return error.ForkPointNotInIndex;
+        };
+        // Is parent on the active chain?  We can't use
+        // chain_state.hasBlock() — that returns true for any block in
+        // CF_BLOCKS, including side-branch bodies we just stored. The
+        // correct check is the height->hash index, which only points
+        // at the active chain (atomic with tip via ChainState.flush).
+        // Reference: storage.zig:2150 getBlockHashByHeight.
+        if (std.mem.eql(u8, &parent_ptr.hash, &chain_state.best_hash)) {
+            fork_point_hash = parent_ptr.hash;
+            break;
+        }
+        if (chain_state.getBlockHashByHeight(parent_ptr.height)) |active_hash| {
+            if (std.mem.eql(u8, &active_hash, &parent_ptr.hash)) {
+                fork_point_hash = parent_ptr.hash;
+                break;
+            }
+        }
+        // Not on active chain — keep walking up. Push parent onto
+        // fork_chain (we're collecting in tip-first order; we'll reverse
+        // before handing off to reorgToChain).
+        try fork_chain.append(parent_ptr);
+        cursor = parent_ptr;
+    }
+
+    const fp = fork_point_hash orelse return error.ForkPointNotFound;
+
+    // Reverse: reorgToChain expects [fork_point + 1, ..., new_tip].
+    std.mem.reverse(*validation.BlockIndexEntry, fork_chain.items);
+
+    // Build ReorgBlock array. Each block's body comes from CF_BLOCKS
+    // (queueBlockWrite + flush already persisted them as the side-branch
+    // submissions arrived). The new_tip's body, however, may not yet be
+    // persisted (the caller's `body_persisted` flag) — but in
+    // processSideBranchSubmission we always flush before getting here,
+    // so the lookup should succeed for new_tip too. Defensive: if the
+    // disk lookup fails for new_tip, fall back to the in-memory block
+    // we already have.
+    var rb_list = std.ArrayList(storage.ChainState.ReorgBlock).init(allocator);
+    // Track allocated blocks so we can free them on error.
+    var owned_blocks = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (owned_blocks.items) |*b| serialize.freeBlock(allocator, b);
+        owned_blocks.deinit();
+        rb_list.deinit();
+    }
+
+    for (fork_chain.items) |fc_entry| {
+        if (std.mem.eql(u8, &fc_entry.hash, new_tip_hash)) {
+            // Use the in-memory block for the new tip — avoids a
+            // serialize-deserialize round-trip and handles the case
+            // where the body flush above silently failed.
+            try rb_list.append(.{
+                .hash = new_tip_hash.*,
+                .block = new_tip_block.*,
+                .height = new_tip_height,
+            });
+            continue;
+        }
+
+        const bytes_opt = chain_state.getBlockBytes(&fc_entry.hash) catch null;
+        const bytes = bytes_opt orelse return error.SideBranchBodyNotFound;
+        defer allocator.free(bytes);
+
+        var reader = serialize.Reader{ .data = bytes };
+        const decoded = try serialize.readBlock(&reader, allocator);
+        try owned_blocks.append(decoded);
+        try rb_list.append(.{
+            .hash = fc_entry.hash,
+            .block = decoded,
+            .height = fc_entry.height,
+        });
+    }
+
+    // Fire the reorg.  reorgToChain will:
+    //   1. Disconnect blocks from current tip back to fp (UTXO rewind +
+    //      best_hash/best_height update).
+    //   2. Re-queueBlockWrite each new chain block (idempotent for the
+    //      side-branch ones already on disk).
+    //   3. connectBlockFastWithUndo each new block (UTXO apply + undo
+    //      capture + atomic flush).
+    const connected = try chain_state.reorgToChain(&fp, rb_list.items);
+    _ = connected;
+
+    // Update cm.active_tip to point at the new tip.
+    cm.active_tip = new_tip_entry;
+
+    return .{
+        .accepted = true,
+        .reject_reason = null,
+        .block_hash = new_tip_hash.*,
     };
 }
 
