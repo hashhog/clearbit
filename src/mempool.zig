@@ -127,6 +127,13 @@ pub const MempoolError = error{
     NonBIP125Replaceable,
     /// Replacement transaction fee is too low.
     ReplacementFeeTooLow,
+    /// BIP-125 Rule 2: replacement spends an outpoint owned by a tx that
+    /// would itself be evicted by this replacement (i.e., the replacement
+    /// introduces a "new unconfirmed input" — one whose parent only became
+    /// available because of the replacement's own conflict graph). Mirrors
+    /// Core's `EntriesAndTxidsDisjoint` reject ("spends conflicting
+    /// transaction") in policy/rbf.cpp.
+    ReplacementSpendsConflicting,
     /// Replacement would evict too many transactions (exceeds MAX_REPLACEMENT_EVICTIONS).
     TooManyEvictions,
     /// Mempool is full and transaction's fee is too low for eviction.
@@ -941,6 +948,7 @@ pub const Mempool = struct {
                 MempoolError.MissingInputs => "missing-inputs",
                 MempoolError.NonBIP125Replaceable => "txn-mempool-conflict",
                 MempoolError.ReplacementFeeTooLow => "insufficient fee",
+                MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
                 MempoolError.TooManyEvictions => "too many potential replacements",
                 MempoolError.MempoolFull => "mempool full",
                 MempoolError.NonStandard => "non-standard",
@@ -1529,7 +1537,15 @@ pub const Mempool = struct {
     /// Full RBF: ALL mempool transactions are replaceable regardless of nSequence signaling.
     /// Rules:
     /// 1. [REMOVED for full RBF] Original txs must signal RBF - no longer required
-    /// 2. New tx must not add new unconfirmed inputs (enforced elsewhere)
+    /// 2. Replacement must not introduce "new unconfirmed inputs": every input
+    ///    must be either confirmed (in chainstate UTXO set) OR reference a
+    ///    mempool tx that is NOT itself being evicted by this replacement.
+    ///    Equivalently: no input may reference a tx in `all_evicted`. Mirrors
+    ///    Core's `EntriesAndTxidsDisjoint` ("spends conflicting transaction")
+    ///    in `policy/rbf.cpp`. Without this, an attacker can craft a
+    ///    replacement whose ancestor is itself a conflict — Core fails the
+    ///    check pre-eviction; clearbit (pre-fix) would evict and end up with
+    ///    an unspendable mempool tx (mempool-integrity DoS).
     /// 3. New tx must pay higher absolute fee than sum of all evicted txs
     /// 4. New fee must exceed old fees by at least incremental_relay_fee * new_vsize
     /// 5. Total number of evicted transactions must not exceed MAX_REPLACEMENT_EVICTIONS
@@ -1541,7 +1557,6 @@ pub const Mempool = struct {
         new_vsize: usize,
         conflicting_txids: []const types.Hash256,
     ) MempoolError!void {
-        _ = new_tx;
         _ = new_txid;
 
         // Collect all transactions to be evicted (direct conflicts + all descendants)
@@ -1572,6 +1587,19 @@ pub const Mempool = struct {
                         total_evicted_fee += entry.fee;
                     }
                 }
+            }
+        }
+
+        // Rule 2 (BIP-125): reject if any input of the replacement spends an
+        // outpoint owned by a tx that would itself be evicted. Doing the
+        // eviction first and then discovering this would leave an
+        // unspendable tx in the mempool (parent gone) — Core checks the
+        // disjointness up-front and rejects with "spends conflicting
+        // transaction". See policy/rbf.cpp::EntriesAndTxidsDisjoint and
+        // CORE-PARITY-AUDIT/_mempool-package-rbf-cross-impl-audit-2026-05-06-part1.md.
+        for (new_tx.inputs) |input| {
+            if (all_evicted.contains(input.previous_output.hash)) {
+                return MempoolError.ReplacementSpendsConflicting;
             }
         }
 
@@ -5316,6 +5344,196 @@ test "full RBF constants" {
     // Verify key RBF constants
     try std.testing.expectEqual(@as(i64, 1000), INCREMENTAL_RELAY_FEE);
     try std.testing.expectEqual(@as(usize, 100), MAX_REPLACEMENT_EVICTIONS);
+}
+
+// ============================================================================
+// BIP-125 Rule 2 Tests (no new unconfirmed inputs)
+// ============================================================================
+//
+// Rule 2 (Core: policy/rbf.cpp::EntriesAndTxidsDisjoint, "spends conflicting
+// transaction"): a replacement transaction must not spend an outpoint owned
+// by a tx that is itself being evicted by the replacement. Without this,
+// an attacker can force-evict an honest tx graph by replacing the root and
+// referencing an ancestor in the evicted subtree.
+
+test "BIP-125 Rule 2: replacement spending only old/confirmed inputs is accepted" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Funding tx — provides the pre-existing outpoint that both the
+    // original and the replacement spend (so the replacement is NOT pulling
+    // in any new unconfirmed parent).
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xA1} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_000_000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Original tx spends funding[0].
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 900_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(original_tx);
+
+    // Replacement spends the SAME funding[0] outpoint as original (so its
+    // only mempool ancestor is funding, which is NOT being evicted).
+    // Higher fee => Rules 3/4 satisfied. No new-unconfirmed-input violation.
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 600_000, // fee = 400_000 (much higher than 100_000)
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1,
+    };
+
+    // Should accept: only ancestor (funding) is not in the evicted set.
+    try mempool.addTransaction(replacement_tx);
+
+    // Original gone, replacement present.
+    const original_txid = crypto.computeTxid(&original_tx, allocator) catch unreachable;
+    const replacement_txid = crypto.computeTxid(&replacement_tx, allocator) catch unreachable;
+    try std.testing.expect(!mempool.contains(original_txid));
+    try std.testing.expect(mempool.contains(replacement_txid));
+}
+
+test "BIP-125 Rule 2: replacement spending an evicted descendant is rejected" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    // Two funding txs — funding_a feeds the conflict graph, funding_b is an
+    // independent confirmed-equivalent input the replacement also pulls in.
+    const funding_a = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xB1} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 2_000_000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(funding_a);
+    const funding_a_txid = crypto.computeTxid(&funding_a, allocator) catch unreachable;
+
+    // tx A spends funding_a[0].
+    const tx_a = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_a_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_900_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx_a);
+    const tx_a_txid = crypto.computeTxid(&tx_a, allocator) catch unreachable;
+
+    // tx B spends A[0] — B is a descendant of A.
+    const tx_b = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = tx_a_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_800_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx_b);
+    const tx_b_txid = crypto.computeTxid(&tx_b, allocator) catch unreachable;
+
+    try std.testing.expectEqual(@as(usize, 3), mempool.entries.count());
+
+    // Replacement R conflicts with A (spends funding_a[0]) AND ALSO spends
+    // tx_b[0]. tx_b is a descendant of A and would be evicted alongside A,
+    // making tx_b[0] a "new unconfirmed input" in the BIP-125 sense.
+    // Rule 2 must reject this BEFORE the eviction mutates state.
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{
+            .{
+                .previous_output = .{ .hash = funding_a_txid, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            },
+            .{
+                .previous_output = .{ .hash = tx_b_txid, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            },
+        },
+        // Plenty of fee to pass Rules 3/4 if we ever got there:
+        // total_in = 2_000_000 + 1_800_000 = 3_800_000
+        // out      =                            1_000_000
+        // fee      =                            2_800_000
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_000_000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1,
+    };
+
+    const result = mempool.addTransaction(replacement_tx);
+    try std.testing.expectError(MempoolError.ReplacementSpendsConflicting, result);
+
+    // Critical: state must be unchanged. Original conflict graph still
+    // intact (funding_a, tx_a, tx_b all present).
+    try std.testing.expectEqual(@as(usize, 3), mempool.entries.count());
+    try std.testing.expect(mempool.contains(funding_a_txid));
+    try std.testing.expect(mempool.contains(tx_a_txid));
+    try std.testing.expect(mempool.contains(tx_b_txid));
 }
 
 // ============================================================================
