@@ -21,6 +21,10 @@ pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 pub const MAX_INV_SIZE: usize = 50000;
 pub const MAX_HEADERS_SIZE: usize = 2000;
 pub const MAX_ADDR_SIZE: usize = 1000;
+/// BIP-130 / Core MAX_LOCATOR_SZ (chain.h): cap on locator hashes in
+/// a `getheaders` / `getblocks` message.  Anti-DoS: an attacker could
+/// otherwise force unbounded `Hash256` allocation.
+pub const MAX_LOCATOR_SIZE: usize = 101;
 
 /// Network magic bytes for different networks
 pub const NetworkMagic = struct {
@@ -800,6 +804,10 @@ fn decodeInv(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseError
 fn decodeGetHeaders(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseError!GetHeadersMessage {
     const version = try reader.readInt(u32);
     const count = try reader.readCompactSize();
+    // Anti-DoS: Bitcoin Core MAX_LOCATOR_SZ = 101 (chain.h).  Reject
+    // before allocating to prevent unbounded memory allocation via a
+    // crafted `getheaders` / `getblocks` message.
+    if (count > MAX_LOCATOR_SIZE) return ParseError.InvalidData;
     var locators = try allocator.alloc(types.Hash256, @intCast(count));
     for (0..@intCast(count)) |i| {
         locators[i] = try reader.readHash();
