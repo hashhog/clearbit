@@ -1305,8 +1305,12 @@ fn fireReorgFromSideBranch(
         var walk_depth: u32 = 0;
         // Bound the snapshot walk to MAX_DEPTH so a malformed index
         // never runs us off into infinity.  reorgToChain itself caps
-        // at MIN_BLOCKS_TO_KEEP / 288 — we use the same MAX_DEPTH used
-        // for the fork-point walk above so the two phases agree.
+        // at storage.ChainState.MAX_REORG_DEPTH (100, per Pattern D
+        // multi-block atomicity batch-size cap) — but the fork-point
+        // walk above uses MAX_DEPTH for symmetry with the peer-layer
+        // header walk (peer.MAX_REORG_DEPTH = 288).  A reorg accepted
+        // by the peer layer but rejected by storage as too deep
+        // surfaces as `error.ReorgTooDeep` — operator-visible.
         while (walk_depth < MAX_DEPTH and !std.mem.eql(u8, &walk_hash, &fp)) : (walk_depth += 1) {
             const bytes_opt = chain_state.getBlockBytes(&walk_hash) catch null;
             const bytes = bytes_opt orelse break;
