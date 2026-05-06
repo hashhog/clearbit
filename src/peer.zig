@@ -4070,6 +4070,14 @@ pub const PeerManager = struct {
                     // Accept transaction into mempool via AcceptToMemoryPool
                     const result = pool.acceptToMemoryPool(tx_msg, false);
                     if (result.accepted) {
+                        // After admitting a parent, see if any orphan
+                        // transactions are now resolvable.  Successfully
+                        // promoted orphans drain into the mempool
+                        // automatically (mempool-side fixpoint loop).
+                        // Reference: Bitcoin Core
+                        // `ProcessOrphanTx` in net_processing.cpp.
+                        _ = pool.processOrphansForParent(result.txid);
+
                         // Relay to all other peers via inv (BIP 339: use MSG_WITNESS_TX)
                         const inv_items = [_]p2p.InvVector{.{
                             .inv_type = .msg_witness_tx,
@@ -4088,6 +4096,16 @@ pub const PeerManager = struct {
                             relay_peer.sendMessage(&inv_msg) catch {};
                         }
                         std.debug.print("MEMPOOL: accepted tx, relaying to peers\n", .{});
+                    } else if (result.reject_reason) |reason| {
+                        // On `missing-inputs` (Core's TX_MISSING_INPUTS),
+                        // park the tx in the orphan pool keyed by the
+                        // sending peer so we can retry after the parent
+                        // arrives.  Bounded by `MAX_ORPHAN_TRANSACTIONS`
+                        // / `MAX_ORPHAN_TX_SIZE` / `MAX_PEER_ORPHANS`.
+                        if (std.mem.eql(u8, reason, "missing-inputs")) {
+                            const peer_id: u64 = @intFromPtr(peer);
+                            _ = pool.addOrphan(&tx_msg, peer_id);
+                        }
                     }
                 }
             },
@@ -4462,6 +4480,12 @@ pub const PeerManager = struct {
             if (self.download_cursor > self.connect_cursor) {
                 self.download_cursor = self.connect_cursor;
             }
+        }
+        // Drop any orphan-pool entries this peer announced so the peer's
+        // pointer is not dangling-referenced after `destroy`.  Mirrors
+        // Bitcoin Core `EraseOrphansFor` from net_processing.cpp.
+        if (self.mempool) |pool| {
+            pool.eraseOrphansForPeer(@intFromPtr(peer));
         }
         peer.disconnect();
         self.allocator.destroy(peer);

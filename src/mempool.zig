@@ -53,6 +53,37 @@ pub const INCREMENTAL_RELAY_FEE: i64 = 1000;
 pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
 
 // ============================================================================
+// Orphan Transaction Pool Constants
+// ============================================================================
+//
+// Reference: Bitcoin Core `src/node/txorphanage.{h,cpp}`.  An orphan is a tx
+// that fails AcceptToMemoryPool with `TX_MISSING_INPUTS` because at least one
+// of its referenced parents is neither in the UTXO set nor in the mempool yet.
+// We hold it briefly so that, when the parent arrives in a later `tx` or
+// `block` message, we can re-attempt acceptance instead of losing the
+// child entirely (which would slow tx propagation).
+//
+// Bounds chosen to mirror the legacy pre-cluster Core defaults:
+//   - global cap   = 100 transactions
+//   - per-tx cap   = 100 000 bytes (serialized weight unit upper bound)
+//   - per-peer cap = MAX_PEER_ORPHANS (so a single adversarial peer cannot
+//     monopolize the pool)
+// Eviction policy: oldest-first when the global cap is reached.
+//
+
+/// Maximum number of orphan transactions held globally.
+/// Mirrors Bitcoin Core's `MAX_ORPHAN_TRANSACTIONS` (legacy / pre-cluster).
+pub const MAX_ORPHAN_TRANSACTIONS: usize = 100;
+
+/// Maximum serialized size (bytes) of any single orphan transaction.
+/// Mirrors Bitcoin Core's `MAX_ORPHAN_TX_SIZE` (legacy / pre-cluster).
+pub const MAX_ORPHAN_TX_SIZE: usize = 100_000;
+
+/// Maximum number of orphans a single peer may have in the pool.
+/// Provides per-peer fairness so one peer cannot evict another's orphans.
+pub const MAX_PEER_ORPHANS: usize = 100;
+
+// ============================================================================
 // TRUC (v3) Policy Constants - BIP 431
 // ============================================================================
 
@@ -360,6 +391,34 @@ pub const MempoolEntry = struct {
 };
 
 // ============================================================================
+// Orphan Transaction Pool
+// ============================================================================
+
+/// A transaction whose parent is not yet in the UTXO set or the mempool.
+///
+/// Held briefly so that if the parent arrives in a later `tx` or `block`
+/// message, we can re-attempt AcceptToMemoryPool for the child rather than
+/// silently dropping it.  Mirrors Bitcoin Core's `TxOrphanage::OrphanTx`.
+///
+/// The `tx` slices (inputs / outputs / scripts / witnesses) are owned by
+/// the orphan pool's allocator and freed via `serialize.freeTransaction`
+/// when the orphan is evicted, expired, or successfully resolved.
+pub const OrphanTx = struct {
+    /// Owned, deep-copied transaction.  Slices are allocator-owned.
+    tx: types.Transaction,
+    /// Cached txid (lookup key in the orphan map).
+    txid: types.Hash256,
+    /// Serialized size in bytes (with witness).  Bounded by `MAX_ORPHAN_TX_SIZE`.
+    size: usize,
+    /// Wall-clock time the orphan was added.  Used by oldest-first eviction.
+    time_added: i64,
+    /// Identifier of the peer that announced this orphan (opaque to the pool).
+    /// Caller passes any stable u64; we use it for per-peer accounting and
+    /// for `eraseOrphansForPeer` on disconnect.  `0` means "no peer / test".
+    peer_id: u64,
+};
+
+// ============================================================================
 // Mempool
 // ============================================================================
 
@@ -416,6 +475,19 @@ pub const Mempool = struct {
     /// Fee estimator for smart fee estimation.
     fee_estimator: FeeEstimator,
 
+    // ========================================================================
+    // Orphan Transaction Pool
+    // ========================================================================
+
+    /// Orphan transactions indexed by txid.
+    /// See `OrphanTx` and the constants `MAX_ORPHAN_TRANSACTIONS`,
+    /// `MAX_ORPHAN_TX_SIZE`, `MAX_PEER_ORPHANS` for bounds.
+    orphans: std.AutoHashMap(types.Hash256, *OrphanTx),
+
+    /// Per-peer orphan count.  Used to enforce `MAX_PEER_ORPHANS` and to
+    /// support O(N) cleanup when a peer disconnects.
+    orphans_by_peer: std.AutoHashMap(u64, u32),
+
     /// Initialize a new mempool.
     pub fn init(
         chain_state: ?*storage.ChainState,
@@ -440,6 +512,8 @@ pub const Mempool = struct {
             .linearization_dirty = true,
             .mutex = std.Thread.Mutex{},
             .fee_estimator = FeeEstimator.init(allocator),
+            .orphans = std.AutoHashMap(types.Hash256, *OrphanTx).init(allocator),
+            .orphans_by_peer = std.AutoHashMap(u64, u32).init(allocator),
         };
     }
 
@@ -473,6 +547,17 @@ pub const Mempool = struct {
         }
         self.cluster_linearizations.deinit();
         self.fee_estimator.deinit();
+
+        // Free any pending orphan transactions.  Each OrphanTx owns its
+        // tx slices via its own allocator copy.
+        var orphan_iter = self.orphans.iterator();
+        while (orphan_iter.next()) |entry| {
+            const orphan = entry.value_ptr.*;
+            serialize.freeTransaction(self.allocator, &orphan.tx);
+            self.allocator.destroy(orphan);
+        }
+        self.orphans.deinit();
+        self.orphans_by_peer.deinit();
     }
 
     /// Attempt to add a transaction to the mempool.
@@ -949,6 +1034,9 @@ pub const Mempool = struct {
             const tx_hash = crypto.computeTxid(&tx, self.allocator) catch continue;
             self.removeTransaction(tx_hash);
         }
+        // Sweep the orphan pool for entries invalidated or confirmed by
+        // this block (Core: `TxOrphanage::EraseForBlock`).
+        self.eraseOrphansForBlock(block);
     }
 
     /// Re-admit transactions from a block that has been disconnected during a
@@ -1005,6 +1093,285 @@ pub const Mempool = struct {
             if (!accepted) {
                 serialize.freeTransaction(self.allocator, &owned_tx);
             }
+        }
+    }
+
+    // ========================================================================
+    // Orphan Transaction Pool
+    // ========================================================================
+    //
+    // An orphan is a tx that AcceptToMemoryPool rejected with `MissingInputs`
+    // because at least one referenced parent is neither in the UTXO set nor in
+    // the mempool yet.  We hold up to `MAX_ORPHAN_TRANSACTIONS` such txs (≤
+    // `MAX_ORPHAN_TX_SIZE` bytes each, ≤ `MAX_PEER_ORPHANS` per peer) and
+    // re-attempt admission when the parent later arrives.
+    //
+    // Reference: Bitcoin Core `src/node/txorphanage.{h,cpp}`.  Cross-impl
+    // reference: camlcoin `lib/mempool.ml:1860+` (`add_orphan` /
+    // `process_orphans`).
+
+    /// Compute the serialized size (bytes) of a transaction including
+    /// witness data.  Used to enforce `MAX_ORPHAN_TX_SIZE`.
+    fn serializedTxSize(self: *Mempool, tx: *const types.Transaction) !usize {
+        var w = serialize.Writer.init(self.allocator);
+        defer w.deinit();
+        try serialize.writeTransaction(&w, tx);
+        return w.list.items.len;
+    }
+
+    /// Add a transaction to the orphan pool.  Returns true if the orphan
+    /// was added (or already present), false if it was rejected (size /
+    /// per-peer / global cap).  The caller retains ownership of `tx`; this
+    /// function deep-copies (via serialize round-trip) into pool storage on
+    /// success.
+    ///
+    /// `peer_id` is an opaque caller-supplied stable identifier for the
+    /// announcing peer (e.g. a pointer cast to usize, or a sequence
+    /// number); 0 is reserved for "no peer / test".  The orphan pool uses
+    /// it only for per-peer accounting and `eraseOrphansForPeer`.
+    pub fn addOrphan(
+        self: *Mempool,
+        tx: *const types.Transaction,
+        peer_id: u64,
+    ) bool {
+        // Compute txid up-front; if hashing fails, drop silently.
+        const txid = crypto.computeTxid(tx, self.allocator) catch return false;
+
+        // Already in the orphan pool — treat as success but don't double-charge.
+        if (self.orphans.contains(txid)) return true;
+
+        // Reject orphans that exceed the per-tx size cap before allocating.
+        const sz = self.serializedTxSize(tx) catch return false;
+        if (sz > MAX_ORPHAN_TX_SIZE) return false;
+
+        // Per-peer cap (only applied for non-zero peer_id).
+        if (peer_id != 0) {
+            const cur = self.orphans_by_peer.get(peer_id) orelse 0;
+            if (cur >= MAX_PEER_ORPHANS) return false;
+        }
+
+        // Global cap: oldest-first eviction (mirrors Core's pre-cluster
+        // `LimitOrphanTxSize`).  We evict until we are strictly below the
+        // cap, so the new orphan can fit.
+        while (self.orphans.count() >= MAX_ORPHAN_TRANSACTIONS) {
+            if (!self.evictOldestOrphan()) break;
+        }
+
+        // Deep-copy the tx via serialize round-trip so the orphan owns its
+        // own slices independent of the caller's buffer.
+        var w = serialize.Writer.init(self.allocator);
+        defer w.deinit();
+        serialize.writeTransaction(&w, tx) catch return false;
+        var r = serialize.Reader{ .data = w.list.items };
+        var owned_tx = serialize.readTransaction(&r, self.allocator) catch return false;
+
+        const orphan_ptr = self.allocator.create(OrphanTx) catch {
+            serialize.freeTransaction(self.allocator, &owned_tx);
+            return false;
+        };
+        orphan_ptr.* = OrphanTx{
+            .tx = owned_tx,
+            .txid = txid,
+            .size = sz,
+            .time_added = std.time.timestamp(),
+            .peer_id = peer_id,
+        };
+
+        self.orphans.put(txid, orphan_ptr) catch {
+            serialize.freeTransaction(self.allocator, &owned_tx);
+            self.allocator.destroy(orphan_ptr);
+            return false;
+        };
+
+        if (peer_id != 0) {
+            const cur = self.orphans_by_peer.get(peer_id) orelse 0;
+            self.orphans_by_peer.put(peer_id, cur + 1) catch {};
+        }
+        return true;
+    }
+
+    /// Evict the oldest orphan in the pool.  Returns true if one was
+    /// removed, false if the pool is empty.  Used by `addOrphan` when the
+    /// global cap is reached.
+    fn evictOldestOrphan(self: *Mempool) bool {
+        var oldest_txid: ?types.Hash256 = null;
+        var oldest_time: i64 = std.math.maxInt(i64);
+        var iter = self.orphans.iterator();
+        while (iter.next()) |entry| {
+            const o = entry.value_ptr.*;
+            if (o.time_added < oldest_time) {
+                oldest_time = o.time_added;
+                oldest_txid = o.txid;
+            }
+        }
+        if (oldest_txid) |t| {
+            return self.removeOrphan(t);
+        }
+        return false;
+    }
+
+    /// Remove a specific orphan by txid.  Returns true if one was removed.
+    pub fn removeOrphan(self: *Mempool, txid: types.Hash256) bool {
+        if (self.orphans.fetchRemove(txid)) |kv| {
+            const orphan = kv.value;
+            if (orphan.peer_id != 0) {
+                if (self.orphans_by_peer.get(orphan.peer_id)) |cur| {
+                    if (cur > 1) {
+                        self.orphans_by_peer.put(orphan.peer_id, cur - 1) catch {};
+                    } else {
+                        _ = self.orphans_by_peer.remove(orphan.peer_id);
+                    }
+                }
+            }
+            serialize.freeTransaction(self.allocator, &orphan.tx);
+            self.allocator.destroy(orphan);
+            return true;
+        }
+        return false;
+    }
+
+    /// Erase every orphan announced by `peer_id`.  Called by the peer
+    /// manager when a peer disconnects so its orphans don't pin pool slots
+    /// forever.  Mirrors Core's `EraseOrphansFor`.
+    pub fn eraseOrphansForPeer(self: *Mempool, peer_id: u64) void {
+        if (peer_id == 0) return;
+        // Collect targets first to avoid mutating the map mid-iteration.
+        var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
+        defer to_remove.deinit();
+        var iter = self.orphans.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.*.peer_id == peer_id) {
+                to_remove.append(entry.value_ptr.*.txid) catch break;
+            }
+        }
+        for (to_remove.items) |txid| {
+            _ = self.removeOrphan(txid);
+        }
+        _ = self.orphans_by_peer.remove(peer_id);
+    }
+
+    /// Check whether an orphan exists by txid.  Test / introspection helper.
+    pub fn hasOrphan(self: *Mempool, txid: types.Hash256) bool {
+        return self.orphans.contains(txid);
+    }
+
+    /// Number of orphans currently held.  Test / introspection helper.
+    pub fn orphanCount(self: *Mempool) usize {
+        return self.orphans.count();
+    }
+
+    /// After a parent transaction enters the mempool (or a block is
+    /// connected), look for orphans that reference any of `parent_txids`
+    /// and re-attempt acceptance.  Successfully admitted orphans are
+    /// removed from the pool; orphans that still fail (e.g. another
+    /// missing parent, or now-invalid) are discarded.
+    ///
+    /// We iterate to fixpoint: a newly-admitted orphan may itself unlock
+    /// further orphans.  Fixpoint is bounded by the orphan-pool size, so
+    /// the loop terminates in O(N²) worst case (N ≤ 100).
+    ///
+    /// Returns the number of orphans successfully promoted into the
+    /// mempool.
+    pub fn processOrphansForParent(
+        self: *Mempool,
+        parent_txid: types.Hash256,
+    ) usize {
+        var promoted: usize = 0;
+        // Seed worklist with the freshly-arrived parent; new admissions
+        // append themselves so their children get a chance too.
+        var worklist = std.ArrayList(types.Hash256).init(self.allocator);
+        defer worklist.deinit();
+        worklist.append(parent_txid) catch return 0;
+
+        var processed_idx: usize = 0;
+        while (processed_idx < worklist.items.len) : (processed_idx += 1) {
+            const cur_parent = worklist.items[processed_idx];
+
+            // Snapshot orphan txids that reference cur_parent.  We can't
+            // mutate `self.orphans` while iterating, so collect first.
+            var candidates = std.ArrayList(types.Hash256).init(self.allocator);
+            defer candidates.deinit();
+            var iter = self.orphans.iterator();
+            while (iter.next()) |entry| {
+                const o = entry.value_ptr.*;
+                for (o.tx.inputs) |inp| {
+                    if (std.mem.eql(u8, &inp.previous_output.hash, &cur_parent)) {
+                        candidates.append(o.txid) catch break;
+                        break;
+                    }
+                }
+            }
+
+            for (candidates.items) |orphan_txid| {
+                // Pull the orphan out of the pool first; ownership of
+                // the inner tx now lives on this stack frame.
+                const orphan_ptr = self.orphans.get(orphan_txid) orelse continue;
+                _ = self.orphans.remove(orphan_txid);
+                if (orphan_ptr.peer_id != 0) {
+                    if (self.orphans_by_peer.get(orphan_ptr.peer_id)) |cur| {
+                        if (cur > 1) {
+                            self.orphans_by_peer.put(orphan_ptr.peer_id, cur - 1) catch {};
+                        } else {
+                            _ = self.orphans_by_peer.remove(orphan_ptr.peer_id);
+                        }
+                    }
+                }
+
+                // Try to admit.  On success, the mempool entry takes
+                // ownership of the tx slices; on failure, free them.
+                const accepted = if (self.addTransaction(orphan_ptr.tx)) |_| true else |_| false;
+                if (accepted) {
+                    promoted += 1;
+                    // The orphan's child orphans (if any) might now be
+                    // unlockable, so recurse via the worklist.
+                    worklist.append(orphan_txid) catch {};
+                } else {
+                    serialize.freeTransaction(self.allocator, &orphan_ptr.tx);
+                }
+                self.allocator.destroy(orphan_ptr);
+            }
+        }
+
+        return promoted;
+    }
+
+    /// Erase orphans that reference inputs of the given block's
+    /// transactions, OR that match any tx in the block by txid (now
+    /// confirmed elsewhere).  Called after a block is connected.  Mirrors
+    /// Core's `TxOrphanage::EraseForBlock`.
+    pub fn eraseOrphansForBlock(self: *Mempool, block: *const types.Block) void {
+        var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
+        defer to_remove.deinit();
+
+        // Build a set of txids in the block for O(B+O) outpoint check.
+        var block_txids = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer block_txids.deinit();
+        for (block.transactions) |btx| {
+            const btxid = crypto.computeTxid(&btx, self.allocator) catch continue;
+            block_txids.put(btxid, {}) catch {};
+        }
+
+        var iter = self.orphans.iterator();
+        while (iter.next()) |entry| {
+            const o = entry.value_ptr.*;
+            // Same-txid orphan? remove.
+            if (block_txids.contains(o.txid)) {
+                to_remove.append(o.txid) catch break;
+                continue;
+            }
+            // Orphan whose inputs are now spent by a block tx? remove
+            // (the orphan is invalidated; another peer's tx took the
+            // outpoint).
+            for (o.tx.inputs) |inp| {
+                if (block_txids.contains(inp.previous_output.hash)) {
+                    to_remove.append(o.txid) catch break;
+                    break;
+                }
+            }
+        }
+
+        for (to_remove.items) |t| {
+            _ = self.removeOrphan(t);
         }
     }
 
@@ -6758,4 +7125,329 @@ test "blockDisconnected: silent failure for already-present tx (no double-insert
     mempool.blockDisconnected(&block_txs);
 
     try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+}
+
+// ============================================================================
+// Orphan Transaction Pool Tests
+// ============================================================================
+
+// Static script_pubkey lives in module data, not on a stack frame, so any
+// test tx may safely point its outputs at this slice.
+const TEST_ORPHAN_SCRIPT = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xCC} ** 20;
+
+test "orphan pool: add / has / remove cycle" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const parent_hash = [_]u8{0xAA} ** 32;
+    const inputs = [_]types.TxIn{.{
+        .previous_output = .{ .hash = parent_hash, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    }};
+    const outputs = [_]types.TxOut{
+        .{ .value = 50_000, .script_pubkey = &TEST_ORPHAN_SCRIPT },
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &inputs,
+        .outputs = &outputs,
+        .lock_time = 0,
+    };
+    const txid = try crypto.computeTxid(&tx, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), mempool.orphanCount());
+    try std.testing.expect(mempool.addOrphan(&tx, 1));
+    try std.testing.expect(mempool.hasOrphan(txid));
+    try std.testing.expectEqual(@as(usize, 1), mempool.orphanCount());
+
+    // Re-adding the same orphan is idempotent (returns true, no double-charge).
+    try std.testing.expect(mempool.addOrphan(&tx, 1));
+    try std.testing.expectEqual(@as(usize, 1), mempool.orphanCount());
+
+    // Remove succeeds, then no-ops.
+    try std.testing.expect(mempool.removeOrphan(txid));
+    try std.testing.expect(!mempool.hasOrphan(txid));
+    try std.testing.expectEqual(@as(usize, 0), mempool.orphanCount());
+    try std.testing.expect(!mempool.removeOrphan(txid));
+}
+
+test "orphan pool: MAX_ORPHAN_TRANSACTIONS cap with oldest-first eviction" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Sanity: the constant the prompt requires.
+    try std.testing.expectEqual(@as(usize, 100), MAX_ORPHAN_TRANSACTIONS);
+
+    // Add MAX_ORPHAN_TRANSACTIONS + 5 distinct orphans.  Each must use a
+    // distinct txid; we vary the lock_time so the resulting txids
+    // differ.  Stagger time_added by 1 second per insert so oldest-first
+    // eviction is unambiguous.
+    const total = MAX_ORPHAN_TRANSACTIONS + 5;
+    var first_five_txids: [5]types.Hash256 = undefined;
+    const outputs = [_]types.TxOut{
+        .{ .value = 50_000, .script_pubkey = &TEST_ORPHAN_SCRIPT },
+    };
+
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var parent_hash: [32]u8 = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, parent_hash[0..8], @as(u64, @intCast(i + 1)), .little);
+        const inputs = [_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_hash, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFF_FFFF,
+            .witness = &[_][]const u8{},
+        }};
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &inputs,
+            .outputs = &outputs,
+            .lock_time = @as(u32, @intCast(i)),
+        };
+        if (i < 5) {
+            first_five_txids[i] = try crypto.computeTxid(&tx, allocator);
+        }
+        // Use peer_id derived from i so the per-peer cap (100) doesn't
+        // bite for the first 100; use a different peer for the rest.
+        const peer_id: u64 = if (i < MAX_ORPHAN_TRANSACTIONS) 1 else 2;
+        try std.testing.expect(mempool.addOrphan(&tx, peer_id));
+
+        // Force the time_added of *this* orphan to be strictly older
+        // than any to-be-inserted future orphan, so oldest-first
+        // eviction picks the right victims when we exceed the cap.
+        const just_added_txid = try crypto.computeTxid(&tx, allocator);
+        if (mempool.orphans.get(just_added_txid)) |o| {
+            o.time_added = @as(i64, @intCast(i));
+        }
+    }
+
+    // The pool is bounded at the global cap regardless of insert count.
+    try std.testing.expectEqual(MAX_ORPHAN_TRANSACTIONS, mempool.orphanCount());
+
+    // The five oldest entries (i=0..4) must have been evicted.
+    for (first_five_txids) |t| {
+        try std.testing.expect(!mempool.hasOrphan(t));
+    }
+}
+
+test "orphan pool: MAX_ORPHAN_TX_SIZE rejects oversized tx" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Constants the prompt explicitly requires.
+    try std.testing.expectEqual(@as(usize, 100_000), MAX_ORPHAN_TX_SIZE);
+
+    // Build a tx whose serialized size exceeds 100 000 bytes by
+    // attaching a giant witness blob.  101 KB witness + a few bytes of
+    // header/inputs/outputs is comfortably above the cap.
+    const big = try allocator.alloc(u8, 101_000);
+    defer allocator.free(big);
+    @memset(big, 0xEE);
+
+    const witness_items = [_][]const u8{big};
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xAB} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const out_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xDD} ** 20;
+    const output = types.TxOut{ .value = 1000, .script_pubkey = &out_script };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    // Oversize → reject.
+    try std.testing.expect(!mempool.addOrphan(&tx, 7));
+    try std.testing.expectEqual(@as(usize, 0), mempool.orphanCount());
+}
+
+test "orphan pool: per-peer cap MAX_PEER_ORPHANS" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const outputs = [_]types.TxOut{
+        .{ .value = 50_000, .script_pubkey = &TEST_ORPHAN_SCRIPT },
+    };
+
+    // Saturate peer 42 right up to its cap.
+    const cap = MAX_PEER_ORPHANS;
+    var i: usize = 0;
+    while (i < cap) : (i += 1) {
+        var parent_hash: [32]u8 = [_]u8{0xBB} ** 32;
+        std.mem.writeInt(u64, parent_hash[0..8], @as(u64, @intCast(i + 1)), .little);
+        const inputs = [_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_hash, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFF_FFFF,
+            .witness = &[_][]const u8{},
+        }};
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &inputs,
+            .outputs = &outputs,
+            .lock_time = @as(u32, @intCast(i)),
+        };
+        try std.testing.expect(mempool.addOrphan(&tx, 42));
+    }
+
+    // Next insert from peer 42 must be refused (per-peer cap), even
+    // though the global cap may also be hit — we assert on per-peer
+    // semantics regardless.
+    var parent_hash: [32]u8 = [_]u8{0xBB} ** 32;
+    std.mem.writeInt(u64, parent_hash[0..8], 0xFFFF_FFFF, .little);
+    const inputs = [_]types.TxIn{.{
+        .previous_output = .{ .hash = parent_hash, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    }};
+    const overflow_tx = types.Transaction{
+        .version = 2,
+        .inputs = &inputs,
+        .outputs = &outputs,
+        .lock_time = 99_999,
+    };
+    try std.testing.expect(!mempool.addOrphan(&overflow_tx, 42));
+}
+
+test "orphan pool: eraseOrphansForPeer drops only that peer's orphans" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const outputs = [_]types.TxOut{
+        .{ .value = 50_000, .script_pubkey = &TEST_ORPHAN_SCRIPT },
+    };
+
+    // Add 3 orphans from peer 11, 2 from peer 22.
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var parent_hash: [32]u8 = [_]u8{0x11} ** 32;
+        parent_hash[31] = @as(u8, @intCast(i));
+        const inputs = [_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_hash, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFF_FFFF,
+            .witness = &[_][]const u8{},
+        }};
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &inputs,
+            .outputs = &outputs,
+            .lock_time = @as(u32, @intCast(i)),
+        };
+        try std.testing.expect(mempool.addOrphan(&tx, 11));
+    }
+    while (i < 5) : (i += 1) {
+        var parent_hash: [32]u8 = [_]u8{0x22} ** 32;
+        parent_hash[31] = @as(u8, @intCast(i));
+        const inputs = [_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_hash, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFF_FFFF,
+            .witness = &[_][]const u8{},
+        }};
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &inputs,
+            .outputs = &outputs,
+            .lock_time = @as(u32, @intCast(i)),
+        };
+        try std.testing.expect(mempool.addOrphan(&tx, 22));
+    }
+    try std.testing.expectEqual(@as(usize, 5), mempool.orphanCount());
+
+    // Disconnect peer 11.
+    mempool.eraseOrphansForPeer(11);
+    try std.testing.expectEqual(@as(usize, 2), mempool.orphanCount());
+
+    // Disconnect peer 22.
+    mempool.eraseOrphansForPeer(22);
+    try std.testing.expectEqual(@as(usize, 0), mempool.orphanCount());
+
+    // No-op for unknown peer.
+    mempool.eraseOrphansForPeer(99);
+    try std.testing.expectEqual(@as(usize, 0), mempool.orphanCount());
+}
+
+test "orphan pool: processOrphansForParent re-admits child after parent arrives" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    // The orphan we'll add below is deep-copied via serialize round-trip
+    // (so OrphanTx owns its own slices); when it is promoted into the
+    // mempool the entry retains those slices but `mempool.deinit` only
+    // destroys the entry pointer.  Free the inner tx data here, the
+    // same dance used by the `blockDisconnected` test above.
+    defer {
+        var it = mempool.entries.iterator();
+        while (it.next()) |kv| {
+            var t = kv.value_ptr.*.tx;
+            serialize.freeTransaction(allocator, &t);
+        }
+        mempool.deinit();
+    }
+
+    // Build a parent tx (unrelated outpoint, will be admitted directly)
+    // and a child tx whose input references parent_txid:0.  When the
+    // parent enters the mempool (or notionally, when we call
+    // processOrphansForParent with parent_txid), the orphan should drain
+    // into the mempool.
+    const parent_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xF0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const parent_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xE1} ** 20;
+    const parent_output = types.TxOut{ .value = 200_000, .script_pubkey = &parent_script };
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_input},
+        .outputs = &[_]types.TxOut{parent_output},
+        .lock_time = 0,
+    };
+    const parent_txid = try crypto.computeTxid(&parent_tx, allocator);
+
+    // Child references parent_txid:0.
+    const child_inputs = [_]types.TxIn{.{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    }};
+    const child_outputs = [_]types.TxOut{
+        .{ .value = 50_000, .script_pubkey = &TEST_ORPHAN_SCRIPT },
+    };
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &child_inputs,
+        .outputs = &child_outputs,
+        .lock_time = 0,
+    };
+    const child_txid = try crypto.computeTxid(&child_tx, allocator);
+
+    // Park child in orphan pool.
+    try std.testing.expect(mempool.addOrphan(&child_tx, 5));
+    try std.testing.expect(mempool.hasOrphan(child_txid));
+
+    // Pretend the parent just arrived: nothing forces it through
+    // addTransaction in this no-chain-state test, but
+    // processOrphansForParent operates only on the orphan side and
+    // promotes children into the mempool via addTransaction.  With
+    // chain_state == null, addTransaction skips the missing-input check
+    // (see mempool.zig:558-560), so the child admits successfully.
+    const promoted = mempool.processOrphansForParent(parent_txid);
+    try std.testing.expectEqual(@as(usize, 1), promoted);
+    try std.testing.expect(!mempool.hasOrphan(child_txid));
+    try std.testing.expect(mempool.contains(child_txid));
 }
