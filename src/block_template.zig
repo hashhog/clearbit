@@ -701,6 +701,31 @@ pub fn submitBlockWithIndex(
     chain_manager: ?*validation.ChainManager,
     allocator: std.mem.Allocator,
 ) !SubmitResult {
+    return submitBlockWithIndexAndMempool(
+        block,
+        chain_state,
+        params,
+        chain_manager,
+        null,
+        allocator,
+    );
+}
+
+/// Same as `submitBlockWithIndex`, but additionally accepts a mempool to
+/// drive Bitcoin Core-parity mempool refill on the reorg path (Pattern B,
+/// `_mempool-refill-on-reorg-fleet-result-2026-05-05.md`).  Existing
+/// callers without a mempool may keep using `submitBlockWithIndex`; the
+/// RPC `submitblock` handler always passes a mempool through this entry
+/// point so a heavier-branch arrival re-admits disconnected non-coinbase
+/// txs, matching `MaybeUpdateMempoolForReorg` in Bitcoin Core.
+pub fn submitBlockWithIndexAndMempool(
+    block: *const types.Block,
+    chain_state: *storage.ChainState,
+    params: *const consensus.NetworkParams,
+    chain_manager: ?*validation.ChainManager,
+    mempool: ?*mempool_mod.Mempool,
+    allocator: std.mem.Allocator,
+) !SubmitResult {
     // Compute block hash
     const block_hash = crypto.computeBlockHash(&block.header);
 
@@ -821,6 +846,7 @@ pub fn submitBlockWithIndex(
             chain_state,
             chain_manager.?,
             parent_in_cm.?,
+            mempool,
             allocator,
         );
     }
@@ -991,6 +1017,7 @@ pub fn processSideBranchSubmission(
     chain_state: *storage.ChainState,
     cm: *validation.ChainManager,
     parent_entry: *validation.BlockIndexEntry,
+    mempool: ?*mempool_mod.Mempool,
     allocator: std.mem.Allocator,
 ) !SubmitResult {
     // Compute new chain_work = parent.chain_work + workFromBits(this header).
@@ -1123,6 +1150,7 @@ pub fn processSideBranchSubmission(
         chain_state,
         cm,
         entry,
+        mempool,
         allocator,
     ) catch |err| {
         std.debug.print(
@@ -1143,6 +1171,15 @@ pub fn processSideBranchSubmission(
 /// with the in-order list of fork blocks. On success: updates
 /// `cm.active_tip` to `new_tip_entry`. On failure: returns the storage
 /// error for the caller to map.
+///
+/// When `mempool` is non-null, this also implements Pattern B mempool
+/// refill (`_mempool-refill-on-reorg-fleet-result-2026-05-05.md`).
+/// Before firing the reorg, we walk the active chain from the current
+/// tip back to the fork point and snapshot the non-coinbase txs of
+/// every block being disconnected.  After `reorgToChain` succeeds, we
+/// re-admit those snapshots to the mempool via `Mempool.blockDisconnected`,
+/// matching Bitcoin Core's `MaybeUpdateMempoolForReorg` flow.
+/// Reference: camlcoin `lib/sync.ml:2354-2363`.
 fn fireReorgFromSideBranch(
     new_tip_block: *const types.Block,
     new_tip_hash: *const types.Hash256,
@@ -1150,6 +1187,7 @@ fn fireReorgFromSideBranch(
     chain_state: *storage.ChainState,
     cm: *validation.ChainManager,
     new_tip_entry: *validation.BlockIndexEntry,
+    mempool: ?*mempool_mod.Mempool,
     allocator: std.mem.Allocator,
 ) !SubmitResult {
     // Walk up the parent chain from new_tip_entry back to the active chain.
@@ -1244,6 +1282,49 @@ fn fireReorgFromSideBranch(
         });
     }
 
+    // Pattern B (mempool refill on reorg, _mempool-refill-on-reorg-
+    // fleet-result-2026-05-05.md): collect the active-chain blocks
+    // we're about to disconnect.  The disconnect path doesn't delete
+    // CF_BLOCKS entries, so we could in principle re-load these AFTER
+    // reorgToChain runs — but staging them up-front mirrors Core's
+    // DisconnectTip flow (which queues the disconnected txs into a
+    // pool-update list and applies them after reconnection) and keeps
+    // the read path independent of any future ChainDB-level cleanup
+    // pass that does evict body bytes during disconnect.
+    //
+    // Collected only when a mempool is wired in — non-RPC paths (test
+    // shims, miner-driven submitBlock) pass null and skip the work.
+    var disconnected_blocks = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (disconnected_blocks.items) |*b| serialize.freeBlock(allocator, b);
+        disconnected_blocks.deinit();
+    }
+
+    if (mempool != null) {
+        var walk_hash: types.Hash256 = chain_state.best_hash;
+        var walk_depth: u32 = 0;
+        // Bound the snapshot walk to MAX_DEPTH so a malformed index
+        // never runs us off into infinity.  reorgToChain itself caps
+        // at MIN_BLOCKS_TO_KEEP / 288 — we use the same MAX_DEPTH used
+        // for the fork-point walk above so the two phases agree.
+        while (walk_depth < MAX_DEPTH and !std.mem.eql(u8, &walk_hash, &fp)) : (walk_depth += 1) {
+            const bytes_opt = chain_state.getBlockBytes(&walk_hash) catch null;
+            const bytes = bytes_opt orelse break;
+            defer allocator.free(bytes);
+
+            var block_reader = serialize.Reader{ .data = bytes };
+            const disc_block = serialize.readBlock(&block_reader, allocator) catch break;
+            disconnected_blocks.append(disc_block) catch {
+                var to_free = disc_block;
+                serialize.freeBlock(allocator, &to_free);
+                break;
+            };
+
+            // Step to parent on the active chain.
+            walk_hash = disc_block.header.prev_block;
+        }
+    }
+
     // Fire the reorg.  reorgToChain will:
     //   1. Disconnect blocks from current tip back to fp (UTXO rewind +
     //      best_hash/best_height update).
@@ -1256,6 +1337,19 @@ fn fireReorgFromSideBranch(
 
     // Update cm.active_tip to point at the new tip.
     cm.active_tip = new_tip_entry;
+
+    // Pattern B refill — fire AFTER the new chain is fully connected
+    // (Core orders things the same way: ActivateBestChain finishes the
+    // reorg, then MaybeUpdateMempoolForReorg re-admits disconnected txs
+    // against the new tip's UTXO state).  Each block hands its txs to
+    // mempool.blockDisconnected, which round-trips per non-coinbase tx
+    // through serialize → deserialize so the mempool entry owns its
+    // own slices regardless of when the source block is freed.
+    if (mempool) |mp| {
+        for (disconnected_blocks.items) |*b| {
+            mp.blockDisconnected(b.transactions);
+        }
+    }
 
     return .{
         .accepted = true,
