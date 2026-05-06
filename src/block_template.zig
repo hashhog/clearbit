@@ -629,6 +629,38 @@ pub const SubmitResult = struct {
     block_hash: types.Hash256,
 };
 
+/// Pattern X helper (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md):
+/// derive the height that should be used to validate a submitted block,
+/// using the BLOCK'S parent in the block index when available rather
+/// than the active tip. Bitcoin Core's `ContextualCheckBlockHeader`
+/// (validation.cpp:4072) uses `pindexPrev->nHeight + 1` — which is the
+/// parent in the block index, NOT the active tip — so that BIP-34
+/// height-in-coinbase enforcement works correctly for side-branch
+/// blocks during a reorg-via-submitblock.
+///
+/// Falls back to active-tip-relative arithmetic when:
+///   - chain_manager is unset (early-startup / no block index loaded)
+///   - the parent block isn't yet indexed (genesis-adjacent / unknown
+///     parent — the validation gate downstream will surface this as
+///     a different rejection)
+///
+/// The fallback matches pre-fix behaviour for the common best-chain
+/// extension case where parent == active tip, and is also invoked for
+/// genuinely unknown-parent blocks where the surface error is
+/// downstream of BIP-34.
+pub fn deriveSubmitHeight(
+    prev_block_hash: *const types.Hash256,
+    chain_manager: ?*validation.ChainManager,
+    active_best_height: u32,
+) u32 {
+    if (chain_manager) |cm| {
+        if (cm.getBlock(prev_block_hash)) |parent| {
+            return parent.height + 1;
+        }
+    }
+    return active_best_height + 1;
+}
+
 /// Submit a mined block to the chain.
 ///
 /// This function:
@@ -652,6 +684,15 @@ pub fn submitBlock(
 /// in-memory block index (and persisted to ChainStore if available).  Without
 /// this step, subsequent RPCs like getblockheader / getblockhash cannot find
 /// the newly-mined block.
+///
+/// Pattern X (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md):
+/// height is derived from the BLOCK'S parent in the block index, not from the
+/// active tip. This is parity with Bitcoin Core's
+/// ContextualCheckBlockHeader (validation.cpp:4072) which uses
+/// `pindexPrev->nHeight + 1`. Side-branch blocks (e.g. B1 forking off
+/// an ancestor of the current best) get correct BIP-34 height
+/// enforcement instead of the spurious bad-cb-height that arises from
+/// `chain_state.best_height + 1`.
 pub fn submitBlockWithIndex(
     block: *const types.Block,
     chain_state: *storage.ChainState,
@@ -681,8 +722,16 @@ pub fn submitBlockWithIndex(
         };
     }
 
-    // Connect the block to the chain (UTXO set + best_hash/best_height)
-    const height = chain_state.best_height + 1;
+    // Pattern X: derive height from BLOCK'S parent in the block index, not
+    // from the active tip. Falls back to active-tip-relative arithmetic
+    // when chain_manager is unset or the parent isn't indexed (genesis-
+    // adjacent / pre-IBD). See the doc-comment above this function and
+    // `deriveSubmitHeight`.
+    const height: u32 = deriveSubmitHeight(
+        &block.header.prev_block,
+        chain_manager,
+        chain_state.best_height,
+    );
 
     // Context-free block sanity check: coinbase position, merkle root, weight,
     // BIP-34 height, BIP-141 witness commitment recomputation (bad-witness-merkle-match),

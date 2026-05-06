@@ -24,6 +24,8 @@ const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
 const serialize = @import("serialize.zig");
 const p2p = @import("p2p.zig");
+const validation = @import("validation.zig");
+const block_template = @import("block_template.zig");
 
 // ====================================================================
 // Helpers
@@ -652,4 +654,179 @@ test "maybeArmReorg: equal-chainwork fork is ignored (first-seen wins)" {
 
     pm.maybeArmReorg(&stub, &fork_blk.hash);
     try testing.expect(pm.pending_reorg == null);
+}
+
+// ====================================================================
+// Pattern X — submitblock height derived parent-relative, not active-tip
+// (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md)
+//
+// Bug: clearbit's submit_height was `chain_state.best_height + 1`,
+// which derived from the active chain tip rather than the BLOCK'S
+// parent in the block index. When a competing fork's first block (B1)
+// arrives whose parent is the COMMON ANCESTOR (not the active tip),
+// validation fired BadCoinbaseHeight because the derived height
+// mismatched the BIP-34 height encoded in B1's coinbase.
+//
+// Fix: `block_template.deriveSubmitHeight()` uses `parent.height + 1`
+// when the parent is in the ChainManager block index. Falls back to
+// the active-tip-relative shortcut otherwise.
+//
+// Bitcoin Core reference: src/validation.cpp:4072
+// `ContextualCheckBlockHeader` uses `pindexPrev->nHeight + 1`.
+// ====================================================================
+
+fn makePatternXEntry(
+    allocator: std.mem.Allocator,
+    hash: types.Hash256,
+    height: u32,
+    parent: ?*validation.BlockIndexEntry,
+) !*validation.BlockIndexEntry {
+    const entry = try allocator.create(validation.BlockIndexEntry);
+    entry.* = validation.BlockIndexEntry{
+        .hash = hash,
+        .header = consensus.REGTEST.genesis_header,
+        .height = height,
+        .status = validation.BlockStatus{
+            .valid_header = true,
+            .has_data = true,
+            .has_undo = false,
+            .failed_valid = false,
+            .failed_child = false,
+            ._padding = 0,
+        },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = parent,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    return entry;
+}
+
+test "Pattern X: deriveSubmitHeight — parent on active tip yields best_height + 1" {
+    // Best-chain extension: parent IS the active tip. Pattern X
+    // derivation must agree with the active-tip-relative shortcut so
+    // the common single-chain IBD / mining case is unchanged.
+    const allocator = std.testing.allocator;
+    var manager = validation.ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    const parent_hash: types.Hash256 = [_]u8{0xA0} ** 32;
+    const parent = try makePatternXEntry(allocator, parent_hash, 110, null);
+    try manager.addBlock(parent);
+
+    const h = block_template.deriveSubmitHeight(&parent_hash, &manager, 110);
+    try testing.expectEqual(@as(u32, 111), h);
+}
+
+test "Pattern X: deriveSubmitHeight — side-branch parent uses parent.height + 1, not active tip" {
+    // The Pattern X bug: an A-chain extends the active tip to h=112
+    // and a B-chain block (B1) arrives whose parent is the COMMON
+    // ANCESTOR at h=110. With the buggy formula
+    // `chain_state.best_height + 1` the validator expects height 113;
+    // B1's coinbase encodes 111 (its true parent-relative height), so
+    // BIP-34 fires bad-cb-height. The Pattern X fix uses
+    // parent.height + 1 = 111, matching B1's coinbase encoding.
+    const allocator = std.testing.allocator;
+    var manager = validation.ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    const ancestor_hash: types.Hash256 = [_]u8{0xA0} ** 32;
+    const ancestor = try makePatternXEntry(allocator, ancestor_hash, 110, null);
+    try manager.addBlock(ancestor);
+
+    const a1_hash: types.Hash256 = [_]u8{0xA1} ** 32;
+    const a1 = try makePatternXEntry(allocator, a1_hash, 111, ancestor);
+    try manager.addBlock(a1);
+
+    const a2_hash: types.Hash256 = [_]u8{0xA2} ** 32;
+    const a2 = try makePatternXEntry(allocator, a2_hash, 112, a1);
+    try manager.addBlock(a2);
+
+    // B1's parent is the common ancestor at h=110, not the active tip
+    // at h=112. Pattern X fix derives parent.height + 1 == 111, NOT
+    // best_height + 1 == 113.
+    const h_b1 = block_template.deriveSubmitHeight(&ancestor_hash, &manager, 112);
+    try testing.expectEqual(@as(u32, 111), h_b1);
+
+    // Sanity: A2 as parent (best-chain extension at h=113) still works.
+    const h_extend = block_template.deriveSubmitHeight(&a2_hash, &manager, 112);
+    try testing.expectEqual(@as(u32, 113), h_extend);
+}
+
+test "Pattern X: deriveSubmitHeight — null chain_manager falls back to active tip" {
+    // Early-startup / no block index: the active-tip-relative shortcut
+    // is the only signal we have. This preserves pre-fix behaviour for
+    // call sites that haven't wired chain_manager through yet.
+    const dummy_hash: types.Hash256 = [_]u8{0xCC} ** 32;
+    const h = block_template.deriveSubmitHeight(&dummy_hash, null, 200);
+    try testing.expectEqual(@as(u32, 201), h);
+}
+
+test "Pattern X: deriveSubmitHeight — unknown parent falls back to active tip" {
+    // Parent isn't yet indexed (could be a genuinely unknown-parent
+    // block submitted out of order). Falling back to active-tip-
+    // relative is correct here because the validation gate downstream
+    // surfaces this as a different rejection (the unknown parent
+    // becomes a Pattern Y / orphan-block concern, not a Pattern X
+    // height-encoding concern). Pre-fix behaviour preserved.
+    const allocator = std.testing.allocator;
+    var manager = validation.ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    const known_hash: types.Hash256 = [_]u8{0x11} ** 32;
+    const known = try makePatternXEntry(allocator, known_hash, 100, null);
+    try manager.addBlock(known);
+
+    const unknown_hash: types.Hash256 = [_]u8{0xFF} ** 32;
+    const h = block_template.deriveSubmitHeight(&unknown_hash, &manager, 150);
+    try testing.expectEqual(@as(u32, 151), h);
+}
+
+test "Pattern X: 2-chain A+B fork — derives correct heights for B1 and A2-extension" {
+    // Build a 2-block A-chain and a partial B-chain sharing a common
+    // parent. After A is fed, the active tip is A2 (h=112). Verify
+    // that:
+    //   * B1's submission height derives from its parent (h=110+1=111)
+    //     — Pattern X correctness.
+    //   * Extending A2 with a hypothetical A3 derives from A2 (h=113).
+    // This is the corpus entry's chain shape captured as a unit test.
+    const allocator = std.testing.allocator;
+    var manager = validation.ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Common ancestor at h=110.
+    const a0_hash: types.Hash256 = [_]u8{0xC0} ** 32;
+    const a0 = try makePatternXEntry(allocator, a0_hash, 110, null);
+    try manager.addBlock(a0);
+
+    // Chain A: A1 (h=111), A2 (h=112).
+    const a1_hash: types.Hash256 = [_]u8{0xA1} ** 32;
+    const a1 = try makePatternXEntry(allocator, a1_hash, 111, a0);
+    try manager.addBlock(a1);
+
+    const a2_hash: types.Hash256 = [_]u8{0xA2} ** 32;
+    const a2 = try makePatternXEntry(allocator, a2_hash, 112, a1);
+    try manager.addBlock(a2);
+
+    // Chain B (only B1 indexed at this point — B1 sharing A0 as parent).
+    const b1_hash: types.Hash256 = [_]u8{0xB1} ** 32;
+    const b1 = try makePatternXEntry(allocator, b1_hash, 111, a0);
+    try manager.addBlock(b1);
+
+    // Active tip == A2 (h=112).
+    const active_best_height: u32 = 112;
+
+    // B1 (parent A0 at h=110) — Pattern X must give 111.
+    const h_b1 = block_template.deriveSubmitHeight(&a0_hash, &manager, active_best_height);
+    try testing.expectEqual(@as(u32, 111), h_b1);
+
+    // B2 (parent B1 at h=111) — Pattern X must give 112, even though
+    // active tip is also at 112 (the depths happen to align here).
+    const h_b2 = block_template.deriveSubmitHeight(&b1_hash, &manager, active_best_height);
+    try testing.expectEqual(@as(u32, 112), h_b2);
+
+    // Hypothetical A3 (parent A2 at h=112) — best-chain extension to 113.
+    const h_a3 = block_template.deriveSubmitHeight(&a2_hash, &manager, active_best_height);
+    try testing.expectEqual(@as(u32, 113), h_a3);
 }
