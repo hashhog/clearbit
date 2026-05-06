@@ -928,6 +928,7 @@ test "Pattern Y: side-branch storage preserves active tip when chain_work <= act
         &cs,
         &manager,
         a0,
+        null, // mempool: not exercised in this test
         allocator,
     );
 
@@ -1014,6 +1015,7 @@ test "Pattern Y: side-branch parent lookup succeeds for B2's submission off B1" 
         &cs,
         &manager,
         a0,
+        null, // mempool: not exercised in this test
         allocator,
     );
 
@@ -1111,6 +1113,7 @@ test "Pattern Y: side-branch with strictly-greater chain_work flips active_tip v
         &cs,
         &manager,
         b1,
+        null, // mempool: not exercised in this test
         allocator,
     );
 
