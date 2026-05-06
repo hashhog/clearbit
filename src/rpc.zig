@@ -2873,11 +2873,20 @@ pub const RpcServer = struct {
         // derive height parent-relative (Pattern X — see rpc.zig
         // submit_height blk above and block_template.submitBlockWithIndex
         // doc-comment).
-        const result = block_template.submitBlockWithIndex(
+        //
+        // Pattern B (mempool refill on reorg, _mempool-refill-on-reorg-
+        // fleet-result-2026-05-05.md): pass the mempool so that a
+        // heavier-branch arrival re-admits non-coinbase txs from every
+        // disconnected block, matching Bitcoin Core
+        // MaybeUpdateMempoolForReorg.  Counterpart to today's Pattern Y
+        // closure (`863fb10`); without this, disconnected txs silently
+        // vanish from the wallet's pending queue on a reorg.
+        const result = block_template.submitBlockWithIndexAndMempool(
             &block_data,
             self.chain_state,
             self.network_params,
             self.chain_manager,
+            self.mempool,
             self.allocator,
         ) catch {
             // Unexpected Zig error (allocator / I/O) — use "rejected" catch-all.
