@@ -951,6 +951,63 @@ pub const Mempool = struct {
         }
     }
 
+    /// Re-admit transactions from a block that has been disconnected during a
+    /// reorg.  Walks the block's non-coinbase transactions and attempts to
+    /// re-add each one to the mempool via `addTransaction`.  Failures
+    /// (NonStandard, MissingInputs, AlreadyInMempool, etc.) are silently
+    /// ignored — the transaction simply stays out of the mempool.
+    ///
+    /// Each transaction is round-tripped through serialize → deserialize
+    /// before insertion so the mempool's stored entry owns its
+    /// inputs/outputs slices independently of the caller's block.  This
+    /// is necessary because `addTransaction` stores `tx` by value into
+    /// `MempoolEntry.tx` (slices retained); the caller is generally
+    /// going to free the source block right after this call returns.
+    ///
+    /// Reference: Bitcoin Core `MaybeUpdateMempoolForReorg`
+    /// (validation.cpp), called from `Chainstate::DisconnectTip`.  Cross-
+    /// impl reference: camlcoin `lib/sync.ml:2354-2363` (`Mempool.add_transaction`
+    /// per disconnected non-coinbase tx, ignoring failures).
+    ///
+    /// Pattern B of `_mempool-refill-on-reorg-fleet-result-2026-05-05.md`.
+    /// Companion to today's Pattern Y closure (`863fb10`); the reorg
+    /// dispatcher in `block_template.fireReorgFromSideBranch` calls this
+    /// after `chain_state.reorgToChain` succeeds, once per disconnected
+    /// block.
+    pub fn blockDisconnected(self: *Mempool, txs: []const types.Transaction) void {
+        for (txs, 0..) |tx, i| {
+            // Skip the coinbase (always at index 0; coinbases can't
+            // enter the mempool anyway).
+            if (i == 0) continue;
+
+            // Round-trip via serialize so the mempool's MempoolEntry
+            // ends up with a tx whose script_sig / script_pubkey /
+            // witness slices live in fresh allocator-owned buffers.
+            var tx_writer = serialize.Writer.init(self.allocator);
+            serialize.writeTransaction(&tx_writer, &tx) catch {
+                tx_writer.deinit();
+                continue;
+            };
+            const buf = tx_writer.toOwnedSlice() catch {
+                tx_writer.deinit();
+                continue;
+            };
+            defer self.allocator.free(buf);
+
+            var tx_reader = serialize.Reader{ .data = buf };
+            var owned_tx = serialize.readTransaction(&tx_reader, self.allocator) catch continue;
+
+            // addTransaction failure → silent free (camlcoin parity).
+            // Any tx that no longer fits the standardness / UTXO / dup
+            // gates drops on the floor.  Successful add transfers
+            // ownership of owned_tx into the mempool entry.
+            const accepted = if (self.addTransaction(owned_tx)) |_| true else |_| false;
+            if (!accepted) {
+                serialize.freeTransaction(self.allocator, &owned_tx);
+            }
+        }
+    }
+
     /// Check if a transaction signals RBF (BIP-125).
     pub fn isRBFSignaled(tx: *const types.Transaction) bool {
         for (tx.inputs) |input| {
@@ -6542,5 +6599,163 @@ test "addTransaction: accepts tx whose inputs script-verify" {
     // Should be accepted: the OP_TRUE input verifies under STANDARD flags,
     // the output is a standard P2WPKH, fee is well above min-relay.
     try mempool.addTransaction(spending_tx);
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+}
+
+// ============================================================================
+// Pattern B (mempool refill on reorg) — _mempool-refill-on-reorg-fleet-result-2026-05-05.md
+// ============================================================================
+
+test "blockDisconnected: re-admits non-coinbase txs from a disconnected block" {
+    // Pattern B unit test: hand the mempool a synthetic "disconnected
+    // block" whose tx slice is [coinbase, T1, T2].  After the call,
+    // the mempool must contain T1 and T2 (the coinbase is filtered)
+    // and nothing else.  Mirrors the camlcoin behaviour at
+    // sync.ml:2354-2363 — re-adds non-coinbase txs to the mempool
+    // when their containing block is disconnected during a reorg.
+    //
+    // This is the "test mode" path: chain_state == null skips the
+    // standardness / UTXO / script gates inside addTransaction, so
+    // we can exercise blockDisconnected's filter+reinsert logic
+    // without standing up a full chainstate.
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    // blockDisconnected serialise→deserialise round-trips each tx so
+    // the mempool's MempoolEntry owns freshly-allocated input/output
+    // slices.  mempool.deinit only destroys the MempoolEntry itself,
+    // not the inner tx data, so we explicitly free those allocations
+    // here.  (Existing mempool tests pass static literal slices and
+    // don't need this dance.)
+    defer {
+        var it = mempool.entries.iterator();
+        while (it.next()) |kv| {
+            var t = kv.value_ptr.*.tx;
+            serialize.freeTransaction(allocator, &t);
+        }
+        mempool.deinit();
+    }
+
+    // Coinbase: skipped by blockDisconnected (index 0).
+    const coinbase_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0xFFFF_FFFF },
+        .script_sig = &[_]u8{ 0x51, 0x52 }, // OP_1 OP_2 (BIP-34-ish; ignored in test mode)
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const coinbase_output = types.TxOut{ .value = 50_0000_0000, .script_pubkey = &cb_script };
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+
+    // T1: spends a synthetic prevout, P2WPKH output (standard).
+    const t1_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xA1} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const t1_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xB1} ** 20;
+    const t1_output = types.TxOut{ .value = 100_000, .script_pubkey = &t1_script };
+    const t1 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{t1_input},
+        .outputs = &[_]types.TxOut{t1_output},
+        .lock_time = 0,
+    };
+
+    // T2: independent, different prevout.
+    const t2_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xA2} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const t2_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xB2} ** 20;
+    const t2_output = types.TxOut{ .value = 200_000, .script_pubkey = &t2_script };
+    const t2 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{t2_input},
+        .outputs = &[_]types.TxOut{t2_output},
+        .lock_time = 1,
+    };
+
+    const block_txs = [_]types.Transaction{ coinbase_tx, t1, t2 };
+
+    // Sanity: mempool starts empty.
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+
+    // Run the disconnected-block hook.
+    mempool.blockDisconnected(&block_txs);
+
+    // Post: T1 and T2 are in the mempool (coinbase was skipped).
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+
+    const t1_txid = try crypto.computeTxid(&t1, allocator);
+    const t2_txid = try crypto.computeTxid(&t2, allocator);
+    const cb_txid = try crypto.computeTxid(&coinbase_tx, allocator);
+
+    try std.testing.expect(mempool.contains(t1_txid));
+    try std.testing.expect(mempool.contains(t2_txid));
+    try std.testing.expect(!mempool.contains(cb_txid));
+}
+
+test "blockDisconnected: silent failure for already-present tx (no double-insert)" {
+    // Idempotency check: if a tx was already in the mempool before
+    // the disconnect (e.g. a wallet just re-broadcast it during the
+    // reorg window), blockDisconnected must NOT crash and must NOT
+    // duplicate the entry.  addTransaction returns AlreadyInMempool
+    // which the helper swallows silently (camlcoin parity).
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    // No round-tripped txs are kept (the only tx in the mempool was
+    // added with static-literal slices), so no inner-tx free dance.
+    defer mempool.deinit();
+
+    const tx_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xC1} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const out_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xD1} ** 20;
+    const tx_output = types.TxOut{ .value = 50_000, .script_pubkey = &out_script };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{tx_input},
+        .outputs = &[_]types.TxOut{tx_output},
+        .lock_time = 0,
+    };
+
+    // Pre-load the mempool with this exact tx.
+    try mempool.addTransaction(tx);
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+
+    // Coinbase + the duplicate.
+    const coinbase_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0xFFFF_FFFF },
+        .script_sig = &[_]u8{ 0x51, 0x52 },
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const coinbase_output = types.TxOut{ .value = 50_0000_0000, .script_pubkey = &cb_script };
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+
+    const block_txs = [_]types.Transaction{ coinbase_tx, tx };
+
+    // Should be a no-op (silent AlreadyInMempool failure).
+    mempool.blockDisconnected(&block_txs);
+
     try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
 }
