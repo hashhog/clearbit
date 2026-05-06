@@ -348,6 +348,15 @@ pub const MAX_BLOCK_RELAY_ONLY_ANCHORS: usize = 2;
 /// Maximum number of block-relay-only connections.
 pub const MAX_BLOCK_RELAY_ONLY_CONNECTIONS: usize = 2;
 
+/// Bitcoin Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS
+/// (net_processing.cpp).  A peer that delivers more than this many
+/// successive unconnecting-headers messages is disconnected.  Per
+/// CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+/// (Pattern B), clearbit previously instant-disconnected on the first
+/// orphan; this constant lets us tolerate up to 10 (>1 transient reorg)
+/// before banning honest peers.
+pub const MAX_NUM_UNCONNECTING_HEADERS_MSGS: u32 = 10;
+
 /// Hardcoded fallback peers for testnet4 (DNS seeds unreliable).
 pub const TESTNET_FALLBACK_PEERS: []const []const u8 = &[_][]const u8{
     "127.0.0.1", // Placeholder - would be real testnet4 peers
@@ -617,6 +626,17 @@ pub const Peer = struct {
     /// receive).  Non-null iff `transport_version == .v2`.  Allocated on the
     /// peer's `allocator`; freed in `disconnect`.
     v2_transport: ?*v2_transport.V2Transport = null,
+
+    /// Per-peer counter of consecutive unconnecting-headers messages.
+    /// Mirrors Bitcoin Core's `nUnconnectingHeaders` in
+    /// net_processing.cpp::ProcessHeadersMessage.  When the counter
+    /// would exceed `MAX_NUM_UNCONNECTING_HEADERS_MSGS` (10), the peer
+    /// is misbehavior-scored and disconnected.  Reset to 0 on every
+    /// successful connecting headers batch.  Pre-fix, clearbit
+    /// instant-banned on the first orphan; see
+    /// CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+    /// (Pattern B).
+    unconnecting_headers_count: u32 = 0,
 
     /// Connect to a remote peer.
     pub fn connect(
@@ -3733,11 +3753,42 @@ pub const PeerManager = struct {
 
                 switch (klass) {
                     .extends_active => {
+                        // Successful chain extension — reset the
+                        // unconnecting-headers counter for this peer.
+                        // Mirrors Core's `nUnconnectingHeaders = 0` in
+                        // ProcessHeadersMessage's success path.
+                        peer.unconnecting_headers_count = 0;
                         // Fall through to the existing extension path below.
                     },
                     .unknown_parent => {
-                        // Headers don't connect to our chain - misbehave (+20)
-                        peer.misbehaving(20, "headers don't connect to our chain");
+                        // Bitcoin Core (net_processing.cpp::ProcessHeadersMessage)
+                        // tolerates up to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
+                        // unconnecting-headers messages from a peer before
+                        // disconnecting.  Pre-fix, clearbit dropped the
+                        // peer on the very first orphan, which is stricter
+                        // than Core and discards honest peers caught in a
+                        // transient reorg.  See
+                        // CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+                        // (Pattern B).
+                        peer.unconnecting_headers_count += 1;
+                        if (peer.unconnecting_headers_count > MAX_NUM_UNCONNECTING_HEADERS_MSGS) {
+                            std.debug.print(
+                                "P2P: peer={any} exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS ({d}), disconnecting\n",
+                                .{ peer.address, MAX_NUM_UNCONNECTING_HEADERS_MSGS },
+                            );
+                            peer.misbehaving(20, "too many unconnecting headers");
+                            return;
+                        }
+                        // Under threshold: do NOT misbehave/disconnect.
+                        // Re-issue getheaders to try to find a common
+                        // ancestor (Core's FindForkInGlobalIndex behavior).
+                        std.debug.print(
+                            "P2P: orphan headers from peer={any} (unconnecting #{d}/{d}), re-requesting\n",
+                            .{ peer.address, peer.unconnecting_headers_count, MAX_NUM_UNCONNECTING_HEADERS_MSGS },
+                        );
+                        self.sendGetHeaders(peer) catch |err| {
+                            std.debug.print("P2P: failed to re-issue getheaders: {}\n", .{err});
+                        };
                         return;
                     },
                     .competing_fork => {
@@ -5636,6 +5687,82 @@ test "version message construction with correct protocol version" {
     // Verify services bitmap
     try std.testing.expect((version_msg.services & p2p.NODE_NETWORK) != 0);
     try std.testing.expect((version_msg.services & p2p.NODE_WITNESS) != 0);
+}
+
+// Core parity: unconnecting-headers counter must tolerate up to
+// MAX_NUM_UNCONNECTING_HEADERS_MSGS (10) before triggering disconnect.
+// Mirrors Bitcoin Core's `nUnconnectingHeaders` accounting in
+// net_processing.cpp::ProcessHeadersMessage.  Pre-fix, clearbit
+// instant-banned on the very first orphan via misbehaving(20).
+test "unconnecting-headers counter under MAX is tolerated" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var recv_buffer = std.ArrayList(u8).init(allocator);
+    defer recv_buffer.deinit();
+
+    var peer = Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4([4]u8{ 192, 168, 1, 2 }, 8333),
+        .state = .connected,
+        .direction = .outbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = std.time.timestamp(),
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = params,
+        .allocator = allocator,
+        .recv_buffer = recv_buffer,
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = std.time.timestamp(),
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
+        .best_known_height = 0,
+        .last_getheaders_time = 0,
+        .oldest_block_in_flight_time = 0,
+        .blocks_in_flight_count = 0,
+        .chain_sync_protected = false,
+    };
+
+    // Initial counter is zero.
+    try std.testing.expectEqual(@as(u32, 0), peer.unconnecting_headers_count);
+
+    // Drive the counter through 10 successive unconnecting messages —
+    // none should trigger the disconnect threshold (the comparison in
+    // peer.zig is `> MAX_NUM_UNCONNECTING_HEADERS_MSGS`, so up to and
+    // including 10 are tolerated).
+    var i: u32 = 1;
+    while (i <= MAX_NUM_UNCONNECTING_HEADERS_MSGS) : (i += 1) {
+        peer.unconnecting_headers_count += 1;
+        try std.testing.expect(peer.unconnecting_headers_count <= MAX_NUM_UNCONNECTING_HEADERS_MSGS);
+        try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
+    }
+
+    // 11th message exceeds the threshold.
+    peer.unconnecting_headers_count += 1;
+    try std.testing.expect(peer.unconnecting_headers_count > MAX_NUM_UNCONNECTING_HEADERS_MSGS);
+
+    // A successfully-connecting batch resets the counter (mirrors
+    // Core's nUnconnectingHeaders = 0 in the success path; the
+    // assignment lives in the .extends_active arm of the header
+    // classifier).
+    peer.unconnecting_headers_count = 0;
+    try std.testing.expectEqual(@as(u32, 0), peer.unconnecting_headers_count);
 }
 
 test "ban score accumulation" {
