@@ -25,6 +25,12 @@ const cf_names = [_][*:0]const u8{
     "utxo",
     "tx_index",
     "block_undo",
+    // Added 2026-05-05 — BIP-157/158 persistent BlockFilterIndex.  The
+    // existing-CF reopen branch (rocksdb_list_column_families) makes this
+    // backwards-compatible: legacy datadirs missing these CFs are upgraded
+    // in place on next open.
+    "block_filter",
+    "block_filter_header",
 };
 
 /// Internal database state
@@ -32,7 +38,7 @@ const DbState = struct {
     db: ?*c.rocksdb_t,
     write_options: ?*c.rocksdb_writeoptions_t,
     read_options: ?*c.rocksdb_readoptions_t,
-    cf_handles: [6]?*c.rocksdb_column_family_handle_t,
+    cf_handles: [storage.CF_COUNT]?*c.rocksdb_column_family_handle_t,
     allocator: std.mem.Allocator,
 };
 
@@ -88,7 +94,7 @@ pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.A
 
     c.rocksdb_options_set_block_based_table_factory(options, block_based_options);
 
-    const N_CF: usize = cf_names.len; // 6 as of 2026-05-02 (CF_BLOCK_UNDO added)
+    const N_CF: usize = cf_names.len; // 8 as of 2026-05-05 (CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER added)
     const cf_options = [_]?*c.rocksdb_options_t{options} ** N_CF;
     var cf_handles: [N_CF]?*c.rocksdb_column_family_handle_t = undefined;
 
