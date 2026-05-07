@@ -10469,3 +10469,402 @@ test "BlockFilterIndex: getPersistedFilter round-trip via connectBlockFastWithUn
     const off = try chain_state.getPersistedFilter(&bh1);
     try std.testing.expect(off == null);
 }
+
+// =====================================================================
+// Phase 2 (BIP-157/158 reorg-aware filter chain).  Pattern D extension:
+// the filter index must roll back atomically with chainstate when a
+// multi-block reorg fires.  reorgToChain accumulates N filter-deletes
+// (one per disconnected chain-A block) and M filter-writes (one per
+// new chain-B block) into the SAME shared WriteBatch as the UTXO /
+// txindex / undo mutations.  prev_filter_header rewinds to the new tip
+// during disconnect so the chain-B writes that follow chain on the
+// correct recurrence input.
+//
+// Bitcoin Core analog: index/blockfilterindex.cpp::CustomRemove +
+// CustomAppend driven by BaseIndex::BlockDisconnected /
+// BlockConnected during ActivateBestChain's reorg path.
+// =====================================================================
+
+test "BlockFilterIndex Pattern D: reorg drops orphaned filters and rewinds chain" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    chain_state.blockfilterindex_enabled = true;
+
+    // Build chain A: 3 coinbase-only blocks (script_byte=0xAA) → CF_BLOCK_FILTER
+    // + CF_BLOCK_FILTER_HEADER populated for each.
+    var hashes_a: [3]types.Hash256 = undefined;
+    var prev_a: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        const block = makeReorgTestBlock(prev_a, @intCast(h), 0xAA);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        bh[1] = 0xAD;
+        hashes_a[h - 1] = bh;
+
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh, owned, h);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev_a = bh;
+    }
+    try std.testing.expectEqual(@as(u32, 3), chain_state.best_height);
+    try std.testing.expectEqual(@as(u32, 3), chain_state.blockfilterindex_height);
+
+    // Verify all 3 chain-A filter entries are on disk before the reorg.
+    for (hashes_a) |bh| {
+        const f = (try db.get(CF_BLOCK_FILTER, &bh)) orelse {
+            std.debug.print("CF_BLOCK_FILTER missing for chain-A block {x}\n", .{bh[0]});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(f);
+        const fh = (try db.get(CF_BLOCK_FILTER_HEADER, &bh)) orelse {
+            std.debug.print("CF_BLOCK_FILTER_HEADER missing for chain-A block {x}\n", .{bh[0]});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(fh);
+    }
+
+    // Build chain B: 5 blocks from genesis with a different script_byte
+    // (0xBB) so the filter element sets, and therefore the chained
+    // headers, diverge from chain A.
+    var blocks_b: [5]types.Block = undefined;
+    var hashes_b: [5]types.Hash256 = undefined;
+    var prev_b: [32]u8 = [_]u8{0} ** 32;
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        blocks_b[i] = makeReorgTestBlock(prev_b, @intCast(i + 1), 0xBB);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(i + 1);
+        bh[1] = 0xBD;
+        hashes_b[i] = bh;
+        prev_b = bh;
+    }
+
+    var new_chain: [5]ChainState.ReorgBlock = undefined;
+    var j: usize = 0;
+    while (j < 5) : (j += 1) {
+        new_chain[j] = .{
+            .hash = hashes_b[j],
+            .block = blocks_b[j],
+            .height = @intCast(j + 1),
+        };
+    }
+
+    const fork_point: types.Hash256 = [_]u8{0} ** 32;
+    const connected = try chain_state.reorgToChain(&fork_point, &new_chain);
+    try std.testing.expectEqual(@as(u32, 5), connected);
+    try std.testing.expectEqual(@as(u32, 5), chain_state.best_height);
+    try std.testing.expectEqual(@as(u32, 5), chain_state.blockfilterindex_height);
+
+    // Pattern D filter-rewind: chain-A filter entries are GONE.  Single
+    // shared WriteBatch atomically dropped CF_BLOCK_FILTER +
+    // CF_BLOCK_FILTER_HEADER for every disconnected block.
+    for (hashes_a) |bh| {
+        const f = try db.get(CF_BLOCK_FILTER, &bh);
+        if (f) |bytes| {
+            defer allocator.free(bytes);
+            std.debug.print(
+                "Pattern D filter rewind: CF_BLOCK_FILTER for orphaned chain-A {x} still present\n",
+                .{bh[0]},
+            );
+            return error.TestUnexpectedResult;
+        }
+        const fh = try db.get(CF_BLOCK_FILTER_HEADER, &bh);
+        if (fh) |bytes| {
+            defer allocator.free(bytes);
+            std.debug.print(
+                "Pattern D filter rewind: CF_BLOCK_FILTER_HEADER for orphaned chain-A {x} still present\n",
+                .{bh[0]},
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // Chain-B filter entries are present, with the chained-header
+    // recurrence rebuilt from prev_filter_header=zero (post-rewind to
+    // genesis) forward through the new chain.
+    const indexes_mod = @import("indexes.zig");
+    var expected_prev: [32]u8 = [_]u8{0} ** 32;
+    for (blocks_b, 0..) |blk, idx| {
+        const bh = hashes_b[idx];
+        const f = (try db.get(CF_BLOCK_FILTER, &bh)) orelse {
+            std.debug.print("CF_BLOCK_FILTER missing for chain-B block {x}\n", .{bh[0]});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(f);
+        const fh = (try db.get(CF_BLOCK_FILTER_HEADER, &bh)) orelse {
+            std.debug.print("CF_BLOCK_FILTER_HEADER missing for chain-B block {x}\n", .{bh[0]});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(fh);
+        try std.testing.expectEqual(@as(usize, 32), fh.len);
+
+        // Recompute the expected chained header for this block from
+        // scratch: filter element set is just the single P2WPKH coinbase
+        // output (no spent prevouts on a coinbase-only block).
+        var collected = std.ArrayList([]const u8).init(allocator);
+        defer collected.deinit();
+        for (blk.transactions) |tx| {
+            for (tx.outputs) |o| try collected.append(o.script_pubkey);
+        }
+        var rebuilt = try indexes_mod.buildBasicBlockFilter(
+            &bh,
+            collected.items,
+            &.{},
+            allocator,
+        );
+        defer rebuilt.deinit();
+        const expected_hdr = rebuilt.computeHeader(&expected_prev);
+        try std.testing.expectEqualSlices(u8, &expected_hdr, fh);
+        expected_prev = expected_hdr;
+    }
+
+    // In-memory prev_filter_header tracks the new chain-B tip after the
+    // reorg (driven by queueFilterIndexWriteForBlock at the end of the
+    // M-block connect loop).
+    try std.testing.expectEqualSlices(u8, &expected_prev, &chain_state.prev_filter_header);
+
+    // Persisted filterindex tip key matches the new tip height.
+    const fi_data = (try db.get(CF_DEFAULT, ChainState.FILTERINDEX_TIP_KEY)) orelse {
+        std.debug.print("FILTERINDEX_TIP_KEY missing post-reorg\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer allocator.free(fi_data);
+    const persisted_tip = std.mem.readInt(u32, fi_data[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 5), persisted_tip);
+}
+
+test "BlockFilterIndex Pattern D: filter rewind commits in single shared WriteBatch" {
+    // Atomicity property: the multi-block reorg, including the
+    // CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER deletes (chain A) AND the
+    // chain-B filter writes, must collapse into exactly one writeBatch
+    // call.  A crash mid-reorg therefore lands on either the pre-reorg
+    // filter chain (chain A intact) or the post-reorg one (chain B
+    // intact) — never a partial state with chain-A filters dropped but
+    // chain-B filters not yet written.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    chain_state.blockfilterindex_enabled = true;
+
+    // Chain A: 3 blocks via per-block flush (one writeBatch each).
+    var hashes_a: [3]types.Hash256 = undefined;
+    var prev_a: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        const block = makeReorgTestBlock(prev_a, @intCast(h), 0xAA);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        bh[1] = 0xAD;
+        hashes_a[h - 1] = bh;
+
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh, owned, h);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev_a = bh;
+    }
+
+    // Chain B: 5 blocks pending.
+    var blocks_b: [5]types.Block = undefined;
+    var hashes_b: [5]types.Hash256 = undefined;
+    var prev_b: [32]u8 = [_]u8{0} ** 32;
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        blocks_b[i] = makeReorgTestBlock(prev_b, @intCast(i + 1), 0xBB);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(i + 1);
+        bh[1] = 0xBD;
+        hashes_b[i] = bh;
+        prev_b = bh;
+    }
+    var new_chain: [5]ChainState.ReorgBlock = undefined;
+    var j: usize = 0;
+    while (j < 5) : (j += 1) {
+        new_chain[j] = .{
+            .hash = hashes_b[j],
+            .block = blocks_b[j],
+            .height = @intCast(j + 1),
+        };
+    }
+
+    // Confirm all queues are empty going into the reorg (per-block
+    // flushes drained them above).
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_filter_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_filter_deletes.items.len);
+
+    const writes_before = db.write_batch_calls;
+
+    const fork_point: types.Hash256 = [_]u8{0} ** 32;
+    const connected = try chain_state.reorgToChain(&fork_point, &new_chain);
+    try std.testing.expectEqual(@as(u32, 5), connected);
+
+    // Pattern D atomicity: exactly one writeBatch across the entire
+    // reorg, including the 3 chain-A filter deletes + 5 chain-B filter
+    // writes.  Pre-Phase-2, the filter-rewind would not have queued
+    // into the shared batch at all (CustomRemove was missing), so this
+    // test would still pass at "1 batch" with a silent stale chain-A
+    // filter index — covered by the orphan-deletion assertions in the
+    // sibling test.  Pre-Pattern-D, the filter writes for chain B
+    // would fire as M separate writeBatch calls (one per connect),
+    // breaking this count.  Both regression vectors are now caught.
+    const writes_after = db.write_batch_calls;
+    const reorg_writes = writes_after - writes_before;
+    if (reorg_writes != 1) {
+        std.debug.print(
+            "Pattern D filter atomicity broken: reorg issued {d} writeBatch calls (expected 1)\n",
+            .{reorg_writes},
+        );
+        return error.TestUnexpectedResult;
+    }
+
+    // Both filter queues drained by the single shared flush().
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_filter_writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_filter_deletes.items.len);
+
+    // Sanity-check disk state — chain A filter pairs gone, chain B
+    // filter pairs present.  (Detailed chained-header verification
+    // lives in the sibling test.)
+    for (hashes_a) |bh| {
+        const f = try db.get(CF_BLOCK_FILTER, &bh);
+        if (f) |bytes| {
+            defer allocator.free(bytes);
+            return error.TestUnexpectedResult;
+        }
+    }
+    for (hashes_b) |bh| {
+        const f = (try db.get(CF_BLOCK_FILTER, &bh)) orelse return error.TestUnexpectedResult;
+        defer allocator.free(f);
+    }
+}
+
+test "BlockFilterIndex Pattern D: failure mid-reorg leaves chain-A filters intact" {
+    // Pattern D crash-pre-commit invariant for the filter index: if
+    // reorgToChain hits a connect-side error AFTER queueing all N
+    // disconnect-side filter deletes BUT BEFORE the final flush, the
+    // on-disk filter index must still show chain A.  Mirrors the
+    // Pattern D undo-deletes invariant test.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    chain_state.blockfilterindex_enabled = true;
+
+    // Chain A: 3 blocks indexed.
+    var hashes_a: [3]types.Hash256 = undefined;
+    var prev_a: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        const block = makeReorgTestBlock(prev_a, @intCast(h), 0xAA);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        bh[1] = 0xAD;
+        hashes_a[h - 1] = bh;
+
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh, owned, h);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev_a = bh;
+    }
+
+    // Build a deliberately broken chain B: the 2nd entry's prev_block
+    // points at a wrong hash.  reorgToChain will queue all 3 disconnects
+    // (filter deletes for chain A) + 1 successful connect, then trip on
+    // the bad linkage and return an error BEFORE the final flush.
+    var blocks_b: [2]types.Block = undefined;
+    var hashes_b: [2]types.Hash256 = undefined;
+    const prev_b: [32]u8 = [_]u8{0} ** 32;
+    blocks_b[0] = makeReorgTestBlock(prev_b, 1, 0xBB);
+    var bh0: [32]u8 = [_]u8{0} ** 32;
+    bh0[0] = 1;
+    bh0[1] = 0xBD;
+    hashes_b[0] = bh0;
+    // Wrong prev_block — should be hashes_b[0] but we use a bogus hash.
+    const bogus: [32]u8 = [_]u8{0xEE} ** 32;
+    blocks_b[1] = makeReorgTestBlock(bogus, 2, 0xBB);
+    var bh1_arr: [32]u8 = [_]u8{0} ** 32;
+    bh1_arr[0] = 2;
+    bh1_arr[1] = 0xBD;
+    hashes_b[1] = bh1_arr;
+
+    var new_chain: [2]ChainState.ReorgBlock = undefined;
+    new_chain[0] = .{ .hash = hashes_b[0], .block = blocks_b[0], .height = 1 };
+    new_chain[1] = .{ .hash = hashes_b[1], .block = blocks_b[1], .height = 2 };
+
+    const writes_before = db.write_batch_calls;
+
+    const fork_point: types.Hash256 = [_]u8{0} ** 32;
+    const result = chain_state.reorgToChain(&fork_point, &new_chain);
+    try std.testing.expectError(error.PrevBlockMismatch, result);
+
+    // Zero writeBatch calls fired during the failed reorg.
+    try std.testing.expectEqual(writes_before, db.write_batch_calls);
+
+    // Chain-A filter entries are STILL on disk — pre-flush rejection
+    // means no batch ever committed.
+    for (hashes_a) |bh| {
+        const f = (try db.get(CF_BLOCK_FILTER, &bh)) orelse {
+            std.debug.print(
+                "Pattern D filter crash-safety: chain-A filter for {x} dropped before commit\n",
+                .{bh[0]},
+            );
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(f);
+        const fh = (try db.get(CF_BLOCK_FILTER_HEADER, &bh)) orelse {
+            std.debug.print(
+                "Pattern D filter crash-safety: chain-A header for {x} dropped before commit\n",
+                .{bh[0]},
+            );
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(fh);
+    }
+
+    // The successfully-queued chain-B filter (height 1) MUST NOT be
+    // visible on disk either — the reorg aborted before flush.
+    const f_b = try db.get(CF_BLOCK_FILTER, &hashes_b[0]);
+    if (f_b) |bytes| {
+        defer allocator.free(bytes);
+        std.debug.print("Pattern D filter crash-safety: orphaned chain-B filter wrote pre-commit\n", .{});
+        return error.TestUnexpectedResult;
+    }
+}
