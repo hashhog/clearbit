@@ -34,9 +34,17 @@ pub const CF_TX_INDEX: usize = 4; // Transaction hash -> block location
 /// to close the IBD-only / no-disconnect deferred P0s without inheriting
 /// rev*.dat-file management complexity (Option B in the deferred audit).
 pub const CF_BLOCK_UNDO: usize = 5;
+/// Per-block BIP-158 basic filter encoded bytes keyed by block hash.
+/// Populated by the persistent BlockFilterIndex on block connect when
+/// `--blockfilterindex` is enabled.  Bitcoin Core analog:
+/// `index/blockfilterindex.cpp`'s `m_filter_fileseq` + `BlockFilterIndex::CustomAppend`.
+pub const CF_BLOCK_FILTER: usize = 6;
+/// Per-block BIP-157 filter header (chained hash256(filter_hash || prev_header))
+/// keyed by block hash.  Populated alongside CF_BLOCK_FILTER.
+pub const CF_BLOCK_FILTER_HEADER: usize = 7;
 /// Total number of column families. Must match `cf_names` length in
 /// storage_rocksdb.zig and the array sizes in DbState.
-pub const CF_COUNT: usize = 6;
+pub const CF_COUNT: usize = 8;
 
 pub const StorageError = error{
     OpenFailed,
@@ -1974,6 +1982,47 @@ pub const ChainState = struct {
     pending_tx_index_deletes: std.ArrayList(types.Hash256) = undefined,
 
     // ----------------------------------------------------------------------
+    // BIP-157/158 BlockFilterIndex (2026-05-05): mirror the CF_TX_INDEX
+    // wiring above.  When `blockfilterindex_enabled` is true,
+    // connectBlockInner computes the BIP-158 basic filter from the block's
+    // output scripts + spent UTXO scripts and queues a (block_hash → filter
+    // bytes) put into pending_filter_writes plus a (block_hash → 32-byte
+    // header) put into pending_filter_header_writes.  flush() drains both
+    // into the same WriteBatch as the UTXO mutations + tip update so a
+    // crash leaves the chainstate and the filter index advanced together
+    // or both rewound.  The chained filter-header recurrence requires the
+    // previous block's header, which we keep in `prev_filter_header` and
+    // advance per block.  Bitcoin Core analog: index/blockfilterindex.cpp
+    // CustomAppend — Core stores filters in flat .dat files keyed by a
+    // (height, hash) tuple, but the on-disk-bytes-per-block invariant +
+    // the chained-header recurrence is identical.
+    //
+    // Disconnect path queues filter + header deletes, mirroring
+    // pending_tx_index_deletes.  On disconnect, prev_filter_header is
+    // restored from CF_BLOCK_FILTER_HEADER for the new tip (or set to all-
+    // zero when rewinding to genesis).
+
+    /// True when `--blockfilterindex` is on; gates queue-append + lookup.
+    blockfilterindex_enabled: bool = false,
+    /// Highest block height for which CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER
+    /// are populated.  Loaded on startup from the persisted "filterindex_tip"
+    /// key in CF_DEFAULT and advanced by connectBlockInner.  Used by the
+    /// IBD-time backfill walker (main.zig) to know where to resume.
+    blockfilterindex_height: u32 = 0,
+    /// Most-recently-stored filter header.  Genesis = all-zero.  Advanced
+    /// per block by `queueFilterIndexWriteForBlock` so chained-header
+    /// computation is O(1) per block during connect.  On startup this is
+    /// loaded from CF_BLOCK_FILTER_HEADER for the persisted tip.
+    prev_filter_header: types.Hash256 = [_]u8{0} ** 32,
+    /// Per-block CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER writes pending
+    /// durable commit.  flush() appends two puts per entry (one per CF).
+    pending_filter_writes: std.ArrayList(PendingFilterWrite) = undefined,
+    /// Per-block CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER deletes pending
+    /// durable commit (block-disconnect path).  Inline 32-byte hashes; no
+    /// heap to free in the entries themselves.
+    pending_filter_deletes: std.ArrayList(types.Hash256) = undefined,
+
+    // ----------------------------------------------------------------------
     // Pattern D (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-
     // 2026-05-05.md): multi-block reorg disconnect+reconnect must commit in
     // ONE atomic RocksDB WriteBatch.  Previously (3f3ba26-and-prior),
@@ -2017,6 +2066,23 @@ pub const ChainState = struct {
         txid: types.Hash256,
         value: [TXINDEX_VAL_LEN]u8,
     };
+
+    /// Per-block (block_hash → filter_bytes, filter_header) tuple pending
+    /// durable commit to CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER.  Filter
+    /// bytes are heap-owned by ChainState until flush() succeeds; the
+    /// 32-byte header is inline.  Bitcoin Core analog: the on-disk record
+    /// emitted by index/blockfilterindex.cpp::CustomAppend.
+    pub const PendingFilterWrite = struct {
+        hash: types.Hash256,
+        filter_bytes: []u8,
+        filter_header: types.Hash256,
+        height: u32,
+    };
+
+    /// CF_DEFAULT key for the persisted blockfilterindex tip height.  Stored
+    /// as a 4-byte little-endian u32 alongside the chain tip so an opened
+    /// datadir knows how far the index reached before the last shutdown.
+    pub const FILTERINDEX_TIP_KEY: []const u8 = "filterindex_tip";
 
     /// Undo data for a connected block — needed for disconnection during reorgs.
     /// This is the in-memory representation used during block connection.
@@ -2116,6 +2182,8 @@ pub const ChainState = struct {
             .pending_tx_index_writes = std.ArrayList(PendingTxIndexWrite).init(allocator),
             .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
+            .pending_filter_writes = std.ArrayList(PendingFilterWrite).init(allocator),
+            .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
         };
     }
 
@@ -2133,6 +2201,8 @@ pub const ChainState = struct {
             .pending_tx_index_writes = std.ArrayList(PendingTxIndexWrite).init(allocator),
             .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
+            .pending_filter_writes = std.ArrayList(PendingFilterWrite).init(allocator),
+            .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
         };
     }
 
@@ -2191,6 +2261,15 @@ pub const ChainState = struct {
         // queue on a flush_error path — the on-disk undo entries are
         // still resident and a restart-from-disk recovers cleanly.
         self.pending_undo_deletes.deinit();
+        // BlockFilterIndex (2026-05-05): drain any unflushed filter bytes
+        // (heap-owned by ChainState until flush() succeeds, mirrors
+        // pending_block_writes / pending_undo_writes).  Deletes are
+        // inline-only.
+        for (self.pending_filter_writes.items) |entry| {
+            self.allocator.free(entry.filter_bytes);
+        }
+        self.pending_filter_writes.deinit();
+        self.pending_filter_deletes.deinit();
         self.utxo_set.deinit();
     }
 
@@ -2304,6 +2383,290 @@ pub const ChainState = struct {
             const tx_hash = crypto.computeTxidStreaming(&tx);
             try self.pending_tx_index_deletes.append(tx_hash);
         }
+    }
+
+    /// Queue CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER writes for the given
+    /// block.  Called by `connectBlockInner` after the per-tx UTXO loop has
+    /// produced the (output_scripts, spent_scripts) lists used by BIP-158.
+    /// No-op when `blockfilterindex_enabled = false` or when running in
+    /// memory-only mode.
+    ///
+    /// Bitcoin Core analog: `BlockFilterIndex::CustomAppend` in
+    /// `src/index/blockfilterindex.cpp`.  Core writes the GCS-encoded filter
+    /// to flat .dat files and a (height, hash) → file-position record to a
+    /// LevelDB table; we collapse both into a single (block_hash → bytes)
+    /// CF_BLOCK_FILTER put plus a (block_hash → 32-byte header) put.  The
+    /// chained header recurrence — `header_n = hash256(filter_hash_n ||
+    /// header_{n-1})` — is identical (BIP-157 §"Filter Headers").
+    ///
+    /// Caller contract: must invoke with the block-being-connected at
+    /// height = best_height + 1, so prev_filter_header is the correct
+    /// chained input for the recurrence.  Mutates `prev_filter_header` and
+    /// `blockfilterindex_height` on success — those move only after the
+    /// actual flush() commits, but we move them eagerly here so the next
+    /// in-batch block sees the right chained input.  flush() failure
+    /// rewinds them via the same flush_error sticky-flag the rest of the
+    /// connect-time state uses.
+    ///
+    /// Takes ownership of `filter_bytes` on success (will be freed by
+    /// flush() cleanup).
+    fn queueFilterIndexWriteForBlock(
+        self: *ChainState,
+        block: *const types.Block,
+        block_hash: *const types.Hash256,
+        height: u32,
+        spent_scripts: []const []const u8,
+    ) !void {
+        if (!self.blockfilterindex_enabled) return;
+        if (self.utxo_set.db == null) return;
+
+        const indexes_mod = @import("indexes.zig");
+
+        // Build the BIP-158 element list directly from the block's outputs +
+        // the spent prevout scripts.  buildBasicBlockFilter handles the
+        // OP_RETURN + empty-script filtering itself.
+        var output_scripts = std.ArrayList([]const u8).init(self.allocator);
+        defer output_scripts.deinit();
+        for (block.transactions) |tx| {
+            for (tx.outputs) |o| {
+                try output_scripts.append(o.script_pubkey);
+            }
+        }
+
+        var filter = indexes_mod.buildBasicBlockFilter(
+            block_hash,
+            output_scripts.items,
+            spent_scripts,
+            self.allocator,
+        ) catch |err| {
+            std.debug.print("queueFilterIndexWriteForBlock: build failed at height {d}: {}\n", .{ height, err });
+            return err;
+        };
+        defer filter.deinit();
+
+        // Compute chained filter header: hash256(filter_hash || prev_header).
+        const new_header = filter.computeHeader(&self.prev_filter_header);
+
+        // Copy out the filter's encoded bytes — buildBasicBlockFilter returns
+        // a non-owning slice into the GCSFilter's internal buffer, which goes
+        // away on `filter.deinit()`.  The duplicated bytes are owned by the
+        // queue entry until flush() drains them.
+        const encoded = filter.filter.getEncoded();
+        const owned = try self.allocator.dupe(u8, encoded);
+        errdefer self.allocator.free(owned);
+
+        try self.pending_filter_writes.append(.{
+            .hash = block_hash.*,
+            .filter_bytes = owned,
+            .filter_header = new_header,
+            .height = height,
+        });
+
+        // Advance the chained-header state in-memory so the next block's
+        // recurrence is correct.  flush() will persist this via the
+        // FILTERINDEX_TIP_KEY put below.
+        self.prev_filter_header = new_header;
+        self.blockfilterindex_height = height;
+    }
+
+    /// Queue CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER deletes for a
+    /// disconnected block.  Mirrors the txindex-delete path in
+    /// `queueTxIndexDeletesForBlock`.
+    ///
+    /// On block disconnect we drop both the filter bytes and the header for
+    /// that block, then restore `prev_filter_header` from the parent block's
+    /// CF_BLOCK_FILTER_HEADER (or all-zero when rewinding to genesis).
+    fn queueFilterIndexDeleteForBlock(
+        self: *ChainState,
+        block_hash: *const types.Hash256,
+        prev_block_hash: *const types.Hash256,
+        new_height: u32,
+    ) !void {
+        if (!self.blockfilterindex_enabled) return;
+        const db = self.utxo_set.db orelse return;
+        try self.pending_filter_deletes.append(block_hash.*);
+
+        // Restore prev_filter_header from the parent's persisted header.
+        // Reading from disk here is safe because pending_filter_writes /
+        // deletes for the parent's block are already drained (flush()
+        // commits per-disconnect in the no-flush path's caller, and the
+        // caller — disconnectBlockByHashCFInner — runs deterministically
+        // top-of-chain to ancestor).
+        if (new_height == 0) {
+            self.prev_filter_header = [_]u8{0} ** 32;
+        } else if (try db.get(CF_BLOCK_FILTER_HEADER, prev_block_hash)) |data| {
+            defer self.allocator.free(data);
+            if (data.len == 32) {
+                @memcpy(&self.prev_filter_header, data[0..32]);
+            } else {
+                // Header CF entry is wrong size — restart-from-disk recovery
+                // path.  Reset to zero and let backfill (main.zig) rebuild.
+                self.prev_filter_header = [_]u8{0} ** 32;
+            }
+        } else {
+            // Parent has no filter header — datadir was upgraded mid-flight
+            // or backfill never reached it.  Reset to zero and let backfill
+            // rebuild the chain from scratch on next connect.
+            self.prev_filter_header = [_]u8{0} ** 32;
+        }
+        if (new_height < self.blockfilterindex_height) {
+            self.blockfilterindex_height = new_height;
+        }
+    }
+
+    /// Look up the persistent BIP-158 filter bytes for a block.  Returns
+    /// the encoded GCS filter (caller-owned, freed via self.allocator) or
+    /// null if the index is off / the block isn't yet indexed / the entry
+    /// was disconnected.  REST `/rest/blockfilter` (rpc.zig) prefers this
+    /// over compute-on-demand when `blockfilterindex_enabled = true`.
+    pub fn getPersistedFilter(
+        self: *ChainState,
+        block_hash: *const types.Hash256,
+    ) !?[]const u8 {
+        if (!self.blockfilterindex_enabled) return null;
+        const db = self.utxo_set.db orelse return null;
+        return db.get(CF_BLOCK_FILTER, block_hash);
+    }
+
+    /// IBD-time backfill — populate CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER
+    /// for every block in [blockfilterindex_height+1 .. best_height] using
+    /// data already on disk (CF_BLOCKS + CF_BLOCK_UNDO).  Called by main.zig
+    /// after the chain tip is loaded but before the IBD/peer loop starts so
+    /// we don't race connectBlockInner's per-block writes.
+    ///
+    /// Bitcoin Core analog: BaseIndex::Sync (background thread that walks
+    /// from `m_best_block_index` to `m_chainstate.m_chain.Tip()` and calls
+    /// CustomAppend per block).  Core runs this in a separate thread; we
+    /// run synchronously here for simplicity — typical mainnet tip is
+    /// ~900k blocks and the per-block cost is dominated by filter
+    /// construction (one SipHash + GCS encode per script), so a full
+    /// from-scratch backfill takes roughly an hour on commodity hardware.
+    /// Operators who need faster catch-up can pre-seed the datadir via
+    /// `--blockfilterindex` from genesis IBD.
+    ///
+    /// Behaviour:
+    ///   - flushes every 256 blocks so the WriteBatch stays bounded.
+    ///   - tolerates missing CF_BLOCK_UNDO entries for genesis (no inputs).
+    ///   - tolerates missing CF_BLOCKS bodies under prune mode (logs +
+    ///     stops the walk; later live-connects will re-populate the index
+    ///     from blockfilterindex_height onward).
+    pub fn backfillBlockFilterIndex(self: *ChainState) !void {
+        if (!self.blockfilterindex_enabled) return;
+        const db = self.utxo_set.db orelse return;
+        if (self.best_height == 0) return;
+        if (self.blockfilterindex_height >= self.best_height) return;
+
+        const indexes_mod = @import("indexes.zig");
+        const start_height: u32 = self.blockfilterindex_height + 1;
+        const tip_height: u32 = self.best_height;
+        std.debug.print(
+            "BlockFilterIndex backfill: scanning heights {d}..{d} ({d} blocks)\n",
+            .{ start_height, tip_height, tip_height - start_height + 1 },
+        );
+
+        const FLUSH_EVERY: u32 = 256;
+        var written_since_flush: u32 = 0;
+        var h: u32 = start_height;
+        while (h <= tip_height) : (h += 1) {
+            const hash = self.getBlockHashByHeight(h) orelse {
+                std.debug.print("BlockFilterIndex backfill: missing height→hash for {d}; stopping at {d}\n", .{ h, self.blockfilterindex_height });
+                break;
+            };
+
+            const raw = (try db.get(CF_BLOCKS, &hash)) orelse {
+                std.debug.print("BlockFilterIndex backfill: missing block body for height {d} (pruned?); stopping at {d}\n", .{ h, self.blockfilterindex_height });
+                break;
+            };
+            defer self.allocator.free(raw);
+
+            var reader = serialize.Reader{ .data = raw };
+            var block = serialize.readBlock(&reader, self.allocator) catch {
+                std.debug.print("BlockFilterIndex backfill: corrupt block body at height {d}; stopping\n", .{h});
+                break;
+            };
+            defer serialize.freeBlock(self.allocator, &block);
+
+            // Output scripts come straight from the block.
+            var output_scripts = std.ArrayList([]const u8).init(self.allocator);
+            defer output_scripts.deinit();
+            for (block.transactions) |tx| {
+                for (tx.outputs) |o| {
+                    try output_scripts.append(o.script_pubkey);
+                }
+            }
+
+            // Spent scripts come from CF_BLOCK_UNDO (genesis has none).
+            var spent_scripts = std.ArrayList([]const u8).init(self.allocator);
+            defer spent_scripts.deinit();
+            var owned_undo: ?BlockUndoData = null;
+            defer if (owned_undo) |*u| u.deinit(self.allocator);
+            if (try db.get(CF_BLOCK_UNDO, &hash)) |undo_bytes| {
+                defer self.allocator.free(undo_bytes);
+                owned_undo = BlockUndoData.fromBytes(undo_bytes, self.allocator) catch null;
+                if (owned_undo) |u| {
+                    for (u.tx_undo) |tu| {
+                        for (tu.prev_outputs) |p| {
+                            try spent_scripts.append(p.script_pubkey);
+                        }
+                    }
+                }
+            }
+
+            var filter = indexes_mod.buildBasicBlockFilter(
+                &hash,
+                output_scripts.items,
+                spent_scripts.items,
+                self.allocator,
+            ) catch |err| {
+                std.debug.print("BlockFilterIndex backfill: build failed at height {d}: {}\n", .{ h, err });
+                return err;
+            };
+            defer filter.deinit();
+
+            const new_header = filter.computeHeader(&self.prev_filter_header);
+            const encoded = filter.filter.getEncoded();
+            const owned = try self.allocator.dupe(u8, encoded);
+            errdefer self.allocator.free(owned);
+
+            try self.pending_filter_writes.append(.{
+                .hash = hash,
+                .filter_bytes = owned,
+                .filter_header = new_header,
+                .height = h,
+            });
+            self.prev_filter_header = new_header;
+            self.blockfilterindex_height = h;
+            written_since_flush += 1;
+
+            if (written_since_flush >= FLUSH_EVERY) {
+                try self.flush();
+                written_since_flush = 0;
+            }
+        }
+        if (written_since_flush > 0) {
+            try self.flush();
+        }
+        std.debug.print(
+            "BlockFilterIndex backfill: complete, indexed up to height {d}\n",
+            .{self.blockfilterindex_height},
+        );
+    }
+
+    /// Look up the persistent BIP-157 filter header for a block.  Returns
+    /// the 32-byte chained header (by-value), or null if the index is off /
+    /// the block isn't indexed.
+    pub fn getPersistedFilterHeader(
+        self: *ChainState,
+        block_hash: *const types.Hash256,
+    ) !?types.Hash256 {
+        if (!self.blockfilterindex_enabled) return null;
+        const db = self.utxo_set.db orelse return null;
+        const data = (try db.get(CF_BLOCK_FILTER_HEADER, block_hash)) orelse return null;
+        defer self.allocator.free(data);
+        if (data.len != 32) return null;
+        var hdr: types.Hash256 = undefined;
+        @memcpy(&hdr, data[0..32]);
+        return hdr;
     }
 
     /// CF_TX_INDEX lookup helper used by `getrawtransaction`.  Returns the
@@ -2988,6 +3351,14 @@ pub const ChainState = struct {
         // delete-of-missing-key is a no-op).
         try self.pending_undo_deletes.append(hash.*);
 
+        // BlockFilterIndex (2026-05-05): queue CF_BLOCK_FILTER +
+        // CF_BLOCK_FILTER_HEADER deletes for the disconnected block, and
+        // restore the chained `prev_filter_header` to the parent block's
+        // header (or all-zero when rewinding to genesis).  Same single-
+        // WriteBatch atomicity guarantee as the txindex/undo-deletes
+        // queues above.  No-op when blockfilterindex_enabled is false.
+        try self.queueFilterIndexDeleteForBlock(hash, &block.header.prev_block, self.best_height);
+
         if (do_flush) {
             // Flush so the tip rewind + UTXO mutations land on disk
             // immediately.  Without this, a caller that runs disconnect
@@ -3226,6 +3597,14 @@ pub const ChainState = struct {
         self.pending_tx_index_deletes.clearRetainingCapacity();
         self.pending_undo_deletes.clearRetainingCapacity();
 
+        // BlockFilterIndex (2026-05-05): heap-owned filter bytes need to be
+        // freed alongside block bodies + undo bytes.  Header is inline.
+        for (self.pending_filter_writes.items) |entry| {
+            self.allocator.free(entry.filter_bytes);
+        }
+        self.pending_filter_writes.clearRetainingCapacity();
+        self.pending_filter_deletes.clearRetainingCapacity();
+
         // utxo_set's pending_deletes / dirty_keys are NOT freed here:
         // they hold tracker entries pointing into the cache hashmap
         // (which still owns the byte buffers).  Drop the trackers so
@@ -3284,6 +3663,22 @@ pub const ChainState = struct {
         var created_list = std.ArrayList(types.OutPoint).init(self.allocator);
         errdefer created_list.deinit();
 
+        // BlockFilterIndex (2026-05-05): capture spent scriptPubKeys
+        // alongside the UTXO spend loop when --blockfilterindex is on.
+        // BIP-158 basic filters need both output scripts (which we can
+        // pull from `block.transactions`) AND spent prevout scripts (which
+        // are only knowable here, mid-spend).  Decoupling this from
+        // skip_undo lets the IBD fast path (skip_undo=true) still build
+        // the filter without paying the full BlockUndo capture cost.
+        // Each entry is allocator-owned via reconstructScript() and freed
+        // by `spent_scripts_owned.deinit()` below.
+        const want_filters = self.blockfilterindex_enabled and self.utxo_set.db != null;
+        var spent_scripts_owned = std.ArrayList([]const u8).init(self.allocator);
+        defer {
+            for (spent_scripts_owned.items) |s| self.allocator.free(@constCast(s));
+            spent_scripts_owned.deinit();
+        }
+
         // W73 per-block phase accumulators.  Written to ChainState scratch
         // fields on success; connectBlockFast reads them.
         var spend_ns_block: u64 = 0;
@@ -3325,10 +3720,22 @@ pub const ChainState = struct {
                             return error.MissingInput;
                         };
                         var s = spent;
+                        // BlockFilterIndex (2026-05-05): when --blockfilterindex
+                        // is enabled, reconstruct the spent script from the
+                        // CompactUtxo before freeing it — BIP-158 needs the
+                        // raw scriptPubKey bytes for the GCS element set.
+                        if (want_filters) {
+                            const script = try s.reconstructScript(self.allocator);
+                            try spent_scripts_owned.append(script);
+                        }
                         s.deinit(self.allocator);
                     } else {
                         const spent = try self.utxo_set.spend(&input.previous_output)
                             orelse return error.MissingInput;
+                        if (want_filters) {
+                            const script = try spent.reconstructScript(self.allocator);
+                            try spent_scripts_owned.append(script);
+                        }
                         try spent_list.append(.{
                             .outpoint = input.previous_output,
                             .utxo = spent,
@@ -3374,6 +3781,14 @@ pub const ChainState = struct {
         // (MissingInput, etc.) doesn't leak orphan txindex entries — the
         // for-loop above returns on first error and we never get here.
         try self.queueTxIndexWritesForBlock(block, hash, height);
+
+        // BlockFilterIndex (2026-05-05): build + queue the BIP-158 filter
+        // record for this block.  No-op when blockfilterindex_enabled is
+        // false (default).  Same atomicity guarantee as the txindex writes
+        // above — both land in the next flush() WriteBatch alongside the
+        // UTXO mutations + tip update so a crash leaves all four pieces
+        // either advanced together or rewound together.
+        try self.queueFilterIndexWriteForBlock(block, hash, height, spent_scripts_owned.items);
 
         // BIP-113: push the new block's timestamp into the ring buffer so
         // computeMTP() can serve the correct MTP for the NEXT submitted block
@@ -3683,6 +4098,73 @@ pub const ChainState = struct {
             } });
         }
 
+        // 9. BlockFilterIndex deletes (BIP-157/158 disconnect side).  One
+        //    delete per CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER pair for
+        //    each disconnected block.  Append BEFORE writes so a reorg's
+        //    delete-then-rewrite at the same hash within one flush window
+        //    sees the put win (RocksDB applies batch ops in array order).
+        //    Empty queue when --blockfilterindex is off.
+        for (self.pending_filter_deletes.items) |bh| {
+            const k1 = try self.allocator.alloc(u8, 32);
+            @memcpy(k1, &bh);
+            try batch.append(.{ .delete = .{
+                .cf = CF_BLOCK_FILTER,
+                .key = k1,
+            } });
+            const k2 = try self.allocator.alloc(u8, 32);
+            @memcpy(k2, &bh);
+            try batch.append(.{ .delete = .{
+                .cf = CF_BLOCK_FILTER_HEADER,
+                .key = k2,
+            } });
+        }
+
+        // 10. BlockFilterIndex writes (BIP-157/158 connect side).  Two
+        //     puts per entry — filter bytes into CF_BLOCK_FILTER, header
+        //     into CF_BLOCK_FILTER_HEADER, both keyed by block hash.
+        //     filter_bytes are heap-owned by the queue entry and transfer
+        //     ownership to the BatchOp cleanup loop on success (mirrors
+        //     CF_BLOCKS / CF_BLOCK_UNDO).  Empty queue when
+        //     blockfilterindex_enabled is false.
+        for (self.pending_filter_writes.items) |entry| {
+            const k_filter = try self.allocator.alloc(u8, 32);
+            @memcpy(k_filter, &entry.hash);
+            try batch.append(.{ .put = .{
+                .cf = CF_BLOCK_FILTER,
+                .key = k_filter,
+                .value = entry.filter_bytes,
+            } });
+            const k_hdr = try self.allocator.alloc(u8, 32);
+            @memcpy(k_hdr, &entry.hash);
+            const v_hdr = try self.allocator.alloc(u8, 32);
+            @memcpy(v_hdr, &entry.filter_header);
+            try batch.append(.{ .put = .{
+                .cf = CF_BLOCK_FILTER_HEADER,
+                .key = k_hdr,
+                .value = v_hdr,
+            } });
+        }
+
+        // 10b. Persisted filterindex tip — only emit when at least one
+        //      filter write/delete is in flight (otherwise we'd churn
+        //      this key on every flush even with the index disabled).
+        //      Stored as a 4-byte little-endian u32; loaded by main.zig
+        //      on startup so the IBD-time backfill walker knows where to
+        //      resume from.
+        if (self.blockfilterindex_enabled and
+            (self.pending_filter_writes.items.len > 0 or self.pending_filter_deletes.items.len > 0))
+        {
+            const fi_key = try self.allocator.alloc(u8, FILTERINDEX_TIP_KEY.len);
+            @memcpy(fi_key, FILTERINDEX_TIP_KEY);
+            const fi_val = try self.allocator.alloc(u8, 4);
+            std.mem.writeInt(u32, fi_val[0..4], self.blockfilterindex_height, .little);
+            try batch.append(.{ .put = .{
+                .cf = CF_DEFAULT,
+                .key = fi_key,
+                .value = fi_val,
+            } });
+        }
+
         flush_build_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_build_start));
 
         if (batch.items.len > 0) {
@@ -3700,10 +4182,13 @@ pub const ChainState = struct {
                     switch (op) {
                         .put => |p| {
                             self.allocator.free(@constCast(p.key));
-                            // CF_BLOCKS / CF_BLOCK_UNDO values are still
-                            // owned by their respective pending queues for
-                            // the next retry; do NOT free them here.
-                            if (p.cf != CF_BLOCKS and p.cf != CF_BLOCK_UNDO) {
+                            // CF_BLOCKS / CF_BLOCK_UNDO / CF_BLOCK_FILTER
+                            // values are still owned by their respective
+                            // pending queues for the next retry; do NOT
+                            // free them here.  CF_BLOCK_FILTER_HEADER
+                            // values are inline copies allocated in the
+                            // build loop above, so they ARE freed here.
+                            if (p.cf != CF_BLOCKS and p.cf != CF_BLOCK_UNDO and p.cf != CF_BLOCK_FILTER) {
                                 self.allocator.free(@constCast(p.value));
                             }
                         },
@@ -3759,15 +4244,29 @@ pub const ChainState = struct {
             // the per-op key copies.
             self.pending_undo_deletes.clearRetainingCapacity();
 
+            // BlockFilterIndex (2026-05-05): CF_BLOCK_FILTER bytes
+            // committed — free filter_bytes here exactly once (the BatchOp
+            // cleanup skips CF_BLOCK_FILTER values by cf-tag below) and
+            // clear both queues.  CF_BLOCK_FILTER_HEADER values are inline
+            // 32-byte copies allocated in the build loop and ARE freed by
+            // the BatchOp cleanup.
+            for (self.pending_filter_writes.items) |entry| {
+                self.allocator.free(entry.filter_bytes);
+            }
+            self.pending_filter_writes.clearRetainingCapacity();
+            self.pending_filter_deletes.clearRetainingCapacity();
+
             // Free allocated keys and values
             for (batch.items) |op| {
                 switch (op) {
                     .put => |p| {
                         self.allocator.free(@constCast(p.key));
-                        // CF_BLOCKS / CF_BLOCK_UNDO values were freed above
-                        // via their respective pending queues — skip here
-                        // to avoid double-free.
-                        if (p.cf != CF_BLOCKS and p.cf != CF_BLOCK_UNDO) {
+                        // CF_BLOCKS / CF_BLOCK_UNDO / CF_BLOCK_FILTER
+                        // values were freed above via their respective
+                        // pending queues — skip here to avoid double-free.
+                        // CF_BLOCK_FILTER_HEADER values are inline 32-byte
+                        // copies and DO need freeing here.
+                        if (p.cf != CF_BLOCKS and p.cf != CF_BLOCK_UNDO and p.cf != CF_BLOCK_FILTER) {
                             self.allocator.free(@constCast(p.value));
                         }
                     },
@@ -9730,4 +10229,243 @@ test "ChainStateManager completeValidation with matching hashes" {
     const result = try manager.completeValidation();
     try std.testing.expect(result);
     try std.testing.expect(!manager.isAssumeUtxoMode());
+}
+
+// ============================================================================
+// BlockFilterIndex tests (BIP-157/158, 2026-05-05)
+// ============================================================================
+
+test "BlockFilterIndex: connectBlockFastWithUndo populates CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    chain_state.blockfilterindex_enabled = true;
+
+    // Connect a single coinbase-only block at height 1.  Filter element
+    // set is exactly the coinbase output's P2WPKH script (no inputs to
+    // spend and no OP_RETURN to skip).
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xAA);
+    const bh1 = [_]u8{0x01} ** 32;
+
+    var writer = serialize.Writer.init(allocator);
+    try serialize.writeBlock(&writer, &block1);
+    const owned_const = try writer.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    try chain_state.queueBlockWrite(&bh1, owned, 1);
+
+    try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+
+    // Tip advanced.
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    // Filter index advanced + queues drained by flush().
+    try std.testing.expectEqual(@as(u32, 1), chain_state.blockfilterindex_height);
+    try std.testing.expectEqual(@as(usize, 0), chain_state.pending_filter_writes.items.len);
+
+    // CF_BLOCK_FILTER has the encoded filter bytes.
+    const filter_bytes = (try db.get(CF_BLOCK_FILTER, &bh1)) orelse {
+        std.debug.print("CF_BLOCK_FILTER missing for h=1\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer allocator.free(filter_bytes);
+    try std.testing.expect(filter_bytes.len >= 1); // GCS prefix at minimum.
+
+    // CF_BLOCK_FILTER_HEADER has the chained 32-byte header.
+    const hdr = (try db.get(CF_BLOCK_FILTER_HEADER, &bh1)) orelse {
+        std.debug.print("CF_BLOCK_FILTER_HEADER missing for h=1\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer allocator.free(hdr);
+    try std.testing.expectEqual(@as(usize, 32), hdr.len);
+
+    // Header chains correctly: header_1 = hash256(filter_hash || 0...).
+    const indexes_mod = @import("indexes.zig");
+    var collected = std.ArrayList([]const u8).init(allocator);
+    defer collected.deinit();
+    for (block1.transactions) |tx| {
+        for (tx.outputs) |o| try collected.append(o.script_pubkey);
+    }
+    var rebuilt = try indexes_mod.buildBasicBlockFilter(
+        &bh1,
+        collected.items,
+        &.{},
+        allocator,
+    );
+    defer rebuilt.deinit();
+    const zero_prev: [32]u8 = [_]u8{0} ** 32;
+    const expected_hdr = rebuilt.computeHeader(&zero_prev);
+    try std.testing.expectEqualSlices(u8, &expected_hdr, hdr);
+
+    // Persisted tip key matches the in-memory height.
+    const fi_data = (try db.get(CF_DEFAULT, ChainState.FILTERINDEX_TIP_KEY)) orelse {
+        std.debug.print("FILTERINDEX_TIP_KEY missing\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer allocator.free(fi_data);
+    try std.testing.expectEqual(@as(usize, 4), fi_data.len);
+    const persisted_tip = std.mem.readInt(u32, fi_data[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 1), persisted_tip);
+}
+
+test "BlockFilterIndex: disabled flag → CF_BLOCK_FILTER stays empty" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    // Default: blockfilterindex_enabled = false.
+
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xBB);
+    const bh1 = [_]u8{0x02} ** 32;
+
+    var writer = serialize.Writer.init(allocator);
+    try serialize.writeBlock(&writer, &block1);
+    const owned_const = try writer.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    try chain_state.queueBlockWrite(&bh1, owned, 1);
+    try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    try std.testing.expectEqual(@as(u32, 0), chain_state.blockfilterindex_height);
+
+    // No CF_BLOCK_FILTER entry — gate held.
+    const filter_data = try db.get(CF_BLOCK_FILTER, &bh1);
+    if (filter_data) |fd| {
+        defer allocator.free(fd);
+        try std.testing.expect(false); // unreachable
+    }
+    // No filterindex tip key either.
+    const fi_data = try db.get(CF_DEFAULT, ChainState.FILTERINDEX_TIP_KEY);
+    if (fi_data) |fd| {
+        defer allocator.free(fd);
+        try std.testing.expect(false);
+    }
+}
+
+test "BlockFilterIndex: backfillBlockFilterIndex populates from already-connected blocks" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    // Filter index OFF during the initial connects — simulates an
+    // operator who did the IBD without --blockfilterindex and is now
+    // turning it on.
+    var prev_hash: [32]u8 = [_]u8{0} ** 32;
+    var hashes: [3]types.Hash256 = undefined;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        const block = makeReorgTestBlock(prev_hash, @intCast(h), 0xCC);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        hashes[h - 1] = bh;
+
+        var writer = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&writer, &block);
+        const owned_const = try writer.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh, owned, h);
+
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev_hash = bh;
+    }
+
+    // Confirm no filter entries pre-backfill.
+    const pre = try db.get(CF_BLOCK_FILTER, &hashes[0]);
+    if (pre) |p| {
+        defer allocator.free(p);
+        try std.testing.expect(false);
+    }
+    try std.testing.expectEqual(@as(u32, 0), chain_state.blockfilterindex_height);
+
+    // Now flip the flag and run the backfill.
+    chain_state.blockfilterindex_enabled = true;
+    try chain_state.backfillBlockFilterIndex();
+
+    // Index has caught up to chain tip.
+    try std.testing.expectEqual(@as(u32, 3), chain_state.blockfilterindex_height);
+
+    // All three blocks have CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER entries.
+    for (hashes) |bh| {
+        const f = (try db.get(CF_BLOCK_FILTER, &bh)) orelse {
+            std.debug.print("missing filter for backfilled block\n", .{});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(f);
+        try std.testing.expect(f.len >= 1);
+
+        const fh = (try db.get(CF_BLOCK_FILTER_HEADER, &bh)) orelse {
+            std.debug.print("missing filter header for backfilled block\n", .{});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(fh);
+        try std.testing.expectEqual(@as(usize, 32), fh.len);
+    }
+}
+
+test "BlockFilterIndex: getPersistedFilter round-trip via connectBlockFastWithUndo" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    chain_state.blockfilterindex_enabled = true;
+
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xDD);
+    const bh1 = [_]u8{0x03} ** 32;
+
+    var writer = serialize.Writer.init(allocator);
+    try serialize.writeBlock(&writer, &block1);
+    const owned_const = try writer.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    try chain_state.queueBlockWrite(&bh1, owned, 1);
+    try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+
+    // getPersistedFilter returns the bytes that connectBlockFastWithUndo
+    // queued + flush() committed.
+    const persisted = (try chain_state.getPersistedFilter(&bh1)) orelse {
+        std.debug.print("getPersistedFilter returned null\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer allocator.free(@constCast(persisted));
+    try std.testing.expect(persisted.len >= 1);
+
+    // Flag-off behaviour: getPersistedFilter returns null even when the
+    // entry exists on disk (caller should fall back to compute-on-demand).
+    chain_state.blockfilterindex_enabled = false;
+    const off = try chain_state.getPersistedFilter(&bh1);
+    try std.testing.expect(off == null);
 }

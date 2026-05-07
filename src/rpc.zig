@@ -1348,12 +1348,14 @@ pub const RpcServer = struct {
 
     /// /rest/blockfilter/<filtertype>/<hash>.{bin,hex,json}
     ///
-    /// Computes the BIP-158 basic filter on demand from the block body
-    /// (CF_BLOCKS) + undo data (CF_BLOCK_UNDO). Today's clearbit does not
-    /// run a persistent BlockFilterIndex (the Phase 1 module exists but
-    /// is not wired into the indexer thread); the on-demand computation
-    /// matches Core's filter byte-for-byte and avoids needing an index
-    /// rebuild for REST query coverage.
+    /// Returns the BIP-158 basic filter for `<hash>`.  When
+    /// `--blockfilterindex` is enabled and the persisted CF_BLOCK_FILTER
+    /// has the entry, we serve from the index (O(1) RocksDB get).
+    /// Otherwise we fall back to compute-on-demand from CF_BLOCKS +
+    /// CF_BLOCK_UNDO — matching Core's filter byte-for-byte at the cost
+    /// of one block-deserialize + one filter-build per request.  The
+    /// fallback keeps REST coverage even when the index is off or the
+    /// queried block falls before the persisted backfill point.
     fn restBlockFilter(self: *RpcServer, stream: std.net.Stream, remainder: []const u8) !void {
         // Path is "<filtertype>/<hash>.<ext>".
         const slash_idx = std.mem.indexOf(u8, remainder, "/") orelse {
@@ -1612,6 +1614,12 @@ pub const RpcServer = struct {
     /// the encoded filter bytes (allocator-owned). Returns null if the block
     /// body isn't on disk (pruned / never connected).
     ///
+    /// Fast path (BlockFilterIndex, 2026-05-05): when --blockfilterindex is
+    /// enabled and CF_BLOCK_FILTER has an entry for `block_hash`, serve
+    /// directly from the persistent index — one RocksDB get, no
+    /// deserialization.  Falls through to compute-on-demand when the index
+    /// is off or the entry is missing (pre-backfill / pruned).
+    ///
     /// Element set per BIP-158:
     ///   - All non-empty, non-OP_RETURN scriptPubKeys from outputs in this block.
     ///   - All non-empty scriptPubKeys from inputs (from CF_BLOCK_UNDO).
@@ -1621,6 +1629,13 @@ pub const RpcServer = struct {
         block_hash: *const types.Hash256,
     ) !?[]const u8 {
         const db = self.chain_state.utxo_set.db orelse return null;
+
+        // Fast path: persistent BlockFilterIndex.  No-op + falls through
+        // when blockfilterindex_enabled is false or the index hasn't
+        // covered this block yet.
+        if (try self.chain_state.getPersistedFilter(block_hash)) |persisted| {
+            return persisted;
+        }
 
         // Load raw block from CF_BLOCKS.
         const raw = (db.get(storage.CF_BLOCKS, block_hash) catch return null) orelse return null;

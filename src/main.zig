@@ -1639,6 +1639,18 @@ pub fn main() !void {
     if (config.txindex) {
         std.debug.print("Transaction index enabled (--txindex)\n", .{});
     }
+    // BlockFilterIndex (2026-05-05) — wire --blockfilterindex into ChainState
+    // so connectBlockInner queues CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER
+    // writes (and disconnect queues deletes), atomic with the chainstate
+    // advance via the shared flush() WriteBatch.  Bitcoin Core analog:
+    // -blockfilterindex toggling BlockFilterIndex base-index registration
+    // in init.cpp (see blockfilterindex.cpp::CustomAppend).  Pre-this-commit
+    // the flag was parsed-but-dead; the existing rpc.zig REST handler
+    // computed BIP-158 filters on demand from CF_BLOCKS + CF_BLOCK_UNDO.
+    chain_state.blockfilterindex_enabled = config.blockfilterindex;
+    if (config.blockfilterindex) {
+        std.debug.print("Block filter index enabled (--blockfilterindex)\n", .{});
+    }
     // Seed the BIP-113 MTP ring buffer with the genesis timestamp so that
     // blocks at heights 1..10 see the correct MTP window (which includes
     // genesis).  connectBlockInner pushes subsequent block timestamps into
@@ -1830,6 +1842,33 @@ pub fn main() !void {
                 }
             }
         } else |_| {}
+        // BlockFilterIndex (2026-05-05): load persisted filterindex tip +
+        // restore the chained `prev_filter_header` from CF_BLOCK_FILTER_HEADER
+        // for that tip.  Skip when --blockfilterindex is off (legacy datadirs
+        // upgrade lazily on first filter write — backfill picks up from 0).
+        if (config.blockfilterindex) {
+            if (dbp.get(storage.CF_DEFAULT, storage.ChainState.FILTERINDEX_TIP_KEY)) |fi_data| {
+                if (fi_data) |data| {
+                    defer allocator.free(data);
+                    if (data.len == 4) {
+                        chain_state.blockfilterindex_height = std.mem.readInt(u32, data[0..4], .little);
+                        std.debug.print(
+                            "Loaded filterindex tip from DB: height {d}\n",
+                            .{chain_state.blockfilterindex_height},
+                        );
+                    }
+                }
+            } else |_| {}
+            // Restore prev_filter_header from the persisted tip's header
+            // (or leave zero if filterindex_height == 0 / header CF empty).
+            if (chain_state.blockfilterindex_height > 0) {
+                if (chain_state.getBlockHashByHeight(chain_state.blockfilterindex_height)) |tip_hash| {
+                    if (chain_state.getPersistedFilterHeader(&tip_hash) catch null) |hdr| {
+                        chain_state.prev_filter_header = hdr;
+                    }
+                }
+            }
+        }
     }
     if (chain_state.best_height == 0) {
         chain_state.best_hash = params.genesis_hash;
@@ -1874,6 +1913,19 @@ pub fn main() !void {
         }
     } else if (config.dns_seed) {
         std.debug.print("Discovering peers via DNS seeds\n", .{});
+    }
+
+    // 9b. BlockFilterIndex IBD-time backfill (2026-05-05).  When
+    // --blockfilterindex is on AND the persisted index lags the loaded
+    // chain tip, walk forward block-by-block reading CF_BLOCKS +
+    // CF_BLOCK_UNDO and populating CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER.
+    // Runs synchronously here (before the P2P thread spawns) so the
+    // index is consistent with the chain tip the moment connectBlockInner
+    // starts queuing live filter writes.
+    if (config.blockfilterindex) {
+        chain_state.backfillBlockFilterIndex() catch |err| {
+            std.debug.print("Warning: BlockFilterIndex backfill failed: {}\n", .{err});
+        };
     }
 
     // 10. Start subsystem threads
