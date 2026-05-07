@@ -24,14 +24,21 @@ pub const Hash256 = types.Hash256;
 /// Column family index for transaction index (extends storage.zig CFs)
 pub const CF_TX_INDEX: usize = storage.CF_TX_INDEX;
 
-/// Column family index for block filters (new)
-pub const CF_BLOCK_FILTER: usize = 5;
+/// Column family index for block filters — BIP-158 basic filter encoded bytes
+/// keyed by block hash.  Sourced from storage.zig so we don't drift from the
+/// canonical CF table.  Pre-2026-05-05 this was a duplicate `5` constant that
+/// silently aliased CF_BLOCK_UNDO; harmless when the index was unwired but
+/// would have corrupted both indexes the moment putFilter() was called.
+pub const CF_BLOCK_FILTER: usize = storage.CF_BLOCK_FILTER;
 
-/// Column family index for block filter headers (new)
-pub const CF_BLOCK_FILTER_HEADER: usize = 6;
+/// Column family index for block filter headers — BIP-157 chained
+/// hash256(filter_hash || prev_header) keyed by block hash.
+pub const CF_BLOCK_FILTER_HEADER: usize = storage.CF_BLOCK_FILTER_HEADER;
 
-/// Column family index for coin statistics (new)
-pub const CF_COINSTATS: usize = 7;
+/// Column family index for coin statistics — not yet wired into the storage
+/// CF table; this constant is a placeholder for the eventual coinstatsindex.
+/// Reserving 8 = CF_COUNT keeps it out of the active range until then.
+pub const CF_COINSTATS: usize = storage.CF_COUNT;
 
 // ============================================================================
 // SipHash-2-4 Implementation (BIP-158)
