@@ -1190,11 +1190,36 @@ pub const Wallet = struct {
                 }
 
                 // P2SH-P2WPKH signing: BIP-143 sighash with scriptSig containing redeem script
+                //
+                // W31 defense-in-depth: verify the BIP-16 P2SH commitment
+                // before signing. Today's dispatch only routes here when the
+                // wallet matched the UTXO by `(txid, vout)` against an owned
+                // entry whose key derives the redeemScript, so the pubkey we
+                // sign with is the same one whose hash160 forms the P2SH
+                // scriptPubKey. Future refactors (e.g. signing against a
+                // caller-supplied prevout) could break that invariant — this
+                // check fails loud rather than emitting a tx whose script
+                // commitment doesn't match the on-chain UTXO.
+                const pubkey_hash = crypto.hash160(&key.public_key);
+                const spk = utxo.output.script_pubkey;
+                if (spk.len != 23 or spk[0] != 0xa9 or spk[1] != 0x14 or spk[22] != 0x87) {
+                    return error.UtxoNotP2SH;
+                }
+                {
+                    var inner_redeem: [22]u8 = undefined;
+                    inner_redeem[0] = 0x00; // OP_0
+                    inner_redeem[1] = 0x14; // Push 20 bytes
+                    @memcpy(inner_redeem[2..22], &pubkey_hash);
+                    const expected = crypto.hash160(&inner_redeem);
+                    if (!std.mem.eql(u8, spk[2..22], &expected)) {
+                        return error.RedeemScriptCommitmentMismatch;
+                    }
+                }
+
                 const sighash = try computeWitnessSigHashV0(tx, input_index, utxo, sighash_type, self.allocator);
                 const sig = try self.ecdsaSign(&sighash, &key.secret_key);
 
                 // Build scriptSig: push of redeem script (OP_0 <pubkey_hash>)
-                const pubkey_hash = crypto.hash160(&key.public_key);
                 var script_sig = try self.allocator.alloc(u8, 23);
                 script_sig[0] = 0x16; // Push 22 bytes
                 script_sig[1] = 0x00; // OP_0
@@ -2186,6 +2211,21 @@ pub fn signP2SH_P2WSH(
     redeem[0] = 0x00; // OP_0
     redeem[1] = 0x20; // Push 32 bytes
     @memcpy(redeem[2..34], &ws_hash);
+
+    // W31 defense-in-depth: assert the BIP-141 P2WSH inner commitment
+    // ties redeem_script[2..34] back to sha256(witness_script). The
+    // redeem here is constructed from `ws_hash` two lines above, so this
+    // is structurally guaranteed today — but a future refactor that
+    // accepts an externally-supplied redeemScript (the same shape as
+    // the cross-impl bug class found in hotbuns/blockbrew/etc.) would
+    // need this check to stay safe. Keeping it as a runtime assertion
+    // means any drift is caught at the signing site, not by a remote
+    // verifier on the wire.
+    if (!std.mem.eql(u8, redeem[2..34], &ws_hash)) {
+        for (witness) |w| allocator.free(w);
+        allocator.free(witness);
+        return error.WitnessScriptCommitmentMismatch;
+    }
 
     // scriptSig = single push of the 34-byte redeemScript.
     var script_sig = try allocator.alloc(u8, 35);

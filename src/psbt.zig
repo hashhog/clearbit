@@ -104,6 +104,21 @@ pub const PsbtError = error{
     MissingUtxo,
     InvalidCompactSize,
     InvalidSegwitMarker,
+    /// W31: finalizeP2SH refused to emit `final_script_sig` because
+    /// `hash160(redeem_script)` did not equal the 20-byte payload of the
+    /// witness UTXO's `OP_HASH160 <h> OP_EQUAL` scriptPubKey. Same shape as
+    /// the cross-impl bug class found in hotbuns/blockbrew/etc — a forged
+    /// or wrong redeemScript would otherwise be wrapped into a malleable
+    /// scriptSig that any later verifier would reject anyway, so we fail
+    /// loudly at finalize time instead.
+    RedeemScriptCommitmentMismatch,
+    /// W31: defense-in-depth for `signP2SH_P2WSH` — the inner BIP-141
+    /// P2WSH commitment (`sha256(witness_script)` ↔ `redeem_script[2..34]`)
+    /// did not match. The dispatch path can't currently reach this (the
+    /// inner script is computed from the witness_script the caller hands
+    /// us), but the assertion catches drift if the call site is ever
+    /// extended to take an externally-supplied redeemScript.
+    WitnessScriptCommitmentMismatch,
 };
 
 // ============================================================================
@@ -770,6 +785,29 @@ pub const Psbt = struct {
 
         // Must have redeem script
         const redeem_script = input.redeem_script orelse return;
+
+        // W31: Verify the BIP-16 P2SH commitment before emitting a
+        // scriptSig that pushes `redeem_script`. Without this guard the
+        // finalizer would happily wrap an arbitrary attacker-supplied
+        // redeemScript into a structurally-valid scriptSig — every later
+        // verifier would reject it anyway (Core enforces hash160 ==
+        // scriptPubKey[2..22]), but we'd silently emit a tx that loses
+        // value to fees in the relay pipeline. This matches the same bug
+        // shape found across hotbuns/blockbrew/etc. The witness UTXO's
+        // scriptPubKey is the on-chain P2SH script: OP_HASH160 <20-byte
+        // hash> OP_EQUAL (23 bytes total).
+        const witness_utxo = input.witness_utxo orelse return PsbtError.MissingUtxo;
+        const spk = witness_utxo.script_pubkey;
+        if (!isP2SH(spk)) {
+            // Caller routed a non-P2SH UTXO to finalizeP2SH; refuse to
+            // emit anything rather than commit to garbage.
+            return PsbtError.RedeemScriptCommitmentMismatch;
+        }
+        const expected_h160 = spk[2..22];
+        const actual_h160 = crypto.hash160(redeem_script);
+        if (!std.mem.eql(u8, expected_h160, &actual_h160)) {
+            return PsbtError.RedeemScriptCommitmentMismatch;
+        }
 
         // Check if it's P2SH-P2WPKH
         if (isP2WPKH(redeem_script)) {
