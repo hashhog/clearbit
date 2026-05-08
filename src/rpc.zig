@@ -7855,10 +7855,17 @@ pub const RpcServer = struct {
                     }
                 },
                 .p2tr => {
+                    // BIP-86: the on-chain output key is the *tweaked*
+                    // x-only pubkey, so we match wallet keys by computing
+                    // each candidate's BIP-86 tweak and comparing. Pre-W20
+                    // this matched the raw internal key, which would never
+                    // match an on-chain P2TR address that any compliant
+                    // signer (clearbit included, post-fix) produced.
                     if (prev.script_pubkey.len == 34) {
                         const target = prev.script_pubkey[2..34];
                         for (ephem.keys.items, 0..) |key, ki| {
-                            if (std.mem.eql(u8, &key.x_only_pubkey, target)) {
+                            const tweaked = wallet_mod.bip86TweakXOnly(ephem.ctx, &key.x_only_pubkey) catch continue;
+                            if (std.mem.eql(u8, &tweaked, target)) {
                                 matched_key_idx = ki;
                                 matched_addr_type = .p2tr;
                                 break;
