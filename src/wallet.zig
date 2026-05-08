@@ -529,11 +529,17 @@ pub const Wallet = struct {
                 try result.appendSlice(&script_hash);
             },
             .p2tr => {
+                // BIP-86: the on-chain output key is the *tweaked* x-only
+                // pubkey, never the raw internal key. Pre-W20 clearbit
+                // emitted the untweaked internal key, so any output sent
+                // to a clearbit P2TR address was unspendable on-chain — the
+                // chain carried a key the wallet would never sign for.
+                const tweaked = try bip86TweakXOnly(self.ctx, &key.x_only_pubkey);
                 try result.appendSlice(&[_]u8{
                     0x51, // OP_1 (witness version 1)
                     0x20, // Push 32 bytes
                 });
-                try result.appendSlice(&key.x_only_pubkey);
+                try result.appendSlice(&tweaked);
             },
         }
 
@@ -588,7 +594,11 @@ pub const Wallet = struct {
                 return error.NotImplemented;
             },
             .p2tr => {
-                return try address.segwitEncode(hrp, 1, &key.x_only_pubkey, self.allocator);
+                // BIP-86 tweaked output key — see getScriptPubKey above for
+                // the rationale; the address must encode the same bytes that
+                // appear inside the on-chain `OP_1 <0x20> <key>` script.
+                const tweaked = try bip86TweakXOnly(self.ctx, &key.x_only_pubkey);
+                return try address.segwitEncode(hrp, 1, &tweaked, self.allocator);
             },
         }
     }
@@ -1183,9 +1193,22 @@ pub const Wallet = struct {
                 const prevouts = all_prevouts orelse return error.TaprootRequiresAllPrevouts;
                 const sighash = try computeTaprootSigHash(tx, input_index, prevouts, sighash_type, self.allocator);
 
+                // BIP-86: build the keypair from the raw secret, then apply
+                // the empty-merkle-root TapTweak so the Schnorr signature
+                // commits to the *tweaked* output key — i.e. the same key
+                // the wallet now puts into `getScriptPubKey(.p2tr)` (and
+                // therefore the on-chain UTXO). Without this tweak the
+                // chain carries the internal key while the signature is
+                // over a key that can never appear in a compliant P2TR
+                // output, so the spend would always fail Schnorr verify.
                 var keypair: secp256k1.secp256k1_keypair = undefined;
                 if (secp256k1.secp256k1_keypair_create(self.ctx, &keypair, &key.secret_key) != 1) {
                     return error.KeypairCreationFailed;
+                }
+
+                const tweak = bip86Tweak(&key.x_only_pubkey);
+                if (secp256k1.secp256k1_keypair_xonly_tweak_add(self.ctx, &keypair, &tweak) != 1) {
+                    return error.TaprootTweakFailed;
                 }
 
                 var sig: [64]u8 = undefined;
@@ -1707,6 +1730,56 @@ fn getDerSigLen(der: *const [72]u8) usize {
     // DER format: 30 <len> 02 <r_len> <r> 02 <s_len> <s>
     if (der[0] != 0x30) return 72;
     return @as(usize, der[1]) + 2;
+}
+
+// ============================================================================
+// BIP-86: Single-key Taproot output (empty merkle root)
+// ============================================================================
+
+/// Compute the BIP-86 TapTweak for a single-key Taproot output.
+///
+/// BIP-86 (https://github.com/bitcoin/bips/blob/master/bip-0086.mediawiki) is
+/// the descriptor / wallet convention where a P2TR output spent by a single
+/// key has *no* script tree. The tweak is therefore over the empty merkle
+/// root, i.e. just the 32-byte internal x-only key with nothing appended.
+/// Reference: bitcoin-core/src/key.cpp::ComputeTapTweakHash.
+///
+/// Returns the 32-byte tweak that must be added to either the internal
+/// x-only pubkey (for the on-chain output key) or the keypair's secret
+/// scalar (for signing) via libsecp256k1.
+pub fn bip86Tweak(internal_xonly: *const [32]u8) [32]u8 {
+    return crypto.taggedHash("TapTweak", internal_xonly);
+}
+
+/// Apply the BIP-86 tweak to an x-only internal pubkey, producing the
+/// 32-byte tweaked output key that goes on chain inside `OP_1 <0x20> <key>`.
+///
+/// Uses libsecp256k1 via `Wallet.ctx`. Returns `error.TaprootTweakFailed`
+/// if the tweak addition produces the point at infinity (negligible
+/// probability for any non-attacker-chosen internal key).
+pub fn bip86TweakXOnly(
+    ctx: *secp256k1.secp256k1_context,
+    internal_xonly: *const [32]u8,
+) ![32]u8 {
+    var internal: secp256k1.secp256k1_xonly_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_parse(ctx, &internal, internal_xonly) != 1) {
+        return error.InvalidInternalKey;
+    }
+    const tweak = bip86Tweak(internal_xonly);
+
+    var tweaked_full: secp256k1.secp256k1_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full, &internal, &tweak) != 1) {
+        return error.TaprootTweakFailed;
+    }
+    var tweaked_xonly: secp256k1.secp256k1_xonly_pubkey = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, null, &tweaked_full) != 1) {
+        return error.TaprootTweakFailed;
+    }
+    var out: [32]u8 = undefined;
+    if (secp256k1.secp256k1_xonly_pubkey_serialize(ctx, &out, &tweaked_xonly) != 1) {
+        return error.TaprootTweakFailed;
+    }
+    return out;
 }
 
 // ============================================================================
