@@ -932,13 +932,30 @@ pub const Psbt = struct {
     }
 
     fn serializeGlobalMap(self: *const Psbt, writer: *serialize_mod.Writer) !void {
-        // Unsigned TX (required)
-        try self.writeKeyValue(writer, PSBT_GLOBAL_UNSIGNED_TX, &[_]u8{}, blk: {
-            var tx_writer = serialize_mod.Writer.init(self.allocator);
-            defer tx_writer.deinit();
-            try serialize_mod.writeTransactionNoWitness(&tx_writer, &self.tx);
-            break :blk tx_writer.getWritten();
-        });
+        // Unsigned TX (required). BIP-174 mandates the unsigned-tx body be
+        // serialized in NON-segwit form (no `00 01` marker, no witness
+        // sections), even when downstream inputs carry witness data — those
+        // travel in PSBT_IN_FINAL_SCRIPTWITNESS (key 0x08) instead.
+        // `writeTransactionNoWitness` already enforces that.
+        //
+        // Critical: `tx_writer` MUST outlive the `writeKeyValue` call below.
+        // The previous shape used a labeled block `blk: { var tx_writer =
+        // ...; defer tx_writer.deinit(); break :blk tx_writer.getWritten(); }`
+        // — but Zig's `defer` runs at scope exit of the enclosing block, so
+        // the writer was deinit'd BEFORE `writeKeyValue` consumed the slice.
+        // The slice then pointed into freed/reused memory, producing a
+        // garbage unsigned-tx body that round-tripped to `EndOfStream`
+        // inside `readTransaction.script_sig`. Hoist the writer to function
+        // scope so the defer fires after the value has been copied out.
+        var tx_writer = serialize_mod.Writer.init(self.allocator);
+        defer tx_writer.deinit();
+        try serialize_mod.writeTransactionNoWitness(&tx_writer, &self.tx);
+        try self.writeKeyValue(
+            writer,
+            PSBT_GLOBAL_UNSIGNED_TX,
+            &[_]u8{},
+            tx_writer.getWritten(),
+        );
 
         // Version (if non-zero)
         if (self.version > 0) {
@@ -1914,4 +1931,104 @@ test "psbt bip32 derivation" {
     try std.testing.expectEqualSlices(u8, &fingerprint, &info.fingerprint);
     try std.testing.expectEqual(@as(usize, 5), info.path.len);
     try std.testing.expectEqual(@as(u32, 84 | 0x80000000), info.path[0]);
+}
+
+// W32-B regression pin: BIP-174 mandates the unsigned-tx body inside the
+// PSBT global map be serialized in NON-segwit form (no `00 01` marker, no
+// witness sections), regardless of whether any input carries witness data.
+// Pre-W32-B, `serializeGlobalMap` placed the temporary `tx_writer` inside
+// a labeled `blk:` whose `defer tx_writer.deinit()` fired BEFORE the slice
+// was consumed by `writeKeyValue`, so the unsigned-tx body landed in freed
+// memory. The PSBT then round-tripped to `EndOfStream` inside
+// `readTransaction.script_sig`. This test exercises the empty-witness
+// path explicitly and asserts the round-tripped tx is byte-equal to the
+// original — which would have failed deterministically pre-fix.
+test "psbt empty-witness round-trip is byte-identical (W32-B regression)" {
+    const allocator = std.testing.allocator;
+
+    // Two inputs, both empty-witness, distinct prevout hashes so we'd
+    // notice a use-after-free that overwrote one with a stale view of
+    // the other.
+    const inputs = [_]types.TxIn{
+        .{
+            .previous_output = .{
+                .hash = [_]u8{0xAA} ** 32,
+                .index = 0,
+            },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFE,
+            .witness = &[_][]const u8{},
+        },
+        .{
+            .previous_output = .{
+                .hash = [_]u8{0xBB} ** 32,
+                .index = 7,
+            },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        },
+    };
+
+    const script_pubkey = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xCD} ** 20;
+    const outputs = [_]types.TxOut{.{
+        .value = 12345,
+        .script_pubkey = &script_pubkey,
+    }};
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &inputs,
+        .outputs = &outputs,
+        .lock_time = 0,
+    };
+
+    var psbt = try Psbt.create(allocator, tx);
+    defer psbt.deinit();
+
+    // Build the expected canonical (non-segwit) tx body the way BIP-174
+    // requires — this is what should be embedded in the unsigned-tx
+    // value, byte-for-byte.
+    var expected_body_writer = serialize_mod.Writer.init(allocator);
+    defer expected_body_writer.deinit();
+    try serialize_mod.writeTransactionNoWitness(&expected_body_writer, &tx);
+    const expected_body = expected_body_writer.getWritten();
+
+    // No segwit marker should ever appear inside the unsigned-tx body.
+    // Concretely: byte[4] (first byte after nVersion) must be the
+    // input count, not 0x00.
+    try std.testing.expect(expected_body.len > 4);
+    try std.testing.expect(expected_body[4] != 0x00);
+
+    // Serialize and decode back.
+    const serialized = try psbt.serialize(allocator);
+    defer allocator.free(serialized);
+
+    var psbt2 = try Psbt.deserialize(allocator, serialized);
+    defer psbt2.deinit();
+
+    // Re-serialize the round-tripped tx with the same non-witness path
+    // and assert byte-equality with the original.
+    var actual_body_writer = serialize_mod.Writer.init(allocator);
+    defer actual_body_writer.deinit();
+    try serialize_mod.writeTransactionNoWitness(&actual_body_writer, &psbt2.tx);
+    const actual_body = actual_body_writer.getWritten();
+
+    try std.testing.expectEqualSlices(u8, expected_body, actual_body);
+
+    // Also verify the structural fields survived intact. (Pre-fix the
+    // unsigned tx itself wouldn't even decode, so we never got this far;
+    // post-fix these double-check we didn't lose data.)
+    try std.testing.expectEqual(tx.version, psbt2.tx.version);
+    try std.testing.expectEqual(tx.inputs.len, psbt2.tx.inputs.len);
+    try std.testing.expectEqual(tx.outputs.len, psbt2.tx.outputs.len);
+    try std.testing.expectEqual(tx.lock_time, psbt2.tx.lock_time);
+    for (tx.inputs, psbt2.tx.inputs) |orig, got| {
+        try std.testing.expectEqualSlices(u8, &orig.previous_output.hash, &got.previous_output.hash);
+        try std.testing.expectEqual(orig.previous_output.index, got.previous_output.index);
+        try std.testing.expectEqual(orig.sequence, got.sequence);
+        try std.testing.expectEqualSlices(u8, orig.script_sig, got.script_sig);
+        // Witness must be empty after non-segwit round-trip.
+        try std.testing.expectEqual(@as(usize, 0), got.witness.len);
+    }
 }
