@@ -376,6 +376,50 @@ pub fn build(b: *std.Build) void {
         // error surfaces whenever wallet.zig is a test root).
     }
 
+    // PSBT P2SH commitment-check tests (W31). The PSBT module has no
+    // `@embedFile` of its own and doesn't depend on `wallet.zig`, so
+    // the test root can sit directly under `src/` (no project-root
+    // wrapper). Linked against secp256k1 + sha256_shani because
+    // `crypto.zig` cImports them unconditionally. Run with
+    // `zig build test-p2sh-commitment`.
+    {
+        const p2sh_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_p2sh_commitment.zig"),
+            .target = target,
+            .optimize = optimize,
+            // Filter to only the W31 tests so we don't drag in
+            // pre-existing psbt.zig tests (the serialize-round-trip
+            // / base64 / bip32-derivation trio fails when psbt.zig
+            // is a test root because of an unrelated path pulled
+            // out of `serialize.readTransaction` — surfaced before
+            // W31, not in scope to fix here). Same filter pattern
+            // used by tests_wallet_taproot / tests_wallet_segwit_v0.
+            .filters = &[_][]const u8{"W31"},
+        });
+        p2sh_tests.linkSystemLibrary("secp256k1");
+        p2sh_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        p2sh_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            p2sh_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        p2sh_tests.root_module.addOptions("build_options", build_options);
+
+        const run_p2sh_tests = b.addRunArtifact(p2sh_tests);
+        const p2sh_step = b.step(
+            "test-p2sh-commitment",
+            "Run PSBT P2SH commitment-check tests (W31)",
+        );
+        p2sh_step.dependOn(&run_p2sh_tests.step);
+        // Folded into the default `test` step — the test root only
+        // pulls in psbt.zig + types.zig + serialize.zig + crypto.zig,
+        // which are clean of the wallet.zig selectCoins mismatch that
+        // blocks tests_rpc / tests_wallet_*.
+        test_step.dependOn(&run_p2sh_tests.step);
+    }
+
     // BIP-39 mnemonic + PBKDF2 tests (W21). Same wrapper pattern as
     // tests_rpc.zig: project-root wrapper at `tests_bip39.zig` so
     // `src/bip39.zig`'s `@embedFile("../resources/bip39-english.txt")`
