@@ -308,7 +308,7 @@ pub fn build(b: *std.Build) void {
             // Filter to only the W20 test names so we don't drag in the
             // unrelated pre-existing wallet.zig tests (some of which leak
             // in a way that's outside the scope of this wave).
-            .filters = &[_][]const u8{"BIP-86", "BIP-341", "wallet computeTaprootSigHash", "signInput .p2tr"},
+            .filters = &[_][]const u8{"BIP-86", "BIP-341", "BIP-39", "wallet computeTaprootSigHash", "signInput .p2tr", "Wallet.initFromMnemonic"},
         });
         wallet_taproot_tests.linkSystemLibrary("rocksdb");
         wallet_taproot_tests.linkSystemLibrary("secp256k1");
