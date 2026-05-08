@@ -7533,8 +7533,27 @@ pub const RpcServer = struct {
     // validateaddress, gettxout, getmempoolancestors, getmempooldescendants
     // ========================================================================
 
-    /// signrawtransactionwithwallet "hexstring" ( [{"txid":"hex","vout":n,"scriptPubKey":"hex","redeemScript":"hex","witnessScript":"hex","amount":n},...] "sighashtype" )
+    /// signrawtransactionwithwallet "hexstring" ( prevtxs_ignored "sighashtype" )
     /// Sign inputs for raw transaction using wallet keys.
+    ///
+    /// W31 docstring fix: the prior signature advertised a 2nd-positional
+    /// `prevtxs` array with `redeemScript`/`witnessScript`/`scriptPubKey`/`amount`
+    /// fields, mirroring Core's API surface. The handler below NEVER
+    /// parses that param — every input must already be present in the
+    /// wallet's UTXO set, and signing is dispatched off the matched
+    /// `OwnedUtxo`. The slot is positionally reserved (the sighash
+    /// param is read from `params[2]`) so it must be passed (any JSON
+    /// value will do, e.g. `null` or `[]`), but its contents are
+    /// discarded. Advertising fields the handler ignores would let a
+    /// caller pass a forged `redeemScript` and silently get a tx
+    /// signed against the wallet's own redeemScript anyway (safe by
+    /// construction, but a confusing API contract). Until the prevtxs
+    /// path is wired up with proper P2SH/P2WSH commitment checks, the
+    /// docstring labels the slot `prevtxs_ignored`. Reference for the
+    /// wired-up shape: `signrawtransactionwithkey` (rpc.zig:7700+)
+    /// which DOES parse a prevtxs array — keep that as the porter
+    /// when expanding scope.
+    /// TODO(W31+): wire `prevtxs` here for foreign-input cosigning.
     fn handleSignRawTransactionWithWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
