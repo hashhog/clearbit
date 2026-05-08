@@ -259,6 +259,20 @@ pub const OwnedUtxo = struct {
     confirmations: u32,
     is_coinbase: bool = false, // Whether this UTXO is from a coinbase transaction
     height: u32 = 0, // Block height where this UTXO was confirmed
+    /// W29-C: Optional witness script for P2WSH and P2SH-P2WSH inputs.
+    /// When set on a `.p2wsh` UTXO, the witness script becomes the BIP-143
+    /// scriptCode for the per-input sighash and the last element of the
+    /// assembled witness stack. When set on a `.p2sh_p2wpkh` UTXO whose
+    /// `output.script_pubkey` is the P2SH wrap of `OP_0 <SHA256(witness_script)>`,
+    /// the input is signed as P2SH-wrapped-P2WSH (scriptSig = push of the
+    /// P2WSH redeemScript, witness identical to bare P2WSH).
+    /// Default `null` preserves the legacy P2WPKH / P2SH-P2WPKH paths.
+    witness_script: ?[]const u8 = null,
+    /// W29-C: Optional extra signing keys for M-of-N CHECKMULTISIG witness
+    /// scripts. The wallet's own key (at `key_index`) is always considered;
+    /// these are additional cosigner secrets the caller controls.
+    /// Indexed by witness-script pubkey order at signing time.
+    extra_signing_keys: ?[]const [32]u8 = null,
 };
 
 // ============================================================================
@@ -1148,6 +1162,33 @@ pub const Wallet = struct {
                 };
             },
             .p2sh_p2wpkh => {
+                // W29-C: When the caller supplies a witness_script on a
+                // P2SH UTXO, treat it as P2SH-wrapped-P2WSH (BIP-141 nested
+                // segwit on a script-hash inner). Detect this *before* the
+                // legacy P2SH-P2WPKH path so a P2WSH inner doesn't get
+                // signed as P2WPKH-shaped garbage.
+                if (utxo.witness_script) |witness_script| {
+                    const key_indices = [_]usize{utxo.key_index};
+                    const result = try signP2SH_P2WSH(
+                        self,
+                        tx,
+                        input_index,
+                        witness_script,
+                        utxo.output.value,
+                        &key_indices,
+                        utxo.extra_signing_keys,
+                        sighash_type,
+                        self.allocator,
+                    );
+                    mutable_inputs[input_index] = types.TxIn{
+                        .previous_output = tx.inputs[input_index].previous_output,
+                        .script_sig = result.script_sig,
+                        .sequence = tx.inputs[input_index].sequence,
+                        .witness = result.witness,
+                    };
+                    return;
+                }
+
                 // P2SH-P2WPKH signing: BIP-143 sighash with scriptSig containing redeem script
                 const sighash = try computeWitnessSigHashV0(tx, input_index, utxo, sighash_type, self.allocator);
                 const sig = try self.ecdsaSign(&sighash, &key.secret_key);
@@ -1269,7 +1310,37 @@ pub const Wallet = struct {
                 };
             },
             .p2wsh => {
-                return error.NotImplemented; // Requires witness script
+                // W29-C: P2WSH signing requires the caller to supply the
+                // witness script via `OwnedUtxo.witness_script`. Without it
+                // there is no scriptCode for the BIP-143 sighash and no
+                // final element for the witness stack.
+                const witness_script = utxo.witness_script orelse return error.P2WSHMissingWitnessScript;
+
+                // W29-C: per the design doc, dispatch through the
+                // Wallet's own key (at `utxo.key_index`) plus optional
+                // cosigner secrets carried on the UTXO. Multisig is
+                // detected at signing time inside `signP2WSH`.
+                const key_indices = [_]usize{utxo.key_index};
+                const witness = try signP2WSH(
+                    self,
+                    tx,
+                    input_index,
+                    witness_script,
+                    utxo.output.value,
+                    &key_indices,
+                    utxo.extra_signing_keys,
+                    sighash_type,
+                    self.allocator,
+                );
+
+                // For bare P2WSH the scriptSig stays empty and only the
+                // witness is populated.
+                mutable_inputs[input_index] = types.TxIn{
+                    .previous_output = tx.inputs[input_index].previous_output,
+                    .script_sig = tx.inputs[input_index].script_sig,
+                    .sequence = tx.inputs[input_index].sequence,
+                    .witness = witness,
+                };
             },
         }
     }
@@ -1854,6 +1925,277 @@ pub fn computeWitnessSigHashV0(
     script_code[24] = 0xac; // OP_CHECKSIG
 
     return try crypto.segwitSighash(tx, input_index, &script_code, utxo.output.value, sighash_type, allocator);
+}
+
+// ============================================================================
+// W29-C — P2WSH + P2SH-P2WSH signing (BIP-143 segwit-v0 with witness scripts)
+// ============================================================================
+//
+// Closes the W19 P0 finding "P2WSH = error.NotImplemented at wallet.zig:1208".
+// The signing path is the canonical BIP-143 sighash with the witnessScript as
+// scriptCode, signed with one or more wallet keys. Multisig (M-of-N
+// CHECKMULTISIG) and the trivial single-CHECKSIG witness scripts are both
+// supported.
+//
+// Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature
+//            bitcoin-core/src/script/standard.cpp::MatchMultisig
+//            BIP-143 (segwit v0 sighash + P2WSH witness layout).
+//
+// Wave-aligned with blockbrew W27-D (`5d9d942`) and lunarblock W28
+// (`a977878`); the Zig dispatcher mirrors the same {single-key, multisig}
+// branch shape, so a single set of cross-impl test vectors should cover
+// them byte-for-byte. See `_design-per-impl-wallet-phase2-segwit-v0-2026-05-08.md`.
+
+/// Detect an M-of-N CHECKMULTISIG witness script and return its
+/// (M, pubkeys[]) shape. Mirrors Core's `MatchMultisig` but only the
+/// canonical encoding (small-int M, N small-int N, OP_CHECKMULTISIG, every
+/// pubkey is a 33- or 65-byte direct push).
+///
+/// Returns `null` if `script` is not an M-of-N CHECKMULTISIG witness script.
+/// Caller owns the returned `pubkeys` slice.
+pub const MultisigShape = struct { m: u8, pubkeys: [][]const u8 };
+
+pub fn parseMultisigScript(allocator: std.mem.Allocator, script: []const u8) !?MultisigShape {
+    if (script.len < 4) return null;
+    // Last opcode must be OP_CHECKMULTISIG (0xae).
+    if (script[script.len - 1] != 0xae) return null;
+    // First byte must be small-int M (OP_1..OP_16 = 0x51..0x60).
+    const op_m = script[0];
+    if (op_m < 0x51 or op_m > 0x60) return null;
+    const m: u8 = op_m - 0x50;
+
+    // Walk N pubkey pushes. The byte just before OP_CHECKMULTISIG is small-int N.
+    const op_n = script[script.len - 2];
+    if (op_n < 0x51 or op_n > 0x60) return null;
+    const n: u8 = op_n - 0x50;
+    if (m == 0 or m > n or n > 16) return null;
+
+    var pubkeys = std.ArrayList([]const u8).init(allocator);
+    errdefer pubkeys.deinit();
+
+    var i: usize = 1; // skip M
+    while (i < script.len - 2) : ({}) {
+        const len_byte = script[i];
+        if (len_byte != 0x21 and len_byte != 0x41) return null; // 33 or 65 bytes only
+        i += 1;
+        const plen: usize = @intCast(len_byte);
+        if (i + plen > script.len - 2) return null;
+        try pubkeys.append(script[i .. i + plen]);
+        i += plen;
+    }
+    if (pubkeys.items.len != n) {
+        pubkeys.deinit();
+        return null;
+    }
+    return MultisigShape{ .m = m, .pubkeys = try pubkeys.toOwnedSlice() };
+}
+
+/// Sign a P2WSH input given an explicit witnessScript and one or more
+/// signing key indices. Returns the assembled witness stack.
+///
+/// For multisig witnessScripts the stack is laid out as
+/// `[OP_0_dummy, sig_1, ..., sig_M, witnessScript]` where signatures are
+/// emitted in canonical witnessScript pubkey order (Core's
+/// `ProduceSignature`/`SignStep` semantics). The leading empty element
+/// is the BIP-147 CHECKMULTISIG dummy push (the legacy off-by-one bug).
+///
+/// For single-key witnessScripts (`<pubkey> OP_CHECKSIG` shape) the stack
+/// is `[sig, witnessScript]` — no leading dummy.
+///
+/// Caller owns the returned witness slice and every byte slice inside it.
+pub fn signP2WSH(
+    wallet: *Wallet,
+    tx: *const types.Transaction,
+    input_index: usize,
+    witness_script: []const u8,
+    value: i64,
+    signing_key_indices: []const usize,
+    extra_signing_keys: ?[]const [32]u8,
+    sighash_type: u32,
+    allocator: std.mem.Allocator,
+) ![][]const u8 {
+    if (witness_script.len == 0) return error.EmptyWitnessScript;
+    if (signing_key_indices.len == 0 and (extra_signing_keys == null or extra_signing_keys.?.len == 0)) {
+        return error.NoSigningKeys;
+    }
+
+    const sighash = try crypto.segwitSighash(
+        tx,
+        input_index,
+        witness_script,
+        value,
+        sighash_type,
+        allocator,
+    );
+
+    // Try to parse the witness script as M-of-N CHECKMULTISIG.
+    const maybe_ms = try parseMultisigScript(allocator, witness_script);
+    if (maybe_ms) |ms| {
+        defer allocator.free(ms.pubkeys);
+
+        // Map of pubkey-bytes -> signature (DER+hashtype). Both `pk` and
+        // `sig` are owned by `allocator`; freed unconditionally below.
+        var sig_by_pubkey = std.ArrayList(struct { pk: []const u8, sig: []const u8 }).init(allocator);
+        defer {
+            for (sig_by_pubkey.items) |entry| {
+                allocator.free(entry.pk);
+                allocator.free(entry.sig);
+            }
+            sig_by_pubkey.deinit();
+        }
+
+        // Sign with every wallet key the caller supplied. We dup the
+        // pubkey bytes into the allocator so the slice we store in
+        // `sig_by_pubkey.pk` outlives the loop's local KeyPair copy
+        // (taking `&wallet.keys.items[ki].public_key` would tie the
+        // slice to the ArrayList's backing buffer, which can move on
+        // a future append — safer to dup unconditionally).
+        for (signing_key_indices) |ki| {
+            if (ki >= wallet.keys.items.len) return error.KeyNotFound;
+            const k = wallet.keys.items[ki];
+            const sig = try wallet.ecdsaSign(&sighash, &k.secret_key);
+            const sig_len = getDerSigLen(&sig);
+            const sig_buf = try allocator.alloc(u8, sig_len + 1);
+            @memcpy(sig_buf[0..sig_len], sig[0..sig_len]);
+            sig_buf[sig_len] = @intCast(sighash_type & 0xFF);
+            const pk_dup = try allocator.dupe(u8, &k.public_key);
+            try sig_by_pubkey.append(.{ .pk = pk_dup, .sig = sig_buf });
+        }
+        // Sign with every extra cosigner secret.
+        if (extra_signing_keys) |xks| {
+            for (xks) |sk| {
+                // Derive pubkey from secret via libsecp.
+                var pubkey: secp256k1.secp256k1_pubkey = undefined;
+                if (secp256k1.secp256k1_ec_pubkey_create(wallet.ctx, &pubkey, &sk) != 1) {
+                    return error.PubkeyDeriveFailed;
+                }
+                var pk_serialized: [33]u8 = undefined;
+                var pk_len: usize = 33;
+                _ = secp256k1.secp256k1_ec_pubkey_serialize(
+                    wallet.ctx,
+                    &pk_serialized,
+                    &pk_len,
+                    &pubkey,
+                    secp256k1.SECP256K1_EC_COMPRESSED,
+                );
+                const sig = try wallet.ecdsaSign(&sighash, &sk);
+                const sig_len = getDerSigLen(&sig);
+                const sig_buf = try allocator.alloc(u8, sig_len + 1);
+                @memcpy(sig_buf[0..sig_len], sig[0..sig_len]);
+                sig_buf[sig_len] = @intCast(sighash_type & 0xFF);
+                const pk_dup = try allocator.dupe(u8, &pk_serialized);
+                try sig_by_pubkey.append(.{ .pk = pk_dup, .sig = sig_buf });
+            }
+        }
+
+        // Assemble witness in canonical witness-script pubkey order, M sigs only.
+        var stack = std.ArrayList([]const u8).init(allocator);
+        errdefer {
+            for (stack.items) |it| allocator.free(it);
+            stack.deinit();
+        }
+        // Leading OP_0 dummy element (BIP-147 CHECKMULTISIG off-by-one pad).
+        try stack.append(try allocator.alloc(u8, 0));
+
+        var collected: u8 = 0;
+        for (ms.pubkeys) |script_pk| {
+            if (collected >= ms.m) break;
+            for (sig_by_pubkey.items) |entry| {
+                if (std.mem.eql(u8, entry.pk, script_pk)) {
+                    const sig_dup = try allocator.dupe(u8, entry.sig);
+                    try stack.append(sig_dup);
+                    collected += 1;
+                    break;
+                }
+            }
+        }
+        if (collected < ms.m) {
+            return error.PartialSignNotEnoughKeys;
+        }
+        // Trailing witness script.
+        try stack.append(try allocator.dupe(u8, witness_script));
+
+        return try stack.toOwnedSlice();
+    }
+
+    // Non-multisig witness script: assume single-CHECKSIG shape and emit
+    // [sig, witness_script]. Mirrors blockbrew + lunarblock single-sig path.
+    if (signing_key_indices.len != 1) {
+        return error.SingleKeyP2WSHRequiresOneKey;
+    }
+    const ki = signing_key_indices[0];
+    if (ki >= wallet.keys.items.len) return error.KeyNotFound;
+    const k = wallet.keys.items[ki];
+    const sig = try wallet.ecdsaSign(&sighash, &k.secret_key);
+    const sig_len = getDerSigLen(&sig);
+
+    var stack = try allocator.alloc([]const u8, 2);
+    errdefer allocator.free(stack);
+
+    var sig_buf = try allocator.alloc(u8, sig_len + 1);
+    @memcpy(sig_buf[0..sig_len], sig[0..sig_len]);
+    sig_buf[sig_len] = @intCast(sighash_type & 0xFF);
+    stack[0] = sig_buf;
+    stack[1] = try allocator.dupe(u8, witness_script);
+
+    return stack;
+}
+
+/// Sign a P2SH-wrapped-P2WSH input. The on-chain scriptPubKey is
+/// `OP_HASH160 <hash160(redeemScript)> OP_EQUAL` where
+/// `redeemScript = OP_0 <0x20> <sha256(witnessScript)>`. The witness layout
+/// is identical to bare P2WSH; the scriptSig is a single push of the
+/// 34-byte redeemScript.
+///
+/// Returns `{ script_sig, witness }` — caller owns both.
+pub const SignP2SHP2WSHResult = struct {
+    script_sig: []const u8,
+    witness: []const []const u8,
+};
+
+pub fn signP2SH_P2WSH(
+    wallet: *Wallet,
+    tx: *const types.Transaction,
+    input_index: usize,
+    witness_script: []const u8,
+    value: i64,
+    signing_key_indices: []const usize,
+    extra_signing_keys: ?[]const [32]u8,
+    sighash_type: u32,
+    allocator: std.mem.Allocator,
+) !SignP2SHP2WSHResult {
+    const witness = try signP2WSH(
+        wallet,
+        tx,
+        input_index,
+        witness_script,
+        value,
+        signing_key_indices,
+        extra_signing_keys,
+        sighash_type,
+        allocator,
+    );
+    errdefer {
+        for (witness) |w| allocator.free(w);
+        allocator.free(witness);
+    }
+
+    // Build redeemScript = OP_0 <0x20> <sha256(witnessScript)>.
+    const ws_hash = crypto.sha256(witness_script);
+    var redeem: [34]u8 = undefined;
+    redeem[0] = 0x00; // OP_0
+    redeem[1] = 0x20; // Push 32 bytes
+    @memcpy(redeem[2..34], &ws_hash);
+
+    // scriptSig = single push of the 34-byte redeemScript.
+    var script_sig = try allocator.alloc(u8, 35);
+    script_sig[0] = 0x22; // Push 34 bytes
+    @memcpy(script_sig[1..35], &redeem);
+
+    return SignP2SHP2WSHResult{
+        .script_sig = script_sig,
+        .witness = witness,
+    };
 }
 
 /// Compute BIP-341 Taproot sighash.
