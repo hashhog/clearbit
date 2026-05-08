@@ -1168,6 +1168,33 @@ pub const Wallet = struct {
                 // legacy P2SH-P2WPKH path so a P2WSH inner doesn't get
                 // signed as P2WPKH-shaped garbage.
                 if (utxo.witness_script) |witness_script| {
+                    // W38 defense-in-depth: verify the BIP-16 P2SH outer
+                    // commitment at the dispatch site, mirroring the W31
+                    // idiom used a few lines below for the legacy
+                    // P2SH-P2WPKH path. The reconstructed redeemScript here
+                    // is `OP_0 <0x20> <sha256(witness_script)>`, and its
+                    // hash160 must equal `script_pubkey[2..22]` of the
+                    // on-chain `OP_HASH160 <h> OP_EQUAL` SPK. The inner
+                    // P2WSH commitment is also asserted inside
+                    // `signP2SH_P2WSH` itself (defense-in-depth, lines
+                    // 2215-2228) — this check closes the *outer* gap that
+                    // W37 audit flagged at the dispatch site.
+                    const spk = utxo.output.script_pubkey;
+                    if (spk.len != 23 or spk[0] != 0xa9 or spk[1] != 0x14 or spk[22] != 0x87) {
+                        return error.UtxoNotP2SH;
+                    }
+                    {
+                        const ws_hash = crypto.sha256(witness_script);
+                        var inner_redeem: [34]u8 = undefined;
+                        inner_redeem[0] = 0x00; // OP_0
+                        inner_redeem[1] = 0x20; // Push 32 bytes
+                        @memcpy(inner_redeem[2..34], &ws_hash);
+                        const expected = crypto.hash160(&inner_redeem);
+                        if (!std.mem.eql(u8, spk[2..22], &expected)) {
+                            return error.RedeemScriptCommitmentMismatch;
+                        }
+                    }
+
                     const key_indices = [_]usize{utxo.key_index};
                     const result = try signP2SH_P2WSH(
                         self,
@@ -1340,6 +1367,29 @@ pub const Wallet = struct {
                 // there is no scriptCode for the BIP-143 sighash and no
                 // final element for the witness stack.
                 const witness_script = utxo.witness_script orelse return error.P2WSHMissingWitnessScript;
+
+                // W38 defense-in-depth: verify the BIP-141 P2WSH commitment
+                // before signing — `sha256(witness_script)` must match the
+                // 32 bytes embedded in the on-chain segwit-v0 scriptPubKey
+                // (`OP_0 <0x20> <ws_hash>`). Without this guard the signer
+                // would happily sign a sighash committed to a witnessScript
+                // that the on-chain UTXO never references, then emit a
+                // structurally-valid spend that every consensus verifier
+                // rejects. Same bug shape as the W31 P2SH outer-commitment
+                // check just above on `.p2sh_p2wpkh` (lines 1203-1217); same
+                // sentinel-error idiom (`WitnessScriptCommitmentMismatch`,
+                // already declared in `psbt.zig` for the inner check inside
+                // `signP2SH_P2WSH`).
+                {
+                    const spk = utxo.output.script_pubkey;
+                    if (spk.len != 34 or spk[0] != 0x00 or spk[1] != 0x20) {
+                        return error.WitnessScriptCommitmentMismatch;
+                    }
+                    const ws_hash = crypto.sha256(witness_script);
+                    if (!std.mem.eql(u8, spk[2..34], &ws_hash)) {
+                        return error.WitnessScriptCommitmentMismatch;
+                    }
+                }
 
                 // W29-C: per the design doc, dispatch through the
                 // Wallet's own key (at `utxo.key_index`) plus optional

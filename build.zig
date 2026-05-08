@@ -343,11 +343,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests_wallet_segwit_v0.zig"),
             .target = target,
             .optimize = optimize,
-            // Filter to only the W29-C test names so we don't drag in the
+            // Filter to only the W29-C / W38 test names so we don't drag in the
             // unrelated pre-existing wallet.zig tests (same gotcha as
             // tests_wallet_taproot.zig — the selectCoins anonymous-struct
             // mismatch surfaces whenever wallet.zig is a test root).
-            .filters = &[_][]const u8{"W29-C"},
+            .filters = &[_][]const u8{ "W29-C", "W38" },
         });
         ws_tests.linkSystemLibrary("rocksdb");
         ws_tests.linkSystemLibrary("secp256k1");
