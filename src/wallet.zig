@@ -4,6 +4,7 @@ const crypto = @import("crypto.zig");
 const serialize = @import("serialize.zig");
 const address = @import("address.zig");
 const consensus = @import("consensus.zig");
+const taproot_sighash = @import("taproot_sighash.zig");
 
 // ============================================================================
 // libsecp256k1 Bindings
@@ -1062,12 +1063,19 @@ pub const Wallet = struct {
     }
 
     /// Sign a transaction input using the appropriate signing algorithm.
+    ///
+    /// `all_prevouts`: optional slice of all spent prevouts in input order.
+    /// REQUIRED for BIP-341 Taproot inputs (`utxo.address_type == .p2tr`)
+    /// because BIP-341 commits to `sha_amounts` and `sha_scriptPubKeys` over
+    /// every input. May be `null` for legacy / BIP-143 v0 inputs, which only
+    /// commit to the per-input prevout already passed via `utxo`.
     pub fn signInput(
         self: *Wallet,
         tx: *types.Transaction,
         input_index: usize,
         utxo: OwnedUtxo,
         sighash_type: u32,
+        all_prevouts: ?[]const OwnedUtxo,
     ) !void {
         if (utxo.key_index >= self.keys.items.len) {
             return error.KeyNotFound;
@@ -1166,15 +1174,21 @@ pub const Wallet = struct {
                 };
             },
             .p2tr => {
-                // BIP-341 Taproot key-path signing (Schnorr)
-                const sighash = try computeTaprootSigHash(tx, input_index, utxo, sighash_type, self.allocator);
-                var sig: [64]u8 = undefined;
-                var keypair: secp256k1.secp256k1_keypair = undefined;
+                // BIP-341 Taproot key-path signing (Schnorr).
+                //
+                // Requires all spent prevouts to compute sha_amounts /
+                // sha_scriptPubKeys per BIP-341. The pre-W20 path discarded
+                // them and emitted a sighash that no compliant verifier
+                // would ever accept; see audit note on `computeTaprootSigHash`.
+                const prevouts = all_prevouts orelse return error.TaprootRequiresAllPrevouts;
+                const sighash = try computeTaprootSigHash(tx, input_index, prevouts, sighash_type, self.allocator);
 
+                var keypair: secp256k1.secp256k1_keypair = undefined;
                 if (secp256k1.secp256k1_keypair_create(self.ctx, &keypair, &key.secret_key) != 1) {
                     return error.KeypairCreationFailed;
                 }
 
+                var sig: [64]u8 = undefined;
                 if (secp256k1.secp256k1_schnorrsig_sign32(
                     self.ctx,
                     &sig,
@@ -1654,9 +1668,10 @@ pub fn createTransaction(
         .lock_time = lock_time,
     };
 
-    // Sign each input
+    // Sign each input. `utxos_to_spend` is the canonical per-input prevouts
+    // slice used for BIP-341 sha_amounts / sha_scriptPubKeys.
     for (utxos_to_spend, 0..) |utxo, i| {
-        try wallet.signInput(&tx, i, utxo, options.sighash_type);
+        try wallet.signInput(&tx, i, utxo, options.sighash_type, utxos_to_spend);
     }
 
     return tx;
@@ -1745,117 +1760,55 @@ pub fn computeWitnessSigHashV0(
 }
 
 /// Compute BIP-341 Taproot sighash.
+///
+/// Wire-up to the canonical implementation in `taproot_sighash.zig`, which is
+/// validated against `bitcoin-core/src/test/data/bip341_wallet_vectors.json`
+/// (all 7 keyPathSpending vectors produce byte-perfect sigMsg + sigHash).
+///
+/// `all_prevouts` MUST contain one entry per input in `tx`, in input order
+/// (matching `tx.inputs`). BIP-341 hashes `sha_amounts` and
+/// `sha_scriptPubKeys` over every spent prevout, so the per-input `utxo`
+/// alone is insufficient — pre-fix this function discarded the prevouts and
+/// emitted 32 zero bytes for both, producing a sighash that no compliant
+/// signer (Core, libwally, BDK, etc.) would ever accept. See W19 audit.
+///
+/// Only key-path spends are wired here; tapscript leaves are a separate
+/// signing entry point (`taproot_sighash.computeTaprootSighash` accepts a
+/// `TapscriptContext` for ext_flag = 1).
 pub fn computeTaprootSigHash(
     tx: *const types.Transaction,
     input_index: usize,
-    utxo: OwnedUtxo,
+    all_prevouts: []const OwnedUtxo,
     sighash_type: u32,
     allocator: std.mem.Allocator,
 ) ![32]u8 {
-    _ = utxo;
+    if (all_prevouts.len != tx.inputs.len) return error.PrevoutsLengthMismatch;
 
-    var writer = serialize.Writer.init(allocator);
-    defer writer.deinit();
+    // Build flat amounts + scripts arrays in input order, as BIP-341 expects.
+    var amounts = try allocator.alloc(i64, all_prevouts.len);
+    defer allocator.free(amounts);
+    var scripts = try allocator.alloc([]const u8, all_prevouts.len);
+    defer allocator.free(scripts);
 
-    // Epoch (0x00 for key path spend)
-    try writer.writeInt(u8, 0x00);
-
-    // Sighash type
-    const hash_type: u8 = if (sighash_type == 0) 0x00 else @intCast(sighash_type & 0xFF);
-    try writer.writeInt(u8, hash_type);
-
-    // Transaction data
-    try writer.writeInt(i32, tx.version);
-    try writer.writeInt(u32, tx.lock_time);
-
-    const base_type = sighash_type & 0x1f;
-    const anyone_can_pay = (sighash_type & 0x80) != 0;
-
-    // hashPrevouts
-    if (!anyone_can_pay) {
-        var prevouts_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        for (tx.inputs) |input| {
-            prevouts_hasher.update(&input.previous_output.hash);
-            var idx_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &idx_buf, input.previous_output.index, .little);
-            prevouts_hasher.update(&idx_buf);
-        }
-        var hash_prevouts: [32]u8 = undefined;
-        prevouts_hasher.final(&hash_prevouts);
-        try writer.writeBytes(&hash_prevouts);
+    for (all_prevouts, 0..) |po, i| {
+        amounts[i] = po.output.value;
+        scripts[i] = po.output.script_pubkey;
     }
 
-    // hashAmounts (all input amounts)
-    if (!anyone_can_pay) {
-        // Note: In a real implementation, we'd need all spent outputs' values
-        // For now, we'll use placeholder (this is incomplete for full verification)
-        var amounts_hash: [32]u8 = [_]u8{0} ** 32;
-        try writer.writeBytes(&amounts_hash);
+    const hash_type: u8 = @intCast(sighash_type & 0xFF);
+    if (!taproot_sighash.isValidTaprootHashType(hash_type)) {
+        return error.InvalidSighashType;
     }
 
-    // hashScriptPubKeys
-    if (!anyone_can_pay) {
-        // Placeholder - would need all scriptPubKeys
-        var scripts_hash: [32]u8 = [_]u8{0} ** 32;
-        try writer.writeBytes(&scripts_hash);
-    }
-
-    // hashSequences
-    if (!anyone_can_pay and base_type != 0x02 and base_type != 0x03) {
-        var seq_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        for (tx.inputs) |input| {
-            var seq_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &seq_buf, input.sequence, .little);
-            seq_hasher.update(&seq_buf);
-        }
-        var hash_sequences: [32]u8 = undefined;
-        seq_hasher.final(&hash_sequences);
-        try writer.writeBytes(&hash_sequences);
-    }
-
-    // hashOutputs
-    if (base_type != 0x02 and base_type != 0x03) {
-        var out_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        for (tx.outputs) |output| {
-            var val_buf: [8]u8 = undefined;
-            std.mem.writeInt(i64, &val_buf, output.value, .little);
-            out_hasher.update(&val_buf);
-
-            // CompactSize
-            if (output.script_pubkey.len < 0xFD) {
-                out_hasher.update(&[_]u8{@intCast(output.script_pubkey.len)});
-            }
-            out_hasher.update(output.script_pubkey);
-        }
-        var hash_outputs: [32]u8 = undefined;
-        out_hasher.final(&hash_outputs);
-        try writer.writeBytes(&hash_outputs);
-    } else if (base_type == 0x03 and input_index < tx.outputs.len) {
-        var out_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        const output = tx.outputs[input_index];
-        var val_buf: [8]u8 = undefined;
-        std.mem.writeInt(i64, &val_buf, output.value, .little);
-        out_hasher.update(&val_buf);
-        if (output.script_pubkey.len < 0xFD) {
-            out_hasher.update(&[_]u8{@intCast(output.script_pubkey.len)});
-        }
-        out_hasher.update(output.script_pubkey);
-        var hash_outputs: [32]u8 = undefined;
-        out_hasher.final(&hash_outputs);
-        try writer.writeBytes(&hash_outputs);
-    }
-
-    // spend_type (key path = 0)
-    try writer.writeInt(u8, 0x00);
-
-    // Input index
-    try writer.writeInt(u32, @intCast(input_index));
-
-    const data = try writer.toOwnedSlice();
-    defer allocator.free(data);
-
-    // BIP-341 uses tagged hash with "TapSighash"
-    return crypto.taggedHash("TapSighash", data);
+    return try taproot_sighash.computeTaprootSighash(
+        allocator,
+        tx,
+        input_index,
+        .{ .amounts = amounts, .scripts = scripts },
+        hash_type,
+        null, // annex
+        null, // key-path spend
+    );
 }
 
 // ============================================================================

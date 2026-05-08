@@ -7596,28 +7596,54 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
         };
 
-        // Try to sign each input with wallet keys
+        // First pass: resolve each input to a wallet UTXO (if any). This
+        // gives us the full prevouts vector that BIP-341 needs to build
+        // sha_amounts / sha_scriptPubKeys for Taproot inputs. A null entry
+        // marks an input the wallet doesn't own — `complete` becomes false
+        // and we skip signing it, but the slot still occupies a position so
+        // input_idx stays aligned.
+        const all_prevouts = self.allocator.alloc(?wallet_mod.OwnedUtxo, tx.inputs.len) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer self.allocator.free(all_prevouts);
+
         var complete = true;
         for (0..tx.inputs.len) |input_idx| {
             const input = tx.inputs[input_idx];
-            // Look up the UTXO being spent to find the matching wallet key
-            var found_utxo: ?wallet_mod.OwnedUtxo = null;
+            all_prevouts[input_idx] = null;
             for (wallet.utxos.items) |utxo| {
                 if (std.mem.eql(u8, &utxo.outpoint.hash, &input.previous_output.hash) and
                     utxo.outpoint.index == input.previous_output.index)
                 {
-                    found_utxo = utxo;
+                    all_prevouts[input_idx] = utxo;
                     break;
                 }
             }
+            if (all_prevouts[input_idx] == null) complete = false;
+        }
 
-            if (found_utxo) |utxo| {
-                wallet.signInput(&tx, input_idx, utxo, sighash_type) catch {
+        // If every input is owned by the wallet, expose a flat prevouts
+        // slice so Taproot can hash sha_amounts/sha_scriptPubKeys correctly.
+        // A heterogenous (some-owned/some-foreign) tx can't sign Taproot
+        // inputs anyway under BIP-341 without the foreign prevouts, so we
+        // fall back to legacy/witness-v0 single-input mode in that case.
+        var flat_prevouts_buf: ?[]wallet_mod.OwnedUtxo = null;
+        defer if (flat_prevouts_buf) |b| self.allocator.free(b);
+        var flat_prevouts: ?[]const wallet_mod.OwnedUtxo = null;
+        if (complete) {
+            const buf = self.allocator.alloc(wallet_mod.OwnedUtxo, tx.inputs.len) catch {
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+            };
+            for (all_prevouts, 0..) |po, i| buf[i] = po.?;
+            flat_prevouts_buf = buf;
+            flat_prevouts = buf;
+        }
+
+        for (0..tx.inputs.len) |input_idx| {
+            if (all_prevouts[input_idx]) |utxo| {
+                wallet.signInput(&tx, input_idx, utxo, sighash_type, flat_prevouts) catch {
                     complete = false;
                 };
-            } else {
-                // No wallet key for this input
-                complete = false;
             }
         }
 
@@ -7741,8 +7767,33 @@ pub const RpcServer = struct {
         // Per-input prev-output lookup. Try the optional prevtxs array first,
         // then chainstate UTXO set, then mempool. If none match, the input
         // is left unsigned and `complete` is forced to false.
+        //
+        // Two-pass: first resolve all prevouts (so we can hand BIP-341 the
+        // sha_amounts/sha_scriptPubKeys vectors), then sign. If a prevout
+        // resolves but no key matches, we still keep the prevout entry for
+        // the BIP-341 hash; only inputs whose prevout we couldn't resolve
+        // at all leave a null in `synth_prevouts`, in which case the
+        // Taproot path can't run for any input (BIP-341 requires *all*
+        // amounts/scripts).
+        const synth_prevouts = self.allocator.alloc(?wallet_mod.OwnedUtxo, tx.inputs.len) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer {
+            for (synth_prevouts) |maybe_po| {
+                if (maybe_po) |po| self.allocator.free(po.output.script_pubkey);
+            }
+            self.allocator.free(synth_prevouts);
+        }
+        const matched_key_idx_per_input = self.allocator.alloc(?usize, tx.inputs.len) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer self.allocator.free(matched_key_idx_per_input);
+
         var complete = true;
         for (tx.inputs, 0..) |input, input_idx| {
+            synth_prevouts[input_idx] = null;
+            matched_key_idx_per_input[input_idx] = null;
+
             const prev_out: ?types.TxOut = self.lookupPrevoutForSign(
                 params,
                 input.previous_output,
@@ -7751,11 +7802,6 @@ pub const RpcServer = struct {
                 complete = false;
                 continue;
             };
-            // lookupPrevoutForSign always returns an allocator-owned
-            // script_pubkey slice (or null). Free it once we're done with
-            // this input; signInput copies into the tx, so we don't need to
-            // hold the prevout past the call.
-            defer self.allocator.free(prev.script_pubkey);
 
             const script_type = script_mod.classifyScript(prev.script_pubkey);
 
@@ -7765,82 +7811,117 @@ pub const RpcServer = struct {
 
             switch (script_type) {
                 .p2pkh => {
-                    if (prev.script_pubkey.len != 25) continue;
-                    const target = prev.script_pubkey[3..23];
-                    for (ephem.keys.items, 0..) |key, ki| {
-                        const pkh = crypto.hash160(&key.public_key);
-                        if (std.mem.eql(u8, &pkh, target)) {
-                            matched_key_idx = ki;
-                            matched_addr_type = .p2pkh;
-                            break;
+                    if (prev.script_pubkey.len == 25) {
+                        const target = prev.script_pubkey[3..23];
+                        for (ephem.keys.items, 0..) |key, ki| {
+                            const pkh = crypto.hash160(&key.public_key);
+                            if (std.mem.eql(u8, &pkh, target)) {
+                                matched_key_idx = ki;
+                                matched_addr_type = .p2pkh;
+                                break;
+                            }
                         }
                     }
                 },
                 .p2wpkh => {
-                    if (prev.script_pubkey.len != 22) continue;
-                    const target = prev.script_pubkey[2..22];
-                    for (ephem.keys.items, 0..) |key, ki| {
-                        const pkh = crypto.hash160(&key.public_key);
-                        if (std.mem.eql(u8, &pkh, target)) {
-                            matched_key_idx = ki;
-                            matched_addr_type = .p2wpkh;
-                            break;
+                    if (prev.script_pubkey.len == 22) {
+                        const target = prev.script_pubkey[2..22];
+                        for (ephem.keys.items, 0..) |key, ki| {
+                            const pkh = crypto.hash160(&key.public_key);
+                            if (std.mem.eql(u8, &pkh, target)) {
+                                matched_key_idx = ki;
+                                matched_addr_type = .p2wpkh;
+                                break;
+                            }
                         }
                     }
                 },
                 .p2sh => {
-                    // Treat P2SH as P2SH-P2WPKH only (the most common modern
-                    // shape); deeper P2SH subscript decoding is out of scope
-                    // here and matches camlcoin's port (pre-fix Core itself
-                    // delegates to redeemScript decode, but neither the wallet
-                    // path nor camlcoin's port try harder than P2SH-P2WPKH
-                    // either).
-                    if (prev.script_pubkey.len != 23) continue;
-                    const target_script_hash = prev.script_pubkey[2..22];
-                    for (ephem.keys.items, 0..) |key, ki| {
-                        const pkh = crypto.hash160(&key.public_key);
-                        var redeem: [22]u8 = undefined;
-                        redeem[0] = 0x00;
-                        redeem[1] = 0x14;
-                        @memcpy(redeem[2..22], &pkh);
-                        const sh = crypto.hash160(&redeem);
-                        if (std.mem.eql(u8, &sh, target_script_hash)) {
-                            matched_key_idx = ki;
-                            matched_addr_type = .p2sh_p2wpkh;
-                            break;
+                    if (prev.script_pubkey.len == 23) {
+                        const target_script_hash = prev.script_pubkey[2..22];
+                        for (ephem.keys.items, 0..) |key, ki| {
+                            const pkh = crypto.hash160(&key.public_key);
+                            var redeem: [22]u8 = undefined;
+                            redeem[0] = 0x00;
+                            redeem[1] = 0x14;
+                            @memcpy(redeem[2..22], &pkh);
+                            const sh = crypto.hash160(&redeem);
+                            if (std.mem.eql(u8, &sh, target_script_hash)) {
+                                matched_key_idx = ki;
+                                matched_addr_type = .p2sh_p2wpkh;
+                                break;
+                            }
                         }
                     }
                 },
                 .p2tr => {
-                    if (prev.script_pubkey.len != 34) continue;
-                    const target = prev.script_pubkey[2..34];
-                    for (ephem.keys.items, 0..) |key, ki| {
-                        if (std.mem.eql(u8, &key.x_only_pubkey, target)) {
-                            matched_key_idx = ki;
-                            matched_addr_type = .p2tr;
-                            break;
+                    if (prev.script_pubkey.len == 34) {
+                        const target = prev.script_pubkey[2..34];
+                        for (ephem.keys.items, 0..) |key, ki| {
+                            if (std.mem.eql(u8, &key.x_only_pubkey, target)) {
+                                matched_key_idx = ki;
+                                matched_addr_type = .p2tr;
+                                break;
+                            }
                         }
                     }
                 },
                 else => {},
             }
 
-            if (matched_key_idx) |ki| {
-                const synth_utxo = wallet_mod.OwnedUtxo{
-                    .outpoint = input.previous_output,
-                    .output = prev,
-                    .key_index = ki,
-                    .address_type = matched_addr_type,
-                    .confirmations = 0,
-                    .is_coinbase = false,
-                    .height = 0,
-                };
-                ephem.signInput(&tx, input_idx, synth_utxo, sighash_type) catch {
-                    complete = false;
-                };
-            } else {
-                complete = false;
+            // We always keep the prevout in the synth array so that
+            // BIP-341 has the amounts/scripts vector for any taproot input
+            // the wallet can actually sign. We *don't* free `prev` here —
+            // the deferred loop above frees every non-null entry.
+            synth_prevouts[input_idx] = wallet_mod.OwnedUtxo{
+                .outpoint = input.previous_output,
+                .output = prev,
+                .key_index = matched_key_idx orelse 0,
+                .address_type = matched_addr_type,
+                .confirmations = 0,
+                .is_coinbase = false,
+                .height = 0,
+            };
+            matched_key_idx_per_input[input_idx] = matched_key_idx;
+            if (matched_key_idx == null) complete = false;
+        }
+
+        // Build the flat prevouts vector for BIP-341 if every prevout
+        // resolved (BIP-341 hashes ALL inputs' prevouts; missing any one
+        // makes a taproot signature impossible).
+        var flat_prevouts_buf: ?[]wallet_mod.OwnedUtxo = null;
+        defer if (flat_prevouts_buf) |b| self.allocator.free(b);
+        var flat_prevouts: ?[]const wallet_mod.OwnedUtxo = null;
+        var all_resolved = true;
+        for (synth_prevouts) |po| {
+            if (po == null) {
+                all_resolved = false;
+                break;
             }
+        }
+        if (all_resolved) {
+            const buf = self.allocator.alloc(wallet_mod.OwnedUtxo, tx.inputs.len) catch {
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+            };
+            for (synth_prevouts, 0..) |po, i| buf[i] = po.?;
+            flat_prevouts_buf = buf;
+            flat_prevouts = buf;
+        }
+
+        for (tx.inputs, 0..) |_, input_idx| {
+            const ki = matched_key_idx_per_input[input_idx] orelse continue;
+            const synth_utxo = wallet_mod.OwnedUtxo{
+                .outpoint = synth_prevouts[input_idx].?.outpoint,
+                .output = synth_prevouts[input_idx].?.output,
+                .key_index = ki,
+                .address_type = synth_prevouts[input_idx].?.address_type,
+                .confirmations = 0,
+                .is_coinbase = false,
+                .height = 0,
+            };
+            ephem.signInput(&tx, input_idx, synth_utxo, sighash_type, flat_prevouts) catch {
+                complete = false;
+            };
         }
 
         // Re-serialize the signed tx.
