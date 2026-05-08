@@ -327,6 +327,30 @@ pub const Wallet = struct {
         return wallet;
     }
 
+    /// Initialize the wallet from a BIP-39 mnemonic + optional passphrase.
+    ///
+    /// The mnemonic is the already-tokenized form (each element is one
+    /// wordlist entry). For a user-typed string, parse with
+    /// `bip39.parseMnemonicString` first.
+    ///
+    /// Equivalent to `mnemonicToSeed(mnemonic, passphrase) -> initFromSeed`.
+    /// Validates the mnemonic checksum on the way through; returns
+    /// `error.InvalidChecksum` etc. on invalid input. See `bip39.zig`.
+    pub fn initFromMnemonic(
+        allocator: std.mem.Allocator,
+        network: Network,
+        mnemonic: []const []const u8,
+        passphrase: []const u8,
+    ) !Wallet {
+        const bip39 = @import("bip39.zig");
+        // Validate first so we surface a clean error before allocating
+        // the secp256k1 context / wallet.
+        try bip39.validateMnemonic(allocator, mnemonic);
+        var seed: [64]u8 = undefined;
+        try bip39.mnemonicToSeed(allocator, mnemonic, passphrase, &seed);
+        return try initFromSeed(allocator, network, &seed);
+    }
+
     pub fn deinit(self: *Wallet) void {
         secp256k1.secp256k1_context_destroy(self.ctx);
         self.keys.deinit();

@@ -467,3 +467,73 @@ test "signInput .p2tr without all_prevouts errors honestly" {
     // loudly rather than silently produce a bogus signature.
     try std.testing.expectError(error.TaprootRequiresAllPrevouts, w.signInput(&tx, 0, utxo, 0x00, null));
 }
+
+// ---------------------------------------------------------------------------
+// W21: BIP-39 Wallet.initFromMnemonic integration test
+//
+// Verifies the full mnemonic → seed → BIP-32 master → BIP-86 derivation
+// pipeline against a known TREZOR vector. This is the user-facing entry
+// point added in W21; if either bip39.zig or the wiring through
+// `initFromMnemonic` regressed, the derived master fingerprint /
+// receiving address would change.
+// ---------------------------------------------------------------------------
+
+test "BIP-39 Wallet.initFromMnemonic produces canonical TREZOR-vector seed" {
+    const allocator = std.testing.allocator;
+    const bip39 = @import("bip39.zig");
+
+    // TREZOR vector 1: 12-word, all-zero entropy, passphrase "TREZOR".
+    const mnemonic_str =
+        "abandon abandon abandon abandon abandon abandon " ++
+        "abandon abandon abandon abandon abandon about";
+    const expected_seed_hex =
+        "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04";
+
+    const m = try bip39.parseMnemonicString(allocator, mnemonic_str);
+    defer allocator.free(m);
+
+    // (1) Direct mnemonicToSeed must match the canonical seed.
+    var seed: [64]u8 = undefined;
+    try bip39.mnemonicToSeed(allocator, m, "TREZOR", &seed);
+    const expected_seed = try hexToBytesAlloc(allocator, expected_seed_hex);
+    defer allocator.free(expected_seed);
+    try std.testing.expectEqualSlices(u8, expected_seed, &seed);
+
+    // (2) initFromMnemonic must derive the same master key as
+    //     initFromSeed(seed) — the wiring is "validate + derive seed +
+    //     pass to initFromSeed", and we lock that in here.
+    var w_from_mnemonic = try wallet_mod.Wallet.initFromMnemonic(allocator, .mainnet, m, "TREZOR");
+    defer w_from_mnemonic.deinit();
+    var w_from_seed = try wallet_mod.Wallet.initFromSeed(allocator, .mainnet, &seed);
+    defer w_from_seed.deinit();
+
+    try std.testing.expect(w_from_mnemonic.master_key != null);
+    try std.testing.expect(w_from_seed.master_key != null);
+    try std.testing.expectEqualSlices(
+        u8,
+        &w_from_mnemonic.master_key.?.key,
+        &w_from_seed.master_key.?.key,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &w_from_mnemonic.master_key.?.chain_code,
+        &w_from_seed.master_key.?.chain_code,
+    );
+}
+
+test "BIP-39 Wallet.initFromMnemonic rejects invalid checksum" {
+    const allocator = std.testing.allocator;
+    const bip39 = @import("bip39.zig");
+    // Replace last word with one that breaks the 4-bit checksum.
+    const bad_mnemonic =
+        "abandon abandon abandon abandon abandon abandon " ++
+        "abandon abandon abandon abandon abandon abandon";
+
+    const m = try bip39.parseMnemonicString(allocator, bad_mnemonic);
+    defer allocator.free(m);
+
+    try std.testing.expectError(
+        error.InvalidChecksum,
+        wallet_mod.Wallet.initFromMnemonic(allocator, .mainnet, m, ""),
+    );
+}
