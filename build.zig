@@ -334,6 +334,37 @@ pub fn build(b: *std.Build) void {
         // surfaces whenever wallet.zig is a test root, blocking tests.zig).
     }
 
+    // BIP-39 mnemonic + PBKDF2 tests (W21). Same wrapper pattern as
+    // tests_rpc.zig: project-root wrapper at `tests_bip39.zig` so
+    // `src/bip39.zig`'s `@embedFile("../resources/bip39-english.txt")`
+    // resolves correctly. Run with `zig build test-bip39`.
+    {
+        const bip39_tests = b.addTest(.{
+            .root_source_file = b.path("tests_bip39.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        // bip39.zig only uses Zig std crypto (no secp256k1 / no rocksdb /
+        // no SHA-NI shim), but link the SHA-NI C shim defensively in case
+        // something transitive in std pulls it via the build options.
+        bip39_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            bip39_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        bip39_tests.root_module.addOptions("build_options", build_options);
+        const run_bip39_tests = b.addRunArtifact(bip39_tests);
+        const bip39_step = b.step("test-bip39", "Run BIP-39 mnemonic + PBKDF2 vector tests (W21)");
+        bip39_step.dependOn(&run_bip39_tests.step);
+        // Fold into the default `test` step — bip39.zig is self-contained,
+        // doesn't import wallet.zig, and so doesn't trigger the
+        // long-standing selectCoins anonymous-struct compile error that
+        // blocks `tests_rpc.zig` and `tests_wallet_taproot.zig`.
+        test_step.dependOn(&run_bip39_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
