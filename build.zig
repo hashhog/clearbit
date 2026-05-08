@@ -334,6 +334,48 @@ pub fn build(b: *std.Build) void {
         // surfaces whenever wallet.zig is a test root, blocking tests.zig).
     }
 
+    // P2WSH + P2SH-P2WSH wallet tests (W29-C / Phase-2). Same wrapper
+    // pattern as tests_wallet_taproot.zig: project-root wrapper so
+    // `src/wallet.zig`'s `@embedFile("../resources/bip39-english.txt")`
+    // resolves correctly. Run with `zig build test-wallet-segwit-v0`.
+    {
+        const ws_tests = b.addTest(.{
+            .root_source_file = b.path("tests_wallet_segwit_v0.zig"),
+            .target = target,
+            .optimize = optimize,
+            // Filter to only the W29-C test names so we don't drag in the
+            // unrelated pre-existing wallet.zig tests (same gotcha as
+            // tests_wallet_taproot.zig — the selectCoins anonymous-struct
+            // mismatch surfaces whenever wallet.zig is a test root).
+            .filters = &[_][]const u8{"W29-C"},
+        });
+        ws_tests.linkSystemLibrary("rocksdb");
+        ws_tests.linkSystemLibrary("secp256k1");
+        ws_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        ws_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            ws_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            ws_tests.linkSystemLibrary("minisketch");
+            ws_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        ws_tests.root_module.addOptions("build_options", build_options);
+
+        const run_ws_tests = b.addRunArtifact(ws_tests);
+        const ws_step = b.step(
+            "test-wallet-segwit-v0",
+            "Run wallet P2WSH + P2SH-P2WSH multisig tests (W29-C)",
+        );
+        ws_step.dependOn(&run_ws_tests.step);
+        // NOTE: deliberately NOT folded into `test` — same reason as
+        // test-wallet-taproot above (selectCoins anonymous-struct compile
+        // error surfaces whenever wallet.zig is a test root).
+    }
+
     // BIP-39 mnemonic + PBKDF2 tests (W21). Same wrapper pattern as
     // tests_rpc.zig: project-root wrapper at `tests_bip39.zig` so
     // `src/bip39.zig`'s `@embedFile("../resources/bip39-english.txt")`
