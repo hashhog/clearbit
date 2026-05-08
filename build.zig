@@ -296,6 +296,44 @@ pub fn build(b: *std.Build) void {
         // live in `src/crypto.zig` and run via `zig build test`.
     }
 
+    // Wallet Taproot tests — BIP-86 tweak + BIP-341 sighash wire-up (W20).
+    // Same wrapper pattern as tests_rpc.zig: the test root lives at the
+    // project root so `src/wallet.zig`'s `@embedFile("../resources/bip39-english.txt")`
+    // resolves correctly. Run with `zig build test-wallet-taproot`.
+    {
+        const wallet_taproot_tests = b.addTest(.{
+            .root_source_file = b.path("tests_wallet_taproot.zig"),
+            .target = target,
+            .optimize = optimize,
+            // Filter to only the W20 test names so we don't drag in the
+            // unrelated pre-existing wallet.zig tests (some of which leak
+            // in a way that's outside the scope of this wave).
+            .filters = &[_][]const u8{"BIP-86", "BIP-341", "wallet computeTaprootSigHash", "signInput .p2tr"},
+        });
+        wallet_taproot_tests.linkSystemLibrary("rocksdb");
+        wallet_taproot_tests.linkSystemLibrary("secp256k1");
+        wallet_taproot_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        wallet_taproot_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            wallet_taproot_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            wallet_taproot_tests.linkSystemLibrary("minisketch");
+            wallet_taproot_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        wallet_taproot_tests.root_module.addOptions("build_options", build_options);
+
+        const run_wallet_taproot_tests = b.addRunArtifact(wallet_taproot_tests);
+        const wt_step = b.step("test-wallet-taproot", "Run wallet BIP-86 + BIP-341 sighash tests (W20)");
+        wt_step.dependOn(&run_wallet_taproot_tests.step);
+        // NOTE: deliberately NOT folded into `test` — same reason as
+        // test-rpc above (selectCoins anonymous-struct compile error
+        // surfaces whenever wallet.zig is a test root, blocking tests.zig).
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
