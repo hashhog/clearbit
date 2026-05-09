@@ -420,6 +420,36 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_p2sh_tests.step);
     }
 
+    // PSBT W47 multisig finalize + sort-on-emit tests. Same wiring shape
+    // as test-p2sh-commitment above (psbt.zig has no @embedFile and
+    // doesn't pull wallet.zig). Run with `zig build test-psbt-w47`.
+    {
+        const w47_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_psbt_w47.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"W47"},
+        });
+        w47_tests.linkSystemLibrary("secp256k1");
+        w47_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w47_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w47_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        w47_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w47_tests = b.addRunArtifact(w47_tests);
+        const w47_step = b.step(
+            "test-psbt-w47",
+            "Run PSBT multisig finalize + sort-on-emit tests (W47)",
+        );
+        w47_step.dependOn(&run_w47_tests.step);
+        test_step.dependOn(&run_w47_tests.step);
+    }
+
     // BIP-39 mnemonic + PBKDF2 tests (W21). Same wrapper pattern as
     // tests_rpc.zig: project-root wrapper at `tests_bip39.zig` so
     // `src/bip39.zig`'s `@embedFile("../resources/bip39-english.txt")`
