@@ -2958,6 +2958,26 @@ test "OP_RETURN script classified as null_data" {
     try std.testing.expectEqual(ScriptType.null_data, classifyScript(&script));
 }
 
+test "OP_RETURN with truncated push is nonstandard (W56 regression)" {
+    // 0x6a = OP_RETURN, 0x09 = push 9 bytes, but only 4 bytes follow.
+    // Mirrors the W56 fix: classifyScript must return .nonstandard, not .null_data.
+    // This is the exact pattern that was misclassified before W56.
+    const truncated = [_]u8{ 0x6a, 0x09, 0xde, 0xad, 0xbe, 0xef };
+    try std.testing.expectEqual(ScriptType.nonstandard, classifyScript(&truncated));
+
+    // Bare OP_RETURN (no data) is valid null_data.
+    const bare = [_]u8{0x6a};
+    try std.testing.expectEqual(ScriptType.null_data, classifyScript(&bare));
+
+    // OP_RETURN with PUSHDATA1 opcode (0x4c) but truncated length byte is nonstandard.
+    const truncated_pushdata1 = [_]u8{ 0x6a, 0x4c }; // 0x4c = OP_PUSHDATA1, length byte missing
+    try std.testing.expectEqual(ScriptType.nonstandard, classifyScript(&truncated_pushdata1));
+
+    // OP_RETURN with non-push opcode after it is nonstandard.
+    const non_push = [_]u8{ 0x6a, 0x76 }; // 0x76 = OP_DUP, not a push opcode
+    try std.testing.expectEqual(ScriptType.nonstandard, classifyScript(&non_push));
+}
+
 test "scriptNumEncode/Decode round-trip" {
     const allocator = std.testing.allocator;
 
