@@ -3322,6 +3322,67 @@ test "dust output rejection" {
     try std.testing.expectError(MempoolError.DustOutput, result);
 }
 
+test "truncated OP_RETURN push rejected by mempool (W56 regression)" {
+    // Verifies that the mempool policy path (checkStandard → classifyScript)
+    // correctly rejects a tx whose output has a truncated OP_RETURN push.
+    // Before W56, classifyScript returned .null_data for these scripts; a tx
+    // with such an output would be admitted instead of rejected.
+    //
+    // Script: 6a 09 de ad be ef
+    //   0x6a = OP_RETURN
+    //   0x09 = push 9 bytes, but only 4 bytes follow → truncated → nonstandard
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    // (a) Truncated OP_RETURN push: classifies as .nonstandard → must be rejected.
+    const truncated_op_return = [_]u8{ 0x6a, 0x09, 0xde, 0xad, 0xbe, 0xef };
+    const stype_truncated = script.classifyScript(&truncated_op_return);
+    try std.testing.expectEqual(script.ScriptType.nonstandard, stype_truncated);
+
+    const bad_output = types.TxOut{ .value = 0, .script_pubkey = &truncated_op_return };
+    const bad_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{bad_output},
+        .lock_time = 0,
+    };
+    // checkStandard must reject via MempoolError.NonStandard
+    try std.testing.expectError(MempoolError.NonStandard, mempool.checkStandard(&bad_tx));
+    // addTransaction must also reject (policy gate fires before dust check)
+    try std.testing.expectError(MempoolError.NonStandard, mempool.addTransaction(bad_tx));
+
+    // (b) Valid OP_RETURN push: 6a 04 de ad be ef → .null_data → passes standardness.
+    //     Also verifies the dust exemption: value=0 is not dust for OP_RETURN.
+    const valid_op_return = [_]u8{ 0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef };
+    const stype_valid = script.classifyScript(&valid_op_return);
+    try std.testing.expectEqual(script.ScriptType.null_data, stype_valid);
+
+    const good_output = types.TxOut{ .value = 0, .script_pubkey = &valid_op_return };
+    const good_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{good_output},
+        .lock_time = 0,
+    };
+    // checkStandard must pass (no error)
+    try mempool.checkStandard(&good_tx);
+    // isDust must return false for OP_RETURN output with value=0
+    try std.testing.expect(!Mempool.isDust(&good_output));
+    // addTransaction with no chain state: the mempool skips UTXO lookup and
+    // admits the tx (test-only path — see "No chain state" comment in addTransaction).
+    // The key invariant: no NonStandard or DustOutput error is returned.
+    try mempool.addTransaction(good_tx);
+}
+
 test "wtxid lookup" {
     const allocator = std.testing.allocator;
 
