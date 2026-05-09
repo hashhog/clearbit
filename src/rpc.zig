@@ -5411,7 +5411,153 @@ pub const RpcServer = struct {
                         try writer.writeByte('"');
                     }
                     try writer.writeByte(']');
+                    has_field = true;
                 }
+            }
+
+            // BIP-371 taproot fields (input-side)
+            // Order mirrors Core's pushKV order (rawtransaction.cpp:1249-1329):
+            //   taproot_key_path_sig, taproot_script_path_sigs, taproot_scripts,
+            //   taproot_bip32_derivs, taproot_internal_key, taproot_merkle_root
+
+            // taproot_key_path_sig
+            if (input.tap_key_sig) |tks| {
+                if (has_field) try writer.writeByte(',');
+                try writer.writeAll("\"taproot_key_path_sig\":\"");
+                for (tks) |byte| try writer.print("{x:0>2}", .{byte});
+                try writer.writeByte('"');
+                has_field = true;
+            }
+
+            // taproot_script_path_sigs — sorted by (xonly pubkey, leaf_hash)
+            if (input.tap_script_sigs.items.len > 0) {
+                if (has_field) try writer.writeByte(',');
+                // Sort by xonly pubkey then leaf_hash (Core: std::map<pair<XOnlyPubKey,uint256>,sig>)
+                const TapScriptSigEntry = psbt_mod.TapScriptSig;
+                const sorted_sigs = try self.allocator.dupe(TapScriptSigEntry, input.tap_script_sigs.items);
+                defer self.allocator.free(sorted_sigs);
+                std.sort.pdq(TapScriptSigEntry, sorted_sigs, {}, struct {
+                    pub fn lessThan(_: void, a: TapScriptSigEntry, b: TapScriptSigEntry) bool {
+                        const pk_cmp = std.mem.order(u8, &a.pubkey, &b.pubkey);
+                        if (pk_cmp != .eq) return pk_cmp == .lt;
+                        return std.mem.order(u8, &a.leaf_hash, &b.leaf_hash) == .lt;
+                    }
+                }.lessThan);
+                try writer.writeAll("\"taproot_script_path_sigs\":[");
+                for (sorted_sigs, 0..) |entry, si| {
+                    if (si > 0) try writer.writeByte(',');
+                    try writer.writeAll("{\"pubkey\":\"");
+                    for (entry.pubkey) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"leaf_hash\":\"");
+                    for (entry.leaf_hash) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"sig\":\"");
+                    for (entry.sig) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\"}");
+                }
+                try writer.writeByte(']');
+                has_field = true;
+            }
+
+            // taproot_scripts — group by (script, leaf_ver), collect control_blocks[]
+            // Core stores as std::map<pair<CScript,uint8_t>, set<vector<u8>>> (lex sorted)
+            if (input.tap_leaf_scripts.items.len > 0) {
+                if (has_field) try writer.writeByte(',');
+                // Sort entries by (script lex, leaf_ver) then emit grouped
+                const TapLeafScriptEntry = psbt_mod.TapLeafScript;
+                const sorted_leaves = try self.allocator.dupe(TapLeafScriptEntry, input.tap_leaf_scripts.items);
+                defer self.allocator.free(sorted_leaves);
+                std.sort.pdq(TapLeafScriptEntry, sorted_leaves, {}, struct {
+                    pub fn lessThan(_: void, a: TapLeafScriptEntry, b: TapLeafScriptEntry) bool {
+                        const s_cmp = std.mem.order(u8, a.script, b.script);
+                        if (s_cmp != .eq) return s_cmp == .lt;
+                        if (a.leaf_ver != b.leaf_ver) return a.leaf_ver < b.leaf_ver;
+                        return std.mem.order(u8, a.control_block, b.control_block) == .lt;
+                    }
+                }.lessThan);
+                try writer.writeAll("\"taproot_scripts\":[");
+                var ls_i: usize = 0;
+                var ls_first = true;
+                while (ls_i < sorted_leaves.len) {
+                    const cur_script = sorted_leaves[ls_i].script;
+                    const cur_leaf_ver = sorted_leaves[ls_i].leaf_ver;
+                    if (!ls_first) try writer.writeByte(',');
+                    ls_first = false;
+                    try writer.writeAll("{\"script\":\"");
+                    for (cur_script) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.print("\",\"leaf_ver\":{d},\"control_blocks\":[", .{cur_leaf_ver});
+                    var cb_first = true;
+                    while (ls_i < sorted_leaves.len and
+                        std.mem.eql(u8, sorted_leaves[ls_i].script, cur_script) and
+                        sorted_leaves[ls_i].leaf_ver == cur_leaf_ver)
+                    {
+                        if (!cb_first) try writer.writeByte(',');
+                        cb_first = false;
+                        try writer.writeByte('"');
+                        for (sorted_leaves[ls_i].control_block) |byte| try writer.print("{x:0>2}", .{byte});
+                        try writer.writeByte('"');
+                        ls_i += 1;
+                    }
+                    try writer.writeAll("]}");
+                }
+                try writer.writeByte(']');
+                has_field = true;
+            }
+
+            // taproot_bip32_derivs — sorted by x-only pubkey (Core: std::map<XOnlyPubKey,...>)
+            if (input.tap_bip32_derivation.count() > 0) {
+                if (has_field) try writer.writeByte(',');
+                // Collect and sort by xonly pubkey lex
+                const TapDerivEntry = struct { key: [32]u8, val: psbt_mod.TapKeyOriginInfo };
+                var tap_deriv_list = std.ArrayList(TapDerivEntry).init(self.allocator);
+                defer tap_deriv_list.deinit();
+                var td_iter = input.tap_bip32_derivation.iterator();
+                while (td_iter.next()) |entry| {
+                    try tap_deriv_list.append(.{ .key = entry.key_ptr.*, .val = entry.value_ptr.* });
+                }
+                std.sort.pdq(TapDerivEntry, tap_deriv_list.items, {}, struct {
+                    pub fn lessThan(_: void, a: TapDerivEntry, b: TapDerivEntry) bool {
+                        return std.mem.order(u8, &a.key, &b.key) == .lt;
+                    }
+                }.lessThan);
+                try writer.writeAll("\"taproot_bip32_derivs\":[");
+                for (tap_deriv_list.items, 0..) |entry, tdi| {
+                    if (tdi > 0) try writer.writeByte(',');
+                    try writer.writeAll("{\"pubkey\":\"");
+                    for (entry.key) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"master_fingerprint\":\"");
+                    // Core uses ReadBE32 with %08x — big-endian interpretation as hex
+                    for (entry.val.fingerprint) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"path\":\"");
+                    try writeBip32Path(writer, entry.val.path);
+                    try writer.writeAll("\",\"leaf_hashes\":[");
+                    for (entry.val.leaf_hashes, 0..) |lh, lhi| {
+                        if (lhi > 0) try writer.writeByte(',');
+                        try writer.writeByte('"');
+                        for (lh) |byte| try writer.print("{x:0>2}", .{byte});
+                        try writer.writeByte('"');
+                    }
+                    try writer.writeAll("]}");
+                }
+                try writer.writeByte(']');
+                has_field = true;
+            }
+
+            // taproot_internal_key
+            if (input.tap_internal_key) |tik| {
+                if (has_field) try writer.writeByte(',');
+                try writer.writeAll("\"taproot_internal_key\":\"");
+                for (tik) |byte| try writer.print("{x:0>2}", .{byte});
+                try writer.writeByte('"');
+                has_field = true;
+            }
+
+            // taproot_merkle_root
+            if (input.tap_merkle_root) |tmr| {
+                if (has_field) try writer.writeByte(',');
+                try writer.writeAll("\"taproot_merkle_root\":\"");
+                for (tmr) |byte| try writer.print("{x:0>2}", .{byte});
+                try writer.writeByte('"');
+                has_field = true;
             }
 
             try writer.writeByte('}');
@@ -5476,8 +5622,106 @@ pub const RpcServer = struct {
                 out_has_field = true;
             }
 
-            // suppress unused variable warning — Zig ReleaseFast is strict
-            if (out_has_field) {} // used in prior branches
+            // BIP-371 output-side taproot fields.
+            // Order mirrors Core's pushKV order (rawtransaction.cpp:1419-1469):
+            //   taproot_internal_key, taproot_tree, taproot_bip32_derivs, musig2_participant_pubkeys
+
+            // taproot_internal_key
+            if (output.tap_internal_key) |tik| {
+                if (out_has_field) try writer.writeByte(',');
+                try writer.writeAll("\"taproot_internal_key\":\"");
+                for (tik) |byte| try writer.print("{x:0>2}", .{byte});
+                try writer.writeByte('"');
+                out_has_field = true;
+            }
+
+            // taproot_tree — parse raw tap_tree bytes: repeated (depth u8, leaf_ver u8, compact_size || script)
+            // Wire format from Core psbt.h: no prefix count, read until buffer empty.
+            if (output.tap_tree) |tt| {
+                if (out_has_field) try writer.writeByte(',');
+                try writer.writeAll("\"taproot_tree\":[");
+                var tt_reader = serialize.Reader{ .data = tt };
+                var tt_first = true;
+                while (!tt_reader.isAtEnd()) {
+                    const depth = tt_reader.readInt(u8) catch break;
+                    const leaf_ver = tt_reader.readInt(u8) catch break;
+                    const script_len = tt_reader.readCompactSize() catch break;
+                    const script_bytes = tt_reader.readBytes(@intCast(script_len)) catch break;
+                    if (!tt_first) try writer.writeByte(',');
+                    tt_first = false;
+                    try writer.print("{{\"depth\":{d},\"leaf_ver\":{d},\"script\":\"", .{ depth, leaf_ver });
+                    for (script_bytes) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\"}");
+                }
+                try writer.writeByte(']');
+                out_has_field = true;
+            }
+
+            // taproot_bip32_derivs — sorted by x-only pubkey (Core: std::map)
+            if (output.tap_bip32_derivation.count() > 0) {
+                if (out_has_field) try writer.writeByte(',');
+                const TapDerivEntryOut = struct { key: [32]u8, val: psbt_mod.TapKeyOriginInfo };
+                var tap_deriv_out = std.ArrayList(TapDerivEntryOut).init(self.allocator);
+                defer tap_deriv_out.deinit();
+                var td_iter = output.tap_bip32_derivation.iterator();
+                while (td_iter.next()) |entry| {
+                    try tap_deriv_out.append(.{ .key = entry.key_ptr.*, .val = entry.value_ptr.* });
+                }
+                std.sort.pdq(TapDerivEntryOut, tap_deriv_out.items, {}, struct {
+                    pub fn lessThan(_: void, a: TapDerivEntryOut, b: TapDerivEntryOut) bool {
+                        return std.mem.order(u8, &a.key, &b.key) == .lt;
+                    }
+                }.lessThan);
+                try writer.writeAll("\"taproot_bip32_derivs\":[");
+                for (tap_deriv_out.items, 0..) |entry, tdi| {
+                    if (tdi > 0) try writer.writeByte(',');
+                    try writer.writeAll("{\"pubkey\":\"");
+                    for (entry.key) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"master_fingerprint\":\"");
+                    for (entry.val.fingerprint) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"path\":\"");
+                    try writeBip32Path(writer, entry.val.path);
+                    try writer.writeAll("\",\"leaf_hashes\":[");
+                    for (entry.val.leaf_hashes, 0..) |lh, lhi| {
+                        if (lhi > 0) try writer.writeByte(',');
+                        try writer.writeByte('"');
+                        for (lh) |byte| try writer.print("{x:0>2}", .{byte});
+                        try writer.writeByte('"');
+                    }
+                    try writer.writeAll("]}");
+                }
+                try writer.writeByte(']');
+                out_has_field = true;
+            }
+
+            // musig2_participant_pubkeys — sorted by aggregate_pubkey (Core: std::map)
+            if (output.musig2_participants.items.len > 0) {
+                if (out_has_field) try writer.writeByte(',');
+                const MuSig2Entry = psbt_mod.MuSig2ParticipantEntry;
+                const musig_list = try self.allocator.dupe(MuSig2Entry, output.musig2_participants.items);
+                defer self.allocator.free(musig_list);
+                std.sort.pdq(MuSig2Entry, musig_list, {}, struct {
+                    pub fn lessThan(_: void, a: MuSig2Entry, b: MuSig2Entry) bool {
+                        return std.mem.order(u8, &a.aggregate_pubkey, &b.aggregate_pubkey) == .lt;
+                    }
+                }.lessThan);
+                try writer.writeAll("\"musig2_participant_pubkeys\":[");
+                for (musig_list, 0..) |entry, mi| {
+                    if (mi > 0) try writer.writeByte(',');
+                    try writer.writeAll("{\"aggregate_pubkey\":\"");
+                    for (entry.aggregate_pubkey) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"participant_pubkeys\":[");
+                    for (entry.participant_pubkeys, 0..) |pk, pki| {
+                        if (pki > 0) try writer.writeByte(',');
+                        try writer.writeByte('"');
+                        for (pk) |byte| try writer.print("{x:0>2}", .{byte});
+                        try writer.writeByte('"');
+                    }
+                    try writer.writeAll("]}");
+                }
+                try writer.writeByte(']');
+                out_has_field = true;
+            }
 
             try writer.writeByte('}');
         }
@@ -10854,9 +11098,21 @@ fn inferDescriptorForSpk(
     network: address_mod.Network,
     is_regtest: bool,
 ) ![]const u8 {
-    const maybe_addr = try extractAddressForSpk(allocator, spk, network, is_regtest);
+    const t = script_mod.classifyScript(spk);
     var inner = std.ArrayList(u8).init(allocator);
     defer inner.deinit();
+
+    // Bitcoin Core's InferDescriptor emits rawtr(<x-only-hex>) for
+    // OP_1 <32-byte push> (witness_v1_taproot / P2TR) instead of addr().
+    // This matches Core's InferRawtrDescriptor path in script/descriptor.cpp.
+    if (t == .p2tr and spk.len == 34) {
+        try inner.appendSlice("rawtr(");
+        for (spk[2..34]) |byte| try inner.writer().print("{x:0>2}", .{byte});
+        try inner.append(')');
+        return descriptor.addChecksum(allocator, inner.items);
+    }
+
+    const maybe_addr = try extractAddressForSpk(allocator, spk, network, is_regtest);
     if (maybe_addr) |addr_str| {
         defer allocator.free(addr_str);
         try inner.appendSlice("addr(");
