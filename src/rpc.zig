@@ -5255,62 +5255,246 @@ pub const RpcServer = struct {
         // exercise the field.
         try writer.writeAll("\"global_xpubs\":[],");
 
-        // Per-input PSBT extension records. Existing W47 fields preserved.
+        // W53 — Per-input PSBT extension records. Mirrors Bitcoin Core's
+        // decodepsbt input loop (rpc/rawtransaction.cpp:1117-1340). Each
+        // field is conditional — emitted only when the underlying PSBT field
+        // is non-empty. Field order follows Core's pushKV order.
+        //
+        // Fields implemented:
+        //   witness_utxo      {amount, scriptPubKey}  (full ScriptToUniv shape)
+        //   non_witness_utxo  full TxToUniv shape (no hex)
+        //   partial_signatures {pubkey_hex -> sig_hex}
+        //   sighash            SighashToStr string
+        //   redeem_script      {asm, hex, type}  (ScriptToUniv no-address variant)
+        //   witness_script     {asm, hex, type}
+        //   bip32_derivs       [{pubkey, master_fingerprint, path}]
+        //   final_scriptSig    {asm (with sighash decode), hex}
+        //   final_scriptwitness [hex, ...]
+        var total_in: i64 = 0;
+        var have_all_utxos = true;
         try writer.writeAll("\"inputs\":[");
-        for (psbt.inputs, 0..) |*input, i| {
-            if (i > 0) try writer.writeByte(',');
+        for (psbt.inputs, 0..) |*input, inp_i| {
+            if (inp_i > 0) try writer.writeByte(',');
             try writer.writeAll("{");
-
             var has_field = false;
 
-            if (input.witness_utxo != null) {
-                try writer.print("\"witness_utxo\":{{\"amount\":{d:.8}}}", .{
-                    @as(f64, @floatFromInt(input.witness_utxo.?.value)) / 100_000_000.0,
+            // witness_utxo — 2-key shape: {amount, scriptPubKey}
+            // non_witness_utxo — full TxToUniv (no hex field)
+            //
+            // UTXO accumulation mirrors Core's logic (rawtransaction.cpp:1122-1156):
+            // both are emitted if present; total_in counts once per input using
+            // the txout value from whichever utxo was set last (non_witness wins
+            // if both present, matching Core's sequential overwrite of `txout`).
+            var input_utxo_value: i64 = 0;
+            var have_this_utxo = false;
+
+            if (input.witness_utxo) |wu| {
+                input_utxo_value = wu.value;
+                have_this_utxo = true;
+                try writer.print("\"witness_utxo\":{{\"amount\":{d:.8},\"scriptPubKey\":", .{
+                    @as(f64, @floatFromInt(wu.value)) / 100_000_000.0,
                 });
+                try writeScriptPubKeyUniv(self.allocator, writer, wu.script_pubkey, network, is_regtest);
+                try writer.writeByte('}');
                 has_field = true;
             }
 
+            if (input.non_witness_utxo) |*nwu| {
+                const prev_idx = psbt.tx.inputs[inp_i].previous_output.index;
+                if (prev_idx < nwu.outputs.len) {
+                    input_utxo_value = nwu.outputs[prev_idx].value; // overwrites witness_utxo value, matching Core
+                    have_this_utxo = true;
+                } else {
+                    have_all_utxos = false;
+                }
+                if (has_field) try writer.writeByte(',');
+                try writer.writeAll("\"non_witness_utxo\":");
+                try writeTxToUnivForPsbt(self, writer, nwu);
+                has_field = true;
+            }
+
+            if (have_this_utxo) {
+                // MoneyRange check (0 <= value <= 21M BTC in satoshis)
+                if (input_utxo_value >= 0 and input_utxo_value <= 2_100_000_000_000_000) {
+                    total_in += input_utxo_value;
+                } else {
+                    have_all_utxos = false;
+                }
+            } else {
+                have_all_utxos = false;
+            }
+
+            // partial_signatures — {pubkey_hex: sig_hex, ...}
             if (input.partial_sigs.count() > 0) {
                 if (has_field) try writer.writeByte(',');
-                try writer.print("\"partial_signatures\":{d}", .{input.partial_sigs.count()});
+                try writer.writeAll("\"partial_signatures\":{");
+                var ps_iter = input.partial_sigs.iterator();
+                var ps_first = true;
+                while (ps_iter.next()) |entry| {
+                    if (!ps_first) try writer.writeByte(',');
+                    ps_first = false;
+                    try writer.writeByte('"');
+                    for (entry.key_ptr) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\":\"");
+                    for (entry.value_ptr.*) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeByte('"');
+                }
+                try writer.writeByte('}');
                 has_field = true;
             }
 
-            if (input.sighash_type != null) {
+            // sighash — SighashToStr string
+            if (input.sighash_type) |sh| {
                 if (has_field) try writer.writeByte(',');
-                try writer.print("\"sighash\":{d}", .{input.sighash_type.?});
+                const sh_str = sighashTypeToStr(sh);
+                try writer.print("\"sighash\":\"{s}\"", .{sh_str});
                 has_field = true;
             }
 
-            if (input.isFinalized()) {
+            // redeem_script — {asm, hex, type}
+            if (input.redeem_script) |rs| {
                 if (has_field) try writer.writeByte(',');
-                try writer.writeAll("\"final\":true");
+                try writer.writeAll("\"redeem_script\":");
+                try writeScriptUnivNoAddr(writer, rs);
+                has_field = true;
+            }
+
+            // witness_script — {asm, hex, type}
+            if (input.witness_script) |ws| {
+                if (has_field) try writer.writeByte(',');
+                try writer.writeAll("\"witness_script\":");
+                try writeScriptUnivNoAddr(writer, ws);
+                has_field = true;
+            }
+
+            // bip32_derivs — [{pubkey, master_fingerprint, path}]
+            if (input.bip32_derivation.count() > 0) {
+                if (has_field) try writer.writeByte(',');
+                try writer.writeAll("\"bip32_derivs\":[");
+                var bip_iter = input.bip32_derivation.iterator();
+                var bip_first = true;
+                while (bip_iter.next()) |entry| {
+                    if (!bip_first) try writer.writeByte(',');
+                    bip_first = false;
+                    try writer.writeAll("{\"pubkey\":\"");
+                    for (entry.key_ptr) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"master_fingerprint\":\"");
+                    for (entry.value_ptr.fingerprint) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"path\":\"");
+                    try writeBip32Path(writer, entry.value_ptr.path);
+                    try writer.writeAll("\"}");
+                }
+                try writer.writeByte(']');
+                has_field = true;
+            }
+
+            // final_scriptSig — {asm (sighash decode on), hex}
+            if (input.final_script_sig) |fss| {
+                if (has_field) try writer.writeByte(',');
+                try writer.writeAll("\"final_scriptSig\":{\"asm\":\"");
+                try writeScriptAsmCoreSigDecode(writer, fss);
+                try writer.writeAll("\",\"hex\":\"");
+                for (fss) |byte| try writer.print("{x:0>2}", .{byte});
+                try writer.writeAll("\"}");
+                has_field = true;
+            }
+
+            // final_scriptwitness — [hex, ...]
+            if (input.final_script_witness) |fsw| {
+                if (fsw.len > 0) {
+                    if (has_field) try writer.writeByte(',');
+                    try writer.writeAll("\"final_scriptwitness\":[");
+                    for (fsw, 0..) |wit_item, w| {
+                        if (w > 0) try writer.writeByte(',');
+                        try writer.writeByte('"');
+                        for (wit_item) |byte| try writer.print("{x:0>2}", .{byte});
+                        try writer.writeByte('"');
+                    }
+                    try writer.writeByte(']');
+                }
             }
 
             try writer.writeByte('}');
         }
         try writer.writeAll("],");
 
-        // Per-output PSBT extension records.
+        // Per-output PSBT extension records. Mirrors Core's output loop
+        // (rawtransaction.cpp:1395-1503). Each field conditional.
+        // Also accumulates output_value for fee calculation.
+        var output_value: i64 = 0;
         try writer.writeAll("\"outputs\":[");
-        for (psbt.outputs, 0..) |*output, i| {
-            if (i > 0) try writer.writeByte(',');
+        for (psbt.outputs, 0..) |*output, oi| {
+            if (oi > 0) try writer.writeByte(',');
             try writer.writeAll("{");
+            var out_has_field = false;
 
-            if (output.bip32_derivation.count() > 0) {
-                try writer.print("\"bip32_derivs\":{d}", .{output.bip32_derivation.count()});
+            // accumulate output value for fee
+            if (oi < psbt.tx.outputs.len) {
+                const out_val = psbt.tx.outputs[oi].value;
+                // MoneyRange check: 0 <= val <= 21_000_000 BTC
+                if (out_val >= 0 and out_val <= 2_100_000_000_000_000) {
+                    output_value += out_val;
+                } else {
+                    have_all_utxos = false;
+                }
             }
+
+            // redeem_script — {asm, hex, type}
+            if (output.redeem_script) |rs| {
+                if (out_has_field) try writer.writeByte(',');
+                try writer.writeAll("\"redeem_script\":");
+                try writeScriptUnivNoAddr(writer, rs);
+                out_has_field = true;
+            }
+
+            // witness_script — {asm, hex, type}
+            if (output.witness_script) |ws| {
+                if (out_has_field) try writer.writeByte(',');
+                try writer.writeAll("\"witness_script\":");
+                try writeScriptUnivNoAddr(writer, ws);
+                out_has_field = true;
+            }
+
+            // bip32_derivs — [{pubkey, master_fingerprint, path}]
+            if (output.bip32_derivation.count() > 0) {
+                if (out_has_field) try writer.writeByte(',');
+                try writer.writeAll("\"bip32_derivs\":[");
+                var bip_iter = output.bip32_derivation.iterator();
+                var bip_first = true;
+                while (bip_iter.next()) |entry| {
+                    if (!bip_first) try writer.writeByte(',');
+                    bip_first = false;
+                    try writer.writeAll("{\"pubkey\":\"");
+                    for (entry.key_ptr) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"master_fingerprint\":\"");
+                    for (entry.value_ptr.fingerprint) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeAll("\",\"path\":\"");
+                    try writeBip32Path(writer, entry.value_ptr.path);
+                    try writer.writeAll("\"}");
+                }
+                try writer.writeByte(']');
+                out_has_field = true;
+            }
+
+            // suppress unused variable warning — Zig ReleaseFast is strict
+            if (out_has_field) {} // used in prior branches
 
             try writer.writeByte('}');
         }
         try writer.writeAll("],");
 
-        // W51 — Top-level `proprietary:[]` and `unknown:{}` are mandatory
-        // in Core's decodepsbt output. Both always emitted, regardless of
-        // whether the PSBT carries any proprietary or unknown fields. We
-        // do NOT emit a `fee` field at the top level: Core's decodepsbt
-        // never emits fee — that's analyzepsbt's job (analyzepsbt emits
-        // `estimated_feerate`, not `fee`, per rpc/rawtransaction.cpp).
+        // W53 — fee: emitted by Core when all input UTXOs are present and
+        // the fee is non-negative (rpc/rawtransaction.cpp:1506-1508).
+        // Core: `if (have_all_utxos) result.pushKV("fee", ValueFromAmount(total_in - output_value));`
+        if (have_all_utxos and total_in > 0) {
+            const fee = total_in - output_value;
+            if (fee >= 0) {
+                try writer.print("\"fee\":{d:.8},", .{@as(f64, @floatFromInt(fee)) / 100_000_000.0});
+            }
+        }
+
+        // Top-level `proprietary:[]` and `unknown:{}` are mandatory in
+        // Core's decodepsbt output (always emitted, empty when absent).
         try writer.writeAll("\"proprietary\":[],\"unknown\":{}}");
 
         return self.jsonRpcResult(buf.items, id);
@@ -10366,6 +10550,227 @@ fn networkFromMagic(magic: u32) address_mod.Network {
 /// bytes which is what `address_mod.Network.testnet` already produces.
 fn isRegtestMagic(magic: u32) bool {
     return magic == consensus.REGTEST.magic;
+}
+
+/// W53 — map a PSBT_IN_SIGHASH_TYPE value to the Core string emitted by
+/// `SighashToStr` (core_io.cpp:334-347). Unknown sighash types return "".
+fn sighashTypeToStr(sighash: u32) []const u8 {
+    return switch (sighash) {
+        0x01 => "ALL",
+        0x02 => "NONE",
+        0x03 => "SINGLE",
+        0x81 => "ALL|ANYONECANPAY",
+        0x82 => "NONE|ANYONECANPAY",
+        0x83 => "SINGLE|ANYONECANPAY",
+        else  => "",
+    };
+}
+
+/// W53 — Core-byte-compat ASM with sighash decode, mirroring
+/// `ScriptToAsmStr(script, fAttemptSighashDecode=true)`. Identical to
+/// `writeScriptAsmCore` except: for push data > 4 bytes, if the data
+/// passes a simplified DER-signature check and its last byte is a known
+/// sighash type, the last byte is stripped and `[SIGHASH]` is appended.
+/// Used for `final_scriptSig` and `non_witness_utxo` vin scriptSigs.
+fn writeScriptAsmCoreSigDecode(writer: anytype, script_bytes: []const u8) !void {
+    var i: usize = 0;
+    var first = true;
+    while (i < script_bytes.len) {
+        if (!first) try writer.writeByte(' ');
+        first = false;
+
+        const op = script_bytes[i];
+        i += 1;
+
+        if (op <= 0x4e) { // push opcodes
+            var data_len: usize = 0;
+            var bad = false;
+            if (op < 0x4c) {
+                data_len = op;
+            } else if (op == 0x4c) {
+                if (i >= script_bytes.len) { bad = true; } else {
+                    data_len = script_bytes[i];
+                    i += 1;
+                }
+            } else if (op == 0x4d) {
+                if (i + 2 > script_bytes.len) { bad = true; } else {
+                    data_len = @as(usize, script_bytes[i]) |
+                        (@as(usize, script_bytes[i + 1]) << 8);
+                    i += 2;
+                }
+            } else { // 0x4e
+                if (i + 4 > script_bytes.len) { bad = true; } else {
+                    data_len = @as(usize, script_bytes[i]) |
+                        (@as(usize, script_bytes[i + 1]) << 8) |
+                        (@as(usize, script_bytes[i + 2]) << 16) |
+                        (@as(usize, script_bytes[i + 3]) << 24);
+                    i += 4;
+                }
+            }
+            if (bad or i + data_len > script_bytes.len) {
+                try writer.writeAll("[error]");
+                return;
+            }
+            const data = script_bytes[i .. i + data_len];
+            i += data_len;
+            if (data_len <= 4) {
+                try writeScriptNumAsmInt(writer, data);
+            } else {
+                // fAttemptSighashDecode: check if data looks like a DER sig
+                // (starts with 0x30, min 9 bytes) and last byte is known sighash.
+                const sig_str = attemptSighashDecode(data);
+                if (sig_str) |sh_str| {
+                    // emit hex of data without the last byte, then [SIGHASH]
+                    for (data[0 .. data.len - 1]) |byte| {
+                        try writer.print("{x:0>2}", .{byte});
+                    }
+                    try writer.writeByte('[');
+                    try writer.writeAll(sh_str);
+                    try writer.writeByte(']');
+                } else {
+                    for (data) |byte| try writer.print("{x:0>2}", .{byte});
+                }
+            }
+            continue;
+        }
+        try writeOpcodeName(writer, op);
+    }
+}
+
+/// Simplified DER-signature sighash decode check.
+/// Returns the sighash string if `vch` looks like a DER-encoded signature
+/// whose last byte is a known sighash type (matching Core's heuristic in
+/// `CheckSignatureEncoding` → `mapSigHashTypes` lookup). Returns null
+/// when the data is not a plausible signature.
+fn attemptSighashDecode(vch: []const u8) ?[]const u8 {
+    // Must be at least 9 bytes for a minimal DER sig + 1 sighash byte.
+    if (vch.len < 9) return null;
+    // DER SEQUENCE marker
+    if (vch[0] != 0x30) return null;
+    const sighash_byte = vch[vch.len - 1];
+    const sh_str = sighashTypeToStr(sighash_byte);
+    if (sh_str.len == 0) return null;
+    return sh_str;
+}
+
+/// W53 — emit a `scriptPubKey`-like JSON for `redeem_script` /
+/// `witness_script`. Mirrors `ScriptToUniv(script, out)` with
+/// `include_hex=true, include_address=false` — so the shape is
+/// `{asm, hex, type}` (NO `desc`, NO `address`).
+fn writeScriptUnivNoAddr(writer: anytype, script_bytes: []const u8) !void {
+    const t = script_mod.classifyScript(script_bytes);
+    const type_str: []const u8 = switch (t) {
+        .p2pkh    => "pubkeyhash",
+        .p2sh     => "scripthash",
+        .p2wpkh   => "witness_v0_keyhash",
+        .p2wsh    => "witness_v0_scripthash",
+        .p2tr     => "witness_v1_taproot",
+        .anchor   => "anchor",
+        .p2pk     => "pubkey",
+        .multisig => "multisig",
+        .null_data=> "nulldata",
+        .nonstandard => "nonstandard",
+    };
+    try writer.writeAll("{\"asm\":\"");
+    try writeScriptAsmCore(writer, script_bytes);
+    try writer.writeAll("\",\"hex\":\"");
+    for (script_bytes) |byte| try writer.print("{x:0>2}", .{byte});
+    try writer.print("\",\"type\":\"{s}\"}}", .{type_str});
+}
+
+/// W53 — emit a BIP-32 derivation path as `m/N/M/...` with `h` suffix for
+/// hardened steps (bit 31 set). Mirrors `WriteHDKeypath(path)` (util/bip32.cpp).
+fn writeBip32Path(writer: anytype, path: []const u32) !void {
+    try writer.writeByte('m');
+    for (path) |step| {
+        const idx = step & 0x7FFF_FFFF;
+        const hardened = (step >> 31) != 0;
+        try writer.print("/{d}", .{idx});
+        if (hardened) try writer.writeByte('h');
+    }
+}
+
+/// W53 — emit a full TxToUniv-style JSON object for a Transaction, mirroring
+/// Bitcoin Core's `TxToUniv(*tx, uint256(), entry, include_hex=false)` in
+/// the decodepsbt `non_witness_utxo` path (rawtransaction.cpp:1142).
+///
+/// The shape is `{txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}`.
+/// No `hex` field (include_hex=false). Non-coinbase vin uses
+/// `ScriptToAsmStr(scriptSig, true)` (sighash decode on).
+fn writeTxToUnivForPsbt(
+    self: *RpcServer,
+    writer: anytype,
+    tx: *const types.Transaction,
+) !void {
+    const txid = crypto.computeTxidStreaming(tx);
+    const hash = crypto.computeWtxidStreaming(tx);
+
+    var tx_serialize_writer = serialize.Writer.init(self.allocator);
+    defer tx_serialize_writer.deinit();
+    try serialize.writeTransaction(&tx_serialize_writer, tx);
+    const tx_bytes_len = tx_serialize_writer.getWritten().len;
+
+    const tx_weight = try mempool_mod.computeTxWeight(tx, self.allocator);
+    const tx_vsize = (tx_weight + 3) / 4;
+
+    try writer.writeAll("{\"txid\":\"");
+    try writeHashHex(writer, &txid);
+    try writer.writeAll("\",\"hash\":\"");
+    try writeHashHex(writer, &hash);
+    try writer.print("\",\"version\":{d},\"size\":{d},\"vsize\":{d},\"weight\":{d},\"locktime\":{d},", .{
+        tx.version,
+        tx_bytes_len,
+        tx_vsize,
+        tx_weight,
+        tx.lock_time,
+    });
+
+    // vin
+    try writer.writeAll("\"vin\":[");
+    const is_coinbase = tx.isCoinbase();
+    for (tx.inputs, 0..) |inp, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        if (is_coinbase) {
+            try writer.writeAll("{\"coinbase\":\"");
+            for (inp.script_sig) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.print("\",\"sequence\":{d}}}", .{inp.sequence});
+        } else {
+            try writer.writeAll("{\"txid\":\"");
+            try writeHashHex(writer, &inp.previous_output.hash);
+            try writer.print("\",\"vout\":{d},\"scriptSig\":{{\"asm\":\"", .{inp.previous_output.index});
+            try writeScriptAsmCoreSigDecode(writer, inp.script_sig);
+            try writer.writeAll("\",\"hex\":\"");
+            for (inp.script_sig) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeAll("\"}");
+            if (inp.witness.len > 0) {
+                try writer.writeAll(",\"txinwitness\":[");
+                for (inp.witness, 0..) |wit, w| {
+                    if (w > 0) try writer.writeByte(',');
+                    try writer.writeByte('"');
+                    for (wit) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeByte('"');
+                }
+                try writer.writeByte(']');
+            }
+            try writer.print(",\"sequence\":{d}}}", .{inp.sequence});
+        }
+    }
+    try writer.writeAll("],");
+
+    // vout
+    const network = networkFromMagic(self.network_params.magic);
+    const is_regtest = isRegtestMagic(self.network_params.magic);
+    try writer.writeAll("\"vout\":[");
+    for (tx.outputs, 0..) |out, oi| {
+        if (oi > 0) try writer.writeByte(',');
+        try writer.print("{{\"value\":{d:.8},\"n\":{d},\"scriptPubKey\":", .{
+            @as(f64, @floatFromInt(out.value)) / 100_000_000.0,
+            oi,
+        });
+        try writeScriptPubKeyUniv(self.allocator, writer, out.script_pubkey, network, is_regtest);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
 }
 
 /// Try to extract a Bitcoin Core-compatible bech32/base58 address from a
