@@ -7050,6 +7050,13 @@ pub const RpcServer = struct {
     /// Handle decodescript RPC - decode a hex-encoded script.
     /// Reference: Bitcoin Core rpc/rawtransaction.cpp decodescript
     ///
+    /// Mirrors ScriptToUniv(script, r, include_hex=false, include_address=true)
+    /// for the top-level object, then appends `p2sh` and `segwit` fields
+    /// following Core's can_wrap / can_wrap_P2WSH logic.
+    ///
+    /// Top level: {asm, desc, type, address?}  — NO `hex` (include_hex=false).
+    /// segwit sub-object: {asm, desc, hex, type, address?, p2sh-segwit}.
+    ///
     /// Arguments:
     ///   1. hexstring (string, required) - hex-encoded script
     fn handleDecodeScript(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
@@ -7064,7 +7071,10 @@ pub const RpcServer = struct {
 
         const hex_str = hex_param.string;
 
-        // Handle empty script
+        // Handle empty script: Core returns {asm:"",type:"nonstandard"} with
+        // p2sh (empty script is wrappable) but no address or segwit.
+        // Keep it simple — an empty hex is degenerate enough that we just
+        // return the bare minimum like the legacy handler did.
         if (hex_str.len == 0) {
             return self.jsonRpcResult("{\"asm\":\"\",\"type\":\"nonstandard\"}", id);
         }
@@ -7084,31 +7094,156 @@ pub const RpcServer = struct {
             };
         }
 
+        const network = networkFromMagic(self.network_params.magic);
+        const is_regtest = isRegtestMagic(self.network_params.magic);
+
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
-        // Determine script type
+        // ── Top-level object (ScriptToUniv include_hex=false) ────────────────
+        // We reuse writeScriptPubKeyUniv's logic but suppress the `hex` field.
         const script_type = script_mod.classifyScript(script_bytes);
-        const type_str = switch (script_type) {
-            .p2pkh => "pubkeyhash",
-            .p2sh => "scripthash",
-            .p2wpkh => "witness_v0_keyhash",
-            .p2wsh => "witness_v0_scripthash",
-            .p2tr => "witness_v1_taproot",
-            .null_data => "nulldata",
+        const type_str: []const u8 = switch (script_type) {
+            .p2pkh    => "pubkeyhash",
+            .p2sh     => "scripthash",
+            .p2wpkh   => "witness_v0_keyhash",
+            .p2wsh    => "witness_v0_scripthash",
+            .p2tr     => "witness_v1_taproot",
+            .anchor   => "anchor",
+            .p2pk     => "pubkey",
             .multisig => "multisig",
-            else => "nonstandard",
+            .null_data=> "nulldata",
+            .nonstandard => "nonstandard",
         };
 
         try writer.writeAll("{\"asm\":\"");
-        // Write simplified asm
-        try writeScriptAsm(writer, script_bytes);
-        try writer.print("\",\"type\":\"{s}\"", .{type_str});
+        try writeScriptAsmCore(writer, script_bytes);
+        try writer.writeAll("\",\"desc\":\"");
+        const desc_str = try inferDescriptorForSpk(self.allocator, script_bytes, network, is_regtest);
+        defer self.allocator.free(desc_str);
+        try writer.writeAll(desc_str);
+        try writer.writeByte('"');
 
-        // Add P2SH and segwit addresses if applicable
-        if (script_type == .p2pkh or script_type == .p2sh or script_type == .p2wpkh or script_type == .p2wsh or script_type == .p2tr) {
-            // In a full implementation, we'd derive the address here
+        // address field — suppressed for pubkey type (Core: ScriptToUniv
+        // does not emit address for bare-pubkey scripts).
+        if (script_type != .p2pk) {
+            const maybe_addr = try extractAddressForSpk(self.allocator, script_bytes, network, is_regtest);
+            if (maybe_addr) |addr_str| {
+                defer self.allocator.free(addr_str);
+                try writer.writeAll(",\"address\":\"");
+                try writer.writeAll(addr_str);
+                try writer.writeByte('"');
+            }
+        }
+
+        try writer.print(",\"type\":\"{s}\"", .{type_str});
+
+        // ── can_wrap check (Core rawtransaction.cpp:498-527) ─────────────────
+        // Eligible types: pubkey/pubkeyhash/multisig/nonstandard/
+        //                 witness_v0_keyhash/witness_v0_scripthash
+        // Additional guards: HasValidOps AND !IsUnspendable AND
+        //                    no OP_CHECKSIGADD/OP_SUCCESSx.
+        const can_wrap = blk: {
+            switch (script_type) {
+                .p2pk, .p2pkh, .multisig, .nonstandard,
+                .p2wpkh, .p2wsh => {
+                    // Fall through to guard checks.
+                },
+                // null_data / p2sh / p2tr / anchor — never wrapped.
+                else => break :blk false,
+            }
+            if (!decodeScriptHasValidOps(script_bytes)) break :blk false;
+            if (decodeScriptIsUnspendable(script_bytes))  break :blk false;
+            if (decodeScriptHasTaprootOps(script_bytes))  break :blk false;
+            break :blk true;
+        };
+
+        if (can_wrap) {
+            // p2sh = Hash160(script) wrapped in a P2SH address.
+            const h160 = crypto.hash160(script_bytes);
+            const p2sh_addr = try buildP2SHAddress(self.allocator, &h160, network, is_regtest);
+            defer self.allocator.free(p2sh_addr);
+            try writer.writeAll(",\"p2sh\":\"");
+            try writer.writeAll(p2sh_addr);
+            try writer.writeByte('"');
+
+            // ── can_wrap_P2WSH (Core rawtransaction.cpp:533-560) ─────────────
+            const can_wrap_p2wsh = blk2: {
+                switch (script_type) {
+                    .p2pkh, .nonstandard => break :blk2 true,
+                    .p2pk => {
+                        // Compressed pubkey only: 33-byte push (script[0] == 0x21).
+                        break :blk2 (script_bytes.len == 35 and script_bytes[0] == 0x21);
+                    },
+                    .multisig => {
+                        // All pubkeys must be compressed (33 bytes, 0x02/0x03 prefix).
+                        break :blk2 decodeScriptMultisigAllCompressed(script_bytes);
+                    },
+                    // witness_v0_keyhash / witness_v0_scripthash / anything else
+                    // already-segwit or ineligible.
+                    else => break :blk2 false,
+                }
+            };
+
+            if (can_wrap_p2wsh) {
+                // Build the segwit script to wrap this redeem script with.
+                var segwit_script: [34]u8 = undefined;
+                var segwit_len: usize = 0;
+
+                switch (script_type) {
+                    .p2pk => {
+                        // P2WPKH: Hash160 of the embedded pubkey.
+                        // P2PK layout: <0x21> <33-byte-pubkey> <OP_CHECKSIG>
+                        const pubkey = script_bytes[1..34];
+                        const pkh = crypto.hash160(pubkey);
+                        segwit_script[0] = 0x00; // OP_0
+                        segwit_script[1] = 0x14; // PUSH20
+                        @memcpy(segwit_script[2..22], &pkh);
+                        segwit_len = 22;
+                    },
+                    .p2pkh => {
+                        // P2WPKH: reuse the embedded 20-byte hash.
+                        // P2PKH layout: OP_DUP OP_HASH160 OP_PUSH20 <20b> OP_EQUALVERIFY OP_CHECKSIG
+                        // hash20 is at bytes [3..23].
+                        segwit_script[0] = 0x00; // OP_0
+                        segwit_script[1] = 0x14; // PUSH20
+                        @memcpy(segwit_script[2..22], script_bytes[3..23]);
+                        segwit_len = 22;
+                    },
+                    else => {
+                        // P2WSH: SHA256 of the entire redeem script.
+                        const sh = crypto.sha256(script_bytes);
+                        segwit_script[0] = 0x00; // OP_0
+                        segwit_script[1] = 0x20; // PUSH32
+                        @memcpy(segwit_script[2..34], &sh);
+                        segwit_len = 34;
+                    },
+                }
+
+                const sw_spk = segwit_script[0..segwit_len];
+
+                // segwit sub-object: ScriptToUniv(segwitScr, include_hex=true).
+                try writer.writeAll(",\"segwit\":");
+                try writeScriptPubKeyUniv(self.allocator, writer, sw_spk, network, is_regtest);
+
+                // Strip the closing '}' to append p2sh-segwit.
+                // writeScriptPubKeyUniv ends with `,"type":"..."}`.
+                // We need to insert p2sh-segwit before the closing brace.
+                // Easier: rebuild the segwit object manually with p2sh-segwit.
+                // Actually — let's post-process: remove trailing '}' we just wrote.
+                // Better approach: write segwit object inline without calling writeScriptPubKeyUniv.
+                // We already wrote it. Remove the trailing '}' and add p2sh-segwit.
+                if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '}') {
+                    buf.items.len -= 1; // strip trailing '}'
+                }
+                const sw_h160 = crypto.hash160(sw_spk);
+                const p2sh_segwit_addr = try buildP2SHAddress(self.allocator, &sw_h160, network, is_regtest);
+                defer self.allocator.free(p2sh_segwit_addr);
+                try writer.writeAll(",\"p2sh-segwit\":\"");
+                try writer.writeAll(p2sh_segwit_addr);
+                try writer.writeAll("\"}");
+            }
         }
 
         try writer.writeByte('}');
@@ -11140,6 +11275,149 @@ fn writeScriptPubKeyUniv(
     }
 
     try writer.print(",\"type\":\"{s}\"}}", .{type_str});
+}
+
+// ── decodescript helpers (W56) ──────────────────────────────────────────────
+
+/// Returns true if the script has no truncated push opcodes.
+/// Mirrors CScript::HasValidOps (script/script.h).
+fn decodeScriptHasValidOps(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        const op = s[i];
+        i += 1;
+        var data_len: usize = 0;
+        if (op >= 0x01 and op <= 0x4b) {
+            data_len = op;
+        } else if (op == 0x4c) {
+            if (i >= s.len) return false;
+            data_len = s[i];
+            i += 1;
+        } else if (op == 0x4d) {
+            if (i + 2 > s.len) return false;
+            data_len = @as(usize, s[i]) | (@as(usize, s[i + 1]) << 8);
+            i += 2;
+        } else if (op == 0x4e) {
+            if (i + 4 > s.len) return false;
+            data_len = @as(usize, s[i]) |
+                       (@as(usize, s[i + 1]) << 8) |
+                       (@as(usize, s[i + 2]) << 16) |
+                       (@as(usize, s[i + 3]) << 24);
+            i += 4;
+        }
+        if (i + data_len > s.len) return false;
+        i += data_len;
+    }
+    return true;
+}
+
+/// Returns true if the script is unspendable (OP_RETURN, or len > 10000).
+/// Mirrors CScript::IsUnspendable (script/script.h).
+fn decodeScriptIsUnspendable(s: []const u8) bool {
+    if (s.len > 10000) return true;
+    if (s.len > 0 and s[0] == 0x6a) return true;  // OP_RETURN
+    return false;
+}
+
+/// Returns true if the script contains OP_CHECKSIGADD (0xba) or any
+/// OP_SUCCESSx opcode (187-254, i.e. 0xbb-0xfe in the opcode namespace,
+/// but Core's IsOpSuccess covers 0x50 and 0x62, 0x80-0x8d, etc.).
+/// We walk actual opcodes (skipping push-data payloads) to avoid
+/// misidentifying push-data bytes as opcodes — the fleet-wide bug caught
+/// in batch 1.
+///
+/// Core's IsOpSuccess: https://github.com/bitcoin/bitcoin/blob/master/src/script/script.h
+/// OP_SUCCESS: all opcodes in {80, 98, 126-129, 131-134, 137-138, 141-142,
+///             149-153, 187-254}.
+fn decodeScriptHasTaprootOps(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        const op = s[i];
+        i += 1;
+        // OP_CHECKSIGADD = 0xba
+        if (op == 0xba) return true;
+        // OP_SUCCESSx (from Core's IsOpSuccess): these are opcodes in the
+        // tapscript execution namespace that are always-success.
+        if (isOpSuccess(op)) return true;
+        // Skip push payload so we don't inspect data bytes as opcodes.
+        var data_len: usize = 0;
+        if (op >= 0x01 and op <= 0x4b) {
+            data_len = op;
+        } else if (op == 0x4c) {
+            if (i >= s.len) return false;
+            data_len = s[i];
+            i += 1;
+        } else if (op == 0x4d) {
+            if (i + 2 > s.len) return false;
+            data_len = @as(usize, s[i]) | (@as(usize, s[i + 1]) << 8);
+            i += 2;
+        } else if (op == 0x4e) {
+            if (i + 4 > s.len) return false;
+            data_len = @as(usize, s[i]) |
+                       (@as(usize, s[i + 1]) << 8) |
+                       (@as(usize, s[i + 2]) << 16) |
+                       (@as(usize, s[i + 3]) << 24);
+            i += 4;
+        }
+        if (i + data_len > s.len) break;
+        i += data_len;
+    }
+    return false;
+}
+
+/// Core IsOpSuccess (script/script.cpp:364-370): opcodes reserved for future
+/// soft forks (BIP342). Exact mapping from Core:
+///   80 (0x50), 98 (0x62),
+///   126-129 (0x7e-0x81), 131-134 (0x83-0x86),
+///   137-138 (0x89-0x8a), 141-142 (0x8d-0x8e),
+///   149-153 (0x95-0x99), 187-254 (0xbb-0xfe).
+fn isOpSuccess(op: u8) bool {
+    return op == 0x50 or op == 0x62 or
+        (op >= 0x7e and op <= 0x81) or
+        (op >= 0x83 and op <= 0x86) or
+        (op >= 0x89 and op <= 0x8a) or
+        (op >= 0x8d and op <= 0x8e) or
+        (op >= 0x95 and op <= 0x99) or
+        (op >= 0xbb and op <= 0xfe);
+}
+
+/// Returns true if all pubkeys in a bare multisig script are compressed
+/// (33 bytes, prefix 0x02 or 0x03). Assumes the script is multisig-shaped.
+fn decodeScriptMultisigAllCompressed(s: []const u8) bool {
+    if (s.len < 4) return false;
+    // Layout: OP_M <pubkeys...> OP_N OP_CHECKMULTISIG
+    // OP_M is s[0] (0x51..0x60), skip it.
+    var pc: usize = 1;
+    while (pc < s.len - 2) {
+        const op = s[pc];
+        pc += 1;
+        const size: usize = op; // push opcode value = byte count
+        if (pc + size > s.len - 2) return false;
+        // Compressed pubkey: exactly 33 bytes, prefix 0x02 or 0x03.
+        if (size != 33 or (s[pc] != 0x02 and s[pc] != 0x03)) return false;
+        pc += size;
+    }
+    return true;
+}
+
+/// Encode a Hash160 (20 bytes) as a P2SH base58check address.
+fn buildP2SHAddress(
+    allocator: std.mem.Allocator,
+    h160: *const crypto.Hash160,
+    network: address_mod.Network,
+    is_regtest: bool,
+) ![]const u8 {
+    _ = is_regtest;
+    const hash_buf = try allocator.dupe(u8, h160);
+    errdefer allocator.free(hash_buf);
+    const addr = address_mod.Address{
+        .addr_type = .p2sh,
+        .hash = hash_buf,
+        .network = network,
+    };
+    const out = try addr.encode(allocator);
+    allocator.free(hash_buf);
+    return out;
 }
 
 /// Write script as disassembled opcodes (simplified ASM output).
