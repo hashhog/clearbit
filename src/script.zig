@@ -2182,9 +2182,44 @@ pub fn classifyScript(script: []const u8) ScriptType {
         return .p2pk;
     }
 
-    // OP_RETURN (null data)
+    // OP_RETURN (null data) — mirrors Core's Solver NULL_DATA gate:
+    // the remainder after OP_RETURN must be push-only with no truncated pushes.
+    // A script with a truncated push data (e.g. `09 e6 9a 7e` where only 3 bytes
+    // follow a "push 9" opcode) is classified NONSTANDARD, not NULL_DATA.
     if (script.len > 0 and script[0] == 0x6a) {
-        return .null_data;
+        // Walk the remainder checking all pushes are well-formed.
+        var i: usize = 1;
+        var valid = true;
+        while (i < script.len) {
+            const op = script[i];
+            i += 1;
+            // Only push opcodes (0x00..0x4e) are allowed.
+            if (op > 0x4e) { valid = false; break; }
+            var data_len: usize = 0;
+            if (op < 0x4c) {
+                data_len = op;
+            } else if (op == 0x4c) {
+                if (i >= script.len) { valid = false; break; }
+                data_len = script[i];
+                i += 1;
+            } else if (op == 0x4d) {
+                if (i + 2 > script.len) { valid = false; break; }
+                data_len = @as(usize, script[i]) | (@as(usize, script[i + 1]) << 8);
+                i += 2;
+            } else { // 0x4e
+                if (i + 4 > script.len) { valid = false; break; }
+                data_len = @as(usize, script[i]) |
+                           (@as(usize, script[i + 1]) << 8) |
+                           (@as(usize, script[i + 2]) << 16) |
+                           (@as(usize, script[i + 3]) << 24);
+                i += 4;
+            }
+            if (i + data_len > script.len) { valid = false; break; }
+            i += data_len;
+        }
+        if (valid) return .null_data;
+        // Truncated or non-push bytes after OP_RETURN → nonstandard.
+        return .nonstandard;
     }
 
     // Multisig: OP_M <keys> OP_N OP_CHECKMULTISIG
