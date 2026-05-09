@@ -191,6 +191,60 @@ pub const KeyOriginInfo = struct {
 pub const UnknownEntry = struct { key: []const u8, value: []const u8 };
 
 // ============================================================================
+// BIP-371 Taproot types
+// ============================================================================
+
+/// BIP-371 PSBT_IN_TAP_SCRIPT_SIG entry
+/// key: x-only pubkey (32 bytes) || leaf_hash (32 bytes)
+/// value: signature
+pub const TapScriptSig = struct {
+    pubkey: [32]u8,
+    leaf_hash: [32]u8,
+    sig: []const u8,
+};
+
+/// BIP-371 PSBT_IN_TAP_LEAF_SCRIPT entry
+/// key: control_block bytes
+/// value: script || leaf_ver
+pub const TapLeafScript = struct {
+    control_block: []const u8,
+    script: []const u8,
+    leaf_ver: u8,
+};
+
+/// BIP-371 tap-specific BIP-32 derivation
+/// key: x-only pubkey (32 bytes)
+/// value: compact_size(num_leaf_hashes) || leaf_hash[]... || fingerprint(4) || path(4*n)
+pub const TapKeyOriginInfo = struct {
+    leaf_hashes: []const [32]u8,
+    fingerprint: [4]u8,
+    path: []u32,
+
+    pub fn deinit(self: *TapKeyOriginInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.leaf_hashes);
+        allocator.free(self.path);
+    }
+
+    pub fn clone(self: TapKeyOriginInfo, allocator: std.mem.Allocator) !TapKeyOriginInfo {
+        return TapKeyOriginInfo{
+            .leaf_hashes = try allocator.dupe([32]u8, self.leaf_hashes),
+            .fingerprint = self.fingerprint,
+            .path = if (self.path.len > 0) try allocator.dupe(u32, self.path) else &[_]u32{},
+        };
+    }
+};
+
+/// BIP-370/371 PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS entry (type 0x08)
+/// key: aggregate_pubkey (33 bytes compressed)
+/// value: participant_pubkeys (33 bytes each, concatenated)
+pub const MuSig2ParticipantEntry = struct {
+    aggregate_pubkey: [33]u8,
+    participant_pubkeys: []const [33]u8,
+};
+
+pub const PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x08;
+
+// ============================================================================
 // PSBT Input
 // ============================================================================
 
@@ -221,10 +275,14 @@ pub const PsbtInput = struct {
     hash160_preimages: std.AutoHashMap([20]u8, []const u8),
     hash256_preimages: std.AutoHashMap([32]u8, []const u8),
 
-    // Taproot data
+    // Taproot data (BIP-371)
     tap_key_sig: ?[]const u8 = null,
     tap_internal_key: ?[32]u8 = null,
     tap_merkle_root: ?[32]u8 = null,
+    // BIP-371 extended taproot fields
+    tap_script_sigs: std.ArrayList(TapScriptSig),
+    tap_leaf_scripts: std.ArrayList(TapLeafScript),
+    tap_bip32_derivation: std.AutoHashMap([32]u8, TapKeyOriginInfo),
 
     // Unknown key-value pairs (for forward compatibility)
     unknown: std.AutoHashMap(u64, UnknownEntry),
@@ -240,6 +298,9 @@ pub const PsbtInput = struct {
             .hash160_preimages = std.AutoHashMap([20]u8, []const u8).init(allocator),
             .hash256_preimages = std.AutoHashMap([32]u8, []const u8).init(allocator),
             .unknown = std.AutoHashMap(u64, UnknownEntry).init(allocator),
+            .tap_script_sigs = std.ArrayList(TapScriptSig).init(allocator),
+            .tap_leaf_scripts = std.ArrayList(TapLeafScript).init(allocator),
+            .tap_bip32_derivation = std.AutoHashMap([32]u8, TapKeyOriginInfo).init(allocator),
             .allocator = allocator,
         };
     }
@@ -304,6 +365,25 @@ pub const PsbtInput = struct {
             self.allocator.free(w);
         }
         if (self.tap_key_sig) |s| self.allocator.free(s);
+
+        // Free BIP-371 taproot extended fields
+        for (self.tap_script_sigs.items) |*entry| {
+            self.allocator.free(entry.sig);
+        }
+        self.tap_script_sigs.deinit();
+
+        for (self.tap_leaf_scripts.items) |*entry| {
+            self.allocator.free(entry.control_block);
+            self.allocator.free(entry.script);
+        }
+        self.tap_leaf_scripts.deinit();
+
+        var tap_bip32_iter = self.tap_bip32_derivation.iterator();
+        while (tap_bip32_iter.next()) |entry| {
+            var info = entry.value_ptr.*;
+            info.deinit(self.allocator);
+        }
+        self.tap_bip32_derivation.deinit();
 
         // Free non_witness_utxo transaction data
         if (self.non_witness_utxo) |*tx| {
@@ -379,9 +459,12 @@ pub const PsbtOutput = struct {
     // BIP32 derivations
     bip32_derivation: std.AutoHashMap([33]u8, KeyOriginInfo),
 
-    // Taproot data
+    // Taproot data (BIP-371)
     tap_internal_key: ?[32]u8 = null,
     tap_tree: ?[]const u8 = null,
+    // BIP-371 extended output taproot fields
+    tap_bip32_derivation: std.AutoHashMap([32]u8, TapKeyOriginInfo),
+    musig2_participants: std.ArrayList(MuSig2ParticipantEntry),
 
     // Unknown key-value pairs
     unknown: std.AutoHashMap(u64, UnknownEntry),
@@ -391,6 +474,8 @@ pub const PsbtOutput = struct {
     pub fn init(allocator: std.mem.Allocator) PsbtOutput {
         return PsbtOutput{
             .bip32_derivation = std.AutoHashMap([33]u8, KeyOriginInfo).init(allocator),
+            .tap_bip32_derivation = std.AutoHashMap([32]u8, TapKeyOriginInfo).init(allocator),
+            .musig2_participants = std.ArrayList(MuSig2ParticipantEntry).init(allocator),
             .unknown = std.AutoHashMap(u64, UnknownEntry).init(allocator),
             .allocator = allocator,
         };
@@ -417,6 +502,19 @@ pub const PsbtOutput = struct {
         if (self.redeem_script) |s| self.allocator.free(s);
         if (self.witness_script) |s| self.allocator.free(s);
         if (self.tap_tree) |t| self.allocator.free(t);
+
+        // Free BIP-371 extended output fields
+        var tap_bip32_iter = self.tap_bip32_derivation.iterator();
+        while (tap_bip32_iter.next()) |entry| {
+            var info = entry.value_ptr.*;
+            info.deinit(self.allocator);
+        }
+        self.tap_bip32_derivation.deinit();
+
+        for (self.musig2_participants.items) |*entry| {
+            self.allocator.free(entry.participant_pubkeys);
+        }
+        self.musig2_participants.deinit();
     }
 
     /// Merge another output into this one
@@ -1563,13 +1661,75 @@ fn parseInputMap(allocator: std.mem.Allocator, reader: *serialize_mod.Reader, in
             PSBT_IN_TAP_KEY_SIG => {
                 input.tap_key_sig = try allocator.dupe(u8, value);
             },
+            PSBT_IN_TAP_SCRIPT_SIG => {
+                // key_data = x-only-pubkey(32) || leaf_hash(32); value = sig
+                if (key_data.len != 64) return PsbtError.InvalidKeyLength;
+                var pubkey: [32]u8 = undefined;
+                var leaf_hash: [32]u8 = undefined;
+                @memcpy(&pubkey, key_data[0..32]);
+                @memcpy(&leaf_hash, key_data[32..64]);
+                try input.tap_script_sigs.append(TapScriptSig{
+                    .pubkey = pubkey,
+                    .leaf_hash = leaf_hash,
+                    .sig = try allocator.dupe(u8, value),
+                });
+            },
+            PSBT_IN_TAP_LEAF_SCRIPT => {
+                // key_data = control_block; value = script || leaf_ver(1)
+                if (value.len < 1) return PsbtError.InvalidValueLength;
+                const script_len = value.len - 1;
+                const leaf_ver = value[value.len - 1];
+                try input.tap_leaf_scripts.append(TapLeafScript{
+                    .control_block = try allocator.dupe(u8, key_data),
+                    .script = try allocator.dupe(u8, value[0..script_len]),
+                    .leaf_ver = leaf_ver,
+                });
+            },
+            PSBT_IN_TAP_BIP32_DERIVATION => {
+                // key_data = x-only pubkey (32 bytes)
+                // value = compact_size(n_leaf_hashes) || [32]u8 * n || fingerprint(4) || path(4*m)
+                if (key_data.len != 32) return PsbtError.InvalidKeyLength;
+                var xonly: [32]u8 = undefined;
+                @memcpy(&xonly, key_data[0..32]);
+                var val_reader = serialize_mod.Reader{ .data = value };
+                const n_leaf_hashes = try val_reader.readCompactSize();
+                const leaf_hashes = try allocator.alloc([32]u8, @intCast(n_leaf_hashes));
+                errdefer allocator.free(leaf_hashes);
+                for (0..@intCast(n_leaf_hashes)) |i| {
+                    const lh_bytes = try val_reader.readBytes(32);
+                    @memcpy(&leaf_hashes[i], lh_bytes[0..32]);
+                }
+                // remaining bytes: fingerprint(4) + path(4*m)
+                const remaining = value[val_reader.pos..];
+                if (remaining.len < 4 or (remaining.len - 4) % 4 != 0) {
+                    allocator.free(leaf_hashes);
+                    return PsbtError.InvalidValueLength;
+                }
+                var fingerprint: [4]u8 = undefined;
+                @memcpy(&fingerprint, remaining[0..4]);
+                const path_len = (remaining.len - 4) / 4;
+                const path = try allocator.alloc(u32, path_len);
+                errdefer allocator.free(path);
+                for (0..path_len) |i| {
+                    path[i] = std.mem.readInt(u32, remaining[4 + i * 4 ..][0..4], .little);
+                }
+                try input.tap_bip32_derivation.put(xonly, TapKeyOriginInfo{
+                    .leaf_hashes = leaf_hashes,
+                    .fingerprint = fingerprint,
+                    .path = path,
+                });
+            },
             PSBT_IN_TAP_INTERNAL_KEY => {
                 if (value.len != 32) return PsbtError.InvalidValueLength;
-                @memcpy(&input.tap_internal_key.?, value[0..32]);
+                var key_bytes_arr: [32]u8 = undefined;
+                @memcpy(&key_bytes_arr, value[0..32]);
+                input.tap_internal_key = key_bytes_arr;
             },
             PSBT_IN_TAP_MERKLE_ROOT => {
                 if (value.len != 32) return PsbtError.InvalidValueLength;
-                @memcpy(&input.tap_merkle_root.?, value[0..32]);
+                var key_bytes_arr: [32]u8 = undefined;
+                @memcpy(&key_bytes_arr, value[0..32]);
+                input.tap_merkle_root = key_bytes_arr;
             },
             else => {
                 // Store unknown entries
@@ -1625,10 +1785,62 @@ fn parseOutputMap(allocator: std.mem.Allocator, reader: *serialize_mod.Reader, o
             },
             PSBT_OUT_TAP_INTERNAL_KEY => {
                 if (value.len != 32) return PsbtError.InvalidValueLength;
-                @memcpy(&output.tap_internal_key.?, value[0..32]);
+                var key_bytes_arr: [32]u8 = undefined;
+                @memcpy(&key_bytes_arr, value[0..32]);
+                output.tap_internal_key = key_bytes_arr;
             },
             PSBT_OUT_TAP_TREE => {
                 output.tap_tree = try allocator.dupe(u8, value);
+            },
+            PSBT_OUT_TAP_BIP32_DERIVATION => {
+                // same wire format as PSBT_IN_TAP_BIP32_DERIVATION
+                if (key_data.len != 32) return PsbtError.InvalidKeyLength;
+                var xonly: [32]u8 = undefined;
+                @memcpy(&xonly, key_data[0..32]);
+                var val_reader = serialize_mod.Reader{ .data = value };
+                const n_leaf_hashes = try val_reader.readCompactSize();
+                const leaf_hashes = try allocator.alloc([32]u8, @intCast(n_leaf_hashes));
+                errdefer allocator.free(leaf_hashes);
+                for (0..@intCast(n_leaf_hashes)) |i| {
+                    const lh_bytes = try val_reader.readBytes(32);
+                    @memcpy(&leaf_hashes[i], lh_bytes[0..32]);
+                }
+                const remaining = value[val_reader.pos..];
+                if (remaining.len < 4 or (remaining.len - 4) % 4 != 0) {
+                    allocator.free(leaf_hashes);
+                    return PsbtError.InvalidValueLength;
+                }
+                var fingerprint: [4]u8 = undefined;
+                @memcpy(&fingerprint, remaining[0..4]);
+                const path_len = (remaining.len - 4) / 4;
+                const path = try allocator.alloc(u32, path_len);
+                errdefer allocator.free(path);
+                for (0..path_len) |i| {
+                    path[i] = std.mem.readInt(u32, remaining[4 + i * 4 ..][0..4], .little);
+                }
+                try output.tap_bip32_derivation.put(xonly, TapKeyOriginInfo{
+                    .leaf_hashes = leaf_hashes,
+                    .fingerprint = fingerprint,
+                    .path = path,
+                });
+            },
+            PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS => {
+                // key_data = aggregate_pubkey (33 bytes compressed)
+                // value = participant_pubkeys (33 bytes each, concatenated)
+                if (key_data.len != 33) return PsbtError.InvalidKeyLength;
+                if (value.len == 0 or value.len % 33 != 0) return PsbtError.InvalidValueLength;
+                var agg_pubkey: [33]u8 = undefined;
+                @memcpy(&agg_pubkey, key_data[0..33]);
+                const n_participants = value.len / 33;
+                const participants = try allocator.alloc([33]u8, n_participants);
+                errdefer allocator.free(participants);
+                for (0..n_participants) |i| {
+                    @memcpy(&participants[i], value[i * 33 ..][0..33]);
+                }
+                try output.musig2_participants.append(MuSig2ParticipantEntry{
+                    .aggregate_pubkey = agg_pubkey,
+                    .participant_pubkeys = participants,
+                });
             },
             else => {
                 // Store unknown entries
@@ -1744,6 +1956,26 @@ fn clonePsbtInput(allocator: std.mem.Allocator, input: *const PsbtInput) !PsbtIn
         try result.bip32_derivation.put(entry.key_ptr.*, try entry.value_ptr.clone(allocator));
     }
 
+    // Clone BIP-371 extended input fields
+    for (input.tap_script_sigs.items) |entry| {
+        try result.tap_script_sigs.append(TapScriptSig{
+            .pubkey = entry.pubkey,
+            .leaf_hash = entry.leaf_hash,
+            .sig = try allocator.dupe(u8, entry.sig),
+        });
+    }
+    for (input.tap_leaf_scripts.items) |entry| {
+        try result.tap_leaf_scripts.append(TapLeafScript{
+            .control_block = try allocator.dupe(u8, entry.control_block),
+            .script = try allocator.dupe(u8, entry.script),
+            .leaf_ver = entry.leaf_ver,
+        });
+    }
+    var tap_bip32_iter = input.tap_bip32_derivation.iterator();
+    while (tap_bip32_iter.next()) |entry| {
+        try result.tap_bip32_derivation.put(entry.key_ptr.*, try entry.value_ptr.clone(allocator));
+    }
+
     return result;
 }
 
@@ -1761,6 +1993,18 @@ fn clonePsbtOutput(allocator: std.mem.Allocator, output: *const PsbtOutput) !Psb
     var bip32_iter = output.bip32_derivation.iterator();
     while (bip32_iter.next()) |entry| {
         try result.bip32_derivation.put(entry.key_ptr.*, try entry.value_ptr.clone(allocator));
+    }
+
+    // Clone BIP-371 extended output fields
+    var tap_bip32_iter = output.tap_bip32_derivation.iterator();
+    while (tap_bip32_iter.next()) |entry| {
+        try result.tap_bip32_derivation.put(entry.key_ptr.*, try entry.value_ptr.clone(allocator));
+    }
+    for (output.musig2_participants.items) |entry| {
+        try result.musig2_participants.append(MuSig2ParticipantEntry{
+            .aggregate_pubkey = entry.aggregate_pubkey,
+            .participant_pubkeys = try allocator.dupe([33]u8, entry.participant_pubkeys),
+        });
     }
 
     return result;
