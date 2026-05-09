@@ -7030,76 +7030,19 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
         };
 
-        // Compute txid and hash
-        const txid = crypto.computeTxid(&tx, self.allocator) catch {
-            return self.jsonRpcError(RPC_INTERNAL_ERROR, "txid computation failed", id);
-        };
-        const hash = crypto.computeWtxid(&tx, self.allocator) catch {
-            return self.jsonRpcError(RPC_INTERNAL_ERROR, "wtxid computation failed", id);
-        };
-        const weight = mempool_mod.computeTxWeight(&tx, self.allocator) catch {
-            return self.jsonRpcError(RPC_INTERNAL_ERROR, "weight computation failed", id);
-        };
-        const vsize = (weight + 3) / 4;
-
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.writeAll("{\"txid\":\"");
-        try writeHashHex(writer, &txid);
-        try writer.writeAll("\",\"hash\":\"");
-        try writeHashHex(writer, &hash);
-        try writer.print("\",\"version\":{d},\"size\":{d},\"vsize\":{d},\"weight\":{d},\"locktime\":{d},", .{
-            tx.version,
-            tx_bytes.len,
-            vsize,
-            weight,
-            tx.lock_time,
-        });
-
-        // vin array
-        try writer.writeAll("\"vin\":[");
-        for (tx.inputs, 0..) |input, i| {
-            if (i > 0) try writer.writeByte(',');
-            try writer.writeAll("{\"txid\":\"");
-            try writeHashHex(writer, &input.previous_output.hash);
-            try writer.print("\",\"vout\":{d},\"scriptSig\":{{\"hex\":\"", .{input.previous_output.index});
-            for (input.script_sig) |byte| {
-                try writer.print("{x:0>2}", .{byte});
-            }
-            try writer.print("\"}},\"sequence\":{d}", .{input.sequence});
-            if (input.witness.len > 0) {
-                try writer.writeAll(",\"txinwitness\":[");
-                for (input.witness, 0..) |wit, w| {
-                    if (w > 0) try writer.writeByte(',');
-                    try writer.writeByte('"');
-                    for (wit) |byte| {
-                        try writer.print("{x:0>2}", .{byte});
-                    }
-                    try writer.writeByte('"');
-                }
-                try writer.writeByte(']');
-            }
-            try writer.writeByte('}');
-        }
-        try writer.writeAll("],");
-
-        // vout array
-        try writer.writeAll("\"vout\":[");
-        for (tx.outputs, 0..) |output, i| {
-            if (i > 0) try writer.writeByte(',');
-            try writer.print("{{\"value\":{d:.8},\"n\":{d},\"scriptPubKey\":{{\"hex\":\"", .{
-                @as(f64, @floatFromInt(output.value)) / 100_000_000.0,
-                i,
-            });
-            for (output.script_pubkey) |byte| {
-                try writer.print("{x:0>2}", .{byte});
-            }
-            try writer.writeAll("\"}}");
-            try writer.writeByte('}');
-        }
-        try writer.writeAll("]}");
+        // Delegate to the shared writeTxToUnivForPsbt helper (W53), which
+        // produces byte-identical output to Core's TxToUniv (core_io.cpp):
+        //   - txid/hash/version/size/vsize/weight/locktime header
+        //   - vin: coinbase shape with optional txinwitness, or normal shape
+        //     with scriptSig.asm (sighash-decode), scriptSig.hex, txinwitness
+        //   - vout: Core 8-decimal value (0E-8 for zero), scriptPubKeyUniv
+        //     with asm/desc/hex/address?/type (W51 writeScriptPubKeyUniv)
+        // No top-level "hex" field (Core's include_hex=false at rawtransaction.cpp:443).
+        try writeTxToUnivForPsbt(self, writer, &tx);
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -10977,7 +10920,20 @@ fn writeTxToUnivForPsbt(
         if (is_coinbase) {
             try writer.writeAll("{\"coinbase\":\"");
             for (inp.script_sig) |byte| try writer.print("{x:0>2}", .{byte});
-            try writer.print("\",\"sequence\":{d}}}", .{inp.sequence});
+            try writer.writeAll("\"");
+            // Coinbase may carry a txinwitness (e.g. block 800000 witness commitment).
+            // Core's TxToUniv emits txinwitness before sequence for all vin entries.
+            if (inp.witness.len > 0) {
+                try writer.writeAll(",\"txinwitness\":[");
+                for (inp.witness, 0..) |wit, w| {
+                    if (w > 0) try writer.writeByte(',');
+                    try writer.writeByte('"');
+                    for (wit) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeByte('"');
+                }
+                try writer.writeByte(']');
+            }
+            try writer.print(",\"sequence\":{d}}}", .{inp.sequence});
         } else {
             try writer.writeAll("{\"txid\":\"");
             try writeHashHex(writer, &inp.previous_output.hash);
@@ -11007,10 +10963,18 @@ fn writeTxToUnivForPsbt(
     try writer.writeAll("\"vout\":[");
     for (tx.outputs, 0..) |out, oi| {
         if (oi > 0) try writer.writeByte(',');
-        try writer.print("{{\"value\":{d:.8},\"n\":{d},\"scriptPubKey\":", .{
-            @as(f64, @floatFromInt(out.value)) / 100_000_000.0,
-            oi,
-        });
+        try writer.writeAll("{\"value\":");
+        // Core uses UniValue::setNumStr which serializes zero as "0E-8" (scientific
+        // notation from the underlying decimal arithmetic), not "0.00000000".
+        // All other values are fixed 8-decimal (e.g. "6.38687680").
+        if (out.value == 0) {
+            try writer.writeAll("0E-8");
+        } else {
+            try writer.print("{d:.8}", .{
+                @as(f64, @floatFromInt(out.value)) / 100_000_000.0,
+            });
+        }
+        try writer.print(",\"n\":{d},\"scriptPubKey\":", .{oi});
         try writeScriptPubKeyUniv(self.allocator, writer, out.script_pubkey, network, is_regtest);
         try writer.writeByte('}');
     }
