@@ -793,11 +793,18 @@ pub const Psbt = struct {
         // verifier would reject it anyway (Core enforces hash160 ==
         // scriptPubKey[2..22]), but we'd silently emit a tx that loses
         // value to fees in the relay pipeline. This matches the same bug
-        // shape found across hotbuns/blockbrew/etc. The witness UTXO's
-        // scriptPubKey is the on-chain P2SH script: OP_HASH160 <20-byte
-        // hash> OP_EQUAL (23 bytes total).
-        const witness_utxo = input.witness_utxo orelse return PsbtError.MissingUtxo;
-        const spk = witness_utxo.script_pubkey;
+        // shape found across hotbuns/blockbrew/etc.
+        //
+        // W47: Legacy P2SH-multisig uses PSBT_IN_NON_WITNESS_UTXO (BIP-174
+        // forbids witness_utxo for non-segwit), so accept either source.
+        // The on-chain P2SH script is `OP_HASH160 <20-byte hash> OP_EQUAL`
+        // (23 bytes total) regardless of which UTXO field carries it.
+        const spk: []const u8 = if (input.witness_utxo) |utxo|
+            utxo.script_pubkey
+        else if (input.non_witness_utxo) |tx|
+            tx.outputs[self.tx.inputs[input_index].previous_output.index].script_pubkey
+        else
+            return PsbtError.MissingUtxo;
         if (!isP2SH(spk)) {
             // Caller routed a non-P2SH UTXO to finalizeP2SH; refuse to
             // emit anything rather than commit to garbage.
@@ -809,7 +816,10 @@ pub const Psbt = struct {
             return PsbtError.RedeemScriptCommitmentMismatch;
         }
 
-        // Check if it's P2SH-P2WPKH
+        // W47: Dispatch on inner-script shape. Three live variants:
+        //   - P2SH-P2WPKH:   redeem = `OP_0 <20>`
+        //   - P2SH-P2WSH:    redeem = `OP_0 <32>`  (multisig witnessScript)
+        //   - legacy P2SH-multisig: redeem = `OP_M ... OP_N OP_CHECKMULTISIG`
         if (isP2WPKH(redeem_script)) {
             // Need exactly one partial signature
             if (input.partial_sigs.count() != 1) return;
@@ -827,18 +837,158 @@ pub const Psbt = struct {
 
             // Build scriptSig: push(redeemScript)
             var script_sig = std.ArrayList(u8).init(self.allocator);
-            try script_sig.append(@intCast(redeem_script.len));
-            try script_sig.appendSlice(redeem_script);
+            defer script_sig.deinit();
+            try pushScriptData(&script_sig, redeem_script);
             input.final_script_sig = try script_sig.toOwnedSlice();
+
+            try clearProducerFields(input);
+        } else if (isP2WSH(redeem_script)) {
+            // P2SH-P2WSH-multisig. Outer commitment already checked above.
+            // The redeem_script must commit to sha256(witness_script).
+            try self.finalizeP2SHP2WSHMultisig(input_index);
+        } else if (parseMultisigScript(redeem_script) != null) {
+            // Legacy P2SH-multisig.
+            try self.finalizeP2SHMultisig(input_index);
         }
-        // TODO: Handle other P2SH types
+        // Unknown P2SH inner shape → leave unfinalized (matches Core: no
+        // signal, just `complete:false`).
     }
 
     fn finalizeP2WSH(self: *Psbt, input_index: usize) !void {
-        _ = self;
-        _ = input_index;
-        // TODO: Implement P2WSH finalization
-        // This requires understanding the witness script structure
+        // W47: Bare P2WSH-multisig (witness program v0, 32-byte hash).
+        // Outer commitment is `sha256(witness_script) == spk[2..34]`.
+        const input = &self.inputs[input_index];
+
+        const witness_script = input.witness_script orelse return;
+        const witness_utxo = input.witness_utxo orelse return PsbtError.MissingUtxo;
+        const spk = witness_utxo.script_pubkey;
+        if (!isP2WSH(spk)) {
+            return PsbtError.WitnessScriptCommitmentMismatch;
+        }
+        const expected_sha = spk[2..34];
+        const actual_sha = crypto.sha256(witness_script);
+        if (!std.mem.eql(u8, expected_sha, &actual_sha)) {
+            return PsbtError.WitnessScriptCommitmentMismatch;
+        }
+
+        try self.buildP2WSHMultisigWitness(input_index, witness_script);
+        // Only clear producer fields if we actually finalized — for
+        // 1-of-3 multisigs missing M sigs, buildP2WSHMultisigWitness
+        // silently leaves the input unfinalized so a later combine() can
+        // complete it.
+        if (input.final_script_witness != null) {
+            try clearProducerFields(input);
+        }
+    }
+
+    /// W47: Legacy P2SH-multisig finalizer.
+    ///
+    /// Builds the BIP-11 scriptSig:
+    ///   `OP_0 <push sig1> ... <push sigM> <push redeem_script>`
+    /// where the M signatures are picked in script-pubkey order (i.e. the
+    /// order pubkeys appear in `redeem_script`), NOT insertion order, NOT
+    /// hash-table order, and NOT pubkey-byte order. This matches Core
+    /// `script/sign.cpp::PushAll` which iterates the multisig pubkey vector
+    /// in script order and emits whichever sig matches each slot.
+    /// Reference: bitcoin-core/src/script/sign.cpp ProduceSignature.
+    fn finalizeP2SHMultisig(self: *Psbt, input_index: usize) !void {
+        var input = &self.inputs[input_index];
+        const redeem_script = input.redeem_script orelse return;
+        const ms = parseMultisigScript(redeem_script) orelse return;
+
+        // Pick sigs in script-pubkey pubkey order. M sigs needed.
+        var sigs = std.ArrayList([]const u8).init(self.allocator);
+        defer sigs.deinit();
+        try collectMultisigSigsInScriptOrder(input, ms, &sigs);
+
+        // Need at least M signatures to finalize.
+        if (sigs.items.len < ms.m) return;
+        const used = sigs.items[0..ms.m];
+
+        var script_sig = std.ArrayList(u8).init(self.allocator);
+        defer script_sig.deinit();
+        // Multisig CHECKMULTISIG dummy (BIP-147 enforces it must be empty
+        // OP_0, encoded as 0x00 single byte).
+        try script_sig.append(0x00); // OP_0 (the bug-fix dummy)
+        for (used) |s| {
+            try pushScriptData(&script_sig, s);
+        }
+        try pushScriptData(&script_sig, redeem_script);
+        input.final_script_sig = try script_sig.toOwnedSlice();
+
+        try clearProducerFields(input);
+    }
+
+    /// W47: P2SH-P2WSH-multisig finalizer.
+    ///
+    /// Outer (legacy) scriptSig is a single push of the redeem_script
+    /// (`OP_0 PUSH32 sha256(witness_script)`). Inner witness stack is the
+    /// same shape as bare P2WSH-multisig: `[OP_0_byte, sig1, ..., sigM,
+    /// witness_script]`.
+    fn finalizeP2SHP2WSHMultisig(self: *Psbt, input_index: usize) !void {
+        var input = &self.inputs[input_index];
+        const redeem_script = input.redeem_script orelse return;
+        const witness_script = input.witness_script orelse return;
+
+        // W31/W38 commitment chain: outer P2SH→redeem already checked by
+        // caller (`finalizeP2SH`). Now check inner P2WSH commitment:
+        // `redeem_script[2..34] == sha256(witness_script)`.
+        if (redeem_script.len != 34 or redeem_script[0] != 0x00 or redeem_script[1] != 0x20) {
+            return PsbtError.WitnessScriptCommitmentMismatch;
+        }
+        const expected_sha = redeem_script[2..34];
+        const actual_sha = crypto.sha256(witness_script);
+        if (!std.mem.eql(u8, expected_sha, &actual_sha)) {
+            return PsbtError.WitnessScriptCommitmentMismatch;
+        }
+
+        try self.buildP2WSHMultisigWitness(input_index, witness_script);
+        // If the witness side couldn't finalize (missing sigs), don't
+        // emit a half-finished outer scriptSig either — leave the input
+        // for combine() to complete.
+        if (input.final_script_witness == null) return;
+
+        // Outer scriptSig: `<push redeem_script>`.
+        var script_sig = std.ArrayList(u8).init(self.allocator);
+        defer script_sig.deinit();
+        try pushScriptData(&script_sig, redeem_script);
+        input.final_script_sig = try script_sig.toOwnedSlice();
+
+        try clearProducerFields(input);
+    }
+
+    /// Shared P2WSH-multisig witness-stack builder. Used by bare
+    /// P2WSH-multisig (`finalizeP2WSH`) and P2SH-P2WSH-multisig
+    /// (`finalizeP2SHP2WSHMultisig`). Sets `final_script_witness` only;
+    /// caller is responsible for any outer scriptSig and `clearProducerFields`.
+    fn buildP2WSHMultisigWitness(
+        self: *Psbt,
+        input_index: usize,
+        witness_script: []const u8,
+    ) !void {
+        var input = &self.inputs[input_index];
+        const ms = parseMultisigScript(witness_script) orelse
+            return; // unknown witness-script shape → leave unfinalized
+
+        var sigs = std.ArrayList([]const u8).init(self.allocator);
+        defer sigs.deinit();
+        try collectMultisigSigsInScriptOrder(input, ms, &sigs);
+        if (sigs.items.len < ms.m) return;
+        const used = sigs.items[0..ms.m];
+
+        // Witness stack: [OP_0_byte (0x00 dummy), sig1, ..., sigM, witness_script]
+        const stack_len = 1 + ms.m + 1;
+        var witness = try self.allocator.alloc([]const u8, stack_len);
+        errdefer self.allocator.free(witness);
+        // The dummy must be a zero-length push (OP_0 byte in scriptSig
+        // becomes empty stack element in witness — Core PushAll emits
+        // CScript() << OP_0 which the witness layer encodes as empty).
+        witness[0] = try self.allocator.dupe(u8, &[_]u8{});
+        for (used, 0..) |s, i| {
+            witness[1 + i] = try self.allocator.dupe(u8, s);
+        }
+        witness[stack_len - 1] = try self.allocator.dupe(u8, witness_script);
+        input.final_script_witness = witness;
     }
 
     /// Finalize all inputs
@@ -872,6 +1022,25 @@ pub const Psbt = struct {
             const psbt_input = &self.inputs[i];
             const orig_input = &self.tx.inputs[i];
 
+            // W47: deep-clone the witness stack. The previous shape used
+            // `allocator.dupe([]const u8, w)` which only duplicates the
+            // outer `[]const u8` slice — the inner item slices still
+            // pointed into PsbtInput's allocation. The RPC handler
+            // (`handleFinalizePsbt` in rpc.zig:5460-5466) then freed each
+            // item AND `psbt.deinit()` freed the same items again →
+            // double-free in glibc tcache. This was latent because the
+            // pre-W47 finalizer never produced a complete PSBT, so
+            // extract() was never reached. Now that multisig finalize
+            // works, the bug fires on every harness run.
+            const witness_clone: []const []const u8 = if (psbt_input.final_script_witness) |w| blk: {
+                const items = try self.allocator.alloc([]const u8, w.len);
+                errdefer self.allocator.free(items);
+                for (w, 0..) |item, k| {
+                    items[k] = try self.allocator.dupe(u8, item);
+                }
+                break :blk items;
+            } else &[_][]const u8{};
+
             input.* = types.TxIn{
                 .previous_output = orig_input.previous_output,
                 .script_sig = if (psbt_input.final_script_sig) |s|
@@ -879,10 +1048,7 @@ pub const Psbt = struct {
                 else
                     &[_]u8{},
                 .sequence = orig_input.sequence,
-                .witness = if (psbt_input.final_script_witness) |w|
-                    try self.allocator.dupe([]const u8, w)
-                else
-                    &[_][]const u8{},
+                .witness = witness_clone,
             };
         }
 
@@ -991,9 +1157,18 @@ pub const Psbt = struct {
 
         // Partial signatures (not finalized)
         if (!input.isFinalized()) {
-            var sig_iter = input.partial_sigs.iterator();
-            while (sig_iter.next()) |entry| {
-                try self.writeKeyValue(writer, PSBT_IN_PARTIAL_SIG, &entry.key_ptr.*, entry.value_ptr.*);
+            // W47: deterministic emit order. Storage is std.AutoHashMap
+            // (unordered, hash-table iteration), but Core's
+            // `std::map<CKeyID, SigPair>` (psbt.h:270) emits sorted by
+            // HASH160(pubkey). Without this the bytes of the serialized
+            // PSBT differ between processes (and between combine()
+            // permutations), tripping the cross-impl T2 round-trip
+            // assertion. Same fix-shape as blockbrew W45 e000f9b /
+            // beamchain W46-2 e8f04a0 / ouroboros W46-4 3d44478.
+            const sorted_sigs = try sortedPartialSigs(self.allocator, &input.partial_sigs);
+            defer self.allocator.free(sorted_sigs);
+            for (sorted_sigs) |entry| {
+                try self.writeKeyValue(writer, PSBT_IN_PARTIAL_SIG, &entry.pubkey, entry.sig);
             }
 
             // Sighash type
@@ -1013,16 +1188,19 @@ pub const Psbt = struct {
                 try self.writeKeyValue(writer, PSBT_IN_WITNESSSCRIPT, &[_]u8{}, script);
             }
 
-            // BIP32 derivations
-            var bip32_iter = input.bip32_derivation.iterator();
-            while (bip32_iter.next()) |entry| {
+            // BIP32 derivations.
+            // W47: sort by raw pubkey bytes. Core
+            // `std::map<CPubKey, KeyOriginInfo>` (psbt.h:269).
+            const sorted_d = try sortedBip32Derivation(self.allocator, &input.bip32_derivation);
+            defer self.allocator.free(sorted_d);
+            for (sorted_d) |entry| {
                 var value_writer = serialize_mod.Writer.init(self.allocator);
                 defer value_writer.deinit();
-                try value_writer.writeBytes(&entry.value_ptr.fingerprint);
-                for (entry.value_ptr.path) |idx| {
+                try value_writer.writeBytes(&entry.info.fingerprint);
+                for (entry.info.path) |idx| {
                     try value_writer.writeInt(u32, idx);
                 }
-                try self.writeKeyValue(writer, PSBT_IN_BIP32_DERIVATION, &entry.key_ptr.*, value_writer.getWritten());
+                try self.writeKeyValue(writer, PSBT_IN_BIP32_DERIVATION, &entry.pubkey, value_writer.getWritten());
             }
         }
 
@@ -1058,16 +1236,19 @@ pub const Psbt = struct {
             try self.writeKeyValue(writer, PSBT_OUT_WITNESSSCRIPT, &[_]u8{}, script);
         }
 
-        // BIP32 derivations
-        var bip32_iter = output.bip32_derivation.iterator();
-        while (bip32_iter.next()) |entry| {
+        // BIP32 derivations.
+        // W47: sort by raw pubkey bytes (same key as input bip32, mirrors
+        // Core's `std::map<CPubKey, KeyOriginInfo>` from psbt.h:269).
+        const sorted_d = try sortedBip32Derivation(self.allocator, &output.bip32_derivation);
+        defer self.allocator.free(sorted_d);
+        for (sorted_d) |entry| {
             var value_writer = serialize_mod.Writer.init(self.allocator);
             defer value_writer.deinit();
-            try value_writer.writeBytes(&entry.value_ptr.fingerprint);
-            for (entry.value_ptr.path) |idx| {
+            try value_writer.writeBytes(&entry.info.fingerprint);
+            for (entry.info.path) |idx| {
                 try value_writer.writeInt(u32, idx);
             }
-            try self.writeKeyValue(writer, PSBT_OUT_BIP32_DERIVATION, &entry.key_ptr.*, value_writer.getWritten());
+            try self.writeKeyValue(writer, PSBT_OUT_BIP32_DERIVATION, &entry.pubkey, value_writer.getWritten());
         }
 
         // Separator
@@ -1583,6 +1764,201 @@ fn clonePsbtOutput(allocator: std.mem.Allocator, output: *const PsbtOutput) !Psb
     }
 
     return result;
+}
+
+// ============================================================================
+// W47: Multisig parsing + script-push + producer-field cleanup helpers
+// ============================================================================
+
+/// Parsed `OP_M <pk1> ... <pkN> OP_N OP_CHECKMULTISIG` multisig template.
+const MultisigTemplate = struct {
+    m: usize,
+    n: usize,
+    /// Slices into the source script. Each is a 33-byte compressed pubkey.
+    pubkeys: [20][]const u8,
+};
+
+/// Recognise a BIP-11 multisig script and return `m`, `n`, and the pubkey
+/// slices in script-pubkey order. Only compressed (33-byte) pubkeys are
+/// accepted — the finalizer keys partial sigs by [33]u8 so uncompressed
+/// signers can't round-trip through this path anyway.
+///
+/// Returns null on any structural mismatch. Callers treat null as "unknown
+/// shape, leave unfinalized" rather than an error (matches Core's silent
+/// `complete:false` behavior for unsupported scripts).
+fn parseMultisigScript(script: []const u8) ?MultisigTemplate {
+    // Minimum: OP_1 <push33> <pk> OP_1 OP_CHECKMULTISIG  (1+34+1+1 = 37)
+    if (script.len < 37) return null;
+    if (script[script.len - 1] != 0xae) return null; // OP_CHECKMULTISIG
+    const m_op = script[0];
+    const n_op = script[script.len - 2];
+    if (m_op < 0x51 or m_op > 0x60) return null; // OP_1..OP_16
+    if (n_op < 0x51 or n_op > 0x60) return null;
+    const m: usize = @as(usize, m_op) - 0x50;
+    const n: usize = @as(usize, n_op) - 0x50;
+    if (m == 0 or m > n or n > 20) return null;
+
+    var t = MultisigTemplate{ .m = m, .n = n, .pubkeys = undefined };
+    var i: usize = 1;
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        if (i >= script.len) return null;
+        const push_op = script[i];
+        // Only direct-push compressed (33-byte) pubkeys are accepted.
+        if (push_op != 0x21) return null;
+        if (i + 1 + 33 > script.len) return null;
+        t.pubkeys[k] = script[i + 1 .. i + 1 + 33];
+        i += 1 + 33;
+    }
+    // After the pubkeys we must be exactly at OP_N OP_CHECKMULTISIG.
+    if (i != script.len - 2) return null;
+    return t;
+}
+
+/// Walk the multisig pubkey slots in script-pubkey order, append any
+/// partial signature whose pubkey matches the slot to `out`. Skips slots
+/// without a sig. Caller decides whether `out.len >= m`.
+fn collectMultisigSigsInScriptOrder(
+    input: *const PsbtInput,
+    ms: MultisigTemplate,
+    out: *std.ArrayList([]const u8),
+) !void {
+    var k: usize = 0;
+    while (k < ms.n) : (k += 1) {
+        const pk_slice = ms.pubkeys[k];
+        if (pk_slice.len != 33) continue;
+        var pk_arr: [33]u8 = undefined;
+        @memcpy(&pk_arr, pk_slice);
+        if (input.partial_sigs.get(pk_arr)) |sig| {
+            try out.append(sig);
+        }
+    }
+}
+
+/// Append a properly-encoded script push of `data` to `out`.
+///   - 0..75 bytes:   single direct-push opcode (0x01..0x4b)
+///   - 76..255:       OP_PUSHDATA1 + 1-byte length
+///   - 256..65535:    OP_PUSHDATA2 + 2-byte LE length
+/// (Larger pushes are theoretically OP_PUSHDATA4 but no PSBT producer
+/// fields ever come close — script size cap is 10000 bytes.)
+fn pushScriptData(out: *std.ArrayList(u8), data: []const u8) !void {
+    if (data.len <= 75) {
+        try out.append(@intCast(data.len));
+    } else if (data.len <= 255) {
+        try out.append(0x4c); // OP_PUSHDATA1
+        try out.append(@intCast(data.len));
+    } else if (data.len <= 65535) {
+        try out.append(0x4d); // OP_PUSHDATA2
+        var buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &buf, @intCast(data.len), .little);
+        try out.appendSlice(&buf);
+    } else {
+        try out.append(0x4e); // OP_PUSHDATA4
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, @intCast(data.len), .little);
+        try out.appendSlice(&buf);
+    }
+    try out.appendSlice(data);
+}
+
+/// W47: Deterministic emit order for partial sigs and bip32 derivations.
+///
+/// Storage uses `std.AutoHashMap` (intentional — it's the cheapest
+/// in-memory keyed lookup), but Core stores both as `std::map<...>`
+/// (`psbt.h:269` / `psbt.h:270`), and downstream tools (combine round-trip,
+/// byte-for-byte fixture compare) rely on the resulting deterministic
+/// emit order. The fix is purely on the EMIT path: we materialize the
+/// entries into a slice, sort it, and iterate the sorted slice. Storage
+/// stays unchanged (no perf regression on lookup).
+///
+/// Sort keys (matching the cross-impl fleet decision):
+///   - partial_sigs: HASH160(pubkey) — Core `std::map<CKeyID, SigPair>`,
+///     pinned by blockbrew W45 e000f9b, beamchain W46-2 e8f04a0,
+///     ouroboros W46-4 3d44478.
+///   - bip32_derivation: raw pubkey bytes — Core
+///     `std::map<CPubKey, KeyOriginInfo>` (lex compare on serialized
+///     pubkey).
+const SortedPartialSig = struct { pubkey: [33]u8, sig: []const u8 };
+const SortedBip32 = struct { pubkey: [33]u8, info: KeyOriginInfo };
+
+fn sortedPartialSigs(
+    allocator: std.mem.Allocator,
+    map: *const std.AutoHashMap([33]u8, []const u8),
+) ![]SortedPartialSig {
+    const out = try allocator.alloc(SortedPartialSig, map.count());
+    var i: usize = 0;
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        out[i] = .{ .pubkey = entry.key_ptr.*, .sig = entry.value_ptr.* };
+        i += 1;
+    }
+    std.sort.pdq(SortedPartialSig, out, {}, struct {
+        fn lt(_: void, a: SortedPartialSig, b: SortedPartialSig) bool {
+            const ha = crypto.hash160(&a.pubkey);
+            const hb = crypto.hash160(&b.pubkey);
+            return std.mem.lessThan(u8, &ha, &hb);
+        }
+    }.lt);
+    return out;
+}
+
+fn sortedBip32Derivation(
+    allocator: std.mem.Allocator,
+    map: *const std.AutoHashMap([33]u8, KeyOriginInfo),
+) ![]SortedBip32 {
+    const out = try allocator.alloc(SortedBip32, map.count());
+    var i: usize = 0;
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        out[i] = .{ .pubkey = entry.key_ptr.*, .info = entry.value_ptr.* };
+        i += 1;
+    }
+    std.sort.pdq(SortedBip32, out, {}, struct {
+        fn lt(_: void, a: SortedBip32, b: SortedBip32) bool {
+            return std.mem.lessThan(u8, &a.pubkey, &b.pubkey);
+        }
+    }.lt);
+    return out;
+}
+
+/// W47: After a successful finalize the producer-side fields (partial sigs,
+/// witness/redeem scripts, BIP32 derivations, sighash type) must be
+/// cleared so they don't ride along into the finalized PSBT or get
+/// re-emitted by the serializer. Matches Core's `psbt.cpp` Finalize() path
+/// which sets `final_script_sig`/`final_script_witness` and clears the
+/// rest. The serializer already gates these on `!isFinalized()`, but
+/// holding stale memory wastes allocator capacity and confuses the
+/// Combiner role on a re-merge.
+fn clearProducerFields(input: *PsbtInput) !void {
+    // Free partial sigs.
+    var sig_iter = input.partial_sigs.iterator();
+    while (sig_iter.next()) |entry| {
+        input.allocator.free(entry.value_ptr.*);
+    }
+    input.partial_sigs.clearRetainingCapacity();
+
+    // Free BIP32 derivations.
+    var d_iter = input.bip32_derivation.iterator();
+    while (d_iter.next()) |entry| {
+        var info = entry.value_ptr.*;
+        info.deinit(input.allocator);
+    }
+    input.bip32_derivation.clearRetainingCapacity();
+
+    // Drop witness_script / redeem_script. The on-chain commitment lives
+    // in final_script_sig / final_script_witness now.
+    if (input.redeem_script) |s| {
+        input.allocator.free(s);
+        input.redeem_script = null;
+    }
+    if (input.witness_script) |s| {
+        input.allocator.free(s);
+        input.witness_script = null;
+    }
+
+    // Sighash type is producer metadata, not consensus-relevant after
+    // finalize.
+    input.sighash_type = null;
 }
 
 /// Check if script is P2PKH
