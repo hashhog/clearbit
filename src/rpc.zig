@@ -5190,16 +5190,20 @@ pub const RpcServer = struct {
             psbt.tx.lock_time,
         });
 
-        // Inputs — Core emits txid (BE) + vout + scriptSig.hex + sequence,
-        // plus txinwitness when the input has witness data. The PSBT global
-        // tx is the unsigned tx, so scriptSig is always empty here, but we
-        // emit the field for shape-parity with Core.
+        // W51 — Per-vin shape: every input emits `scriptSig: {asm, hex}`
+        // even when scriptSig is empty (PSBT's global tx is the *unsigned*
+        // tx, so scriptSig is empty for non-finalized inputs). Core's
+        // TxToUniv → ScriptToAsmStr emits "asm":"" for an empty script;
+        // matching that string-empty case is what makes
+        // `jq -S` byte-identity work.
         try writer.writeAll("\"vin\":[");
         for (psbt.tx.inputs, 0..) |input, i| {
             if (i > 0) try writer.writeByte(',');
             try writer.writeAll("{\"txid\":\"");
             try writeHashHex(writer, &input.previous_output.hash);
-            try writer.print("\",\"vout\":{d},\"scriptSig\":{{\"hex\":\"", .{input.previous_output.index});
+            try writer.print("\",\"vout\":{d},\"scriptSig\":{{\"asm\":\"", .{input.previous_output.index});
+            try writeScriptAsmCore(writer, input.script_sig);
+            try writer.writeAll("\",\"hex\":\"");
             for (input.script_sig) |byte| {
                 try writer.print("{x:0>2}", .{byte});
             }
@@ -5220,25 +5224,38 @@ pub const RpcServer = struct {
         }
         try writer.writeAll("],");
 
-        // Outputs — Core emits value (BTC) + n + scriptPubKey.hex.
+        // W51 — Per-vout: every output emits the full Core
+        // `scriptPubKey: {asm, desc, hex, address?, type}` shape. `address`
+        // is suppressed for bare-pubkey / multisig / OP_RETURN /
+        // nonstandard outputs, mirroring `ScriptToUniv` (which only emits
+        // address when ExtractDestination succeeds AND type != PUBKEY).
+        const network = networkFromMagic(self.network_params.magic);
+        const is_regtest = isRegtestMagic(self.network_params.magic);
         try writer.writeAll("\"vout\":[");
         for (psbt.tx.outputs, 0..) |output, i| {
             if (i > 0) try writer.writeByte(',');
-            try writer.print("{{\"value\":{d:.8},\"n\":{d},\"scriptPubKey\":{{\"hex\":\"", .{
+            try writer.print("{{\"value\":{d:.8},\"n\":{d},\"scriptPubKey\":", .{
                 @as(f64, @floatFromInt(output.value)) / 100_000_000.0,
                 i,
             });
-            for (output.script_pubkey) |byte| {
-                try writer.print("{x:0>2}", .{byte});
-            }
-            try writer.writeAll("\"}}");
+            try writeScriptPubKeyUniv(self.allocator, writer, output.script_pubkey, network, is_regtest);
+            try writer.writeByte('}');
         }
         try writer.writeAll("]},");
 
         // PSBT version
         try writer.print("\"psbt_version\":{d},", .{psbt.version});
 
-        // Inputs info
+        // W51 — Top-level `global_xpubs:[]` is mandatory in Core's
+        // decodepsbt (always present, empty when the PSBT carries no
+        // PSBT_GLOBAL_XPUB records). Matching Core's empty-array shape is
+        // what makes the `jq -S` sha256 collapse onto Core's reference.
+        // Once clearbit gains a `psbt.global_xpubs` slice, switch this
+        // path to enumerate it; today the corpus contains zero PSBTs that
+        // exercise the field.
+        try writer.writeAll("\"global_xpubs\":[],");
+
+        // Per-input PSBT extension records. Existing W47 fields preserved.
         try writer.writeAll("\"inputs\":[");
         for (psbt.inputs, 0..) |*input, i| {
             if (i > 0) try writer.writeByte(',');
@@ -5274,7 +5291,7 @@ pub const RpcServer = struct {
         }
         try writer.writeAll("],");
 
-        // Outputs info
+        // Per-output PSBT extension records.
         try writer.writeAll("\"outputs\":[");
         for (psbt.outputs, 0..) |*output, i| {
             if (i > 0) try writer.writeByte(',');
@@ -5288,15 +5305,13 @@ pub const RpcServer = struct {
         }
         try writer.writeAll("],");
 
-        // Fee if available
-        const analysis = psbt.analyze();
-        if (analysis.estimated_fee) |fee| {
-            try writer.print("\"fee\":{d:.8}", .{@as(f64, @floatFromInt(fee)) / 100_000_000.0});
-        } else {
-            try writer.writeAll("\"fee\":null");
-        }
-
-        try writer.writeByte('}');
+        // W51 — Top-level `proprietary:[]` and `unknown:{}` are mandatory
+        // in Core's decodepsbt output. Both always emitted, regardless of
+        // whether the PSBT carries any proprietary or unknown fields. We
+        // do NOT emit a `fee` field at the top level: Core's decodepsbt
+        // never emits fee — that's analyzepsbt's job (analyzepsbt emits
+        // `estimated_feerate`, not `fee`, per rpc/rawtransaction.cpp).
+        try writer.writeAll("\"proprietary\":[],\"unknown\":{}}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -10107,6 +10122,399 @@ fn writeTargetHex(writer: anytype, bits: u32) !void {
     for (target) |byte| {
         try writer.print("{x:0>2}", .{byte});
     }
+}
+
+// ── Core-byte-compat script ASM, address, and descriptor helpers ──────────
+//
+// Everything below mirrors `core_io.cpp`'s `ScriptToAsmStr`, `ScriptToUniv`,
+// and the no-provider fallback path of `script/descriptor.cpp::InferScript`
+// so that `decodepsbt` produces a JSON shape that is byte-identical to
+// Bitcoin Core 31.99 once both sides are normalized through `jq -S`.
+//
+// References:
+//   bitcoin-core/src/core_io.cpp:357   ScriptToAsmStr
+//   bitcoin-core/src/core_io.cpp:409   ScriptToUniv
+//   bitcoin-core/src/script/script.cpp:18  GetOpName
+//   bitcoin-core/src/script/descriptor.cpp:2897  InferDescriptor
+
+/// Decode a CScriptNum-formatted byte slice (≤4 bytes per Core's ASM path)
+/// to its signed-integer text form. Returns an error if the slice is
+/// 0-length (which Core handles via `CScriptNum(empty).getint() == 0`, so
+/// callers must short-circuit empty pushes themselves).
+fn writeScriptNumAsmInt(writer: anytype, vch: []const u8) !void {
+    if (vch.len == 0) {
+        try writer.writeByte('0');
+        return;
+    }
+    // CScriptNum: little-endian, sign bit in MSB of last byte.
+    var result: i64 = 0;
+    for (vch, 0..) |b, i| {
+        result |= @as(i64, b) << @as(u6, @intCast(8 * i));
+    }
+    // Sign bit in MSB of last byte → flip and negate.
+    const last = vch[vch.len - 1];
+    if ((last & 0x80) != 0) {
+        // Clear sign bit, negate.
+        const sign_bit_pos: u6 = @intCast(8 * (vch.len - 1) + 7);
+        result &= ~(@as(i64, 1) << sign_bit_pos);
+        result = -result;
+    }
+    try writer.print("{d}", .{result});
+}
+
+/// Core-byte-compat ASM disassembly: matches `ScriptToAsmStr(script)` for
+/// `fAttemptSighashDecode == false`. Differences vs the legacy
+/// `writeScriptAsm`:
+///   • OP_0     → "0"  (not "OP_0")
+///   • OP_1NEGATE→ "-1"
+///   • OP_1..OP_16 → "1".."16"  (not "OP_1".."OP_16")
+///   • Pushes ≤4 bytes are decoded as CScriptNum integers
+///   • Pushes  >4 bytes are emitted as plain hex
+///   • Unknown opcodes use Core's GetOpName-style fallback ("OP_UNKNOWN").
+fn writeScriptAsmCore(writer: anytype, script_bytes: []const u8) !void {
+    var i: usize = 0;
+    var first = true;
+    while (i < script_bytes.len) {
+        if (!first) try writer.writeByte(' ');
+        first = false;
+
+        const op = script_bytes[i];
+        i += 1;
+
+        // Push opcodes (0..OP_PUSHDATA4) — Core decodes the data.
+        if (op <= 0x4e) {
+            var data_len: usize = 0;
+            var bad = false;
+            if (op < 0x4c) {
+                data_len = op;
+            } else if (op == 0x4c) {
+                if (i >= script_bytes.len) { bad = true; } else {
+                    data_len = script_bytes[i];
+                    i += 1;
+                }
+            } else if (op == 0x4d) {
+                if (i + 2 > script_bytes.len) { bad = true; } else {
+                    data_len = @as(usize, script_bytes[i]) |
+                        (@as(usize, script_bytes[i + 1]) << 8);
+                    i += 2;
+                }
+            } else { // 0x4e
+                if (i + 4 > script_bytes.len) { bad = true; } else {
+                    data_len = @as(usize, script_bytes[i]) |
+                        (@as(usize, script_bytes[i + 1]) << 8) |
+                        (@as(usize, script_bytes[i + 2]) << 16) |
+                        (@as(usize, script_bytes[i + 3]) << 24);
+                    i += 4;
+                }
+            }
+            if (bad or i + data_len > script_bytes.len) {
+                try writer.writeAll("[error]");
+                return;
+            }
+            const data = script_bytes[i .. i + data_len];
+            i += data_len;
+            if (data_len <= 4) {
+                try writeScriptNumAsmInt(writer, data);
+            } else {
+                for (data) |byte| try writer.print("{x:0>2}", .{byte});
+            }
+            continue;
+        }
+
+        // Non-push opcodes — Core falls through to GetOpName(opcode).
+        try writeOpcodeName(writer, op);
+    }
+}
+
+/// GetOpName(op) for the non-push range. Mirrors
+/// bitcoin-core/src/script/script.cpp::GetOpName. We only emit names that
+/// can appear in a standard PSBT-decoded SPK / scriptSig; the
+/// "default" branch returns "OP_UNKNOWN" exactly like Core.
+fn writeOpcodeName(writer: anytype, op: u8) !void {
+    const name: ?[]const u8 = switch (op) {
+        0x4f => "-1", // OP_1NEGATE — Core's GetOpName returns "-1"
+        0x50 => "OP_RESERVED",
+        0x51 => "1",
+        0x52 => "2",
+        0x53 => "3",
+        0x54 => "4",
+        0x55 => "5",
+        0x56 => "6",
+        0x57 => "7",
+        0x58 => "8",
+        0x59 => "9",
+        0x5a => "10",
+        0x5b => "11",
+        0x5c => "12",
+        0x5d => "13",
+        0x5e => "14",
+        0x5f => "15",
+        0x60 => "16",
+        0x61 => "OP_NOP",
+        0x62 => "OP_VER",
+        0x63 => "OP_IF",
+        0x64 => "OP_NOTIF",
+        0x65 => "OP_VERIF",
+        0x66 => "OP_VERNOTIF",
+        0x67 => "OP_ELSE",
+        0x68 => "OP_ENDIF",
+        0x69 => "OP_VERIFY",
+        0x6a => "OP_RETURN",
+        0x6b => "OP_TOALTSTACK",
+        0x6c => "OP_FROMALTSTACK",
+        0x6d => "OP_2DROP",
+        0x6e => "OP_2DUP",
+        0x6f => "OP_3DUP",
+        0x70 => "OP_2OVER",
+        0x71 => "OP_2ROT",
+        0x72 => "OP_2SWAP",
+        0x73 => "OP_IFDUP",
+        0x74 => "OP_DEPTH",
+        0x75 => "OP_DROP",
+        0x76 => "OP_DUP",
+        0x77 => "OP_NIP",
+        0x78 => "OP_OVER",
+        0x79 => "OP_PICK",
+        0x7a => "OP_ROLL",
+        0x7b => "OP_ROT",
+        0x7c => "OP_SWAP",
+        0x7d => "OP_TUCK",
+        0x7e => "OP_CAT",
+        0x7f => "OP_SUBSTR",
+        0x80 => "OP_LEFT",
+        0x81 => "OP_RIGHT",
+        0x82 => "OP_SIZE",
+        0x83 => "OP_INVERT",
+        0x84 => "OP_AND",
+        0x85 => "OP_OR",
+        0x86 => "OP_XOR",
+        0x87 => "OP_EQUAL",
+        0x88 => "OP_EQUALVERIFY",
+        0x8b => "OP_1ADD",
+        0x8c => "OP_1SUB",
+        0x8d => "OP_2MUL",
+        0x8e => "OP_2DIV",
+        0x8f => "OP_NEGATE",
+        0x90 => "OP_ABS",
+        0x91 => "OP_NOT",
+        0x92 => "OP_0NOTEQUAL",
+        0x93 => "OP_ADD",
+        0x94 => "OP_SUB",
+        0x95 => "OP_MUL",
+        0x96 => "OP_DIV",
+        0x97 => "OP_MOD",
+        0x98 => "OP_LSHIFT",
+        0x99 => "OP_RSHIFT",
+        0x9a => "OP_BOOLAND",
+        0x9b => "OP_BOOLOR",
+        0x9c => "OP_NUMEQUAL",
+        0x9d => "OP_NUMEQUALVERIFY",
+        0x9e => "OP_NUMNOTEQUAL",
+        0x9f => "OP_LESSTHAN",
+        0xa0 => "OP_GREATERTHAN",
+        0xa1 => "OP_LESSTHANOREQUAL",
+        0xa2 => "OP_GREATERTHANOREQUAL",
+        0xa3 => "OP_MIN",
+        0xa4 => "OP_MAX",
+        0xa5 => "OP_WITHIN",
+        0xa6 => "OP_RIPEMD160",
+        0xa7 => "OP_SHA1",
+        0xa8 => "OP_SHA256",
+        0xa9 => "OP_HASH160",
+        0xaa => "OP_HASH256",
+        0xab => "OP_CODESEPARATOR",
+        0xac => "OP_CHECKSIG",
+        0xad => "OP_CHECKSIGVERIFY",
+        0xae => "OP_CHECKMULTISIG",
+        0xaf => "OP_CHECKMULTISIGVERIFY",
+        0xb0 => "OP_NOP1",
+        0xb1 => "OP_CHECKLOCKTIMEVERIFY",
+        0xb2 => "OP_CHECKSEQUENCEVERIFY",
+        0xb3 => "OP_NOP4",
+        0xb4 => "OP_NOP5",
+        0xb5 => "OP_NOP6",
+        0xb6 => "OP_NOP7",
+        0xb7 => "OP_NOP8",
+        0xb8 => "OP_NOP9",
+        0xb9 => "OP_NOP10",
+        0xba => "OP_CHECKSIGADD",
+        else => null,
+    };
+    if (name) |n| {
+        try writer.writeAll(n);
+    } else {
+        try writer.writeAll("OP_UNKNOWN");
+    }
+}
+
+/// Map the active `consensus.NetworkParams` magic to the `address_mod.Network`
+/// enum used by base58check / bech32 encoders. Falls back to mainnet when
+/// the magic is unrecognised (regtest scripts simply use the testnet HRP /
+/// version bytes in clearbit's address module — `bcrt` is signaled by
+/// callers, not by `Network` here).
+fn networkFromMagic(magic: u32) address_mod.Network {
+    return switch (magic) {
+        consensus.MAINNET.magic => .mainnet,
+        consensus.TESTNET.magic, consensus.TESTNET4.magic, consensus.SIGNET.magic => .testnet,
+        else => .mainnet,
+    };
+}
+
+/// Map the active `consensus.NetworkParams` to the `bcrt` HRP for regtest.
+/// Returns true if the network is regtest and the SPK is bech32-encoded
+/// (segwit). For non-segwit regtest, base58check uses the testnet version
+/// bytes which is what `address_mod.Network.testnet` already produces.
+fn isRegtestMagic(magic: u32) bool {
+    return magic == consensus.REGTEST.magic;
+}
+
+/// Try to extract a Bitcoin Core-compatible bech32/base58 address from a
+/// `scriptPubKey`. Returns null when the SPK is non-standard, P2A, P2PK,
+/// `OP_RETURN`, or any multisig/raw shape that Core's
+/// `ExtractDestination` would reject. Caller owns the returned slice and
+/// must free it with the same allocator.
+fn extractAddressForSpk(
+    allocator: std.mem.Allocator,
+    spk: []const u8,
+    network: address_mod.Network,
+    is_regtest: bool,
+) !?[]const u8 {
+    const t = script_mod.classifyScript(spk);
+    switch (t) {
+        .p2pkh => {
+            if (spk.len != 25) return null;
+            const hash_buf = try allocator.dupe(u8, spk[3..23]);
+            errdefer allocator.free(hash_buf);
+            const addr = address_mod.Address{
+                .addr_type = .p2pkh,
+                .hash = hash_buf,
+                .network = network,
+            };
+            const out = try addr.encode(allocator);
+            allocator.free(hash_buf);
+            return out;
+        },
+        .p2sh => {
+            if (spk.len != 23) return null;
+            const hash_buf = try allocator.dupe(u8, spk[2..22]);
+            errdefer allocator.free(hash_buf);
+            const addr = address_mod.Address{
+                .addr_type = .p2sh,
+                .hash = hash_buf,
+                .network = network,
+            };
+            const out = try addr.encode(allocator);
+            allocator.free(hash_buf);
+            return out;
+        },
+        .p2wpkh => {
+            if (spk.len != 22) return null;
+            const hrp: []const u8 = if (is_regtest) "bcrt" else if (network == .mainnet) "bc" else "tb";
+            return try address_mod.segwitEncode(hrp, 0, spk[2..22], allocator);
+        },
+        .p2wsh => {
+            if (spk.len != 34) return null;
+            const hrp: []const u8 = if (is_regtest) "bcrt" else if (network == .mainnet) "bc" else "tb";
+            return try address_mod.segwitEncode(hrp, 0, spk[2..34], allocator);
+        },
+        .p2tr => {
+            if (spk.len != 34) return null;
+            const hrp: []const u8 = if (is_regtest) "bcrt" else if (network == .mainnet) "bc" else "tb";
+            return try address_mod.segwitEncode(hrp, 1, spk[2..34], allocator);
+        },
+        .anchor => {
+            // P2A: OP_1 push("Ns") — ExtractDestination returns the segwit
+            // destination so Core encodes it like a witness-v1 pubkey of
+            // length 2. Mirror that path.
+            const hrp: []const u8 = if (is_regtest) "bcrt" else if (network == .mainnet) "bc" else "tb";
+            return try address_mod.segwitEncode(hrp, 1, spk[2..4], allocator);
+        },
+        .p2pk, .multisig, .null_data, .nonstandard => return null,
+    }
+}
+
+/// Compute the BIP-380 descriptor string Core would emit for an SPK in the
+/// no-provider context (decodepsbt). Mirrors `InferScript(...,
+/// ParseScriptContext::TOP, DUMMY_SIGNING_PROVIDER)`:
+///
+///   • If `ExtractDestination(script, dest)` succeeds and
+///     `GetScriptForDestination(dest) == script`, emit
+///     `addr(<EncodeDestination(dest)>)#<checksum>`.
+///   • Otherwise emit `raw(<HexStr(script)>)#<checksum>`.
+///
+/// Caller owns the returned slice.
+fn inferDescriptorForSpk(
+    allocator: std.mem.Allocator,
+    spk: []const u8,
+    network: address_mod.Network,
+    is_regtest: bool,
+) ![]const u8 {
+    const maybe_addr = try extractAddressForSpk(allocator, spk, network, is_regtest);
+    var inner = std.ArrayList(u8).init(allocator);
+    defer inner.deinit();
+    if (maybe_addr) |addr_str| {
+        defer allocator.free(addr_str);
+        try inner.appendSlice("addr(");
+        try inner.appendSlice(addr_str);
+        try inner.append(')');
+    } else {
+        try inner.appendSlice("raw(");
+        for (spk) |byte| try inner.writer().print("{x:0>2}", .{byte});
+        try inner.append(')');
+    }
+    return descriptor.addChecksum(allocator, inner.items);
+}
+
+/// Emit a Core-byte-compat `scriptPubKey` JSON object: `{asm, desc, hex,
+/// address?, type}`. Key insertion order does not matter (all callers
+/// normalize through `jq -S`); we follow Core's `ScriptToUniv` order for
+/// human readability when verbose dumps are inspected.
+fn writeScriptPubKeyUniv(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    spk: []const u8,
+    network: address_mod.Network,
+    is_regtest: bool,
+) !void {
+    const t = script_mod.classifyScript(spk);
+    const type_str: []const u8 = switch (t) {
+        .p2pkh => "pubkeyhash",
+        .p2sh => "scripthash",
+        .p2wpkh => "witness_v0_keyhash",
+        .p2wsh => "witness_v0_scripthash",
+        .p2tr => "witness_v1_taproot",
+        .anchor => "anchor",
+        .p2pk => "pubkey",
+        .multisig => "multisig",
+        .null_data => "nulldata",
+        .nonstandard => "nonstandard",
+    };
+
+    try writer.writeAll("{\"asm\":\"");
+    try writeScriptAsmCore(writer, spk);
+    try writer.writeAll("\",\"desc\":\"");
+    const desc_str = try inferDescriptorForSpk(allocator, spk, network, is_regtest);
+    defer allocator.free(desc_str);
+    try writer.writeAll(desc_str);
+    try writer.writeAll("\",\"hex\":\"");
+    for (spk) |byte| try writer.print("{x:0>2}", .{byte});
+    try writer.writeByte('"');
+
+    // Address: only when extractable AND type is not "pubkey" (Core's
+    // ScriptToUniv suppresses the address field for bare-pubkey outputs;
+    // the destination it would emit is the implied P2PKH which would be
+    // misleading).
+    if (t != .p2pk) {
+        const maybe_addr = try extractAddressForSpk(allocator, spk, network, is_regtest);
+        if (maybe_addr) |addr_str| {
+            defer allocator.free(addr_str);
+            try writer.writeAll(",\"address\":\"");
+            try writer.writeAll(addr_str);
+            try writer.writeByte('"');
+        }
+    }
+
+    try writer.print(",\"type\":\"{s}\"}}", .{type_str});
 }
 
 /// Write script as disassembled opcodes (simplified ASM output).
