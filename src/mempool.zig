@@ -66,6 +66,33 @@ pub const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1650;
 pub const MAX_OP_RETURN_RELAY: usize = consensus.MAX_STANDARD_TX_WEIGHT / consensus.WITNESS_SCALE_FACTOR;
 
 // ============================================================================
+// IsWitnessStandard Constants (Core policy/policy.h)
+// ============================================================================
+
+/// Maximum size of a P2WSH witness script (3600 bytes).
+/// Mirrors Bitcoin Core's MAX_STANDARD_P2WSH_SCRIPT_SIZE in policy/policy.h.
+pub const MAX_STANDARD_P2WSH_SCRIPT_SIZE: usize = 3600;
+
+/// Maximum number of witness stack items (excluding script) for P2WSH (100).
+/// Mirrors Bitcoin Core's MAX_STANDARD_P2WSH_STACK_ITEMS in policy/policy.h.
+pub const MAX_STANDARD_P2WSH_STACK_ITEMS: usize = 100;
+
+/// Maximum size of a single witness stack item in P2WSH and tapscript (80 bytes).
+/// Mirrors Bitcoin Core's MAX_STANDARD_P2WSH_STACK_ITEM_SIZE /
+/// MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE in policy/policy.h.
+pub const MAX_STANDARD_WITNESS_STACK_ITEM_SIZE: usize = 80;
+
+/// Annex tag byte (BIP-341).  A witness stack item starting with 0x50 is an
+/// annex; annexes are non-standard as long as no semantics are defined.
+pub const ANNEX_TAG: u8 = 0x50;
+
+/// Taproot leaf version mask (BIP-341): mask to extract leaf version byte.
+pub const TAPROOT_LEAF_MASK: u8 = 0xfe;
+
+/// Tapscript leaf version (BIP-342): c0 after masking → tapscript rules apply.
+pub const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
+
+// ============================================================================
 // Orphan Transaction Pool Constants
 // ============================================================================
 //
@@ -206,6 +233,9 @@ pub const MempoolError = error{
     /// Cumulative OP_RETURN (null_data) output bytes exceed MAX_OP_RETURN_RELAY.
     /// Core reject code: "datacarrier".
     DatacarrierTooLarge,
+    /// Witness data violates standardness rules (IsWitnessStandard).
+    /// Core reject code: "bad-witness-nonstandard".
+    WitnessNonStandard,
 };
 
 // ============================================================================
@@ -1447,6 +1477,202 @@ pub const Mempool = struct {
     /// Reference: Bitcoin Core src/validation.cpp
     ///   MemPoolAccept::PolicyScriptChecks (~line 1170+) and
     ///   MemPoolAccept::ConsensusScriptChecks (~line 1230+).
+    /// Extract the top (last-pushed) stack element from a push-only scriptSig.
+    /// Returns null if the scriptSig is empty, malformed, or contains a
+    /// non-push opcode.  Mirrors the "casual EvalScript" Core performs in
+    /// IsWitnessStandard() for P2SH-wrapped witness programs (policy.cpp:293).
+    ///
+    /// We never allocate — the returned slice is a sub-slice of `script_sig`.
+    fn scriptSigTopPush(script_sig: []const u8) ?[]const u8 {
+        if (script_sig.len == 0) return null;
+
+        var pc: usize = 0;
+        var top: ?[]const u8 = null;
+
+        while (pc < script_sig.len) {
+            const opcode = script_sig[pc];
+            pc += 1;
+
+            if (opcode == 0x00) {
+                // OP_0: push empty array
+                top = script_sig[pc..pc]; // zero-length slice
+            } else if (opcode >= 0x01 and opcode <= 0x4b) {
+                // Direct push: next `opcode` bytes
+                const n: usize = opcode;
+                if (pc + n > script_sig.len) return null;
+                top = script_sig[pc .. pc + n];
+                pc += n;
+            } else if (opcode == 0x4c) {
+                // OP_PUSHDATA1
+                if (pc >= script_sig.len) return null;
+                const n: usize = script_sig[pc];
+                pc += 1;
+                if (pc + n > script_sig.len) return null;
+                top = script_sig[pc .. pc + n];
+                pc += n;
+            } else if (opcode == 0x4d) {
+                // OP_PUSHDATA2
+                if (pc + 2 > script_sig.len) return null;
+                const n: usize = std.mem.readInt(u16, script_sig[pc..][0..2], .little);
+                pc += 2;
+                if (pc + n > script_sig.len) return null;
+                top = script_sig[pc .. pc + n];
+                pc += n;
+            } else if (opcode == 0x4e) {
+                // OP_PUSHDATA4
+                if (pc + 4 > script_sig.len) return null;
+                const n: usize = std.mem.readInt(u32, script_sig[pc..][0..4], .little);
+                pc += 4;
+                if (pc + n > script_sig.len) return null;
+                top = script_sig[pc .. pc + n];
+                pc += n;
+            } else if (opcode >= 0x4f and opcode <= 0x60) {
+                // OP_1NEGATE (0x4f) through OP_16 (0x60): push small integers
+                // These push 1 byte (the value); for IsWitnessStandard purposes
+                // none of these decode to valid witness programs, so a zero-
+                // length slice is fine — the witness-program check will just
+                // return null and the input will pass the non-witness gate.
+                top = script_sig[pc..pc];
+            } else {
+                // Non-push opcode: treat the scriptSig as invalid for our
+                // purposes (Core's EvalScript(SCRIPT_VERIFY_NONE) would also
+                // return false for these).
+                return null;
+            }
+        }
+
+        return top;
+    }
+
+    /// Enforce Bitcoin Core's IsWitnessStandard() policy (policy.cpp:265–351).
+    ///
+    /// Called from verifyInputScripts() after prevout scriptPubKeys have been
+    /// collected into `spent_scripts`.  Returns WitnessNonStandard on the first
+    /// violation; returns void if every input passes.
+    ///
+    /// Gates (Core line refs):
+    ///   1. P2A prevout + any witness → reject  (Core:283–285)
+    ///   2. P2SH prevout: scriptSig stack-top → redeemScript; fail/empty → reject (Core:288–299)
+    ///   3. Non-witness-program prevout + non-empty witness → reject  (Core:304–306)
+    ///   4. P2WSH v0 32B: script ≤3600; stack items (excl script) ≤100; each ≤80  (Core:308–318)
+    ///   5. P2TR v1 32B (non-P2SH): annex 0x50 reject; tapscript leaf 0xc0 → items ≤80; empty stack reject (Core:321–348)
+    ///   6. Coinbase exempt — coinbase is rejected earlier in verifyInputScripts().
+    fn checkWitnessStandard(
+        tx: *const types.Transaction,
+        spent_scripts: []const []const u8,
+    ) MempoolError!void {
+        for (tx.inputs, 0..) |input, i| {
+            // Skip inputs with no witness data — Core also skips these.
+            if (input.witness.len == 0) continue;
+
+            const prev_script = spent_scripts[i];
+
+            // --- Gate 1: P2A + any witness → reject ---
+            // (Core policy.cpp:283; "witness stuffing detected")
+            if (script.isPayToAnchor(prev_script)) {
+                return MempoolError.WitnessNonStandard;
+            }
+
+            // --- Gate 2: P2SH prevout → extract redeemScript ---
+            // For P2SH, the actual witness program is the redeemScript pushed
+            // last by the scriptSig.  Evaluate the scriptSig as a push stack
+            // and take the top element.
+            var effective_script = prev_script;
+            var is_p2sh = false;
+
+            if (script.isPayToScriptHash(prev_script)) {
+                // Casually evaluate scriptSig: extract top push element.
+                const top = scriptSigTopPush(input.script_sig) orelse {
+                    // EvalScript failure → reject (Core:294–296)
+                    return MempoolError.WitnessNonStandard;
+                };
+                if (top.len == 0 and input.script_sig.len == 0) {
+                    // Empty stack → reject (Core:295–296)
+                    return MempoolError.WitnessNonStandard;
+                }
+                effective_script = top;
+                is_p2sh = true;
+            }
+
+            // --- Gate 3: non-witness-program + non-empty witness → reject ---
+            const wp = script.isWitnessProgram(effective_script) orelse {
+                // prevScript is not a witness program — any witness is non-standard.
+                return MempoolError.WitnessNonStandard;
+            };
+
+            // --- Gate 4: P2WSH v0 32-byte program ---
+            // (Core:308–318)
+            if (wp.version == 0 and wp.program.len == script.WITNESS_V0_SCRIPTHASH_SIZE) {
+                // Last witness item is the witness script.
+                if (input.witness.len == 0) {
+                    // Empty witness for P2WSH is consensus-invalid but also non-standard.
+                    return MempoolError.WitnessNonStandard;
+                }
+                const witness_script = input.witness[input.witness.len - 1];
+                if (witness_script.len > MAX_STANDARD_P2WSH_SCRIPT_SIZE) {
+                    return MempoolError.WitnessNonStandard;
+                }
+                // Stack items count excludes the trailing script.
+                const stack_items = input.witness.len - 1;
+                if (stack_items > MAX_STANDARD_P2WSH_STACK_ITEMS) {
+                    return MempoolError.WitnessNonStandard;
+                }
+                for (input.witness[0..stack_items]) |item| {
+                    if (item.len > MAX_STANDARD_WITNESS_STACK_ITEM_SIZE) {
+                        return MempoolError.WitnessNonStandard;
+                    }
+                }
+                continue;
+            }
+
+            // --- Gate 5: P2TR v1 32-byte program (non-P2SH) ---
+            // (Core:324–349)
+            if (wp.version == 1 and wp.program.len == 32 and !is_p2sh) {
+                const stack = input.witness;
+
+                // Check for annex: ≥2 stack items and last item starts with 0x50.
+                if (stack.len >= 2 and stack[stack.len - 1].len > 0 and
+                    stack[stack.len - 1][0] == ANNEX_TAG)
+                {
+                    return MempoolError.WitnessNonStandard;
+                }
+
+                if (stack.len >= 2) {
+                    // Script path spend: control block is second-to-last
+                    // (after removing optional annex, which we already checked
+                    // is absent).  control_block = stack[stack.len-1],
+                    // script = stack[stack.len-2].
+                    const control_block = stack[stack.len - 1];
+                    if (control_block.len == 0) {
+                        // Empty control block is invalid.
+                        return MempoolError.WitnessNonStandard;
+                    }
+                    if ((control_block[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSCRIPT) {
+                        // Tapscript path (leaf version 0xc0): check stack item sizes.
+                        // Exclude the control block and script from the budget.
+                        const script_items = stack.len - 2; // stack[0..len-2] are the script inputs
+                        for (stack[0..script_items]) |item| {
+                            if (item.len > MAX_STANDARD_WITNESS_STACK_ITEM_SIZE) {
+                                return MempoolError.WitnessNonStandard;
+                            }
+                        }
+                    }
+                    // Key path (1 item) → no policy limits apply.
+                } else if (stack.len == 0) {
+                    // 0 stack elements: consensus-invalid; also non-standard.
+                    return MempoolError.WitnessNonStandard;
+                }
+                // else stack.len == 1 → key path spend; no limits.
+                continue;
+            }
+
+            // All other witness-program types (unknown versions, v0 non-32B, etc.)
+            // pass the witness-standardness check.  Unknown witness versions are
+            // allowed by policy (they may be future soft-forks); only the above
+            // specific gates constrain them.
+        }
+    }
+
     fn verifyInputScripts(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
         // No chain_state → unit-test path, skip script verify (parity with
         // the "assume inputs exist" branch a few lines up the call stack).
@@ -1506,6 +1732,12 @@ pub const Mempool = struct {
                 spent_scripts[i] = script_bytes;
             }
         }
+
+        // Enforce IsWitnessStandard() before running the full script engine.
+        // This mirrors Core's MemPoolAccept::PreChecks calling IsWitnessStandard()
+        // before PolicyScriptChecks (validation.cpp).  We need spent_scripts to be
+        // fully populated (above) before calling this.
+        try checkWitnessStandard(tx, spent_scripts);
 
         // Now actually run the script engine against each input.
         for (tx.inputs, 0..) |input, input_index| {
@@ -8079,4 +8311,437 @@ test "orphan pool: processOrphansForParent re-admits child after parent arrives"
     try std.testing.expectEqual(@as(usize, 1), promoted);
     try std.testing.expect(!mempool.hasOrphan(child_txid));
     try std.testing.expect(mempool.contains(child_txid));
+}
+
+// ============================================================================
+// W72: IsWitnessStandard tests (policy.cpp:265–351)
+// ============================================================================
+
+test "W72: scriptSigTopPush — basic cases" {
+    // Empty scriptSig → null
+    try std.testing.expect(Mempool.scriptSigTopPush(&[_]u8{}) == null);
+
+    // OP_0 → empty slice (not null, just zero-length)
+    const r0 = Mempool.scriptSigTopPush(&[_]u8{0x00});
+    try std.testing.expect(r0 != null);
+    try std.testing.expectEqual(@as(usize, 0), r0.?.len);
+
+    // Direct push 3 bytes: opcode 0x03 + data
+    const push3 = [_]u8{ 0x03, 0xAA, 0xBB, 0xCC };
+    const r3 = Mempool.scriptSigTopPush(&push3);
+    try std.testing.expect(r3 != null);
+    try std.testing.expectEqual(@as(usize, 3), r3.?.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC }, r3.?);
+
+    // Two pushes: top = last push
+    const two_pushes = [_]u8{ 0x01, 0x11, 0x02, 0x22, 0x33 };
+    const r2 = Mempool.scriptSigTopPush(&two_pushes);
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x22, 0x33 }, r2.?);
+
+    // Non-push opcode → null
+    const bad = [_]u8{0x76}; // OP_DUP
+    try std.testing.expect(Mempool.scriptSigTopPush(&bad) == null);
+
+    // OP_PUSHDATA1
+    const pd1 = [_]u8{ 0x4c, 0x02, 0xDE, 0xAD };
+    const rpd1 = Mempool.scriptSigTopPush(&pd1);
+    try std.testing.expect(rpd1 != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD }, rpd1.?);
+}
+
+test "W72 gate 1: P2A prevout + witness → WitnessNonStandard" {
+    // P2A output: OP_1 <0x4e73> = [0x51, 0x02, 0x4e, 0x73]
+    // Any non-empty witness spending P2A is non-standard.
+    const witness_item = [_]u8{0x01};
+    const witness_items = [_][]const u8{&witness_item};
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const p2a_spk = script.P2A_SCRIPT;
+    const spent: []const []const u8 = &[_][]const u8{&p2a_spk};
+    try std.testing.expectError(
+        MempoolError.WitnessNonStandard,
+        Mempool.checkWitnessStandard(&tx, spent),
+    );
+}
+
+test "W72 gate 3: non-witness-program prevout + non-empty witness → WitnessNonStandard" {
+    // P2PKH prevout is NOT a witness program; having any witness is non-standard.
+    const p2pkh_spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const witness_item = [_]u8{0x01};
+    const witness_items = [_][]const u8{&witness_item};
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x02} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2pkh_spk};
+    try std.testing.expectError(
+        MempoolError.WitnessNonStandard,
+        Mempool.checkWitnessStandard(&tx, spent),
+    );
+}
+
+test "W72 gate 3: no witness on non-witness-program → OK" {
+    // P2PKH with no witness is fine.
+    const p2pkh_spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x03} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{}, // no witness
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2pkh_spk};
+    // No witness → skipped entirely → OK.
+    try Mempool.checkWitnessStandard(&tx, spent);
+}
+
+test "W72 gate 4: P2WSH script size > 3600 → WitnessNonStandard" {
+    // P2WSH: OP_0 <32-byte hash>
+    const p2wsh_spk = [_]u8{0x00} ++ [_]u8{0x20} ++ [_]u8{0xBB} ** 32;
+    // Oversized witness script (3601 bytes).
+    const allocator = std.testing.allocator;
+    const big_script = try allocator.alloc(u8, 3601);
+    defer allocator.free(big_script);
+    @memset(big_script, 0x51); // OP_1 repeated
+
+    const witness_items = [_][]const u8{big_script};
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x04} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2wsh_spk};
+    try std.testing.expectError(
+        MempoolError.WitnessNonStandard,
+        Mempool.checkWitnessStandard(&tx, spent),
+    );
+}
+
+test "W72 gate 4: P2WSH stack items > 100 → WitnessNonStandard" {
+    const p2wsh_spk = [_]u8{0x00} ++ [_]u8{0x20} ++ [_]u8{0xCC} ** 32;
+    // 101 items + 1 script = 102 total witness items; 101 stack items > 100 limit.
+    const allocator = std.testing.allocator;
+    const dummy_item = [_]u8{0x01};
+    const small_script = [_]u8{0x51}; // OP_1
+
+    var witness_list = try allocator.alloc([]const u8, 102);
+    defer allocator.free(witness_list);
+    for (0..101) |j| witness_list[j] = &dummy_item;
+    witness_list[101] = &small_script; // The witness script (last item)
+
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x05} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = witness_list,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2wsh_spk};
+    try std.testing.expectError(
+        MempoolError.WitnessNonStandard,
+        Mempool.checkWitnessStandard(&tx, spent),
+    );
+}
+
+test "W72 gate 4: P2WSH stack item size > 80 → WitnessNonStandard" {
+    const p2wsh_spk = [_]u8{0x00} ++ [_]u8{0x20} ++ [_]u8{0xDD} ** 32;
+    const allocator = std.testing.allocator;
+    const big_item = try allocator.alloc(u8, 81); // 81 > 80
+    defer allocator.free(big_item);
+    @memset(big_item, 0x00);
+    const small_script = [_]u8{0x51};
+    const witness_items = [_][]const u8{ big_item, &small_script };
+
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x06} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2wsh_spk};
+    try std.testing.expectError(
+        MempoolError.WitnessNonStandard,
+        Mempool.checkWitnessStandard(&tx, spent),
+    );
+}
+
+test "W72 gate 4: P2WSH valid witness → OK" {
+    // Script ≤3600, ≤100 stack items, each ≤80 bytes → should pass.
+    const p2wsh_spk = [_]u8{0x00} ++ [_]u8{0x20} ++ [_]u8{0xEE} ** 32;
+    const item = [_]u8{0x01} ** 32; // 32 bytes < 80
+    const small_script = [_]u8{0x51}; // 1 byte < 3600
+    const witness_items = [_][]const u8{ &item, &small_script };
+
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x07} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2wsh_spk};
+    try Mempool.checkWitnessStandard(&tx, spent);
+}
+
+test "W72 gate 5: P2TR annex 0x50 → WitnessNonStandard" {
+    // P2TR: OP_1 <32 bytes>
+    const p2tr_spk = [_]u8{0x51} ++ [_]u8{0x20} ++ [_]u8{0xFF} ** 32;
+    // Two items, last starts with 0x50 (annex tag).
+    const annex = [_]u8{ 0x50, 0x01, 0x02 };
+    const sig = [_]u8{0xAA} ** 32;
+    const witness_items = [_][]const u8{ &sig, &annex };
+
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x08} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2tr_spk};
+    try std.testing.expectError(
+        MempoolError.WitnessNonStandard,
+        Mempool.checkWitnessStandard(&tx, spent),
+    );
+}
+
+test "W72 gate 5: P2TR tapscript stack item > 80 → WitnessNonStandard" {
+    // Script path: ≥2 items; control block leaf version = 0xc0
+    // Stack: [big_item, witness_script, control_block]
+    const p2tr_spk = [_]u8{0x51} ++ [_]u8{0x20} ++ [_]u8{0xF1} ** 32;
+    const allocator = std.testing.allocator;
+    const big_item = try allocator.alloc(u8, 81); // 81 > 80
+    defer allocator.free(big_item);
+    @memset(big_item, 0x00);
+    const witness_script = [_]u8{0x51}; // OP_1
+    // Control block: 1 byte leaf version 0xc0 + 32-byte internal key = 33 bytes
+    var ctrl_block: [33]u8 = undefined;
+    ctrl_block[0] = 0xc0; // tapscript leaf version
+    @memset(ctrl_block[1..], 0xAB);
+    const witness_items = [_][]const u8{ big_item, &witness_script, &ctrl_block };
+
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x09} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2tr_spk};
+    try std.testing.expectError(
+        MempoolError.WitnessNonStandard,
+        Mempool.checkWitnessStandard(&tx, spent),
+    );
+}
+
+test "W72 gate 5: P2TR key path (1 item) → OK" {
+    // Key path spend: exactly 1 witness item (signature), no annex.
+    const p2tr_spk = [_]u8{0x51} ++ [_]u8{0x20} ++ [_]u8{0xF2} ** 32;
+    const sig = [_]u8{0xCC} ** 64; // Schnorr sig: 64 bytes
+    const witness_items = [_][]const u8{&sig};
+
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x0A} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2tr_spk};
+    try Mempool.checkWitnessStandard(&tx, spent);
+}
+
+test "W72 gate 5: P2TR empty-witness skipped (outer guard)" {
+    // 0 witness items → outer guard (witness.len==0) → skipped, no error.
+    const p2tr_spk = [_]u8{0x51} ++ [_]u8{0x20} ++ [_]u8{0xF3} ** 32;
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x0B} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{}, // 0 items → skipped by top guard
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2tr_spk};
+    // Empty witness → outer guard skips → no error.
+    try Mempool.checkWitnessStandard(&tx, spent);
+}
+
+test "W72 gate 5: P2TR tapscript valid stack items ≤80 → OK" {
+    // Script path with all items ≤80 bytes → should pass.
+    const p2tr_spk = [_]u8{0x51} ++ [_]u8{0x20} ++ [_]u8{0xF4} ** 32;
+    const item = [_]u8{0x01} ** 32; // 32 bytes ≤ 80
+    const witness_script = [_]u8{0x51};
+    var ctrl_block: [33]u8 = undefined;
+    ctrl_block[0] = 0xc0;
+    @memset(ctrl_block[1..], 0x12);
+    const witness_items = [_][]const u8{ &item, &witness_script, &ctrl_block };
+
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x0C} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2tr_spk};
+    try Mempool.checkWitnessStandard(&tx, spent);
+}
+
+test "W72 gate 2: P2SH-wrapped P2WSH valid → OK" {
+    // scriptSig pushes a P2WSH redeemScript: OP_0 <32-byte hash>
+    // P2SH prevout: OP_HASH160 <20> OP_EQUAL
+    const p2sh_spk = [_]u8{ 0xa9, 0x14 } ++ [_]u8{0x99} ** 20 ++ [_]u8{0x87};
+
+    // redeemScript = P2WSH program (34 bytes: OP_0 <32>)
+    var redeem: [34]u8 = undefined;
+    redeem[0] = 0x00; // OP_0
+    redeem[1] = 0x20; // push 32
+    @memset(redeem[2..], 0xAA);
+
+    // scriptSig: push the redeemScript: opcode 0x22 (34 bytes) + redeem
+    var script_sig_buf: [35]u8 = undefined;
+    script_sig_buf[0] = 0x22; // push 34 bytes
+    @memcpy(script_sig_buf[1..35], &redeem);
+
+    const stack_item = [_]u8{0x01} ** 32; // ≤80 bytes
+    const witness_items = [_][]const u8{ &stack_item, &redeem }; // stack item + witness script
+
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x0D} ** 32, .index = 0 },
+        .script_sig = &script_sig_buf,
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2sh_spk};
+    try Mempool.checkWitnessStandard(&tx, spent);
+}
+
+test "W72 gate 2: P2SH empty scriptSig → WitnessNonStandard" {
+    // P2SH with a witness but empty scriptSig → cannot extract redeemScript → reject.
+    const p2sh_spk = [_]u8{ 0xa9, 0x14 } ++ [_]u8{0x77} ** 20 ++ [_]u8{0x87};
+    const witness_item = [_]u8{0x01};
+    const witness_items = [_][]const u8{&witness_item};
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x0E} ** 32, .index = 0 },
+        .script_sig = &[_]u8{}, // empty → cannot get redeemScript
+        .sequence = 0xFFFF_FFFF,
+        .witness = &witness_items,
+    };
+    const output = types.TxOut{ .value = 546, .script_pubkey = &p2wpkh_out };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2sh_spk};
+    try std.testing.expectError(
+        MempoolError.WitnessNonStandard,
+        Mempool.checkWitnessStandard(&tx, spent),
+    );
 }
