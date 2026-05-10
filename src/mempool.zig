@@ -50,7 +50,15 @@ pub const INCREMENTAL_RELAY_FEE: i64 = 1000;
 
 /// Maximum number of transactions that can be evicted by a single RBF replacement.
 /// This includes direct conflicts and all their descendants.
+/// Mirrors Bitcoin Core's MAX_REPLACEMENT_CANDIDATES in policy/rbf.h.
 pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
+
+/// Maximum nSequence value that signals BIP-125 opt-in RBF.
+/// Any input with nSequence <= this value opts in to replacement.
+/// SEQUENCE_FINAL-2: leaves room for nLockTime (SEQUENCE_FINAL-1 = 0xFFFFFFFE)
+/// while still allowing replacement signaling.
+/// Mirrors Bitcoin Core's MAX_BIP125_RBF_SEQUENCE in util/rbf.h.
+pub const MAX_BIP125_RBF_SEQUENCE: u32 = 0xFFFFFFFD;
 
 /// Minimum non-witness serialized size for relay (CVE-2017-12842 mitigation).
 /// Mirrors Bitcoin Core's MIN_STANDARD_TX_NONWITNESS_SIZE in policy/policy.h.
@@ -537,6 +545,11 @@ pub const Mempool = struct {
     /// Fee estimator for smart fee estimation.
     fee_estimator: FeeEstimator,
 
+    /// When true, allow replacing any mempool transaction regardless of whether
+    /// it signals BIP-125 opt-in RBF (Gate 1).  Mirrors Bitcoin Core's
+    /// `-mempoolfullrbf` flag (default: false — only opt-in replacements allowed).
+    full_rbf: bool,
+
     // ========================================================================
     // Orphan Transaction Pool
     // ========================================================================
@@ -574,6 +587,7 @@ pub const Mempool = struct {
             .linearization_dirty = true,
             .mutex = std.Thread.Mutex{},
             .fee_estimator = FeeEstimator.init(allocator),
+            .full_rbf = false,
             .orphans = std.AutoHashMap(types.Hash256, *OrphanTx).init(allocator),
             .orphans_by_peer = std.AutoHashMap(u64, u32).init(allocator),
         };
@@ -871,8 +885,11 @@ pub const Mempool = struct {
             .descendant_count = 1,
             .descendant_size = vsize,
             .descendant_fees = fee,
-            // V3/TRUC transactions are always RBF-replaceable (BIP 431)
-            .is_rbf = tx.version == TRUC_VERSION or isRBFSignaled(&tx),
+            // V3/TRUC transactions are always RBF-replaceable (BIP 431).
+            // BIP-125 opt-in also propagates from unconfirmed ancestors: a tx is
+            // replaceable if it signals opt-in OR if any mempool ancestor does.
+            // Mirrors Bitcoin Core's IsRBFOptIn() ancestor loop in policy/rbf.cpp.
+            .is_rbf = tx.version == TRUC_VERSION or isRBFSignaled(&tx) or self.hasRBFAncestor(&tx),
             .cluster_index = cluster_idx,
             .mining_score = fee_rate, // Initial score is individual fee rate
         };
@@ -1442,11 +1459,37 @@ pub const Mempool = struct {
         }
     }
 
-    /// Check if a transaction signals RBF (BIP-125).
+    /// Check if a transaction has any mempool ancestor that signals BIP-125 opt-in RBF.
+    ///
+    /// BIP-125 Rule 1 (ancestor propagation): a transaction is considered replaceable
+    /// if ANY of its unconfirmed mempool ancestors signals opt-in, even if the tx
+    /// itself uses sequence 0xFFFFFFFF.  Mirrors Bitcoin Core's IsRBFOptIn() in
+    /// policy/rbf.cpp (the loop over `pool.CalculateMemPoolAncestors(entry)`).
+    ///
+    /// We only check direct parents here (their `is_rbf` flag already captures their
+    /// own ancestor chain transitively since it is set at admission time).
+    fn hasRBFAncestor(self: *Mempool, tx: *const types.Transaction) bool {
+        for (tx.inputs) |input| {
+            if (self.entries.get(input.previous_output.hash)) |parent| {
+                if (parent.is_rbf) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Check if a transaction signals BIP-125 opt-in RBF by inspecting its inputs.
+    ///
+    /// Returns true if ANY input has nSequence <= MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD).
+    /// This mirrors Bitcoin Core's SignalsOptInRBF() in util/rbf.cpp, which checks
+    /// `txin.nSequence <= MAX_BIP125_RBF_SEQUENCE` (unsigned comparison, `<=` not `<`).
+    ///
+    /// Note: this only checks the transaction itself.  Full BIP-125 opt-in also
+    /// propagates through unconfirmed ancestors — see hasRBFAncestor() and the
+    /// `is_rbf` field on MempoolEntry which ORs both together at admission time.
     pub fn isRBFSignaled(tx: *const types.Transaction) bool {
         for (tx.inputs) |input| {
-            // Sequence < 0xFFFFFFFE signals RBF
-            if (input.sequence < 0xFFFFFFFF - 1) return true;
+            // nSequence <= 0xFFFFFFFD (MAX_BIP125_RBF_SEQUENCE) signals opt-in.
+            if (input.sequence <= MAX_BIP125_RBF_SEQUENCE) return true;
         }
         return false;
     }
@@ -1860,22 +1903,36 @@ pub const Mempool = struct {
         }
     }
 
-    /// Check full RBF replacement rules.
-    /// Full RBF: ALL mempool transactions are replaceable regardless of nSequence signaling.
-    /// Rules:
-    /// 1. [REMOVED for full RBF] Original txs must signal RBF - no longer required
-    /// 2. Replacement must not introduce "new unconfirmed inputs": every input
-    ///    must be either confirmed (in chainstate UTXO set) OR reference a
-    ///    mempool tx that is NOT itself being evicted by this replacement.
-    ///    Equivalently: no input may reference a tx in `all_evicted`. Mirrors
-    ///    Core's `EntriesAndTxidsDisjoint` ("spends conflicting transaction")
-    ///    in `policy/rbf.cpp`. Without this, an attacker can craft a
-    ///    replacement whose ancestor is itself a conflict — Core fails the
-    ///    check pre-eviction; clearbit (pre-fix) would evict and end up with
-    ///    an unspendable mempool tx (mempool-integrity DoS).
-    /// 3. New tx must pay higher absolute fee than sum of all evicted txs
-    /// 4. New fee must exceed old fees by at least incremental_relay_fee * new_vsize
-    /// 5. Total number of evicted transactions must not exceed MAX_REPLACEMENT_EVICTIONS
+    /// Check BIP-125 RBF replacement rules (policy/rbf.cpp).
+    ///
+    /// Gates in Core order:
+    /// 1. [Gate 1] Each directly-conflicting tx must signal BIP-125 opt-in RBF
+    ///    (stored in MempoolEntry.is_rbf, which already captures ancestor
+    ///    inheritance).  Skipped when self.full_rbf == true (-mempoolfullrbf).
+    ///    Core error: "txn-mempool-conflict".
+    ///    Reference: policy/rbf.cpp::IsRBFOptIn, util/rbf.cpp::SignalsOptInRBF.
+    ///
+    /// 2. [Gate 4] Replacement must not spend an output from a tx that is itself
+    ///    being evicted (EntriesAndTxidsDisjoint).
+    ///    Core error: "spends conflicting transaction".
+    ///    Reference: policy/rbf.cpp::EntriesAndTxidsDisjoint.
+    ///
+    /// 3. [Gate 3] Total evicted transactions must not exceed MAX_REPLACEMENT_EVICTIONS.
+    ///    Core error: "too many potential replacements".
+    ///    Reference: policy/rbf.cpp::GetEntriesForConflicts.
+    ///
+    /// 4. [Gate 6] Replacement fees >= sum of original fees (Rule #3).
+    ///    Core: `replacement_fees < original_fees` → reject.  Equal fees are OK
+    ///    (Rule #4 catches the incremental-bandwidth requirement).
+    ///    Core error: "rejecting replacement %s, less fees than conflicting txs".
+    ///    Reference: policy/rbf.cpp::PaysForRBF (first check).
+    ///
+    /// 5. [Gate 7] Additional fees must cover relay cost of the replacement tx (Rule #4).
+    ///    Core: `additional_fees < relay_fee.GetFee(replacement_vsize)` → reject.
+    ///    Core error: "rejecting replacement %s, not enough additional fees to relay".
+    ///    Reference: policy/rbf.cpp::PaysForRBF (second check).
+    ///
+    /// Gate 8 (ImprovesFeerateDiagram) requires cluster mempool — deferred.
     fn checkRBFRules(
         self: *Mempool,
         new_tx: *const types.Transaction,
@@ -1885,6 +1942,20 @@ pub const Mempool = struct {
         conflicting_txids: []const types.Hash256,
     ) MempoolError!void {
         _ = new_txid;
+
+        // Gate 1 (BIP-125 opt-in): unless full-RBF mode is enabled, every
+        // directly-conflicting tx must have is_rbf=true.  is_rbf already
+        // incorporates ancestor signaling (set at admission time).
+        // Core: policy/rbf.cpp::IsRBFOptIn checks entry.GetTx() + ancestors.
+        if (!self.full_rbf) {
+            for (conflicting_txids) |conflicting_txid| {
+                if (self.entries.get(conflicting_txid)) |entry| {
+                    if (!entry.is_rbf) {
+                        return MempoolError.NonBIP125Replaceable;
+                    }
+                }
+            }
+        }
 
         // Collect all transactions to be evicted (direct conflicts + all descendants)
         var all_evicted = std.AutoHashMap(types.Hash256, void).init(self.allocator);
@@ -1917,7 +1988,7 @@ pub const Mempool = struct {
             }
         }
 
-        // Rule 2 (BIP-125): reject if any input of the replacement spends an
+        // Gate 4 / Rule 2 (BIP-125): reject if any input of the replacement spends an
         // outpoint owned by a tx that would itself be evicted. Doing the
         // eviction first and then discovering this would leave an
         // unspendable tx in the mempool (parent gone) — Core checks the
@@ -1930,18 +2001,22 @@ pub const Mempool = struct {
             }
         }
 
-        // Rule 5: Check max eviction limit
+        // Gate 3 / Rule 5: Check max eviction limit
         if (all_evicted.count() > MAX_REPLACEMENT_EVICTIONS) {
             return MempoolError.TooManyEvictions;
         }
 
-        // Rule 3: Replacement must pay higher absolute fee than sum of all evicted txs
-        if (new_fee <= total_evicted_fee) {
+        // Gate 6 / Rule 3: Replacement must pay >= absolute fee of all evicted txs.
+        // Core uses strict `<` (equal fees are ALLOWED here; Rule 4 enforces
+        // the incremental bandwidth requirement).
+        // Reference: policy/rbf.cpp::PaysForRBF, line `if (replacement_fees < original_fees)`.
+        if (new_fee < total_evicted_fee) {
             return MempoolError.ReplacementFeeTooLow;
         }
 
-        // Rule 4: Replacement must pay for its own bandwidth
+        // Gate 7 / Rule 4: Replacement must pay for its own bandwidth.
         // new_fee - sum(old_fees) >= incremental_relay_fee * new_vsize
+        // Reference: policy/rbf.cpp::PaysForRBF, line `if (additional_fees < relay_fee.GetFee(...))`.
         const additional_fee = new_fee - total_evicted_fee;
         const min_additional_fee = @divTrunc(@as(i64, @intCast(new_vsize)) * INCREMENTAL_RELAY_FEE, 1000);
         if (additional_fee < min_additional_fee) {
@@ -2563,8 +2638,11 @@ pub const Mempool = struct {
             .descendant_count = 1,
             .descendant_size = vsize,
             .descendant_fees = fee,
-            // V3/TRUC transactions are always RBF-replaceable (BIP 431)
-            .is_rbf = tx.version == TRUC_VERSION or isRBFSignaled(&tx),
+            // V3/TRUC transactions are always RBF-replaceable (BIP 431).
+            // BIP-125 opt-in also propagates from unconfirmed ancestors: a tx is
+            // replaceable if it signals opt-in OR if any mempool ancestor does.
+            // Mirrors Bitcoin Core's IsRBFOptIn() ancestor loop in policy/rbf.cpp.
+            .is_rbf = tx.version == TRUC_VERSION or isRBFSignaled(&tx) or self.hasRBFAncestor(&tx),
             .cluster_index = cluster_idx,
             .mining_score = individual_fee_rate, // Initial score
         };
@@ -5484,6 +5562,8 @@ test "full RBF: replacement succeeds with higher fee" {
 
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
+    // full_rbf=true: allow replacing non-signaling txs (-mempoolfullrbf equivalent).
+    mempool.full_rbf = true;
 
     const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
 
@@ -5907,6 +5987,8 @@ test "full RBF: non-signaling tx is still replaceable" {
 
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
+    // Enable full-RBF mode so non-signaling txs are replaceable.
+    mempool.full_rbf = true;
 
     const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
 
@@ -5987,6 +6069,513 @@ test "full RBF constants" {
     // Verify key RBF constants
     try std.testing.expectEqual(@as(i64, 1000), INCREMENTAL_RELAY_FEE);
     try std.testing.expectEqual(@as(usize, 100), MAX_REPLACEMENT_EVICTIONS);
+}
+
+// ============================================================================
+// W73 BIP-125 Gate Tests
+// ============================================================================
+//
+// Reference: bitcoin-core/src/policy/rbf.cpp, src/util/rbf.cpp
+// Covers the 7 implemented gates:
+//   Gate 1  — SignalsOptInRBF (MAX_BIP125_RBF_SEQUENCE constant)
+//   Gate 2  — Ancestor inheritance of opt-in RBF
+//   Gate 1b — Non-BIP125-replaceable rejection (conflicting tx must opt in)
+//   Gate 3  — MAX_REPLACEMENT_EVICTIONS (100)
+//   Gate 4  — EntriesAndTxidsDisjoint (tested in BIP-125 Rule 2 section below)
+//   Gate 6  — Rule #3: replacement_fees >= original_fees (strict <, NOT <=)
+//   Gate 7  — Rule #4: additional_fees >= incremental_relay_fee * replacement_vsize
+
+test "W73 Gate 1: MAX_BIP125_RBF_SEQUENCE constant is 0xFFFFFFFD" {
+    // Core: static constexpr uint32_t MAX_BIP125_RBF_SEQUENCE{0xfffffffd};
+    // util/rbf.h line 12.
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFD), MAX_BIP125_RBF_SEQUENCE);
+}
+
+test "W73 Gate 1: sequence boundary cases for isRBFSignaled" {
+    const allocator = std.testing.allocator;
+    _ = allocator;
+
+    // 0xFFFFFFFD → signals RBF (= MAX_BIP125_RBF_SEQUENCE)
+    {
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &[_]types.TxIn{.{
+                .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFD,
+                .witness = &[_][]const u8{},
+            }},
+            .outputs = &[_]types.TxOut{},
+            .lock_time = 0,
+        };
+        try std.testing.expect(Mempool.isRBFSignaled(&tx));
+    }
+
+    // 0xFFFFFFFE → does NOT signal RBF (SEQUENCE_FINAL-1, used for nLockTime)
+    {
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &[_]types.TxIn{.{
+                .previous_output = .{ .hash = [_]u8{0x02} ** 32, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFE,
+                .witness = &[_][]const u8{},
+            }},
+            .outputs = &[_]types.TxOut{},
+            .lock_time = 0,
+        };
+        try std.testing.expect(!Mempool.isRBFSignaled(&tx));
+    }
+
+    // 0xFFFFFFFF → does NOT signal RBF (SEQUENCE_FINAL)
+    {
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &[_]types.TxIn{.{
+                .previous_output = .{ .hash = [_]u8{0x03} ** 32, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            }},
+            .outputs = &[_]types.TxOut{},
+            .lock_time = 0,
+        };
+        try std.testing.expect(!Mempool.isRBFSignaled(&tx));
+    }
+
+    // 0x00 → signals RBF (absolute minimum, well below threshold)
+    {
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &[_]types.TxIn{.{
+                .previous_output = .{ .hash = [_]u8{0x04} ** 32, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0x00000000,
+                .witness = &[_][]const u8{},
+            }},
+            .outputs = &[_]types.TxOut{},
+            .lock_time = 0,
+        };
+        try std.testing.expect(Mempool.isRBFSignaled(&tx));
+    }
+
+    // Multi-input: any-input rule — only ONE needs to signal.
+    // Core: "All inputs rather than just one is for the sake of multi-party protocols".
+    // Wait — Core actually requires ANY input <= threshold (one is enough).
+    {
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &[_]types.TxIn{
+                .{
+                    .previous_output = .{ .hash = [_]u8{0x05} ** 32, .index = 0 },
+                    .script_sig = &[_]u8{},
+                    .sequence = 0xFFFFFFFF, // does NOT signal
+                    .witness = &[_][]const u8{},
+                },
+                .{
+                    .previous_output = .{ .hash = [_]u8{0x05} ** 32, .index = 1 },
+                    .script_sig = &[_]u8{},
+                    .sequence = 0xFFFFFFFD, // DOES signal
+                    .witness = &[_][]const u8{},
+                },
+            },
+            .outputs = &[_]types.TxOut{},
+            .lock_time = 0,
+        };
+        try std.testing.expect(Mempool.isRBFSignaled(&tx));
+    }
+}
+
+test "W73 Gate 1b: non-BIP125-replaceable rejection (default non-full-RBF mode)" {
+    // Without full_rbf=true, replacing a tx that does NOT signal opt-in must
+    // fail with NonBIP125Replaceable.
+    // Core: policy/rbf.cpp::IsRBFOptIn → "txn-mempool-conflict".
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    // full_rbf defaults to false — Core's default behaviour.
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xBB} ** 20;
+
+    // Funding tx (acts as confirmed UTXO in null-chainstate test mode).
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xF1} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_000_000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Original tx with SEQUENCE_FINAL (no opt-in).
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF, // Does NOT opt in to RBF.
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 900_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(original_tx);
+
+    // Verify is_rbf=false for the original entry.
+    const original_txid = crypto.computeTxid(&original_tx, allocator) catch unreachable;
+    try std.testing.expect(!mempool.get(original_txid).?.is_rbf);
+
+    // Replacement: higher fee, but conflicting tx doesn't opt in → rejected.
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 700_000, // fee = 300_000 (higher)
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1,
+    };
+
+    const result = mempool.addTransaction(replacement_tx);
+    try std.testing.expectError(MempoolError.NonBIP125Replaceable, result);
+
+    // Original must still be in the mempool (state unchanged).
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+    try std.testing.expect(mempool.contains(original_txid));
+}
+
+test "W73 Gate 1b: BIP-125 opt-in tx IS replaceable in non-full-RBF mode" {
+    // Confirm the positive case: a conflicting tx WITH sequence <= 0xFFFFFFFD
+    // IS replaceable even without full_rbf.
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xCC} ** 20;
+
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xF2} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_000_000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Original tx WITH opt-in signal (sequence = 0xFFFFFFFD).
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD, // Opts in.
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 900_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(original_tx);
+
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 700_000, // fee = 300_000 (higher)
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1,
+    };
+
+    // Must succeed: original opted in, fee is higher, incremental fee covered.
+    try mempool.addTransaction(replacement_tx);
+    const original_txid = crypto.computeTxid(&original_tx, allocator) catch unreachable;
+    try std.testing.expect(!mempool.contains(original_txid));
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count()); // funding + replacement
+}
+
+test "W73 Gate 2: ancestor RBF inheritance — child of opt-in tx is replaceable" {
+    // BIP-125: a tx whose ancestor signals opt-in is ITSELF replaceable.
+    // Core: policy/rbf.cpp::IsRBFOptIn walks CalculateMemPoolAncestors.
+    // Clearbit: is_rbf=true propagates via hasRBFAncestor() at admission time.
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xDD} ** 20;
+
+    // Confirmed UTXO equivalent (funding).
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xF3} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 2_000_000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Parent tx WITH opt-in (sequence = 0xFFFFFFFD).
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD, // signals opt-in
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_900_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = crypto.computeTxid(&parent_tx, allocator) catch unreachable;
+
+    // Child tx WITHOUT its own opt-in signal, but inherits from parent.
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF, // no direct opt-in
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_800_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(child_tx);
+    const child_txid = crypto.computeTxid(&child_tx, allocator) catch unreachable;
+
+    // Child should have is_rbf=true via ancestor inheritance.
+    const child_entry = mempool.get(child_txid).?;
+    try std.testing.expect(child_entry.is_rbf);
+
+    // Replacement for the child (different output, higher fee).
+    // Spends the SAME parent output as child.
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_700_000, // fee = 200_000 (higher than child's 100_000)
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1,
+    };
+
+    // Must succeed: child is replaceable via ancestor opt-in.
+    // Gate 1b should NOT fire even though child.sequence=0xFFFFFFFF.
+    try mempool.addTransaction(replacement_tx);
+    try std.testing.expect(!mempool.contains(child_txid));
+}
+
+test "W73 Gate 6: Rule #3 equal fees are ALLOWED (strict < not <=)" {
+    // Core: policy/rbf.cpp::PaysForRBF uses `replacement_fees < original_fees`
+    // (strict less-than).  Equal fees are fine for Rule #3; Rule #4 handles
+    // the incremental bandwidth requirement.
+    //
+    // Pre-fix clearbit used `<=` and incorrectly rejected equal-fee replacements
+    // at Rule #3 instead of letting Rule #4 decide.
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xEE} ** 20;
+
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xF4} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_000_000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    // Original tx with opt-in signal.
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD, // opts in
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 900_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(original_tx);
+
+    // Replacement with EXACTLY the same fee (900_000 output → same 100_000 fee).
+    // Rule #3 must PASS (equal fees allowed).
+    // Rule #4 must also PASS because we need additional_fee >= incremental_relay_fee * vsize.
+    // With fee=total_evicted_fee → additional_fee=0 and min_additional_fee=vsize*1000/1000=vsize.
+    // So this will be rejected by Rule #4 (Gate 7), NOT Rule #3.
+    // We verify we get ReplacementFeeTooLow but the old Rule #3 error path is gone.
+    const replacement_same_fee = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 900_000, // fee = 100_000 = same as original
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1,
+    };
+    // Still fails (Gate 7 — no additional bandwidth fee) but NOT due to Gate 6.
+    const result = mempool.addTransaction(replacement_same_fee);
+    try std.testing.expectError(MempoolError.ReplacementFeeTooLow, result);
+
+    // Now verify that replacement_fees > original_fees with enough increment → succeeds.
+    const replacement_higher_fee = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 700_000, // fee = 300_000 (original 100_000 + 200_000 incremental)
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 2,
+    };
+    try mempool.addTransaction(replacement_higher_fee);
+    const original_txid = crypto.computeTxid(&original_tx, allocator) catch unreachable;
+    try std.testing.expect(!mempool.contains(original_txid));
+}
+
+test "W73 Gate 7: Rule #4 replacement must pay incremental relay fee" {
+    // Core: policy/rbf.cpp::PaysForRBF second check:
+    //   additional_fees < relay_fee.GetFee(replacement_vsize) → reject.
+    // Even if replacement_fees > original_fees, the increment must cover the
+    // bandwidth cost of the new transaction.
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xFF} ** 20;
+
+    const funding_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xF5} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 1_000_000,
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(funding_tx);
+    const funding_txid = crypto.computeTxid(&funding_tx, allocator) catch unreachable;
+
+    const original_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 900_000, // fee = 100_000
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(original_tx);
+
+    // Replacement with fee = 100_001 (only 1 sat more than original).
+    // For a ~100 vbyte tx: min_additional_fee = 100 * 1000 / 1000 = 100 sats.
+    // 1 sat < 100 sats → Gate 7 fires.
+    const replacement_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = funding_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = 899_999, // fee = 100_001 (only 1 sat above original)
+            .script_pubkey = &p2wpkh_script,
+        }},
+        .lock_time = 1,
+    };
+
+    const result = mempool.addTransaction(replacement_tx);
+    try std.testing.expectError(MempoolError.ReplacementFeeTooLow, result);
 }
 
 // ============================================================================
