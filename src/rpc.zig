@@ -9964,8 +9964,8 @@ pub const RpcServer = struct {
 
         // Try to decode the address
         const addr = address_mod.Address.decode(addr_str, self.allocator) catch {
-            // Invalid address
-            try writer.print("{{\"isvalid\":false,\"address\":\"{s}\"}}", .{addr_str});
+            // Invalid address — Core 27+ format: error string + error_locations, NO address field
+            try writer.writeAll("{\"error\":\"Invalid or unsupported Segwit (Bech32) or Base58 encoding.\",\"error_locations\":[],\"isvalid\":false}");
             return self.jsonRpcResult(buf.items, id);
         };
         defer self.allocator.free(addr.hash);
@@ -10016,8 +10016,8 @@ pub const RpcServer = struct {
         }
         try writer.writeByte('"');
 
-        // isscript
-        const is_script = addr.addr_type == .p2sh or addr.addr_type == .p2wsh;
+        // isscript: TRUE for any witness_program > 20 bytes (P2WSH=32, P2TR=32) or P2SH
+        const is_script = addr.addr_type == .p2sh or addr.addr_type == .p2wsh or addr.addr_type == .p2tr;
         try writer.print(",\"isscript\":{s}", .{if (is_script) "true" else "false"});
 
         // iswitness
