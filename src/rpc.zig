@@ -1805,11 +1805,13 @@ pub const RpcServer = struct {
         } else if (std.mem.eql(u8, method, "getwalletinfo")) {
             return self.handleGetWalletInfo(id);
         }
-        // Descriptor RPC methods
+        // Descriptor / multisig RPC methods
         else if (std.mem.eql(u8, method, "getdescriptorinfo")) {
             return self.handleGetDescriptorInfo(params, id);
         } else if (std.mem.eql(u8, method, "deriveaddresses")) {
             return self.handleDeriveAddresses(params, id);
+        } else if (std.mem.eql(u8, method, "createmultisig")) {
+            return self.handleCreateMultisig(params, id);
         }
         // Regtest mining RPC methods
         else if (std.mem.eql(u8, method, "generatetoaddress")) {
@@ -8125,6 +8127,277 @@ pub const RpcServer = struct {
                 try writer.writeAll(p2sh_segwit_addr);
                 try writer.writeAll("\"}");
             }
+        }
+
+        try writer.writeByte('}');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle createmultisig RPC.
+    ///
+    /// Reference: Bitcoin Core src/rpc/output_script.cpp createmultisig
+    ///
+    /// Params:
+    ///   [0] nrequired  (int)    — number of required signatures, 1..nKeys
+    ///   [1] keys       (array)  — hex-encoded compressed (33-byte) pubkeys
+    ///   [2] address_type (str, optional) — "legacy" (default), "bech32", "p2sh-segwit"
+    ///
+    /// Returns: {address, redeemScript, descriptor}
+    /// Optional: {warnings} when uncompressed keys force type override.
+    fn handleCreateMultisig(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "createmultisig requires nrequired and keys", id);
+        }
+
+        // --- Parse nrequired ---
+        const nreq_val = params.array.items[0];
+        if (nreq_val != .integer) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "nrequired must be an integer", id);
+        }
+        const n_required: i64 = nreq_val.integer;
+        if (n_required < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS,
+                "a multisignature address must require at least one key to redeem", id);
+        }
+
+        // --- Parse keys array ---
+        const keys_val = params.array.items[1];
+        if (keys_val != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "keys must be an array", id);
+        }
+        const keys = keys_val.array.items;
+        const n_keys: i64 = @intCast(keys.len);
+
+        if (n_keys > 16) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS,
+                "Number of keys involved in the multisignature address creation > 16\nReduce the number", id);
+        }
+        if (n_required > n_keys) {
+            var msg_buf: [128]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&msg_buf,
+                "not enough keys supplied (got {d} keys, but need at least {d} to redeem)",
+                .{ n_keys, n_required });
+            return self.jsonRpcError(RPC_INVALID_PARAMS, msg, id);
+        }
+
+        // --- Parse and validate pubkeys ---
+        // Each pubkey is 33 bytes (compressed) or 65 bytes (uncompressed).
+        // Stored as a flat byte buffer; offsets tracked separately.
+        const MAX_KEYS = 16;
+        var pk_data: [MAX_KEYS][65]u8 = undefined;
+        var pk_lens: [MAX_KEYS]usize = undefined;
+        var has_uncompressed = false;
+
+        for (keys, 0..) |key_val, i| {
+            if (key_val != .string) {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY,
+                    "pubkey must be a hex string", id);
+            }
+            const hex_str = key_val.string;
+            const byte_len = hex_str.len / 2;
+
+            // Length check: must be 33 or 65 bytes
+            if ((hex_str.len != 66 and hex_str.len != 130) or hex_str.len % 2 != 0) {
+                var emsg: [256]u8 = undefined;
+                const s = try std.fmt.bufPrint(&emsg,
+                    "Pubkey \"{s}\" must have a length of either 33 or 65 bytes", .{hex_str});
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+            }
+
+            // Decode hex
+            for (0..byte_len) |bi| {
+                pk_data[i][bi] = std.fmt.parseInt(u8, hex_str[bi * 2 ..][0..2], 16) catch {
+                    var emsg: [256]u8 = undefined;
+                    const s = try std.fmt.bufPrint(&emsg,
+                        "Pubkey \"{s}\" must be a hex string", .{hex_str});
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+                };
+            }
+            pk_lens[i] = byte_len;
+
+            // Validate via secp256k1: use crypto helpers which call secp256k1_ec_pubkey_parse.
+            // decompressPubkey33 returns null if the point is not on the curve.
+            // parseUncompressedPubkey65 returns null for invalid uncompressed keys.
+            if (byte_len == 33) {
+                if (pk_data[i][0] != 0x02 and pk_data[i][0] != 0x03) {
+                    var emsg: [256]u8 = undefined;
+                    const s = try std.fmt.bufPrint(&emsg,
+                        "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+                }
+                const pk33: *const [33]u8 = pk_data[i][0..33];
+                if (crypto.decompressPubkey33(pk33) == null) {
+                    var emsg: [256]u8 = undefined;
+                    const s = try std.fmt.bufPrint(&emsg,
+                        "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+                }
+            } else { // 65 bytes
+                if (pk_data[i][0] != 0x04) {
+                    var emsg: [256]u8 = undefined;
+                    const s = try std.fmt.bufPrint(&emsg,
+                        "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+                }
+                const pk65: *const [65]u8 = pk_data[i][0..65];
+                if (crypto.parseUncompressedPubkey65(pk65) == null) {
+                    var emsg: [256]u8 = undefined;
+                    const s = try std.fmt.bufPrint(&emsg,
+                        "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+                }
+                has_uncompressed = true;
+            }
+        }
+
+        // --- Parse address_type ---
+        var addr_type: []const u8 = "legacy";
+        if (params.array.items.len >= 3) {
+            const at = params.array.items[2];
+            if (at == .string) {
+                addr_type = at.string;
+            }
+        }
+
+        // Validate address_type
+        if (!std.mem.eql(u8, addr_type, "legacy") and
+            !std.mem.eql(u8, addr_type, "bech32") and
+            !std.mem.eql(u8, addr_type, "p2sh-segwit"))
+        {
+            var emsg: [128]u8 = undefined;
+            const s = try std.fmt.bufPrint(&emsg, "Unknown address type '{s}'", .{addr_type});
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+        }
+
+        // Uncompressed keys → force legacy (Core behaviour: descriptor type mismatch)
+        var warnings_buf: [1][]const u8 = undefined;
+        var n_warnings: usize = 0;
+        var effective_type = addr_type;
+        if (has_uncompressed and !std.mem.eql(u8, effective_type, "legacy")) {
+            effective_type = "legacy";
+            warnings_buf[0] = "Unable to make chosen address type, please ensure no uncompressed public keys are present.";
+            n_warnings = 1;
+        }
+
+        // --- Build redeemScript: OP_M <push><pk1> ... OP_N OP_CHECKMULTISIG ---
+        // Max script length: 1 + 16*(1+65) + 1 + 1 = 1091 bytes
+        var rs_buf: [1 + 16 * (1 + 65) + 1 + 1]u8 = undefined;
+        var rs_len: usize = 0;
+
+        rs_buf[rs_len] = @intCast(0x50 + n_required);
+        rs_len += 1;
+
+        for (0..@intCast(n_keys)) |i| {
+            rs_buf[rs_len] = @intCast(pk_lens[i]); // push byte: 0x21 or 0x41
+            rs_len += 1;
+            @memcpy(rs_buf[rs_len..][0..pk_lens[i]], pk_data[i][0..pk_lens[i]]);
+            rs_len += pk_lens[i];
+        }
+
+        rs_buf[rs_len] = @intCast(0x50 + n_keys);
+        rs_len += 1;
+        rs_buf[rs_len] = 0xae; // OP_CHECKMULTISIG
+        rs_len += 1;
+
+        const rs = rs_buf[0..rs_len];
+
+        // --- Determine network for address encoding ---
+        const network = networkFromMagic(self.network_params.magic);
+        const is_regtest = isRegtestMagic(self.network_params.magic);
+        _ = is_regtest;
+
+        // HRP for bech32 addresses
+        const hrp: []const u8 = switch (self.network_params.magic) {
+            consensus.MAINNET.magic => "bc",
+            consensus.TESTNET.magic, consensus.TESTNET4.magic, consensus.SIGNET.magic => "tb",
+            else => "bcrt", // regtest
+        };
+
+        // --- Derive address and descriptor ---
+        var addr_str: []const u8 = undefined;
+        var desc_str: []const u8 = undefined;
+        var addr_owned = false;
+        var desc_owned = false;
+
+        // Build the inner descriptor string (without checksum)
+        // "sh(multi(M,pk1,pk2,...))" etc.
+        var desc_inner = std.ArrayList(u8).init(self.allocator);
+        defer desc_inner.deinit();
+
+        if (std.mem.eql(u8, effective_type, "legacy")) {
+            // P2SH: base58check(version=0x05 || HASH160(rs))
+            const h160 = crypto.hash160(rs);
+            addr_str = try buildP2SHAddress(self.allocator, &h160, network, false);
+            addr_owned = true;
+
+            try desc_inner.appendSlice("sh(multi(");
+            try desc_inner.writer().print("{d}", .{n_required});
+            for (0..@intCast(n_keys)) |i| {
+                try desc_inner.append(',');
+                for (pk_data[i][0..pk_lens[i]]) |b| try desc_inner.writer().print("{x:0>2}", .{b});
+            }
+            try desc_inner.appendSlice("))");
+        } else if (std.mem.eql(u8, effective_type, "bech32")) {
+            // P2WSH: bech32 v0 with SHA256(rs) as 32-byte witness program
+            const sh = crypto.sha256(rs);
+            addr_str = try address_mod.segwitEncode(hrp, 0, &sh, self.allocator);
+            addr_owned = true;
+
+            try desc_inner.appendSlice("wsh(multi(");
+            try desc_inner.writer().print("{d}", .{n_required});
+            for (0..@intCast(n_keys)) |i| {
+                try desc_inner.append(',');
+                for (pk_data[i][0..pk_lens[i]]) |b| try desc_inner.writer().print("{x:0>2}", .{b});
+            }
+            try desc_inner.appendSlice("))");
+        } else { // p2sh-segwit
+            // P2SH(P2WSH): P2SH wrapping the P2WSH script (0x00 0x20 <sha256(rs)>)
+            const sh = crypto.sha256(rs);
+            var p2wsh_script: [34]u8 = undefined;
+            p2wsh_script[0] = 0x00; // OP_0
+            p2wsh_script[1] = 0x20; // PUSH32
+            @memcpy(p2wsh_script[2..34], &sh);
+            const h160 = crypto.hash160(&p2wsh_script);
+            addr_str = try buildP2SHAddress(self.allocator, &h160, network, false);
+            addr_owned = true;
+
+            try desc_inner.appendSlice("sh(wsh(multi(");
+            try desc_inner.writer().print("{d}", .{n_required});
+            for (0..@intCast(n_keys)) |i| {
+                try desc_inner.append(',');
+                for (pk_data[i][0..pk_lens[i]]) |b| try desc_inner.writer().print("{x:0>2}", .{b});
+            }
+            try desc_inner.appendSlice(")))");
+        }
+
+        desc_str = try descriptor.addChecksum(self.allocator, desc_inner.items);
+        desc_owned = true;
+        defer if (addr_owned) self.allocator.free(addr_str);
+        defer if (desc_owned) self.allocator.free(desc_str);
+
+        // --- Build JSON response ---
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"address\":\"");
+        try writer.writeAll(addr_str);
+        try writer.writeAll("\",\"redeemScript\":\"");
+        for (rs) |b| try writer.print("{x:0>2}", .{b});
+        try writer.writeAll("\",\"descriptor\":\"");
+        // Escape descriptor (contains parens and commas but no quotes)
+        try writer.writeAll(desc_str);
+        try writer.writeByte('"');
+
+        if (n_warnings > 0) {
+            try writer.writeAll(",\"warnings\":[");
+            for (0..n_warnings) |wi| {
+                if (wi > 0) try writer.writeByte(',');
+                try writer.writeByte('"');
+                try writer.writeAll(warnings_buf[wi]);
+                try writer.writeByte('"');
+            }
+            try writer.writeByte(']');
         }
 
         try writer.writeByte('}');
