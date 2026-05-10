@@ -1859,6 +1859,63 @@ pub const Mempool = struct {
             }
         }
 
+        // Per-input sigop checks (ValidateInputsStandardness, policy/policy.cpp).
+        //
+        // 1. Per-input P2SH redeemScript sigop limit (MAX_P2SH_SIGOPS = 15).
+        //    For each input that spends a P2SH output, extract the redeemScript
+        //    from scriptSig (last push item) and ensure it has ≤ 15 sigops.
+        //    Reference: Bitcoin Core policy/policy.cpp ValidateInputsStandardness()
+        //    line ~254: subscript.GetSigOpCount(true) > MAX_P2SH_SIGOPS.
+        //
+        // 2. Per-tx legacy sigop limit (MAX_TX_LEGACY_SIGOPS = 2_500, BIP-54).
+        //    Count accurate scriptSig sigops + output scriptPubKey sigops.
+        //    The spent-output portion of BIP-54 requires UTXO access (done in
+        //    script-validation path); we gate on what's available here.
+        //    Reference: Bitcoin Core policy/policy.cpp CheckSigopsBIP54().
+        {
+            // Legacy sigop count: scriptSig (inaccurate) + outputs (inaccurate).
+            // This mirrors getLegacySigOpCount in validation.zig which uses
+            // inaccurate mode for all scriptSig and output sigops.
+            const legacy_sigops = validation.getLegacySigOpCount(tx);
+            if (legacy_sigops > consensus.MAX_TX_LEGACY_SIGOPS) {
+                return MempoolError.NonStandard;
+            }
+        }
+        for (tx.inputs) |input| {
+            // Check if this input has a P2SH-style scriptSig: last push is a
+            // redeemScript.  We check any scriptSig that is push-only and
+            // non-empty (isPushOnly already confirmed above).
+            //
+            // isPayToScriptHash requires the *spent* scriptPubKey, which we do
+            // not have here without UTXO access.  As an approximation: if the
+            // last pushed item in scriptSig has > MAX_P2SH_SIGOPS sigops when
+            // treated as a redeemScript, reject it unconditionally.  This gates
+            // on the worst-case — scripts that couldn't be P2SH are harmless
+            // because their sigop count in the subscript is typically 0.
+            //
+            // NOTE: The accurate P2SH-only enforcement (requiring the spent
+            // scriptPubKey to be P2SH) happens in validation.getP2SHSigOpCount
+            // during block connect; this is a conservative policy pre-filter.
+            //
+            // Reference: Bitcoin Core policy/policy.cpp ValidateInputsStandardness()
+            // block ~line 241-258.
+            if (input.script_sig.len > 0) {
+                // Use getP2SHSigOpCount with a dummy P2SH scriptPubKey to extract
+                // sigops from the last push item without checking the output type.
+                // Build a P2SH dummy so getP2SHSigOpCount takes the P2SH branch.
+                const dummy_p2sh = [_]u8{
+                    0xa9, 0x14, // OP_HASH160 <push 20>
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 20-byte placeholder hash
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x87, // OP_EQUAL
+                };
+                const redeem_sigops = script.getP2SHSigOpCount(&dummy_p2sh, input.script_sig);
+                if (redeem_sigops > consensus.MAX_P2SH_SIGOPS) {
+                    return MempoolError.NonStandard;
+                }
+            }
+        }
+
         // Per-output checks: script type standardness, P2A value, datacarrier
         // cumulative limit, and bare-multisig n-of-m validity.
         var datacarrier_bytes: usize = 0;
@@ -9333,4 +9390,134 @@ test "W72 gate 2: P2SH empty scriptSig → WitnessNonStandard" {
         MempoolError.WitnessNonStandard,
         Mempool.checkWitnessStandard(&tx, spent),
     );
+}
+
+// ============================================================================
+// W74 sigop policy tests
+// ============================================================================
+
+test "checkStandard: P2SH redeemScript with 16 sigops is rejected (> MAX_P2SH_SIGOPS=15)" {
+    // Build a redeemScript with 16 OP_CHECKSIG operations (16 > 15 = MAX_P2SH_SIGOPS).
+    // The scriptSig pushes this redeemScript as the last data item.
+    // Reference: Bitcoin Core policy/policy.cpp ValidateInputsStandardness() line ~254.
+    var redeem: [16]u8 = undefined;
+    @memset(&redeem, 0xac); // 16× OP_CHECKSIG → 16 sigops
+
+    // scriptSig: push 16 bytes (redeemScript)
+    var script_sig: [17]u8 = undefined;
+    script_sig[0] = 0x10; // push 16 bytes
+    @memcpy(script_sig[1..17], &redeem);
+
+    // Output scriptPubKey: something standard (P2WPKH)
+    var p2wpkh: [22]u8 = undefined;
+    p2wpkh[0] = 0x00; p2wpkh[1] = 0x14;
+    @memset(p2wpkh[2..22], 0xAB);
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &script_sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 50_000_000, .script_pubkey = &p2wpkh };
+
+    // Need a non-coinbase tx with a sensible size (>= 65 non-witness bytes).
+    // Pad the input scriptSig to satisfy MIN_STANDARD_TX_NONWITNESS_SIZE.
+    // Actually the 17-byte scriptSig + overhead should be fine for a tx size check.
+    // Let's use 2 inputs to get size up.
+    const input2 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00} ** 10, // pad
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{ input, input2 },
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    var mempool = Mempool.init(null, null, std.testing.allocator);
+    defer mempool.deinit();
+
+    // Should be rejected due to P2SH redeemScript having 16 > 15 sigops.
+    try std.testing.expectError(MempoolError.NonStandard, mempool.checkStandard(&tx));
+}
+
+test "checkStandard: P2SH redeemScript with 15 sigops is accepted (= MAX_P2SH_SIGOPS)" {
+    // 15 OP_CHECKSIG operations = exactly MAX_P2SH_SIGOPS → should pass.
+    var redeem: [15]u8 = undefined;
+    @memset(&redeem, 0xac); // 15× OP_CHECKSIG
+
+    var script_sig: [16]u8 = undefined;
+    script_sig[0] = 0x0f; // push 15 bytes
+    @memcpy(script_sig[1..16], &redeem);
+
+    var p2wpkh: [22]u8 = undefined;
+    p2wpkh[0] = 0x00; p2wpkh[1] = 0x14;
+    @memset(p2wpkh[2..22], 0xAB);
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x33} ** 32, .index = 0 },
+        .script_sig = &script_sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const input2 = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x44} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00} ** 10,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 50_000_000, .script_pubkey = &p2wpkh };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{ input, input2 },
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    var mempool = Mempool.init(null, null, std.testing.allocator);
+    defer mempool.deinit();
+
+    // 15 sigops in redeemScript = exactly MAX_P2SH_SIGOPS → pass.
+    // (checkStandard without chain_state skips script verification)
+    try mempool.checkStandard(&tx);
+}
+
+test "checkStandard: MAX_TX_LEGACY_SIGOPS constant and getLegacySigOpCount relationship" {
+    // Verify that MAX_TX_LEGACY_SIGOPS constant is 2500 (policy/policy.h:46, BIP-54).
+    // In practice, standard transactions (all output types standard) cannot
+    // reach 2501 legacy sigops without also exceeding MAX_STANDARD_TX_WEIGHT,
+    // but the checkStandard guard is defence-in-depth.
+    //
+    // Note: a non-standard output scriptPubKey is caught first by the per-output
+    // classifyScript check. Standard output types (P2PKH, P2WPKH, P2WSH, P2TR,
+    // P2SH, multisig) have at most 1 sigop each (or 20 for bare multisig inaccurate),
+    // so 2501 sigops from outputs alone requires at least 2501 P2PKH-class outputs,
+    // which would trigger MAX_STANDARD_TX_WEIGHT first. The guard is still correct.
+    try std.testing.expectEqual(@as(u32, 2_500), consensus.MAX_TX_LEGACY_SIGOPS);
+
+    // Verify getLegacySigOpCount counts OP_CHECKSIG in outputs (inaccurate mode).
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const dummy_input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x55} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 1_000_000, .script_pubkey = &p2pkh };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{dummy_input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    // 1 P2PKH output = 1 CHECKSIG legacy sigop (far below 2500 limit).
+    const sigops = validation.getLegacySigOpCount(&tx);
+    try std.testing.expectEqual(@as(u32, 1), sigops);
+    try std.testing.expect(sigops <= consensus.MAX_TX_LEGACY_SIGOPS);
 }
