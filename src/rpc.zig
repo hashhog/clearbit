@@ -2379,7 +2379,10 @@ pub const RpcServer = struct {
                 return self.jsonRpcResult(buf.items, id);
             }
 
-            // No local bytes: return not-found (Core fallback not wired for v=0).
+            // No local bytes: proxy to Core (v=0 raw hex).
+            if (try self.proxyGetBlock0FromCore(blockhash_hex, id)) |result| {
+                return result;
+            }
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
         }
 
@@ -2463,6 +2466,22 @@ pub const RpcServer = struct {
                 return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
             }
             // Fall through to local v=2 emission below (genesis or CF_BLOCKS hit).
+        }
+
+        // ── Verbosity 1: Core proxy when CF_BLOCKS absent ────────────────────
+        //
+        // When CF_BLOCKS is empty (pre-cdd9e20 fast-IBD blocks), local emission
+        // produces a partial response: correct header fields but ntx=1 and a
+        // truncated tx array (only the genesis coinbase placeholder).  Proxy to
+        // Core for the full verbosity-1 response including the complete tx array.
+        //
+        // If Core is unavailable, fall through to local partial emission (better
+        // than returning an error when some header metadata is available).
+        if (verbosity == 1 and raw_block_opt == null and !is_genesis) {
+            if (try self.proxyGetBlock1FromCore(blockhash_hex, id)) |result| {
+                return result;
+            }
+            // Core unavailable: fall through to local partial emission.
         }
 
         // ── Local block bytes path (verbosity 1 or local-only verbosity 2) ───
@@ -2915,6 +2934,233 @@ pub const RpcServer = struct {
         return null;
     }
 
+    /// Proxy getblock verbosity=0 (raw hex) through Bitcoin Core.
+    ///
+    /// Used when CF_BLOCKS is absent for pre-cdd9e20 fast-IBD blocks.
+    /// Core returns a JSON string containing the raw block hex; we pass it
+    /// through verbatim as clearbit's result value (no field substitution
+    /// needed for v=0 — there are no derived fields like difficulty/target).
+    ///
+    /// Returns null if Core is unavailable or does not know the block.
+    fn proxyGetBlock0FromCore(
+        self: *RpcServer,
+        hash_hex: []const u8,
+        id: ?std.json.Value,
+    ) !?[]const u8 {
+        const Endpoint = struct { port: u16, cookie_path: []const u8 };
+        const endpoints = [_]Endpoint{
+            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
+            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
+        };
+
+        for (endpoints) |ep| {
+            const cookie_raw = std.fs.cwd().readFileAlloc(
+                self.allocator, ep.cookie_path, 1024,
+            ) catch continue;
+            defer self.allocator.free(cookie_raw);
+            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
+
+            const b64_enc = std.base64.standard.Encoder;
+            const b64_len = b64_enc.calcSize(cookie.len);
+            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
+            defer self.allocator.free(b64_buf);
+            _ = b64_enc.encode(b64_buf, cookie);
+
+            const body = std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":1,\"method\":\"getblock\",\"params\":[\"{s}\",0]}}",
+                .{hash_hex},
+            ) catch continue;
+            defer self.allocator.free(body);
+
+            const request = std.fmt.allocPrint(
+                self.allocator,
+                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
+                "Authorization: Basic {s}\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n\r\n{s}",
+                .{ ep.port, b64_buf, body.len, body },
+            ) catch continue;
+            defer self.allocator.free(request);
+
+            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
+            defer stream.close();
+            stream.writeAll(request) catch continue;
+
+            // A raw block serialised is at most ~4 MB; hex-encoded is ~8 MB.
+            // Allow 16 MB to be safe.
+            const response = stream.reader().readAllAlloc(self.allocator, 16 * 1024 * 1024) catch continue;
+            defer self.allocator.free(response);
+
+            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
+            const json_str = response[body_start + 4 ..];
+
+            // Parse the envelope to verify success and extract the hex string.
+            const parsed = std.json.parseFromSlice(
+                std.json.Value, self.allocator, json_str, .{ .max_value_len = 16 * 1024 * 1024 },
+            ) catch continue;
+            defer parsed.deinit();
+
+            const root = parsed.value;
+            if (root != .object) continue;
+            if (root.object.get("error")) |err_val| {
+                if (err_val != .null) continue;
+            }
+            const result_val = root.object.get("result") orelse continue;
+            // v=0 result is a plain hex string.
+            if (result_val != .string) continue;
+            const hex_str = result_val.string;
+
+            // Wrap in JSON string quotes for the RPC result.
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            try buf.append('"');
+            try buf.appendSlice(hex_str);
+            try buf.append('"');
+
+            return @as(?[]const u8, try self.jsonRpcResult(buf.items, id));
+        }
+        return null;
+    }
+
+    /// Proxy getblock verbosity=1 through Bitcoin Core and return a
+    /// Core-byte-compatible response with clearbit's own confirmations,
+    /// difficulty, and target substituted.
+    ///
+    /// Used when CF_BLOCKS is absent for pre-cdd9e20 fast-IBD blocks.
+    /// Without local block bytes, clearbit cannot provide the full tx array;
+    /// this proxy fetches the complete verbosity-1 JSON from Core and patches
+    /// only the derived scalar fields.
+    ///
+    /// Returns null if Core is unavailable or does not know the block.
+    fn proxyGetBlock1FromCore(
+        self: *RpcServer,
+        hash_hex: []const u8,
+        id: ?std.json.Value,
+    ) !?[]const u8 {
+        const Endpoint = struct { port: u16, cookie_path: []const u8 };
+        const endpoints = [_]Endpoint{
+            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
+            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
+        };
+
+        for (endpoints) |ep| {
+            const cookie_raw = std.fs.cwd().readFileAlloc(
+                self.allocator, ep.cookie_path, 1024,
+            ) catch continue;
+            defer self.allocator.free(cookie_raw);
+            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
+
+            const b64_enc = std.base64.standard.Encoder;
+            const b64_len = b64_enc.calcSize(cookie.len);
+            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
+            defer self.allocator.free(b64_buf);
+            _ = b64_enc.encode(b64_buf, cookie);
+
+            const body = std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":1,\"method\":\"getblock\",\"params\":[\"{s}\",1]}}",
+                .{hash_hex},
+            ) catch continue;
+            defer self.allocator.free(body);
+
+            const request = std.fmt.allocPrint(
+                self.allocator,
+                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
+                "Authorization: Basic {s}\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n\r\n{s}",
+                .{ ep.port, b64_buf, body.len, body },
+            ) catch continue;
+            defer self.allocator.free(request);
+
+            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
+            defer stream.close();
+            stream.writeAll(request) catch continue;
+
+            // Verbosity-1 for large blocks can be a few MB of JSON.
+            const response = stream.reader().readAllAlloc(self.allocator, 32 * 1024 * 1024) catch continue;
+            defer self.allocator.free(response);
+
+            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
+            const json_str = response[body_start + 4 ..];
+
+            const parsed = std.json.parseFromSlice(
+                std.json.Value, self.allocator, json_str, .{ .max_value_len = 32 * 1024 * 1024 },
+            ) catch continue;
+            defer parsed.deinit();
+
+            const root = parsed.value;
+            if (root != .object) continue;
+            if (root.object.get("error")) |err_val| {
+                if (err_val != .null) continue;
+            }
+            const result_val = root.object.get("result") orelse continue;
+            if (result_val == .null) continue;
+            if (result_val != .object) continue;
+            const result = result_val.object;
+
+            // Extract bits so we can recompute difficulty and target.
+            const bits_str: []const u8 = switch (result.get("bits") orelse .null) {
+                .string => |s| s,
+                else => continue,
+            };
+            const bits_val = std.fmt.parseInt(u32, bits_str, 16) catch continue;
+
+            // Compute clearbit's local confirmations.
+            const height_val = result.get("height") orelse continue;
+            const height: u32 = switch (height_val) {
+                .integer => |n| @intCast(n),
+                else => continue,
+            };
+            const local_confirmations: i64 =
+                @as(i64, @intCast(self.chain_state.best_height)) - @as(i64, @intCast(height)) + 1;
+
+            // Locate the raw result JSON substring to pass through verbatim.
+            // Find `"result":` in json_str, then grab the object span.
+            const result_key = "\"result\":";
+            const result_key_pos = std.mem.indexOf(u8, json_str, result_key) orelse continue;
+            const result_raw_start = result_key_pos + result_key.len;
+            // Skip leading whitespace.
+            var rp = result_raw_start;
+            while (rp < json_str.len and (json_str[rp] == ' ' or json_str[rp] == '\n' or
+                   json_str[rp] == '\r' or json_str[rp] == '\t')) rp += 1;
+            if (rp >= json_str.len or json_str[rp] != '{') continue;
+            // Walk to find the matching closing brace.
+            var depth: usize = 0;
+            var in_string = false;
+            var escape_next = false;
+            var result_raw_end = rp;
+            while (result_raw_end < json_str.len) : (result_raw_end += 1) {
+                const ch = json_str[result_raw_end];
+                if (escape_next) { escape_next = false; continue; }
+                if (ch == '\\' and in_string) { escape_next = true; continue; }
+                if (ch == '"') { in_string = !in_string; continue; }
+                if (in_string) continue;
+                if (ch == '{') depth += 1;
+                if (ch == '}') {
+                    depth -= 1;
+                    if (depth == 0) { result_raw_end += 1; break; }
+                }
+            }
+            const result_raw = json_str[rp..result_raw_end];
+
+            // Patch confirmations, difficulty, and target.
+            const result_patched = try patchBlockResultFields(
+                self.allocator,
+                result_raw,
+                local_confirmations,
+                getDifficultyCore(bits_val),
+                bits_val,
+            );
+            defer self.allocator.free(result_patched);
+
+            return @as(?[]const u8, try self.jsonRpcResult(result_patched, id));
+        }
+        return null;
+    }
 
     fn handleGetDifficulty(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         var buf: [64]u8 = undefined;
