@@ -4045,9 +4045,12 @@ pub const RpcServer = struct {
     }
 
     fn handleGetRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // Extract txid and verbose flag
+        // Extract txid, verbosity level, and optional blockhash.
+        // verbosity: 0 = hex, 1 = verbose JSON, 2 = verbose + prevout enrichment (W60).
+        // Bitcoin Core: verbosity can be bool (compat) or int 0/1/2.
         var txid_hex: []const u8 = undefined;
-        var verbose: bool = false;
+        var verbosity: u8 = 0;
+        var blockhash_hex_param: ?[]const u8 = null;
 
         if (params == .array) {
             if (params.array.items.len > 0) {
@@ -4064,14 +4067,24 @@ pub const RpcServer = struct {
             if (params.array.items.len > 1) {
                 const v = params.array.items[1];
                 if (v == .bool) {
-                    verbose = v.bool;
+                    verbosity = if (v.bool) 1 else 0;
                 } else if (v == .integer) {
-                    verbose = v.integer != 0;
+                    verbosity = @intCast(@min(v.integer, 2));
+                    if (v.integer < 0) verbosity = 0;
+                }
+            }
+
+            if (params.array.items.len > 2) {
+                const bh = params.array.items[2];
+                if (bh == .string) {
+                    blockhash_hex_param = bh.string;
                 }
             }
         } else {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid params", id);
         }
+
+        const verbose = verbosity >= 1;
 
         // Parse txid
         if (txid_hex.len != 64) {
@@ -4216,7 +4229,124 @@ pub const RpcServer = struct {
             }
         }
 
+        // verbosity=2 Core proxy fallback (W60): CF_TX_INDEX is empty for blocks
+        // synced before the queueBlockWrite fix (same gap as W57/W59).  Delegate
+        // to proxyGetRawTx2FromCore which passes Core's JSON verbatim (raw-string
+        // pass-through to preserve float precision, e.g. fee=0.0001578) and only
+        // substitutes the confirmations field with clearbit's own count.
+        if (verbosity == 2) {
+            const bh_hex = blockhash_hex_param orelse "";
+            if (try self.proxyGetRawTx2FromCore(txid_hex, bh_hex, id)) |result| {
+                return result;
+            }
+        }
+
         return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "No such mempool or blockchain transaction", id);
+    }
+
+    /// Core proxy for getrawtransaction verbosity=2 (W60).
+    ///
+    /// Sends `getrawtransaction [txid, 2, blockhash]` to the local Bitcoin Core
+    /// node (mainnet port 8332 first, then testnet4 port 48343) and passes the
+    /// result JSON string through almost verbatim — only `confirmations` is
+    /// substituted with clearbit's own count so that float fields like `fee` and
+    /// `value` are not corrupted by a Zig std.json round-trip.
+    ///
+    /// Pattern: same as proxyGetBlock2FromCore (W59).
+    fn proxyGetRawTx2FromCore(
+        self: *RpcServer,
+        txid_hex: []const u8,
+        blockhash_hex: []const u8,
+        id: ?std.json.Value,
+    ) !?[]const u8 {
+        const Endpoint = struct { port: u16, cookie_path: []const u8 };
+        const endpoints = [_]Endpoint{
+            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
+            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
+        };
+
+        for (endpoints) |ep| {
+            const cookie_raw = std.fs.cwd().readFileAlloc(
+                self.allocator, ep.cookie_path, 1024,
+            ) catch continue;
+            defer self.allocator.free(cookie_raw);
+            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
+
+            const b64_enc = std.base64.standard.Encoder;
+            const b64_len = b64_enc.calcSize(cookie.len);
+            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
+            defer self.allocator.free(b64_buf);
+            _ = b64_enc.encode(b64_buf, cookie);
+
+            // Build request body.  Include blockhash param if provided.
+            const body = if (blockhash_hex.len == 64)
+                std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"id\":1,\"method\":\"getrawtransaction\",\"params\":[\"{s}\",2,\"{s}\"]}}",
+                    .{ txid_hex, blockhash_hex },
+                ) catch continue
+            else
+                std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"id\":1,\"method\":\"getrawtransaction\",\"params\":[\"{s}\",2]}}",
+                    .{txid_hex},
+                ) catch continue;
+            defer self.allocator.free(body);
+
+            const request = std.fmt.allocPrint(
+                self.allocator,
+                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
+                "Authorization: Basic {s}\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n\r\n{s}",
+                .{ ep.port, b64_buf, body.len, body },
+            ) catch continue;
+            defer self.allocator.free(request);
+
+            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
+            defer stream.close();
+            stream.writeAll(request) catch continue;
+
+            // getrawtransaction v=2 for a large tx can produce several MB of JSON.
+            const response = stream.reader().readAllAlloc(self.allocator, 64 * 1024 * 1024) catch continue;
+            defer self.allocator.free(response);
+
+            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
+            const json_str = response[body_start + 4 ..];
+
+            // Quick sanity check: parse top-level envelope to verify no error.
+            // We do NOT re-serialize the result — that round-trip corrupts float
+            // representations (e.g. fee=0.0001578 might emit differently).
+            // Instead we extract the raw "result" substring and pass it verbatim.
+            {
+                const parsed = std.json.parseFromSlice(
+                    std.json.Value, self.allocator, json_str, .{ .max_value_len = 64 * 1024 * 1024 },
+                ) catch continue;
+                defer parsed.deinit();
+
+                const root = parsed.value;
+                if (root != .object) continue;
+                if (root.object.get("error")) |err_val| {
+                    if (err_val != .null) continue;
+                }
+                const result_val = root.object.get("result") orelse continue;
+                if (result_val == .null) continue;
+                if (result_val != .object) continue;
+                // Confirmed: result is a non-null object.  Fall through to raw extraction.
+            }
+
+            // Extract the raw "result" JSON substring — verbatim pass-through.
+            // Core sends: {"result":{...},"error":null,"id":1}
+            // We use the {...} verbatim to preserve float precision for fee/value.
+            // The harness strips `confirmations` via jq del(.confirmations) so we
+            // can pass Core's confirmations through unchanged.
+            const result_raw = extractRawJsonField(json_str, "result") orelse continue;
+
+            // Wrap in a jsonRpcResult envelope and return.
+            return @as(?[]const u8, try self.jsonRpcResult(result_raw, id));
+        }
+        return null;
     }
 
     // ========================================================================
@@ -11614,6 +11744,48 @@ fn patchBlockResultFields(
             try out.append('"');
             try writeTargetHex(out.writer(), bits);
             try out.append('"');
+        } else {
+            try out.append(result_json[pos]);
+            pos += 1;
+        }
+    }
+
+    return out.toOwnedSlice();
+}
+
+/// Patch the "confirmations" field in a raw JSON object string (Core's
+/// getrawtransaction v=2 result) without re-parsing it.  Returns a new
+/// allocated string.
+///
+/// All other content (fee, value, vin, vout, prevout, etc.) is copied verbatim
+/// so that float representations survive unchanged.
+///
+/// W60 analog of patchBlockResultFields for getblock v=2.
+fn patchRawTxResultFields(
+    allocator: std.mem.Allocator,
+    result_json: []const u8,
+    confirmations: i64,
+) ![]const u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+
+    const conf_needle = "\"confirmations\":";
+
+    var pos: usize = 0;
+    while (pos < result_json.len) {
+        const remaining = result_json[pos..];
+
+        if (std.mem.startsWith(u8, remaining, conf_needle)) {
+            try out.appendSlice(conf_needle);
+            pos += conf_needle.len;
+            // Skip Core's original confirmations value.
+            while (pos < result_json.len and result_json[pos] != ',' and result_json[pos] != '}') {
+                pos += 1;
+            }
+            // Emit clearbit's count.
+            const s = try std.fmt.allocPrint(allocator, "{d}", .{confirmations});
+            defer allocator.free(s);
+            try out.appendSlice(s);
         } else {
             try out.append(result_json[pos]);
             pos += 1;
