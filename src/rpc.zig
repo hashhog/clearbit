@@ -4749,7 +4749,9 @@ pub const RpcServer = struct {
         try writer.writeAll(checksum);
         try writer.writeAll("\",\"isrange\":");
         try writer.writeAll(if (desc.isRange()) "true" else "false");
-        try writer.writeAll(",\"issolvable\":true,\"hasprivatekeys\":");
+        try writer.writeAll(",\"issolvable\":");
+        try writer.writeAll(if (descriptor.isSolvable(&desc)) "true" else "false");
+        try writer.writeAll(",\"hasprivatekeys\":");
         try writer.writeAll(if (descriptor.hasPrivateKeys(&desc)) "true" else "false");
         try writer.writeByte('}');
 
