@@ -11074,11 +11074,16 @@ pub const RpcServer = struct {
                     return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
             }
             const entry_opt = if (self.chain_manager) |cm| cm.getBlock(&bh) else null;
-            if (entry_opt == null)
-                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+            if (entry_opt == null) {
+                // Block not in in-memory chain index — proxy to Core (W67).
+                return self.proxyGetTxOutProofFromCore(params, id);
+            }
+            block_bytes_opt = db.get(storage.CF_BLOCKS, &bh) catch null;
+            if (block_bytes_opt == null) {
+                // Block header known but body not in CF_BLOCKS — proxy to Core (W67).
+                return self.proxyGetTxOutProofFromCore(params, id);
+            }
             block_header = entry_opt.?.header;
-            block_bytes_opt = (db.get(storage.CF_BLOCKS, &bh) catch null) orelse
-                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block body not found", id);
         } else {
             // Search last 100 blocks for any containing the target txids
             const tip_h = self.chain_state.best_height;
@@ -11164,6 +11169,123 @@ pub const RpcServer = struct {
         for (proof_bytes) |byte| try result_buf.writer().print("{x:0>2}", .{byte});
         try result_buf.append('"');
         return self.jsonRpcResult(result_buf.items, id);
+    }
+
+    /// Proxy gettxoutproof to a local Bitcoin Core instance (W67).
+    /// Used when the requested block is not in clearbit's local CF_BLOCKS store
+    /// (fast-IBD path did not persist historical block bodies).
+    /// The result is a plain hex string — no float or complex-type issues —
+    /// so we extract Core's raw "result" string and pass it through verbatim.
+    fn proxyGetTxOutProofFromCore(
+        self: *RpcServer,
+        params: std.json.Value,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        const Endpoint = struct { port: u16, cookie_path: []const u8 };
+        const endpoints = [_]Endpoint{
+            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
+            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
+        };
+
+        // Build the JSON params array as a compact string from the already-parsed
+        // params value.  We only need params[0] (txids array) and params[1]
+        // (blockhash string), both of which are plain strings — no float risk.
+        var params_buf = std.ArrayList(u8).init(self.allocator);
+        defer params_buf.deinit();
+        const pw = params_buf.writer();
+
+        if (params != .array or params.array.items.len < 1)
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Expected [txids, (blockhash)]", id);
+
+        // Emit txids array.
+        try pw.writeByte('[');
+        const txids_val = params.array.items[0];
+        if (txids_val != .array)
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "txids must be an array", id);
+        try pw.writeByte('[');
+        for (txids_val.array.items, 0..) |item, i| {
+            if (i > 0) try pw.writeByte(',');
+            if (item != .string)
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "txid must be a string", id);
+            try pw.print("\"{s}\"", .{item.string});
+        }
+        try pw.writeByte(']');
+        // Emit optional blockhash.
+        if (params.array.items.len >= 2) {
+            const bh_val = params.array.items[1];
+            if (bh_val == .string) {
+                try pw.print(",\"{s}\"", .{bh_val.string});
+            }
+        }
+        try pw.writeByte(']');
+
+        for (endpoints) |ep| {
+            const cookie_raw = std.fs.cwd().readFileAlloc(
+                self.allocator, ep.cookie_path, 1024,
+            ) catch continue;
+            defer self.allocator.free(cookie_raw);
+            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
+
+            const b64_enc = std.base64.standard.Encoder;
+            const b64_len = b64_enc.calcSize(cookie.len);
+            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
+            defer self.allocator.free(b64_buf);
+            _ = b64_enc.encode(b64_buf, cookie);
+
+            const body = std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":1,\"method\":\"gettxoutproof\",\"params\":{s}}}",
+                .{params_buf.items},
+            ) catch continue;
+            defer self.allocator.free(body);
+
+            const request = std.fmt.allocPrint(
+                self.allocator,
+                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
+                "Authorization: Basic {s}\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n\r\n{s}",
+                .{ ep.port, b64_buf, body.len, body },
+            ) catch continue;
+            defer self.allocator.free(request);
+
+            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
+            defer stream.close();
+            stream.writeAll(request) catch continue;
+
+            // gettxoutproof hex for a large block can be a few KB; 4 MB is ample.
+            const response = stream.reader().readAllAlloc(self.allocator, 4 * 1024 * 1024) catch continue;
+            defer self.allocator.free(response);
+
+            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
+            const json_str = response[body_start + 4 ..];
+
+            // Parse envelope to validate Core returned a non-error result.
+            const parsed = std.json.parseFromSlice(
+                std.json.Value, self.allocator, json_str, .{ .max_value_len = 4 * 1024 * 1024 },
+            ) catch continue;
+            defer parsed.deinit();
+
+            const root = parsed.value;
+            if (root != .object) continue;
+            if (root.object.get("error")) |err_val| {
+                if (err_val != .null) continue;
+            }
+            const result_val = root.object.get("result") orelse continue;
+            if (result_val == .null) continue;
+            // Result must be a plain hex string.
+            if (result_val != .string) continue;
+            const hex = result_val.string;
+
+            // Return as a JSON-RPC result, wrapping the string in quotes.
+            var out = std.ArrayList(u8).init(self.allocator);
+            defer out.deinit();
+            try out.writer().print("\"{s}\"", .{hex});
+            return self.jsonRpcResult(out.items, id);
+        }
+
+        return self.jsonRpcError(RPC_INTERNAL_ERROR, "gettxoutproof: block not available locally and Core proxy failed", id);
     }
 
     fn handleVerifyTxOutProof(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
