@@ -391,6 +391,8 @@ pub const Descriptor = union(enum) {
     addr: []const u8,
     /// raw(HEX) - raw scriptPubKey
     raw: []const u8,
+    /// rawtr(XONLY_HEX) - raw taproot key-spend (BIP-386)
+    rawtr: []const u8,
     /// combo(KEY) - all standard output types
     combo: Key,
 
@@ -413,6 +415,7 @@ pub const Descriptor = union(enum) {
             .sorted_multi => |*m| m.deinit(allocator),
             .addr => |a| allocator.free(a),
             .raw => |r| allocator.free(r),
+            .rawtr => |r| allocator.free(r),
             .combo => |*k| k.deinit(allocator),
         }
     }
@@ -443,6 +446,7 @@ pub const Descriptor = union(enum) {
             },
             .addr => false,
             .raw => false,
+            .rawtr => false,
             .combo => |k| k.isRange(),
         };
     }
@@ -633,6 +637,19 @@ pub const Parser = struct {
             const hex_copy = try self.allocator.dupe(u8, hex_str);
             try self.expect(')');
             return .{ .raw = hex_copy };
+        } else if (std.mem.eql(u8, name, "rawtr")) {
+            // rawtr(XONLY_HEX) - BIP-386: raw taproot x-only pubkey key-spend
+            // The argument is a 32-byte x-only pubkey as 64 hex chars.
+            try self.expect('(');
+            const hex_str = self.readUntil(')');
+            // Validate: must be exactly 64 lowercase hex chars (32 bytes x-only pubkey)
+            if (hex_str.len != 64) return error.InvalidKeyExpression;
+            for (hex_str) |c| {
+                if (!std.ascii.isHex(c)) return error.InvalidKeyExpression;
+            }
+            const hex_copy = try self.allocator.dupe(u8, hex_str);
+            try self.expect(')');
+            return .{ .rawtr = hex_copy };
         } else if (std.mem.eql(u8, name, "combo")) {
             try self.expect('(');
             const key = try self.parseKey(ctx);
@@ -991,6 +1008,15 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
             const decoded = try decodeHex(allocator, hex_str);
             try script.appendSlice(decoded);
             allocator.free(decoded);
+        },
+        .rawtr => |hex_str| {
+            // rawtr(XONLY_HEX) → OP_1 <32-byte-x-only-pubkey> (P2TR key-spend)
+            const pk_bytes = try decodeHex(allocator, hex_str);
+            defer allocator.free(pk_bytes);
+            if (pk_bytes.len != 32) return error.InvalidKeyExpression;
+            try script.append(0x51); // OP_1 (segwit version 1)
+            try script.append(0x20); // push 32 bytes
+            try script.appendSlice(pk_bytes);
         },
         .combo => |key| {
             // combo() returns multiple scripts - for now just return P2PKH
@@ -1383,6 +1409,11 @@ fn writeDescriptor(out: *std.ArrayList(u8), desc: *const Descriptor) !void {
             try out.appendSlice(r);
             try out.append(')');
         },
+        .rawtr => |r| {
+            try out.appendSlice("rawtr(");
+            try out.appendSlice(r);
+            try out.append(')');
+        },
         .combo => |key| {
             try out.appendSlice("combo(");
             try writeKey(out, key);
@@ -1541,7 +1572,17 @@ pub fn hasPrivateKeys(desc: *const Descriptor) bool {
             }
             return false;
         },
+        .addr, .raw, .rawtr => false,
+    };
+}
+
+/// Return whether this descriptor is solvable (can we construct a scriptSig/witness?).
+/// addr() and raw() are not solvable — they describe a script but provide no signing info.
+/// rawtr() IS solvable — it specifies a key-path spend directly.
+pub fn isSolvable(desc: *const Descriptor) bool {
+    return switch (desc.*) {
         .addr, .raw => false,
+        else => true,
     };
 }
 
