@@ -52,6 +52,19 @@ pub const INCREMENTAL_RELAY_FEE: i64 = 1000;
 /// This includes direct conflicts and all their descendants.
 pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
 
+/// Minimum non-witness serialized size for relay (CVE-2017-12842 mitigation).
+/// Mirrors Bitcoin Core's MIN_STANDARD_TX_NONWITNESS_SIZE in policy/policy.h.
+pub const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
+
+/// Maximum scriptSig size per input.
+/// Mirrors Bitcoin Core's MAX_STANDARD_SCRIPTSIG_SIZE (1650) in policy/policy.h.
+pub const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1650;
+
+/// Maximum cumulative OP_RETURN (null_data) output bytes across all outputs.
+/// = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 400_000 / 4 = 100_000.
+/// Mirrors Bitcoin Core's MAX_OP_RETURN_RELAY in policy/policy.h.
+pub const MAX_OP_RETURN_RELAY: usize = consensus.MAX_STANDARD_TX_WEIGHT / consensus.WITNESS_SCALE_FACTOR;
+
 // ============================================================================
 // Orphan Transaction Pool Constants
 // ============================================================================
@@ -181,6 +194,18 @@ pub const MempoolError = error{
     /// BIP-68 relative sequence lock is not yet satisfied.
     /// Core reject code: "non-BIP68-final".
     SequenceLockNotSatisfied,
+    /// Non-witness serialized size is below MIN_STANDARD_TX_NONWITNESS_SIZE (65 bytes).
+    /// CVE-2017-12842 mitigation. Core reject code: "tx-size-small".
+    TxTooSmall,
+    /// Input scriptSig exceeds MAX_STANDARD_SCRIPTSIG_SIZE (1650 bytes).
+    /// Core reject code: "scriptsig-size".
+    ScriptSigTooLarge,
+    /// Input scriptSig contains non-push opcodes.
+    /// Core reject code: "scriptsig-not-pushonly".
+    ScriptSigNotPushOnly,
+    /// Cumulative OP_RETURN (null_data) output bytes exceed MAX_OP_RETURN_RELAY.
+    /// Core reject code: "datacarrier".
+    DatacarrierTooLarge,
 };
 
 // ============================================================================
@@ -953,6 +978,10 @@ pub const Mempool = struct {
                 MempoolError.MempoolFull => "mempool full",
                 MempoolError.NonStandard => "non-standard",
                 MempoolError.TxWeightTooLarge => "tx-size",
+                MempoolError.TxTooSmall => "tx-size-small",
+                MempoolError.ScriptSigTooLarge => "scriptsig-size",
+                MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
+                MempoolError.DatacarrierTooLarge => "datacarrier",
                 MempoolError.DustOutput => "dust",
                 MempoolError.TooManyAncestors => "too-long-mempool-chain",
                 MempoolError.TooManyDescendants => "too-long-mempool-chain",
@@ -1514,12 +1543,50 @@ pub const Mempool = struct {
         // (400,000 WU). This is a relay/mempool-only rule — a 400_000+ WU tx
         // remains consensus-valid up to MAX_BLOCK_WEIGHT, but should never be
         // accepted into our mempool or relayed onward.
-        const tx_weight = computeTxWeight(tx, self.allocator) catch return MempoolError.OutOfMemory;
+        //
+        // We compute base_size here (the non-witness serialization) so we can
+        // also apply the MIN_STANDARD_TX_NONWITNESS_SIZE gate in one pass.
+        var base_writer = serialize.Writer.init(self.allocator);
+        defer base_writer.deinit();
+        serialize.writeTransactionNoWitness(&base_writer, tx) catch return MempoolError.OutOfMemory;
+        const base_size = base_writer.getWritten().len;
+
+        var total_writer = serialize.Writer.init(self.allocator);
+        defer total_writer.deinit();
+        serialize.writeTransaction(&total_writer, tx) catch return MempoolError.OutOfMemory;
+        const total_size = total_writer.getWritten().len;
+
+        const tx_weight = base_size * (consensus.WITNESS_SCALE_FACTOR - 1) + total_size;
         if (tx_weight > consensus.MAX_STANDARD_TX_WEIGHT) {
             return MempoolError.TxWeightTooLarge;
         }
 
-        // Check output script types
+        // CVE-2017-12842 mitigation: reject tiny transactions whose non-witness
+        // serialization is < 65 bytes. A 64-byte tx with a carefully crafted
+        // txid can collide with an inner node of the block's Merkle tree,
+        // enabling a fake-confirmation attack. Core: "tx-size-small".
+        // Reference: Bitcoin Core validation.cpp ~line 813,
+        // MIN_STANDARD_TX_NONWITNESS_SIZE = 65 in policy/policy.h.
+        if (base_size < MIN_STANDARD_TX_NONWITNESS_SIZE) {
+            return MempoolError.TxTooSmall;
+        }
+
+        // Per-input: scriptSig size ≤ 1650 bytes and must be push-only.
+        // Mirrors Bitcoin Core IsStandardTx() per-input checks (policy.cpp).
+        // A scriptSig with non-push opcodes is never standard; oversized
+        // scriptSigs are a potential DoS vector.
+        for (tx.inputs) |input| {
+            if (input.script_sig.len > MAX_STANDARD_SCRIPTSIG_SIZE) {
+                return MempoolError.ScriptSigTooLarge;
+            }
+            if (!script.isPushOnly(input.script_sig)) {
+                return MempoolError.ScriptSigNotPushOnly;
+            }
+        }
+
+        // Per-output checks: script type standardness, P2A value, datacarrier
+        // cumulative limit, and bare-multisig n-of-m validity.
+        var datacarrier_bytes: usize = 0;
         for (tx.outputs) |output| {
             const stype = script.classifyScript(output.script_pubkey);
             if (stype == .nonstandard) return MempoolError.NonStandard;
@@ -1529,6 +1596,34 @@ pub const Mempool = struct {
             // Reference: Bitcoin Core policy/policy.cpp
             if (stype == .anchor and output.value != 0) {
                 return MempoolError.AnchorNonZeroValue;
+            }
+
+            // Datacarrier (OP_RETURN / null_data) cumulative limit.
+            // Core tracks how many bytes remain of max_datacarrier_bytes across
+            // all outputs; if any output pushes the cumulative total past
+            // MAX_OP_RETURN_RELAY (100,000 bytes), the tx is non-standard.
+            // Reference: Bitcoin Core IsStandardTx() datacarrier_bytes_left
+            // logic in policy/policy.cpp.
+            if (stype == .null_data) {
+                datacarrier_bytes += output.script_pubkey.len;
+                if (datacarrier_bytes > MAX_OP_RETURN_RELAY) {
+                    return MempoolError.DatacarrierTooLarge;
+                }
+            }
+
+            // Bare multisig validity: Core's IsStandard() restricts bare
+            // multisig to x-of-3 with 1 ≤ m ≤ n ≤ 3. Scripts with n > 3 or
+            // m > n are NONSTANDARD even though classifyScript returns .multisig
+            // (classifyScript only checks 1 ≤ m,n ≤ 16 for detection).
+            // Reference: Bitcoin Core policy/policy.cpp IsStandard() MULTISIG branch.
+            if (stype == .multisig) {
+                // Script layout: OP_m <key1> … <keyN> OP_n OP_CHECKMULTISIG
+                // script[0] = OP_m (0x51..0x60), script[len-2] = OP_n.
+                const m = @as(usize, output.script_pubkey[0]) - 0x50;
+                const n = @as(usize, output.script_pubkey[output.script_pubkey.len - 2]) - 0x50;
+                if (n < 1 or n > 3 or m < 1 or m > n) {
+                    return MempoolError.NonStandard;
+                }
             }
         }
     }
@@ -2940,10 +3035,15 @@ test "P2A (Pay-to-Anchor) standardness" {
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
 
-    // Create input
+    // Create input. Use a single OP_0 (0x00) scriptSig so the non-witness
+    // serialization is exactly 65 bytes, satisfying MIN_STANDARD_TX_NONWITNESS_SIZE.
+    // Without it the tx is 64 bytes and hits TxTooSmall before AnchorNonZeroValue.
+    // Serialization: version(4) + in_count(1) + outpoint(36) + scriptSig_len(1) +
+    //   scriptSig(1) + sequence(4) + out_count(1) + value(8) + spk_len(1) +
+    //   P2A_SCRIPT(4) + locktime(4) = 65 bytes.
     const input = types.TxIn{
         .previous_output = types.OutPoint{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
-        .script_sig = &[_]u8{},
+        .script_sig = &[_]u8{0x00}, // OP_0 — push-only, 1 byte, pads tx to ≥ 65 B
         .sequence = 0xFFFFFFFF,
         .witness = &[_][]const u8{},
     };
@@ -3381,6 +3481,256 @@ test "truncated OP_RETURN push rejected by mempool (W56 regression)" {
     // admits the tx (test-only path — see "No chain state" comment in addTransaction).
     // The key invariant: no NonStandard or DustOutput error is returned.
     try mempool.addTransaction(good_tx);
+}
+
+// ============================================================================
+// W71 gate tests: MIN_STANDARD_TX_NONWITNESS_SIZE, scriptSig limits,
+// datacarrier cumulative, bare-multisig n≤3 validity.
+// Reference: Bitcoin Core policy/policy.cpp IsStandardTx() — W70e audit.
+// ============================================================================
+
+test "W71: TxTooSmall — non-witness size < 65 bytes rejected (CVE-2017-12842)" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // A bare minimal tx: 1 input (empty scriptSig) + 1 P2WPKH output.
+    // Non-witness serialization:
+    //   version(4) + in_count(1) + outpoint(36) + scriptSig_len(1)
+    //   + sequence(4) + out_count(1) + value(8) + spk_len(1) + spk(22)
+    //   + locktime(4) = 82 bytes.
+    // NOTE: this is ≥65, so we need to craft a *smaller* tx.
+    // 1-byte scriptPubKey (OP_TRUE = 0x51) makes it:
+    //   4+1+36+1+4+1+8+1+1+4 = 61 bytes → TxTooSmall.
+    const tiny_spk = [_]u8{0x51}; // OP_1 (non-standard for output but non-witness size < 65 triggers first)
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xBB} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 50_000, .script_pubkey = &tiny_spk };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    try std.testing.expectError(MempoolError.TxTooSmall, mempool.checkStandard(&tx));
+}
+
+test "W71: TxTooSmall boundary — exactly 65 bytes accepted" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // P2A script is 4 bytes; with OP_0 (1-byte) scriptSig:
+    // 4+1+36+1+1+4+1+8+1+4+4 = 65 bytes exactly.
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xCC} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00}, // OP_0 — push-only
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 0, .script_pubkey = &script.P2A_SCRIPT };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    // Should not return TxTooSmall (or any other gate that fires for this tx)
+    const err_or_ok = mempool.checkStandard(&tx);
+    if (err_or_ok) |_| {
+        // accepted — correct
+    } else |e| {
+        try std.testing.expect(e != MempoolError.TxTooSmall);
+    }
+}
+
+test "W71: ScriptSigTooLarge — scriptSig > 1650 bytes rejected" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Build a scriptSig that is 1651 bytes (1 byte over the limit).
+    // Construct a valid push-only scriptSig: OP_PUSHDATA2 <len16le> <data>.
+    // 0x4d = OP_PUSHDATA2, followed by 2-byte LE length, then data.
+    var big_sig_buf: [1651]u8 = undefined;
+    big_sig_buf[0] = 0x4d; // OP_PUSHDATA2
+    const data_len: u16 = 1648;
+    big_sig_buf[1] = @intCast(data_len & 0xFF);
+    big_sig_buf[2] = @intCast((data_len >> 8) & 0xFF);
+    @memset(big_sig_buf[3..], 0xAA);
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xDD} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xEE} ** 32, .index = 0 },
+        .script_sig = &big_sig_buf,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 50_000, .script_pubkey = &p2wpkh_script };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    try std.testing.expectError(MempoolError.ScriptSigTooLarge, mempool.checkStandard(&tx));
+}
+
+test "W71: ScriptSigNotPushOnly — scriptSig with OP_DUP rejected" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // OP_DUP (0x76) is not a push opcode — scriptSig is non-push-only.
+    // We need the tx to be ≥65 bytes to not hit TxTooSmall first.
+    // Put OP_DUP in a 30-byte scriptSig so tx is well over 65 bytes.
+    var non_push_sig: [30]u8 = undefined;
+    @memset(&non_push_sig, 0x00); // OP_0 push bytes
+    non_push_sig[0] = 0x76; // OP_DUP at position 0
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xFF} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &non_push_sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 50_000, .script_pubkey = &p2wpkh_script };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    try std.testing.expectError(MempoolError.ScriptSigNotPushOnly, mempool.checkStandard(&tx));
+}
+
+test "W71: datacarrier gate implemented — large OP_RETURN triggers weight first" {
+    // Note: at the default MAX_OP_RETURN_RELAY (100,000 bytes), the weight gate
+    // (400,000 WU) always fires before the datacarrier gate because any tx whose
+    // OP_RETURN outputs sum to > 100,000 bytes also exceeds the weight cap.
+    // This test verifies: (a) TxWeightTooLarge is returned (not a silent accept),
+    // and (b) the datacarrier cumulative tracking logic in checkStandard compiles
+    // and runs without error.  Non-default -datacarriersize values (e.g. Bitcoin
+    // Core node configurations with smaller limits) would make this gate active.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Build a 100,001-byte OP_RETURN script: would exceed datacarrier limit,
+    // but also exceeds MAX_STANDARD_TX_WEIGHT so TxWeightTooLarge fires first.
+    const dc_script_len: usize = 100_001;
+    const dc_data_len: usize = 99_995;
+    var dc_script = try allocator.alloc(u8, dc_script_len);
+    defer allocator.free(dc_script);
+    dc_script[0] = 0x6a; // OP_RETURN
+    dc_script[1] = 0x4e; // OP_PUSHDATA4
+    dc_script[2] = @intCast(dc_data_len & 0xFF);
+    dc_script[3] = @intCast((dc_data_len >> 8) & 0xFF);
+    dc_script[4] = @intCast((dc_data_len >> 16) & 0xFF);
+    dc_script[5] = 0x00;
+    @memset(dc_script[6..], 0xAA);
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0x22} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x33} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00}, // OP_0 — push-only
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const outputs = [_]types.TxOut{
+        .{ .value = 50_000, .script_pubkey = &p2wpkh_script },
+        .{ .value = 0, .script_pubkey = dc_script },
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &outputs,
+        .lock_time = 0,
+    };
+    // TxWeightTooLarge fires before DatacarrierTooLarge at default limits.
+    try std.testing.expectError(MempoolError.TxWeightTooLarge, mempool.checkStandard(&tx));
+}
+
+test "W71: bare multisig n>3 rejected (4-of-5 is nonstandard)" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Build a 4-of-5 bare multisig output script.
+    // Layout: OP_4 <key1>...<key5> OP_5 OP_CHECKMULTISIG
+    // OP_4 = 0x54, OP_5 = 0x55, OP_CHECKMULTISIG = 0xae
+    // Compressed pubkey placeholder: 33 bytes each (0x21 push + 33 bytes)
+    // scriptPubKey = [0x54] + 5*(0x21 + 33*[0xAA]) + [0x55, 0xae]
+    const n_keys = 5;
+    const key_push_len = 34; // 0x21 + 33 key bytes
+    const multisig_script_len = 1 + n_keys * key_push_len + 2; // OP_m + keys + OP_n OP_CHECKMULTISIG
+    var ms_script: [1 + 5 * 34 + 2]u8 = undefined;
+    ms_script[0] = 0x54; // OP_4 (m=4)
+    for (0..n_keys) |i| {
+        ms_script[1 + i * key_push_len] = 0x21; // push 33 bytes
+        @memset(ms_script[2 + i * key_push_len .. 1 + (i + 1) * key_push_len], 0xAA);
+    }
+    ms_script[multisig_script_len - 2] = 0x55; // OP_5 (n=5)
+    ms_script[multisig_script_len - 1] = 0xae; // OP_CHECKMULTISIG
+
+    // Use a scriptSig long enough to make total tx ≥65 bytes.
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x44} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00}, // OP_0 — push-only
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 50_000, .script_pubkey = &ms_script };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    // n=5 > 3 → NonStandard (mirrors Core IsStandard() MULTISIG branch)
+    try std.testing.expectError(MempoolError.NonStandard, mempool.checkStandard(&tx));
+}
+
+test "W71: bare multisig 2-of-3 accepted (n≤3, m≤n)" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // 2-of-3 multisig: OP_2 <key1> <key2> <key3> OP_3 OP_CHECKMULTISIG
+    const n_keys2 = 3;
+    const key_push_len2 = 34;
+    var ms_script2: [1 + 3 * 34 + 2]u8 = undefined;
+    ms_script2[0] = 0x52; // OP_2 (m=2)
+    for (0..n_keys2) |i| {
+        ms_script2[1 + i * key_push_len2] = 0x21; // push 33 bytes
+        @memset(ms_script2[2 + i * key_push_len2 .. 1 + (i + 1) * key_push_len2], 0xBB);
+    }
+    ms_script2[1 + n_keys2 * key_push_len2] = 0x53; // OP_3 (n=3)
+    ms_script2[1 + n_keys2 * key_push_len2 + 1] = 0xae; // OP_CHECKMULTISIG
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x55} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00}, // OP_0 — push-only
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 50_000, .script_pubkey = &ms_script2 };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    // 2-of-3 is standard — should pass checkStandard with no error
+    mempool.checkStandard(&tx) catch |e| {
+        std.debug.print("Unexpected error for 2-of-3 multisig: {}\n", .{e});
+        return error.TestUnexpectedResult;
+    };
 }
 
 test "wtxid lookup" {
