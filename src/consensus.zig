@@ -13,10 +13,26 @@ pub const MAX_BLOCK_WEIGHT: u32 = 4_000_000;
 pub const MAX_BLOCK_SERIALIZED_SIZE: u32 = 4_000_000;
 
 /// Maximum number of signature operations in a block (scaled by witness discount).
+/// Reference: Bitcoin Core consensus/consensus.h:17
 pub const MAX_BLOCK_SIGOPS_COST: u32 = 80_000;
+
+/// Maximum sigop cost for a single standard (relay/mempool) transaction.
+/// = MAX_BLOCK_SIGOPS_COST / 5 = 16,000.
+/// Reference: Bitcoin Core policy/policy.h:44
+pub const MAX_STANDARD_TX_SIGOPS_COST: u32 = MAX_BLOCK_SIGOPS_COST / 5; // 16_000
+
+/// Maximum legacy (non-witness) sigops for a single transaction in the mempool.
+/// = 2,500.  Mirrors Bitcoin Core policy/policy.h MAX_TX_LEGACY_SIGOPS (BIP-54).
+/// Reference: Bitcoin Core policy/policy.h:46
+pub const MAX_TX_LEGACY_SIGOPS: u32 = 2_500;
+
+/// Maximum sigops in a P2SH redeemScript (per-input policy limit).
+/// Reference: Bitcoin Core policy/policy.h:42
+pub const MAX_P2SH_SIGOPS: u32 = 15;
 
 /// Witness scale factor: non-witness data counts as 4 weight units,
 /// witness data counts as 1 weight unit.
+/// Reference: Bitcoin Core consensus/consensus.h:21
 pub const WITNESS_SCALE_FACTOR: u32 = 4;
 
 /// Maximum standard transaction weight: 400,000 weight units.

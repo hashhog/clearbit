@@ -4598,6 +4598,151 @@ test "countWitnessSigOps: witness version 1 returns 0" {
 }
 
 // ===========================================================================
+// W74 sigops comprehensive boundary tests
+// ===========================================================================
+
+test "getSigOpCount: OP_CHECKMULTISIG accurate with OP_1 counts as 1" {
+    // OP_1 OP_CHECKMULTISIG — accurate mode should decode OP_1 → 1
+    const script_data = [_]u8{ 0x51, 0xae }; // OP_1 OP_CHECKMULTISIG
+    const count = getSigOpCount(&script_data, true);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getSigOpCount: OP_CHECKMULTISIG accurate with OP_0 counts as 20 (inaccurate fallback)" {
+    // OP_0 is NOT in OP_1..OP_16 range, so accurate mode falls back to 20.
+    // Reference: Core script.cpp:172 fAccurate && lastOpcode >= OP_1 && lastOpcode <= OP_16
+    const script_data = [_]u8{ 0x00, 0xae }; // OP_0 OP_CHECKMULTISIG
+    const count = getSigOpCount(&script_data, true);
+    try std.testing.expectEqual(@as(u32, MAX_PUBKEYS_PER_MULTISIG), count);
+}
+
+test "getSigOpCount: lastOpcode not reset by pushdata" {
+    // A data push between OP_2 and OP_CHECKMULTISIG should NOT reset lastOpcode.
+    // Core updates lastOpcode to the push opcode (0x01), so accurate mode
+    // sees 0x01 as lastOpcode and falls back to 20.
+    // Script: OP_2 <1-byte push: 0x99> OP_CHECKMULTISIG
+    const script_data = [_]u8{ 0x52, 0x01, 0x99, 0xae };
+    const count = getSigOpCount(&script_data, true);
+    // lastOpcode is now 0x01 (the data push opcode), not OP_2 (0x52)
+    // 0x01 < 0x51 (OP_1), so falls back to 20 sigops
+    try std.testing.expectEqual(@as(u32, MAX_PUBKEYS_PER_MULTISIG), count);
+}
+
+test "getSigOpCount: OP_CHECKMULTISIGVERIFY accurate with OP_16 counts as 16" {
+    // OP_16 OP_CHECKMULTISIGVERIFY (boundary: max valid OP_N)
+    const script_data = [_]u8{ 0x60, 0xaf }; // OP_16 OP_CHECKMULTISIGVERIFY
+    const count = getSigOpCount(&script_data, true);
+    try std.testing.expectEqual(@as(u32, 16), count);
+}
+
+test "getSigOpCount: OP_CHECKMULTISIG inaccurate always 20 even with OP_1" {
+    // inaccurate=false must always return 20 for CHECKMULTISIG, ignoring OP_1
+    const script_data = [_]u8{ 0x51, 0xae }; // OP_1 OP_CHECKMULTISIG
+    const count = getSigOpCount(&script_data, false);
+    try std.testing.expectEqual(@as(u32, MAX_PUBKEYS_PER_MULTISIG), count);
+}
+
+test "getSigOpCount: data inside PUSHDATA1 not counted" {
+    // OP_PUSHDATA1 <len=2> <0xac 0xac> OP_CHECKSIG
+    // The two 0xac bytes are push data and must NOT count as sigops.
+    const script_data = [_]u8{ 0x4c, 0x02, 0xac, 0xac, 0xac };
+    const count = getSigOpCount(&script_data, false);
+    // Only the trailing OP_CHECKSIG (0xac) after the push counts.
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getP2SHSigOpCount: redeemScript with OP_2 OP_CHECKMULTISIG counts 2" {
+    // P2SH scriptPubKey
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xAB);
+    script_pubkey[22] = 0x87;
+
+    // scriptSig: push a 2-byte redeemScript: OP_2 OP_CHECKMULTISIG
+    const redeem = [_]u8{ 0x52, 0xae };
+    var script_sig: [3]u8 = undefined;
+    script_sig[0] = 0x02; // push 2 bytes
+    script_sig[1] = redeem[0];
+    script_sig[2] = redeem[1];
+
+    const count = getP2SHSigOpCount(&script_pubkey, &script_sig);
+    // Accurate: OP_2 (0x52) → 2 sigops
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "getP2SHSigOpCount: scriptSig with non-push opcode returns 0" {
+    // Core returns 0 when scriptSig has opcode > OP_16
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xCC);
+    script_pubkey[22] = 0x87;
+
+    // OP_DUP (0x76) is a non-push opcode
+    const script_sig = [_]u8{0x76};
+    const count = getP2SHSigOpCount(&script_pubkey, &script_sig);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "countWitnessSigOps: P2WSH with OP_2 OP_CHECKMULTISIG counts 2" {
+    // P2WSH: OP_0 <32-byte hash>
+    var script_pubkey: [34]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x20;
+    @memset(script_pubkey[2..34], 0xDD);
+
+    // witnessScript: OP_2 OP_CHECKMULTISIG (2 sigops accurate)
+    const witness_script = [_]u8{ 0x52, 0xae };
+    const witness = &[_][]const u8{
+        &[_]u8{0xAA} ** 72, // sig1
+        &[_]u8{0xBB} ** 72, // sig2
+        &witness_script,    // witnessScript (last item)
+    };
+
+    var flags = ScriptFlags{};
+    flags.verify_witness = true;
+    flags.verify_p2sh = true;
+
+    const count = countWitnessSigOps(&[_]u8{}, &script_pubkey, witness, flags);
+    // Accurate: OP_2 → 2 sigops (no WITNESS_SCALE_FACTOR scaling)
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "countWitnessSigOps: P2SH-wrapped P2WPKH returns 1" {
+    // P2SH scriptPubKey wrapping a P2WPKH program
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9; // OP_HASH160
+    script_pubkey[1] = 0x14; // push 20 bytes
+    @memset(script_pubkey[2..22], 0xEE);
+    script_pubkey[22] = 0x87; // OP_EQUAL
+
+    // scriptSig: push a P2WPKH redeem script: OP_0 <20-byte key hash>
+    var p2wpkh_program: [22]u8 = undefined;
+    p2wpkh_program[0] = 0x00; // OP_0
+    p2wpkh_program[1] = 0x14; // push 20 bytes
+    @memset(p2wpkh_program[2..22], 0x77);
+
+    // scriptSig = push(p2wpkh_program)
+    var script_sig: [23]u8 = undefined;
+    script_sig[0] = 0x16; // push 22 bytes
+    @memcpy(script_sig[1..23], &p2wpkh_program);
+
+    const witness = &[_][]const u8{
+        &[_]u8{0xAA} ** 71, // signature
+        &[_]u8{0xBB} ** 33, // pubkey
+    };
+
+    var flags = ScriptFlags{};
+    flags.verify_witness = true;
+    flags.verify_p2sh = true;
+
+    const count = countWitnessSigOps(&script_sig, &script_pubkey, witness, flags);
+    // P2SH-wrapped P2WPKH: 1 sigop
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+// ===========================================================================
 // BIP-342 tapscript validation-weight budget (interpreter.cpp:362)
 // ===========================================================================
 
