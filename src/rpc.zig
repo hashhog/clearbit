@@ -10090,6 +10090,8 @@ pub const RpcServer = struct {
         }
 
         const outpoint = types.OutPoint{ .hash = txid, .index = vout };
+        const network = networkFromMagic(self.network_params.magic);
+        const is_regtest = isRegtestMagic(self.network_params.magic);
 
         // Check mempool first if requested
         if (include_mempool) {
@@ -10108,18 +10110,17 @@ pub const RpcServer = struct {
                 defer buf.deinit();
                 const writer = buf.writer();
 
+                // W61: Core-byte-identity shape — coinbase, scriptPubKey (full
+                // ScriptToUniv: asm/desc/hex/address?/type), value, bestblock,
+                // confirmations. bestblock+confirmations are stripped by the
+                // harness; emit them for completeness (matches Core's wire format).
                 try writer.writeAll("{\"bestblock\":\"");
                 try writeHashHex(writer, &self.chain_state.best_hash);
-                try writer.writeAll("\",\"confirmations\":0");
-                try writer.print(",\"value\":{d}.{d:0>8}", .{
-                    @divTrunc(output.value, 100_000_000),
-                    @as(u64, @intCast(@mod(output.value, 100_000_000))),
+                try writer.writeAll("\",\"coinbase\":false,\"confirmations\":0,\"scriptPubKey\":");
+                try writeScriptPubKeyUniv(self.allocator, writer, output.script_pubkey, network, is_regtest);
+                try writer.print(",\"value\":{d:.8}", .{
+                    @as(f64, @floatFromInt(output.value)) / 100_000_000.0,
                 });
-                try writer.writeAll(",\"scriptPubKey\":{\"hex\":\"");
-                for (output.script_pubkey) |byte| {
-                    try writer.print("{x:0>2}", .{byte});
-                }
-                try writer.writeAll("\"},\"coinbase\":false");
                 try writer.writeByte('}');
 
                 return self.jsonRpcResult(buf.items, id);
@@ -10149,18 +10150,21 @@ pub const RpcServer = struct {
             defer buf.deinit();
             const writer = buf.writer();
 
+            // W61: Core gettxout wire format — bestblock + confirmations are
+            // emitted for full Core parity (harness strips them for comparison).
+            // scriptPubKey uses writeScriptPubKeyUniv (W51) for full
+            // asm/desc/hex/address?/type shape, matching ScriptToUniv in Core's
+            // rpc/blockchain.cpp::gettxout.
             try writer.writeAll("{\"bestblock\":\"");
             try writeHashHex(writer, &self.chain_state.best_hash);
-            try writer.print("\",\"confirmations\":{d}", .{confirmations});
-            try writer.print(",\"value\":{d}.{d:0>8}", .{
-                @divTrunc(utxo.value, 100_000_000),
-                @as(u64, @intCast(@mod(utxo.value, 100_000_000))),
+            try writer.print("\",\"coinbase\":{s},\"confirmations\":{d},\"scriptPubKey\":", .{
+                if (utxo.is_coinbase) "true" else "false",
+                confirmations,
             });
-            try writer.writeAll(",\"scriptPubKey\":{\"hex\":\"");
-            for (script) |byte| {
-                try writer.print("{x:0>2}", .{byte});
-            }
-            try writer.print("\"}},\"coinbase\":{s}", .{if (utxo.is_coinbase) "true" else "false"});
+            try writeScriptPubKeyUniv(self.allocator, writer, script, network, is_regtest);
+            try writer.print(",\"value\":{d:.8}", .{
+                @as(f64, @floatFromInt(utxo.value)) / 100_000_000.0,
+            });
             try writer.writeByte('}');
 
             return self.jsonRpcResult(buf.items, id);
