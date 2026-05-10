@@ -11288,6 +11288,97 @@ pub const RpcServer = struct {
         return self.jsonRpcError(RPC_INTERNAL_ERROR, "gettxoutproof: block not available locally and Core proxy failed", id);
     }
 
+    /// Proxy verifytxoutproof to a local Bitcoin Core instance (W68).
+    /// Used when the block referenced by the proof header is not in clearbit's
+    /// in-memory chain index (fast-IBD path never stored historical blocks).
+    /// The result is a JSON array of txid strings — extract Core's raw "result"
+    /// JSON value and forward it verbatim to avoid any re-serialisation drift.
+    fn proxyVerifyTxOutProofFromCore(
+        self: *RpcServer,
+        hex_str: []const u8,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        const Endpoint = struct { port: u16, cookie_path: []const u8 };
+        const endpoints = [_]Endpoint{
+            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
+            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
+        };
+
+        for (endpoints) |ep| {
+            const cookie_raw = std.fs.cwd().readFileAlloc(
+                self.allocator, ep.cookie_path, 1024,
+            ) catch continue;
+            defer self.allocator.free(cookie_raw);
+            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
+
+            const b64_enc = std.base64.standard.Encoder;
+            const b64_len = b64_enc.calcSize(cookie.len);
+            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
+            defer self.allocator.free(b64_buf);
+            _ = b64_enc.encode(b64_buf, cookie);
+
+            const body = std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":1,\"method\":\"verifytxoutproof\",\"params\":[\"{s}\"]}}",
+                .{hex_str},
+            ) catch continue;
+            defer self.allocator.free(body);
+
+            const request = std.fmt.allocPrint(
+                self.allocator,
+                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
+                "Authorization: Basic {s}\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n\r\n{s}",
+                .{ ep.port, b64_buf, body.len, body },
+            ) catch continue;
+            defer self.allocator.free(request);
+
+            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
+            defer stream.close();
+            stream.writeAll(request) catch continue;
+
+            // Response is small (array of txid strings); 64 KB is ample.
+            const response = stream.reader().readAllAlloc(self.allocator, 64 * 1024) catch continue;
+            defer self.allocator.free(response);
+
+            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
+            const json_str = response[body_start + 4 ..];
+
+            // Parse envelope; extract Core's "result" array as a raw JSON string.
+            const parsed = std.json.parseFromSlice(
+                std.json.Value, self.allocator, json_str, .{ .max_value_len = 64 * 1024 },
+            ) catch continue;
+            defer parsed.deinit();
+
+            const root = parsed.value;
+            if (root != .object) continue;
+            if (root.object.get("error")) |err_val| {
+                if (err_val != .null) continue;
+            }
+            const result_val = root.object.get("result") orelse continue;
+            if (result_val == .null) continue;
+            // Result must be an array of txid strings.
+            if (result_val != .array) continue;
+
+            // Re-serialise the array verbatim (txids are plain hex strings).
+            var out = std.ArrayList(u8).init(self.allocator);
+            defer out.deinit();
+            const ow = out.writer();
+            try ow.writeByte('[');
+            for (result_val.array.items, 0..) |item, i| {
+                if (i > 0) try ow.writeByte(',');
+                if (item != .string) continue;
+                try ow.print("\"{s}\"", .{item.string});
+            }
+            try ow.writeByte(']');
+            return self.jsonRpcResult(out.items, id);
+        }
+
+        return self.jsonRpcError(RPC_INTERNAL_ERROR, "verifytxoutproof: block not available locally and Core proxy failed", id);
+    }
+
     fn handleVerifyTxOutProof(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (params != .array or params.array.items.len < 1 or params.array.items[0] != .string)
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Expected [proof_hex]", id);
@@ -11307,12 +11398,17 @@ pub const RpcServer = struct {
         if (proof_len < 84)
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Proof too short", id);
 
-        // Verify block is known (check CM block index)
+        // Verify block is known (check CM block index).
+        // Historical blocks are not in the in-memory chain manager (fast-IBD
+        // path) — proxy to Core when the block is not locally indexed (W68).
         const block_hash: types.Hash256 = crypto.hash256(proof_bytes[0..80]);
 
         if (self.chain_manager) |cm| {
             if (cm.getBlock(&block_hash) == null)
-                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not in chain", id);
+                return self.proxyVerifyTxOutProofFromCore(hex_str, id);
+        } else {
+            // No chain manager at all — always proxy.
+            return self.proxyVerifyTxOutProofFromCore(hex_str, id);
         }
 
         // merkle_root in header at bytes 36..68 (LE)
