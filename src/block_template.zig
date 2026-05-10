@@ -465,63 +465,23 @@ fn encodeHeightPush(script: *std.ArrayList(u8), height: u32) !void {
     }
 }
 
-/// Estimate sigops for a transaction.
-/// This is a simplified estimation - full implementation would parse scripts.
+/// Estimate the sigop cost for a transaction (in weight units, consistent with
+/// MAX_BLOCK_SIGOPS_COST = 80,000).
+///
+/// Without UTXO access we cannot count P2SH or witness sigops accurately, so
+/// we return only the legacy portion scaled by WITNESS_SCALE_FACTOR (4).
+/// This is a conservative lower-bound: the actual cost can only be higher once
+/// P2SH/witness sigops are added during block connect, so the block template
+/// will never exceed the consensus limit due to this estimation.
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp GetTransactionSigOpCost()
+/// (the legacy-only term: GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR).
 fn estimateSigops(tx: *const types.Transaction) usize {
-    var sigops: usize = 0;
-
-    // Legacy sigops: count CHECKSIG and CHECKMULTISIG in outputs
-    for (tx.outputs) |output| {
-        sigops += countScriptSigops(output.script_pubkey);
-    }
-
-    // For inputs, we'd need the spent outputs to count accurately
-    // Use a conservative estimate based on input count
-    sigops += tx.inputs.len;
-
-    return sigops;
-}
-
-/// Count sigops in a script (simplified).
-fn countScriptSigops(script: []const u8) usize {
-    var count: usize = 0;
-    var i: usize = 0;
-
-    while (i < script.len) {
-        const op = script[i];
-        i += 1;
-
-        if (op == 0xac or op == 0xad) {
-            // OP_CHECKSIG (0xac) or OP_CHECKSIGVERIFY (0xad)
-            count += 1;
-        } else if (op == 0xae or op == 0xaf) {
-            // OP_CHECKMULTISIG (0xae) or OP_CHECKMULTISIGVERIFY (0xaf)
-            // Conservative estimate: 20 sigops
-            count += 20;
-        } else if (op <= 0x4b) {
-            // Direct push: skip data
-            i += op;
-        } else if (op == 0x4c) {
-            // OP_PUSHDATA1
-            if (i < script.len) {
-                i += script[i] + 1;
-            }
-        } else if (op == 0x4d) {
-            // OP_PUSHDATA2
-            if (i + 1 < script.len) {
-                const len = std.mem.readInt(u16, script[i..][0..2], .little);
-                i += 2 + len;
-            }
-        } else if (op == 0x4e) {
-            // OP_PUSHDATA4
-            if (i + 3 < script.len) {
-                const len = std.mem.readInt(u32, script[i..][0..4], .little);
-                i += 4 + len;
-            }
-        }
-    }
-
-    return count;
+    // getLegacySigOpCount uses inaccurate mode (CHECKMULTISIG = 20) for both
+    // scriptSig inputs and output scriptPubKeys, matching Core's
+    // GetLegacySigOpCount which calls GetSigOpCount(false).
+    const legacy = validation.getLegacySigOpCount(tx);
+    return @as(usize, legacy) * @as(usize, consensus.WITNESS_SCALE_FACTOR);
 }
 
 // ============================================================================
@@ -2015,9 +1975,11 @@ test "sigops estimation" {
 
     const sigops = estimateSigops(&tx);
 
-    // Should have at least 1 sigop from CHECKSIG in P2PKH output
-    // Plus 1 from the input estimate
-    try std.testing.expect(sigops >= 2);
+    // P2PKH output: 1 CHECKSIG (inaccurate mode) * WITNESS_SCALE_FACTOR (4) = 4.
+    // Empty scriptSig: 0 sigops.
+    // Total cost: 4.
+    // Reference: Bitcoin Core GetTransactionSigOpCost() legacy term.
+    try std.testing.expectEqual(@as(usize, 4), sigops);
 }
 
 test "transactions are ordered by fee rate" {
