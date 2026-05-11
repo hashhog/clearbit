@@ -49,6 +49,7 @@ pub const ValidationError = error{
     FirstTxNotCoinbase,
     MultipleCoinbase,
     BadWitnessCommitment,
+    UnexpectedWitness,
     BadProofOfWork,
     BadCoinbaseValue,
     SequenceLockNotSatisfied,
@@ -789,21 +790,11 @@ pub fn checkBlock(
         return ValidationError.TooManySigops;
     }
 
-    // 11. Check segwit witness commitment (BIP-141)
-    if (height >= params.segwit_height) {
-        // Check for witness commitment if any transactions have witness data
-        var has_witness = false;
-        for (block.transactions) |*tx| {
-            if (tx.hasWitness()) {
-                has_witness = true;
-                break;
-            }
-        }
-
-        if (has_witness) {
-            try checkWitnessCommitment(block, allocator);
-        }
-    }
+    // 11. BIP-141 witness commitment + unexpected-witness check.
+    // Mirrors Bitcoin Core's CheckWitnessMalleation called from
+    // ContextualCheckBlock (validation.cpp:4169).
+    // `expect_witness_commitment` is true when SegWit is active.
+    try checkWitnessMalleation(block, height >= params.segwit_height, allocator);
 }
 
 /// Connect a block to the chain, performing full validation including sigop counting,
@@ -1521,76 +1512,101 @@ fn validateCoinbaseHeight(cb_script: []const u8, height: u32) bool {
     return std.mem.eql(u8, cb_script[0..expect.len], expect);
 }
 
-/// Check the segwit witness commitment (BIP-141).
-/// The commitment is in the coinbase's outputs as:
-/// OP_RETURN 0x24 0xaa21a9ed <32-byte commitment>
-fn checkWitnessCommitment(block: *const types.Block, allocator: std.mem.Allocator) ValidationError!void {
+/// BIP-141 witness commitment magic header (6 bytes):
+///   OP_RETURN(0x6a) 0x24 0xaa 0x21 0xa9 0xed
+/// Reference: Bitcoin Core consensus/validation.h:147-165
+const WITNESS_COMMITMENT_MAGIC = [_]u8{ 0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed };
+
+/// Minimum witness commitment scriptPubKey length (6-byte header + 32-byte hash).
+/// Reference: Bitcoin Core consensus/validation.h:18
+const MINIMUM_WITNESS_COMMITMENT: usize = 38;
+
+/// Locate the coinbase output index whose scriptPubKey encodes a BIP-141 witness
+/// commitment.  When multiple matching outputs exist the LAST one is used, matching
+/// Bitcoin Core's GetWitnessCommitmentIndex which keeps overwriting `commitpos`.
+/// Reference: Bitcoin Core consensus/validation.h:147-165
+/// Returns the output index, or null if no commitment is present.
+fn getWitnessCommitmentIndex(block: *const types.Block) ?usize {
+    if (block.transactions.len == 0) return null;
     const coinbase = &block.transactions[0];
-
-    // Find the witness commitment output (search from last to first)
-    var commitment_output: ?[]const u8 = null;
-    var i = coinbase.outputs.len;
-    while (i > 0) {
-        i -= 1;
-        const script_pubkey = coinbase.outputs[i].script_pubkey;
-
-        // Check for OP_RETURN 0x24 0xaa21a9ed (witness commitment header)
-        if (script_pubkey.len >= 38 and
-            script_pubkey[0] == 0x6a and // OP_RETURN
-            script_pubkey[1] == 0x24 and // Push 36 bytes
-            script_pubkey[2] == 0xaa and
-            script_pubkey[3] == 0x21 and
-            script_pubkey[4] == 0xa9 and
-            script_pubkey[5] == 0xed)
+    var commitpos: ?usize = null;
+    for (coinbase.outputs, 0..) |*out, o| {
+        const spk = out.script_pubkey;
+        if (spk.len >= MINIMUM_WITNESS_COMMITMENT and
+            std.mem.eql(u8, spk[0..6], &WITNESS_COMMITMENT_MAGIC))
         {
-            commitment_output = script_pubkey[6..38];
-            break;
+            commitpos = o; // keep updating: last match wins
+        }
+    }
+    return commitpos;
+}
+
+/// Analogue of Bitcoin Core's CheckWitnessMalleation.
+/// Called from checkBlock; `expect_witness_commitment` is true when SegWit
+/// deployment is active for this block (height >= params.segwit_height).
+///
+/// When `expect_witness_commitment`:
+///   - Locate the coinbase's witness-commitment output (last match).
+///   - If found: validate the coinbase witness stack (exactly 1 × 32-byte element)
+///     and verify SHA256d(witness_merkle_root || nonce) matches the commitment.
+///   - If not found: fall through to the unexpected-witness check.
+/// When not `expect_witness_commitment` (or when no commitment output present):
+///   - Any transaction that carries witness data triggers UnexpectedWitness.
+///
+/// Reference: Bitcoin Core src/validation.cpp:3864-3916
+fn checkWitnessMalleation(
+    block: *const types.Block,
+    expect_witness_commitment: bool,
+    allocator: std.mem.Allocator,
+) ValidationError!void {
+    if (expect_witness_commitment) {
+        const commitpos = getWitnessCommitmentIndex(block);
+        if (commitpos != null) {
+            // Gate 1: coinbase witness stack must have exactly 1 element.
+            // Reference: validation.cpp:3880
+            const coinbase = &block.transactions[0];
+            const witness_stack = coinbase.inputs[0].witness;
+            if (witness_stack.len != 1 or witness_stack[0].len != 32) {
+                return ValidationError.BadWitnessCommitment; // bad-witness-nonce-size
+            }
+            const witness_nonce = witness_stack[0];
+
+            // Gate 2: compute witness merkle root (coinbase wtxid = 0x00..00).
+            // Reference: validation.cpp:3890-3892
+            var wtxids = allocator.alloc(types.Hash256, block.transactions.len) catch {
+                return ValidationError.OutOfMemory;
+            };
+            defer allocator.free(wtxids);
+            wtxids[0] = [_]u8{0} ** 32; // coinbase wtxid is all zeros
+            for (block.transactions[1..], 1..) |*tx, idx| {
+                wtxids[idx] = crypto.computeWtxid(tx, allocator) catch {
+                    return ValidationError.OutOfMemory;
+                };
+            }
+            const witness_root = crypto.computeMerkleRoot(wtxids, allocator) catch {
+                return ValidationError.OutOfMemory;
+            };
+
+            // Gate 3: SHA256d(witness_root || nonce) must match committed value.
+            // Reference: validation.cpp:3892-3897
+            var preimage: [64]u8 = undefined;
+            @memcpy(preimage[0..32], &witness_root);
+            @memcpy(preimage[32..64], witness_nonce);
+            const computed = crypto.hash256(&preimage);
+            const committed = coinbase.outputs[commitpos.?].script_pubkey[6..38];
+            if (!std.mem.eql(u8, &computed, committed)) {
+                return ValidationError.BadWitnessCommitment; // bad-witness-merkle-match
+            }
+            return; // commitment valid; no need to scan for unexpected witness
         }
     }
 
-    // If no commitment found but we have witness data, that's an error
-    if (commitment_output == null) {
-        // No witness commitment, but we already checked for witness data
-        return ValidationError.BadWitnessCommitment;
-    }
-
-    // Get witness nonce from coinbase witness
-    if (coinbase.inputs[0].witness.len == 0) {
-        return ValidationError.BadWitnessCommitment;
-    }
-    const witness_nonce = coinbase.inputs[0].witness[0];
-    if (witness_nonce.len != 32) {
-        return ValidationError.BadWitnessCommitment;
-    }
-
-    // Compute witness root (merkle root of wtxids, coinbase wtxid is all zeros)
-    var wtxids = allocator.alloc(types.Hash256, block.transactions.len) catch {
-        return ValidationError.OutOfMemory;
-    };
-    defer allocator.free(wtxids);
-
-    // Coinbase wtxid is all zeros
-    wtxids[0] = [_]u8{0} ** 32;
-
-    // Compute wtxid for other transactions
-    for (block.transactions[1..], 1..) |*tx, idx| {
-        wtxids[idx] = crypto.computeWtxid(tx, allocator) catch {
-            return ValidationError.OutOfMemory;
-        };
-    }
-
-    const witness_root = crypto.computeMerkleRoot(wtxids, allocator) catch {
-        return ValidationError.OutOfMemory;
-    };
-
-    // Compute commitment: SHA256(SHA256(witness_root || witness_nonce))
-    var commitment_preimage: [64]u8 = undefined;
-    @memcpy(commitment_preimage[0..32], &witness_root);
-    @memcpy(commitment_preimage[32..64], witness_nonce);
-    const computed_commitment = crypto.hash256(&commitment_preimage);
-
-    if (!std.mem.eql(u8, &computed_commitment, commitment_output.?)) {
-        return ValidationError.BadWitnessCommitment;
+    // No commitment found (or pre-segwit): any witness data is unexpected.
+    // Reference: validation.cpp:3906-3913
+    for (block.transactions) |*tx| {
+        if (tx.hasWitness()) {
+            return ValidationError.UnexpectedWitness; // unexpected-witness
+        }
     }
 }
 
@@ -6252,7 +6268,10 @@ test "submitblock-gate: rejects block with witness data but missing commitment" 
         .force_skip_scripts = true,
     };
     const result = validateBlockForIBD(&block, &ctx, allocator);
-    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+    // W77 fix: no commitment output + witness data → UnexpectedWitness
+    // (was incorrectly BadWitnessCommitment before W77 rewrite).
+    // Core: validation.cpp:3906-3913 "unexpected-witness".
+    try std.testing.expectError(ValidationError.UnexpectedWitness, result);
 }
 
 test "submitblock-gate: rejects block with non-final tx" {
@@ -6771,4 +6790,407 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range (h=250000)" {
     if (result) |_| {} else |err| {
         try std.testing.expect(err != ValidationError.Bip30DuplicateOutput);
     }
+}
+
+// ============================================================================
+// W77 — BIP-141 witness commitment comprehensive audit tests
+// Reference: Bitcoin Core src/validation.cpp:3864-3916 (CheckWitnessMalleation)
+//            consensus/validation.h:147-165 (GetWitnessCommitmentIndex)
+//
+// 12 gates tested:
+//  G1  pre-segwit block with witness data  → UnexpectedWitness
+//  G2  post-segwit no witness + no commit  → OK (no commitment needed)
+//  G3  post-segwit no commit + witness     → UnexpectedWitness
+//  G4  commitment found; coinbase stack=0  → BadWitnessCommitment (nonce-size)
+//  G5  commitment found; stack len=2       → BadWitnessCommitment (nonce-size)
+//  G6  commitment found; nonce 31 bytes    → BadWitnessCommitment (nonce-size)
+//  G7  commitment found; nonce 33 bytes    → BadWitnessCommitment (nonce-size)
+//  G8  commitment found; wrong hash        → BadWitnessCommitment (merkle-match)
+//  G9  commitment found; all correct       → OK
+//  G10 38-byte minimum (exactly 38 bytes)  → recognized as valid commitment
+//  G11 LAST-scan: second matching output   → used (last wins)
+//  G12 coinbase wtxid must be all-zeros    → validated implicitly via correct hash
+// ============================================================================
+
+/// Build the expected BIP-141 commitment bytes for a block:
+///   SHA256d(witness_merkle_root || witness_nonce)
+/// The commitment is placed at scriptPubKey[6..38].
+fn w77ComputeCommitment(block: *const types.Block, nonce: *const [32]u8, allocator: std.mem.Allocator) !types.Hash256 {
+    var wtxids = try allocator.alloc(types.Hash256, block.transactions.len);
+    defer allocator.free(wtxids);
+    wtxids[0] = [_]u8{0} ** 32; // coinbase wtxid = zeros
+    for (block.transactions[1..], 1..) |*tx, i| {
+        wtxids[i] = try crypto.computeWtxid(tx, allocator);
+    }
+    const witness_root = try crypto.computeMerkleRoot(wtxids, allocator);
+    var preimage: [64]u8 = undefined;
+    @memcpy(preimage[0..32], &witness_root);
+    @memcpy(preimage[32..64], nonce);
+    return crypto.hash256(&preimage);
+}
+
+/// Build a 38-byte witness commitment scriptPubKey from a 32-byte hash.
+fn w77CommitScript(hash: *const types.Hash256) [38]u8 {
+    var spk: [38]u8 = undefined;
+    @memcpy(spk[0..6], &WITNESS_COMMITMENT_MAGIC);
+    @memcpy(spk[6..38], hash);
+    return spk;
+}
+
+test "W77 G1: pre-segwit block with witness → UnexpectedWitness" {
+    // Any block before segwit_height that carries witness data must be
+    // rejected with UnexpectedWitness (Core:validation.cpp:3906-3913).
+    const allocator = std.testing.allocator;
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&([_]u8{0x42} ** 32)}, // witness data
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    // segwit_height=481824 on mainnet; height=100 is pre-segwit
+    const result = checkWitnessMalleation(&block, false, allocator);
+    try std.testing.expectError(ValidationError.UnexpectedWitness, result);
+}
+
+test "W77 G2: post-segwit, no witness, no commitment → OK" {
+    // A block with no witness data and no commitment output is valid —
+    // the unexpected-witness loop finds nothing to complain about.
+    const allocator = std.testing.allocator;
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    try checkWitnessMalleation(&block, true, allocator);
+}
+
+test "W77 G3: post-segwit, no commitment, but witness data → UnexpectedWitness" {
+    // Commitment output absent; non-coinbase tx carries witness → reject.
+    // Core: validation.cpp:3906-3913.
+    const allocator = std.testing.allocator;
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    const spender = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint{ .hash = [_]u8{0xAB} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&[_]u8{0x01}},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 1000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{ cb, spender } };
+    const result = checkWitnessMalleation(&block, true, allocator);
+    try std.testing.expectError(ValidationError.UnexpectedWitness, result);
+}
+
+test "W77 G4: commitment present but coinbase witness stack empty → BadWitnessCommitment" {
+    // Commitment output exists but coinbase has NO witness element.
+    // Core: validation.cpp:3880 witness_stack.size() != 1 → bad-witness-nonce-size.
+    const allocator = std.testing.allocator;
+    const dummy_hash = [_]u8{0x11} ** 32;
+    const commit_spk = w77CommitScript(&dummy_hash);
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{}, // empty stack — must be exactly 1
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &commit_spk }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    const result = checkWitnessMalleation(&block, true, allocator);
+    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+}
+
+test "W77 G5: commitment present; coinbase witness stack has 2 elements → BadWitnessCommitment" {
+    // Stack must have exactly 1 element.  2 elements → nonce-size error.
+    // Core: validation.cpp:3880 witness_stack.size() != 1.
+    const allocator = std.testing.allocator;
+    const dummy_hash = [_]u8{0x22} ** 32;
+    const commit_spk = w77CommitScript(&dummy_hash);
+    const nonce1 = [_]u8{0} ** 32;
+    const nonce2 = [_]u8{0x01} ** 32;
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{ &nonce1, &nonce2 }, // 2 elements
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &commit_spk }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    const result = checkWitnessMalleation(&block, true, allocator);
+    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+}
+
+test "W77 G6: commitment present; nonce is 31 bytes → BadWitnessCommitment" {
+    // Nonce must be exactly 32 bytes. 31 bytes → nonce-size error.
+    const allocator = std.testing.allocator;
+    const dummy_hash = [_]u8{0x33} ** 32;
+    const commit_spk = w77CommitScript(&dummy_hash);
+    const short_nonce = [_]u8{0} ** 31;
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&short_nonce},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &commit_spk }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    const result = checkWitnessMalleation(&block, true, allocator);
+    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+}
+
+test "W77 G7: commitment present; nonce is 33 bytes → BadWitnessCommitment" {
+    // Nonce must be exactly 32 bytes. 33 bytes → nonce-size error.
+    const allocator = std.testing.allocator;
+    const dummy_hash = [_]u8{0x44} ** 32;
+    const commit_spk = w77CommitScript(&dummy_hash);
+    const long_nonce = [_]u8{0} ** 33;
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&long_nonce},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &commit_spk }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    const result = checkWitnessMalleation(&block, true, allocator);
+    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+}
+
+test "W77 G8: commitment present; hash mismatch → BadWitnessCommitment" {
+    // Nonce size is valid but the committed hash doesn't match the computed
+    // SHA256d(witness_root || nonce). Core: validation.cpp:3893-3897.
+    const allocator = std.testing.allocator;
+    const wrong_hash = [_]u8{0xDE, 0xAD} ++ [_]u8{0xFF} ** 30;
+    const commit_spk = w77CommitScript(&wrong_hash);
+    const nonce = [_]u8{0} ** 32;
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&nonce},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &commit_spk }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    const result = checkWitnessMalleation(&block, true, allocator);
+    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+}
+
+test "W77 G9: valid commitment → OK" {
+    // Correctly computed SHA256d(witness_root || nonce) placed in last output.
+    // All gates pass; checkWitnessMalleation must return without error.
+    const allocator = std.testing.allocator;
+    const nonce = [_]u8{0} ** 32;
+
+    // Build a coinbase-only block first (without commitment) to compute the hash.
+    const cb_no_commit = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&nonce},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    // A block with only the coinbase; witness_root is the wtxid of coinbase = zeros.
+    // SHA256d(zeros32 || zeros32) = the correct commitment.
+    const temp_block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb_no_commit} };
+    const correct_hash = try w77ComputeCommitment(&temp_block, &nonce, allocator);
+    const commit_spk = w77CommitScript(&correct_hash);
+
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&nonce},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &commit_spk }},
+        .lock_time = 0,
+    };
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    try checkWitnessMalleation(&block, true, allocator);
+}
+
+test "W77 G10: exactly 38-byte scriptPubKey recognized as commitment" {
+    // MINIMUM_WITNESS_COMMITMENT=38; a scriptPubKey of exactly 38 bytes with the
+    // correct magic must be treated as a commitment (not skipped).
+    // A 37-byte script must NOT match.
+    const allocator = std.testing.allocator;
+    // 37-byte script: magic (6) + 31 bytes — must NOT match, no commitment found.
+    const short_spk = WITNESS_COMMITMENT_MAGIC ++ [_]u8{0} ** 31; // 37 bytes
+    const cb_short = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &short_spk }},
+        .lock_time = 0,
+    };
+    const block_short = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb_short} };
+    // No commitment found (37 < 38), no witness → passes
+    try checkWitnessMalleation(&block_short, true, allocator);
+    // Also verify getWitnessCommitmentIndex returns null for 37-byte script
+    try std.testing.expectEqual(@as(?usize, null), getWitnessCommitmentIndex(&block_short));
+
+    // 38-byte script: magic (6) + 32 bytes — must match.
+    const exact_spk = WITNESS_COMMITMENT_MAGIC ++ [_]u8{0} ** 32; // 38 bytes
+    const cb_exact = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &exact_spk }},
+        .lock_time = 0,
+    };
+    const block_exact = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb_exact} };
+    try std.testing.expectEqual(@as(?usize, 0), getWitnessCommitmentIndex(&block_exact));
+}
+
+test "W77 G11: LAST-scan — multiple commitment outputs, last one is used" {
+    // Core keeps overwriting commitpos on each match; the last matching output
+    // is the authoritative commitment. We place a wrong hash in output[0] and
+    // the correct hash in output[1]; validation must use output[1].
+    // Reference: consensus/validation.h:147-165 (commitpos = o; for each match).
+    const allocator = std.testing.allocator;
+    const nonce = [_]u8{0} ** 32;
+
+    // Compute correct commitment for a coinbase-only block.
+    const cb_temp = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&nonce},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    const temp_block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb_temp} };
+    const correct_hash = try w77ComputeCommitment(&temp_block, &nonce, allocator);
+
+    const wrong_hash = [_]u8{0xFF} ** 32;
+    const spk_wrong = w77CommitScript(&wrong_hash); // first output — wrong
+    const spk_correct = w77CommitScript(&correct_hash); // second output — correct
+
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{0x00},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{&nonce},
+        }},
+        .outputs = &[_]types.TxOut{
+            .{ .value = 0, .script_pubkey = &spk_wrong }, // output[0]: wrong hash
+            .{ .value = 0, .script_pubkey = &spk_correct }, // output[1]: correct hash (LAST)
+        },
+        .lock_time = 0,
+    };
+    // getWitnessCommitmentIndex must return 1 (last match)
+    const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    try std.testing.expectEqual(@as(?usize, 1), getWitnessCommitmentIndex(&block));
+    // checkWitnessMalleation must pass (uses last = correct hash)
+    try checkWitnessMalleation(&block, true, allocator);
+}
+
+test "W77 G12: coinbase wtxid is all-zeros in witness merkle root" {
+    // The coinbase transaction's witness txid must be treated as 0x00..00 (32 bytes).
+    // A non-coinbase transaction contributes its actual wtxid.
+    // We verify this by computing the commitment both ways and checking correctness.
+    const allocator = std.testing.allocator;
+    const nonce = [_]u8{0} ** 32;
+
+    const cb_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{0x00},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{&nonce},
+    };
+    // We can't add a real spender without a prevout, so use coinbase-only.
+    // The witness_root for a 1-tx block is SHA256d(SHA256d(zeros32)):
+    //   wtxids[0] = zeros32 (coinbase), single-element merkle = zeros32 itself.
+    // commitment = SHA256d(zeros32 || zeros32)
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_input},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    const temp_block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    const commitment = try w77ComputeCommitment(&temp_block, &nonce, allocator);
+
+    // Manually compute: merkle of [zeros32] = zeros32; SHA256d(zeros64).
+    const zeros32 = [_]u8{0} ** 32;
+    var preimage: [64]u8 = undefined;
+    @memcpy(preimage[0..32], &zeros32); // witness_root (single leaf = zero wtxid)
+    @memcpy(preimage[32..64], &zeros32); // nonce
+    const manual = crypto.hash256(&preimage);
+    try std.testing.expectEqualSlices(u8, &manual, &commitment);
+
+    // Confirm the commitment is accepted by checkWitnessMalleation.
+    const commit_spk = w77CommitScript(&commitment);
+    const cb2 = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_input},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &commit_spk }},
+        .lock_time = 0,
+    };
+    const block2 = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb2} };
+    try checkWitnessMalleation(&block2, true, allocator);
 }
