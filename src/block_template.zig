@@ -384,9 +384,46 @@ pub fn createBlockTemplate(
     }
     const merkle_root = try crypto.computeMerkleRoot(tx_hashes, allocator);
 
-    // 8. Construct block header
+    // 8. Compute block version via BIP-9 state machine and construct header.
+    //
+    // W91 fix: call computeBlockVersion() instead of hardcoding 0x20000000.
+    // Miners MUST signal for deployments in STARTED or LOCKED_IN state by
+    // setting the corresponding bit in nVersion.
+    // Reference: Bitcoin Core versionbits.cpp ComputeBlockVersion() + miner.cpp.
+    //
+    // Limitation: accurate signaling requires per-height block version data for
+    // counting signals during STARTED periods. clearbit's ChainState currently
+    // does not maintain a height-keyed version index (the fast IBD path bypasses
+    // CF_BLOCK_INDEX). Until that index is wired, the state machine evaluates
+    // without historical signal data (all blocks appear as non-signaling in the
+    // backward walk). For currently ACTIVE/FAILED deployments this is harmless
+    // (NEVER_ACTIVE short-circuits to FAILED; start_time=0 deployments appear
+    // STARTED and the bit gets set, which is the correct miner behavior). For
+    // deployments still in the signaling window, the count-without-data path
+    // will keep them in STARTED and correctly signal the bit.
+    const nVersion = blk: {
+        // Build a stub IndexView: returns null for all heights since we lack
+        // a height-keyed version index. The BIP9 state machine handles null
+        // returns as "genesis region = DEFINED".
+        const StubCtx = struct {
+            fn getAtHeight(_: *anyopaque, _: u32) ?consensus.VersionBitsBlockIndex {
+                return null;
+            }
+        };
+        var stub_ctx: u8 = 0;
+        const stub_view = consensus.VersionBitsIndexView{
+            .context = @ptrCast(&stub_ctx),
+            .getAtHeightFn = StubCtx.getAtHeight,
+        };
+        break :blk consensus.computeBlockVersion(
+            params.bip9_deployments,
+            height,
+            &stub_view,
+            null, // no cache in block template path
+        );
+    };
     const header = types.BlockHeader{
-        .version = 0x20000000, // BIP-9 version bits base
+        .version = nVersion,
         .prev_block = chain_state.best_hash,
         .merkle_root = merkle_root,
         .timestamp = @intCast(std.time.timestamp()),
