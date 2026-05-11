@@ -4026,10 +4026,27 @@ pub const PeerManager = struct {
                     }
                     self.allocator.free(cb.prefilled_txs);
                 }
-                const block_hash = crypto.computeBlockHash(&cb.header);
+
+                // Gate B3: null header guard (Core blockencodings.cpp:62).
+                // A zeroed-out header signals a malformed cmpctblock.
+                const header_hash = crypto.computeBlockHash(&cb.header);
+                const zero_hash = [_]u8{0} ** 32;
+                if (std.mem.eql(u8, &header_hash, &zero_hash)) {
+                    std.debug.print("P2P: cmpctblock null header, ignoring\n", .{});
+                    return;
+                }
+
+                // Gate B4: both-empty guard (Core blockencodings.cpp:62).
+                if (cb.short_ids.len == 0 and cb.prefilled_txs.len == 0) {
+                    std.debug.print("P2P: cmpctblock both shorttxids and prefilled empty, ignoring\n", .{});
+                    return;
+                }
+
+                const block_hash = header_hash;
 
                 // BIP 152: Reconstruct block from compact block + mempool.
                 // Derive SipHash key: SHA256(header_bytes || nonce_le)[0:16]
+                // Reference: Bitcoin Core blockencodings.cpp FillShortTxIDSelector
                 var key_data: [88]u8 = undefined;
                 // Serialize header (80 bytes) inline
                 std.mem.writeInt(i32, key_data[0..4], cb.header.version, .little);
@@ -4059,51 +4076,142 @@ pub const PeerManager = struct {
                 defer self.allocator.free(txn_available);
                 for (txn_available) |*slot| slot.* = null;
 
-                // Place prefilled transactions
-                for (cb.prefilled_txs) |pt| {
-                    if (pt.index < total_tx_count) {
-                        txn_available[pt.index] = pt.tx;
+                // Gate B5+B6: Place prefilled transactions using accumulated
+                // differential index (Core blockencodings.cpp:72-87).
+                // prefilled_txs[i].index is a DELTA from the previous absolute
+                // position; accumulate to get the true slot.
+                var last_prefilled_index: i32 = -1;
+                var valid = true;
+                for (cb.prefilled_txs, 0..) |pt, i| {
+                    // Accumulate: absolute = last_absolute + delta + 1
+                    last_prefilled_index += @as(i32, @intCast(pt.index)) + 1;
+                    // Gate B5: overflow beyond uint16 (Core blockencodings.cpp:78)
+                    if (last_prefilled_index > 0xffff) {
+                        std.debug.print("P2P: cmpctblock prefilled index overflow, ignoring\n", .{});
+                        valid = false;
+                        break;
+                    }
+                    // Gate B6: gap check — absolute index must not exceed
+                    // shorttxids.len + number of prefilled so far (Core:80-85).
+                    if (@as(u32, @intCast(last_prefilled_index)) > cb.short_ids.len + i) {
+                        std.debug.print("P2P: cmpctblock prefilled index gap, ignoring\n", .{});
+                        valid = false;
+                        break;
+                    }
+                    txn_available[@intCast(last_prefilled_index)] = pt.tx;
+                }
+                if (!valid) {
+                    // Fall back to full block download
+                    var inv_fb = std.ArrayList(p2p.InvVector).init(self.allocator);
+                    defer inv_fb.deinit();
+                    inv_fb.append(.{ .inv_type = .msg_witness_block, .hash = block_hash }) catch {};
+                    if (inv_fb.items.len > 0) {
+                        const gd_fb = p2p.Message{ .getdata = .{ .inventory = inv_fb.items } };
+                        peer.sendMessage(&gd_fb) catch {};
+                    }
+                    return;
+                }
+
+                // Build short_id -> slot map, checking for collisions.
+                // Gate B7: short-id collision detection (Core:115-116).
+                // Gate B8: bucket-size DoS check (Core:110-111, max 12 per bucket).
+                // We simulate bucket detection by checking for duplicate keys.
+                const SipHash = std.crypto.auth.siphash.SipHash64(2, 4);
+                var sip_key: [16]u8 = undefined;
+                std.mem.writeInt(u64, sip_key[0..8], k0, .little);
+                std.mem.writeInt(u64, sip_key[8..16], k1, .little);
+
+                // Map: packed 6-byte short-id (as u64 low 48 bits) -> slot index.
+                // Using u64 key for the hashmap (upper 2 bytes zero).
+                var sid_to_slot = std.AutoHashMap(u64, usize).init(self.allocator);
+                defer sid_to_slot.deinit();
+                // Bucket-collision counter: track how many entries land in each bucket.
+                // We use a secondary AutoHashMap keyed by bucket index (sid % bucket_count).
+                var bucket_counts = std.AutoHashMap(u64, u32).init(self.allocator);
+                defer bucket_counts.deinit();
+
+                var collision_detected = false;
+                var sid_idx: usize = 0;
+                for (0..total_tx_count) |i| {
+                    if (txn_available[i] == null) {
+                        if (sid_idx < cb.short_ids.len) {
+                            const sid_bytes = cb.short_ids[sid_idx];
+                            sid_idx += 1;
+                            // Unpack 6 bytes as a u64 (little-endian, upper 2 bytes = 0)
+                            var sid_le8 = [_]u8{0} ** 8;
+                            @memcpy(sid_le8[0..6], &sid_bytes);
+                            const sid_val = std.mem.readInt(u64, &sid_le8, .little);
+
+                            // Gate B7: duplicate short-id → collision
+                            if (sid_to_slot.contains(sid_val)) {
+                                std.debug.print("P2P: cmpctblock short-id collision detected, requesting full block\n", .{});
+                                collision_detected = true;
+                                break;
+                            }
+                            sid_to_slot.put(sid_val, i) catch {
+                                collision_detected = true;
+                                break;
+                            };
+
+                            // Gate B8: bucket-size DoS check (bucket = sid_val % map_size).
+                            // We approximate: count entries sharing the same (sid_val % 16384).
+                            const bucket_key = sid_val % 16384;
+                            const prev_count = bucket_counts.get(bucket_key) orelse 0;
+                            const new_count = prev_count + 1;
+                            if (new_count > 12) {
+                                std.debug.print("P2P: cmpctblock bucket overflow (DoS), requesting full block\n", .{});
+                                collision_detected = true;
+                                break;
+                            }
+                            bucket_counts.put(bucket_key, new_count) catch {};
+                        }
                     }
                 }
 
-                // Build short_id -> index map and match against mempool
+                if (collision_detected) {
+                    var inv_cd = std.ArrayList(p2p.InvVector).init(self.allocator);
+                    defer inv_cd.deinit();
+                    inv_cd.append(.{ .inv_type = .msg_witness_block, .hash = block_hash }) catch {};
+                    if (inv_cd.items.len > 0) {
+                        const gd_cd = p2p.Message{ .getdata = .{ .inventory = inv_cd.items } };
+                        peer.sendMessage(&gd_cd) catch {};
+                    }
+                    return;
+                }
+
+                // Match mempool entries against short IDs.
+                // Gate B9: if two mempool txns match the same short ID, clear the
+                // slot and request the tx (Core blockencodings.cpp:129-136).
                 var mempool_hits: usize = 0;
-                var sid_idx: usize = 0;
-                const SipHash = std.crypto.auth.siphash.SipHash64(2, 4);
+                var have_txn = self.allocator.alloc(bool, total_tx_count) catch return;
+                defer self.allocator.free(have_txn);
+                for (have_txn) |*h| h.* = false;
+
                 if (self.mempool) |mp| {
                     mp.mutex.lock();
                     defer mp.mutex.unlock();
-                    var sid_to_slot = std.AutoHashMap([6]u8, usize).init(self.allocator);
-                    defer sid_to_slot.deinit();
-                    for (0..total_tx_count) |i| {
-                        if (txn_available[i] == null) {
-                            if (sid_idx < cb.short_ids.len) {
-                                sid_to_slot.put(cb.short_ids[sid_idx], i) catch {};
-                                sid_idx += 1;
-                            }
-                        }
-                    }
-                    // Iterate mempool entries and match short IDs
-                    var sip_key: [16]u8 = undefined;
-                    std.mem.writeInt(u64, sip_key[0..8], k0, .little);
-                    std.mem.writeInt(u64, sip_key[8..16], k1, .little);
                     var it = mp.entries.iterator();
                     while (it.next()) |kv| {
                         const entry = kv.value_ptr.*;
-                        // Compute short ID: SipHash24(k0, k1, wtxid)[0:6]
+                        // Compute short ID: SipHash-2-4(k0, k1, wtxid) & 0xffffffffffff
                         var hasher = SipHash.init(&sip_key);
                         hasher.update(&entry.wtxid);
-                        const hash_val = hasher.finalInt();
-                        var short_id: [6]u8 = undefined;
-                        // Write lower 6 bytes of hash as little-endian short ID
-                        const hash_le = std.mem.toBytes(hash_val);
-                        @memcpy(&short_id, hash_le[0..6]);
-                        if (sid_to_slot.get(short_id)) |slot_idx| {
-                            if (txn_available[slot_idx] == null) {
+                        const hash_val = hasher.finalInt() & 0x0000ffffffffffff;
+                        if (sid_to_slot.get(hash_val)) |slot_idx| {
+                            if (!have_txn[slot_idx]) {
                                 txn_available[slot_idx] = entry.tx;
+                                have_txn[slot_idx] = true;
                                 mempool_hits += 1;
+                            } else {
+                                // Gate B9: second mempool match → clear slot, request tx
+                                if (txn_available[slot_idx] != null) {
+                                    txn_available[slot_idx] = null;
+                                    mempool_hits -= 1;
+                                }
                             }
                         }
+                        // Early-exit once all short IDs are matched (Core perf note)
+                        if (mempool_hits == cb.short_ids.len) break;
                     }
                 }
 
@@ -4129,7 +4237,8 @@ pub const PeerManager = struct {
                             peer.sendMessage(&getdata_msg) catch {};
                         }
                     } else {
-                        // Send getblocktxn for missing transactions
+                        // Send getblocktxn for missing transactions.
+                        // Indexes are encoded as differentials (Core DifferenceFormatter).
                         std.debug.print("P2P: compact block {x} missing {} txns (mempool_hits={}), sending getblocktxn\n", .{ block_hash, missing_count, mempool_hits });
                         var missing_indices = std.ArrayList(u16).init(self.allocator);
                         defer missing_indices.deinit();

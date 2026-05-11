@@ -420,6 +420,39 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_p2sh_tests.step);
     }
 
+    // BIP-152 compact-block audit tests (W89).
+    // Tests p2p.zig gates (deser bounds, differential encode/decode) and the
+    // SipHash key derivation.  No RocksDB or wallet dependency.
+    // Run with `zig build test-bip152`.
+    {
+        const bip152_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_bip152.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"W89 BIP-152"},
+        });
+        bip152_tests.linkSystemLibrary("secp256k1");
+        bip152_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        bip152_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            bip152_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        bip152_tests.root_module.addOptions("build_options", build_options);
+
+        const run_bip152_tests = b.addRunArtifact(bip152_tests);
+        const bip152_step = b.step(
+            "test-bip152",
+            "Run BIP-152 compact-block audit tests (W89)",
+        );
+        bip152_step.dependOn(&run_bip152_tests.step);
+        // Fold into the main `test` step — no wallet.zig dependency,
+        // so no selectCoins compile-error risk.
+        test_step.dependOn(&run_bip152_tests.step);
+    }
+
     // PSBT W47 multisig finalize + sort-on-emit tests. Same wiring shape
     // as test-p2sh-commitment above (psbt.zig has no @embedFile and
     // doesn't pull wallet.zig). Run with `zig build test-psbt-w47`.
