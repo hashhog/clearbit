@@ -156,6 +156,7 @@ pub const ScriptError = error{
     UnbalancedConditional,
     SigPushOnly, // BIP-16: P2SH scriptSig must be push-only
     InvalidSignatureEncoding, // BIP-66: invalid DER signature encoding (SIG_DER)
+    SigHighS, // LOW_S: S value is above the curve order / 2 (SCRIPT_ERR_SIG_HIGH_S)
     InvalidSigHashType, // STRICTENC: invalid sighash type (SIG_HASHTYPE)
     InvalidPubkeyType, // STRICTENC: invalid pubkey encoding (PUBKEYTYPE)
     DiscourageOpSuccess, // BIP-342: OP_SUCCESSx found during tapscript pre-scan
@@ -1943,18 +1944,53 @@ pub const ScriptEngine = struct {
                 break;
             }
 
-            // BIP-141: witness v0 requires compressed pubkeys
-            // Check encoding for each key as it's iterated (matching Bitcoin Core behavior).
-            // Keys beyond the last matched signature are NOT checked.
+            // Mirror Core's CHECKMULTISIG encoding checks (interpreter.cpp:1161):
+            //   CheckSignatureEncoding(sig) → then CheckPubKeyEncoding(pubkey)
+            // CheckSignatureEncoding returns true for empty sigs, so sig encoding
+            // checks are only enforced for non-empty sigs.  But CheckPubKeyEncoding
+            // fires unconditionally for every (sig, key) pair iterated — even when
+            // the sig is empty.  verifySignature() returns false early for empty sigs
+            // (skipping pubkey checks), so we must enforce them here explicitly.
+
+            const cur_sig = sigs[sig_idx];
+            const cur_key = pubkeys[key_idx];
+
+            // Sig encoding checks (only for non-empty sigs, matching Core).
+            if (cur_sig.len > 0) {
+                if (self.flags.verify_dersig or self.flags.verify_low_s or self.flags.verify_strictenc) {
+                    if (!isValidSignatureEncoding(cur_sig)) {
+                        return ScriptError.InvalidSignatureEncoding;
+                    }
+                }
+                if (self.flags.verify_low_s) {
+                    if (!crypto.isLowDERSignature(cur_sig[0 .. cur_sig.len - 1])) {
+                        return ScriptError.SigHighS;
+                    }
+                }
+                if (self.flags.verify_strictenc) {
+                    if (!isDefinedHashtype(cur_sig[cur_sig.len - 1])) {
+                        return ScriptError.InvalidSigHashType;
+                    }
+                }
+            }
+
+            // Pubkey encoding checks — fire for ALL iterated keys (Core parity).
             if (self.flags.verify_witness_pubkeytype and self.sig_version == .witness_v0) {
-                if (!isCompressedPubkey(pubkeys[key_idx])) {
+                if (!isCompressedPubkey(cur_key)) {
                     return ScriptError.WitnessPubkeyType;
+                }
+            }
+            if (self.flags.verify_strictenc) {
+                if (!isValidPubkeyEncoding(cur_key)) {
+                    return ScriptError.InvalidPubkeyType;
                 }
             }
 
             // Errors from verifySignature (DER/LOW_S/encoding) must propagate,
             // only treat verification failure (false return) as non-match.
-            const valid = try self.verifySignature(sigs[sig_idx], pubkeys[key_idx]);
+            // Encoding checks above already fired; verifySignature will re-check
+            // them for non-empty sigs (idempotent) and skip them for empty sigs.
+            const valid = try self.verifySignature(cur_sig, cur_key);
             if (valid) {
                 sig_idx += 1;
             }
@@ -1986,37 +2022,29 @@ pub const ScriptEngine = struct {
     }
 
     fn verifySignature(self: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {
+        // Empty signature: allowed by CheckSignatureEncoding (returns true) but always
+        // fails crypto verification.  Encoding checks below are skipped for empty sigs
+        // exactly as Core does (CheckSignatureEncoding returns early for size==0).
+        // NOTE: pubkey encoding checks (STRICTENC / WITNESS_PUBKEYTYPE) ARE still
+        // enforced even for empty sigs when called from CHECKMULTISIG — the caller
+        // (executeCheckMultisig) handles that path directly.
         if (sig.len == 0) return false;
 
-        // BIP-141: witness v0 requires compressed pubkeys (this IS a hard error)
-        if (self.flags.verify_witness_pubkeytype and self.sig_version == .witness_v0) {
-            if (!isCompressedPubkey(pubkey)) {
-                return ScriptError.WitnessPubkeyType;
-            }
-        }
-
-        // STRICTENC: check pubkey encoding (must be valid compressed or uncompressed)
-        // This is a HARD error - invalid pubkey encoding must be rejected
-        if (self.flags.verify_strictenc) {
-            if (!isValidPubkeyEncoding(pubkey)) {
-                return ScriptError.InvalidPubkeyType;
-            }
-        }
-
-        // DER signature encoding validation
-        // This is a HARD error - invalid DER encoding must be rejected
+        // DER signature encoding validation — Core: CheckSignatureEncoding (line 207).
+        // Must come BEFORE pubkey check (matches Core's ordering in EvalChecksigPreTapscript
+        // line 335: CheckSignatureEncoding first, CheckPubKeyEncoding second).
         if (self.flags.verify_dersig or self.flags.verify_low_s or self.flags.verify_strictenc) {
             if (!isValidSignatureEncoding(sig)) {
                 return ScriptError.InvalidSignatureEncoding;
             }
         }
 
-        // Low-S check (BIP-62 rule 5 / BIP-146)
-        // Must come after DER check (needs valid DER to parse)
+        // Low-S check (BIP-62 rule 5 / BIP-146) — Core: IsLowDERSignature, sets
+        // SCRIPT_ERR_SIG_HIGH_S.  Must come after DER check (requires valid DER to parse).
         if (self.flags.verify_low_s) {
             const sig_data_for_low_s = sig[0 .. sig.len - 1];
             if (!crypto.isLowDERSignature(sig_data_for_low_s)) {
-                return ScriptError.InvalidSignatureEncoding;
+                return ScriptError.SigHighS;
             }
         }
 
@@ -2025,10 +2053,26 @@ pub const ScriptEngine = struct {
         const sig_data = sig[0 .. sig.len - 1];
 
         // STRICTENC: check hashtype validity (low bits without SIGHASH_ANYONECANPAY must be 1-3)
-        // This is a HARD error
+        // Core: IsDefinedHashtypeSignature, sets SCRIPT_ERR_SIG_HASHTYPE.
         if (self.flags.verify_strictenc) {
             if (!isDefinedHashtype(hash_type)) {
                 return ScriptError.InvalidSigHashType;
+            }
+        }
+
+        // BIP-141: witness v0 requires compressed pubkeys (hard error).
+        // Core: CheckPubKeyEncoding with SCRIPT_VERIFY_WITNESS_PUBKEYTYPE.
+        if (self.flags.verify_witness_pubkeytype and self.sig_version == .witness_v0) {
+            if (!isCompressedPubkey(pubkey)) {
+                return ScriptError.WitnessPubkeyType;
+            }
+        }
+
+        // STRICTENC: check pubkey encoding (must be valid compressed or uncompressed).
+        // Core: CheckPubKeyEncoding with SCRIPT_VERIFY_STRICTENC, sets SCRIPT_ERR_PUBKEYTYPE.
+        if (self.flags.verify_strictenc) {
+            if (!isValidPubkeyEncoding(pubkey)) {
+                return ScriptError.InvalidPubkeyType;
             }
         }
 
@@ -5753,6 +5797,558 @@ test "BIP-113 CLTV: zero-locktime tx is always final regardless of MTP cutoff" {
 
 // --- W81 summary test: verify fix for Bug #1 (require_minimal hardcoded false) ---
 // Both CLTV and CSV must honour verify_minimaldata flag for 5-byte ScriptNum arguments.
+// ============================================================================
+// W82 BIP-66 + Signature/Pubkey Encoding Comprehensive Tests
+// Reference: Bitcoin Core script/interpreter.cpp:64-227, :335-345, :1150-1210
+// ============================================================================
+
+// --- isValidSignatureEncoding (BIP-66 DER) ---
+
+test "W82 BIP-66: minimal valid DER signature (9 bytes)" {
+    // 0x30 0x06 0x02 0x01 0x01 0x02 0x01 0x01 + sighash
+    const sig = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01 };
+    try std.testing.expect(isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: too short (8 bytes) rejected" {
+    const sig = [_]u8{ 0x30, 0x05, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: too long (74 bytes) rejected" {
+    var sig: [74]u8 = undefined;
+    sig[0] = 0x30;
+    sig[1] = 71; // total-len
+    sig[2] = 0x02;
+    sig[3] = 33; // R-len
+    sig[4] = 0x00; // leading zero (R high bit set)
+    sig[5] = 0x80; // R first real byte (high bit = 0x80)
+    @memset(sig[6..37], 0x01); // R remainder
+    sig[37] = 0x02;
+    sig[38] = 33; // S-len
+    sig[39] = 0x00; // leading zero
+    sig[40] = 0x80;
+    @memset(sig[41..72], 0x01); // S remainder
+    sig[72] = 0x01; // hashtype
+    // 37 + 1 + 1 + 33 + 1 + 1 = actually need to recount; just check length>73
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: wrong compound tag (0x31 instead of 0x30) rejected" {
+    const sig = [_]u8{ 0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: total-length mismatch rejected" {
+    // total-len byte says 5 but actual is 6
+    const sig = [_]u8{ 0x30, 0x05, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: R integer tag wrong (0x03 instead of 0x02) rejected" {
+    const sig = [_]u8{ 0x30, 0x06, 0x03, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: R zero-length rejected" {
+    // R-len=0 → invalid
+    const sig = [_]u8{ 0x30, 0x05, 0x02, 0x00, 0x02, 0x01, 0x01, 0x00, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: R negative (high bit set, no leading zero) rejected" {
+    // R = 0x80 with no leading zero byte → negative
+    const sig = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x80, 0x02, 0x01, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: R unnecessary leading zero rejected" {
+    // R = 0x00 0x01 — leading zero when next byte does NOT have high bit set
+    const sig = [_]u8{ 0x30, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: R required leading zero valid (next byte high bit set)" {
+    // R = 0x00 0x80 — leading zero is required because 0x80 has high bit set
+    const sig = [_]u8{ 0x30, 0x07, 0x02, 0x02, 0x00, 0x80, 0x02, 0x01, 0x01, 0x01 };
+    try std.testing.expect(isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: S integer tag wrong rejected" {
+    // S tag byte = 0x03 instead of 0x02
+    const sig = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x03, 0x01, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: S zero-length rejected" {
+    // R-len=1, S-len=0 → total should be 6 but sig is 8
+    const sig = [_]u8{ 0x30, 0x05, 0x02, 0x01, 0x01, 0x02, 0x00, 0x00, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: S negative (high bit set, no leading zero) rejected" {
+    const sig = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x80, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: S unnecessary leading zero rejected" {
+    const sig = [_]u8{ 0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: S required leading zero valid" {
+    const sig = [_]u8{ 0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x80, 0x01 };
+    try std.testing.expect(isValidSignatureEncoding(&sig));
+}
+
+test "W82 BIP-66: lenR+lenS overflow check (5+lenR >= sig.len)" {
+    // lenR=255 — 5+255=260 which is >= sig.len=9 → rejected
+    const sig = [_]u8{ 0x30, 0x06, 0x02, 0xff, 0x01, 0x02, 0x01, 0x01, 0x01 };
+    try std.testing.expect(!isValidSignatureEncoding(&sig));
+}
+
+// --- isDefinedHashtype ---
+
+test "W82 isDefinedHashtype: SIGHASH_ALL (0x01) valid" {
+    try std.testing.expect(isDefinedHashtype(0x01));
+}
+
+test "W82 isDefinedHashtype: SIGHASH_NONE (0x02) valid" {
+    try std.testing.expect(isDefinedHashtype(0x02));
+}
+
+test "W82 isDefinedHashtype: SIGHASH_SINGLE (0x03) valid" {
+    try std.testing.expect(isDefinedHashtype(0x03));
+}
+
+test "W82 isDefinedHashtype: SIGHASH_ALL | ANYONECANPAY (0x81) valid" {
+    try std.testing.expect(isDefinedHashtype(0x81));
+}
+
+test "W82 isDefinedHashtype: SIGHASH_NONE | ANYONECANPAY (0x82) valid" {
+    try std.testing.expect(isDefinedHashtype(0x82));
+}
+
+test "W82 isDefinedHashtype: SIGHASH_SINGLE | ANYONECANPAY (0x83) valid" {
+    try std.testing.expect(isDefinedHashtype(0x83));
+}
+
+test "W82 isDefinedHashtype: 0x00 (zero base) rejected" {
+    try std.testing.expect(!isDefinedHashtype(0x00));
+}
+
+test "W82 isDefinedHashtype: 0x04 rejected" {
+    try std.testing.expect(!isDefinedHashtype(0x04));
+}
+
+test "W82 isDefinedHashtype: 0x80 (ANYONECANPAY alone, base=0) rejected" {
+    try std.testing.expect(!isDefinedHashtype(0x80));
+}
+
+test "W82 isDefinedHashtype: 0x84 (ANYONECANPAY | 0x04) rejected" {
+    try std.testing.expect(!isDefinedHashtype(0x84));
+}
+
+test "W82 isDefinedHashtype: 0xFF rejected" {
+    try std.testing.expect(!isDefinedHashtype(0xff));
+}
+
+// --- isCompressedPubkey ---
+
+test "W82 isCompressedPubkey: valid 0x02 prefix" {
+    var key: [33]u8 = undefined;
+    key[0] = 0x02;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(isCompressedPubkey(&key));
+}
+
+test "W82 isCompressedPubkey: valid 0x03 prefix" {
+    var key: [33]u8 = undefined;
+    key[0] = 0x03;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(isCompressedPubkey(&key));
+}
+
+test "W82 isCompressedPubkey: 0x04 prefix (65B) rejected" {
+    var key: [65]u8 = undefined;
+    key[0] = 0x04;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(!isCompressedPubkey(&key));
+}
+
+test "W82 isCompressedPubkey: wrong length (32B) rejected" {
+    var key: [32]u8 = undefined;
+    key[0] = 0x02;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(!isCompressedPubkey(&key));
+}
+
+test "W82 isCompressedPubkey: 0x04 prefix but only 33B rejected" {
+    var key: [33]u8 = undefined;
+    key[0] = 0x04;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(!isCompressedPubkey(&key));
+}
+
+// --- isValidPubkeyEncoding (STRICTENC: compressed or uncompressed) ---
+
+test "W82 isValidPubkeyEncoding: compressed 0x02 valid" {
+    var key: [33]u8 = undefined;
+    key[0] = 0x02;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(isValidPubkeyEncoding(&key));
+}
+
+test "W82 isValidPubkeyEncoding: compressed 0x03 valid" {
+    var key: [33]u8 = undefined;
+    key[0] = 0x03;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(isValidPubkeyEncoding(&key));
+}
+
+test "W82 isValidPubkeyEncoding: uncompressed 0x04 (65B) valid" {
+    var key: [65]u8 = undefined;
+    key[0] = 0x04;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(isValidPubkeyEncoding(&key));
+}
+
+test "W82 isValidPubkeyEncoding: 64-byte key (no valid prefix) rejected" {
+    var key: [64]u8 = undefined;
+    key[0] = 0x04;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(!isValidPubkeyEncoding(&key));
+}
+
+test "W82 isValidPubkeyEncoding: 33B with 0x04 prefix rejected" {
+    var key: [33]u8 = undefined;
+    key[0] = 0x04;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(!isValidPubkeyEncoding(&key));
+}
+
+test "W82 isValidPubkeyEncoding: 65B with 0x02 prefix rejected" {
+    var key: [65]u8 = undefined;
+    key[0] = 0x02;
+    @memset(key[1..], 0xab);
+    try std.testing.expect(!isValidPubkeyEncoding(&key));
+}
+
+test "W82 isValidPubkeyEncoding: empty rejected" {
+    try std.testing.expect(!isValidPubkeyEncoding(&[_]u8{}));
+}
+
+// --- Engine-level gates: DERSIG flag rejects bad DER sig ---
+
+test "W82 DERSIG gate: bad DER sig rejected by OP_CHECKSIG" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    const flags = ScriptFlags{
+        .verify_dersig = true,
+        .verify_low_s = false,
+        .verify_strictenc = false,
+        .verify_nullfail = false,
+        .verify_nulldummy = false,
+        .verify_witness_pubkeytype = false,
+    };
+    // Stub: DERSIG is not enough to trigger STRICTENC pubkey check.
+    // Push a 9-byte sig with wrong compound tag (0x31), then a valid compressed key.
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    // Script: <bad_sig 9B> <pubkey 33B> OP_CHECKSIG
+    var script_buf: [1 + 9 + 1 + 33 + 1]u8 = undefined;
+    script_buf[0] = 9; // push 9 bytes
+    script_buf[1] = 0x31; // wrong tag
+    @memset(script_buf[2..10], 0x01);
+    script_buf[10] = 33; // push 33 bytes
+    script_buf[11] = 0x02; // valid compressed key prefix
+    @memset(script_buf[12..44], 0xab);
+    script_buf[44] = 0xac; // OP_CHECKSIG
+    const result = engine.execute(&script_buf);
+    try std.testing.expectError(ScriptError.InvalidSignatureEncoding, result);
+}
+
+// --- Engine-level gate: LOW_S flag returns SigHighS (not InvalidSignatureEncoding) ---
+
+test "W82 LOW_S gate: high-S sig returns SigHighS error (Bug #2 regression)" {
+    // Build a sig that is valid DER but has high S.
+    // S = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A1
+    // (just above half the curve order).  We craft the bytes by hand without
+    // secp256k1 — the isValidSignatureEncoding check passes (DER well-formed)
+    // but isLowDERSignature will detect the high S and return SigHighS.
+    // R=1 (minimal), S = order/2 + 1.
+    // secp256k1 order n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    // n/2          = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+    // n/2 + 1      = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A1
+    // That's 32 bytes, high bit of first byte is 0 (0x7F), so no leading zero needed.
+    // Total sig length = 1+1+1+1+1+1+1+32+1 = 9+32 = need to build properly:
+    // 0x30 [total] 0x02 0x01 0x01 0x02 0x20 [32 bytes of S] [hashtype]
+    // total = 2+1+1+1+1+32 = 38, sig.len = 2+38 = 40? Let me count:
+    // 0x30 total 0x02 R-len R 0x02 S-len S hashtype
+    //   1    1    1    1    1  1    1    32   1   = 40 bytes
+    var sig: [40]u8 = undefined;
+    sig[0] = 0x30;
+    sig[1] = 37; // total-len = sig.len - 3 = 40 - 3 = 37
+    sig[2] = 0x02;
+    sig[3] = 1; // R-len
+    sig[4] = 0x01; // R = 1
+    sig[5] = 0x02;
+    sig[6] = 32; // S-len = 32
+    // S = n/2 + 1 (high-S value, above half-order)
+    sig[7] = 0x7f;
+    sig[8] = 0xff;
+    @memset(sig[9..22], 0xff);
+    sig[22] = 0xff;
+    sig[23] = 0xff;
+    sig[24] = 0xff;
+    sig[25] = 0xff;
+    sig[26] = 0x5d;
+    sig[27] = 0x57;
+    sig[28] = 0x6e;
+    sig[29] = 0x73;
+    sig[30] = 0x57;
+    sig[31] = 0xa4;
+    sig[32] = 0x50;
+    sig[33] = 0x1d;
+    sig[34] = 0xdf;
+    sig[35] = 0xe9;
+    sig[36] = 0x2f;
+    sig[37] = 0x46;
+    sig[38] = 0x01; // last byte of S (n/2 + 1 ≈ ...20A1 but approx for test)
+    sig[39] = 0x01; // hashtype = SIGHASH_ALL
+
+    // Verify DER passes first
+    try std.testing.expect(isValidSignatureEncoding(&sig));
+
+    // Now test via engine: with LOW_S flag, should get SigHighS not InvalidSignatureEncoding
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    const flags = ScriptFlags{
+        .verify_dersig = true,
+        .verify_low_s = true,
+        .verify_strictenc = false,
+        .verify_nullfail = false,
+        .verify_nulldummy = false,
+        .verify_witness_pubkeytype = false,
+    };
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    // Script: <high-S sig 40B> <pubkey 33B> OP_CHECKSIG
+    var script_buf: [1 + 40 + 1 + 33 + 1]u8 = undefined;
+    script_buf[0] = 40; // push 40 bytes
+    @memcpy(script_buf[1..41], &sig);
+    script_buf[41] = 33; // push 33 bytes
+    script_buf[42] = 0x02; // valid compressed key prefix
+    @memset(script_buf[43..75], 0xab);
+    script_buf[75] = 0xac; // OP_CHECKSIG
+    const result = engine.execute(&script_buf);
+    try std.testing.expectError(ScriptError.SigHighS, result);
+}
+
+// --- Engine-level gate: STRICTENC flag enforces hashtype check ---
+
+test "W82 STRICTENC: invalid hashtype 0x04 rejected" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    const flags = ScriptFlags{
+        .verify_dersig = true,
+        .verify_low_s = false,
+        .verify_strictenc = true,
+        .verify_nullfail = false,
+        .verify_nulldummy = false,
+        .verify_witness_pubkeytype = false,
+    };
+    // Well-formed DER sig but hashtype = 0x04 (undefined)
+    const sig = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x04 };
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    var script_buf: [1 + 9 + 1 + 33 + 1]u8 = undefined;
+    script_buf[0] = 9;
+    @memcpy(script_buf[1..10], &sig);
+    script_buf[10] = 33;
+    script_buf[11] = 0x02;
+    @memset(script_buf[12..44], 0xab);
+    script_buf[44] = 0xac;
+    const result = engine.execute(&script_buf);
+    try std.testing.expectError(ScriptError.InvalidSigHashType, result);
+}
+
+test "W82 STRICTENC: hashtype 0x00 (base 0) rejected" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    const flags = ScriptFlags{
+        .verify_dersig = true,
+        .verify_low_s = false,
+        .verify_strictenc = true,
+        .verify_nullfail = false,
+        .verify_nulldummy = false,
+        .verify_witness_pubkeytype = false,
+    };
+    const sig = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00 };
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    var script_buf: [1 + 9 + 1 + 33 + 1]u8 = undefined;
+    script_buf[0] = 9;
+    @memcpy(script_buf[1..10], &sig);
+    script_buf[10] = 33;
+    script_buf[11] = 0x02;
+    @memset(script_buf[12..44], 0xab);
+    script_buf[44] = 0xac;
+    const result = engine.execute(&script_buf);
+    try std.testing.expectError(ScriptError.InvalidSigHashType, result);
+}
+
+// --- Engine-level: STRICTENC pubkey encoding check ---
+
+test "W82 STRICTENC: invalid pubkey (wrong prefix/length) rejected by OP_CHECKSIG" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    const flags = ScriptFlags{
+        .verify_dersig = true,
+        .verify_low_s = false,
+        .verify_strictenc = true,
+        .verify_nullfail = false,
+        .verify_nulldummy = false,
+        .verify_witness_pubkeytype = false,
+    };
+    // Valid DER sig (SIGHASH_ALL), bad pubkey (0x05 prefix)
+    const sig = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01 };
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    var script_buf: [1 + 9 + 1 + 33 + 1]u8 = undefined;
+    script_buf[0] = 9;
+    @memcpy(script_buf[1..10], &sig);
+    script_buf[10] = 33;
+    script_buf[11] = 0x05; // invalid prefix
+    @memset(script_buf[12..44], 0xab);
+    script_buf[44] = 0xac;
+    const result = engine.execute(&script_buf);
+    try std.testing.expectError(ScriptError.InvalidPubkeyType, result);
+}
+
+// Bug #1 regression: sig DER check fires BEFORE pubkey STRICTENC check.
+// When sig is bad DER AND pubkey is bad, must get InvalidSignatureEncoding,
+// not InvalidPubkeyType.
+test "W82 check-order: bad DER sig fires before bad STRICTENC pubkey (Bug #1 regression)" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    const flags = ScriptFlags{
+        .verify_dersig = true,
+        .verify_low_s = false,
+        .verify_strictenc = true,
+        .verify_nullfail = false,
+        .verify_nulldummy = false,
+        .verify_witness_pubkeytype = false,
+    };
+    // Bad DER sig (wrong compound tag 0x31) AND bad pubkey (0x05 prefix).
+    // Core: CheckSignatureEncoding fires first → SCRIPT_ERR_SIG_DER.
+    // Pre-fix clearbit: pubkey check fired first → InvalidPubkeyType (wrong).
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    var script_buf: [1 + 9 + 1 + 33 + 1]u8 = undefined;
+    script_buf[0] = 9;
+    script_buf[1] = 0x31; // wrong compound tag
+    @memset(script_buf[2..10], 0x01);
+    script_buf[10] = 33;
+    script_buf[11] = 0x05; // bad prefix
+    @memset(script_buf[12..44], 0xab);
+    script_buf[44] = 0xac;
+    const result = engine.execute(&script_buf);
+    try std.testing.expectError(ScriptError.InvalidSignatureEncoding, result);
+}
+
+// Bug #3 regression: In CHECKMULTISIG, STRICTENC pubkey check fires even
+// when the current sig slot is empty (Core parity).
+test "W82 CHECKMULTISIG: STRICTENC pubkey check fires for empty-sig slot (Bug #3 regression)" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    // STRICTENC enabled; NULLFAIL off so empty sig doesn't error there first.
+    const flags = ScriptFlags{
+        .verify_dersig = true,
+        .verify_low_s = false,
+        .verify_strictenc = true,
+        .verify_nullfail = false,
+        .verify_nulldummy = false,
+        .verify_witness_pubkeytype = false,
+    };
+    // Script: OP_0 (dummy) OP_0 (empty sig) OP_1 (m=1) <bad-pubkey 33B> OP_1 (n=1) OP_CHECKMULTISIG
+    // Stack when CHECKMULTISIG executes (top first): n=1, bad-pubkey, m=1, empty-sig, dummy
+    //
+    // Build as: push-dummy(OP_0) push-sig(OP_0) push-m(OP_1) push-key push-n(OP_1) OP_CHECKMULTISIG
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    // Script bytes:
+    // 0x00               — OP_0 (dummy for NULLDUMMY bug)
+    // 0x00               — OP_0 (empty sig)
+    // 0x51               — OP_1 (m=1)
+    // 0x21 <33B bad key> — push bad pubkey (0x05 prefix)
+    // 0x51               — OP_1 (n=1)
+    // 0xae               — OP_CHECKMULTISIG
+    var script_buf: [1 + 1 + 1 + 1 + 33 + 1 + 1]u8 = undefined;
+    script_buf[0] = 0x00; // OP_0 (dummy)
+    script_buf[1] = 0x00; // OP_0 (empty sig)
+    script_buf[2] = 0x51; // OP_1 (m=1)
+    script_buf[3] = 0x21; // push 33 bytes
+    script_buf[4] = 0x05; // bad pubkey prefix
+    @memset(script_buf[5..37], 0xab); // pubkey body
+    script_buf[37] = 0x51; // OP_1 (n=1)
+    script_buf[38] = 0xae; // OP_CHECKMULTISIG
+    const result = engine.execute(&script_buf);
+    // Must reject with InvalidPubkeyType even though the sig is empty.
+    try std.testing.expectError(ScriptError.InvalidPubkeyType, result);
+}
+
+// --- SigHighS error is distinct from InvalidSignatureEncoding ---
+
+test "W82 SigHighS error type is distinct from InvalidSignatureEncoding" {
+    // Verify the error union has both variants and they are different.
+    const e1: ScriptError = ScriptError.SigHighS;
+    const e2: ScriptError = ScriptError.InvalidSignatureEncoding;
+    try std.testing.expect(e1 != e2);
+}
+
 // Before fix: scriptNumDecodeN(data, false, 5) — non-minimal always accepted.
 // After fix:  scriptNumDecodeN(data, self.flags.verify_minimaldata, 5) — flags respected.
 test "W81 Bug-1 regression: CLTV and CSV both reject non-minimal encoding when MINIMALDATA active" {
