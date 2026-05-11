@@ -159,6 +159,12 @@ pub const MEDIAN_TIME_SPAN: usize = 11;
 /// Maximum allowed block timestamp: 2 hours into the future.
 pub const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
 
+/// Maximum number of seconds that the timestamp of the first block of a
+/// difficulty adjustment period is allowed to be earlier than the last
+/// block of the previous period (BIP-94 timewarp prevention, testnet4 only).
+/// Reference: bitcoin-core/src/consensus/consensus.h:35.
+pub const MAX_TIMEWARP: u32 = 600;
+
 // ============================================================================
 // Soft Fork Activation Heights (Mainnet)
 // ============================================================================

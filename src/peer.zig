@@ -4868,6 +4868,16 @@ pub const PeerManager = struct {
         // BIP-113: compute MTP-of-11 for the block's parent.
         const prev_mtp = self.computePrevMtp(&block.header.prev_block);
 
+        // BIP-94 timewarp: get the actual timestamp of the preceding block.
+        // header_index stores the raw nTime field; 0 means "not available".
+        const prev_block_timestamp: u32 = blk: {
+            const entry = self.header_index.get(block.header.prev_block) orelse break :blk 0;
+            break :blk entry.timestamp;
+        };
+
+        // Future-time gate: capture wall clock at block-body validation time.
+        const current_time: i64 = std.time.timestamp();
+
         validation.acceptBlock(
             block,
             block_hash,
@@ -4878,6 +4888,8 @@ pub const PeerManager = struct {
             self.allocator,
             .{
                 .prev_mtp = prev_mtp,
+                .prev_block_timestamp = prev_block_timestamp,
+                .current_time = current_time,
                 .force_skip_scripts = skip_via_height,
                 // BIP-68 time-based enforcement: wire the MTP-at-height callback
                 // so validateBlockForIBD can look up the prior-block MTP for each
