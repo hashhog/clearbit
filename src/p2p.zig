@@ -567,8 +567,14 @@ pub fn encodeMessage(
         .getblocktxn => |gbt| {
             try payload_writer.writeBytes(&gbt.block_hash);
             try payload_writer.writeCompactSize(gbt.indexes.len);
+            // Core blockencodings.h DifferenceFormatter: encode each index as
+            // a delta from (previous_absolute_index + 1).  shift starts at 0.
+            var shift: u64 = 0;
             for (gbt.indexes) |idx| {
-                try payload_writer.writeCompactSize(idx);
+                const abs: u64 = @intCast(idx);
+                // abs >= shift is guaranteed by sorted ascending indices
+                try payload_writer.writeCompactSize(abs - shift);
+                shift = abs + 1;
             }
         },
         .blocktxn => |bt| {
@@ -727,14 +733,30 @@ pub fn decodePayload(
         const header = try serialize.readBlockHeader(&reader);
         const nonce = try reader.readInt(u64);
         const short_id_count = try reader.readCompactSize();
+        // BIP-152 / Core blockencodings.cpp:64: guard against DoS via huge
+        // short-id vector.  MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TX_WEIGHT = 100000.
+        // Also guard: short_id_count alone must not overflow uint16_t (Core
+        // blockencodings.h:125 — BlockTxCount() must fit in uint16).
+        if (short_id_count > 100_000) return ParseError.InvalidData;
+        if (short_id_count > 0xffff) return ParseError.InvalidData;
         var short_ids = try allocator.alloc([6]u8, @intCast(short_id_count));
+        errdefer allocator.free(short_ids);
         for (0..@intCast(short_id_count)) |i| {
             short_ids[i] = (try reader.readBytes(6))[0..6].*;
         }
         const prefilled_count = try reader.readCompactSize();
+        if (prefilled_count > 100_000) return ParseError.InvalidData;
+        if (prefilled_count > 0xffff) return ParseError.InvalidData;
+        // Core blockencodings.h:125: BlockTxCount() = shorttxids.size() +
+        // prefilledtxn.size() must fit in uint16_t (≤ 65535).
+        if (short_id_count + prefilled_count > 0xffff) return ParseError.InvalidData;
         var prefilled_txs = try allocator.alloc(PrefilledTransaction, @intCast(prefilled_count));
+        errdefer allocator.free(prefilled_txs);
         for (0..@intCast(prefilled_count)) |i| {
+            // Index is a compact-size differential offset from the previous
+            // prefilled position (Core blockencodings.h DifferenceFormatter).
             const index = try reader.readCompactSize();
+            if (index > 0xffff) return ParseError.InvalidData;
             const transaction = try serialize.readTransaction(&reader, allocator);
             prefilled_txs[i] = .{
                 .index = @intCast(index),
@@ -751,8 +773,16 @@ pub fn decodePayload(
         const block_hash = try reader.readHash();
         const index_count = try reader.readCompactSize();
         var indexes = try allocator.alloc(u16, @intCast(index_count));
+        errdefer allocator.free(indexes);
+        // Core blockencodings.h DifferenceFormatter: each encoded value is the
+        // delta from (previous_absolute_index + 1), so we accumulate.
+        var shift: u64 = 0;
         for (0..@intCast(index_count)) |i| {
-            indexes[i] = @intCast(try reader.readCompactSize());
+            const delta = try reader.readCompactSize();
+            shift += delta;
+            if (shift > 0xffff) return ParseError.InvalidData;
+            indexes[i] = @intCast(shift);
+            shift += 1; // DifferenceFormatter increments shift after each value
         }
         return Message{ .getblocktxn = .{
             .block_hash = block_hash,
