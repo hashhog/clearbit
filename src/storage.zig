@@ -4150,8 +4150,19 @@ pub const ChainState = struct {
             // Create outputs
             const t_create_start = std.time.nanoTimestamp();
             for (tx.outputs, 0..) |output, out_idx| {
-                // Skip OP_RETURN outputs (unspendable)
-                if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) continue;
+                // W93 G15: full CScript::IsUnspendable parity — skip OP_RETURN
+                // outputs AND outputs whose scriptPubKey exceeds MAX_SCRIPT_SIZE
+                // (10000 bytes; unspendable because every spend execution would
+                // hit the size cap in interpreter.cpp:428).  Pre-W93 only the
+                // OP_RETURN prong was checked here, so oversized scripts were
+                // emplaced into the UTXO set even though no spend could ever
+                // succeed — that broke `gettxoutsetinfo` byte-parity with
+                // Core (different UTXO count) and wasted RocksDB entries.
+                // The disconnect path's output loop (storage.zig:3583) already
+                // used the full helper; this loop now matches it.
+                // Reference: bitcoin-core/src/coins.cpp:91 (AddCoin IsUnspendable)
+                //            bitcoin-core/src/script/script.h:563 (IsUnspendable)
+                if (isScriptUnspendable(output.script_pubkey)) continue;
 
                 const outpoint = types.OutPoint{
                     .hash = tx_hash,
@@ -11912,4 +11923,150 @@ test "W92 haveCoin returns true for unspent coin in cache" {
         s.deinit(allocator);
     }
     try std.testing.expectEqual(false, chain_state.utxo_set.haveCoin(&outpoint));
+}
+
+// ============================================================================
+// W93 — ConnectBlock + ConnectTip + UpdateCoins (Core parity audit)
+// ============================================================================
+//
+// These tests pin behavior the W93 audit added or normalized.  Each gate
+// label (G15 etc.) maps to the Core ConnectBlock gate-by-gate table in
+// CORE-PARITY-AUDIT/.  Companion validation.zig tests cover the
+// `connectBlock` (legacy) and `validateBlockForIBD` (live IBD) paths.
+
+test "W93 G15 IsUnspendable parity: AddCoin skips OP_RETURN outputs on connect" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // Build a block with a coinbase whose vout[0] is OP_RETURN.
+    // The connect path's IsUnspendable filter must NOT emplace this output
+    // into the UTXO set (Core coins.cpp:91).
+    const cb_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const op_return_script = [_]u8{ 0x6a, 0x04, 'h', 'a', 's', 'h' };
+    const cb_output = types.TxOut{ .value = 0, .script_pubkey = &op_return_script };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_input},
+        .outputs = &[_]types.TxOut{cb_output},
+        .lock_time = 0,
+    };
+    const block = types.Block{
+        .header = types.BlockHeader{
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 0,
+            .bits = 0,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{cb_tx},
+    };
+    const block_hash = [_]u8{0x55} ** 32;
+
+    const txid_before = chain_state.utxo_set.total_utxos;
+    try chain_state.connectBlockFast(&block, &block_hash, 1);
+    const txid_after = chain_state.utxo_set.total_utxos;
+
+    // No UTXO entry should have been added — OP_RETURN outputs are filtered.
+    try std.testing.expectEqual(txid_before, txid_after);
+}
+
+test "W93 G15 IsUnspendable parity: AddCoin skips oversize-script outputs on connect" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // 10_001-byte scriptPubKey: 1 byte over MAX_SCRIPT_SIZE.  Pre-W93 this
+    // was emplaced into the UTXO set despite being unspendable; post-W93 it
+    // is filtered to match Core's coins.cpp:91 IsUnspendable check.
+    const oversize_script = try allocator.alloc(u8, 10_001);
+    defer allocator.free(oversize_script);
+    @memset(oversize_script, 0x51); // all OP_1 bytes — not OP_RETURN-prefixed
+
+    const cb_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_output = types.TxOut{ .value = 0, .script_pubkey = oversize_script };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_input},
+        .outputs = &[_]types.TxOut{cb_output},
+        .lock_time = 0,
+    };
+    const block = types.Block{
+        .header = types.BlockHeader{
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 0,
+            .bits = 0,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{cb_tx},
+    };
+    const block_hash = [_]u8{0x56} ** 32;
+
+    const before = chain_state.utxo_set.total_utxos;
+    try chain_state.connectBlockFast(&block, &block_hash, 1);
+    const after = chain_state.utxo_set.total_utxos;
+
+    // Oversize scriptPubKey → unspendable → no UTXO entry added.
+    try std.testing.expectEqual(before, after);
+}
+
+test "W93 G15 IsUnspendable parity: normal P2WPKH coinbase IS emplaced (regression guard)" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // Use the shared test helper — emits a 22-byte P2WPKH coinbase that is
+    // definitively spendable.  Post-W93 this must still be emplaced, i.e.
+    // the new IsUnspendable filter must NOT over-reach.
+    const block = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xAA);
+    const block_hash = [_]u8{0xAB} ** 32;
+
+    const before = chain_state.utxo_set.total_utxos;
+    try chain_state.connectBlockFast(&block, &block_hash, 1);
+    const after = chain_state.utxo_set.total_utxos;
+
+    try std.testing.expectEqual(@as(u64, before + 1), after);
 }
