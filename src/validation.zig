@@ -838,6 +838,14 @@ pub fn checkBlock(
 /// CScriptCheck jobs and uses N worker threads + the master thread to verify them.
 /// We mirror that pattern via ScriptCheckQueue (below), which spawns N-1 workers on
 /// first use and has the caller participate as the Nth thread in waitAll().
+///
+/// W93: pre-fix this function hardcoded `total_fees = 0` and skipped the
+/// `bad-cb-amount` check entirely.  Now fees are computed per-tx and the
+/// coinbase-value-vs-(subsidy+fees) check fires before script verification —
+/// matching Bitcoin Core ConnectBlock (validation.cpp:2611-2614).  The legacy
+/// path is exercised by storage.zig tests + the dumptxoutset rollback dance;
+/// keeping it Core-faithful prevents the consensus invariant from diverging
+/// between IBD (`validateBlockForIBD`) and the legacy/test path.
 pub fn connectBlock(
     block: *const types.Block,
     height: u32,
@@ -866,9 +874,10 @@ pub fn connectBlock(
         }
     }
 
-    // Track total sigop cost and fees
+    // Track total sigop cost and fees.
+    // W93: total_fees is now actually computed (was hardcoded 0 pre-fix).
     var total_sigops_cost: u64 = 0;
-    const total_fees: i64 = 0; // TODO: Calculate actual fees when full tx validation is implemented
+    var total_fees: i64 = 0;
 
     // Process each transaction
     for (block.transactions) |*tx| {
@@ -899,11 +908,44 @@ pub fn connectBlock(
             }
         }
 
-        // TODO: Add fee calculation here when we have full transaction validation
+        // W93 G10/G11: per-tx fee accumulation (Core Consensus::CheckTxInputs
+        // + nFees MoneyRange).  For non-coinbase txs, sum the prevout amounts
+        // resolved through `sigop_view` and subtract the output sum.  Coinbase
+        // is excluded (no real inputs).  When the prevout lookup fails, we
+        // surface ValidationError.MissingInput rather than silently skipping —
+        // a missing input means the caller's view doesn't cover the spend.
+        // Reference: bitcoin-core/src/validation.cpp:2535-2547.
+        if (!tx.isCoinbase()) {
+            var input_sum: i64 = 0;
+            for (tx.inputs) |input| {
+                const entry = sigop_view.lookup(&input.previous_output) orelse
+                    return ValidationError.MissingInput;
+                // Per-coin value range check.
+                if (!consensus.isValidMoney(entry.amount))
+                    return ValidationError.InputValuesOutOfRange;
+                input_sum += entry.amount;
+                if (!consensus.isValidMoney(input_sum))
+                    return ValidationError.InputValuesOutOfRange;
+            }
+            var output_sum: i64 = 0;
+            for (tx.outputs) |out| output_sum += out.value;
+            if (input_sum < output_sum) return ValidationError.InsufficientFunds;
+            total_fees += input_sum - output_sum;
+            // Accumulated fee MoneyRange (Core "bad-txns-accumulated-fee-outofrange").
+            if (!consensus.isValidMoney(total_fees))
+                return ValidationError.AccumulatedFeeOutOfRange;
+        }
     }
 
-    // TODO: Verify coinbase value <= subsidy + total_fees
-    // const subsidy = consensus.getBlockSubsidy(height, params);
+    // W93 G16: coinbase value ≤ subsidy + total_fees (Core "bad-cb-amount",
+    // validation.cpp:2611-2614).  Previously a TODO; now the legacy path
+    // matches `validateBlockForIBD`'s gate exactly.
+    const subsidy = consensus.getBlockSubsidy(height, params);
+    var coinbase_value: i64 = 0;
+    for (block.transactions[0].outputs) |out| coinbase_value += out.value;
+    if (coinbase_value > subsidy + total_fees) {
+        return ValidationError.BadCoinbaseValue;
+    }
 
     // Parallel script verification.
     // UTXO apply (above) must complete in tx order before scripts are checked.
@@ -1322,8 +1364,14 @@ pub fn validateBlockForIBD(
 
         // Add this tx's outputs to the prevouts map (intra-block stitching).
         for (tx.outputs, 0..) |out, out_idx| {
-            // Skip OP_RETURN — never spendable (matches storage.zig:2464).
+            // W93 G15: full CScript::IsUnspendable parity (Core
+            // script/script.h:563) — skip OP_RETURN AND scripts > MAX_SCRIPT_SIZE.
+            // Mirrors the same filter in storage.zig::connectBlockInner output
+            // loop so the intra-block view matches what the UTXO set will hold
+            // for spends inside the same block.
+            // Reference: bitcoin-core/src/coins.cpp:91 AddCoin IsUnspendable.
             if (out.script_pubkey.len > 0 and out.script_pubkey[0] == 0x6a) continue;
+            if (out.script_pubkey.len > 10000) continue;
             var key: OutpointKey = undefined;
             @memcpy(key[0..32], &tx_hashes[tx_idx]);
             const idx_le = std.mem.nativeToLittle(u32, @intCast(out_idx));
@@ -3671,9 +3719,29 @@ test "connectBlock enforces BIP-68 sequence locks" {
         .lookupFn = testUtxoLookup,
     };
 
+    // W93: sigop_view must now expose the prevout amount (used by fee
+    // accumulation in connectBlock).  We stub a one-entry map so the
+    // regular_tx's spend resolves to 50 BTC, leaving 10 BTC of fee for
+    // the coinbase-value gate.
+    var sigop_utxos = std.AutoHashMap([36]u8, SigopUtxoEntry).init(std.testing.allocator);
+    defer sigop_utxos.deinit();
+    try sigop_utxos.put(key, .{ .script_pubkey = &[_]u8{0x51}, .amount = 50_000_000_000 });
+    const SigopMapCtx = struct {
+        map: *std.AutoHashMap([36]u8, SigopUtxoEntry),
+
+        fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?SigopUtxoEntry {
+            const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            var k: [36]u8 = undefined;
+            @memcpy(k[0..32], &outpoint.hash);
+            const idx_le = std.mem.nativeToLittle(u32, @intCast(outpoint.index));
+            @memcpy(k[32..36], std.mem.asBytes(&idx_le));
+            return me.map.get(k);
+        }
+    };
+    var sigop_ctx = SigopMapCtx{ .map = &sigop_utxos };
     const sigop_view = SigopUtxoView{
-        .context = undefined,
-        .lookupFn = emptySigopLookup,
+        .context = @ptrCast(&sigop_ctx),
+        .lookupFn = SigopMapCtx.lookup,
     };
 
     // Create a coinbase transaction
@@ -3769,8 +3837,11 @@ test "connectBlock allows coinbase transactions regardless of sequence" {
         .witness = &[_][]const u8{},
     };
 
+    // W93: coinbase value must be <= subsidy (= 50 BTC = 5_000_000_000 sat
+    // pre-halving).  Pre-fix this was 50_000_000_000 sat (= 500 BTC) and
+    // would have been rejected; the old `total_fees=0` TODO masked the bug.
     const coinbase_output = types.TxOut{
-        .value = 50_000_000_000,
+        .value = 5_000_000_000,
         .script_pubkey = &[_]u8{0x51},
     };
 
@@ -3801,8 +3872,11 @@ test "connectBlock allows coinbase transactions regardless of sequence" {
     };
 
     // Should pass - coinbase transactions are exempt from BIP-68
-    // (sequence_view is null, so no BIP-68 check happens at all)
-    _ = try connectBlock(&block, 500000, &consensus.MAINNET, &sigop_view, null, &tip, std.testing.allocator);
+    // (sequence_view is null, so no BIP-68 check happens at all).
+    // W93: use h=100000 so subsidy=50 BTC matches the 50 BTC coinbase output;
+    // post-W93 connectBlock enforces bad-cb-amount, so the prior h=500000
+    // (where subsidy is 12.5 BTC) would now correctly reject the block.
+    _ = try connectBlock(&block, 100000, &consensus.MAINNET, &sigop_view, null, &tip, std.testing.allocator);
 }
 
 test "connectBlock skips BIP-68 when views are null" {
@@ -3828,8 +3902,9 @@ test "connectBlock skips BIP-68 when views are null" {
         .witness = &[_][]const u8{},
     };
 
+    // W93: 50 BTC = 5_000_000_000 sat (subsidy pre-halving).
     const coinbase_output = types.TxOut{
-        .value = 50_000_000_000,
+        .value = 5_000_000_000,
         .script_pubkey = &[_]u8{0x51},
     };
 
@@ -3856,7 +3931,302 @@ test "connectBlock skips BIP-68 when views are null" {
 
     // With null sequence_view and tip, BIP-68 check is skipped for non-coinbase txs.
     // Coinbase-only block passes trivially with empty script verification.
-    _ = try connectBlock(&block, 500000, &consensus.MAINNET, &sigop_view, null, null, std.testing.allocator);
+    // W93: h=100000 keeps subsidy=50 BTC matching the 50 BTC coinbase.
+    _ = try connectBlock(&block, 100000, &consensus.MAINNET, &sigop_view, null, null, std.testing.allocator);
+}
+
+// ============================================================================
+// W93 — legacy `connectBlock` fee + bad-cb-amount gates
+// ============================================================================
+//
+// Pre-W93 this function hardcoded `total_fees = 0` and skipped the coinbase-
+// value check entirely (two TODO markers).  Post-W93 it mirrors Core
+// validation.cpp:2535-2614: per-tx CheckTxInputs (fees + MoneyRange) then
+// bad-cb-amount.
+
+// Per-tx sigop_view lookup helper that uses a static map of OutPoint → entry.
+const W93FeeLookup = struct {
+    map: *std.AutoHashMap([36]u8, SigopUtxoEntry),
+
+    fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?SigopUtxoEntry {
+        const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        var k: [36]u8 = undefined;
+        @memcpy(k[0..32], &outpoint.hash);
+        const idx_le = std.mem.nativeToLittle(u32, @intCast(outpoint.index));
+        @memcpy(k[32..36], std.mem.asBytes(&idx_le));
+        return me.map.get(k);
+    }
+};
+
+test "W93 connectBlock: bad-cb-amount fires when coinbase > subsidy + fees" {
+    var sigop_utxos = std.AutoHashMap([36]u8, SigopUtxoEntry).init(std.testing.allocator);
+    defer sigop_utxos.deinit();
+
+    // 1-BTC prevout for the single non-coinbase tx.
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &([_]u8{0x77} ** 32));
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    try sigop_utxos.put(key, .{ .script_pubkey = &[_]u8{0x51}, .amount = 100_000_000 });
+    var ctx = W93FeeLookup{ .map = &sigop_utxos };
+    const sigop_view = SigopUtxoView{ .context = @ptrCast(&ctx), .lookupFn = W93FeeLookup.lookup };
+
+    // Coinbase claims 60 BTC.  At h=100000: subsidy=50 BTC, fees=1 BTC,
+    // limit=51 BTC.  60 > 51 → BadCoinbaseValue.
+    const cb_in = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_out = types.TxOut{ .value = 6_000_000_000, .script_pubkey = &[_]u8{0x51} };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_in},
+        .outputs = &[_]types.TxOut{cb_out},
+        .lock_time = 0,
+    };
+    // Non-coinbase tx: 1 BTC in, 0 BTC out (entire prevout becomes fee).
+    const tx_in = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x77} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx_out = types.TxOut{ .value = 0, .script_pubkey = &[_]u8{0x51} };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{tx_in},
+        .outputs = &[_]types.TxOut{tx_out},
+        .lock_time = 0,
+    };
+
+    const block = types.Block{
+        .header = .{
+            .version = 0x20000000,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 1000100,
+            .bits = 0x1d00ffff,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{ cb_tx, tx },
+    };
+
+    const result = connectBlock(&block, 100_000, &consensus.MAINNET, &sigop_view, null, null, std.testing.allocator);
+    try std.testing.expectError(ValidationError.BadCoinbaseValue, result);
+}
+
+test "W93 connectBlock: coinbase exactly at subsidy + fees is accepted" {
+    var sigop_utxos = std.AutoHashMap([36]u8, SigopUtxoEntry).init(std.testing.allocator);
+    defer sigop_utxos.deinit();
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &([_]u8{0x77} ** 32));
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    try sigop_utxos.put(key, .{ .script_pubkey = &[_]u8{0x51}, .amount = 100_000_000 });
+    var ctx = W93FeeLookup{ .map = &sigop_utxos };
+    const sigop_view = SigopUtxoView{ .context = @ptrCast(&ctx), .lookupFn = W93FeeLookup.lookup };
+
+    // Coinbase claims 51 BTC = subsidy + fees.  Should pass.
+    const cb_in = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_out = types.TxOut{ .value = 5_100_000_000, .script_pubkey = &[_]u8{0x51} };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_in},
+        .outputs = &[_]types.TxOut{cb_out},
+        .lock_time = 0,
+    };
+    const tx_in = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x77} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx_out = types.TxOut{ .value = 0, .script_pubkey = &[_]u8{0x51} };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{tx_in},
+        .outputs = &[_]types.TxOut{tx_out},
+        .lock_time = 0,
+    };
+
+    const block = types.Block{
+        .header = .{
+            .version = 0x20000000,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 1000100,
+            .bits = 0x1d00ffff,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{ cb_tx, tx },
+    };
+
+    const fees = try connectBlock(&block, 100_000, &consensus.MAINNET, &sigop_view, null, null, std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 100_000_000), fees);
+}
+
+test "W93 connectBlock: output > input returns InsufficientFunds" {
+    var sigop_utxos = std.AutoHashMap([36]u8, SigopUtxoEntry).init(std.testing.allocator);
+    defer sigop_utxos.deinit();
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &([_]u8{0x77} ** 32));
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    // Prevout 1 BTC, output 2 BTC → InsufficientFunds.
+    try sigop_utxos.put(key, .{ .script_pubkey = &[_]u8{0x51}, .amount = 100_000_000 });
+    var ctx = W93FeeLookup{ .map = &sigop_utxos };
+    const sigop_view = SigopUtxoView{ .context = @ptrCast(&ctx), .lookupFn = W93FeeLookup.lookup };
+
+    const cb_in = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_out = types.TxOut{ .value = 5_000_000_000, .script_pubkey = &[_]u8{0x51} };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_in},
+        .outputs = &[_]types.TxOut{cb_out},
+        .lock_time = 0,
+    };
+    const tx_in = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x77} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    // Output 2 BTC > input 1 BTC.
+    const tx_out = types.TxOut{ .value = 200_000_000, .script_pubkey = &[_]u8{0x51} };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{tx_in},
+        .outputs = &[_]types.TxOut{tx_out},
+        .lock_time = 0,
+    };
+
+    const block = types.Block{
+        .header = .{
+            .version = 0x20000000,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 1000100,
+            .bits = 0x1d00ffff,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{ cb_tx, tx },
+    };
+
+    const result = connectBlock(&block, 100_000, &consensus.MAINNET, &sigop_view, null, null, std.testing.allocator);
+    try std.testing.expectError(ValidationError.InsufficientFunds, result);
+}
+
+test "W93 connectBlock: missing prevout returns MissingInput" {
+    // sigop_view has NO entry for the non-coinbase tx's prevout.
+    var sigop_utxos = std.AutoHashMap([36]u8, SigopUtxoEntry).init(std.testing.allocator);
+    defer sigop_utxos.deinit();
+    var ctx = W93FeeLookup{ .map = &sigop_utxos };
+    const sigop_view = SigopUtxoView{ .context = @ptrCast(&ctx), .lookupFn = W93FeeLookup.lookup };
+
+    const cb_in = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_out = types.TxOut{ .value = 5_000_000_000, .script_pubkey = &[_]u8{0x51} };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_in},
+        .outputs = &[_]types.TxOut{cb_out},
+        .lock_time = 0,
+    };
+    const tx_in = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x88} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx_out = types.TxOut{ .value = 0, .script_pubkey = &[_]u8{0x51} };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{tx_in},
+        .outputs = &[_]types.TxOut{tx_out},
+        .lock_time = 0,
+    };
+
+    const block = types.Block{
+        .header = .{
+            .version = 0x20000000,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 1000100,
+            .bits = 0x1d00ffff,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{ cb_tx, tx },
+    };
+
+    const result = connectBlock(&block, 100_000, &consensus.MAINNET, &sigop_view, null, null, std.testing.allocator);
+    try std.testing.expectError(ValidationError.MissingInput, result);
+}
+
+test "W93 connectBlock: prevout amount out of range returns InputValuesOutOfRange" {
+    var sigop_utxos = std.AutoHashMap([36]u8, SigopUtxoEntry).init(std.testing.allocator);
+    defer sigop_utxos.deinit();
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &([_]u8{0x77} ** 32));
+    std.mem.writeInt(u32, key[32..36], 0, .little);
+    // Out-of-range prevout amount (MAX_MONEY + 1).
+    try sigop_utxos.put(key, .{ .script_pubkey = &[_]u8{0x51}, .amount = consensus.MAX_MONEY + 1 });
+    var ctx = W93FeeLookup{ .map = &sigop_utxos };
+    const sigop_view = SigopUtxoView{ .context = @ptrCast(&ctx), .lookupFn = W93FeeLookup.lookup };
+
+    const cb_in = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_out = types.TxOut{ .value = 0, .script_pubkey = &[_]u8{0x51} };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_in},
+        .outputs = &[_]types.TxOut{cb_out},
+        .lock_time = 0,
+    };
+    const tx_in = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x77} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx_out = types.TxOut{ .value = 0, .script_pubkey = &[_]u8{0x51} };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{tx_in},
+        .outputs = &[_]types.TxOut{tx_out},
+        .lock_time = 0,
+    };
+
+    const block = types.Block{
+        .header = .{
+            .version = 0x20000000,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 1000100,
+            .bits = 0x1d00ffff,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{ cb_tx, tx },
+    };
+
+    const result = connectBlock(&block, 100_000, &consensus.MAINNET, &sigop_view, null, null, std.testing.allocator);
+    try std.testing.expectError(ValidationError.InputValuesOutOfRange, result);
 }
 
 // ============================================================================
