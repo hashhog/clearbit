@@ -5544,13 +5544,27 @@ pub const ChainManager = struct {
 
             // Disconnect the tip: load block bytes from CF_BLOCKS, deserialize,
             // and apply undo via the file-based undo manager.
+            //
+            // W92 — both `error.DisconnectFailed` (Core DISCONNECT_FAILED)
+            // and `error.DisconnectUnclean` (Core DISCONNECT_UNCLEAN) are
+            // treated as fatal here, mirroring Bitcoin Core's
+            // DisconnectTip (validation.cpp:2949) which checks
+            // `!= DISCONNECT_OK`.  VerifyDB callers (RollbackBlock at
+            // validation.cpp:4824) may tolerate UNCLEAN but the reorg
+            // path must not — an UNCLEAN means the UTXO set diverged
+            // from the block-being-reversed, so continuing the rewind
+            // would build on top of inconsistent state.
             const prev_hash = tip.header.prev_block;
             chain_state.disconnectBlockByHash(
                 &tip.hash,
                 tip.file_number,
                 tip.file_offset,
                 prev_hash,
-            ) catch return ChainError.DisconnectFailed;
+            ) catch |err| {
+                std.debug.print("disconnectToBlock: disconnect of {x} failed with {}\n",
+                    .{ std.fmt.fmtSliceHexLower(&tip.hash), err });
+                return ChainError.DisconnectFailed;
+            };
 
             // Update active tip
             self.active_tip = tip.parent;
