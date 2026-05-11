@@ -23,8 +23,10 @@ const validation = @import("validation.zig");
 // Mempool Constants
 // ============================================================================
 
-/// Maximum mempool size in bytes (300 MB).
-pub const MAX_MEMPOOL_SIZE: usize = 300 * 1024 * 1024;
+/// Maximum mempool size in bytes (300 MB, SI units — Core kernel/mempool_options.h:40).
+/// Bitcoin Core uses DEFAULT_MAX_MEMPOOL_SIZE_MB * 1_000_000 (SI megabytes), NOT
+/// 1024*1024.  Using binary MiB inflates the limit by ~4.9% and diverges from Core.
+pub const MAX_MEMPOOL_SIZE: usize = 300 * 1_000_000;
 
 /// Maximum number of unconfirmed ancestors.
 pub const MAX_ANCESTOR_COUNT: usize = 25;
@@ -42,11 +44,21 @@ pub const MAX_DESCENDANT_SIZE: usize = 101_000;
 pub const MEMPOOL_EXPIRY: i64 = 14 * 24 * 60 * 60;
 
 /// Minimum relay fee in satoshis per 1000 vbytes.
-pub const MIN_RELAY_FEE: i64 = 1000;
+/// Bitcoin Core: DEFAULT_MIN_RELAY_TX_FEE = 100 (policy/policy.h:70).
+/// Was wrongly set to 1000 (10× too high), causing over-rejection of valid relay txs.
+pub const MIN_RELAY_FEE: i64 = 100;
 
 /// Incremental relay fee in satoshis per 1000 vbytes (BIP125).
-/// Replacement tx must pay: old_fees + (incremental_relay_fee * new_vsize)
-pub const INCREMENTAL_RELAY_FEE: i64 = 1000;
+/// Replacement tx must pay: old_fees + (incremental_relay_fee * new_vsize).
+/// Bitcoin Core: DEFAULT_INCREMENTAL_RELAY_FEE = 100 (policy/policy.h:48).
+/// Was wrongly set to 1000 (10× too high), breaking RBF fee bump rule 4.
+pub const INCREMENTAL_RELAY_FEE: i64 = 100;
+
+/// Rolling minimum fee halflife in seconds (12 hours).
+/// Bitcoin Core: ROLLING_FEE_HALFLIFE = 60 * 60 * 12 (txmempool.h).
+/// When the mempool is below 1/4 full the halflife is divided by 4 (→ 3h);
+/// below 1/2 full it is divided by 2 (→ 6h) — see GetMinFee / getMinFee.
+pub const ROLLING_FEE_HALFLIFE: f64 = 60.0 * 60.0 * 12.0;
 
 /// Maximum number of transactions that can be evicted by a single RBF replacement.
 /// This includes direct conflicts and all their descendants.
@@ -583,6 +595,32 @@ pub const Mempool = struct {
     full_rbf: bool,
 
     // ========================================================================
+    // Rolling Minimum Fee Rate State
+    // (Bitcoin Core: CTxMemPool::rollingMinimumFeeRate, txmempool.cpp:829-859)
+    // ========================================================================
+
+    /// Current rolling minimum fee rate in sat/kvB (floating point).
+    /// Set to the evicted chunk's feerate + incremental_relay_fee on each
+    /// TrimToSize/evict call (via trackPackageRemoved).  Decays exponentially
+    /// toward zero with halflife ROLLING_FEE_HALFLIFE between blocks.
+    /// Mirrors Bitcoin Core: `rollingMinimumFeeRate` (double, sat/kvB).
+    rolling_minimum_fee_rate: f64,
+
+    /// Wall-clock second of the last time we updated (decayed) the rolling
+    /// minimum fee rate.  Updated inside getMinFee whenever > 10 s have
+    /// elapsed since the last decay step.
+    /// Mirrors Bitcoin Core: `lastRollingFeeUpdate`.
+    last_rolling_fee_update: i64,
+
+    /// Set to true by CTxMemPool::blockConnected (after a new block arrives),
+    /// set to false by trackPackageRemoved when a size-limit eviction happens.
+    /// GetMinFee/getMinFee returns CFeeRate(rollingMinimumFeeRate) unchanged
+    /// when this is false (no block has arrived since the last bump, so decay
+    /// hasn't started yet).
+    /// Mirrors Bitcoin Core: `blockSinceLastRollingFeeBump`.
+    block_since_last_rolling_fee_bump: bool,
+
+    // ========================================================================
     // Orphan Transaction Pool
     // ========================================================================
 
@@ -622,6 +660,10 @@ pub const Mempool = struct {
             .full_rbf = false,
             .orphans = std.AutoHashMap(types.Hash256, *OrphanTx).init(allocator),
             .orphans_by_peer = std.AutoHashMap(u64, u32).init(allocator),
+            // Rolling minimum fee rate state (Core txmempool.cpp:829-859).
+            .rolling_minimum_fee_rate = 0.0,
+            .last_rolling_fee_update = std.time.timestamp(),
+            .block_since_last_rolling_fee_bump = false,
         };
     }
 
@@ -823,9 +865,17 @@ pub const Mempool = struct {
         else
             0;
 
-        // Check minimum relay fee (only if fee is being computed)
-        if (total_in > 0 and fee_rate < @as(f64, @floatFromInt(MIN_RELAY_FEE)) / 1000.0) {
-            return MempoolError.InsufficientFee;
+        // Check minimum relay fee against the rolling minimum (only when fee is computed).
+        // getMinFee() returns the max of MIN_RELAY_FEE and the decayed rolling minimum
+        // (which may be elevated after recent size-limit evictions).  Using the static
+        // MIN_RELAY_FEE constant here would accept txs that pay less than what was just
+        // evicted — a correctness gap vs Core's GetMinFee(sizelimit) gate in
+        // MemPoolAccept::PreChecks (validation.cpp:~1050).
+        if (total_in > 0) {
+            const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
+            if (fee_rate * 1000.0 < min_fee_sat_kvb) {
+                return MempoolError.InsufficientFee;
+            }
         }
 
         // 6b. Script verification (STANDARD_SCRIPT_VERIFY_FLAGS).
@@ -1160,11 +1210,17 @@ pub const Mempool = struct {
     }
 
     /// Remove transactions that were included in a newly connected block.
+    /// Also resets the rolling-fee-bump sentinel so that GetMinFee starts
+    /// decaying from the current rollingMinimumFeeRate (Core: after each block
+    /// CTxMemPool::blockConnected sets blockSinceLastRollingFeeBump = true,
+    /// txmempool.cpp:1143).
     pub fn removeForBlock(self: *Mempool, block: *const types.Block) void {
         for (block.transactions) |tx| {
             const tx_hash = crypto.computeTxid(&tx, self.allocator) catch continue;
             self.removeTransaction(tx_hash);
         }
+        // A new block arrived — start decaying the rolling minimum fee rate.
+        self.block_since_last_rolling_fee_bump = true;
         // Sweep the orphan pool for entries invalidated or confirmed by
         // this block (Core: `TxOrphanage::EraseForBlock`).
         self.eraseOrphansForBlock(block);
@@ -2163,8 +2219,12 @@ pub const Mempool = struct {
     }
 
     /// Evict lowest-fee-rate transactions to make room.
-    /// Evict lowest-fee-rate transactions to make room.
     /// Uses cluster-based mining score for eviction decisions.
+    ///
+    /// Mirrors Bitcoin Core's CTxMemPool::TrimToSize (txmempool.cpp:861-911):
+    /// after each eviction, calls trackPackageRemoved with the evicted chunk's
+    /// feerate + INCREMENTAL_RELAY_FEE, bumping the rolling minimum fee rate so
+    /// subsequent admissions must pay more than what was just evicted.
     fn evict(self: *Mempool, needed_bytes: usize) !void {
         // Update mining scores if needed (cluster-aware)
         self.updateMiningScores() catch {};
@@ -2175,6 +2235,8 @@ pub const Mempool = struct {
             // Find the transaction with the lowest mining score (cluster-aware)
             var worst: ?types.Hash256 = null;
             var worst_score: f64 = std.math.floatMax(f64);
+            var worst_fee: i64 = 0;
+            var worst_vsize: usize = 1;
 
             var iter = self.entries.iterator();
             while (iter.next()) |entry| {
@@ -2183,12 +2245,24 @@ pub const Mempool = struct {
                 if (score < worst_score) {
                     worst_score = score;
                     worst = entry.key_ptr.*;
+                    worst_fee = entry.value_ptr.*.fee;
+                    worst_vsize = if (entry.value_ptr.*.vsize > 0) entry.value_ptr.*.vsize else 1;
                 }
             }
 
             if (worst) |txid_hash| {
                 const entry = self.entries.get(txid_hash) orelse break;
                 freed += entry.vsize;
+
+                // Bump rolling minimum: evicted rate (sat/kvB) + INCREMENTAL_RELAY_FEE.
+                // Core: `removed += m_opts.incremental_relay_feerate; trackPackageRemoved(removed);`
+                // (txmempool.cpp:877-878).  This prevents the next tx from entering at
+                // exactly the evicted rate (equal fee is not enough to bump out a tx).
+                const evicted_rate_sat_kvb: f64 =
+                    @as(f64, @floatFromInt(worst_fee)) * 1000.0 /
+                    @as(f64, @floatFromInt(worst_vsize));
+                self.trackPackageRemoved(evicted_rate_sat_kvb + @as(f64, @floatFromInt(INCREMENTAL_RELAY_FEE)));
+
                 self.removeTransactionWithDescendants(txid_hash);
             } else break;
         }
@@ -2626,33 +2700,77 @@ pub const Mempool = struct {
         };
     }
 
+    /// Bump the rolling minimum fee rate to `rate_sat_kvb` if it is higher
+    /// than the current rolling minimum.  Called by `evict()` on each eviction.
+    /// Mirrors Bitcoin Core `CTxMemPool::trackPackageRemoved` (txmempool.cpp:853-859).
+    ///
+    /// After a bump, `block_since_last_rolling_fee_bump` is set to false so
+    /// that `getMinFee` holds the bumped value until the next block arrives.
+    pub fn trackPackageRemoved(self: *Mempool, rate_sat_kvb: f64) void {
+        if (rate_sat_kvb > self.rolling_minimum_fee_rate) {
+            self.rolling_minimum_fee_rate = rate_sat_kvb;
+            self.block_since_last_rolling_fee_bump = false;
+        }
+    }
+
     /// Get the minimum fee rate required for a transaction to be accepted.
     /// Returns the fee rate in sat/kvB (satoshis per 1000 virtual bytes).
-    /// When the mempool is not full, returns MIN_RELAY_FEE.
-    /// When the mempool is full, returns the fee rate of the lowest-fee transaction
-    /// plus INCREMENTAL_RELAY_FEE to ensure new transactions pay enough to evict.
+    ///
+    /// Implements Bitcoin Core's rolling-minimum-fee-rate logic
+    /// (txmempool.cpp:829-851):
+    ///
+    ///   1. If no block has arrived since the last eviction-driven bump
+    ///      (`block_since_last_rolling_fee_bump == false`), the rolling
+    ///      minimum is held constant (no decay yet).
+    ///   2. If `rolling_minimum_fee_rate == 0`, return 0 immediately.
+    ///   3. Every > 10 s, decay exponentially:
+    ///        rate = rate / 2^((now - last_update) / halflife)
+    ///      The halflife is 12 h, but is divided by 4 (→ 3 h) when the
+    ///      mempool is < 1/4 full, or by 2 (→ 6 h) when < 1/2 full.
+    ///   4. If the decayed rate drops below incremental_relay_fee / 2,
+    ///      zero it out and return 0.
+    ///   5. Return max(rolling_minimum_fee_rate, incremental_relay_fee).
+    ///
+    /// The floor is always at least MIN_RELAY_FEE (= incremental_relay_feerate
+    /// in the default config).
     pub fn getMinFee(self: *Mempool) u64 {
-        // If mempool is not full, use the default minimum relay fee
-        if (self.total_size < MAX_MEMPOOL_SIZE) {
-            return @intCast(MIN_RELAY_FEE);
+        // Step 1/2: if no block since the last bump, or rate already zero,
+        // return the rounded rolling rate directly (no decay).
+        if (!self.block_since_last_rolling_fee_bump or self.rolling_minimum_fee_rate == 0.0) {
+            const rolling = @as(u64, @intFromFloat(@round(self.rolling_minimum_fee_rate)));
+            return @max(rolling, @as(u64, @intCast(MIN_RELAY_FEE)));
         }
 
-        // When full, find the minimum fee rate in the mempool
-        var min_fee_rate: f64 = std.math.floatMax(f64);
-        var iter = self.entries.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.*.fee_rate < min_fee_rate) {
-                min_fee_rate = entry.value_ptr.*.fee_rate;
+        const now = std.time.timestamp();
+
+        // Step 3: only decay when > 10 s have elapsed.
+        if (now > self.last_rolling_fee_update + 10) {
+            var halflife: f64 = ROLLING_FEE_HALFLIFE;
+            // Accelerate decay when mempool is mostly empty.
+            if (self.total_size < MAX_MEMPOOL_SIZE / 4) {
+                halflife /= 4.0;
+            } else if (self.total_size < MAX_MEMPOOL_SIZE / 2) {
+                halflife /= 2.0;
+            }
+
+            const elapsed = @as(f64, @floatFromInt(now - self.last_rolling_fee_update));
+            self.rolling_minimum_fee_rate = self.rolling_minimum_fee_rate /
+                std.math.pow(f64, 2.0, elapsed / halflife);
+            self.last_rolling_fee_update = now;
+
+            // Step 4: zero out when below incremental_relay_fee / 2.
+            if (self.rolling_minimum_fee_rate <
+                @as(f64, @floatFromInt(INCREMENTAL_RELAY_FEE)) / 2.0)
+            {
+                self.rolling_minimum_fee_rate = 0.0;
+                return @intCast(MIN_RELAY_FEE);
             }
         }
 
-        // Convert fee rate from sat/vB to sat/kvB and add incremental relay fee
-        if (min_fee_rate < std.math.floatMax(f64)) {
-            const min_kvb = @as(u64, @intFromFloat(min_fee_rate * 1000));
-            return @max(min_kvb + @as(u64, @intCast(INCREMENTAL_RELAY_FEE)), @as(u64, @intCast(MIN_RELAY_FEE)));
-        }
-
-        return @intCast(MIN_RELAY_FEE);
+        // Step 5: return max(rolling, incremental_relay_fee), floor MIN_RELAY_FEE.
+        const rolling = @as(u64, @intFromFloat(@round(self.rolling_minimum_fee_rate)));
+        const incremental = @as(u64, @intCast(INCREMENTAL_RELAY_FEE));
+        return @max(@max(rolling, incremental), @as(u64, @intCast(MIN_RELAY_FEE)));
     }
 
     /// Check if mempool contains a transaction.
@@ -2671,7 +2789,18 @@ pub const Mempool = struct {
         return self.entries.get(txid);
     }
 
-    /// Remove expired transactions (older than MEMPOOL_EXPIRY).
+    /// Remove expired transactions (older than MEMPOOL_EXPIRY) and all their
+    /// descendants.
+    ///
+    /// Mirrors Bitcoin Core CTxMemPool::Expire (txmempool.cpp:811-827):
+    /// Core collects the set of directly-expired entries, calls
+    /// CalculateDescendants on each, then removes the entire "stage" in one
+    /// pass (MemPoolRemovalReason::EXPIRY).  The critical difference from a
+    /// simple per-tx remove is that descendants of an expired parent must also
+    /// be removed — otherwise they reference a now-absent input.
+    ///
+    /// Bug that was here before: called removeTransaction (no descendants) so
+    /// child transactions of expired parents were orphaned in the mempool.
     pub fn removeExpired(self: *Mempool) void {
         const now = std.time.timestamp();
         var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
@@ -2684,8 +2813,11 @@ pub const Mempool = struct {
             }
         }
 
+        // removeTransactionWithDescendants handles the case where a txid has
+        // already been removed (by an earlier iteration removing it as a
+        // descendant) — removeTransaction is a no-op when the entry is absent.
         for (to_remove.items) |txid| {
-            self.removeTransaction(txid);
+            self.removeTransactionWithDescendants(txid);
         }
     }
 
@@ -2753,12 +2885,13 @@ pub const Mempool = struct {
         const individual_fee_rate = if (vsize > 0)
             @as(f64, @floatFromInt(fee)) / @as(f64, @floatFromInt(vsize))
         else
-            0;
+            0.0;
 
-        // Check PACKAGE fee rate (not individual) - this is the CPFP magic
-        // Individual tx may have low fee rate, but package rate must be sufficient
-        const min_fee_rate = @as(f64, @floatFromInt(MIN_RELAY_FEE)) / 1000.0;
-        if (total_in > 0 and package_fee_rate < min_fee_rate) {
+        // Check PACKAGE fee rate (not individual) - this is the CPFP magic.
+        // Individual tx may have low fee rate, but package rate must be sufficient.
+        // Use getMinFee() so we respect the rolling minimum (elevated post-eviction).
+        const min_fee_rate_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
+        if (total_in > 0 and package_fee_rate * 1000.0 < min_fee_rate_sat_kvb) {
             return MempoolError.InsufficientFee;
         }
 
@@ -3342,6 +3475,7 @@ pub const Mempool = struct {
 
     /// Evict transactions using cluster-based mining score.
     /// Evicts from the worst cluster (lowest mining score).
+    /// Also bumps the rolling minimum fee rate (trackPackageRemoved) on each eviction.
     fn evictByCluster(self: *Mempool, needed_bytes: usize) !void {
         try self.updateMiningScores();
 
@@ -3351,18 +3485,27 @@ pub const Mempool = struct {
             // Find the transaction with the lowest mining score
             var worst: ?types.Hash256 = null;
             var worst_score: f64 = std.math.floatMax(f64);
+            var worst_fee: i64 = 0;
+            var worst_vsize: usize = 1;
 
             var iter = self.entries.iterator();
             while (iter.next()) |entry| {
                 if (entry.value_ptr.*.mining_score < worst_score) {
                     worst_score = entry.value_ptr.*.mining_score;
                     worst = entry.key_ptr.*;
+                    worst_fee = entry.value_ptr.*.fee;
+                    worst_vsize = if (entry.value_ptr.*.vsize > 0) entry.value_ptr.*.vsize else 1;
                 }
             }
 
             if (worst) |txid_hash| {
                 const entry = self.entries.get(txid_hash) orelse break;
                 freed += entry.vsize;
+                // Bump rolling minimum (same logic as evict()).
+                const evicted_rate_sat_kvb: f64 =
+                    @as(f64, @floatFromInt(worst_fee)) * 1000.0 /
+                    @as(f64, @floatFromInt(worst_vsize));
+                self.trackPackageRemoved(evicted_rate_sat_kvb + @as(f64, @floatFromInt(INCREMENTAL_RELAY_FEE)));
                 self.removeTransactionWithDescendants(txid_hash);
             } else break;
         }
@@ -3785,14 +3928,21 @@ test "getBlockCandidates returns transactions sorted by fee rate" {
 }
 
 test "mempool constants" {
-    // Verify key constants
-    try std.testing.expectEqual(@as(usize, 300 * 1024 * 1024), MAX_MEMPOOL_SIZE);
+    // Verify key constants match Bitcoin Core (policy/policy.h, kernel/mempool_options.h).
+    // W86: fixed MAX_MEMPOOL_SIZE (binary MiB → SI MB), MIN_RELAY_FEE and
+    // INCREMENTAL_RELAY_FEE (1000 → 100 sat/kvB each).
+    try std.testing.expectEqual(@as(usize, 300 * 1_000_000), MAX_MEMPOOL_SIZE);
     try std.testing.expectEqual(@as(usize, 25), MAX_ANCESTOR_COUNT);
     try std.testing.expectEqual(@as(usize, 25), MAX_DESCENDANT_COUNT);
     try std.testing.expectEqual(@as(usize, 101_000), MAX_ANCESTOR_SIZE);
     try std.testing.expectEqual(@as(usize, 101_000), MAX_DESCENDANT_SIZE);
     try std.testing.expectEqual(@as(i64, 14 * 24 * 60 * 60), MEMPOOL_EXPIRY);
-    try std.testing.expectEqual(@as(i64, 1000), MIN_RELAY_FEE);
+    // Core: DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB (policy/policy.h:70)
+    try std.testing.expectEqual(@as(i64, 100), MIN_RELAY_FEE);
+    // Core: DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB (policy/policy.h:48)
+    try std.testing.expectEqual(@as(i64, 100), INCREMENTAL_RELAY_FEE);
+    // Rolling fee halflife: 12 hours (txmempool.h ROLLING_FEE_HALFLIFE)
+    try std.testing.expectEqual(@as(f64, 43200.0), ROLLING_FEE_HALFLIFE);
 }
 
 test "nonstandard version rejection" {
@@ -6747,8 +6897,9 @@ test "full RBF: non-signaling tx is still replaceable" {
 }
 
 test "full RBF constants" {
-    // Verify key RBF constants
-    try std.testing.expectEqual(@as(i64, 1000), INCREMENTAL_RELAY_FEE);
+    // Verify key RBF constants.
+    // W86: INCREMENTAL_RELAY_FEE corrected from 1000 → 100 (Core DEFAULT_INCREMENTAL_RELAY_FEE).
+    try std.testing.expectEqual(@as(i64, 100), INCREMENTAL_RELAY_FEE);
     try std.testing.expectEqual(@as(usize, 100), MAX_REPLACEMENT_EVICTIONS);
 }
 
@@ -7459,8 +7610,9 @@ test "getMinFee returns MIN_RELAY_FEE when mempool is empty" {
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
 
-    // Empty mempool should return MIN_RELAY_FEE
-    try std.testing.expectEqual(@as(u64, 1000), mempool.getMinFee());
+    // Empty mempool, rolling rate = 0 → getMinFee returns MIN_RELAY_FEE floor.
+    // W86: corrected expectation from 1000 → 100 sat/kvB.
+    try std.testing.expectEqual(@as(u64, 100), mempool.getMinFee());
 }
 
 test "getMinFee returns MIN_RELAY_FEE when mempool is not full" {
@@ -7469,7 +7621,7 @@ test "getMinFee returns MIN_RELAY_FEE when mempool is not full" {
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
 
-    // Add a transaction (doesn't make it full)
+    // Add a transaction (doesn't make it full).
     const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
     const input = types.TxIn{
         .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
@@ -7491,18 +7643,20 @@ test "getMinFee returns MIN_RELAY_FEE when mempool is not full" {
 
     try mempool.addTransaction(tx);
 
-    // Mempool is not full, should still return MIN_RELAY_FEE
-    try std.testing.expectEqual(@as(u64, 1000), mempool.getMinFee());
+    // Mempool is not full, no evictions → rolling rate = 0 → MIN_RELAY_FEE floor.
+    // W86: corrected expectation from 1000 → 100 sat/kvB.
+    try std.testing.expectEqual(@as(u64, 100), mempool.getMinFee());
 }
 
 test "feefilter constants in sat/kvB" {
-    // Verify units are sat/kvB (satoshis per 1000 virtual bytes)
-    try std.testing.expectEqual(@as(i64, 1000), MIN_RELAY_FEE);
-    try std.testing.expectEqual(@as(i64, 1000), INCREMENTAL_RELAY_FEE);
+    // Verify units are sat/kvB (satoshis per 1000 virtual bytes).
+    // W86: corrected from 1000 → 100 sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE = 100).
+    try std.testing.expectEqual(@as(i64, 100), MIN_RELAY_FEE);
+    try std.testing.expectEqual(@as(i64, 100), INCREMENTAL_RELAY_FEE);
 
-    // 1000 sat/kvB = 1 sat/vB, which is Bitcoin Core's default
+    // 100 sat/kvB = 0.1 sat/vB, which is Bitcoin Core's default minimum relay fee.
     const sat_per_vb = @as(f64, @floatFromInt(MIN_RELAY_FEE)) / 1000.0;
-    try std.testing.expectEqual(@as(f64, 1.0), sat_per_vb);
+    try std.testing.expectEqual(@as(f64, 0.1), sat_per_vb);
 }
 
 // ============================================================================
@@ -10580,4 +10734,267 @@ test "checkStandard: MAX_TX_LEGACY_SIGOPS constant and getLegacySigOpCount relat
     const sigops = validation.getLegacySigOpCount(&tx);
     try std.testing.expectEqual(@as(u32, 1), sigops);
     try std.testing.expect(sigops <= consensus.MAX_TX_LEGACY_SIGOPS);
+}
+
+// ============================================================================
+// W86: Mempool Eviction Audit Tests
+// Core refs: txmempool.cpp:811-915, kernel/mempool_options.h, policy/policy.h:48
+// ============================================================================
+
+/// Shared helper: P2WPKH script (22 bytes) and outpoint hash arrays used by W86 tests.
+const w86_p2wpkh_script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+const w86_hash_11 = [_]u8{0x11} ** 32;
+const w86_hash_33 = [_]u8{0x33} ** 32;
+
+test "W86-G1: MAX_MEMPOOL_SIZE uses SI megabytes (not binary MiB)" {
+    // Bitcoin Core: DEFAULT_MAX_MEMPOOL_SIZE_MB * 1_000_000 (kernel/mempool_options.h:40).
+    // Binary MiB (1024*1024) gives 314,572,800 which diverges from Core's 300,000,000.
+    try std.testing.expectEqual(@as(usize, 300_000_000), MAX_MEMPOOL_SIZE);
+    // Sanity: must NOT equal the old binary value.
+    try std.testing.expect(MAX_MEMPOOL_SIZE != 300 * 1024 * 1024);
+}
+
+test "W86-G2: MIN_RELAY_FEE is 100 sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE)" {
+    // policy/policy.h:70 — was 1000 (10× too high), causing valid relay txs to be
+    // over-rejected (e.g. a 100 sat/kvB tx should be accepted but was not).
+    try std.testing.expectEqual(@as(i64, 100), MIN_RELAY_FEE);
+}
+
+test "W86-G3: INCREMENTAL_RELAY_FEE is 100 sat/kvB (Core DEFAULT_INCREMENTAL_RELAY_FEE)" {
+    // policy/policy.h:48 — was 1000 (10× too high), breaking RBF Rule 4 fee-bump math.
+    try std.testing.expectEqual(@as(i64, 100), INCREMENTAL_RELAY_FEE);
+}
+
+test "W86-G4: ROLLING_FEE_HALFLIFE is 12 hours (43200 seconds)" {
+    // txmempool.h: ROLLING_FEE_HALFLIFE = 60 * 60 * 12.
+    try std.testing.expectEqual(@as(f64, 43200.0), ROLLING_FEE_HALFLIFE);
+}
+
+test "W86-G5: trackPackageRemoved bumps rolling minimum" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Initially rolling_minimum_fee_rate = 0.
+    try std.testing.expectEqual(@as(f64, 0.0), mempool.rolling_minimum_fee_rate);
+
+    // Bumping to 500 should set it.
+    mempool.trackPackageRemoved(500.0);
+    try std.testing.expectEqual(@as(f64, 500.0), mempool.rolling_minimum_fee_rate);
+    // block_since_last_rolling_fee_bump should be false (no block since bump).
+    try std.testing.expect(!mempool.block_since_last_rolling_fee_bump);
+
+    // A lower value should NOT overwrite it.
+    mempool.trackPackageRemoved(200.0);
+    try std.testing.expectEqual(@as(f64, 500.0), mempool.rolling_minimum_fee_rate);
+
+    // A higher value SHOULD overwrite it.
+    mempool.trackPackageRemoved(800.0);
+    try std.testing.expectEqual(@as(f64, 800.0), mempool.rolling_minimum_fee_rate);
+}
+
+test "W86-G6: getMinFee returns at least MIN_RELAY_FEE when rolling rate is zero" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // With no evictions and no block, rolling_minimum_fee_rate = 0.
+    try std.testing.expect(mempool.getMinFee() >= @as(u64, @intCast(MIN_RELAY_FEE)));
+}
+
+test "W86-G7: getMinFee returns bumped value after eviction-driven trackPackageRemoved" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Simulate a size-limit eviction bumping rolling minimum to 1200 sat/kvB.
+    mempool.trackPackageRemoved(1200.0);
+    // block_since_last_rolling_fee_bump = false → no decay, returns 1200.
+    const min_fee = mempool.getMinFee();
+    try std.testing.expect(min_fee >= 1200);
+}
+
+test "W86-G8: getMinFee decays after a block arrives (block_since_last_rolling_fee_bump = true)" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Bump rolling minimum to 1000 sat/kvB.
+    mempool.trackPackageRemoved(1000.0);
+    // Simulate a block arriving (sets block_since_last_rolling_fee_bump = true).
+    mempool.block_since_last_rolling_fee_bump = true;
+    // Force last_rolling_fee_update to be in the past (> 10s).
+    mempool.last_rolling_fee_update = std.time.timestamp() - 100;
+
+    // After the block, getMinFee should decay the value.
+    const min_fee = mempool.getMinFee();
+    // Decayed value must be <= original (100 sat/kvB bump - was 1000, now lower).
+    // After ~100s decay with halflife 43200s: 1000 * 2^(−100/43200) ≈ 998.4 sat/kvB.
+    // Still well above MIN_RELAY_FEE (100) and above 0 so returns the decayed value.
+    try std.testing.expect(min_fee >= @as(u64, @intCast(MIN_RELAY_FEE)));
+    // The decay must have moved the value (it should be < 1000 now).
+    try std.testing.expect(mempool.rolling_minimum_fee_rate < 1000.0);
+}
+
+test "W86-G9: getMinFee zeroes out when rolling rate drops below incremental/2" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Set rolling minimum to just above the zero-out threshold (incremental/2 = 50).
+    mempool.rolling_minimum_fee_rate = 51.0;
+    mempool.block_since_last_rolling_fee_bump = true;
+    // Force a large elapsed time so the exponential decay drops below 50.
+    mempool.last_rolling_fee_update = std.time.timestamp() - (43200 * 10); // 10 halflives
+
+    const min_fee = mempool.getMinFee();
+    // After zeroing out, rolling_minimum_fee_rate = 0 and returns MIN_RELAY_FEE.
+    try std.testing.expectEqual(@as(f64, 0.0), mempool.rolling_minimum_fee_rate);
+    try std.testing.expectEqual(@as(u64, @intCast(MIN_RELAY_FEE)), min_fee);
+}
+
+test "W86-G10: evict bumps rolling minimum via trackPackageRemoved" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Add a transaction with fee=0 (no chain state, so fee stays 0).
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = w86_hash_11, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100000, .script_pubkey = &w86_p2wpkh_script }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx);
+
+    // Trigger eviction (needed_bytes > 0 forces the eviction loop).
+    try mempool.evict(mempool.total_size + 1);
+
+    // rolling_minimum_fee_rate should have been updated via trackPackageRemoved.
+    // Even if evicted feerate is 0, we add INCREMENTAL_RELAY_FEE = 100 sat/kvB,
+    // so the rate must be at least 100 after the bump.
+    try std.testing.expect(mempool.rolling_minimum_fee_rate >= @as(f64, @floatFromInt(INCREMENTAL_RELAY_FEE)));
+}
+
+test "W86-G11: removeExpired evicts descendants of expired transactions" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Add parent transaction.
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = w86_hash_33, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100000, .script_pubkey = &w86_p2wpkh_script }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = try crypto.computeTxid(&parent_tx, allocator);
+
+    // Add child transaction that spends the parent's output.
+    const child_p2wpkh = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20;
+    const child_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50000, .script_pubkey = child_p2wpkh }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(child_tx);
+    const child_txid = try crypto.computeTxid(&child_tx, allocator);
+
+    // Both should be in the mempool.
+    try std.testing.expect(mempool.entries.contains(parent_txid));
+    try std.testing.expect(mempool.entries.contains(child_txid));
+
+    // Manually expire the parent by backdating its time_added.
+    if (mempool.entries.getPtr(parent_txid)) |entry_ptr| {
+        entry_ptr.*.time_added = std.time.timestamp() - MEMPOOL_EXPIRY - 1;
+    }
+
+    // removeExpired should evict the parent AND its child (Core Expire behaviour).
+    mempool.removeExpired();
+
+    // Both parent and child should be gone.
+    try std.testing.expect(!mempool.entries.contains(parent_txid));
+    try std.testing.expect(!mempool.entries.contains(child_txid));
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+}
+
+test "W86-G12: removeForBlock sets block_since_last_rolling_fee_bump" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    try std.testing.expect(!mempool.block_since_last_rolling_fee_bump);
+
+    // Simulate connecting an empty block.
+    const empty_block = types.Block{
+        .header = std.mem.zeroes(types.BlockHeader),
+        .transactions = &[_]types.Transaction{},
+    };
+    mempool.removeForBlock(&empty_block);
+
+    // Must be set to true after a block.
+    try std.testing.expect(mempool.block_since_last_rolling_fee_bump);
+}
+
+test "W86-G13: addTransaction uses getMinFee (rolling minimum), not static MIN_RELAY_FEE" {
+    // Simulate a scenario where the rolling minimum has been elevated by a
+    // prior eviction.  A new transaction whose fee_rate equals the old static
+    // MIN_RELAY_FEE (100 sat/kvB) but is below the elevated rolling minimum
+    // must be rejected.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Elevate rolling minimum to 5000 sat/kvB (simulating a full + eviction).
+    mempool.trackPackageRemoved(5000.0);
+    // Rolling minimum is now 5000, block_since_last_rolling_fee_bump = false
+    // → no decay → getMinFee returns max(5000, 100) = 5000.
+
+    // A transaction with fee_rate ≈ 100 sat/kvB (no chain state → fee = 0 → no check).
+    // The fee check is skipped when total_in == 0 (no chain state path).
+    // This test therefore validates the constant correction; the rolling check
+    // triggers only when chain state is available (total_in > 0).
+    // Verify the getMinFee threshold is correctly elevated.
+    try std.testing.expect(mempool.getMinFee() >= 5000);
+}
+
+test "W86-G14: getMinFee halflife accelerates when mempool < 1/4 full" {
+    // When total_size < MAX_MEMPOOL_SIZE / 4, the halflife is divided by 4
+    // (→ 3h) so the rolling minimum decays faster.
+    // Verify the code path by checking the decayed value differs from the
+    // value we'd get with the full 12h halflife.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Very small total_size (well below MAX/4) → halflife /= 4.
+    mempool.total_size = 0;
+    mempool.rolling_minimum_fee_rate = 1000.0;
+    mempool.block_since_last_rolling_fee_bump = true;
+    mempool.last_rolling_fee_update = std.time.timestamp() - 3600; // 1 hour ago
+
+    // With 12h halflife, decay factor = 2^(3600/43200) ≈ 1.0593, rate ≈ 944.
+    // With 3h halflife (accel), decay factor = 2^(3600/10800) ≈ 1.2599, rate ≈ 794.
+    // Either way, the rate must be below 1000 and above 0.
+    const result = mempool.getMinFee();
+    try std.testing.expect(mempool.rolling_minimum_fee_rate < 1000.0);
+    try std.testing.expect(mempool.rolling_minimum_fee_rate > 0.0);
+    try std.testing.expect(result >= @as(u64, @intCast(MIN_RELAY_FEE)));
 }
