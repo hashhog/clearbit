@@ -399,12 +399,32 @@ pub const NetworkParams = struct {
     /// Used only as a hint for the UTXO-undo-data optimisation in
     /// block_template.zig; NOT used for script-skip decisions.
     assume_valid_height: u32,
-    /// BIP-30 exception heights: blocks permanently exempt from the
-    /// duplicate-UTXO check.  On mainnet these are h=91842 and h=91880,
-    /// which predate BIP-30 and intentionally duplicate earlier coinbase txids.
+    /// BIP-30 exception blocks: permanently exempt from the duplicate-UTXO
+    /// check.  On mainnet these are h=91842 and h=91880, which predate BIP-30
+    /// and intentionally duplicate earlier coinbase txids.
+    /// Each entry is (height, block_hash) — BOTH must match (mirrors Core's
+    /// IsBIP30Repeat which checks nHeight && GetBlockHash()).
     /// All other networks use an empty slice.
     /// Reference: Bitcoin Core validation.cpp IsBIP30Repeat().
-    bip30_exception_heights: []const u32,
+    bip30_exceptions: []const Bip30Exception,
+    /// BIP-34 activation block hash.  The block at height `bip34_height` must
+    /// have exactly this hash for the BIP-30 bypass to be valid.  Without this
+    /// check an attacker could present a fork whose coinbases never actually
+    /// encoded the block height, bypassing BIP-30.
+    /// Mirrors Bitcoin Core consensus/params.h BIP34Hash and
+    /// validation.cpp ConnectBlock():
+    ///   fEnforceBIP30 &&= !(pindexBIP34height &&
+    ///                       pindexBIP34height->GetBlockHash()==params.BIP34Hash)
+    /// Null disables the hash check (testnet3/testnet4/signet/regtest where
+    /// BIP34 was always active from genesis and the bypass is never triggered).
+    bip34_hash: ?[32]u8,
+};
+
+/// A (height, block_hash) pair identifying a block permanently exempt from
+/// the BIP-30 duplicate-UTXO check.  Mirrors Bitcoin Core's IsBIP30Repeat().
+pub const Bip30Exception = struct {
+    height: u32,
+    block_hash: [32]u8,
 };
 
 // ============================================================================
@@ -512,7 +532,22 @@ pub const MAINNET = NetworkParams{
     .assume_valid_height = 938343,
     // BIP-30: h=91842 and h=91880 predate BIP-30 and are permanently exempt.
     // Reference: Bitcoin Core validation.cpp IsBIP30Repeat().
-    .bip30_exception_heights = &[_]u32{ 91842, 91880 },
+    // Both height AND block hash must match — mirrors Core's IsBIP30Repeat().
+    .bip30_exceptions = &[_]Bip30Exception{
+        .{
+            .height = 91842,
+            .block_hash = hexToHash("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"),
+        },
+        .{
+            .height = 91880,
+            .block_hash = hexToHash("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"),
+        },
+    },
+    // BIP-34 activation block hash (mainnet h=227931).
+    // The bypass from BIP-30 checking is only valid when the block at
+    // bip34_height has exactly this hash (Core validation.cpp:2462).
+    // Display: 000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8
+    .bip34_hash = hexToHash("000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"),
 };
 
 /// Testnet3 parameters.
@@ -557,7 +592,11 @@ pub const TESTNET3 = NetworkParams{
     // Testnet3 has no active assumevalid; scripts always run.
     .assumed_valid_hash = null,
     .assume_valid_height = 0,
-    .bip30_exception_heights = &[_]u32{}, // No BIP-30 exceptions on testnet3
+    .bip30_exceptions = &[_]Bip30Exception{}, // No BIP-30 exceptions on testnet3
+    // Testnet3 BIP34 was active from height 21111; the bypass path is never
+    // triggered by a canonical chain, but we store the hash for correctness.
+    // Display: 0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8
+    .bip34_hash = hexToHash("0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"),
 };
 
 /// Alias for backwards compatibility.
@@ -604,7 +643,9 @@ pub const TESTNET4 = NetworkParams{
     // Display: 000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4
     .assumed_valid_hash = hexToHash("000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"),
     .assume_valid_height = 4842348,
-    .bip30_exception_heights = &[_]u32{}, // No BIP-30 exceptions on testnet4
+    .bip30_exceptions = &[_]Bip30Exception{}, // No BIP-30 exceptions on testnet4
+    // Testnet4: BIP34 active from genesis; null hash disables the bypass check.
+    .bip34_hash = null,
 };
 
 /// Signet parameters.
@@ -649,7 +690,9 @@ pub const SIGNET = NetworkParams{
     // Display: 00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329
     .assumed_valid_hash = hexToHash("00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"),
     .assume_valid_height = 293175,
-    .bip30_exception_heights = &[_]u32{}, // No BIP-30 exceptions on signet
+    .bip30_exceptions = &[_]Bip30Exception{}, // No BIP-30 exceptions on signet
+    // Signet: BIP34 active from genesis; null hash disables the bypass check.
+    .bip34_hash = null,
 };
 
 /// Regtest parameters.
@@ -693,7 +736,9 @@ pub const REGTEST = NetworkParams{
     // Regtest has no assumevalid — every script check runs for test determinism.
     .assumed_valid_hash = null,
     .assume_valid_height = 0,
-    .bip30_exception_heights = &[_]u32{}, // No BIP-30 exceptions on regtest
+    .bip30_exceptions = &[_]Bip30Exception{}, // No BIP-30 exceptions on regtest
+    // Regtest: BIP34 active from genesis; null hash disables the bypass check.
+    .bip34_hash = null,
 };
 
 // ============================================================================
