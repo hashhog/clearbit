@@ -1669,6 +1669,20 @@ fn checkWitnessMalleation(
 // ============================================================================
 
 /// Check that a block's difficulty is correct for its position in the chain.
+///
+/// Mirrors Bitcoin Core GetNextWorkRequired() / CalculateNextWorkRequired() logic:
+///
+///  Non-retarget blocks (height % interval != 0):
+///    - Mainnet: bits must equal prev bits.
+///    - Testnet (pow_allow_min_difficulty_blocks): if block timestamp > prev + 2*spacing,
+///      bits MUST be pow_limit (special min-difficulty rule). Otherwise bits must equal
+///      the last non-min-difficulty bits in the walk-back chain.
+///
+///  Retarget blocks (height % interval == 0):
+///    - Normal: new bits = calculateNextWorkRequired(last_entry, first_entry.timestamp).
+///    - BIP-94 (testnet4): new bits use the first block's difficulty, not the last.
+///
+/// Reference: bitcoin-core/src/pow.cpp GetNextWorkRequired(), CalculateNextWorkRequired()
 pub fn checkDifficulty(
     header: *const types.BlockHeader,
     height: u32,
@@ -1679,26 +1693,77 @@ pub fn checkDifficulty(
 
     if (prev_headers.len == 0) return ValidationError.BadDifficulty;
 
-    if (height % consensus.DIFFICULTY_ADJUSTMENT_INTERVAL != 0) {
-        // Non-retarget block: must match previous difficulty
-        if (header.bits != prev_headers[prev_headers.len - 1].bits) {
-            return ValidationError.BadDifficulty;
+    const interval = consensus.difficultyAdjustmentInterval(params);
+    const pow_limit_bits = consensus.getPowLimitBits(params);
+    const prev = prev_headers[prev_headers.len - 1];
+
+    if (height % interval != 0) {
+        // Non-retarget block.
+        if (params.pow_allow_min_difficulty_blocks) {
+            // Testnet special rule (Core pow.cpp:22-38):
+            // If this block's timestamp is > prev + 2*spacing, it MUST use pow_limit.
+            if (header.timestamp > prev.timestamp + params.pow_target_spacing * 2) {
+                if (header.bits != pow_limit_bits) return ValidationError.BadDifficulty;
+                return;
+            }
+            // Otherwise walk back to find the last non-min-difficulty bits.
+            // Core walks pindexLast backwards while bits == pow_limit and not at interval.
+            // prev_headers[i] is the block at height (height - prev_headers.len + i).
+            var walk: usize = prev_headers.len;
+            while (walk > 0) {
+                walk -= 1;
+                const entry = prev_headers[walk];
+                if (entry.bits != pow_limit_bits) {
+                    if (header.bits != entry.bits) return ValidationError.BadDifficulty;
+                    return;
+                }
+                // Stop at a retarget boundary (don't walk past the start of the period).
+                // entry_height = height - prev_headers.len + walk
+                // Use saturating arithmetic to guard against height < prev_headers.len.
+                const offset: u32 = if (prev_headers.len > walk) @intCast(prev_headers.len - walk) else 0;
+                const entry_height: u32 = if (height >= offset) height - offset else 0;
+                if (entry_height % interval == 0) break;
+            }
+            // Fell through to retarget boundary or genesis — use those bits.
+            if (header.bits != prev_headers[walk].bits) return ValidationError.BadDifficulty;
+        } else {
+            // Mainnet: must match previous block's difficulty exactly.
+            if (header.bits != prev.bits) return ValidationError.BadDifficulty;
         }
     } else {
-        // Retarget block: compute new difficulty
-        if (prev_headers.len < consensus.DIFFICULTY_ADJUSTMENT_INTERVAL) {
-            return ValidationError.BadDifficulty;
-        }
+        // Retarget block: compute expected new difficulty.
+        if (prev_headers.len < interval) return ValidationError.BadDifficulty;
 
-        const interval_start = prev_headers[prev_headers.len - consensus.DIFFICULTY_ADJUSTMENT_INTERVAL];
-        const expected_bits = consensus.calculateNextWorkRequired(
-            &prev_headers[prev_headers.len - 1],
-            interval_start.timestamp,
-            params,
-        );
-        if (header.bits != expected_bits) {
-            return ValidationError.BadDifficulty;
-        }
+        const last = prev_headers[prev_headers.len - 1];
+        // The first block of the current difficulty period is interval-1 blocks before last.
+        // Core: nHeightFirst = pindexLast->nHeight - (interval - 1).
+        const first = prev_headers[prev_headers.len - interval];
+
+        const expected_bits = blk: {
+            if (params.pow_no_retarget) {
+                // Regtest: difficulty never adjusts.
+                break :blk last.bits;
+            }
+
+            var actual_timespan: i64 = @as(i64, last.timestamp) - @as(i64, first.timestamp);
+            const min_ts: i64 = @divTrunc(@as(i64, params.pow_target_timespan), 4);
+            const max_ts: i64 = @as(i64, params.pow_target_timespan) * 4;
+            if (actual_timespan < min_ts) actual_timespan = min_ts;
+            if (actual_timespan > max_ts) actual_timespan = max_ts;
+
+            // BIP-94 (testnet4): use the first block's difficulty as the base,
+            // not the last block's (prevents time-warp attacks).
+            // Reference: bitcoin-core/src/pow.cpp:67-76.
+            const base_bits: u32 = if (params.enforce_bip94) first.bits else last.bits;
+            const base_target = consensus.bitsToTarget(base_bits);
+            var new_target = consensus.multiplyTargetByRatio(&base_target, @intCast(actual_timespan), params.pow_target_timespan);
+            if (!consensus.hashMeetsTarget(&new_target, &params.pow_limit)) {
+                new_target = params.pow_limit;
+            }
+            break :blk consensus.targetToBits(&new_target);
+        };
+
+        if (header.bits != expected_bits) return ValidationError.BadDifficulty;
     }
 }
 
@@ -2766,6 +2831,203 @@ test "checkDifficulty validates non-retarget block" {
     current_header.bits = 0x1d00fffe;
     const result = checkDifficulty(&current_header, 1, &[_]types.BlockHeader{prev_header}, &consensus.MAINNET);
     try std.testing.expectError(ValidationError.BadDifficulty, result);
+}
+
+// ============================================================================
+// W83: checkDifficulty — testnet min-difficulty + BIP-94 tests
+// ============================================================================
+
+/// Build a run of N BlockHeaders all with the same bits and consecutive timestamps.
+fn makeHeaders(comptime N: usize, bits: u32, start_ts: u32, spacing: u32) [N]types.BlockHeader {
+    var hdrs: [N]types.BlockHeader = undefined;
+    for (0..N) |i| {
+        hdrs[i] = .{
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = start_ts + @as(u32, @intCast(i)) * spacing,
+            .bits = bits,
+            .nonce = 0,
+        };
+    }
+    return hdrs;
+}
+
+test "W83: checkDifficulty testnet allows min-difficulty when timestamp > prev + 2*spacing" {
+    // Core pow.cpp:27: if (pblock->GetBlockTime() > pindexLast->GetBlockTime() + nPowTargetSpacing*2)
+    //     return nProofOfWorkLimit;
+    const pow_limit_bits = consensus.getPowLimitBits(&consensus.TESTNET3);
+    const real_bits: u32 = 0x1b0404cb;
+    const prev = types.BlockHeader{
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1_296_688_602,
+        .bits = real_bits,
+        .nonce = 0,
+    };
+    // Block that arrives > 20 minutes after prev — must use pow_limit
+    var new_hdr = prev;
+    new_hdr.timestamp = prev.timestamp + 1201; // 1201s > 2*600
+    new_hdr.bits = pow_limit_bits;
+    try checkDifficulty(&new_hdr, 1, &[_]types.BlockHeader{prev}, &consensus.TESTNET3);
+
+    // Same timestamp gap but WRONG bits (not pow_limit) — must fail
+    new_hdr.bits = real_bits;
+    try std.testing.expectError(
+        ValidationError.BadDifficulty,
+        checkDifficulty(&new_hdr, 1, &[_]types.BlockHeader{prev}, &consensus.TESTNET3),
+    );
+
+    // Exactly 20 minutes (1200s = 2*600) — NOT over threshold, so bits must match prev
+    new_hdr.timestamp = prev.timestamp + 1200;
+    new_hdr.bits = real_bits;
+    try checkDifficulty(&new_hdr, 1, &[_]types.BlockHeader{prev}, &consensus.TESTNET3);
+
+    // 1200s but bits = pow_limit — must fail (not over threshold)
+    new_hdr.bits = pow_limit_bits;
+    // prev.bits == real_bits != pow_limit_bits so walk-back would stop at prev
+    // Only matters if real_bits != pow_limit_bits, which is true
+    try std.testing.expectError(
+        ValidationError.BadDifficulty,
+        checkDifficulty(&new_hdr, 1, &[_]types.BlockHeader{prev}, &consensus.TESTNET3),
+    );
+}
+
+test "W83: checkDifficulty testnet walk-back skips min-difficulty blocks" {
+    // Core pow.cpp:32-36: walk back past pow_limit blocks to find real difficulty.
+    const pow_limit_bits = consensus.getPowLimitBits(&consensus.TESTNET3);
+    const real_bits: u32 = 0x1b0404cb;
+
+    // Chain of 10 blocks: first 5 have real difficulty, next 4 have pow_limit, last 1 has pow_limit.
+    // When new block arrives within 20 min, should find real_bits.
+    var chain: [10]types.BlockHeader = undefined;
+    for (0..5) |i| {
+        chain[i] = .{
+            .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+            .timestamp = @intCast(1000 + i * 600),
+            .bits = real_bits, .nonce = 0,
+        };
+    }
+    for (5..10) |i| {
+        chain[i] = .{
+            .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+            .timestamp = @intCast(1000 + i * 600),
+            .bits = pow_limit_bits, .nonce = 0,
+        };
+    }
+    const new_ts = chain[9].timestamp + 500; // Within 20 minutes
+    var new_hdr: types.BlockHeader = .{
+        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .timestamp = new_ts, .bits = real_bits, .nonce = 0,
+    };
+    try checkDifficulty(&new_hdr, 10, &chain, &consensus.TESTNET3);
+
+    // Wrong bits — must fail
+    new_hdr.bits = pow_limit_bits;
+    try std.testing.expectError(
+        ValidationError.BadDifficulty,
+        checkDifficulty(&new_hdr, 10, &chain, &consensus.TESTNET3),
+    );
+}
+
+test "W83: checkDifficulty mainnet non-retarget rejects wrong bits" {
+    // Mainnet: pow_allow_min_difficulty_blocks = false.
+    // Even if timestamp gap > 20min, bits must match previous block.
+    const prev = types.BlockHeader{
+        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1000, .bits = 0x1d00ffff, .nonce = 0,
+    };
+    // Any large timestamp gap — bits still must match
+    const new_hdr = types.BlockHeader{
+        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1000 + 3600, // 1 hour gap — doesn't matter for mainnet
+        .bits = consensus.getPowLimitBits(&consensus.MAINNET), .nonce = 0,
+    };
+    try std.testing.expectError(
+        ValidationError.BadDifficulty,
+        checkDifficulty(&new_hdr, 1, &[_]types.BlockHeader{prev}, &consensus.MAINNET),
+    );
+}
+
+test "W83: checkDifficulty retarget uses first block bits for BIP-94" {
+    // BIP-94 (testnet4): base difficulty = first block of period, not last.
+    // Core pow.cpp:67-76.
+    const interval = consensus.difficultyAdjustmentInterval(&consensus.TESTNET4);
+    const pow_limit = &consensus.TESTNET4.pow_limit;
+    _ = pow_limit;
+
+    // Build a period of `interval` blocks. First block has real bits, last block has pow_limit bits.
+    const real_bits: u32 = 0x1d00ffff;
+    const pow_limit_bits = consensus.getPowLimitBits(&consensus.TESTNET4);
+
+    var period: [2016]types.BlockHeader = undefined;
+    period[0] = .{
+        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1714777860, .bits = real_bits, .nonce = 0,
+    };
+    for (1..2015) |i| {
+        period[i] = .{
+            .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+            .timestamp = @intCast(1714777860 + @as(u32, @intCast(i)) * 600),
+            .bits = pow_limit_bits, // min-difficulty blocks
+            .nonce = 0,
+        };
+    }
+    // Last block of period: also pow_limit bits but timestamp = exactly one target timespan later
+    period[2015] = .{
+        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .timestamp = period[0].timestamp + consensus.TARGET_TIMESPAN,
+        .bits = pow_limit_bits,
+        .nonce = 0,
+    };
+
+    // With BIP-94, the retarget is based on first block (real_bits) and exactly TARGET_TIMESPAN elapsed.
+    // Target * (TARGET_TIMESPAN / TARGET_TIMESPAN) = target unchanged = real_bits.
+    const expected_bits = consensus.calculateNextWorkRequiredBip94(
+        .{ .height = interval - 1, .timestamp = period[2015].timestamp, .bits = period[2015].bits },
+        .{ .height = 0, .timestamp = period[0].timestamp, .bits = period[0].bits },
+        &consensus.BlockIndexView{
+            .context = @constCast(@ptrCast(&period)),
+            .getAtHeightFn = struct {
+                fn get(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
+                    _ = ctx;
+                    _ = h;
+                    return null;
+                }
+            }.get,
+            .pow_limit_bits = pow_limit_bits,
+        },
+        &consensus.TESTNET4,
+    );
+
+    // Build new block header for retarget (height = interval = 2016)
+    const new_hdr = types.BlockHeader{
+        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .timestamp = period[2015].timestamp + 600,
+        .bits = expected_bits,
+        .nonce = 0,
+    };
+    try checkDifficulty(&new_hdr, interval, &period, &consensus.TESTNET4);
+}
+
+test "W83: checkDifficulty regtest never retargets" {
+    // Regtest: pow_no_retarget = true, bits always stays the same.
+    var period: [144]types.BlockHeader = undefined;
+    for (0..144) |i| {
+        period[i] = .{
+            .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+            .timestamp = @intCast(1000 + i * 600),
+            .bits = 0x207fffff, .nonce = 0,
+        };
+    }
+    const new_hdr = types.BlockHeader{
+        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .timestamp = period[143].timestamp + 600,
+        .bits = 0x207fffff, .nonce = 0,
+    };
+    // Height 144 = interval for regtest (86400/600=144), but pow_no_retarget means same bits
+    try checkDifficulty(&new_hdr, 144, &period, &consensus.REGTEST);
 }
 
 // ============================================================================
