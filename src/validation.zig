@@ -1013,25 +1013,55 @@ pub fn validateBlockForIBD(
     // outpoints already exist in the UTXO set.  If they do, the block is
     // invalid ("bad-txns-BIP30").
     //
-    // Two mainnet blocks (91842 and 91880) are permanently exempted by height
-    // because they contain the two historical coinbases that legitimately
-    // duplicated earlier txids before BIP-30 was enforced.
+    // Two mainnet blocks (91842 and 91880) are permanently exempted because
+    // they contain the two historical coinbases that legitimately duplicated
+    // earlier txids before BIP-30 was enforced.  The exception requires BOTH
+    // height AND block hash to match — an attacker reusing the same height on
+    // a different fork must not get the exemption.
+    // Reference: Bitcoin Core validation.cpp IsBIP30Repeat() (line 6189).
     //
     // After BIP-34 activates (h >= bip34_height) the height-in-coinbase rule
     // makes duplicate txids practically impossible, so we skip the check for
-    // performance.  However, at h >= 1,983,702 BIP-34 modular arithmetic can
-    // repeat pre-BIP34 coinbase heights, so the check is re-enabled there.
+    // performance.  HOWEVER this bypass is only valid when the block at
+    // bip34_height on our active chain actually has the canonical BIP34Hash
+    // (params.bip34_hash).  Without this check an attacker could present a
+    // fork whose coinbase-height rule was never truly activated, bypassing
+    // BIP-30 protection.
+    // Reference: Bitcoin Core validation.cpp ConnectBlock():
+    //   CBlockIndex* pindexBIP34height = pindex->pprev->GetAncestor(BIP34Height);
+    //   fEnforceBIP30 &&= !(pindexBIP34height &&
+    //       pindexBIP34height->GetBlockHash() == params.BIP34Hash);
+    //   (line 2460-2462)
     //
-    // Reference: Bitcoin Core validation.cpp ConnectBlock (~line 2402-2476)
-    // and IsBIP30Repeat().
+    // At h >= 1,983,702 BIP-34 modular arithmetic can repeat pre-BIP34
+    // coinbase heights, so BIP-30 is re-enabled there regardless.
+    //
+    // Reference: Bitcoin Core validation.cpp ConnectBlock (~line 2402-2476).
     {
         const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
-        const bip30_exempt = for (params.bip30_exception_heights) |eh| {
-            if (height == eh) break true;
+
+        // IsBIP30Repeat: exempt only when BOTH height AND block hash match.
+        const bip30_exempt = for (params.bip30_exceptions) |ex| {
+            if (height == ex.height and std.mem.eql(u8, &ctx.block_hash, &ex.block_hash))
+                break true;
         } else false;
+
+        // Determine whether BIP-34 was truly activated on our active chain at
+        // the BIP34Height anchor block.  If params.bip34_hash is set and we
+        // have an active_chain that includes the BIP34Height, check the hash.
+        // When active_chain is too short (still syncing), we conservatively
+        // keep BIP-30 enforcement on.
+        const bip34_truly_active: bool = blk: {
+            const bip34_h = params.bip34_height;
+            const bip34_hash = params.bip34_hash orelse break :blk false;
+            const chain = ctx.active_chain orelse break :blk false;
+            if (bip34_h >= chain.len) break :blk false; // chain too short
+            break :blk std.mem.eql(u8, &chain[bip34_h], &bip34_hash);
+        };
+
         const enforce_bip30 = if (bip30_exempt)
             false
-        else if (height >= params.bip34_height and height < BIP34_IMPLIES_BIP30_LIMIT)
+        else if (bip34_truly_active and height >= params.bip34_height and height < BIP34_IMPLIES_BIP30_LIMIT)
             false
         else
             true;
@@ -6690,9 +6720,13 @@ test "validateBlockForIBD: BIP-30 rejects duplicate UTXO (pre-BIP34 height)" {
     try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
 }
 
-test "validateBlockForIBD: BIP-30 exempt at h=91842" {
-    // h=91842 is the first BIP-30 exception block.  Even with a pre-existing UTXO
-    // at the coinbase txid, the block must NOT be rejected with Bip30DuplicateOutput.
+test "validateBlockForIBD: BIP-30 exempt at h=91842 only when hash matches (W79)" {
+    // Bug #1 fixed in W79: IsBIP30Repeat requires BOTH height AND block hash.
+    // A freshly-mined block at h=91842 gets a random hash → exception does NOT
+    // apply → BIP-30 is enforced → Bip30DuplicateOutput is expected.
+    // Only the one specific canonical block with hash
+    //   00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec
+    // is permanently exempt.
     const alloc = std.testing.allocator;
     var cb_bufs: Bip30CoinbaseBufs = .{};
     var cb = bip30MakeCoinbase(91842, &cb_bufs);
@@ -6703,10 +6737,14 @@ test "validateBlockForIBD: BIP-30 exempt at h=91842" {
     var hit_ctx = Bip30LookupCtx{ .target_txid = coinbase_txid };
     const block_hash = crypto.computeBlockHash(&blk.header);
 
-    // Use mainnet params so bip34_height=227931 (91842 < bip34_height → normally enforced).
-    // The exception overrides this.
+    // Verify the mined hash is NOT the canonical exception hash.
+    const canonical_91842 = comptime consensus.hexToHash("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec");
+    try std.testing.expect(!std.mem.eql(u8, &block_hash, &canonical_91842));
+
     var mainnet_regtest_pow = consensus.MAINNET;
     mainnet_regtest_pow.genesis_header.bits = 0x207fffff;
+    mainnet_regtest_pow.pow_limit = consensus.REGTEST.pow_limit;
+    mainnet_regtest_pow.pow_no_retarget = true;
 
     const result = validateBlockForIBD(&blk, &IBDValidationContext{
         .block_hash = block_hash,
@@ -6720,14 +6758,14 @@ test "validateBlockForIBD: BIP-30 exempt at h=91842" {
         .prev_mtp = 0,
         .force_skip_scripts = true,
     }, alloc);
-    // Must NOT be Bip30DuplicateOutput (may succeed or fail for another reason).
-    if (result) |_| {} else |err| {
-        try std.testing.expect(err != ValidationError.Bip30DuplicateOutput);
-    }
+    // A block at h=91842 with a WRONG hash must be BIP-30 rejected.
+    try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
 }
 
-test "validateBlockForIBD: BIP-30 exempt at h=91880" {
-    // h=91880 is the second BIP-30 exception block.
+test "validateBlockForIBD: BIP-30 exempt at h=91880 only when hash matches (W79)" {
+    // Bug #1 fixed in W79: IsBIP30Repeat requires BOTH height AND block hash.
+    // A freshly-mined block at h=91880 with a different hash → exception does NOT
+    // apply → Bip30DuplicateOutput is expected.
     const alloc = std.testing.allocator;
     var cb_bufs: Bip30CoinbaseBufs = .{};
     var cb = bip30MakeCoinbase(91880, &cb_bufs);
@@ -6738,8 +6776,14 @@ test "validateBlockForIBD: BIP-30 exempt at h=91880" {
     var hit_ctx = Bip30LookupCtx{ .target_txid = coinbase_txid };
     const block_hash = crypto.computeBlockHash(&blk.header);
 
+    // Verify the mined hash is NOT the canonical exception hash.
+    const canonical_91880 = comptime consensus.hexToHash("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721");
+    try std.testing.expect(!std.mem.eql(u8, &block_hash, &canonical_91880));
+
     var mainnet_regtest_pow = consensus.MAINNET;
     mainnet_regtest_pow.genesis_header.bits = 0x207fffff;
+    mainnet_regtest_pow.pow_limit = consensus.REGTEST.pow_limit;
+    mainnet_regtest_pow.pow_no_retarget = true;
 
     const result = validateBlockForIBD(&blk, &IBDValidationContext{
         .block_hash = block_hash,
@@ -6753,14 +6797,16 @@ test "validateBlockForIBD: BIP-30 exempt at h=91880" {
         .prev_mtp = 0,
         .force_skip_scripts = true,
     }, alloc);
-    if (result) |_| {} else |err| {
-        try std.testing.expect(err != ValidationError.Bip30DuplicateOutput);
-    }
+    // A block at h=91880 with a WRONG hash must be BIP-30 rejected.
+    try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
 }
 
-test "validateBlockForIBD: BIP-30 skipped in BIP-34 range (h=250000)" {
-    // At h=250000, BIP-34 is active (>= 227,931) and h < 1,983,702.
-    // The duplicate-UTXO check is skipped → no Bip30DuplicateOutput even with a hit.
+test "validateBlockForIBD: BIP-30 skipped in BIP-34 range when BIP34Hash verified (W79)" {
+    // Bug #2 fixed in W79: BIP-30 bypass via BIP-34 is only valid when the active_chain
+    // includes a block at bip34_height with the canonical BIP34Hash.
+    //
+    // Case A: active_chain is null → BIP-30 is conservatively enforced (no bypass).
+    // Case B: active_chain has the correct BIP34Hash at index 227931 → bypass applies.
     const alloc = std.testing.allocator;
     var cb_bufs: Bip30CoinbaseBufs = .{};
     var cb = bip30MakeCoinbase(250000, &cb_bufs);
@@ -6773,11 +6819,128 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range (h=250000)" {
 
     var mainnet_regtest_pow = consensus.MAINNET;
     mainnet_regtest_pow.genesis_header.bits = 0x207fffff;
+    mainnet_regtest_pow.pow_limit = consensus.REGTEST.pow_limit;
+    mainnet_regtest_pow.pow_no_retarget = true;
+
+    // Case A: null active_chain → BIP-30 enforced → Bip30DuplicateOutput.
+    {
+        const result = validateBlockForIBD(&blk, &IBDValidationContext{
+            .block_hash = block_hash,
+            .height = 250000,
+            .params = &mainnet_regtest_pow,
+            .prevout_lookup_ctx = @ptrCast(&hit_ctx),
+            .prevout_lookupFn = bip30HitLookup,
+            .active_chain = null,
+            .best_tip_chain_work = [_]u8{0} ** 32,
+            .best_tip_timestamp = 0,
+            .prev_mtp = 0,
+            .force_skip_scripts = true,
+        }, alloc);
+        try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
+    }
+
+    // Case B: active_chain with correct BIP34Hash at index 227931 → bypass → no BIP-30 error.
+    {
+        // Build a minimal active_chain of length 250001.  Only index 227931 matters
+        // (must match params.bip34_hash = "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8").
+        const bip34_hash = mainnet_regtest_pow.bip34_hash.?;
+        var chain = alloc.alloc(types.Hash256, 250001) catch unreachable;
+        defer alloc.free(chain);
+        @memset(chain, [_]u8{0} ** 32);
+        chain[227931] = bip34_hash;
+
+        const result = validateBlockForIBD(&blk, &IBDValidationContext{
+            .block_hash = block_hash,
+            .height = 250000,
+            .params = &mainnet_regtest_pow,
+            .prevout_lookup_ctx = @ptrCast(&hit_ctx),
+            .prevout_lookupFn = bip30HitLookup,
+            .active_chain = chain,
+            .best_tip_chain_work = [_]u8{0} ** 32,
+            .best_tip_timestamp = 0,
+            .prev_mtp = 0,
+            .force_skip_scripts = true,
+        }, alloc);
+        // BIP-34 hash verified → BIP-30 bypassed → not Bip30DuplicateOutput.
+        if (result) |_| {} else |err| {
+            try std.testing.expect(err != ValidationError.Bip30DuplicateOutput);
+        }
+    }
+
+    // Case C: active_chain has WRONG hash at index 227931 → bypass fails → BIP-30 enforced.
+    {
+        const wrong_hash = [_]u8{0xDE} ** 32;
+        var chain = alloc.alloc(types.Hash256, 250001) catch unreachable;
+        defer alloc.free(chain);
+        @memset(chain, [_]u8{0} ** 32);
+        chain[227931] = wrong_hash;
+
+        const result = validateBlockForIBD(&blk, &IBDValidationContext{
+            .block_hash = block_hash,
+            .height = 250000,
+            .params = &mainnet_regtest_pow,
+            .prevout_lookup_ctx = @ptrCast(&hit_ctx),
+            .prevout_lookupFn = bip30HitLookup,
+            .active_chain = chain,
+            .best_tip_chain_work = [_]u8{0} ** 32,
+            .best_tip_timestamp = 0,
+            .prev_mtp = 0,
+            .force_skip_scripts = true,
+        }, alloc);
+        // Wrong BIP34Hash → BIP-30 stays enforced → Bip30DuplicateOutput.
+        try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
+    }
+}
+
+// ============================================================================
+// W79 — BIP-30 + BIP-34 coinbase comprehensive gate tests
+// Reference: Bitcoin Core validation.cpp ConnectBlock (~line 2402-2476),
+//            IsBIP30Repeat() (line 6189), IsBIP30Unspendable() (line 6195),
+//            ContextualCheckBlock() (line 4129), BIP34Hash in chainparams.
+//
+// 10 gates tested:
+//  G1  IsBIP30Repeat height+hash: correct hash → exempt from BIP-30
+//  G2  IsBIP30Repeat height+hash: wrong hash → BIP-30 enforced
+//  G3  BIP-34 bypass: active_chain with correct BIP34Hash → BIP-30 skipped
+//  G4  BIP-34 bypass: null active_chain → conservative, BIP-30 enforced
+//  G5  BIP-34 bypass: wrong BIP34Hash in chain → BIP-30 enforced
+//  G6  BIP-34 bypass: active_chain too short → BIP-30 enforced
+//  G7  BIP34_IMPLIES_BIP30_LIMIT (h=1,983,702): BIP-30 re-enabled above limit
+//  G8  BIP-34 height encoding: OP_0/OP_N/CScriptNum canonical forms
+//  G9  BIP-34 coinbase prefix match: prefix required, extra bytes allowed
+//  G10 bip30_exceptions params: mainnet has 2 exceptions; others have 0
+// ============================================================================
+
+test "W79 G1: IsBIP30Repeat — canonical h=91842 hash is exempt" {
+    // When block_hash matches the canonical exception hash for h=91842,
+    // BIP-30 must NOT be enforced even with a matching UTXO hit.
+    // We simulate this by building params with a fake bip30_exceptions entry
+    // whose block_hash matches the block we mine.
+    const alloc = std.testing.allocator;
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(91842, &cb_bufs);
+    var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    bip30Mine(&blk, alloc);
+
+    const coinbase_txid = crypto.computeTxidStreaming(&cb);
+    var hit_ctx = Bip30LookupCtx{ .target_txid = coinbase_txid };
+    const block_hash = crypto.computeBlockHash(&blk.header);
+
+    // Build params where the exception hash matches the block we just mined.
+    const fake_exception = [_]consensus.Bip30Exception{.{
+        .height = 91842,
+        .block_hash = block_hash, // exact match → exempt
+    }};
+    var params = consensus.MAINNET;
+    params.genesis_header.bits = 0x207fffff;
+    params.pow_limit = consensus.REGTEST.pow_limit;
+    params.pow_no_retarget = true;
+    params.bip30_exceptions = &fake_exception;
 
     const result = validateBlockForIBD(&blk, &IBDValidationContext{
         .block_hash = block_hash,
-        .height = 250000,
-        .params = &mainnet_regtest_pow,
+        .height = 91842,
+        .params = &params,
         .prevout_lookup_ctx = @ptrCast(&hit_ctx),
         .prevout_lookupFn = bip30HitLookup,
         .active_chain = null,
@@ -6786,10 +6949,227 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range (h=250000)" {
         .prev_mtp = 0,
         .force_skip_scripts = true,
     }, alloc);
-    // Not Bip30DuplicateOutput (BIP-34 buried the check).
+    // Hash matches → exempt → NOT Bip30DuplicateOutput.
     if (result) |_| {} else |err| {
         try std.testing.expect(err != ValidationError.Bip30DuplicateOutput);
     }
+}
+
+test "W79 G2: IsBIP30Repeat — same height, wrong hash → BIP-30 enforced" {
+    // A block at an exception height but with a DIFFERENT hash is not exempt.
+    const alloc = std.testing.allocator;
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(91842, &cb_bufs);
+    var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    bip30Mine(&blk, alloc);
+
+    const coinbase_txid = crypto.computeTxidStreaming(&cb);
+    var hit_ctx = Bip30LookupCtx{ .target_txid = coinbase_txid };
+    const block_hash = crypto.computeBlockHash(&blk.header);
+
+    // Exception lists a DIFFERENT hash for h=91842.
+    const wrong_exception = [_]consensus.Bip30Exception{.{
+        .height = 91842,
+        .block_hash = [_]u8{0xAB} ** 32, // does not match
+    }};
+    var params = consensus.MAINNET;
+    params.genesis_header.bits = 0x207fffff;
+    params.pow_limit = consensus.REGTEST.pow_limit;
+    params.pow_no_retarget = true;
+    params.bip30_exceptions = &wrong_exception;
+
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 91842,
+        .params = &params,
+        .prevout_lookup_ctx = @ptrCast(&hit_ctx),
+        .prevout_lookupFn = bip30HitLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    // Wrong hash → not exempt → Bip30DuplicateOutput.
+    try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
+}
+
+test "W79 G6: BIP-34 bypass — active_chain too short to include bip34_height → BIP-30 enforced" {
+    // If the active_chain is shorter than bip34_height we cannot verify the
+    // BIP34Hash anchor → conservative: keep BIP-30 enforced.
+    const alloc = std.testing.allocator;
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(250000, &cb_bufs);
+    var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    bip30Mine(&blk, alloc);
+
+    const coinbase_txid = crypto.computeTxidStreaming(&cb);
+    var hit_ctx = Bip30LookupCtx{ .target_txid = coinbase_txid };
+    const block_hash = crypto.computeBlockHash(&blk.header);
+
+    var params = consensus.MAINNET;
+    params.genesis_header.bits = 0x207fffff;
+    params.pow_limit = consensus.REGTEST.pow_limit;
+    params.pow_no_retarget = true;
+
+    // Provide a chain that ends before bip34_height (227931).
+    var short_chain = [_]types.Hash256{ [_]u8{0} ** 32, [_]u8{0} ** 32 };
+
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 250000,
+        .params = &params,
+        .prevout_lookup_ctx = @ptrCast(&hit_ctx),
+        .prevout_lookupFn = bip30HitLookup,
+        .active_chain = &short_chain,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    // Chain too short → can't verify → BIP-30 enforced → Bip30DuplicateOutput.
+    try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
+}
+
+test "W79 G7: BIP34_IMPLIES_BIP30_LIMIT — BIP-30 re-enabled at h=1,983,702" {
+    // Above BIP34_IMPLIES_BIP30_LIMIT (1,983,702) BIP-30 is re-enabled even if
+    // BIP-34 is active, because modular arithmetic can repeat pre-BIP34 coinbase heights.
+    const alloc = std.testing.allocator;
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(1983702, &cb_bufs);
+    var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    bip30Mine(&blk, alloc);
+
+    const coinbase_txid = crypto.computeTxidStreaming(&cb);
+    var hit_ctx = Bip30LookupCtx{ .target_txid = coinbase_txid };
+    const block_hash = crypto.computeBlockHash(&blk.header);
+
+    // Even with a valid BIP34Hash anchor, h=1,983,702 is at the limit → BIP-30 enforced.
+    const bip34_hash = consensus.MAINNET.bip34_hash.?;
+    var chain = alloc.alloc(types.Hash256, 1983703) catch unreachable;
+    defer alloc.free(chain);
+    @memset(chain, [_]u8{0} ** 32);
+    chain[227931] = bip34_hash;
+
+    var params = consensus.MAINNET;
+    params.genesis_header.bits = 0x207fffff;
+    params.pow_limit = consensus.REGTEST.pow_limit;
+    params.pow_no_retarget = true;
+
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 1983702,
+        .params = &params,
+        .prevout_lookup_ctx = @ptrCast(&hit_ctx),
+        .prevout_lookupFn = bip30HitLookup,
+        .active_chain = chain,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    // h >= 1,983,702 → BIP-30 re-enabled → Bip30DuplicateOutput.
+    try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
+}
+
+test "W79 G7b: h=1,983,701 is still BIP-34 range (BIP-30 skipped with good chain)" {
+    // One block before the limit should still get the BIP-30 skip.
+    const alloc = std.testing.allocator;
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(1983701, &cb_bufs);
+    var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    bip30Mine(&blk, alloc);
+
+    const coinbase_txid = crypto.computeTxidStreaming(&cb);
+    var hit_ctx = Bip30LookupCtx{ .target_txid = coinbase_txid };
+    const block_hash = crypto.computeBlockHash(&blk.header);
+
+    const bip34_hash = consensus.MAINNET.bip34_hash.?;
+    var chain = alloc.alloc(types.Hash256, 1983702) catch unreachable;
+    defer alloc.free(chain);
+    @memset(chain, [_]u8{0} ** 32);
+    chain[227931] = bip34_hash;
+
+    var params = consensus.MAINNET;
+    params.genesis_header.bits = 0x207fffff;
+    params.pow_limit = consensus.REGTEST.pow_limit;
+    params.pow_no_retarget = true;
+
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 1983701,
+        .params = &params,
+        .prevout_lookup_ctx = @ptrCast(&hit_ctx),
+        .prevout_lookupFn = bip30HitLookup,
+        .active_chain = chain,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    // h=1,983,701 < limit and BIP-34 verified → BIP-30 skipped → not Bip30DuplicateOutput.
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.Bip30DuplicateOutput);
+    }
+}
+
+test "W79 G8: BIP-34 height encoding canonical vectors (Core parity)" {
+    // encodeBip34Height must produce Core-exact CScript() << nHeight output.
+    // Already covered by "encodeBip34Height canonical vectors" test; this test
+    // verifies validateCoinbaseHeight across the boundary cases that matter for
+    // the BIP-34 gate.
+    // height 0 → OP_0 (0x00)
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{0x00}, 0));
+    // height 1..16 → OP_N (0x51..0x60)
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{0x51}, 1));
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{0x60}, 16));
+    // height 17 → 2-byte length-prefixed
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x01, 0x11 }, 17));
+    // height 227931 (BIP-34 activation; LE = 0xFB79 0x03)
+    var buf: [6]u8 = undefined;
+    const enc = encodeBip34Height(227931, &buf);
+    try std.testing.expect(validateCoinbaseHeight(enc, 227931));
+    // height 1983702 (BIP34_IMPLIES_BIP30_LIMIT)
+    const enc2 = encodeBip34Height(1983702, &buf);
+    try std.testing.expect(validateCoinbaseHeight(enc2, 1983702));
+}
+
+test "W79 G9: BIP-34 prefix match — extra bytes are allowed, wrong prefix is not" {
+    // Core's check: sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
+    // Extra trailing bytes are OK; wrong leading bytes are not.
+    // height 100: canonical = [0x01, 0x64]
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x01, 0x64 }, 100)); // exact
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x01, 0x64, 0x00 }, 100)); // extra byte OK
+    try std.testing.expect(validateCoinbaseHeight(&[_]u8{ 0x01, 0x64, 0xDE, 0xAD }, 100)); // extra OK
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{ 0x02, 0x64, 0x00 }, 100)); // wrong (zero-padded)
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{ 0x01, 0x63 }, 100)); // wrong value
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{0x64}, 100)); // missing length prefix
+    try std.testing.expect(!validateCoinbaseHeight(&[_]u8{}, 100)); // too short
+}
+
+test "W79 G10: bip30_exceptions in params — mainnet has 2, others have 0" {
+    // Structural check: mainnet has exactly 2 BIP-30 exceptions (h=91842, h=91880).
+    // All other networks have empty exception lists.
+    try std.testing.expectEqual(@as(usize, 2), consensus.MAINNET.bip30_exceptions.len);
+    try std.testing.expectEqual(@as(u32, 91842), consensus.MAINNET.bip30_exceptions[0].height);
+    try std.testing.expectEqual(@as(u32, 91880), consensus.MAINNET.bip30_exceptions[1].height);
+    // Verify the canonical exception hashes (Core IsBIP30Repeat):
+    //   h=91842: 00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec
+    //   h=91880: 00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721
+    const h91842_hash = comptime consensus.hexToHash("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec");
+    const h91880_hash = comptime consensus.hexToHash("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721");
+    try std.testing.expectEqualSlices(u8, &h91842_hash, &consensus.MAINNET.bip30_exceptions[0].block_hash);
+    try std.testing.expectEqualSlices(u8, &h91880_hash, &consensus.MAINNET.bip30_exceptions[1].block_hash);
+    // All other networks: empty.
+    try std.testing.expectEqual(@as(usize, 0), consensus.TESTNET3.bip30_exceptions.len);
+    try std.testing.expectEqual(@as(usize, 0), consensus.TESTNET4.bip30_exceptions.len);
+    try std.testing.expectEqual(@as(usize, 0), consensus.SIGNET.bip30_exceptions.len);
+    try std.testing.expectEqual(@as(usize, 0), consensus.REGTEST.bip30_exceptions.len);
+    // BIP34 hash: mainnet must be set; testnet4/signet/regtest null.
+    try std.testing.expect(consensus.MAINNET.bip34_hash != null);
+    try std.testing.expect(consensus.TESTNET4.bip34_hash == null);
+    try std.testing.expect(consensus.SIGNET.bip34_hash == null);
+    try std.testing.expect(consensus.REGTEST.bip34_hash == null);
 }
 
 // ============================================================================
