@@ -11,6 +11,9 @@ const erlay_mod = @import("erlay.zig");
 pub const PROTOCOL_VERSION: i32 = 70016;
 pub const MIN_PROTOCOL_VERSION: i32 = 70001;
 pub const NODE_NETWORK: u64 = 1;
+/// NODE_COMPACT_FILTERS (BIP-157): node serves getcfilters/getcfheaders/getcfcheckpt.
+/// Value = 1 << 6 = 64.  Core protocol.h:323.
+pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
 /// BIP-37 / BIP-35: signals that the node supports bloom-filtered mempool
 /// queries.  Required for serving the `mempool` message per BIP-35.
 pub const NODE_BLOOM: u64 = 4;

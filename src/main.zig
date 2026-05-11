@@ -1712,6 +1712,11 @@ pub fn main() !void {
     // NODE_NETWORK_LIMITED so peers know we serve only the recent-288
     // keep window.  Mirrors Core's init.cpp `IsPruneMode()` gate.
     peer_manager.advertise_node_network_limited = chain_state.prune_target_mib > 0;
+    // BIP-157: advertise NODE_COMPACT_FILTERS (1<<6) when blockfilterindex is
+    // enabled.  Mirrors Core's init.cpp:992-998 where g_local_services gains
+    // NODE_COMPACT_FILTERS when both peerblockfilters + blockfilterindex hold.
+    // clearbit gates only on blockfilterindex (peerblockfilters follows it).
+    peer_manager.blockfilterindex_enabled = config.blockfilterindex;
 
     const auth_token = computeAuthToken(config.rpc_user, config.rpc_password, allocator) catch null;
     defer if (auth_token) |t| allocator.free(t);
