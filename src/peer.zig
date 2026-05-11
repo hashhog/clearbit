@@ -605,6 +605,13 @@ pub const Peer = struct {
     /// blocks below the recent-`MIN_BLOCKS_TO_KEEP` (288) keep window.
     advertise_node_network_limited: bool = false,
 
+    /// BIP-157: when true, OR `NODE_COMPACT_FILTERS` (1<<6) into the
+    /// outbound `services` bitfield in the version handshake.  Set when
+    /// `--blockfilterindex` and `--peerblockfilters` are both enabled.
+    /// Mirrors Core's `init.cpp:992-998` where `g_local_services` gains
+    /// `NODE_COMPACT_FILTERS` when both conditions hold.
+    advertise_compact_filters: bool = false,
+
     /// BIP-130: peer requested header-style block announcements via the
     /// `sendheaders` message.  When true, this node MUST announce new
     /// blocks to this peer with a `headers` message containing the new
@@ -1296,6 +1303,9 @@ pub const Peer = struct {
             // the auto-prune case (the node still has the recent-288 window),
             // so we keep NODE_NETWORK set as well.
             if (self.advertise_node_network_limited) s |= p2p.NODE_NETWORK_LIMITED;
+            // BIP-157: signal compact-filter serving when both --blockfilterindex
+            // and --peerblockfilters are enabled (Core init.cpp:992-998).
+            if (self.advertise_compact_filters) s |= p2p.NODE_COMPACT_FILTERS;
             break :blk s;
         };
 
@@ -2130,6 +2140,14 @@ pub const PeerManager = struct {
     /// `MIN_BLOCKS_TO_KEEP` (288) keep window.
     advertise_node_network_limited: bool = false,
 
+    /// BIP-157: when true, advertise NODE_COMPACT_FILTERS (1<<6) in outgoing
+    /// VERSION messages.  Wired from `config.blockfilterindex` at peer-creation
+    /// time.  Mirrors Core's `init.cpp:992-998` where `g_local_services` gains
+    /// `NODE_COMPACT_FILTERS` when both `peerblockfilters` and `blockfilterindex`
+    /// are enabled.  We gate on `blockfilterindex` alone (peerblockfilters
+    /// currently always follows the filter index in clearbit).
+    blockfilterindex_enabled: bool = false,
+
     /// Per-address fall-back set for BIP-324 v2 outbound negotiation.
     /// Once we've tried v2 against an address and fallen back to v1 (because
     /// the peer didn't speak v2 — a non-ellswift response or a deadline
@@ -2279,6 +2297,7 @@ pub const PeerManager = struct {
             };
             peer.advertise_node_bloom = self.peerbloomfilters;
             peer.advertise_node_network_limited = self.advertise_node_network_limited;
+            peer.advertise_compact_filters = self.blockfilterindex_enabled;
 
             // Attach an initiator-mode V2Transport to the peer and let it
             // drive the cipher handshake.  The transport's init() already
@@ -2337,6 +2356,7 @@ pub const PeerManager = struct {
         };
         peer.advertise_node_bloom = self.peerbloomfilters;
         peer.advertise_node_network_limited = self.advertise_node_network_limited;
+        peer.advertise_compact_filters = self.blockfilterindex_enabled;
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -2953,6 +2973,7 @@ pub const PeerManager = struct {
         peer.* = Peer.accept(conn.stream, conn.address, self.network_params, self.allocator);
         peer.advertise_node_bloom = self.peerbloomfilters;
         peer.advertise_node_network_limited = self.advertise_node_network_limited;
+        peer.advertise_compact_filters = self.blockfilterindex_enabled;
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
