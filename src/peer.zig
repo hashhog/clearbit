@@ -4709,6 +4709,45 @@ pub const PeerManager = struct {
         return validation.medianTimePast(timestamps[0..n]);
     }
 
+    /// Compute the median-time-past (GetMedianTimePast) OF block at `height`.
+    ///
+    /// Core: `GetAncestor(height)->GetMedianTimePast()` includes the block at
+    /// `height` itself plus up to 10 preceding blocks.
+    ///
+    /// Implementation: looks up the block hash via getBlockHashByHeight
+    /// (CF_DEFAULT height→hash index), then walks the in-memory header_index
+    /// up to 11 steps collecting timestamps.  Returns 0 when:
+    ///   - the chain state is not available,
+    ///   - the height→hash DB entry is missing (pre-IBD, pruned, etc.), or
+    ///   - the header_index has evicted those entries (header_index is capped
+    ///     at MAX_HEADER_INDEX and LRU-evicts; old heights may be missing).
+    /// A 0 return causes the caller to skip time-based BIP-68 enforcement for
+    /// that UTXO (safe: height-based locks are still checked).
+    fn computeMtpAtHeight(self: *PeerManager, height: u32) u32 {
+        const cs = self.chain_state orelse return 0;
+        // Retrieve the hash of block at `height` from the persistent index.
+        const block_hash = cs.getBlockHashByHeight(height) orelse return 0;
+        // Collect timestamps: block at `height` then its ancestors.
+        var timestamps: [11]u32 = undefined;
+        var n: usize = 0;
+        var cursor = block_hash;
+        while (n < 11) {
+            const entry = self.header_index.get(cursor) orelse break;
+            timestamps[n] = entry.timestamp;
+            n += 1;
+            cursor = entry.prev_hash;
+        }
+        if (n == 0) return 0;
+        return validation.medianTimePast(timestamps[0..n]);
+    }
+
+    /// Trampoline so PeerManager.computeMtpAtHeight can be passed as a
+    /// *const fn(*anyopaque, u32) u32 to IBDValidationContext.getMtpAtHeightFn.
+    fn getMtpAtHeightTrampoline(ctx_ptr: *anyopaque, h: u32) u32 {
+        const self: *PeerManager = @ptrCast(@alignCast(ctx_ptr));
+        return self.computeMtpAtHeight(h);
+    }
+
     /// Header-time validation result.
     pub const HeaderTimeReject = enum {
         ok,
@@ -4837,7 +4876,15 @@ pub const PeerManager = struct {
             @ptrCast(&adapter),
             Adapter.lookup,
             self.allocator,
-            .{ .prev_mtp = prev_mtp, .force_skip_scripts = skip_via_height },
+            .{
+                .prev_mtp = prev_mtp,
+                .force_skip_scripts = skip_via_height,
+                // BIP-68 time-based enforcement: wire the MTP-at-height callback
+                // so validateBlockForIBD can look up the prior-block MTP for each
+                // spent UTXO.  PeerManager is long-lived; safe to pass self here.
+                .getMtpAtHeightFn = PeerManager.getMtpAtHeightTrampoline,
+                .getMtpAtHeightCtx = @ptrCast(self),
+            },
         ) catch |err| {
             std.debug.print(
                 "P2P: REJECT block height={d} validation={}\n",
