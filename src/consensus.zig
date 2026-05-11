@@ -413,6 +413,17 @@ pub const NetworkParams = struct {
     /// All other networks use an empty slice.
     /// Reference: Bitcoin Core validation.cpp IsBIP30Repeat().
     bip30_exceptions: []const Bip30Exception,
+    /// W92 — BIP-30 *disconnect* exceptions.  These are the EARLIER of each
+    /// duplicate-coinbase pair (the ones whose outputs were overwritten by a
+    /// later block) — h=91722 and h=91812 on mainnet.  Disconnect of these
+    /// blocks tolerates output-mismatch on the coinbase because the duplicate
+    /// at h=91842/91880 silently overwrote the UTXO entry, so the slot now
+    /// contains the LATER coinbase's data (not what 91722/91812 originally
+    /// created).  Distinct from `bip30_exceptions` (used by ConnectBlock):
+    /// connect tolerates duplicates at the *later* heights; disconnect
+    /// tolerates output-mismatch at the *earlier* heights.
+    /// Reference: Bitcoin Core validation.cpp:2201-2202.
+    bip30_disconnect_exceptions: []const Bip30Exception = &.{},
     /// BIP-34 activation block hash.  The block at height `bip34_height` must
     /// have exactly this hash for the BIP-30 bypass to be valid.  Without this
     /// check an attacker could present a fork whose coinbases never actually
@@ -551,6 +562,22 @@ pub const MAINNET = NetworkParams{
         .{
             .height = 91880,
             .block_hash = hexToHash("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"),
+        },
+    },
+    // W92 — BIP-30 disconnect exceptions (h=91722, h=91812).
+    // These are the EARLIER of each duplicate-coinbase pair.  Disconnect
+    // tolerates output-mismatch on these coinbases because the duplicate
+    // coinbase at h=91842/91880 silently overwrote the UTXO entry on
+    // connect, so the slot now contains the LATER coinbase's data.
+    // Reference: Bitcoin Core validation.cpp:2201-2202.
+    .bip30_disconnect_exceptions = &[_]Bip30Exception{
+        .{
+            .height = 91722,
+            .block_hash = hexToHash("00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"),
+        },
+        .{
+            .height = 91812,
+            .block_hash = hexToHash("00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"),
         },
     },
     // BIP-34 activation block hash (mainnet h=227931).

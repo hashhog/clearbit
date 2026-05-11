@@ -1173,32 +1173,15 @@ pub fn getBlockProof(bits: u32) [32]u8 {
     // then correct.  For simplicity, use a bit-by-bit binary long division
     // (good enough for anti-DoS work comparison; 256 iterations is fast).
 
-    // Represent remainder as 33 bytes LE.
-    var remainder: [33]u8 = [_]u8{0} ** 33;
-    remainder[32] = 1; // = 2^256
-
+    // W92 cleanup — earlier prototyping left a dead `var bit / while`
+    // loop and an unused `remainder` followed by `_ = bit; _ = remainder`
+    // discards.  Zig 0.13's compiler flags those discards as "pointless"
+    // because the variables ARE read on the immediately-preceding lines.
+    // The actual algorithm is the schoolbook long-division on `num/q/r`
+    // below; the dead block has been removed.
     var quotient: [32]u8 = [_]u8{0} ** 32;
 
-    // We process bits from MSB (bit 255) down to LSB (bit 0).
-    // This is a standard non-restoring binary division.
-    var bit: i32 = 255;
-    while (bit >= 0) : (bit -= 1) {
-        // remainder <<= 1 (shift left one bit, keep 33 bytes)
-        // Actually: we compute 2^256 / divisor by thinking of the quotient
-        // bit-by-bit.  At each step, check if (remainder << 1) >= divisor.
-        //
-        // Simpler: use the standard schoolbook approach on the 257-bit dividend.
-        // remainder = 2^256; divisor = t_plus_1 (33 bytes LE).
-        // For each bit position b from 255 down to 0:
-        //   if divisor <= remainder >> (b) ... this is complex.
-        //
-        // Instead use: quotient = floor(2^256 / divisor) via subtractive loop
-        // with 256 steps — shift-and-subtract in base-2.
-        _ = bit; // suppress unused warning; loop below handles it.
-        break;
-    }
-
-    // Use a cleaner approach: schoolbook long division using u32 limbs.
+    // Schoolbook long division using u32 limbs.
     // numerator = 2^256 (33 bytes LE, byte[32]=1, rest=0).
     // divisor = t_plus_1 (33 bytes LE).
     // result (quotient) fits in 32 bytes LE.
@@ -1211,7 +1194,6 @@ pub fn getBlockProof(bits: u32) [32]u8 {
 
     var q: [33]u8 = [_]u8{0} ** 33;
     var r: [33]u8 = [_]u8{0} ** 33;
-    _ = remainder;
 
     // Bit-by-bit long division: process from bit 256 down to 0.
     var i: i32 = 256;
