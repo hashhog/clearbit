@@ -10953,6 +10953,123 @@ test "W86-G12: removeForBlock sets block_since_last_rolling_fee_bump" {
     try std.testing.expect(mempool.block_since_last_rolling_fee_bump);
 }
 
+test "W93: removeForBlock evicts confirmed txs from the mempool" {
+    // Pre-W93 the block-connect path (peer.zig drainBlockBuffer +
+    // block_template.submitBlockWithIndexAndMempool) never called
+    // mempool.removeForBlock, so confirmed txs lingered in the pool.
+    // This unit test pins the behaviour of removeForBlock itself; the
+    // wiring tests live in the integration smoke harness.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Add a tx to the mempool, then build a block "confirming" it.
+    const p2wpkh_script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x99} ** 32, .index = 7 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 12_345, .script_pubkey = &p2wpkh_script };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx);
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+
+    // Build a block whose vtx[1] is the same tx (vtx[0] is the coinbase).
+    const cb_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_output = types.TxOut{ .value = 5_000_000_000, .script_pubkey = &p2wpkh_script };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_input},
+        .outputs = &[_]types.TxOut{cb_output},
+        .lock_time = 0,
+    };
+    const block = types.Block{
+        .header = std.mem.zeroes(types.BlockHeader),
+        .transactions = &[_]types.Transaction{ cb_tx, tx },
+    };
+
+    mempool.removeForBlock(&block);
+
+    // The confirmed tx must be gone — pool back to empty.
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+}
+
+test "W93: removeForBlock leaves unrelated mempool txs untouched" {
+    // Negative case: only the confirmed tx is evicted, not every other entry.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20;
+
+    // tx_a: gets confirmed.
+    const tx_a = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 1000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 0,
+    };
+    // tx_b: stays in the pool.
+    const tx_b = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xBB} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 2000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx_a);
+    try mempool.addTransaction(tx_b);
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+
+    const cb_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_output = types.TxOut{ .value = 5_000_000_000, .script_pubkey = &p2wpkh_script };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_input},
+        .outputs = &[_]types.TxOut{cb_output},
+        .lock_time = 0,
+    };
+    const block = types.Block{
+        .header = std.mem.zeroes(types.BlockHeader),
+        .transactions = &[_]types.Transaction{ cb_tx, tx_a },
+    };
+
+    mempool.removeForBlock(&block);
+
+    // tx_b must remain in the pool; tx_a was evicted.
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+    const txid_b = try crypto.computeTxid(&tx_b, allocator);
+    try std.testing.expect(mempool.entries.get(txid_b) != null);
+    const txid_a = try crypto.computeTxid(&tx_a, allocator);
+    try std.testing.expect(mempool.entries.get(txid_a) == null);
+}
+
 test "W86-G13: addTransaction uses getMinFee (rolling minimum), not static MIN_RELAY_FEE" {
     // Simulate a scenario where the rolling minimum has been elevated by a
     // prior eviction.  A new transaction whose fee_rate equals the old static

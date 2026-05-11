@@ -1116,6 +1116,20 @@ pub fn submitBlockWithIndexAndMempool(
         }
     }
 
+    // W93 G15 mempool-removeForBlock parity: drop confirmed txs from the
+    // mempool now that the block is part of the active chain.  Mirrors
+    // Bitcoin Core's Chainstate::ConnectTip (validation.cpp:3074):
+    //   if (m_mempool) {
+    //       m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);
+    //   }
+    // Without this, confirmed txs linger in the mempool indefinitely and
+    // would be (a) re-relayed on the next `inv` round and (b) cause
+    // double-spend rejections for any RBF replacements landing in a
+    // later block.  Runs only after the chain-state advance succeeds.
+    if (mempool) |mp| {
+        mp.removeForBlock(block);
+    }
+
     return .{
         .accepted = true,
         .reject_reason = null,
@@ -1484,6 +1498,19 @@ fn fireReorgFromSideBranch(
     if (mempool) |mp| {
         for (disconnected_blocks.items) |*b| {
             mp.blockDisconnected(b.transactions);
+        }
+
+        // W93 G15: after re-admitting txs from the disconnected blocks,
+        // evict any tx that the NEW active branch confirmed.  Two-step
+        // dance mirrors Core's MaybeUpdateMempoolForReorg + per-tip
+        // ConnectTip-time removeForBlock: an RBF tx that confirmed on the
+        // new branch must NOT be re-admitted from the disconnected side
+        // (re-admit happens above; this loop drops it again).  Without
+        // this, the mempool ends up with stale entries for any tx already
+        // on the heavier chain.  Iterates the new-branch blocks in chain
+        // order (rb_list is already [fork_point + 1 ... new_tip]).
+        for (rb_list.items) |rb| {
+            mp.removeForBlock(&rb.block);
         }
     }
 

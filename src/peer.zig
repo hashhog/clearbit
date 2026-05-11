@@ -5243,6 +5243,26 @@ pub const PeerManager = struct {
                 };
             }
 
+            // W93 G15 mempool-removeForBlock parity: after the block has been
+            // applied to chainstate, evict any mempool entries that the block
+            // confirmed.  Mirrors Bitcoin Core's Chainstate::ConnectTip
+            // (validation.cpp:3074):
+            //   if (m_mempool) {
+            //       m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);
+            //       disconnectpool.removeForBlock(block_to_connect->vtx);
+            //   }
+            // Without this, confirmed txs linger in the mempool and would be
+            // re-relayed on the next `inv` round + waste fee-estimation samples
+            // + cause double-spend rejections for any RBF replacements.
+            //
+            // The mempool field on PeerManager is plumbed by main.zig's
+            // wireMempool() helper; null when the test harness skips it.  Doing
+            // this *after* the connect succeeds preserves the existing
+            // failure-path semantics (mempool untouched on rejected blocks).
+            if (self.mempool) |mp| {
+                mp.removeForBlock(&block);
+            }
+
             const block_elapsed_ns = std.time.nanoTimestamp() - block_start;
             const block_elapsed_ms = @divTrunc(block_elapsed_ns, 1_000_000);
             if (block_elapsed_ms > 50) {
