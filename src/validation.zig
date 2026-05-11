@@ -45,6 +45,13 @@ pub const ValidationError = error{
     BadMerkleRoot,
     BadDifficulty,
     BadTimestamp,
+    /// Block timestamp too far in the future (Core "time-too-new").
+    /// Reference: validation.cpp:4108 — block.Time() > NodeClock::now() + 7200s.
+    FutureTimestamp,
+    /// Block timestamp on a BIP-94 retarget boundary is more than 600s
+    /// earlier than the preceding block (Core "time-timewarp-attack").
+    /// Reference: validation.cpp:4101 — enforce_BIP94 path.
+    TimewarpAttack,
     BadBlockSize,
     BadBlockWeight,
     DuplicateTx,
@@ -56,6 +63,10 @@ pub const ValidationError = error{
     BadCoinbaseValue,
     SequenceLockNotSatisfied,
     TooManySigops,
+    /// Block version too old for the active softfork set (Core "bad-version").
+    /// Reference: validation.cpp:4113-4118 — nVersion < 2/3/4 after
+    /// HEIGHTINCB/DERSIG/CLTV activation respectively.
+    BadVersion,
 
     // Checkpoint errors
     CheckpointMismatch,
@@ -973,6 +984,18 @@ pub const IBDValidationContext = struct {
     /// for IsFinalTx + BIP-68 sequence locks once CSV is active.
     /// 0 disables MTP-based contextual checks (genesis case).
     prev_mtp: u32,
+    /// Actual timestamp of the immediately preceding block (nTime field).
+    /// Used by the BIP-94 timewarp check on difficulty-adjustment boundaries.
+    /// 0 means "not available" (genesis, or caller has no header); the timewarp
+    /// gate is skipped in that case.
+    /// Reference: validation.cpp:4101 — block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP.
+    prev_block_timestamp: u32 = 0,
+    /// Wall-clock time at the moment this block was received (Unix seconds, i64).
+    /// When non-zero, enforces the "time-too-new" gate: the block is rejected if
+    /// its timestamp exceeds current_time + MAX_FUTURE_BLOCK_TIME (7200s).
+    /// 0 means "not available" (test / IBD fast-path); the gate is skipped.
+    /// Reference: validation.cpp:4108 — block.Time() > NodeClock::now() + 7200s.
+    current_time: i64 = 0,
     /// Caller-provided override for the assumevalid skip decision.  When
     /// `active_chain` is null but the caller knows by construction that
     /// the block is an ancestor of `params.assumed_valid_hash` (e.g.
@@ -1031,6 +1054,70 @@ pub fn validateBlockForIBD(
     // Reference: bitcoin-core/src/validation.cpp:4092-4093.
     if (ctx.prev_mtp != 0 and block.header.timestamp <= ctx.prev_mtp) {
         return ValidationError.BadTimestamp;
+    }
+
+    // 1b. BIP-94 timewarp check (ContextualCheckBlockHeader in Core).
+    // On testnet4 (enforce_bip94=true), the first block of each difficulty
+    // adjustment period must not have a timestamp more than MAX_TIMEWARP (600s)
+    // earlier than the immediately preceding block.  This prevents the
+    // "timewarp attack" that could be used to artificially manipulate difficulty.
+    // Reference: bitcoin-core/src/validation.cpp:4097-4105.
+    //   if (consensusParams.enforce_BIP94) {
+    //     if (nHeight % DiffAdjInterval == 0 && block.time < pindexPrev->GetBlockTime() - MAX_TIMEWARP)
+    //       return INVALID "time-timewarp-attack"
+    //   }
+    if (params.enforce_bip94 and ctx.prev_block_timestamp != 0) {
+        const interval = consensus.difficultyAdjustmentInterval(params);
+        if (height % interval == 0) {
+            // Use saturating subtraction: if prev_block_timestamp < MAX_TIMEWARP,
+            // the lower bound is 0 (never reachable in practice, but safe).
+            const lower_bound: u32 = if (ctx.prev_block_timestamp >= consensus.MAX_TIMEWARP)
+                ctx.prev_block_timestamp - consensus.MAX_TIMEWARP
+            else
+                0;
+            if (block.header.timestamp < lower_bound) {
+                return ValidationError.TimewarpAttack;
+            }
+        }
+    }
+
+    // 1c. Future-time gate (ContextualCheckBlockHeader in Core).
+    // Block timestamp must not exceed current wall time + 2 hours.
+    // In IBD we skip this check when current_time is 0 (not available).
+    // At live-tip (P2P path) peer.zig populates current_time via std.time.timestamp().
+    // Reference: bitcoin-core/src/validation.cpp:4108-4110.
+    //   if (block.Time() > NodeClock::now() + 7200s) return INVALID "time-too-new"
+    if (ctx.current_time != 0) {
+        const max_allowed: i64 = ctx.current_time + @as(i64, consensus.MAX_FUTURE_BLOCK_TIME);
+        if (@as(i64, block.header.timestamp) > max_allowed) {
+            return ValidationError.FutureTimestamp;
+        }
+    }
+
+    // 1d. Bad-version gates (ContextualCheckBlockHeader in Core).
+    // Reject blocks with a version number lower than the minimum required after
+    // each version-based softfork activates.
+    //   nVersion < 2 after BIP34/HEIGHTINCB (bip34_height)
+    //   nVersion < 3 after BIP66/DERSIG     (bip66_height)
+    //   nVersion < 4 after BIP65/CLTV       (bip65_height)
+    // Reference: bitcoin-core/src/validation.cpp:4113-4118.
+    //   if (block.nVersion < 2 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_HEIGHTINCB))
+    //       return INVALID "bad-version"
+    //   if (block.nVersion < 3 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_DERSIG))
+    //       return INVALID "bad-version"
+    //   if (block.nVersion < 4 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_CLTV))
+    //       return INVALID "bad-version"
+    // We use height-based activation thresholds (params.bip34/66/65_height) rather
+    // than BIP9 versionbits deployment because all three have long since locked in.
+    // "DeploymentActiveAfter(pindexPrev, ...)" means the rule applies at height >= activation.
+    if (height >= params.bip34_height and block.header.version < 2) {
+        return ValidationError.BadVersion;
+    }
+    if (height >= params.bip66_height and block.header.version < 3) {
+        return ValidationError.BadVersion;
+    }
+    if (height >= params.bip65_height and block.header.version < 4) {
+        return ValidationError.BadVersion;
     }
 
     // 2. Per-block sanity: coinbase position, merkle root, weight, BIP-34,
@@ -1462,6 +1549,10 @@ pub const AcceptBlockOptions = struct {
     /// Optional: see IBDValidationContext.getMtpAtHeightFn.
     getMtpAtHeightFn: ?*const fn (ctx: *anyopaque, height: u32) u32 = null,
     getMtpAtHeightCtx: ?*anyopaque = null,
+    /// See IBDValidationContext.prev_block_timestamp.  0 = skip timewarp check.
+    prev_block_timestamp: u32 = 0,
+    /// See IBDValidationContext.current_time.  0 = skip future-time check.
+    current_time: i64 = 0,
 };
 
 /// Unified block consensus-validation entry point.
@@ -1501,6 +1592,8 @@ pub fn acceptBlock(
         .best_tip_chain_work = [_]u8{0} ** 32,
         .best_tip_timestamp = 0,
         .prev_mtp = options.prev_mtp,
+        .prev_block_timestamp = options.prev_block_timestamp,
+        .current_time = options.current_time,
         .force_skip_scripts = options.force_skip_scripts,
         .getMtpAtHeightFn = options.getMtpAtHeightFn,
         .getMtpAtHeightCtx = options.getMtpAtHeightCtx,
@@ -6862,6 +6955,7 @@ test "validateBlockForIBD: rejects bad merkle root" {
 
     // Bad merkle root + loose PoW so the merkle check is what trips.
     var loose_header = consensus.REGTEST.genesis_header;
+    loose_header.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     loose_header.merkle_root = [_]u8{0xFF} ** 32; // wrong merkle
     loose_header.bits = 0x207fffff; // regtest-loose
     loose_header.nonce = 0;
@@ -6926,6 +7020,7 @@ test "validateBlockForIBD: rejects coinbase value > subsidy + fees (no inputs)" 
 
     // Use REGTEST so the loose bits header passes PoW.
     var header = consensus.REGTEST.genesis_header;
+    header.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     header.merkle_root = merkle;
     header.bits = 0x207fffff;
     ibdTestMineNonce(&header, &consensus.REGTEST);
@@ -6980,6 +7075,7 @@ test "validateBlockForIBD: bad BIP-34 coinbase height" {
     const merkle = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, allocator);
 
     var header = consensus.REGTEST.genesis_header;
+    header.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     header.merkle_root = merkle;
     header.bits = 0x207fffff;
     ibdTestMineNonce(&header, &consensus.REGTEST);
@@ -7075,6 +7171,7 @@ test "validateBlockForIBD: missing prevout returns MissingInput" {
     );
 
     var header = consensus.REGTEST.genesis_header;
+    header.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     header.merkle_root = merkle;
     header.bits = 0x207fffff;
     ibdTestMineNonce(&header, &consensus.REGTEST);
@@ -7129,6 +7226,7 @@ test "validateBlockForIBD: force_skip_scripts honours caller override" {
     const merkle = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, allocator);
 
     var header = consensus.REGTEST.genesis_header;
+    header.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     header.merkle_root = merkle;
     header.bits = 0x207fffff;
     ibdTestMineNonce(&header, &consensus.REGTEST);
@@ -7232,6 +7330,7 @@ test "submitblock-gate: rejects block with witness data but missing commitment" 
     );
 
     var header = consensus.REGTEST.genesis_header;
+    header.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     header.merkle_root = merkle;
     header.bits = 0x207fffff;
     ibdTestMineNonce(&header, &consensus.REGTEST);
@@ -7316,6 +7415,7 @@ test "submitblock-gate: rejects block with non-final tx" {
     );
 
     var header = consensus.REGTEST.genesis_header;
+    header.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     header.merkle_root = merkle;
     header.bits = 0x207fffff;
     ibdTestMineNonce(&header, &consensus.REGTEST);
@@ -7384,6 +7484,7 @@ test "submitblock-gate: accepts a structurally valid coinbase-only block" {
     const merkle = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, allocator);
 
     var header = consensus.REGTEST.genesis_header;
+    header.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     header.merkle_root = merkle;
     header.bits = 0x207fffff;
     ibdTestMineNonce(&header, &consensus.REGTEST);
@@ -7435,6 +7536,7 @@ test "validateBlockForIBD: rejects block with timestamp == MTP (BIP-113)" {
     const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{tid}, alloc);
     const test_mtp: u32 = 1_296_688_602;
     var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     hdr.merkle_root = mr;
     hdr.bits = 0x207fffff;
     hdr.timestamp = test_mtp; // == MTP must be rejected
@@ -7478,6 +7580,7 @@ test "validateBlockForIBD: accepts block with timestamp = MTP + 1 (BIP-113)" {
     const mr2 = try crypto.computeMerkleRoot(&[_]types.Hash256{tid2}, alloc);
     const test_mtp2: u32 = 1_296_688_602;
     var hdr2 = consensus.REGTEST.genesis_header;
+    hdr2.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     hdr2.merkle_root = mr2;
     hdr2.bits = 0x207fffff;
     hdr2.timestamp = test_mtp2 + 1; // strictly greater -> pass
@@ -7519,6 +7622,7 @@ test "validateBlockForIBD: prev_mtp=0 skips MTP check (genesis-adjacent)" {
     const tid3 = try crypto.computeTxid(&cb3, alloc);
     const mr3 = try crypto.computeMerkleRoot(&[_]types.Hash256{tid3}, alloc);
     var hdr3 = consensus.REGTEST.genesis_header;
+    hdr3.version = 4; // REGTEST bip34/66/65 all active at height=1 → min version 4
     hdr3.merkle_root = mr3;
     hdr3.bits = 0x207fffff;
     hdr3.timestamp = 1; // very old - skipped when prev_mtp=0
@@ -7538,6 +7642,602 @@ test "validateBlockForIBD: prev_mtp=0 skips MTP check (genesis-adjacent)" {
         .prev_mtp = 0,
         .force_skip_scripts = true,
     }, alloc);
+}
+
+// ============================================================================
+// W85 — ContextualCheckBlockHeader gate tests
+//
+// Reference: bitcoin-core/src/validation.cpp:4080-4121
+//   Gate 2: time-too-old (MTP) — already covered above (BIP-113 tests).
+//   Gate 3: time-timewarp-attack (BIP-94) — below.
+//   Gate 4: time-too-new (MAX_FUTURE_BLOCK_TIME) — below.
+//   Gate 5/6/7: bad-version v<2/3/4 (BIP34/BIP66/BIP65) — below.
+// ============================================================================
+
+/// Build a minimal valid coinbase transaction for W85 gate tests.
+/// Uses script_sig = OP_1 + 0x00, which satisfies BIP-34 at height=1.
+/// All W85 tests use height=1 (or a height where BIP-34 is not yet active).
+fn w85MakeCoinbase(subsidy_params: *const consensus.NetworkParams) types.Transaction {
+    return types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler (canonical BIP-34 height=1)
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.getBlockSubsidy(1, subsidy_params),
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }},
+        .lock_time = 0,
+    };
+}
+
+// ---- BIP-94 timewarp gate -----------------------------------------------
+
+test "W85: timewarp rejected on testnet4-like retarget boundary (BIP-94)" {
+    // On a network with enforce_bip94=true, the first block of a difficulty period
+    // must have timestamp >= prev_block_timestamp - MAX_TIMEWARP (600s).
+    // Reference: validation.cpp:4097-4105.
+    //
+    // We use REGTEST params with enforce_bip94=true to get regtest-loose PoW.
+    const alloc = std.testing.allocator;
+    var test_params = consensus.REGTEST;
+    test_params.enforce_bip94 = true;
+    // Use REGTEST's 1-day target_timespan so the interval is small (144 blocks).
+    const interval = consensus.difficultyAdjustmentInterval(&test_params);
+
+    const cb = w85MakeCoinbase(&test_params);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    // prev_block_timestamp = 1_000_000; block timestamp = 999_399 < 999_400 → reject
+    hdr.timestamp = 1_000_000 - 601; // 601s earlier than prev — exceeds MAX_TIMEWARP (600)
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = interval, // first block of second period
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .prev_block_timestamp = 1_000_000,
+        .force_skip_scripts = true,
+    }, alloc);
+    try std.testing.expectError(ValidationError.TimewarpAttack, result);
+}
+
+test "W85: timewarp accepted on testnet4 retarget boundary (timestamp >= prev - 600)" {
+    // Block timestamp exactly at the lower bound should pass.
+    const alloc = std.testing.allocator;
+    var test_params = consensus.REGTEST;
+    test_params.enforce_bip94 = true;
+    const interval = consensus.difficultyAdjustmentInterval(&test_params);
+
+    const cb = w85MakeCoinbase(&test_params);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    // prev = 1_000_000; lower_bound = 1_000_000 - 600 = 999_400; timestamp >= lower_bound → pass
+    hdr.timestamp = 1_000_000 - 600; // exactly at lower bound — should pass
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    // This should NOT return TimewarpAttack (timestamp == prev - 600 is allowed).
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = interval,
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .prev_block_timestamp = 1_000_000,
+        .force_skip_scripts = true,
+    }, alloc);
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.TimewarpAttack);
+    }
+}
+
+test "W85: timewarp gate skipped on non-retarget block (height % interval != 0)" {
+    // The timewarp gate only fires at retarget boundaries.  At a mid-period block
+    // (height=1) even a wildly backward timestamp must NOT trigger TimewarpAttack.
+    const alloc = std.testing.allocator;
+    var test_params = consensus.REGTEST;
+    test_params.enforce_bip94 = true;
+
+    const cb = w85MakeCoinbase(&test_params);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    hdr.timestamp = 1_000_000 - 9999; // very old but not on retarget boundary
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    // height=1 is NOT a retarget boundary → timewarp gate must NOT fire.
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1, // not a retarget boundary
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .prev_block_timestamp = 1_000_000,
+        .force_skip_scripts = true,
+    }, alloc);
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.TimewarpAttack);
+    }
+}
+
+test "W85: timewarp gate skipped when enforce_bip94=false (mainnet)" {
+    // Mainnet (enforce_bip94=false) must never trigger TimewarpAttack at any height.
+    const alloc = std.testing.allocator;
+
+    // Build test params: mainnet-like but regtest-loose PoW.
+    var test_params = consensus.MAINNET;
+    test_params.pow_limit = consensus.REGTEST.pow_limit;
+    test_params.pow_no_retarget = true;
+    // enforce_bip94 is already false on mainnet.
+
+    const interval = consensus.difficultyAdjustmentInterval(&test_params); // 2016
+    const cb = w85MakeCoinbase(&test_params);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.MAINNET.genesis_header;
+    hdr.version = 1; // pre-BIP34 height (2016 < mainnet bip34=227931)
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    hdr.timestamp = 1_000_000 - 9999; // wildly backward
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    // height=2016 (retarget) + mainnet enforce_bip94=false → no timewarp check.
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = interval,
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .prev_block_timestamp = 1_000_000,
+        .force_skip_scripts = true,
+    }, alloc);
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.TimewarpAttack);
+    }
+}
+
+test "W85: timewarp gate skipped when prev_block_timestamp=0 (not available)" {
+    // When prev_block_timestamp=0 (not set by caller), skip the timewarp check
+    // regardless of enforce_bip94.
+    const alloc = std.testing.allocator;
+    var test_params = consensus.REGTEST;
+    test_params.enforce_bip94 = true;
+    const interval = consensus.difficultyAdjustmentInterval(&test_params);
+
+    const cb = w85MakeCoinbase(&test_params);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    hdr.timestamp = 1; // would be wildly backward if prev_block_timestamp were set
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = interval,
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .prev_block_timestamp = 0, // not available → skip timewarp check
+        .force_skip_scripts = true,
+    }, alloc);
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.TimewarpAttack);
+    }
+}
+
+// ---- Future-time gate (time-too-new) ------------------------------------
+
+test "W85: FutureTimestamp rejected when block.timestamp > current_time + 7200" {
+    // Core validation.cpp:4108: block.Time() > NodeClock::now() + 7200s → INVALID.
+    const alloc = std.testing.allocator;
+    var test_params = consensus.REGTEST;
+
+    const cb = w85MakeCoinbase(&test_params);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    const fake_now: i64 = 1_700_000_000; // arbitrary "current time"
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    // block timestamp = now + 7201 (exceeds limit)
+    hdr.timestamp = @intCast(fake_now + consensus.MAX_FUTURE_BLOCK_TIME + 1);
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1,
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .current_time = fake_now,
+        .force_skip_scripts = true,
+    }, alloc);
+    try std.testing.expectError(ValidationError.FutureTimestamp, result);
+}
+
+test "W85: FutureTimestamp accepted when block.timestamp == current_time + 7200 (boundary)" {
+    // Exactly at the boundary (== now + 7200) must be accepted.
+    // Core condition is strictly >, so == is allowed.
+    const alloc = std.testing.allocator;
+    var test_params = consensus.REGTEST;
+
+    const cb = w85MakeCoinbase(&test_params);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    const fake_now: i64 = 1_700_000_000;
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    hdr.timestamp = @intCast(fake_now + consensus.MAX_FUTURE_BLOCK_TIME); // exactly at limit
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1,
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .current_time = fake_now,
+        .force_skip_scripts = true,
+    }, alloc);
+    // Should NOT be FutureTimestamp (boundary is inclusive — == is allowed).
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.FutureTimestamp);
+    }
+}
+
+test "W85: FutureTimestamp gate skipped when current_time=0 (IBD fast-path)" {
+    // current_time=0 means caller has not set it → gate is skipped entirely.
+    const alloc = std.testing.allocator;
+    var test_params = consensus.REGTEST;
+
+    const cb = w85MakeCoinbase(&test_params);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    hdr.timestamp = 0xFFFF_FFFF; // max u32 — far future, would fail if gate fired
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1,
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .current_time = 0, // gate disabled
+        .force_skip_scripts = true,
+    }, alloc);
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.FutureTimestamp);
+    }
+}
+
+// ---- bad-version gates (BIP34 v<2, BIP66 v<3, BIP65 v<4) ---------------
+
+test "W85: BadVersion v<2 rejected after BIP34 activation (REGTEST)" {
+    // REGTEST bip34_height=1: version < 2 at height >= 1 must fail.
+    // Reference: validation.cpp:4113.
+    const alloc = std.testing.allocator;
+
+    const cb = w85MakeCoinbase(&consensus.REGTEST);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 1; // too old — BIP34 active at height 1
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    ibdTestMineNonce(&hdr, &consensus.REGTEST);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    try std.testing.expectError(ValidationError.BadVersion, result);
+}
+
+test "W85: BadVersion v<2 NOT rejected before BIP34 activation (mainnet pre-activation)" {
+    // Mainnet bip34_height=227931; at height=100 version=1 is still valid.
+    const alloc = std.testing.allocator;
+
+    var test_params = consensus.MAINNET;
+    test_params.pow_limit = consensus.REGTEST.pow_limit;
+    test_params.pow_no_retarget = true;
+
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x01, 0x64 }, // height 100 encoded (BIP34 not yet active)
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.getBlockSubsidy(100, &test_params),
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }},
+        .lock_time = 0,
+    };
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.MAINNET.genesis_header;
+    hdr.version = 1; // still OK at pre-BIP34 height
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 100, // below bip34_height=227931 → version 1 still valid
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    // Should NOT fail with BadVersion (version 1 is valid pre-BIP34).
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.BadVersion);
+    }
+}
+
+test "W85: BadVersion v<3 rejected after BIP66/DERSIG activation (REGTEST)" {
+    // REGTEST bip66_height=1: version < 3 at height >= 1 must fail.
+    // Reference: validation.cpp:4114.
+    const alloc = std.testing.allocator;
+
+    const cb = w85MakeCoinbase(&consensus.REGTEST);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 2; // too old — BIP66 active at height 1 requires v>=3
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    ibdTestMineNonce(&hdr, &consensus.REGTEST);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    try std.testing.expectError(ValidationError.BadVersion, result);
+}
+
+test "W85: BadVersion v<4 rejected after BIP65/CLTV activation (REGTEST)" {
+    // REGTEST bip65_height=1: version < 4 at height >= 1 must fail.
+    // Reference: validation.cpp:4115.
+    const alloc = std.testing.allocator;
+
+    const cb = w85MakeCoinbase(&consensus.REGTEST);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 3; // too old — BIP65 active at height 1 requires v>=4
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    ibdTestMineNonce(&hdr, &consensus.REGTEST);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    try std.testing.expectError(ValidationError.BadVersion, result);
+}
+
+test "W85: BadVersion version=4 accepted after all BIP activations (REGTEST)" {
+    // version=4 satisfies all three bad-version gates after activation.
+    const alloc = std.testing.allocator;
+
+    const cb = w85MakeCoinbase(&consensus.REGTEST);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4; // meets all three thresholds
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    ibdTestMineNonce(&hdr, &consensus.REGTEST);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    // Should not fail with BadVersion.
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 1,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.BadVersion);
+    }
+}
+
+test "W85: BadVersion v<3 NOT rejected before BIP66 activation (mainnet h=363724)" {
+    // Mainnet bip66_height=363725; at height=363724 version=2 is still valid.
+    const alloc = std.testing.allocator;
+
+    var test_params = consensus.MAINNET;
+    test_params.pow_limit = consensus.REGTEST.pow_limit;
+    test_params.pow_no_retarget = true;
+
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x03, 0x44, 0x8D, 0x05 }, // height 363716 in little-endian (just below 363725)
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.getBlockSubsidy(363724, &test_params),
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }},
+        .lock_time = 0,
+    };
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    var hdr = consensus.MAINNET.genesis_header;
+    hdr.version = 2; // OK at height < bip66_height=363725
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    ibdTestMineNonce(&hdr, &test_params);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const result = validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = bhash,
+        .height = 363724, // one block below bip66_height
+        .params = &test_params,
+        .prevout_lookup_ctx = @ptrCast(&d),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+    // version 2 is valid here (bip66 not yet active).
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.BadVersion);
+    }
 }
 
 // ============================================================================
@@ -7768,6 +8468,9 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range when BIP34Hash verifie
     var cb_bufs: Bip30CoinbaseBufs = .{};
     var cb = bip30MakeCoinbase(250000, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    // Height 250000 > MAINNET bip34_height=227931 → bad-version gate fires for v<2.
+    // Set version=4 BEFORE mining so the hash is correct for the new version.
+    blk.header.version = 4;
     bip30Mine(&blk, alloc);
 
     const coinbase_txid = crypto.computeTxidStreaming(&cb);
@@ -7958,6 +8661,9 @@ test "W79 G6: BIP-34 bypass — active_chain too short to include bip34_height �
     var cb_bufs: Bip30CoinbaseBufs = .{};
     var cb = bip30MakeCoinbase(250000, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    // Height 250000 > MAINNET bip34_height=227931 → bad-version gate fires for v<2.
+    // Set version=4 BEFORE mining so the hash is correct for the new version.
+    blk.header.version = 4;
     bip30Mine(&blk, alloc);
 
     const coinbase_txid = crypto.computeTxidStreaming(&cb);
@@ -7995,6 +8701,9 @@ test "W79 G7: BIP34_IMPLIES_BIP30_LIMIT — BIP-30 re-enabled at h=1,983,702" {
     var cb_bufs: Bip30CoinbaseBufs = .{};
     var cb = bip30MakeCoinbase(1983702, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    // Height 1,983,702 > MAINNET bip65_height=388381 → bad-version gate fires for v<4.
+    // Set version=4 BEFORE mining so the hash is correct for the new version.
+    blk.header.version = 4;
     bip30Mine(&blk, alloc);
 
     const coinbase_txid = crypto.computeTxidStreaming(&cb);
@@ -8035,6 +8744,9 @@ test "W79 G7b: h=1,983,701 is still BIP-34 range (BIP-30 skipped with good chain
     var cb_bufs: Bip30CoinbaseBufs = .{};
     var cb = bip30MakeCoinbase(1983701, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    // Height 1,983,701 > MAINNET bip65_height=388381 → bad-version gate fires for v<4.
+    // Set version=4 BEFORE mining so the hash is correct for the new version.
+    blk.header.version = 4;
     bip30Mine(&blk, alloc);
 
     const coinbase_txid = crypto.computeTxidStreaming(&cb);
