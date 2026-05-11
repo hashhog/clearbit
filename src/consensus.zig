@@ -822,12 +822,17 @@ pub fn targetToBits(target: *const [32]u8) u32 {
             @as(u32, target[size - 2]) << 8 |
             @as(u32, target[size - 3]);
     } else if (size == 2) {
+        // Bug fix: exponent must equal `size` (2), not 3.
+        // Core's GetCompact: nCompact = GetLow64() << 8*(3-2); nSize stays 2.
+        // The mantissa is the 2-byte value shifted to the top of the 3-byte field.
         mantissa = @as(u32, target[size - 1]) << 16 |
             @as(u32, target[size - 2]) << 8;
-        exponent = 3;
+        // exponent is already set to size (= 2) above — do not override to 3.
     } else {
+        // size == 1: exponent must equal 1, not 3.
+        // Core's GetCompact: nCompact = GetLow64() << 8*(3-1); nSize stays 1.
         mantissa = @as(u32, target[size - 1]) << 16;
-        exponent = 3;
+        // exponent is already set to size (= 1) above — do not override to 3.
     }
 
     // If the high bit is set, we need to shift right and increment exponent
@@ -1082,34 +1087,122 @@ pub fn getPowLimitBits(params: *const NetworkParams) u32 {
     return targetToBits(&params.pow_limit);
 }
 
+/// Return false if the proof-of-work requirement specified by new_nbits at a
+/// given height is not possible, given the proof-of-work on the prior block as
+/// specified by old_nbits.
+///
+/// - At difficulty adjustment boundaries (height % interval == 0): new_nbits must
+///   be within the 4× factor of old_nbits (after rounding through SetCompact/GetCompact).
+/// - At all other heights: new_nbits must equal old_nbits.
+///
+/// Always returns true on networks where min-difficulty blocks are allowed
+/// (testnet3/testnet4/regtest) because those networks permit arbitrary nBits.
+///
+/// Reference: bitcoin-core/src/pow.cpp PermittedDifficultyTransition()
+pub fn permittedDifficultyTransition(
+    params: *const NetworkParams,
+    height: u64,
+    old_nbits: u32,
+    new_nbits: u32,
+) bool {
+    // Testnet/regtest allow min-difficulty blocks — skip validation.
+    if (params.pow_allow_min_difficulty_blocks) return true;
+
+    const interval = @as(u64, difficultyAdjustmentInterval(params));
+
+    if (height % interval == 0) {
+        // At a retarget boundary, validate the 4× factor.
+        const smallest_timespan: u32 = params.pow_target_timespan / 4;
+        const largest_timespan: u32 = params.pow_target_timespan * 4;
+        const pow_limit = params.pow_limit;
+
+        // Calculate the largest (easiest) allowed new target:
+        // largest_difficulty_target = old_target * largest_timespan / target_timespan
+        const old_target_raw = bitsToTarget(old_nbits);
+        var largest_target = multiplyTargetByRatio(&old_target_raw, largest_timespan, params.pow_target_timespan);
+        if (!hashMeetsTarget(&largest_target, &pow_limit)) {
+            largest_target = pow_limit;
+        }
+        // Round through compact representation (mirrors Core: SetCompact(GetCompact()))
+        const maximum_new_target = bitsToTarget(targetToBits(&largest_target));
+
+        // Calculate the smallest (hardest) allowed new target:
+        var smallest_target = multiplyTargetByRatio(&old_target_raw, smallest_timespan, params.pow_target_timespan);
+        if (!hashMeetsTarget(&smallest_target, &pow_limit)) {
+            smallest_target = pow_limit;
+        }
+        const minimum_new_target = bitsToTarget(targetToBits(&smallest_target));
+
+        // new_target must be in [minimum_new_target, maximum_new_target]
+        const observed_new_target = bitsToTarget(new_nbits);
+        // observed > maximum → too easy
+        if (compareTargets(&maximum_new_target, &observed_new_target) < 0) return false;
+        // observed < minimum → too hard
+        if (compareTargets(&minimum_new_target, &observed_new_target) > 0) return false;
+    } else {
+        // Between retargets, bits must be unchanged.
+        if (old_nbits != new_nbits) return false;
+    }
+    return true;
+}
+
+/// Compare two 256-bit targets (little-endian byte arrays).
+/// Returns -1 if a < b, 0 if a == b, 1 if a > b.
+fn compareTargets(a: *const [32]u8, b: *const [32]u8) i8 {
+    var i: usize = 32;
+    while (i > 0) {
+        i -= 1;
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return 1;
+    }
+    return 0;
+}
+
 /// Multiply a 256-bit target by a ratio (numerator / denominator).
-/// Uses a simple byte-by-byte multiplication approach.
-fn multiplyTargetByRatio(target: *const [32]u8, numerator: u32, denominator: u32) [32]u8 {
-    // We'll work with the target as a big integer
+///
+/// Mirrors Bitcoin Core's arith_uint256 `*= nActualTimespan; /= nPowTargetTimespan`.
+/// The intermediate product is 256+32 = 288 bits: numerator fits in u32, so the
+/// carry after processing the last (MSB) byte of the 256-bit target can be up to
+/// (numerator - 1) ≈ 22 bits.  Storing the carry as u8 would overflow and corrupt
+/// the result for targets with significant bits near byte 31 (e.g. regtest 0x207fffff).
+///
+/// Fix: use a u64 overflow cell instead of a u8 byte, and feed it correctly into the
+/// long-division pass.
+///
+/// Reference: bitcoin-core/src/arith_uint256.cpp base_uint::operator*=(uint32_t)
+///            and base_uint::operator/=()
+pub fn multiplyTargetByRatio(target: *const [32]u8, numerator: u32, denominator: u32) [32]u8 {
+    // We'll work with the target as a big integer (256-bit, little-endian bytes).
     // new = target * numerator / denominator
+    //
+    // Intermediate: 33 bytes (256+8 bits) where result[32] is a u64 overflow cell.
+    // After multiplying by a u32 numerator the carry from byte 31 can be up to
+    // (numerator - 1) which requires up to 22 bits — does not fit in u8.
 
-    // First, multiply by numerator
-    var result: [33]u8 = [_]u8{0} ** 33; // Extra byte for overflow
+    var result_lo: [32]u8 = [_]u8{0} ** 32;
+    var result_hi: u64 = 0; // overflow cell: holds carry beyond byte 31
+
     var carry: u64 = 0;
-
     for (0..32) |i| {
         const product = @as(u64, target[i]) * @as(u64, numerator) + carry;
-        result[i] = @intCast(product & 0xFF);
+        result_lo[i] = @intCast(product & 0xFF);
         carry = product >> 8;
     }
-    result[32] = @intCast(carry);
+    result_hi = carry; // carry from the 256-bit multiplication (up to ~22 bits)
 
-    // Then divide by denominator
+    // Long-division pass: iterate from MSB (overflow cell) down to byte 0.
     var final: [32]u8 = [_]u8{0} ** 32;
     var remainder: u64 = 0;
 
-    var i: usize = 33;
+    // Process the overflow cell first (does not produce output bytes, only remainder)
+    remainder = result_hi % denominator;
+
+    // Then process bytes 31..0 from MSB to LSB
+    var i: usize = 32;
     while (i > 0) {
         i -= 1;
-        const dividend = (remainder << 8) | @as(u64, result[i]);
-        if (i < 32) {
-            final[i] = @intCast(dividend / denominator);
-        }
+        const dividend = (remainder << 8) | @as(u64, result_lo[i]);
+        final[i] = @intCast(dividend / denominator);
         remainder = dividend % denominator;
     }
 
@@ -1715,6 +1808,155 @@ test "difficulty adjustment 4x clamp up" {
         }
     }
     try std.testing.expect(!new_larger); // New target should be smaller
+}
+
+// ============================================================================
+// W83: multiplyTargetByRatio, targetToBits, permittedDifficultyTransition tests
+// ============================================================================
+
+test "W83: multiplyTargetByRatio identity (×1 / ×1)" {
+    // result = target * T / T = target
+    const bits: u32 = 0x1d00ffff;
+    const target = bitsToTarget(bits);
+    const result = multiplyTargetByRatio(&target, TARGET_TIMESPAN, TARGET_TIMESPAN);
+    try std.testing.expectEqualSlices(u8, &target, &result);
+}
+
+test "W83: multiplyTargetByRatio 4x scale-up (easy case)" {
+    // actual = 4*T → target * 4. After retarget result should be 4× harder-to-mine.
+    const bits: u32 = 0x1c0fffff;
+    const target = bitsToTarget(bits);
+    const numerator = TARGET_TIMESPAN * 4;
+    const result = multiplyTargetByRatio(&target, numerator, TARGET_TIMESPAN);
+    // result should be 4× target; check it is larger (easier difficulty)
+    var result_larger = false;
+    var i: usize = 32;
+    while (i > 0) {
+        i -= 1;
+        if (result[i] > target[i]) { result_larger = true; break; }
+        if (result[i] < target[i]) break;
+    }
+    try std.testing.expect(result_larger);
+}
+
+test "W83: multiplyTargetByRatio regtest 0x207fffff no carry overflow" {
+    // Regtest target has significant bits up to byte 31. With 4× numerator the
+    // carry after multiplying byte 31 exceeds u8 range. The fix stores it in u64.
+    // Result should be >= target (difficulty eased) and ≤ pow_limit (clamped).
+    const target = bitsToTarget(0x207fffff);
+    const result = multiplyTargetByRatio(&target, TARGET_TIMESPAN * 4, TARGET_TIMESPAN);
+    // Clamp: result >= pow_limit → result should be pow_limit for REGTEST
+    // (0x207fffff is the regtest pow_limit itself, so any result ≥ it clamps to it)
+    // Just verify no crash and result makes sense (≥ target).
+    var result_ge_target = true;
+    var j: usize = 32;
+    while (j > 0) {
+        j -= 1;
+        if (result[j] > target[j]) break;
+        if (result[j] < target[j]) { result_ge_target = false; break; }
+    }
+    try std.testing.expect(result_ge_target);
+}
+
+test "W83: multiplyTargetByRatio exact known vector (mainnet genesis bits)" {
+    // 0x1d00ffff = mainnet genesis/first difficulty.
+    // Timespan exactly TARGET_TIMESPAN → result unchanged.
+    const bits: u32 = 0x1d00ffff;
+    const target = bitsToTarget(bits);
+    const result = multiplyTargetByRatio(&target, TARGET_TIMESPAN, TARGET_TIMESPAN);
+    // Should round-trip through targetToBits to same compact
+    const result_bits = targetToBits(&result);
+    try std.testing.expectEqual(bits, result_bits);
+}
+
+test "W83: targetToBits correct exponent for size >= 3" {
+    // Standard case: 0x1d00ffff should round-trip cleanly.
+    const bits: u32 = 0x1d00ffff;
+    const target = bitsToTarget(bits);
+    const back = targetToBits(&target);
+    try std.testing.expectEqual(bits, back);
+}
+
+test "W83: targetToBits correct exponent for size == 2 (was wrong: exponent=3 instead of 2)" {
+    // A target with only 2 significant bytes. Build manually.
+    // target[0]=0xAB, target[1]=0x12, rest zero → size=2.
+    var target: [32]u8 = [_]u8{0} ** 32;
+    target[0] = 0xAB;
+    target[1] = 0x12;
+    // Core: nSize=2, nCompact = (target[1]<<8 | target[0]) << 8 = 0x12AB00,
+    // exponent=2 → compact = (2<<24) | 0x12AB00 = 0x0212AB00
+    // BUT: mantissa = 0x12AB00 → bit 23 (0x00800000) = 0 → no shift.
+    const result = targetToBits(&target);
+    const expected_exp: u32 = 2;
+    const exp_got = result >> 24;
+    try std.testing.expectEqual(expected_exp, exp_got);
+    // Verify round-trip
+    const back = bitsToTarget(result);
+    try std.testing.expectEqualSlices(u8, &target, &back);
+}
+
+test "W83: targetToBits correct exponent for size == 1 (was wrong: exponent=3 instead of 1)" {
+    // A target with only 1 significant byte.
+    var target: [32]u8 = [_]u8{0} ** 32;
+    target[0] = 0x05;
+    // Core: nSize=1, nCompact = target[0] << 16 = 0x050000, exponent=1
+    // compact = (1<<24) | 0x050000 = 0x01050000
+    const result = targetToBits(&target);
+    const exp_got = result >> 24;
+    try std.testing.expectEqual(@as(u32, 1), exp_got);
+    // Round-trip
+    const back = bitsToTarget(result);
+    try std.testing.expectEqualSlices(u8, &target, &back);
+}
+
+test "W83: permittedDifficultyTransition always true on testnet" {
+    // Core pow.cpp:91: if (params.fPowAllowMinDifficultyBlocks) return true;
+    try std.testing.expect(permittedDifficultyTransition(&TESTNET3, 2016, 0x1d00ffff, 0x18014621));
+    try std.testing.expect(permittedDifficultyTransition(&TESTNET4, 2016, 0x1d00ffff, 0x18014621));
+    try std.testing.expect(permittedDifficultyTransition(&REGTEST, 144, 0x207fffff, 0x1d00ffff));
+}
+
+test "W83: permittedDifficultyTransition non-boundary requires same bits" {
+    // Off boundary: old_bits must equal new_bits.
+    try std.testing.expect(permittedDifficultyTransition(&MAINNET, 100, 0x1d00ffff, 0x1d00ffff));
+    try std.testing.expect(!permittedDifficultyTransition(&MAINNET, 100, 0x1d00ffff, 0x1c0fffff));
+}
+
+test "W83: permittedDifficultyTransition boundary within 4x factor" {
+    // At a retarget boundary, new_bits must be within the ±4× factor of old_bits.
+    // Same bits → within factor of 1 → allowed.
+    try std.testing.expect(permittedDifficultyTransition(&MAINNET, 2016, 0x1d00ffff, 0x1d00ffff));
+}
+
+test "W83: permittedDifficultyTransition boundary at maximum 4x (allowed)" {
+    // Compute the exact maximum new_bits for a given old_bits by replicating Core's math.
+    // Core pow.cpp:103-114.
+    const old_bits: u32 = 0x1c0fffff;
+    const old_target = bitsToTarget(old_bits);
+    var max_target = multiplyTargetByRatio(&old_target, MAINNET.pow_target_timespan * 4, MAINNET.pow_target_timespan);
+    if (!hashMeetsTarget(&max_target, &MAINNET.pow_limit)) {
+        max_target = MAINNET.pow_limit;
+    }
+    // Round through compact (Core does SetCompact(GetCompact()) to normalize)
+    const max_bits = targetToBits(&bitsToTarget(targetToBits(&max_target)));
+    try std.testing.expect(permittedDifficultyTransition(&MAINNET, 2016, old_bits, max_bits));
+}
+
+test "W83: permittedDifficultyTransition boundary too easy (> 4x, rejected)" {
+    // An extremely easy target that is clearly beyond any 4× adjustment.
+    // old=0x1c0fffff, max 4× is around 0x1c3fffff range.
+    // Something like 0x1e00ffff (much larger mantissa × bigger exponent) will exceed it.
+    const old_bits: u32 = 0x1c0fffff;
+    const too_easy: u32 = 0x1e00ffff; // This is >> 4× old_bits
+    try std.testing.expect(!permittedDifficultyTransition(&MAINNET, 2016, old_bits, too_easy));
+}
+
+test "W83: permittedDifficultyTransition boundary too hard (>4x harder)" {
+    // 1/4× factor: old * (T/4) / T = old/4. New target smaller than old/4 → rejected.
+    const old_bits: u32 = 0x1d00ffff;
+    // An absurdly hard target (e.g., genesis bits but with exponent 0x17) is well below old/4.
+    const very_hard: u32 = 0x17000001;
+    try std.testing.expect(!permittedDifficultyTransition(&MAINNET, 2016, old_bits, very_hard));
 }
 
 // ============================================================================
