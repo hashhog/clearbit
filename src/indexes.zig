@@ -185,17 +185,26 @@ pub fn fastRange64(x: u64, range: u64) u64 {
     return @intCast(product >> 64);
 }
 
-/// Golomb-Rice bit stream writer.
+/// Golomb-Rice bit stream writer — MSB-first, matching Bitcoin Core's BitStreamWriter
+/// (src/streams.h).  Bitcoin Core comment: "The next bit to be written to is at
+/// m_offset from the most significant bit position."
+///
+/// W90 bug fixed: the previous implementation used LSB-first bit ordering.  That
+/// produced bit-reversed output, making every encoded filter incompatible with Core
+/// (different bytes, wrong match results for all elements).
 pub const BitStreamWriter = struct {
     data: std.ArrayList(u8),
-    pending: u64,
-    pending_bits: u6,
+    /// Buffered byte being assembled; bits filled from MSB downward.
+    buffer: u8,
+    /// How many HIGH-ORDER bits of `buffer` have been written so far (0..8).
+    /// When offset == 8 the byte is complete and is flushed.
+    offset: u8,
 
     pub fn init(allocator: std.mem.Allocator) BitStreamWriter {
         return BitStreamWriter{
             .data = std.ArrayList(u8).init(allocator),
-            .pending = 0,
-            .pending_bits = 0,
+            .buffer = 0,
+            .offset = 0,
         };
     }
 
@@ -203,15 +212,29 @@ pub const BitStreamWriter = struct {
         self.data.deinit();
     }
 
-    /// Write n bits (n <= 57).
+    /// Write the `n` least-significant bits of `value`, MSB first (n <= 57).
+    /// Mirrors Core's BitStreamWriter::Write (streams.h:329).
     pub fn writeBits(self: *BitStreamWriter, value: u64, n: u6) !void {
-        self.pending |= value << self.pending_bits;
-        self.pending_bits += n;
-
-        while (self.pending_bits >= 8) {
-            try self.data.append(@intCast(self.pending & 0xff));
-            self.pending >>= 8;
-            self.pending_bits -= 8;
+        var remaining: u32 = n; // use u32 to avoid narrow-type arithmetic traps
+        while (remaining > 0) {
+            const avail: u32 = 8 - @as(u32, self.offset);
+            const bits: u32 = @min(avail, remaining);
+            // Extract `bits` bits from the MSB side of the remaining `remaining`
+            // bits of value and place them in the MSB side of buffer.
+            // Core: m_buffer |= (data << (64 - nbits)) >> (64 - 8 + m_offset)
+            // `remaining > 0` so `64 - remaining <= 63` (fits u6).
+            // `self.offset < 8` so `64 - 8 + self.offset <= 63` (fits u6).
+            const ls: u6 = @intCast(64 - remaining);
+            const rs: u6 = @intCast(64 - 8 + @as(u32, self.offset));
+            const shift_in: u64 = (value << ls) >> rs;
+            self.buffer |= @as(u8, @intCast(shift_in & 0xff));
+            self.offset += @as(u8, @intCast(bits));
+            remaining -= bits;
+            if (self.offset == 8) {
+                try self.data.append(self.buffer);
+                self.buffer = 0;
+                self.offset = 0;
+            }
         }
     }
 
@@ -222,25 +245,28 @@ pub const BitStreamWriter = struct {
 
     /// Golomb-Rice encode a delta value with parameter P.
     pub fn golombRiceEncode(self: *BitStreamWriter, delta: u64, p: u8) !void {
-        // Quotient in unary (q ones followed by a zero)
+        // Quotient in unary: q 1-bits followed by one 0-bit.
         const q = delta >> @intCast(p);
-        var i: u64 = 0;
-        while (i < q) : (i += 1) {
-            try self.writeBit(true);
+        // Write q ones in chunks of up to 64 to match Core's batch-write path.
+        var ones_left: u64 = q;
+        while (ones_left > 0) {
+            const batch: u6 = @intCast(@min(ones_left, 57)); // keep within writeBits range
+            try self.writeBits(~@as(u64, 0), batch);
+            ones_left -= batch;
         }
-        try self.writeBit(false);
+        try self.writeBit(false); // terminating zero
 
-        // Remainder in P bits
+        // Remainder in P bits (MSB first).
         const r = delta & ((@as(u64, 1) << @intCast(p)) - 1);
         try self.writeBits(r, @intCast(p));
     }
 
-    /// Flush remaining bits, padding with zeros.
+    /// Flush remaining bits, padding low-order bits with zeros (MSB-first).
     pub fn flush(self: *BitStreamWriter) !void {
-        if (self.pending_bits > 0) {
-            try self.data.append(@intCast(self.pending & 0xff));
-            self.pending = 0;
-            self.pending_bits = 0;
+        if (self.offset > 0) {
+            try self.data.append(self.buffer);
+            self.buffer = 0;
+            self.offset = 0;
         }
     }
 
@@ -250,38 +276,51 @@ pub const BitStreamWriter = struct {
     }
 };
 
-/// Golomb-Rice bit stream reader.
+/// Golomb-Rice bit stream reader — MSB-first, matching Bitcoin Core's BitStreamReader
+/// (src/streams.h).  Bitcoin Core comment: "m_offset … number of high order bits
+/// in m_buffer already returned by previous Read() calls."
+///
+/// W90 bug fixed: the previous implementation used LSB-first ordering, so decoded
+/// values from any Core-produced filter were garbage.
 pub const BitStreamReader = struct {
     data: []const u8,
     pos: usize,
-    pending: u64,
-    pending_bits: u6,
+    /// Buffered byte; bits consumed from MSB downward.
+    buffer: u8,
+    /// How many HIGH-ORDER bits of `buffer` have already been consumed (0..8).
+    /// When offset == 8 we need to load the next byte.
+    offset: u8, // 0..8
 
     pub fn init(data: []const u8) BitStreamReader {
         return BitStreamReader{
             .data = data,
             .pos = 0,
-            .pending = 0,
-            .pending_bits = 0,
+            .buffer = 0,
+            .offset = 8, // force load on first read
         };
     }
 
-    /// Read n bits (n <= 57).
+    /// Read `n` bits, returned in the `n` LSBs of the result (MSB-first from stream).
+    /// Mirrors Core's BitStreamReader::Read (streams.h:281).
     pub fn readBits(self: *BitStreamReader, n: u6) !u64 {
-        // Load more bytes if needed
-        while (self.pending_bits < n) {
-            if (self.pos >= self.data.len) {
-                return error.UnexpectedEndOfData;
+        var result: u64 = 0;
+        var remaining: u32 = n; // u32 to avoid narrow arithmetic traps
+        while (remaining > 0) {
+            if (self.offset == 8) {
+                if (self.pos >= self.data.len) return error.UnexpectedEndOfData;
+                self.buffer = self.data[self.pos];
+                self.pos += 1;
+                self.offset = 0;
             }
-            self.pending |= @as(u64, self.data[self.pos]) << self.pending_bits;
-            self.pending_bits += 8;
-            self.pos += 1;
+            const avail: u32 = 8 - @as(u32, self.offset);
+            const bits: u32 = @min(avail, remaining);
+            // Core: data <<= bits; data |= (uint8_t)(m_buffer << m_offset) >> (8 - bits)
+            result <<= @intCast(bits);
+            const shifted: u8 = @as(u8, self.buffer << @as(u3, @intCast(self.offset))) >> @as(u3, @intCast(8 - bits));
+            result |= shifted;
+            self.offset += @as(u8, @intCast(bits));
+            remaining -= bits;
         }
-
-        const mask = (@as(u64, 1) << n) - 1;
-        const result = self.pending & mask;
-        self.pending >>= n;
-        self.pending_bits -= n;
         return result;
     }
 
@@ -292,21 +331,19 @@ pub const BitStreamReader = struct {
 
     /// Golomb-Rice decode with parameter P.
     pub fn golombRiceDecode(self: *BitStreamReader, p: u8) !u64 {
-        // Read unary quotient (count ones until zero)
+        // Read unary quotient (count 1-bits until a 0-bit).
         var q: u64 = 0;
         while (try self.readBit()) {
             q += 1;
         }
-
-        // Read P-bit remainder
+        // Read P-bit remainder.
         const r = try self.readBits(@intCast(p));
-
         return (q << @intCast(p)) | r;
     }
 
-    /// Check if we've reached the end.
+    /// Check if we've reached the end of the data (no bits remaining).
     pub fn isAtEnd(self: *const BitStreamReader) bool {
-        return self.pos >= self.data.len and self.pending_bits == 0;
+        return self.pos >= self.data.len and self.offset == 8;
     }
 };
 
@@ -332,12 +369,19 @@ pub const GCSFilter = struct {
     allocator: std.mem.Allocator,
 
     /// Create a new filter from a set of elements.
+    ///
+    /// Mirrors Core's GCSFilter constructor (blockfilter.cpp): elements are treated as
+    /// a set — duplicates are removed by content before N and F are computed.  Core uses
+    /// ElementSet (std::unordered_set<Element>) which deduplicates at insertion; we
+    /// replicate that by sorting element slices and removing consecutive equal entries.
+    ///
+    /// Bug fixed (W90): the previous implementation computed F = raw_element_count * M
+    /// before deduplication, then stored N = unique_count with F = unique_count * M.
+    /// This meant hashes were mapped to [0, F_wrong) at build time but to [0, F_correct)
+    /// during match() — making every element appear absent from its own filter.
     pub fn init(params: GCSParams, elements: []const []const u8, allocator: std.mem.Allocator) !GCSFilter {
-        const n: u32 = @intCast(elements.len);
-        const f: u64 = @as(u64, n) * @as(u64, params.m);
-
-        if (n == 0) {
-            // Empty filter: just the count
+        if (elements.len == 0) {
+            // Empty filter: just the CompactSize(0) count byte.
             var writer = serialize.Writer.init(allocator);
             try writer.writeCompactSize(0);
             return GCSFilter{
@@ -349,47 +393,60 @@ pub const GCSFilter = struct {
             };
         }
 
-        // Hash all elements to the range [0, F)
-        var hashes = try allocator.alloc(u64, elements.len);
+        // Step 1: deduplicate elements by content (Core uses ElementSet / unordered_set).
+        // Sort a copy of the slice-pointers by content, then unique-compact.
+        var dedup_ptrs = try allocator.alloc([]const u8, elements.len);
+        defer allocator.free(dedup_ptrs);
+        @memcpy(dedup_ptrs, elements);
+
+        const LexLess = struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        };
+        std.mem.sort([]const u8, dedup_ptrs, {}, LexLess.less);
+
+        var dedup_count: usize = 1;
+        for (1..dedup_ptrs.len) |i| {
+            if (!std.mem.eql(u8, dedup_ptrs[i], dedup_ptrs[dedup_count - 1])) {
+                dedup_ptrs[dedup_count] = dedup_ptrs[i];
+                dedup_count += 1;
+            }
+        }
+        const unique_elements = dedup_ptrs[0..dedup_count];
+
+        // Step 2: now that N is the deduplicated count, compute F = N * M (Core blockfilter.cpp:82).
+        const n: u32 = @intCast(unique_elements.len);
+        const f: u64 = @as(u64, n) * @as(u64, params.m);
+
+        // Step 3: hash each unique element to [0, F) and sort.
+        var hashes = try allocator.alloc(u64, unique_elements.len);
         defer allocator.free(hashes);
 
-        for (elements, 0..) |element, i| {
+        for (unique_elements, 0..) |element, i| {
             const h = SipHash.hash(params.siphash_k0, params.siphash_k1, element);
             hashes[i] = fastRange64(h, f);
         }
-
-        // Sort hashes
         std.mem.sort(u64, hashes, {}, std.sort.asc(u64));
 
-        // Remove duplicates (in place)
-        var unique_count: usize = 1;
-        for (1..hashes.len) |i| {
-            if (hashes[i] != hashes[unique_count - 1]) {
-                hashes[unique_count] = hashes[i];
-                unique_count += 1;
-            }
-        }
+        // Step 4: encode as Golomb-Rice deltas (CompactSize(N) ++ GR-encoded deltas).
+        var count_writer = serialize.Writer.init(allocator);
+        defer count_writer.deinit();
+        try count_writer.writeCompactSize(n);
 
-        // Encode deltas using Golomb-Rice
         var bit_writer = BitStreamWriter.init(allocator);
         errdefer bit_writer.deinit();
 
-        // Write element count as CompactSize (we'll prepend later)
-        var count_writer = serialize.Writer.init(allocator);
-        defer count_writer.deinit();
-        try count_writer.writeCompactSize(@intCast(unique_count));
-
         var last_value: u64 = 0;
-        for (hashes[0..unique_count]) |hash| {
+        for (hashes) |hash| {
             const delta = hash - last_value;
             try bit_writer.golombRiceEncode(delta, params.p);
             last_value = hash;
         }
-
         try bit_writer.flush();
         const filter_data = try bit_writer.toOwnedSlice();
 
-        // Combine count and filter data
+        // Combine CompactSize(N) prefix with Golomb-Rice body.
         const count_data = count_writer.getWritten();
         const encoded = try allocator.alloc(u8, count_data.len + filter_data.len);
         @memcpy(encoded[0..count_data.len], count_data);
@@ -398,8 +455,8 @@ pub const GCSFilter = struct {
 
         return GCSFilter{
             .params = params,
-            .n = @intCast(unique_count),
-            .f = @as(u64, @intCast(unique_count)) * @as(u64, params.m),
+            .n = n,
+            .f = f,
             .encoded = encoded,
             .allocator = allocator,
         };
@@ -969,17 +1026,32 @@ pub const BackgroundIndexer = struct {
 // Tests
 // ============================================================================
 
-test "SipHash-2-4 basic" {
-    // Test vector from SipHash reference
+test "SipHash-2-4 reference vector empty" {
+    // SipHash-2-4 reference test vector from the paper (also checked in
+    // Bitcoin Core's hash_tests.cpp:84).
+    // Key = 0x000102...0f split as k0=0x0706050403020100, k1=0x0f0e0d0c0b0a0908.
+    // SipHash-2-4("") == 0x726fdb47dd0e0e31.
     const k0: u64 = 0x0706050403020100;
     const k1: u64 = 0x0f0e0d0c0b0a0908;
 
-    // SipHash-2-4("") with this key
     var h = SipHash.init(k0, k1);
     const result = h.final();
 
-    // Expected from reference implementation
-    try std.testing.expect(result != 0);
+    try std.testing.expectEqual(@as(u64, 0x726fdb47dd0e0e31), result);
+}
+
+test "SipHash-2-4 single byte 0x00" {
+    // Feed a single byte 0x00; expected = second entry in the SipHash
+    // reference test-vector table (hash_tests.cpp:87 — testvec[1]).
+    const k0: u64 = 0x0706050403020100;
+    const k1: u64 = 0x0f0e0d0c0b0a0908;
+
+    var h = SipHash.init(k0, k1);
+    const input = [_]u8{0x00};
+    h.update(&input);
+    const result = h.final();
+
+    try std.testing.expectEqual(@as(u64, 0x74f839c593dc67fd), result);
 }
 
 test "SipHash with block hash" {
@@ -1142,6 +1214,138 @@ test "buildBasicBlockFilter" {
 
     // Filter should match the included script
     try std.testing.expect(try filter.filter.match(&script1));
+}
+
+test "GCSFilter duplicate elements are deduplicated before F computation" {
+    // W90 regression test: building a filter with two identical elements must
+    // produce the same encoded bytes as building with one element.  The pre-fix
+    // code mapped hashes using F = 2*M then stored N=1 with F = 1*M, causing
+    // every match to fail because the stored hash was mapped to the wrong range.
+    const allocator = std.testing.allocator;
+
+    const params = GCSParams{
+        .siphash_k0 = 0xDEADBEEFCAFEBABE,
+        .siphash_k1 = 0x0102030405060708,
+        .p = BASIC_FILTER_P,
+        .m = BASIC_FILTER_M,
+    };
+
+    const script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x55} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const one_elem: []const []const u8 = &.{&script};
+    const two_elem: []const []const u8 = &.{ &script, &script }; // duplicate
+
+    var f1 = try GCSFilter.init(params, one_elem, allocator);
+    defer f1.deinit();
+    var f2 = try GCSFilter.init(params, two_elem, allocator);
+    defer f2.deinit();
+
+    // Deduplicated count must be 1 in both cases.
+    try std.testing.expectEqual(@as(u32, 1), f1.n);
+    try std.testing.expectEqual(@as(u32, 1), f2.n);
+
+    // Encoded bytes must be identical.
+    try std.testing.expectEqualSlices(u8, f1.getEncoded(), f2.getEncoded());
+
+    // The element must match in both filters.
+    try std.testing.expect(try f1.match(&script));
+    try std.testing.expect(try f2.match(&script));
+}
+
+test "GCSFilter match fails before W90 dedup fix (regression guard)" {
+    // Demonstrates that the old code would produce N=1 but F=2*M, meaning the
+    // hash was stored at position fastRange64(h, 2*M) but looked up at
+    // fastRange64(h, 1*M).  With the fix, match must succeed.
+    const allocator = std.testing.allocator;
+
+    const params = GCSParams{
+        .siphash_k0 = 0x1111222233334444,
+        .siphash_k1 = 0x5555666677778888,
+        .p = BASIC_FILTER_P,
+        .m = BASIC_FILTER_M,
+    };
+
+    const script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+    const elems: []const []const u8 = &.{ &script, &script }; // two duplicates
+
+    var filter = try GCSFilter.init(params, elems, allocator);
+    defer filter.deinit();
+
+    // After the fix: N=1, match must succeed.
+    try std.testing.expectEqual(@as(u32, 1), filter.n);
+    try std.testing.expect(try filter.match(&script));
+}
+
+test "BIP-158 genesis block test vector" {
+    // From Bitcoin Core's test/data/blockfilters.json (first non-comment entry).
+    //
+    // Block 0 (genesis, testnet3 — same format as mainnet genesis filter):
+    //   block_hash = 000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943
+    //   prev_filter_header = 0000...0000 (32 zero bytes)
+    //   basic_filter_hex = 019dfca8
+    //   basic_header_hex = 21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750
+    //
+    // The genesis coinbase has a single output whose scriptPubKey begins with
+    // OP_CHECKSIG (not OP_RETURN), so it must be included in the filter.
+    const allocator = std.testing.allocator;
+
+    // Genesis block hash (display order → internal byte order)
+    var block_hash: Hash256 = undefined;
+    const hash_hex = "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943";
+    for (0..32) |i| {
+        const hi = std.fmt.charToDigit(hash_hex[(31 - i) * 2], 16) catch unreachable;
+        const lo = std.fmt.charToDigit(hash_hex[(31 - i) * 2 + 1], 16) catch unreachable;
+        block_hash[i] = (hi << 4) | lo;
+    }
+
+    // Genesis coinbase scriptPubKey (67 bytes).
+    // Extracted from block hex in test/data/blockfilters.json (testnet3 block 0).
+    // scriptPubKey = OP_PUSH65 <65-byte uncompressed pubkey> OP_CHECKSIG.
+    // Verified against raw block hex: ...43 4104678afdb0fe55 48271967f1a67130
+    // b7105cd6a828e039 09a67962e0ea1f61 deb649f6bc3f4cef 38c4f35504e51ec1
+    // 12de5c384df7ba0b 8d578a4c702b6bf1 1d5fac ...
+    const genesis_spk = [_]u8{
+        0x41, 0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, 0x48, 0x27, 0x19, 0x67, 0xf1, 0xa6, 0x71, 0x30,
+        0xb7, 0x10, 0x5c, 0xd6, 0xa8, 0x28, 0xe0, 0x39, 0x09, 0xa6, 0x79, 0x62, 0xe0, 0xea, 0x1f, 0x61,
+        0xde, 0xb6, 0x49, 0xf6, 0xbc, 0x3f, 0x4c, 0xef, 0x38, 0xc4, 0xf3, 0x55, 0x04, 0xe5, 0x1e, 0xc1,
+        0x12, 0xde, 0x5c, 0x38, 0x4d, 0xf7, 0xba, 0x0b, 0x8d, 0x57, 0x8a, 0x4c, 0x70, 0x2b, 0x6b, 0xf1,
+        0x1d, 0x5f, 0xac,
+    };
+    const output_scripts: []const []const u8 = &.{&genesis_spk};
+
+    var block_filter = try buildBasicBlockFilter(&block_hash, output_scripts, &.{}, allocator);
+    defer block_filter.deinit();
+
+    // Expected encoded filter: 019dfca8
+    const expected_encoded = [_]u8{ 0x01, 0x9d, 0xfc, 0xa8 };
+    try std.testing.expectEqualSlices(u8, &expected_encoded, block_filter.filter.getEncoded());
+
+    // Filter must match the genesis scriptPubKey.
+    try std.testing.expect(try block_filter.filter.match(&genesis_spk));
+
+    // Compute filter header: Hash256(filter_hash || prev_header_zero)
+    const genesis_prev_header = [_]u8{0} ** 32;
+    const computed_header = block_filter.computeHeader(&genesis_prev_header);
+
+    // Expected filter header (from blockfilters.json):
+    // 21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750
+    //
+    // Note: this is in display (big-endian) order, so we reverse it to get
+    // the internal byte order used by clearbit's hash256 output (which matches
+    // Core's uint256 internal representation — i.e., byte[0] is the LSB).
+    var expected_header: Hash256 = undefined;
+    const hdr_hex = "21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750";
+    for (0..32) |i| {
+        const hi = std.fmt.charToDigit(hdr_hex[(31 - i) * 2], 16) catch unreachable;
+        const lo = std.fmt.charToDigit(hdr_hex[(31 - i) * 2 + 1], 16) catch unreachable;
+        expected_header[i] = (hi << 4) | lo;
+    }
+    try std.testing.expectEqualSlices(u8, &expected_header, &computed_header);
+}
+
+test "NODE_COMPACT_FILTERS service bit value" {
+    // Sanity-check: Core defines NODE_COMPACT_FILTERS = (1 << 6) = 64 (protocol.h:323).
+    const p2p = @import("p2p.zig");
+    try std.testing.expectEqual(@as(u64, 64), p2p.NODE_COMPACT_FILTERS);
 }
 
 test "BlockFilter header chain" {
