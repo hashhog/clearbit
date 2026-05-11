@@ -7,9 +7,11 @@ const crypto = @import("crypto.zig");
 // ============================================================================
 
 /// Maximum block weight (BIP-141). 4,000,000 weight units.
+/// Reference: Bitcoin Core consensus/consensus.h:15
 pub const MAX_BLOCK_WEIGHT: u32 = 4_000_000;
 
-/// Maximum block size for legacy (pre-segwit) serialization: 1 MB.
+/// Maximum allowed size for a serialized block, in bytes (buffer size limit only).
+/// Reference: Bitcoin Core consensus/consensus.h:13
 pub const MAX_BLOCK_SERIALIZED_SIZE: u32 = 4_000_000;
 
 /// Maximum number of signature operations in a block (scaled by witness discount).
@@ -36,13 +38,67 @@ pub const MAX_P2SH_SIGOPS: u32 = 15;
 pub const WITNESS_SCALE_FACTOR: u32 = 4;
 
 /// Maximum standard transaction weight: 400,000 weight units.
+/// Reference: Bitcoin Core policy/policy.h:38
 pub const MAX_STANDARD_TX_WEIGHT: u32 = 400_000;
+
+/// Minimum transaction weight (BIP-141 lower bound, for block-level sanity).
+/// 60 bytes is the smallest valid serialized CTransaction; × 4 = 240 WU.
+/// Used to bound the maximum transaction count in a block (merkleblock, BIP152).
+/// Reference: Bitcoin Core consensus/consensus.h:23
+pub const MIN_TRANSACTION_WEIGHT: u32 = WITNESS_SCALE_FACTOR * 60; // 240
+
+/// Minimum serializable transaction weight.
+/// 10 bytes is the lower bound for any serialized CTransaction form; × 4 = 40 WU.
+/// Used in compact-block pre-filter (BIP152 short-id count bound).
+/// Reference: Bitcoin Core consensus/consensus.h:24
+pub const MIN_SERIALIZABLE_TRANSACTION_WEIGHT: u32 = WITNESS_SCALE_FACTOR * 10; // 40
+
+/// Default bytes-per-sigop for sigop-adjusted vsize computation.
+/// When a transaction's sigop cost × 20 exceeds its raw weight, the sigop
+/// cost dominates and vsize = ceil(sigop_cost × 20 / 4).
+/// Reference: Bitcoin Core policy/policy.h:50
+pub const DEFAULT_BYTES_PER_SIGOP: u32 = 20;
 
 /// Maximum number of inputs for standard transactions.
 pub const MAX_TX_IN_STANDARD: usize = 100_000;
 
 /// Minimum transaction size (bytes).
 pub const MIN_TX_SIZE: usize = 60;
+
+// ============================================================================
+// BIP-141 Weight / Virtual-size Functions
+// ============================================================================
+
+/// Return the sigop-adjusted weight: the larger of raw weight or sigop_cost × bytes_per_sigop.
+///
+/// When many sigops are packed into a small transaction, the sigop-adjusted weight
+/// is used instead of the raw weight so that high-sigop transactions effectively
+/// pay for their validation cost.  This matches Bitcoin Core's
+/// `GetSigOpsAdjustedWeight` (policy/policy.cpp:390-392).
+///
+/// Gate (policy, not consensus): applied in `getVirtualTransactionSize`.
+/// Reference: Bitcoin Core policy/policy.cpp:390
+pub fn getSigOpsAdjustedWeight(weight: u64, sigop_cost: u64, bytes_per_sigop: u32) u64 {
+    return @max(weight, sigop_cost * @as(u64, bytes_per_sigop));
+}
+
+/// Compute virtual transaction size (vsize) from weight + sigop cost.
+///
+/// Formula (Bitcoin Core policy/policy.cpp:395-397):
+///   adjusted = max(weight, sigop_cost × bytes_per_sigop)
+///   vsize    = ceil(adjusted / WITNESS_SCALE_FACTOR)
+///            = (adjusted + 3) / 4          [integer ceiling]
+///
+/// For standard relay, pass `bytes_per_sigop = DEFAULT_BYTES_PER_SIGOP` (20)
+/// and `sigop_cost` = the transaction's total sigop cost (BIP-141 basis).
+/// Pass `sigop_cost = 0` and `bytes_per_sigop = 0` to get plain weight→vsize.
+///
+/// Reference: Bitcoin Core policy/policy.cpp:395-397, policy/policy.h:182-188
+pub fn getVirtualTransactionSize(weight: u64, sigop_cost: u64, bytes_per_sigop: u32) u64 {
+    const adjusted = getSigOpsAdjustedWeight(weight, sigop_cost, bytes_per_sigop);
+    // Ceiling division: (adjusted + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR
+    return (adjusted + @as(u64, WITNESS_SCALE_FACTOR) - 1) / @as(u64, WITNESS_SCALE_FACTOR);
+}
 
 // ============================================================================
 // Monetary Policy
@@ -1209,6 +1265,114 @@ test "consensus constants" {
     try std.testing.expectEqual(@as(u32, 363_725), BIP66_HEIGHT);
     try std.testing.expectEqual(@as(u32, 481_824), SEGWIT_HEIGHT);
     try std.testing.expectEqual(@as(u32, 709_632), TAPROOT_HEIGHT);
+}
+
+// ============================================================================
+// W76 BIP-141 Weight / Vsize Tests
+// ============================================================================
+
+test "W76: weight constants correct values" {
+    // Core consensus/consensus.h:15,21,23,24; policy/policy.h:38,50
+    try std.testing.expectEqual(@as(u32, 4_000_000), MAX_BLOCK_WEIGHT);
+    try std.testing.expectEqual(@as(u32, 400_000), MAX_STANDARD_TX_WEIGHT);
+    try std.testing.expectEqual(@as(u32, 4), WITNESS_SCALE_FACTOR);
+    try std.testing.expectEqual(@as(u32, 240), MIN_TRANSACTION_WEIGHT);       // 4 × 60
+    try std.testing.expectEqual(@as(u32, 40), MIN_SERIALIZABLE_TRANSACTION_WEIGHT); // 4 × 10
+    try std.testing.expectEqual(@as(u32, 20), DEFAULT_BYTES_PER_SIGOP);
+    // Cross-check derived constants
+    try std.testing.expectEqual(@as(u32, 4 * 60), MIN_TRANSACTION_WEIGHT);
+    try std.testing.expectEqual(@as(u32, 4 * 10), MIN_SERIALIZABLE_TRANSACTION_WEIGHT);
+}
+
+test "W76: legacy tx weight = 4 × size" {
+    // A non-segwit tx has base_size == total_size, so:
+    //   weight = base_size × 3 + total_size = 4 × base_size
+    // Pick an arbitrary size; verify formula holds.
+    const legacy_size: u64 = 200; // arbitrary non-witness serialized size
+    const weight = legacy_size * (WITNESS_SCALE_FACTOR - 1) + legacy_size;
+    try std.testing.expectEqual(@as(u64, 800), weight);    // 4 × 200
+    try std.testing.expectEqual(legacy_size * 4, weight);
+}
+
+test "W76: segwit tx weight = 3 × stripped + total" {
+    // segwit: stripped (non-witness) = 100, total = 130 (30 bytes witness overhead)
+    const stripped: u64 = 100;
+    const total: u64 = 130;
+    // Correct formula: weight = stripped × 3 + total
+    const weight = stripped * (WITNESS_SCALE_FACTOR - 1) + total;
+    try std.testing.expectEqual(@as(u64, 430), weight); // 300 + 130
+    // Equivalently: stripped × 4 + witness_bytes (witness_bytes = total − stripped = 30)
+    const witness_bytes: u64 = total - stripped;
+    try std.testing.expectEqual(weight, stripped * 4 + witness_bytes);
+}
+
+test "W76: vsize ceiling division" {
+    // vsize = ceil(weight / 4)
+    // weight = 0 → vsize = 0
+    try std.testing.expectEqual(@as(u64, 0), getVirtualTransactionSize(0, 0, 0));
+    // weight = 4 → vsize = 1 (exact)
+    try std.testing.expectEqual(@as(u64, 1), getVirtualTransactionSize(4, 0, 0));
+    // weight = 5 → vsize = 2 (ceiling)
+    try std.testing.expectEqual(@as(u64, 2), getVirtualTransactionSize(5, 0, 0));
+    // weight = 7 → vsize = 2 (ceiling)
+    try std.testing.expectEqual(@as(u64, 2), getVirtualTransactionSize(7, 0, 0));
+    // weight = 8 → vsize = 2 (exact)
+    try std.testing.expectEqual(@as(u64, 2), getVirtualTransactionSize(8, 0, 0));
+    // weight = 9 → vsize = 3 (ceiling)
+    try std.testing.expectEqual(@as(u64, 3), getVirtualTransactionSize(9, 0, 0));
+    // weight = 400_000 → vsize = 100_000 (MAX_STANDARD_TX_WEIGHT boundary)
+    try std.testing.expectEqual(@as(u64, 100_000), getVirtualTransactionSize(400_000, 0, 0));
+    // weight = 4_000_000 → vsize = 1_000_000 (MAX_BLOCK_WEIGHT)
+    try std.testing.expectEqual(@as(u64, 1_000_000), getVirtualTransactionSize(4_000_000, 0, 0));
+}
+
+test "W76: sigop-adjusted vsize — sigops dominate" {
+    // weight = 200 WU, sigop_cost = 20, bytes_per_sigop = 20
+    // adjusted = max(200, 20 × 20) = max(200, 400) = 400
+    // vsize = ceil(400 / 4) = 100
+    try std.testing.expectEqual(@as(u64, 100), getVirtualTransactionSize(200, 20, 20));
+}
+
+test "W76: sigop-adjusted vsize — weight dominates" {
+    // weight = 800 WU, sigop_cost = 4, bytes_per_sigop = 20
+    // adjusted = max(800, 4 × 20) = max(800, 80) = 800
+    // vsize = ceil(800 / 4) = 200
+    try std.testing.expectEqual(@as(u64, 200), getVirtualTransactionSize(800, 4, 20));
+}
+
+test "W76: sigop-adjusted vsize — exact Core formula" {
+    // Mirror Bitcoin Core GetVirtualTransactionSize(nWeight, nSigOpCost, bytes_per_sigop)
+    // policy/policy.cpp:395-397:
+    //   return (max(nWeight, nSigOpCost * bytes_per_sigop) + 3) / 4
+    const weight: u64 = 1000;
+    const sigop_cost: u64 = 80;
+    const bps: u32 = 20;
+    // adjusted = max(1000, 80 × 20) = max(1000, 1600) = 1600
+    // vsize = (1600 + 3) / 4 = 1603 / 4 = 400 (integer div, since 1600 % 4 == 0)
+    try std.testing.expectEqual(@as(u64, 400), getVirtualTransactionSize(weight, sigop_cost, bps));
+}
+
+test "W76: getSigOpsAdjustedWeight no-op when weight >= sigop term" {
+    try std.testing.expectEqual(@as(u64, 500), getSigOpsAdjustedWeight(500, 10, 20)); // max(500,200)=500
+    try std.testing.expectEqual(@as(u64, 400), getSigOpsAdjustedWeight(400, 20, 20)); // max(400,400)=400
+    try std.testing.expectEqual(@as(u64, 400), getSigOpsAdjustedWeight(300, 20, 20)); // max(300,400)=400
+}
+
+test "W76: MIN_TRANSACTION_WEIGHT boundary — 240 WU" {
+    // Any tx with weight < MIN_TRANSACTION_WEIGHT (240) is considered pathologically
+    // small.  Verify the constant and that a 60-byte non-witness tx hits exactly this.
+    try std.testing.expectEqual(@as(u32, 240), MIN_TRANSACTION_WEIGHT);
+    const sixty_byte_weight: u64 = 60 * 4; // non-witness: weight = 4 × size
+    try std.testing.expectEqual(@as(u64, MIN_TRANSACTION_WEIGHT), sixty_byte_weight);
+}
+
+test "W76: MAX_STANDARD_TX_WEIGHT boundary vsize" {
+    // A tx at exactly MAX_STANDARD_TX_WEIGHT (400_000) has vsize = 100_000.
+    const vsize = getVirtualTransactionSize(MAX_STANDARD_TX_WEIGHT, 0, 0);
+    try std.testing.expectEqual(@as(u64, 100_000), vsize);
+    // One weight unit over still produces vsize = 100_001 (ceiling).
+    const vsize_over = getVirtualTransactionSize(MAX_STANDARD_TX_WEIGHT + 1, 0, 0);
+    try std.testing.expectEqual(@as(u64, 100_001), vsize_over);
 }
 
 test "difficulty retarget clamping" {
