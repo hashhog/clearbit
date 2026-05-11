@@ -1790,7 +1790,10 @@ pub const ScriptEngine = struct {
                 }
 
                 const data = try self.peek(); // Don't pop
-                const locktime = try scriptNumDecodeN(data, false, 5);
+                // BIP-65: 5-byte ScriptNum (avoids year-2038 issue on uint32 nLockTime).
+                // Respect MINIMALDATA flag — Core passes fRequireMinimal here too.
+                // interpreter.cpp:546: CScriptNum nLockTime(stacktop(-1), fRequireMinimal, 5)
+                const locktime = try scriptNumDecodeN(data, self.flags.verify_minimaldata, 5);
 
                 if (locktime < 0) return ScriptError.NegativeLocktime;
 
@@ -1823,7 +1826,9 @@ pub const ScriptEngine = struct {
                 }
 
                 const data = try self.peek(); // Don't pop
-                const sequence = try scriptNumDecodeN(data, false, 5);
+                // BIP-112: 5-byte ScriptNum, respect MINIMALDATA flag.
+                // interpreter.cpp:574: CScriptNum nSequence(stacktop(-1), fRequireMinimal, 5)
+                const sequence = try scriptNumDecodeN(data, self.flags.verify_minimaldata, 5);
 
                 if (sequence < 0) return ScriptError.NegativeLocktime;
 
@@ -5016,3 +5021,773 @@ test "witness_v0: MAX_OPS_PER_SCRIPT still enforced" {
 
     try std.testing.expectError(ScriptError.OpCountExceeded, engine.execute(&script_buf));
 }
+
+// ============================================================================
+// W81: BIP-65 (CHECKLOCKTIMEVERIFY) + BIP-112 (CHECKSEQUENCEVERIFY) + BIP-113
+// Gate-by-gate parity with Bitcoin Core interpreter.cpp:522-593 + tx_verify.cpp:17-37
+// ============================================================================
+
+// Note on MINIMALDATA in tests:
+// Most tests set verify_minimaldata=false to avoid push-level MinimalData errors
+// (e.g. single-byte values 1-16 must use OP_1..OP_16, and 0x81=-1 must use OP_1NEGATE).
+// Tests that explicitly validate the MINIMALDATA ScriptNum path keep it true.
+
+// --- CLTV gate 1: flag off → NOP (does not fail, even on empty stack) ---
+test "BIP-65 gate-1: CLTV flag off → NOP, no error" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = false;
+    flags.discourage_upgradable_nops = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Script: OP_CHECKLOCKTIMEVERIFY — on empty stack, but flag off → NOP
+    const s = [_]u8{0xb1};
+    try engine.execute(&s); // must not fail
+}
+
+// --- CLTV gate 2: flag off + discourage_upgradable_nops → DiscourageUpgradableNops ---
+test "BIP-65 gate-2: CLTV flag off + DISCOURAGE_UPGRADABLE_NOPS → error" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = false;
+    flags.discourage_upgradable_nops = true;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    const s = [_]u8{0xb1};
+    try std.testing.expectError(ScriptError.DiscourageUpgradableNops, engine.execute(&s));
+}
+
+// --- CLTV gate 3: empty stack → StackUnderflow ---
+test "BIP-65 gate-3: CLTV on empty stack → StackUnderflow (Core: INVALID_STACK_OPERATION)" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Script: just OP_CHECKLOCKTIMEVERIFY with empty stack
+    const s = [_]u8{0xb1};
+    try std.testing.expectError(ScriptError.StackUnderflow, engine.execute(&s));
+}
+
+// --- CLTV gate 4a: 5-byte ScriptNum accepted (avoids year-2038 issue) ---
+test "BIP-65 gate-4a: CLTV accepts 5-byte ScriptNum (value 2^32-1)" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0xFFFFFFFF,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 5-byte encoding of 0xFFFFFFFF: FF FF FF FF 00 (positive, 5 bytes — 0xFF in MSB would set sign bit)
+    const s = [_]u8{ 0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xb1 };
+    try engine.execute(&s); // 0xFFFFFFFF == tx.lock_time → passes
+}
+
+// --- CLTV gate 4b: MINIMALDATA flag rejects non-minimal encoding (Bug #1 fix) ---
+test "BIP-65 gate-4b: CLTV with MINIMALDATA rejects non-minimal ScriptNum encoding" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = true;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Non-minimal encoding of 100: 0x64 0x00 (2 bytes, last byte 0x00 not needed → non-minimal)
+    const s = [_]u8{ 0x02, 0x64, 0x00, 0xb1 };
+    try std.testing.expectError(ScriptError.InvalidNumber, engine.execute(&s));
+}
+
+// --- CLTV gate 4c: MINIMALDATA=false accepts non-minimal encoding ---
+test "BIP-65 gate-4c: CLTV without MINIMALDATA accepts non-minimal ScriptNum encoding" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Non-minimal encoding of 100: 0x64 0x00 (decodes as 100, non-minimal)
+    const s = [_]u8{ 0x02, 0x64, 0x00, 0xb1 };
+    try engine.execute(&s); // should pass: 100 <= 100, no type mismatch
+}
+
+// --- CLTV gate 5: negative locktime → NegativeLocktime ---
+test "BIP-65 gate-5: CLTV with negative stack value → NegativeLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push -1: encoded as 0x81 (single byte, sign bit set on LSB means -1)
+    // verify_minimaldata=false avoids MinimalData rejection of the push opcode.
+    const s = [_]u8{ 0x01, 0x81, 0xb1 };
+    try std.testing.expectError(ScriptError.NegativeLocktime, engine.execute(&s));
+}
+
+// --- CLTV gate 6: type mismatch (block-height script vs timestamp tx) → UnsatisfiedLocktime ---
+test "BIP-65 gate-6: CLTV type mismatch (height operand vs timestamp tx.locktime) → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 600_000_000, // timestamp-based (>= 500_000_000)
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 (block-height operand — < 500_000_000)
+    const s = [_]u8{ 0x01, 0x64, 0xb1 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CLTV gate 6b: type mismatch (timestamp script vs block-height tx) → UnsatisfiedLocktime ---
+test "BIP-65 gate-6b: CLTV type mismatch (timestamp operand vs block-height tx.locktime) → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100, // block-height (< 500_000_000)
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 500_000_001 (timestamp operand — >= 500_000_000)
+    // 500_000_001 = 0x1DCD_6501; little-endian: 01 65 CD 1D; sign bit clear (MSB < 0x80)
+    const s = [_]u8{ 0x04, 0x01, 0x65, 0xCD, 0x1D, 0xb1 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CLTV gate 7: script locktime > tx locktime → UnsatisfiedLocktime ---
+test "BIP-65 gate-7: CLTV script locktime > tx.locktime → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 99, // tx locktime = 99
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 > 99 → UnsatisfiedLocktime
+    const s = [_]u8{ 0x01, 0x64, 0xb1 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CLTV gate 7b: script locktime == tx locktime → pass ---
+test "BIP-65 gate-7b: CLTV script locktime == tx.locktime → pass (equal is valid)" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000, // non-FINAL: 0 != 0xFFFFFFFF
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 == 100 → pass
+    const s = [_]u8{ 0x01, 0x64, 0xb1 };
+    try engine.execute(&s); // no error
+}
+
+// --- CLTV gate 8: input sequence == SEQUENCE_FINAL → UnsatisfiedLocktime ---
+// Core: "Testing if this vin is not final is sufficient to prevent this condition"
+// interpreter.cpp:1775: if (CTxIn::SEQUENCE_FINAL == txTo->vin[nIn].nSequence) return false;
+test "BIP-65 gate-8: CLTV with input.sequence == 0xFFFFFFFF → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF, // SEQUENCE_FINAL
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 ≤ 100, same type, but sequence is FINAL → fails
+    const s = [_]u8{ 0x01, 0x64, 0xb1 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CLTV: timestamp-based locktime pass ---
+test "BIP-65 CLTV: timestamp-based locktime passes (script <= tx)" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 600_000_000, // timestamp
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 500_000_001 (< 600_000_000) — timestamp type matches, value ≤ tx locktime → pass
+    const s = [_]u8{ 0x04, 0x01, 0x65, 0xCD, 0x1D, 0xb1 };
+    try engine.execute(&s);
+}
+
+// --- CLTV: zero value (OP_0 push) → passes when tx.lock_time == 0 ---
+test "BIP-65 CLTV: zero locktime operand (OP_0) passes with tx.lock_time=0" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 0 (OP_0 = 0x00, pushes empty bytes = value 0)
+    const s = [_]u8{ 0x00, 0xb1 }; // OP_0 OP_CHECKLOCKTIMEVERIFY
+    try engine.execute(&s);
+}
+
+// ============================================================================
+// BIP-112 (CHECKSEQUENCEVERIFY) gate tests
+// Reference: interpreter.cpp:561-593, interpreter.cpp:1781-1825
+// ============================================================================
+
+// --- CSV gate 9: flag off → NOP3 ---
+test "BIP-112 gate-9: CSV flag off → NOP, no error" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = false;
+    flags.discourage_upgradable_nops = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    const s = [_]u8{0xb2};
+    try engine.execute(&s); // must not fail
+}
+
+// --- CSV gate 10: flag off + discourage_upgradable_nops → error ---
+test "BIP-112 gate-10: CSV flag off + DISCOURAGE_UPGRADABLE_NOPS → error" {
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = false;
+    flags.discourage_upgradable_nops = true;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    const s = [_]u8{0xb2};
+    try std.testing.expectError(ScriptError.DiscourageUpgradableNops, engine.execute(&s));
+}
+
+// --- CSV gate 11: empty stack → StackUnderflow ---
+test "BIP-112 gate-11: CSV on empty stack → StackUnderflow" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    const s = [_]u8{0xb2};
+    try std.testing.expectError(ScriptError.StackUnderflow, engine.execute(&s));
+}
+
+// --- CSV gate 12: MINIMALDATA rejects non-minimal encoding (Bug #1 fix) ---
+test "BIP-112 gate-12: CSV with MINIMALDATA rejects non-minimal ScriptNum encoding" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000005,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = true;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Non-minimal encoding of 5: 0x05 0x00 (extra zero byte is non-minimal)
+    const s = [_]u8{ 0x02, 0x05, 0x00, 0xb2 };
+    try std.testing.expectError(ScriptError.InvalidNumber, engine.execute(&s));
+}
+
+// --- CSV gate 13: negative operand → NegativeLocktime ---
+test "BIP-112 gate-13: CSV with negative operand → NegativeLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000001,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push -1: 0x81 (verify_minimaldata=false avoids MinimalData push-opcode rejection)
+    const s = [_]u8{ 0x01, 0x81, 0xb2 };
+    try std.testing.expectError(ScriptError.NegativeLocktime, engine.execute(&s));
+}
+
+// --- CSV gate 14: DISABLE_FLAG set in operand → NOP (soft-fork extensibility) ---
+// Core: interpreter.cpp:585 "if ((nSequence & SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0) break;"
+test "BIP-112 gate-14: CSV operand with DISABLE_FLAG (bit 31) set → NOP, no error" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000001, // non-final, no disable flag
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 0x80000001 (bit 31 set = DISABLE_FLAG): little-endian 5 bytes = 01 00 00 80 00
+    // Sign byte 0x00 required because data[3]=0x80 has high bit set (sign-magnitude encoding).
+    const s = [_]u8{ 0x05, 0x01, 0x00, 0x00, 0x80, 0x00, 0xb2 };
+    try engine.execute(&s); // NOP — no error
+}
+
+// --- CSV gate 15: tx.version < 2 → UnsatisfiedLocktime ---
+// Core: interpreter.cpp:1790: if (txTo->version < 2) return false;
+test "BIP-112 gate-15: CSV with tx.version=1 → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000064, // 100
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1, // version 1 — BIP-68/CSV does not apply
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 (height-based, no disable flag) using 1-byte explicit push
+    const s = [_]u8{ 0x01, 0x64, 0xb2 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CSV gate 16: input.sequence has DISABLE_FLAG → UnsatisfiedLocktime ---
+// Core: interpreter.cpp:1797: if (txToSequence & SEQUENCE_LOCKTIME_DISABLE_FLAG) return false;
+test "BIP-112 gate-16: CSV when input.sequence has DISABLE_FLAG (bit 31) → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x80000001, // bit 31 set = SEQUENCE_LOCKTIME_DISABLE_FLAG
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 (height-based, no disable flag in operand)
+    const s = [_]u8{ 0x01, 0x64, 0xb2 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CSV gate 17: type flag mismatch (operand height vs input time) → UnsatisfiedLocktime ---
+// Core: interpreter.cpp:1813-1818: apples-to-apples type check
+test "BIP-112 gate-17: CSV type mismatch (height operand vs time-type input.sequence) → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00400001, // SEQUENCE_LOCKTIME_TYPE_FLAG (bit 22) set → time-based
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 (height-based: bit 22 not set)
+    const s = [_]u8{ 0x01, 0x64, 0xb2 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CSV gate 17b: type flag mismatch (time operand vs height input.sequence) → UnsatisfiedLocktime ---
+test "BIP-112 gate-17b: CSV type mismatch (time operand vs height input.sequence) → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000064, // 100, no type flag → height-based
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 0x00400064 (bit 22 set = time-based, value=100): LE minimal = 64 00 40 (3 bytes)
+    // 0x00400064: LE = 64 00 40; MSB 0x40 has bit 7 clear → minimal 3-byte encoding.
+    const s = [_]u8{ 0x03, 0x64, 0x00, 0x40, 0xb2 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CSV gate 18: operand (masked) > input.sequence (masked) → UnsatisfiedLocktime ---
+// Core: interpreter.cpp:1822: if (nSequenceMasked > txToSequenceMasked) return false;
+test "BIP-112 gate-18: CSV operand > input.sequence (masked) → UnsatisfiedLocktime" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000032, // lock_value = 50 (height-based)
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 (0x64) > 50 (0x32) → UnsatisfiedLocktime; 0x64 < 0x80, so single byte is positive
+    const s = [_]u8{ 0x01, 0x64, 0xb2 };
+    try std.testing.expectError(ScriptError.UnsatisfiedLocktime, engine.execute(&s));
+}
+
+// --- CSV gate 18b: operand == input.sequence (masked) → pass ---
+test "BIP-112 gate-18b: CSV operand == input.sequence (masked) → pass (equal is valid)" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000064, // lock_value = 100
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 100 == 100 → pass
+    const s = [_]u8{ 0x01, 0x64, 0xb2 };
+    try engine.execute(&s);
+}
+
+// --- CSV gate 18c: operand < input.sequence (masked) → pass ---
+test "BIP-112 gate-18c: CSV operand < input.sequence (masked) → pass" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000064, // lock_value = 100
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 50 < 100 → pass; 0x32 = 50
+    const s = [_]u8{ 0x01, 0x32, 0xb2 };
+    try engine.execute(&s);
+}
+
+// --- CSV: time-based operand and input.sequence match type → pass ---
+test "BIP-112 CSV: time-based sequence lock, operand <= tx.sequence (masked) → pass" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        // SEQUENCE_LOCKTIME_TYPE_FLAG | lock_value=100 = 0x00400064
+        .sequence = 0x00400064,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // Push 0x00400032 (type flag set, lock_value=50 <= 100): LE = 32 00 40 (3 bytes, minimal)
+    // 0x00400032 LE: 0x32, 0x00, 0x40 — MSB 0x40 has bit 7 clear → 3 bytes is minimal.
+    const s = [_]u8{ 0x03, 0x32, 0x00, 0x40, 0xb2 };
+    try engine.execute(&s);
+}
+
+// --- BIP-113 gate: IsFinalTx uses MTP as lock_time_cutoff when CSV active ---
+// See also: validation.zig test "BIP-113 gate-21: IsFinalTx uses MTP cutoff when CSV active"
+// This test verifies the script-interpreter side: that tx.lock_time == 0 is always final,
+// independent of whether BIP-113 is active (it only affects the external cutoff value passed
+// to isFinalTx, not the interpreter itself).
+test "BIP-113 CLTV: zero-locktime tx is always final regardless of MTP cutoff" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000000,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0, // always final
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_minimaldata = false;
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+    // OP_0 OP_CHECKLOCKTIMEVERIFY: lock_time 0 <= tx.lock_time 0, same type → pass
+    const s = [_]u8{ 0x00, 0xb1 };
+    try engine.execute(&s);
+}
+
+// --- W81 summary test: verify fix for Bug #1 (require_minimal hardcoded false) ---
+// Both CLTV and CSV must honour verify_minimaldata flag for 5-byte ScriptNum arguments.
+// Before fix: scriptNumDecodeN(data, false, 5) — non-minimal always accepted.
+// After fix:  scriptNumDecodeN(data, self.flags.verify_minimaldata, 5) — flags respected.
+test "W81 Bug-1 regression: CLTV and CSV both reject non-minimal encoding when MINIMALDATA active" {
+    const allocator = std.testing.allocator;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0x00000064, // 100
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 100,
+    };
+    var flags = ScriptFlags{};
+    flags.verify_checklocktimeverify = true;
+    flags.verify_checksequenceverify = true;
+    flags.verify_minimaldata = true;
+
+    // CLTV: non-minimal encoding of 100 = [0x64, 0x00]
+    {
+        var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+        defer engine.deinit();
+        const s_cltv = [_]u8{ 0x02, 0x64, 0x00, 0xb1 };
+        try std.testing.expectError(ScriptError.InvalidNumber, engine.execute(&s_cltv));
+    }
+
+    // CSV: non-minimal encoding of 100 = [0x64, 0x00]
+    {
+        var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+        defer engine.deinit();
+        const s_csv = [_]u8{ 0x02, 0x64, 0x00, 0xb2 };
+        try std.testing.expectError(ScriptError.InvalidNumber, engine.execute(&s_csv));
+    }
+}
+
