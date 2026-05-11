@@ -38,6 +38,8 @@ pub const ValidationError = error{
     InsufficientFunds,
     ScriptVerificationFailed,
     ImmatureCoinbase,
+    InputValuesOutOfRange,
+    AccumulatedFeeOutOfRange,
 
     // Block errors
     BadMerkleRoot,
@@ -275,6 +277,13 @@ pub fn checkTransactionSanity(tx: *const types.Transaction) ValidationError!void
     if (tx.inputs.len == 0) return ValidationError.NoInputs;
     if (tx.outputs.len == 0) return ValidationError.NoOutputs;
 
+    // 1b. Transaction base size must not exceed one full block weight.
+    // Core: GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    // Reference: Bitcoin Core consensus/tx_check.cpp:19-21 ("bad-txns-oversize")
+    if (txBaseSerializeSize(tx) * consensus.WITNESS_SCALE_FACTOR > consensus.MAX_BLOCK_WEIGHT) {
+        return ValidationError.TxTooLarge;
+    }
+
     // 2. Each output value must be non-negative and <= MAX_MONEY
     var total_out: i64 = 0;
     for (tx.outputs) |output| {
@@ -349,10 +358,20 @@ pub fn checkTransactionContextual(
         };
         utxos[i] = utxo_result orelse return ValidationError.MissingInput;
 
-        if (utxos[i].is_coinbase and height < utxos[i].height + consensus.COINBASE_MATURITY) {
+        // Coinbase maturity: use subtraction form to avoid u32 wrap-around.
+        // Core: nSpendHeight - coin.nHeight < COINBASE_MATURITY
+        // Reference: Bitcoin Core consensus/tx_verify.cpp:179-182
+        if (utxos[i].is_coinbase and
+            (height < utxos[i].height or
+                height - utxos[i].height < consensus.COINBASE_MATURITY))
+        {
             return ValidationError.ImmatureCoinbase;
         }
+        // Per-input value range check (CVE-2010-5139 / bad-txns-inputvalues-outofrange).
+        // Reference: Bitcoin Core consensus/tx_verify.cpp:186
+        if (!consensus.isValidMoney(utxos[i].value)) return ValidationError.InputValuesOutOfRange;
         total_in += utxos[i].value;
+        if (!consensus.isValidMoney(total_in)) return ValidationError.InputValuesOutOfRange;
         spent_amounts[i] = utxos[i].value;
         spent_scripts[i] = utxos[i].script_pubkey;
     }
@@ -1142,7 +1161,11 @@ pub fn validateBlockForIBD(
 
                 // Check intra-block first.
                 if (prevouts.get(key)) |entry| {
+                    // Per-coin value range check (same as chainstate path).
+                    // Reference: Bitcoin Core consensus/tx_verify.cpp:186
+                    if (!consensus.isValidMoney(entry.amount)) return ValidationError.InputValuesOutOfRange;
                     input_sum += entry.amount;
+                    if (!consensus.isValidMoney(input_sum)) return ValidationError.InputValuesOutOfRange;
                     // Intra-block prevouts are never coinbase (coinbase is
                     // tx_idx == 0; non-coinbase outputs are spendable
                     // immediately within the same block per Core).
@@ -1154,10 +1177,20 @@ pub fn validateBlockForIBD(
                     return ValidationError.MissingInput;
                 defer if (info.owner_allocator) |a| a.free(info.script_pubkey);
 
-                // Coinbase maturity check (100 blocks).
-                if (info.is_coinbase and height - info.height < consensus.COINBASE_MATURITY) {
+                // Coinbase maturity: use explicit < guard before subtraction to
+                // avoid u32 wrap-around when height < info.height (shouldn't
+                // happen in practice, but safe-by-construction).
+                // Reference: Bitcoin Core consensus/tx_verify.cpp:179-182
+                if (info.is_coinbase and
+                    (height < info.height or
+                        height - info.height < consensus.COINBASE_MATURITY))
+                {
                     return ValidationError.ImmatureCoinbase;
                 }
+
+                // Per-coin value range check.
+                // Reference: Bitcoin Core consensus/tx_verify.cpp:186
+                if (!consensus.isValidMoney(info.amount)) return ValidationError.InputValuesOutOfRange;
 
                 // Dupe the script into the arena so it survives past the
                 // owner_allocator.free(...) above.
@@ -1183,6 +1216,9 @@ pub fn validateBlockForIBD(
                 }) catch return ValidationError.OutOfMemory;
 
                 input_sum += info.amount;
+                // Accumulated input value range check.
+                // Reference: Bitcoin Core consensus/tx_verify.cpp:186
+                if (!consensus.isValidMoney(input_sum)) return ValidationError.InputValuesOutOfRange;
             }
 
             // Per-tx output sum.
@@ -1191,6 +1227,10 @@ pub fn validateBlockForIBD(
 
             if (input_sum < output_sum) return ValidationError.InsufficientFunds;
             total_fees += input_sum - output_sum;
+            // Accumulated block fee range check.
+            // Reference: Bitcoin Core validation.cpp:2543-2547
+            // ("bad-txns-accumulated-fee-outofrange")
+            if (!consensus.isValidMoney(total_fees)) return ValidationError.AccumulatedFeeOutOfRange;
         }
 
         // Add this tx's outputs to the prevouts map (intra-block stitching).
@@ -1497,6 +1537,35 @@ fn calculateBlockWeight(block: *const types.Block, allocator: std.mem.Allocator)
     // This is equivalent to: base_size * (4-1) + total_size
     // Which counts non-witness data 4x and witness data 1x
     return base_size * (consensus.WITNESS_SCALE_FACTOR - 1) + total_size;
+}
+
+/// Compute the non-witness ("base") serialized byte length of a transaction
+/// without any allocation.  This mirrors Bitcoin Core's
+/// `GetSerializeSize(TX_NO_WITNESS(tx))` used in CheckTransaction.
+///
+/// Reference: Bitcoin Core consensus/tx_check.cpp:19
+fn txBaseSerializeSize(tx: *const types.Transaction) u64 {
+    // 4-byte version
+    var sz: u64 = 4;
+    // compact-size input count
+    sz += compactSizeLen(tx.inputs.len);
+    for (tx.inputs) |inp| {
+        sz += 32; // prevout hash
+        sz += 4;  // prevout index
+        sz += compactSizeLen(inp.script_sig.len);
+        sz += inp.script_sig.len;
+        sz += 4;  // sequence
+    }
+    // compact-size output count
+    sz += compactSizeLen(tx.outputs.len);
+    for (tx.outputs) |out| {
+        sz += 8;  // nValue (int64)
+        sz += compactSizeLen(out.script_pubkey.len);
+        sz += out.script_pubkey.len;
+    }
+    // 4-byte locktime
+    sz += 4;
+    return sz;
 }
 
 /// Calculate the serialized size of a transaction.
@@ -2683,6 +2752,133 @@ test "checkTransactionSanity passes for valid coinbase with correct scriptSig si
     };
 
     try checkTransactionSanity(&tx);
+}
+
+// ============================================================================
+// W84 new tests: oversize, input-value MoneyRange, accumulated-fee MoneyRange
+// ============================================================================
+
+test "checkTransactionSanity rejects oversize transaction (bad-txns-oversize)" {
+    // Build a transaction whose base (no-witness) size × WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT.
+    // MAX_BLOCK_WEIGHT = 4_000_000; WITNESS_SCALE_FACTOR = 4 → base size > 1_000_000 bytes.
+    // We craft a single input with a ~1_100_000-byte scriptSig.
+    const big_script = [_]u8{0x00} ** 1_100_000;
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &big_script,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 1,
+        .script_pubkey = &[_]u8{0x00},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const result = checkTransactionSanity(&tx);
+    try std.testing.expectError(ValidationError.TxTooLarge, result);
+}
+
+test "checkTransactionSanity accepts transaction just under the size limit" {
+    // base size of exactly 1_000_000 → weight = 4_000_000 (== MAX_BLOCK_WEIGHT, not >).
+    // Fixed overhead: version(4) + input_count(3, fd 00 00) + hash(32) + index(4) +
+    //   script_len(3, fd XX XX) + seq(4) + output_count(1) + value(8) +
+    //   script_pub_len(1) + script_pub(1) + locktime(4) = 65 bytes of fixed fields.
+    // We want script_sig.len = 1_000_000 - 65 - 3 (fd encoding for ~997935) ≈ 999_935.
+    // Simpler: use a script_sig of exactly 999_931 bytes (fd encoding costs 3 bytes):
+    //   4 + 3 + 32 + 4 + 3 + 999_931 + 4 + 1 + 8 + 1 + 1 + 4 = 1_000_000
+    const ok_script = [_]u8{0x00} ** 999_931;
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &ok_script,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 1,
+        .script_pubkey = &[_]u8{0x00},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    // Should not error with TxTooLarge (base size == 1_000_000 × 4 == MAX_BLOCK_WEIGHT, not >)
+    const result = checkTransactionSanity(&tx);
+    // May fail for other reasons (coinbase null check, etc.) but NOT TxTooLarge.
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.TxTooLarge);
+    }
+}
+
+test "txBaseSerializeSize computes expected size for minimal transaction" {
+    // version(4) + inputs_count(1) + [hash(32)+index(4)+script_len(1)+script(3)+seq(4)]
+    // + outputs_count(1) + [value(8)+script_len(1)+script(3)] + locktime(4) = 66
+    const input = types.TxIn{
+        .previous_output = types.OutPoint{
+            .hash = [_]u8{0x11} ** 32,
+            .index = 0,
+        },
+        .script_sig = &[_]u8{ 0x01, 0x02, 0x03 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 50_000_000,
+        .script_pubkey = &[_]u8{ 0x01, 0x02, 0x03 },
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    const expected: u64 = 4 + 1 + 32 + 4 + 1 + 3 + 4 + 1 + 8 + 1 + 3 + 4;
+    try std.testing.expectEqual(expected, txBaseSerializeSize(&tx));
+}
+
+test "getBlockSubsidy returns 50 BTC at genesis" {
+    try std.testing.expectEqual(@as(i64, 50 * 100_000_000), consensus.getBlockSubsidy(0, &consensus.MAINNET));
+}
+
+test "getBlockSubsidy returns 25 BTC at first halving" {
+    try std.testing.expectEqual(@as(i64, 25 * 100_000_000), consensus.getBlockSubsidy(210_000, &consensus.MAINNET));
+}
+
+test "getBlockSubsidy returns 0 after 64 halvings" {
+    // 64 halvings = height 64 * 210_000 = 13_440_000
+    try std.testing.expectEqual(@as(i64, 0), consensus.getBlockSubsidy(64 * 210_000, &consensus.MAINNET));
+}
+
+test "getBlockSubsidy returns 0 well past 64 halvings" {
+    try std.testing.expectEqual(@as(i64, 0), consensus.getBlockSubsidy(std.math.maxInt(u32), &consensus.MAINNET));
+}
+
+test "isValidMoney returns false for negative value" {
+    try std.testing.expect(!consensus.isValidMoney(-1));
+}
+
+test "isValidMoney returns true for zero" {
+    try std.testing.expect(consensus.isValidMoney(0));
+}
+
+test "isValidMoney returns true for MAX_MONEY" {
+    try std.testing.expect(consensus.isValidMoney(consensus.MAX_MONEY));
+}
+
+test "isValidMoney returns false for MAX_MONEY + 1" {
+    try std.testing.expect(!consensus.isValidMoney(consensus.MAX_MONEY + 1));
 }
 
 test "medianTimePast returns correct median for 11 timestamps" {
