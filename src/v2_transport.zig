@@ -1130,20 +1130,23 @@ pub const V2Transport = struct {
         while (true) {
             switch (self.recv_state) {
                 .key_maybe_v1 => {
-                    // Check for V1 magic bytes
-                    if (self.recv_buffer.items.len >= 4) {
-                        const magic = std.mem.readInt(u32, self.recv_buffer.items[0..4], .little);
-                        if (magic == std.mem.readInt(u32, &self.network_magic, .little)) {
-                            // Looks like V1, fallback
-                            self.recv_state = .v1;
-                            self.send_state = .v1;
-                            return true;
-                        }
-                        // Not V1, proceed as V2
-                        self.recv_state = .key;
-                    } else {
+                    // Wait for all V1_PREFIX_LEN (16) bytes before deciding.
+                    // Bitcoin Core collects the full 4-byte network magic +
+                    // 12-byte "version\0\0\0\0\0" command before committing to
+                    // V1 fallback (net.cpp:1091-1101).  Deciding after only
+                    // 4 bytes is wrong: an ellswift pubkey that starts with the
+                    // network magic bytes would be incorrectly classified as V1.
+                    if (self.recv_buffer.items.len < V1_PREFIX_LEN) {
                         return true;
                     }
+                    if (looksLikeV1Version(self.recv_buffer.items[0..V1_PREFIX_LEN], self.network_magic)) {
+                        // Full 16-byte match: fall back to V1.
+                        self.recv_state = .v1;
+                        self.send_state = .v1;
+                        return true;
+                    }
+                    // Mismatch with V1 prefix: treat as V2.
+                    self.recv_state = .key;
                 },
                 .key => {
                     if (self.recv_buffer.items.len >= ELLSWIFT_PUBKEY_LEN) {
@@ -1960,11 +1963,16 @@ test "V2Transport V1 fallback detection" {
     var transport = V2Transport.init(allocator, false, p2p.NetworkMagic.MAINNET);
     defer transport.deinit();
 
-    // Send mainnet magic bytes - should trigger V1 fallback
+    // Must feed the full 16-byte V1 prefix (4-byte magic + "version\0\0\0\0\0")
+    // before V1 fallback is triggered.  Feeding only 4 bytes (the old buggy
+    // behaviour) is no longer sufficient — matches Bitcoin Core net.cpp:1091.
+    var prefix: [V1_PREFIX_LEN]u8 = undefined;
     var magic: [4]u8 = undefined;
     std.mem.writeInt(u32, &magic, p2p.NetworkMagic.MAINNET, .little);
+    @memcpy(prefix[0..4], &magic);
+    @memcpy(prefix[4..16], &V1_VERSION_COMMAND);
 
-    const ok = transport.processReceivedBytes(&magic);
+    const ok = transport.processReceivedBytes(&prefix);
     try std.testing.expect(ok);
     try std.testing.expect(transport.isV1Fallback());
 }
