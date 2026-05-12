@@ -1735,6 +1735,11 @@ pub fn main() !void {
 
     var chain_manager = validation.ChainManager.init(&chain_state, &mempool_instance, allocator);
     defer chain_manager.deinit();
+    // BUG-9 fix: seed genesis with has_data=true so activateBestChain can
+    // select it.  Mirrors Core's LoadGenesisBlock → ReceivedBlockTransactions.
+    chain_manager.loadGenesis(params) catch |err| {
+        std.debug.print("Warning: could not seed genesis block in ChainManager: {}\n", .{err});
+    };
 
     var rpc_server = rpc.RpcServer.init(
         allocator,
