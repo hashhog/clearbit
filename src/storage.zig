@@ -5138,13 +5138,24 @@ pub const ChainStateManager = struct {
 
     /// Activate a snapshot chainstate.
     /// The old chainstate becomes the background chainstate for validation.
+    ///
+    /// Returns `SnapshotError.AlreadyActivated` if a snapshot chainstate is
+    /// already active. Mirrors Bitcoin Core validation.cpp:5600-5602:
+    ///   "Can't activate a snapshot-based chainstate more than once".
+    /// B2 guard: prevents double-activation that would clobber the original
+    /// background chainstate pointer.
     pub fn activateSnapshot(
         self: *ChainStateManager,
         snapshot_chainstate: *ChainState,
         base_blockhash: types.Hash256,
-    ) void {
+    ) SnapshotError!void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // B2: double-activation guard — Core validation.cpp:5600-5602.
+        if (self.active_role == .snapshot) {
+            return SnapshotError.AlreadyActivated;
+        }
 
         // The current active becomes background
         self.background_chainstate = self.active_chainstate;
@@ -5630,8 +5641,12 @@ pub fn loadTxOutSet(
     var reader = serialize.Reader{ .data = buf[SnapshotMetadata.HEADER_SIZE..] };
 
     var chainstate = ChainState.init(null, 64, allocator);
+    // errdefer ensures chainstate is cleaned up on any early-return error path
+    // (B3 MoneyRange rejection, B7 trailing-bytes rejection, parse errors, etc.)
+    errdefer chainstate.deinit();
     chainstate.best_hash = metadata.base_blockhash;
 
+    const consensus = @import("consensus.zig");
     var coins_left = metadata.coins_count;
     while (coins_left > 0) {
         const txid_bytes = reader.readBytes(32) catch return StorageError.CorruptData;
@@ -5646,6 +5661,9 @@ pub fn loadTxOutSet(
         while (i < coins_per_txid) : (i += 1) {
             var coin = readSnapshotCoinPayload(&reader, &txid, allocator) catch return StorageError.CorruptData;
             defer coin.deinit(allocator);
+            // B3: MoneyRange check — Core validation.cpp:5820-5823.
+            // Reject coins with values outside [0, MAX_MONEY].
+            if (!consensus.isValidMoney(coin.value)) return StorageError.CorruptData;
             const txout = types.TxOut{
                 .value = coin.value,
                 .script_pubkey = coin.script_pubkey,
@@ -5654,6 +5672,11 @@ pub fn loadTxOutSet(
             coins_left -= 1;
         }
     }
+
+    // B7: trailing-bytes EOF gate — Core validation.cpp:5872-5883.
+    // After reading all coins_count coins, there must be no bytes left.
+    // Core explicitly tries to read one more byte and rejects if it succeeds.
+    if (!reader.isAtEnd()) return StorageError.CorruptData;
 
     return .{ .chainstate = chainstate, .metadata = metadata };
 }
@@ -5738,6 +5761,12 @@ pub const SnapshotError = error{
     OutOfMemory,
     /// Background validation failed.
     BackgroundValidationFailed,
+    /// Snapshot already activated — Core: "Can't activate a snapshot-based
+    /// chainstate more than once" (validation.cpp:5600-5602).
+    AlreadyActivated,
+    /// Base block is on an invalid chain — Core: "The base block header (%s)
+    /// is part of an invalid chain" (validation.cpp:5617-5619).
+    InvalidBaseBlock,
 };
 
 /// Result of loading a snapshot.
@@ -5760,8 +5789,12 @@ pub const SnapshotLoadResult = struct {
 ///    (validation.cpp:5775-5780) after first resolving the block index;
 ///    clearbit's `AssumeUtxoData` pairs `(height, block_hash)` 1:1, so
 ///    matching by hash is equivalent to matching by height.
-/// 2. Loads all coins into a new chainstate.
-/// 3. STRICT CONTENT HASH: computes `hash_serialized` (SHA256d via
+/// 2. B11: BLOCK_FAILED_VALID check — if `db` is non-null, looks up the base
+///    block header in CF_BLOCK_INDEX and rejects if `status.failed_valid` is
+///    set. Mirrors Core validation.cpp:5617-5619:
+///    "The base block header (%s) is part of an invalid chain".
+/// 3. Loads all coins into a new chainstate.
+/// 4. STRICT CONTENT HASH: computes `hash_serialized` (SHA256d via
 ///    HashWriter) over the loaded UTXO set
 ///    (`computeHashSerializedTxOutSet`) and compares it byte-for-byte
 ///    against `au_data.hash_serialized`. Mirrors Core
@@ -5770,6 +5803,10 @@ pub const SnapshotLoadResult = struct {
 ///    (NOT MuHash3072 — MuHash3072 is the separate hash type for
 ///    `gettxoutsetinfo hash_type=muhash`). Rejection diagnostic:
 ///    `"Bad snapshot content hash: expected %s, got %s"`.
+///
+/// `db` (optional): when non-null, the block index is queried to enforce the
+/// B11 BLOCK_FAILED_VALID guard. Pass `null` to skip (e.g. in unit tests
+/// that have no on-disk block index).
 ///
 /// `out_rejected_hash` (optional): when non-null and the snapshot is
 /// rejected by the whitelist, the offending `metadata.base_blockhash`
@@ -5789,6 +5826,7 @@ pub fn validateAndLoadSnapshot(
     path: []const u8,
     network_params: *const @import("consensus.zig").NetworkParams,
     allocator: std.mem.Allocator,
+    db: ?*Database,
     out_rejected_hash: ?*types.Hash256,
     out_actual_hash: ?*types.Hash256,
     out_expected_hash: ?*types.Hash256,
@@ -5815,6 +5853,26 @@ pub fn validateAndLoadSnapshot(
         chainstate.deinit();
         return SnapshotError.UnknownSnapshot;
     };
+
+    // B11: BLOCK_FAILED_VALID check — Core validation.cpp:5617-5619.
+    // If the base block header is known and marked invalid, refuse the snapshot.
+    // `db` is optional: unit tests that have no on-disk block index pass null.
+    if (db) |database| {
+        if (database.get(CF_BLOCK_INDEX, &metadata.base_blockhash) catch null) |rec_data| {
+            defer allocator.free(rec_data);
+            // Block index record layout: height(4) + header(80) + status(4) + …
+            // status is at byte offset 84.  We only need the u32 status word.
+            const STATUS_OFFSET = 4 + 80; // height + header
+            if (rec_data.len >= STATUS_OFFSET + 4) {
+                const status_u32 = std.mem.readInt(u32, rec_data[STATUS_OFFSET..][0..4], .little);
+                const bs: @import("validation.zig").BlockStatus = @bitCast(status_u32);
+                if (bs.failed_valid) {
+                    chainstate.deinit();
+                    return SnapshotError.InvalidBaseBlock;
+                }
+            }
+        }
+    }
 
     // STRICT CONTENT HASH: hash_serialized (SHA256d via HashWriter) over
     // the loaded UTXO set must equal the value pinned in
@@ -10261,7 +10319,7 @@ test "chainstate manager activate snapshot" {
 
     // Activate snapshot
     const base_hash = [_]u8{0x12} ** 32;
-    manager.activateSnapshot(&snapshot_chainstate, base_hash);
+    try manager.activateSnapshot(&snapshot_chainstate, base_hash);
 
     try std.testing.expect(manager.isAssumeUtxoMode());
     try std.testing.expectEqual(ChainstateRole.snapshot, manager.active_role);
@@ -10672,6 +10730,7 @@ test "validateAndLoadSnapshot rejects regtest-genesis snapshot under mainnet par
         tmp_path,
         &consensus.MAINNET,
         allocator,
+        null,
         &rejected_hash,
         null,
         null,
@@ -10726,7 +10785,7 @@ test "ChainStateManager completeValidation with matching hashes" {
     defer manager.deinit();
 
     // Activate snapshot mode
-    manager.activateSnapshot(&active_chainstate, base_hash);
+    try manager.activateSnapshot(&active_chainstate, base_hash);
     // Set background chainstate directly for testing
     manager.background_chainstate = &background_chainstate;
 
@@ -10780,10 +10839,11 @@ test "W102 G3 dumpTxOutSet coins_count matches cache not persisted total" {
     try std.testing.expectEqual(@as(u64, 1), md.coins_count);
 }
 
-// BUG G5: activateSnapshot has no "already loaded" guard.  Calling it
-// twice silently replaces background_chainstate with the previous active,
-// losing the original background pointer.
-test "W102 G5 activateSnapshot double-call clobbers background chainstate" {
+// FIX B2: activateSnapshot now returns SnapshotError.AlreadyActivated when
+// called a second time, preventing the background-chainstate clobber.
+// Mirrors Core validation.cpp:5600-5602: "Can't activate a snapshot-based
+// chainstate more than once".
+test "W102 G5 activateSnapshot double-call returns AlreadyActivated" {
     const allocator = std.testing.allocator;
     const consensus = @import("consensus.zig");
 
@@ -10798,17 +10858,16 @@ test "W102 G5 activateSnapshot double-call clobbers background chainstate" {
     defer mgr.deinit();
 
     const hash1 = [_]u8{0x01} ** 32;
-    mgr.activateSnapshot(&cs_snap1, hash1);
+    try mgr.activateSnapshot(&cs_snap1, hash1);
     // background is now &cs_normal, active is &cs_snap1.
     try std.testing.expectEqual(&cs_normal, mgr.background_chainstate.?);
 
     const hash2 = [_]u8{0x02} ** 32;
-    // Second call: BUG — no guard; background is now clobbered to cs_snap1,
-    // the original cs_normal background pointer is orphaned.
-    mgr.activateSnapshot(&cs_snap2, hash2);
-    // After the second call active changed — the ORIGINAL background
-    // (&cs_normal) is gone.  We document the clobbering here.
-    try std.testing.expectEqual(&cs_snap1, mgr.background_chainstate.?);
+    // Second call: FIX — guard fires; original background pointer preserved.
+    try std.testing.expectError(SnapshotError.AlreadyActivated, mgr.activateSnapshot(&cs_snap2, hash2));
+    // Background pointer must still be the original &cs_normal (not clobbered).
+    try std.testing.expectEqual(&cs_normal, mgr.background_chainstate.?);
+    try std.testing.expectEqual(&cs_snap1, mgr.active_chainstate);
 }
 
 // BUG G7: loadTxOutSet (in-memory path used by validateAndLoadSnapshot)
@@ -10875,7 +10934,7 @@ test "W102 G15 completeValidation uses legacy hash not hash_serialized" {
 
     var mgr = ChainStateManager.init(&active_cs, &consensus.MAINNET, allocator);
     defer mgr.deinit();
-    mgr.activateSnapshot(&active_cs, base_hash);
+    try mgr.activateSnapshot(&active_cs, base_hash);
     mgr.background_chainstate = &bg_cs;
 
     // completeValidation calls computeUtxoSetHash (legacy), not
@@ -10920,7 +10979,7 @@ test "W102 G15 completeValidation accepts mismatched-chainparams UTXO set" {
 
     var mgr = ChainStateManager.init(&active_cs, &consensus.MAINNET, allocator);
     defer mgr.deinit();
-    mgr.activateSnapshot(&active_cs, entry840k.block_hash);
+    try mgr.activateSnapshot(&active_cs, entry840k.block_hash);
     mgr.background_chainstate = &bg_cs;
 
     // BUG: completeValidation returns true even though neither chainstate
@@ -10929,10 +10988,11 @@ test "W102 G15 completeValidation accepts mismatched-chainparams UTXO set" {
     try std.testing.expect(ok); // passes — bug documented.
 }
 
-// BUG G20: loadTxOutSet does not detect trailing bytes after all coins
-// have been read.  Core explicitly tries to read one more byte after the
-// loop and rejects if it succeeds (validation.cpp:5872-5883).
-test "W102 G20 loadTxOutSet ignores trailing bytes (no EOF gate)" {
+// FIX B7: loadTxOutSet now detects trailing bytes after all coins have been
+// read and returns StorageError.CorruptData.
+// Mirrors Core validation.cpp:5872-5883: try read one more byte; reject if
+// it succeeds ("Bad snapshot - coins left over after deserializing N coins").
+test "W102 G20 loadTxOutSet rejects trailing bytes (EOF gate)" {
     const allocator = std.testing.allocator;
     const consensus = @import("consensus.zig");
 
@@ -10971,10 +11031,8 @@ test "W102 G20 loadTxOutSet ignores trailing bytes (no EOF gate)" {
         try f.writer().writeByte(0xFF); // junk trailing byte
     }
 
-    // BUG: loadTxOutSet returns success; Core would return error.
-    var loaded = try loadTxOutSet(dirty_path, consensus.MAINNET.magic, allocator);
-    loaded.chainstate.deinit();
-    // If we reach here, the trailing-byte check is absent (bug confirmed).
+    // FIX: loadTxOutSet now returns StorageError.CorruptData on trailing bytes.
+    try std.testing.expectError(StorageError.CorruptData, loadTxOutSet(dirty_path, consensus.MAINNET.magic, allocator));
 }
 
 // BUG G26/G27: testnet4 assume_utxo table is empty in clearbit but
@@ -11039,7 +11097,7 @@ test "W102 G4 validateAndLoadSnapshot enforces hash_serialized content check" {
 
     var actual: types.Hash256 = undefined;
     var expected: types.Hash256 = undefined;
-    const result = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, &actual, &expected);
+    const result = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, null, &actual, &expected);
     // Should fail with HashMismatch (not UnknownSnapshot).
     try std.testing.expectError(SnapshotError.HashMismatch, result);
     // Confirm expected == the pinned value.
@@ -11070,7 +11128,7 @@ test "W102 G4 validateAndLoadSnapshot out_actual_hash is populated on HashMismat
 
     var actual: types.Hash256 = [_]u8{0} ** 32;
     var expected: types.Hash256 = [_]u8{0} ** 32;
-    _ = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, &actual, &expected) catch {};
+    _ = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, null, &actual, &expected) catch {};
 
     // actual should be non-zero and different from expected.
     const all_zeros = [_]u8{0} ** 32;
@@ -11147,7 +11205,7 @@ test "W102 G14 validateAndLoadSnapshot does not persist snapshot_base key" {
     try dumpTxOutSet(&cs, consensus.MAINNET.magic, tmp, allocator);
 
     // Attempt to load (will fail at hash check, which is fine).
-    _ = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, null, null) catch {};
+    _ = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, null, null, null) catch {};
 
     // ChainStateManager has no persistent snapshot_base_blockhash field.
     // We document the gap: a real implementation would write a
@@ -11155,6 +11213,114 @@ test "W102 G14 validateAndLoadSnapshot does not persist snapshot_base key" {
     // node knows it came from a snapshot and must background-validate.
     // This test passes trivially because the key is never written (bug).
     try std.testing.expect(true); // placeholder documenting the gap
+}
+
+// FIX B11: validateAndLoadSnapshot now rejects a snapshot whose base block
+// header has BLOCK_FAILED_VALID set in CF_BLOCK_INDEX.
+// Mirrors Core validation.cpp:5617-5619: "The base block header (%s) is
+// part of an invalid chain".
+test "W102 B11 validateAndLoadSnapshot rejects base block with BLOCK_FAILED_VALID" {
+    const allocator = std.testing.allocator;
+    const consensus_mod = @import("consensus.zig");
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var db = try Database.open(db_path, 64, allocator);
+    defer db.close();
+
+    // Build a snapshot whose base_blockhash is the mainnet 840k entry.
+    const entry840k = consensus_mod.MAINNET.assume_utxo[0];
+
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = entry840k.block_hash;
+    cs.best_height = entry840k.height;
+
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xAB); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0xB1} ** 32, .index = 0 };
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = 10_000, .script_pubkey = &p2pkh }, 100, false);
+
+    const tmp = "/tmp/clearbit-w102-b11-failed-valid.dat";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try dumpTxOutSet(&cs, consensus_mod.MAINNET.magic, tmp, allocator);
+
+    // Write a CF_BLOCK_INDEX record for the 840k base block with
+    // BLOCK_FAILED_VALID set.  Layout: height(4) + header(80) + status(4).
+    // status = bit 3 set → failed_valid = true.
+    const bs_invalid = @import("validation.zig").BlockStatus{ .failed_valid = true };
+    const status_u32: u32 = @bitCast(bs_invalid);
+    var rec_buf: [88]u8 = [_]u8{0} ** 88; // height(4) + header(80) + status(4)
+    std.mem.writeInt(u32, rec_buf[0..4], entry840k.height, .little);
+    // header bytes stay zero — not used by the B11 guard
+    std.mem.writeInt(u32, rec_buf[84..88], status_u32, .little);
+    try db.put(CF_BLOCK_INDEX, &entry840k.block_hash, &rec_buf);
+
+    // With db provided: should be rejected with InvalidBaseBlock.
+    const result = validateAndLoadSnapshot(
+        tmp,
+        &consensus_mod.MAINNET,
+        allocator,
+        &db,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectError(SnapshotError.InvalidBaseBlock, result);
+}
+
+// FIX B11 negative: when base block is NOT marked invalid, snapshot passes B11 gate.
+test "W102 B11 validateAndLoadSnapshot passes when base block not BLOCK_FAILED_VALID" {
+    const allocator = std.testing.allocator;
+    const consensus_mod = @import("consensus.zig");
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var db = try Database.open(db_path, 64, allocator);
+    defer db.close();
+
+    const entry840k = consensus_mod.MAINNET.assume_utxo[0];
+
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = entry840k.block_hash;
+    cs.best_height = entry840k.height;
+
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xCD); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0xC2} ** 32, .index = 0 };
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = 5_000, .script_pubkey = &p2pkh }, 10, false);
+
+    const tmp = "/tmp/clearbit-w102-b11-valid-block.dat";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try dumpTxOutSet(&cs, consensus_mod.MAINNET.magic, tmp, allocator);
+
+    // Write a CF_BLOCK_INDEX record for the 840k base block with NO failure flags.
+    var rec_buf: [88]u8 = [_]u8{0} ** 88;
+    std.mem.writeInt(u32, rec_buf[0..4], entry840k.height, .little);
+    // status = 0 (all flags clear)
+    try db.put(CF_BLOCK_INDEX, &entry840k.block_hash, &rec_buf);
+
+    // B11 gate should pass; the load will then fail at hash_serialized check
+    // (garbage UTXO set vs pinned 840k value), which is expected and correct.
+    const result = validateAndLoadSnapshot(
+        tmp,
+        &consensus_mod.MAINNET,
+        allocator,
+        &db,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectError(SnapshotError.HashMismatch, result);
 }
 
 // ============================================================================
