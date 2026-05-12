@@ -7849,18 +7849,18 @@ test "W99/G12: orphan pool lacks 5-minute TTL expiry" {
     // Bitcoin Core: static constexpr auto ORPHAN_TX_EXPIRE_TIME = 5min.
 }
 
-// G14: orphan pool is keyed by txid, not wtxid (BIP-339 violation).
-// BUG: Core's TxOrphanage uses wtxid as the key since BIP-339 adoption.
-// Clearbit's orphan HashMap is keyed by txid (mempool.zig:671).
-test "W99/G14: orphan pool keyed by txid not wtxid" {
+// G14 FIXED: orphan pool primary key changed txid → wtxid (BIP-339 / Core PR #18044).
+// Primary map keyed by wtxid; secondary orphans_by_txid index maps txid→wtxid
+// for parent-resolution and public hasOrphan/removeOrphan callers.
+test "W99/G14: orphan pool keyed by wtxid (BIP-339 fix asserted)" {
     const mempool = @import("mempool.zig");
-    // The comment at mempool.zig:671 explicitly says "indexed by txid".
-    // We verify the OrphanTx struct stores txid (not wtxid) as the lookup field.
+    // OrphanTx now carries both txid (secondary) and wtxid (primary key).
     const OrphanTx = mempool.OrphanTx;
     try std.testing.expect(@hasField(OrphanTx, "txid"));
-    // BUG: no wtxid field; Core keys orphans by wtxid for BIP-339 segregation.
-    // Consequence: a tx with different txid but same wtxid (malleation) could
-    // enter the orphan pool twice under different txid keys.
+    try std.testing.expect(@hasField(OrphanTx, "wtxid"));
+    // Mempool has the secondary txid→wtxid index for parent-resolution.
+    const Mempool = mempool.Mempool;
+    try std.testing.expect(@hasField(Mempool, "orphans_by_txid"));
 }
 
 // G16/G17: validateBlockForIBDOrReject failure does NOT misbehave the supplying peer.
