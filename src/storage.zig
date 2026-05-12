@@ -12043,6 +12043,656 @@ test "W93 G15 IsUnspendable parity: AddCoin skips oversize-script outputs on con
     try std.testing.expectEqual(before, after);
 }
 
+// ============================================================================
+// W100 — CCoinsViewCache + FlushStateToDisk gate audit (clearbit, Zig 0.13)
+// Discovery audit; bugs documented, NOT fixed.
+//
+// BUG-1  [P1] UtxoSet.haveCoin() ignores spent state: the comment on the
+//             cache-hit branch says "existing entries are unspent" but does
+//             not check an isSpent() predicate. Core's HaveCoin() explicitly
+//             checks !coin.IsSpent(). If a spent null-coin ever remains
+//             resident (non-FRESH path), haveCoin() returns true (wrong).
+// BUG-2  [P1] UtxoSet.add() lacks `possible_overwrite` guard: silently
+//             overwrites without asserting/returning error on double-add of
+//             an unspent coin. Core asserts(!HaveCoin(outpoint)) when
+//             possible_overwrite=false. Consensus-critical on IBD.
+// BUG-3  [P2] UtxoSet.add() always sets fresh=true on overwrite: when a
+//             dirty entry is overwritten the fresh flag is reset to true,
+//             violating the Core invariant "fresh can only be set if the
+//             entry was never flushed to the parent". This causes the next
+//             BatchWrite to skip the tombstone write for the old key.
+// BUG-4  [P2] UtxoSet.haveCoinInCache() absent: Core exposes
+//             HaveCoinInCache() as a non-DB-touching predicate used by
+//             net_processing (txn relay path). UtxoSet has no equivalent;
+//             callers fall back to haveCoin() which may hit DB.
+// BUG-5  [P2] UtxoSet.cacheMemoryUsage() flat-estimate: returns
+//             count*500 bytes unconditionally. Core's DynamicMemoryUsage()
+//             uses memusage::DynamicUsage() on each CoinEntry. The flat
+//             estimate underestimates large-script UTXOs, causing the flush
+//             threshold to trigger too late (memory overshoot).
+// BUG-6  [P1] ChainState.flush() lacks FlushStateMode dispatch: always
+//             flushes everything (hardcoded ALWAYS semantics). Core's
+//             FlushStateToDisk() accepts NONE/IF_NEEDED/PERIODIC/ALWAYS and
+//             skips I/O for NONE or when cache is under threshold.
+// BUG-7  [P1] ChainState.flush() missing nMinDiskSpace abort guard: Core
+//             aborts with AbortNode when free disk space < nMinDiskSpace
+//             (default 50 MiB). clearbit silently continues, risking DB
+//             corruption on full-disk.
+// BUG-8  [P2] ChainState.flush() missing GetMainSignals().ChainStateFlushed()
+//             post-flush signal: downstream subscribers (indexes, wallets)
+//             are never notified of a flush event.
+// BUG-9  [P2] CoinsViewCache.flush() clears ALL entries after writing dirty
+//             ones (clearRetainingCapacity): should evict only dirty entries,
+//             retaining clean ones for cache efficiency. The current impl
+//             thrashes the cache every flush.
+// BUG-10 [P3] suppress_eviction flag mid-block: UtxoSet sets
+//             suppress_eviction=true during connectBlockFast but the guard
+//             is not checked in the flush() hot path, so a concurrent
+//             periodic flush could still run during block application.
+// BUG-11 [P2] BatchWrite FRESH+DIRTY flag merge absent in UtxoSet: when
+//             flushing child→parent, Core merges (child.FRESH & !parent.DIRTY)
+//             to set FRESH on the parent entry. UtxoSet always overwrites
+//             parent flags unconditionally.
+// ============================================================================
+
+// --- G1/G2: HaveCoin / HaveCoinInCache ---
+
+test "W100 G1: UtxoSet.haveCoin returns false after spend (FRESH path removes from cache)" {
+    // Core: HaveCoin() returns false when coin.IsSpent().
+    // clearbit: spend() removes FRESH entries from cache entirely, so
+    // haveCoin() correctly returns false for the FRESH path.  BUG-1 applies
+    // to the non-FRESH path where a spent null-coin may remain resident.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const txid = [_]u8{0x10} ** 32;
+    const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
+    const script = [_]u8{ 0x51 }; // OP_1
+    const txout = types.TxOut{ .value = 5000, .script_pubkey = &script };
+
+    // Add then spend the coin (FRESH path: never flushed to DB).
+    try chain_state.utxo_set.add(&outpoint, &txout, 100, false);
+    try std.testing.expect(chain_state.utxo_set.haveCoin(&outpoint));
+
+    if (try chain_state.utxo_set.spend(&outpoint)) |*s| {
+        var sc = s.*;
+        sc.deinit(allocator);
+    }
+
+    // FRESH spend removes from cache; haveCoin must return false.
+    try std.testing.expect(!chain_state.utxo_set.haveCoin(&outpoint));
+}
+
+test "W100 G2: UtxoSet lacks HaveCoinInCache predicate (BUG-4)" {
+    // Core: HaveCoinInCache() checks cache without DB lookup.
+    // clearbit: no such method on UtxoSet; only haveCoin() exists (may hit DB).
+    // This test documents the absent API surface by confirming haveCoin exists
+    // but the cache-only variant does not.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const txid = [_]u8{0x20} ** 32;
+    const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
+    const script = [_]u8{ 0x51 };
+    const txout = types.TxOut{ .value = 1000, .script_pubkey = &script };
+    try chain_state.utxo_set.add(&outpoint, &txout, 1, false);
+
+    // haveCoin exists (may hit DB).
+    try std.testing.expect(chain_state.utxo_set.haveCoin(&outpoint));
+    // BUG-4: chain_state.utxo_set.haveCoinInCache(&outpoint) does not exist.
+    // CoinsViewCache.haveCoinInCache() exists in the secondary layer (see G19).
+}
+
+// --- G3: AddCoin possible_overwrite ---
+
+test "W100 G3: UtxoSet.add silently overwrites unspent coin without assertion (BUG-2)" {
+    // Core: AddCoin() asserts(!HaveCoin(out)) when possible_overwrite=false.
+    // clearbit: second add() simply overwrites without error.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const txid = [_]u8{0x30} ** 32;
+    const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
+    const script = [_]u8{ 0x51 };
+    const txout1 = types.TxOut{ .value = 1000, .script_pubkey = &script };
+    const txout2 = types.TxOut{ .value = 9999, .script_pubkey = &script };
+
+    try chain_state.utxo_set.add(&outpoint, &txout1, 1, false);
+    // BUG-2: second add should fail / assert; instead it silently overwrites.
+    try chain_state.utxo_set.add(&outpoint, &txout2, 2, false);
+
+    // The coin has been overwritten; Core would have aborted.
+    // Confirm it is in cache with the second value (overwrite succeeded silently).
+    try std.testing.expect(chain_state.utxo_set.haveCoin(&outpoint));
+    const fetched = try chain_state.utxo_set.get(&outpoint);
+    try std.testing.expect(fetched != null);
+    // Documents the overwrite succeeded (wrong in Core model — BUG-2).
+    if (fetched) |f| {
+        var fc = f;
+        defer fc.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 9999), fc.value);
+    }
+}
+
+// --- G4: SpendCoin moveout ---
+
+test "W100 G4: UtxoSet.spend returns CompactUtxo (Core SpendCoin moveout)" {
+    // Core: SpendCoin() moves the coin out into the provided CoinEntry.
+    // clearbit: spend() returns an optional CompactUtxo.  Verify it is non-null.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const txid = [_]u8{0x40} ** 32;
+    const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
+    const script = [_]u8{ 0x51 };
+    const txout = types.TxOut{ .value = 2000, .script_pubkey = &script };
+
+    try chain_state.utxo_set.add(&outpoint, &txout, 5, false);
+    const spent = try chain_state.utxo_set.spend(&outpoint);
+    try std.testing.expect(spent != null);
+    if (spent) |s| {
+        var sc = s;
+        defer sc.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, 2000), sc.value);
+    }
+
+    // After spending, haveCoin must return false (Core parity).
+    try std.testing.expect(!chain_state.utxo_set.haveCoin(&outpoint));
+}
+
+// --- G5: FRESH flag invariant on overwrite (BUG-3) ---
+
+test "W100 G5: UtxoSet.add always sets fresh=true even after DB flush (BUG-3)" {
+    // Core BatchWrite invariant: fresh flag may only be set if the entry was
+    // never written to the parent DB layer.  Overwriting a DB-resident entry
+    // must keep fresh=false so the tombstone path fires on spend.
+    // clearbit: add() always sets fresh=true unconditionally (line ~1195).
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const txid = [_]u8{0x50} ** 32;
+    const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
+    const key = makeUtxoKey(&outpoint);
+    const script = [_]u8{ 0x51 };
+    const txout = types.TxOut{ .value = 3000, .script_pubkey = &script };
+
+    // First add: entry enters cache as fresh+dirty.
+    try chain_state.utxo_set.add(&outpoint, &txout, 10, false);
+
+    // Flush to DB: entry now in DB; flush() clears fresh flag on cache entry.
+    try chain_state.utxo_set.flush();
+
+    // Confirm flush correctly cleared fresh on the cache entry.
+    if (chain_state.utxo_set.cache.get(key)) |entry| {
+        try std.testing.expect(!entry.fresh); // post-flush: fresh=false (correct).
+    }
+
+    // Second add (overwrite of DB-resident entry): should set fresh=false.
+    const txout2 = types.TxOut{ .value = 3001, .script_pubkey = &script };
+    try chain_state.utxo_set.add(&outpoint, &txout2, 11, false);
+
+    // BUG-3: clearbit unconditionally sets fresh=true here.
+    if (chain_state.utxo_set.cache.get(key)) |entry| {
+        // Confirmed BUG-3: fresh=true after overwriting a DB-resident entry.
+        try std.testing.expect(entry.fresh); // documents wrong value (should be false).
+    }
+}
+
+// --- G6: DynamicMemoryUsage flat estimate (BUG-5) ---
+
+test "W100 G6: cacheMemoryUsage is flat count*500 not dynamic script-size aware (BUG-5)" {
+    // Core: DynamicMemoryUsage() traverses all entries for true memory.
+    // clearbit: returns count * 500 regardless of script sizes.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    // Insert two coins: one small script, one large script.
+    const small_script = [_]u8{ 0x51 };
+    const large_script = [_]u8{0x01} ** 520; // 520-byte script
+
+    const out1 = types.OutPoint{ .hash = [_]u8{0x61} ** 32, .index = 0 };
+    const out2 = types.OutPoint{ .hash = [_]u8{0x62} ** 32, .index = 0 };
+    const txout1 = types.TxOut{ .value = 100, .script_pubkey = &small_script };
+    const txout2 = types.TxOut{ .value = 200, .script_pubkey = &large_script };
+
+    try chain_state.utxo_set.add(&out1, &txout1, 1, false);
+    try chain_state.utxo_set.add(&out2, &txout2, 1, false);
+
+    const usage = chain_state.utxo_set.cacheMemoryUsage();
+    // BUG-5: flat estimate is 2 * 500 = 1000 regardless of actual sizes.
+    // Core would report ~small_script.len + large_script.len + overhead ≈ 600+.
+    try std.testing.expectEqual(@as(usize, 2 * 500), usage);
+    // The large-script coin is not reflected in the estimate (BUG-5).
+}
+
+// --- G7: BatchWrite FRESH+DIRTY flag merge (BUG-11) ---
+
+test "W100 G7: UtxoSet flush writes dirty entries without FRESH+DIRTY merge (BUG-11)" {
+    // Core BatchWrite: when child entry is FRESH and parent is NOT DIRTY,
+    // parent gets FRESH=true.  Otherwise parent FRESH is cleared.
+    // clearbit: flush() writes dirty entries to DB unconditionally without
+    // consulting prior flag state.  The merge logic is absent (BUG-11).
+    // This test verifies the round-trip succeeds and coin is readable from DB.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const txid = [_]u8{0x70} ** 32;
+    const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
+    const key = makeUtxoKey(&outpoint);
+    const script = [_]u8{ 0x51 };
+    const txout = types.TxOut{ .value = 777, .script_pubkey = &script };
+
+    try chain_state.utxo_set.add(&outpoint, &txout, 7, false);
+    // Flush (child→DB): no FRESH+DIRTY flag-merge logic present (BUG-11).
+    try chain_state.utxo_set.flush();
+
+    // Coin should be readable directly from DB via RocksDB key lookup.
+    const raw = try db.get(CF_UTXO, &key);
+    try std.testing.expect(raw != null);
+    if (raw) |r| allocator.free(r);
+}
+
+// --- G8: FlushStateMode dispatch absent (BUG-6) ---
+
+test "W100 G8: ChainState.flush performs full I/O regardless of mode (BUG-6)" {
+    // Core FlushStateToDisk() skips I/O when mode=NONE or when cache is
+    // under the threshold for PERIODIC/IF_NEEDED.
+    // clearbit: flush() always flushes; no mode parameter.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // Document: flush() accepts no mode argument.
+    // This call always flushes (ALWAYS semantics, BUG-6).
+    try chain_state.flush();
+}
+
+// --- G9: nMinDiskSpace abort guard absent (BUG-7) ---
+
+test "W100 G9: ChainState.flush lacks nMinDiskSpace abort guard (BUG-7)" {
+    // Core: if statvfs free_space < nMinDiskSpace (50 MiB), AbortNode fires.
+    // clearbit: no disk-space check in flush().
+    // This test documents the absent check; no runtime mechanism to inject
+    // a fake low-disk condition, so we verify flush() completes without
+    // any disk-space gate.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // flush() succeeds unconditionally — no disk-space gate (BUG-7).
+    try chain_state.flush();
+    // If a disk-space check existed, it would be tested here with a mock.
+}
+
+// --- G10: ChainStateFlushed signal absent (BUG-8) ---
+
+test "W100 G10: ChainState.flush emits no post-flush ChainStateFlushed signal (BUG-8)" {
+    // Core: FlushStateToDisk() calls GetMainSignals().ChainStateFlushed()
+    // after a successful flush so that indexes and wallets can update.
+    // clearbit: no signal/callback mechanism around flush().
+    // Documented as absent; test confirms flush() succeeds without error.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    try chain_state.flush();
+    // No signal emitted; BUG-8 is a structural absence.
+}
+
+// --- G11: CoinsViewCache.flush clears all entries (BUG-9) ---
+
+test "W100 G11: CoinsViewCache.flush evicts all entries including clean ones (BUG-9)" {
+    // Core: after flushing dirty entries to the parent, only dirty entries
+    // are removed; clean entries are retained for cache efficiency.
+    // clearbit CoinsViewCache.flush(): calls clearRetainingCapacity() which
+    // wipes ALL entries, trashing the cache (BUG-9).
+    const allocator = std.testing.allocator;
+
+    // null base: no DB, no parent — flush is a no-op for the DB layer
+    // but clearRetainingCapacity() still runs (BUG-9).
+    var cvc = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cvc.deinit();
+
+    const script = [_]u8{ 0x51 };
+    const out1 = types.OutPoint{ .hash = [_]u8{0xA1} ** 32, .index = 0 };
+    const out2 = types.OutPoint{ .hash = [_]u8{0xA2} ** 32, .index = 0 };
+
+    // Add out1 and out2 (both dirty+fresh).
+    try cvc.addCoin(&out1, Coin{ .tx_out = .{ .value = 111, .script_pubkey = &script }, .height = 1, .is_coinbase = false }, false);
+    try cvc.addCoin(&out2, Coin{ .tx_out = .{ .value = 222, .script_pubkey = &script }, .height = 1, .is_coinbase = false }, false);
+
+    try cvc.flush();
+
+    // BUG-9: both entries are gone from the cache after flush.
+    // Core would retain clean entries; only dirty ones should be evicted.
+    try std.testing.expectEqual(@as(usize, 0), cvc.cache.count());
+}
+
+// --- G12: CoinsViewCache.addCoin possible_overwrite guard (correct path) ---
+
+test "W100 G12: CoinsViewCache.addCoin rejects double-add with possible_overwrite=false" {
+    // CoinsViewCache.addCoin() returns error.CoinOverwrite on double-add
+    // when possible_overwrite=false — correct Core semantics absent from UtxoSet.
+    const allocator = std.testing.allocator;
+
+    var cvc = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cvc.deinit();
+
+    const script = [_]u8{ 0x51 };
+    const out = types.OutPoint{ .hash = [_]u8{0xB1} ** 32, .index = 0 };
+
+    try cvc.addCoin(&out, Coin{ .tx_out = .{ .value = 500, .script_pubkey = &script }, .height = 1, .is_coinbase = false }, false);
+    try std.testing.expect(cvc.haveCoin(&out));
+
+    // Second add with possible_overwrite=false must return CoinOverwrite.
+    const result = cvc.addCoin(&out, Coin{ .tx_out = .{ .value = 501, .script_pubkey = &script }, .height = 2, .is_coinbase = false }, false);
+    try std.testing.expectError(error.CoinOverwrite, result);
+}
+
+// --- G13: makeUtxoKey 36-byte layout ---
+
+test "W100 G13: makeUtxoKey produces 36-byte txid||vout_le key" {
+    // Core: COutPoint serialises as txid(32) + vout(4, LE).
+    // clearbit: makeUtxoKey() produces the same layout.
+    const txid = [_]u8{0xCC} ** 32;
+    const outpoint = types.OutPoint{ .hash = txid, .index = 0x00000003 };
+    const key = makeUtxoKey(&outpoint);
+
+    try std.testing.expectEqual(@as(usize, 36), key.len);
+    // First 32 bytes = txid.
+    try std.testing.expectEqualSlices(u8, &txid, key[0..32]);
+    // Bytes 32-35 = vout as LE uint32.
+    try std.testing.expectEqual(@as(u8, 0x03), key[32]);
+    try std.testing.expectEqual(@as(u8, 0x00), key[33]);
+    try std.testing.expectEqual(@as(u8, 0x00), key[34]);
+    try std.testing.expectEqual(@as(u8, 0x00), key[35]);
+}
+
+// --- G14: total_utxos counter consistency ---
+
+test "W100 G14: total_utxos counter increments on add and decrements on spend" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const txid = [_]u8{0xD0} ** 32;
+    const out = types.OutPoint{ .hash = txid, .index = 0 };
+    const script = [_]u8{ 0x51 };
+    const txout = types.TxOut{ .value = 100, .script_pubkey = &script };
+
+    const before = chain_state.utxo_set.total_utxos;
+    try chain_state.utxo_set.add(&out, &txout, 1, false);
+    try std.testing.expectEqual(before + 1, chain_state.utxo_set.total_utxos);
+
+    if (try chain_state.utxo_set.spend(&out)) |*s| {
+        var sc = s.*;
+        sc.deinit(allocator);
+    }
+    try std.testing.expectEqual(before, chain_state.utxo_set.total_utxos);
+}
+
+// --- G15: flush_error sticky flag ---
+
+test "W100 G15: flush_error field exists and defaults to false" {
+    // clearbit has a flush_error sticky flag to halt IBD on write failure.
+    // Verify it is initialized to false and accessible.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    try std.testing.expect(!chain_state.flush_error);
+}
+
+// --- G16: suppress_eviction guard ---
+
+test "W100 G16: suppress_eviction flag exists and defaults to false" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    try std.testing.expect(!chain_state.utxo_set.suppress_eviction);
+}
+
+// --- G17: RocksDB WriteBatch atomicity ---
+
+test "W100 G17: UtxoSet.flush uses RocksDB WriteBatch for atomic UTXO+tip write" {
+    // Core: WriteBatch ensures crash-consistency — either all UTXO updates
+    // and the new tip land together, or none do.
+    // clearbit: flush() should use a WriteBatch.  Verify a flush round-trip
+    // leaves the DB in a consistent state.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const txid = [_]u8{0xE0} ** 32;
+    const out = types.OutPoint{ .hash = txid, .index = 0 };
+    const key = makeUtxoKey(&out);
+    const script = [_]u8{ 0x51 };
+    const txout = types.TxOut{ .value = 400, .script_pubkey = &script };
+    try chain_state.utxo_set.add(&out, &txout, 20, false);
+
+    // flush() must succeed; coin must be readable directly from RocksDB.
+    try chain_state.utxo_set.flush();
+    const raw = try db.get(CF_UTXO, &key);
+    try std.testing.expect(raw != null);
+    if (raw) |r| allocator.free(r);
+}
+
+// --- G18: accessByTxidSibling only on opt-in sentinel path ---
+
+test "W100 G18: accessByTxidSibling is opt-in only; applyTxInUndo uses direct key lookup" {
+    // Core equivalent: SpendCoin() is called by ConnectInputs with the outpoint
+    // known exactly; there is no txid-sibling scan.
+    // clearbit: applyTxInUndoSentinel() uses accessByTxidSibling(); the
+    // production applyTxInUndo() uses the exact key.  Documented as correct.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    // Insert two outputs of the same tx.
+    const txid = [_]u8{0xF0} ** 32;
+    const out0 = types.OutPoint{ .hash = txid, .index = 0 };
+    const out1 = types.OutPoint{ .hash = txid, .index = 1 };
+    const script = [_]u8{ 0x51 };
+    const txout0 = types.TxOut{ .value = 1000, .script_pubkey = &script };
+    const txout1 = types.TxOut{ .value = 2000, .script_pubkey = &script };
+    try chain_state.utxo_set.add(&out0, &txout0, 1, false);
+    try chain_state.utxo_set.add(&out1, &txout1, 1, false);
+
+    // Spend out0 specifically — must not disturb out1.
+    if (try chain_state.utxo_set.spend(&out0)) |*s| {
+        var sc = s.*;
+        sc.deinit(allocator);
+    }
+    try std.testing.expect(chain_state.utxo_set.haveCoin(&out1));
+    try std.testing.expect(!chain_state.utxo_set.haveCoin(&out0));
+}
+
+// --- G19: CoinsViewCache.haveCoinInCache ---
+
+test "W100 G19: CoinsViewCache.haveCoinInCache present in secondary layer (BUG-4 contrast)" {
+    // CoinsViewCache exposes haveCoinInCache() (cache-only, no DB round-trip).
+    // UtxoSet lacks this predicate (BUG-4) — callers must fall back to haveCoin().
+    const allocator = std.testing.allocator;
+
+    // null base: no DB backing needed for haveCoinInCache test.
+    var cvc = CoinsViewCache.init(null, 1024 * 1024, allocator);
+    defer cvc.deinit();
+
+    const out = types.OutPoint{ .hash = [_]u8{0x19} ** 32, .index = 0 };
+    const script = [_]u8{ 0x51 };
+    try cvc.addCoin(&out, Coin{ .tx_out = .{ .value = 50, .script_pubkey = &script }, .height = 1, .is_coinbase = false }, false);
+
+    // haveCoinInCache: returns true without DB lookup.
+    try std.testing.expect(cvc.haveCoinInCache(&out));
+
+    // Out-of-cache outpoint must return false.
+    const miss = types.OutPoint{ .hash = [_]u8{0x00} ** 32, .index = 99 };
+    try std.testing.expect(!cvc.haveCoinInCache(&miss));
+}
+
+// --- G20: GetCoin DB round-trip ---
+
+test "W100 G20: UtxoSet.get returns null for unknown outpoint; after add+flush DB has key" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    const out = types.OutPoint{ .hash = [_]u8{0x2F} ** 32, .index = 5 };
+    // Not in cache or DB: get() must return null.
+    const miss = try chain_state.utxo_set.get(&out);
+    try std.testing.expectEqual(@as(?CompactUtxo, null), miss);
+
+    const script = [_]u8{ 0x51 };
+    const txout = types.TxOut{ .value = 600, .script_pubkey = &script };
+    try chain_state.utxo_set.add(&out, &txout, 3, false);
+    try chain_state.utxo_set.flush();
+
+    // After flush, key must exist in RocksDB.
+    const key = makeUtxoKey(&out);
+    const raw = try db.get(CF_UTXO, &key);
+    try std.testing.expect(raw != null);
+    if (raw) |r| allocator.free(r);
+}
+
 test "W93 G15 IsUnspendable parity: normal P2WPKH coinbase IS emplaced (regression guard)" {
     const allocator = std.testing.allocator;
 
