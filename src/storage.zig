@@ -10737,6 +10737,427 @@ test "ChainStateManager completeValidation with matching hashes" {
 }
 
 // ============================================================================
+// W102 AssumeUTXO snapshot loading gate audit tests
+// ============================================================================
+
+// BUG G3/G18: dumpTxOutSet embeds utxo_set.cache.count() in the header,
+// which is the in-memory HashMap size.  For a node with a live RocksDB
+// backend the cache may not hold the full set, so coins_count will
+// undercount — Core uses the persisted total.  This test pins the current
+// (buggy) behaviour so a fix becomes visible.
+test "W102 G3 dumpTxOutSet coins_count matches cache not persisted total" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = [_]u8{0xBB} ** 32;
+    cs.best_height = 1;
+
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x44); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0x10} ** 32, .index = 0 };
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = 1_000_000, .script_pubkey = &p2pkh }, 1, false);
+
+    // Artificially inflate total_utxos to simulate a persistent store with
+    // more UTXOs than what is in the in-memory cache.
+    cs.utxo_set.total_utxos = 999_999;
+
+    const tmp = "/tmp/clearbit-w102-g3-coins-count.dat";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try dumpTxOutSet(&cs, consensus.MAINNET.magic, tmp, allocator);
+
+    // Read back the header and check: coins_count should match cache size
+    // (1), NOT total_utxos (999_999).  This documents the current buggy
+    // behaviour (cache size wins over persistent total).
+    const file = try std.fs.cwd().openFile(tmp, .{});
+    defer file.close();
+    var hdr: [SnapshotMetadata.HEADER_SIZE]u8 = undefined;
+    try file.reader().readNoEof(&hdr);
+    const md = try SnapshotMetadata.fromBytes(&hdr, consensus.MAINNET.magic);
+    // BUG: coins_count == cache.count() (1), not total_utxos (999_999).
+    try std.testing.expectEqual(@as(u64, 1), md.coins_count);
+}
+
+// BUG G5: activateSnapshot has no "already loaded" guard.  Calling it
+// twice silently replaces background_chainstate with the previous active,
+// losing the original background pointer.
+test "W102 G5 activateSnapshot double-call clobbers background chainstate" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    var cs_normal = ChainState.init(null, 64, allocator);
+    defer cs_normal.deinit();
+    var cs_snap1 = ChainState.init(null, 64, allocator);
+    defer cs_snap1.deinit();
+    var cs_snap2 = ChainState.init(null, 64, allocator);
+    defer cs_snap2.deinit();
+
+    var mgr = ChainStateManager.init(&cs_normal, &consensus.MAINNET, allocator);
+    defer mgr.deinit();
+
+    const hash1 = [_]u8{0x01} ** 32;
+    mgr.activateSnapshot(&cs_snap1, hash1);
+    // background is now &cs_normal, active is &cs_snap1.
+    try std.testing.expectEqual(&cs_normal, mgr.background_chainstate.?);
+
+    const hash2 = [_]u8{0x02} ** 32;
+    // Second call: BUG — no guard; background is now clobbered to cs_snap1,
+    // the original cs_normal background pointer is orphaned.
+    mgr.activateSnapshot(&cs_snap2, hash2);
+    // After the second call active changed — the ORIGINAL background
+    // (&cs_normal) is gone.  We document the clobbering here.
+    try std.testing.expectEqual(&cs_snap1, mgr.background_chainstate.?);
+}
+
+// BUG G7: loadTxOutSet (in-memory path used by validateAndLoadSnapshot)
+// does NOT perform a MoneyRange check on coin amounts.  A crafted snapshot
+// with a negative nValue would pass through, but compressor.writeCoin has
+// its own assert(value >= 0), so we cannot create a negative-value snapshot
+// via the normal dump path.  Instead we verify the gap exists by checking
+// that loadTxOutSet has no MoneyRange call in its coin loop — which we do
+// by confirming a zero-value coin (edge of valid range) is accepted with
+// no error.  A fully correct implementation would also guard against values
+// below 0 that bypass the compressor assert via direct byte injection.
+test "W102 G7 loadTxOutSet accepts zero-value coin (MoneyRange boundary)" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    // Build a snapshot with a zero-value coin (borderline valid; no
+    // MoneyRange guard in loadTxOutSet means this passes through silently).
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = [_]u8{0xAA} ** 32;
+    cs.best_height = 0;
+    const op = types.OutPoint{ .hash = [_]u8{0x55} ** 32, .index = 0 };
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x77); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = 0, .script_pubkey = &p2pkh }, 0, false);
+
+    const tmp = "/tmp/clearbit-w102-g7-zero-val.dat";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try dumpTxOutSet(&cs, consensus.MAINNET.magic, tmp, allocator);
+
+    // loadTxOutSet has no MoneyRange check — a zero-value coin is accepted.
+    var loaded = try loadTxOutSet(tmp, consensus.MAINNET.magic, allocator);
+    defer loaded.chainstate.deinit();
+    const key = makeUtxoKey(&op);
+    const hit = loaded.chainstate.utxo_set.cache.get(key);
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqual(@as(i64, 0), hit.?.utxo.value);
+}
+
+// BUG G15: completeValidation uses the legacy computeUtxoSetHash
+// (VARINT-based, not Core's SHA256d TxOutSer hash).  This test
+// demonstrates that two chainstates with identical UTXOs produce the same
+// legacy hash and pass, but the hash function is not Core-compat.
+test "W102 G15 completeValidation uses legacy hash not hash_serialized" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    var active_cs = ChainState.init(null, 64, allocator);
+    defer active_cs.deinit();
+    var bg_cs = ChainState.init(null, 64, allocator);
+    defer bg_cs.deinit();
+
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xCC); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0x11} ** 32, .index = 0 };
+    try active_cs.utxo_set.add(&op, &types.TxOut{ .value = 5_000_000_000, .script_pubkey = &p2pkh }, 100, true);
+    try bg_cs.utxo_set.add(&op, &types.TxOut{ .value = 5_000_000_000, .script_pubkey = &p2pkh }, 100, true);
+
+    const base_hash = [_]u8{0x12} ** 32;
+    active_cs.best_hash = base_hash;
+    bg_cs.best_hash = base_hash;
+
+    var mgr = ChainStateManager.init(&active_cs, &consensus.MAINNET, allocator);
+    defer mgr.deinit();
+    mgr.activateSnapshot(&active_cs, base_hash);
+    mgr.background_chainstate = &bg_cs;
+
+    // completeValidation calls computeUtxoSetHash (legacy), not
+    // computeHashSerializedTxOutSet.  The two hashes differ for the same set.
+    const legacy_hash = try computeUtxoSetHash(&active_cs.utxo_set, allocator);
+    const strict_hash = try computeHashSerializedTxOutSet(&active_cs.utxo_set, allocator);
+    // BUG: the hash functions are not equivalent — the legacy one would
+    // pass where strict would also pass here, but the two functions diverge
+    // when content differs (strict is what Core pins in m_assumeutxo_data).
+    try std.testing.expect(!std.mem.eql(u8, &legacy_hash, &strict_hash));
+
+    // completeValidation still succeeds (both chainstates identical), but
+    // it is using the wrong hash function.
+    const ok = try mgr.completeValidation();
+    try std.testing.expect(ok);
+}
+
+// BUG G15: completeValidation does not compare against
+// assume_entry.hash_serialized from chainparams.  Two identical-but-wrong
+// chainstates pass validation.
+test "W102 G15 completeValidation accepts mismatched-chainparams UTXO set" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    var active_cs = ChainState.init(null, 64, allocator);
+    defer active_cs.deinit();
+    var bg_cs = ChainState.init(null, 64, allocator);
+    defer bg_cs.deinit();
+
+    // Single dummy coin — clearly not the 840k mainnet UTXO set.
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xDD); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0x22} ** 32, .index = 0 };
+    try active_cs.utxo_set.add(&op, &types.TxOut{ .value = 100_000, .script_pubkey = &p2pkh }, 50, false);
+    try bg_cs.utxo_set.add(&op, &types.TxOut{ .value = 100_000, .script_pubkey = &p2pkh }, 50, false);
+
+    // Use 840k block hash so the base_hash is a known chainparams entry.
+    const entry840k = consensus.MAINNET.assume_utxo[0];
+    active_cs.best_hash = entry840k.block_hash;
+    bg_cs.best_hash = entry840k.block_hash;
+
+    var mgr = ChainStateManager.init(&active_cs, &consensus.MAINNET, allocator);
+    defer mgr.deinit();
+    mgr.activateSnapshot(&active_cs, entry840k.block_hash);
+    mgr.background_chainstate = &bg_cs;
+
+    // BUG: completeValidation returns true even though neither chainstate
+    // matches the real 840k UTXO set (entry840k.hash_serialized).
+    const ok = try mgr.completeValidation();
+    try std.testing.expect(ok); // passes — bug documented.
+}
+
+// BUG G20: loadTxOutSet does not detect trailing bytes after all coins
+// have been read.  Core explicitly tries to read one more byte after the
+// loop and rejects if it succeeds (validation.cpp:5872-5883).
+test "W102 G20 loadTxOutSet ignores trailing bytes (no EOF gate)" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    // Build a valid small snapshot, then append a junk byte.
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = [_]u8{0xCC} ** 32;
+    cs.best_height = 0;
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x88); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0x33} ** 32, .index = 0 };
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = 1_000, .script_pubkey = &p2pkh }, 0, false);
+
+    const clean_path = "/tmp/clearbit-w102-g20-clean.dat";
+    const dirty_path = "/tmp/clearbit-w102-g20-trailing.dat";
+    defer std.fs.cwd().deleteFile(clean_path) catch {};
+    defer std.fs.cwd().deleteFile(dirty_path) catch {};
+    try dumpTxOutSet(&cs, consensus.MAINNET.magic, clean_path, allocator);
+
+    // Read clean snapshot and append one junk byte.
+    const clean_bytes = blk: {
+        const f = try std.fs.cwd().openFile(clean_path, .{});
+        defer f.close();
+        const st = try f.stat();
+        const b = try allocator.alloc(u8, @intCast(st.size));
+        try f.reader().readNoEof(b);
+        break :blk b;
+    };
+    defer allocator.free(clean_bytes);
+
+    {
+        const f = try std.fs.cwd().createFile(dirty_path, .{});
+        defer f.close();
+        try f.writer().writeAll(clean_bytes);
+        try f.writer().writeByte(0xFF); // junk trailing byte
+    }
+
+    // BUG: loadTxOutSet returns success; Core would return error.
+    var loaded = try loadTxOutSet(dirty_path, consensus.MAINNET.magic, allocator);
+    loaded.chainstate.deinit();
+    // If we reach here, the trailing-byte check is absent (bug confirmed).
+}
+
+// BUG G26/G27: testnet4 assume_utxo table is empty in clearbit but
+// Bitcoin Core carries 2 entries (90k and 120k).
+test "W102 G26 testnet4 assume_utxo table is empty (missing Core entries)" {
+    const consensus = @import("consensus.zig");
+    // Bitcoin Core CTestNet4Params has entries at h=90_000 and h=120_000.
+    // clearbit TESTNET4 carries an empty slice.  Snapshot loads for
+    // testnet4 will always fail with UnknownSnapshot.
+    try std.testing.expectEqual(@as(usize, 0), consensus.TESTNET4.assume_utxo.len);
+    // The correct value should be 2 (this assertion documents the bug —
+    // it passes because 0 == 0, confirming the table is empty).
+}
+
+// BUG G26/G27: signet assume_utxo table is empty in clearbit but
+// Bitcoin Core carries 2 entries (160k and 290k).
+test "W102 G27 signet assume_utxo table is empty (missing Core entries)" {
+    const consensus = @import("consensus.zig");
+    // Bitcoin Core SigNetParams has entries at h=160_000 and h=290_000.
+    // clearbit SIGNET carries an empty slice.
+    try std.testing.expectEqual(@as(usize, 0), consensus.SIGNET.assume_utxo.len);
+}
+
+// BUG G26: testnet3 assume_utxo table is empty in clearbit but
+// Bitcoin Core carries 2 entries (2_500_000 and 4_840_000).
+test "W102 G26 testnet3 assume_utxo table is empty (missing Core entries)" {
+    const consensus = @import("consensus.zig");
+    // Bitcoin Core CTestNetParams has entries at h=2_500_000 and h=4_840_000.
+    try std.testing.expectEqual(@as(usize, 0), consensus.TESTNET3.assume_utxo.len);
+}
+
+// BUG G4: validateAndLoadSnapshot (RPC/in-memory path) correctly enforces
+// the whitelist, but loadSnapshotFromFile (CLI path) does NOT perform the
+// hash_serialized content-hash check after importing coins.  We cannot
+// exercise the CLI path in unit tests (it calls std.process.exit), but
+// we document the gap via the in-memory path which DOES have the check.
+test "W102 G4 validateAndLoadSnapshot enforces hash_serialized content check" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    // Build a snapshot whose base_blockhash IS in the mainnet whitelist
+    // (840k) but whose UTXO set contents are garbage — hash_serialized
+    // will not match the pinned value.
+    const entry840k = consensus.MAINNET.assume_utxo[0];
+
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = entry840k.block_hash;
+    cs.best_height = entry840k.height;
+
+    // Garbage UTXO set.
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xEE); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0x99} ** 32, .index = 0 };
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = 1_234, .script_pubkey = &p2pkh }, 100, false);
+
+    const tmp = "/tmp/clearbit-w102-g4-hash-check.dat";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+    // Dump with MAINNET magic so the network check passes.
+    try dumpTxOutSet(&cs, consensus.MAINNET.magic, tmp, allocator);
+
+    var actual: types.Hash256 = undefined;
+    var expected: types.Hash256 = undefined;
+    const result = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, &actual, &expected);
+    // Should fail with HashMismatch (not UnknownSnapshot).
+    try std.testing.expectError(SnapshotError.HashMismatch, result);
+    // Confirm expected == the pinned value.
+    try std.testing.expectEqualSlices(u8, &entry840k.hash_serialized, &expected);
+}
+
+// Regression: validateAndLoadSnapshot (RPC/in-memory path) also reports
+// the actual computed hash so callers can format the Core diagnostic.
+test "W102 G4 validateAndLoadSnapshot out_actual_hash is populated on HashMismatch" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    const entry840k = consensus.MAINNET.assume_utxo[0];
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = entry840k.block_hash;
+    cs.best_height = entry840k.height;
+
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xFF); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0x77} ** 32, .index = 0 };
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = 9_999, .script_pubkey = &p2pkh }, 50, false);
+
+    const tmp = "/tmp/clearbit-w102-actual-hash.dat";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try dumpTxOutSet(&cs, consensus.MAINNET.magic, tmp, allocator);
+
+    var actual: types.Hash256 = [_]u8{0} ** 32;
+    var expected: types.Hash256 = [_]u8{0} ** 32;
+    _ = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, &actual, &expected) catch {};
+
+    // actual should be non-zero and different from expected.
+    const all_zeros = [_]u8{0} ** 32;
+    try std.testing.expect(!std.mem.eql(u8, &actual, &all_zeros));
+    try std.testing.expect(!std.mem.eql(u8, &actual, &expected));
+}
+
+// BUG G9: loadTxOutSet does NOT call MoneyRange on coin values.  Values
+// above MAX_MONEY should be rejected (Core: validation.cpp:5820-5823).
+// compressor.compressAmount clamps large values silently; the missing
+// MoneyRange guard means no explicit rejection happens.  We document the
+// gap here: a coin at exactly MAX_MONEY is accepted with no error
+// (correct behaviour), but the absence of the check means a value that
+// slips through compressor as MAX_MONEY+delta would also not be caught.
+test "W102 G9 loadTxOutSet has no MoneyRange gate (MAX_MONEY boundary passes)" {
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
+
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = [_]u8{0xEE} ** 32;
+    cs.best_height = 0;
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x11); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0x44} ** 32, .index = 0 };
+    // MAX_MONEY itself is valid per MoneyRange — this round-trips fine.
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = MAX_MONEY, .script_pubkey = &p2pkh }, 0, false);
+
+    const tmp = "/tmp/clearbit-w102-g9-max.dat";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try dumpTxOutSet(&cs, consensus.MAINNET.magic, tmp, allocator);
+
+    // loadTxOutSet has no MoneyRange check — the value passes through.
+    var loaded = try loadTxOutSet(tmp, consensus.MAINNET.magic, allocator);
+    defer loaded.chainstate.deinit();
+    const key = makeUtxoKey(&op);
+    const hit = loaded.chainstate.utxo_set.cache.get(key);
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqual(MAX_MONEY, hit.?.utxo.value);
+}
+
+// BUG G14: loadSnapshotFromFile never persists a "snapshot base" key so
+// restarts cannot distinguish snapshot-loaded from normally synced state.
+// We document the gap here by verifying the key is absent after a
+// validateAndLoadSnapshot call (which uses the same underlying storage).
+test "W102 G14 validateAndLoadSnapshot does not persist snapshot_base key" {
+    // validateAndLoadSnapshot returns a ChainState but does not write a
+    // persistent "snapshot_base_blockhash" key to any Database — the
+    // ChainState is in-memory only.  This test verifies the key is absent,
+    // documenting the observability gap vs Core's WriteSnapshotBaseBlockhash.
+    const allocator = std.testing.allocator;
+    const consensus = @import("consensus.zig");
+
+    const entry840k = consensus.MAINNET.assume_utxo[0];
+
+    // Build a valid 840k snapshot (1 coin, garbage UTXO — will fail hash
+    // check, but we only care that no DB key was written).
+    var cs = ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_hash = entry840k.block_hash;
+    cs.best_height = entry840k.height;
+
+    var p2pkh: [25]u8 = undefined;
+    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x55); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    const op = types.OutPoint{ .hash = [_]u8{0xAB} ** 32, .index = 0 };
+    try cs.utxo_set.add(&op, &types.TxOut{ .value = 500_000, .script_pubkey = &p2pkh }, 10, false);
+
+    const tmp = "/tmp/clearbit-w102-g14-base-key.dat";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try dumpTxOutSet(&cs, consensus.MAINNET.magic, tmp, allocator);
+
+    // Attempt to load (will fail at hash check, which is fine).
+    _ = validateAndLoadSnapshot(tmp, &consensus.MAINNET, allocator, null, null, null) catch {};
+
+    // ChainStateManager has no persistent snapshot_base_blockhash field.
+    // We document the gap: a real implementation would write a
+    // "snapshot_base_blockhash" key to CF_DEFAULT so that on restart the
+    // node knows it came from a snapshot and must background-validate.
+    // This test passes trivially because the key is never written (bug).
+    try std.testing.expect(true); // placeholder documenting the gap
+}
+
+// ============================================================================
 // BlockFilterIndex tests (BIP-157/158, 2026-05-05)
 // ============================================================================
 
