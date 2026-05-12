@@ -621,6 +621,12 @@ pub const Peer = struct {
     /// Reference impl: camlcoin lib/peer_manager.ml::announce_block.
     send_headers: bool = false,
 
+    /// BIP-339: peer sent us a `wtxidrelay` message during handshake.
+    /// When true, relay tx invs using MSG_WTX (=5) with wtxid as hash.
+    /// When false, use MSG_TX (=1) with txid (legacy behaviour).
+    /// Mirrors Core: CNodeState::m_wtxid_relay (net_processing.cpp:283).
+    wtxid_relay_negotiated: bool = false,
+
     /// BIP-324 v2 transport protocol version.
     transport_version: TransportVersion = .v1,
 
@@ -1371,7 +1377,11 @@ pub const Peer = struct {
                 const msg = try self.receiveMessage();
                 switch (msg) {
                     .verack => break,
-                    .wtxidrelay, .sendaddrv2, .sendcmpct, .sendheaders => {
+                    .wtxidrelay => {
+                        // BIP-339: peer negotiated wtxid relay.
+                        self.wtxid_relay_negotiated = true;
+                    },
+                    .sendaddrv2, .sendcmpct, .sendheaders => {
                         // Accept these during handshake but no action needed
                     },
                     .feefilter => |ff| {
@@ -3733,11 +3743,24 @@ pub const PeerManager = struct {
                     if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_block))) {
                         has_block_inv = true;
                     } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
-                        // Transaction announcement: request if not already in mempool
+                        // Legacy txid inv: request if not already in mempool by txid.
                         if (self.mempool) |pool| {
                             if (!pool.entries.contains(item.hash)) {
                                 tx_requests.append(.{
-                                    .inv_type = .msg_witness_tx,
+                                    .inv_type = .msg_tx,
+                                    .hash = item.hash,
+                                }) catch {};
+                            }
+                        }
+                    } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_wtx))) {
+                        // BIP-339 wtxid inv: item.hash is a wtxid.
+                        // Request if we don't already have this wtxid in the mempool.
+                        // Use MSG_WTX in the outgoing getdata so the peer responds with
+                        // the witness-serialised transaction.
+                        if (self.mempool) |pool| {
+                            if (!pool.by_wtxid.contains(item.hash)) {
+                                tx_requests.append(.{
+                                    .inv_type = .msg_wtx,
                                     .hash = item.hash,
                                 }) catch {};
                             }
@@ -4415,12 +4438,12 @@ pub const PeerManager = struct {
                         // `ProcessOrphanTx` in net_processing.cpp.
                         _ = pool.processOrphansForParent(result.txid);
 
-                        // Relay to all other peers via inv (BIP 339: use MSG_WITNESS_TX)
-                        const inv_items = [_]p2p.InvVector{.{
-                            .inv_type = .msg_witness_tx,
-                            .hash = result.txid,
-                        }};
-                        const inv_msg = p2p.Message{ .inv = .{ .inventory = &inv_items } };
+                        // Relay to all other peers via inv.
+                        // BIP-339: use MSG_WTX (=5) + wtxid for peers that negotiated
+                        // wtxidrelay; fall back to MSG_TX (=1) + txid for legacy peers.
+                        // Core: net_processing.cpp:6007-6009 RelayTransaction.
+                        // Do NOT use MSG_WITNESS_TX (0x40000001) for relay inv — that
+                        // is a getdata-only flag for witness-serialised block data.
                         for (self.peers.items) |relay_peer| {
                             if (relay_peer == peer) continue; // Don't relay back to sender
                             if (!relay_peer.relay_txs) continue; // Respect fRelay
@@ -4430,6 +4453,12 @@ pub const PeerManager = struct {
                                 const fee_rate_per_kvb: u64 = @intCast(@divTrunc(result.fee * 1000, @as(i64, @intCast(result.vsize))));
                                 if (fee_rate_per_kvb < relay_peer.fee_filter_received) continue;
                             }
+                            const relay_inv = if (relay_peer.wtxid_relay_negotiated)
+                                p2p.InvVector{ .inv_type = .msg_wtx, .hash = result.wtxid }
+                            else
+                                p2p.InvVector{ .inv_type = .msg_tx, .hash = result.txid };
+                            const relay_inv_items = [_]p2p.InvVector{relay_inv};
+                            const inv_msg = p2p.Message{ .inv = .{ .inventory = &relay_inv_items } };
                             relay_peer.sendMessage(&inv_msg) catch {};
                         }
                         std.debug.print("MEMPOOL: accepted tx, relaying to peers\n", .{});
@@ -4484,9 +4513,29 @@ pub const PeerManager = struct {
                             peer.sendMessage(&nf_msg) catch {};
                         }
                     } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
-                        // Serve transaction from mempool
+                        // Serve transaction from mempool by txid (legacy getdata).
                         if (self.mempool) |pool| {
                             if (pool.entries.get(item.hash)) |entry| {
+                                const tx_msg = p2p.Message{ .tx = entry.tx };
+                                peer.sendMessage(&tx_msg) catch {};
+                            } else {
+                                const not_found_inv = [_]p2p.InvVector{.{
+                                    .inv_type = item.inv_type,
+                                    .hash = item.hash,
+                                }};
+                                const nf_msg = p2p.Message{ .notfound = .{ .inventory = &not_found_inv } };
+                                peer.sendMessage(&nf_msg) catch {};
+                            }
+                        }
+                    } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_wtx))) {
+                        // BIP-339 getdata: item.hash is a wtxid.
+                        // Consult by_wtxid secondary index to resolve wtxid → txid,
+                        // then serve via the primary entries map.
+                        // Core: net_processing.cpp FindTxForGetData (GenTxid lookup).
+                        if (self.mempool) |pool| {
+                            const txid_opt = pool.by_wtxid.get(item.hash);
+                            const entry_opt = if (txid_opt) |txid| pool.entries.get(txid) else null;
+                            if (entry_opt) |entry| {
                                 const tx_msg = p2p.Message{ .tx = entry.tx };
                                 peer.sendMessage(&tx_msg) catch {};
                             } else {
@@ -7974,13 +8023,12 @@ test "W99/G23: MAX_MESSAGE_SIZE equals Core MAX_PROTOCOL_MESSAGE_LENGTH (4,000,0
 // BUG: Core gates MSG_WITNESS_TX inv relay on whether the peer sent wtxidrelay.
 // Clearbit always uses msg_witness_tx in relays (peer.zig:4315) regardless of
 // whether the remote peer negotiated BIP-339.
-test "W99/G25: Peer struct has no wtxid_relay_negotiated flag" {
-    // A compliant implementation must track per-peer wtxidrelay negotiation.
+test "W99/G25: Peer struct has wtxid_relay_negotiated flag (FIXED — W103 G6+G20)" {
     // Core: CNodeState::m_wtxid_relay (set when we receive the wtxidrelay msg).
-    // Clearbit: no such field on Peer.
-    try std.testing.expect(!@hasField(Peer, "wtxid_relay_negotiated"));
-    // BUG: without this flag, we announce with msg_witness_tx to peers that
-    // may only understand msg_tx (pre-BIP-339), causing them to ignore our inv.
+    // FIXED (W103): wtxid_relay_negotiated added to Peer; set in handshake when
+    // the peer sends a wtxidrelay message. Relay path now uses MSG_WTX (=5) +
+    // wtxid for negotiated peers and MSG_TX (=1) + txid for legacy peers.
+    try std.testing.expect(@hasField(Peer, "wtxid_relay_negotiated"));
 }
 
 // G28: sendAddresses() caps at 100 addresses, not Core's MAX_ADDR_TO_SEND = 1000.

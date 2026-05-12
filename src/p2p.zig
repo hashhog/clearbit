@@ -175,6 +175,11 @@ pub const InvType = enum(u32) {
     msg_block = 2,
     msg_filtered_block = 3,
     msg_cmpct_block = 4,
+    /// BIP-339: wtxid-relay inv type (=5). Used for mempool tx relay to peers
+    /// that negotiated wtxidrelay. Distinct from MSG_WITNESS_TX (0x40000001)
+    /// which is a getdata-only flag for witness-serialised block data.
+    /// Reference: bitcoin-core/src/protocol.h:481.
+    msg_wtx = 5,
     msg_witness_tx = 0x40000001,
     msg_witness_block = 0x40000002,
     msg_witness_filtered_block = 0x40000003,
