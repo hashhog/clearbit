@@ -10703,3 +10703,588 @@ const peer_mod_for_w97 = struct {
         }
     }
 };
+
+// ============================================================================
+// W101 — ActivateBestChain + InvalidateBlock + tip-update orchestration audit
+// Discovery audit; bugs documented below, NOT fixed.
+//
+// BUG-1  [CONSENSUS-DIVERGENT] activateBestChain() is a stub: the reorg
+//             path skips disconnect/connect entirely and just swaps
+//             active_tip pointer (line 6226: "TODO: Full reorg
+//             implementation").  UTXO set is NOT updated on reorg.
+// BUG-2  [CONSENSUS-DIVERGENT] activateBestChain() scans ALL block_index
+//             entries O(N) without a sorted candidate set.  Core's
+//             setBlockIndexCandidates (sorted by chainwork) is absent;
+//             PruneBlockIndexCandidates() is never called, so dead
+//             low-work entries accumulate without bound.
+// BUG-3  [CONSENSUS-DIVERGENT] FindMostWorkChain equivalent skips path
+//             ancestor walk.  activateBestChain() calls isValidCandidate()
+//             only on the leaf node.  Core walks every intermediate block
+//             back to the active chain verifying BLOCK_HAVE_DATA and no
+//             BLOCK_FAILED_VALID.  A chain with a failed/missing ancestor
+//             can be selected as best chain.
+// BUG-4  [CONSENSUS-DIVERGENT] No InvalidBlockFound on connect failure.
+//             Core's ActivateBestChainStep calls InvalidChainFound() on
+//             ConnectTip failure to mark the chain failed_valid so it is
+//             never re-selected.  clearbit does not mark the block invalid
+//             on activation failure; it will be re-selected indefinitely.
+// BUG-5  [DOS] activateBestChain() has no chainstate_mutex guard.
+//             Core's ActivateBestChain holds m_chainstate_mutex for the
+//             full duration, preventing concurrent reorg races.
+// BUG-6  [CORRECTNESS] invalidateBlock() calls activateBestChain()
+//             BEFORE evictConflictingTransactions(); Core orders activation
+//             before mempool reconciliation, but both are done inside
+//             MaybeUpdateMempoolForReorg during activation.  The mempool
+//             eviction stub is a no-op today but the ordering is wrong.
+// BUG-7  [CORRECTNESS] reconsiderBlock/clearDescendantFailure does not
+//             re-add valid cleared descendants back to chain_tips.  Core's
+//             ResetBlockFailureFlags re-inserts into setBlockIndexCandidates
+//             every block whose flags are cleared.  clearbit only adds the
+//             direct target.
+// BUG-8  [CORRECTNESS] reconsiderBlock clears best_invalid only if it
+//             points exactly to the target.  If best_invalid points to a
+//             descendant of the reconsidered block it is never cleared;
+//             stale best_invalid persists.
+// BUG-9  [OBSERVABILITY] Genesis block added without setting has_data=true.
+//             Core's LoadGenesisBlock calls ReceivedBlockTransactions which
+//             sets BLOCK_HAVE_DATA.  clearbit creates BlockIndexEntry with
+//             default status (has_data=false), so genesis fails
+//             isValidCandidate() and activateBestChain() cannot pick it.
+// BUG-10 [CORRECTNESS] No m_dirty_blockindex batching: each
+//             persistBlockStatus call fires an individual RocksDB put.
+//             Core accumulates dirty entries and flushes them together in
+//             FlushStateToDisk (PruneAndFlush analog).
+// ============================================================================
+
+// Helper: build a minimal ChainManager with a genesis → block1 → block2 chain
+// where block1 and block2 have has_data=true (can be selected as tip).
+fn makeLinearChain(allocator: std.mem.Allocator) !struct {
+    manager: ChainManager,
+    genesis: *BlockIndexEntry,
+    block1: *BlockIndexEntry,
+    block2: *BlockIndexEntry,
+} {
+    var manager = ChainManager.init(null, null, allocator);
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    const block1 = try allocator.create(BlockIndexEntry);
+    block1.* = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x10},
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block1);
+
+    const block2 = try allocator.create(BlockIndexEntry);
+    block2.* = BlockIndexEntry{
+        .hash = [_]u8{0x02} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 2,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x20},
+        .sequence_id = 2,
+        .parent = block1,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block2);
+
+    return .{ .manager = manager, .genesis = genesis, .block1 = block1, .block2 = block2 };
+}
+
+// ---- G1 (BUG-1): activateBestChain() is a TODO stub — no UTXO reorg ------
+// Spec: ActivateBestChain calls ActivateBestChainStep which calls
+// DisconnectTip / ConnectTip to actually rewrite the UTXO set.
+// clearbit: activateBestChain() only swaps active_tip without any
+// disconnect/connect, leaving UTXO set stale.
+
+test "W101 G1: activateBestChain swaps active_tip without UTXO reorg (stub)" {
+    const allocator = std.testing.allocator;
+    var chain = try makeLinearChain(allocator);
+    defer chain.manager.deinit();
+
+    // Set tip to block1; block2 (higher work) should win after activate.
+    chain.manager.active_tip = chain.block1;
+
+    // activateBestChain: selects block2 (higher chain_work).
+    try chain.manager.activateBestChain();
+
+    // BUG-1: tip pointer is swapped but there is no UTXO connect.
+    // The test documents that the pointer move DOES happen (stub works for
+    // pointer update) but no real block connect occurs.
+    try std.testing.expectEqual(chain.block2, chain.manager.active_tip.?);
+}
+
+// ---- G2 (BUG-2): no PruneBlockIndexCandidates — O(N) scan over all blocks --
+// Spec: After each tip update, Core calls PruneBlockIndexCandidates() to
+// remove all entries with less work than the active tip from the sorted
+// candidate set.  Without this, the candidate set grows unbounded.
+
+test "W101 G2: activateBestChain scans all block_index entries (no sorted set)" {
+    const allocator = std.testing.allocator;
+    var chain = try makeLinearChain(allocator);
+    defer chain.manager.deinit();
+
+    // All 3 entries in block_index; no pruning of lower-work candidates.
+    // After activation with block2 as tip, genesis and block1 remain in
+    // block_index and would be iterated by any future activateBestChain call.
+    chain.manager.active_tip = chain.block2;
+    try chain.manager.activateBestChain();
+
+    // Document: block_index still contains all 3 entries (no pruning).
+    try std.testing.expectEqual(@as(usize, 3), chain.manager.block_index.count());
+}
+
+// ---- G3 (BUG-3): path ancestor walk absent in FindMostWorkChain equivalent --
+// Spec: FindMostWorkChain walks back from candidate to active chain,
+// checking each intermediate block for BLOCK_HAVE_DATA and no BLOCK_FAILED_VALID.
+// A chain whose INTERMEDIATE ancestor has failed_child would still be selected.
+
+test "W101 G3: activateBestChain selects block with failed_child intermediate ancestor" {
+    const allocator = std.testing.allocator;
+    var chain = try makeLinearChain(allocator);
+    defer chain.manager.deinit();
+
+    // Mark block1 (intermediate) with failed_child.
+    chain.block1.status.failed_child = true;
+    // block2 still has has_data=true and no own failure flag, so
+    // isValidCandidate() returns true for block2.
+    // Core's FindMostWorkChain would walk back and reject block2 (bad ancestor).
+    // clearbit's activateBestChain only checks the leaf; block2 passes.
+    chain.manager.active_tip = chain.genesis;
+    try chain.manager.activateBestChain();
+
+    // BUG-3: block2 is selected despite having a failed_child intermediate
+    // ancestor.  Core would select genesis (highest-work valid chain tip).
+    // We document the wrong selection here.
+    try std.testing.expectEqual(chain.block2, chain.manager.active_tip.?);
+}
+
+// ---- G4 (BUG-4): no InvalidBlockFound on activation failure ----------------
+// Spec: ActivateBestChainStep marks the candidate chain failed_valid when
+// ConnectTip returns state.IsInvalid(), ensuring re-selection never happens.
+// clearbit: on any connect failure the block is not marked invalid.
+
+test "W101 G4: failed_valid NOT set when activateBestChain finds no valid candidate" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Single block with has_data=false → not a valid candidate.
+    const block = try allocator.create(BlockIndexEntry);
+    block.* = BlockIndexEntry{
+        .hash = [_]u8{0x11} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = false },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 1,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(block);
+
+    try manager.activateBestChain();
+
+    // BUG-4: block is NOT marked failed_valid despite not being activatable.
+    // Core would call InvalidBlockFound and mark it.
+    try std.testing.expect(!block.status.failed_valid);
+}
+
+// ---- G5 (BUG-5): no chainstate_mutex for ActivateBestChain -----------------
+// Spec: Core's ActivateBestChain holds m_chainstate_mutex for its full
+// duration; ChainManager has no such mutual-exclusion field.
+
+test "W101 G5: ChainManager has no chainstate_mutex field (no concurrent-reorg guard)" {
+    // Shape test: confirm the struct has no dedicated mutex/rwlock field.
+    // Core has: LOCK(m_chainstate_mutex) at the top of ActivateBestChain.
+    // We check at comptime for a field named exactly "mutex", "chainstate_mutex",
+    // or "rwlock" — narrower than a substring search so "block_index" (which
+    // contains "lock") is not a false positive.
+    const has_mutex = comptime blk: {
+        const fields = @typeInfo(ChainManager).Struct.fields;
+        for (fields) |f| {
+            if (std.mem.eql(u8, f.name, "mutex") or
+                std.mem.eql(u8, f.name, "chainstate_mutex") or
+                std.mem.eql(u8, f.name, "rwlock") or
+                std.mem.eql(u8, f.name, "rw_lock"))
+            {
+                break :blk true;
+            }
+        }
+        break :blk false;
+    };
+    // BUG-5: no dedicated mutex field present.
+    try std.testing.expect(!has_mutex);
+}
+
+// ---- G6 (BUG-6): invalidateBlock ordering — activate before mempool evict --
+// Spec: Core calls MaybeUpdateMempoolForReorg inside DisconnectTip, which
+// means mempool is reconciled AS PART of the activation step.  Clearbit
+// calls activateBestChain() then evictConflictingTransactions() separately.
+
+test "W101 G6: evictConflictingTransactions is a no-op stub" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // evictConflictingTransactions must not panic; it is a stub (no-op).
+    // The function accepts (pool, block) but ignores both arguments.
+    // We cannot call it without a Mempool, so we test invalidateBlock with
+    // mempool=null (should not crash on the evict stub path).
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    const child = try allocator.create(BlockIndexEntry);
+    child.* = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(child);
+
+    // With mempool=null the evict stub is skipped entirely (no-op guard).
+    try manager.invalidateBlock(&child.hash);
+    try std.testing.expect(child.status.failed_valid);
+}
+
+// ---- G7 (BUG-7): reconsiderBlock does not re-add cleared descendants to tips --
+// Spec: ResetBlockFailureFlags in Core re-inserts every valid cleared block
+// into setBlockIndexCandidates.  reconsiderBlock only re-adds the direct target
+// if it has no valid children (isValidCandidate + tip check).
+
+test "W101 G7: reconsiderBlock adds target to chain_tips but not cleared descendants" {
+    const allocator = std.testing.allocator;
+    var chain = try makeLinearChain(allocator);
+    defer chain.manager.deinit();
+
+    // Invalidate block1 (marks block1 failed_valid, block2 failed_child).
+    try chain.manager.invalidateBlock(&chain.block1.hash);
+    try std.testing.expect(chain.block1.status.failed_valid);
+    try std.testing.expect(chain.block2.status.failed_child);
+
+    // Reconsider block1.
+    try chain.manager.reconsiderBlock(&chain.block1.hash);
+
+    // block1 and block2 flags cleared.
+    try std.testing.expect(!chain.block1.status.failed_valid);
+    try std.testing.expect(!chain.block2.status.failed_child);
+
+    // BUG-7: block2 (a cleared descendant that is now a valid chain tip)
+    // is NOT re-added to chain_tips by reconsiderBlock.  Core would have
+    // re-inserted it into setBlockIndexCandidates.
+    // chain_tips might contain block1 (the reconsidered target) but NOT block2.
+    var block2_in_tips = false;
+    for (chain.manager.chain_tips.items) |tip| {
+        if (std.mem.eql(u8, &tip.hash, &chain.block2.hash)) block2_in_tips = true;
+    }
+    // Document the gap: block2 is absent from chain_tips after reconsider.
+    try std.testing.expect(!block2_in_tips);
+}
+
+// ---- G8 (BUG-8): stale best_invalid after reconsiderBlock ------------------
+// Spec: Core's ResetBlockFailureFlags sets m_best_invalid=nullptr for any
+// block on the cleared path that currently equals m_best_invalid.
+// clearbit only clears best_invalid if it points exactly to the target.
+
+test "W101 G8: best_invalid points to descendant not cleared after reconsiderBlock" {
+    const allocator = std.testing.allocator;
+    var chain = try makeLinearChain(allocator);
+    defer chain.manager.deinit();
+
+    // Invalidate block1; best_invalid is set to block1 (or possibly block2).
+    try chain.manager.invalidateBlock(&chain.block1.hash);
+
+    // Manually set best_invalid to block2 (a descendant of block1).
+    chain.manager.best_invalid = chain.block2;
+
+    // Reconsider block1.
+    try chain.manager.reconsiderBlock(&chain.block1.hash);
+
+    // BUG-8: best_invalid still points to block2 because reconsiderBlock only
+    // clears it if best_invalid == &target (block1).  block2 is a descendant.
+    // Core would have cleared it because block2 is on the reconsidered path.
+    try std.testing.expectEqual(chain.block2, chain.manager.best_invalid.?);
+}
+
+// ---- G9 (BUG-9): genesis created without has_data=true ----------------------
+// Spec: LoadGenesisBlock calls ReceivedBlockTransactions which sets
+// BLOCK_HAVE_DATA on the genesis pindex.  isValidCandidate requires has_data.
+// Tests check what happens when genesis is inserted with default status.
+
+test "W101 G9: genesis with default status fails isValidCandidate (has_data absent)" {
+    // When genesis is created with default BlockStatus{} (has_data=false),
+    // isValidCandidate returns false and activateBestChain cannot select it.
+    const genesis = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{}, // default: has_data=false
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    // BUG-9: genesis without has_data=true is not a valid candidate.
+    try std.testing.expect(!genesis.status.has_data);
+    try std.testing.expect(!genesis.isValidCandidate());
+}
+
+test "W101 G9b: genesis with has_data=true passes isValidCandidate" {
+    // Demonstrates the fix shape: LoadGenesisBlock must set has_data=true.
+    var genesis = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try std.testing.expect(genesis.isValidCandidate());
+}
+
+// ---- G10 (BUG-10): persistBlockStatus is per-entry (no dirty batching) ------
+// Spec: Core accumulates dirty index entries in m_dirty_blockindex and flushes
+// them as a batch in FlushStateToDisk (PruneAndFlush analog).
+// clearbit: each persistBlockStatus call fires one RocksDB put immediately.
+// This test documents the missing batch-dirty tracking structure.
+
+test "W101 G10: ChainManager has no m_dirty_blockindex batch accumulator" {
+    // Shape test: the struct has no dirty_blockindex or pending_index_writes field.
+    // We check at comptime using exact field-name matching.
+    const has_dirty = comptime blk: {
+        const fields = @typeInfo(ChainManager).Struct.fields;
+        for (fields) |f| {
+            if (std.mem.eql(u8, f.name, "dirty_blockindex") or
+                std.mem.eql(u8, f.name, "m_dirty_blockindex") or
+                std.mem.eql(u8, f.name, "pending_index_writes"))
+            {
+                break :blk true;
+            }
+        }
+        break :blk false;
+    };
+    // BUG-10: no dirty accumulator present; all writes are immediate.
+    try std.testing.expect(!has_dirty);
+}
+
+// ---- G11: compareCandidates tie-breaking — equal work uses sequence_id ------
+// Spec: Core's CBlockIndexWorkComparator first orders by nChainWork, then by
+// nSequenceId (lower = preferred), then falls back to a pointer comparison.
+// clearbit: compareCandidates matches: work → sequence_id → hash.
+
+test "W101 G11: compareCandidates prefers lower sequence_id on equal chain_work" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    const a = try allocator.create(BlockIndexEntry);
+    a.* = BlockIndexEntry{
+        .hash = [_]u8{0x0A} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 5,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(a);
+
+    const b = try allocator.create(BlockIndexEntry);
+    b.* = BlockIndexEntry{
+        .hash = [_]u8{0x0B} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 2, // lower = preferred
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(b);
+
+    // b has lower sequence_id with equal work: compareCandidates should prefer b.
+    try std.testing.expect(manager.compareCandidates(b, a));
+    try std.testing.expect(!manager.compareCandidates(a, b));
+}
+
+// ---- G12: activateBestChain with empty block_index returns without crash ----
+
+test "W101 G12: activateBestChain with empty block_index is a no-op" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // No entries in block_index; activateBestChain should not crash.
+    try manager.activateBestChain();
+    try std.testing.expect(manager.active_tip == null);
+}
+
+// ---- G13: invalidateBlock with no active chain does not call disconnectToBlock --
+
+test "W101 G13: invalidateBlock off-chain block skips disconnect and marks failed_valid" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    const stale = try allocator.create(BlockIndexEntry);
+    stale.* = BlockIndexEntry{
+        .hash = [_]u8{0x55} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x05} ** 32,
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(stale);
+
+    // active_tip is null (no connected chain): stale is off-chain.
+    // invalidateBlock must not attempt to call disconnectToBlock (which needs
+    // chain_state) and must still set failed_valid.
+    try manager.invalidateBlock(&stale.hash);
+    try std.testing.expect(stale.status.failed_valid);
+    try std.testing.expect(!stale.status.failed_child);
+}
+
+// ---- G14: isValidCandidate requires BOTH has_data AND no failure flags ------
+// Spec: Core's FindMostWorkChain checks BLOCK_HAVE_DATA and !BLOCK_FAILED_VALID.
+// isValidCandidate is the clearbit equivalent; verify both conditions hold.
+
+test "W101 G14: isValidCandidate requires has_data=true and no invalid flag" {
+    // Case 1: has_data=true, no failure → valid candidate.
+    const ok = BlockIndexEntry{
+        .hash = [_]u8{0x01} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try std.testing.expect(ok.isValidCandidate());
+
+    // Case 2: has_data=false → NOT a valid candidate.
+    var no_data = ok;
+    no_data.status.has_data = false;
+    try std.testing.expect(!no_data.isValidCandidate());
+
+    // Case 3: has_data=true, failed_valid=true → NOT a valid candidate.
+    var failed = ok;
+    failed.status.failed_valid = true;
+    try std.testing.expect(!failed.isValidCandidate());
+
+    // Case 4: has_data=true, failed_child=true → NOT a valid candidate.
+    var child_fail = ok;
+    child_fail.status.failed_child = true;
+    try std.testing.expect(!child_fail.isValidCandidate());
+}
+
+// ---- G15: best_invalid is updated when new invalid chain has more work ------
+// Spec: Core's FindMostWorkChain sets m_best_invalid to the highest-work
+// invalid chain seen.  clearbit's invalidateBlock updates best_invalid if
+// the target has more work than the current best_invalid.
+
+test "W101 G15: invalidateBlock updates best_invalid when new chain has more work" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0x00} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+
+    const heavy = try allocator.create(BlockIndexEntry);
+    heavy.* = BlockIndexEntry{
+        .hash = [_]u8{0xFF} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0xFF} ** 32, // max work
+        .sequence_id = 1,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(heavy);
+
+    // best_invalid is initially null.
+    try std.testing.expect(manager.best_invalid == null);
+
+    try manager.invalidateBlock(&heavy.hash);
+
+    // After invalidation, best_invalid should point to heavy (most work invalid).
+    try std.testing.expectEqual(heavy, manager.best_invalid.?);
+}
