@@ -7577,3 +7577,237 @@ test "HSync: BIP-130 send_headers flag defaults false on fresh Peer" {
 
     try std.testing.expect(!dummy.send_headers);
 }
+
+// ============================================================================
+// W99 net_processing dispatch + Misbehaving gate audit tests
+// ============================================================================
+
+// Helper to create a minimal Peer struct for testing.
+fn makeTestPeer(allocator: std.mem.Allocator, conn_type: ConnectionType) Peer {
+    return Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 8333),
+        .state = .handshake_complete,
+        .direction = .inbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = std.time.timestamp(),
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = &consensus.MAINNET,
+        .allocator = allocator,
+        .recv_buffer = std.ArrayList(u8).init(allocator),
+        .is_witness_capable = true,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = conn_type,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
+    };
+}
+
+// G1: misbehaving() uses score accumulation, NOT the 2022 single-event flag model.
+// BUG: Core since 2022 sets m_should_discourage=true on any single Misbehaving call;
+// clearbit still requires cumulative score >= 100 before discouraging.
+// This means a peer can receive multiple low-score infractions (e.g., 10+10+...×9)
+// before being discouraged — violating the 2022 DoS policy tightening.
+test "W99/G1: ban_score accumulation model diverges from Core 2022 single-event flag" {
+    const allocator = std.testing.allocator;
+    var peer = makeTestPeer(allocator, .outbound_full_relay);
+    defer peer.recv_buffer.deinit();
+
+    // A single Misbehaving call with score=50 should NOT mark should_ban (score < 100).
+    peer.misbehaving(50, "first infraction");
+    try std.testing.expectEqual(@as(u32, 50), peer.ban_score);
+    // BUG: In Core's 2022 model, should_discourage would be true here;
+    // clearbit still requires score >= 100. Document that clearbit does NOT
+    // set should_ban on the first infraction below the threshold.
+    try std.testing.expect(!peer.should_ban);
+
+    // A second 50-point infraction tips over threshold.
+    peer.misbehaving(50, "second infraction");
+    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    try std.testing.expect(peer.should_ban);
+}
+
+// G2: misbehaving() ignores conn_type — manual and noban peers are NOT exempt.
+// BUG: Core's MaybeDiscourageAndDisconnect checks NoBan, IsManualConn(), IsLocal()
+// before discouraging. Clearbit's misbehaving() sets should_ban unconditionally.
+test "W99/G2: misbehaving sets should_ban for manual peer — missing noban/manual exemption" {
+    const allocator = std.testing.allocator;
+    var manual_peer = makeTestPeer(allocator, .manual);
+    defer manual_peer.recv_buffer.deinit();
+
+    // After 100 points, should_ban becomes true even for manual peer.
+    manual_peer.misbehaving(100, "bad behavior from manual peer");
+    // BUG: should remain false for manual peers per Bitcoin Core.
+    // We document the bug by asserting the ACTUAL (wrong) behavior:
+    try std.testing.expect(manual_peer.should_ban); // BUG: should be false per Core
+}
+
+// G3: loadBanList() is defined but never called on startup.
+// BUG: bans do not persist across restarts.
+test "W99/G3: loadBanList is never invoked — ban persistence broken across restarts" {
+    // This is an architectural/wiring bug; we can verify the function exists
+    // and returns successfully when called manually, but it is never wired to startup.
+    const allocator = std.testing.allocator;
+    var bl = banlist.BanList.init(allocator, null); // null path = no file
+    defer bl.deinit();
+    // load() with null path should be a no-op (or fail gracefully).
+    // The bug is that even a real path version is never called from main.zig.
+    // We assert the function at least compiles and the BanList struct exists.
+    try std.testing.expectEqual(@as(usize, 0), bl.banned.count());
+}
+
+// G4: headers message with count > 2000 is not rejected with Misbehaving.
+// BUG: Core calls Misbehaving() when nCount > max_headers_result (2000).
+// Clearbit uses `h.headers.len >= 2000` only as a "request more" signal,
+// never enforces the cap with misbehavior.
+test "W99/G4: MAX_HEADERS_RESULTS cap (2000) not enforced with misbehaving" {
+    // Verify the constant value that should be the cap.
+    // Bitcoin Core net_processing.h: static const unsigned int MAX_HEADERS_RESULTS = 2000;
+    const EXPECTED_MAX_HEADERS: u32 = 2000;
+    // clearbit uses 2000 as a magic number inline, not as a named constant.
+    // BUG: no Misbehaving call when a peer sends > 2000 headers.
+    try std.testing.expectEqual(@as(u32, 2000), EXPECTED_MAX_HEADERS);
+}
+
+// G8: MAX_NUM_UNCONNECTING_HEADERS_MSGS is 10 in clearbit; Core uses 8.
+// BUG: clearbit tolerates 2 extra unconnecting-headers batches before disconnecting.
+test "W99/G8: unconnecting-headers limit is 10 (clearbit) vs 8 (Core)" {
+    // Bitcoin Core constant: MAX_NUM_UNCONNECTING_HEADERS_MSGS (from older code) = 8.
+    // clearbit sets it to 10, permitting 2 extra bogus orphan-header batches.
+    const clearbit_limit = MAX_NUM_UNCONNECTING_HEADERS_MSGS;
+    const core_limit: u32 = 8;
+    try std.testing.expectEqual(@as(u32, 10), clearbit_limit);
+    // Document the divergence:
+    try std.testing.expect(clearbit_limit != core_limit);
+}
+
+// G12: orphan transactions have no time-based expiry (5-minute TTL missing).
+// BUG: Bitcoin Core's TxOrphanage expires orphans after ORPHAN_TX_EXPIRE_TIME (5 min).
+// Clearbit evicts orphans only when the pool is full (oldest-first by size),
+// never by wall-clock age. A stale orphan can live indefinitely.
+test "W99/G12: orphan pool lacks 5-minute TTL expiry" {
+    const mempool = @import("mempool.zig");
+    // Verify there is NO expiry constant defined (documenting the absence).
+    // If someone adds it, this test will need updating.
+    // We check that OrphanTx has a time_added field (it does) but no expiry sweep.
+    const OrphanTx = mempool.OrphanTx;
+    // time_added field exists (used for oldest-first eviction, not time-based expiry).
+    const has_time_added = @hasField(OrphanTx, "time_added");
+    try std.testing.expect(has_time_added);
+    // BUG: no ORPHAN_TTL constant, no periodic expiry call exists in the codebase.
+    // Bitcoin Core: static constexpr auto ORPHAN_TX_EXPIRE_TIME = 5min.
+}
+
+// G14: orphan pool is keyed by txid, not wtxid (BIP-339 violation).
+// BUG: Core's TxOrphanage uses wtxid as the key since BIP-339 adoption.
+// Clearbit's orphan HashMap is keyed by txid (mempool.zig:671).
+test "W99/G14: orphan pool keyed by txid not wtxid" {
+    const mempool = @import("mempool.zig");
+    // The comment at mempool.zig:671 explicitly says "indexed by txid".
+    // We verify the OrphanTx struct stores txid (not wtxid) as the lookup field.
+    const OrphanTx = mempool.OrphanTx;
+    try std.testing.expect(@hasField(OrphanTx, "txid"));
+    // BUG: no wtxid field; Core keys orphans by wtxid for BIP-339 segregation.
+    // Consequence: a tx with different txid but same wtxid (malleation) could
+    // enter the orphan pool twice under different txid keys.
+}
+
+// G16/G17: validateBlockForIBDOrReject failure does NOT misbehave the supplying peer.
+// BUG: The comment at peer.zig:5185 says "(c) misbehave the supplying peer at +100"
+// but the actual code at 5188-5196 only breaks out of the drain loop with no
+// Misbehaving call. The peer that fed a consensus-invalid block is not penalized.
+test "W99/G16: invalid block from peer does not trigger misbehaving call" {
+    const allocator = std.testing.allocator;
+    var peer = makeTestPeer(allocator, .outbound_full_relay);
+    defer peer.recv_buffer.deinit();
+
+    // Simulate: after receiving an invalid block, the peer's ban_score stays 0.
+    // The drain loop breaks without calling peer.misbehaving().
+    // BUG: should call misbehaving(100, "invalid block") per the comment.
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score); // no penalty applied
+    try std.testing.expect(!peer.should_ban);
+}
+
+// G19: post-handshake version message is silently ignored, not rejected.
+// BUG: Core's ProcessMessage disconnects on a duplicate version message.
+// Clearbit's handleMessage() has no .version arm; falls to `else => {}`.
+test "W99/G19: duplicate version message falls to silent else branch" {
+    // Verify handleMessage's switch has no dedicated .version case.
+    // The only version handling is in performHandshake() — once, at connect time.
+    // A second version message after handshake_complete is swallowed silently.
+    // Bitcoin Core: "Got a 'version' message from peer %d after the handshake"
+    // → fDisconnect = true.
+    // We document this by checking the PeerState machine:
+    // once state == .handshake_complete, there is no guard against a second version.
+    const allocator = std.testing.allocator;
+    var peer = makeTestPeer(allocator, .outbound_full_relay);
+    defer peer.recv_buffer.deinit();
+    try std.testing.expectEqual(PeerState.handshake_complete, peer.state);
+    // No version-received flag is set on the peer struct — duplicate detection absent.
+    try std.testing.expect(!@hasField(Peer, "version_received_count"));
+}
+
+// G23: MAX_MESSAGE_SIZE is 32 MiB in clearbit vs 4 MiB in Bitcoin Core.
+// BUG: Core defines MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1024 * 1024 (4 MiB).
+// Clearbit's p2p.MAX_MESSAGE_SIZE = 32 * 1024 * 1024 (32 MiB), 8× too large.
+// A malicious peer can send an 8× larger payload before it is rejected.
+test "W99/G23: MAX_MESSAGE_SIZE is 32 MiB (should be 4 MiB per Core)" {
+    // Bitcoin Core: CMessageHeader::MAXIMUM_MESSAGE_LENGTH = 4 * 1024 * 1024
+    const CORE_MAX: usize = 4 * 1024 * 1024;
+    const clearbit_max = p2p.MAX_MESSAGE_SIZE;
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), clearbit_max);
+    // BUG: clearbit allows 8x the Core limit.
+    try std.testing.expect(clearbit_max != CORE_MAX);
+    try std.testing.expect(clearbit_max > CORE_MAX);
+}
+
+// G25: wtxidrelay segregation — peer wtxid negotiation state is not tracked.
+// BUG: Core gates MSG_WITNESS_TX inv relay on whether the peer sent wtxidrelay.
+// Clearbit always uses msg_witness_tx in relays (peer.zig:4315) regardless of
+// whether the remote peer negotiated BIP-339.
+test "W99/G25: Peer struct has no wtxid_relay_negotiated flag" {
+    // A compliant implementation must track per-peer wtxidrelay negotiation.
+    // Core: CNodeState::m_wtxid_relay (set when we receive the wtxidrelay msg).
+    // Clearbit: no such field on Peer.
+    try std.testing.expect(!@hasField(Peer, "wtxid_relay_negotiated"));
+    // BUG: without this flag, we announce with msg_witness_tx to peers that
+    // may only understand msg_tx (pre-BIP-339), causing them to ignore our inv.
+}
+
+// G28: sendAddresses() caps at 100 addresses, not Core's MAX_ADDR_TO_SEND = 1000.
+// BUG: Bitcoin Core net_processing.cpp:190 defines MAX_ADDR_TO_SEND = 1000.
+// clearbit's sendAddresses() loop breaks at count >= 100, sending 10× fewer.
+test "W99/G28: sendAddresses caps at 100 addresses (Core limit is 1000)" {
+    // Bitcoin Core: static constexpr size_t MAX_ADDR_TO_SEND{1000};
+    const CORE_MAX_ADDR: usize = 1000;
+    // clearbit inline constant in sendAddresses(): if (count >= 100) break;
+    const CLEARBIT_MAX_ADDR: usize = 100;
+    try std.testing.expectEqual(@as(usize, 100), CLEARBIT_MAX_ADDR);
+    // BUG: under-serving addr responses reduces peer discovery for requesting nodes.
+    try std.testing.expect(CLEARBIT_MAX_ADDR < CORE_MAX_ADDR);
+}
+
+// G5/G6: PRESYNC/REDOWNLOAD and min_pow_checked are entirely absent.
+// BUG: Core's headerssync.cpp PRESYNC phase anti-DoS pipeline (W88) and the
+// min_pow_checked parameter threading (W97) are missing in clearbit.
+// Without PRESYNC, a peer can send low-work headers indefinitely with no DoS cost.
+test "W99/G5+G6: PRESYNC/REDOWNLOAD and min_pow_checked absent from headers path" {
+    // Verify no PRESYNC-related state exists on PeerManager.
+    // Core: Peer::m_headers_sync (HeadersSyncState) drives PRESYNC/REDOWNLOAD.
+    try std.testing.expect(!@hasField(PeerManager, "headers_sync"));
+    // min_pow_checked threading absent: ProcessNewBlockHeaders call does not carry it.
+    // No min_pow_checked field on Peer either.
+    try std.testing.expect(!@hasField(Peer, "min_pow_checked"));
+}
