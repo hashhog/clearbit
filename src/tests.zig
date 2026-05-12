@@ -1025,6 +1025,7 @@ comptime {
     _ = @import("bench.zig");
     _ = @import("indexes.zig");
     _ = @import("v2_transport.zig");
+    _ = @import("tests_bip324_w98.zig"); // W98 BIP-324 gate audit
     _ = @import("erlay.zig");
     // rpc.zig is exercised in its own dedicated test step (`zig build
     // test-rpc` and folded into `zig build test` via build.zig). Importing
