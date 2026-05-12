@@ -51,9 +51,12 @@ test "Hash256 (double SHA-256) of genesis block header" {
     // Genesis block header bytes (80 bytes)
     const genesis_header = [_]u8{
         0x01, 0x00, 0x00, 0x00, // version
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // prev_block
         0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2,
         0x7a, 0xc7, 0x2c, 0x3e, 0x67, 0x76, 0x8f, 0x61,
@@ -347,7 +350,7 @@ test "Script: OP_RETURN classified as null_data" {
 // MINIMALIF test vectors (BIP-342 / segwit consensus)
 // ============================================================
 
-test "MINIMALIF: OP_IF with 0x02 fails in witness v0" {
+test "MINIMALIF: OP_IF with 0x02 fails in witness v0 (with verify_minimalif)" {
     const allocator = testing.allocator;
     const tx = types.Transaction{
         .version = 1,
@@ -356,7 +359,16 @@ test "MINIMALIF: OP_IF with 0x02 fails in witness v0" {
         .lock_time = 0,
     };
 
-    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    // W94: MINIMALIF on witness_v0 is POLICY-ONLY (Core interpreter.cpp:622).
+    // The flag must be set explicitly; the old version of this test ran on
+    // the default ScriptFlags and assumed consensus-level enforcement.
+    var engine = script.ScriptEngine.init(
+        allocator,
+        &tx,
+        0,
+        0,
+        script.ScriptFlags{ .verify_minimalif = true },
+    );
     defer engine.deinit();
 
     // Set witness v0 mode to enforce MINIMALIF
@@ -368,6 +380,31 @@ test "MINIMALIF: OP_IF with 0x02 fails in witness v0" {
     const s = [_]u8{ 0x52, 0x63, 0x51, 0x67, 0x00, 0x68 };
     const result = engine.execute(&s);
     try testing.expectError(script.ScriptError.MinimalIf, result);
+}
+
+test "MINIMALIF (W94): witness v0 0x02 IF passes without verify_minimalif" {
+    // W94 regression test: MINIMALIF on witness_v0 must be policy-only.
+    // Without the flag, a non-minimal IF arg under SegWit-v0 must NOT
+    // trigger MinimalIf. Core (interpreter.cpp:621-627) gates the v0
+    // check on SCRIPT_VERIFY_MINIMALIF.
+    const allocator = testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    defer engine.deinit();
+    engine.sig_version = .witness_v0;
+
+    // Same script: OP_2 OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF — 0x02 is truthy
+    // under base/v0 semantics so the true branch is taken and OP_1 pushed.
+    const s = [_]u8{ 0x52, 0x63, 0x51, 0x67, 0x00, 0x68 };
+    try engine.execute(&s);
+    try testing.expectEqual(@as(usize, 1), engine.stack.items.len);
+    try testing.expectEqual(@as(u8, 1), engine.stack.items[0][0]);
 }
 
 test "MINIMALIF: OP_IF with 0x01 passes in witness v0" {
@@ -421,7 +458,7 @@ test "MINIMALIF: OP_IF with empty slice takes else branch in witness v0" {
     try testing.expectEqual(@as(u8, 2), engine.stack.items[0][0]);
 }
 
-test "MINIMALIF: OP_IF with 0x00 byte fails in witness v0" {
+test "MINIMALIF: OP_IF with 0x00 byte fails in witness v0 (with verify_minimalif)" {
     const allocator = testing.allocator;
     const tx = types.Transaction{
         .version = 1,
@@ -430,10 +467,16 @@ test "MINIMALIF: OP_IF with 0x00 byte fails in witness v0" {
         .lock_time = 0,
     };
 
-    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    var engine = script.ScriptEngine.init(
+        allocator,
+        &tx,
+        0,
+        0,
+        script.ScriptFlags{ .verify_minimalif = true },
+    );
     defer engine.deinit();
 
-    // Set witness v0 mode to enforce MINIMALIF
+    // Set witness v0 mode to enforce MINIMALIF (W94: policy-only flag)
     engine.sig_version = .witness_v0;
 
     // Push a single 0x00 byte (invalid - only empty slice is acceptable for false)
@@ -443,7 +486,7 @@ test "MINIMALIF: OP_IF with 0x00 byte fails in witness v0" {
     try testing.expectError(script.ScriptError.MinimalIf, result);
 }
 
-test "MINIMALIF: OP_NOTIF with 0x02 fails in witness v0" {
+test "MINIMALIF: OP_NOTIF with 0x02 fails in witness v0 (with verify_minimalif)" {
     const allocator = testing.allocator;
     const tx = types.Transaction{
         .version = 1,
@@ -452,10 +495,16 @@ test "MINIMALIF: OP_NOTIF with 0x02 fails in witness v0" {
         .lock_time = 0,
     };
 
-    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    var engine = script.ScriptEngine.init(
+        allocator,
+        &tx,
+        0,
+        0,
+        script.ScriptFlags{ .verify_minimalif = true },
+    );
     defer engine.deinit();
 
-    // Set witness v0 mode to enforce MINIMALIF
+    // Set witness v0 mode to enforce MINIMALIF (W94: policy-only flag)
     engine.sig_version = .witness_v0;
 
     // Push 0x02 (invalid MINIMALIF value), then OP_NOTIF OP_1 OP_ELSE OP_0 OP_ENDIF
@@ -466,7 +515,7 @@ test "MINIMALIF: OP_NOTIF with 0x02 fails in witness v0" {
     try testing.expectError(script.ScriptError.MinimalIf, result);
 }
 
-test "MINIMALIF: multi-byte value fails in witness v0" {
+test "MINIMALIF: multi-byte value fails in witness v0 (with verify_minimalif)" {
     const allocator = testing.allocator;
     const tx = types.Transaction{
         .version = 1,
@@ -475,10 +524,16 @@ test "MINIMALIF: multi-byte value fails in witness v0" {
         .lock_time = 0,
     };
 
-    var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
+    var engine = script.ScriptEngine.init(
+        allocator,
+        &tx,
+        0,
+        0,
+        script.ScriptFlags{ .verify_minimalif = true },
+    );
     defer engine.deinit();
 
-    // Set witness v0 mode to enforce MINIMALIF
+    // Set witness v0 mode to enforce MINIMALIF (W94: policy-only flag)
     engine.sig_version = .witness_v0;
 
     // Push [0x01, 0x00] (multi-byte, even though would be truthy, fails MINIMALIF)
@@ -512,7 +567,7 @@ test "MINIMALIF: OP_IF with 0x02 allowed in legacy (base) mode" {
     try testing.expectEqual(@as(u8, 1), engine.stack.items[0][0]);
 }
 
-test "MINIMALIF: enforced in tapscript mode" {
+test "MINIMALIF: enforced in tapscript mode (TapscriptMinimalIf consensus)" {
     const allocator = testing.allocator;
     const tx = types.Transaction{
         .version = 1,
@@ -521,18 +576,16 @@ test "MINIMALIF: enforced in tapscript mode" {
         .lock_time = 0,
     };
 
+    // W94: tapscript MINIMALIF is a CONSENSUS rule (interpreter.cpp:614-620),
+    // and now surfaces the dedicated TapscriptMinimalIf error to match
+    // Core's SCRIPT_ERR_TAPSCRIPT_MINIMALIF.
     var engine = script.ScriptEngine.init(allocator, &tx, 0, 0, script.ScriptFlags{});
     defer engine.deinit();
-
-    // Set tapscript mode to enforce MINIMALIF
     engine.sig_version = .tapscript;
 
-    // Push 0x02 (invalid MINIMALIF value), then OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
-    // Use OP_2 (0x52) — the minimal encoding for integer 2 — so MinimalData does not
-    // fire before MinimalIf. Script: OP_2 OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
     const s = [_]u8{ 0x52, 0x63, 0x51, 0x67, 0x00, 0x68 };
     const result = engine.execute(&s);
-    try testing.expectError(script.ScriptError.MinimalIf, result);
+    try testing.expectError(script.ScriptError.TapscriptMinimalIf, result);
 }
 
 // ============================================================
