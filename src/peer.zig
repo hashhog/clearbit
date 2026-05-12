@@ -645,6 +645,11 @@ pub const Peer = struct {
     /// (Pattern B).
     unconnecting_headers_count: u32 = 0,
 
+    /// When true, misbehaving() will never set should_ban or should_discourage.
+    /// Mirrors Bitcoin Core's NetPermissionFlags::NoBan.  Set for whitelisted
+    /// peers (e.g. -whitelist/-addnode with noban permission).  Default false.
+    no_ban: bool = false,
+
     /// Connect to a remote peer.
     pub fn connect(
         address: std.net.Address,
@@ -1648,8 +1653,62 @@ pub const Peer = struct {
         return false;
     }
 
-    /// Record misbehavior with a reason. Adds to ban score and logs. If score >= 100, marks for ban.
+    /// Return true if the peer's address is a local/loopback address.
+    /// Mirrors Bitcoin Core's CNetAddr::IsLocal() check in
+    /// MaybeDiscourageAndDisconnect (net_processing.cpp:5083).
+    /// Local peers are disconnected-only (no discourage entry written).
+    pub fn isLocalAddress(self: *const Peer) bool {
+        switch (self.address.any.family) {
+            std.posix.AF.INET => {
+                const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&self.address.any)));
+                const ip_bytes = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                // 127.0.0.0/8 loopback range
+                return ip_bytes[0] == 127;
+            },
+            std.posix.AF.INET6 => {
+                const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&self.address.any)));
+                // ::1 loopback
+                const is_loopback = for (ip6.addr[0..15]) |b| {
+                    if (b != 0) break false;
+                } else true;
+                return is_loopback and ip6.addr[15] == 1;
+            },
+            else => return false,
+        }
+    }
+
+    /// Record misbehavior with a reason.  Mirrors Bitcoin Core's
+    /// MaybeDiscourageAndDisconnect (net_processing.cpp:5083).
+    ///
+    /// Exemptions (no ban, no discourage):
+    ///   - no_ban == true  (whitelisted / -noban permission)
+    ///   - conn_type == .manual  (manually added peer via addnode)
+    ///   - local address  (disconnect-only, no discourage entry)
+    ///
+    /// For all other peers: accumulate score; set should_ban when >= 100.
     pub fn misbehaving(self: *Peer, howmuch: u32, message: []const u8) void {
+        // NoBan: exempted entirely — no score, no disconnect.
+        if (self.no_ban) {
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = self.getAddressString(&addr_buf);
+            std.log.info("Misbehaving ignored (noban): peer={s} +{d}: {s}", .{ addr_str, howmuch, message });
+            return;
+        }
+        // Manual peers: exempted entirely — no score, no disconnect.
+        if (self.conn_type == .manual) {
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = self.getAddressString(&addr_buf);
+            std.log.info("Misbehaving ignored (manual): peer={s} +{d}: {s}", .{ addr_str, howmuch, message });
+            return;
+        }
+        // Local peers: disconnect-only; no discourage entry written.
+        if (self.isLocalAddress()) {
+            self.should_ban = true; // causes disconnect without ban-list entry
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = self.getAddressString(&addr_buf);
+            std.log.warn("Misbehaving (local, disconnect-only): peer={s} +{d}: {s}", .{ addr_str, howmuch, message });
+            return;
+        }
         self.ban_score += howmuch;
         if (self.ban_score >= 100) {
             self.should_ban = true;
@@ -7639,19 +7698,55 @@ test "W99/G1: ban_score accumulation model diverges from Core 2022 single-event 
     try std.testing.expect(peer.should_ban);
 }
 
-// G2: misbehaving() ignores conn_type — manual and noban peers are NOT exempt.
-// BUG: Core's MaybeDiscourageAndDisconnect checks NoBan, IsManualConn(), IsLocal()
-// before discouraging. Clearbit's misbehaving() sets should_ban unconditionally.
-test "W99/G2: misbehaving sets should_ban for manual peer — missing noban/manual exemption" {
+// G2 FIX: misbehaving() now exempts noban/manual/local peers (W99 G2).
+// Core canonical: MaybeDiscourageAndDisconnect (net_processing.cpp:5083).
+test "W99/G2: noban peer — misbehaving is a no-op (should_ban stays false)" {
+    const allocator = std.testing.allocator;
+    var peer = makeTestPeer(allocator, .inbound);
+    defer peer.recv_buffer.deinit();
+    peer.no_ban = true;
+
+    peer.misbehaving(100, "bad behavior from noban peer");
+    // NoBan peers must never be banned or disconnected.
+    try std.testing.expect(!peer.should_ban);
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
+}
+
+test "W99/G2: manual peer — misbehaving is a no-op (should_ban stays false)" {
     const allocator = std.testing.allocator;
     var manual_peer = makeTestPeer(allocator, .manual);
     defer manual_peer.recv_buffer.deinit();
 
-    // After 100 points, should_ban becomes true even for manual peer.
     manual_peer.misbehaving(100, "bad behavior from manual peer");
-    // BUG: should remain false for manual peers per Bitcoin Core.
-    // We document the bug by asserting the ACTUAL (wrong) behavior:
-    try std.testing.expect(manual_peer.should_ban); // BUG: should be false per Core
+    // Manual (addnode) peers must never be banned.
+    try std.testing.expect(!manual_peer.should_ban);
+    try std.testing.expectEqual(@as(u32, 0), manual_peer.ban_score);
+}
+
+test "W99/G2: local peer — misbehaving triggers disconnect-only (no ban-list entry)" {
+    const allocator = std.testing.allocator;
+    var local_peer = makeTestPeer(allocator, .inbound);
+    defer local_peer.recv_buffer.deinit();
+    // Override address to 127.0.0.1 (loopback).
+    local_peer.address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8333);
+
+    local_peer.misbehaving(100, "bad behavior from local peer");
+    // Local peers: should_ban (triggers disconnect) but score NOT accumulated
+    // (no discourage entry written to ban-list).
+    try std.testing.expect(local_peer.should_ban);
+    try std.testing.expectEqual(@as(u32, 0), local_peer.ban_score);
+}
+
+test "W99/G2: regular inbound peer — misbehaving discourages normally" {
+    const allocator = std.testing.allocator;
+    var peer = makeTestPeer(allocator, .inbound);
+    defer peer.recv_buffer.deinit();
+    // Default address is 10.0.0.1 (non-local).
+
+    peer.misbehaving(100, "bad behavior from regular peer");
+    // Regular peers: score accumulated and should_ban set.
+    try std.testing.expect(peer.should_ban);
+    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
 }
 
 // G3: loadBanList() is defined but never called on startup.
