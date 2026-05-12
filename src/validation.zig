@@ -187,6 +187,14 @@ pub fn getBlockScriptFlagsForHash(
     flags.discourage_upgradable_nops = false;
     flags.discourage_upgradable_witness_program = false;
     flags.discourage_op_success = false;
+    // BIP-341/342 + MINIMALIF: these flags are POLICY-only in Core (they
+    // live in STANDARD_NOT_MANDATORY_VERIFY_FLAGS, never in MANDATORY).
+    // Force them off on the consensus path so block validation never
+    // rejects spends with unknown leaf versions / unknown pubkey types
+    // (future soft-fork outputs) or non-minimal SegWit-v0 IF args.
+    flags.discourage_upgradable_taproot_version = false;
+    flags.discourage_upgradable_pubkeytype = false;
+    flags.verify_minimalif = false;
 
     return flags;
 }
@@ -241,6 +249,20 @@ pub fn getStandardScriptFlagsForHash(
     flags.discourage_upgradable_nops = true;
     flags.discourage_upgradable_witness_program = true;
     flags.discourage_op_success = true;
+    // BIP-341/BIP-342 policy discouragements — these are in
+    // STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:130, 132) and were
+    // missing from clearbit's relay-policy flag set. They MUST stay out
+    // of `getBlockScriptFlags`: setting them during consensus validation
+    // would reject otherwise-valid blocks that spend with unknown leaf
+    // versions or unknown pubkey types (future soft-fork outputs).
+    flags.discourage_upgradable_taproot_version = true;
+    flags.discourage_upgradable_pubkeytype = true;
+    // BIP-141 MINIMALIF on witness_v0 — policy-only in Core
+    // (interpreter.cpp:622). Without this flag, non-minimal IF args on
+    // SegWit-v0 scripts pass relay; with it, they're rejected at the
+    // mempool boundary. Tapscript MINIMALIF is consensus and is enforced
+    // unconditionally — no flag.
+    flags.verify_minimalif = true;
 
     return flags;
 }
@@ -374,7 +396,7 @@ pub fn checkTransactionContextual(
         // Reference: Bitcoin Core consensus/tx_verify.cpp:179-182
         if (utxos[i].is_coinbase and
             (height < utxos[i].height or
-                height - utxos[i].height < consensus.COINBASE_MATURITY))
+            height - utxos[i].height < consensus.COINBASE_MATURITY))
         {
             return ValidationError.ImmatureCoinbase;
         }
@@ -1312,7 +1334,7 @@ pub fn validateBlockForIBD(
                 // Reference: Bitcoin Core consensus/tx_verify.cpp:179-182
                 if (info.is_coinbase and
                     (height < info.height or
-                        height - info.height < consensus.COINBASE_MATURITY))
+                    height - info.height < consensus.COINBASE_MATURITY))
                 {
                     return ValidationError.ImmatureCoinbase;
                 }
@@ -1692,15 +1714,15 @@ fn txBaseSerializeSize(tx: *const types.Transaction) u64 {
     sz += compactSizeLen(tx.inputs.len);
     for (tx.inputs) |inp| {
         sz += 32; // prevout hash
-        sz += 4;  // prevout index
+        sz += 4; // prevout index
         sz += compactSizeLen(inp.script_sig.len);
         sz += inp.script_sig.len;
-        sz += 4;  // sequence
+        sz += 4; // sequence
     }
     // compact-size output count
     sz += compactSizeLen(tx.outputs.len);
     for (tx.outputs) |out| {
-        sz += 8;  // nValue (int64)
+        sz += 8; // nValue (int64)
         sz += compactSizeLen(out.script_pubkey.len);
         sz += out.script_pubkey.len;
     }
@@ -3241,22 +3263,32 @@ test "W83: checkDifficulty testnet walk-back skips min-difficulty blocks" {
     var chain: [10]types.BlockHeader = undefined;
     for (0..5) |i| {
         chain[i] = .{
-            .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
             .timestamp = @intCast(1000 + i * 600),
-            .bits = real_bits, .nonce = 0,
+            .bits = real_bits,
+            .nonce = 0,
         };
     }
     for (5..10) |i| {
         chain[i] = .{
-            .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
             .timestamp = @intCast(1000 + i * 600),
-            .bits = pow_limit_bits, .nonce = 0,
+            .bits = pow_limit_bits,
+            .nonce = 0,
         };
     }
     const new_ts = chain[9].timestamp + 500; // Within 20 minutes
     var new_hdr: types.BlockHeader = .{
-        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
-        .timestamp = new_ts, .bits = real_bits, .nonce = 0,
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = new_ts,
+        .bits = real_bits,
+        .nonce = 0,
     };
     try checkDifficulty(&new_hdr, 10, &chain, &consensus.TESTNET3);
 
@@ -3272,14 +3304,21 @@ test "W83: checkDifficulty mainnet non-retarget rejects wrong bits" {
     // Mainnet: pow_allow_min_difficulty_blocks = false.
     // Even if timestamp gap > 20min, bits must match previous block.
     const prev = types.BlockHeader{
-        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
-        .timestamp = 1000, .bits = 0x1d00ffff, .nonce = 0,
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1000,
+        .bits = 0x1d00ffff,
+        .nonce = 0,
     };
     // Any large timestamp gap — bits still must match
     const new_hdr = types.BlockHeader{
-        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
         .timestamp = 1000 + 3600, // 1 hour gap — doesn't matter for mainnet
-        .bits = consensus.getPowLimitBits(&consensus.MAINNET), .nonce = 0,
+        .bits = consensus.getPowLimitBits(&consensus.MAINNET),
+        .nonce = 0,
     };
     try std.testing.expectError(
         ValidationError.BadDifficulty,
@@ -3300,12 +3339,18 @@ test "W83: checkDifficulty retarget uses first block bits for BIP-94" {
 
     var period: [2016]types.BlockHeader = undefined;
     period[0] = .{
-        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
-        .timestamp = 1714777860, .bits = real_bits, .nonce = 0,
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1714777860,
+        .bits = real_bits,
+        .nonce = 0,
     };
     for (1..2015) |i| {
         period[i] = .{
-            .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
             .timestamp = @intCast(1714777860 + @as(u32, @intCast(i)) * 600),
             .bits = pow_limit_bits, // min-difficulty blocks
             .nonce = 0,
@@ -3313,7 +3358,9 @@ test "W83: checkDifficulty retarget uses first block bits for BIP-94" {
     }
     // Last block of period: also pow_limit bits but timestamp = exactly one target timespan later
     period[2015] = .{
-        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
         .timestamp = period[0].timestamp + consensus.TARGET_TIMESPAN,
         .bits = pow_limit_bits,
         .nonce = 0,
@@ -3340,7 +3387,9 @@ test "W83: checkDifficulty retarget uses first block bits for BIP-94" {
 
     // Build new block header for retarget (height = interval = 2016)
     const new_hdr = types.BlockHeader{
-        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
         .timestamp = period[2015].timestamp + 600,
         .bits = expected_bits,
         .nonce = 0,
@@ -3353,15 +3402,21 @@ test "W83: checkDifficulty regtest never retargets" {
     var period: [144]types.BlockHeader = undefined;
     for (0..144) |i| {
         period[i] = .{
-            .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
             .timestamp = @intCast(1000 + i * 600),
-            .bits = 0x207fffff, .nonce = 0,
+            .bits = 0x207fffff,
+            .nonce = 0,
         };
     }
     const new_hdr = types.BlockHeader{
-        .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32,
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
         .timestamp = period[143].timestamp + 600,
-        .bits = 0x207fffff, .nonce = 0,
+        .bits = 0x207fffff,
+        .nonce = 0,
     };
     // Height 144 = interval for regtest (86400/600=144), but pow_no_retarget means same bits
     try checkDifficulty(&new_hdr, 144, &period, &consensus.REGTEST);
@@ -4973,9 +5028,9 @@ test "getTransactionSigOpCost counts P2WSH sigops" {
         .script_sig = &[_]u8{}, // Empty for native segwit
         .sequence = 0xFFFFFFFF,
         .witness = &[_][]const u8{
-            &[_]u8{0x00},      // Dummy
+            &[_]u8{0x00}, // Dummy
             &[_]u8{0xAA} ** 71, // Signature
-            &witness_script,  // Witness script (last item)
+            &witness_script, // Witness script (last item)
         },
     };
 
@@ -5046,9 +5101,12 @@ test "getTransactionSigOpCost: coinbase skips P2SH and witness, only legacy×4" 
     // Coinbase tx: Core returns only legacy sigops * WITNESS_SCALE_FACTOR.
     // Reference: Bitcoin Core tx_verify.cpp:147 — if (tx.IsCoinBase()) return nSigOps;
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 0x14;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 0x14;
     @memset(p2pkh[3..23], 0xAB);
-    p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
 
     const cb_input = types.TxIn{
         .previous_output = types.OutPoint.COINBASE,
@@ -5931,8 +5989,7 @@ pub const ChainManager = struct {
                 tip.file_offset,
                 prev_hash,
             ) catch |err| {
-                std.debug.print("disconnectToBlock: disconnect of {x} failed with {}\n",
-                    .{ std.fmt.fmtSliceHexLower(&tip.hash), err });
+                std.debug.print("disconnectToBlock: disconnect of {x} failed with {}\n", .{ std.fmt.fmtSliceHexLower(&tip.hash), err });
                 return ChainError.DisconnectFailed;
             };
 
@@ -7009,7 +7066,7 @@ test "getBlockScriptFlagsForHash: non-exception block matches unconditional set"
 
 test "ScriptCheckJob initializes with pending result" {
     const tx_bytes = [_]u8{0x01} ** 100;
-    const prev_script = [_]u8{0x76, 0xa9, 0x14} ++ [_]u8{0xAB} ** 20 ++ [_]u8{0x88, 0xac};
+    const prev_script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
     const flags = script.ScriptFlags{};
 
     const job = ScriptCheckJob.init(
@@ -7026,7 +7083,7 @@ test "ScriptCheckJob initializes with pending result" {
 
 test "ScriptCheckJob result can be atomically updated" {
     const tx_bytes = [_]u8{0x01} ** 100;
-    const prev_script = [_]u8{0x76, 0xa9, 0x14} ++ [_]u8{0xAB} ** 20 ++ [_]u8{0x88, 0xac};
+    const prev_script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
     const flags = script.ScriptFlags{};
 
     var job = ScriptCheckJob.init(
@@ -9435,7 +9492,7 @@ test "W77 G8: commitment present; hash mismatch → BadWitnessCommitment" {
     // Nonce size is valid but the committed hash doesn't match the computed
     // SHA256d(witness_root || nonce). Core: validation.cpp:3893-3897.
     const allocator = std.testing.allocator;
-    const wrong_hash = [_]u8{0xDE, 0xAD} ++ [_]u8{0xFF} ** 30;
+    const wrong_hash = [_]u8{ 0xDE, 0xAD } ++ [_]u8{0xFF} ** 30;
     const commit_spk = w77CommitScript(&wrong_hash);
     const nonce = [_]u8{0} ** 32;
     const cb = types.Transaction{
