@@ -1039,6 +1039,12 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
             };
             const compressor = @import("compressor.zig");
             const amount: i64 = @intCast(compressor.decompressAmount(compressed_amount));
+            // B4: MoneyRange check — Core validation.cpp:5820-5823.
+            // Reject coins with values outside [0, MAX_MONEY].
+            if (!@import("consensus.zig").isValidMoney(amount)) {
+                std.debug.print("\nFATAL: Coin value {d} out of MoneyRange at coin {d}\n", .{ amount, imported });
+                std.process.exit(1);
+            }
 
             const script_pubkey = readCompressedScriptStreaming(&reader, allocator) catch |err| {
                 std.debug.print("\nFATAL: Read error (script) at coin {d}: {}\n", .{ imported, err });
