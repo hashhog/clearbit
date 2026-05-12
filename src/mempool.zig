@@ -256,6 +256,50 @@ pub const MempoolError = error{
     /// Witness data violates standardness rules (IsWitnessStandard).
     /// Core reject code: "bad-witness-nonstandard".
     WitnessNonStandard,
+    /// CheckTransaction sanity failure (W96 ATMP gate).
+    /// Maps to one of Core's `bad-txns-*` consensus rejects from
+    /// CheckTransaction(): bad-txns-vin-empty, bad-txns-vout-empty,
+    /// bad-txns-vout-negative, bad-txns-vout-toolarge,
+    /// bad-txns-txouttotal-toolarge, bad-txns-inputs-duplicate,
+    /// bad-cb-length, or bad-txns-prevout-null.
+    /// Reference: Bitcoin Core consensus/tx_check.cpp, called from
+    /// MemPoolAccept::PreChecks line 798.
+    TxSanityFailed,
+    /// Per-input or accumulated input value out of MoneyRange (W96 ATMP gate).
+    /// Maps to Core "bad-txns-inputvalues-outofrange" from CheckTxInputs.
+    /// Reference: Bitcoin Core consensus/tx_verify.cpp:186-189.
+    InputValuesOutOfRange,
+    /// Transaction's serialized base size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    /// (W96 consensus gate from CheckTransaction).
+    /// Core reject code: "bad-txns-oversize".
+    TxOversize,
+    /// Coinbase transaction submitted to mempool (W96 ATMP gate).
+    /// Core reject code: "coinbase" (validation.cpp:803-804).
+    /// Coinbase is only valid in a block, not as a loose mempool tx.
+    Coinbase,
+    /// Same-wtxid duplicate (W96 ATMP gate).
+    /// Core reject code: "txn-already-in-mempool" (validation.cpp:823-825).
+    /// Triggered when an EXACT match (witness-and-all) already lives
+    /// in the mempool — distinct from same-txid-different-wtxid below.
+    SameWtxidInMempool,
+    /// Same-txid different-wtxid duplicate (W96 ATMP gate).
+    /// Core reject code: "txn-same-nonwitness-data-in-mempool" (validation.cpp:826-830).
+    /// The non-witness data matches an existing mempool tx but the
+    /// witness differs.
+    SameNonWitnessDataInMempool,
+    /// Standardness-weighted sigop cost gate (W96 ATMP gate).
+    /// Core reject code: "bad-txns-too-many-sigops" via
+    /// `nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST` (validation.cpp:941-943).
+    /// 4× legacy + 4× P2SH + 1× witness sigops weighted; cap = 16,000.
+    /// Distinct from the per-tx legacy-only consensus cap (2,500).
+    TooManySigopsCost,
+    /// Witness-stripped tx detection (W96 ATMP gate).
+    /// Core reject code: "non-mandatory-script-verify-flag" with
+    /// TX_WITNESS_STRIPPED result when script verification fails for
+    /// a tx that has NO witness but spends a witness program (the peer
+    /// likely stripped the witness data). validation.cpp:1148-1151.
+    /// Detected here so callers can suppress reject-cache pollution.
+    WitnessStripped,
 };
 
 // ============================================================================
@@ -714,9 +758,56 @@ pub const Mempool = struct {
     pub fn addTransaction(self: *Mempool, tx: types.Transaction) MempoolError!void {
         const tx_hash = crypto.computeTxid(&tx, self.allocator) catch return MempoolError.OutOfMemory;
 
-        // 1. Check if already in mempool
+        // 1a. CheckTransaction() consensus sanity gate (W96).
+        //
+        //     Bitcoin Core MemPoolAccept::PreChecks calls CheckTransaction first
+        //     (validation.cpp:798).  Without this gate clearbit's mempool would
+        //     accept consensus-invalid txs with zero inputs/outputs, negative or
+        //     overflow output values, duplicate inputs, coinbase null-prevouts in
+        //     non-coinbase position, or oversized serialization — Core would
+        //     reject them with "bad-txns-vin-empty", "bad-txns-vout-empty",
+        //     "bad-txns-vout-negative", "bad-txns-vout-toolarge",
+        //     "bad-txns-txouttotal-toolarge", "bad-txns-inputs-duplicate",
+        //     "bad-cb-length", "bad-txns-prevout-null", or "bad-txns-oversize".
+        //
+        //     Reference: consensus/tx_check.cpp CheckTransaction(),
+        //     called from validation.cpp:798.
+        validation.checkTransactionSanity(&tx) catch |err| switch (err) {
+            error.TxTooLarge => return MempoolError.TxOversize,
+            error.InputValuesOutOfRange => return MempoolError.InputValuesOutOfRange,
+            error.OutputTooLarge,
+            error.TotalOutputTooLarge,
+            error.NegativeOutput,
+            => return MempoolError.TxSanityFailed,
+            else => return MempoolError.TxSanityFailed,
+        };
+
+        // 1b. Coinbase reject (W96).
+        //
+        //     "Coinbase is only valid in a block, not as a loose transaction."
+        //     Reference: Bitcoin Core validation.cpp:803-804.
+        //     Previously enforced only inside verifyInputScripts() (which is
+        //     itself only called when chain_state != null). Without an early
+        //     reject here, a coinbase submitted via RPC on a tests-only
+        //     mempool would be accepted up to the script-verify step.
+        if (tx.isCoinbase()) return MempoolError.Coinbase;
+
+        // 1c. Check if already in mempool, with wtxid-vs-txid disambiguation
+        //     (W96).
+        //
+        //     Bitcoin Core (validation.cpp:823-830) checks:
+        //       - exists(wtxid) → "txn-already-in-mempool"
+        //       - exists(txid)  → "txn-same-nonwitness-data-in-mempool"
+        //     The previous code only checked txid; resubmitting the SAME wtxid
+        //     therefore returned a generic "txn-already-in-mempool" but
+        //     resubmitting a malleated witness (same txid, different wtxid)
+        //     was indistinguishable from an exact duplicate, masking a
+        //     legitimate witness-malleation diagnostic.
+        const tx_wtxid = crypto.computeWtxid(&tx, self.allocator) catch tx_hash;
+        if (self.by_wtxid.contains(tx_wtxid)) return MempoolError.AlreadyInMempool;
         if (self.entries.contains(tx_hash)) {
-            return MempoolError.AlreadyInMempool;
+            // Same non-witness data, different witness.
+            return MempoolError.SameNonWitnessDataInMempool;
         }
 
         // 2. Check standardness
@@ -752,7 +843,18 @@ pub const Mempool = struct {
         for (tx.inputs) |input| {
             // Check mempool first for unconfirmed parent outputs
             if (self.getOutputFromMempool(&input.previous_output)) |mempool_output| {
+                // W96: per-input MoneyRange (Core CheckTxInputs, tx_verify.cpp:186).
+                // Mempool-parent values came from an accepted tx so they were
+                // checked at admission, but defense-in-depth catches a future
+                // bug where someone forgets to gate output ranges upstream.
+                if (!consensus.isValidMoney(mempool_output.value)) {
+                    return MempoolError.InputValuesOutOfRange;
+                }
                 total_in += mempool_output.value;
+                // W96: accumulated input MoneyRange (Core tx_verify.cpp:188).
+                if (!consensus.isValidMoney(total_in)) {
+                    return MempoolError.InputValuesOutOfRange;
+                }
                 // Mempool-parent: synthetic confirmed height = tipHeight + 1 (Core PreChecks).
                 const synthetic_height: u32 = if (self.chain_state) |cs2| cs2.best_height + 1 else 1;
                 seq_utxo_infos.append(validation.UtxoInfo{
@@ -767,7 +869,17 @@ pub const Mempool = struct {
                         var mut_u = u;
                         mut_u.deinit(self.allocator);
                     }
+                    // W96: per-input MoneyRange (Core CheckTxInputs, tx_verify.cpp:186).
+                    // A poisoned UTXO entry with negative or overflowing value
+                    // would silently allow inflation when summed; reject up-front.
+                    if (!consensus.isValidMoney(u.value)) {
+                        return MempoolError.InputValuesOutOfRange;
+                    }
                     total_in += u.value;
+                    // W96: accumulated input MoneyRange (Core tx_verify.cpp:188).
+                    if (!consensus.isValidMoney(total_in)) {
+                        return MempoolError.InputValuesOutOfRange;
+                    }
 
                     // Coinbase maturity check: coinbase outputs require 100 confirmations.
                     // Reference: Bitcoin Core CheckTxInputs() in consensus/tx_verify.cpp.
@@ -1113,6 +1225,7 @@ pub const Mempool = struct {
         self.addTransaction(tx) catch |err| {
             const reason: []const u8 = switch (err) {
                 MempoolError.AlreadyInMempool => "txn-already-in-mempool",
+                MempoolError.SameNonWitnessDataInMempool => "txn-same-nonwitness-data-in-mempool",
                 MempoolError.InsufficientFee => "min relay fee not met",
                 MempoolError.MissingInputs => "missing-inputs",
                 MempoolError.NonBIP125Replaceable => "txn-mempool-conflict",
@@ -1123,6 +1236,12 @@ pub const Mempool = struct {
                 MempoolError.NonStandard => "non-standard",
                 MempoolError.TxWeightTooLarge => "tx-size",
                 MempoolError.TxTooSmall => "tx-size-small",
+                MempoolError.TxOversize => "bad-txns-oversize",
+                MempoolError.TxSanityFailed => "bad-txns-sanity",
+                MempoolError.Coinbase => "coinbase",
+                MempoolError.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
+                MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
+                MempoolError.WitnessStripped => "witness-stripped",
                 MempoolError.ScriptSigTooLarge => "scriptsig-size",
                 MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
                 MempoolError.DatacarrierTooLarge => "datacarrier",
@@ -1885,6 +2004,53 @@ pub const Mempool = struct {
         // fully populated (above) before calling this.
         try checkWitnessStandard(tx, spent_scripts);
 
+        // W96: MAX_STANDARD_TX_SIGOPS_COST relay gate.
+        //
+        //   Bitcoin Core line 908 + 941: after collecting prevouts, compute the
+        //   weighted sigop cost (4× legacy + 4× P2SH + 1× witness) and reject
+        //   if it exceeds MAX_STANDARD_TX_SIGOPS_COST = 16,000 (MAX_BLOCK_SIGOPS_COST/5).
+        //   Distinct from the per-tx legacy-only consensus cap (2,500) already
+        //   gated in `checkStandard`. Without this gate a single tx can occupy
+        //   ~5× the policy budget of standard sigops and still be relayed.
+        //
+        //   Reference: Bitcoin Core validation.cpp:941-943,
+        //   getTransactionSigOpCost in consensus/tx_verify.cpp.
+        {
+            const W96SigopView = struct {
+                inputs: []const types.TxIn,
+                amounts: []const i64,
+                scripts: []const []const u8,
+
+                fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.SigopUtxoEntry {
+                    const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                    for (me.inputs, 0..) |inp, i| {
+                        if (std.mem.eql(u8, &inp.previous_output.hash, &outpoint.hash) and
+                            inp.previous_output.index == outpoint.index)
+                        {
+                            return validation.SigopUtxoEntry{
+                                .script_pubkey = me.scripts[i],
+                                .amount = me.amounts[i],
+                            };
+                        }
+                    }
+                    return null;
+                }
+            };
+            var sv = W96SigopView{
+                .inputs = tx.inputs,
+                .amounts = spent_amounts,
+                .scripts = spent_scripts,
+            };
+            const sigop_view = validation.SigopUtxoView{
+                .context = @ptrCast(&sv),
+                .lookupFn = W96SigopView.lookup,
+            };
+            const sigop_cost = validation.getTransactionSigOpCost(tx, &sigop_view, flags);
+            if (sigop_cost > consensus.MAX_STANDARD_TX_SIGOPS_COST) {
+                return MempoolError.TooManySigopsCost;
+            }
+        }
+
         // Now actually run the script engine against each input.
         for (tx.inputs, 0..) |input, input_index| {
             var engine = script.ScriptEngine.initWithPrevouts(
@@ -1903,12 +2069,95 @@ pub const Mempool = struct {
                 spent_scripts[input_index],
                 input.witness,
             );
+            const script_ok: bool = if (result) |ok| ok else |_| false;
+            if (!script_ok) {
+                // W96: TX_WITNESS_STRIPPED detection.
+                //
+                //   If the tx has NO witness data anywhere but spends a witness
+                //   program (non-anchor), the failure is most likely because a
+                //   relay/peer stripped the witness in transit. Core marks this
+                //   as TX_WITNESS_STRIPPED (validation.cpp:1148-1151) so the p2p
+                //   reject-cache layer can avoid penalizing the originating peer.
+                //
+                //   We don't have a separate state-result enum, but we surface a
+                //   distinct error variant so callers (RPC / p2p) can diagnose.
+                if (!txHasAnyWitness(tx) and spendsNonAnchorWitnessProgram(tx, spent_scripts)) {
+                    return MempoolError.WitnessStripped;
+                }
+                return MempoolError.ScriptVerifyFailed;
+            }
+        }
+
+        // W96: ConsensusScriptChecks — re-verify under the current block-tip
+        // consensus flags as well as STANDARD. This catches the case where a
+        // standard-only flag is "incorrectly permissive" (Core comment: "the
+        // STRICTENC flag was incorrectly allowing certain CHECKSIG NOT scripts
+        // to pass"). A divergence between STANDARD and CONSENSUS for the same
+        // input would let an attacker DoS the mempool with txs that mine into
+        // an invalid block.
+        //
+        // Reference: Bitcoin Core MemPoolAccept::ConsensusScriptChecks,
+        // validation.cpp:1158-1190.
+        //
+        // The STANDARD flag set is a superset of CONSENSUS, so any tx that
+        // passes the STANDARD verify above must by construction also pass the
+        // consensus verify — unless a soft-fork policy bit is doing the wrong
+        // thing. We still re-run for parity + future-proofing, matching Core.
+        const consensus_flags = validation.getBlockScriptFlags(cs.best_height, params);
+        for (tx.inputs, 0..) |input, input_index| {
+            var engine = script.ScriptEngine.initWithPrevouts(
+                self.allocator,
+                tx,
+                input_index,
+                spent_amounts[input_index],
+                consensus_flags,
+                spent_amounts,
+                spent_scripts,
+            );
+            defer engine.deinit();
+
+            const result = engine.verify(
+                input.script_sig,
+                spent_scripts[input_index],
+                input.witness,
+            );
             if (result) |ok| {
                 if (!ok) return MempoolError.ScriptVerifyFailed;
             } else |_| {
                 return MempoolError.ScriptVerifyFailed;
             }
         }
+    }
+
+    /// Helper: does any input of `tx` carry a non-empty witness?
+    /// Mirrors Core's `tx.HasWitness()` (primitives/transaction.h).
+    fn txHasAnyWitness(tx: *const types.Transaction) bool {
+        for (tx.inputs) |input| {
+            if (input.witness.len > 0) {
+                for (input.witness) |item| {
+                    if (item.len > 0) return true;
+                }
+                // Witness vector non-empty even with zero-length items
+                // (e.g. P2WSH with OP_0 push) is still "has witness".
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Helper: does `tx` spend a non-anchor witness program prevout?
+    /// Mirrors Core's `SpendsNonAnchorWitnessProg(tx, view)` used in
+    /// the TX_WITNESS_STRIPPED branch (validation.cpp:1148).
+    fn spendsNonAnchorWitnessProgram(
+        tx: *const types.Transaction,
+        spent_scripts: []const []const u8,
+    ) bool {
+        for (tx.inputs, 0..) |_, i| {
+            const prev = spent_scripts[i];
+            if (script.isPayToAnchor(prev)) continue;
+            if (script.isWitnessProgram(prev) != null) return true;
+        }
+        return false;
     }
 
     /// Check standardness rules.
@@ -11114,4 +11363,493 @@ test "W86-G14: getMinFee halflife accelerates when mempool < 1/4 full" {
     try std.testing.expect(mempool.rolling_minimum_fee_rate < 1000.0);
     try std.testing.expect(mempool.rolling_minimum_fee_rate > 0.0);
     try std.testing.expect(result >= @as(u64, @intCast(MIN_RELAY_FEE)));
+}
+
+// ============================================================================
+// W96 — AcceptToMemoryPool end-to-end audit tests
+// ============================================================================
+//
+// Reference: Bitcoin Core MemPoolAccept::PreChecks (validation.cpp:782-983).
+// Each test exercises one ATMP gate that was previously bypassed in
+// `addTransaction` and would have admitted a consensus-invalid tx to the
+// mempool.
+
+/// Helper: build a small P2WPKH scriptPubKey for tests.
+fn w96TestP2wpkhScript() [22]u8 {
+    return [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+}
+
+/// Helper: build a non-coinbase tx with a reasonable serialized size
+/// (over 65 non-witness bytes so we pass CVE-2017-12842 mitigation).
+fn w96BuildPlausibleTx(version: i32) types.Transaction {
+    const P = struct {
+        var sp: [22]u8 = undefined;
+        var inputs_buf: [1]types.TxIn = undefined;
+        var outputs_buf: [1]types.TxOut = undefined;
+    };
+    P.sp = w96TestP2wpkhScript();
+    P.inputs_buf[0] = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    P.outputs_buf[0] = types.TxOut{
+        .value = 100_000,
+        .script_pubkey = &P.sp,
+    };
+    return types.Transaction{
+        .version = version,
+        .inputs = &P.inputs_buf,
+        .outputs = &P.outputs_buf,
+        .lock_time = 0,
+    };
+}
+
+test "W96 G1: CheckTransaction — empty inputs → TxSanityFailed" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+}
+
+test "W96 G2: CheckTransaction — empty outputs → TxSanityFailed" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+}
+
+test "W96 G3: CheckTransaction — negative output value → TxSanityFailed" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = -1, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+}
+
+test "W96 G4: CheckTransaction — output > MAX_MONEY → TxSanityFailed" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.MAX_MONEY + 1,
+            .script_pubkey = &sp,
+        }},
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+}
+
+test "W96 G5: CheckTransaction — sum(outputs) > MAX_MONEY → TxSanityFailed" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const half = @divTrunc(consensus.MAX_MONEY, 2) + 1;
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{
+            .{ .value = half, .script_pubkey = &sp },
+            .{ .value = half, .script_pubkey = &sp },
+        },
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+}
+
+test "W96 G6: CheckTransaction — duplicate inputs → TxSanityFailed" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const outpoint = types.OutPoint{ .hash = [_]u8{0x11} ** 32, .index = 0 };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{
+            .{ .previous_output = outpoint, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} },
+            .{ .previous_output = outpoint, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} },
+        },
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+}
+
+test "W96 G7: CheckTransaction — non-coinbase with null-prevout input → TxSanityFailed (bad-txns-prevout-null)" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    // Build a non-coinbase tx (two inputs ensures isCoinbase() returns false)
+    // whose first input has the all-zero null prevout used by coinbases.
+    // Core "bad-txns-prevout-null": a non-coinbase must never reference the
+    // coinbase outpoint.
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{
+            .{
+                .previous_output = types.OutPoint.COINBASE,
+                .script_sig = &[_]u8{ 0x51, 0x51 }, // 2 bytes so coinbase script-size gate would pass IF coinbase
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            },
+            .{
+                .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            },
+        },
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+}
+
+test "W96 G8: Coinbase rejected up-front from mempool" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const cb_script = [_]u8{ 0x51, 0x51 }; // 2 bytes (minimum coinbase script length)
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &cb_script,
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.Coinbase, result);
+}
+
+test "W96 G9: SameNonWitnessDataInMempool — same txid different witness" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Insert a tx with witness data W1.
+    const sp = w96TestP2wpkhScript();
+    const witness_data1 = [_]u8{ 0x01, 0x02, 0x03 };
+    const witness_v1: []const []const u8 = &[_][]const u8{&witness_data1};
+    const tx1 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x33} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = witness_v1,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx1);
+
+    // Resubmit with the SAME non-witness data but a DIFFERENT witness:
+    // txid matches, wtxid differs.  Core: "txn-same-nonwitness-data-in-mempool".
+    const witness_data2 = [_]u8{ 0x04, 0x05, 0x06 };
+    const witness_v2: []const []const u8 = &[_][]const u8{&witness_data2};
+    const tx2 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x33} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = witness_v2,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+    const result = mempool.addTransaction(tx2);
+    try std.testing.expectError(MempoolError.SameNonWitnessDataInMempool, result);
+}
+
+test "W96 G10: wtxid match → AlreadyInMempool (exact duplicate)" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Add a tx, then resubmit byte-identical: wtxid match.
+    const tx = w96BuildPlausibleTx(2);
+    try mempool.addTransaction(tx);
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.AlreadyInMempool, result);
+}
+
+test "W96 G11: AcceptResult reject_reason is `txn-same-nonwitness-data-in-mempool`" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const wit1 = [_]u8{0xaa};
+    const wv1: []const []const u8 = &[_][]const u8{&wit1};
+    const tx1 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x44} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = wv1,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx1);
+
+    const wit2 = [_]u8{0xbb};
+    const wv2: []const []const u8 = &[_][]const u8{&wit2};
+    const tx2 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x44} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = wv2,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+    const r = mempool.acceptToMemoryPool(tx2, false);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("txn-same-nonwitness-data-in-mempool", r.reject_reason.?);
+}
+
+test "W96 G12: AcceptResult reject_reason is `coinbase` for coinbase submission" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const cb_script = [_]u8{ 0x51, 0x51 };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &cb_script,
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 50_0000_0000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const r = mempool.acceptToMemoryPool(tx, false);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expectEqualStrings("coinbase", r.reject_reason.?);
+}
+
+test "W96 G13: oversize tx — base_size * 4 > MAX_BLOCK_WEIGHT → TxOversize" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Build a tx whose base serialized size, times 4, exceeds MAX_BLOCK_WEIGHT.
+    // MAX_BLOCK_WEIGHT = 4_000_000, so base size > 1_000_000 triggers it.
+    // We achieve this with one input + one giant scriptPubKey output.
+    const big_script = try allocator.alloc(u8, 1_100_000);
+    defer allocator.free(big_script);
+    @memset(big_script, 0x6a); // OP_RETURN bytes — content doesn't matter for the size check.
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x55} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = big_script }},
+        .lock_time = 0,
+    };
+
+    const result = mempool.addTransaction(tx);
+    try std.testing.expectError(MempoolError.TxOversize, result);
+}
+
+test "W96 G14: MempoolError variants — new W96 variants exist in enum" {
+    // Compile-time check: every W96 variant we expect is reachable.
+    const variants = [_]MempoolError{
+        MempoolError.TxSanityFailed,
+        MempoolError.InputValuesOutOfRange,
+        MempoolError.TxOversize,
+        MempoolError.Coinbase,
+        MempoolError.SameNonWitnessDataInMempool,
+        MempoolError.TooManySigopsCost,
+        MempoolError.WitnessStripped,
+    };
+    try std.testing.expectEqual(@as(usize, 7), variants.len);
+}
+
+test "W96 G15: acceptToMemoryPool — empty-inputs tx surfaces a non-null reject reason" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const r = mempool.acceptToMemoryPool(tx, false);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("bad-txns-sanity", r.reject_reason.?);
+}
+
+test "W96 G16: helper txHasAnyWitness — no-witness tx returns false" {
+    const tx = w96BuildPlausibleTx(2);
+    try std.testing.expect(!Mempool.txHasAnyWitness(&tx));
+}
+
+test "W96 G17: helper txHasAnyWitness — single non-empty witness item returns true" {
+    const sp = w96TestP2wpkhScript();
+    const wd = [_]u8{0xaa};
+    const wv: []const []const u8 = &[_][]const u8{&wd};
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x66} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = wv,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+    try std.testing.expect(Mempool.txHasAnyWitness(&tx));
+}
+
+test "W96 G18: spendsNonAnchorWitnessProgram — P2WPKH prevout returns true" {
+    const sp = w96TestP2wpkhScript();
+    const tx = w96BuildPlausibleTx(2);
+    const spent_scripts = [_][]const u8{&sp};
+    try std.testing.expect(Mempool.spendsNonAnchorWitnessProgram(&tx, &spent_scripts));
+}
+
+test "W96 G19: spendsNonAnchorWitnessProgram — legacy P2PKH prevout returns false" {
+    const p2pkh = [_]u8{0x76} ++ [_]u8{0xa9} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20 ++ [_]u8{0x88} ++ [_]u8{0xac};
+    const tx = w96BuildPlausibleTx(2);
+    const spent_scripts = [_][]const u8{&p2pkh};
+    try std.testing.expect(!Mempool.spendsNonAnchorWitnessProgram(&tx, &spent_scripts));
+}
+
+test "W96 G20: spendsNonAnchorWitnessProgram — P2A (anchor) prevout returns false" {
+    // P2A (Pay-to-Anchor): OP_1 OP_PUSHBYTES_2 0x4e73
+    const p2a = [_]u8{ 0x51, 0x02, 0x4e, 0x73 };
+    const tx = w96BuildPlausibleTx(2);
+    const spent_scripts = [_][]const u8{&p2a};
+    try std.testing.expect(!Mempool.spendsNonAnchorWitnessProgram(&tx, &spent_scripts));
+}
+
+test "W96 G21: reject_reason mapping — TxOversize -> `bad-txns-oversize`" {
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const big_script = try allocator.alloc(u8, 1_100_000);
+    defer allocator.free(big_script);
+    @memset(big_script, 0x6a);
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x77} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = big_script }},
+        .lock_time = 0,
+    };
+
+    const r = mempool.acceptToMemoryPool(tx, false);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expectEqualStrings("bad-txns-oversize", r.reject_reason.?);
+}
+
+test "W96 G22: addTransaction accepts a well-formed plausible tx" {
+    // Sanity check: the W96 gates must NOT regress baseline acceptance.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const tx = w96BuildPlausibleTx(2);
+    try mempool.addTransaction(tx);
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
 }
