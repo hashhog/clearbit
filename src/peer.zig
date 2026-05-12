@@ -5085,6 +5085,16 @@ pub const PeerManager = struct {
                 // spent UTXO.  PeerManager is long-lived; safe to pass self here.
                 .getMtpAtHeightFn = PeerManager.getMtpAtHeightTrampoline,
                 .getMtpAtHeightCtx = @ptrCast(self),
+                // fTooFarAhead gate (W97 G19c): supply the active-tip height so
+                // validateBlockForIBD can reject unrequested blocks that are more
+                // than MIN_BLOCKS_TO_KEEP (288) above our tip.  IBD drain blocks
+                // ARE explicitly requested (pipelineBlockRequests sent getdata for
+                // them), so is_requested=true suppresses the ceiling check for this
+                // path.  active_tip_height is still wired so future callers that
+                // pass is_requested=false (e.g. unsolicited block handlers) get
+                // the check for free.
+                .active_tip_height = cs.best_height,
+                .is_requested = true,
             },
         ) catch |err| {
             std.debug.print(
