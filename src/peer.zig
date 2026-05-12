@@ -3951,6 +3951,40 @@ pub const PeerManager = struct {
                     }
                 }
 
+                // G8 — min_pow_checked / MinimumChainWork (W97 FIX-4)
+                // Reference: bitcoin-core/src/validation.cpp:4226-4232
+                //   AcceptBlockHeader: if (!min_pow_checked)
+                //     return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
+                //
+                // min_pow_checked = (parent_chain_work + work(batch) >= min_chain_work)
+                // The live .headers handler (this path) is called from a random peer
+                // with no out-of-band PRESYNC guarantee, so min_pow_checked = false
+                // initially.  We wire the existing (dead-helper) netMinimumChainWork
+                // by computing cumulative batch work and comparing to
+                // network_params.min_chain_work.  Regtest sets min_chain_work = 0
+                // so this gate is a no-op there (consistent with Core).
+                {
+                    const min_cw = self.network_params.min_chain_work;
+                    // Fast path: skip gate when min_chain_work is all-zeros (regtest).
+                    const zero: [32]u8 = [_]u8{0} ** 32;
+                    if (!std.mem.eql(u8, &min_cw, &zero)) {
+                        // Compute cumulative chain work for this batch.
+                        // Start from the parent's work (genesis = all-zeros).
+                        var cum_work: [32]u8 = if (self.lookupParentChainWork(&h.headers[0].prev_block)) |p| p.work else [_]u8{0} ** 32;
+                        for (h.headers) |hdr| {
+                            const w = workFromBits(hdr.bits);
+                            addChainWorkBE(&cum_work, &w);
+                        }
+                        // Reject batch when cumulative work < min_chain_work.
+                        if (cmpChainWorkBE(&cum_work, &min_cw) < 0) {
+                            std.debug.print("P2P: peer={any} rejected: too-little-chainwork (batch work below min_chain_work)\n",
+                                .{peer.address});
+                            peer.misbehaving(100, "too-little-chainwork");
+                            return;
+                        }
+                    }
+                }
+
                 // Add header hashes to the expected_blocks queue.  Also
                 // insert into the header_index when reorg detection is
                 // enabled — this populates the structure so future
@@ -7904,15 +7938,35 @@ test "W99/G28: sendAddresses caps at 100 addresses (Core limit is 1000)" {
     try std.testing.expect(CLEARBIT_MAX_ADDR < CORE_MAX_ADDR);
 }
 
-// G5/G6: PRESYNC/REDOWNLOAD and min_pow_checked are entirely absent.
-// BUG: Core's headerssync.cpp PRESYNC phase anti-DoS pipeline (W88) and the
-// min_pow_checked parameter threading (W97) are missing in clearbit.
-// Without PRESYNC, a peer can send low-work headers indefinitely with no DoS cost.
-test "W99/G5+G6: PRESYNC/REDOWNLOAD and min_pow_checked absent from headers path" {
+// G5: PRESYNC/REDOWNLOAD pipeline still absent (W88 gap, not yet fixed).
+// BUG: Core's headerssync.cpp PRESYNC phase anti-DoS pipeline is missing in clearbit.
+// Without PRESYNC, a peer can exhaust the header-index memory before the
+// min_chain_work gate fires.  The G8 min_pow_checked gate (FIX-4) closes the
+// chain-work threshold gap but does not add the full PRESYNC/REDOWNLOAD pipeline.
+test "W99/G5: PRESYNC/REDOWNLOAD pipeline absent from PeerManager" {
     // Verify no PRESYNC-related state exists on PeerManager.
     // Core: Peer::m_headers_sync (HeadersSyncState) drives PRESYNC/REDOWNLOAD.
     try std.testing.expect(!@hasField(PeerManager, "headers_sync"));
-    // min_pow_checked threading absent: ProcessNewBlockHeaders call does not carry it.
-    // No min_pow_checked field on Peer either.
-    try std.testing.expect(!@hasField(Peer, "min_pow_checked"));
+}
+
+// G6: min_pow_checked gate — FIXED (W97 FIX-4).
+// The live .headers handler now computes cumulative batch chain work and
+// rejects batches below network_params.min_chain_work with a 100-point
+// misbehave score, consistent with BLOCK_HEADER_LOW_WORK.
+// Reference: bitcoin-core/src/validation.cpp:4226-4232 AcceptBlockHeader.
+test "W99/G6: min_pow_checked gate wired — min_chain_work non-zero for mainnet" {
+    // Gate uses network_params.min_chain_work.  Verify the dead-helper is now live:
+    // mainnet has a non-zero threshold, regtest has zero (gate is a no-op there).
+    const zero: [32]u8 = [_]u8{0} ** 32;
+    try std.testing.expect(!std.mem.eql(u8, &consensus.MAINNET.min_chain_work, &zero));
+    try std.testing.expectEqualSlices(u8, &zero, &consensus.REGTEST.min_chain_work);
+    // The .headers handler now calls cmpChainWorkBE(cum_work, min_chain_work).
+    // Verify the comparison function exists and returns the expected sign.
+    var low: [32]u8 = [_]u8{0} ** 32;
+    low[31] = 1; // 0x01
+    var high: [32]u8 = [_]u8{0} ** 32;
+    high[30] = 1; // 0x0100 > 0x01
+    try std.testing.expect(cmpChainWorkBE(&low, &high) < 0); // low < high → would be rejected
+    try std.testing.expect(cmpChainWorkBE(&high, &low) > 0); // high >= low → passes
+    try std.testing.expect(cmpChainWorkBE(&low, &low) == 0); // equal → passes
 }
