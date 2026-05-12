@@ -1678,14 +1678,16 @@ pub const Peer = struct {
     }
 
     /// Record misbehavior with a reason.  Mirrors Bitcoin Core's
-    /// MaybeDiscourageAndDisconnect (net_processing.cpp:5083).
+    /// MaybeDiscourageAndDisconnect (net_processing.cpp:5083) and the 2022
+    /// single-event model (PR #25974): any single Misbehaving call sets
+    /// m_should_discourage=true immediately — no score accumulation.
     ///
     /// Exemptions (no ban, no discourage):
     ///   - no_ban == true  (whitelisted / -noban permission)
     ///   - conn_type == .manual  (manually added peer via addnode)
     ///   - local address  (disconnect-only, no discourage entry)
     ///
-    /// For all other peers: accumulate score; set should_ban when >= 100.
+    /// For all other peers: single-event — set should_ban immediately on any call.
     pub fn misbehaving(self: *Peer, howmuch: u32, message: []const u8) void {
         // NoBan: exempted entirely — no score, no disconnect.
         if (self.no_ban) {
@@ -1709,17 +1711,13 @@ pub const Peer = struct {
             std.log.warn("Misbehaving (local, disconnect-only): peer={s} +{d}: {s}", .{ addr_str, howmuch, message });
             return;
         }
-        self.ban_score += howmuch;
-        if (self.ban_score >= 100) {
-            self.should_ban = true;
-            var addr_buf: [64]u8 = undefined;
-            const addr_str = self.getAddressString(&addr_buf);
-            std.log.warn("Misbehaving: peer={s} score={d}: {s}", .{ addr_str, self.ban_score, message });
-        } else {
-            var addr_buf: [64]u8 = undefined;
-            const addr_str = self.getAddressString(&addr_buf);
-            std.log.info("Misbehaving: peer={s} score={d}: {s}", .{ addr_str, self.ban_score, message });
-        }
+        // Core 2022 single-event model (PR #25974): any Misbehaving call
+        // immediately sets should_ban (≡ m_should_discourage=true in Core).
+        // No score accumulation — a single infraction is enough to discourage.
+        self.should_ban = true;
+        var addr_buf: [64]u8 = undefined;
+        const addr_str = self.getAddressString(&addr_buf);
+        std.log.warn("Misbehaving: peer={s} +{d} (single-event discourage): {s}", .{ addr_str, howmuch, message });
     }
 
     /// Get the latency in milliseconds based on last ping/pong.
@@ -7748,26 +7746,22 @@ fn makeTestPeer(allocator: std.mem.Allocator, conn_type: ConnectionType) Peer {
 }
 
 // G1: misbehaving() uses score accumulation, NOT the 2022 single-event flag model.
-// BUG: Core since 2022 sets m_should_discourage=true on any single Misbehaving call;
-// clearbit still requires cumulative score >= 100 before discouraging.
-// This means a peer can receive multiple low-score infractions (e.g., 10+10+...×9)
-// before being discouraged — violating the 2022 DoS policy tightening.
-test "W99/G1: ban_score accumulation model diverges from Core 2022 single-event flag" {
+// FIX (W99 G1): misbehaving() now uses the Core 2022 single-event model
+// (PR #25974): any single Misbehaving call sets should_ban=true immediately,
+// no score accumulation required.
+test "W99/G1: single Misbehaving call immediately sets should_ban (Core 2022 single-event)" {
     const allocator = std.testing.allocator;
     var peer = makeTestPeer(allocator, .outbound_full_relay);
     defer peer.recv_buffer.deinit();
 
-    // A single Misbehaving call with score=50 should NOT mark should_ban (score < 100).
+    // A single Misbehaving call with ANY score immediately discourages.
+    // Core canonical: net_processing.cpp:1898 peer.m_should_discourage = true
     peer.misbehaving(50, "first infraction");
-    try std.testing.expectEqual(@as(u32, 50), peer.ban_score);
-    // BUG: In Core's 2022 model, should_discourage would be true here;
-    // clearbit still requires score >= 100. Document that clearbit does NOT
-    // set should_ban on the first infraction below the threshold.
-    try std.testing.expect(!peer.should_ban);
+    // Single-event: should_ban must be set after the first call, regardless of score.
+    try std.testing.expect(peer.should_ban);
 
-    // A second 50-point infraction tips over threshold.
+    // A second call does not blow up or reset the flag.
     peer.misbehaving(50, "second infraction");
-    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
     try std.testing.expect(peer.should_ban);
 }
 
@@ -7817,9 +7811,10 @@ test "W99/G2: regular inbound peer — misbehaving discourages normally" {
     // Default address is 10.0.0.1 (non-local).
 
     peer.misbehaving(100, "bad behavior from regular peer");
-    // Regular peers: score accumulated and should_ban set.
+    // Regular peers: single-event — should_ban set immediately.
+    // ban_score is NOT accumulated by misbehaving() (Core 2022 model).
     try std.testing.expect(peer.should_ban);
-    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
 }
 
 // G3: loadBanList() is defined but never called on startup.
