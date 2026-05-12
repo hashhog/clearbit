@@ -1499,6 +1499,29 @@ pub const BlockDownloader = struct {
         }
     }
 
+    /// Compute the Median-Time-Past (BIP-113) for the block identified by
+    /// `prev_hash`, walking back up to 11 ancestors via the in-memory
+    /// block_index.  Returns 0 when fewer than 1 ancestor is known (genesis /
+    /// not-yet-fetched), which causes the caller to skip the MTP check.
+    ///
+    /// Mirrors peer.zig::PeerManager.computePrevMtp, adapted for the
+    /// SyncManager.block_index (*BlockIndex values keyed by Hash256).
+    ///
+    /// Reference: Bitcoin Core CBlockIndex::GetMedianTimePast() (chain.h).
+    fn computePrevMtp(self: *BlockDownloader, prev_hash: *const types.Hash256) u32 {
+        var timestamps: [11]u32 = undefined;
+        var n: usize = 0;
+        var cursor = prev_hash.*;
+        while (n < 11) {
+            const entry = self.sync_manager.block_index.get(cursor) orelse break;
+            timestamps[n] = entry.header.timestamp;
+            n += 1;
+            cursor = entry.header.prev_block;
+        }
+        if (n == 0) return 0;
+        return validation.medianTimePast(timestamps[0..n]);
+    }
+
     /// Main IBD loop: request blocks, process received blocks, connect to chain.
     pub fn runIBD(self: *BlockDownloader) !void {
         const tip_height = if (self.sync_manager.best_tip) |tip| tip.height else return BlockDownloadError.NoBestTip;
@@ -1744,6 +1767,13 @@ pub const BlockDownloader = struct {
         // Phase 1: full consensus validation via the unified acceptBlock helper.
         // On failure, map to the BlockDownloadError variants the caller
         // (connectBlocks) propagates up to runIBD.
+        //
+        // BIP-113 (W97 G7/G21 fix): compute the median-time-past of the 11
+        // ancestors of the previous block so that acceptBlock can enforce
+        // block.header.timestamp > MTP (ContextualCheckBlockHeader in Core).
+        // Previously this was hard-coded to 0 which silently disabled the
+        // BIP-113 timestamp check on this legacy IBD path.
+        const prev_mtp = self.computePrevMtp(&block.header.prev_block);
         if (chain_store) |cs| {
             var adapter = Adapter{ .cs = cs, .alloc = self.allocator };
             validation.acceptBlock(
@@ -1754,7 +1784,7 @@ pub const BlockDownloader = struct {
                 @ptrCast(&adapter),
                 Adapter.lookup,
                 self.allocator,
-                .{ .prev_mtp = 0, .force_skip_scripts = skip_via_height },
+                .{ .prev_mtp = prev_mtp, .force_skip_scripts = skip_via_height },
             ) catch |err| {
                 return switch (err) {
                     error.BadMerkleRoot => BlockDownloadError.BadMerkleRoot,
