@@ -7898,18 +7898,19 @@ test "W99/G19: duplicate version message falls to silent else branch" {
     try std.testing.expect(!@hasField(Peer, "version_received_count"));
 }
 
-// G23: MAX_MESSAGE_SIZE is 32 MiB in clearbit vs 4 MiB in Bitcoin Core.
-// BUG: Core defines MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1024 * 1024 (4 MiB).
-// Clearbit's p2p.MAX_MESSAGE_SIZE = 32 * 1024 * 1024 (32 MiB), 8× too large.
-// A malicious peer can send an 8× larger payload before it is rejected.
-test "W99/G23: MAX_MESSAGE_SIZE is 32 MiB (should be 4 MiB per Core)" {
-    // Bitcoin Core: CMessageHeader::MAXIMUM_MESSAGE_LENGTH = 4 * 1024 * 1024
-    const CORE_MAX: usize = 4 * 1024 * 1024;
+// G23 FIXED: MAX_MESSAGE_SIZE now matches Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH.
+// Core net.h: static const unsigned int MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000;
+// Was: 32 * 1024 * 1024 (33,554,432 bytes — 8× too large).
+// Fix: 4 * 1000 * 1000 (4,000,000 bytes).
+test "W99/G23: MAX_MESSAGE_SIZE equals Core MAX_PROTOCOL_MESSAGE_LENGTH (4,000,000)" {
+    // Bitcoin Core net.h: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000
+    const CORE_MAX: usize = 4 * 1000 * 1000;
     const clearbit_max = p2p.MAX_MESSAGE_SIZE;
-    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), clearbit_max);
-    // BUG: clearbit allows 8x the Core limit.
-    try std.testing.expect(clearbit_max != CORE_MAX);
-    try std.testing.expect(clearbit_max > CORE_MAX);
+    try std.testing.expectEqual(CORE_MAX, clearbit_max);
+    // Verify the named constant is also set correctly.
+    try std.testing.expectEqual(CORE_MAX, p2p.MAX_PROTOCOL_MESSAGE_LENGTH);
+    // Sanity: NOT the old 32 MiB value.
+    try std.testing.expect(clearbit_max != 32 * 1024 * 1024);
 }
 
 // G25: wtxidrelay segregation — peer wtxid negotiation state is not tracked.
