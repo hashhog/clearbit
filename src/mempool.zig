@@ -564,8 +564,13 @@ pub const MempoolEntry = struct {
 pub const OrphanTx = struct {
     /// Owned, deep-copied transaction.  Slices are allocator-owned.
     tx: types.Transaction,
-    /// Cached txid (lookup key in the orphan map).
+    /// Cached txid.  Used as the secondary-index key and for parent-resolution
+    /// (looking up which orphans depend on a newly-arrived parent tx).
     txid: types.Hash256,
+    /// Cached wtxid (full-serialization hash including witness).  This is the
+    /// PRIMARY key in the orphan map (BIP-339 / Core PR #18044).  For
+    /// non-segwit txs wtxid == txid.
+    wtxid: types.Hash256,
     /// Serialized size in bytes (with witness).  Bounded by `MAX_ORPHAN_TX_SIZE`.
     size: usize,
     /// Wall-clock time the orphan was added.  Used by oldest-first eviction.
@@ -668,10 +673,18 @@ pub const Mempool = struct {
     // Orphan Transaction Pool
     // ========================================================================
 
-    /// Orphan transactions indexed by txid.
+    /// Orphan transactions indexed by wtxid (BIP-339 / Core PR #18044).
+    /// Primary key is the full-serialization hash (wtxid) so two witness-
+    /// malleated variants of the same txid occupy separate slots.
     /// See `OrphanTx` and the constants `MAX_ORPHAN_TRANSACTIONS`,
     /// `MAX_ORPHAN_TX_SIZE`, `MAX_PEER_ORPHANS` for bounds.
     orphans: std.AutoHashMap(types.Hash256, *OrphanTx),
+
+    /// Secondary index: txid → wtxid.  Used by parent-resolution
+    /// (processOrphansForParent looks up children by the parent's txid, which
+    /// is what the child's `previous_output.hash` field contains) and by the
+    /// public hasOrphan / removeOrphan helpers that callers identify by txid.
+    orphans_by_txid: std.AutoHashMap(types.Hash256, types.Hash256),
 
     /// Per-peer orphan count.  Used to enforce `MAX_PEER_ORPHANS` and to
     /// support O(N) cleanup when a peer disconnects.
@@ -703,6 +716,7 @@ pub const Mempool = struct {
             .fee_estimator = FeeEstimator.init(allocator),
             .full_rbf = false,
             .orphans = std.AutoHashMap(types.Hash256, *OrphanTx).init(allocator),
+            .orphans_by_txid = std.AutoHashMap(types.Hash256, types.Hash256).init(allocator),
             .orphans_by_peer = std.AutoHashMap(u64, u32).init(allocator),
             // Rolling minimum fee rate state (Core txmempool.cpp:829-859).
             .rolling_minimum_fee_rate = 0.0,
@@ -751,6 +765,7 @@ pub const Mempool = struct {
             self.allocator.destroy(orphan);
         }
         self.orphans.deinit();
+        self.orphans_by_txid.deinit();
         self.orphans_by_peer.deinit();
     }
 
@@ -1455,11 +1470,13 @@ pub const Mempool = struct {
         tx: *const types.Transaction,
         peer_id: u64,
     ) bool {
-        // Compute txid up-front; if hashing fails, drop silently.
+        // Compute txid and wtxid up-front; drop silently on hash failure.
         const txid = crypto.computeTxid(tx, self.allocator) catch return false;
+        const wtxid = crypto.computeWtxid(tx, self.allocator) catch return false;
 
-        // Already in the orphan pool — treat as success but don't double-charge.
-        if (self.orphans.contains(txid)) return true;
+        // Already in the orphan pool (keyed by wtxid per BIP-339) — treat as
+        // success but don't double-charge the per-peer counter.
+        if (self.orphans.contains(wtxid)) return true;
 
         // Reject orphans that exceed the per-tx size cap before allocating.
         const sz = self.serializedTxSize(tx) catch return false;
@@ -1493,15 +1510,22 @@ pub const Mempool = struct {
         orphan_ptr.* = OrphanTx{
             .tx = owned_tx,
             .txid = txid,
+            .wtxid = wtxid,
             .size = sz,
             .time_added = std.time.timestamp(),
             .peer_id = peer_id,
         };
 
-        self.orphans.put(txid, orphan_ptr) catch {
+        // Insert into primary (wtxid) map.
+        self.orphans.put(wtxid, orphan_ptr) catch {
             serialize.freeTransaction(self.allocator, &owned_tx);
             self.allocator.destroy(orphan_ptr);
             return false;
+        };
+
+        // Maintain secondary txid→wtxid index.
+        self.orphans_by_txid.put(txid, wtxid) catch {
+            // Non-fatal: parent-resolution will fall back to full scan.
         };
 
         if (peer_id != 0) {
@@ -1515,26 +1539,29 @@ pub const Mempool = struct {
     /// removed, false if the pool is empty.  Used by `addOrphan` when the
     /// global cap is reached.
     fn evictOldestOrphan(self: *Mempool) bool {
-        var oldest_txid: ?types.Hash256 = null;
+        var oldest_wtxid: ?types.Hash256 = null;
         var oldest_time: i64 = std.math.maxInt(i64);
         var iter = self.orphans.iterator();
         while (iter.next()) |entry| {
             const o = entry.value_ptr.*;
             if (o.time_added < oldest_time) {
                 oldest_time = o.time_added;
-                oldest_txid = o.txid;
+                oldest_wtxid = o.wtxid;
             }
         }
-        if (oldest_txid) |t| {
-            return self.removeOrphan(t);
+        if (oldest_wtxid) |t| {
+            return self.removeOrphanByWtxid(t);
         }
         return false;
     }
 
-    /// Remove a specific orphan by txid.  Returns true if one was removed.
-    pub fn removeOrphan(self: *Mempool, txid: types.Hash256) bool {
-        if (self.orphans.fetchRemove(txid)) |kv| {
+    /// Internal helper: remove an orphan using its wtxid (the primary key).
+    /// Cleans up secondary txid→wtxid index and per-peer counters.
+    fn removeOrphanByWtxid(self: *Mempool, wtxid: types.Hash256) bool {
+        if (self.orphans.fetchRemove(wtxid)) |kv| {
             const orphan = kv.value;
+            // Remove secondary txid→wtxid index entry.
+            _ = self.orphans_by_txid.remove(orphan.txid);
             if (orphan.peer_id != 0) {
                 if (self.orphans_by_peer.get(orphan.peer_id)) |cur| {
                     if (cur > 1) {
@@ -1551,29 +1578,38 @@ pub const Mempool = struct {
         return false;
     }
 
+    /// Remove a specific orphan by txid.  Looks up the wtxid via the secondary
+    /// index and delegates to removeOrphanByWtxid.  Returns true if removed.
+    pub fn removeOrphan(self: *Mempool, txid: types.Hash256) bool {
+        const wtxid = self.orphans_by_txid.get(txid) orelse return false;
+        return self.removeOrphanByWtxid(wtxid);
+    }
+
     /// Erase every orphan announced by `peer_id`.  Called by the peer
     /// manager when a peer disconnects so its orphans don't pin pool slots
     /// forever.  Mirrors Core's `EraseOrphansFor`.
     pub fn eraseOrphansForPeer(self: *Mempool, peer_id: u64) void {
         if (peer_id == 0) return;
-        // Collect targets first to avoid mutating the map mid-iteration.
+        // Collect wtxids first to avoid mutating the map mid-iteration.
         var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
         defer to_remove.deinit();
         var iter = self.orphans.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.*.peer_id == peer_id) {
-                to_remove.append(entry.value_ptr.*.txid) catch break;
+                to_remove.append(entry.value_ptr.*.wtxid) catch break;
             }
         }
-        for (to_remove.items) |txid| {
-            _ = self.removeOrphan(txid);
+        for (to_remove.items) |wtxid| {
+            _ = self.removeOrphanByWtxid(wtxid);
         }
         _ = self.orphans_by_peer.remove(peer_id);
     }
 
-    /// Check whether an orphan exists by txid.  Test / introspection helper.
+    /// Check whether an orphan exists by txid.  Looks up via the secondary
+    /// txid→wtxid index.  Test / introspection helper.
     pub fn hasOrphan(self: *Mempool, txid: types.Hash256) bool {
-        return self.orphans.contains(txid);
+        const wtxid = self.orphans_by_txid.get(txid) orelse return false;
+        return self.orphans.contains(wtxid);
     }
 
     /// Number of orphans currently held.  Test / introspection helper.
@@ -1608,8 +1644,11 @@ pub const Mempool = struct {
         while (processed_idx < worklist.items.len) : (processed_idx += 1) {
             const cur_parent = worklist.items[processed_idx];
 
-            // Snapshot orphan txids that reference cur_parent.  We can't
-            // mutate `self.orphans` while iterating, so collect first.
+            // Snapshot orphan wtxids (primary keys) that reference cur_parent.
+            // We can't mutate `self.orphans` while iterating, so collect first.
+            // The child's input's previous_output.hash is the parent's txid,
+            // so we still match on txid — just record the child's wtxid for
+            // removal.
             var candidates = std.ArrayList(types.Hash256).init(self.allocator);
             defer candidates.deinit();
             var iter = self.orphans.iterator();
@@ -1617,17 +1656,19 @@ pub const Mempool = struct {
                 const o = entry.value_ptr.*;
                 for (o.tx.inputs) |inp| {
                     if (std.mem.eql(u8, &inp.previous_output.hash, &cur_parent)) {
-                        candidates.append(o.txid) catch break;
+                        candidates.append(o.wtxid) catch break;
                         break;
                     }
                 }
             }
 
-            for (candidates.items) |orphan_txid| {
+            for (candidates.items) |orphan_wtxid| {
                 // Pull the orphan out of the pool first; ownership of
                 // the inner tx now lives on this stack frame.
-                const orphan_ptr = self.orphans.get(orphan_txid) orelse continue;
-                _ = self.orphans.remove(orphan_txid);
+                const orphan_ptr = self.orphans.get(orphan_wtxid) orelse continue;
+                _ = self.orphans.remove(orphan_wtxid);
+                // Remove secondary txid→wtxid index entry.
+                _ = self.orphans_by_txid.remove(orphan_ptr.txid);
                 if (orphan_ptr.peer_id != 0) {
                     if (self.orphans_by_peer.get(orphan_ptr.peer_id)) |cur| {
                         if (cur > 1) {
@@ -1644,8 +1685,9 @@ pub const Mempool = struct {
                 if (accepted) {
                     promoted += 1;
                     // The orphan's child orphans (if any) might now be
-                    // unlockable, so recurse via the worklist.
-                    worklist.append(orphan_txid) catch {};
+                    // unlockable, so recurse via the worklist using the txid
+                    // (worklist entries are parent txids for input matching).
+                    worklist.append(orphan_ptr.txid) catch {};
                 } else {
                     serialize.freeTransaction(self.allocator, &orphan_ptr.tx);
                 }
@@ -1675,9 +1717,9 @@ pub const Mempool = struct {
         var iter = self.orphans.iterator();
         while (iter.next()) |entry| {
             const o = entry.value_ptr.*;
-            // Same-txid orphan? remove.
+            // Same-txid orphan? remove (collect wtxid for primary-key removal).
             if (block_txids.contains(o.txid)) {
-                to_remove.append(o.txid) catch break;
+                to_remove.append(o.wtxid) catch break;
                 continue;
             }
             // Orphan whose inputs are now spent by a block tx? remove
@@ -1685,14 +1727,14 @@ pub const Mempool = struct {
             // outpoint).
             for (o.tx.inputs) |inp| {
                 if (block_txids.contains(inp.previous_output.hash)) {
-                    to_remove.append(o.txid) catch break;
+                    to_remove.append(o.wtxid) catch break;
                     break;
                 }
             }
         }
 
-        for (to_remove.items) |t| {
-            _ = self.removeOrphan(t);
+        for (to_remove.items) |wtxid| {
+            _ = self.removeOrphanByWtxid(wtxid);
         }
     }
 
@@ -10211,8 +10253,10 @@ test "orphan pool: MAX_ORPHAN_TRANSACTIONS cap with oldest-first eviction" {
         // Force the time_added of *this* orphan to be strictly older
         // than any to-be-inserted future orphan, so oldest-first
         // eviction picks the right victims when we exceed the cap.
-        const just_added_txid = try crypto.computeTxid(&tx, allocator);
-        if (mempool.orphans.get(just_added_txid)) |o| {
+        // The orphan map is keyed by wtxid (BIP-339); for non-witness txs
+        // wtxid == txid so either hash works, but we use wtxid explicitly.
+        const just_added_wtxid = try crypto.computeWtxid(&tx, allocator);
+        if (mempool.orphans.get(just_added_wtxid)) |o| {
             o.time_added = @as(i64, @intCast(i));
         }
     }
