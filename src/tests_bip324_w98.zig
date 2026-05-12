@@ -268,28 +268,49 @@ test "G12: SendState has all required BIP-324 states" {
 // incorrectly trigger V1 fallback before seeing bytes 5-16.
 // =============================================================================
 
-test "G13/G14: V1 detection fires at 4 bytes — should require 16 (BUG DOCUMENTED)" {
+test "G13/G14: V1 detection waits for full 16-byte prefix (FIXED)" {
+    // Fix: processRecvBuffer now waits for V1_PREFIX_LEN (16) bytes before
+    // deciding V1 vs V2, matching Bitcoin Core net.cpp:1091-1101.
+    //
+    // Scenario A — magic only (4 bytes): state must remain .key_maybe_v1.
+    // Scenario B — magic + "version\0\0\0\0\0" (16 bytes): V1 fallback fires.
+    // Scenario C — magic + wrong command (16 bytes): treated as V2 (.key state).
     const allocator = std.testing.allocator;
-    var transport = v2.V2Transport.init(allocator, false, 0xD9B4BEF9); // mainnet magic
-    defer transport.deinit();
 
-    // Feed exactly the first 4 bytes that happen to be the network magic.
-    // A real ellswift key starting with magic bytes should NOT trigger V1
-    // fallback until bytes 5-16 are checked for "version\0\0\0\0\0".
-    //
-    // Currently clearbit incorrectly enters .v1 state here.
-    const magic_only: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
-    _ = transport.processReceivedBytes(&magic_only);
+    // --- Scenario A: only 4 magic bytes → still key_maybe_v1 ---
+    {
+        var t = v2.V2Transport.init(allocator, false, 0xD9B4BEF9);
+        defer t.deinit();
+        const magic_only: [4]u8 = .{ 0xf9, 0xbe, 0xb4, 0xd9 };
+        _ = t.processReceivedBytes(&magic_only);
+        // After 4 bytes the state must still be key_maybe_v1 (not yet decided).
+        try std.testing.expect(!t.isV1Fallback());
+    }
 
-    // BUG: after only 4 bytes matching magic, clearbit is already in .v1.
-    // Bitcoin Core would wait for all 16 bytes before deciding.
-    // The correct behavior: state should still be .key_maybe_v1 until 16 bytes received.
-    //
-    // Document current (buggy) behavior:
-    const is_v1_after_4_bytes = transport.isV1Fallback();
-    // This will be TRUE (bug) — should be FALSE until 16 bytes seen.
-    // We assert the current behavior to track it; remove after fix.
-    try std.testing.expect(is_v1_after_4_bytes); // CURRENTLY TRUE — BUG: should be false
+    // --- Scenario B: full 16-byte V1 prefix → V1 fallback ---
+    {
+        var t = v2.V2Transport.init(allocator, false, 0xD9B4BEF9);
+        defer t.deinit();
+        const full_prefix: [16]u8 = .{
+            0xf9, 0xbe, 0xb4, 0xd9, // mainnet magic
+            'v',  'e',  'r',  's', 'i', 'o', 'n', 0, 0, 0, 0, 0, // "version\0\0\0\0\0"
+        };
+        _ = t.processReceivedBytes(&full_prefix);
+        try std.testing.expect(t.isV1Fallback());
+    }
+
+    // --- Scenario C: magic + non-version command → V2 (not V1 fallback) ---
+    {
+        var t = v2.V2Transport.init(allocator, false, 0xD9B4BEF9);
+        defer t.deinit();
+        const magic_plus_inv: [16]u8 = .{
+            0xf9, 0xbe, 0xb4, 0xd9, // mainnet magic
+            'i',  'n',  'v',  0, 0, 0, 0, 0, 0, 0, 0, 0, // "inv\0..." (not version)
+        };
+        _ = t.processReceivedBytes(&magic_plus_inv);
+        // Non-version command → should NOT trigger V1 fallback.
+        try std.testing.expect(!t.isV1Fallback());
+    }
 }
 
 test "G14: V1_PREFIX_LEN constant equals 16 but is not used in state machine" {
