@@ -20,7 +20,12 @@ pub const NODE_BLOOM: u64 = 4;
 pub const NODE_WITNESS: u64 = 8;
 pub const NODE_NETWORK_LIMITED: u64 = 1024;
 pub const USER_AGENT: []const u8 = "/clearbit:0.1.0/";
-pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32 MB
+/// Maximum protocol message payload length accepted from a peer.
+/// Matches Bitcoin Core net.h: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000.
+/// W99 G23 fix: was 32 * 1024 * 1024 (32 MiB, 8× too large).
+pub const MAX_PROTOCOL_MESSAGE_LENGTH: usize = 4 * 1000 * 1000; // 4,000,000 bytes
+/// Alias for backward compatibility within this file.
+pub const MAX_MESSAGE_SIZE: usize = MAX_PROTOCOL_MESSAGE_LENGTH;
 pub const MAX_INV_SIZE: usize = 50000;
 pub const MAX_HEADERS_SIZE: usize = 2000;
 pub const MAX_ADDR_SIZE: usize = 1000;
