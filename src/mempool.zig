@@ -1995,6 +1995,54 @@ pub const Mempool = struct {
         }
     }
 
+    /// ValidateInputsStandardness (FIX-12 / W96) — per-input prevout type gates.
+    ///
+    /// Implements Bitcoin Core policy/policy.cpp ValidateInputsStandardness()
+    /// lines 226-258.  Three gates:
+    ///
+    ///   1. NONSTANDARD prevout: classifyScript() == .nonstandard → reject.
+    ///      Core error: "bad-txns-nonstandard-inputs".
+    ///   2. WITNESS_UNKNOWN prevout: valid witness-program syntax but unknown
+    ///      version (2-16).  In clearbit these also classify as .nonstandard
+    ///      (classifyScript does not have a distinct witness_unknown variant),
+    ///      so gate 1 covers both.
+    ///   3. P2SH prevout with redeemScript > MAX_P2SH_SIGOPS (15) sigops → reject.
+    ///      Uses the actual prevout type (from spent_scripts) so only real P2SH
+    ///      inputs are gated, unlike the conservative approximation in checkStandard().
+    ///
+    /// `spent_scripts[i]` must be the scriptPubKey of the output spent by
+    /// `tx.inputs[i]` (populated from UTXO set / mempool parent).
+    fn validateInputsStandardness(
+        tx: *const types.Transaction,
+        spent_scripts: []const []const u8,
+    ) MempoolError!void {
+        for (tx.inputs, 0..) |input, i| {
+            const prevout_script = spent_scripts[i];
+            const stype = script.classifyScript(prevout_script);
+
+            // Gates 1 + 2: NONSTANDARD or WITNESS_UNKNOWN prevout → reject.
+            if (stype == .nonstandard) {
+                return MempoolError.NonStandard;
+            }
+
+            // Gate 3: P2SH prevout — accurate redeemScript sigops check.
+            if (stype == .p2sh and input.script_sig.len > 0) {
+                // Build a dummy P2SH scriptPubKey so getP2SHSigOpCount takes
+                // the P2SH branch and extracts sigops from the last push item.
+                const dummy_p2sh = [_]u8{
+                    0xa9, 0x14,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x87,
+                };
+                const redeem_sigops = script.getP2SHSigOpCount(&dummy_p2sh, input.script_sig);
+                if (redeem_sigops > consensus.MAX_P2SH_SIGOPS) {
+                    return MempoolError.NonStandard;
+                }
+            }
+        }
+    }
+
     fn verifyInputScripts(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
         // No chain_state → unit-test path, skip script verify (parity with
         // the "assume inputs exist" branch a few lines up the call stack).
@@ -2060,6 +2108,10 @@ pub const Mempool = struct {
         // before PolicyScriptChecks (validation.cpp).  We need spent_scripts to be
         // fully populated (above) before calling this.
         try checkWitnessStandard(tx, spent_scripts);
+
+        // ValidateInputsStandardness (FIX-12 / W96): per-input prevout type gates.
+        // See validateInputsStandardness() for the three gates checked here.
+        try validateInputsStandardness(tx, spent_scripts);
 
         // W96: MAX_STANDARD_TX_SIGOPS_COST relay gate.
         //
@@ -9955,7 +10007,14 @@ test "addTransaction: rejects tx with high-S signature (LOW_S policy enforced)" 
     try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
 }
 
-test "addTransaction: accepts tx whose inputs script-verify" {
+test "addTransaction: rejects tx whose prevout is NONSTANDARD (FIX-12/ValidateInputsStandardness)" {
+    // OP_TRUE (0x51) is a 1-byte script that does not match any standard type
+    // (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2PK, P2A, multisig, null_data).
+    // Bitcoin Core's ValidateInputsStandardness() rejects inputs spending
+    // NONSTANDARD prevouts with "bad-txns-nonstandard-inputs".
+    //
+    // Before FIX-12, clearbit never called classifyScript() on prevout scripts
+    // and would have admitted this tx. Now validateInputsStandardness() rejects it.
     const allocator = std.testing.allocator;
 
     var chain_state = storage.ChainState.init(null, 64, allocator);
@@ -9965,14 +10024,11 @@ test "addTransaction: accepts tx whose inputs script-verify" {
     var mempool = Mempool.init(&chain_state, &consensus.MAINNET, allocator);
     defer mempool.deinit();
 
-    // The simplest "always satisfies" scriptPubKey: OP_TRUE (0x51) — pushes
-    // 1 onto the stack with no scriptSig needed. This verifies cleanly
-    // under STANDARD (clean stack of [TRUE], no sig encoding to police).
     const prev_outpoint = types.OutPoint{
         .hash = [_]u8{0x77} ** 32,
         .index = 0,
     };
-    const prev_script = [_]u8{0x51}; // OP_TRUE
+    const prev_script = [_]u8{0x51}; // OP_TRUE — NONSTANDARD (1-byte script)
     const prev_output = types.TxOut{
         .value = 100_000,
         .script_pubkey = &prev_script,
@@ -9981,7 +10037,7 @@ test "addTransaction: accepts tx whose inputs script-verify" {
 
     const spending_input = types.TxIn{
         .previous_output = prev_outpoint,
-        .script_sig = &[_]u8{}, // empty; OP_TRUE alone satisfies
+        .script_sig = &[_]u8{},
         .sequence = 0xFFFF_FFFF,
         .witness = &[_][]const u8{},
     };
@@ -9997,10 +10053,9 @@ test "addTransaction: accepts tx whose inputs script-verify" {
         .lock_time = 0,
     };
 
-    // Should be accepted: the OP_TRUE input verifies under STANDARD flags,
-    // the output is a standard P2WPKH, fee is well above min-relay.
-    try mempool.addTransaction(spending_tx);
-    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+    // Must be rejected: NONSTANDARD prevout type blocked by ValidateInputsStandardness.
+    try std.testing.expectError(MempoolError.NonStandard, mempool.addTransaction(spending_tx));
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
 }
 
 // ============================================================================
@@ -11993,4 +12048,97 @@ test "W96 G24: test_accept txid-only duplicate → `txn-same-nonwitness-data-in-
     try std.testing.expect(!r.accepted);
     try std.testing.expect(r.reject_reason != null);
     try std.testing.expectEqualStrings("txn-same-nonwitness-data-in-mempool", r.reject_reason.?);
+}
+
+// ============================================================================
+// FIX-12 / W96: ValidateInputsStandardness unit tests
+// ============================================================================
+//
+// These tests call Mempool.validateInputsStandardness() directly (static
+// method, no chain_state required), mirroring the checkWitnessStandard()
+// test pattern used in the W72 section.
+//
+// Reference: Bitcoin Core policy/policy.cpp ValidateInputsStandardness()
+// lines 226-258.
+
+test "FIX-12 G1: NONSTANDARD prevout rejects with NonStandard (gate 1)" {
+    // A bare OP_CHECKSIG with wrong-length pubkey is NONSTANDARD.
+    // classifyScript returns .nonstandard → validateInputsStandardness rejects.
+    const nonstandard_spk = [_]u8{ 0x01, 0x42, 0xac }; // push 1 byte + OP_CHECKSIG
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &p2wpkh_out }},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&nonstandard_spk};
+    try std.testing.expectError(
+        MempoolError.NonStandard,
+        Mempool.validateInputsStandardness(&tx, spent),
+    );
+}
+
+test "FIX-12 G2: WITNESS_UNKNOWN prevout (version 2) rejects with NonStandard (gate 2)" {
+    // OP_2 (0x52) + push-20 (0x14) + 20 bytes = witness version 2 program.
+    // classifyScript has no .witness_unknown variant; this falls through to
+    // .nonstandard, so validateInputsStandardness rejects it as NonStandard.
+    // Reference: Bitcoin Core Solver() returning WITNESS_UNKNOWN for version != 0.
+    const witness_unknown_spk = [_]u8{0x52} ++ [_]u8{0x14} ++ [_]u8{0xCC} ** 20;
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x02} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &p2wpkh_out }},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&witness_unknown_spk};
+    try std.testing.expectError(
+        MempoolError.NonStandard,
+        Mempool.validateInputsStandardness(&tx, spent),
+    );
+}
+
+test "FIX-12 G3: P2SH prevout with 16 sigops in redeemScript rejects with NonStandard (gate 3)" {
+    // 16 OP_CHECKSIG operations in the redeemScript exceed MAX_P2SH_SIGOPS = 15.
+    // scriptSig: push the 16-byte redeemScript (opcode 0x10 = push 16 bytes).
+    // Reference: Bitcoin Core policy/policy.cpp ValidateInputsStandardness()
+    // lines 253-258: subscript.GetSigOpCount(true) > MAX_P2SH_SIGOPS.
+    var redeem_script: [16]u8 = undefined;
+    @memset(&redeem_script, 0xac); // 16 x OP_CHECKSIG
+    // scriptSig: opcode 0x10 (push 16 bytes) + redeemScript
+    var script_sig_buf: [17]u8 = undefined;
+    script_sig_buf[0] = 0x10;
+    @memcpy(script_sig_buf[1..], &redeem_script);
+    const p2sh_spk = [_]u8{ 0xa9, 0x14 } ++ [_]u8{0x00} ** 20 ++ [_]u8{0x87};
+    const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x03} ** 32, .index = 0 },
+        .script_sig = &script_sig_buf,
+        .sequence = 0xFFFF_FFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &p2wpkh_out }},
+        .lock_time = 0,
+    };
+    const spent: []const []const u8 = &[_][]const u8{&p2sh_spk};
+    try std.testing.expectError(
+        MempoolError.NonStandard,
+        Mempool.validateInputsStandardness(&tx, spent),
+    );
 }
