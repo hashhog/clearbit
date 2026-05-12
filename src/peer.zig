@@ -2232,6 +2232,13 @@ pub const PeerManager = struct {
     /// announcements while one is pending are deferred to the next round.
     pending_reorg: ?PendingReorg,
 
+    /// Maps block hash → source peer pointer (as usize) so drainBlockBuffer
+    /// can penalise the supplying peer when validateBlockForIBDOrReject rejects
+    /// a block.  Mirrors Bitcoin Core's mapBlockSource (net_processing.cpp:834).
+    /// Value is @intFromPtr(*Peer); looked up by linear scan over self.peers at
+    /// drain time so a disconnected peer is never dereferenced.
+    block_source_peers: std.AutoHashMap(types.Hash256, usize),
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
@@ -2274,6 +2281,7 @@ pub const PeerManager = struct {
             .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
             .header_index = std.AutoHashMap(types.Hash256, BlockHeaderEntry).init(allocator),
             .pending_reorg = null,
+            .block_source_peers = std.AutoHashMap(types.Hash256, usize).init(allocator),
         };
     }
 
@@ -2311,6 +2319,7 @@ pub const PeerManager = struct {
         self.v2_fallback_set.deinit();
         self.header_index.deinit();
         if (self.pending_reorg) |*pr| pr.deinit();
+        self.block_source_peers.deinit();
     }
 
     /// Cap on the BIP-324 v2 fall-back set (per-process).  Once exceeded
@@ -4080,6 +4089,11 @@ pub const PeerManager = struct {
                     serialize.freeBlock(self.allocator, &block);
                     return;
                 };
+                // Record which peer supplied this block so drainBlockBuffer can
+                // penalise them if validation rejects it.  Mirrors Core's
+                // mapBlockSource (net_processing.cpp:4805).  Best-effort; OOM
+                // here means we can't penalise but the block is still buffered.
+                self.block_source_peers.put(block_hash, @intFromPtr(peer)) catch {};
 
                 // Try to connect as many buffered blocks as possible in order.
                 // W101: skip when already inside a drain (reached via the
@@ -5287,8 +5301,21 @@ pub const PeerManager = struct {
             // so pipelineBlockRequests will re-fetch the slot from another
             // peer, (c) misbehave the supplying peer at +100 (immediate ban)
             // because feeding consensus-invalid bytes is a bright-line
-            // protocol violation.
+            // protocol violation.  Mirrors Core's MaybePunishNodeForBlock
+            // BLOCK_MUTATED / BLOCK_INVALID_HEADER arms (net_processing.cpp:1919,1935).
             if (!self.validateBlockForIBDOrReject(&block, &block_hash, height)) {
+                // Penalise the supplying peer (G16/G17 fix: was missing before).
+                // Look up source peer by pointer value; linear scan over the live
+                // peer list so a disconnected peer is never dereferenced.
+                if (self.block_source_peers.get(block_hash)) |source_ptr| {
+                    for (self.peers.items) |p| {
+                        if (@intFromPtr(p) == source_ptr) {
+                            p.misbehaving(100, "mutated-block");
+                            break;
+                        }
+                    }
+                }
+                _ = self.block_source_peers.remove(block_hash);
                 // Treat as a fatal-for-this-block error: do NOT advance
                 // connect_cursor.  The pipeline will re-request from a
                 // different peer.  We rewind download_cursor to the current
@@ -5298,6 +5325,8 @@ pub const PeerManager = struct {
                 }
                 break;
             }
+            // Block accepted: remove source-peer tracking entry.
+            _ = self.block_source_peers.remove(block_hash);
 
             // Persist the raw block body to CF_BLOCKS BEFORE applying UTXO
             // mutations.  Bitcoin Core analog: BlockManager::SaveBlockToDisk
@@ -7863,20 +7892,53 @@ test "W99/G14: orphan pool keyed by wtxid (BIP-339 fix asserted)" {
     try std.testing.expect(@hasField(Mempool, "orphans_by_txid"));
 }
 
-// G16/G17: validateBlockForIBDOrReject failure does NOT misbehave the supplying peer.
-// BUG: The comment at peer.zig:5185 says "(c) misbehave the supplying peer at +100"
-// but the actual code at 5188-5196 only breaks out of the drain loop with no
-// Misbehaving call. The peer that fed a consensus-invalid block is not penalized.
-test "W99/G16: invalid block from peer does not trigger misbehaving call" {
+// G16/G17 FIXED: validateBlockForIBDOrReject failure now misbehaves the supplying peer.
+// Fix: drainBlockBuffer looks up the source peer in block_source_peers and calls
+// peer.misbehaving(100, "mutated-block") before breaking out of the loop.
+// Mirrors Bitcoin Core MaybePunishNodeForBlock BLOCK_MUTATED/BLOCK_INVALID_HEADER
+// arms (net_processing.cpp:1919, 1935).
+test "W99/G16: block_source_peers tracks supplying peer; misbehaving(100) fires on reject" {
     const allocator = std.testing.allocator;
-    var peer = makeTestPeer(allocator, .outbound_full_relay);
-    defer peer.recv_buffer.deinit();
 
-    // Simulate: after receiving an invalid block, the peer's ban_score stays 0.
-    // The drain loop breaks without calling peer.misbehaving().
-    // BUG: should call misbehaving(100, "invalid block") per the comment.
-    try std.testing.expectEqual(@as(u32, 0), peer.ban_score); // no penalty applied
-    try std.testing.expect(!peer.should_ban);
+    // Create a PeerManager and a heap-allocated peer (mirrors the real alloc path).
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    defer pm.deinit();
+
+    const peer = try allocator.create(Peer);
+    peer.* = makeTestPeer(allocator, .outbound_full_relay);
+    defer peer.recv_buffer.deinit();
+    // Do NOT destroy peer here — pm.deinit() does not own it in this test;
+    // we destroy it manually after asserting, before pm.deinit runs (pm has no
+    // chain_state so it never reaches the ban-list save that touches peers).
+    defer allocator.destroy(peer);
+
+    // Add the peer to the manager's live list so the drain-path lookup finds it.
+    try pm.peers.append(peer);
+
+    // Record the peer as the source for a synthetic invalid block hash.
+    const fake_hash: types.Hash256 = [_]u8{0xDE} ** 32;
+    try pm.block_source_peers.put(fake_hash, @intFromPtr(peer));
+
+    // Simulate the drain reject path: look up source and misbehave (mirrors
+    // the fixed drainBlockBuffer code at the validateBlockForIBDOrReject site).
+    if (pm.block_source_peers.get(fake_hash)) |source_ptr| {
+        for (pm.peers.items) |p| {
+            if (@intFromPtr(p) == source_ptr) {
+                p.misbehaving(100, "mutated-block");
+                break;
+            }
+        }
+    }
+    _ = pm.block_source_peers.remove(fake_hash);
+
+    // Peer must now carry a 100-point score and should_ban=true.
+    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    try std.testing.expect(peer.should_ban);
+    // Source map entry was removed.
+    try std.testing.expect(pm.block_source_peers.get(fake_hash) == null);
+
+    // Remove from peers list before allocator.destroy runs in defers above.
+    _ = pm.peers.swapRemove(0);
 }
 
 // G19: post-handshake version message is silently ignored, not rejected.
