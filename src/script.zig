@@ -172,6 +172,8 @@ pub const ScriptError = error{
     ConstScriptCode, // CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy (BASE) script
     StackSize, // MAX_STACK_SIZE exceeded (incl. tapscript-entry stack check)
     PushSize, // MAX_SCRIPT_ELEMENT_SIZE exceeded on a witness stack input element
+    SchnorrSigSize, // BIP-340/341: Schnorr signature is not 64 or 65 bytes
+    SchnorrSigHashType, // BIP-340/341: invalid hashtype byte appended to 65-byte sig
 };
 
 // ============================================================================
@@ -1099,23 +1101,41 @@ pub const ScriptEngine = struct {
                         effective_witness = witness[0 .. witness.len - 1];
                     }
 
-                    // Key path: single 64 or 65 byte signature (no script execution)
-                    if (effective_witness.len == 1 and
-                        (effective_witness[0].len == 64 or effective_witness[0].len == 65))
-                    {
+                    // Key path: exactly one element after annex strip (Core
+                    // interpreter.cpp:1960). Core dispatches to CheckSchnorrSignature
+                    // regardless of element size; the BIP-340 size guard there
+                    // emits SCRIPT_ERR_SCHNORR_SIG_SIZE for size ≠ {64, 65}.
+                    if (effective_witness.len == 1) {
+                        const sig_bytes = effective_witness[0];
+
+                        // BIP-340 sig-size gate (interpreter.cpp:1726).
+                        if (sig_bytes.len != 64 and sig_bytes.len != 65) {
+                            return ScriptError.SchnorrSigSize;
+                        }
+
                         // BIP-341 key-path: signature verified against the witness
                         // program (the tweaked output key Q) directly. No on-the-fly
                         // tweak math needed by the verifier.
-                        const sig_bytes = effective_witness[0];
-
-                        // Sig is 64B (SIGHASH_DEFAULT) or 65B (with hash_type byte).
                         var sig: [64]u8 = undefined;
                         @memcpy(&sig, sig_bytes[0..64]);
                         var hash_type: u8 = taproot_sighash.SIGHASH_DEFAULT;
                         if (sig_bytes.len == 65) {
                             hash_type = sig_bytes[64];
-                            // Strict: explicit SIGHASH_DEFAULT byte invalid.
-                            if (hash_type == taproot_sighash.SIGHASH_DEFAULT) return false;
+                            // BIP-340/341: an explicit SIGHASH_DEFAULT byte
+                            // (0x00) in a 65-byte signature is invalid
+                            // (interpreter.cpp:1733). Core surfaces
+                            // SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
+                            if (hash_type == taproot_sighash.SIGHASH_DEFAULT) {
+                                return ScriptError.SchnorrSigHashType;
+                            }
+                            // BIP-341: hashtype must be one of {0x01, 0x02,
+                            // 0x03, 0x81, 0x82, 0x83}. Core's
+                            // SignatureHashSchnorr also enforces this
+                            // (interpreter.cpp:1516) and surfaces
+                            // SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
+                            if (!taproot_sighash.isValidTaprootHashType(hash_type)) {
+                                return ScriptError.SchnorrSigHashType;
+                            }
                         }
 
                         // Need full prevouts for BIP-341 sha_amounts + sha_scriptpubkeys.
@@ -2266,7 +2286,29 @@ pub const ScriptEngine = struct {
     fn verifyTaprootSignature(self: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {
         // Tapscript OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKSIGADD path:
         // BIP-341 ext_flag=1 sighash + BIP-340 Schnorr verify.
-        if (sig.len != 64 and sig.len != 65) return false;
+        //
+        // Mirrors Core's CheckSchnorrSignature (interpreter.cpp:1717-1742):
+        //   - empty sig                        → not invoked from EvalChecksigTapscript
+        //                                        (caller short-circuits on `success`).
+        //                                        We return `false` to mirror that path.
+        //   - size ∉ {64, 65}                  → SCRIPT_ERR_SCHNORR_SIG_SIZE
+        //   - 65-byte sig with hashtype 0x00   → SCRIPT_ERR_SCHNORR_SIG_HASHTYPE
+        //   - SignatureHashSchnorr rejects ht  → SCRIPT_ERR_SCHNORR_SIG_HASHTYPE
+        //   - VerifySchnorrSignature fails     → SCRIPT_ERR_SCHNORR_SIG (bool false)
+        // The caller (EvalChecksigTapscript) treats SCHNORR_SIG_SIZE and
+        // SCHNORR_SIG_HASHTYPE as hard script-abort errors (set_error path),
+        // and uses the bool return to decide pushFalse / NULLFAIL.
+        //
+        // Core's CheckSchnorrSignature is never reached on an empty sig in
+        // tapscript (EvalChecksigTapscript shortcuts via `success`). We
+        // preserve clearbit's existing all-paths-call-the-verifier shape by
+        // letting empty-sig fall through to a `false` return; the caller
+        // suppresses NULLFAIL when sig is empty.
+        if (sig.len == 0) return false;
+        if (sig.len != 64 and sig.len != 65) return ScriptError.SchnorrSigSize;
+        // Pubkey-size gating is the caller's responsibility per BIP-342
+        // (interpreter.cpp:1721 assertion). The op_checksig / op_checksigadd
+        // sites already enforce pubkey.len == 32 before invoking us.
         if (pubkey.len != 32) return false;
 
         // Tapscript context (tapleaf_hash) must have been set by the
@@ -2279,7 +2321,12 @@ pub const ScriptEngine = struct {
         var hash_type: u8 = taproot_sighash.SIGHASH_DEFAULT;
         if (sig.len == 65) {
             hash_type = sig[64];
-            if (hash_type == taproot_sighash.SIGHASH_DEFAULT) return false;
+            if (hash_type == taproot_sighash.SIGHASH_DEFAULT) {
+                return ScriptError.SchnorrSigHashType;
+            }
+            if (!taproot_sighash.isValidTaprootHashType(hash_type)) {
+                return ScriptError.SchnorrSigHashType;
+            }
         }
 
         // Need full prevouts for BIP-341 sha_amounts + sha_scriptpubkeys.
@@ -6928,4 +6975,152 @@ test "W94: CHECKSIGVERIFY unknown pubkey + EMPTY sig fails without flag" {
 
     // Empty sig + unknown pubkey: VERIFY fails (set_error in CHECKSIGVERIFY).
     try std.testing.expectError(ScriptError.CheckSigFailed, engine.execute(s.items));
+}
+
+// ============================================================================
+// W95: BIP-340 Schnorr wire-format gates
+// ============================================================================
+//
+// These tests pin the BIP-340/341 sig-size and sig-hashtype error paths that
+// were previously collapsed into WitnessProgramWitnessEmpty / NullFail.
+// Reference: bitcoin-core/src/script/interpreter.cpp CheckSchnorrSignature
+//            (lines 1717-1742) and the BIP-341 key-path entry (line 1962).
+
+// Tapscript CHECKSIG with a 63-byte signature (not 64 or 65) and a valid
+// 32-byte pubkey must abort with SCHNORR_SIG_SIZE, not NullFail / VerifyFail.
+test "W95: tapscript CHECKSIG with 63-byte sig aborts with SchnorrSigSize" {
+    const allocator = std.testing.allocator;
+    const tx = w94EmptyTx();
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 1_000;
+    engine.validation_weight_init = true;
+    // tapleaf_hash is set per BIP-341 ext_flag=1 sighash, but the size guard
+    // in verifyTaprootSignature triggers BEFORE the sighash is built — so
+    // the actual placeholder value below is never hashed.
+    engine.tapleaf_hash = [_]u8{0xAB} ** 32;
+
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(63); // PUSHBYTES_63
+    try s.appendNTimes(0xCC, 63);
+    try s.append(32); // PUSHBYTES_32 for the pubkey
+    try s.appendNTimes(0xDD, 32);
+    try s.append(0xac); // OP_CHECKSIG
+
+    try std.testing.expectError(ScriptError.SchnorrSigSize, engine.execute(s.items));
+}
+
+// Tapscript CHECKSIGADD with a 65-byte sig whose hashtype byte is 0x00
+// must abort with SCHNORR_SIG_HASHTYPE (BIP-341 forbids explicitly
+// encoding SIGHASH_DEFAULT).
+test "W95: tapscript CHECKSIGADD with 65-byte sig + 0x00 hashtype aborts with SchnorrSigHashType" {
+    const allocator = std.testing.allocator;
+    const tx = w94EmptyTx();
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 1_000;
+    engine.validation_weight_init = true;
+    engine.tapleaf_hash = [_]u8{0xAB} ** 32;
+
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(65); // PUSHBYTES_65: 64 sig bytes + 1 hashtype byte
+    try s.appendNTimes(0xCC, 64);
+    try s.append(0x00); // explicit SIGHASH_DEFAULT — invalid in 65-byte sig
+    try s.append(0x51); // OP_1 (push num=1)
+    try s.append(32);
+    try s.appendNTimes(0xDD, 32);
+    try s.append(0xba); // OP_CHECKSIGADD
+
+    try std.testing.expectError(ScriptError.SchnorrSigHashType, engine.execute(s.items));
+}
+
+// Tapscript CHECKSIG with a 65-byte sig whose hashtype byte is 0x04
+// (not in the valid set {0x01, 0x02, 0x03, 0x81, 0x82, 0x83}) must
+// abort with SCHNORR_SIG_HASHTYPE.
+test "W95: tapscript CHECKSIG with 65-byte sig + invalid hashtype 0x04 aborts" {
+    const allocator = std.testing.allocator;
+    const tx = w94EmptyTx();
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 1_000;
+    engine.validation_weight_init = true;
+    engine.tapleaf_hash = [_]u8{0xAB} ** 32;
+
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(65);
+    try s.appendNTimes(0xCC, 64);
+    try s.append(0x04); // invalid hashtype
+    try s.append(32);
+    try s.appendNTimes(0xDD, 32);
+    try s.append(0xac); // OP_CHECKSIG
+
+    try std.testing.expectError(ScriptError.SchnorrSigHashType, engine.execute(s.items));
+}
+
+// Tapscript CHECKSIG with empty sig + 32-byte pubkey must push false and
+// NOT trigger SchnorrSigSize. The empty-sig path predates the size guard.
+test "W95: tapscript CHECKSIG with empty sig + 32-byte pubkey pushes false" {
+    const allocator = std.testing.allocator;
+    const tx = w94EmptyTx();
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 1_000;
+    engine.validation_weight_init = true;
+    engine.tapleaf_hash = [_]u8{0xAB} ** 32;
+
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(0x00); // empty sig (OP_0 pushes empty)
+    try s.append(32);
+    try s.appendNTimes(0xDD, 32);
+    try s.append(0xac); // OP_CHECKSIG
+
+    // Should not error; pushes empty-bytes (false) on the stack.
+    try engine.execute(s.items);
+    try std.testing.expectEqual(@as(usize, 1), engine.stack.items.len);
+    try std.testing.expect(!engine.stackToBool(engine.stack.items[0]));
+}
+
+// BIP-340 hashtype validity table (BIP-341 table of allowed hashtype bytes).
+test "W95: isValidTaprootHashType covers BIP-341 spec exactly" {
+    // Valid: 0x00 (SIGHASH_DEFAULT — only when sig is 64B; the 65B-with-0x00
+    // case is caught elsewhere), 0x01, 0x02, 0x03, 0x81, 0x82, 0x83.
+    try std.testing.expect(taproot_sighash.isValidTaprootHashType(0x00));
+    try std.testing.expect(taproot_sighash.isValidTaprootHashType(0x01));
+    try std.testing.expect(taproot_sighash.isValidTaprootHashType(0x02));
+    try std.testing.expect(taproot_sighash.isValidTaprootHashType(0x03));
+    try std.testing.expect(taproot_sighash.isValidTaprootHashType(0x81));
+    try std.testing.expect(taproot_sighash.isValidTaprootHashType(0x82));
+    try std.testing.expect(taproot_sighash.isValidTaprootHashType(0x83));
+    // Invalid: everything else.
+    try std.testing.expect(!taproot_sighash.isValidTaprootHashType(0x04));
+    try std.testing.expect(!taproot_sighash.isValidTaprootHashType(0x10));
+    try std.testing.expect(!taproot_sighash.isValidTaprootHashType(0x7f));
+    try std.testing.expect(!taproot_sighash.isValidTaprootHashType(0x80)); // ANYONECANPAY alone
+    try std.testing.expect(!taproot_sighash.isValidTaprootHashType(0x84));
+    try std.testing.expect(!taproot_sighash.isValidTaprootHashType(0xff));
+    // Spot-check a few across the middle range.
+    var i: u16 = 0;
+    while (i < 256) : (i += 1) {
+        const b: u8 = @intCast(i);
+        const expected = (b <= 0x03) or (b >= 0x81 and b <= 0x83);
+        try std.testing.expectEqual(expected, taproot_sighash.isValidTaprootHashType(b));
+    }
+}
+
+// Confirm new ScriptError variants exist and are distinct.
+test "W95: SchnorrSigSize and SchnorrSigHashType are distinct ScriptError variants" {
+    const e1: anyerror = ScriptError.SchnorrSigSize;
+    const e2: anyerror = ScriptError.SchnorrSigHashType;
+    const e3: anyerror = ScriptError.NullFail;
+    try std.testing.expect(e1 != e2);
+    try std.testing.expect(e1 != e3);
+    try std.testing.expect(e2 != e3);
 }
