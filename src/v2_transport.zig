@@ -704,6 +704,9 @@ pub const BIP324Cipher = struct {
         network_magic: [4]u8,
     ) void {
         var shared_secret: [32]u8 = undefined;
+        // Zeroize the ECDH shared secret after use regardless of which path is
+        // taken (mirrors Core's memory_cleanse on the ECDH output buffer).
+        defer std.crypto.utils.secureZero(u8, &shared_secret);
 
         if (!builtin.is_test and @hasDecl(secp256k1, "secp256k1_ellswift_xdh")) {
             const ctx_opt = getSecp256k1Context();
@@ -752,6 +755,10 @@ pub const BIP324Cipher = struct {
         network_magic: [4]u8,
     ) !void {
         var shared_secret: [32]u8 = undefined;
+        // Zeroize the ECDH shared secret after deriving key material regardless
+        // of success/failure path (mirrors Core's memory_cleanse on the ECDH
+        // output buffer in bip324.cpp).
+        defer std.crypto.utils.secureZero(u8, &shared_secret);
 
         if (@hasDecl(secp256k1, "secp256k1_ellswift_xdh")) {
             const privkey = self.our_privkey orelse return error.NoPrivateKey;
@@ -801,8 +808,17 @@ pub const BIP324Cipher = struct {
         @memcpy(salt[0..salt_prefix.len], salt_prefix);
         @memcpy(salt[salt_prefix.len..], &network_magic);
 
-        // Derive key material
-        const keys = KeyMaterial.derive(shared_secret, &salt);
+        // Derive key material.
+        // Use `var` so we can zeroize after use (mirroring Core's memory_cleanse
+        // on hkdf_32_okm and the HKDF state after Initialize()).
+        var keys = KeyMaterial.derive(shared_secret, &salt);
+        // Zeroize the intermediate key material as soon as the ciphers are
+        // loaded.  This mirrors Bitcoin Core bip324.cpp:67-70 which calls
+        // memory_cleanse() on every intermediate buffer after Initialize().
+        defer {
+            std.crypto.utils.secureZero(u8, std.mem.asBytes(&keys));
+            std.crypto.utils.secureZero(u8, &salt);
+        }
 
         // Initialize ciphers based on role
         if (initiator) {
