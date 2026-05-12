@@ -1784,7 +1784,17 @@ pub const BlockDownloader = struct {
                 @ptrCast(&adapter),
                 Adapter.lookup,
                 self.allocator,
-                .{ .prev_mtp = prev_mtp, .force_skip_scripts = skip_via_height },
+                .{
+                    .prev_mtp = prev_mtp,
+                    .force_skip_scripts = skip_via_height,
+                    // fTooFarAhead gate (W97 G19c): active tip is one below the
+                    // block being validated.  BlockDownloader requests blocks
+                    // sequentially (is_requested=true), so the ceiling is not
+                    // enforced on this path; active_tip_height is wired so any
+                    // future caller with is_requested=false gets the gate.
+                    .active_tip_height = if (height > 0) height - 1 else 0,
+                    .is_requested = true,
+                },
             ) catch |err| {
                 return switch (err) {
                     error.BadMerkleRoot => BlockDownloadError.BadMerkleRoot,

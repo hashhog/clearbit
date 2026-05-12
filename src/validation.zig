@@ -78,6 +78,13 @@ pub const ValidationError = error{
     // BIP-30 errors
     Bip30DuplicateOutput,
 
+    // AcceptBlock anti-DoS gates
+    /// Block height is more than MIN_BLOCKS_TO_KEEP (288) above the active tip
+    /// and the block was not explicitly requested.  Core returns early without
+    /// full validation to prevent an attacker from buffering blocks at tip+1M.
+    /// Reference: validation.cpp:4325-4339 — fTooFarAhead gate.
+    TooFarAhead,
+
     // General errors
     OutOfMemory,
 };
@@ -1079,6 +1086,20 @@ pub const IBDValidationContext = struct {
     getMtpAtHeightFn: ?*const fn (ctx: *anyopaque, height: u32) u32 = null,
     /// Context pointer passed as the first argument to getMtpAtHeightFn.
     getMtpAtHeightCtx: ?*anyopaque = null,
+    /// Height of the current active-chain tip at the moment this block is
+    /// being accepted.  Used to enforce the fTooFarAhead gate: if the block
+    /// height is more than MIN_BLOCKS_TO_KEEP (288) above the active tip AND
+    /// the block was not explicitly requested, reject it as TooFarAhead.
+    /// 0 means "not available" (genesis / test path); the gate is skipped.
+    /// Set to cs.best_height by the peer.zig and sync.zig callers.
+    /// Reference: validation.cpp:4325 — fTooFarAhead.
+    active_tip_height: u32 = 0,
+    /// True when the block was explicitly requested (via getdata sent by us).
+    /// Mirrors Bitcoin Core's fRequested parameter to AcceptBlock.
+    /// When true, the fTooFarAhead ceiling is not enforced (requested blocks
+    /// are always processed regardless of how far ahead they are).
+    /// Default false — callers that know the block was requested must set this.
+    is_requested: bool = false,
 };
 
 /// Information about a previous output, returned by IBDValidationContext.
@@ -1107,6 +1128,23 @@ pub fn validateBlockForIBD(
 
     const params = ctx.params;
     const height = ctx.height;
+
+    // 0. fTooFarAhead gate (AcceptBlock, validation.cpp:4325-4339).
+    // If the block height is more than MIN_BLOCKS_TO_KEEP (288) above the
+    // current active tip AND the block was not explicitly requested, reject
+    // it early.  This prevents an attacker from OOM-ing us by announcing
+    // a long chain and flooding us with blocks at tip+1M while our tip is
+    // at tip.  active_tip_height == 0 means "not available" (genesis /
+    // test fast-path); skip the gate in that case.
+    // Reference: validation.cpp:4325
+    //   bool fTooFarAhead{pindex->nHeight > ActiveHeight() + int(MIN_BLOCKS_TO_KEEP)};
+    //   if (!fRequested) { if (fTooFarAhead) return true; }
+    if (!ctx.is_requested and ctx.active_tip_height != 0) {
+        const min_blocks_to_keep: u32 = storage.ChainState.MIN_BLOCKS_TO_KEEP;
+        if (height > ctx.active_tip_height + min_blocks_to_keep) {
+            return ValidationError.TooFarAhead;
+        }
+    }
 
     // 1. Header PoW.
     try checkBlockHeader(&block.header, params);
@@ -1623,6 +1661,10 @@ pub const AcceptBlockOptions = struct {
     prev_block_timestamp: u32 = 0,
     /// See IBDValidationContext.current_time.  0 = skip future-time check.
     current_time: i64 = 0,
+    /// See IBDValidationContext.active_tip_height.  0 = skip fTooFarAhead check.
+    active_tip_height: u32 = 0,
+    /// See IBDValidationContext.is_requested.  true = skip fTooFarAhead ceiling.
+    is_requested: bool = false,
 };
 
 /// Unified block consensus-validation entry point.
@@ -1667,6 +1709,8 @@ pub fn acceptBlock(
         .force_skip_scripts = options.force_skip_scripts,
         .getMtpAtHeightFn = options.getMtpAtHeightFn,
         .getMtpAtHeightCtx = options.getMtpAtHeightCtx,
+        .active_tip_height = options.active_tip_height,
+        .is_requested = options.is_requested,
     };
     return validateBlockForIBD(block, &ctx, allocator);
 }
@@ -10106,18 +10150,107 @@ test "W97 G19b: expected_blocks queue exists in PeerManager" {
 // "too-far-ahead".  Without this, an attacker can OOM us by buffering
 // blocks at h+1M while our tip is at h.
 //
-// Clearbit: NO equivalent.  block_buffer has a 1024-entry cap and the
-// expected_blocks queue is bounded only by remaining_queue<16000 in the
-// headers handler.  Neither check enforces the 288-block ceiling against
-// the ACTIVE tip — only against the headers queue.
+// Fix (W97 G19c): validateBlockForIBD now checks ctx.active_tip_height and
+// ctx.is_requested.  When is_requested=false and
+// height > active_tip_height + MIN_BLOCKS_TO_KEEP (288), it returns
+// ValidationError.TooFarAhead immediately, before any expensive validation.
 
-test "W97 G19c: 288-block far-ahead ceiling NOT enforced (gap)" {
-    // We assert the absence: the live drainBlockBuffer path validates
-    // any block whose hash matches expected_blocks[connect_cursor],
-    // regardless of how far ahead expected_blocks is.  The
-    // MAX_REORG_DEPTH constant is the closest equivalent; it's 288 but
-    // is used only by the reorg path.
-    try std.testing.expectEqual(@as(u32, 288), peer_mod_for_w97.MAX_REORG_DEPTH);
+test "W97 G19c: unrequested block >288 above tip is rejected TooFarAhead" {
+    // Block at height 1000 with active tip at 700 → 1000 > 700+288=988 → TooFarAhead.
+    const allocator = std.testing.allocator;
+    var txs: [1]types.Transaction = undefined;
+    var ins: [1]types.TxIn = undefined;
+    var outs: [1]types.TxOut = undefined;
+    const ssig = [_]u8{ 0x51, 0x00 };
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const built = w97FillRegtestHeightOneBlock(&txs, &ins, &outs, &ssig, &spk, allocator) catch unreachable;
+    var blk = built.block;
+    ibdTestMineNonce(&blk.header, &consensus.REGTEST);
+    const block_hash = crypto.computeBlockHash(&blk.header);
+    var dummy: u8 = 0;
+    const ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 1000, // claimed height
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&dummy),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .active_tip_height = 700, // 1000 > 700+288=988 → too far
+        .is_requested = false,
+    };
+    const result = validateBlockForIBD(&blk, &ctx, allocator);
+    try std.testing.expectError(ValidationError.TooFarAhead, result);
+}
+
+test "W97 G19c: unrequested block exactly at 288-ceiling is NOT TooFarAhead" {
+    // Block at height 988 with active tip at 700 → 988 == 700+288 → NOT too far.
+    // The block still fails (PoW or coinbase checks), but NOT with TooFarAhead.
+    const allocator = std.testing.allocator;
+    var txs: [1]types.Transaction = undefined;
+    var ins: [1]types.TxIn = undefined;
+    var outs: [1]types.TxOut = undefined;
+    const ssig = [_]u8{ 0x51, 0x00 };
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const built = w97FillRegtestHeightOneBlock(&txs, &ins, &outs, &ssig, &spk, allocator) catch unreachable;
+    var blk = built.block;
+    ibdTestMineNonce(&blk.header, &consensus.REGTEST);
+    const block_hash = crypto.computeBlockHash(&blk.header);
+    var dummy: u8 = 0;
+    const ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 988, // 988 == 700+288 → at the limit, not over
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&dummy),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .active_tip_height = 700,
+        .is_requested = false,
+    };
+    const result = validateBlockForIBD(&blk, &ctx, allocator);
+    // Must NOT be TooFarAhead; may fail for other reasons (e.g. coinbase subsidy).
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.TooFarAhead);
+    }
+}
+
+test "W97 G19c: requested block >288 above tip is NOT TooFarAhead (is_requested=true)" {
+    // Block at height 1000 with active tip at 700 → would be TooFarAhead, but
+    // is_requested=true suppresses the gate (explicitly fetched block).
+    const allocator = std.testing.allocator;
+    var txs: [1]types.Transaction = undefined;
+    var ins: [1]types.TxIn = undefined;
+    var outs: [1]types.TxOut = undefined;
+    const ssig = [_]u8{ 0x51, 0x00 };
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const built = w97FillRegtestHeightOneBlock(&txs, &ins, &outs, &ssig, &spk, allocator) catch unreachable;
+    var blk = built.block;
+    ibdTestMineNonce(&blk.header, &consensus.REGTEST);
+    const block_hash = crypto.computeBlockHash(&blk.header);
+    var dummy: u8 = 0;
+    const ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 1000, // far ahead, but is_requested=true
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&dummy),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .active_tip_height = 700,
+        .is_requested = true, // explicitly requested → skip ceiling
+    };
+    const result = validateBlockForIBD(&blk, &ctx, allocator);
+    // Must NOT be TooFarAhead; may fail for other reasons.
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.TooFarAhead);
+    }
 }
 
 // ---- G19d — nChainWork < MinimumChainWork() early return ------------------
