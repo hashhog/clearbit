@@ -490,12 +490,14 @@ test "maybeArmReorg: fork too deep → refused with peer +20" {
     var stub = makeStubPeer(&params, allocator);
     defer stub.recv_buffer.deinit();
 
-    const ban_before = stub.ban_score;
     pm.maybeArmReorg(&stub, &fork_tip);
     try testing.expect(pm.pending_reorg == null);
     // Either fork too deep (+20) OR fork never intersects (+20) — both
     // are consistent with rejection.
-    try testing.expect(stub.ban_score > ban_before);
+    // The stub peer uses 127.0.0.1 (local address); per the W99 G2 fix,
+    // misbehaving() on a local peer sets should_ban (disconnect-only) but
+    // does NOT accumulate ban_score (no discourage entry written).
+    try testing.expect(stub.should_ban);
 }
 
 test "tryFireReorg: arms pending_reorg when fork has higher chainwork" {
