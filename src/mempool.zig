@@ -1191,7 +1191,12 @@ pub const Mempool = struct {
         if (test_accept) {
             // Dry-run: check if it would be accepted without modifying state.
             // We check the same conditions as addTransaction but don't persist.
-            if (self.entries.contains(tx_hash)) {
+            //
+            // BIP-339 / W96 two-step duplicate check (mirrors addTransaction §1c):
+            //   1. exists(wtxid) → "txn-already-in-mempool"   (exact duplicate)
+            //   2. exists(txid)  → "txn-same-nonwitness-data-in-mempool" (malleated witness)
+            // Reference: Bitcoin Core validation.cpp:823-830.
+            if (self.by_wtxid.contains(wtxid)) {
                 return AcceptResult{
                     .accepted = false,
                     .txid = tx_hash,
@@ -1199,6 +1204,16 @@ pub const Mempool = struct {
                     .fee = 0,
                     .vsize = 0,
                     .reject_reason = "txn-already-in-mempool",
+                };
+            }
+            if (self.entries.contains(tx_hash)) {
+                return AcceptResult{
+                    .accepted = false,
+                    .txid = tx_hash,
+                    .wtxid = wtxid,
+                    .fee = 0,
+                    .vsize = 0,
+                    .reject_reason = "txn-same-nonwitness-data-in-mempool",
                 };
             }
             // For test_accept, attempt validation via addTransaction on a copy
@@ -3076,9 +3091,16 @@ pub const Mempool = struct {
     pub fn addTransactionWithPackageRate(self: *Mempool, tx: types.Transaction, package_fee_rate: f64) MempoolError!void {
         const tx_hash = crypto.computeTxid(&tx, self.allocator) catch return MempoolError.OutOfMemory;
 
-        // 1. Check if already in mempool
-        if (self.entries.contains(tx_hash)) {
+        // 1. Check if already in mempool — BIP-339 two-step wtxid/txid split (W96).
+        //    Mirror of addTransaction §1c: wtxid match → AlreadyInMempool (exact
+        //    duplicate); txid-only match → SameNonWitnessDataInMempool (malleated
+        //    witness).  Reference: Bitcoin Core validation.cpp:823-830.
+        const tx_wtxid_pkg = crypto.computeWtxid(&tx, self.allocator) catch tx_hash;
+        if (self.by_wtxid.contains(tx_wtxid_pkg)) {
             return MempoolError.AlreadyInMempool;
+        }
+        if (self.entries.contains(tx_hash)) {
+            return MempoolError.SameNonWitnessDataInMempool;
         }
 
         // 2. Check standardness
@@ -11852,4 +11874,79 @@ test "W96 G22: addTransaction accepts a well-formed plausible tx" {
     const tx = w96BuildPlausibleTx(2);
     try mempool.addTransaction(tx);
     try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+}
+
+test "W96 G23: test_accept wtxid duplicate → `txn-already-in-mempool`" {
+    // BIP-339 split in acceptToMemoryPool(test_accept=true): exact wtxid match
+    // must return "txn-already-in-mempool", not "txn-same-nonwitness-data-in-mempool".
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const wit = [_]u8{0xcc};
+    const wv: []const []const u8 = &[_][]const u8{&wit};
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x88} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = wv,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+    // Add directly first so it lives in the mempool.
+    try mempool.addTransaction(tx);
+
+    // Now test_accept on the exact same tx — wtxid match.
+    const r = mempool.acceptToMemoryPool(tx, true);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("txn-already-in-mempool", r.reject_reason.?);
+}
+
+test "W96 G24: test_accept txid-only duplicate → `txn-same-nonwitness-data-in-mempool`" {
+    // BIP-339 split in acceptToMemoryPool(test_accept=true): same non-witness data
+    // but different witness must return "txn-same-nonwitness-data-in-mempool".
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const wit1 = [_]u8{0xdd};
+    const wit2 = [_]u8{0xee};
+    const wv1: []const []const u8 = &[_][]const u8{&wit1};
+    const wv2: []const []const u8 = &[_][]const u8{&wit2};
+    const tx1 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x99} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = wv1,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+    // Same non-witness data, different witness.
+    const tx2 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x99} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = wv2,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx1);
+
+    // test_accept on tx2 — txid match but different wtxid.
+    const r = mempool.acceptToMemoryPool(tx2, true);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("txn-same-nonwitness-data-in-mempool", r.reject_reason.?);
 }
