@@ -415,16 +415,18 @@ test "w105 G18: SigCache is now wired into ScriptCheckQueue and verifyScriptJob"
 
     // The queue carries a live SigCache instance.
     // Verify insert+lookup round-trip works through the embedded cache.
-    const dummy_txid = [_]u8{0xAB} ** 32;
-    const input_index: u32 = 0;
+    // W105 G19/G20 fix: API now takes full sig material (sighash, pubkey, sig, flags).
+    const dummy_sighash = [_]u8{0xAB} ** 32;
+    const dummy_pubkey = [_]u8{0x02} ++ [_]u8{0xAB} ** 32; // compressed pubkey
+    const dummy_sig = [_]u8{0x30, 0x44} ++ [_]u8{0xCC} ** 68; // DER sig
     const flags: u32 = 0x1F;
 
     // Before insert: miss
-    try testing.expect(!queue.sig_cache.lookup(dummy_txid, input_index, flags));
+    try testing.expect(!queue.sig_cache.lookup(dummy_sighash, &dummy_pubkey, &dummy_sig, flags));
 
     // After insert: hit — cache is wired and functional
-    queue.sig_cache.insert(dummy_txid, input_index, flags);
-    try testing.expect(queue.sig_cache.lookup(dummy_txid, input_index, flags));
+    queue.sig_cache.insert(dummy_sighash, &dummy_pubkey, &dummy_sig, flags);
+    try testing.expect(queue.sig_cache.lookup(dummy_sighash, &dummy_pubkey, &dummy_sig, flags));
 
     // Stats must reflect the above operations
     const stats = queue.sig_cache.getStats();
@@ -434,57 +436,84 @@ test "w105 G18: SigCache is now wired into ScriptCheckQueue and verifyScriptJob"
 }
 
 // ============================================================================
-// G19 — SigCache key uses txid+index+flags, not a salted hash
+// G19 — FIXED: SigCache key now commits to sig + pubkey bytes
 //
 // Core's SignatureCache key is SHA256(nonce || 'E'/'S' || zeros || sighash || pubkey || sig)
 // — a salted hash that commits to the actual signature bytes.  This prevents
 // cache collisions across different sighash algorithms and prevents an attacker
 // from crafting a signature that has the same (txid, index, flags) triple as a
 // valid cached entry but a different public key.
-// Clearbit's CacheKey is (txid, input_index, flags) — it does NOT include the
-// public key or signature bytes, so a different signature on the same input
-// with the same flags would return a cache hit, bypassing verification.
-// Reference: sigcache.h:44-46 (entries are SHA256(nonce || sig || pubkey…))
-// Severity: HIGH — cache collision attack: an attacker knowing a valid (txid, idx)
-//           could bypass ECDSA/Schnorr verification (though SigCache is also
-//           unwired at G18, so this bug has no live impact until G18 is fixed)
+//
+// Fix (W105 G19): SigCache.lookup/insert now accept (sighash, pubkey_bytes, sig_bytes, flags).
+// The internal key is SHA256(nonce || sighash || pubkey_bytes || sig_bytes || flags_le).
+// A different pubkey or signature on the same sighash + flags is guaranteed to be a MISS.
+// Reference: sigcache.h:44-46
 // ============================================================================
-test "w105 G19: SigCache key missing signature/pubkey bytes — collision attack possible" {
+test "w105 G19 FIXED: different sig/pubkey bytes produce different cache key (no collision)" {
     var cache = sig_cache.SigCache.init(testing.allocator, 100);
     defer cache.deinit();
 
-    const txid = [_]u8{0x01} ** 32;
+    const sighash = [_]u8{0x01} ** 32;
     const flags: u32 = 0x1F;
 
-    // Insert with one "signature" (actually just txid+index+flags)
-    cache.insert(txid, 0, flags);
-    try testing.expect(cache.lookup(txid, 0, flags));
+    const pubkey_a = [_]u8{0x02} ++ [_]u8{0xAA} ** 32;
+    const pubkey_b = [_]u8{0x02} ++ [_]u8{0xBB} ** 32;
+    const sig_a = [_]u8{0x30, 0x44} ++ [_]u8{0xCC} ** 68;
+    const sig_b = [_]u8{0x30, 0x44} ++ [_]u8{0xDD} ** 68;
 
-    // A different signature on the same (txid, index, flags) would also hit.
-    // In Core, the key includes the actual sig bytes so this cannot happen.
-    // BUG: cache key must include SHA256(nonce || sig_bytes || pubkey_bytes)
+    // Insert a valid (sighash, pubkey_a, sig_a, flags) entry.
+    cache.insert(sighash, &pubkey_a, &sig_a, flags);
+    try testing.expect(cache.lookup(sighash, &pubkey_a, &sig_a, flags));
+
+    // FIXED: a different pubkey on the same sighash must be a MISS.
+    // Before the fix, CacheKey was (txid, index, flags) — no sig/pubkey —
+    // so this would have returned a cache HIT, bypassing verification.
+    try testing.expect(!cache.lookup(sighash, &pubkey_b, &sig_a, flags));
+
+    // FIXED: a different sig on the same sighash must also be a MISS.
+    try testing.expect(!cache.lookup(sighash, &pubkey_a, &sig_b, flags));
+
+    // FIXED: a completely different (pubkey, sig) pair must be a MISS.
+    try testing.expect(!cache.lookup(sighash, &pubkey_b, &sig_b, flags));
 }
 
 // ============================================================================
-// G20 — SigCache key not salted: predictable hash, HashDoS possible
+// G20 — FIXED: SigCache key now uses a per-startup CSPRNG nonce
 //
 // Core initialises a per-node 256-bit random nonce at ValidationCache creation
 // and prefixes all cache keys with it (validation.cpp:2030-2035).  This
 // prevents an adversary from pre-computing inputs that collide in the cache.
-// Clearbit's CacheKey.hash() uses a fixed FNV basis with no random nonce.
+//
+// Fix (W105 G20): SigCache.init() calls std.crypto.random.bytes(&nonce) to
+// generate a fresh 32-byte CSPRNG nonce.  computeKey() uses SHA256(nonce || …)
+// so the key space is unpredictable to any external party.
 // Reference: sigcache.h; validation.cpp:2026-2040
-// Severity: MEDIUM — HashDoS / cache-pollution; no live impact until G18 fixed
 // ============================================================================
-test "w105 G20: SigCache hash function has no random nonce (HashDoS possible)" {
-    // The CacheKey.hash() function uses a fixed FNV basis (0xcbf29ce484222325).
-    // An adversary can pre-compute txid/index/flags triples that all collide.
-    var cache = sig_cache.SigCache.init(testing.allocator, 100);
-    defer cache.deinit();
-    // BUG: fixed seed — Core uses a per-startup random nonce
-    // Demonstrate deterministic hashing:
-    const key1 = sig_cache.CacheKey{ .txid = [_]u8{0x01} ** 32, .input_index = 0, .flags = 0 };
-    const key2 = sig_cache.CacheKey{ .txid = [_]u8{0x01} ** 32, .input_index = 0, .flags = 0 };
-    try testing.expectEqual(key1.hash(), key2.hash()); // always equal — deterministic
+test "w105 G20 FIXED: CSPRNG nonce makes cache keys non-deterministic across instances" {
+    // Two independent caches each get a fresh CSPRNG nonce on init().
+    var cache_a = sig_cache.SigCache.init(testing.allocator, 100);
+    defer cache_a.deinit();
+    var cache_b = sig_cache.SigCache.init(testing.allocator, 100);
+    defer cache_b.deinit();
+
+    const sighash = [_]u8{0x01} ** 32;
+    const pubkey = [_]u8{0x02} ++ [_]u8{0xAB} ** 32;
+    const sig = [_]u8{0x30, 0x44} ++ [_]u8{0x55} ** 68;
+    const flags: u32 = 0;
+
+    // FIXED: nonces differ between instances (probability of match is 1/2^256).
+    try testing.expect(!std.mem.eql(u8, &cache_a.nonce, &cache_b.nonce));
+
+    // FIXED: keys for identical material differ between instances —
+    // an attacker cannot pre-compute colliding txids without knowing the nonce.
+    const key_a = cache_a.computeKey(sighash, &pubkey, &sig, flags);
+    const key_b = cache_b.computeKey(sighash, &pubkey, &sig, flags);
+    try testing.expect(key_a.raw != key_b.raw);
+
+    // Within a single cache, the same material always maps to the same key
+    // (deterministic within one run — required for hit/miss consistency).
+    const key_a2 = cache_a.computeKey(sighash, &pubkey, &sig, flags);
+    try testing.expectEqual(key_a.raw, key_a2.raw);
 }
 
 // ============================================================================

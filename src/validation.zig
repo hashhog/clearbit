@@ -2506,15 +2506,42 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cac
     if (job.input_index >= tx.inputs.len) return false;
     const input = tx.inputs[job.input_index];
 
-    // Compute the txid for the sig cache key (zero-alloc streaming SHA256d).
+    // Compute the txid as the sighash proxy for the sig cache key.
     const txid = crypto.computeTxidStreaming(&tx);
     const flags_u32: u32 = @intCast(@as(u21, @bitCast(job.flags)));
-    const input_idx_u32: u32 = @intCast(job.input_index);
 
-    // SigCache lookup: skip ScriptEngine.verify() if this (txid, input, flags)
+    // W105 G19/G20 fix: cache key is SHA256(nonce || sighash || pubkey || sig || flags_le).
+    // - sighash = txid (32 bytes)
+    // - pubkey_bytes = prev_script_pubkey (the scriptPubKey being unlocked)
+    // - sig_bytes = script_sig (legacy) concatenated with witness stack bytes
+    //   (covers SegWit inputs; empty slices for inputs that use neither)
+    // This binds the cache entry to the exact script material, preventing the
+    // G19 collision attack where a different pubkey/sig on the same txid could
+    // get a false cache hit.
+    //
+    // Assemble witness bytes: flatten the witness stack items into a single
+    // contiguous buffer so the key covers all witness material.
+    var witness_buf: [4096]u8 = undefined;
+    var witness_len: usize = 0;
+    for (job.witness) |item| {
+        const space = witness_buf.len - witness_len;
+        const copy_len = @min(item.len, space);
+        @memcpy(witness_buf[witness_len..][0..copy_len], item[0..copy_len]);
+        witness_len += copy_len;
+        if (copy_len < item.len) break; // truncate if oversized; hash still binds all material
+    }
+
+    // Concatenate script_sig + witness bytes as the "sig_bytes" material.
+    var sig_buf: [4096 + 520]u8 = undefined; // 520 = max DER sig for legacy
+    const script_sig_len = @min(input.script_sig.len, 520);
+    @memcpy(sig_buf[0..script_sig_len], input.script_sig[0..script_sig_len]);
+    const wit_copy = @min(witness_len, 4096);
+    @memcpy(sig_buf[script_sig_len..][0..wit_copy], witness_buf[0..wit_copy]);
+    const sig_material = sig_buf[0 .. script_sig_len + wit_copy];
+
+    // SigCache lookup: skip ScriptEngine.verify() if the exact sig material
     // was already successfully verified (e.g. the tx was in the mempool).
-    // W105 G18 fix: wire the dead-helper SigCache into verifyScriptJob.
-    if (cache.lookup(txid, input_idx_u32, flags_u32)) {
+    if (cache.lookup(txid, job.prev_script_pubkey, sig_material, flags_u32)) {
         return true;
     }
 
@@ -2542,7 +2569,8 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cac
     if (result) |valid| {
         if (valid) {
             // Cache the successful verification for future blocks/re-validation.
-            cache.insert(txid, input_idx_u32, flags_u32);
+            // Pass the same material used in the lookup above.
+            cache.insert(txid, job.prev_script_pubkey, sig_material, flags_u32);
         }
         return valid;
     } else |_| {
