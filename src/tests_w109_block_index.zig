@@ -9,6 +9,7 @@ const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 const types = @import("types.zig");
 const consensus = @import("consensus.zig");
+const serialize = @import("serialize.zig");
 
 // ============================================================================
 // G1 — BlockStatus: BLOCK_VALID_* graduated-validity levels missing
@@ -422,6 +423,111 @@ test "w109 G17: has_data=false → isValidCandidate returns false (IBD blocks in
     // BUG-17: without ReceivedBlockTransactions setting has_data=true,
     // IBD-accepted blocks are never selected as valid candidates
     try std.testing.expect(!entry.isValidCandidate());
+}
+
+// FIX-33 — BLOCK_HAVE_DATA + BLOCK_HAVE_UNDO set after WriteBlock+WriteUndo
+//
+// After connectBlockFastWithUndo (which calls queueBlockWrite + captures undo),
+// flush() must OR bit 1 (has_data) and bit 2 (has_undo) into the CF_BLOCK_INDEX
+// entry atomically with the CF_BLOCKS and CF_BLOCK_UNDO writes.
+//
+// Bitcoin Core analog:
+//   - BLOCK_HAVE_DATA set in ReceiveBlockTransactions (validation.cpp:3784)
+//   - BLOCK_HAVE_UNDO set in WriteUndoData (node/blockstorage.cpp:1029)
+//
+// This test verifies the fix: after connect+flush, reading the CF_BLOCK_INDEX
+// record for the block hash must show has_data=true AND has_undo=true.
+
+test "FIX-33: connectBlockFastWithUndo sets has_data+has_undo in CF_BLOCK_INDEX (BUG-17 fix)" {
+    const allocator = std.testing.allocator;
+    const Database = storage.Database;
+    const ChainState = storage.ChainState;
+    const CF_BLOCK_INDEX = storage.CF_BLOCK_INDEX;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // Build a minimal coinbase-only block at height 1.
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const coinbase_output = types.TxOut{
+        .value = 5000000000,
+        .script_pubkey = &[_]u8{0x51}, // OP_1 (minimal valid script)
+    };
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+    const block1 = types.Block{
+        .header = types.BlockHeader{
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0xAA} ** 32,
+            .timestamp = 1296688602,
+            .bits = 0x207fffff,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{coinbase_tx},
+    };
+    const bh1 = [_]u8{0x01} ** 32;
+
+    // Queue the block body (mirrors peer.zig queuing before connectBlockFast).
+    var writer = serialize.Writer.init(allocator);
+    defer writer.deinit();
+    try serialize.writeBlock(&writer, &block1);
+    const owned_const = try writer.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    try chain_state.queueBlockWrite(&bh1, owned, 1);
+
+    // Connect with undo capture (this calls flush() at the end).
+    try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
+
+    // FIX-33: read back CF_BLOCK_INDEX for bh1 and assert status bits.
+    const idx_bytes = (try db.get(CF_BLOCK_INDEX, &bh1)) orelse {
+        std.debug.print("FIX-33: CF_BLOCK_INDEX missing for block hash after connect\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer allocator.free(idx_bytes);
+
+    // Parse the status field: format is height(4) + header(80) + status(4) + ...
+    var rdr = serialize.Reader{ .data = idx_bytes };
+    _ = rdr.readInt(u32) catch return error.TestUnexpectedResult; // height
+    _ = serialize.readBlockHeader(&rdr) catch return error.TestUnexpectedResult; // header
+    const status = rdr.readInt(u32) catch return error.TestUnexpectedResult;
+
+    // Bit 1 = has_data (BLOCK_HAVE_DATA), bit 2 = has_undo (BLOCK_HAVE_UNDO).
+    const bs: validation.BlockStatus = @bitCast(status);
+    try std.testing.expect(bs.has_data);
+    try std.testing.expect(bs.has_undo);
+
+    // Sanity: isValidCandidate would return true if loaded into a BlockIndexEntry.
+    const fake_entry = validation.BlockIndexEntry{
+        .hash = bh1,
+        .header = block1.header,
+        .height = 1,
+        .status = bs,
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try std.testing.expect(fake_entry.isValidCandidate());
 }
 
 // ============================================================================
