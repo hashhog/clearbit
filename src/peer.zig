@@ -2541,6 +2541,97 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Return true if `address` is publicly routable on the global internet.
+    ///
+    /// Mirrors Bitcoin Core's CNetAddr::IsRoutable() in netaddress.cpp:
+    ///   return IsValid() && !(IsRFC1918() || IsRFC2544() || IsRFC3927() ||
+    ///          IsRFC4862() || IsRFC6598() || IsRFC5737() || IsRFC4193() ||
+    ///          IsRFC4843() || IsRFC7343() || IsLocal() || IsInternal());
+    ///
+    /// For clearbit's IPv4/IPv6 scope we implement the IPv4 non-routable ranges
+    /// and the most-common IPv6 non-routable ranges.  Addresses from overlay
+    /// networks (Tor, I2P, CJDNS) are not yet handled here (separate network_id
+    /// in addrv2) and are conservatively treated as non-routable until the addrv2
+    /// IPv6/Tor path is wired up (W104/G5).
+    pub fn isRoutable(address: std.net.Address) bool {
+        switch (address.any.family) {
+            std.posix.AF.INET => {
+                const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+                const b = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                const a0 = b[0];
+                const a1 = b[1];
+
+                // Unspecified / broadcast
+                if (a0 == 0 or (a0 == 255 and a1 == 255)) return false;
+
+                // RFC 1918 private ranges: 10/8, 172.16/12, 192.168/16
+                if (a0 == 10) return false;
+                if (a0 == 172 and a1 >= 16 and a1 <= 31) return false;
+                if (a0 == 192 and a1 == 168) return false;
+
+                // RFC 2544 benchmarking: 198.18/15
+                if (a0 == 198 and (a1 == 18 or a1 == 19)) return false;
+
+                // RFC 3927 link-local: 169.254/16
+                if (a0 == 169 and a1 == 254) return false;
+
+                // RFC 6598 shared address (CGNAT): 100.64/10
+                if (a0 == 100 and a1 >= 64 and a1 <= 127) return false;
+
+                // RFC 5737 documentation: 192.0.2/24, 198.51.100/24, 203.0.113/24
+                if (a0 == 192 and a1 == 0 and b[2] == 2) return false;
+                if (a0 == 198 and a1 == 51 and b[2] == 100) return false;
+                if (a0 == 203 and a1 == 0 and b[2] == 113) return false;
+
+                // Loopback: 127/8
+                if (a0 == 127) return false;
+
+                return true;
+            },
+            std.posix.AF.INET6 => {
+                const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&address.any)));
+                const b = ip6.addr;
+
+                // Unspecified ::/128 or loopback ::1/128
+                const all_zero = for (b) |v| {
+                    if (v != 0) break false;
+                } else true;
+                if (all_zero) return false;
+
+                var is_loopback = all_zero;
+                if (!is_loopback) {
+                    is_loopback = true;
+                    for (b[0..15]) |v| {
+                        if (v != 0) { is_loopback = false; break; }
+                    }
+                    if (is_loopback) is_loopback = (b[15] == 1);
+                }
+                if (is_loopback) return false;
+
+                // RFC 4862 / RFC 4291 link-local: fe80::/10
+                if (b[0] == 0xFE and (b[1] & 0xC0) == 0x80) return false;
+
+                // RFC 4193 unique-local: fc00::/7  (fc::/8 and fd::/8)
+                if ((b[0] & 0xFE) == 0xFC) return false;
+
+                // RFC 3849 documentation: 2001:db8::/32
+                if (b[0] == 0x20 and b[1] == 0x01 and b[2] == 0x0D and b[3] == 0xB8) return false;
+
+                // RFC 4380 Teredo: 2001::/32
+                if (b[0] == 0x20 and b[1] == 0x01 and b[2] == 0x00 and b[3] == 0x00) return false;
+
+                // RFC 4843 / RFC 7343 ORCHIDv1/v2: 2001:10::/28 and 2001:20::/28
+                if (b[0] == 0x20 and b[1] == 0x01 and b[2] == 0x00) {
+                    if ((b[3] & 0xF0) == 0x10) return false; // RFC 4843
+                    if ((b[3] & 0xF0) == 0x20) return false; // RFC 7343
+                }
+
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     /// Add a known address.
     pub fn addAddress(
         self: *PeerManager,
@@ -2548,6 +2639,13 @@ pub const PeerManager = struct {
         services: u64,
         source: AddressSource,
     ) !void {
+        // Reject non-publicly-routable addresses from gossip.
+        // Core: addrman.cpp AddrManImpl::AddSingle() line ~534:
+        //   if (!addr.IsRoutable()) return false;
+        // This prevents RFC1918 / loopback / link-local addresses received
+        // via addr/addrv2 messages from polluting the address book.
+        if (!isRoutable(address)) return;
+
         const key = addressKey(address);
         if (self.known_addresses.contains(key)) return;
 
