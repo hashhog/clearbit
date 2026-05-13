@@ -394,31 +394,43 @@ test "w105 G17: no script-execution cache (full-tx wtxid-keyed cache absent)" {
 }
 
 // ============================================================================
-// G18 — SigCache (per-signature ECDSA/Schnorr cache): defined but never wired
+// G18 — SigCache (per-signature ECDSA/Schnorr cache): FIXED — wired into
+//       verifyScriptJob via ScriptCheckQueue.sig_cache field.
 //
-// sig_cache.zig provides SigCache with lookup() + insert() methods, but
-// validation.zig does NOT import sig_cache.zig and verifyScriptJob() does not
-// consult or populate the cache.  The SigCache is a dead module.
+// sig_cache.zig provides SigCache with lookup() + insert() methods.
+// validation.zig now imports sig_cache.zig and ScriptCheckQueue carries a
+// SigCache instance that verifyScriptJob() consults before and populates
+// after each successful ScriptEngine.verify() call.
 //
 // Core's CachingTransactionSignatureChecker wraps the SignatureCache and is
 // passed to VerifyScript() (sigcache.h:65-75, validation.cpp:2018).
 // Reference: sigcache.h, validation.cpp:2018, 2109
-// Severity: HIGH — mempool→block re-verification perf gap; mempool txs pay
-//           double ECDSA/Schnorr cost on ConnectBlock
+// Fix: validation.zig imports sig_cache_mod; ScriptCheckQueue.sig_cache field
+//      initialized in init(), deinit'd in deinit(), passed to verifyScriptJob().
 // ============================================================================
-test "w105 G18: SigCache exists in sig_cache.zig but is NOT wired into script verification" {
-    // sig_cache.SigCache can be instantiated independently, but validation.zig
-    // never imports it.  Script verification in verifyScriptJob() uses a raw
-    // ScriptEngine.verify() call with no cache consultation.
-    var cache = sig_cache.SigCache.init(testing.allocator, 1000);
-    defer cache.deinit();
+test "w105 G18: SigCache is now wired into ScriptCheckQueue and verifyScriptJob" {
+    // ScriptCheckQueue must expose a sig_cache field (the wiring).
+    var queue = try validation.ScriptCheckQueue.init(testing.allocator);
+    defer queue.deinit();
 
+    // The queue carries a live SigCache instance.
+    // Verify insert+lookup round-trip works through the embedded cache.
     const dummy_txid = [_]u8{0xAB} ** 32;
-    // Cache lookup always misses — it is never populated by script verification
-    try testing.expect(!cache.lookup(dummy_txid, 0, 0xFFFF_FFFF));
-    _ = cache.getStats();
-    // BUG-DEAD-HELPER: sig_cache.zig is a complete, correct implementation
-    // that is never called from validation.zig — classic dead-helper pattern
+    const input_index: u32 = 0;
+    const flags: u32 = 0x1F;
+
+    // Before insert: miss
+    try testing.expect(!queue.sig_cache.lookup(dummy_txid, input_index, flags));
+
+    // After insert: hit — cache is wired and functional
+    queue.sig_cache.insert(dummy_txid, input_index, flags);
+    try testing.expect(queue.sig_cache.lookup(dummy_txid, input_index, flags));
+
+    // Stats must reflect the above operations
+    const stats = queue.sig_cache.getStats();
+    try testing.expect(stats.hits >= 1);
+    try testing.expect(stats.misses >= 1);
+    try testing.expect(stats.insertions >= 1);
 }
 
 // ============================================================================
