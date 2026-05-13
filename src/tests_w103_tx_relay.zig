@@ -407,21 +407,63 @@ test "W103/G21: MAX_ORPHAN_TRANSACTIONS = 100 matches Core" {
 }
 
 // ============================================================================
-// G22: 5-minute orphan TTL expiry
+// G22: 5-minute orphan TTL expiry (FIXED)
 // Bitcoin Core net_processing.cpp / txorphanage: orphans are periodically swept
 //   using ORPHAN_TX_EXPIRE_TIME (5 minutes) and ORPHAN_TX_EXPIRE_INTERVAL.
-// Clearbit: W99/G12 documented this bug. No TTL constant, no periodic expiry sweep.
-// The evictOldestOrphan() is capacity-based (oldest-first on overflow), NOT time-based.
-// BUG: orphans can live forever as long as pool stays under 100 items.
+// FIXED: ORPHAN_TX_EXPIRE_TIME = 300 (5 min) constant added to mempool.zig.
+//   sweepExpiredOrphans(now: i64) method added to Mempool.
+//   PeerManager.sweepOrphanPool() wired into the main run() loop at step 6b,
+//   gated by ORPHAN_TX_EXPIRE_INTERVAL so the O(N) scan runs at most once per
+//   5 minutes.
 // ============================================================================
-test "W103/G22: orphan 5-minute TTL expiry absent — no ORPHAN_TX_EXPIRE_TIME constant" {
-    // Core: static constexpr auto ORPHAN_TX_EXPIRE_TIME = 5min (txorphanage).
-    // Clearbit: no such constant.
-    const OrphanTx = mempool_mod.OrphanTx;
-    // time_added exists (used for oldest-first eviction, NOT time-based expiry).
-    try testing.expect(@hasField(OrphanTx, "time_added"));
-    // No expiry sweep function: sweepExpiredOrphans doesn't exist.
-    // BUG: orphans are never expired by time; they can live indefinitely.
+test "W103/G22: ORPHAN_TX_EXPIRE_TIME = 300s constant present (FIXED)" {
+    // Core: static constexpr auto ORPHAN_TX_EXPIRE_TIME = 5min = 300s.
+    // FIXED: constant now present in mempool_mod.
+    try testing.expectEqual(@as(i64, 300), mempool_mod.ORPHAN_TX_EXPIRE_TIME);
+    try testing.expectEqual(@as(i64, 300), mempool_mod.ORPHAN_TX_EXPIRE_INTERVAL);
+}
+
+test "W103/G22: sweepExpiredOrphans removes orphans older than TTL (FIXED)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    var pool = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool.deinit();
+
+    // Build a minimal segwit tx to use as an orphan.
+    const p2wpkh_script = [_]u8{0x00, 0x14} ++ [_]u8{0xBB} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0xDE} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xffffffff,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{ .value = 42_000, .script_pubkey = &p2wpkh_script };
+    const orphan_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+
+    const peer_id: u64 = 99;
+    const added = pool.addOrphan(&orphan_tx, peer_id);
+    try testing.expect(added);
+    try testing.expectEqual(@as(usize, 1), pool.orphanCount());
+
+    // Sweep with a "now" that is still within TTL — orphan must survive.
+    var orphan_iter = pool.orphans.iterator();
+    const time_added = orphan_iter.next().?.value_ptr.*.time_added;
+    const not_expired_now = time_added + mempool_mod.ORPHAN_TX_EXPIRE_TIME - 1;
+    const swept_early = pool.sweepExpiredOrphans(not_expired_now);
+    try testing.expectEqual(@as(usize, 0), swept_early);
+    try testing.expectEqual(@as(usize, 1), pool.orphanCount());
+
+    // Sweep with a "now" exactly at the expiry boundary — orphan must be removed.
+    const expired_now = time_added + mempool_mod.ORPHAN_TX_EXPIRE_TIME;
+    const swept = pool.sweepExpiredOrphans(expired_now);
+    try testing.expectEqual(@as(usize, 1), swept);
+    try testing.expectEqual(@as(usize, 0), pool.orphanCount());
 }
 
 // ============================================================================
