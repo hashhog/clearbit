@@ -325,6 +325,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w104_tests.step);
     }
 
+    // W105 — CCheckQueue / parallel script verification 30-gate fleet audit.
+    {
+        const w105_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w105_checkqueue.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w105"},
+        });
+        w105_tests.linkSystemLibrary("rocksdb");
+        w105_tests.linkSystemLibrary("secp256k1");
+        w105_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w105_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w105_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w105_tests.linkSystemLibrary("minisketch");
+            w105_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w105_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w105_tests = b.addRunArtifact(w105_tests);
+        const w105_test_step = b.step("test-w105", "Run W105 CCheckQueue parallel script verification 30-gate audit tests");
+        w105_test_step.dependOn(&run_w105_tests.step);
+        // Fold into the main `test` step so CI exercises W105.
+        test_step.dependOn(&run_w105_tests.step);
+    }
+
     // RPC tests run via `tests_rpc.zig` at the project root. The main
     // `tests.zig` root cannot pull in `rpc.zig` because doing so transitively
     // imports `wallet.zig`, whose `@embedFile("../resources/bip39-english.txt")`
