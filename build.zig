@@ -356,6 +356,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w105_tests.step);
     }
 
+    // W107 — CompactSize + VarInt serialization 30-gate audit.
+    {
+        const w107_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w107_compactsize.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w107"},
+        });
+        w107_tests.linkSystemLibrary("rocksdb");
+        w107_tests.linkSystemLibrary("secp256k1");
+        w107_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w107_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w107_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w107_tests.linkSystemLibrary("minisketch");
+            w107_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w107_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w107_tests = b.addRunArtifact(w107_tests);
+        const w107_test_step = b.step("test-w107", "Run W107 CompactSize + VarInt serialization 30-gate audit tests");
+        w107_test_step.dependOn(&run_w107_tests.step);
+        // Fold into the main `test` step so CI exercises W107.
+        test_step.dependOn(&run_w107_tests.step);
+    }
+
     // W106 — CTxMemPool descendant/ancestor + RBF + package mempool 30-gate audit.
     {
         const w106_tests = b.addTest(.{
