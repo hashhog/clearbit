@@ -449,6 +449,39 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w109_tests.step);
     }
 
+    // W110 — BIP-37 bloom filter 30-gate audit.
+    // No RocksDB dependency (p2p.zig + v2_transport.zig + peer.zig only).
+    // Run with `zig build test-w110`.
+    {
+        const w110_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w110_bloom_filter.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w110"},
+        });
+        w110_tests.linkSystemLibrary("rocksdb");
+        w110_tests.linkSystemLibrary("secp256k1");
+        w110_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w110_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w110_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w110_tests.linkSystemLibrary("minisketch");
+            w110_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w110_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w110_tests = b.addRunArtifact(w110_tests);
+        const w110_test_step = b.step("test-w110", "Run W110 BIP-37 bloom filter 30-gate audit tests");
+        w110_test_step.dependOn(&run_w110_tests.step);
+        // Fold into the main `test` step so CI exercises W110.
+        test_step.dependOn(&run_w110_tests.step);
+    }
+
     // W106 — CTxMemPool descendant/ancestor + RBF + package mempool 30-gate audit.
     {
         const w106_tests = b.addTest(.{
