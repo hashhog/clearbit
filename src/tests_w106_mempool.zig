@@ -345,14 +345,20 @@ test "w106 G4: updateDescendantCounts propagates through ancestors" {
 
 test "w106 G5: BUG-1 removeTransaction does not update ancestor descendant_count" {
     // After removing a child, the parent's descendant_count should decrease.
-    // Clearbit's removeTransaction skips this reverse-propagation → BUG.
+    // FIXED: removeTransaction now decrements each ancestor's descendant_count/size.
+    //
+    // NOTE: Transactions must be defined inline so stored .tx.inputs pointers
+    // remain valid throughout the test (no dangling pointer UB from a helper
+    // that returns Transaction by value).
     const allocator = testing.allocator;
     var pool = mempool_mod.Mempool.init(null, null, allocator);
     defer pool.deinit();
 
-    // Insert parent
+    // Parent tx — inline definition.
     const dummy_prev2: [32]u8 = [_]u8{0x22} ** 32;
-    const px = makeTx(dummy_prev2, 0, 90_000, 1, 0xFFFFFFFE);
+    const p_in = types.TxIn{ .previous_output = .{ .hash = dummy_prev2, .index = 0 }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFE, .witness = &[_][]const u8{} };
+    const p_out = types.TxOut{ .value = 90_000, .script_pubkey = &[_]u8{ 0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0xac } };
+    const px = types.Transaction{ .version = 1, .inputs = &[_]types.TxIn{p_in}, .outputs = &[_]types.TxOut{p_out}, .lock_time = 0 };
     const px_txid = crypto.computeTxid(&px, allocator) catch unreachable;
     const pe = allocator.create(mempool_mod.MempoolEntry) catch unreachable;
     pe.* = mempool_mod.MempoolEntry{
@@ -379,8 +385,10 @@ test "w106 G5: BUG-1 removeTransaction does not update ancestor descendant_count
     pool.entries.put(px_txid, pe) catch unreachable;
     pool.spenders.put(types.OutPoint{ .hash = dummy_prev2, .index = 0 }, px_txid) catch unreachable;
 
-    // Insert child
-    const cx = makeTx(px_txid, 0, 80_000, 1, 0xFFFFFFFE);
+    // Child tx — inline definition.
+    const c_in = types.TxIn{ .previous_output = .{ .hash = px_txid, .index = 0 }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFE, .witness = &[_][]const u8{} };
+    const c_out = types.TxOut{ .value = 80_000, .script_pubkey = &[_]u8{ 0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0xac } };
+    const cx = types.Transaction{ .version = 1, .inputs = &[_]types.TxIn{c_in}, .outputs = &[_]types.TxOut{c_out}, .lock_time = 0 };
     const cx_txid = crypto.computeTxid(&cx, allocator) catch unreachable;
     const ce = allocator.create(mempool_mod.MempoolEntry) catch unreachable;
     ce.* = mempool_mod.MempoolEntry{
@@ -407,6 +415,7 @@ test "w106 G5: BUG-1 removeTransaction does not update ancestor descendant_count
     pool.entries.put(cx_txid, ce) catch unreachable;
     pool.spenders.put(types.OutPoint{ .hash = px_txid, .index = 0 }, cx_txid) catch unreachable;
 
+    // Wire up children map so removeTransaction can find the ancestor direction.
     var cl2 = std.ArrayList(types.Hash256).init(allocator);
     cl2.append(cx_txid) catch unreachable;
     pool.children.put(px_txid, cl2) catch unreachable;
@@ -414,14 +423,11 @@ test "w106 G5: BUG-1 removeTransaction does not update ancestor descendant_count
     // Remove the child
     pool.removeTransaction(cx_txid);
 
-    // BUG-1: parent's descendant_count is still 2, should be 1.
+    // FIXED: parent's descendant_count must be decremented to 1 after child removal.
     const p2 = pool.entries.get(px_txid).?;
-    // Document current (broken) behavior:
-    // The invariant Core maintains is: after remove, parent.descendant_count == 1.
-    // Clearbit does NOT maintain this → descendant_count remains 2.
-    const current_desc_count = p2.descendant_count;
-    // Assert the BUG exists (count stays at 2, not decremented to 1):
-    try testing.expect(current_desc_count == 2); // BUG: should be 1 after child removal
+    // Core invariant: after remove, parent.descendant_count == 1 (self only).
+    try testing.expectEqual(@as(usize, 1), p2.descendant_count); // FIXED BUG-1
+    try testing.expectEqual(@as(usize, 200), p2.descendant_size); // FIXED: self-only
 }
 
 // ============================================================================
@@ -1326,14 +1332,19 @@ test "w106 BUG-8: removeForBlock does not update in-mempool children ancestor st
     pool.entries.put(child_txid, ce_b8) catch unreachable;
     pool.spenders.put(types.OutPoint{ .hash = parent_txid, .index = 0 }, child_txid) catch unreachable;
 
+    // Wire up children map so removeTransaction can walk descendants of parent.
+    var b8_children = std.ArrayList(types.Hash256).init(allocator);
+    b8_children.append(child_txid) catch unreachable;
+    pool.children.put(parent_txid, b8_children) catch unreachable;
+
     // Remove parent (as if mined in a block)
     pool.removeTransaction(parent_txid);
 
     // Child is still in mempool
     try testing.expect(pool.entries.contains(child_txid));
 
-    // BUG-8: child's ancestor_count should now be 1 (only self), but is still 2
+    // FIXED BUG-8: child's ancestor_count must drop to 1 (self only) after parent removed.
     const child_after = pool.entries.get(child_txid).?;
-    // Document the broken behavior:
-    try testing.expect(child_after.ancestor_count == 2); // BUG: should be 1
+    try testing.expectEqual(@as(usize, 1), child_after.ancestor_count); // FIXED BUG-8
+    try testing.expectEqual(@as(usize, 200), child_after.ancestor_size); // FIXED: self-only
 }
