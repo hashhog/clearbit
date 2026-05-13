@@ -152,6 +152,9 @@ test "CompactSize encoding four bytes" {
 }
 
 test "CompactSize round-trip" {
+    // Values within MAX_SIZE (0x02000000) round-trip through readCompactSize.
+    // 0xFFFFFFFF and 0x100000000 exceed MAX_SIZE and are rejected; their
+    // write-side encoding is correct and tested elsewhere.
     const allocator = testing.allocator;
     const test_values = [_]u64{
         0,
@@ -161,8 +164,7 @@ test "CompactSize round-trip" {
         0xFFFE,
         0xFFFF,
         0x10000,
-        0xFFFFFFFF,
-        0x100000000,
+        0x02000000, // MAX_SIZE boundary — must be accepted
     };
 
     for (test_values) |value| {

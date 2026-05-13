@@ -64,54 +64,39 @@ const serialize = @import("serialize.zig");
 // BUG-1: clearbit silently accepts all of these.
 // Tests document the current (broken) behaviour and what the fix should do.
 
-test "w107 G1a BUG-1 readCompactSize non-canonical 0xFD prefix currently accepted" {
+test "w107 G1a BUG-1 readCompactSize non-canonical 0xFD prefix rejected" {
     // 0xFD 0x01 0x00 = LE u16 = 1.  Should have been encoded as [0x01] (1 byte).
-    // Core rejects; clearbit silently returns 1.
+    // Core rejects with "non-canonical ReadCompactSize()".
+    // FIXED: clearbit now returns error.InvalidCompactSize.
     const non_canonical: [3]u8 = .{ 0xFD, 0x01, 0x00 };
-    var reader = serialize.Reader{ .data = &non_canonical };
-    // BUG-1: this succeeds when it should fail with error.InvalidCompactSize
-    const value = reader.readCompactSize() catch {
-        return; // pass if fixed: error returned
-    };
-    // Currently succeeds — assert the wrong-but-observed behaviour so the test
-    // turns red when someone breaks something else unrelated.
-    try testing.expectEqual(@as(u64, 1), value);
-    // TODO fix: replace above with:
-    // try testing.expectError(error.InvalidCompactSize,
-    //     (serialize.Reader{ .data = &non_canonical }).readCompactSize());
+    var r = serialize.Reader{ .data = &non_canonical };
+    try testing.expectError(error.InvalidCompactSize, r.readCompactSize());
 }
 
-test "w107 G1b BUG-1 readCompactSize non-canonical 0xFE prefix currently accepted" {
+test "w107 G1b BUG-1 readCompactSize non-canonical 0xFE prefix rejected" {
     // 0xFE 0xFF 0xFF 0x00 0x00 = LE u32 = 0xFFFF.
     // Should have been encoded with 0xFD prefix (3 bytes).
+    // FIXED: clearbit now returns error.InvalidCompactSize.
     const non_canonical: [5]u8 = .{ 0xFE, 0xFF, 0xFF, 0x00, 0x00 };
-    var reader = serialize.Reader{ .data = &non_canonical };
-    const value = reader.readCompactSize() catch {
-        return; // pass if fixed
-    };
-    try testing.expectEqual(@as(u64, 0xFFFF), value);
-    // TODO fix: expectError(error.InvalidCompactSize, ...)
+    var r = serialize.Reader{ .data = &non_canonical };
+    try testing.expectError(error.InvalidCompactSize, r.readCompactSize());
 }
 
-test "w107 G1c BUG-1 readCompactSize non-canonical 0xFF prefix currently accepted" {
+test "w107 G1c BUG-1 readCompactSize non-canonical 0xFF prefix rejected" {
     // 0xFF 0xFF 0xFF 0xFF 0xFF 0x00 0x00 0x00 0x00 = LE u64 = 0xFFFFFFFF.
     // Should have been encoded with 0xFE prefix (5 bytes).
+    // FIXED: clearbit now returns error.InvalidCompactSize.
     const non_canonical: [9]u8 = .{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00 };
-    var reader = serialize.Reader{ .data = &non_canonical };
-    const value = reader.readCompactSize() catch {
-        return; // pass if fixed
-    };
-    try testing.expectEqual(@as(u64, 0xFFFFFFFF), value);
-    // TODO fix: expectError(error.InvalidCompactSize, ...)
+    var r = serialize.Reader{ .data = &non_canonical };
+    try testing.expectError(error.InvalidCompactSize, r.readCompactSize());
 }
 
 test "w107 G1d writeCompactSize then readCompactSize canonical round-trip (PASS)" {
-    // Verify that canonical encodings are NOT rejected (regression guard for
-    // when the non-canonical check is added).
+    // Verify that canonical encodings within MAX_SIZE are NOT rejected.
+    // Values > MAX_SIZE (0x02000000) are correctly rejected — see G14.
     const allocator = testing.allocator;
     const cases = [_]u64{
-        0, 1, 0xFC, 0xFD, 0xFFFE, 0xFFFF, 0x10000, 0xFFFFFFFF, 0x100000000,
-        0x01FFFFFF, 0x02000000,
+        0, 1, 0xFC, 0xFD, 0xFFFE, 0xFFFF, 0x10000, 0x01FFFFFF, 0x02000000,
     };
     for (cases) |v| {
         var writer = serialize.Writer.init(allocator);
@@ -142,31 +127,25 @@ test "w107 G2a readCompactSize value exactly MAX_SIZE (0x02000000) must be accep
     try testing.expectEqual(@as(u64, 0x02000000), got);
 }
 
-test "w107 G2b BUG-2 readCompactSize MAX_SIZE+1 currently accepted" {
-    // Core rejects 0x02000001 as "size too large".  BUG-2: clearbit accepts it.
+test "w107 G2b BUG-2 readCompactSize MAX_SIZE+1 rejected" {
+    // Core rejects 0x02000001 as "size too large".
+    // FIXED: clearbit now returns error.OversizedVector.
     const allocator = testing.allocator;
     var writer = serialize.Writer.init(allocator);
     defer writer.deinit();
     try writer.writeCompactSize(0x02000001);
-    var reader = serialize.Reader{ .data = writer.getWritten() };
-    const value = reader.readCompactSize() catch {
-        return; // pass if fixed
-    };
-    try testing.expectEqual(@as(u64, 0x02000001), value);
-    // TODO fix: expectError(error.InvalidCompactSize, ...) for value > MAX_SIZE
+    var r = serialize.Reader{ .data = writer.getWritten() };
+    try testing.expectError(error.OversizedVector, r.readCompactSize());
 }
 
-test "w107 G2c BUG-2 readCompactSize maximum u64 currently accepted" {
+test "w107 G2c BUG-2 readCompactSize maximum u64 rejected as OversizedVector" {
+    // FIXED: clearbit now returns error.OversizedVector for u64 max >> MAX_SIZE.
     const allocator = testing.allocator;
     var writer = serialize.Writer.init(allocator);
     defer writer.deinit();
     try writer.writeCompactSize(std.math.maxInt(u64));
-    var reader = serialize.Reader{ .data = writer.getWritten() };
-    const value = reader.readCompactSize() catch {
-        return; // pass if fixed
-    };
-    try testing.expectEqual(std.math.maxInt(u64), value);
-    // TODO fix: expectError for value > MAX_SIZE
+    var r = serialize.Reader{ .data = writer.getWritten() };
+    try testing.expectError(error.OversizedVector, r.readCompactSize());
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +235,9 @@ test "w107 G3b writeCompactSize little-endian byte order (PASS)" {
 // Cross-check from bitcoin-core/src/test/serialize_tests.cpp
 
 test "w107 G4 Core serialize_tests CompactSize vectors (PASS)" {
+    // Round-trip test for values within MAX_SIZE (0x02000000).
+    // Values 4294967295 and 4294967296 exceed MAX_SIZE and are rejected by
+    // readCompactSize — their encoding correctness is covered by write-only below.
     const vectors = [_]struct { value: u64, bytes: []const u8 }{
         .{ .value = 0, .bytes = &[_]u8{0x00} },
         .{ .value = 252, .bytes = &[_]u8{0xFC} },
@@ -265,8 +247,6 @@ test "w107 G4 Core serialize_tests CompactSize vectors (PASS)" {
         .{ .value = 256, .bytes = &[_]u8{ 0xFD, 0x00, 0x01 } },
         .{ .value = 65535, .bytes = &[_]u8{ 0xFD, 0xFF, 0xFF } },
         .{ .value = 65536, .bytes = &[_]u8{ 0xFE, 0x00, 0x00, 0x01, 0x00 } },
-        .{ .value = 4294967295, .bytes = &[_]u8{ 0xFE, 0xFF, 0xFF, 0xFF, 0xFF } },
-        .{ .value = 4294967296, .bytes = &[_]u8{ 0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 } },
     };
 
     const allocator = testing.allocator;
@@ -279,6 +259,19 @@ test "w107 G4 Core serialize_tests CompactSize vectors (PASS)" {
         try testing.expect(reader.isAtEnd());
 
         // Encode test
+        var writer = serialize.Writer.init(allocator);
+        defer writer.deinit();
+        try writer.writeCompactSize(v.value);
+        try testing.expectEqualSlices(u8, v.bytes, writer.getWritten());
+    }
+
+    // Write-only: verify encoding of values > MAX_SIZE is byte-correct even
+    // though readCompactSize will reject them with OversizedVector.
+    const write_only = [_]struct { value: u64, bytes: []const u8 }{
+        .{ .value = 4294967295, .bytes = &[_]u8{ 0xFE, 0xFF, 0xFF, 0xFF, 0xFF } },
+        .{ .value = 4294967296, .bytes = &[_]u8{ 0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 } },
+    };
+    for (write_only) |v| {
         var writer = serialize.Writer.init(allocator);
         defer writer.deinit();
         try writer.writeCompactSize(v.value);
@@ -660,10 +653,14 @@ test "w107 G13 readVarInt on empty input returns EndOfStream (PASS)" {
 }
 
 // ---------------------------------------------------------------------------
-// G14 — CompactSize large (legitimate) values decode correctly (PASS)
+// G14 — CompactSize values > MAX_SIZE are rejected (BUG-2 regression guard)
 // ---------------------------------------------------------------------------
+//
+// After the BUG-2 fix, readCompactSize rejects all values > 0x02000000.
+// These large values are canonically encoded but exceed MAX_SIZE and must
+// return error.OversizedVector (matching Core's "size too large" path).
 
-test "w107 G14 readCompactSize large but valid values round-trip (PASS)" {
+test "w107 G14 readCompactSize values exceeding MAX_SIZE return OversizedVector" {
     const allocator = testing.allocator;
     const cases = [_]u64{
         0xFFFFFFFE, 0xFFFFFFFF, 0x100000000, std.math.maxInt(u32), std.math.maxInt(u64),
@@ -673,9 +670,7 @@ test "w107 G14 readCompactSize large but valid values round-trip (PASS)" {
         defer w.deinit();
         try w.writeCompactSize(v);
         var r = serialize.Reader{ .data = w.getWritten() };
-        const got = try r.readCompactSize();
-        try testing.expectEqual(v, got);
-        try testing.expect(r.isAtEnd());
+        try testing.expectError(error.OversizedVector, r.readCompactSize());
     }
 }
 
@@ -777,15 +772,20 @@ test "w107 G19 VarInt large value round-trip (PASS)" {
 }
 
 // ---------------------------------------------------------------------------
-// G20 — readCompactSize with a valid 0xFF prefix (PASS)
+// G20 — readCompactSize with 0xFF prefix: canonical but > MAX_SIZE → rejected
 // ---------------------------------------------------------------------------
+//
+// Any canonical 0xFF-prefix CompactSize encodes a value >= 0x100000000, which
+// exceeds MAX_SIZE (0x02000000).  All such values are correctly rejected with
+// error.OversizedVector.  The encoding byte format is still verified via
+// writeCompactSize (write-only path, no range check).
 
-test "w107 G20 readCompactSize 0xFF prefix decodes correctly (PASS)" {
+test "w107 G20 readCompactSize 0xFF-prefix value rejected as OversizedVector (PASS)" {
+    // 0xFF 0x08 0x07 0x06 0x05 0x04 0x03 0x02 0x01 = LE u64 = 0x0102030405060708
+    // Canonical 0xFF-prefix → value >= 0x100000000 → always > MAX_SIZE.
     const bytes: [9]u8 = .{ 0xFF, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01 };
     var reader = serialize.Reader{ .data = &bytes };
-    const v = try reader.readCompactSize();
-    try testing.expectEqual(@as(u64, 0x0102030405060708), v);
-    try testing.expect(reader.isAtEnd());
+    try testing.expectError(error.OversizedVector, reader.readCompactSize());
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +838,8 @@ test "w107 G23 readVarInt all single-byte values (0..127) decode correctly (PASS
 // ---------------------------------------------------------------------------
 
 test "w107 G24 multiple CompactSize values in sequence parse correctly (PASS)" {
+    // Uses values within MAX_SIZE only; 0x100000000 exceeds MAX_SIZE and is
+    // rejected — covered by G14.
     const allocator = testing.allocator;
     var w = serialize.Writer.init(allocator);
     defer w.deinit();
@@ -845,14 +847,14 @@ test "w107 G24 multiple CompactSize values in sequence parse correctly (PASS)" {
     try w.writeCompactSize(252);
     try w.writeCompactSize(0xFD);
     try w.writeCompactSize(0x10000);
-    try w.writeCompactSize(0x100000000);
+    try w.writeCompactSize(0x02000000);
 
     var r = serialize.Reader{ .data = w.getWritten() };
     try testing.expectEqual(@as(u64, 0), try r.readCompactSize());
     try testing.expectEqual(@as(u64, 252), try r.readCompactSize());
     try testing.expectEqual(@as(u64, 0xFD), try r.readCompactSize());
     try testing.expectEqual(@as(u64, 0x10000), try r.readCompactSize());
-    try testing.expectEqual(@as(u64, 0x100000000), try r.readCompactSize());
+    try testing.expectEqual(@as(u64, 0x02000000), try r.readCompactSize());
     try testing.expect(r.isAtEnd());
 }
 

@@ -42,6 +42,8 @@ pub const OBFUSCATION_KEY_SIZE: usize = 8;
 
 pub const Error = error{
     InvalidFormat,
+    InvalidCompactSize,
+    OversizedVector,
     UnsupportedVersion,
     InvalidObfuscationKey,
     UnexpectedEof,
@@ -159,20 +161,37 @@ const ObfReader = struct {
 
     fn readCompactSize(self: *ObfReader) Error!u64 {
         const first = try self.readU8();
+        // 1-byte form: always canonical and within MAX_SIZE.
         if (first < 0xFD) return first;
-        if (first == 0xFD) {
-            var b: [2]u8 = undefined;
-            try self.readObfuscated(&b);
-            return std.mem.readInt(u16, &b, .little);
-        }
-        if (first == 0xFE) {
-            var b: [4]u8 = undefined;
-            try self.readObfuscated(&b);
-            return std.mem.readInt(u32, &b, .little);
-        }
-        var b: [8]u8 = undefined;
-        try self.readObfuscated(&b);
-        return std.mem.readInt(u64, &b, .little);
+        const value: u64 = switch (first) {
+            0xFD => blk: {
+                var b: [2]u8 = undefined;
+                try self.readObfuscated(&b);
+                const v = @as(u64, std.mem.readInt(u16, &b, .little));
+                // Non-canonical: value fits in 1-byte form.
+                if (v < 0xFD) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+            0xFE => blk: {
+                var b: [4]u8 = undefined;
+                try self.readObfuscated(&b);
+                const v = @as(u64, std.mem.readInt(u32, &b, .little));
+                // Non-canonical: value fits in 3-byte (0xFD) form.
+                if (v < 0x10000) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+            else => blk: { // 0xFF
+                var b: [8]u8 = undefined;
+                try self.readObfuscated(&b);
+                const v = std.mem.readInt(u64, &b, .little);
+                // Non-canonical: value fits in 5-byte (0xFE) form.
+                if (v < 0x100000000) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+        };
+        // MAX_SIZE range check (Core: range_check=true by default).
+        if (value > serialize.MAX_SIZE) return Error.OversizedVector;
+        return value;
     }
 };
 
@@ -202,7 +221,7 @@ fn readObfuscatedTransaction(
     var inner = serialize.Reader{ .data = scratch.items };
     const tx = serialize.readTransaction(&inner, allocator) catch |e| switch (e) {
         error.EndOfStream => return Error.UnexpectedEof,
-        error.InvalidCompactSize, error.InvalidSegwitMarker => return Error.InvalidFormat,
+        error.InvalidCompactSize, error.InvalidSegwitMarker, error.OversizedVector => return Error.InvalidFormat,
         error.OutOfMemory => return Error.OutOfMemory,
     };
     reader.pos += inner.pos;
