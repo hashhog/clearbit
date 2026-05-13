@@ -2215,6 +2215,10 @@ pub const PeerManager = struct {
     /// currently always follows the filter index in clearbit).
     blockfilterindex_enabled: bool = false,
 
+    /// Last time we swept the orphan pool for expired entries (Unix seconds).
+    /// Initialized to 0 so the first tick always triggers a sweep.
+    last_orphan_sweep: i64,
+
     /// Per-address fall-back set for BIP-324 v2 outbound negotiation.
     /// Once we've tried v2 against an address and fallen back to v1 (because
     /// the peer didn't speak v2 — a non-ellswift response or a deadline
@@ -2290,6 +2294,7 @@ pub const PeerManager = struct {
             .header_index = std.AutoHashMap(types.Hash256, BlockHeaderEntry).init(allocator),
             .pending_reorg = null,
             .block_source_peers = std.AutoHashMap(types.Hash256, usize).init(allocator),
+            .last_orphan_sweep = 0,
         };
     }
 
@@ -4717,6 +4722,21 @@ pub const PeerManager = struct {
         self.evictStaleTipPeer();
     }
 
+    /// Sweep the orphan pool for entries older than `ORPHAN_TX_EXPIRE_TIME`.
+    ///
+    /// Runs at most once per `ORPHAN_TX_EXPIRE_INTERVAL` seconds to bound
+    /// the cost of the O(N) scan.  Mirrors Bitcoin Core's periodic orphan
+    /// expiry sweep in `net_processing.cpp` (historical name
+    /// `nNextSweep` / `ORPHAN_TX_EXPIRE_INTERVAL`).
+    pub fn sweepOrphanPool(self: *PeerManager) void {
+        const now = std.time.timestamp();
+        if (now - self.last_orphan_sweep < mempool_mod.ORPHAN_TX_EXPIRE_INTERVAL) return;
+        self.last_orphan_sweep = now;
+        if (self.mempool) |pool| {
+            _ = pool.sweepExpiredOrphans(now);
+        }
+    }
+
     /// Check for ping timeouts (ping sent, no pong within PING_TIMEOUT).
     fn checkPingTimeouts(self: *PeerManager) void {
         var i: usize = 0;
@@ -5767,6 +5787,9 @@ pub const PeerManager = struct {
 
             // 6. Check for stale tips and evict peers (runs every 45 seconds)
             self.checkForStaleTipAndEvictPeers();
+
+            // 6b. Sweep expired orphans (runs every ORPHAN_TX_EXPIRE_INTERVAL seconds)
+            self.sweepOrphanPool();
 
             // 7. Peer rotation (skip if --connect mode)
             if (self.connect_address == null) {
