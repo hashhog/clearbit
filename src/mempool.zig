@@ -1790,7 +1790,7 @@ pub const Mempool = struct {
     ///
     /// We only check direct parents here (their `is_rbf` flag already captures their
     /// own ancestor chain transitively since it is set at admission time).
-    fn hasRBFAncestor(self: *Mempool, tx: *const types.Transaction) bool {
+    pub fn hasRBFAncestor(self: *Mempool, tx: *const types.Transaction) bool {
         for (tx.inputs) |input| {
             if (self.entries.get(input.previous_output.hash)) |parent| {
                 if (parent.is_rbf) return true;
@@ -2494,7 +2494,7 @@ pub const Mempool = struct {
     ///    Reference: policy/rbf.cpp::PaysForRBF (second check).
     ///
     /// Gate 8 (ImprovesFeerateDiagram) requires cluster mempool — deferred.
-    fn checkRBFRules(
+    pub fn checkRBFRules(
         self: *Mempool,
         new_tx: *const types.Transaction,
         new_txid: types.Hash256,
@@ -2671,7 +2671,7 @@ pub const Mempool = struct {
 
     /// Compute ancestors using BFS traversal with visited set.
     /// Returns the full ancestor set (not including self) for accurate limit checking.
-    fn getAncestors(self: *Mempool, txid: types.Hash256, tx: *const types.Transaction) MempoolError!struct {
+    pub fn getAncestors(self: *Mempool, txid: types.Hash256, tx: *const types.Transaction) MempoolError!struct {
         count: usize,
         size: usize,
         fees: i64,
@@ -2744,7 +2744,7 @@ pub const Mempool = struct {
     /// 5. V3 tx can have at most 1 unconfirmed ancestor (TRUC_ANCESTOR_LIMIT = 2 including self)
     /// 6. V3 tx can have at most 1 unconfirmed descendant (TRUC_DESCENDANT_LIMIT = 2 including self)
     /// 7. Sibling eviction: a v3 child can replace an existing v3 child of the same parent
-    fn checkTrucPolicy(
+    pub fn checkTrucPolicy(
         self: *Mempool,
         tx: *const types.Transaction,
         vsize: usize,
@@ -3001,7 +3001,7 @@ pub const Mempool = struct {
 
     /// Update descendant counts when a new transaction is added.
     /// Must propagate updates to ALL ancestors, not just direct parents.
-    fn updateDescendantCounts(self: *Mempool, txid: types.Hash256) MempoolError!void {
+    pub fn updateDescendantCounts(self: *Mempool, txid: types.Hash256) MempoolError!void {
         const entry = self.entries.get(txid) orelse return;
 
         // Use BFS to find all ancestors and update their descendant counts
