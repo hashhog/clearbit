@@ -27,6 +27,11 @@ pub const MAX_PROTOCOL_MESSAGE_LENGTH: usize = 4 * 1000 * 1000; // 4,000,000 byt
 /// Alias for backward compatibility within this file.
 pub const MAX_MESSAGE_SIZE: usize = MAX_PROTOCOL_MESSAGE_LENGTH;
 pub const MAX_INV_SIZE: usize = 50000;
+/// Maximum items in a single getdata message.
+/// Core protocol.h:482: static const unsigned int MAX_GETDATA_SZ = 1000.
+/// Incoming getdata over this limit triggers Misbehaving(100).
+/// Outgoing getdata is batched at this size.
+pub const MAX_GETDATA_SZ: usize = 1000;
 pub const MAX_HEADERS_SIZE: usize = 2000;
 pub const MAX_ADDR_SIZE: usize = 1000;
 /// BIP-130 / Core MAX_LOCATOR_SZ (chain.h): cap on locator hashes in
