@@ -153,6 +153,19 @@ pub const Message = union(enum) {
     cmpctblock: CmpctBlockMessage,
     getblocktxn: GetBlockTxnMessage,
     blocktxn: BlockTxnMessage,
+    // BIP-37 / BIP-111 bloom filter messages (received from peers).
+    // We do NOT implement CBloomFilter; these variants exist solely so the
+    // message decoder does not return ParseError.UnknownCommand and so the
+    // peer handler can apply the BIP-111 disconnect gate
+    // (net_processing.cpp:4964 / 4990 / 5018: disconnect when NODE_BLOOM not
+    // advertised).  The payload bytes are kept opaque — no full parse needed.
+    filterload: BloomFilterRawMessage,
+    filteradd: BloomFilterRawMessage,
+    filterclear: void,
+    // merkleblock is a server→client message; receiving one is unusual
+    // (buggy peer).  We keep the variant to avoid ParseError.UnknownCommand
+    // and log+drop it in the handler.
+    merkleblock: BloomFilterRawMessage,
 };
 
 /// Version message - exchanged during handshake.
@@ -385,6 +398,18 @@ pub const BlockTxnMessage = struct {
     transactions: []const types.Transaction,
 };
 
+/// BIP-37 / BIP-111 opaque bloom-filter message payload.
+///
+/// We do not parse the bloom filter wire format — clearbit has no CBloomFilter
+/// implementation.  The payload is kept as raw bytes so the peer handler can
+/// apply the BIP-111 disconnect gate without ever touching filter internals.
+/// Lifetime: payload slice points into a caller-managed buffer; the caller is
+/// responsible for freeing it (use allocator.free(msg.payload)).
+pub const BloomFilterRawMessage = struct {
+    /// Raw wire payload bytes (opaque; do not interpret).
+    payload: []const u8,
+};
+
 // ============================================================================
 // Encoding
 // ============================================================================
@@ -435,6 +460,11 @@ pub fn encodeMessage(
         .cmpctblock => "cmpctblock",
         .getblocktxn => "getblocktxn",
         .blocktxn => "blocktxn",
+        // BIP-37 / BIP-111: never sent by us; included for exhaustive switch.
+        .filterload => "filterload",
+        .filteradd => "filteradd",
+        .filterclear => "filterclear",
+        .merkleblock => "merkleblock",
     };
 
     // Encode payload based on message type
@@ -601,6 +631,14 @@ pub fn encodeMessage(
             for (bt.transactions) |transaction| {
                 try serialize.writeTransaction(&payload_writer, &transaction);
             }
+        },
+        // BIP-37 / BIP-111: we never SEND these; write raw payload back verbatim
+        // (used only in tests that round-trip; in production these are inbound only).
+        .filterload, .filteradd, .merkleblock => |bfm| {
+            try payload_writer.writeBytes(bfm.payload);
+        },
+        .filterclear => {
+            // filterclear has an empty payload per BIP-37.
         },
     }
 
@@ -818,6 +856,29 @@ pub fn decodePayload(
             .block_hash = block_hash,
             .transactions = transactions,
         } };
+    }
+
+    // BIP-37 / BIP-111 bloom filter messages.
+    //
+    // We do not parse the filter wire format.  The payload is kept as a raw
+    // slice so the peer handler can apply the BIP-111 disconnect gate
+    // (net_processing.cpp:4964 / 4990 / 5018).  The slice's backing store is
+    // the `payload` argument — the caller (receiveMessage) uses `defer
+    // allocator.free(payload)`, so the caller must NOT free the buffer when
+    // one of these variants is returned; instead the peer handler frees
+    // msg.filterload.payload (or .filteradd.payload / .merkleblock.payload).
+    // For filterclear the payload is empty — no allocation needed.
+    if (std.mem.eql(u8, command, "filterload")) {
+        const owned = try allocator.dupe(u8, payload);
+        return Message{ .filterload = .{ .payload = owned } };
+    } else if (std.mem.eql(u8, command, "filteradd")) {
+        const owned = try allocator.dupe(u8, payload);
+        return Message{ .filteradd = .{ .payload = owned } };
+    } else if (std.mem.eql(u8, command, "filterclear")) {
+        return Message{ .filterclear = {} };
+    } else if (std.mem.eql(u8, command, "merkleblock")) {
+        const owned = try allocator.dupe(u8, payload);
+        return Message{ .merkleblock = .{ .payload = owned } };
     }
 
     return ParseError.UnknownCommand;

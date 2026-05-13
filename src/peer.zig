@@ -4708,6 +4708,64 @@ pub const PeerManager = struct {
                 // (PeerManagerImpl::ProcessMessage NetMsgType::SENDHEADERS).
                 peer.send_headers = true;
             },
+            // BIP-37 / BIP-111 bloom filter messages.
+            //
+            // Bitcoin Core: net_processing.cpp:4964 (filterload), 4990
+            // (filteradd), 5018 (filterclear) — if NODE_BLOOM is not in
+            // m_our_services, set fDisconnect=true and return immediately.
+            //
+            // clearbit never has a CBloomFilter; NODE_BLOOM is never
+            // advertised (peerbloomfilters defaults to false, matching
+            // Core's DEFAULT_PEERBLOOMFILTERS=false in net_processing.h:44).
+            // So the disconnect path fires for every peer that attempts
+            // filter setup — correct BIP-111 behavior.
+            .filterload => |bfm| {
+                self.allocator.free(bfm.payload);
+                if (!peer.advertise_node_bloom) {
+                    std.log.debug(
+                        "BIP-111: filterload from peer={any} without NODE_BLOOM, disconnecting",
+                        .{peer.address},
+                    );
+                    peer.should_ban = false;
+                    peer.disconnect();
+                }
+                // If NODE_BLOOM were ever enabled (future extension), the
+                // full CBloomFilter parse + IsWithinSizeConstraints check
+                // would go here.  For now we just disconnect cleanly.
+            },
+            .filteradd => |bfm| {
+                self.allocator.free(bfm.payload);
+                if (!peer.advertise_node_bloom) {
+                    std.log.debug(
+                        "BIP-111: filteradd from peer={any} without NODE_BLOOM, disconnecting",
+                        .{peer.address},
+                    );
+                    peer.should_ban = false;
+                    peer.disconnect();
+                }
+            },
+            .filterclear => {
+                if (!peer.advertise_node_bloom) {
+                    std.log.debug(
+                        "BIP-111: filterclear from peer={any} without NODE_BLOOM, disconnecting",
+                        .{peer.address},
+                    );
+                    peer.should_ban = false;
+                    peer.disconnect();
+                }
+            },
+            // merkleblock is a server→client message (Core sends it in
+            // response to a MSG_FILTERED_BLOCK getdata).  Receiving one is
+            // unexpected (buggy or misbehaving peer).  Log and drop; do NOT
+            // disconnect — Core does not disconnect on unsolicited merkleblock
+            // and the peer may simply be confused.
+            .merkleblock => |bfm| {
+                self.allocator.free(bfm.payload);
+                std.log.debug(
+                    "unexpected merkleblock from peer={any}, dropping",
+                    .{peer.address},
+                );
+            },
             else => {},
         }
     }
