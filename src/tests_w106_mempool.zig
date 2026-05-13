@@ -770,18 +770,20 @@ test "w106 G16: RBF Rule 3 — replacement must pay at least as much as conflict
 // G17 — ImprovesFeerateDiagram absent (BUG-5)
 // ============================================================================
 
-test "w106 G17: BUG-5 ImprovesFeerateDiagram absent — feerate diagram not checked in RBF" {
-    // Core: PaysForRBF + ImprovesFeerateDiagram are BOTH required since 28.0.
-    // Clearbit: only PaysForRBF (Gate 6+7) is checked; Gate 8 is explicitly
-    // deferred ("Gate 8 (ImprovesFeerateDiagram) requires cluster mempool — deferred").
-    // This means a replacement that pays slightly more in absolute terms but
-    // worsens the feerate diagram (e.g. replaces a tiny high-feerate tx with
-    // a large low-feerate tx) is accepted.
+test "w106 G17: ImprovesFeerateDiagram implemented — worsening diagram is rejected" {
+    // FIX (W106 BUG-5): Gate 8 (ImprovesFeerateDiagram) is now implemented.
+    // Scenario: old tx has a high feerate (5 sat/vb); replacement pays more in
+    // absolute terms (Rule 3 OK) and just enough incremental relay (Rule 4 OK),
+    // but its feerate is far worse (0.2 sat/vb vs 5 sat/vb).
     //
-    // Verify the gap by checking the absence of an ImprovesFeerateDiagram function.
-    // There is no direct Zig symbol to check here; we assert via comment and
-    // test that checkRBFRules succeeds when only absolute fee is bumped but
-    // rate is worse.
+    // Numbers:
+    //   old_fee=1000, old_vsize=200  → feerate 5.0 sat/vb
+    //   new_fee=2000, new_vsize=10000 → feerate 0.2 sat/vb
+    //   Rule 3: 2000 >= 1000  ✓
+    //   Rule 4: additional=1000, min=10000*100/1000=1000 → 1000>=1000  ✓
+    //   Diagram: new feerate 0.2 < old feerate 5.0 → REJECT (DiagramNotImproved)
+    //
+    // Core reference: policy/rbf.cpp::ImprovesFeerateDiagram (since 28.0).
     const allocator = testing.allocator;
     var pool = mempool_mod.Mempool.init(null, null, allocator);
     defer pool.deinit();
@@ -797,7 +799,7 @@ test "w106 G17: BUG-5 ImprovesFeerateDiagram absent — feerate diagram not chec
         .tx = conflict_tx,
         .txid = conflict_txid,
         .wtxid = conflict_txid,
-        .fee = 1000, // high feerate: 1000 sat / 200 vbyte = 5 sat/vbyte
+        .fee = 1000, // 1000 sat / 200 vbyte = 5.0 sat/vbyte
         .size = 200,
         .weight = 800,
         .vsize = 200,
@@ -817,29 +819,30 @@ test "w106 G17: BUG-5 ImprovesFeerateDiagram absent — feerate diagram not chec
     pool.entries.put(conflict_txid, ce4) catch unreachable;
     pool.spenders.put(types.OutPoint{ .hash = prev_h, .index = 0 }, conflict_txid) catch unreachable;
 
-    // Replacement: pays 1100 sat but 10000 vbytes → feerate = 0.11 sat/vbyte (worse!)
+    // Replacement: 2000 sat / 10000 vbytes = 0.2 sat/vb (worse feerate).
+    // Rule 3 passes (2000 >= 1000), Rule 4 passes (additional=1000 >= 1000),
+    // but Gate 8 must reject: new diagram worsens feerate.
     const conflicts_list = [_]types.Hash256{conflict_txid};
     const result = pool.checkRBFRules(
-        &conflict_tx, // content doesn't matter for this gate check
+        &conflict_tx,
         conflict_txid,
-        1100, // replacement fee > original (rule 3 OK)
-        10000, // but much larger — feerate 1100/10000 = 0.11 sat/vb << 5 sat/vb
+        2000, // new_fee: passes Rule 3 and exactly meets Rule 4
+        10000, // new_vsize: feerate = 0.2 sat/vb << 5.0 sat/vb (old)
         &conflicts_list,
     );
-    // BUG-5: clearbit accepts this (no diagram check); it should reject.
-    // checkRBFRules requires: replacement_fee >= original_fee (1100 >= 1000 OK)
-    // and additional_fees >= incremental_fee * new_vsize (100 >= 100*10000/1000 = 1000 FAILS)
-    // So rule 4 catches this specific case. Document that diagram check is absent anyway.
-    if (result) |_| {
-        // Accepted — BUG-5 would be exposed if rule 4 didn't catch it here
-    } else |_| {
-        // Rule 4 (incremental relay fee) fires first in this case — that's OK
-    }
-    // The key invariant that's ABSENT: ImprovesFeerateDiagram.
-    // Future test: a case where rule 3+4 pass but feerate diagram worsens.
-    // That requires a more complex scenario (replacing low-fee tx while paying enough
-    // absolute increment). Documented as BUG-5.
-    try testing.expect(true); // invariant documented above
+    try testing.expectError(mempool_mod.MempoolError.DiagramNotImproved, result);
+
+    // Positive case: replacement with strictly better feerate must be accepted.
+    // old: 1000 sat / 200 vb = 5.0 sat/vb; new: 3000 sat / 200 vb = 15.0 sat/vb.
+    // Rule 3: 3000 >= 1000 ✓  Rule 4: 2000 >= 200*100/1000=20 ✓  Diagram: 15>5 ✓
+    const result_ok = pool.checkRBFRules(
+        &conflict_tx,
+        conflict_txid,
+        3000,
+        200,
+        &conflicts_list,
+    );
+    try testing.expectEqual({}, try result_ok);
 }
 
 // ============================================================================
