@@ -387,6 +387,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w107_tests.step);
     }
 
+    // W108 — BlockTemplate + GBT mining RPC 30-gate audit.
+    {
+        const w108_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w108_gbt.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w108"},
+        });
+        w108_tests.linkSystemLibrary("rocksdb");
+        w108_tests.linkSystemLibrary("secp256k1");
+        w108_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w108_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w108_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w108_tests.linkSystemLibrary("minisketch");
+            w108_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w108_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w108_tests = b.addRunArtifact(w108_tests);
+        const w108_test_step = b.step("test-w108", "Run W108 BlockTemplate + GBT mining RPC 30-gate audit tests");
+        w108_test_step.dependOn(&run_w108_tests.step);
+        // Fold into the main `test` step so CI exercises W108.
+        test_step.dependOn(&run_w108_tests.step);
+    }
+
     // W106 — CTxMemPool descendant/ancestor + RBF + package mempool 30-gate audit.
     {
         const w106_tests = b.addTest(.{
