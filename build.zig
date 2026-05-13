@@ -290,6 +290,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w103_tests.step);
     }
 
+    // W104 — AddrMan 30-gate fleet audit + isRoutable fix.
+    // Uses a dedicated test root (tests_w104_addrman.zig) so it can import
+    // peer.zig without pulling in unrelated peer.zig tests.
+    {
+        const w104_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w104_addrman.zig"),
+            .target = target,
+            .optimize = optimize,
+            // Filter to only our W104 tests; exclude drifted peer.zig tests
+            // that this root transitively pulls in via the peer import.
+            .filters = &[_][]const u8{"w104", "tests_w104_addrman"},
+        });
+        w104_tests.linkSystemLibrary("rocksdb");
+        w104_tests.linkSystemLibrary("secp256k1");
+        w104_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w104_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w104_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w104_tests.linkSystemLibrary("minisketch");
+            w104_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w104_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w104_tests = b.addRunArtifact(w104_tests);
+        const w104_test_step = b.step("test-w104", "Run W104 AddrMan 30-gate audit + isRoutable fix tests");
+        w104_test_step.dependOn(&run_w104_tests.step);
+        // Fold into the main `test` step so CI exercises W104.
+        test_step.dependOn(&run_w104_tests.step);
+    }
+
     // RPC tests run via `tests_rpc.zig` at the project root. The main
     // `tests.zig` root cannot pull in `rpc.zig` because doing so transitively
     // imports `wallet.zig`, whose `@embedFile("../resources/bip39-english.txt")`

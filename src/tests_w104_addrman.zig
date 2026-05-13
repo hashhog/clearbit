@@ -43,7 +43,9 @@ test "w104/G1: addAddress does not apply time_penalty — last_seen set to now u
     var manager = PeerManager.init(allocator, &consensus.MAINNET);
     defer manager.deinit();
 
-    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 8333);
+    // Use a routable address (1.2.3.4) so the isRoutable guard (fixed in this
+    // wave) does not interfere with the time_penalty bug being documented here.
+    const addr = std.net.Address.initIp4([4]u8{ 1, 2, 3, 4 }, 8333);
     const before = std.time.timestamp();
     try manager.addAddress(addr, p2p.NODE_NETWORK, .peer_addr);
     const after = std.time.timestamp();
@@ -238,13 +240,14 @@ test "w104/G11: known_addresses has no maximum-capacity guard (unbounded growth)
     var manager = PeerManager.init(allocator, &consensus.MAINNET);
     defer manager.deinit();
 
-    // Add many addresses — none are rejected.
+    // Add many publicly-routable addresses — none are rejected by a capacity cap.
+    // Using 1.2.3.i (publicly routable, APNIC-allocated 1.0.0.0/8 block).
     var i: u8 = 0;
     while (i < 200) : (i += 1) {
-        const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, i }, 8333);
+        const addr = std.net.Address.initIp4([4]u8{ 1, 2, 3, i }, 8333);
         try manager.addAddress(addr, p2p.NODE_NETWORK, .peer_addr);
     }
-    // All 200 accepted — no cap enforced.
+    // All 200 accepted — no capacity cap enforced.
     try testing.expectEqual(@as(usize, 200), manager.knownAddressCount());
     // Core would have capped this via bucket eviction if all fell in same bucket.
     // No capacity constant on PeerManager:
@@ -460,10 +463,12 @@ test "w104/G23: No per-source subnet flooding cap (ADDRMAN_NEW_BUCKETS_PER_SOURC
     var manager = PeerManager.init(allocator, &consensus.MAINNET);
     defer manager.deinit();
 
-    // Flood from a single /16 (10.0.x.x) — all accepted, no cap.
+    // Flood from a single routable /16 (1.2.x.1) — all accepted, no per-source cap.
+    // Using publicly-routable 1.2.x.x (APNIC block) so the isRoutable guard does
+    // not interfere with the per-source-subnet flooding bug being documented here.
     var i: u8 = 0;
     while (i < 255) : (i += 1) {
-        const addr = std.net.Address.initIp4([4]u8{ 10, 0, i, 1 }, 8333);
+        const addr = std.net.Address.initIp4([4]u8{ 1, 2, i, 1 }, 8333);
         try manager.addAddress(addr, p2p.NODE_NETWORK, .peer_addr);
     }
     // All 255 accepted — Core would limit to 64 per source group.
@@ -601,4 +606,64 @@ test "w104/G30: loadBanList is live; address-book persistence entirely absent" {
     try testing.expect(!@hasDecl(PeerManager, "saveAddressBook"));
     try testing.expect(!@hasDecl(PeerManager, "loadKnownAddresses"));
     try testing.expect(!@hasDecl(PeerManager, "saveKnownAddresses"));
+}
+
+// ============================================================================
+// IsRoutable fix test (W104)
+// ============================================================================
+
+// FIX (W104): addAddress now rejects non-routable addresses from gossip.
+// Core ref: addrman.cpp:534  if (!addr.IsRoutable()) return false;
+// Non-routable ranges rejected: RFC1918 private (10/8, 172.16/12, 192.168/16),
+// RFC3927 link-local (169.254/16), RFC6598 CGNAT (100.64/10),
+// RFC5737 documentation (192.0.2/24, 198.51.100/24, 203.0.113/24),
+// loopback (127/8), IPv6 link-local (fe80::/10), IPv6 ULA (fc00::/7).
+test "w104/isRoutable: addAddress rejects non-routable gossip addresses (W104 fix)" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+
+    const non_routable = [_]std.net.Address{
+        // RFC1918: 10/8
+        std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 8333),
+        // RFC1918: 172.16/12
+        std.net.Address.initIp4([4]u8{ 172, 16, 0, 1 }, 8333),
+        // RFC1918: 192.168/16
+        std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333),
+        // RFC3927 link-local: 169.254/16
+        std.net.Address.initIp4([4]u8{ 169, 254, 0, 1 }, 8333),
+        // RFC6598 CGNAT: 100.64/10
+        std.net.Address.initIp4([4]u8{ 100, 64, 0, 1 }, 8333),
+        // RFC5737 documentation: 192.0.2/24
+        std.net.Address.initIp4([4]u8{ 192, 0, 2, 1 }, 8333),
+        // Loopback: 127.0.0.1
+        std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8333),
+        // IPv6 link-local: fe80::1
+        std.net.Address.initIp6([16]u8{ 0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 8333, 0, 0),
+        // IPv6 ULA: fc00::1
+        std.net.Address.initIp6([16]u8{ 0xFC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 8333, 0, 0),
+        // IPv6 loopback: ::1
+        std.net.Address.initIp6([16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 8333, 0, 0),
+    };
+
+    for (non_routable) |addr| {
+        // isRoutable must return false for all of these
+        try testing.expect(!PeerManager.isRoutable(addr));
+        // addAddress must silently drop them
+        try manager.addAddress(addr, p2p.NODE_NETWORK, .peer_addr);
+    }
+    // None of the non-routable addresses were stored
+    try testing.expectEqual(@as(usize, 0), manager.knownAddressCount());
+
+    // Routable addresses ARE accepted
+    const routable = [_]std.net.Address{
+        std.net.Address.initIp4([4]u8{ 1, 2, 3, 4 }, 8333),
+        std.net.Address.initIp4([4]u8{ 8, 8, 8, 8 }, 8333),
+        std.net.Address.initIp4([4]u8{ 203, 0, 112, 1 }, 8333), // adjacent to RFC5737, still routable
+    };
+    for (routable) |addr| {
+        try testing.expect(PeerManager.isRoutable(addr));
+        try manager.addAddress(addr, p2p.NODE_NETWORK, .peer_addr);
+    }
+    try testing.expectEqual(@as(usize, 3), manager.knownAddressCount());
 }
