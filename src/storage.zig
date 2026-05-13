@@ -1553,7 +1553,9 @@ pub const BlockUndoData = struct {
     /// - For each TxUndo:
     ///   - num_prev_outputs (CompactSize)
     ///   - For each prev_output:
-    ///     - packed_height_coinbase (varint): height * 2 + is_coinbase
+    ///     - packed_height_coinbase (VARINT): height * 2 + is_coinbase
+    ///       Reference: bitcoin-core/src/undo.h TxInUndoFormatter::Ser
+    ///       Uses VARINT (MSB-continuation encoding), NOT CompactSize.
     ///     - value (i64 LE)
     ///     - script_pubkey_len (CompactSize)
     ///     - script_pubkey bytes
@@ -1571,9 +1573,11 @@ pub const BlockUndoData = struct {
 
             for (tx_undo.prev_outputs) |prev_out| {
                 // Pack height and coinbase flag: height * 2 + is_coinbase
-                // This matches Bitcoin Core's TxInUndoFormatter
+                // W107 BUG-4 fix: use VARINT (MSB-continuation) not CompactSize.
+                // Core's TxInUndoFormatter (undo.h:26): VARINT(nHeight*2 + fCoinBase).
+                // coins.h:67: Coin::Serialize also uses VARINT for the same field.
                 const packed_code: u64 = @as(u64, prev_out.height) * 2 + @intFromBool(prev_out.is_coinbase);
-                try writer.writeCompactSize(packed_code);
+                try writer.writeVarInt(packed_code);
 
                 // Value
                 try writer.writeInt(i64, prev_out.value);
@@ -1592,7 +1596,13 @@ pub const BlockUndoData = struct {
         const ser = @import("serialize.zig");
         var reader = ser.Reader{ .data = data };
 
+        // W107 BUG-5 fix: apply MAX_SIZE cap on array-count CompactSize reads.
+        // Core uses range_check=true by default for all vector sizes.
+        // Reference: bitcoin-core/src/serialize.h ReadCompactSize MAX_SIZE = 0x02000000.
+        const MAX_SIZE: u64 = 0x02000000;
+
         const num_tx_undo = try reader.readCompactSize();
+        if (num_tx_undo > MAX_SIZE) return error.OversizedVector;
 
         var tx_undo_list = std.ArrayList(TxUndo).init(allocator);
         errdefer {
@@ -1604,6 +1614,8 @@ pub const BlockUndoData = struct {
 
         for (0..num_tx_undo) |_| {
             const num_prev_outputs = try reader.readCompactSize();
+            // W107 BUG-5 fix: cap num_prev_outputs too.
+            if (num_prev_outputs > MAX_SIZE) return error.OversizedVector;
 
             var prev_outputs_list = std.ArrayList(TxUndo.TxOut).init(allocator);
             errdefer {
@@ -1614,8 +1626,10 @@ pub const BlockUndoData = struct {
             }
 
             for (0..num_prev_outputs) |_| {
-                // Unpack height and coinbase flag
-                const packed_code = try reader.readCompactSize();
+                // Unpack height and coinbase flag.
+                // W107 BUG-4 fix: use VARINT (MSB-continuation) not CompactSize.
+                // Core's TxInUndoFormatter (undo.h:37): VARINT(nCode).
+                const packed_code = try reader.readVarInt();
                 const height: u32 = @intCast(packed_code >> 1);
                 const is_coinbase = (packed_code & 1) != 0;
 

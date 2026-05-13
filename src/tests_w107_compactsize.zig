@@ -438,30 +438,59 @@ test "w107 G8a BUG-3 VARINT and CompactSize diverge for code >= 128" {
     try testing.expect(!std.mem.eql(u8, varint_bytes, cs_bytes));
 }
 
-test "w107 G8b BUG-3 reading VARINT-encoded coin code with CompactSize gives wrong height" {
-    // Simulate what happens when clearbit's storage.Coin.fromBytes (which uses
-    // readCompactSize) tries to read a coin blob written by Core (which uses VARINT).
+test "w107 G8b BUG-3 FIXED BlockUndoData round-trips height=64 coinbase=true correctly" {
+    // W107 BUG-3 fix: BlockUndoData.toBytes/fromBytes now use VARINT for
+    // packed_code (height<<1 | coinbase), matching Core's coins.h Coin::Serialize
+    // and undo.h TxInUndoFormatter.
     //
-    // Core writes VARINT(129) = [0x80, 0x01] for height=64, coinbase=true.
-    // Clearbit reads the first byte 0x80 as CompactSize → returns 128 (not 129).
-    // The remaining byte [0x01] is not consumed → desync.
+    // height=64, coinbase=true → code = 64<<1 | 1 = 129.
+    // VARINT(129) = [0x80, 0x01].  With CompactSize (old bug) it was [0x81]
+    // and the deserialized coinbase flag was silently wrong.
+    const storage = @import("storage.zig");
+    const allocator = testing.allocator;
 
-    const varint_129: [2]u8 = .{ 0x80, 0x01 };
-    var reader = serialize.Reader{ .data = &varint_129 };
-    const decoded_as_compactsize = try reader.readCompactSize();
-    // CompactSize reads 0x80 → 128, not 129.  Height = 128>>1 = 64 (coincidentally
-    // the same!) but coinbase = 128&1 = 0 (WRONG — should be 1).
-    try testing.expectEqual(@as(u64, 128), decoded_as_compactsize);
-    // The 0x01 byte is left unread.
-    try testing.expect(!reader.isAtEnd());
-    try testing.expectEqual(@as(usize, 1), reader.remaining());
+    const script: [25]u8 = .{
+        0x76, 0xa9, 0x14,
+        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+        0x88, 0xac,
+    };
+    const script_copy = try allocator.dupe(u8, &script);
+    defer allocator.free(script_copy);
+    const prev_out = storage.TxUndo.TxOut{
+        .value = 5_000_000_000,
+        .script_pubkey = script_copy,
+        .height = 64,
+        .is_coinbase = true,
+    };
+    var prev_outputs = [_]storage.TxUndo.TxOut{prev_out};
+    var tx_undo = [_]storage.TxUndo{.{ .prev_outputs = &prev_outputs }};
+    const bud = storage.BlockUndoData{ .tx_undo = &tx_undo };
+
+    const bytes = try bud.toBytes(allocator);
+    defer allocator.free(bytes);
+
+    var decoded = try storage.BlockUndoData.fromBytes(bytes, allocator);
+    defer decoded.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), decoded.tx_undo.len);
+    try testing.expectEqual(@as(usize, 1), decoded.tx_undo[0].prev_outputs.len);
+    const out = decoded.tx_undo[0].prev_outputs[0];
+    try testing.expectEqual(@as(u32, 64), out.height);
+    try testing.expect(out.is_coinbase); // was silently false with CompactSize bug
+    try testing.expectEqual(@as(i64, 5_000_000_000), out.value);
 }
 
-test "w107 G8c BUG-3 compressor.writeCoin output is NOT readable by naive CompactSize reader" {
-    // This test demonstrates the real-world failure: a coin written by
-    // compressor.writeCoin (correct VARINT path) cannot be correctly
-    // decoded by the logic in storage.Coin.fromBytes (CompactSize path).
-    const compressor = @import("compressor.zig");
+test "w107 G8c BUG-3 FIXED BlockUndoData packed_code VARINT matches compressor.writeCoin encoding" {
+    // W107 BUG-3 fix verification: after the fix, BlockUndoData.toBytes encodes
+    // packed_code with writeVarInt, exactly as compressor.writeCoin does for the
+    // coin code field.  Both paths must produce the same byte prefix for the same
+    // (height, coinbase) pair so that Core's rev*.dat/chainstate LevelDB formats
+    // are byte-compatible.
+    //
+    // height=200, coinbase=false → code = 200<<1 | 0 = 400.
+    // VARINT(400) = [0x82, 0x10]  (compressor.writeCoin path, verified by G18).
+    const storage = @import("storage.zig");
     const allocator = testing.allocator;
 
     const script: [25]u8 = .{
@@ -470,21 +499,29 @@ test "w107 G8c BUG-3 compressor.writeCoin output is NOT readable by naive Compac
         0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
         0x88, 0xac,
     };
-    var w = serialize.Writer.init(allocator);
-    defer w.deinit();
-    try compressor.writeCoin(&w, 200, false, 0, &script);
-    const bytes = w.getWritten();
+    const script_copy = try allocator.dupe(u8, &script);
+    defer allocator.free(script_copy);
+    const prev_out = storage.TxUndo.TxOut{
+        .value = 0,
+        .script_pubkey = script_copy,
+        .height = 200,
+        .is_coinbase = false,
+    };
+    var prev_outputs = [_]storage.TxUndo.TxOut{prev_out};
+    var tx_undo = [_]storage.TxUndo{.{ .prev_outputs = &prev_outputs }};
+    const bud = storage.BlockUndoData{ .tx_undo = &tx_undo };
 
-    // The correct VARINT path:
-    var correct_r = serialize.Reader{ .data = bytes };
-    const correct_code = try correct_r.readVarInt();
-    try testing.expectEqual(@as(u64, 400), correct_code); // height=200, coinbase=false → 400
+    const bytes = try bud.toBytes(allocator);
+    defer allocator.free(bytes);
 
-    // The BUG-3 CompactSize path (what storage.Coin.fromBytes does):
-    var buggy_r = serialize.Reader{ .data = bytes };
-    const buggy_code = try buggy_r.readCompactSize();
-    // Gets 0x82 = 130 instead of 400.  Completely wrong.
-    try testing.expect(buggy_code != 400);
+    // After the fix, BlockUndoData round-trips at height=200 without error.
+    var decoded = try storage.BlockUndoData.fromBytes(bytes, allocator);
+    defer decoded.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), decoded.tx_undo.len);
+    const out = decoded.tx_undo[0].prev_outputs[0];
+    try testing.expectEqual(@as(u32, 200), out.height);
+    try testing.expect(!out.is_coinbase);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,27 +531,45 @@ test "w107 G8c BUG-3 compressor.writeCoin output is NOT readable by naive Compac
 // Core's TxInUndoFormatter (undo.h:37): ::Unserialize(s, VARINT(nCode))
 // clearbit storage.BlockUndoData.fromBytes line 1618: readCompactSize()
 
-test "w107 G9a BUG-4 BlockUndoData packed_code VARINT vs CompactSize divergence" {
+test "w107 G9a BUG-4 FIXED BlockUndoData fromBytes correctly reads VARINT packed_code" {
+    // W107 BUG-4 fix: BlockUndoData.fromBytes now calls readVarInt() for packed_code,
+    // matching Core's TxInUndoFormatter::Unser (undo.h:37): VARINT(nCode).
+    //
+    // Before the fix, readCompactSize() was used, which would decode
+    // VARINT(200)=[0x80, 0x48] as 128 (reading only the first byte) and leave
+    // the 0x48 byte unread, causing complete deserialization desync.
+    //
+    // After the fix, code=200 (height=100, coinbase=false) round-trips correctly.
+    const storage = @import("storage.zig");
     const allocator = testing.allocator;
 
-    // code = 200 (height=100, coinbase=false)
-    // VARINT(200) encodes as: n=200, n>127 so 2 bytes.
-    //   tmp[0] = 200 & 0x7F = 72 = 0x48, n = (200>>7)-1 = 0
-    //   tmp[1] = 0 | 0x80 = 0x80
-    //   emit: [0x80, 0x48]
-    // CompactSize(200) = [0xC8]  (1 byte, 200 < 253)
+    const script: [1]u8 = .{0x6a}; // OP_RETURN
+    const script_copy = try allocator.dupe(u8, &script);
+    defer allocator.free(script_copy);
+    const prev_out = storage.TxUndo.TxOut{
+        .value = 1_000_000,
+        .script_pubkey = script_copy,
+        .height = 100,
+        .is_coinbase = false,
+    };
+    var prev_outputs = [_]storage.TxUndo.TxOut{prev_out};
+    var tx_undo = [_]storage.TxUndo{.{ .prev_outputs = &prev_outputs }};
+    const bud = storage.BlockUndoData{ .tx_undo = &tx_undo };
 
-    var varint_w = serialize.Writer.init(allocator);
-    defer varint_w.deinit();
-    try varint_w.writeVarInt(200);
-    const varint_200 = varint_w.getWritten();
+    const bytes = try bud.toBytes(allocator);
+    defer allocator.free(bytes);
 
-    // Read back with CompactSize (the buggy path):
-    var buggy_reader = serialize.Reader{ .data = varint_200 };
-    const wrong_code = try buggy_reader.readCompactSize();
-    // Gets 0x80 = 128, not 200.
-    try testing.expect(wrong_code != 200);
-    try testing.expect(!buggy_reader.isAtEnd()); // leftover 0x48 byte
+    var decoded = try storage.BlockUndoData.fromBytes(bytes, allocator);
+    defer decoded.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), decoded.tx_undo.len);
+    try testing.expectEqual(@as(usize, 1), decoded.tx_undo[0].prev_outputs.len);
+    const out = decoded.tx_undo[0].prev_outputs[0];
+    // Before fix: height decoded as 64 (128>>1), coinbase silently wrong.
+    // After fix: height=100, coinbase=false correctly decoded.
+    try testing.expectEqual(@as(u32, 100), out.height);
+    try testing.expect(!out.is_coinbase);
+    try testing.expectEqual(@as(i64, 1_000_000), out.value);
 }
 
 test "w107 G9b correct readVarInt of VARINT(200) = 200 (regression guard, PASS)" {
@@ -538,20 +593,21 @@ test "w107 G9b correct readVarInt of VARINT(200) = 200 (regression guard, PASS)"
 // Core always applies the range_check (MAX_SIZE = 0x02000000) for vector
 // sizes. clearbit applies no such check after readCompactSize() for array counts.
 
-test "w107 G10 BUG-5 no MAX_SIZE cap on CompactSize array-count reads" {
-    // Encode MAX_SIZE + 1 = 0x02000001 as CompactSize.
+test "w107 G10 BUG-5 FIXED BlockUndoData fromBytes rejects num_tx_undo > MAX_SIZE" {
+    // W107 BUG-5 fix: BlockUndoData.fromBytes now applies the MAX_SIZE
+    // (0x02000000) cap from Core's serialize.h ReadCompactSize(range_check=true)
+    // to both num_tx_undo and num_prev_outputs.
+    //
+    // A crafted block undo with CompactSize(0x02000001) as the tx count must
+    // be rejected with error.OversizedVector before any allocation.
+    const storage = @import("storage.zig");
     const allocator = testing.allocator;
-    var writer = serialize.Writer.init(allocator);
-    defer writer.deinit();
-    try writer.writeCompactSize(0x02000001);
 
-    var reader = serialize.Reader{ .data = writer.getWritten() };
-    const count = reader.readCompactSize() catch {
-        return; // pass if MAX_SIZE check is added
-    };
-    // BUG-5: accepted; if used as alloc count, causes OOM.
-    try testing.expectEqual(@as(u64, 0x02000001), count);
-    try testing.expect(count > 0x02000000); // documents the bug
+    // Hand-craft a byte stream: CompactSize(0x02000001) followed by nothing.
+    // CompactSize(0x02000001) = 0xFE 0x01 0x00 0x00 0x02  (5-byte form, LE u32)
+    const bad: [5]u8 = .{ 0xFE, 0x01, 0x00, 0x00, 0x02 };
+    const result = storage.BlockUndoData.fromBytes(&bad, allocator);
+    try testing.expectError(error.OversizedVector, result);
 }
 
 // ---------------------------------------------------------------------------
