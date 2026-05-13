@@ -796,29 +796,52 @@ test "w108 G20b BUG-20 createBlockTemplate at height 145 produces 2-byte scriptS
     try testing.expect(tmpl.coinbase_tx.script_sig.len >= 2);
 }
 
-test "w108 G20c BUG-30 BIP-9 state machine panics for prev_height < period (bonus latent bug)" {
-    // Discovered while writing G20 tests: consensus.getDeploymentStateAlloc
-    // at consensus.zig:2261 computes:
+test "w108 G20c BUG-30 FIXED BIP-9 state machine returns DEFINED for prev_height < period (no panic)" {
+    // Previously: consensus.getDeploymentStateAlloc at consensus.zig:2261 computed:
     //   boundary_height = prev_height - ((prev_height + 1) % period)
-    // For REGTEST (period=144) and prev_height < 144, this underflows an
-    // unsigned integer, causing a panic in debug builds.
+    // For REGTEST (period=144) and prev_height < 144, this underflowed u32,
+    // causing a panic in debug builds and silent corruption in release builds.
     //
-    // Bitcoin Core handles this gracefully: the period walk simply returns
-    // DEFINED state without iterating when height < start_height.
-    // clearbit panics instead, making it impossible to call createBlockTemplate
-    // for regtest heights 1..144 in tests.
+    // FIX (consensus.zig): guard added before boundary_height computation —
+    //   if (prev_height + 1 < period) return .defined;
+    // Mirrors Bitcoin Core versionbits.cpp:48-50:
+    //   if (pindexPrev != nullptr && pindexPrev->nHeight + 1 < nPeriod)
+    //       return ThresholdState::DEFINED;
     //
-    // Documented as BUG-30; not directly observable here without triggering
-    // the panic. This comment serves as the regression anchor.
-    //
-    // FIX: consensus.zig::getDeploymentStateAlloc must handle the case where
-    // prev_height < period (return DEFINED state immediately).
-    const period: u32 = 144; // REGTEST TESTDUMMY period
-    const prev_height: u32 = 1; // < period
-    // Demonstrate the would-be underflow: (prev_height+1) % period = 2, 1-2 underflows
-    try testing.expect(prev_height < period);
-    // The actual call would panic. We document the fix instead:
-    // if (prev_height < period) return .DEFINED;
+    // This test calls getDeploymentState directly at heights 1, 50, 143 (all
+    // < period=144) and asserts DEFINED is returned without panicking.
+
+    // Minimal index_view: returns null for all heights (genesis region).
+    const NullCtx = struct {
+        fn getAtHeight(_: *anyopaque, _: u32) ?consensus.VersionBitsBlockIndex {
+            return null;
+        }
+    };
+    var dummy_ctx: u8 = 0;
+    const view = consensus.VersionBitsIndexView{
+        .context = @ptrCast(&dummy_ctx),
+        .getAtHeightFn = NullCtx.getAtHeight,
+    };
+
+    // REGTEST TESTDUMMY deployment: period=144, start_time=0.
+    const deployment = consensus.Deployments.TESTDUMMY_REGTEST;
+
+    // height=1 → prev_height=0 → 0+1=1 < 144 → DEFINED (was: panic)
+    const s1 = consensus.getDeploymentState(deployment, 1, &view, null);
+    try testing.expectEqual(consensus.ThresholdState.defined, s1);
+
+    // height=50 → prev_height=49 → 49+1=50 < 144 → DEFINED
+    const s50 = consensus.getDeploymentState(deployment, 50, &view, null);
+    try testing.expectEqual(consensus.ThresholdState.defined, s50);
+
+    // height=143 → prev_height=142 → 142+1=143 < 144 → DEFINED
+    const s143 = consensus.getDeploymentState(deployment, 143, &view, null);
+    try testing.expectEqual(consensus.ThresholdState.defined, s143);
+
+    // height=144 → prev_height=143 → 143+1=144, NOT < 144 → proceeds normally (no panic).
+    // index_view returns null so the backward walk terminates at genesis → DEFINED.
+    const s144 = consensus.getDeploymentState(deployment, 144, &view, null);
+    try testing.expectEqual(consensus.ThresholdState.defined, s144);
 }
 
 // ---------------------------------------------------------------------------

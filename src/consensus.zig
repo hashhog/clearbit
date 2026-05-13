@@ -2258,6 +2258,18 @@ fn getDeploymentStateAlloc(
     // Here pindexPrev is at height-1.
     // Reference: versionbits.cpp:46
     const prev_height = height - 1;
+
+    // Guard: if prev_height + 1 < period, we're still in the first period.
+    // Core returns DEFINED immediately (no period walk needed).
+    // Without this guard, the boundary_height subtraction below underflows u32
+    // (e.g. prev_height=1, period=144 → 1 - (2 % 144) = 1 - 2 → wrap-around panic).
+    // Reference: versionbits.cpp:48-50
+    //   if (pindexPrev != nullptr && pindexPrev->nHeight + 1 < nPeriod)
+    //       return ThresholdState::DEFINED;
+    if (prev_height + 1 < period) {
+        return .defined;
+    }
+
     const boundary_height = prev_height - ((prev_height + 1) % period);
 
     // Fast path: state already cached for this period boundary.
