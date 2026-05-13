@@ -143,6 +143,17 @@ pub const MAX_ORPHAN_TX_SIZE: usize = 100_000;
 /// Provides per-peer fairness so one peer cannot evict another's orphans.
 pub const MAX_PEER_ORPHANS: usize = 100;
 
+/// Time-to-live for orphan transactions in seconds.
+/// Mirrors Bitcoin Core's `ORPHAN_TX_EXPIRE_TIME` (net_processing.cpp / txorphanage).
+/// Orphans older than this are swept by `sweepExpiredOrphans`.
+pub const ORPHAN_TX_EXPIRE_TIME: i64 = 300; // 5 minutes
+
+/// Minimum interval between orphan expiry sweeps in seconds.
+/// Mirrors Bitcoin Core's `ORPHAN_TX_EXPIRE_INTERVAL` (5 minutes).
+/// The sweep is cheap (O(N), N ≤ 100) so batching adds no practical benefit;
+/// this constant is exposed for testing and future tuning.
+pub const ORPHAN_TX_EXPIRE_INTERVAL: i64 = 300; // 5 minutes
+
 // ============================================================================
 // TRUC (v3) Policy Constants - BIP 431
 // ============================================================================
@@ -1615,6 +1626,38 @@ pub const Mempool = struct {
     /// Number of orphans currently held.  Test / introspection helper.
     pub fn orphanCount(self: *Mempool) usize {
         return self.orphans.count();
+    }
+
+    /// Sweep orphans that have exceeded `ORPHAN_TX_EXPIRE_TIME` seconds.
+    ///
+    /// Called periodically by the peer manager (every `ORPHAN_TX_EXPIRE_INTERVAL`
+    /// seconds) to prevent stale orphans from occupying pool slots indefinitely.
+    /// Mirrors Bitcoin Core's time-based expiry sweep in `net_processing.cpp` /
+    /// `TxOrphanage` (historical `ORPHAN_TX_EXPIRE_TIME = 20 * 60`; clearbit uses
+    /// the stricter 5-minute policy documented in `ORPHAN_TX_EXPIRE_TIME`).
+    ///
+    /// `now` is a Unix timestamp in seconds (e.g. `std.time.timestamp()`).
+    /// Returns the number of orphans removed.
+    pub fn sweepExpiredOrphans(self: *Mempool, now: i64) usize {
+        var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
+        defer to_remove.deinit();
+
+        var iter = self.orphans.iterator();
+        while (iter.next()) |entry| {
+            const o = entry.value_ptr.*;
+            if (now - o.time_added >= ORPHAN_TX_EXPIRE_TIME) {
+                to_remove.append(o.wtxid) catch continue;
+            }
+        }
+
+        const n = to_remove.items.len;
+        for (to_remove.items) |wtxid| {
+            _ = self.removeOrphanByWtxid(wtxid);
+        }
+        if (n > 0) {
+            std.log.debug("Swept {d} expired orphan(s) (TTL={d}s)", .{ n, ORPHAN_TX_EXPIRE_TIME });
+        }
+        return n;
     }
 
     /// After a parent transaction enters the mempool (or a block is
