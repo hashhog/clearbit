@@ -739,32 +739,36 @@ test "w108 G19 BUG-19 coinbasevalue emitted unconditionally (no capabilities che
 // BUG-20: coinbase at heights 1..16 without extra_data has 1-byte scriptSig,
 //         failing bad-cb-length.
 
-test "w108 G20 BUG-20 coinbase scriptSig is 1 byte at height <= 16 (fails bad-cb-length)" {
-    // NOTE: createBlockTemplate panics for best_height < period (144 for regtest) due to
-    // a BIP-9 state machine integer underflow (see BUG-30 below).
-    // So we cannot call createBlockTemplate for heights 1..16 in tests.
+test "w108 G20 FIXED coinbase scriptSig >= 2 bytes at heights 1..16 (bad-cb-length guard)" {
+    // Consensus: coinbase scriptSig must be 2..100 bytes (tx_check.cpp:49).
+    // Heights 1..16: BIP-34 height push is a single OP_N byte (0x51..0x60).
+    // Fix: constructCoinbaseWithCommitment now appends OP_0 dummy extranonce
+    // when scriptSig would otherwise be < 2 bytes, matching Bitcoin Core
+    // miner.cpp:187-193 include_dummy_extranonce logic.
     //
-    // Instead, verify the encoding bug via known byte values for OP_1..OP_16:
-    //   encodeHeightPush(1)  = [0x51] (OP_1, 1 byte)
-    //   encodeHeightPush(16) = [0x60] (OP_16, 1 byte)
-    //   All < 2 bytes, all fail bad-cb-length.
-    //
-    // The OP codes: OP_1=0x51, ..., OP_16=0x60 (each is 1 byte).
-    // Height 17 encodes as [0x01, 0x11] (push 1 byte + value 17 = 2 bytes, PASS).
-    //
-    // Correct behaviour: Core adds OP_0 dummy when height <= 16 and
-    //   include_dummy_extranonce=true (miner.cpp:187-193).
-    // FIX: clearbit must add the same OP_0 padding when height <= 16.
+    // We verify via buildCoinbaseScriptSig (public helper) because
+    // createBlockTemplate panics at heights < 144 due to BIP-9 underflow (BUG-30).
+    const allocator = testing.allocator;
 
-    // Verify that OP_N encodings are exactly 1 byte (documenting the issue):
-    const OP_1: u8 = 0x51;
-    const OP_16: u8 = 0x60;
-    // OP_1..OP_16 map to heights 1..16 and each is 1 byte — below the 2-byte minimum.
-    try testing.expect(OP_16 - OP_1 + 1 == 16); // 16 distinct 1-byte opcodes
-    // A 1-byte scriptSig would trigger bad-cb-length rejection.
-    const min_coinbase_scriptsig_len: usize = 2;
-    const op_n_len: usize = 1; // single opcode
-    try testing.expect(op_n_len < min_coinbase_scriptsig_len); // documents the bug
+    const heights_to_test = [_]u32{ 1, 2, 8, 16 };
+    for (heights_to_test) |h| {
+        const script = try block_template.buildCoinbaseScriptSig(h, &[_]u8{}, allocator);
+        defer allocator.free(script);
+        // Must be >= 2 bytes (bad-cb-length minimum satisfied)
+        try testing.expect(script.len >= 2);
+        // First byte: OP_N height push (0x51..0x60)
+        try testing.expectEqual(@as(u8, 0x50) + @as(u8, @intCast(h)), script[0]);
+        // Second byte: OP_0 dummy extranonce (0x00)
+        try testing.expectEqual(@as(u8, 0x00), script[1]);
+    }
+
+    // Height 17 and above produce >= 2 bytes natively (no OP_0 needed)
+    const heights_above16 = [_]u32{ 17, 127, 128, 256 };
+    for (heights_above16) |h| {
+        const script = try block_template.buildCoinbaseScriptSig(h, &[_]u8{}, allocator);
+        defer allocator.free(script);
+        try testing.expect(script.len >= 2);
+    }
 }
 
 test "w108 G20b BUG-20 createBlockTemplate at height 145 produces 2-byte scriptSig (PASS above 16)" {
@@ -788,9 +792,8 @@ test "w108 G20b BUG-20 createBlockTemplate at height 145 produces 2-byte scriptS
     defer tmpl.deinit();
 
     try testing.expectEqual(@as(u32, 145), tmpl.height);
-    // Height 145 > 16: encodes as multi-byte push → scriptSig >= 2 bytes (PASS)
+    // Height 145 > 16: encodes as multi-byte push → scriptSig >= 2 bytes (PASS, was always correct)
     try testing.expect(tmpl.coinbase_tx.script_sig.len >= 2);
-    // The BUG-20 is only for heights 1..16, which require OP_0 dummy extranonce.
 }
 
 test "w108 G20c BUG-30 BIP-9 state machine panics for prev_height < period (bonus latent bug)" {
