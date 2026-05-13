@@ -5,9 +5,14 @@ const types = @import("types.zig");
 pub const Error = error{
     EndOfStream,
     InvalidCompactSize,
+    OversizedVector,
     InvalidSegwitMarker,
     OutOfMemory,
 };
+
+/// Maximum serialized vector/collection size accepted on decode.
+/// Matches Bitcoin Core serialize.h: MAX_SIZE = 0x02000000.
+pub const MAX_SIZE: u64 = 0x02000000;
 
 /// Reader for parsing Bitcoin binary data
 pub const Reader = struct {
@@ -31,19 +36,37 @@ pub const Reader = struct {
         return std.mem.readInt(T, bytes[0..size], .little);
     }
 
-    /// Read a CompactSize (variable-length integer)
+    /// Read a CompactSize (variable-length integer).
+    /// Rejects non-canonical encodings and values exceeding MAX_SIZE (0x02000000),
+    /// matching Bitcoin Core serialize.h ReadCompactSize behaviour.
     pub fn readCompactSize(self: *Reader) Error!u64 {
         @setRuntimeSafety(true);
         const first = try self.readInt(u8);
-        if (first < 0xFD) {
-            return first;
-        } else if (first == 0xFD) {
-            return try self.readInt(u16);
-        } else if (first == 0xFE) {
-            return try self.readInt(u32);
-        } else {
-            return try self.readInt(u64);
-        }
+        // 1-byte form (0x00..0xFC): always canonical, always within MAX_SIZE.
+        if (first < 0xFD) return first;
+        const value: u64 = switch (first) {
+            0xFD => blk: {
+                const v = @as(u64, try self.readInt(u16));
+                // Non-canonical: value fits in 1-byte form.
+                if (v < 0xFD) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+            0xFE => blk: {
+                const v = @as(u64, try self.readInt(u32));
+                // Non-canonical: value fits in 3-byte (0xFD) form.
+                if (v < 0x10000) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+            else => blk: { // 0xFF
+                const v = try self.readInt(u64);
+                // Non-canonical: value fits in 5-byte (0xFE) form.
+                if (v < 0x100000000) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+        };
+        // MAX_SIZE range check (Core: range_check=true by default for P2P/block/tx).
+        if (value > MAX_SIZE) return Error.OversizedVector;
+        return value;
     }
 
     /// Read a VARINT (Bitcoin Core's special MSB-continuation encoding,
@@ -399,6 +422,9 @@ pub fn writeBlock(writer: *Writer, block: *const types.Block) !void {
 // ============================================================================
 
 test "compactsize round-trip" {
+    // Values within MAX_SIZE (0x02000000) round-trip through readCompactSize.
+    // 0xFFFFFFFF and 0x100000000 exceed MAX_SIZE and are now correctly rejected;
+    // their write encoding is still correct (tested separately).
     const allocator = std.testing.allocator;
     const test_values = [_]u64{
         0,
@@ -408,8 +434,7 @@ test "compactsize round-trip" {
         0xFFFE,
         0xFFFF,
         0x10000,
-        0xFFFFFFFF,
-        0x100000000,
+        0x02000000, // MAX_SIZE — boundary, must be accepted
     };
 
     for (test_values) |value| {

@@ -635,6 +635,7 @@ fn encodeNetworkAddress(writer: *serialize.Writer, addr: *const types.NetworkAdd
 pub const ParseError = error{
     EndOfStream,
     InvalidCompactSize,
+    OversizedVector,
     InvalidSegwitMarker,
     InvalidData,
     UnknownCommand,

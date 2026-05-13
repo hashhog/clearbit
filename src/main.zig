@@ -820,23 +820,40 @@ const StreamingFileReader = struct {
         const r = self.inner.reader();
         const first = try r.readByte();
         self.bytes_consumed += 1;
+        // 1-byte form: always canonical and within MAX_SIZE.
         if (first < 0xFD) return first;
-        if (first == 0xFD) {
-            var b: [2]u8 = undefined;
-            try r.readNoEof(&b);
-            self.bytes_consumed += 2;
-            return std.mem.readInt(u16, &b, .little);
-        }
-        if (first == 0xFE) {
-            var b: [4]u8 = undefined;
-            try r.readNoEof(&b);
-            self.bytes_consumed += 4;
-            return std.mem.readInt(u32, &b, .little);
-        }
-        var b: [8]u8 = undefined;
-        try r.readNoEof(&b);
-        self.bytes_consumed += 8;
-        return std.mem.readInt(u64, &b, .little);
+        const value: u64 = switch (first) {
+            0xFD => blk: {
+                var b: [2]u8 = undefined;
+                try r.readNoEof(&b);
+                self.bytes_consumed += 2;
+                const v = @as(u64, std.mem.readInt(u16, &b, .little));
+                // Non-canonical: value fits in 1-byte form.
+                if (v < 0xFD) return error.InvalidCompactSize;
+                break :blk v;
+            },
+            0xFE => blk: {
+                var b: [4]u8 = undefined;
+                try r.readNoEof(&b);
+                self.bytes_consumed += 4;
+                const v = @as(u64, std.mem.readInt(u32, &b, .little));
+                // Non-canonical: value fits in 3-byte (0xFD) form.
+                if (v < 0x10000) return error.InvalidCompactSize;
+                break :blk v;
+            },
+            else => blk: { // 0xFF
+                var b: [8]u8 = undefined;
+                try r.readNoEof(&b);
+                self.bytes_consumed += 8;
+                const v = std.mem.readInt(u64, &b, .little);
+                // Non-canonical: value fits in 5-byte (0xFE) form.
+                if (v < 0x100000000) return error.InvalidCompactSize;
+                break :blk v;
+            },
+        };
+        // MAX_SIZE range check (Core: range_check=true by default).
+        if (value > serialize.MAX_SIZE) return error.OversizedVector;
+        return value;
     }
 
     /// Bitcoin Core's MSB-continuation VARINT (NOT compactsize). See
