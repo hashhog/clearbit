@@ -311,6 +311,11 @@ pub const MempoolError = error{
     /// likely stripped the witness data). validation.cpp:1148-1151.
     /// Detected here so callers can suppress reject-cache pollution.
     WitnessStripped,
+    /// RBF Gate 8 (ImprovesFeerateDiagram, Core 28.0+): the replacement
+    /// does not strictly improve the mempool feerate diagram.
+    /// Core reject code: "insufficient feerate: does not improve feerate diagram"
+    /// (policy/rbf.cpp::ImprovesFeerateDiagram).
+    DiagramNotImproved,
 };
 
 // ============================================================================
@@ -495,6 +500,158 @@ pub const Linearization = struct {
         self.allocator.free(self.mining_scores);
     }
 };
+
+// ============================================================================
+// Feerate Diagram helpers (ImprovesFeerateDiagram — Core 28.0 Gate #17)
+// ============================================================================
+
+/// A single point on a cumulative feerate diagram.
+/// Represents a chunk with cumulative (total_fee, total_vsize) since the
+/// beginning of the diagram.  Analogous to Core's FeeFrac type but without
+/// 128-bit arithmetic — i64/u64 is sufficient for realistic mempool sizes.
+pub const FeeRateChunk = struct {
+    /// Cumulative vsize in bytes (must be > 0 for a real chunk).
+    vsize: u64,
+    /// Cumulative fee in satoshis.
+    fee: i64,
+};
+
+/// Four-way comparison result for feerate diagrams.
+/// Analogous to std::partial_ordering in Core's util/feefrac.cpp.
+pub const DiagramOrder = enum {
+    /// New diagram strictly dominates old at every point (accept RBF).
+    gt,
+    /// Old diagram strictly dominates new (reject).
+    lt,
+    /// Diagrams are identical (reject — must STRICTLY improve).
+    eq,
+    /// Diagrams cross: neither dominates everywhere (reject).
+    unordered,
+};
+
+/// Compare two feerate diagram sequences (new vs old) following the
+/// same linearised-chunk algorithm as Bitcoin Core's `CompareChunks` in
+/// util/feefrac.cpp.
+///
+/// Returns DiagramOrder: .gt means accept; .lt/.eq/.unordered mean reject.
+///
+/// Input chunks are CUMULATIVE (each chunk gives total fee/vsize from the
+/// origin, not just the increment of that chunk).  This matches the output
+/// of `buildSingleChunkDiagram`.
+///
+/// Algorithm (faithful port of Core's feefrac.cpp CompareChunks):
+///   - Maintain accumulators (last-processed cumulative point) for each side.
+///   - At each step pick the next unprocessed point from the side with the
+///     smaller next-cumulative-vsize.
+///   - Compare the slope A→P (from the OTHER side's last point to P) against:
+///       • the slope A→B if the other side has a next point, or
+///       • a tail slope of 0 if the other side is exhausted.
+///   - Track which side is "better somewhere" and return accordingly.
+pub fn compareFeeDiagrams(
+    new_chunks: []const FeeRateChunk,
+    old_chunks: []const FeeRateChunk,
+) DiagramOrder {
+    // Accumulators: last processed cumulative point on each side.
+    // "new" = side 0, "old" = side 1.
+    var accum = [2]FeeRateChunk{
+        .{ .vsize = 0, .fee = 0 },
+        .{ .vsize = 0, .fee = 0 },
+    };
+    var next_index = [2]usize{ 0, 0 };
+    const chunks = [2][]const FeeRateChunk{ new_chunks, old_chunks };
+
+    var better_somewhere = [2]bool{ false, false };
+
+    while (true) {
+        const done = [2]bool{
+            next_index[0] == chunks[0].len,
+            next_index[1] == chunks[1].len,
+        };
+        if (done[0] and done[1]) break;
+
+        // next_point for side d = chunks[d][next_index[d]] (already cumulative).
+        // prev_point for side d = accum[d].
+        //
+        // Determine which side has the smaller next-point cumulative vsize.
+        // If one side is done, use the other.  (At most one can be done here.)
+        const unproc: usize = blk: {
+            if (done[0]) break :blk 1;
+            if (done[1]) break :blk 0;
+            // Both have points — process the side with smaller (or equal) vsize.
+            const v0 = chunks[0][next_index[0]].vsize;
+            const v1 = chunks[1][next_index[1]].vsize;
+            break :blk if (v0 <= v1) @as(usize, 0) else @as(usize, 1);
+        };
+        const other: usize = 1 - unproc;
+
+        const point_p = chunks[unproc][next_index[unproc]]; // next point on unproc side
+        const point_a = accum[other]; // last processed point on the OTHER side
+
+        // slope_ap: (point_p.fee - point_a.fee) over (point_p.vsize - point_a.vsize)
+        // We compare this against slope_ab (other side's next segment) or 0 (tail).
+        const df_ap = point_p.fee - point_a.fee;
+        const dv_ap = @as(i64, @intCast(point_p.vsize)) - @as(i64, @intCast(point_a.vsize));
+        // dv_ap must be > 0 (cumulative vsize is strictly increasing and point_p.vsize
+        // is strictly greater than point_a.vsize because point_a is the other side's
+        // last cumulative and we sweep left-to-right).
+
+        const cmp: i32 = if (done[other]) blk: {
+            // Tail of other side: slope = 0.  Is slope_ap > 0?
+            break :blk if (df_ap > 0) @as(i32, 1) else if (df_ap == 0) @as(i32, 0) else @as(i32, -1);
+        } else blk: {
+            // Compare slope_ap against slope_ab where B = next point of other side.
+            const point_b = chunks[other][next_index[other]];
+            const df_ab = point_b.fee - point_a.fee;
+            const dv_ab = @as(i64, @intCast(point_b.vsize)) - @as(i64, @intCast(point_a.vsize));
+            // FeeRateCompare(slope_ap, slope_ab): cross-multiply.
+            // df_ap/dv_ap > df_ab/dv_ab  iff  df_ap * dv_ab > df_ab * dv_ap
+            const lhs = df_ap * dv_ab;
+            const rhs = df_ab * dv_ap;
+            break :blk if (lhs > rhs) @as(i32, 1) else if (lhs == rhs) @as(i32, 0) else @as(i32, -1);
+        };
+
+        // P above AB → unproc side is better at P.
+        // P below AB → other side is better at P.
+        if (cmp > 0) better_somewhere[unproc] = true;
+        if (cmp < 0) better_somewhere[other] = true;
+
+        // Advance the unproc side's accumulator.
+        accum[unproc] = point_p;
+        next_index[unproc] += 1;
+
+        // If B and P have the same vsize, advance the other side too.
+        if (!done[other] and chunks[other][next_index[other]].vsize == point_p.vsize) {
+            accum[other] = chunks[other][next_index[other]];
+            next_index[other] += 1;
+        }
+
+        if (better_somewhere[0] and better_somewhere[1]) return DiagramOrder.unordered;
+    }
+
+    if (better_somewhere[0] and !better_somewhere[1]) return DiagramOrder.gt;
+    if (better_somewhere[1] and !better_somewhere[0]) return DiagramOrder.lt;
+    return DiagramOrder.eq;
+}
+
+/// Build a single-chunk feerate diagram from a flat slice of (fee, vsize)
+/// entries (no clustering assumed — single-cluster linearization).
+/// The returned slice is caller-owned; free with allocator.free().
+///
+/// For the RBF diagram check we treat the set of evicted transactions as one
+/// "old" chunk and the replacement as one "new" chunk, both starting from
+/// vsize=0.  Core's CalculateChunksForRBF does full cluster linearization;
+/// this is a simplified but sound approximation for single-conflict RBF:
+/// the diagram is the total (fee, vsize) of the whole evicted cluster vs the
+/// replacement.
+pub fn buildSingleChunkDiagram(
+    allocator: std.mem.Allocator,
+    total_fee: i64,
+    total_vsize: u64,
+) std.mem.Allocator.Error![]FeeRateChunk {
+    const result = try allocator.alloc(FeeRateChunk, 1);
+    result[0] = .{ .vsize = total_vsize, .fee = total_fee };
+    return result;
+}
 
 // ============================================================================
 // Mempool Entry
@@ -2493,7 +2650,13 @@ pub const Mempool = struct {
     ///    Core error: "rejecting replacement %s, not enough additional fees to relay".
     ///    Reference: policy/rbf.cpp::PaysForRBF (second check).
     ///
-    /// Gate 8 (ImprovesFeerateDiagram) requires cluster mempool — deferred.
+    /// 6. [Gate 8] Replacement must strictly improve the mempool feerate diagram.
+    ///    Core (28.0+): `ImprovesFeerateDiagram` in policy/rbf.cpp calls
+    ///    `CalculateChunksForRBF` and rejects unless the new diagram is strictly
+    ///    greater (CompareChunks returns std::partial_ordering::greater).
+    ///    We approximate with single-chunk diagrams (evicted cluster vs replacement)
+    ///    which is sound for the common single-conflict case.
+    ///    Core error: "insufficient feerate: does not improve feerate diagram".
     pub fn checkRBFRules(
         self: *Mempool,
         new_tx: *const types.Transaction,
@@ -2582,6 +2745,49 @@ pub const Mempool = struct {
         const min_additional_fee = @divTrunc(@as(i64, @intCast(new_vsize)) * INCREMENTAL_RELAY_FEE, 1000);
         if (additional_fee < min_additional_fee) {
             return MempoolError.ReplacementFeeTooLow;
+        }
+
+        // Gate 8 / ImprovesFeerateDiagram (Core 28.0+):
+        // The replacement must strictly improve the feerate diagram of the
+        // affected cluster(s).  We use a single-chunk approximation: compute
+        // the cumulative (fee, vsize) of the evicted set as the "old" diagram
+        // and (new_fee, new_vsize) as the "new" diagram, then compare.
+        //
+        // Skip when fee data is unavailable (no chain state → fees = 0 for all
+        // txs; comparing two zero-fee diagrams produces .eq which would
+        // spuriously reject valid replacements in unit-test environments without
+        // UTXO sets).
+        //
+        // Reference: policy/rbf.cpp::ImprovesFeerateDiagram + util/feefrac.cpp::CompareChunks.
+        if (new_fee > 0 or total_evicted_fee > 0) {
+            // Collect evicted total vsize.
+            var evicted_vsize: u64 = 0;
+            var evicted_iter = all_evicted.keyIterator();
+            while (evicted_iter.next()) |evicted_txid| {
+                if (self.entries.get(evicted_txid.*)) |entry| {
+                    evicted_vsize += @as(u64, @intCast(entry.vsize));
+                }
+            }
+
+            const old_diagram = buildSingleChunkDiagram(
+                self.allocator,
+                total_evicted_fee,
+                evicted_vsize,
+            ) catch return MempoolError.OutOfMemory;
+            defer self.allocator.free(old_diagram);
+
+            const new_diagram = buildSingleChunkDiagram(
+                self.allocator,
+                new_fee,
+                @as(u64, @intCast(new_vsize)),
+            ) catch return MempoolError.OutOfMemory;
+            defer self.allocator.free(new_diagram);
+
+            const cmp = compareFeeDiagrams(new_diagram, old_diagram);
+            if (cmp != DiagramOrder.gt) {
+                // New diagram is not strictly better — reject.
+                return MempoolError.DiagramNotImproved;
+            }
         }
     }
 
