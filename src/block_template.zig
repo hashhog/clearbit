@@ -476,6 +476,14 @@ fn constructCoinbaseWithCommitment(
     // Encode height as minimal CScriptNum push (BIP-34)
     try encodeHeightPush(&script_sig, height);
 
+    // Consensus rule: coinbase scriptSig must be at least 2 bytes (bad-cb-length,
+    // tx_check.cpp:49).  For heights 1..16 the BIP-34 height push is a single
+    // OP_N byte.  Append an OP_0 dummy extranonce to reach the minimum length,
+    // mirroring Bitcoin Core miner.cpp:187-193 include_dummy_extranonce logic.
+    if (script_sig.items.len < 2) {
+        try script_sig.append(0x00); // OP_0 dummy extranonce
+    }
+
     // Append extra data (pool name, etc.)
     if (extra_data.len > 0) {
         // Limit extra data to keep scriptSig under 100 bytes
@@ -599,12 +607,31 @@ fn constructCoinbase(
     );
 }
 
+/// Build the full coinbase scriptSig for a block at the given height.
+///
+/// Encodes the BIP-34 height push and appends an OP_0 dummy extranonce when
+/// necessary to satisfy the 2-byte minimum (bad-cb-length consensus rule).
+/// Returns a caller-owned slice; free with allocator.free().
+pub fn buildCoinbaseScriptSig(height: u32, extra: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    var script = std.ArrayList(u8).init(allocator);
+    errdefer script.deinit();
+    try encodeHeightPush(&script, height);
+    if (script.items.len < 2) {
+        try script.append(0x00); // OP_0 dummy extranonce (bad-cb-length guard)
+    }
+    if (extra.len > 0) {
+        const max_extra = @min(extra.len, 96 - script.items.len);
+        try script.appendSlice(extra[0..max_extra]);
+    }
+    return script.toOwnedSlice();
+}
+
 /// Encode a block height as a minimal CScriptNum push (BIP-34).
 ///
 /// This pushes the height as a minimal-encoded signed integer:
 /// - Heights 0-16 use OP_0 through OP_16
 /// - Other heights use a minimal byte push
-fn encodeHeightPush(script: *std.ArrayList(u8), height: u32) !void {
+pub fn encodeHeightPush(script: *std.ArrayList(u8), height: u32) !void {
     if (height == 0) {
         // OP_0
         try script.append(0x00);
@@ -1972,6 +1999,79 @@ test "height encoding BIP-34" {
         try std.testing.expectEqual(@as(u8, 0x20), script.items[1]); // LSB
         try std.testing.expectEqual(@as(u8, 0xA1), script.items[2]);
         try std.testing.expectEqual(@as(u8, 0x07), script.items[3]); // MSB
+    }
+}
+
+test "coinbase scriptSig >=2 bytes at heights 1-16 (bad-cb-length fix, W108 BUG-20)" {
+    // Consensus: coinbase scriptSig must be 2..100 bytes (tx_check.cpp:49).
+    // Heights 1-16: encodeHeightPush emits one OP_N byte.  The
+    // constructCoinbaseWithCommitment path must append OP_0 to reach 2 bytes.
+    const allocator = std.testing.allocator;
+    const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+
+    const heights_to_test = [_]u32{ 1, 2, 8, 16 };
+    for (heights_to_test) |h| {
+        const coinbase = try constructCoinbase(h, 0, "", &payout, false, &consensus.MAINNET, allocator);
+        defer {
+            allocator.free(coinbase.script_sig);
+            allocator.free(coinbase.outputs);
+            allocator.free(coinbase.inputs);
+        }
+        try std.testing.expect(coinbase.script_sig.len >= 2);
+        // First byte should still be the OP_N height encoding (0x51..0x60)
+        try std.testing.expectEqual(@as(u8, 0x50) + @as(u8, @intCast(h)), coinbase.script_sig[0]);
+        // Second byte should be OP_0 dummy extranonce
+        try std.testing.expectEqual(@as(u8, 0x00), coinbase.script_sig[1]);
+    }
+}
+
+test "coinbase scriptSig CScriptNum sign-bit padding at height 128+ (W108 BUG-20 sign-bit)" {
+    // Heights with MSB set (e.g. 128 = 0x80) require a zero sign byte appended
+    // to indicate the value is positive.  Verify heights 128, 255, 256 encode
+    // correctly as multi-byte CScriptNum pushes with sign-bit padding.
+    const allocator = std.testing.allocator;
+    const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20;
+
+    // height=128: CScriptNum encoding: push 2 bytes [0x80, 0x00] → [0x02, 0x80, 0x00]
+    {
+        const coinbase = try constructCoinbase(128, 0, "", &payout, false, &consensus.MAINNET, allocator);
+        defer {
+            allocator.free(coinbase.script_sig);
+            allocator.free(coinbase.outputs);
+            allocator.free(coinbase.inputs);
+        }
+        try std.testing.expect(coinbase.script_sig.len >= 2);
+        try std.testing.expectEqual(@as(u8, 0x02), coinbase.script_sig[0]); // push 2 bytes
+        try std.testing.expectEqual(@as(u8, 0x80), coinbase.script_sig[1]); // 128 LE
+        try std.testing.expectEqual(@as(u8, 0x00), coinbase.script_sig[2]); // sign byte
+    }
+
+    // height=255: 0xFF has high bit set → push [0xFF, 0x00]
+    {
+        const coinbase = try constructCoinbase(255, 0, "", &payout, false, &consensus.MAINNET, allocator);
+        defer {
+            allocator.free(coinbase.script_sig);
+            allocator.free(coinbase.outputs);
+            allocator.free(coinbase.inputs);
+        }
+        try std.testing.expect(coinbase.script_sig.len >= 2);
+        try std.testing.expectEqual(@as(u8, 0x02), coinbase.script_sig[0]); // push 2 bytes
+        try std.testing.expectEqual(@as(u8, 0xFF), coinbase.script_sig[1]); // 255 LE
+        try std.testing.expectEqual(@as(u8, 0x00), coinbase.script_sig[2]); // sign byte
+    }
+
+    // height=256: 0x0100, high bit of LSB not set → push [0x00, 0x01]
+    {
+        const coinbase = try constructCoinbase(256, 0, "", &payout, false, &consensus.MAINNET, allocator);
+        defer {
+            allocator.free(coinbase.script_sig);
+            allocator.free(coinbase.outputs);
+            allocator.free(coinbase.inputs);
+        }
+        try std.testing.expect(coinbase.script_sig.len >= 2);
+        try std.testing.expectEqual(@as(u8, 0x02), coinbase.script_sig[0]); // push 2 bytes
+        try std.testing.expectEqual(@as(u8, 0x00), coinbase.script_sig[1]); // 256 LSB
+        try std.testing.expectEqual(@as(u8, 0x01), coinbase.script_sig[2]); // 256 MSB
     }
 }
 
