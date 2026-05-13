@@ -418,6 +418,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w108_tests.step);
     }
 
+    // W109 — CChain + CBlockIndex + CBlockTreeDB + block-file storage 30-gate audit.
+    {
+        const w109_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w109_block_index.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w109"},
+        });
+        w109_tests.linkSystemLibrary("rocksdb");
+        w109_tests.linkSystemLibrary("secp256k1");
+        w109_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w109_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w109_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w109_tests.linkSystemLibrary("minisketch");
+            w109_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w109_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w109_tests = b.addRunArtifact(w109_tests);
+        const w109_test_step = b.step("test-w109", "Run W109 CChain + CBlockIndex + CBlockTreeDB + block-file storage 30-gate audit tests");
+        w109_test_step.dependOn(&run_w109_tests.step);
+        // Fold into the main `test` step so CI exercises W109.
+        test_step.dependOn(&run_w109_tests.step);
+    }
+
     // W106 — CTxMemPool descendant/ancestor + RBF + package mempool 30-gate audit.
     {
         const w106_tests = b.addTest(.{
