@@ -2192,6 +2192,7 @@ pub const ChainState = struct {
     pub const PendingBlockWrite = struct {
         hash: types.Hash256,
         bytes: []u8,
+        height: u32,
     };
 
     pub const PendingUndoWrite = struct {
@@ -2463,6 +2464,7 @@ pub const ChainState = struct {
         try self.pending_block_writes.append(.{
             .hash = hash.*,
             .bytes = bytes,
+            .height = height,
         });
     }
 
@@ -4491,6 +4493,106 @@ pub const ChainState = struct {
                 .key = k,
                 .value = entry.bytes,
             } });
+        }
+
+        // 6b. Block index status bits: BLOCK_HAVE_DATA (bit 1 in clearbit's
+        //     BlockStatus packed struct) and BLOCK_HAVE_UNDO (bit 2).
+        //
+        //     Bitcoin Core analog: ReceiveBlockTransactions sets
+        //     pindexNew->nStatus |= BLOCK_HAVE_DATA after writing block data
+        //     (validation.cpp:3784), and WriteUndoData sets
+        //     block.nStatus |= BLOCK_HAVE_UNDO after writing undo data
+        //     (node/blockstorage.cpp:1029).
+        //
+        //     Without these, isValidCandidate() always returns false for
+        //     IBD-connected blocks (BUG-17), and prune / AssumeUTXO snapshot
+        //     validation cannot determine which blocks have on-disk data.
+        //
+        //     We set both flags here, atomically with the CF_BLOCKS /
+        //     CF_BLOCK_UNDO writes above.  A block that appears in
+        //     pending_undo_writes also appears in pending_block_writes (since
+        //     connectBlockFastWithUndo always calls queueBlockWrite AND queues
+        //     undo).  Build a set of hashes that have undo data so we can OR
+        //     the correct flags in a single write per block.
+        //
+        //     Bit positions in clearbit's BlockStatus packed struct(u32):
+        //       bit 0 = valid_header
+        //       bit 1 = has_data  (BLOCK_HAVE_DATA)
+        //       bit 2 = has_undo  (BLOCK_HAVE_UNDO)
+        {
+            // Collect hashes that have undo data in this flush window.
+            // Using a temporary HashMap keyed by hash so the block-write
+            // loop below can check membership in O(1).
+            var undo_set = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+            defer undo_set.deinit();
+            for (self.pending_undo_writes.items) |uw| {
+                try undo_set.put(uw.hash, {});
+            }
+
+            for (self.pending_block_writes.items) |bw| {
+                // Parse the block header from the first 80 bytes of the
+                // serialized block body so we can populate the index record.
+                var rdr = serialize.Reader{ .data = bw.bytes };
+                const blk_header = serialize.readBlockHeader(&rdr) catch continue;
+
+                // Determine which status bits to set.
+                const has_undo_this_block = undo_set.contains(bw.hash);
+                // Bit 1 = has_data, bit 2 = has_undo (clearbit packed layout).
+                const new_status_bits: u32 = @as(u32, 1 << 1) |
+                    (if (has_undo_this_block) @as(u32, 1 << 2) else @as(u32, 0));
+
+                // Read back the existing CF_BLOCK_INDEX entry so we can
+                // preserve chain_work, sequence_id, file_number, file_offset
+                // fields that may have been set by ChainManager.persistBlockStatus.
+                // If no entry exists (normal IBD fast path), start from zeros.
+                var rec = ChainStore.BlockIndexRecord{
+                    .height = bw.height,
+                    .header = blk_header,
+                    .status = new_status_bits,
+                    .chain_work = [_]u8{0} ** 32,
+                    .sequence_id = 0,
+                    .file_number = 0,
+                    .file_offset = 0,
+                };
+                if (db.get(CF_BLOCK_INDEX, &bw.hash) catch null) |existing| {
+                    defer self.allocator.free(existing);
+                    var er = serialize.Reader{ .data = existing };
+                    _ = er.readInt(u32) catch {}; // skip stored height
+                    _ = serialize.readBlockHeader(&er) catch {};
+                    const existing_status = er.readInt(u32) catch 0;
+                    // OR in the new bits, preserve any existing bits.
+                    rec.status = existing_status | new_status_bits;
+                    if (er.readBytes(32) catch null) |cw| {
+                        @memcpy(&rec.chain_work, cw[0..32]);
+                    }
+                    rec.sequence_id = er.readInt(i64) catch 0;
+                    rec.file_number = er.readInt(u32) catch 0;
+                    rec.file_offset = er.readInt(u64) catch 0;
+                }
+
+                // Serialize the updated record and add it to the batch.
+                var w = serialize.Writer.init(self.allocator);
+                defer w.deinit();
+                w.writeInt(u32, rec.height) catch continue;
+                serialize.writeBlockHeader(&w, &rec.header) catch continue;
+                w.writeInt(u32, rec.status) catch continue;
+                w.writeBytes(&rec.chain_work) catch continue;
+                w.writeInt(i64, rec.sequence_id) catch continue;
+                w.writeInt(u32, rec.file_number) catch continue;
+                w.writeInt(u64, rec.file_offset) catch continue;
+
+                const v = w.toOwnedSlice() catch continue;
+                const idx_k = self.allocator.alloc(u8, 32) catch {
+                    self.allocator.free(@constCast(v));
+                    continue;
+                };
+                @memcpy(idx_k, &bw.hash);
+                try batch.append(.{ .put = .{
+                    .cf = CF_BLOCK_INDEX,
+                    .key = idx_k,
+                    .value = @constCast(v),
+                } });
+            }
         }
 
         // 7. Pending CF_TX_INDEX deletes (Pattern C revert) — append BEFORE
