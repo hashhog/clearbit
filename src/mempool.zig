@@ -1477,6 +1477,81 @@ pub const Mempool = struct {
 
     /// Remove a transaction from the mempool (e.g., when mined).
     pub fn removeTransaction(self: *Mempool, txid_hash: types.Hash256) void {
+        // Snapshot size/fee BEFORE removal so we can update ancestor/descendant stats.
+        const removed_vsize: usize = if (self.entries.get(txid_hash)) |e| e.vsize else 0;
+        const removed_fee: i64 = if (self.entries.get(txid_hash)) |e| e.fee else 0;
+
+        // BUG-1 fix: walk the transitive ancestor set and decrement each ancestor's
+        // descendant_count/descendant_size/descendant_fees (mirrors updateDescendantCounts
+        // in reverse).  Must happen before fetchRemove so parent entries are still present.
+        if (removed_vsize > 0) {
+            if (self.entries.get(txid_hash)) |removed_entry| {
+                var visited_anc = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+                defer visited_anc.deinit();
+                var queue_anc = std.ArrayList(types.Hash256).init(self.allocator);
+                defer queue_anc.deinit();
+
+                for (removed_entry.tx.inputs) |input| {
+                    const parent_txid = input.previous_output.hash;
+                    if (self.entries.contains(parent_txid) and !visited_anc.contains(parent_txid)) {
+                        visited_anc.put(parent_txid, {}) catch {};
+                        queue_anc.append(parent_txid) catch {};
+                    }
+                }
+                while (queue_anc.items.len > 0) {
+                    const cur = queue_anc.orderedRemove(0);
+                    if (self.entries.getPtr(cur)) |anc_ptr| {
+                        if (anc_ptr.*.descendant_count > 0) anc_ptr.*.descendant_count -= 1;
+                        anc_ptr.*.descendant_size -|= removed_vsize;
+                        anc_ptr.*.descendant_fees -= removed_fee;
+                        for (anc_ptr.*.tx.inputs) |input| {
+                            const gp = input.previous_output.hash;
+                            if (self.entries.contains(gp) and !visited_anc.contains(gp)) {
+                                visited_anc.put(gp, {}) catch {};
+                                queue_anc.append(gp) catch {};
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // BUG-8 fix: walk the transitive descendant set (in-mempool children) and
+        // decrement each descendant's ancestor_count/ancestor_size/ancestor_fees.
+        // This ensures that when a parent is confirmed (removeForBlock), its children
+        // see their ancestor_count drop by 1.
+        if (removed_vsize > 0) {
+            var visited_desc = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+            defer visited_desc.deinit();
+            var queue_desc = std.ArrayList(types.Hash256).init(self.allocator);
+            defer queue_desc.deinit();
+
+            if (self.children.get(txid_hash)) |children_list| {
+                for (children_list.items) |child_txid| {
+                    if (!visited_desc.contains(child_txid)) {
+                        visited_desc.put(child_txid, {}) catch {};
+                        queue_desc.append(child_txid) catch {};
+                    }
+                }
+            }
+            while (queue_desc.items.len > 0) {
+                const cur = queue_desc.orderedRemove(0);
+                if (self.entries.getPtr(cur)) |desc_ptr| {
+                    if (desc_ptr.*.ancestor_count > 0) desc_ptr.*.ancestor_count -= 1;
+                    desc_ptr.*.ancestor_size -|= removed_vsize;
+                    desc_ptr.*.ancestor_fees -= removed_fee;
+                    if (self.children.get(cur)) |gc_list| {
+                        for (gc_list.items) |gc_txid| {
+                            if (!visited_desc.contains(gc_txid)) {
+                                visited_desc.put(gc_txid, {}) catch {};
+                                queue_desc.append(gc_txid) catch {};
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         const entry_ptr = self.entries.fetchRemove(txid_hash);
         if (entry_ptr) |kv| {
             const entry = kv.value;
