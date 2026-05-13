@@ -8,6 +8,12 @@
 //!
 //! The cache uses a hash map with random eviction when full.
 //! It is cleared on block disconnects to ensure consistency.
+//!
+//! W105 G19/G20 fix: cache key is now SHA256(nonce || sighash || pubkey || sig || flags_le)
+//! — a per-startup CSPRNG nonce prevents HashDoS, and committing to actual
+//! signature + pubkey bytes prevents cache-collision attacks.
+//! Reference: bitcoin-core/src/script/sigcache.h (CSignatureCache random 256-bit
+//! nonce, key = SHA256(nonce || sig || pubkey || hash || flags)).
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -28,50 +34,28 @@ pub const MIN_ENTRIES: usize = 1_000;
 pub const MAX_ENTRIES: usize = 1_000_000;
 
 // ============================================================================
-// Cache Key
+// Cache Key (opaque 64-bit hash)
 // ============================================================================
 
-/// Key for signature cache lookups.
-/// Uniquely identifies a signature verification by:
-/// - Transaction ID being verified
-/// - Input index within the transaction
-/// - Script verification flags (different flags = different result)
+/// A 64-bit opaque cache key derived from SHA256 of all sig material.
+/// The full entropy lives in the 256-bit hash; we use the first 8 bytes
+/// as the HashMap key (collision probability is negligible).
+///
+/// This type is kept public so that the W105 audit tests can reference
+/// the module-level constant name `CacheKey`, but callers MUST use
+/// SigCache.lookup / SigCache.insert — never construct a key by hand.
 pub const CacheKey = struct {
-    /// TXID of the transaction containing the signature.
-    txid: [32]u8,
-    /// Index of the input being verified.
-    input_index: u32,
-    /// Script verification flags used during verification.
-    /// Different flags can produce different verification results.
-    flags: u32,
+    /// First 8 bytes of SHA256(nonce || sighash || pubkey || sig || flags_le).
+    raw: u64,
 
-    /// Compute a 64-bit hash of the cache key for HashMap.
+    /// HashMap hash: the raw value is already a cryptographic hash, so return it.
     pub fn hash(self: CacheKey) u64 {
-        // Use SipHash-style mixing for security and quality
-        var h: u64 = 0xcbf29ce484222325; // FNV offset basis
-
-        // Mix in txid (32 bytes)
-        for (self.txid) |b| {
-            h ^= @as(u64, b);
-            h *%= 0x100000001b3; // FNV prime
-        }
-
-        // Mix in input_index
-        h ^= @as(u64, self.input_index);
-        h *%= 0x100000001b3;
-
-        // Mix in flags
-        h ^= @as(u64, self.flags);
-        h *%= 0x100000001b3;
-
-        return h;
+        return self.raw;
     }
 
     /// Equality comparison for HashMap.
     pub fn eql(a: CacheKey, b: CacheKey) bool {
-        return std.mem.eql(u8, &a.txid, &b.txid) and
-            a.input_index == b.input_index and
-            a.flags == b.flags;
+        return a.raw == b.raw;
     }
 };
 
@@ -98,6 +82,13 @@ pub const CacheKeyContext = struct {
 /// be re-verified).
 ///
 /// Thread-safety is provided by a mutex that protects all operations.
+///
+/// Security: a 32-byte CSPRNG nonce is generated at init() time and mixed into
+/// every key via SHA256, preventing:
+///   - HashDoS: attacker cannot pre-compute colliding keys (G20 fix).
+///   - Collision attacks: keys commit to the actual sig + pubkey bytes, so a
+///     forged signature on the same (txid, index, flags) cannot get a cache hit
+///     (G19 fix).
 pub const SigCache = struct {
     /// Hash map storing verified entries.
     /// Value is void since we only care about presence (successful verification).
@@ -112,6 +103,11 @@ pub const SigCache = struct {
     /// Allocator for hash map operations.
     allocator: std.mem.Allocator,
 
+    /// Per-startup 32-byte CSPRNG nonce.
+    /// Mixed into every key via SHA256, preventing HashDoS and pre-computation.
+    /// Reference: sigcache.h — CSignatureCache random 256-bit nonce.
+    nonce: [32]u8,
+
     /// Statistics: cache hits.
     hits: std.atomic.Value(u64),
 
@@ -125,13 +121,17 @@ pub const SigCache = struct {
     evictions: std.atomic.Value(u64),
 
     /// Initialize a new signature cache.
+    /// Generates a fresh CSPRNG nonce for this cache instance.
     pub fn init(allocator: std.mem.Allocator, max_entries: usize) SigCache {
         const capped_max = @max(MIN_ENTRIES, @min(max_entries, MAX_ENTRIES));
+        var nonce: [32]u8 = undefined;
+        std.crypto.random.bytes(&nonce);
         return SigCache{
             .entries = std.HashMap(CacheKey, void, CacheKeyContext, 80).init(allocator),
             .max_entries = capped_max,
             .mutex = std.Thread.Mutex{},
             .allocator = allocator,
+            .nonce = nonce,
             .hits = std.atomic.Value(u64).init(0),
             .misses = std.atomic.Value(u64).init(0),
             .insertions = std.atomic.Value(u64).init(0),
@@ -146,17 +146,56 @@ pub const SigCache = struct {
         self.entries.deinit();
     }
 
+    /// Compute the salted cache key for a signature verification.
+    ///
+    /// key = first 8 bytes of SHA256(nonce || sighash || pubkey_bytes || sig_bytes || flags_le)
+    ///
+    /// This matches Core's CSignatureCache::ComputeEntryECDSA / ComputeEntrySchnorr
+    /// pattern: all material that distinguishes a valid signature is committed to,
+    /// and the random nonce prevents pre-computation of collisions.
+    ///
+    /// Marked pub so W105 G20 audit tests can verify the nonce randomness property.
+    pub fn computeKey(
+        self: *const SigCache,
+        sighash: [32]u8,
+        pubkey_bytes: []const u8,
+        sig_bytes: []const u8,
+        flags: u32,
+    ) CacheKey {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(&self.nonce);
+        h.update(&sighash);
+        h.update(pubkey_bytes);
+        h.update(sig_bytes);
+        var flags_le: [4]u8 = undefined;
+        std.mem.writeInt(u32, &flags_le, flags, .little);
+        h.update(&flags_le);
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        return CacheKey{ .raw = std.mem.readInt(u64, digest[0..8], .little) };
+    }
+
     /// Look up a signature verification result in the cache.
+    ///
+    /// Parameters:
+    ///   sighash      — the 32-byte sighash (txid or taproot sighash) for this input
+    ///   pubkey_bytes — raw public key bytes (33 bytes compressed, 65 uncompressed,
+    ///                  or 32 bytes x-only for Schnorr)
+    ///   sig_bytes    — raw DER/compact signature bytes
+    ///   flags        — script verification flags
+    ///
     /// Returns true if the signature was previously verified successfully.
-    pub fn lookup(self: *SigCache, txid: [32]u8, input_index: u32, flags: u32) bool {
+    pub fn lookup(
+        self: *SigCache,
+        sighash: [32]u8,
+        pubkey_bytes: []const u8,
+        sig_bytes: []const u8,
+        flags: u32,
+    ) bool {
+        const key = self.computeKey(sighash, pubkey_bytes, sig_bytes, flags);
+
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        const key = CacheKey{
-            .txid = txid,
-            .input_index = input_index,
-            .flags = flags,
-        };
 
         if (self.entries.contains(key)) {
             _ = self.hits.fetchAdd(1, .monotonic);
@@ -169,15 +208,19 @@ pub const SigCache = struct {
 
     /// Insert a successful signature verification into the cache.
     /// If the cache is full, a random entry is evicted.
-    pub fn insert(self: *SigCache, txid: [32]u8, input_index: u32, flags: u32) void {
+    ///
+    /// Parameters mirror those of lookup().
+    pub fn insert(
+        self: *SigCache,
+        sighash: [32]u8,
+        pubkey_bytes: []const u8,
+        sig_bytes: []const u8,
+        flags: u32,
+    ) void {
+        const key = self.computeKey(sighash, pubkey_bytes, sig_bytes, flags);
+
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        const key = CacheKey{
-            .txid = txid,
-            .input_index = input_index,
-            .flags = flags,
-        };
 
         // Check if already present
         if (self.entries.contains(key)) {
@@ -273,25 +316,32 @@ test "signature cache basic operations" {
     var cache = SigCache.init(allocator, 100);
     defer cache.deinit();
 
-    const txid = [_]u8{0x01} ** 32;
+    const sighash = [_]u8{0x01} ** 32;
+    const pubkey = [_]u8{0x02} ++ [_]u8{0xAB} ** 32; // compressed pubkey
+    const sig = [_]u8{0x30, 0x44} ++ [_]u8{0x55} ** 68; // DER sig
     const flags: u32 = 0x1F;
 
     // Initially not in cache
-    try std.testing.expect(!cache.lookup(txid, 0, flags));
+    try std.testing.expect(!cache.lookup(sighash, &pubkey, &sig, flags));
 
     // Insert and verify lookup succeeds
-    cache.insert(txid, 0, flags);
-    try std.testing.expect(cache.lookup(txid, 0, flags));
+    cache.insert(sighash, &pubkey, &sig, flags);
+    try std.testing.expect(cache.lookup(sighash, &pubkey, &sig, flags));
 
-    // Different input index should not match
-    try std.testing.expect(!cache.lookup(txid, 1, flags));
+    // Different pubkey should not match
+    const pubkey2 = [_]u8{0x03} ++ [_]u8{0xAB} ** 32;
+    try std.testing.expect(!cache.lookup(sighash, &pubkey2, &sig, flags));
+
+    // Different sig should not match
+    const sig2 = [_]u8{0x30, 0x45} ++ [_]u8{0x55} ** 69;
+    try std.testing.expect(!cache.lookup(sighash, &pubkey, &sig2, flags));
 
     // Different flags should not match
-    try std.testing.expect(!cache.lookup(txid, 0, 0xFF));
+    try std.testing.expect(!cache.lookup(sighash, &pubkey, &sig, 0xFF));
 
     // Clear should remove all entries
     cache.clear();
-    try std.testing.expect(!cache.lookup(txid, 0, flags));
+    try std.testing.expect(!cache.lookup(sighash, &pubkey, &sig, flags));
 }
 
 test "signature cache eviction" {
@@ -303,10 +353,12 @@ test "signature cache eviction" {
 
     // Fill the cache
     for (0..MIN_ENTRIES + 10) |i| {
-        var txid: [32]u8 = [_]u8{0} ** 32;
-        txid[0] = @intCast(i & 0xFF);
-        txid[1] = @intCast((i >> 8) & 0xFF);
-        cache.insert(txid, 0, 0);
+        var sighash: [32]u8 = [_]u8{0} ** 32;
+        sighash[0] = @intCast(i & 0xFF);
+        sighash[1] = @intCast((i >> 8) & 0xFF);
+        const pubkey = [_]u8{0x02} ++ [_]u8{0x01} ** 32;
+        const sig = [_]u8{0x30} ++ [_]u8{0x01} ** 10;
+        cache.insert(sighash, &pubkey, &sig, 0);
     }
 
     // Count should not exceed max
@@ -323,16 +375,18 @@ test "signature cache statistics" {
     var cache = SigCache.init(allocator, 100);
     defer cache.deinit();
 
-    const txid = [_]u8{0x42} ** 32;
+    const sighash = [_]u8{0x42} ** 32;
+    const pubkey = [_]u8{0x02} ++ [_]u8{0x99} ** 32;
+    const sig = [_]u8{0x30} ++ [_]u8{0x55} ** 10;
 
     // Miss
-    _ = cache.lookup(txid, 0, 0);
+    _ = cache.lookup(sighash, &pubkey, &sig, 0);
 
     // Insert
-    cache.insert(txid, 0, 0);
+    cache.insert(sighash, &pubkey, &sig, 0);
 
     // Hit
-    _ = cache.lookup(txid, 0, 0);
+    _ = cache.lookup(sighash, &pubkey, &sig, 0);
 
     const stats = cache.getStats();
     try std.testing.expectEqual(@as(u64, 1), stats.hits);
@@ -348,28 +402,90 @@ test "signature cache statistics" {
 }
 
 test "cache key hash quality" {
-    // Test that different keys produce different hashes
-    var hashes: [100]u64 = undefined;
+    // Test that different sig material produces different keys
+    var cache = SigCache.init(std.testing.allocator, 100);
+    defer cache.deinit();
 
+    var keys: [100]CacheKey = undefined;
     for (0..100) |i| {
-        var txid: [32]u8 = [_]u8{0} ** 32;
-        txid[0] = @intCast(i);
-        const key = CacheKey{
-            .txid = txid,
-            .input_index = 0,
-            .flags = 0,
-        };
-        hashes[i] = key.hash();
+        var sighash: [32]u8 = [_]u8{0} ** 32;
+        sighash[0] = @intCast(i);
+        const pubkey = [_]u8{0x02} ++ [_]u8{0x01} ** 32;
+        const sig = [_]u8{0x30} ++ [_]u8{0x01} ** 10;
+        keys[i] = cache.computeKey(sighash, &pubkey, &sig, 0);
     }
 
-    // Check for collisions (should be rare with good hash)
+    // Check for collisions (should be rare with a cryptographic hash)
     var collisions: usize = 0;
     for (0..100) |i| {
         for (i + 1..100) |j| {
-            if (hashes[i] == hashes[j]) collisions += 1;
+            if (keys[i].raw == keys[j].raw) collisions += 1;
         }
     }
 
-    // With a good hash function, we should have very few collisions
-    try std.testing.expect(collisions < 5);
+    // With SHA256 as the hash, collisions across 100 distinct inputs are impossible
+    try std.testing.expect(collisions == 0);
+}
+
+// ============================================================================
+// W105 G19 + G20 fixed tests
+// ============================================================================
+
+// W105 G19 FIX: cache key now commits to sig + pubkey bytes.
+// A different signature on the same (sighash, index, flags) must be a MISS.
+test "w105 G19 fixed: different sig/pubkey bytes produce different cache key (no collision)" {
+    var cache = SigCache.init(std.testing.allocator, 100);
+    defer cache.deinit();
+
+    const sighash = [_]u8{0x01} ** 32;
+    const flags: u32 = 0x1F;
+
+    // Two different pubkeys for the same sighash+flags
+    const pubkey_a = [_]u8{0x02} ++ [_]u8{0xAA} ** 32;
+    const pubkey_b = [_]u8{0x02} ++ [_]u8{0xBB} ** 32;
+    const sig_a = [_]u8{0x30, 0x44} ++ [_]u8{0xCC} ** 68;
+    const sig_b = [_]u8{0x30, 0x44} ++ [_]u8{0xDD} ** 68;
+
+    // Insert using (sighash, pubkey_a, sig_a, flags)
+    cache.insert(sighash, &pubkey_a, &sig_a, flags);
+    try std.testing.expect(cache.lookup(sighash, &pubkey_a, &sig_a, flags));
+
+    // A different pubkey on the same sighash must be a MISS (G19 fix).
+    // Before the fix, CacheKey was (txid, index, flags) — no sig/pubkey —
+    // so this would have returned a cache HIT, bypassing verification.
+    try std.testing.expect(!cache.lookup(sighash, &pubkey_b, &sig_a, flags));
+
+    // A different sig on the same sighash must also be a MISS (G19 fix).
+    try std.testing.expect(!cache.lookup(sighash, &pubkey_a, &sig_b, flags));
+
+    // A completely different (pubkey, sig) pair must be a MISS.
+    try std.testing.expect(!cache.lookup(sighash, &pubkey_b, &sig_b, flags));
+}
+
+// W105 G20 FIX: per-startup CSPRNG nonce in cache key prevents HashDoS.
+// Two SigCache instances (each with a fresh nonce) must produce DIFFERENT
+// keys for the same input material.
+test "w105 G20 fixed: CSPRNG nonce means different cache instances produce different keys" {
+    // Two independent caches — each call to init() generates a fresh CSPRNG nonce.
+    var cache_a = SigCache.init(std.testing.allocator, 100);
+    defer cache_a.deinit();
+    var cache_b = SigCache.init(std.testing.allocator, 100);
+    defer cache_b.deinit();
+
+    const sighash = [_]u8{0x01} ** 32;
+    const pubkey = [_]u8{0x02} ++ [_]u8{0xAB} ** 32;
+    const sig = [_]u8{0x30, 0x44} ++ [_]u8{0x55} ** 68;
+    const flags: u32 = 0x1F;
+
+    // Nonces are different (probability of collision is 1/2^256)
+    try std.testing.expect(!std.mem.eql(u8, &cache_a.nonce, &cache_b.nonce));
+
+    // Keys for the same material differ between cache instances (non-deterministic)
+    const key_a = cache_a.computeKey(sighash, &pubkey, &sig, flags);
+    const key_b = cache_b.computeKey(sighash, &pubkey, &sig, flags);
+    try std.testing.expect(key_a.raw != key_b.raw);
+
+    // Within the same cache, identical material always produces the same key
+    const key_a2 = cache_a.computeKey(sighash, &pubkey, &sig, flags);
+    try std.testing.expectEqual(key_a.raw, key_a2.raw);
 }
