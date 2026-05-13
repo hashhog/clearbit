@@ -356,6 +356,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w105_tests.step);
     }
 
+    // W106 — CTxMemPool descendant/ancestor + RBF + package mempool 30-gate audit.
+    {
+        const w106_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w106_mempool.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w106"},
+        });
+        w106_tests.linkSystemLibrary("rocksdb");
+        w106_tests.linkSystemLibrary("secp256k1");
+        w106_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w106_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w106_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w106_tests.linkSystemLibrary("minisketch");
+            w106_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w106_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w106_tests = b.addRunArtifact(w106_tests);
+        const w106_test_step = b.step("test-w106", "Run W106 CTxMemPool descendant/ancestor + RBF + package 30-gate audit tests");
+        w106_test_step.dependOn(&run_w106_tests.step);
+        // Fold into the main `test` step so CI exercises W106.
+        test_step.dependOn(&run_w106_tests.step);
+    }
+
     // RPC tests run via `tests_rpc.zig` at the project root. The main
     // `tests.zig` root cannot pull in `rpc.zig` because doing so transitively
     // imports `wallet.zig`, whose `@embedFile("../resources/bip39-english.txt")`
