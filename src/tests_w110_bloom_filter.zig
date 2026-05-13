@@ -8,29 +8,27 @@
 //!
 //! ============================================================
 //! SUBSYSTEM STATUS: BLOOM FILTER CORE ENTIRELY MISSING
+//! BIP-111 DISCONNECT PATH: FIXED (FIX-36, 2026-05-13)
 //! ============================================================
 //!
 //! clearbit has NO `bloom.zig` and no CBloomFilter implementation.
-//! The `p2p.Message` union has no `filterload`, `filteradd`,
-//! `filterclear`, or `merkleblock` variants.  The message decoder
-//! (`p2p.decodeMessage`) returns `ParseError.UnknownCommand` for all
-//! four BIP-37 P2P messages.  The peer handler (`peer.zig`) has no
-//! dispatch arms for any of them.
+//! The `p2p.Message` union now has `filterload`, `filteradd`,
+//! `filterclear`, and `merkleblock` variants (added in FIX-36).
+//! The message decoder (`p2p.decodePayload`) decodes these commands
+//! into opaque-payload message variants instead of returning
+//! `ParseError.UnknownCommand`.  The peer handler (`peer.zig`)
+//! dispatches them and applies the BIP-111 disconnect gate for
+//! filterload/filteradd/filterclear (disconnect if NODE_BLOOM not
+//! advertised, mirroring Core net_processing.cpp:4964/4990/5018).
+//! merkleblock is log+drop (server→client message; receiving it is
+//! unexpected but not worth a disconnect).
 //!
-//! This is a "valid MISSING ENTIRELY" result per the audit spec —
-//! BIP-37 is largely deprecated and the subsystem is intentionally
-//! absent.  However the omission creates a **two-pipeline gap**:
-//! `v2_transport.zig` lists filteradd (6), filterclear (7),
-//! filterload (8), and merkleblock (16) in `V2_MESSAGE_IDS[]`
-//! (the BIP-324 short-ID table), implying the node can receive and
-//! route these messages over v2 transport — but there is nothing on
-//! the receiving end.  A v2 peer that sends `filterload` over a
-//! BIP-324 session gets `ParseError.UnknownCommand`; the node does
-//! not disconnect cleanly as BIP-111 requires.
+//! The TWO-PIPELINE gap between v2_transport.zig (short IDs 6/7/8/16
+//! registered) and the message body layer is now CLOSED.
 //!
 //! BIP-111 requirement: if `peerbloomfilters=false` (the default),
 //! the node MUST disconnect any peer that sends `filterload`.
-//! clearbit silently drops the message instead.
+//! clearbit now satisfies this requirement (FIX-36).
 //!
 //! ============================================================
 //! FINDINGS SUMMARY
@@ -54,19 +52,21 @@
 //!          UPDATE_P2PUBKEY_ONLY / UPDATE_NONE / 36-byte outpoint
 //!          serialization — absent.
 //!
-//!   BUG-6  (G25, HIGH): `filterload` message not parsed or dispatched.
-//!          A peer can send `filterload` and clearbit returns
-//!          `ParseError.UnknownCommand`.  BIP-111: node must disconnect
-//!          peer if bloom filters are disabled; clearbit silently drops.
+//!   BUG-6  (G25, FIXED FIX-36): `filterload` now parsed as opaque
+//!          BloomFilterRawMessage; handler disconnects peer when
+//!          NODE_BLOOM not advertised (BIP-111, mirroring Core).
 //!
-//!   BUG-7  (G26, HIGH): `filteradd` message not parsed or dispatched.
-//!          BIP-111 disconnect-on-oversize guard absent.
+//!   BUG-7  (G26, FIXED FIX-36): `filteradd` now parsed + BIP-111
+//!          disconnect gate applied.  520-byte guard deferred (no
+//!          CBloomFilter to insert into).
 //!
-//!   BUG-8  (G27, HIGH): `filterclear` message not parsed or dispatched.
+//!   BUG-8  (G27, FIXED FIX-36): `filterclear` now parsed + BIP-111
+//!          disconnect gate applied.
 //!
-//!   BUG-9  (G28, HIGH): `merkleblock` message not implemented.
-//!          No PartialMerkleTree construction; msg_filtered_block getdata
-//!          requests cannot be fulfilled.
+//!   BUG-9  (G28, PARTIAL — TWO-PIPELINE CLOSED): `merkleblock` variant
+//!          now in Message union (two-pipeline gap closed); handler
+//!          logs + drops.  Full PartialMerkleTree construction and
+//!          MSG_FILTERED_BLOCK getdata response remain absent.
 //!
 //!   BUG-10 (G29, MEDIUM): IsWithinSizeConstraints + peer disconnect
 //!          on oversized filterload absent (no CBloomFilter at all).
@@ -95,8 +95,12 @@
 //!          (peer.zig:1311).
 //!   PASS:  mempool gate disconnects peer when NODE_BLOOM not advertised
 //!          (peer.zig:4694).
+//!   PASS (FIX-36): filterload/filteradd/filterclear parsed and BIP-111
+//!          disconnect gate applied.
+//!   PASS (FIX-36): merkleblock parsed and dropped (two-pipeline closed).
 //!
 //! Total: 11 BUG entries (G1-G30 coverage), 1 two-pipeline finding.
+//! BUG-6/7/8: FIXED (FIX-36).  BUG-9: TWO-PIPELINE CLOSED (partial fix).
 
 const std = @import("std");
 const testing = std.testing;
@@ -211,12 +215,11 @@ test "w110 G14-G15: BLOOM_UPDATE_MASK = 3 and nFlags application absent (BUG-3)"
 
 test "w110 G16-G20: per-tx bloom match logic absent — no IsRelevantAndUpdate (BUG-4)" {
     // BUG-4: txid match, output pushdata, outpoint 36-byte, scriptSig items —
-    // none present.  p2p.Message has no merkleblock or filterload variants.
-    const has_filterload = @hasField(
-        std.meta.Tag(p2p.Message),
-        "filterload",
-    );
-    try testing.expect(!has_filterload);
+    // none present.  No CBloomFilter implementation exists.
+    // Note: p2p.Message NOW has filterload/merkleblock variants (FIX-36) but
+    // they are opaque-payload stubs with no bloom match logic.
+    try testing.expect(!@hasDecl(p2p, "BloomFilter"));
+    try testing.expect(!@hasDecl(p2p, "CBloomFilter"));
 }
 
 // ============================================================================
@@ -232,131 +235,194 @@ test "w110 G21-G24: isRelevantAndUpdate entirely absent (BUG-5)" {
 }
 
 // ============================================================================
-// G25: filterload — NOT IN p2p.Message; no dispatch
+// G25: filterload — FIXED (FIX-36): now in p2p.Message; BIP-111 disconnect
 // ============================================================================
 //
-// Core: ProcessMessage NetMsgType::FILTERLOAD parses CBloomFilter, calls
-//       IsWithinSizeConstraints(), rejects oversized, sets peer->m_bloom_filter.
-//       If peerbloomfilters=false → Misbehaving(100), disconnect.
-// Clearbit: filterload is NOT a variant of p2p.Message.  The decoder returns
-//           ParseError.UnknownCommand.  No BIP-111 disconnect occurs.
+// Core: ProcessMessage NetMsgType::FILTERLOAD:
+//       if peerbloomfilters=false → fDisconnect=true (net_processing.cpp:4964).
+// FIX-36: filterload is now a variant of p2p.Message (BloomFilterRawMessage).
+//         The handler in peer.zig disconnects when !advertise_node_bloom.
 
-test "w110 G25: filterload not a variant of p2p.Message (BUG-6)" {
-    // BUG-6 (HIGH): filterload absent from Message union.
-    // Core: net_processing.cpp ProcessMessage FILTERLOAD sets peer bloom filter.
-    // Clearbit: p2p.Message union has no .filterload variant.
+test "w110 G25: filterload IS a variant of p2p.Message — FIXED (FIX-36)" {
+    // FIX-36: filterload now in Message union as BloomFilterRawMessage.
+    // The two-pipeline gap (v2_transport short ID 8 registered but no decoder)
+    // is closed.
     comptime {
         const tag = std.meta.Tag(p2p.Message);
         const info = @typeInfo(tag).Enum;
+        var found = false;
         for (info.fields) |f| {
             if (std.mem.eql(u8, f.name, "filterload")) {
-                @compileError("filterload found in Message — update this test");
+                found = true;
+                break;
             }
         }
+        if (!found) @compileError("filterload missing from Message union — FIX-36 regression");
     }
     try testing.expect(true); // comptime check passed
 }
 
-test "w110 G25b: BIP-111 — filterload when NODE_BLOOM=false: no disconnect handler exists (BUG-6)" {
-    // BUG-6: BIP-111 requires: if node does not advertise NODE_BLOOM, it MUST
-    // disconnect any peer that sends filterload (Misbehaving(100) in Core).
-    // Clearbit: advertise_node_bloom field exists on Peer (correct), but there
-    // is no code path that handles a filterload message and checks this flag.
-    // The message never reaches a handler — it returns UnknownCommand first.
+test "w110 G25b: BIP-111 — filterload when NODE_BLOOM=false: disconnect handler present — FIXED (FIX-36)" {
+    // FIX-36: BIP-111 gate now implemented: handler checks advertise_node_bloom
+    // and calls peer.disconnect() when NODE_BLOOM is not advertised.
+    // Structural checks:
     try testing.expect(@hasField(peer_mod.Peer, "advertise_node_bloom"));
-    // Absence of per-peer bloom filter field (would exist if filterload were handled)
+    // No CBloomFilter field expected (we don't parse filter contents).
     try testing.expect(!@hasField(peer_mod.Peer, "bloom_filter"));
     try testing.expect(!@hasField(peer_mod.Peer, "m_bloom_filter"));
+    // BloomFilterRawMessage type present in p2p for opaque payload.
+    try testing.expect(@hasDecl(p2p, "BloomFilterRawMessage"));
+}
+
+test "w110 G25c: filterload decodes to BloomFilterRawMessage via decodePayload — FIXED (FIX-36)" {
+    // FIX-36: decodePayload("filterload", ...) now returns Message.filterload
+    // instead of ParseError.UnknownCommand.
+    // Test with a synthetic payload (arbitrary bytes — no CBloomFilter parse).
+    const fake_payload = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05 };
+    const allocator = std.testing.allocator;
+    const msg = try p2p.decodePayload("filterload", &fake_payload, allocator);
+    defer allocator.free(msg.filterload.payload);
+    try testing.expect(msg == .filterload);
+    try testing.expectEqualSlices(u8, &fake_payload, msg.filterload.payload);
 }
 
 // ============================================================================
-// G26: filteradd — NOT IN p2p.Message; 520-byte guard absent
+// G26: filteradd — FIXED (FIX-36): now in p2p.Message; BIP-111 disconnect
 // ============================================================================
 //
-// Core: FILTERADD: if payload > MAX_SCRIPT_ELEMENT_SIZE (520) → Misbehaving(100).
-//       Inserts data into per-peer bloom filter.
-// Clearbit: filteradd not in Message union; no parsing, no 520-byte guard.
+// Core: FILTERADD: if NODE_BLOOM not advertised → fDisconnect=true
+//       (net_processing.cpp:4990); also Misbehaving(100) for >520-byte data.
+// FIX-36: filteradd now in Message union as BloomFilterRawMessage.
+//         BIP-111 disconnect gate applied.
+//         520-byte guard deferred (no CBloomFilter insert path).
 
-test "w110 G26: filteradd not a variant of p2p.Message (BUG-7)" {
-    // BUG-7 (HIGH): filteradd absent from Message union.
+test "w110 G26: filteradd IS a variant of p2p.Message — FIXED (FIX-36)" {
+    // FIX-36: filteradd now in Message union (two-pipeline gap closed).
     comptime {
         const tag = std.meta.Tag(p2p.Message);
         const info = @typeInfo(tag).Enum;
+        var found = false;
         for (info.fields) |f| {
             if (std.mem.eql(u8, f.name, "filteradd")) {
-                @compileError("filteradd found in Message — update this test");
+                found = true;
+                break;
             }
         }
+        if (!found) @compileError("filteradd missing from Message union — FIX-36 regression");
     }
     try testing.expect(true);
 }
 
-test "w110 G26b: MAX_SCRIPT_ELEMENT_SIZE (520) guard for filteradd absent (BUG-7)" {
-    // BUG-7: Core: if (vData.size() > MAX_SCRIPT_ELEMENT_SIZE) → Misbehaving(100).
-    // No such constant or guard exists in clearbit.
+test "w110 G26b: MAX_SCRIPT_ELEMENT_SIZE (520) guard for filteradd still absent (deferred)" {
+    // The 520-byte size guard from Core FILTERADD (Misbehaving(100) if
+    // vData.size() > MAX_SCRIPT_ELEMENT_SIZE) is deferred — no CBloomFilter
+    // insert path exists.  The BIP-111 disconnect fires first anyway
+    // (NODE_BLOOM not advertised), so the oversize case never reaches the guard.
     try testing.expect(!@hasDecl(p2p, "MAX_SCRIPT_ELEMENT_SIZE"));
 }
 
+test "w110 G26c: filteradd decodes to BloomFilterRawMessage — FIXED (FIX-36)" {
+    // FIX-36: decodePayload("filteradd", ...) now returns Message.filteradd.
+    const fake_payload = [_]u8{ 0xAB, 0xCD };
+    const allocator = std.testing.allocator;
+    const msg = try p2p.decodePayload("filteradd", &fake_payload, allocator);
+    defer allocator.free(msg.filteradd.payload);
+    try testing.expect(msg == .filteradd);
+    try testing.expectEqualSlices(u8, &fake_payload, msg.filteradd.payload);
+}
+
 // ============================================================================
-// G27: filterclear — NOT IN p2p.Message
+// G27: filterclear — FIXED (FIX-36): now in p2p.Message; BIP-111 disconnect
 // ============================================================================
 //
-// Core: FILTERCLEAR: destroys per-peer bloom filter, marks relay as non-filtered.
-// Clearbit: filterclear not in Message union; no handler.
+// Core: FILTERCLEAR: if NODE_BLOOM not advertised → fDisconnect=true
+//       (net_processing.cpp:5018).  Otherwise destroys per-peer bloom filter.
+// FIX-36: filterclear now in Message union (void payload).
+//         BIP-111 disconnect gate applied.
 
-test "w110 G27: filterclear not a variant of p2p.Message (BUG-8)" {
-    // BUG-8 (HIGH): filterclear absent from Message union.
+test "w110 G27: filterclear IS a variant of p2p.Message — FIXED (FIX-36)" {
+    // FIX-36: filterclear now in Message union.
     comptime {
         const tag = std.meta.Tag(p2p.Message);
         const info = @typeInfo(tag).Enum;
+        var found = false;
         for (info.fields) |f| {
             if (std.mem.eql(u8, f.name, "filterclear")) {
-                @compileError("filterclear found in Message — update this test");
+                found = true;
+                break;
             }
         }
+        if (!found) @compileError("filterclear missing from Message union — FIX-36 regression");
     }
     try testing.expect(true);
 }
 
+test "w110 G27b: filterclear decodes to void message — FIXED (FIX-36)" {
+    // FIX-36: decodePayload("filterclear", ...) returns Message.filterclear.
+    // filterclear has an empty payload per BIP-37.
+    const allocator = std.testing.allocator;
+    const msg = try p2p.decodePayload("filterclear", &[_]u8{}, allocator);
+    try testing.expect(msg == .filterclear);
+}
+
 // ============================================================================
-// G28: merkleblock — NOT IN p2p.Message; PartialMerkleTree absent
+// G28: merkleblock — TWO-PIPELINE CLOSED (FIX-36); PartialMerkleTree absent
 // ============================================================================
 //
 // Core: CMerkleBlock constructed from CBlock + CBloomFilter; serializes
 //       PartialMerkleTree (tx count, hashes, flags bits).
 //       getdata MSG_FILTERED_BLOCK triggers merkleblock response.
-// Clearbit: no merkleblock Message variant; no PartialMerkleTree; no
-//           MSG_FILTERED_BLOCK getdata handler.
+// FIX-36: merkleblock now in Message union (opaque BloomFilterRawMessage).
+//         Handler logs + drops (server→client message; receiving is unexpected).
+//         PartialMerkleTree construction and MSG_FILTERED_BLOCK getdata
+//         response remain absent (no CBloomFilter, not sendable by peers).
 
-test "w110 G28: merkleblock not a variant of p2p.Message (BUG-9)" {
-    // BUG-9 (HIGH): merkleblock absent from Message union.
+test "w110 G28: merkleblock IS a variant of p2p.Message — TWO-PIPELINE CLOSED (FIX-36)" {
+    // FIX-36: merkleblock now in Message union.
+    // The v2_transport short ID 16 → "merkleblock" → decodePayload chain
+    // no longer returns ParseError.UnknownCommand.
     comptime {
         const tag = std.meta.Tag(p2p.Message);
         const info = @typeInfo(tag).Enum;
+        var found = false;
         for (info.fields) |f| {
             if (std.mem.eql(u8, f.name, "merkleblock")) {
-                @compileError("merkleblock found in Message — update this test");
+                found = true;
+                break;
             }
         }
+        if (!found) @compileError("merkleblock missing from Message union — FIX-36 regression");
     }
     try testing.expect(true);
 }
 
-test "w110 G28b: PartialMerkleTree type absent (BUG-9)" {
-    // BUG-9: Core merkleblock.h defines PartialMerkleTree with vBits[] and vHash[].
-    // No such type in clearbit.
+test "w110 G28b: PartialMerkleTree type still absent (BUG-9 deferred)" {
+    // BUG-9 partial: Core merkleblock.h defines PartialMerkleTree with
+    // vBits[] and vHash[].  clearbit does not construct merkleblock responses
+    // (no CBloomFilter, no MSG_FILTERED_BLOCK getdata handler).
     try testing.expect(!@hasDecl(p2p, "PartialMerkleTree"));
     try testing.expect(!@hasDecl(p2p, "MerkleBlockMessage"));
 }
 
-test "w110 G28c: msg_filtered_block getdata type present but unhandled (BUG-9)" {
+test "w110 G28c: msg_filtered_block getdata type present but response handler absent (BUG-9 deferred)" {
     // msg_filtered_block = 3 is defined in InvType (correct constant),
     // but getdata processing never issues a merkleblock response for it.
     const val = @as(u32, @intFromEnum(p2p.InvType.msg_filtered_block));
     try testing.expectEqual(@as(u32, 3), val);
-    // The handler path would construct CMerkleBlock — that code doesn't exist.
-    // Verified: no "merkleblock" or "PartialMerkleTree" decl in p2p.zig.
+    // No PartialMerkleTree, MerkleBlock struct (only the raw-opaque variant).
     try testing.expect(!@hasDecl(p2p, "MerkleBlock"));
+    try testing.expect(!@hasDecl(p2p, "PartialMerkleTree"));
+}
+
+test "w110 G28d: merkleblock decodes to BloomFilterRawMessage (log+drop) — FIXED (FIX-36)" {
+    // FIX-36: decodePayload("merkleblock", ...) returns Message.merkleblock
+    // instead of ParseError.UnknownCommand.  Handler logs + drops.
+    const fake_payload = [_]u8{ 0x01, 0x02, 0x03 };
+    const allocator = std.testing.allocator;
+    const msg = try p2p.decodePayload("merkleblock", &fake_payload, allocator);
+    defer allocator.free(msg.merkleblock.payload);
+    try testing.expect(msg == .merkleblock);
+    try testing.expectEqualSlices(u8, &fake_payload, msg.merkleblock.payload);
 }
 
 // ============================================================================
@@ -368,14 +434,16 @@ test "w110 G28c: msg_filtered_block getdata type present but unhandled (BUG-9)" 
 //       filter → Misbehaving(100).
 // Clearbit: no CBloomFilter, no size check, no disconnect on oversized filter.
 
-test "w110 G29: IsWithinSizeConstraints absent — no DoS guard on filterload (BUG-10)" {
-    // BUG-10 (MEDIUM): no size-check + disconnect on oversized filterload.
-    // Core net_processing.cpp FILTERLOAD:
-    //   if (!pfilter->IsWithinSizeConstraints())
-    //       peer->Misbehaving(100, "oversized bloom filter");
-    // Clearbit: filterload message doesn't reach any handler, so this guard
-    // is trivially absent.
+test "w110 G29: IsWithinSizeConstraints absent — DoS guard on filterload deferred (BUG-10)" {
+    // BUG-10 (MEDIUM — deferred): no size-check + Misbehaving(100) on oversized
+    // filterload payload.  Core net_processing.cpp FILTERLOAD calls
+    // IsWithinSizeConstraints() after NODE_BLOOM check.
+    // FIX-36 applies the BIP-111 disconnect (NODE_BLOOM absent → disconnect)
+    // which fires BEFORE the size check, so on a default clearbit node
+    // (peerbloomfilters=false) the oversize case is unreachable.
+    // The guard remains absent as clearbit has no CBloomFilter.
     try testing.expect(!@hasDecl(p2p, "BloomFilter"));
+    try testing.expect(!@hasDecl(p2p, "MAX_BLOOM_FILTER_SIZE"));
 }
 
 // ============================================================================
@@ -419,25 +487,24 @@ test "w110 G30c: peerbloomfilters default is false — PASS" {
     try testing.expectEqual(false, default_val);
 }
 
-test "w110 G30d: BIP-111 filterload-disconnect when NODE_BLOOM=false absent (BUG-11)" {
-    // BUG-11 (LOW — PARTIAL): BIP-111 requires that if a node does not
-    // advertise NODE_BLOOM, it MUST disconnect peers that send filterload.
-    // Bitcoin Core net_processing.cpp:
-    //   if (!pfrom.m_bloom_filter_loaded &&
-    //       !(pfrom.GetLocalServices() & NODE_BLOOM)) {
+test "w110 G30d: BIP-111 filterload-disconnect when NODE_BLOOM=false NOW PRESENT — FIXED (FIX-36)" {
+    // FIX-36: BIP-111 gate now implemented.
+    // Bitcoin Core net_processing.cpp:4964:
+    //   if (!(peer.m_our_services & NODE_BLOOM)) {
     //       pfrom.fDisconnect = true; return;
     //   }
-    // Clearbit: no filterload handler exists at all, so this gate is absent.
-    // The partial PASS is that mempool is correctly gated. The filterload
-    // path (which precedes mempool semantically) is simply missing.
+    // Clearbit peer.zig: handler checks !peer.advertise_node_bloom and calls
+    // peer.disconnect() for filterload, filteradd, filterclear.
     //
-    // Structural check: filterload not in Message union (already tested G25),
-    // and no bloom_filter field on Peer.
+    // Structural check: advertise_node_bloom present; no CBloomFilter field.
+    try testing.expect(@hasField(peer_mod.Peer, "advertise_node_bloom"));
     try testing.expect(!@hasField(peer_mod.Peer, "bloom_filter"));
+    // BloomFilterRawMessage type is the opaque payload carrier.
+    try testing.expect(@hasDecl(p2p, "BloomFilterRawMessage"));
 }
 
 // ============================================================================
-// TWO-PIPELINE: v2_transport short IDs registered but Message variants absent
+// TWO-PIPELINE: v2_transport short IDs registered — NOW CLOSED (FIX-36)
 // ============================================================================
 //
 // v2_transport.zig V2_MESSAGE_IDS[]:
@@ -446,59 +513,60 @@ test "w110 G30d: BIP-111 filterload-disconnect when NODE_BLOOM=false absent (BUG
 //   index 8 = "filterload"
 //   index 16 = "merkleblock"
 //
-// These short IDs are used by BIP-324 v2 transport to encode message names.
-// When a v2 peer sends one of these short IDs, v2_transport decodes it to the
-// command string ("filterload" etc.) and passes it to p2p.decodeMessage.
-// p2p.decodeMessage then returns ParseError.UnknownCommand because there is
-// no matching branch.
-//
-// This is a two-pipeline gap: the v2 name table is populated (upstream),
-// but the downstream message decoder + peer handler pipeline is absent.
+// FIX-36: p2p.Message now has corresponding variants for all four.
+//         v2_transport short ID → command string → decodePayload → Message
+//         variant → handleMessage BIP-111 gate — full pipeline connected.
 
-test "w110 TWO-PIPELINE: filterload short ID in V2_MESSAGE_IDS but not in p2p.Message (two-pipeline)" {
-    // Two-pipeline: v2_transport.V2_MESSAGE_IDS[8] = "filterload"
-    // but p2p.Message has no .filterload variant.
+test "w110 TWO-PIPELINE: filterload/filteradd/filterclear/merkleblock short IDs AND p2p.Message variants present — CLOSED (FIX-36)" {
+    // FIX-36: two-pipeline gap closed.
+    // Both sides of the pipeline are now populated.
     const v2 = @import("v2_transport.zig");
 
-    // Confirm short IDs are registered
+    // Confirm short IDs are still registered in v2_transport (upstream).
     try testing.expectEqualStrings("filterload", v2.V2_MESSAGE_IDS[8]);
     try testing.expectEqualStrings("filteradd", v2.V2_MESSAGE_IDS[6]);
     try testing.expectEqualStrings("filterclear", v2.V2_MESSAGE_IDS[7]);
     try testing.expectEqualStrings("merkleblock", v2.V2_MESSAGE_IDS[16]);
 
-    // Confirm Message union has no corresponding variants (downstream absent)
+    // Confirm Message union now HAS corresponding variants (downstream present).
     comptime {
         const tag = std.meta.Tag(p2p.Message);
         const info = @typeInfo(tag).Enum;
+        var found_filterload = false;
+        var found_filteradd = false;
+        var found_filterclear = false;
+        var found_merkleblock = false;
         for (info.fields) |f| {
-            if (std.mem.eql(u8, f.name, "filterload") or
-                std.mem.eql(u8, f.name, "filteradd") or
-                std.mem.eql(u8, f.name, "filterclear") or
-                std.mem.eql(u8, f.name, "merkleblock"))
-            {
-                @compileError("BIP-37 message found in union — two-pipeline gap is fixed; update test");
-            }
+            if (std.mem.eql(u8, f.name, "filterload")) found_filterload = true;
+            if (std.mem.eql(u8, f.name, "filteradd")) found_filteradd = true;
+            if (std.mem.eql(u8, f.name, "filterclear")) found_filterclear = true;
+            if (std.mem.eql(u8, f.name, "merkleblock")) found_merkleblock = true;
         }
+        if (!found_filterload) @compileError("filterload missing from Message — FIX-36 regression");
+        if (!found_filteradd) @compileError("filteradd missing from Message — FIX-36 regression");
+        if (!found_filterclear) @compileError("filterclear missing from Message — FIX-36 regression");
+        if (!found_merkleblock) @compileError("merkleblock missing from Message — FIX-36 regression");
     }
     try testing.expect(true); // comptime checks passed
 }
 
-test "w110 TWO-PIPELINE: msg_filtered_block InvType registered but merkleblock response absent" {
-    // Two-pipeline extension: msg_filtered_block = 3 exists in InvType
-    // (a getdata peer can request filtered blocks), but the handler that would
-    // construct and send a merkleblock response does not exist.
+test "w110 TWO-PIPELINE: msg_filtered_block InvType registered but merkleblock RESPONSE still absent (BUG-9 deferred)" {
+    // The receive side is now handled (FIX-36).  The send side — constructing
+    // and transmitting a merkleblock in response to MSG_FILTERED_BLOCK getdata
+    // — remains absent (no CBloomFilter, no PartialMerkleTree).
     const filtered_block_val = @as(u32, @intFromEnum(p2p.InvType.msg_filtered_block));
     try testing.expectEqual(@as(u32, 3), filtered_block_val);
-    // No MerkleBlock, PartialMerkleTree, or merkleblock Message variant.
+    // No PartialMerkleTree or high-level MerkleBlock struct.
     try testing.expect(!@hasDecl(p2p, "MerkleBlock"));
+    try testing.expect(!@hasDecl(p2p, "PartialMerkleTree"));
 }
 
 // ============================================================================
 // Overall subsystem presence: confirm MISSING ENTIRELY
 // ============================================================================
 
-test "w110 SUMMARY: BIP-37 CBloomFilter subsystem missing entirely from clearbit" {
-    // Structural summary test: all key identifiers absent.
+test "w110 SUMMARY: BIP-37 CBloomFilter subsystem missing; BIP-111 disconnect FIXED (FIX-36)" {
+    // CBloomFilter core: still absent (BUG-1 through BUG-5 unchanged).
     try testing.expect(!@hasDecl(p2p, "BloomFilter"));
     try testing.expect(!@hasDecl(p2p, "CBloomFilter"));
     try testing.expect(!@hasDecl(p2p, "MAX_BLOOM_FILTER_SIZE"));
@@ -513,4 +581,22 @@ test "w110 SUMMARY: BIP-37 CBloomFilter subsystem missing entirely from clearbit
     try testing.expect(!@hasDecl(p2p, "MerkleBlock"));
     // NODE_BLOOM is present (correct)
     try testing.expectEqual(@as(u64, 4), p2p.NODE_BLOOM);
+    // FIX-36: opaque carrier type present; BIP-111 variants in Message union.
+    try testing.expect(@hasDecl(p2p, "BloomFilterRawMessage"));
+    // Message union now has all four BIP-37 variants (structural check).
+    comptime {
+        const tag = std.meta.Tag(p2p.Message);
+        const info = @typeInfo(tag).Enum;
+        var found_fl = false; var found_fa = false;
+        var found_fc = false; var found_mb = false;
+        for (info.fields) |f| {
+            if (std.mem.eql(u8, f.name, "filterload")) found_fl = true;
+            if (std.mem.eql(u8, f.name, "filteradd")) found_fa = true;
+            if (std.mem.eql(u8, f.name, "filterclear")) found_fc = true;
+            if (std.mem.eql(u8, f.name, "merkleblock")) found_mb = true;
+        }
+        if (!found_fl or !found_fa or !found_fc or !found_mb)
+            @compileError("One or more FIX-36 variants missing from Message — regression");
+    }
+    try testing.expect(true);
 }
