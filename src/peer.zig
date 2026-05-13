@@ -3770,10 +3770,17 @@ pub const PeerManager = struct {
                 if (has_block_inv) {
                     self.sendGetHeaders(peer) catch {};
                 }
-                // Request unknown transactions via getdata
-                if (tx_requests.items.len > 0) {
-                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = tx_requests.items } };
+                // Request unknown transactions via getdata, batched at MAX_GETDATA_SZ=1000.
+                // Core net_processing.cpp:6205-6210 batches outgoing getdata at MAX_GETDATA_SZ.
+                // Sending more than 1000 items in a single getdata violates the protocol limit
+                // and would cause a conformant peer to Misbehave us.
+                var batch_start: usize = 0;
+                while (batch_start < tx_requests.items.len) {
+                    const batch_end = @min(batch_start + p2p.MAX_GETDATA_SZ, tx_requests.items.len);
+                    const batch = tx_requests.items[batch_start..batch_end];
+                    const getdata_msg = p2p.Message{ .getdata = .{ .inventory = batch } };
                     peer.sendMessage(&getdata_msg) catch {};
+                    batch_start = batch_end;
                 }
             },
             .headers => |h| {
@@ -4487,6 +4494,14 @@ pub const PeerManager = struct {
                 // below already replies with `notfound`, matching Core's
                 // ProcessGetBlockData behaviour for pruned-block requests.
                 defer self.allocator.free(gd.inventory);
+                // G2: enforce MAX_GETDATA_SZ=1000 server-side.
+                // Core net_processing.cpp:4131-4134:
+                //   if (vInv.size() > MAX_GETDATA_SZ)
+                //     Misbehaving(peer, "getdata message size = %u", vInv.size())
+                if (gd.inventory.len > p2p.MAX_GETDATA_SZ) {
+                    peer.misbehaving(100, "getdata message size exceeds MAX_GETDATA_SZ (1000)");
+                    return;
+                }
                 for (gd.inventory) |item| {
                     const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
                     if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_block))) {

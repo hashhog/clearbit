@@ -76,26 +76,19 @@ test "W103/G1: getdata decode rejects count > MAX_INV_SIZE (50000)" {
 }
 
 // ============================================================================
-// G2: getdata dispatch — no MAX_GETDATA_SZ=1000 server-side enforcement
+// G2: getdata dispatch — MAX_GETDATA_SZ=1000 server-side enforcement (FIXED)
 // Bitcoin Core net_processing.cpp:4131-4134:
 //   if (vInv.size() > MAX_GETDATA_SZ)
 //     Misbehaving(peer, "getdata message size = %u", vInv.size())
-// Comment at line 127: "Not used in processing INCOMING GETDATA for compatibility"
-// Core still misbehaves a peer that sends > 1000 items in getdata.
-// Clearbit: the getdata handler in peer.zig:4449-4502 iterates gd.inventory
-// with no size cap — it will process up to 50000 items (inv limit) without
-// any additional misbehaving. Both Core and clearbit parse up to MAX_INV_SIZE;
-// Core adds an extra Misbehaving gate at MAX_GETDATA_SZ=1000.
-// BUG: clearbit missing the Misbehaving(peer, "getdata too large") gate.
+// FIXED: MAX_GETDATA_SZ = 1000 constant added to p2p.zig.
+//   The getdata handler now calls peer.misbehaving(100, ...) when
+//   gd.inventory.len > MAX_GETDATA_SZ before processing any items.
 // ============================================================================
-test "W103/G2: MAX_GETDATA_SZ constant is 1000 per Core (clearbit has no server-side gate)" {
-    // Document the missing gate: Core net_processing.cpp:128 MAX_GETDATA_SZ = 1000.
-    const CORE_MAX_GETDATA_SZ: usize = 1000;
-    // clearbit parses getdata up to MAX_INV_SIZE (50000) without extra misbehaving.
-    // The correct cap should be 1000 items per getdata.
-    try testing.expect(CORE_MAX_GETDATA_SZ < p2p.MAX_INV_SIZE);
-    // BUG: no CLEARBIT_MAX_GETDATA_SZ constant defined anywhere.
-    // If this test were fixed, we'd assert: clearbit_max == 1000.
+test "W103/G2: MAX_GETDATA_SZ constant is 1000 per Core (FIXED — server-side gate added)" {
+    // FIXED: p2p.MAX_GETDATA_SZ = 1000 matches Core protocol.h:482.
+    try testing.expectEqual(@as(usize, 1000), p2p.MAX_GETDATA_SZ);
+    // MAX_GETDATA_SZ < MAX_INV_SIZE: the getdata cap is tighter than the parse limit.
+    try testing.expect(p2p.MAX_GETDATA_SZ < p2p.MAX_INV_SIZE);
 }
 
 // ============================================================================
@@ -142,19 +135,19 @@ test "W103/G4: mempool handler lacks bandwidth rate-limit (Core: OutboundTargetR
 }
 
 // ============================================================================
-// G5: getdata MAX 1000 (outgoing batch split)
+// G5: getdata MAX 1000 (outgoing batch split) — FIXED
 // Bitcoin Core net_processing.cpp:6205-6210: batches outgoing getdata at MAX_GETDATA_SZ=1000.
-// Clearbit: the inv handler (peer.zig:3751-3753) builds a single tx_requests list
-// and sends it all in one getdata message. No batch-split at 1000.
-// BUG: clearbit may send getdata with more than 1000 items to a peer.
+// FIXED: the inv handler now uses a while-loop batching tx_requests.items at
+//   MAX_GETDATA_SZ (1000) slices, sending one getdata per batch.
+//   A single inv message may carry up to MAX_INV_SIZE=50000 tx items;
+//   with batching, each outgoing getdata carries at most 1000 items.
 // ============================================================================
-test "W103/G5: MAX_INV_SIZE used for outgoing getdata — should batch at 1000 per Core" {
+test "W103/G5: MAX_GETDATA_SZ = 1000 is the outgoing batch size — not MAX_INV_SIZE (FIXED)" {
+    // FIXED: outgoing getdata batched at MAX_GETDATA_SZ = 1000.
     // Core: static const unsigned int MAX_GETDATA_SZ = 1000 (net_processing.cpp:128).
-    // Core batches outgoing getdata at 1000 items; clearbit uses MAX_INV_SIZE (50000).
-    const CORE_BATCH_SIZE: usize = 1000;
-    const CLEARBIT_EFFECTIVE_MAX: usize = p2p.MAX_INV_SIZE; // no batch split
-    try testing.expect(CORE_BATCH_SIZE < CLEARBIT_EFFECTIVE_MAX);
-    // BUG: a single batch up to 50000 items is non-compliant.
+    try testing.expectEqual(@as(usize, 1000), p2p.MAX_GETDATA_SZ);
+    // MAX_GETDATA_SZ < MAX_INV_SIZE confirms the batch is smaller than the parse limit.
+    try testing.expect(p2p.MAX_GETDATA_SZ < p2p.MAX_INV_SIZE);
 }
 
 // ============================================================================
