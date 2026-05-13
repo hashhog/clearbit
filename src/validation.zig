@@ -15,6 +15,7 @@ const script = @import("script.zig");
 const crypto = @import("crypto.zig");
 const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
+const sig_cache_mod = @import("sig_cache.zig");
 
 // ============================================================================
 // Validation Errors
@@ -2340,6 +2341,10 @@ pub const ScriptCheckQueue = struct {
     /// Number of workers
     worker_count: usize,
 
+    /// Per-signature verification cache (W105 G18 fix).
+    /// Avoids re-running ECDSA/Schnorr on inputs already verified in the mempool.
+    sig_cache: sig_cache_mod.SigCache,
+
     /// Initialize the script check queue with worker threads.
     /// Returns a heap-allocated queue so worker threads always hold a stable
     /// pointer (returning by value would move the struct and invalidate the
@@ -2364,6 +2369,7 @@ pub const ScriptCheckQueue = struct {
             .stop_flag = std.atomic.Value(bool).init(false),
             .allocator = allocator,
             .worker_count = worker_count,
+            .sig_cache = sig_cache_mod.SigCache.init(allocator, sig_cache_mod.DEFAULT_MAX_ENTRIES),
         };
 
         // Spawn worker threads — safe because queue lives on the heap.
@@ -2385,6 +2391,7 @@ pub const ScriptCheckQueue = struct {
             worker.join();
         }
 
+        self.sig_cache.deinit();
         self.allocator.free(self.workers);
         self.allocator.destroy(self);
     }
@@ -2452,8 +2459,8 @@ pub const ScriptCheckQueue = struct {
 
             var job = &self.jobs[job_idx];
 
-            // Perform the verification
-            const result = verifyScriptJob(job, self.allocator);
+            // Perform the verification (with sig_cache lookup/insert)
+            const result = verifyScriptJob(job, self.allocator, &self.sig_cache);
             job.result.store(
                 if (result) .success else .failure,
                 .release,
@@ -2478,7 +2485,7 @@ pub const ScriptCheckQueue = struct {
 ///
 /// The `allocator` parameter is intentionally unused here; it is kept in the
 /// signature only because processJobs passes self.allocator for API consistency.
-fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator) bool {
+fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cache: *sig_cache_mod.SigCache) bool {
     // Per-worker arena backed by libc malloc (thread-safe).
     // All per-job allocations (tx deserialisation, script engine internals)
     // live here and are freed atomically on return via arena.deinit().
@@ -2498,6 +2505,18 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator) boo
     // Get the input being verified
     if (job.input_index >= tx.inputs.len) return false;
     const input = tx.inputs[job.input_index];
+
+    // Compute the txid for the sig cache key (zero-alloc streaming SHA256d).
+    const txid = crypto.computeTxidStreaming(&tx);
+    const flags_u32: u32 = @intCast(@as(u21, @bitCast(job.flags)));
+    const input_idx_u32: u32 = @intCast(job.input_index);
+
+    // SigCache lookup: skip ScriptEngine.verify() if this (txid, input, flags)
+    // was already successfully verified (e.g. the tx was in the mempool).
+    // W105 G18 fix: wire the dead-helper SigCache into verifyScriptJob.
+    if (cache.lookup(txid, input_idx_u32, flags_u32)) {
+        return true;
+    }
 
     // Create script engine and verify. spent_amounts/spent_scripts are
     // empty slices for legacy / SegWit-v0; for Taproot inputs the caller
@@ -2521,6 +2540,10 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator) boo
     );
 
     if (result) |valid| {
+        if (valid) {
+            // Cache the successful verification for future blocks/re-validation.
+            cache.insert(txid, input_idx_u32, flags_u32);
+        }
         return valid;
     } else |_| {
         return false;
