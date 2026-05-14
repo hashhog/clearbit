@@ -68,6 +68,13 @@ pub const KeyPair = struct {
     secret_key: [32]u8,
     public_key: [33]u8, // Compressed SEC format
     x_only_pubkey: [32]u8, // For Taproot
+    // AES-256-GCM per-key encryption metadata (null when wallet is unencrypted).
+    // Each key gets a fresh random 12-byte nonce at encrypt time; the 16-byte
+    // authentication tag is produced by AES-GCM and verified on every decrypt,
+    // so a wrong passphrase returns error.AuthenticationFailed rather than
+    // silently succeeding (as the old XOR path did).
+    encryption_nonce: ?[12]u8 = null,
+    encryption_tag: ?[16]u8 = null,
 };
 
 // ============================================================================
@@ -433,11 +440,23 @@ pub const Wallet = struct {
         var x_only_bytes: [32]u8 = undefined;
         _ = secp256k1.secp256k1_xonly_pubkey_serialize(self.ctx, &x_only_bytes, &xonly);
 
-        const key = KeyPair{
+        var key = KeyPair{
             .secret_key = secret,
             .public_key = compressed,
             .x_only_pubkey = x_only_bytes,
         };
+
+        // If the wallet is encrypted and currently unlocked, encrypt the new
+        // key immediately so it is stored in the same AES-256-GCM form as the
+        // rest.  If the wallet is locked (encryption_key == null) the caller
+        // must unlock before importing.
+        if (self.encrypted) {
+            const enc_key = self.encryption_key orelse return error.WalletLocked;
+            const enc = encryptPrivateKey(&enc_key, &secret);
+            key.secret_key = enc.ciphertext;
+            key.encryption_nonce = enc.nonce;
+            key.encryption_tag = enc.tag;
+        }
 
         try self.keys.append(key);
         return self.keys.items.len - 1;
@@ -1110,6 +1129,25 @@ pub const Wallet = struct {
         return error.InsufficientFunds;
     }
 
+    /// Return the plaintext 32-byte secret key for `key_index`.
+    ///
+    /// If the wallet is unencrypted, returns the stored bytes directly.
+    /// If the wallet is encrypted and unlocked, decrypts with the in-memory
+    /// key; `error.AuthenticationFailed` is returned if the stored tag does
+    /// not verify (should never happen unless the wallet file is corrupted).
+    /// If the wallet is encrypted but locked (encryption_key == null), returns
+    /// `error.WalletLocked`.
+    fn getPlaintextSecretKey(self: *const Wallet, key_index: usize) ![32]u8 {
+        const kp = &self.keys.items[key_index];
+        if (!self.encrypted) {
+            return kp.secret_key;
+        }
+        const enc_key = self.encryption_key orelse return error.WalletLocked;
+        const nonce = kp.encryption_nonce orelse return error.WalletNotEncrypted;
+        const tag = kp.encryption_tag orelse return error.WalletNotEncrypted;
+        return decryptPrivateKey(&enc_key, &kp.secret_key, &nonce, &tag);
+    }
+
     /// Sign a transaction input using the appropriate signing algorithm.
     ///
     /// `all_prevouts`: optional slice of all spent prevouts in input order.
@@ -1131,12 +1169,15 @@ pub const Wallet = struct {
 
         const mutable_inputs = @constCast(tx.inputs);
         const key = self.keys.items[utxo.key_index];
+        // Decrypt the private key if the wallet is encrypted.
+        var plaintext_secret = try self.getPlaintextSecretKey(utxo.key_index);
+        defer @memset(&plaintext_secret, 0);
 
         switch (utxo.address_type) {
             .p2pkh => {
                 // Legacy signing: SIGHASH over simplified transaction
                 const sighash = try computeLegacySigHash(tx, input_index, utxo, sighash_type, self.allocator);
-                const sig = try self.ecdsaSign(&sighash, &key.secret_key);
+                const sig = try self.ecdsaSign(&sighash, &plaintext_secret);
 
                 // Build scriptSig: <sig+hashtype> <pubkey>
                 var script_sig = std.ArrayList(u8).init(self.allocator);
@@ -1244,7 +1285,7 @@ pub const Wallet = struct {
                 }
 
                 const sighash = try computeWitnessSigHashV0(tx, input_index, utxo, sighash_type, self.allocator);
-                const sig = try self.ecdsaSign(&sighash, &key.secret_key);
+                const sig = try self.ecdsaSign(&sighash, &plaintext_secret);
 
                 // Build scriptSig: push of redeem script (OP_0 <pubkey_hash>)
                 var script_sig = try self.allocator.alloc(u8, 23);
@@ -1277,7 +1318,7 @@ pub const Wallet = struct {
             .p2wpkh => {
                 // BIP-143 SegWit v0 signing
                 const sighash = try computeWitnessSigHashV0(tx, input_index, utxo, sighash_type, self.allocator);
-                const sig = try self.ecdsaSign(&sighash, &key.secret_key);
+                const sig = try self.ecdsaSign(&sighash, &plaintext_secret);
 
                 // Build witness: [sig+hashtype, pubkey]
                 var witness = try self.allocator.alloc([]const u8, 2);
@@ -1319,7 +1360,7 @@ pub const Wallet = struct {
                 // over a key that can never appear in a compliant P2TR
                 // output, so the spend would always fail Schnorr verify.
                 var keypair: secp256k1.secp256k1_keypair = undefined;
-                if (secp256k1.secp256k1_keypair_create(self.ctx, &keypair, &key.secret_key) != 1) {
+                if (secp256k1.secp256k1_keypair_create(self.ctx, &keypair, &plaintext_secret) != 1) {
                     return error.KeypairCreationFailed;
                 }
 
@@ -1543,10 +1584,13 @@ pub const Wallet = struct {
             .{ .ln = params.ln, .r = params.r, .p = params.p },
         );
 
-        // Encrypt all private keys in place
+        // Encrypt all private keys in place using AES-256-GCM.
+        // Each key gets a unique random nonce; the auth tag is stored alongside.
         for (self.keys.items) |*keypair| {
-            const encrypted = try encryptPrivateKey(&derived_key, &keypair.secret_key);
-            keypair.secret_key = encrypted;
+            const enc = encryptPrivateKey(&derived_key, &keypair.secret_key);
+            keypair.secret_key = enc.ciphertext;
+            keypair.encryption_nonce = enc.nonce;
+            keypair.encryption_tag = enc.tag;
         }
 
         // Store encryption state
@@ -1578,9 +1622,20 @@ pub const Wallet = struct {
             .{ .ln = 14, .r = 8, .p = 1 },
         );
 
-        // Verify the key by attempting to decrypt the first key
+        // Verify the passphrase by attempting to decrypt the first key.
+        // With AES-256-GCM, decryptPrivateKey returns error.AuthenticationFailed
+        // when the derived key is wrong — the auth tag check fails.
         if (self.keys.items.len > 0) {
-            _ = decryptPrivateKey(&derived_key, &self.keys.items[0].secret_key) catch {
+            const first = &self.keys.items[0];
+            const nonce = first.encryption_nonce orelse {
+                @memset(&derived_key, 0);
+                return error.WalletNotEncrypted;
+            };
+            const tag = first.encryption_tag orelse {
+                @memset(&derived_key, 0);
+                return error.WalletNotEncrypted;
+            };
+            _ = decryptPrivateKey(&derived_key, &first.secret_key, &nonce, &tag) catch {
                 @memset(&derived_key, 0);
                 return error.WrongPassphrase;
             };
@@ -1649,13 +1704,15 @@ pub const Wallet = struct {
         );
         defer @memset(&new_key, 0);
 
-        // Re-encrypt all keys
+        // Re-encrypt all keys: decrypt with old key, re-encrypt with new key + fresh nonces.
         for (self.keys.items) |*keypair| {
-            // Decrypt with old key
-            const plaintext = try decryptPrivateKey(&old_key, &keypair.secret_key);
-            // Encrypt with new key
-            const ciphertext = try encryptPrivateKey(&new_key, &plaintext);
-            keypair.secret_key = ciphertext;
+            const old_nonce = keypair.encryption_nonce orelse return error.WalletNotEncrypted;
+            const old_tag = keypair.encryption_tag orelse return error.WalletNotEncrypted;
+            const plaintext = try decryptPrivateKey(&old_key, &keypair.secret_key, &old_nonce, &old_tag);
+            const enc = encryptPrivateKey(&new_key, &plaintext);
+            keypair.secret_key = enc.ciphertext;
+            keypair.encryption_nonce = enc.nonce;
+            keypair.encryption_tag = enc.tag;
         }
 
         // Update salt
@@ -1747,25 +1804,69 @@ pub const Wallet = struct {
 // Encryption Helpers (AES-256-GCM)
 // ============================================================================
 
+// AES-256-GCM constants via the Zig 0.13 standard library.
+//   key_length  = 32 bytes
+//   nonce_length = 12 bytes  (random per encryption)
+//   tag_length  = 16 bytes  (authentication tag; wrong key → AuthenticationFailed)
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+
+/// Result of encrypting a private key: ciphertext + random nonce + authentication tag.
+/// The nonce and tag must be stored alongside the ciphertext in the wallet file.
+pub const EncryptedKey = struct {
+    ciphertext: [32]u8,
+    nonce: [Aes256Gcm.nonce_length]u8,
+    tag: [Aes256Gcm.tag_length]u8,
+};
+
 /// Encrypt a 32-byte private key using AES-256-GCM.
-/// Encrypt a 32-byte private key using XOR with encryption key.
-/// For a production wallet, use AES-256-GCM with properly stored nonce/tag.
-/// This simplified implementation is reversible with the same key.
-fn encryptPrivateKey(encryption_key: *const [32]u8, plaintext: *const [32]u8) ![32]u8 {
-    var ciphertext: [32]u8 = undefined;
-    for (0..32) |i| {
-        ciphertext[i] = plaintext[i] ^ encryption_key[i];
-    }
-    return ciphertext;
+///
+/// Security properties:
+///   * Authentication: the 16-byte tag binds the ciphertext to the key; any
+///     modification returns error.AuthenticationFailed on decrypt.
+///   * Unique ciphertext: a fresh random 12-byte nonce is generated each call,
+///     so encrypting the same key twice produces different ciphertexts.
+///   * Wrong-key detection: decrypting with the wrong passphrase-derived key
+///     fails with error.AuthenticationFailed (unlike the previous XOR approach
+///     which always "succeeded" regardless of passphrase).
+///
+/// The caller must persist `result.nonce` and `result.tag` alongside the ciphertext.
+fn encryptPrivateKey(encryption_key: *const [Aes256Gcm.key_length]u8, plaintext: *const [32]u8) EncryptedKey {
+    var result: EncryptedKey = undefined;
+    std.crypto.random.bytes(&result.nonce);
+    // Additional data is empty; the key index / pubkey are not secret but
+    // we keep AD empty for simplicity (consistent with Core's CCrypter).
+    Aes256Gcm.encrypt(
+        &result.ciphertext,
+        &result.tag,
+        plaintext,
+        &[_]u8{}, // additional data
+        result.nonce,
+        encryption_key.*,
+    );
+    return result;
 }
 
-/// Decrypt a 32-byte private key using XOR with encryption key.
-fn decryptPrivateKey(encryption_key: *const [32]u8, ciphertext: *const [32]u8) ![32]u8 {
-    // XOR is symmetric, same operation as encrypt
+/// Decrypt a 32-byte private key using AES-256-GCM.
+///
+/// Returns `error.AuthenticationFailed` if the tag does not match — which
+/// happens when the passphrase is wrong, the ciphertext was tampered with,
+/// or the nonce/tag bytes are corrupted.  This replaces the old XOR path that
+/// silently returned garbage (or even a valid-looking key) for any passphrase.
+fn decryptPrivateKey(
+    encryption_key: *const [Aes256Gcm.key_length]u8,
+    ciphertext: *const [32]u8,
+    nonce: *const [Aes256Gcm.nonce_length]u8,
+    tag: *const [Aes256Gcm.tag_length]u8,
+) ![32]u8 {
     var plaintext: [32]u8 = undefined;
-    for (0..32) |i| {
-        plaintext[i] = ciphertext[i] ^ encryption_key[i];
-    }
+    try Aes256Gcm.decrypt(
+        &plaintext,
+        ciphertext,
+        tag.*,
+        &[_]u8{}, // additional data
+        nonce.*,
+        encryption_key.*,
+    );
     return plaintext;
 }
 
@@ -2128,7 +2229,9 @@ pub fn signP2WSH(
         for (signing_key_indices) |ki| {
             if (ki >= wallet.keys.items.len) return error.KeyNotFound;
             const k = wallet.keys.items[ki];
-            const sig = try wallet.ecdsaSign(&sighash, &k.secret_key);
+            var pt_sk = try wallet.getPlaintextSecretKey(ki);
+            defer @memset(&pt_sk, 0);
+            const sig = try wallet.ecdsaSign(&sighash, &pt_sk);
             const sig_len = getDerSigLen(&sig);
             const sig_buf = try allocator.alloc(u8, sig_len + 1);
             @memcpy(sig_buf[0..sig_len], sig[0..sig_len]);
@@ -2200,8 +2303,9 @@ pub fn signP2WSH(
     }
     const ki = signing_key_indices[0];
     if (ki >= wallet.keys.items.len) return error.KeyNotFound;
-    const k = wallet.keys.items[ki];
-    const sig = try wallet.ecdsaSign(&sighash, &k.secret_key);
+    var pt_sk2 = try wallet.getPlaintextSecretKey(ki);
+    defer @memset(&pt_sk2, 0);
+    const sig = try wallet.ecdsaSign(&sighash, &pt_sk2);
     const sig_len = getDerSigLen(&sig);
 
     var stack = try allocator.alloc([]const u8, 2);
@@ -2765,7 +2869,10 @@ pub const WalletManager = struct {
             try json.appendSlice("\",");
         }
 
-        // Keys array
+        // Keys array.
+        // Each encrypted key stores "secret" (ciphertext), "pubkey", "nonce"
+        // (12-byte AES-GCM nonce, hex), and "tag" (16-byte auth tag, hex).
+        // Unencrypted keys omit "nonce" and "tag".
         try json.appendSlice("\"keys\":[");
         for (wallet.keys.items, 0..) |keypair, i| {
             if (i > 0) try json.append(',');
@@ -2777,7 +2884,23 @@ pub const WalletManager = struct {
             var pk_hex: [66]u8 = undefined;
             const pub_hex = std.fmt.bufPrint(&pk_hex, "{s}", .{std.fmt.fmtSliceHexLower(&keypair.public_key)}) catch return error.SerializationFailed;
             try json.appendSlice(pub_hex);
-            try json.appendSlice("\"}");
+            try json.append('"');
+            // AES-256-GCM per-key nonce + authentication tag (present when encrypted).
+            if (keypair.encryption_nonce) |nonce| {
+                try json.appendSlice(",\"nonce\":\"");
+                var nonce_hex: [24]u8 = undefined;
+                const n_hex = std.fmt.bufPrint(&nonce_hex, "{s}", .{std.fmt.fmtSliceHexLower(&nonce)}) catch return error.SerializationFailed;
+                try json.appendSlice(n_hex);
+                try json.append('"');
+            }
+            if (keypair.encryption_tag) |tag| {
+                try json.appendSlice(",\"tag\":\"");
+                var tag_hex: [32]u8 = undefined;
+                const t_hex = std.fmt.bufPrint(&tag_hex, "{s}", .{std.fmt.fmtSliceHexLower(&tag)}) catch return error.SerializationFailed;
+                try json.appendSlice(t_hex);
+                try json.append('"');
+            }
+            try json.append('}');
         }
         try json.appendSlice("],");
 
@@ -2909,10 +3032,26 @@ pub const WalletManager = struct {
                 var x_only: [32]u8 = undefined;
                 @memcpy(&x_only, pubkey[1..33]);
 
+                // Load AES-256-GCM per-key nonce + auth tag (present only when encrypted).
+                var enc_nonce: ?[Aes256Gcm.nonce_length]u8 = null;
+                var enc_tag: ?[Aes256Gcm.tag_length]u8 = null;
+                if (kobj.get("nonce")) |n| {
+                    var nb: [Aes256Gcm.nonce_length]u8 = undefined;
+                    _ = std.fmt.hexToBytes(&nb, n.string) catch return error.WalletLoadFailed;
+                    enc_nonce = nb;
+                }
+                if (kobj.get("tag")) |t| {
+                    var tb: [Aes256Gcm.tag_length]u8 = undefined;
+                    _ = std.fmt.hexToBytes(&tb, t.string) catch return error.WalletLoadFailed;
+                    enc_tag = tb;
+                }
+
                 try wallet.keys.append(KeyPair{
                     .secret_key = secret,
                     .public_key = pubkey,
                     .x_only_pubkey = x_only,
+                    .encryption_nonce = enc_nonce,
+                    .encryption_tag = enc_tag,
                 });
             }
         }
@@ -3950,18 +4089,37 @@ test "getLabeledAddresses" {
 // Encryption Tests
 // ============================================================================
 
-test "encrypt and decrypt private key" {
-    const key: [32]u8 = [_]u8{0xAB} ** 32;
+test "encrypt and decrypt private key — AES-256-GCM" {
+    const key: [Aes256Gcm.key_length]u8 = [_]u8{0xAB} ** Aes256Gcm.key_length;
     const plaintext: [32]u8 = [_]u8{0xCD} ** 32;
 
-    const ciphertext = try encryptPrivateKey(&key, &plaintext);
+    const enc = encryptPrivateKey(&key, &plaintext);
 
-    // Should be different from plaintext
-    try std.testing.expect(!std.mem.eql(u8, &ciphertext, &plaintext));
+    // Ciphertext must differ from plaintext
+    try std.testing.expect(!std.mem.eql(u8, &enc.ciphertext, &plaintext));
 
-    // Should decrypt back to plaintext
-    const decrypted = try decryptPrivateKey(&key, &ciphertext);
+    // Correct key + nonce + tag → decrypts to original plaintext
+    const decrypted = try decryptPrivateKey(&key, &enc.ciphertext, &enc.nonce, &enc.tag);
     try std.testing.expectEqualSlices(u8, &plaintext, &decrypted);
+
+    // Wrong key → error.AuthenticationFailed (not garbage)
+    const wrong_key: [Aes256Gcm.key_length]u8 = [_]u8{0x00} ** Aes256Gcm.key_length;
+    try std.testing.expectError(error.AuthenticationFailed, decryptPrivateKey(&wrong_key, &enc.ciphertext, &enc.nonce, &enc.tag));
+
+    // Bit-flip in ciphertext → error.AuthenticationFailed
+    var flipped = enc.ciphertext;
+    flipped[0] ^= 0xFF;
+    try std.testing.expectError(error.AuthenticationFailed, decryptPrivateKey(&key, &flipped, &enc.nonce, &enc.tag));
+
+    // Bit-flip in tag → error.AuthenticationFailed
+    var bad_tag = enc.tag;
+    bad_tag[0] ^= 0xFF;
+    try std.testing.expectError(error.AuthenticationFailed, decryptPrivateKey(&key, &enc.ciphertext, &enc.nonce, &bad_tag));
+
+    // Encrypting same plaintext twice → different ciphertexts (random nonce)
+    const enc2 = encryptPrivateKey(&key, &plaintext);
+    try std.testing.expect(!std.mem.eql(u8, &enc.ciphertext, &enc2.ciphertext));
+    try std.testing.expect(!std.mem.eql(u8, &enc.nonce, &enc2.nonce));
 }
 
 test "wallet encryption state" {
