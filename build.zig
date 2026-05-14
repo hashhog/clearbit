@@ -810,6 +810,43 @@ pub fn build(b: *std.Build) void {
         w111_step.dependOn(&run_w111_tests.step);
     }
 
+    // W113 Coin selection audit tests. Same wrapper pattern as
+    // tests_wallet_w111.zig: project-root wrapper so wallet.zig's
+    // @embedFile("../resources/bip39-english.txt") resolves correctly.
+    // Run with `zig build test-wallet-w113`.
+    // NOT folded into the default `test` step — wallet.zig pulls secp256k1
+    // and the selectCoins anonymous-struct compile error blocks tests.zig.
+    {
+        const w113_tests = b.addTest(.{
+            .root_source_file = b.path("tests_wallet_w113.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w113"},
+        });
+        w113_tests.linkSystemLibrary("rocksdb");
+        w113_tests.linkSystemLibrary("secp256k1");
+        w113_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w113_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w113_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w113_tests.linkSystemLibrary("minisketch");
+            w113_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w113_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w113_tests = b.addRunArtifact(w113_tests);
+        const w113_step = b.step(
+            "test-wallet-w113",
+            "Run W113 coin selection audit tests",
+        );
+        w113_step.dependOn(&run_w113_tests.step);
+    }
+
     // BIP-39 mnemonic + PBKDF2 tests (W21). Same wrapper pattern as
     // tests_rpc.zig: project-root wrapper at `tests_bip39.zig` so
     // `src/bip39.zig`'s `@embedFile("../resources/bip39-english.txt")`
