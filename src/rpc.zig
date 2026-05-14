@@ -3212,7 +3212,7 @@ pub const RpcServer = struct {
 
             const ping_display: i64 = if (peer.min_ping_time == std.math.maxInt(i64)) 0 else peer.min_ping_time;
             const ping_f64: f64 = @as(f64, @floatFromInt(ping_display)) / 1000.0;
-            try writer.print("],\"relaytxes\":{},\"lastsend\":{d},\"lastrecv\":{d},\"last_transaction\":0,\"last_block\":0,\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d:.6},\"minping\":{d:.6},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"presynced_headers\":-1,\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"addr_relay_enabled\":true,\"addr_processed\":0,\"addr_rate_limited\":0,\"permissions\":[],\"minfeefilter\":0.0,\"bytessent_per_msg\":{{}},\"bytesrecv_per_msg\":{{}},\"connection_type\":\"{s}\",\"transport_protocol_type\":\"v1\",\"session_id\":\"\"}}", .{
+            try writer.print("],\"relaytxes\":{},\"lastsend\":{d},\"lastrecv\":{d},\"last_transaction\":0,\"last_block\":0,\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d:.6},\"minping\":{d:.6},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"presynced_headers\":-1,\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"addr_relay_enabled\":true,\"addr_processed\":0,\"addr_rate_limited\":0,\"permissions\":[],\"minfeefilter\":0.0,\"bytessent_per_msg\":{{}},\"bytesrecv_per_msg\":{{}},\"connection_type\":\"{s}\",\"transport_protocol_type\":\"v1\",\"session_id\":\"\",\"mapped_as\":{d}}}", .{
                 peer.relay_txs,
                 peer.last_message_time,
                 peer.last_message_time,
@@ -3229,6 +3229,7 @@ pub const RpcServer = struct {
                 peer.best_known_height,
                 peer.best_known_height,
                 if (is_inbound) "inbound" else "outbound-full-relay",
+                peer.mapped_as,
             });
         }
 
