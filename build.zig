@@ -711,6 +711,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_bip152_tests.step);
     }
 
+    // W112 — BIP-152 compact-blocks 30-gate audit tests (FIX-42: BUG-4+8).
+    // Tests p2p.zig constants, wire-format gates, and verifies BUG-4/BUG-8 fixes.
+    // No RocksDB or wallet dependency (imports p2p.zig, serialize.zig, crypto.zig).
+    // Run with `zig build test-w112`.
+    {
+        const w112_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w112_compact_blocks.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"W112"},
+        });
+        w112_tests.linkSystemLibrary("secp256k1");
+        w112_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w112_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w112_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        w112_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w112_tests = b.addRunArtifact(w112_tests);
+        const w112_step = b.step(
+            "test-w112",
+            "Run W112 BIP-152 compact-blocks 30-gate audit tests (FIX-42 BUG-4+8)",
+        );
+        w112_step.dependOn(&run_w112_tests.step);
+        // Fold into the main `test` step — no wallet.zig dependency.
+        test_step.dependOn(&run_w112_tests.step);
+    }
+
     // PSBT W47 multisig finalize + sort-on-emit tests. Same wiring shape
     // as test-p2sh-commitment above (psbt.zig has no @embedFile and
     // doesn't pull wallet.zig). Run with `zig build test-psbt-w47`.

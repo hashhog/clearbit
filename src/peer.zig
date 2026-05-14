@@ -4519,8 +4519,52 @@ pub const PeerManager = struct {
             .getblocktxn => |gbt| {
                 // Free allocated index array.
                 defer self.allocator.free(gbt.indexes);
-                // Peer is requesting missing transactions for compact block
-                // reconstruction. We don't serve compact blocks yet, so ignore.
+                // BUG-8 FIX (W112, FIX-42): MAX_BLOCKTXN_DEPTH guard.
+                // Reference: bitcoin-core/src/net_processing.cpp:4276-4303.
+                // If the requested block is more than MAX_BLOCKTXN_DEPTH=10
+                // behind the tip, respond with the full block via MSG_WITNESS_BLOCK
+                // instead of blocktxn (peer can't have a useful mempool that deep;
+                // also protects against cheap getblocktxn DoS from disk reads).
+                // Core: pushes MSG_WITNESS_BLOCK to peer.m_getdata_requests for
+                // the next loop. Clearbit: serve directly from the relay cache.
+                const gbt_tip_height: u32 = if (self.chain_state) |cs| cs.best_height else 0;
+                const gbt_block_height_opt: ?u32 = blk: {
+                    if (self.header_index.get(gbt.block_hash)) |entry| {
+                        break :blk entry.height;
+                    }
+                    break :blk null;
+                };
+                if (gbt_block_height_opt) |gbt_block_height| {
+                    const gbt_depth = if (gbt_tip_height >= gbt_block_height)
+                        gbt_tip_height - gbt_block_height
+                    else
+                        0;
+                    if (gbt_depth > p2p.MAX_BLOCKTXN_DEPTH) {
+                        // Block is too deep — respond with full block instead of blocktxn.
+                        // Reference: bitcoin-core/src/net_processing.cpp:4299-4301.
+                        std.log.debug("P2P: getblocktxn depth={d} > MAX_BLOCKTXN_DEPTH={d}, serving full block", .{ gbt_depth, p2p.MAX_BLOCKTXN_DEPTH });
+                        if (self.served_blocks.get(gbt.block_hash)) |block_data| {
+                            var gbt_reader = serialize.Reader{ .data = block_data };
+                            const gbt_block = serialize.readBlock(&gbt_reader, self.allocator) catch return;
+                            defer serialize.freeBlock(self.allocator, &gbt_block);
+                            const gbt_block_msg = p2p.Message{ .block = gbt_block };
+                            peer.sendMessage(&gbt_block_msg) catch {};
+                        } else if (self.block_buffer.get(gbt.block_hash)) |gbt_buffered| {
+                            const gbt_block_msg = p2p.Message{ .block = gbt_buffered };
+                            peer.sendMessage(&gbt_block_msg) catch {};
+                        } else {
+                            const gbt_nf_inv = [_]p2p.InvVector{.{
+                                .inv_type = .msg_witness_block,
+                                .hash = gbt.block_hash,
+                            }};
+                            const gbt_nf_msg = p2p.Message{ .notfound = .{ .inventory = &gbt_nf_inv } };
+                            peer.sendMessage(&gbt_nf_msg) catch {};
+                        }
+                        return;
+                    }
+                }
+                // Block is within depth (or depth unknown) — we don't yet serve
+                // blocktxn responses (BUG-7, separate from BUG-8). Ignore.
             },
             .blocktxn => |bt| {
                 // Free allocated transactions.
@@ -4629,6 +4673,144 @@ pub const PeerManager = struct {
                             }};
                             const nf_msg = p2p.Message{ .notfound = .{ .inventory = &not_found_inv } };
                             peer.sendMessage(&nf_msg) catch {};
+                        }
+                    } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_cmpct_block))) {
+                        // BUG-4 FIX (W112, FIX-42): MSG_CMPCT_BLOCK getdata handler.
+                        // Reference: bitcoin-core/src/net_processing.cpp:2461-2476
+                        //   (ProcessGetBlockData, IsMsgCmpctBlk branch).
+                        // If block depth ≤ MAX_CMPCTBLOCK_DEPTH=5: build and serve
+                        // CBlockHeaderAndShortTxIDs (cmpctblock). Deeper blocks (or
+                        // blocks not in our cache): fall back to full block.
+                        // Core: "If a peer is asking for old blocks, we're almost
+                        // guaranteed they won't have a useful mempool to match against
+                        // a compact block, and we don't feel like constructing the
+                        // object for them, so instead we respond with the full block."
+                        const tip_height: u32 = if (self.chain_state) |cs| cs.best_height else 0;
+                        const block_height_opt: ?u32 = blk: {
+                            if (self.header_index.get(item.hash)) |entry| {
+                                break :blk entry.height;
+                            }
+                            break :blk null;
+                        };
+                        const depth: u32 = if (block_height_opt) |bh|
+                            (if (tip_height >= bh) tip_height - bh else 0)
+                        else
+                            p2p.MAX_CMPCTBLOCK_DEPTH + 1; // unknown depth → fall back
+                        if (depth <= p2p.MAX_CMPCTBLOCK_DEPTH) {
+                            // Serve compact block (BIP-152 CBlockHeaderAndShortTxIDs).
+                            // Locate the full block from cache.
+                            const cmpct_block_opt: ?types.Block = blk2: {
+                                if (self.served_blocks.get(item.hash)) |block_data| {
+                                    var cmpct_reader = serialize.Reader{ .data = block_data };
+                                    const b = serialize.readBlock(&cmpct_reader, self.allocator) catch break :blk2 null;
+                                    break :blk2 b;
+                                } else if (self.block_buffer.get(item.hash)) |buffered| {
+                                    break :blk2 buffered;
+                                }
+                                break :blk2 null;
+                            };
+                            if (cmpct_block_opt) |cmpct_block| {
+                                // If block came from served_blocks we own a copy; for
+                                // block_buffer we borrow — use defer only for the owned case.
+                                const owns_block = self.served_blocks.contains(item.hash);
+                                defer if (owns_block) serialize.freeBlock(self.allocator, &cmpct_block);
+
+                                // Build CBlockHeaderAndShortTxIDs inline.
+                                // Reference: bitcoin-core/src/blockencodings.cpp
+                                //   CBlockHeaderAndShortTxIDs::CBlockHeaderAndShortTxIDs(const CBlock&, bool).
+                                // Nonce: 64-bit CSPRNG per Core (m_rng.rand64()).
+                                const cb_nonce = std.crypto.random.int(u64);
+
+                                // Derive SipHash key: SHA256(header_bytes || nonce_LE)[0..16]
+                                var cb_key_data: [88]u8 = undefined;
+                                std.mem.writeInt(i32, cb_key_data[0..4], cmpct_block.header.version, .little);
+                                @memcpy(cb_key_data[4..36], &cmpct_block.header.prev_block);
+                                @memcpy(cb_key_data[36..68], &cmpct_block.header.merkle_root);
+                                std.mem.writeInt(u32, cb_key_data[68..72], cmpct_block.header.timestamp, .little);
+                                std.mem.writeInt(u32, cb_key_data[72..76], cmpct_block.header.bits, .little);
+                                std.mem.writeInt(u32, cb_key_data[76..80], cmpct_block.header.nonce, .little);
+                                std.mem.writeInt(u64, cb_key_data[80..88], cb_nonce, .little);
+                                const cb_key_hash = crypto.sha256(&cb_key_data);
+                                const cb_k0 = std.mem.readInt(u64, cb_key_hash[0..8], .little);
+                                const cb_k1 = std.mem.readInt(u64, cb_key_hash[8..16], .little);
+                                var cb_sip_key: [16]u8 = undefined;
+                                std.mem.writeInt(u64, cb_sip_key[0..8], cb_k0, .little);
+                                std.mem.writeInt(u64, cb_sip_key[8..16], cb_k1, .little);
+
+                                const SipHash64 = std.crypto.auth.siphash.SipHash64(2, 4);
+
+                                // Build short_ids for non-coinbase transactions (index ≥ 1).
+                                // Coinbase is always prefilled at index 0.
+                                var short_ids = std.ArrayList([6]u8).init(self.allocator);
+                                defer short_ids.deinit();
+                                var cb_alloc_err = false;
+                                for (cmpct_block.transactions, 0..) |*tx, ti| {
+                                    if (ti == 0) continue; // coinbase → prefilled
+                                    const wtxid = crypto.computeWtxidStreaming(tx);
+                                    var cb_hasher = SipHash64.init(&cb_sip_key);
+                                    cb_hasher.update(&wtxid);
+                                    const short_val = cb_hasher.finalInt() & 0x0000ffffffffffff;
+                                    var sid6: [6]u8 = undefined;
+                                    // Write 6-byte little-endian short ID manually
+                                    // (u48 is not a valid writeInt type in Zig 0.13).
+                                    var tmp64: [8]u8 = undefined;
+                                    std.mem.writeInt(u64, &tmp64, short_val, .little);
+                                    @memcpy(&sid6, tmp64[0..6]);
+                                    short_ids.append(sid6) catch {
+                                        cb_alloc_err = true;
+                                        break;
+                                    };
+                                }
+
+                                if (!cb_alloc_err and cmpct_block.transactions.len > 0) {
+                                    // Coinbase prefilled (index 0 in wire, delta 0).
+                                    const coinbase_prefilled = [_]p2p.PrefilledTransaction{.{
+                                        .index = 0,
+                                        .tx = cmpct_block.transactions[0],
+                                    }};
+                                    const cmpct_msg = p2p.Message{ .cmpctblock = .{
+                                        .header = cmpct_block.header,
+                                        .nonce = cb_nonce,
+                                        .short_ids = short_ids.items,
+                                        .prefilled_txs = &coinbase_prefilled,
+                                    } };
+                                    peer.sendMessage(&cmpct_msg) catch {};
+                                    std.log.debug("P2P: served cmpctblock depth={d} to peer", .{depth});
+                                } else {
+                                    // Alloc failure or empty block — fall back to full block.
+                                    const fb_msg = p2p.Message{ .block = cmpct_block };
+                                    peer.sendMessage(&fb_msg) catch {};
+                                }
+                            } else {
+                                // Block not in cache — notfound.
+                                const not_found_inv = [_]p2p.InvVector{.{
+                                    .inv_type = item.inv_type,
+                                    .hash = item.hash,
+                                }};
+                                const nf_msg = p2p.Message{ .notfound = .{ .inventory = &not_found_inv } };
+                                peer.sendMessage(&nf_msg) catch {};
+                            }
+                        } else {
+                            // Block is too deep — serve full block instead.
+                            // Reference: bitcoin-core/src/net_processing.cpp:2473-2475.
+                            std.log.debug("P2P: cmpctblock request depth={d} > MAX_CMPCTBLOCK_DEPTH={d}, serving full block", .{ depth, p2p.MAX_CMPCTBLOCK_DEPTH });
+                            if (self.served_blocks.get(item.hash)) |block_data| {
+                                var fb_reader = serialize.Reader{ .data = block_data };
+                                const fb_block = serialize.readBlock(&fb_reader, self.allocator) catch continue;
+                                defer serialize.freeBlock(self.allocator, &fb_block);
+                                const fb_msg = p2p.Message{ .block = fb_block };
+                                peer.sendMessage(&fb_msg) catch {};
+                            } else if (self.block_buffer.get(item.hash)) |buffered_block| {
+                                const fb_msg = p2p.Message{ .block = buffered_block };
+                                peer.sendMessage(&fb_msg) catch {};
+                            } else {
+                                const not_found_inv = [_]p2p.InvVector{.{
+                                    .inv_type = item.inv_type,
+                                    .hash = item.hash,
+                                }};
+                                const nf_msg = p2p.Message{ .notfound = .{ .inventory = &not_found_inv } };
+                                peer.sendMessage(&nf_msg) catch {};
+                            }
                         }
                     } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
                         // Serve transaction from mempool by txid (legacy getdata).

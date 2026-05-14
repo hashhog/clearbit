@@ -34,6 +34,18 @@ pub const MAX_INV_SIZE: usize = 50000;
 pub const MAX_GETDATA_SZ: usize = 1000;
 pub const MAX_HEADERS_SIZE: usize = 2000;
 pub const MAX_ADDR_SIZE: usize = 1000;
+/// Maximum depth (tip.height - block.height) at which we will serve a
+/// cmpctblock in response to a MSG_CMPCT_BLOCK getdata.  Deeper blocks
+/// are served as full blocks instead (peer's mempool won't match anyway).
+/// Reference: bitcoin-core/src/net_processing.cpp:138 MAX_CMPCTBLOCK_DEPTH = 5.
+/// FIX-42 / W112 BUG-4.
+pub const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
+/// Maximum depth (tip.height - block.height) at which we will serve
+/// blocktxn in response to a getblocktxn.  Deeper requests get a full
+/// block via MSG_WITNESS_BLOCK getdata instead.
+/// Reference: bitcoin-core/src/net_processing.cpp:140 MAX_BLOCKTXN_DEPTH = 10.
+/// FIX-42 / W112 BUG-8.
+pub const MAX_BLOCKTXN_DEPTH: u32 = 10;
 /// BIP-130 / Core MAX_LOCATOR_SZ (chain.h): cap on locator hashes in
 /// a `getheaders` / `getblocks` message.  Anti-DoS: an attacker could
 /// otherwise force unbounded `Hash256` allocation.
