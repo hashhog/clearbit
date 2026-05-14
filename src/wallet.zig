@@ -1050,7 +1050,6 @@ pub const Wallet = struct {
         var best_value: i64 = std.math.maxInt(i64);
 
         const iterations: usize = 1000;
-        var rng_state: u64 = @bitCast(std.time.milliTimestamp());
 
         for (0..iterations) |_| {
             var included = try self.allocator.alloc(bool, applicable_groups.items.len);
@@ -1066,7 +1065,7 @@ pub const Wallet = struct {
                     // Pass 0: randomly include
                     // Pass 1: include if not yet included and not reached target
                     const should_consider = if (pass == 0)
-                        xorshift(&rng_state) % 2 == 0
+                        std.crypto.random.boolean()
                     else
                         !included[i];
 
@@ -1984,16 +1983,6 @@ fn estimateInputSize(addr_type: AddressType) u64 {
         .p2wsh => 100, // Approximate
         .p2tr => 58, // 32+4+1+0+4 + 64/4
     };
-}
-
-/// Simple xorshift64 PRNG for Knapsack randomization
-fn xorshift(state: *u64) u64 {
-    var x = state.*;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    state.* = x;
-    return x;
 }
 
 /// Get actual length of DER signature (may be less than 72).
