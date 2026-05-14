@@ -9,6 +9,7 @@ const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
 const mempool_mod = @import("mempool.zig");
 const validation = @import("validation.zig");
+const asmap_mod = @import("asmap.zig");
 
 // ============================================================================
 // Peer Manager Constants
@@ -433,6 +434,45 @@ pub fn sameNetGroup(addr1: std.net.Address, addr2: std.net.Address) bool {
     return netGroup(addr1) == netGroup(addr2);
 }
 
+/// Convert a std.net.Address to its canonical 16-byte big-endian IPv6
+/// representation for passing to the asmap interpreter.
+/// IPv4 addresses are returned as IPv4-mapped IPv6 (::ffff:a.b.c.d).
+/// Unknown families return all-zeros (will map to ASN 0).
+fn addressToIPv6(address: std.net.Address) [16]u8 {
+    var out = [_]u8{0} ** 16;
+    switch (address.any.family) {
+        std.posix.AF.INET => {
+            const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+            const ip_bytes = @as(*const [4]u8, @ptrCast(&ip4.addr));
+            // IPv4-mapped IPv6: ::ffff:a.b.c.d
+            out[10] = 0xFF;
+            out[11] = 0xFF;
+            out[12] = ip_bytes[0];
+            out[13] = ip_bytes[1];
+            out[14] = ip_bytes[2];
+            out[15] = ip_bytes[3];
+        },
+        std.posix.AF.INET6 => {
+            const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&address.any)));
+            @memcpy(&out, &ip6.addr);
+        },
+        else => {}, // all-zeros → ASN 0
+    }
+    return out;
+}
+
+/// Look up the mapped AS number for `address` using the loaded asmap.
+/// Returns 0 when asmap is not loaded or the address is non-IPv4/IPv6.
+/// Mirrors Core's `NetGroupManager::GetMappedAS(address)`.
+pub fn getMappedAS(asmap_data: []const u8, address: std.net.Address) u32 {
+    if (asmap_data.len == 0) return 0;
+    // Only IPv4 and IPv6 addresses have ASN mappings.
+    if (address.any.family != std.posix.AF.INET and
+        address.any.family != std.posix.AF.INET6) return 0;
+    const ip = addressToIPv6(address);
+    return asmap_mod.interpret(asmap_data, ip);
+}
+
 // ============================================================================
 // BIP-35 mempool inventory helpers
 //
@@ -589,6 +629,12 @@ pub const Peer = struct {
     /// peer_version_timestamp - our_time_at_receipt.  Matches Bitcoin Core's
     /// CNode::nTimeOffset.  Zero until VERSION has been received.
     time_offset: i64 = 0,
+
+    /// Mapped Autonomous System Number for this peer's address.
+    /// Set at connection-establishment time when an asmap is loaded.
+    /// 0 when asmap is not loaded or the ASN is unknown.
+    /// Mirrors Core's `CNodeStats::m_mapped_as` (net.cpp:3813).
+    mapped_as: u32 = 0,
 
     /// Whether we advertise NODE_BLOOM (BIP-37/BIP-35 service flag) in our
     /// VERSION message and serve `mempool` requests.  Mirrored from
@@ -2276,6 +2322,13 @@ pub const PeerManager = struct {
     /// drain time so a disconnected peer is never dereferenced.
     block_source_peers: std.AutoHashMap(types.Hash256, usize),
 
+    /// ASMap binary bytecode for IP → ASN lookup.  Null when no --asmap file
+    /// was loaded.  When non-null, `netGroupWithAsmap()` returns an ASN-keyed
+    /// group instead of a /16 prefix group, providing AS-level eclipse
+    /// resistance.  Mirrors Core's NetGroupManager::m_asmap field.
+    /// Slice is allocator-owned; freed in deinit().
+    asmap_data: ?[]u8 = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
@@ -2320,6 +2373,7 @@ pub const PeerManager = struct {
             .pending_reorg = null,
             .block_source_peers = std.AutoHashMap(types.Hash256, usize).init(allocator),
             .last_orphan_sweep = 0,
+            .asmap_data = null,
         };
     }
 
@@ -2358,6 +2412,7 @@ pub const PeerManager = struct {
         self.header_index.deinit();
         if (self.pending_reorg) |*pr| pr.deinit();
         self.block_source_peers.deinit();
+        if (self.asmap_data) |data| self.allocator.free(data);
     }
 
     /// Cap on the BIP-324 v2 fall-back set (per-process).  Once exceeded
@@ -2463,6 +2518,10 @@ pub const PeerManager = struct {
         peer.advertise_node_bloom = self.peerbloomfilters;
         peer.advertise_node_network_limited = self.advertise_node_network_limited;
         peer.advertise_compact_filters = self.blockfilterindex_enabled;
+        // Set mapped_as for getpeerinfo when asmap is loaded.
+        if (self.asmap_data) |data| {
+            peer.mapped_as = getMappedAS(data, address);
+        }
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -3029,8 +3088,8 @@ pub const PeerManager = struct {
             const peer = self.connectOutboundNegotiated(addr) orelse continue;
             peer.conn_type = .block_relay;
 
-            // Track netgroup
-            self.outbound_netgroups.put(netGroup(addr), {}) catch {};
+            // Track netgroup (ASN-keyed when asmap is loaded)
+            self.outbound_netgroups.put(self.getNetGroup(addr), {}) catch {};
 
             self.peers.append(peer) catch {
                 peer.disconnect();
@@ -3049,23 +3108,35 @@ pub const PeerManager = struct {
     // Eclipse Attack Protection: Netgroup Diversity
     // ========================================================================
 
+    /// Compute the group key for `address`.  When an asmap is loaded, returns
+    /// an ASN-keyed group (providing AS-level eclipse resistance); otherwise
+    /// falls back to the /16 (IPv4) or /32 (IPv6) prefix group.
+    /// Mirrors Core's `NetGroupManager::GetGroup()` (netgroup.cpp).
+    pub fn getNetGroup(self: *const PeerManager, address: std.net.Address) u32 {
+        if (self.asmap_data) |data| {
+            const asn = getMappedAS(data, address);
+            if (asn != 0) return asn; // ASN found — use AS-level grouping
+        }
+        return netGroup(address);
+    }
+
     /// Check if adding a peer from the given address would violate netgroup diversity.
     pub fn violatesNetgroupDiversity(self: *const PeerManager, address: std.net.Address) bool {
-        const group = netGroup(address);
+        const group = self.getNetGroup(address);
         return self.outbound_netgroups.contains(group);
     }
 
     /// Update netgroup tracking when a peer is connected.
     fn trackOutboundNetgroup(self: *PeerManager, peer: *const Peer) void {
         if (peer.direction == .outbound) {
-            self.outbound_netgroups.put(netGroup(peer.address), {}) catch {};
+            self.outbound_netgroups.put(self.getNetGroup(peer.address), {}) catch {};
         }
     }
 
     /// Remove netgroup tracking when a peer is disconnected.
     fn untrackOutboundNetgroup(self: *PeerManager, peer: *const Peer) void {
         if (peer.direction == .outbound) {
-            _ = self.outbound_netgroups.remove(netGroup(peer.address));
+            _ = self.outbound_netgroups.remove(self.getNetGroup(peer.address));
         }
     }
 
@@ -3178,6 +3249,10 @@ pub const PeerManager = struct {
         peer.advertise_node_bloom = self.peerbloomfilters;
         peer.advertise_node_network_limited = self.advertise_node_network_limited;
         peer.advertise_compact_filters = self.blockfilterindex_enabled;
+        // Set mapped_as for getpeerinfo when asmap is loaded.
+        if (self.asmap_data) |data| {
+            peer.mapped_as = getMappedAS(data, conn.address);
+        }
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
