@@ -114,6 +114,12 @@ pub const Config = struct {
     // Assumevalid control
     noassumevalid: bool = false, // if true, set assumed_valid_hash = null (always verify scripts)
 
+    // ASMap: optional path to a binary asmap file for ASN-based peer bucketing.
+    // When set and the file passes SanityCheckAsmap, getPeerInfo will include
+    // `mapped_as` and netGroup() uses ASN keys instead of /16 prefixes.
+    // Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
+    asmap_path: ?[]const u8 = null,
+
     pub const Network = enum {
         mainnet,
         testnet,
@@ -337,6 +343,12 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         // Assumevalid control
         else if (std.mem.eql(u8, arg, "--noassumevalid") or std.mem.eql(u8, arg, "-noassumevalid")) {
             config.noassumevalid = true;
+        }
+        // ASMap — optional binary asmap file for ASN-based peer bucketing.
+        // Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
+        else if (std.mem.startsWith(u8, arg, "--asmap=") or std.mem.startsWith(u8, arg, "-asmap=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.asmap_path = arg[eq + 1 ..];
         }
         // Help and version
         else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -1740,6 +1752,17 @@ pub fn main() !void {
     // NODE_COMPACT_FILTERS when both peerblockfilters + blockfilterindex hold.
     // clearbit gates only on blockfilterindex (peerblockfilters follows it).
     peer_manager.blockfilterindex_enabled = config.blockfilterindex;
+    // ASMap: load the binary asmap file if --asmap=<path> was provided.
+    // Mirrors Core's init.cpp:1598-1628 DecodeAsmap + CheckStandardAsmap.
+    if (config.asmap_path) |asmap_path| {
+        const asmap_mod = @import("asmap.zig");
+        if (asmap_mod.loadAsmap(allocator, asmap_path)) |data| {
+            peer_manager.asmap_data = data;
+            std.debug.print("ASMap: loaded {d} bytes from '{s}'\n", .{ data.len, asmap_path });
+        } else |err| {
+            std.debug.print("Warning: could not load asmap from '{s}': {}\n", .{ asmap_path, err });
+        }
+    }
 
     const auth_token = computeAuthToken(config.rpc_user, config.rpc_password, allocator) catch null;
     defer if (auth_token) |t| allocator.free(t);

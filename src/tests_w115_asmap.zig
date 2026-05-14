@@ -42,37 +42,38 @@ const AddressInfo = peer_mod.AddressInfo;
 const Config = main_mod.Config;
 
 // ============================================================================
-// G1: -asmap CLI flag absent
-// BUG: Core exposes `-asmap=<file>` (init.cpp:540) and `-asmap=1` (embedded).
-//      clearbit has no such flag in Config or parseArgs.  No operator can
-//      opt into ASN-based bucketing; the feature is absent from the CLI.
+// G1: -asmap CLI flag — FIX-50 IMPLEMENTED
+// FIX: clearbit now has `asmap_path: ?[]const u8 = null` in Config and
+//      parses `--asmap=<file>` / `-asmap=<file>` in parseArgs.
 //
 //      Core ref: bitcoin-core/src/init.cpp:540
 //        argsman.AddArg("-asmap=<file>", "Specify asn mapping used for
 //        bucketing of the peers.")
 // ============================================================================
-test "w115/G1: Config has no asmap_path field (flag absent)" {
-    // ASMap is MISSING ENTIRELY from Config.
-    try testing.expect(!@hasField(Config, "asmap_path"));
-    try testing.expect(!@hasField(Config, "asmap"));
-    try testing.expect(!@hasField(Config, "asmap_file"));
+test "w115/G1: Config has asmap_path field (FIX-50)" {
+    // FIX-50: asmap_path field now present and defaults to null.
+    try testing.expect(@hasField(Config, "asmap_path"));
+    // Default value is null (no asmap loaded).
+    const cfg = Config{};
+    try testing.expect(cfg.asmap_path == null);
 }
 
 // ============================================================================
-// G2: DecodeAsmap / file loading absent
-// BUG: Core loads and validates a binary asmap file from disk in init.cpp:1603
-//      via `DecodeAsmap(asmap_path)`.  clearbit has no equivalent loader.
-//      Consequence: even if an asmap file exists in the datadir, clearbit
-//      ignores it entirely.
+// G2: DecodeAsmap / file loading — FIX-50 IMPLEMENTED
+// FIX: PeerManager now has `asmap_data: ?[]u8 = null` and `src/asmap.zig`
+//      provides `loadAsmap(allocator, path) ![]u8` with MAX_ASMAP_FILESIZE
+//      guard and SanityCheckAsmap validation.
 //
 //      Core ref: bitcoin-core/src/util/asmap.cpp:DecodeAsmap()
-//        std::vector<std::byte> DecodeAsmap(fs::path path) { … fopen … }
 // ============================================================================
-test "w115/G2: PeerManager has no asmap_data field (file loading absent)" {
-    // ASMap file loading is MISSING ENTIRELY from PeerManager.
-    try testing.expect(!@hasField(PeerManager, "asmap_data"));
-    try testing.expect(!@hasField(PeerManager, "asmap"));
-    try testing.expect(!@hasField(PeerManager, "asmap_bytes"));
+test "w115/G2: PeerManager has asmap_data field (FIX-50)" {
+    // FIX-50: asmap_data field now present and defaults to null.
+    try testing.expect(@hasField(PeerManager, "asmap_data"));
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+    // Default: no asmap loaded.
+    try testing.expect(manager.asmap_data == null);
 }
 
 // ============================================================================
@@ -152,20 +153,22 @@ test "w115/G6: no Interpret() trie walker in peer module (core primitive absent)
 }
 
 // ============================================================================
-// G7: NetGroupManager / GetMappedAS() absent — MISSING ENTIRELY
-// BUG: Core wraps all asmap logic in `NetGroupManager` (netgroup.h).
-//      `GetMappedAS(addr)` uses Interpret() with the loaded asmap to return
-//      the ASN (returns 0 when asmap is empty or addr is non-IPv4/IPv6).
-//      clearbit has neither the manager class nor the MappedAS lookup.
+// G7: NetGroupManager / GetMappedAS() — FIX-50 IMPLEMENTED
+// FIX: `getMappedAS(asmap_data, address)` is now exported from peer.zig.
+//      PeerManager.getNetGroup() uses ASN-keyed grouping when asmap is loaded.
+//      PeerManager.asmap_data holds the loaded bytes.
 //
 //      Core ref: bitcoin-core/src/netgroup.h
 //        uint32_t GetMappedAS(const CNetAddr& address) const;
 // ============================================================================
-test "w115/G7: PeerManager has no GetMappedAS / netgroupman integration" {
-    try testing.expect(!@hasField(PeerManager, "netgroupman"));
-    try testing.expect(!@hasField(PeerManager, "netgroup_manager"));
-    try testing.expect(!@hasDecl(peer_mod, "getMappedAS"));
-    try testing.expect(!@hasDecl(peer_mod, "getNetgroupManager"));
+test "w115/G7: getMappedAS available in peer module (FIX-50)" {
+    // FIX-50: getMappedAS() is now exported from peer.zig.
+    try testing.expect(@hasDecl(peer_mod, "getMappedAS"));
+    // Returns 0 when asmap_data is empty.
+    const addr = std.net.Address.initIp4([4]u8{ 1, 2, 3, 4 }, 8333);
+    try testing.expectEqual(@as(u32, 0), peer_mod.getMappedAS(&[_]u8{}, addr));
+    // PeerManager has asmap_data field that feeds getNetGroup().
+    try testing.expect(@hasField(PeerManager, "asmap_data"));
 }
 
 // ============================================================================
@@ -454,26 +457,48 @@ test "w115/G20: no asmap_version / rebucket-on-mismatch logic in PeerManager" {
 }
 
 // ============================================================================
-// G21: mapped_as absent from getpeerinfo RPC response
-// BUG: Core's getpeerinfo returns `"mapped_as": <asn>` for each peer when
-//      asmap is loaded (net.cpp:3813, bitcoin-cli.cpp:537).  clearbit's
-//      handleGetPeerInfo (rpc.zig:3175) emits no such field.  This is an
-//      observable protocol-level divergence: operators cannot see which ASN
-//      a peer belongs to, and bitcoin-cli peer-table rendering breaks if it
-//      expects the field.
+// G21: mapped_as in getpeerinfo RPC response — FIX-50 IMPLEMENTED
+// FIX: Peer struct now has `mapped_as: u32 = 0`.  getpeerinfo handler emits
+//      `"mapped_as": <asn>` for every peer (0 when asmap is not loaded or
+//      the ASN is unknown).  Mirrors Core's net.cpp:3813.
 //
 //      Core ref: bitcoin-core/src/net.cpp:3813
 //        vstats.back().m_mapped_as = GetMappedAS(pnode->addr);
-//      bitcoin-core/src/bitcoin-cli.cpp:537
-//        const int mapped_as{peer["mapped_as"].isNull() ? 0 : …}
 // ============================================================================
-test "w115/G21: getpeerinfo response missing mapped_as field" {
-    // We verify the absence of an asmap_data or mapped_as tracking field
-    // in Peer struct — the structural prerequisite for emitting mapped_as.
-    const has_mapped_as = @hasField(peer_mod.Peer, "mapped_as");
-    const has_asn = @hasField(peer_mod.Peer, "asn");
-    try testing.expect(!has_mapped_as);
-    try testing.expect(!has_asn);
+test "w115/G21: Peer struct has mapped_as field (FIX-50)" {
+    // FIX-50: Peer struct now has mapped_as field.
+    try testing.expect(@hasField(peer_mod.Peer, "mapped_as"));
+    // Default value is 0 (no asmap loaded).
+    const dummy = peer_mod.Peer{
+        .stream = undefined,
+        .address = std.net.Address.initIp4([4]u8{ 1, 2, 3, 4 }, 8333),
+        .direction = .outbound,
+        .state = .connecting,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = &consensus.MAINNET,
+        .allocator = testing.allocator,
+        .recv_buffer = std.ArrayList(u8).init(testing.allocator),
+        .is_witness_capable = false,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
+    };
+    try testing.expectEqual(@as(u32, 0), dummy.mapped_as);
 }
 
 // ============================================================================
@@ -592,18 +617,17 @@ test "w115/G27: Config has no asmap_log_version field (startup log absent)" {
 }
 
 // ============================================================================
-// G28: RPC getnettotals / getpeerinfo column format broken for asmap consumers
-// BUG: Tools that parse `bitcoin-cli -getinfo` or `getpeerinfo` and expect the
-//      `mapped_as` column (shown when any peer has non-zero asmap) will receive
-//      a response lacking the field.  Downstream tooling (e.g. ASN diversity
-//      monitors) would fail silently or crash on field-absence.
+// G28: RPC getpeerinfo column format for asmap consumers — FIX-50 IMPLEMENTED
+// FIX: Peer struct has `mapped_as: u32 = 0`; getpeerinfo always emits the
+//      field (0 when asmap not loaded).  Downstream tooling that parses
+//      `mapped_as` from getpeerinfo will work correctly.
 //
 //      Core ref: bitcoin-core/src/bitcoin-cli.cpp:604-605
-//        m_is_asmap_on ? 7 : 0, // variable spacing
-//        m_is_asmap_on && peer.mapped_as ? ToString(peer.mapped_as) : ""
 // ============================================================================
-test "w115/G28: Peer struct has no mapped_as / asn field for RPC emission" {
-    try testing.expect(!@hasField(peer_mod.Peer, "mapped_as"));
+test "w115/G28: Peer struct has mapped_as field for RPC emission (FIX-50)" {
+    // FIX-50: mapped_as is now present on Peer and emitted by getpeerinfo.
+    try testing.expect(@hasField(peer_mod.Peer, "mapped_as"));
+    // No extra aliased fields needed — single canonical mapped_as field.
     try testing.expect(!@hasField(peer_mod.Peer, "remote_asn"));
     try testing.expect(!@hasField(peer_mod.Peer, "asn_number"));
 }

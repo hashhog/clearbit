@@ -19,6 +19,7 @@ comptime {
     _ = @import("debug_log.zig");
     _ = @import("zmq.zig");
     _ = @import("muhash.zig");
+    _ = @import("asmap.zig");
 }
 
 // ============================================================
