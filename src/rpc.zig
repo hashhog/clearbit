@@ -9282,24 +9282,33 @@ pub const RpcServer = struct {
 
         self.mempool.mutex.lock();
         defer self.mempool.mutex.unlock();
-        const target_clamped: usize = @intCast(@min(@as(u32, mempool_mod.FeeEstimator.MAX_CONFIRMATION_TARGET - 1), conf_target));
-        const fee_rate_opt = self.mempool.fee_estimator.estimateFee(target_clamped);
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const w = buf.writer();
 
-        // The three Bitcoin Core fee-estimate horizons. clearbit collapses
-        // them to a single estimator, so each horizon block reports the same
-        // numbers. Callers that read any single horizon get a meaningful
-        // result; callers that diff them get an honest answer (no data).
+        // The three Bitcoin Core fee-estimate horizons.  FIX-48: each horizon
+        // now reports its own decay + scale from FeeEstimator constants, and
+        // the fee rate is queried per-horizon via estimateFee.
+        const horizons = [_]struct {
+            name: []const u8,
+            decay: f64,
+            scale: u32,
+            max_target: usize,
+        }{
+            .{ .name = "short",  .decay = mempool_mod.FeeEstimator.DECAY[0], .scale = mempool_mod.FeeEstimator.SCALE[0], .max_target = mempool_mod.FeeEstimator.SHORT_MAX_TARGET },
+            .{ .name = "medium", .decay = mempool_mod.FeeEstimator.DECAY[1], .scale = mempool_mod.FeeEstimator.SCALE[1], .max_target = mempool_mod.FeeEstimator.MED_MAX_TARGET },
+            .{ .name = "long",   .decay = mempool_mod.FeeEstimator.DECAY[2], .scale = mempool_mod.FeeEstimator.SCALE[2], .max_target = mempool_mod.FeeEstimator.MAX_CONFIRMATION_TARGET },
+        };
         try w.writeByte('{');
-        const horizons = [_][]const u8{ "short", "medium", "long" };
-        for (horizons, 0..) |horizon, i| {
+        for (horizons, 0..) |h, i| {
             if (i > 0) try w.writeByte(',');
-            try w.print("\"{s}\":{{", .{horizon});
-            try w.writeAll("\"decay\":0.998,\"scale\":1");
-            if (fee_rate_opt) |rate| {
+            // Clamp conf_target to this horizon's max before querying
+            const h_target: usize = @min(conf_target, h.max_target);
+            const h_fee_opt = if (h_target == 0) null else self.mempool.fee_estimator.estimateFee(h_target);
+            try w.print("\"{s}\":{{", .{h.name});
+            try w.print("\"decay\":{d:.5},\"scale\":{d}", .{ h.decay, h.scale });
+            if (h_fee_opt) |rate| {
                 const btc_per_kvb = rate * 1000.0 / 100_000_000.0;
                 try w.print(",\"feerate\":{d:.8}", .{btc_per_kvb});
                 try w.writeAll(",\"pass\":{");
