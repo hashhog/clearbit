@@ -878,6 +878,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_bip39_tests.step);
     }
 
+    // W114 — CBlockPolicyEstimator fee estimation 30-gate audit.
+    // Uses a dedicated test root (tests_w114_fee_estimation.zig) which imports
+    // mempool.zig + types.zig only (no wallet.zig / no RocksDB required at runtime,
+    // but rocksdb is linked because mempool.zig depends on storage.zig).
+    // Run with `zig build test-w114`.
+    {
+        const w114_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w114_fee_estimation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w114"},
+        });
+        w114_tests.linkSystemLibrary("rocksdb");
+        w114_tests.linkSystemLibrary("secp256k1");
+        w114_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w114_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w114_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w114_tests.linkSystemLibrary("minisketch");
+            w114_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w114_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w114_tests = b.addRunArtifact(w114_tests);
+        const w114_test_step = b.step("test-w114", "Run W114 CBlockPolicyEstimator fee estimation 30-gate audit tests");
+        w114_test_step.dependOn(&run_w114_tests.step);
+        // Fold into the main `test` step so CI exercises W114.
+        test_step.dependOn(&run_w114_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
