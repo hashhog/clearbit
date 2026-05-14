@@ -1333,6 +1333,12 @@ pub const Mempool = struct {
             }
             zmq.global.publishTx(&tx_hash, raw_alloc);
         }
+
+        // Feed the fee estimator (Core: CBlockPolicyEstimator::processTransaction via
+        // CValidationInterface::TransactionAddedToMempool).
+        // BUG-1 fix (W114 G10): trackTransaction was defined but never called here.
+        const track_height: u32 = if (self.chain_state) |cs| cs.best_height else 0;
+        self.fee_estimator.trackTransaction(tx_hash, fee_rate, track_height) catch {};
     }
 
     /// Result of AcceptToMemoryPool, mirroring Bitcoin Core's MempoolAcceptResult.
@@ -1607,10 +1613,27 @@ pub const Mempool = struct {
     /// CTxMemPool::blockConnected sets blockSinceLastRollingFeeBump = true,
     /// txmempool.cpp:1143).
     pub fn removeForBlock(self: *Mempool, block: *const types.Block) void {
+        // Determine the block height for fee-estimator hooks.
+        // Core uses pindexNew->nHeight (validation.cpp:3074).  clearbit derives
+        // the height from chain_state.best_height when available; falls back to
+        // incrementing the estimator's current_height for the null-chain test path.
+        // BUG-2/3 fix (W114 G11/G12): confirmTransaction + processBlock were
+        // defined but never called from the block-connect path.
+        const block_height: u32 = if (self.chain_state) |cs|
+            cs.best_height
+        else
+            self.fee_estimator.current_height + 1;
+
         for (block.transactions) |tx| {
             const tx_hash = crypto.computeTxid(&tx, self.allocator) catch continue;
+            // Feed confirmed tx to the estimator before removing from mempool
+            // (Core: CBlockPolicyEstimator::processBlockTx via MempoolTransactionsRemovedForBlock).
+            self.fee_estimator.confirmTransaction(tx_hash, block_height);
             self.removeTransaction(tx_hash);
         }
+        // Update estimator state for the new block: apply decay, advance height.
+        // Core: CBlockPolicyEstimator::processBlock() via UpdateMovingAverages.
+        self.fee_estimator.processBlock(block_height);
         // A new block arrived — start decaying the rolling minimum fee rate.
         self.block_since_last_rolling_fee_bump = true;
         // Sweep the orphan pool for entries invalidated or confirmed by
@@ -3714,6 +3737,12 @@ pub const Mempool = struct {
         try self.updateDescendantCounts(tx_hash);
 
         self.total_size += vsize;
+
+        // Feed the fee estimator using the package fee rate (Core: processTransaction
+        // uses effective/package rate for CPFP child txs).
+        // BUG-1 fix (W114 G10): also applies to the package-rate admission path.
+        const pkg_track_height: u32 = if (self.chain_state) |cs| cs.best_height else 0;
+        self.fee_estimator.trackTransaction(tx_hash, package_fee_rate, pkg_track_height) catch {};
     }
 
     // ========================================================================

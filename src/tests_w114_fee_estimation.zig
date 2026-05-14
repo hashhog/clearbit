@@ -235,8 +235,9 @@ test "w114 G8: BUG-9 no period scale; MAX_CONFIRMATION_TARGET=144, Core LONG cov
 // ============================================================================
 
 test "w114 G10: BUG-1 P0 trackTransaction dead-helper: adding tx to mempool does not feed estimator" {
-    // After adding a tx to the mempool, the fee estimator should have 1 tracked tx.
-    // BUG: it has 0 because addTransaction() never calls fee_estimator.trackTransaction().
+    // FIX-47: addTransaction() now calls fee_estimator.trackTransaction() on success.
+    // This test uses a tx that fails validation (no UTXO for the input), so the
+    // estimator is still 0 — the hook only fires for successfully-added txs.
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -263,11 +264,13 @@ test "w114 G10: BUG-1 P0 trackTransaction dead-helper: adding tx to mempool does
         .lock_time = 0,
     };
 
-    // Adding will fail (no UTXO for the input) but what matters is the estimator state.
+    // With null chain_state, addTransaction assumes inputs exist (test-mode bypass).
+    // The tx is accepted (fee=0, fee_rate=0.0) and trackTransaction fires.
+    // FIX-47: estimator now has 1 tracked tx after successful addTransaction().
     _ = mempool.addTransaction(tx) catch {};
 
-    // BUG-1: estimator still shows 0 tracked (dead-helper — trackTransaction never called)
-    try std.testing.expectEqual(@as(usize, 0), mempool.fee_estimator.trackedCount());
+    // tx accepted in null-chain-state test mode → estimator tracks it.
+    try std.testing.expectEqual(@as(usize, 1), mempool.fee_estimator.trackedCount());
 }
 
 // ============================================================================
@@ -275,8 +278,11 @@ test "w114 G10: BUG-1 P0 trackTransaction dead-helper: adding tx to mempool does
 // ============================================================================
 
 test "w114 G11: BUG-2 P0 confirmTransaction dead-helper: removeForBlock does not feed estimator" {
-    // After a block is connected, confirmed txs should be recorded in the estimator.
-    // BUG: removeForBlock() never calls fee_estimator.confirmTransaction().
+    // FIX-47: removeForBlock() now calls fee_estimator.confirmTransaction() per tx.
+    // This test manually tracks txid=0xAA*32, then calls removeForBlock with a
+    // coinbase tx.  The coinbase txid != 0xAA*32, so confirmTransaction is called
+    // for the coinbase (a no-op in the estimator since it was never tracked) but
+    // 0xAA*32 remains tracked — trackedCount() stays 1.
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -316,8 +322,8 @@ test "w114 G11: BUG-2 P0 confirmTransaction dead-helper: removeForBlock does not
     };
     mempool.removeForBlock(&block);
 
-    // BUG-2: manually-tracked tx still in estimator (not confirmed via block path)
-    // The tracked count won't change because removeForBlock doesn't call confirmTransaction.
+    // The coinbase txid != 0xAA*32, so our manually-tracked entry is unaffected.
+    // confirmTransaction is now wired (FIX-47) but fires for the coinbase txid only.
     try std.testing.expectEqual(@as(usize, 1), mempool.fee_estimator.trackedCount());
 }
 
@@ -326,8 +332,9 @@ test "w114 G11: BUG-2 P0 confirmTransaction dead-helper: removeForBlock does not
 // ============================================================================
 
 test "w114 G12: BUG-3 P0 processBlock dead-helper: removeForBlock does not call processBlock" {
-    // After removeForBlock, current_height should be updated and decay applied.
-    // BUG: processBlock() is never called; current_height stays at 0.
+    // FIX-47: processBlock() is now called from removeForBlock().
+    // After 50 removeForBlock calls (no chain_state), current_height increments
+    // from 0 to 50 (height = current_height+1 each call).
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -365,8 +372,10 @@ test "w114 G12: BUG-3 P0 processBlock dead-helper: removeForBlock does not call 
         mempool.removeForBlock(&blk);
     }
 
-    // BUG-3: current_height should have advanced to ~150 but stays 0
-    try std.testing.expectEqual(@as(u32, 0), mempool.fee_estimator.current_height);
+    // FIX-47: processBlock() is now called from removeForBlock().
+    // With null chain_state, height increments from current_height+1 each call.
+    // After 50 calls starting from 0: current_height == 50.
+    try std.testing.expectEqual(@as(u32, 50), mempool.fee_estimator.current_height);
 }
 
 // ============================================================================
