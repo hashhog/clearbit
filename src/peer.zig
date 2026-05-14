@@ -621,6 +621,20 @@ pub const Peer = struct {
     /// Reference impl: camlcoin lib/peer_manager.ml::announce_block.
     send_headers: bool = false,
 
+    /// BIP-152: peer sent us a valid `sendcmpct` message with version == 2.
+    /// When true, this peer supports compact block relay (witness-aware v2).
+    /// Mirrors Bitcoin Core's CNodeState::m_provides_cmpctblocks.
+    /// Default false; set only after receiving sendcmpct(version=2).
+    /// Reference: bitcoin-core/src/net_processing.cpp:3911.
+    bip152_provides_cmpctblocks: bool = false,
+
+    /// BIP-152: peer requested high-bandwidth compact block relay by sending
+    /// sendcmpct(announce=true, version=2).  When true, we should push new
+    /// compact blocks to this peer proactively (lNodesAnnouncingHeaderAndIDs).
+    /// Mirrors Bitcoin Core's CNode::m_bip152_highbandwidth_from.
+    /// Reference: bitcoin-core/src/net_processing.cpp:3915.
+    bip152_highbandwidth_from: bool = false,
+
     /// BIP-339: peer sent us a `wtxidrelay` message during handshake.
     /// When true, relay tx invs using MSG_WTX (=5) with wtxid as hash.
     /// When false, use MSG_TX (=1) with txid (legacy behaviour).
@@ -1381,8 +1395,19 @@ pub const Peer = struct {
                         // BIP-339: peer negotiated wtxid relay.
                         self.wtxid_relay_negotiated = true;
                     },
-                    .sendaddrv2, .sendcmpct, .sendheaders => {
+                    .sendaddrv2, .sendheaders => {
                         // Accept these during handshake but no action needed
+                    },
+                    .sendcmpct => |sc| {
+                        // BIP-152: validate version field.
+                        // Core rejects version != 2 immediately
+                        // (net_processing.cpp:3907 if sendcmpct_version != CMPCTBLOCKS_VERSION return).
+                        // Version 1 (non-segwit) was removed in Core 0.18+; only v2 is supported.
+                        // Silently drop non-v2: do not update peer compact-relay state.
+                        if (sc.version == 2) {
+                            self.bip152_provides_cmpctblocks = true;
+                            self.bip152_highbandwidth_from = sc.announce;
+                        }
                     },
                     .feefilter => |ff| {
                         // BIP-133: Store the peer's fee filter during handshake
@@ -4889,6 +4914,17 @@ pub const PeerManager = struct {
                 // Reference: bitcoin-core/src/net_processing.cpp
                 // (PeerManagerImpl::ProcessMessage NetMsgType::SENDHEADERS).
                 peer.send_headers = true;
+            },
+            .sendcmpct => |sc| {
+                // BIP-152: validate version field before updating peer compact-relay state.
+                // Core drops the message immediately if version != CMPCTBLOCKS_VERSION (2):
+                //   net_processing.cpp:3907 — if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;
+                // Version 1 (non-segwit short IDs) was removed in Bitcoin Core 0.18+.
+                // Only version 2 (witness-aware wtxid short IDs) is supported per BIP-152 §Note 7.
+                // Silently drop non-v2: do not install compact relay for this peer.
+                if (sc.version != 2) return;
+                peer.bip152_provides_cmpctblocks = true;
+                peer.bip152_highbandwidth_from = sc.announce;
             },
             // BIP-37 / BIP-111 bloom filter messages.
             //
