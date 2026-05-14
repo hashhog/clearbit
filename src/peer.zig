@@ -285,6 +285,12 @@ pub const MAX_TOTAL_CONNECTIONS: usize = MAX_OUTBOUND_CONNECTIONS + MAX_INBOUND_
 /// Peer rotation interval in seconds (30 minutes).
 pub const PEER_ROTATION_INTERVAL: i64 = 30 * 60;
 
+/// ASMap health check interval in seconds (1 hour).
+/// Core runs this every 24 h (net.h:93); clearbit uses a shorter window so
+/// that operators get earlier feedback on coverage gaps.
+/// Reference: bitcoin-core/src/net.h  `ASMAP_HEALTH_CHECK_INTERVAL`
+pub const ASMAP_HEALTH_CHECK_INTERVAL: i64 = 3600;
+
 /// DNS seed resolution timeout in seconds.
 pub const DNS_SEED_TIMEOUT: u32 = 10;
 
@@ -2328,6 +2334,13 @@ pub const PeerManager = struct {
     /// resistance.  Mirrors Core's NetGroupManager::m_asmap field.
     /// Slice is allocator-owned; freed in deinit().
     asmap_data: ?[]u8 = null,
+
+    /// Timestamp (Unix seconds) of the last ASMap health check run.
+    /// Initialized to 0 so the first loop iteration always triggers the
+    /// initial run (matching Core: ASMapHealthCheck() is called once
+    /// immediately then scheduled every ASMAP_HEALTH_CHECK_INTERVAL).
+    /// Only meaningful when asmap_data is non-null.
+    last_asmap_health_check: i64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -5186,6 +5199,112 @@ pub const PeerManager = struct {
         }
     }
 
+    // ========================================================================
+    // ASMap Health Check (Bitcoin Core net.cpp / netgroup.cpp)
+    // ========================================================================
+
+    /// Maximum number of top-by-peer-count ASNs printed in the health log.
+    pub const ASMAP_HEALTH_TOP_N: usize = 5;
+
+    /// Entry type for the top-N ASN table used in asmapHealthCheck.
+    pub const AsmapTopEntry = struct { asn: u32, count: u32 };
+
+    /// Compare two AsmapTopEntry values descending by count (for sorting).
+    fn asmapTopEntryDesc(_: void, a: AsmapTopEntry, b: AsmapTopEntry) bool {
+        return a.count > b.count;
+    }
+
+    /// Run ASMap health diagnostics and emit a log line.
+    ///
+    /// Iterates connected peers with completed handshakes, looks up each
+    /// address in the loaded asmap, and reports:
+    ///   - total clearnet (IPv4/IPv6) peer count
+    ///   - unique ASN count among mapped peers
+    ///   - unmapped peer count (ASN == 0)
+    ///   - top-N ASNs by peer count
+    ///
+    /// Called once at P2P startup (when asmap is loaded) and then
+    /// periodically every `ASMAP_HEALTH_CHECK_INTERVAL` seconds by the
+    /// main event loop.
+    ///
+    /// Reference: bitcoin-core/src/netgroup.cpp:109  `NetGroupManager::ASMapHealthCheck`
+    ///            bitcoin-core/src/net.cpp:4178        `CConnman::ASMapHealthCheck`
+    ///            bitcoin-core/src/net.cpp:3570-3573  (scheduler, 24 h interval)
+    pub fn asmapHealthCheck(self: *PeerManager) void {
+        const asmap = self.asmap_data orelse return; // no-op when asmap not loaded
+
+        // Per-ASN peer count map.
+        var asn_counts = std.AutoHashMap(u32, u32).init(self.allocator);
+        defer asn_counts.deinit();
+
+        var total_clearnet: u32 = 0;
+        var unmapped_count: u32 = 0;
+
+        for (self.peers.items) |peer| {
+            if (peer.state != .handshake_complete) continue;
+            // Filter to clearnet (IPv4 / IPv6) only — skip Tor/I2P/unknown.
+            switch (peer.address.any.family) {
+                std.posix.AF.INET, std.posix.AF.INET6 => {},
+                else => continue,
+            }
+            total_clearnet += 1;
+            const asn = getMappedAS(asmap, peer.address);
+            if (asn == 0) {
+                unmapped_count += 1;
+            } else {
+                const entry = asn_counts.getOrPutValue(asn, 0) catch continue;
+                entry.value_ptr.* += 1;
+            }
+        }
+
+        const unique_asns: u32 = @intCast(asn_counts.count());
+
+        std.log.info(
+            "ASMap Health Check: {d} clearnet peers mapped to {d} ASNs with {d} peers being unmapped",
+            .{ total_clearnet, unique_asns, unmapped_count },
+        );
+
+        // Emit top-N ASNs by peer count.
+        if (asn_counts.count() > 0) {
+            // Collect (asn, count) pairs into a fixed-size array for top-N.
+            var top = [_]AsmapTopEntry{.{ .asn = 0, .count = 0 }} ** ASMAP_HEALTH_TOP_N;
+            var it = asn_counts.iterator();
+            while (it.next()) |kv| {
+                const asn = kv.key_ptr.*;
+                const cnt = kv.value_ptr.*;
+                // Replace the minimum entry in top[] if this one is larger.
+                var min_idx: usize = 0;
+                for (top, 0..) |entry, idx| {
+                    if (entry.count < top[min_idx].count) min_idx = idx;
+                }
+                if (cnt > top[min_idx].count) {
+                    top[min_idx] = .{ .asn = asn, .count = cnt };
+                }
+            }
+            // Sort descending by count.
+            std.mem.sort(AsmapTopEntry, &top, {}, asmapTopEntryDesc);
+            for (top) |entry| {
+                if (entry.count == 0) break;
+                std.log.info("  AS{d}: {d} peer(s)", .{ entry.asn, entry.count });
+            }
+        }
+    }
+
+    /// Run the ASMap health check if enough time has elapsed since the last run,
+    /// or if it has never been run (last_asmap_health_check == 0).
+    ///
+    /// Called from the P2P event loop on every tick.  The no-op path
+    /// (asmap_data == null or interval not yet elapsed) is a single load +
+    /// compare, so the overhead on nodes without asmap is negligible.
+    pub fn runAsmapHealthCheck(self: *PeerManager) void {
+        if (self.asmap_data == null) return;
+        const now = std.time.timestamp();
+        if (self.last_asmap_health_check != 0 and
+            now - self.last_asmap_health_check < ASMAP_HEALTH_CHECK_INTERVAL) return;
+        self.last_asmap_health_check = now;
+        self.asmapHealthCheck();
+    }
+
     /// Check for ping timeouts (ping sent, no pong within PING_TIMEOUT).
     fn checkPingTimeouts(self: *PeerManager) void {
         var i: usize = 0;
@@ -6239,6 +6358,11 @@ pub const PeerManager = struct {
 
             // 6b. Sweep expired orphans (runs every ORPHAN_TX_EXPIRE_INTERVAL seconds)
             self.sweepOrphanPool();
+
+            // 6c. ASMap health check (runs every ASMAP_HEALTH_CHECK_INTERVAL seconds,
+            //     first run at startup — no-op when no asmap is loaded).
+            //     Reference: bitcoin-core/src/net.cpp:3570-3573
+            self.runAsmapHealthCheck();
 
             // 7. Peer rotation (skip if --connect mode)
             if (self.connect_address == null) {
