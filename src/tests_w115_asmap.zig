@@ -3,21 +3,24 @@
 //! Reference: bitcoin-core/src/util/asmap.h/cpp, netgroup.h/cpp, addrman.cpp,
 //!            init.cpp (-asmap arg), net.cpp (GetMappedAS, ASMapHealthCheck)
 //!
-//! VERDICT: MISSING ENTIRELY — ASMap is not implemented in clearbit.
+//! VERDICT: PARTIALLY FIXED (FIX-50 + FIX-51)
 //!
-//! clearbit's peer diversity / bucketing is based on raw /16 (IPv4) or /32
-//! (IPv6) prefix groups computed by `netGroup()` in peer.zig.  There is no:
-//!   - `Interpret()` trie walker
-//!   - `NetGroupManager` / `GetMappedAS()` integration
-//!   - `-asmap` CLI flag
-//!   - ASN-based bucket key derivation in AddrMan
-//!   - `mapped_as` field in `getpeerinfo` RPC response
-//!   - `getnetworkinfo` `asmap` field
+//! FIX-50 implemented: asmap.zig (Interpret trie, SanityCheckAsmap,
+//!   CheckStandardAsmap, getMappedAS, loadAsmap), peer.zig (getMappedAS,
+//!   addressToIPv6, getNetGroup, PeerManager.asmap_data, Peer.mapped_as,
+//!   Config.asmap_path, --asmap CLI flag).
+//!
+//! FIX-51 implemented: AddrMan bucket hashing via PeerManager.getNetGroup()
+//!   uses ASN-keyed group when asmap loaded; outbound ASN-diversity enforced
+//!   via violatesNetgroupDiversity → getNetGroup → ASN.  Tests G8/G13/G22
+//!   converted from bug-documentation to PASS verification.
+//!
+//! Still deferred:
+//!   - `AddrMan` two-table (new/tried) with SipHash nKey (FIX-52)
+//!   - asmap version in peers.dat (FIX-52)
+//!   - `AsmapVersion` checksum (FIX-52)
 //!   - `ASMapHealthCheck` periodic task
-//!   - Persistence of asmap version in peers.dat
-//!   - `MAX_ASMAP_FILESIZE` (8 MiB) file-size guard
-//!   - `SanityCheckAsmap` / `CheckStandardAsmap` validation
-//!   - `AsmapVersion` checksum computation
+//!   - Embedded asmap fallback
 //!
 //! Gate results legend: PASS / BUG / MISSING ENTIRELY
 //!
@@ -36,6 +39,7 @@ const peer_mod = @import("peer.zig");
 const p2p = @import("p2p.zig");
 const consensus = @import("consensus.zig");
 const main_mod = @import("main.zig");
+const asmap_mod = @import("asmap.zig");
 
 const PeerManager = peer_mod.PeerManager;
 const AddressInfo = peer_mod.AddressInfo;
@@ -172,12 +176,13 @@ test "w115/G7: getMappedAS available in peer module (FIX-50)" {
 }
 
 // ============================================================================
-// G8: ASN-keyed GetGroup() absent — bucket keys use raw prefix, not ASN
-// BUG: When asmap is loaded, Core's `GetGroup(addr)` returns a 5-byte key
-//      of the form [NET_IPV6, asn_byte0..3] regardless of whether the address
-//      is IPv4 or IPv6.  This means peers in the same AS but different /16s
-//      compete for the same bucket, providing AS-level eclipse resistance.
-//      clearbit returns /16 or /32 raw prefix — no AS-level grouping.
+// G8: ASN-keyed GetGroup() — FIX-51 IMPLEMENTED
+// FIX: PeerManager.getNetGroup(address) now returns the ASN as a u32 group
+//      key when asmap is loaded (matching Core's NetGroupManager::GetGroup
+//      which embeds the ASN in the returned byte vector).  Two addresses in
+//      the same AS but different /16 prefixes now hash to the same bucket key.
+//      The standalone `netGroup()` helper still returns /16 (used as fallback
+//      when asmap is absent).
 //
 //      Core ref: bitcoin-core/src/netgroup.cpp:NetGroupManager::GetGroup()
 //        if (asn != 0) {
@@ -186,23 +191,56 @@ test "w115/G7: getMappedAS available in peer module (FIX-50)" {
 //            return vchRet;
 //        }
 // ============================================================================
-test "w115/G8: netGroup() uses raw /16 prefix, not ASN-keyed group" {
-    // clearbit's netGroup() slices the first 2 octets of IPv4 — /16 prefix.
-    // If ASMap were active, peers in the same AS would collapse to one group key.
-    // This verifies the current (broken re: ASMap) behavior: two IPs in the same
-    // hypothetical AS but different /16s get DIFFERENT groups.
+test "w115/G8: netGroup() raw /16 fallback + getNetGroup() uses ASN when asmap loaded (FIX-51)" {
+    // --- Part A: standalone netGroup() still returns /16 (correct fallback) ---
     const addr1 = std.net.Address.initIp4([4]u8{ 1, 2, 3, 4 }, 8333);
     const addr2 = std.net.Address.initIp4([4]u8{ 5, 6, 7, 8 }, 8333);
-    // With correct ASMap both might map to the same ASN → same group key.
-    // Without ASMap clearbit returns different /16 keys.
     const g1 = peer_mod.netGroup(addr1);
     const g2 = peer_mod.netGroup(addr2);
     // /16 of 1.2.x.x = (1<<8)|2 = 258
     try testing.expectEqual(@as(u32, 258), g1);
     // /16 of 5.6.x.x = (5<<8)|6 = 1286
     try testing.expectEqual(@as(u32, 1286), g2);
-    // They differ — /16 bucketing, not AS bucketing
-    try testing.expect(g1 != g2);
+    try testing.expect(g1 != g2); // Different /16 → different group (correct)
+
+    // --- Part B: getNetGroup() returns ASN when asmap is loaded ---
+    // Using the Core reference test vector (bitcoin-core/src/test/netbase_tests.cpp).
+    // 0000:1559:... and 00d0:d493:... both map to ASN 961340 in that asmap.
+    const allocator = testing.allocator;
+    const asmap_bytes = try asmap_mod.parseTestAsmapHex(allocator);
+    defer allocator.free(asmap_bytes);
+
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+    // Wire the asmap into PeerManager.
+    manager.asmap_data = try allocator.dupe(u8, asmap_bytes);
+
+    // IPv6 address bytes for 0000:1559:0183:3728:224c:65a5:62e6:e991
+    const ip_a = std.net.Address.initIp6(
+        [16]u8{ 0x00, 0x00, 0x15, 0x59, 0x01, 0x83, 0x37, 0x28,
+                0x22, 0x4c, 0x65, 0xa5, 0x62, 0xe6, 0xe9, 0x91 },
+        8333, 0, 0,
+    );
+    // IPv6 address bytes for 00d0:d493:faa0:8609:e927:8b75:293c:f5a4
+    const ip_b = std.net.Address.initIp6(
+        [16]u8{ 0x00, 0xd0, 0xd4, 0x93, 0xfa, 0xa0, 0x86, 0x09,
+                0xe9, 0x27, 0x8b, 0x75, 0x29, 0x3c, 0xf5, 0xa4 },
+        8333, 0, 0,
+    );
+
+    const grp_a = manager.getNetGroup(ip_a);
+    const grp_b = manager.getNetGroup(ip_b);
+
+    // Both are in ASN 961340 → same group key (ASN-keyed bucketing).
+    try testing.expectEqual(@as(u32, 961340), grp_a);
+    try testing.expectEqual(@as(u32, 961340), grp_b);
+    try testing.expectEqual(grp_a, grp_b); // Confirmed: same bucket
+
+    // Their raw /16 groups differ (different first 2 octets) — confirming
+    // that without asmap they would NOT have been grouped together.
+    const raw_a = peer_mod.netGroup(ip_a);
+    const raw_b = peer_mod.netGroup(ip_b);
+    try testing.expect(raw_a != raw_b);
 }
 
 // ============================================================================
@@ -303,31 +341,67 @@ test "w115/G12: addAddress does not accept source-ASN parameter" {
 }
 
 // ============================================================================
-// G13: violatesNetgroupDiversity uses /16 prefix, not ASN
-// BUG: Core's outbound-slot filter prevents two peers from the same ASN
-//      (when ASMap is loaded) from both being in the outbound set.  clearbit's
-//      `violatesNetgroupDiversity` uses the raw /16 group from `netGroup()`.
-//      Two peers in the same AS but different /16s would NOT be detected as
-//      same-group — an eclipse attack is still possible from a single large AS.
+// G13: violatesNetgroupDiversity uses ASN when asmap loaded — FIX-51 IMPLEMENTED
+// FIX: `violatesNetgroupDiversity` delegates to `getNetGroup()` which returns
+//      the ASN as the group key when asmap is loaded.  Two peers from the same
+//      AS but different /16 prefixes now correctly share the same group key,
+//      so the second peer is rejected as a diversity violation.
+//
+//      Without asmap: falls back to /16 prefix (same as before FIX-51).
+//      With asmap:    uses ASN — same AS → same group → violation detected.
 //
 //      Core ref: bitcoin-core/src/net.cpp (connection diversification uses
 //              netgroupman.GetGroup() which returns ASN-key when asmap loaded)
 // ============================================================================
-test "w115/G13: outbound diversity is /16-based, not AS-based" {
+test "w115/G13: violatesNetgroupDiversity uses ASN when asmap loaded (FIX-51)" {
     const allocator = testing.allocator;
-    var manager = PeerManager.init(allocator, &consensus.MAINNET);
-    defer manager.deinit();
+    const asmap_bytes = try asmap_mod.parseTestAsmapHex(allocator);
+    defer allocator.free(asmap_bytes);
 
-    // Two IPs in different /16s but hypothetically in the same AS.
-    const addr1 = std.net.Address.initIp4([4]u8{ 1, 2, 0, 1 }, 8333);
-    const addr2 = std.net.Address.initIp4([4]u8{ 5, 6, 0, 1 }, 8333);
+    // --- Without asmap: /16-based diversity (baseline / fallback) ---
+    {
+        var manager = PeerManager.init(allocator, &consensus.MAINNET);
+        defer manager.deinit();
 
-    // Record addr1's /16 group as connected outbound.
-    manager.outbound_netgroups.put(peer_mod.netGroup(addr1), {}) catch unreachable;
+        // Two IPs from same AS but different /16s — without asmap they differ.
+        const ip_a = std.net.Address.initIp6(
+            [16]u8{ 0x00, 0x00, 0x15, 0x59, 0x01, 0x83, 0x37, 0x28,
+                    0x22, 0x4c, 0x65, 0xa5, 0x62, 0xe6, 0xe9, 0x91 },
+            8333, 0, 0,
+        );
+        const ip_b = std.net.Address.initIp6(
+            [16]u8{ 0x00, 0xd0, 0xd4, 0x93, 0xfa, 0xa0, 0x86, 0x09,
+                    0xe9, 0x27, 0x8b, 0x75, 0x29, 0x3c, 0xf5, 0xa4 },
+            8333, 0, 0,
+        );
+        // Record ip_a as connected outbound (using getNetGroup → /16 fallback).
+        manager.outbound_netgroups.put(manager.getNetGroup(ip_a), {}) catch unreachable;
+        // ip_b is in a different /16 → no violation without asmap.
+        try testing.expect(!manager.violatesNetgroupDiversity(ip_b));
+    }
 
-    // addr2 has a DIFFERENT /16 → diversity check passes (not a violation).
-    // With ASMap, if both are in the same AS, this SHOULD be a violation.
-    try testing.expect(!manager.violatesNetgroupDiversity(addr2));
+    // --- With asmap: ASN-based diversity (FIX-51 correct behavior) ---
+    {
+        var manager = PeerManager.init(allocator, &consensus.MAINNET);
+        defer manager.deinit();
+        manager.asmap_data = try allocator.dupe(u8, asmap_bytes);
+
+        // Same two IPs — both map to ASN 961340.
+        const ip_a = std.net.Address.initIp6(
+            [16]u8{ 0x00, 0x00, 0x15, 0x59, 0x01, 0x83, 0x37, 0x28,
+                    0x22, 0x4c, 0x65, 0xa5, 0x62, 0xe6, 0xe9, 0x91 },
+            8333, 0, 0,
+        );
+        const ip_b = std.net.Address.initIp6(
+            [16]u8{ 0x00, 0xd0, 0xd4, 0x93, 0xfa, 0xa0, 0x86, 0x09,
+                    0xe9, 0x27, 0x8b, 0x75, 0x29, 0x3c, 0xf5, 0xa4 },
+            8333, 0, 0,
+        );
+        // Record ip_a as connected outbound (getNetGroup → ASN 961340).
+        manager.outbound_netgroups.put(manager.getNetGroup(ip_a), {}) catch unreachable;
+        // ip_b is in the SAME AS (ASN 961340) → diversity violation detected.
+        try testing.expect(manager.violatesNetgroupDiversity(ip_b));
+    }
 }
 
 // ============================================================================
@@ -502,31 +576,54 @@ test "w115/G21: Peer struct has mapped_as field (FIX-50)" {
 }
 
 // ============================================================================
-// G22: Eclipse attack: same ASN peers not collapsed to one group slot
-// BUG: Without ASN-based outbound grouping an adversary who controls many IPs
-//      across multiple /16 prefixes but within a single AS can fill all
-//      outbound slots.  Core prevents this because all those IPs share the
-//      same ASN group key.  clearbit allows it.
+// G22: Eclipse attack prevented by ASN grouping when asmap loaded — FIX-51
+// FIX: With asmap loaded, `violatesNetgroupDiversity` uses `getNetGroup()` →
+//      ASN-keyed group.  Two same-AS peers in different /16 prefixes now share
+//      the same group key, so the second one is blocked as a diversity
+//      violation.  Eclipse resistance is enforced at the AS level when asmap
+//      is active.
 //
-//      Empirical evidence: clearbit allows two peers from different /16s in
-//      the same AS to both pass violatesNetgroupDiversity().
+//      Without asmap: /16-only (pre-FIX-51 behavior preserved as fallback).
+//      With asmap:    same AS → same group → second peer rejected.
 // ============================================================================
-test "w115/G22: eclipse attack possible — same-AS peers in different /16s both pass diversity check" {
+test "w115/G22: eclipse attack prevented with asmap — same-AS peers blocked (FIX-51)" {
     const allocator = testing.allocator;
-    var manager = PeerManager.init(allocator, &consensus.MAINNET);
-    defer manager.deinit();
+    const asmap_bytes = try asmap_mod.parseTestAsmapHex(allocator);
+    defer allocator.free(asmap_bytes);
 
-    // Hypothetical: both IPs belong to AS13335 (Cloudflare) but different /16s.
-    const cf1 = std.net.Address.initIp4([4]u8{ 104, 16, 0, 1 }, 8333); // /16 = 104.16
-    const cf2 = std.net.Address.initIp4([4]u8{ 104, 17, 0, 1 }, 8333); // /16 = 104.17
+    // --- Without asmap: eclipse possible (baseline documented behavior) ---
+    // Two IPs in the same hypothetical AS but different /16s.
+    // Use the Core test-vector addresses: both → ASN 961340, different /32 prefixes.
+    const ip_a = std.net.Address.initIp6(
+        [16]u8{ 0x00, 0x00, 0x15, 0x59, 0x01, 0x83, 0x37, 0x28,
+                0x22, 0x4c, 0x65, 0xa5, 0x62, 0xe6, 0xe9, 0x91 },
+        8333, 0, 0,
+    );
+    const ip_b = std.net.Address.initIp6(
+        [16]u8{ 0x00, 0xd0, 0xd4, 0x93, 0xfa, 0xa0, 0x86, 0x09,
+                0xe9, 0x27, 0x8b, 0x75, 0x29, 0x3c, 0xf5, 0xa4 },
+        8333, 0, 0,
+    );
+    {
+        var manager = PeerManager.init(allocator, &consensus.MAINNET);
+        defer manager.deinit();
+        // No asmap: /16 fallback — different /32 groups.
+        manager.outbound_netgroups.put(manager.getNetGroup(ip_a), {}) catch unreachable;
+        // Without asmap ip_b is in a different /32 → no violation (baseline).
+        try testing.expect(!manager.violatesNetgroupDiversity(ip_b));
+    }
 
-    // Mark cf1 as outbound-connected.
-    manager.outbound_netgroups.put(peer_mod.netGroup(cf1), {}) catch unreachable;
+    // --- With asmap: eclipse prevented (FIX-51 behavior) ---
+    {
+        var manager = PeerManager.init(allocator, &consensus.MAINNET);
+        defer manager.deinit();
+        manager.asmap_data = try allocator.dupe(u8, asmap_bytes);
 
-    // cf2 has a different /16 → diversity check PASSES (not flagged as duplicate).
-    // With ASMap both would be in the same group → cf2 would be rejected.
-    const violation = manager.violatesNetgroupDiversity(cf2);
-    try testing.expect(!violation); // This is the BUG — should be a violation.
+        // ASN 961340 recorded for ip_a.
+        manager.outbound_netgroups.put(manager.getNetGroup(ip_a), {}) catch unreachable;
+        // ip_b shares ASN 961340 → diversity violation detected → eclipse blocked.
+        try testing.expect(manager.violatesNetgroupDiversity(ip_b));
+    }
 }
 
 // ============================================================================
