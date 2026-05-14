@@ -175,59 +175,67 @@ test "w114 G5: max feerate bucket coverage with 48 buckets at 1.1x spacing from 
 }
 
 // ============================================================================
-// G6 — Three-horizon architecture absent (BUG-7)
+// G6 — Three-horizon architecture (FIX-48: BUG-7 closed)
 // ============================================================================
 
-test "w114 G6: BUG-7 single-horizon architecture; SHORT/MED/LONG TxConfirmStats absent" {
-    // Core has:
-    //   feeStats    (MED_BLOCK_PERIODS=24, MED_DECAY=0.9952, MED_SCALE=2)
-    //   shortStats  (SHORT_BLOCK_PERIODS=12, SHORT_DECAY=0.962, SHORT_SCALE=1)
-    //   longStats   (LONG_BLOCK_PERIODS=42, LONG_DECAY=0.99931, LONG_SCALE=24)
-    //
-    // clearbit has a single FeeEstimator with one decay value.
-    // We test that there is only one decay field (structural evidence of single-horizon).
+test "w114 G6: FIX-48 three-horizon architecture; SHORT/MED/LONG TxConfirmStats present" {
+    // FIX-48: clearbit now has Horizon enum + DECAY/SCALE/PERIODS arrays mirroring Core:
+    //   shortStats  (SHORT_BLOCK_PERIODS=12, SHORT_DECAY=0.962,   SHORT_SCALE=1)
+    //   feeStats    (MED_BLOCK_PERIODS=24,   MED_DECAY=0.9952,    MED_SCALE=2)
+    //   longStats   (LONG_BLOCK_PERIODS=42,  LONG_DECAY=0.99931,  LONG_SCALE=24)
     const allocator = std.testing.allocator;
     var est = FeeEstimator.init(allocator);
     defer est.deinit();
-    // The single decay is 0.998, not the three Core values.
-    try std.testing.expectApproxEqRel(@as(f64, 0.998), est.decay, 0.0001);
-    // Core SHORT_DECAY = 0.962 — absent
-    // Core MED_DECAY = 0.9952 — absent
-    // Core LONG_DECAY = 0.99931 — absent
-    // BUG: all three horizon decay constants differ from 0.998
-    try std.testing.expect(est.decay != 0.962);
-    try std.testing.expect(est.decay != 0.9952);
-    try std.testing.expect(est.decay != 0.99931);
+
+    // Verify all three decay constants are present
+    try std.testing.expectApproxEqRel(@as(f64, 0.962),   FeeEstimator.DECAY[0], 0.0001); // SHORT
+    try std.testing.expectApproxEqRel(@as(f64, 0.9952),  FeeEstimator.DECAY[1], 0.0001); // MED
+    try std.testing.expectApproxEqRel(@as(f64, 0.99931), FeeEstimator.DECAY[2], 0.0001); // LONG
+
+    // Verify horizon enum members
+    _ = FeeEstimator.Horizon.short;
+    _ = FeeEstimator.Horizon.medium;
+    _ = FeeEstimator.Horizon.long;
+
+    // Verify per-horizon confirmed arrays exist with correct dimensions
+    try std.testing.expectEqual(@as(usize, 12), FeeEstimator.PERIODS[0]); // SHORT
+    try std.testing.expectEqual(@as(usize, 24), FeeEstimator.PERIODS[1]); // MED
+    try std.testing.expectEqual(@as(usize, 42), FeeEstimator.PERIODS[2]); // LONG
 }
 
 // ============================================================================
-// G7 — Decay constants wrong (BUG-8)
+// G7 — Decay constants correct (FIX-48: BUG-8 closed)
 // ============================================================================
 
-test "w114 G7: BUG-8 single decay=0.998 used; Core SHORT=0.962 MED=0.9952 LONG=0.99931" {
-    const allocator = std.testing.allocator;
-    var est = FeeEstimator.init(allocator);
-    defer est.deinit();
-    // clearbit uses a single fixed 0.998 decay (half-life ~346 blocks ~2.4 days).
-    // Core SHORT half-life is 18 blocks (~3 hours), MED is 144 blocks (~1 day),
-    // LONG is 1008 blocks (~1 week).
-    try std.testing.expectApproxEqRel(@as(f64, 0.998), est.decay, 0.0001);
+test "w114 G7: FIX-48 per-horizon decay constants: SHORT=0.962 MED=0.9952 LONG=0.99931" {
+    // FIX-48: three separate decay constants replace the single 0.998.
+    // Core half-lives: SHORT ~18 blocks (~3h), MED ~144 blocks (~1d), LONG ~1008 blocks (~1w).
+    try std.testing.expectApproxEqRel(@as(f64, 0.962),   FeeEstimator.DECAY[0], 0.0001);
+    try std.testing.expectApproxEqRel(@as(f64, 0.9952),  FeeEstimator.DECAY[1], 0.0001);
+    try std.testing.expectApproxEqRel(@as(f64, 0.99931), FeeEstimator.DECAY[2], 0.0001);
+
+    // Verify SCALE constants: SHORT=1, MED=2, LONG=24
+    try std.testing.expectEqual(@as(u32, 1),  FeeEstimator.SCALE[0]);
+    try std.testing.expectEqual(@as(u32, 2),  FeeEstimator.SCALE[1]);
+    try std.testing.expectEqual(@as(u32, 24), FeeEstimator.SCALE[2]);
 }
 
 // ============================================================================
-// G8 — Period/scale structure absent (BUG-9)
+// G8 — Period/scale present and MAX_CONFIRMATION_TARGET=1008 (FIX-48: BUG-9+10 closed)
 // ============================================================================
 
-test "w114 G8: BUG-9 no period scale; MAX_CONFIRMATION_TARGET=144, Core LONG covers 1008 blocks" {
-    // Core LONG_BLOCK_PERIODS=42 * LONG_SCALE=24 = 1008 blocks
-    // Core MED_BLOCK_PERIODS=24  * MED_SCALE=2   = 48 blocks (periods), real 96 block window
-    // Core SHORT_BLOCK_PERIODS=12 * SHORT_SCALE=1 = 12 blocks
-    //
-    // clearbit MAX_CONFIRMATION_TARGET=144 (treating every block as 1 period, scale=1).
-    // This matches neither the 1008-block long horizon nor the period-scale architecture.
-    try std.testing.expectEqual(@as(usize, 144), FeeEstimator.MAX_CONFIRMATION_TARGET);
-    // Core long horizon max is 42*24=1008
-    try std.testing.expect(FeeEstimator.MAX_CONFIRMATION_TARGET < 1008);
+test "w114 G8: FIX-48 period/scale architecture present; MAX_CONFIRMATION_TARGET=1008" {
+    // FIX-48: Core LONG_BLOCK_PERIODS=42 * LONG_SCALE=24 = 1008 blocks.
+    // Core MED_BLOCK_PERIODS=24  * MED_SCALE=2   = 48 blocks max for MED horizon.
+    // Core SHORT_BLOCK_PERIODS=12 * SHORT_SCALE=1 = 12 blocks max for SHORT horizon.
+    try std.testing.expectEqual(@as(usize, 1008), FeeEstimator.MAX_CONFIRMATION_TARGET);
+    try std.testing.expectEqual(@as(usize, 12),   FeeEstimator.SHORT_MAX_TARGET); // 12*1
+    try std.testing.expectEqual(@as(usize, 48),   FeeEstimator.MED_MAX_TARGET);   // 24*2
+
+    // SCALE values match Core
+    try std.testing.expectEqual(@as(u32, 1),  FeeEstimator.SCALE[0]); // SHORT
+    try std.testing.expectEqual(@as(u32, 2),  FeeEstimator.SCALE[1]); // MED
+    try std.testing.expectEqual(@as(u32, 24), FeeEstimator.SCALE[2]); // LONG
 }
 
 // ============================================================================
@@ -547,14 +555,14 @@ test "w114 G22: BUG-16 blocks field always reflects conf_target not actual retur
     // when the estimator clamps to maxUsableEstimate. clearbit always echoes conf_target
     // in the blocks field of the JSON response.
     //
-    // This is tested structurally: if MAX_CONFIRMATION_TARGET=144 and we request 144,
-    // the estimator returns null (target >= MAX_CONFIRMATION_TARGET), but the RPC
-    // would respond with blocks=144 rather than the actual clamped target used.
+    // Structural test: with no data in the estimator, estimateFee always returns null
+    // regardless of target (including the maximum 1008).  BUG-16 (no returnedTarget
+    // walk) remains open — this test documents the null-return but not the walk.
     const allocator = std.testing.allocator;
     var est = FeeEstimator.init(allocator);
     defer est.deinit();
 
-    // target == MAX_CONFIRMATION_TARGET → null (never tries clamping to a lower useful target)
+    // No data → null for any target within range
     const result = est.estimateFee(FeeEstimator.MAX_CONFIRMATION_TARGET);
     try std.testing.expectEqual(@as(?f64, null), result);
     // BUG: Core would walk backward from max to find the actual usable estimate and
@@ -565,7 +573,7 @@ test "w114 G22: BUG-16 blocks field always reflects conf_target not actual retur
 // G23 — File format incompatible with Core (BUG-17)
 // ============================================================================
 
-test "w114 G23: BUG-17 file format uses 'CBFE' magic + u32 integer counts; Core uses version 309900 + EncodedDouble" {
+test "w114 G23: BUG-17 file format uses 'CBFE' magic + three-horizon u32 counts; Core uses version 309900 + EncodedDouble" {
     // Core fee_estimates.dat format (block_policy_estimator.cpp):
     //   int32 CURRENT_FEES_FILE_VERSION (309900)
     //   uint32 nBestSeenHeight
@@ -575,34 +583,40 @@ test "w114 G23: BUG-17 file format uses 'CBFE' magic + u32 integer counts; Core 
     //   TxConfirmStats (shortStats): same shape
     //   TxConfirmStats (longStats): same shape
     //
-    // clearbit format (mempool.zig):
+    // clearbit format v2 (FIX-48, mempool.zig):
     //   [4]u8 "CBFE"
-    //   u32 LE version=1
+    //   u32 LE version=2
     //   u32 LE current_height
     //   u32[48] total_counts
-    //   u32[144][48] confirmed_counts
+    //   u32[12][48] short_confirmed
+    //   u32[24][48] med_confirmed
+    //   u32[42][48] long_confirmed
     //
-    // Core's fee_estimates.dat cannot be loaded by clearbit and vice versa.
-    // This is a full wire-incompatibility for nodes that want to share or migrate data.
+    // Core's fee_estimates.dat still cannot be loaded by clearbit (BUG-17 partial:
+    // three-horizon structure now matches Core's shape but encoding/version differ).
     const allocator = std.testing.allocator;
     var est = FeeEstimator.init(allocator);
     defer est.deinit();
 
-    // Save to a temp file and check the magic
+    // Save to a temp file and check the magic + version
     const tmp_path = "/tmp/clearbit_test_fee_estimator_w114.dat";
     try est.saveToFile(tmp_path);
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     const file = try std.fs.cwd().openFile(tmp_path, .{});
     defer file.close();
+    var reader = file.reader();
 
     var magic: [4]u8 = undefined;
-    _ = try file.reader().readAll(&magic);
-    // BUG: clearbit writes "CBFE", Core writes 309900 (little-endian int)
+    _ = try reader.readAll(&magic);
     try std.testing.expectEqualSlices(u8, "CBFE", &magic);
     // Core's format would start with 0x9C 0xB9 0x04 0x00 (309900 in LE int32)
     const core_version_le = [_]u8{ 0x9C, 0xB9, 0x04, 0x00 };
     try std.testing.expect(!std.mem.eql(u8, &magic, &core_version_le));
+
+    // FIX-48: version is now 2 (three-horizon format)
+    const version = try reader.readInt(u32, .little);
+    try std.testing.expectEqual(@as(u32, 2), version);
 }
 
 // ============================================================================

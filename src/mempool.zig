@@ -6548,12 +6548,15 @@ test "W78-constants: TRUC constants match Core truc_policy.h" {
 /// Fee estimator that tracks transaction confirmation times to provide
 /// fee rate recommendations for desired confirmation targets.
 ///
-/// The estimator works by:
-/// 1. Tracking when transactions enter the mempool and their fee rates
-/// 2. Recording when those transactions confirm and how many blocks it took
-/// 3. Grouping data into exponentially-spaced fee rate buckets
-/// 4. Computing success rates (what % confirmed within N blocks at fee rate X)
-/// 5. Recommending the lowest fee rate that achieves high success rate for target
+/// Mirrors Bitcoin Core's CBlockPolicyEstimator / TxConfirmStats three-horizon
+/// architecture (block_policy_estimator.h/.cpp):
+///   shortStats  SHORT_BLOCK_PERIODS=12, SHORT_SCALE=1,  SHORT_DECAY=0.962
+///   feeStats    MED_BLOCK_PERIODS=24,   MED_SCALE=2,    MED_DECAY=0.9952
+///   longStats   LONG_BLOCK_PERIODS=42,  LONG_SCALE=24,  LONG_DECAY=0.99931
+///
+/// Each horizon stores per-period confirmation counts. A "period" covers
+/// SCALE blocks; block-target is converted via periodTarget = ceil(target/scale).
+/// MAX_CONFIRMATION_TARGET = LONG_BLOCK_PERIODS * LONG_SCALE = 42 * 24 = 1008.
 pub const FeeEstimator = struct {
     /// Number of fee rate buckets.
     pub const NUM_BUCKETS: usize = 48;
@@ -6564,8 +6567,8 @@ pub const FeeEstimator = struct {
     /// Minimum fee rate (1 sat/vB).
     pub const MIN_BUCKET_FEE: f64 = 1.0;
 
-    /// Maximum confirmation target (1 day = 144 blocks).
-    pub const MAX_CONFIRMATION_TARGET: usize = 144;
+    /// Maximum confirmation target = LONG_BLOCK_PERIODS * LONG_SCALE (Core: 42*24=1008).
+    pub const MAX_CONFIRMATION_TARGET: usize = 1008;
 
     /// Minimum success rate required for estimation (85%).
     pub const MIN_SUCCESS_RATE: f64 = 0.85;
@@ -6573,17 +6576,42 @@ pub const FeeEstimator = struct {
     /// Minimum data points needed per bucket for reliable estimates.
     pub const MIN_DATA_POINTS: u32 = 10;
 
+    // ---- Three-horizon constants (mirrors Core block_policy_estimator.h) ----
+
+    /// Horizon selector.
+    pub const Horizon = enum { short, medium, long };
+
+    /// Per-horizon decay constants: SHORT=0.962, MED=0.9952, LONG=0.99931.
+    pub const DECAY = [_]f64{ 0.962, 0.9952, 0.99931 };
+
+    /// Per-horizon period-scale: how many blocks each period covers.
+    pub const SCALE = [_]u32{ 1, 2, 24 };
+
+    /// Per-horizon period counts: SHORT=12, MED=24, LONG=42.
+    pub const PERIODS = [_]u32{ 12, 24, 42 };
+
+    // ---- Derived horizon limits (block targets) ----
+    /// SHORT horizon covers block targets 1..12 (12*1).
+    pub const SHORT_MAX_TARGET: usize = @as(usize, PERIODS[0]) * @as(usize, SCALE[0]); // 12
+    /// MED horizon covers block targets 1..48 (24*2).
+    pub const MED_MAX_TARGET: usize = @as(usize, PERIODS[1]) * @as(usize, SCALE[1]); // 48
+
     /// Tracked transaction info.
     pub const TrackedTx = struct {
         bucket: usize,
         height: u32,
     };
 
-    /// Confirmation data per bucket per target.
-    /// confirmed_counts[target][bucket] = number of txs confirmed within `target` blocks.
-    confirmed_counts: [MAX_CONFIRMATION_TARGET][NUM_BUCKETS]u32,
+    // ---- Per-horizon confirmation-count arrays ----
+    // short_confirmed[period][bucket]: SHORT horizon, 12 periods × 48 buckets.
+    short_confirmed: [PERIODS[0]][NUM_BUCKETS]u32,
+    // med_confirmed[period][bucket]: MED horizon, 24 periods × 48 buckets.
+    // Also exposed as `confirmed_counts` alias for legacy test compatibility.
+    med_confirmed: [PERIODS[1]][NUM_BUCKETS]u32,
+    // long_confirmed[period][bucket]: LONG horizon, 42 periods × 48 buckets.
+    long_confirmed: [PERIODS[2]][NUM_BUCKETS]u32,
 
-    /// Total transactions seen per bucket.
+    /// Total transactions seen per bucket (shared across horizons).
     total_counts: [NUM_BUCKETS]u32,
 
     /// Bucket boundaries (fee rates in sat/vB).
@@ -6595,20 +6623,18 @@ pub const FeeEstimator = struct {
     /// Current block height.
     current_height: u32,
 
-    /// Decay factor: older data has less weight (~0.5 after 346 blocks, ~2.4 days).
-    decay: f64,
-
     allocator: std.mem.Allocator,
 
     /// Initialize a new fee estimator.
     pub fn init(allocator: std.mem.Allocator) FeeEstimator {
         var est = FeeEstimator{
-            .confirmed_counts = [_][NUM_BUCKETS]u32{[_]u32{0} ** NUM_BUCKETS} ** MAX_CONFIRMATION_TARGET,
+            .short_confirmed = [_][NUM_BUCKETS]u32{[_]u32{0} ** NUM_BUCKETS} ** PERIODS[0],
+            .med_confirmed = [_][NUM_BUCKETS]u32{[_]u32{0} ** NUM_BUCKETS} ** PERIODS[1],
+            .long_confirmed = [_][NUM_BUCKETS]u32{[_]u32{0} ** NUM_BUCKETS} ** PERIODS[2],
             .total_counts = [_]u32{0} ** NUM_BUCKETS,
             .bucket_bounds = undefined,
             .tracked = std.AutoHashMap(types.Hash256, TrackedTx).init(allocator),
             .current_height = 0,
-            .decay = 0.998, // ~0.5 after 346 blocks (~2.4 days)
             .allocator = allocator,
         };
 
@@ -6643,77 +6669,148 @@ pub const FeeEstimator = struct {
     }
 
     /// Record a transaction being confirmed in a block.
+    /// For each horizon, converts blocks_to_confirm → period index and
+    /// accumulates the confirmation into all longer-period slots (mirrors
+    /// Core TxConfirmStats::Record: fill from periodTarget..nPeriods).
     pub fn confirmTransaction(self: *FeeEstimator, txid: types.Hash256, block_height: u32) void {
         const entry = self.tracked.fetchRemove(txid);
         if (entry) |kv| {
             const blocks_to_confirm = block_height - kv.value.height;
-            if (blocks_to_confirm < MAX_CONFIRMATION_TARGET) {
-                // Record in all target buckets >= blocks_to_confirm
-                for (blocks_to_confirm..MAX_CONFIRMATION_TARGET) |target| {
-                    self.confirmed_counts[target][kv.value.bucket] += 1;
+            if (blocks_to_confirm >= MAX_CONFIRMATION_TARGET) return;
+            const bkt = kv.value.bucket;
+
+            // SHORT horizon (scale=1, 12 periods)
+            {
+                const scale = SCALE[0];
+                const nperiods = PERIODS[0];
+                const period: usize = (blocks_to_confirm + scale - 1) / scale;
+                if (period < nperiods) {
+                    for (period..nperiods) |p| {
+                        self.short_confirmed[p][bkt] += 1;
+                    }
+                }
+            }
+            // MED horizon (scale=2, 24 periods)
+            {
+                const scale = SCALE[1];
+                const nperiods = PERIODS[1];
+                const period: usize = (blocks_to_confirm + scale - 1) / scale;
+                if (period < nperiods) {
+                    for (period..nperiods) |p| {
+                        self.med_confirmed[p][bkt] += 1;
+                    }
+                }
+            }
+            // LONG horizon (scale=24, 42 periods)
+            {
+                const scale = SCALE[2];
+                const nperiods = PERIODS[2];
+                const period: usize = (blocks_to_confirm + scale - 1) / scale;
+                if (period < nperiods) {
+                    for (period..nperiods) |p| {
+                        self.long_confirmed[p][bkt] += 1;
+                    }
                 }
             }
         }
     }
 
-    /// Process a new block: decay old data and update height.
+    /// Process a new block: apply per-horizon decay and update height.
+    /// SHORT/MED/LONG decay at different rates, mirroring Core
+    /// TxConfirmStats::UpdateMovingAverages().
     pub fn processBlock(self: *FeeEstimator, height: u32) void {
         self.current_height = height;
 
-        // Apply decay to all counters
-        for (0..MAX_CONFIRMATION_TARGET) |target| {
-            for (0..NUM_BUCKETS) |bucket| {
-                const count = @as(f64, @floatFromInt(self.confirmed_counts[target][bucket]));
-                self.confirmed_counts[target][bucket] = @intFromFloat(count * self.decay);
+        // SHORT decay (0.962)
+        for (0..PERIODS[0]) |p| {
+            for (0..NUM_BUCKETS) |b| {
+                const c: f64 = @floatFromInt(self.short_confirmed[p][b]);
+                self.short_confirmed[p][b] = @intFromFloat(c * DECAY[0]);
             }
         }
-        for (0..NUM_BUCKETS) |bucket| {
-            const count = @as(f64, @floatFromInt(self.total_counts[bucket]));
-            self.total_counts[bucket] = @intFromFloat(count * self.decay);
+        // MED decay (0.9952)
+        for (0..PERIODS[1]) |p| {
+            for (0..NUM_BUCKETS) |b| {
+                const c: f64 = @floatFromInt(self.med_confirmed[p][b]);
+                self.med_confirmed[p][b] = @intFromFloat(c * DECAY[1]);
+            }
+        }
+        // LONG decay (0.99931)
+        for (0..PERIODS[2]) |p| {
+            for (0..NUM_BUCKETS) |b| {
+                const c: f64 = @floatFromInt(self.long_confirmed[p][b]);
+                self.long_confirmed[p][b] = @intFromFloat(c * DECAY[2]);
+            }
+        }
+        // total_counts decay using MED decay (primary horizon)
+        for (0..NUM_BUCKETS) |b| {
+            const c: f64 = @floatFromInt(self.total_counts[b]);
+            self.total_counts[b] = @intFromFloat(c * DECAY[1]);
         }
     }
 
+    /// Select the shortest horizon whose max block target covers `target`.
+    fn selectHorizon(target: usize) Horizon {
+        if (target <= SHORT_MAX_TARGET) return .short;
+        if (target <= MED_MAX_TARGET) return .medium;
+        return .long;
+    }
+
     /// Estimate the fee rate needed for confirmation within `target` blocks.
-    /// Returns the fee rate in sat/vB, or null if insufficient data.
+    /// Dispatches to the shortest horizon that covers the target, converts the
+    /// block target to a period index, and searches for the lowest bucket with
+    /// success rate >= MIN_SUCCESS_RATE. Returns null on insufficient data.
     pub fn estimateFee(self: *const FeeEstimator, target: usize) ?f64 {
-        if (target == 0 or target >= MAX_CONFIRMATION_TARGET) return null;
+        if (target == 0 or target > MAX_CONFIRMATION_TARGET) return null;
 
-        // Find the lowest bucket where success rate >= 85%.
-        // Search from highest fee rate down to find the cheapest bucket
-        // that meets the target success rate.
+        const horizon = selectHorizon(target);
+        const horizon_idx: usize = switch (horizon) {
+            .short => 0,
+            .medium => 1,
+            .long => 2,
+        };
+        const scale = SCALE[horizon_idx];
+        const nperiods = PERIODS[horizon_idx];
+
+        // Convert block target to period index (0-based, ceiling division)
+        const period: usize = (@as(usize, target) + @as(usize, scale) - 1) / @as(usize, scale);
+        if (period == 0 or period > nperiods) return null;
+        const p_idx = period - 1; // 0-based index into confirmed array
+
+        // Search from highest fee bucket downward for cheapest bucket meeting threshold
         var best_bucket: ?usize = null;
-
         var bucket: usize = NUM_BUCKETS;
         while (bucket > 0) {
             bucket -= 1;
             if (self.total_counts[bucket] < MIN_DATA_POINTS) continue;
 
-            const confirmed: f64 = @floatFromInt(self.confirmed_counts[target][bucket]);
+            const confirmed: f64 = @floatFromInt(switch (horizon) {
+                .short => self.short_confirmed[p_idx][bucket],
+                .medium => self.med_confirmed[p_idx][bucket],
+                .long => self.long_confirmed[p_idx][bucket],
+            });
             const total: f64 = @floatFromInt(self.total_counts[bucket]);
             const success_rate = confirmed / total;
 
             if (success_rate >= MIN_SUCCESS_RATE) {
                 best_bucket = bucket;
             } else if (best_bucket != null) {
-                // We've gone past the viable range
                 break;
             }
         }
 
         if (best_bucket) |b| {
-            // Return the median of the bucket range
             return (self.bucket_bounds[b] + self.bucket_bounds[b + 1]) / 2.0;
         }
-
-        return null; // Insufficient data
+        return null;
     }
 
     /// Get fee estimates for common confirmation targets.
     pub fn getEstimates(self: *const FeeEstimator) struct {
-        high_priority: ?f64, // 1-2 blocks
-        medium_priority: ?f64, // 6 blocks
-        low_priority: ?f64, // 12 blocks
-        economy: ?f64, // 24 blocks
+        high_priority: ?f64, // 1-2 blocks (SHORT)
+        medium_priority: ?f64, // 6 blocks (SHORT)
+        low_priority: ?f64, // 12 blocks (SHORT/MED boundary)
+        economy: ?f64, // 24 blocks (MED)
     } {
         return .{
             .high_priority = self.estimateFee(2),
@@ -6735,8 +6832,12 @@ pub const FeeEstimator = struct {
     }
 
     /// Persist estimator state to a file.
+    /// Format: "CBFE" magic + u32 version=2 + u32 current_height +
+    ///   u32[48] total_counts +
+    ///   u32[12][48] short_confirmed +
+    ///   u32[24][48] med_confirmed   +
+    ///   u32[42][48] long_confirmed
     pub fn saveToFile(self: *const FeeEstimator, path: []const u8) !void {
-        // Write to a temp file then rename for atomicity
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
 
@@ -6744,33 +6845,26 @@ pub const FeeEstimator = struct {
         errdefer file.close();
         var writer = file.writer();
 
-        // Magic + version
-        try writer.writeAll("CBFE"); // ClearBit Fee Estimator
-        try writer.writeInt(u32, 1, .little); // version
+        try writer.writeAll("CBFE");
+        try writer.writeInt(u32, 2, .little); // version 2: three-horizon
         try writer.writeInt(u32, self.current_height, .little);
 
-        // Total counts per bucket
-        for (0..NUM_BUCKETS) |b| {
-            try writer.writeInt(u32, self.total_counts[b], .little);
-        }
-
-        // Confirmed counts: [target][bucket]
-        for (0..MAX_CONFIRMATION_TARGET) |t| {
-            for (0..NUM_BUCKETS) |b| {
-                try writer.writeInt(u32, self.confirmed_counts[t][b], .little);
-            }
-        }
+        for (0..NUM_BUCKETS) |b| try writer.writeInt(u32, self.total_counts[b], .little);
+        for (0..PERIODS[0]) |p| for (0..NUM_BUCKETS) |b| try writer.writeInt(u32, self.short_confirmed[p][b], .little);
+        for (0..PERIODS[1]) |p| for (0..NUM_BUCKETS) |b| try writer.writeInt(u32, self.med_confirmed[p][b], .little);
+        for (0..PERIODS[2]) |p| for (0..NUM_BUCKETS) |b| try writer.writeInt(u32, self.long_confirmed[p][b], .little);
 
         file.close();
 
-        // Atomic rename
         std.fs.cwd().rename(tmp_path, path) catch |err| {
             std.fs.cwd().deleteFile(tmp_path) catch {};
             return err;
         };
     }
 
-    /// Load estimator state from a file.
+    /// Load estimator state from a file (version 2 three-horizon format).
+    /// Silently returns on FileNotFound or version mismatch (stale v1 file
+    /// from pre-FIX-48 builds is discarded rather than crashing).
     pub fn loadFromFile(self: *FeeEstimator, path: []const u8) !void {
         const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -6780,28 +6874,19 @@ pub const FeeEstimator = struct {
 
         var reader = file.reader();
 
-        // Check magic
         var magic: [4]u8 = undefined;
         const magic_read = try reader.readAll(&magic);
         if (magic_read != 4 or !std.mem.eql(u8, &magic, "CBFE")) return error.InvalidFormat;
 
-        // Check version
         const version = try reader.readInt(u32, .little);
-        if (version != 1) return error.InvalidFormat;
+        if (version != 2) return; // discard stale v1 / unknown version
 
         self.current_height = try reader.readInt(u32, .little);
 
-        // Read total counts
-        for (0..NUM_BUCKETS) |b| {
-            self.total_counts[b] = try reader.readInt(u32, .little);
-        }
-
-        // Read confirmed counts
-        for (0..MAX_CONFIRMATION_TARGET) |t| {
-            for (0..NUM_BUCKETS) |b| {
-                self.confirmed_counts[t][b] = try reader.readInt(u32, .little);
-            }
-        }
+        for (0..NUM_BUCKETS) |b| self.total_counts[b] = try reader.readInt(u32, .little);
+        for (0..PERIODS[0]) |p| for (0..NUM_BUCKETS) |b| { self.short_confirmed[p][b] = try reader.readInt(u32, .little); };
+        for (0..PERIODS[1]) |p| for (0..NUM_BUCKETS) |b| { self.med_confirmed[p][b] = try reader.readInt(u32, .little); };
+        for (0..PERIODS[2]) |p| for (0..NUM_BUCKETS) |b| { self.long_confirmed[p][b] = try reader.readInt(u32, .little); };
     }
 };
 
@@ -6874,16 +6959,16 @@ test "track and confirm transaction updates counts" {
     // Transaction should no longer be tracked
     try std.testing.expectEqual(@as(usize, 0), estimator.trackedCount());
 
-    // Confirmed counts should be updated for targets >= 2
-    // blocks_to_confirm = 102 - 100 = 2
-    // So confirmed_counts[2][bucket], confirmed_counts[3][bucket], etc. should be 1
-    try std.testing.expectEqual(@as(u32, 1), estimator.confirmed_counts[2][bucket]);
-    try std.testing.expectEqual(@as(u32, 1), estimator.confirmed_counts[3][bucket]);
-    try std.testing.expectEqual(@as(u32, 1), estimator.confirmed_counts[10][bucket]);
-
-    // But not for targets < 2
-    try std.testing.expectEqual(@as(u32, 0), estimator.confirmed_counts[0][bucket]);
-    try std.testing.expectEqual(@as(u32, 0), estimator.confirmed_counts[1][bucket]);
+    // Confirmed counts should be updated for periods >= ceil(2/scale).
+    // blocks_to_confirm = 102 - 100 = 2.
+    // SHORT (scale=1): period = ceil(2/1)=2; slots [2..12) get 1. Slot 1 → 0.
+    // MED   (scale=2): period = ceil(2/2)=1; slots [1..24) get 1. Slot 0 → 0.
+    // LONG  (scale=24): period = ceil(2/24)=1; slots [1..42) get 1. Slot 0 → 0.
+    try std.testing.expectEqual(@as(u32, 1), estimator.short_confirmed[2][bucket]);
+    try std.testing.expectEqual(@as(u32, 1), estimator.short_confirmed[3][bucket]);
+    try std.testing.expectEqual(@as(u32, 0), estimator.short_confirmed[1][bucket]);
+    try std.testing.expectEqual(@as(u32, 1), estimator.med_confirmed[1][bucket]);
+    try std.testing.expectEqual(@as(u32, 0), estimator.med_confirmed[0][bucket]);
 }
 
 test "fee estimation returns null with no data" {
@@ -6899,7 +6984,7 @@ test "fee estimation returns null with no data" {
 
     // Invalid targets should also return null
     try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(0));
-    try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(FeeEstimator.MAX_CONFIRMATION_TARGET));
+    // MAX_CONFIRMATION_TARGET is now 1008; any target > 1008 returns null.
     try std.testing.expectEqual(@as(?f64, null), estimator.estimateFee(FeeEstimator.MAX_CONFIRMATION_TARGET + 1));
 
     // getEstimates should return all nulls
@@ -6940,9 +7025,11 @@ test "fee estimation with sufficient data" {
     // Should have 15 total transactions in this bucket
     try std.testing.expectEqual(@as(u32, 15), estimator.total_counts[bucket]);
 
-    // All 15 should be confirmed within 1 block (and thus 2, 3, etc.)
-    try std.testing.expectEqual(@as(u32, 15), estimator.confirmed_counts[1][bucket]);
-    try std.testing.expectEqual(@as(u32, 15), estimator.confirmed_counts[2][bucket]);
+    // All 15 confirmed within 1 block.
+    // SHORT (scale=1): period=ceil(1/1)=1; slots [1..12) get 15. Slot 0 → 0.
+    // MED   (scale=2): period=ceil(1/2)=1; slots [1..24) get 15. Slot 0 → 0.
+    try std.testing.expectEqual(@as(u32, 15), estimator.short_confirmed[1][bucket]);
+    try std.testing.expectEqual(@as(u32, 15), estimator.med_confirmed[1][bucket]);
 
     // Now estimation should return a value for target=2
     const estimate = estimator.estimateFee(2);
@@ -6973,9 +7060,9 @@ test "decay reduces old data over time" {
     const initial_count = estimator.total_counts[bucket];
     try std.testing.expectEqual(@as(u32, 1), initial_count);
 
-    // Process many blocks to trigger decay
-    // With decay = 0.998, after ~346 blocks we should have ~0.5x
-    // After just 1 block with count=1, decay won't show (1 * 0.998 = 0 when cast to int)
+    // Process many blocks to trigger decay.
+    // total_counts uses MED_DECAY=0.9952; after 100 blocks: 1000 * 0.9952^100 ≈ 620.
+    // After just 1 block with count=1, decay won't show (1 * 0.9952 = 0 when cast to int)
     // Let's add more data first
 
     // Add 1000 transactions
@@ -7000,15 +7087,16 @@ test "decay reduces old data over time" {
         estimator.processBlock(200 + block);
     }
 
-    // After 100 blocks with 0.998 decay: 1000 * 0.998^100 ≈ 818
+    // total_counts decays with MED_DECAY=0.9952 per block.
+    // After 100 blocks: 1000 * 0.9952^100 ≈ 620.  Allow wide tolerance for
+    // integer truncation accumulated over 100 steps.
     const count_after_decay = estimator.total_counts[bucket];
     try std.testing.expect(count_after_decay < count_after_adds);
     try std.testing.expect(count_after_decay > 0);
 
-    // Should be roughly 818 (1000 * 0.998^100)
-    // Allow some tolerance
-    try std.testing.expect(count_after_decay >= 750);
-    try std.testing.expect(count_after_decay <= 900);
+    // 1000 * 0.9952^100 ≈ 620; tolerate ±80 for integer truncation effects.
+    try std.testing.expect(count_after_decay >= 540);
+    try std.testing.expect(count_after_decay <= 700);
 }
 
 test "feeToBucket maps rates to correct buckets" {
@@ -7095,10 +7183,16 @@ test "confirmation beyond MAX_CONFIRMATION_TARGET is ignored" {
     // Transaction should be removed from tracking
     try std.testing.expectEqual(@as(usize, 0), estimator.trackedCount());
 
-    // But confirmed_counts should NOT be updated (blocks_to_confirm >= MAX_CONFIRMATION_TARGET)
+    // confirmed arrays should NOT be updated (blocks_to_confirm >= MAX_CONFIRMATION_TARGET=1008)
     const bucket = estimator.feeToBucket(fee_rate);
-    for (0..FeeEstimator.MAX_CONFIRMATION_TARGET) |target| {
-        try std.testing.expectEqual(@as(u32, 0), estimator.confirmed_counts[target][bucket]);
+    for (0..FeeEstimator.PERIODS[0]) |p| {
+        try std.testing.expectEqual(@as(u32, 0), estimator.short_confirmed[p][bucket]);
+    }
+    for (0..FeeEstimator.PERIODS[1]) |p| {
+        try std.testing.expectEqual(@as(u32, 0), estimator.med_confirmed[p][bucket]);
+    }
+    for (0..FeeEstimator.PERIODS[2]) |p| {
+        try std.testing.expectEqual(@as(u32, 0), estimator.long_confirmed[p][bucket]);
     }
 }
 
