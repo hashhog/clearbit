@@ -1031,6 +1031,7 @@ comptime {
     _ = @import("erlay.zig");
     _ = @import("tests_w104_addrman.zig"); // W104 AddrMan 30-gate fleet audit
     _ = @import("tests_w106_mempool.zig"); // W106 CTxMemPool descendant/ancestor + RBF + package 30-gate audit
+    _ = @import("tests_w112_compact_blocks.zig"); // W112 BIP-152 compact blocks 30-gate fleet audit
     // rpc.zig is exercised in its own dedicated test step (`zig build
     // test-rpc` and folded into `zig build test` via build.zig). Importing
     // it here would transitively pull wallet.zig, which uses an
