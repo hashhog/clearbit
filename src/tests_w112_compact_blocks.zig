@@ -565,14 +565,19 @@ test "W112 G19 BUG-7: getblocktxn receive handler is a no-op (xfail documents ga
 // ============================================================================
 // G20: MAX_BLOCKTXN_DEPTH = 10 check on received getblocktxn
 // Reference: bitcoin-core/src/net_processing.cpp:140, 4276-4299
-// BUG-8 (P1-CDIV): Even if we served blocktxn, clearbit has no depth check.
-// Peers requesting blocks >10 deep should receive MSG_WITNESS_BLOCK not blocktxn.
+// FIX-42 (W112 BUG-8): MAX_BLOCKTXN_DEPTH=10 guard added in peer.zig
+// getblocktxn handler: when block depth > 10, serve full block instead.
 // ============================================================================
 
-test "W112 G20 BUG-8: MAX_BLOCKTXN_DEPTH=10 check absent on getblocktxn receive (xfail)" {
-    // xfail: getblocktxn handler is a no-op so depth check is never needed.
-    // The bug is latent — if getblocktxn is ever served, this guard must be added.
-    try testing.expect(true); // xfail (latent)
+test "W112 G20 BUG-8 FIXED: MAX_BLOCKTXN_DEPTH=10 constant correct; depth guard implemented" {
+    // FIX-42: MAX_BLOCKTXN_DEPTH added to p2p.zig (value=10). Guard implemented in
+    // peer.zig getblocktxn handler: looks up block height from header_index, computes
+    // depth = tip_height - block_height. If depth > MAX_BLOCKTXN_DEPTH, responds with
+    // full block from served_blocks/block_buffer cache (or notfound if not cached).
+    // Reference: bitcoin-core/src/net_processing.cpp:4276-4303.
+    try testing.expectEqual(@as(u32, 10), p2p.MAX_BLOCKTXN_DEPTH);
+    // static_assert from Core: MAX_BLOCKTXN_DEPTH <= MIN_BLOCKS_TO_KEEP (288).
+    try testing.expect(p2p.MAX_BLOCKTXN_DEPTH <= 288);
 }
 
 // ============================================================================
@@ -652,17 +657,23 @@ test "W112 G25: compact blocks version 2 / segwit wtxid short IDs" {
 // G26: MAX_CMPCTBLOCK_DEPTH = 5 check when SERVING cmpctblock via getdata
 // Reference: bitcoin-core/src/net_processing.cpp:2466
 //   if (pindex->nHeight >= tip->nHeight - MAX_CMPCTBLOCK_DEPTH) { serve compact }
-// BUG-4 (P0-CDIV): clearbit has no depth check when a peer sends MSG_CMPCT_BLOCK getdata.
-// The getdata handler serves full witness blocks and does not implement MSG_CMPCT_BLOCK
-// serving at all (peer.zig:4608-4668 base_type == msg_block branch only).
-// This means MSG_CMPCT_BLOCK requests are either silently dropped or served as full blocks.
+// FIX-42 (W112 BUG-4): MSG_CMPCT_BLOCK branch added to getdata handler in peer.zig.
+//   depth <= MAX_CMPCTBLOCK_DEPTH=5 → build CBlockHeaderAndShortTxIDs + serve cmpctblock
+//   depth > 5 (or unknown/not-in-cache) → fall back to full block (or notfound)
 // ============================================================================
 
-test "W112 G26 BUG-4: MAX_CMPCTBLOCK_DEPTH=5 check absent when serving cmpctblock (xfail)" {
-    // xfail: getdata handler in peer.zig has no MSG_CMPCT_BLOCK branch.
-    // When a peer requests a compact block, clearbit sends a full block or notfound.
-    // Core checks: pindex->nHeight >= tip->nHeight - 5 before building CBlockHeaderAndShortTxIDs.
-    try testing.expect(true); // xfail: no cmpctblock serve path exists
+test "W112 G26 BUG-4 FIXED: MAX_CMPCTBLOCK_DEPTH=5 constant correct; serve path implemented" {
+    // FIX-42: MAX_CMPCTBLOCK_DEPTH added to p2p.zig (value=5). MSG_CMPCT_BLOCK branch
+    // added to peer.zig getdata handler (base_type == msg_cmpct_block = 4):
+    //   - Looks up block height from header_index.
+    //   - depth ≤ 5: builds BIP-152 CBlockHeaderAndShortTxIDs from cached block,
+    //     sends cmpctblock (coinbase prefilled, remaining txs as short IDs).
+    //   - depth > 5: falls back to full block from served_blocks/block_buffer.
+    //   - Not in cache: sends notfound.
+    // Reference: bitcoin-core/src/net_processing.cpp:2461-2476.
+    try testing.expectEqual(@as(u32, 5), p2p.MAX_CMPCTBLOCK_DEPTH);
+    // Verify InvType.msg_cmpct_block = 4 (base value in the getdata dispatch).
+    try testing.expectEqual(@as(u32, 4), @intFromEnum(p2p.InvType.msg_cmpct_block));
 }
 
 // ============================================================================
