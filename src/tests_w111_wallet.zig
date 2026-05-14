@@ -630,15 +630,20 @@ test "W111 G23: wallet JSON persistence round-trip (WalletManager)" {
 // G24: Wallet encryption
 // ===========================================================================
 
-// BUG-4: Wallet encryption uses XOR not AES-256-GCM.
-// encryptPrivateKey at wallet.zig:1754-1759 does: ciphertext[i] = plaintext[i] ^ encryption_key[i]
-// This is trivially broken: given one known plaintext (secp256k1 keys are distinguishable),
-// XOR reveals the key stream. Real protection requires AES-256-GCM with a per-key random nonce.
+// BUG-4 FIXED (FIX-39): wallet.zig now uses AES-256-GCM with a per-key random
+// 12-byte nonce and 16-byte authentication tag.  Three cascading security
+// failures have been closed:
+//   1. Known-plaintext attack: ciphertext is no longer key ^ plaintext — random
+//      nonce makes every ciphertext unique even for the same key/passphrase.
+//   2. Bit-flip attack: the GCM auth tag detects any modification to the
+//      ciphertext, nonce, or tag bytes.
+//   3. Any-passphrase "unlocks" wallet: decryptPrivateKey now returns
+//      error.AuthenticationFailed when the derived key is wrong.
 //
-// The implementation also has no authentication tag, so bit-flipping attacks are possible.
-// xfail: BUG-4 — encryption is XOR, not AES-256-GCM
+// KDF: scrypt (ln=14, r=8, p=1) with a 16-byte random salt — stronger than the
+// PBKDF2-100k alternative mentioned in the audit (kept; matches Core's scrypt path).
 
-test "W111 G24: wallet encryption exists but uses XOR not AES-256-GCM — BUG-4" {
+test "W111 G24: wallet encryption uses AES-256-GCM — BUG-4 FIXED" {
     const ctx = secp256k1.secp256k1_context_create(
         secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
     );
@@ -656,27 +661,20 @@ test "W111 G24: wallet encryption exists but uses XOR not AES-256-GCM — BUG-4"
     try w.encryptWallet("correct-horse-battery-staple");
     try std.testing.expect(w.encrypted);
 
-    // The "encrypted" key is just original XOR derived_key.
-    // BUG-4: This means if we know the secp256k1 structure of any key,
-    //        we can recover the key stream and break all other keys.
-    //
-    // Positive behavioral checks that SHOULD pass:
-    //   1. Wallet is marked encrypted
-    //   2. Unlock with correct passphrase works
-    //   3. Unlock with wrong passphrase fails
-    //   4. Lock clears the key
+    // Ciphertext must differ from plaintext
+    try std.testing.expect(!std.mem.eql(u8, &original_secret, &w.keys.items[0].secret_key));
 
-    // BUG-4 sub-bug: unlockWallet with wrong passphrase should return WrongPassphrase,
-    // but decryptPrivateKey is just XOR (never errors), so the catch block at
-    // wallet.zig:1583 never fires. Any passphrase "unlocks" the wallet.
-    // We document this here by showing the wrong-passphrase check is broken:
-    const bad_unlock = w.unlockWallet("wrong-passphrase", 30);
-    // xfail: this should be WrongPassphrase but returns void (XOR can't detect wrong key)
-    _ = bad_unlock catch {}; // accept either outcome — document the broken path
-    // Even "unlocking" with wrong passphrase, the encrypted key bytes are just XOR'd
-    // with the wrong derived key, producing garbage — but the wallet doesn't know.
+    // Per-key nonce and tag must be set after encryption
+    try std.testing.expect(w.keys.items[0].encryption_nonce != null);
+    try std.testing.expect(w.keys.items[0].encryption_tag != null);
 
-    // Lock and re-unlock with correct passphrase
+    // CRITICAL FIX: wrong passphrase must now return WrongPassphrase (not succeed).
+    // Previously XOR always "succeeded" regardless of passphrase.
+    try std.testing.expectError(error.WrongPassphrase, w.unlockWallet("wrong-passphrase", 30));
+    // Wallet must still be locked after a failed unlock attempt
+    try std.testing.expect(!w.isUnlocked());
+
+    // Correct passphrase unlocks successfully
     w.lockWallet();
     try std.testing.expect(!w.isUnlocked());
     try w.unlockWallet("correct-horse-battery-staple", 30);
@@ -686,14 +684,15 @@ test "W111 G24: wallet encryption exists but uses XOR not AES-256-GCM — BUG-4"
     w.lockWallet();
     try std.testing.expect(!w.isUnlocked());
 
-    // The raw key bytes after encrypt != original (XOR changed them)
-    // BUG-4: they differ by XOR with key stream, not by AES-GCM ciphertext
-    try std.testing.expect(!std.mem.eql(u8, &original_secret, &w.keys.items[0].secret_key));
-    // FIXME BUG-4: Replace XOR with AES-256-GCM using a per-key 12-byte nonce
-    //              stored alongside each encrypted key. Core uses CryptedKeyMap
-    //              with vchCryptedKey = AES-CBC-256 + HMAC-SHA256 in CCryptoKeyStore.
-    // Also fix: decryptPrivateKey must call secp256k1_ec_seckey_verify on result
-    //           to detect wrong-passphrase, since XOR is always "successful".
+    // FIX-39: Two encryptions of the same key with the same passphrase must
+    // produce different ciphertexts (random nonce prevents known-plaintext).
+    var w2 = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer w2.deinit();
+    // Import the same original key into a second wallet
+    _ = try w2.importKey(original_secret);
+    try w2.encryptWallet("correct-horse-battery-staple");
+    // Different nonce → different ciphertext
+    try std.testing.expect(!std.mem.eql(u8, &w.keys.items[0].secret_key, &w2.keys.items[0].secret_key));
 }
 
 // ===========================================================================
