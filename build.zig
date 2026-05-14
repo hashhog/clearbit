@@ -913,6 +913,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w114_tests.step);
     }
 
+    // W115 — ASMap IP-to-ASN mapping 30-gate audit.
+    // Tests peer.zig + main.zig (Config) only — no RocksDB or wallet needed
+    // at runtime, but rocksdb is linked because peer.zig depends on storage.zig.
+    // ASMap is MISSING ENTIRELY from clearbit; all 30 gates document the absence.
+    // Run with `zig build test-w115`.
+    {
+        const w115_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w115_asmap.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w115"},
+        });
+        w115_tests.linkSystemLibrary("rocksdb");
+        w115_tests.linkSystemLibrary("secp256k1");
+        w115_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w115_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w115_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w115_tests.linkSystemLibrary("minisketch");
+            w115_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w115_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w115_tests = b.addRunArtifact(w115_tests);
+        const w115_test_step = b.step("test-w115", "Run W115 ASMap IP-to-ASN mapping 30-gate audit tests");
+        w115_test_step.dependOn(&run_w115_tests.step);
+        // Fold into the main `test` step so CI exercises W115.
+        test_step.dependOn(&run_w115_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
