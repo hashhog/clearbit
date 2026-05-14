@@ -367,7 +367,8 @@ test "asmap: getMappedAS returns 0 for empty asmap" {
 
 // Core reference test vector from bitcoin-core/src/test/netbase_tests.cpp
 // `asmap_test_vectors` — 128 ranges, up to 20-bit AS numbers.
-const CORE_ASMAP_HEX =
+// Exported as pub so tests_w115_asmap.zig can build the same asmap bytes.
+pub const TEST_ASMAP_HEX =
     "fd38d50f7d5d665357f64bba6bfc190d6078a7e68e5d3ac032edf47f8b5755f87881bfd3633d9aa7c1fa279b3" ++
     "6fe26c63bbc9de44e0f04e5a382d8e1cddbe1c26653bc939d4327f287e8b4d1f8aff33176787cb0ff7cb28e3f" ++
     "daef0f8f47357f801c9f7ff7a99f7f9c9f99de7f3156ae00f23eb27a303bc486aa3ccc31ec19394c2f8a53ddd" ++
@@ -379,8 +380,18 @@ const CORE_ASMAP_HEX =
     "33e53662a7d72a29477b5beb35710591d3e23e5f0379baea62ffdee535bcdf879cbf69b88d7ea37c8015381cf" ++
     "63dc33d28f757a4a5e15d6a08";
 
+// Keep the private alias so in-file tests still compile without change.
+const CORE_ASMAP_HEX = TEST_ASMAP_HEX;
+
 fn parseCoreAsmapHex(allocator: std.mem.Allocator) ![]u8 {
-    const hex = CORE_ASMAP_HEX;
+    return parseTestAsmapHex(allocator);
+}
+
+/// Parse `TEST_ASMAP_HEX` into a freshly allocated byte slice.
+/// Caller owns the returned memory (free with allocator.free).
+/// Exported so external test files can load the canonical test vector.
+pub fn parseTestAsmapHex(allocator: std.mem.Allocator) ![]u8 {
+    const hex = TEST_ASMAP_HEX;
     const n = hex.len / 2;
     const buf = try allocator.alloc(u8, n);
     var i: usize = 0;
