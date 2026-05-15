@@ -5,6 +5,30 @@ const serialize = @import("serialize.zig");
 const address = @import("address.zig");
 const consensus = @import("consensus.zig");
 const taproot_sighash = @import("taproot_sighash.zig");
+const bip21 = @import("bip21.zig");
+
+// ============================================================================
+// BIP-21 URI parser re-exports (FIX-62 / W119 prereq).
+//
+// `wallet.zig` is the natural import point for PayJoin sender code that
+// extracts `pj=` / `pjos=` from a payment URI before opening a network
+// connection.  Re-exporting from here means the sender doesn't have to add a
+// second module import alongside the existing `address` and `psbt` imports.
+// `parsePjosParam` is the wallet-side alias for `bip21.parseBip21Pjos` (BIP-78
+// `pjos=0|1`).
+// ============================================================================
+
+pub const Bip21Uri = bip21.Bip21Uri;
+pub const parseBip21 = bip21.parseBip21;
+pub const parseBip21Pjos = bip21.parseBip21Pjos;
+
+/// Sender-side helper: parse the `pjos=` value from a BIP-21 URI, returning
+/// the BIP-78 disable-output-substitution toggle.  `null` means the URI did
+/// not include the parameter, in which case the BIP-78 default is "1"
+/// (substitution disabled).
+pub fn parsePjosParam(input: []const u8) !?bool {
+    return bip21.parseBip21Pjos(input);
+}
 
 // ============================================================================
 // libsecp256k1 Bindings
