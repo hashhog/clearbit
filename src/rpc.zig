@@ -1908,6 +1908,10 @@ pub const RpcServer = struct {
             return self.handleLockUnspent(params, id);
         } else if (std.mem.eql(u8, method, "listlockunspent")) {
             return self.handleListLockUnspent(id);
+        } else if (std.mem.eql(u8, method, "bumpfee")) {
+            return self.handleBumpFee(params, id);
+        } else if (std.mem.eql(u8, method, "psbtbumpfee")) {
+            return self.handlePsbtBumpFee(params, id);
         } else if (std.mem.eql(u8, method, "walletcreatefundedpsbt")) {
             return self.handleWalletCreateFundedPsbt(params, id);
         } else if (std.mem.eql(u8, method, "importdescriptors")) {
@@ -9353,6 +9357,275 @@ pub const RpcServer = struct {
         }
 
         try writer.writeByte(']');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // W118 BUG-7 / BUG-8 / FIX-61: bumpfee + psbtbumpfee
+    // ========================================================================
+    //
+    // BIP-125 fee-bumping for unconfirmed wallet transactions. Mirrors
+    // Bitcoin Core's wallet/rpc/spend.cpp::bumpfee + ::psbtbumpfee.
+    //
+    // Minimal viable wiring: look up the original tx by txid in the
+    // mempool (clearbit does not yet keep a per-wallet outgoing-tx
+    // index), match every input's prevout against the wallet's UTXO
+    // set, then dispatch into `wallet.bumpFee` / `wallet.psbtBumpFee`.
+    // Reject paths surface Core-shaped error messages so consensus-diff
+    // tests can compare verbatim.
+    //
+    // Arguments (bumpfee):
+    //   1. txid (string, required)
+    //   2. options (object, optional) — { "fee_rate": <sat/vB>,
+    //                                     "replaceable": <bool>  (ignored — the
+    //                                                              replacement is
+    //                                                              always BIP-125
+    //                                                              signaling).
+    //                                     "force": <bool> }
+    //
+    // Result:  { "txid": <new_txid>,
+    //            "origfee": <BTC>,
+    //            "fee":     <BTC>,
+    //            "errors":  [] }
+    //
+    // psbtbumpfee returns `{ "psbt": <base64>, "origfee": <BTC>,
+    //                        "fee": <BTC>, "errors": [] }` instead.
+
+    /// Parse the `txid`/`options` argument pair shared by `bumpfee` and
+    /// `psbtbumpfee`. Returns the decoded txid bytes (internal order) and
+    /// the parsed `BumpFeeOptions`. The error returned, if any, is an
+    /// already-formed JSON-RPC error response the caller should propagate.
+    fn parseBumpFeeArgs(
+        self: *RpcServer,
+        params: std.json.Value,
+        id: ?std.json.Value,
+    ) !union(enum) {
+        ok: struct { txid: types.Hash256, options: wallet_mod.BumpFeeOptions },
+        err: []const u8,
+    } {
+        if (params != .array or params.array.items.len < 1) {
+            return .{ .err = try self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid", id) };
+        }
+
+        const txid_param = params.array.items[0];
+        if (txid_param != .string or txid_param.string.len != 64) {
+            return .{ .err = try self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid txid: must be 64 hex characters", id) };
+        }
+
+        var txid: types.Hash256 = undefined;
+        for (0..32) |i| {
+            txid[31 - i] = std.fmt.parseInt(u8, txid_param.string[i * 2 ..][0..2], 16) catch {
+                return .{ .err = try self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid txid: non-hex character", id) };
+            };
+        }
+
+        var options: wallet_mod.BumpFeeOptions = .{};
+        if (params.array.items.len >= 2) {
+            const opts = params.array.items[1];
+            if (opts == .object) {
+                if (opts.object.get("fee_rate")) |fr_val| {
+                    switch (fr_val) {
+                        .integer => |v| {
+                            if (v < 0) {
+                                return .{ .err = try self.jsonRpcError(RPC_INVALID_PARAMS, "fee_rate must be non-negative", id) };
+                            }
+                            options.fee_rate = @intCast(v);
+                        },
+                        .float => |v| {
+                            if (v < 0) {
+                                return .{ .err = try self.jsonRpcError(RPC_INVALID_PARAMS, "fee_rate must be non-negative", id) };
+                            }
+                            options.fee_rate = @intFromFloat(v);
+                        },
+                        .null => {},
+                        else => return .{ .err = try self.jsonRpcError(RPC_INVALID_PARAMS, "fee_rate must be numeric", id) },
+                    }
+                }
+                if (opts.object.get("force")) |f_val| {
+                    if (f_val == .bool) options.force = f_val.bool;
+                }
+            }
+        }
+
+        return .{ .ok = .{ .txid = txid, .options = options } };
+    }
+
+    /// Look up the original tx in the mempool by txid and pair its inputs
+    /// with wallet-owned prevouts. Returns either the original tx pointer
+    /// + heap-allocated prevout slice (caller frees) or a JSON-RPC error.
+    fn resolveBumpTarget(
+        self: *RpcServer,
+        wallet: *wallet_mod.Wallet,
+        txid: types.Hash256,
+        id: ?std.json.Value,
+    ) !union(enum) {
+        ok: struct { tx: *const types.Transaction, prevouts: []wallet_mod.OwnedUtxo },
+        err: []const u8,
+    } {
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+
+        const entry = self.mempool.get(txid) orelse {
+            // Tx may be confirmed: check UTXO set for any of its outputs.
+            // For minimal viable bumpfee we just return "not found in
+            // wallet/mempool" — Core distinguishes mempool-absent vs
+            // confirmed separately, but the diagnostic for callers is the
+            // same ("tx not eligible for bumping").
+            return .{ .err = try self.jsonRpcError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Transaction not in mempool — already confirmed or unknown to this wallet",
+                id,
+            ) };
+        };
+
+        const tx_ptr = &entry.tx;
+
+        // Match every input to a wallet UTXO. We require every prevout
+        // to be wallet-owned for the minimal viable path (Core also
+        // requires the wallet to hold all keys before bumping).
+        const prevouts = try self.allocator.alloc(wallet_mod.OwnedUtxo, tx_ptr.inputs.len);
+        errdefer self.allocator.free(prevouts);
+
+        for (tx_ptr.inputs, 0..) |input, i| {
+            var found = false;
+            for (wallet.utxos.items) |utxo| {
+                if (std.mem.eql(u8, &utxo.outpoint.hash, &input.previous_output.hash) and
+                    utxo.outpoint.index == input.previous_output.index)
+                {
+                    prevouts[i] = utxo;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                self.allocator.free(prevouts);
+                return .{ .err = try self.jsonRpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Wallet does not own every input of the original transaction",
+                    id,
+                ) };
+            }
+        }
+
+        return .{ .ok = .{ .tx = tx_ptr, .prevouts = prevouts } };
+    }
+
+    fn bumpFeeErrorToRpc(self: *RpcServer, err: anyerror, id: ?std.json.Value) ![]const u8 {
+        return switch (err) {
+            error.NotBIP125Replaceable => self.jsonRpcError(RPC_VERIFY_REJECTED, "Transaction is not BIP-125 replaceable", id),
+            error.NoChangeOutput => self.jsonRpcError(RPC_VERIFY_REJECTED, "Transaction has no wallet-owned change output to reduce", id),
+            error.InsufficientChange => self.jsonRpcError(RPC_WALLET_INSUFFICIENT_FUNDS, "Change output too small to absorb fee delta", id),
+            error.DustAfterReduce => self.jsonRpcError(RPC_VERIFY_REJECTED, "Reducing change would create a dust output", id),
+            error.PrevoutMismatch => self.jsonRpcError(RPC_MISC_ERROR, "Prevout count mismatch", id),
+            error.AlreadyConfirmed => self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction is already confirmed", id),
+            error.InsufficientFunds => self.jsonRpcError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds in original transaction", id),
+            else => self.jsonRpcError(RPC_MISC_ERROR, "bumpfee failed", id),
+        };
+    }
+
+    /// Handle bumpfee RPC.
+    fn handleBumpFee(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wallet = self.current_wallet orelse self.wallet orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+
+        const parsed = try self.parseBumpFeeArgs(params, id);
+        switch (parsed) {
+            .err => |msg| return msg,
+            .ok => {},
+        }
+        const args = parsed.ok;
+
+        const resolved = try self.resolveBumpTarget(wallet, args.txid, id);
+        switch (resolved) {
+            .err => |msg| return msg,
+            .ok => {},
+        }
+        const target = resolved.ok;
+        defer self.allocator.free(target.prevouts);
+
+        const result = wallet_mod.bumpFee(
+            wallet,
+            target.tx,
+            target.prevouts,
+            args.options,
+        ) catch |err| return self.bumpFeeErrorToRpc(err, id);
+
+        // Free the new tx after we've serialized + computed txid.
+        const new_tx = result.new_tx;
+        defer {
+            for (new_tx.inputs) |inp| {
+                for (inp.witness) |w| self.allocator.free(w);
+                self.allocator.free(inp.witness);
+                if (inp.script_sig.len > 0) self.allocator.free(inp.script_sig);
+            }
+            self.allocator.free(new_tx.inputs);
+            self.allocator.free(new_tx.outputs);
+        }
+
+        const new_txid = crypto.computeTxid(&result.new_tx, self.allocator) catch {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Failed to compute new txid", id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        const orig_fee_btc = @as(f64, @floatFromInt(result.orig_fee)) / 100_000_000.0;
+        const new_fee_btc = @as(f64, @floatFromInt(result.new_fee)) / 100_000_000.0;
+
+        try writer.writeAll("{\"txid\":\"");
+        try writeHashHex(writer, &new_txid);
+        try writer.print("\",\"origfee\":{d:.8},\"fee\":{d:.8},\"errors\":[]}}", .{ orig_fee_btc, new_fee_btc });
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle psbtbumpfee RPC.
+    fn handlePsbtBumpFee(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wallet = self.current_wallet orelse self.wallet orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+
+        const parsed = try self.parseBumpFeeArgs(params, id);
+        switch (parsed) {
+            .err => |msg| return msg,
+            .ok => {},
+        }
+        const args = parsed.ok;
+
+        const resolved = try self.resolveBumpTarget(wallet, args.txid, id);
+        switch (resolved) {
+            .err => |msg| return msg,
+            .ok => {},
+        }
+        const target = resolved.ok;
+        defer self.allocator.free(target.prevouts);
+
+        var result = wallet_mod.psbtBumpFee(
+            wallet,
+            target.tx,
+            target.prevouts,
+            args.options,
+        ) catch |err| return self.bumpFeeErrorToRpc(err, id);
+        defer result.psbt.deinit();
+
+        const psbt_base64 = result.psbt.toBase64(self.allocator) catch {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Failed to serialize PSBT", id);
+        };
+        defer self.allocator.free(psbt_base64);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        const orig_fee_btc = @as(f64, @floatFromInt(result.orig_fee)) / 100_000_000.0;
+        const new_fee_btc = @as(f64, @floatFromInt(result.new_fee)) / 100_000_000.0;
+
+        try writer.writeAll("{\"psbt\":\"");
+        try writer.writeAll(psbt_base64);
+        try writer.print("\",\"origfee\":{d:.8},\"fee\":{d:.8},\"errors\":[]}}", .{ orig_fee_btc, new_fee_btc });
+
         return self.jsonRpcResult(buf.items, id);
     }
 
