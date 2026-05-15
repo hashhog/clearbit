@@ -1797,6 +1797,54 @@ pub const Wallet = struct {
         }
         return total;
     }
+
+    /// Get balance with a minimum-confirmations filter.
+    ///
+    /// Always excludes immature coinbase (depth < `COINBASE_MATURITY` = 100),
+    /// matching Core's `CWallet::GetBalance` which always filters immature
+    /// coinbase before applying `min_depth`.
+    ///
+    /// `minconf` corresponds to the first positional argument of Core's
+    /// `getbalance` RPC. Core's default is 0 (count 0-conf change too); the
+    /// caller is responsible for parsing the JSON-RPC default.
+    ///
+    /// Depth convention matches the rest of clearbit's wallet code (e.g.
+    /// `getSpendableBalance`, `selectCoinsWithOptions`): a UTXO at
+    /// `utxo.height` with chain tip at `self.tip_height` has depth
+    /// `tip_height - height` (so a UTXO from the tip block has depth 0;
+    /// `minconf=1` means "must be 1 block deep").
+    ///
+    /// Reference: bitcoin-core/src/wallet/rpc/coins.cpp::getbalance,
+    ///            bitcoin-core/src/wallet/receive.cpp::CWallet::GetBalance,
+    ///            bitcoin-core/src/wallet/transaction.cpp::CWalletTx::GetDepthInMainChain.
+    ///
+    /// Note: `include_watchonly` and `avoid_reuse` are not yet wired —
+    /// clearbit's `OwnedUtxo` does not track watch-only or address-reuse
+    /// state. See FIX-60 commit body.
+    pub fn getBalanceMinConf(self: *const Wallet, minconf: u32) i64 {
+        var total: i64 = 0;
+        for (self.utxos.items) |utxo| {
+            // A UTXO whose recorded height is in the future of our tip is
+            // treated as unconfirmed (depth 0).
+            if (self.tip_height < utxo.height) {
+                if (minconf > 0) continue;
+                // depth 0 — also reject if it's a coinbase (immature by
+                // definition: 0 < COINBASE_MATURITY).
+                if (utxo.is_coinbase) continue;
+                total += utxo.output.value;
+                continue;
+            }
+
+            const depth = self.tip_height - utxo.height;
+
+            // Always exclude immature coinbase, regardless of minconf.
+            if (utxo.is_coinbase and depth < consensus.COINBASE_MATURITY) continue;
+
+            if (depth < minconf) continue;
+            total += utxo.output.value;
+        }
+        return total;
+    }
 };
 
 // ============================================================================
@@ -1897,6 +1945,15 @@ pub const TxOutput = struct {
 /// reordering blocks to steal fees. This makes the transaction invalid until
 /// the specified block height, preventing fee sniping attacks.
 ///
+/// Balance check (FIX-60 / W118 BUG-10): before signing, validate that
+/// `Σ utxo.value ≥ Σ output.value + change.value + estimated_fee`. If the
+/// inputs do not cover the outputs+fee, returns `error.InsufficientFunds`
+/// (or `error.FeeNotCovered` when the gap is purely the fee — outputs
+/// alone are <= inputs, only the fee tips the scale). This mirrors
+/// `CWallet::CreateTransactionInternal`, which rejects with "Insufficient
+/// funds" / "The total exceeds your balance when the … fee is included"
+/// before any signing happens.
+///
 /// Reference: Bitcoin Core wallet/spend.cpp CreateTransactionInternal()
 pub fn createTransaction(
     wallet: *Wallet,
@@ -1906,6 +1963,58 @@ pub fn createTransaction(
     options: CreateTxOptions,
 ) !types.Transaction {
     const allocator = wallet.allocator;
+
+    // -----------------------------------------------------------------
+    // Pre-sign balance check (W118 BUG-10).
+    //
+    // We compute three numbers:
+    //   sum_in     — Σ utxo.value over selected inputs
+    //   sum_out    — Σ outputs.value (+ change.value if a change output is
+    //                being added)
+    //   est_fee    — rough vsize × fee_rate estimate; we use the same
+    //                input-size estimates as `selectCoinsWithOptions`
+    //                (estimateInputSize), plus a fixed-per-output overhead
+    //                (~34 vbytes for a P2WPKH output, ~32 vbytes for the
+    //                tx skeleton). The estimate is intentionally a tiny
+    //                lower bound — the goal is to surface impossible
+    //                outputs before signing, not to fee-budget exactly.
+    //
+    // Decisions:
+    //   sum_in <  sum_out               → InsufficientFunds (over-spend)
+    //   sum_in == sum_out  & est_fee>0  → FeeNotCovered (no headroom)
+    //   sum_in <  sum_out + est_fee     → FeeNotCovered
+    //   otherwise                       → proceed with signing
+    //
+    // The two distinct errors let callers distinguish "you asked for more
+    // than you have" from "you have enough but not for the fee". Core
+    // surfaces the same distinction via separate error strings.
+    // -----------------------------------------------------------------
+    var sum_in: i128 = 0;
+    for (utxos_to_spend) |utxo| sum_in += utxo.output.value;
+
+    var sum_out: i128 = 0;
+    for (outputs) |out| sum_out += out.value;
+    if (change_output) |change| sum_out += change.value;
+
+    if (sum_in < sum_out) {
+        return error.InsufficientFunds;
+    }
+
+    // Rough vsize estimate:
+    //   tx overhead:    10 vbytes  (version + locktime + counts + segwit marker/flag)
+    //   per-input:      estimateInputSize(addr_type)
+    //   per-output:     34 vbytes  (8 value + 1 script-len + ~25 script)
+    const TX_OVERHEAD_VBYTES: u64 = 10;
+    const OUTPUT_VBYTES: u64 = 34;
+    var est_vsize: u64 = TX_OVERHEAD_VBYTES;
+    for (utxos_to_spend) |utxo| est_vsize += estimateInputSize(utxo.address_type);
+    est_vsize += OUTPUT_VBYTES * @as(u64, outputs.len + if (change_output != null) @as(usize, 1) else @as(usize, 0));
+
+    const est_fee: i128 = @intCast(est_vsize * options.fee_rate);
+    if (sum_in < sum_out + est_fee) {
+        return error.FeeNotCovered;
+    }
+    // -----------------------------------------------------------------
 
     // Count total inputs and outputs
     const num_inputs = utxos_to_spend.len;
