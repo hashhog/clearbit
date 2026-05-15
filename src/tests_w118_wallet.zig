@@ -52,17 +52,24 @@
 //!                            is 0 and `deserialize` rejects v2 explicitly.
 //!                            No PSBT_IN_PREVIOUS_TXID / OUTPUT_INDEX / SEQUENCE
 //!                            constants defined.
-//!   BUG-7  (HIGH)      G19 — BIP-125 `bumpfee` RPC MISSING ENTIRELY. No
-//!                            `handleBumpFee` in rpc.zig dispatcher. Users
-//!                            cannot fee-bump a stuck tx through the wallet.
-//!   BUG-8  (HIGH)      G20 — `psbtbumpfee` RPC MISSING ENTIRELY. Same root
-//!                            cause as G19 — no bumpfee logic anywhere in the
-//!                            wallet.
-//!   BUG-9  (MED)       G22 — `CreateTxOptions.replaceable` field missing.
-//!                            `createTransaction` hard-codes
-//!                            `sequence = 0xFFFFFFFE` for every input —
-//!                            BIP-125 signaling cannot be turned off by
-//!                            callers that want a non-replaceable tx.
+//!   BUG-7  (HIGH)      G19 — FIX-61: BIP-125 `bumpfee` RPC implemented.
+//!                            New `wallet.bumpFee` + `handleBumpFee` in
+//!                            rpc.zig dispatcher. Reduces a wallet-owned
+//!                            change output by `INCREMENTAL_FEE_RATE *
+//!                            orig_vsize` (or by `user_fee_rate * orig_vsize
+//!                            - orig_fee` when set), re-signs every input,
+//!                            and emits the new tx + fee accounting.
+//!   BUG-8  (HIGH)      G20 — FIX-61: `psbtbumpfee` RPC implemented via
+//!                            `wallet.psbtBumpFee`. Same flow as bumpFee
+//!                            but emits a BIP-174 PSBT instead of a
+//!                            signed transaction.
+//!   BUG-9  (MED)       G22 — FIX-61: `CreateTxOptions.replaceable` added.
+//!                            Default `false` preserves the historical
+//!                            `sequence = 0xFFFFFFFE`. `true` emits
+//!                            `0xFFFFFFFD` — BIP-125's canonical opt-in
+//!                            RBF signal — and is used internally by
+//!                            `bumpFee` so the replacement is itself
+//!                            bumpable.
 //!   BUG-10 (HIGH)      G24 — `createTransaction` does not validate the
 //!                            change-output value against fee. Caller can
 //!                            request a transaction where outputs exceed
@@ -732,15 +739,13 @@ test "W118 G18: PSBT analyze reports correct next_role" {
 //
 // This test scans rpc.zig for the handler name; absence is the bug.
 
-test "W118 G19: bumpfee RPC — BUG-7 MISSING ENTIRELY" {
-    // The rpc.zig source can be embedded at comptime to grep for "bumpfee".
-    // Easier: check that no top-level public function exists in wallet.zig
-    // that would implement the bumpfee logic.
-    const has_bump_fee = @hasDecl(wallet_mod, "bumpFee") or
-        @hasDecl(wallet_mod, "bumpTransactionFee") or
-        @hasDecl(Wallet, "bumpFee") or
-        @hasDecl(Wallet, "bumpTransactionFee");
-    try std.testing.expect(!has_bump_fee);
+test "W118 G19: bumpfee RPC — BUG-7 FIXED (FIX-61)" {
+    // FIX-61 closed BUG-7: `wallet_mod.bumpFee` now exists and implements
+    // the BIP-125 fee-bump logic (reduce a wallet-owned change output by
+    // `new_fee - orig_fee`, re-sign every input, return the new tx).
+    // The RPC `bumpfee` dispatches to it via `handleBumpFee` in rpc.zig.
+    const has_bump_fee = @hasDecl(wallet_mod, "bumpFee");
+    try std.testing.expect(has_bump_fee);
 }
 
 // ===========================================================================
@@ -751,12 +756,12 @@ test "W118 G19: bumpfee RPC — BUG-7 MISSING ENTIRELY" {
 // wallet has no bumpfee infrastructure at all.
 // Reference: bitcoin-core/src/wallet/rpc/spend.cpp::psbtbumpfee.
 
-test "W118 G20: psbtbumpfee RPC — BUG-8 MISSING ENTIRELY" {
-    const has_psbt_bump = @hasDecl(wallet_mod, "psbtBumpFee") or
-        @hasDecl(wallet_mod, "createBumpPsbt") or
-        @hasDecl(psbt_mod, "bumpFee") or
-        @hasDecl(psbt_mod.Psbt, "bumpFee");
-    try std.testing.expect(!has_psbt_bump);
+test "W118 G20: psbtbumpfee RPC — BUG-8 FIXED (FIX-61)" {
+    // FIX-61 closed BUG-8: `wallet_mod.psbtBumpFee` now exists. It runs
+    // the same change-reduction flow as `bumpFee` but emits a BIP-174 PSBT
+    // (so a separate signer / hardware wallet can finalize it).
+    const has_psbt_bump = @hasDecl(wallet_mod, "psbtBumpFee");
+    try std.testing.expect(has_psbt_bump);
 }
 
 // ===========================================================================
@@ -820,18 +825,26 @@ test "W118 G21: createTransaction sets BIP-125 sequence (0xFFFFFFFE)" {
 // or strengthen RBF signaling.  Core's `sendtoaddress` / `walletcreatefundedpsbt`
 // accept a `replaceable` parameter — clearbit ignores it.
 
-test "W118 G22: CreateTxOptions.replaceable — BUG-9 field absent" {
+test "W118 G22: CreateTxOptions.replaceable — BUG-9 FIXED (FIX-61)" {
+    // FIX-61 closed BUG-9: `CreateTxOptions.replaceable` now exists.
+    // Default `false` preserves the historical `0xFFFFFFFE` sequence
+    // emitted by `createTransaction` (so G21 — which asserts that
+    // sequence — keeps passing). Setting `replaceable = true` flips
+    // every input's sequence to `0xFFFFFFFD`, BIP-125's canonical
+    // RBF-opt-in signal. The `bumpFee` replacement path uses this
+    // internally so the new tx is itself bumpable.
     const opts: wallet_mod.CreateTxOptions = .{};
 
-    // Verify the only fields are fee_rate / current_height / anti_fee_sniping /
-    // sighash_type.  `replaceable` is NOT a field.
     _ = opts.fee_rate;
     _ = opts.current_height;
     _ = opts.anti_fee_sniping;
     _ = opts.sighash_type;
 
     const has_replaceable = @hasField(wallet_mod.CreateTxOptions, "replaceable");
-    try std.testing.expect(!has_replaceable);
+    try std.testing.expect(has_replaceable);
+
+    // Default must be `false` so G21 (`sequence = 0xFFFFFFFE`) still holds.
+    try std.testing.expectEqual(false, opts.replaceable);
 }
 
 // ===========================================================================
@@ -1432,4 +1445,412 @@ test "W118 G30c: getBalanceMinConf excludes immature coinbase even at minconf=0"
     try std.testing.expectEqual(@as(i64, 5_000_000_000), w.getBalanceMinConf(100));
     // But minconf=101 drops it (depth 100 < 101).
     try std.testing.expectEqual(@as(i64, 0), w.getBalanceMinConf(101));
+}
+
+// ===========================================================================
+// FIX-61: bumpFee / psbtBumpFee round-trip and reject paths
+// ===========================================================================
+//
+// These tests exercise the new W118 BUG-7 + BUG-8 closures. They build a
+// self-spending tx (one wallet-owned P2WPKH input, one external recipient,
+// one wallet-owned change output) and run each branch of `bumpFee` and
+// `psbtBumpFee`.
+
+const wallet_mod_bump = wallet_mod; // alias for clarity below
+
+/// Build a single-input, single-recipient, single-change RBF tx for the
+/// bumpfee tests. Returns the signed transaction + the prevout + the
+/// change-output index.
+fn buildBumpFixture(
+    allocator: std.mem.Allocator,
+    w: *Wallet,
+    input_value: i64,
+    payment_value: i64,
+    fee_rate: u64,
+    replaceable: bool,
+) !struct {
+    tx: types.Transaction,
+    prevout: OwnedUtxo,
+    change_index: usize,
+    /// Heap-allocated buffers the test must free *separately* from
+    /// `freeTx(tx)` — `createTransaction` aliases output script_pubkey
+    /// bytes directly into `tx.outputs[i].script_pubkey`, so the test
+    /// owner has to free those buffers itself (and BEFORE freeing the
+    /// outputs slice, otherwise `tx.outputs[i]` is dangling).
+    own_spk: []u8,
+    ext_spk: []u8,
+} {
+    const ki = try w.generateKey();
+    // Wallet-owned scriptPubKey for the prevout AND the change output.
+    const own_spk = try w.getScriptPubKey(ki, .p2wpkh);
+    errdefer allocator.free(own_spk);
+
+    // External recipient SPK (not wallet-owned). Use a different pkh.
+    const ext_pkh = [_]u8{0xAB} ** 20;
+    const ext_spk_buf = try allocator.alloc(u8, 22);
+    errdefer allocator.free(ext_spk_buf);
+    ext_spk_buf[0] = 0x00;
+    ext_spk_buf[1] = 0x14;
+    @memcpy(ext_spk_buf[2..22], &ext_pkh);
+
+    // Compute change as input - payment - rough fee. The fee budget must
+    // be ≥ createTransaction's internal estimateInputSize-based vsize
+    // (10 overhead + 68 P2WPKH input + 34 × num_outputs). For a 1-input,
+    // 2-output tx that's 146 vbytes. We use a 200-vbyte budget at the
+    // requested fee_rate to leave headroom for the bumpfee delta tests
+    // and stay comfortably above the pre-sign FeeNotCovered guard.
+    const rough_vsize: u64 = 200;
+    const rough_fee: i64 = @intCast(rough_vsize * fee_rate);
+    const change_value: i64 = input_value - payment_value - rough_fee;
+
+    const prevout = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xF1} ** 32, .index = 0 },
+        .output = .{ .value = input_value, .script_pubkey = own_spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+
+    const pay_out = wallet_mod_bump.TxOutput{
+        .value = payment_value,
+        .script_pubkey = ext_spk_buf,
+    };
+    const change_out = wallet_mod_bump.TxOutput{
+        .value = change_value,
+        .script_pubkey = own_spk,
+    };
+
+    const tx = try wallet_mod_bump.createTransaction(
+        w,
+        &[_]OwnedUtxo{prevout},
+        &[_]wallet_mod_bump.TxOutput{pay_out},
+        change_out,
+        .{ .fee_rate = fee_rate, .replaceable = replaceable },
+    );
+
+    return .{
+        .tx = tx,
+        .prevout = prevout,
+        .change_index = 1, // single payment then change → change at index 1
+        .own_spk = own_spk,
+        .ext_spk = ext_spk_buf,
+    };
+}
+
+fn freeTx(allocator: std.mem.Allocator, tx: types.Transaction) void {
+    for (tx.inputs) |inp| {
+        for (inp.witness) |w| allocator.free(w);
+        allocator.free(inp.witness);
+        if (inp.script_sig.len > 0) allocator.free(inp.script_sig);
+    }
+    allocator.free(tx.inputs);
+    allocator.free(tx.outputs);
+}
+
+test "W118 G19b: bumpFee round-trip — RBF-signaled tx, default delta" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+
+    const fx = try buildBumpFixture(allocator, &w, 100_000, 50_000, 1, true);
+    defer {
+        freeTx(allocator, fx.tx);
+        allocator.free(fx.own_spk);
+        allocator.free(fx.ext_spk);
+    }
+
+    // BIP-125 signaled: replaceable=true → sequence 0xFFFFFFFD < 0xFFFFFFFE.
+    try std.testing.expect(fx.tx.inputs[0].sequence < 0xFFFFFFFE);
+
+    const result = try wallet_mod_bump.bumpFee(
+        &w,
+        &fx.tx,
+        &[_]OwnedUtxo{fx.prevout},
+        .{}, // default: 1 sat/vB on top of original
+    );
+    defer freeTx(allocator, result.new_tx);
+
+    try std.testing.expect(result.new_fee > result.orig_fee);
+    try std.testing.expectEqual(@as(usize, 1), result.change_index);
+
+    // Replacement signals BIP-125 too (so it's itself bumpable).
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFD), result.new_tx.inputs[0].sequence);
+
+    // Inputs+outputs counts preserved.
+    try std.testing.expectEqual(fx.tx.inputs.len, result.new_tx.inputs.len);
+    try std.testing.expectEqual(fx.tx.outputs.len, result.new_tx.outputs.len);
+
+    // Change output reduced exactly by (new_fee - orig_fee).
+    const delta: i64 = result.new_fee - result.orig_fee;
+    try std.testing.expectEqual(
+        fx.tx.outputs[fx.change_index].value - delta,
+        result.new_tx.outputs[result.change_index].value,
+    );
+
+    // Payment output untouched.
+    try std.testing.expectEqual(
+        fx.tx.outputs[0].value,
+        result.new_tx.outputs[0].value,
+    );
+
+    // Witness regenerated (re-signed).
+    try std.testing.expect(result.new_tx.inputs[0].witness.len > 0);
+}
+
+test "W118 G19c: bumpFee rejects non-BIP-125 tx" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+
+    // replaceable=false → sequence 0xFFFFFFFE → no RBF signal.
+    const fx = try buildBumpFixture(allocator, &w, 100_000, 50_000, 1, false);
+    defer {
+        freeTx(allocator, fx.tx);
+        allocator.free(fx.own_spk);
+        allocator.free(fx.ext_spk);
+    }
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFE), fx.tx.inputs[0].sequence);
+
+    const err = wallet_mod_bump.bumpFee(
+        &w,
+        &fx.tx,
+        &[_]OwnedUtxo{fx.prevout},
+        .{},
+    );
+    try std.testing.expectError(wallet_mod_bump.BumpFeeError.NotBIP125Replaceable, err);
+}
+
+test "W118 G19d: bumpFee with `force = true` accepts non-BIP-125 tx" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+
+    const fx = try buildBumpFixture(allocator, &w, 100_000, 50_000, 1, false);
+    defer {
+        freeTx(allocator, fx.tx);
+        allocator.free(fx.own_spk);
+        allocator.free(fx.ext_spk);
+    }
+
+    const result = try wallet_mod_bump.bumpFee(
+        &w,
+        &fx.tx,
+        &[_]OwnedUtxo{fx.prevout},
+        .{ .force = true },
+    );
+    defer freeTx(allocator, result.new_tx);
+
+    try std.testing.expect(result.new_fee > result.orig_fee);
+}
+
+test "W118 G19e: bumpFee rejects when no change output is owned" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+
+    const ki = try w.generateKey();
+    const own_spk = try w.getScriptPubKey(ki, .p2wpkh);
+    defer allocator.free(own_spk);
+
+    // Two external (non-wallet) outputs only.
+    const ext1 = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+    const ext2 = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20;
+
+    const prevout = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xF2} ** 32, .index = 0 },
+        .output = .{ .value = 100_000, .script_pubkey = own_spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+
+    const tx = try wallet_mod_bump.createTransaction(
+        &w,
+        &[_]OwnedUtxo{prevout},
+        &[_]wallet_mod_bump.TxOutput{
+            .{ .value = 40_000, .script_pubkey = &ext1 },
+            .{ .value = 40_000, .script_pubkey = &ext2 },
+        },
+        null,
+        .{ .fee_rate = 1, .replaceable = true },
+    );
+    defer freeTx(allocator, tx);
+
+    const err = wallet_mod_bump.bumpFee(
+        &w,
+        &tx,
+        &[_]OwnedUtxo{prevout},
+        .{},
+    );
+    try std.testing.expectError(wallet_mod_bump.BumpFeeError.NoChangeOutput, err);
+}
+
+test "W118 G19f: bumpFee rejects when reducing change crosses the dust threshold" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+
+    // Make change tiny — barely above the P2WPKH dust threshold (294) —
+    // so a single 1 sat/vB bump on a ~146-vB tx (delta ≈ 146) tips it
+    // below dust.
+    //
+    // Fixture math: input = 100_000, payment = 99_500, change = 295 (1 sat
+    // above dust). Fee = sum_in - sum_out = 100_000 - 99_500 - 295 = 205
+    // sats — covers the ~146-vB est_fee at 1 sat/vB with headroom for
+    // createTransaction's pre-sign FeeNotCovered check. The bumpfee
+    // delta (≥ 146 sats) is much larger than the 1-sat headroom above
+    // dust, so DustAfterReduce fires.
+    const ki = try w.generateKey();
+    const own_spk = try w.getScriptPubKey(ki, .p2wpkh);
+    defer allocator.free(own_spk);
+
+    const ext_pkh = [_]u8{0xCC} ** 20;
+    const ext_spk = [_]u8{ 0x00, 0x14 } ++ ext_pkh;
+
+    const prevout = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xF3} ** 32, .index = 0 },
+        .output = .{ .value = 100_000, .script_pubkey = own_spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+
+    const tx = try wallet_mod_bump.createTransaction(
+        &w,
+        &[_]OwnedUtxo{prevout},
+        &[_]wallet_mod_bump.TxOutput{.{ .value = 99_500, .script_pubkey = &ext_spk }},
+        wallet_mod_bump.TxOutput{ .value = 295, .script_pubkey = own_spk }, // 1 sat above P2WPKH dust (294)
+        .{ .fee_rate = 1, .replaceable = true },
+    );
+    defer freeTx(allocator, tx);
+
+    const err = wallet_mod_bump.bumpFee(
+        &w,
+        &tx,
+        &[_]OwnedUtxo{prevout},
+        .{},
+    );
+    try std.testing.expectError(wallet_mod_bump.BumpFeeError.DustAfterReduce, err);
+}
+
+test "W118 G20b: psbtBumpFee round-trip — produces a PSBT with reduced change" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+
+    const fx = try buildBumpFixture(allocator, &w, 100_000, 50_000, 1, true);
+    defer {
+        freeTx(allocator, fx.tx);
+        allocator.free(fx.own_spk);
+        allocator.free(fx.ext_spk);
+    }
+
+    var result = try wallet_mod_bump.psbtBumpFee(
+        &w,
+        &fx.tx,
+        &[_]OwnedUtxo{fx.prevout},
+        .{},
+    );
+    defer result.psbt.deinit();
+
+    try std.testing.expect(result.new_fee > result.orig_fee);
+    try std.testing.expectEqual(@as(usize, 1), result.change_index);
+
+    // PSBT carries an unsigned tx: scriptSig/witness empty on every input.
+    try std.testing.expectEqual(fx.tx.inputs.len, result.psbt.tx.inputs.len);
+    for (result.psbt.tx.inputs) |inp| {
+        try std.testing.expectEqual(@as(usize, 0), inp.script_sig.len);
+        try std.testing.expectEqual(@as(usize, 0), inp.witness.len);
+        // Replacement signals BIP-125.
+        try std.testing.expectEqual(@as(u32, 0xFFFFFFFD), inp.sequence);
+    }
+
+    // Change output value matches the new_change_val computed from delta.
+    const delta: i64 = result.new_fee - result.orig_fee;
+    try std.testing.expectEqual(
+        fx.tx.outputs[fx.change_index].value - delta,
+        result.psbt.tx.outputs[result.change_index].value,
+    );
+
+    // PSBT v0 (BIP-174).
+    try std.testing.expectEqual(@as(u32, 0), result.psbt.version);
+}
+
+test "W118 G20c: psbtBumpFee rejects non-BIP-125 tx" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+
+    const fx = try buildBumpFixture(allocator, &w, 100_000, 50_000, 1, false);
+    defer {
+        freeTx(allocator, fx.tx);
+        allocator.free(fx.own_spk);
+        allocator.free(fx.ext_spk);
+    }
+
+    const err = wallet_mod_bump.psbtBumpFee(
+        &w,
+        &fx.tx,
+        &[_]OwnedUtxo{fx.prevout},
+        .{},
+    );
+    try std.testing.expectError(wallet_mod_bump.BumpFeeError.NotBIP125Replaceable, err);
+}
+
+test "W118 G22b: createTransaction with replaceable=true emits BIP-125 sequence" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+    const ki = try w.generateKey();
+
+    const pk_hash = crypto.hash160(&w.keys.items[ki].public_key);
+    var spk: [22]u8 = undefined;
+    spk[0] = 0x00;
+    spk[1] = 0x14;
+    @memcpy(spk[2..22], &pk_hash);
+
+    const utxo = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0x83} ** 32, .index = 0 },
+        .output = .{ .value = 100_000, .script_pubkey = &spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+
+    const out = wallet_mod_bump.TxOutput{ .value = 90_000, .script_pubkey = &spk };
+
+    const tx = try wallet_mod_bump.createTransaction(
+        &w,
+        &[_]OwnedUtxo{utxo},
+        &[_]wallet_mod_bump.TxOutput{out},
+        null,
+        .{ .fee_rate = 1, .replaceable = true },
+    );
+    defer freeTx(allocator, tx);
+
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFD), tx.inputs[0].sequence);
 }
