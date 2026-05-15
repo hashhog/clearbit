@@ -120,6 +120,28 @@ pub const Config = struct {
     // Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
     asmap_path: ?[]const u8 = null,
 
+    // Anonymous-network proxies (BIP-155 / Core init.cpp).  All four are
+    // optional; when set, peer.PeerManager constructs a ProxyManager and
+    // dispatches outbound connects via it (see src/proxy.zig).
+    //
+    //   --proxy=host:port        SOCKS5 proxy for clearnet (IPv4/IPv6) and
+    //                            the default proxy for overlay networks
+    //                            when -onion is not set.  Mirrors Core's
+    //                            -proxy (init.cpp:592).
+    //   --onion=host:port        SOCKS5 proxy specifically for Tor v3 onion
+    //                            addresses.  When unset and -proxy is set,
+    //                            -proxy is used for onion too.  Mirrors
+    //                            Core's -onion (init.cpp:573).
+    //   --i2psam=host:port       I2P SAM bridge endpoint (default port
+    //                            7656).  Mirrors Core's -i2psam.
+    //   --cjdnsreachable         Treat fc00::/7 as routable rather than
+    //                            RFC-4193 ULA private.  Mirrors Core's
+    //                            -cjdnsreachable.
+    proxy: ?[]const u8 = null,
+    onion: ?[]const u8 = null,
+    i2psam: ?[]const u8 = null,
+    cjdnsreachable: bool = false,
+
     pub const Network = enum {
         mainnet,
         testnet,
@@ -350,6 +372,24 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             const eq = std.mem.indexOf(u8, arg, "=").?;
             config.asmap_path = arg[eq + 1 ..];
         }
+        // Anonymous-network proxy flags.  Wired into PeerManager.proxy_manager
+        // and consulted on every outbound dial (see peer.zig connectOutbound*).
+        else if (std.mem.startsWith(u8, arg, "--proxy=") or std.mem.startsWith(u8, arg, "-proxy=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.proxy = arg[eq + 1 ..];
+        } else if (std.mem.startsWith(u8, arg, "--onion=") or std.mem.startsWith(u8, arg, "-onion=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.onion = arg[eq + 1 ..];
+        } else if (std.mem.startsWith(u8, arg, "--i2psam=") or std.mem.startsWith(u8, arg, "-i2psam=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.i2psam = arg[eq + 1 ..];
+        } else if (std.mem.eql(u8, arg, "--cjdnsreachable") or std.mem.eql(u8, arg, "-cjdnsreachable") or
+            std.mem.eql(u8, arg, "--cjdnsreachable=1") or std.mem.eql(u8, arg, "-cjdnsreachable=1"))
+        {
+            config.cjdnsreachable = true;
+        } else if (std.mem.eql(u8, arg, "--cjdnsreachable=0") or std.mem.eql(u8, arg, "-cjdnsreachable=0")) {
+            config.cjdnsreachable = false;
+        }
         // Help and version
         else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
@@ -450,6 +490,12 @@ pub fn printUsage() void {
         \\  --zmqpubrawtx=<addr>      Bind ZMQ PUB socket for serialized txs
         \\  --zmqpubhashtx=<addr>     Bind ZMQ PUB socket for tx hashes
         \\  --zmqpubsequence=<addr>   Bind ZMQ PUB socket for sequence events
+        \\
+        \\Anonymous networks (BIP-155):
+        \\  --proxy=host:port      SOCKS5 proxy for clearnet (and default for overlays)
+        \\  --onion=host:port      SOCKS5 proxy for Tor v3 .onion connections
+        \\  --i2psam=host:port     I2P SAM bridge endpoint (default port 7656)
+        \\  --cjdnsreachable       Treat fc00::/7 as routable for CJDNS peers
         \\
         \\Performance:
         \\  --benchmark            Run performance benchmarks and exit
@@ -1762,6 +1808,29 @@ pub fn main() !void {
         } else |err| {
             std.debug.print("Warning: could not load asmap from '{s}': {}\n", .{ asmap_path, err });
         }
+    }
+    // Anonymous-network proxy wiring (W117 FIX-56).  Lifts the dead-helper
+    // ProxyManager / Socks5Client / I2pSamClient / TorControlClient into
+    // production.  When any of --proxy / --onion / --i2psam is set, the
+    // outbound dial path (Peer.connect / connectOutbound*) consults
+    // peer_manager.proxy_manager and routes through SOCKS5 / I2P SAM as
+    // appropriate.  --cjdnsreachable opens fc00::/7 as routable for CJDNS.
+    peer_manager.cjdnsreachable = config.cjdnsreachable;
+    if (config.proxy != null or config.onion != null or config.i2psam != null) {
+        peer_manager.initProxy(config.proxy, config.onion, config.i2psam);
+        if (peer_manager.proxy_manager) |pm| {
+            std.debug.print(
+                "Proxy: clearnet={s}:{d} tor={s}:{d} i2psam={s}:{d} cjdnsreachable={any}\n",
+                .{
+                    pm.clearnet_config.host, pm.clearnet_config.port,
+                    pm.tor_config.host,      pm.tor_config.port,
+                    pm.i2p_config.host,      pm.i2p_config.port,
+                    config.cjdnsreachable,
+                },
+            );
+        }
+    } else if (config.cjdnsreachable) {
+        std.debug.print("CJDNS: fc00::/7 treated as routable (--cjdnsreachable)\n", .{});
     }
 
     const auth_token = computeAuthToken(config.rpc_user, config.rpc_password, allocator) catch null;

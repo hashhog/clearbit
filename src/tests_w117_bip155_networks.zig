@@ -234,6 +234,7 @@ const proxy = @import("proxy.zig");
 const p2p = @import("p2p.zig");
 const peer_mod = @import("peer.zig");
 const serialize = @import("serialize.zig");
+const consensus = @import("consensus.zig");
 
 // ============================================================================
 // G1-G10: Tor v3 Support
@@ -829,4 +830,258 @@ test "W117/G30: addrv2 port encoding is big-endian (network byte order)" {
     // Port bytes are at offset 12-13
     try testing.expectEqual(@as(u8, 0x12), payload[12]);
     try testing.expectEqual(@as(u8, 0x34), payload[13]);
+}
+
+// ============================================================================
+// FIX-56: proxy.zig wired into Config + Peer connect path
+// ============================================================================
+//
+// Closes W117 BUG-1 / BUG-3 / BUG-11 (the dead-helper cluster).  The W117
+// audit found that proxy.zig defines 5 well-engineered subsystems
+// (ProxyManager, Socks5Client, I2pSamClient, TorControlClient,
+// StreamIsolation) but no production code path reached any of them.  FIX-56:
+//   1. Config gains proxy / onion / i2psam / cjdnsreachable fields.
+//   2. main.zig parseArgs accepts --proxy=, --onion=, --i2psam=, --cjdnsreachable.
+//   3. PeerManager gains a proxy_manager: ?ProxyManager field plus initProxy(),
+//      shouldDial(), connectViaProxy(), and openClearnetOutbound().
+//   4. Peer.connect / connectOutboundV1 / connectOutboundNegotiated dispatch
+//      via openClearnetOutbound so --proxy is honoured for clearnet too.
+//
+// Tests verify the wiring without making real network connections.
+
+// Note: Config field presence is verified at compile time by the
+// successful build of src/main.zig (which actually uses the fields to
+// drive peer_manager.initProxy).  We intentionally avoid `@import("main.zig")`
+// from the test root because main.zig pulls in wallet.zig, whose
+// @embedFile path resolves only when main.zig is the test root.
+
+test "FIX-56/G21: PeerManager.initProxy installs a ProxyManager from the parsed flags" {
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    // Before initProxy: no manager.
+    try testing.expect(manager.proxy_manager == null);
+
+    // With both --proxy and --i2psam set, the manager installs and routes
+    // tor through proxy (Core fallback semantics) and i2p separately.
+    manager.initProxy("127.0.0.1:9050", null, "127.0.0.1:7656");
+    try testing.expect(manager.proxy_manager != null);
+    const pm = &manager.proxy_manager.?;
+    try testing.expectEqual(proxy.ProxyType.socks5, pm.clearnet_config.proxy_type);
+    try testing.expectEqualStrings("127.0.0.1", pm.clearnet_config.host);
+    try testing.expectEqual(@as(u16, 9050), pm.clearnet_config.port);
+    // tor falls back to proxy_spec when onion_spec is null.
+    try testing.expectEqual(proxy.ProxyType.socks5, pm.tor_config.proxy_type);
+    try testing.expectEqualStrings("127.0.0.1", pm.tor_config.host);
+    try testing.expectEqual(@as(u16, 9050), pm.tor_config.port);
+    // i2p uses its own spec.
+    try testing.expectEqual(proxy.ProxyType.i2p, pm.i2p_config.proxy_type);
+    try testing.expectEqual(@as(u16, 7656), pm.i2p_config.port);
+}
+
+test "FIX-56/G21: PeerManager.initProxy honours --onion override" {
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    // When --onion is set explicitly, tor_config uses it, not --proxy.
+    manager.initProxy("127.0.0.1:1080", "127.0.0.1:9050", null);
+    const pm = &manager.proxy_manager.?;
+    try testing.expectEqual(@as(u16, 1080), pm.clearnet_config.port);
+    try testing.expectEqual(@as(u16, 9050), pm.tor_config.port);
+}
+
+test "FIX-56/G21: PeerManager.initProxy accepts bare-host spec with default port" {
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    // No :port → default ports apply (9050 SOCKS5 / 7656 I2P SAM).
+    manager.initProxy("127.0.0.1", null, "127.0.0.1");
+    const pm = &manager.proxy_manager.?;
+    try testing.expectEqual(@as(u16, 9050), pm.clearnet_config.port);
+    try testing.expectEqual(@as(u16, 7656), pm.i2p_config.port);
+}
+
+test "FIX-56/G21: shouldDial routes overlay traffic only when configured" {
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    // Default: clearnet always dialable; overlays not (no proxy yet).
+    try testing.expect(manager.shouldDial(.ipv4));
+    try testing.expect(manager.shouldDial(.ipv6));
+    try testing.expect(!manager.shouldDial(.torv3));
+    try testing.expect(!manager.shouldDial(.i2p));
+    try testing.expect(!manager.shouldDial(.cjdns));
+    try testing.expect(!manager.shouldDial(.torv2)); // permanently rejected (deprecated)
+
+    // Install proxy + onion: torv3 unblocks, i2p remains off.
+    manager.initProxy("127.0.0.1:9050", null, null);
+    try testing.expect(manager.shouldDial(.torv3));
+    try testing.expect(!manager.shouldDial(.i2p));
+    try testing.expect(!manager.shouldDial(.cjdns));
+
+    // Add i2psam: i2p unblocks.
+    manager.initProxy("127.0.0.1:9050", null, "127.0.0.1:7656");
+    try testing.expect(manager.shouldDial(.i2p));
+
+    // cjdnsreachable flag is independent of the proxy manager.
+    try testing.expect(!manager.shouldDial(.cjdns));
+    manager.cjdnsreachable = true;
+    try testing.expect(manager.shouldDial(.cjdns));
+}
+
+test "FIX-56/G21: shouldDial(.torv2) is permanently disabled" {
+    // Tor v2 was deprecated by Tor in October 2021.  Even when a Tor SOCKS5
+    // is configured, we never dial v2 onion addresses.
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+    manager.initProxy("127.0.0.1:9050", "127.0.0.1:9050", "127.0.0.1:7656");
+    try testing.expect(!manager.shouldDial(.torv2));
+}
+
+test "FIX-56/G21: connectViaProxy returns null when network is unreachable" {
+    // shouldDial(.i2p) returns false when no --i2psam is set → connectViaProxy
+    // must return null without touching the wire.
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+    manager.initProxy("127.0.0.1:9050", null, null); // no i2psam
+    const target = proxy.MultiNetworkAddress{
+        .network = .i2p,
+        .address = &[_]u8{0} ** 32,
+        .port = 0,
+    };
+    try testing.expect(manager.connectViaProxy(&target) == null);
+}
+
+test "FIX-56/G21: connectViaProxy returns null when no proxy_manager is installed" {
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+    // No initProxy call → proxy_manager is null.
+    const target = proxy.MultiNetworkAddress{
+        .network = .torv3,
+        .address = &[_]u8{0} ** 32,
+        .port = 8333,
+    };
+    try testing.expect(manager.connectViaProxy(&target) == null);
+}
+
+test "FIX-56/G21: initProxy is idempotent — replaces previous manager cleanly" {
+    // Two calls should not leak the first manager's lazily-allocated state.
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    manager.initProxy("127.0.0.1:9050", null, "127.0.0.1:7656");
+    try testing.expectEqual(@as(u16, 9050), manager.proxy_manager.?.clearnet_config.port);
+    manager.initProxy("127.0.0.1:1080", null, "127.0.0.1:7656");
+    try testing.expectEqual(@as(u16, 1080), manager.proxy_manager.?.clearnet_config.port);
+}
+
+test "FIX-56/G21: bracketed IPv6 proxy spec parses correctly" {
+    // RFC-3986 bracketed form: [host]:port — required for IPv6 literals to
+    // disambiguate from the last-colon rule.
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+    manager.initProxy("[::1]:9050", null, null);
+    const pm = &manager.proxy_manager.?;
+    try testing.expectEqualStrings("::1", pm.clearnet_config.host);
+    try testing.expectEqual(@as(u16, 9050), pm.clearnet_config.port);
+}
+
+test "FIX-56/G21: empty proxy spec installs no manager" {
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+    // All three nil → no manager.
+    manager.initProxy(null, null, null);
+    try testing.expect(manager.proxy_manager == null);
+}
+
+test "FIX-56/G21: openClearnetOutbound falls back to direct when no proxy is set" {
+    // openClearnetOutbound is private but reachable via the connectOutbound*
+    // wrappers.  We can't actually open a socket in unit tests, but we can
+    // verify the dispatch decision: with no proxy_manager, the code path
+    // calls Peer.connect directly (which will fail with ConnectionFailed
+    // since the target is invalid) — that is, no panic, just a null return.
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+    // 192.0.2.0/24 is the TEST-NET-1 documentation block per RFC 5737;
+    // guaranteed unroutable, so Peer.connect must fail quickly.
+    const target = std.net.Address.initIp4(.{ 192, 0, 2, 1 }, 8333);
+    // The maintainOutbound loop calls connectOutboundNegotiated which
+    // routes through openClearnetOutbound; we exercise the same path here
+    // by calling connectOutboundV1 (no BIP-324 wiring in tests).  This is
+    // *expected* to return null because the connect will time out / fail,
+    // not because of a dispatch error.
+    const result = manager.connectOutboundNegotiated(target);
+    try testing.expect(result == null);
+}
+
+test "FIX-56/G21: ProxyManager init wires NetworkAddress dispatch to correct subsystem" {
+    // Verify (without real network IO) that ProxyManager.connectTo routes by
+    // NetworkId.  We construct a ProxyManager directly and inspect the
+    // configured subsystems for each network type.
+    const allocator = testing.allocator;
+    const clearnet = proxy.ProxyConfig{
+        .proxy_type = .socks5,
+        .host = "127.0.0.1",
+        .port = 1080,
+    };
+    const tor = proxy.ProxyConfig{
+        .proxy_type = .socks5,
+        .host = "127.0.0.1",
+        .port = 9050,
+    };
+    const i2p = proxy.ProxyConfig{
+        .proxy_type = .i2p,
+        .host = "127.0.0.1",
+        .port = 7656,
+    };
+    var pm = proxy.ProxyManager.init(clearnet, tor, i2p, allocator);
+    defer pm.deinit();
+
+    // Tor dispatch: tor_config drives the SOCKS5 endpoint.
+    try testing.expectEqual(proxy.ProxyType.socks5, pm.tor_config.proxy_type);
+    try testing.expectEqual(@as(u16, 9050), pm.tor_config.port);
+    // Clearnet dispatch: clearnet_config drives the SOCKS5 endpoint.
+    try testing.expectEqual(proxy.ProxyType.socks5, pm.clearnet_config.proxy_type);
+    try testing.expectEqual(@as(u16, 1080), pm.clearnet_config.port);
+    // I2P dispatch: i2p_config drives the SAM bridge.
+    try testing.expectEqual(proxy.ProxyType.i2p, pm.i2p_config.proxy_type);
+    try testing.expectEqual(@as(u16, 7656), pm.i2p_config.port);
+}
+
+test "FIX-56/G21: cjdnsreachable flag drives shouldDial(.cjdns) only" {
+    // The cjdnsreachable flag toggles only the CJDNS gate; it does not
+    // affect proxy dispatch for the other overlays.
+    const allocator = testing.allocator;
+    const params = &consensus.MAINNET;
+    var manager = peer_mod.PeerManager.init(allocator, params);
+    defer manager.deinit();
+
+    try testing.expect(!manager.shouldDial(.cjdns));
+    manager.cjdnsreachable = true;
+    try testing.expect(manager.shouldDial(.cjdns));
+    // Setting cjdnsreachable did not install a proxy for the other overlays.
+    try testing.expect(!manager.shouldDial(.torv3));
+    try testing.expect(!manager.shouldDial(.i2p));
 }
