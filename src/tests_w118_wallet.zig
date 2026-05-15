@@ -893,15 +893,21 @@ test "W118 G23: createTransaction populates witness/scriptSig on every input" {
 }
 
 // ===========================================================================
-// G24: createTransaction over-spend not validated (BUG-10)
+// G24: createTransaction over-spend rejected pre-sign (BUG-10 — FIXED in FIX-60)
 // ===========================================================================
 //
-// BUG-10 (HIGH): createTransaction does not check inputs-sum >= outputs-sum.
-// A caller can request outputs whose sum exceeds the inputs' value and the
-// function happily signs the (consensus-invalid) transaction.  Core's
-// CreateTransactionInternal validates this and rejects.
+// BUG-10 (HIGH): createTransaction did not check inputs-sum >= outputs-sum.
+// A caller could request outputs whose sum exceeded the inputs' value and
+// the function happily signed the (consensus-invalid) transaction. Core's
+// CreateTransactionInternal validates this and rejects with
+// "Insufficient funds" before signing.
+//
+// FIX-60: createTransaction now computes sum_in / sum_out + estimated fee
+// BEFORE the signing loop. Returns `error.InsufficientFunds` when outputs
+// alone exceed inputs, and `error.FeeNotCovered` when only the fee tips
+// the scale.
 
-test "W118 G24: createTransaction over-spend — BUG-10 no inputs-vs-outputs check" {
+test "W118 G24: createTransaction over-spend — outputs exceed inputs returns InsufficientFunds" {
     const ctx = makeContext() orelse return;
     defer destroyContext(ctx);
 
@@ -916,7 +922,8 @@ test "W118 G24: createTransaction over-spend — BUG-10 no inputs-vs-outputs che
     spk[1] = 0x14;
     @memcpy(spk[2..22], &pk_hash);
 
-    // Input value 10_000, output value 1_000_000 — over-spend by 99x
+    // Input value 10_000, output value 1_000_000 — over-spend by 99x.
+    // outputs alone (1_000_000) exceed inputs (10_000) → InsufficientFunds.
     const utxo = OwnedUtxo{
         .outpoint = .{ .hash = [_]u8{0xA1} ** 32, .index = 0 },
         .output = .{ .value = 10_000, .script_pubkey = &spk },
@@ -926,7 +933,6 @@ test "W118 G24: createTransaction over-spend — BUG-10 no inputs-vs-outputs che
     };
     const bad = wallet_mod.TxOutput{ .value = 1_000_000, .script_pubkey = &spk };
 
-    // BUG-10: this MUST be rejected by a wallet, but clearbit happily signs.
     const result = wallet_mod.createTransaction(
         &w,
         &[_]OwnedUtxo{utxo},
@@ -934,22 +940,139 @@ test "W118 G24: createTransaction over-spend — BUG-10 no inputs-vs-outputs che
         null,
         .{ .fee_rate = 1 },
     );
+    // Pre-sign rejection — no transaction returned, no signature produced.
+    try std.testing.expectError(error.InsufficientFunds, result);
+}
 
-    if (result) |tx| {
-        // The bug is confirmed: we got a tx.  Free it.
+// G24b: sufficient funds still produce a signed tx (sanity — make sure we
+// didn't over-trigger the new check).
+test "W118 G24b: createTransaction with sufficient funds still signs" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+    const ki = try w.generateKey();
+
+    const pk_hash = crypto.hash160(&w.keys.items[ki].public_key);
+    var spk: [22]u8 = undefined;
+    spk[0] = 0x00;
+    spk[1] = 0x14;
+    @memcpy(spk[2..22], &pk_hash);
+
+    // 100k input, 90k output, plenty of margin for fee. Must succeed and
+    // populate the witness on every input (signing must run to completion).
+    const utxo = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xA2} ** 32, .index = 0 },
+        .output = .{ .value = 100_000, .script_pubkey = &spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+    const good = wallet_mod.TxOutput{ .value = 90_000, .script_pubkey = &spk };
+
+    const tx = try wallet_mod.createTransaction(
+        &w,
+        &[_]OwnedUtxo{utxo},
+        &[_]wallet_mod.TxOutput{good},
+        null,
+        .{ .fee_rate = 1 },
+    );
+    defer {
         for (tx.inputs) |inp| {
             for (inp.witness) |item| allocator.free(item);
             allocator.free(inp.witness);
         }
         allocator.free(tx.inputs);
         allocator.free(tx.outputs);
-        // Document the bug — clearbit returns a tx where outputs > inputs.
-        try std.testing.expect(true);
-    } else |_| {
-        // If a future fix makes this fail, the test still documents the gap
-        // by failing-to-pass.
-        try std.testing.expect(false);
     }
+    try std.testing.expectEqual(@as(usize, 1), tx.inputs.len);
+    // Witness populated → signInput ran (proves we got past the new check).
+    try std.testing.expectEqual(@as(usize, 2), tx.inputs[0].witness.len);
+}
+
+// G24c: outputs == inputs at a non-zero fee_rate is a fee-not-covered error,
+// distinct from insufficient funds. Documents that the new check has two
+// distinct error paths.
+test "W118 G24c: createTransaction outputs == inputs at fee_rate=1 returns FeeNotCovered" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+    const ki = try w.generateKey();
+
+    const pk_hash = crypto.hash160(&w.keys.items[ki].public_key);
+    var spk: [22]u8 = undefined;
+    spk[0] = 0x00;
+    spk[1] = 0x14;
+    @memcpy(spk[2..22], &pk_hash);
+
+    // sum_in == sum_out, fee_rate > 0 → no headroom for fee → FeeNotCovered.
+    const utxo = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xA3} ** 32, .index = 0 },
+        .output = .{ .value = 50_000, .script_pubkey = &spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+    const tight = wallet_mod.TxOutput{ .value = 50_000, .script_pubkey = &spk };
+
+    const result = wallet_mod.createTransaction(
+        &w,
+        &[_]OwnedUtxo{utxo},
+        &[_]wallet_mod.TxOutput{tight},
+        null,
+        .{ .fee_rate = 1 },
+    );
+    try std.testing.expectError(error.FeeNotCovered, result);
+}
+
+// G24d: with `fee_rate = 0`, outputs == inputs is allowed (no fee budget
+// means no fee shortfall). Verifies FeeNotCovered is a fee-rate-dependent
+// distinct error, not just a no-margin error.
+test "W118 G24d: createTransaction outputs == inputs at fee_rate=0 succeeds" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+    const ki = try w.generateKey();
+
+    const pk_hash = crypto.hash160(&w.keys.items[ki].public_key);
+    var spk: [22]u8 = undefined;
+    spk[0] = 0x00;
+    spk[1] = 0x14;
+    @memcpy(spk[2..22], &pk_hash);
+
+    const utxo = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xA4} ** 32, .index = 0 },
+        .output = .{ .value = 50_000, .script_pubkey = &spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+    };
+    const tight = wallet_mod.TxOutput{ .value = 50_000, .script_pubkey = &spk };
+
+    const tx = try wallet_mod.createTransaction(
+        &w,
+        &[_]OwnedUtxo{utxo},
+        &[_]wallet_mod.TxOutput{tight},
+        null,
+        .{ .fee_rate = 0 },
+    );
+    defer {
+        for (tx.inputs) |inp| {
+            for (inp.witness) |item| allocator.free(item);
+            allocator.free(inp.witness);
+        }
+        allocator.free(tx.inputs);
+        allocator.free(tx.outputs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), tx.inputs.len);
 }
 
 // ===========================================================================
@@ -1169,17 +1292,20 @@ test "W118 G29: unlockAllCoins exists but RPC integration missing — BUG-12" {
 }
 
 // ===========================================================================
-// G30: getbalance vs spendable/immature accounting — BUG-13
+// G30: getbalance honors immature-coinbase + minconf (BUG-13 — FIXED in FIX-60)
 // ===========================================================================
 //
-// BUG-13 (HIGH): the wallet has `getSpendableBalance` (excludes immature
-// coinbase) and `getImmatureBalance` (just the immature portion), but the
-// `getbalance` RPC handler (rpc.zig:9201) returns `wallet.getBalance()` —
-// the unfiltered sum, including immature coinbase.  Core's getbalance
-// returns the spendable balance and accepts a `minconf` argument to
-// require N confirmations.  Clearbit ignores both.
+// BUG-13 (HIGH): the wallet had `getSpendableBalance` (excludes immature
+// coinbase) but the `getbalance` RPC handler (rpc.zig) returned
+// `wallet.getBalance()` — the unfiltered sum, including immature coinbase
+// — and ignored the `minconf` argument.
+//
+// FIX-60: `wallet.getBalanceMinConf(minconf)` filters immature coinbase
+// (always) AND honors the `minconf` parameter. The RPC handler now parses
+// `params[1]` and calls the new method. `getBalance()` itself is preserved
+// for legacy callers / internal "raw total" use.
 
-test "W118 G30: getbalance returns unfiltered total — BUG-13 includes immature coinbase" {
+test "W118 G30: getBalanceMinConf excludes immature coinbase" {
     const ctx = makeContext() orelse return;
     defer destroyContext(ctx);
 
@@ -1188,7 +1314,8 @@ test "W118 G30: getbalance returns unfiltered total — BUG-13 includes immature
     defer w.deinit();
     w.setTipHeight(1000);
 
-    // 1 mature non-coinbase UTXO + 1 immature coinbase UTXO
+    // 1 mature non-coinbase UTXO + 1 immature coinbase UTXO.
+    // Clearbit's depth convention: depth = tip_height - utxo.height.
     const mature = OwnedUtxo{
         .outpoint = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
         .output = .{ .value = 10_000, .script_pubkey = &[_]u8{} },
@@ -1196,7 +1323,7 @@ test "W118 G30: getbalance returns unfiltered total — BUG-13 includes immature
         .address_type = .p2wpkh,
         .confirmations = 6,
         .is_coinbase = false,
-        .height = 994, // 6 confirmations
+        .height = 994, // depth = 1000 - 994 = 6
     };
     const immature_cb = OwnedUtxo{
         .outpoint = .{ .hash = [_]u8{0x02} ** 32, .index = 0 },
@@ -1205,17 +1332,104 @@ test "W118 G30: getbalance returns unfiltered total — BUG-13 includes immature
         .address_type = .p2wpkh,
         .confirmations = 1,
         .is_coinbase = true,
-        .height = 999, // 1 confirmation, below COINBASE_MATURITY=100
+        .height = 999, // depth = 1, below COINBASE_MATURITY=100
     };
     try w.addUtxo(mature);
     try w.addUtxo(immature_cb);
 
-    // BUG-13: getBalance() returns sum of ALL utxos, including the immature
-    // coinbase, even though it can't be spent.  Spendable balance excludes it.
+    // Legacy unfiltered helper — preserved.
     try std.testing.expectEqual(@as(i64, 10_000 + 5_000_000_000), w.getBalance());
-    try std.testing.expectEqual(@as(i64, 10_000), w.getSpendableBalance());
     try std.testing.expectEqual(@as(i64, 5_000_000_000), w.getImmatureBalance());
 
-    // rpc.zig:9201 handleGetBalanceWithWallet uses `wallet.getBalance()`, not
-    // `getSpendableBalance()`.  That's BUG-13.
+    // FIX-60: getBalanceMinConf excludes the immature coinbase even at
+    // minconf=0 — matches Core's `CWallet::GetBalance` which always
+    // filters immature coinbase.
+    try std.testing.expectEqual(@as(i64, 10_000), w.getBalanceMinConf(0));
+    // Same value as the (legacy) spendable balance helper.
+    try std.testing.expectEqual(w.getSpendableBalance(), w.getBalanceMinConf(0));
+}
+
+test "W118 G30b: getBalanceMinConf honors minconf parameter" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+    w.setTipHeight(1000);
+
+    // Three non-coinbase UTXOs at depths 0, 5, 10.
+    const u_unconf = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xD0} ** 32, .index = 0 },
+        .output = .{ .value = 1_000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 0,
+        .is_coinbase = false,
+        .height = 1000, // depth 0 (mempool / tip block)
+    };
+    const u_5conf = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xD1} ** 32, .index = 0 },
+        .output = .{ .value = 2_000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 5,
+        .is_coinbase = false,
+        .height = 995, // depth 5
+    };
+    const u_10conf = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xD2} ** 32, .index = 0 },
+        .output = .{ .value = 4_000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 10,
+        .is_coinbase = false,
+        .height = 990, // depth 10
+    };
+    try w.addUtxo(u_unconf);
+    try w.addUtxo(u_5conf);
+    try w.addUtxo(u_10conf);
+
+    // minconf=0: all three counted.
+    try std.testing.expectEqual(@as(i64, 7_000), w.getBalanceMinConf(0));
+    // minconf=1: drops the 0-conf UTXO.
+    try std.testing.expectEqual(@as(i64, 6_000), w.getBalanceMinConf(1));
+    // minconf=6: drops 0-conf + 5-conf, keeps the 10-conf.
+    try std.testing.expectEqual(@as(i64, 4_000), w.getBalanceMinConf(6));
+    // minconf=11: drops all three.
+    try std.testing.expectEqual(@as(i64, 0), w.getBalanceMinConf(11));
+}
+
+test "W118 G30c: getBalanceMinConf excludes immature coinbase even at minconf=0" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const allocator = std.testing.allocator;
+    var w = try Wallet.init(allocator, .mainnet);
+    defer w.deinit();
+    // Tip at height 150 means a coinbase at height 100 has depth 50 (< 100).
+    w.setTipHeight(150);
+
+    const cb_depth_50 = OwnedUtxo{
+        .outpoint = .{ .hash = [_]u8{0xE0} ** 32, .index = 0 },
+        .output = .{ .value = 5_000_000_000, .script_pubkey = &[_]u8{} },
+        .key_index = 0,
+        .address_type = .p2wpkh,
+        .confirmations = 50,
+        .is_coinbase = true,
+        .height = 100, // depth = 50, below COINBASE_MATURITY=100
+    };
+    try w.addUtxo(cb_depth_50);
+
+    // Immature coinbase excluded at every minconf, including 0.
+    try std.testing.expectEqual(@as(i64, 0), w.getBalanceMinConf(0));
+    try std.testing.expectEqual(@as(i64, 0), w.getBalanceMinConf(1));
+    try std.testing.expectEqual(@as(i64, 0), w.getBalanceMinConf(50));
+
+    // Now mature it: tip at 200, depth = 100 = COINBASE_MATURITY → counted.
+    w.setTipHeight(200);
+    try std.testing.expectEqual(@as(i64, 5_000_000_000), w.getBalanceMinConf(0));
+    try std.testing.expectEqual(@as(i64, 5_000_000_000), w.getBalanceMinConf(100));
+    // But minconf=101 drops it (depth 100 < 101).
+    try std.testing.expectEqual(@as(i64, 0), w.getBalanceMinConf(101));
 }
