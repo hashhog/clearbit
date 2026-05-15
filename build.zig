@@ -984,6 +984,40 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w115_tests.step);
     }
 
+    // W119 — BIP-78 PayJoin 30-gate audit.
+    // PayJoin is MISSING ENTIRELY from clearbit; all 30 gates document the
+    // absence using `@hasDecl` style assertions (W115 pattern).
+    // Run with `zig build test-w119`.
+    {
+        const w119_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w119_payjoin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w119"},
+        });
+        w119_tests.linkSystemLibrary("rocksdb");
+        w119_tests.linkSystemLibrary("secp256k1");
+        w119_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w119_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w119_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w119_tests.linkSystemLibrary("minisketch");
+            w119_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w119_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w119_tests = b.addRunArtifact(w119_tests);
+        const w119_test_step = b.step("test-w119", "Run W119 BIP-78 PayJoin 30-gate audit tests");
+        w119_test_step.dependOn(&run_w119_tests.step);
+        // Fold into the main `test` step so CI exercises W119.
+        test_step.dependOn(&run_w119_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
