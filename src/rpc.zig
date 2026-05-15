@@ -9180,26 +9180,68 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
-    /// Handle getbalance RPC - return the wallet balance.
+    /// Handle getbalance RPC - return the wallet's spendable balance.
     /// Reference: Bitcoin Core wallet/rpc/coins.cpp getbalance
     ///
     /// Arguments:
-    ///   1. dummy (string, optional) - ignored, for compatibility
-    ///   2. minconf (numeric, optional) - minimum confirmations
+    ///   1. dummy            (string,  optional) — ignored (kept for compat;
+    ///                        Core throws if not "*", we accept and ignore).
+    ///   2. minconf          (numeric, optional, default 0) — minimum
+    ///                        confirmations a UTXO must have to be counted.
+    ///   3. include_watchonly (bool,   optional, default false) — Core marks
+    ///                        this "No longer used"; clearbit accepts and
+    ///                        ignores it (OwnedUtxo has no watch-only flag).
+    ///   4. avoid_reuse      (bool,    optional, default true) — ignored;
+    ///                        clearbit does not track address-reuse state.
+    ///
+    /// Always excludes immature coinbase (depth < COINBASE_MATURITY=100),
+    /// matching Core's `CWallet::GetBalance`.
+    ///
+    /// W118 BUG-13 (FIX-60): previously this returned `wallet.getBalance()`
+    /// (unfiltered sum of every UTXO including immature coinbase), and
+    /// ignored every argument.
     fn handleGetBalance(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        _ = params;
-
         const wallet = self.current_wallet orelse {
             if (self.wallet) |w| {
-                return self.handleGetBalanceWithWallet(w, id);
+                return self.handleGetBalanceWithWallet(w, params, id);
             }
             return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
         };
-        return self.handleGetBalanceWithWallet(wallet, id);
+        return self.handleGetBalanceWithWallet(wallet, params, id);
     }
 
-    fn handleGetBalanceWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, id: ?std.json.Value) ![]const u8 {
-        const balance = wallet.getBalance();
+    fn handleGetBalanceWithWallet(
+        self: *RpcServer,
+        wallet: *wallet_mod.Wallet,
+        params: std.json.Value,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        // Parse minconf (param index 1). Default 0 per Core.
+        var minconf: u32 = 0;
+        if (params == .array and params.array.items.len >= 2) {
+            const mc = params.array.items[1];
+            switch (mc) {
+                .integer => |v| {
+                    if (v < 0) {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "minconf must be non-negative", id);
+                    }
+                    minconf = @intCast(v);
+                },
+                .float => |v| {
+                    if (v < 0) {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "minconf must be non-negative", id);
+                    }
+                    minconf = @intFromFloat(v);
+                },
+                .null => {},
+                else => return self.jsonRpcError(RPC_INVALID_PARAMS, "minconf must be a number", id),
+            }
+        }
+        // include_watchonly (param 2) and avoid_reuse (param 3) are accepted
+        // for RPC-shape compatibility but ignored — clearbit does not yet
+        // track watch-only or address-reuse state. Documented in FIX-60.
+
+        const balance = wallet.getBalanceMinConf(minconf);
         const btc_amount = @as(f64, @floatFromInt(balance)) / 100_000_000.0;
 
         var buf: [64]u8 = undefined;
