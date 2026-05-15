@@ -126,6 +126,19 @@ pub const RpcConfig = struct {
     /// write auxiliary files (mempool.dat, etc) in the datadir without
     /// touching the chainstate. Empty string disables those RPCs.
     datadir: []const u8 = "",
+    /// Optional path to a PEM-encoded X.509 certificate for HTTPS termination.
+    /// Both `tls_cert_path` and `tls_key_path` must be set together; supplying
+    /// only one is a startup error.  When unset (the default), the RPC server
+    /// binds plain HTTP for backward compatibility with existing operators.
+    ///
+    /// See `validateTlsConfig` for the full deferral rationale: Zig 0.13's
+    /// standard library ships `std.crypto.tls.Client` but no server-side TLS
+    /// implementation.  Supplying these flags today fails fast with a clear
+    /// `TlsServerUnavailable` error instead of silently downgrading to HTTP.
+    tls_cert_path: ?[]const u8 = null,
+    /// Optional path to the PEM-encoded private key matching `tls_cert_path`.
+    /// See the field comment on `tls_cert_path` for the deferral rationale.
+    tls_key_path: ?[]const u8 = null,
 };
 
 /// RPC Server error set.
@@ -138,7 +151,89 @@ pub const RpcError = error{
     OutOfMemory,
     Unauthorized,
     ConnectionError,
+    /// Returned when `tls_cert_path` is set without `tls_key_path` (or vice
+    /// versa).  Operators must supply both PEM paths together.
+    TlsCertWithoutKey,
+    TlsKeyWithoutCert,
+    /// Returned when both TLS paths are supplied but server-side TLS is not
+    /// available in this build.  See `validateTlsConfig` for the rationale
+    /// (Zig 0.13 stdlib has no `std.crypto.tls.Server`; a future drop-in
+    /// will wire BearSSL, OpenSSL, or a Zig 0.14+ server primitive).
+    TlsServerUnavailable,
 };
+
+// ============================================================================
+// HTTPS / TLS termination — DEFERRED, flag plumbing only (W119 + FIX-64)
+// ----------------------------------------------------------------------------
+// BIP-78 PayJoin REQUIRES the receiver endpoint to be either HTTPS or a Tor
+// .onion address (W119 BUG-3 + G3).  Bitcoin Core terminates HTTPS itself via
+// libevent + OpenSSL (see bitcoin-core/src/httpserver.cpp); clearbit's RPC
+// server in this file currently binds plain TCP only.
+//
+// Plumbing the flags now (without implementing the actual handshake) catches
+// two production foot-guns ahead of the eventual real implementation:
+//
+//   1. Operators who set --rpc-tls-cert / --rpc-tls-key today would otherwise
+//      silently get plain HTTP — a privacy / security regression they would
+//      not notice until a packet capture surfaces.  The plumbing in
+//      `validateTlsConfig` fails fast with a clear error instead.
+//
+//   2. The eventual implementation can drop in behind these stable config
+//      fields and a single switch on `RpcServer.tlsAvailable()` — no API
+//      churn for callers (main.zig already passes the paths through
+//      `RpcConfig`, and any future `RpcServerCore` / `TlsRpcServer` split
+//      can be made internal).
+//
+// We deliberately do NOT add `TlsRpcServer`, `TlsPayjoinServer`, or
+// `TlsClient` declarations: W119/G3 + W119/G24 audit-gate tests assert
+// the absence of those names as a way to track this exact gap.  Adding
+// stub decls would silently pass those gates without delivering working
+// TLS, which is precisely the regression the audit is guarding against.
+//
+// Blockers (precise):
+//   - Zig 0.13.0 `lib/std/crypto/tls/` contains only `Client.zig`.  There is
+//     no `Server.zig`; `std.crypto.tls` exposes record-layer + handshake
+//     constants and a client-only `init` flow.  See
+//     /usr/local/zig-linux-x86_64-0.13.0/lib/std/crypto/tls.zig:40
+//     (`pub const Client = @import("tls/Client.zig");` — the only @import).
+//   - Adding BearSSL or OpenSSL bumps clearbit's C-dep surface (currently
+//     rocksdb + secp256k1 + minisketch + optional shani).  That's a build
+//     decision a maintainer should ratify, not silently bolt on.
+//   - A pure-Zig third-party server (e.g. `zig-bearssl`, `zig-tls13-server`)
+//     would also be a dep decision.  The ecosystem is still pre-1.0 and
+//     each candidate has different licensing + supply-chain trade-offs.
+//
+// Tracking: W119 audit (commit 6c0fe8f) BUG-3 + BUG-23, this commit closes
+// the flag-plumbing slice only.  Future audit/fix wave WILL replace the
+// `TlsServerUnavailable` return with a real handshake.
+// ============================================================================
+
+/// Validate that `tls_cert_path` and `tls_key_path` are consistent and that
+/// the build can honor them.  Called from `RpcServer.start` before bind so
+/// mistyped paths surface immediately, not after the listening socket is up.
+///
+/// Returns `void` (HTTP is OK) when both fields are null.  Returns an error
+/// in three cases:
+///   - `TlsCertWithoutKey` / `TlsKeyWithoutCert` — partial config
+///   - `TlsServerUnavailable` — both set, but the build does not include a
+///     TLS server implementation (current state — see deferral block above)
+pub fn validateTlsConfig(cfg: RpcConfig) RpcError!void {
+    const has_cert = cfg.tls_cert_path != null;
+    const has_key = cfg.tls_key_path != null;
+    if (!has_cert and !has_key) return; // HTTP (default)
+    if (has_cert and !has_key) return RpcError.TlsCertWithoutKey;
+    if (!has_cert and has_key) return RpcError.TlsKeyWithoutCert;
+    // Both set.  Today: deferral.  Future: drop in the real handshake here
+    // and return void after parsing/validating the PEM files.
+    return RpcError.TlsServerUnavailable;
+}
+
+/// Whether this build can terminate HTTPS for RPC.  Always false on Zig
+/// 0.13 stdlib (no server-side TLS); the eventual real implementation
+/// flips this to true and `validateTlsConfig` starts honoring the paths.
+pub fn tlsAvailable() bool {
+    return false;
+}
 
 /// JSON-RPC server over HTTP.
 pub const RpcServer = struct {
@@ -250,7 +345,13 @@ pub const RpcServer = struct {
     }
 
     /// Start listening for connections.
+    ///
+    /// Validates the TLS config (see `validateTlsConfig`) before bind so an
+    /// operator who supplies `--rpc-tls-cert` / `--rpc-tls-key` on a build
+    /// without server-side TLS gets a clear startup error instead of a
+    /// silent plain-HTTP downgrade (W119 + FIX-64 deferral).
     pub fn start(self: *RpcServer) !void {
+        try validateTlsConfig(self.config);
         const addr = try std.net.Address.parseIp(self.config.bind_address, self.config.port);
         self.listener = try addr.listen(.{
             .reuse_address = true,
