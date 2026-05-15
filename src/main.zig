@@ -56,6 +56,13 @@ pub const Config = struct {
     rpc_port: u16 = 8332,
     rpc_user: ?[]const u8 = null,
     rpc_password: ?[]const u8 = null,
+    // Optional HTTPS/TLS termination (W119 + FIX-64).  Both paths must be
+    // supplied together; either one alone is a startup error.  Today, even
+    // when both are supplied, RpcServer.start() returns TlsServerUnavailable
+    // — Zig 0.13's stdlib has no server-side TLS.  See rpc.zig
+    // `validateTlsConfig` for the full deferral rationale.
+    rpc_tls_cert: ?[]const u8 = null,
+    rpc_tls_key: ?[]const u8 = null,
 
     // Storage
     datadir: []const u8 = "~/.clearbit",
@@ -225,6 +232,13 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
                 return ArgParseError.InvalidPortNumber;
         } else if (std.mem.startsWith(u8, arg, "--rpcbind=")) {
             config.rpc_bind = arg["--rpcbind=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--rpc-tls-cert=")) {
+            // W119 + FIX-64: HTTPS/TLS termination flag plumbing.  Must be
+            // paired with --rpc-tls-key; today both together produce a clear
+            // TlsServerUnavailable error at startup (no silent HTTP downgrade).
+            config.rpc_tls_cert = arg["--rpc-tls-cert=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--rpc-tls-key=")) {
+            config.rpc_tls_key = arg["--rpc-tls-key=".len..];
         } else if (std.mem.startsWith(u8, arg, "--metricsport=")) {
             config.metrics_port = std.fmt.parseInt(u16, arg["--metricsport=".len..], 10) catch
                 return ArgParseError.InvalidPortNumber;
@@ -457,6 +471,13 @@ pub fn printUsage() void {
         \\  --rpcport=<port>       RPC port (default: 8332)
         \\  --rpcuser=<user>       RPC username
         \\  --rpcpassword=<pw>     RPC password
+        \\  --rpc-tls-cert=<path>  PEM cert for HTTPS termination (BIP-78 ready)
+        \\  --rpc-tls-key=<path>   PEM key paired with --rpc-tls-cert
+        \\                         NOTE: TLS server is DEFERRED on Zig 0.13
+        \\                         (stdlib has no server-side TLS). Supplying
+        \\                         both flags today fails fast with a clear
+        \\                         TlsServerUnavailable error at startup so
+        \\                         operators do not silently get plain HTTP.
         \\
         \\Storage options:
         \\  --datadir=<dir>        Data directory (default: ~/.clearbit)
@@ -633,6 +654,12 @@ pub fn loadConfigFile(
                 config.rpc_port = std.fmt.parseInt(u16, value, 10) catch continue;
             } else if (std.mem.eql(u8, key, "rpcbind")) {
                 config.rpc_bind = value;
+            }
+            // W119 + FIX-64: HTTPS/TLS termination config-file keys.
+            else if (std.mem.eql(u8, key, "rpc-tls-cert") or std.mem.eql(u8, key, "rpctlscert")) {
+                config.rpc_tls_cert = value;
+            } else if (std.mem.eql(u8, key, "rpc-tls-key") or std.mem.eql(u8, key, "rpctlskey")) {
+                config.rpc_tls_key = value;
             }
             // P2P settings
             else if (std.mem.eql(u8, key, "port")) {
@@ -1862,6 +1889,12 @@ pub fn main() !void {
             .auth_token = auth_token,
             .cookie_token = cookie_token,
             .datadir = full_datadir,
+            // W119 + FIX-64: HTTPS/TLS termination flag plumbing.  Today
+            // both unset → HTTP (backward-compatible default).  Either alone
+            // → startup error.  Both set → TlsServerUnavailable error
+            // until Zig stdlib / a deliberate C-dep adds server TLS.
+            .tls_cert_path = config.rpc_tls_cert,
+            .tls_key_path = config.rpc_tls_key,
         },
     );
     defer rpc_server.deinit();
@@ -2068,9 +2101,44 @@ pub fn main() !void {
         return;
     };
 
-    // Start RPC server in background thread
+    // Start RPC server in background thread.
+    //
+    // The three TLS-config errors (TlsCertWithoutKey / TlsKeyWithoutCert /
+    // TlsServerUnavailable) are operator-misconfiguration, not transient
+    // failures — exit fast with a clear message instead of running a node
+    // with no RPC listener (W119 + FIX-64).
     rpc_server.start() catch |err| {
-        std.debug.print("Warning: could not start RPC server: {}\n", .{err});
+        switch (err) {
+            error.TlsCertWithoutKey => {
+                std.debug.print(
+                    "FATAL: --rpc-tls-cert supplied without --rpc-tls-key. " ++
+                        "Both must be provided together.\n",
+                    .{},
+                );
+                std.process.exit(1);
+            },
+            error.TlsKeyWithoutCert => {
+                std.debug.print(
+                    "FATAL: --rpc-tls-key supplied without --rpc-tls-cert. " ++
+                        "Both must be provided together.\n",
+                    .{},
+                );
+                std.process.exit(1);
+            },
+            error.TlsServerUnavailable => {
+                std.debug.print(
+                    "FATAL: HTTPS/TLS termination is not available in this build.\n" ++
+                        "  Zig 0.13's standard library ships std.crypto.tls.Client but no server-side TLS.\n" ++
+                        "  Flag plumbing (--rpc-tls-cert / --rpc-tls-key) is wired so a future drop-in\n" ++
+                        "  can land without changing the CLI contract.  Until then, omit both flags to\n" ++
+                        "  bind plain HTTP (default) or front the RPC port with stunnel / nginx / Caddy.\n" ++
+                        "  Tracked: W119 BUG-3 / BUG-23, FIX-64 deferral.\n",
+                    .{},
+                );
+                std.process.exit(1);
+            },
+            else => std.debug.print("Warning: could not start RPC server: {}\n", .{err}),
+        }
     };
     const rpc_thread = std.Thread.spawn(.{}, rpc.RpcServer.run, .{&rpc_server}) catch |err| {
         std.debug.print("Warning: could not start RPC thread: {}\n", .{err});

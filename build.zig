@@ -1048,6 +1048,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_bip21_tests.step);
     }
 
+    // FIX-64 — HTTPS/TLS termination flag plumbing (W119 + FIX-64 deferral).
+    // `tests_fix64_tls.zig` depends on `rpc.zig`, which transitively pulls in
+    // storage (rocksdb) + secp256k1 + minisketch (when enabled).  Mirror the
+    // W119 link config so the test binary actually links.
+    // Run with `zig build test-fix64`.
+    {
+        const fix64_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_fix64_tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"fix64"},
+        });
+        fix64_tests.linkSystemLibrary("rocksdb");
+        fix64_tests.linkSystemLibrary("secp256k1");
+        fix64_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        fix64_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            fix64_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            fix64_tests.linkSystemLibrary("minisketch");
+            fix64_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        fix64_tests.root_module.addOptions("build_options", build_options);
+
+        const run_fix64_tests = b.addRunArtifact(fix64_tests);
+        const fix64_test_step = b.step("test-fix64", "Run FIX-64 HTTPS/TLS flag plumbing tests");
+        fix64_test_step.dependOn(&run_fix64_tests.step);
+        // Fold into the default `test` step.
+        test_step.dependOn(&run_fix64_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
