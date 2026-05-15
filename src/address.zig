@@ -1,6 +1,20 @@
 const std = @import("std");
 const crypto = @import("crypto.zig");
 const types = @import("types.zig");
+const bip21 = @import("bip21.zig");
+
+// ============================================================================
+// BIP-21 URI parser re-exports (FIX-62 / W119 prereq).
+//
+// `bip21.zig` is a standalone module so it can be unit-tested without pulling
+// in the rest of the wallet stack; we re-expose its public surface here so
+// callers that already import `address.zig` (RPC handlers, future PayJoin
+// sender code) don't need a second import line.
+// ============================================================================
+
+pub const Bip21Uri = bip21.Bip21Uri;
+pub const parseBip21 = bip21.parseBip21;
+pub const parseBip21Pjos = bip21.parseBip21Pjos;
 
 // ============================================================================
 // Base58 Encoding
