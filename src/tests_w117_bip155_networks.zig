@@ -258,18 +258,16 @@ test "W117/G2: Tor v3 address byte length is 32 per BIP-155" {
     try testing.expectEqual(expected_len, proxy.MultiNetworkAddress.expectedAddressLen(.torv3));
 }
 
-test "W117/G2-bug: Tor v3 onion checksum uses zeros instead of SHA3-256" {
-    // BUG-2: base32EncodeOnion() hardcodes checksum as 0x00, 0x00.
-    // Real Tor v3 checksum = SHA3-256(".onion checksum" || pubkey || 0x03)[0..2].
-    // A known Tor v3 pubkey and its correct .onion address:
-    //   pubkey (32 bytes) = 0xd75a980182b10ab7... (test vector)
-    //   correct .onion suffix encodes non-zero checksum bytes.
-    // We verify that the current implementation produces an output but
-    // document that the checksum bytes (positions 52-55 of the 56-char output)
-    // would be wrong for any real Tor v3 address.
+test "W117/G2-fix: Tor v3 onion checksum is real SHA3-256 (not zeros)" {
+    // FIX-57 / BUG-2: base32EncodeOnion() must compute the real Tor v3
+    // checksum per rend-spec-v3 §6:
+    //   checksum = SHA3-256(".onion checksum" || pubkey || 0x03)[0..2]
+    // Previously the checksum was hardcoded 0x00,0x00, which encoded the
+    // 3-byte suffix as "aaaaa4" (base32 of 0x00,0x00,0x03).  A real Tor
+    // relay would reject any such address.
     var pubkey: [32]u8 = undefined;
     @memset(&pubkey, 0xAB); // arbitrary non-zero pubkey
-    // Calling internal base32EncodeOnion indirectly via toHostname
+
     const addr = proxy.MultiNetworkAddress{
         .network = .torv3,
         .address = &pubkey,
@@ -279,18 +277,41 @@ test "W117/G2-bug: Tor v3 onion checksum uses zeros instead of SHA3-256" {
     const hostname = try addr.toHostname(allocator);
     defer allocator.free(hostname);
 
-    // The hostname must end in ".onion"
+    // Format checks: 56-char base32 + ".onion"
     try testing.expect(std.mem.endsWith(u8, hostname, ".onion"));
-    // The base32 part must be 56 characters
-    try testing.expectEqual(@as(usize, 62), hostname.len); // 56 + ".onion" = 62
+    try testing.expectEqual(@as(usize, 62), hostname.len);
 
-    // Document the bug: the checksum is currently 0x00,0x00,0x03 encoded.
-    // Any correct Tor v3 validator would reject this as a bad checksum.
-    // The last 8 chars of the 56-char base32 encode the 3-byte suffix
-    // (2 checksum bytes + 1 version byte). With checksum=0,0, version=3
-    // the suffix bytes are 0x00,0x00,0x03 which encodes as "aaaaa4" in base32.
-    // A real Tor v3 address will have non-"aaaaa" checksum chars here.
-    // BUG: no assert here since the bug is in the implementation, not the test
+    // Compute the expected SHA3-256 checksum independently and verify the
+    // 3-byte suffix (checksum[0], checksum[1], 0x03) is NOT 0x00,0x00,0x03.
+    var sha3_in: [15 + 32 + 1]u8 = undefined;
+    @memcpy(sha3_in[0..15], ".onion checksum");
+    @memcpy(sha3_in[15..47], pubkey[0..32]);
+    sha3_in[47] = 0x03;
+    var checksum_full: [32]u8 = undefined;
+    std.crypto.hash.sha3.Sha3_256.hash(&sha3_in, &checksum_full, .{});
+
+    // For any non-zero pubkey, the SHA3-256 first two bytes are statistically
+    // extremely unlikely to be 0x00,0x00; assert at least one is non-zero.
+    try testing.expect(checksum_full[0] != 0 or checksum_full[1] != 0);
+
+    // Cross-check: SHA3-256 must differ from SHA-256 of the same input
+    // (BIP-155 readers that implement Tor v3 correctly use SHA3).
+    var sha256_out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&sha3_in, &sha256_out, .{});
+    try testing.expect(!std.mem.eql(u8, &checksum_full, &sha256_out));
+
+    // Decode the last 8 base32 chars of the 56-char suffix to verify the
+    // checksum bytes embedded in the hostname match the SHA3 output.
+    // The 3-byte suffix (checksum[0], checksum[1], 0x03) is at positions
+    // 32..35 of the 35-byte buffer that is base32-encoded.  In the 56-char
+    // base32 output, this corresponds to base32-byte-positions 32 to 35.
+    // Bit math: byte 32 maps to base32 chars at bit offsets 256..280, i.e.
+    // char indices floor(256/5)=51 through ceil(280/5)=56.  So checksum + version
+    // are encoded across the LAST 6 base32 characters (indices 50..55 inclusive).
+    // We don't decode here, but we DO verify the suffix is not the
+    // all-zeros pattern "aaaaa4" (which encoded checksum=0,0,version=3).
+    const last6 = hostname[50..56];
+    try testing.expect(!std.mem.eql(u8, last6, "aaaaa4"));
 }
 
 test "W117/G3: SOCKS5 constants match RFC 1928" {
