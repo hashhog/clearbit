@@ -810,6 +810,42 @@ pub fn build(b: *std.Build) void {
         w111_step.dependOn(&run_w111_tests.step);
     }
 
+    // W118 Wallet audit (second-wave wallet 30-gate). Same wrapper pattern as
+    // tests_wallet_w111.zig: project-root wrapper so wallet.zig's
+    // @embedFile("../resources/bip39-english.txt") resolves correctly.
+    // Run with `zig build test-wallet-w118`.
+    // NOT folded into the default `test` step — same reason as W111.
+    {
+        const w118_tests = b.addTest(.{
+            .root_source_file = b.path("tests_wallet_w118.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"W118"},
+        });
+        w118_tests.linkSystemLibrary("rocksdb");
+        w118_tests.linkSystemLibrary("secp256k1");
+        w118_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w118_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w118_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w118_tests.linkSystemLibrary("minisketch");
+            w118_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w118_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w118_tests = b.addRunArtifact(w118_tests);
+        const w118_step = b.step(
+            "test-wallet-w118",
+            "Run W118 wallet audit tests (descriptors, BIP-32, PSBT, fee bumping, send, UTXO)",
+        );
+        w118_step.dependOn(&run_w118_tests.step);
+    }
+
     // W113 Coin selection audit tests. Same wrapper pattern as
     // tests_wallet_w111.zig: project-root wrapper so wallet.zig's
     // @embedFile("../resources/bip39-english.txt") resolves correctly.
