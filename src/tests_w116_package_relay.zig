@@ -687,9 +687,9 @@ test "w116 G10: isWellFormedPackage with empty slice does not crash" {
 // G11 — submitpackage: response keyed by wtxid not txid (BUG-6, BUG-7, BUG-10)
 // ============================================================================
 
-test "w116 G11 BUG-6: PackageTxResult uses txid field; Core response uses wtxid as map key" {
-    // Core: tx-results keyed by wtxid (witness hash).
-    // clearbit: handleSubmitPackage uses tx_result.txid as the JSON map key.
+test "w116 G11 BUG-6: PackageTxResult has wtxid field; Core response uses wtxid as map key" {
+    // Fixed (FIX-53): PackageTxResult now has a wtxid field and handleSubmitPackage
+    // keys tx-results by wtxid, matching Core rpc/mempool.cpp behaviour.
     comptime {
         const PKT = mempool_mod.PackageTxResult;
         const info = @typeInfo(PKT).Struct;
@@ -700,9 +700,8 @@ test "w116 G11 BUG-6: PackageTxResult uses txid field; Core response uses wtxid 
             if (std.mem.eql(u8, f.name, "wtxid")) has_wtxid = true;
         }
         if (!has_txid) @compileError("PackageTxResult must have txid field");
-        if (has_wtxid) @compileError("PackageTxResult already has wtxid — BUG-6 fixed, update test");
+        if (!has_wtxid) @compileError("PackageTxResult missing wtxid field — BUG-6 not fixed");
     }
-    // BUG-6: add wtxid field and use it as the JSON map key.
     try testing.expect(true);
 }
 

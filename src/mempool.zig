@@ -8511,6 +8511,9 @@ pub const PackageError = error{
 pub const PackageTxResult = struct {
     /// Transaction ID.
     txid: types.Hash256,
+    /// Witness transaction ID (full-serialisation hash; equals txid for non-segwit).
+    /// Core keys the tx-results map by wtxid — see rpc/mempool.cpp.
+    wtxid: types.Hash256,
     /// Whether the transaction was accepted.
     accepted: bool,
     /// Error message if rejected.
@@ -8763,10 +8766,12 @@ pub fn acceptPackage(
     // Step 1: Context-free package validation
     try isWellFormedPackage(txns, allocator);
 
-    // Step 2: For multi-tx packages, verify child-with-parents pattern
+    // Step 2: For multi-tx packages, verify child-with-parents-tree pattern.
+    // Core uses IsChildWithParentsTree (not the weaker IsChildWithParents) so
+    // inter-parent dependencies are rejected (BUG-13 / W116 G14).
     if (txns.len >= 2) {
-        const is_cwp = isChildWithParents(txns, allocator) catch return PackageError.OutOfMemory;
-        if (!is_cwp) {
+        const is_cwp_tree = isChildWithParentsTree(txns, allocator) catch return PackageError.OutOfMemory;
+        if (!is_cwp_tree) {
             return PackageError.PackageNotChildWithParents;
         }
     }
@@ -8789,14 +8794,17 @@ pub fn acceptPackage(
         const txid = crypto.computeTxid(tx, allocator) catch {
             tx_results[i] = .{
                 .txid = [_]u8{0} ** 32,
+                .wtxid = [_]u8{0} ** 32,
                 .accepted = false,
                 .error_message = "failed to compute txid",
                 .effective_fee_rate = null,
             };
             continue;
         };
+        const wtxid = crypto.computeWtxid(tx, allocator) catch txid;
 
         tx_results[i].txid = txid;
+        tx_results[i].wtxid = wtxid;
 
         // Check if already in mempool
         if (mempool.entries.contains(txid)) {
@@ -8806,6 +8814,7 @@ pub fn acceptPackage(
             total_vsize += entry.vsize;
             tx_results[i] = .{
                 .txid = txid,
+                .wtxid = wtxid,
                 .accepted = true,
                 .error_message = null,
                 .effective_fee_rate = entry.fee_rate,
@@ -8855,6 +8864,7 @@ pub fn acceptPackage(
         const weight = computeTxWeight(tx, allocator) catch {
             tx_results[i] = .{
                 .txid = txid,
+                .wtxid = wtxid,
                 .accepted = false,
                 .error_message = "failed to compute weight",
                 .effective_fee_rate = null,
@@ -8868,6 +8878,7 @@ pub fn acceptPackage(
 
         tx_results[i] = .{
             .txid = txid,
+            .wtxid = wtxid,
             .accepted = false, // Will be updated after package fee rate check
             .error_message = null,
             .effective_fee_rate = null,

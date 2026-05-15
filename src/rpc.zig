@@ -5609,7 +5609,7 @@ pub const RpcServer = struct {
 
     /// Handle submitpackage RPC - submit a package of related transactions.
     /// Params: [[rawtx1, rawtx2, ...], maxfeerate, maxburnamount]
-    /// Returns JSON object with per-tx results keyed by txid.
+    /// Returns JSON object with per-tx results keyed by wtxid (Core rpc/mempool.cpp).
     fn handleSubmitPackage(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Extract parameters
         if (params != .array or params.array.items.len == 0) {
@@ -5721,9 +5721,9 @@ pub const RpcServer = struct {
         for (result.tx_results, 0..) |tx_result, i| {
             if (i > 0) try writer.writeByte(',');
 
-            // Write txid as key
+            // Write wtxid as key — Core keys tx-results by wtxid (rpc/mempool.cpp).
             try writer.writeByte('"');
-            try writeHashHex(writer, &tx_result.txid);
+            try writeHashHex(writer, &tx_result.wtxid);
             try writer.writeAll("\":{");
 
             // Write per-tx result
