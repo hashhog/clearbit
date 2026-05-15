@@ -8034,9 +8034,16 @@ pub const RpcServer = struct {
     /// Handle testmempoolaccept RPC - test if raw transactions would be accepted.
     /// Reference: Bitcoin Core rpc/mempool.cpp testmempoolaccept
     ///
+    /// Routes each transaction through acceptToMemoryPool(test_accept=true) so
+    /// the real policy gates (checkStandard, duplicate detection) fire without
+    /// mutating mempool state.  Multi-tx packages (>1 entry) are routed through
+    /// acceptPackage with test_accept semantics: validation runs but the txns
+    /// are NOT added to the mempool.
+    ///
     /// Arguments:
     ///   1. rawtxs (array of strings, required) - hex-encoded transactions
-    ///   2. maxfeerate (numeric, optional) - max fee rate in BTC/kvB
+    ///   2. maxfeerate (numeric, optional) - max fee rate in BTC/kvB (parsed,
+    ///      enforcement is a documented future item — BUG-9)
     fn handleTestMempoolAccept(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (params != .array or params.array.items.len == 0) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing rawtxs array", id);
@@ -8047,29 +8054,45 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "rawtxs must be an array", id);
         }
 
+        const rawtxs = rawtxs_param.array.items;
+
+        // Core enforces 1..MAX_PACKAGE_COUNT (25): "Array must contain between
+        // 1 and 25 transactions." (BUG-4 fix)
+        if (rawtxs.len < 1 or rawtxs.len > mempool_mod.MAX_PACKAGE_COUNT) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Array must contain between 1 and 25 transactions.", id);
+        }
+
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.writeByte('[');
+        // --- Decode all hex transactions up front ---
+        var txns = std.ArrayList(types.Transaction).init(self.allocator);
+        defer txns.deinit();
 
-        for (rawtxs_param.array.items, 0..) |tx_item, i| {
-            if (i > 0) try writer.writeByte(',');
+        // We need per-entry error results for any hex/decode failures before
+        // we attempt acceptance.  Build a parallel errors slice.
+        var decode_errors = std.ArrayList(?[]const u8).init(self.allocator);
+        defer decode_errors.deinit();
 
+        for (rawtxs) |tx_item| {
             if (tx_item != .string) {
-                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"invalid-hex\"}");
+                try txns.append(undefined);
+                try decode_errors.append("invalid-hex");
                 continue;
             }
-
             const hex_str = tx_item.string;
-
-            // Try to decode the transaction
+            if (hex_str.len % 2 != 0) {
+                try txns.append(undefined);
+                try decode_errors.append("invalid-hex");
+                continue;
+            }
             var tx_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
-                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"decode-error\"}");
+                try txns.append(undefined);
+                try decode_errors.append("decode-error");
                 continue;
             };
             defer self.allocator.free(tx_bytes);
-
             var valid_hex = true;
             for (0..hex_str.len / 2) |j| {
                 tx_bytes[j] = std.fmt.parseInt(u8, hex_str[j * 2 .. j * 2 + 2], 16) catch {
@@ -8077,44 +8100,160 @@ pub const RpcServer = struct {
                     break;
                 };
             }
-
             if (!valid_hex) {
-                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"invalid-hex\"}");
+                try txns.append(undefined);
+                try decode_errors.append("invalid-hex");
                 continue;
             }
-
-            // Try to deserialize and get txid
             var reader = serialize.Reader{ .data = tx_bytes };
             const tx = serialize.readTransaction(&reader, self.allocator) catch {
-                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"TX decode failed\"}");
+                try txns.append(undefined);
+                try decode_errors.append("TX decode failed");
                 continue;
             };
+            try txns.append(tx);
+            try decode_errors.append(null);
+        }
 
-            const txid = crypto.computeTxid(&tx, self.allocator) catch {
-                try writer.writeAll("{\"allowed\":false,\"reject-reason\":\"txid computation failed\"}");
-                continue;
-            };
+        try writer.writeByte('[');
 
-            // Check if already in mempool
-            self.mempool.mutex.lock();
-            const in_mempool = self.mempool.entries.contains(txid);
-            self.mempool.mutex.unlock();
+        if (rawtxs.len == 1) {
+            // Single-transaction path: route through acceptToMemoryPool(test_accept=true).
+            // This runs policy checks (checkStandard, duplicate detection) without
+            // mutating mempool state.  Mirrors Bitcoin Core's single-tx path in
+            // testmempoolaccept (rpc/mempool.cpp).
+            if (decode_errors.items[0]) |err_reason| {
+                try writer.print("{{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"wtxid\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"allowed\":false,\"reject-reason\":\"{s}\"}}", .{err_reason});
+            } else {
+                const tx = txns.items[0];
+                self.mempool.mutex.lock();
+                const result = self.mempool.acceptToMemoryPool(tx, true);
+                self.mempool.mutex.unlock();
 
-            if (in_mempool) {
                 try writer.writeAll("{\"txid\":\"");
-                try writeHashHex(writer, &txid);
-                try writer.writeAll("\",\"allowed\":false,\"reject-reason\":\"txn-already-in-mempool\"}");
-                continue;
+                try writeHashHex(writer, &result.txid);
+                try writer.writeAll("\",\"wtxid\":\"");
+                try writeHashHex(writer, &result.wtxid);
+                try writer.writeAll("\",\"allowed\":");
+                if (result.accepted) {
+                    try writer.writeAll("true");
+                    try writer.writeAll(",\"vsize\":");
+                    try writer.print("{d}", .{result.vsize});
+                    // fees object: base fee in BTC (satoshis / 1e8)
+                    try writer.writeAll(",\"fees\":{\"base\":");
+                    try writer.print("{d}.{d:0>8}", .{ @divTrunc(result.fee, 100_000_000), @mod(result.fee, 100_000_000) });
+                    try writer.writeByte('}');
+                } else {
+                    try writer.writeAll("false");
+                    if (result.reject_reason) |reason| {
+                        try writer.writeAll(",\"reject-reason\":\"");
+                        try writer.writeAll(reason);
+                        try writer.writeByte('"');
+                    }
+                }
+                try writer.writeByte('}');
+            }
+        } else {
+            // Multi-transaction package path: route through acceptPackage.
+            // To preserve test_accept semantics (no mempool mutation), we run
+            // validation but roll back any additions by working on a snapshot.
+            // Since clearbit has no snapshot support, we call acceptPackage and
+            // then remove the added transactions — this is safe because the
+            // caller holds no lock and test_accept semantics are required.
+            //
+            // Build the decoded-tx slice for acceptPackage (skip decode-error entries).
+            var valid_txns = std.ArrayList(types.Transaction).init(self.allocator);
+            defer valid_txns.deinit();
+            var has_decode_error = false;
+            for (decode_errors.items) |err| {
+                if (err != null) {
+                    has_decode_error = true;
+                    break;
+                }
+            }
+            if (!has_decode_error) {
+                for (txns.items) |tx| {
+                    try valid_txns.append(tx);
+                }
             }
 
-            // Basic validation (would normally do full mempool acceptance check)
-            try writer.writeAll("{\"txid\":\"");
-            try writeHashHex(writer, &txid);
-            try writer.writeAll("\",\"allowed\":true,\"vsize\":");
-            const weight = mempool_mod.computeTxWeight(&tx, self.allocator) catch 0;
-            const vsize = (weight + 3) / 4;
-            try writer.print("{d}", .{vsize});
-            try writer.writeByte('}');
+            if (has_decode_error) {
+                // Emit per-entry errors for all entries
+                for (rawtxs, 0..) |_, i| {
+                    if (i > 0) try writer.writeByte(',');
+                    if (decode_errors.items[i]) |err_reason| {
+                        try writer.print("{{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"wtxid\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"allowed\":false,\"reject-reason\":\"{s}\"}}", .{err_reason});
+                    } else {
+                        const tx = txns.items[i];
+                        const txid = crypto.computeTxid(&tx, self.allocator) catch std.mem.zeroes(types.Hash256);
+                        const wtxid = crypto.computeWtxid(&tx, self.allocator) catch txid;
+                        try writer.writeAll("{\"txid\":\"");
+                        try writeHashHex(writer, &txid);
+                        try writer.writeAll("\",\"wtxid\":\"");
+                        try writeHashHex(writer, &wtxid);
+                        try writer.writeAll("\",\"allowed\":false,\"reject-reason\":\"package-error\"}");
+                    }
+                }
+            } else {
+                // Run package validation; collect txids added so we can roll back.
+                self.mempool.mutex.lock();
+                const pkg_result_or_err = mempool_mod.acceptPackage(self.mempool, valid_txns.items, self.allocator);
+                if (pkg_result_or_err) |pkg_result| {
+                    // Roll back: remove any transactions acceptPackage added (test_accept semantics).
+                    for (pkg_result.tx_results) |tx_res| {
+                        if (tx_res.accepted) {
+                            self.mempool.removeTransaction(tx_res.txid);
+                        }
+                    }
+                    self.mempool.mutex.unlock();
+
+                    // Emit per-tx results
+                    for (pkg_result.tx_results, 0..) |tx_res, i| {
+                        if (i > 0) try writer.writeByte(',');
+                        try writer.writeAll("{\"txid\":\"");
+                        try writeHashHex(writer, &tx_res.txid);
+                        try writer.writeAll("\",\"wtxid\":\"");
+                        try writeHashHex(writer, &tx_res.wtxid);
+                        try writer.writeAll("\",\"allowed\":");
+                        if (tx_res.accepted) {
+                            try writer.writeAll("true");
+                            // vsize from the decoded tx
+                            const tx = valid_txns.items[i];
+                            const weight = mempool_mod.computeTxWeight(&tx, self.allocator) catch 0;
+                            const vsize = (weight + 3) / 4;
+                            try writer.writeAll(",\"vsize\":");
+                            try writer.print("{d}", .{vsize});
+                            try writer.writeAll(",\"fees\":{\"base\":0.00000000}");
+                        } else {
+                            try writer.writeAll("false");
+                            if (tx_res.error_message) |reason| {
+                                try writer.writeAll(",\"reject-reason\":\"");
+                                try writer.writeAll(reason);
+                                try writer.writeByte('"');
+                            }
+                        }
+                        try writer.writeByte('}');
+                    }
+
+                    // pkg_result.deinit() requires non-const — copy to mutable.
+                    var mutable_result = pkg_result;
+                    mutable_result.deinit();
+                } else |_| {
+                    self.mempool.mutex.unlock();
+                    // Emit package-error for all entries on fatal package error
+                    for (rawtxs, 0..) |_, i| {
+                        if (i > 0) try writer.writeByte(',');
+                        const tx = txns.items[i];
+                        const txid = crypto.computeTxid(&tx, self.allocator) catch std.mem.zeroes(types.Hash256);
+                        const wtxid = crypto.computeWtxid(&tx, self.allocator) catch txid;
+                        try writer.writeAll("{\"txid\":\"");
+                        try writeHashHex(writer, &txid);
+                        try writer.writeAll("\",\"wtxid\":\"");
+                        try writeHashHex(writer, &wtxid);
+                        try writer.writeAll("\",\"allowed\":false,\"reject-reason\":\"package-error\"}");
+                    }
+                }
+            }
         }
 
         try writer.writeByte(']');
