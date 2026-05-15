@@ -1107,16 +1107,26 @@ fn directConnect(addr: *const MultiNetworkAddress) ProxyError!std.net.Stream {
 const BASE32_ALPHABET: *const [32]u8 = "abcdefghijklmnopqrstuvwxyz234567";
 
 /// Encode Tor v3 address (32 bytes) to base32 (56 chars).
+/// Per Tor rend-spec-v3 §6:
+///   onion_address = base32(pubkey || checksum || version)
+///   checksum      = SHA3-256(".onion checksum" || pubkey || version)[0..2]
+///   version       = 0x03
 fn base32EncodeOnion(data: []const u8, out: *[56]u8) void {
-    // Tor v3 onion addresses encode: pubkey (32 bytes) + checksum (2 bytes) + version (1 byte)
-    // For now, we just encode the 32-byte pubkey + computed checksum
     var full: [35]u8 = undefined;
     @memcpy(full[0..32], data);
 
-    // Compute checksum: SHA3-256(".onion checksum" || pubkey || version)[0..2]
-    // Simplified: just use zeros for demo (real implementation needs SHA3)
-    full[32] = 0;
-    full[33] = 0;
+    // checksum = SHA3-256(".onion checksum" || pubkey || 0x03)[0..2]
+    const checksum_prefix: []const u8 = ".onion checksum";
+    var sha3_in: [15 + 32 + 1]u8 = undefined;
+    @memcpy(sha3_in[0..15], checksum_prefix);
+    @memcpy(sha3_in[15..47], data[0..32]);
+    sha3_in[47] = 0x03;
+
+    var checksum_full: [32]u8 = undefined;
+    std.crypto.hash.sha3.Sha3_256.hash(&sha3_in, &checksum_full, .{});
+
+    full[32] = checksum_full[0];
+    full[33] = checksum_full[1];
     full[34] = 0x03; // Version 3
 
     base32EncodeBytes(full[0..35], out);
