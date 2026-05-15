@@ -10,6 +10,7 @@ const serialize = @import("serialize.zig");
 const mempool_mod = @import("mempool.zig");
 const validation = @import("validation.zig");
 const asmap_mod = @import("asmap.zig");
+const proxy_mod = @import("proxy.zig");
 
 // ============================================================================
 // Peer Manager Constants
@@ -781,6 +782,83 @@ pub const Peer = struct {
         ) catch {};
 
         const now = std.time.timestamp();
+        return Peer{
+            .stream = stream,
+            .address = address,
+            .state = .connecting,
+            .direction = .outbound,
+            .version_info = null,
+            .services = 0,
+            .last_ping_time = 0,
+            .last_pong_time = 0,
+            .last_ping_nonce = 0,
+            .last_message_time = now,
+            .bytes_sent = 0,
+            .bytes_received = 0,
+            .start_height = 0,
+            .network_params = params,
+            .allocator = allocator,
+            .recv_buffer = std.ArrayList(u8).init(allocator),
+            .is_witness_capable = false,
+            .is_headers_first = false,
+            .ban_score = 0,
+            .should_ban = false,
+            .conn_type = .outbound_full_relay,
+            .last_block_time = 0,
+            .last_tx_time = 0,
+            .min_ping_time = std.math.maxInt(i64),
+            .relay_txs = true,
+            .is_protected = false,
+            .connect_time = now,
+            .fee_filter_received = 0,
+            .fee_filter_sent = 0,
+            .next_send_feefilter = 0,
+            .best_known_height = 0,
+            .last_getheaders_time = 0,
+            .oldest_block_in_flight_time = 0,
+            .blocks_in_flight_count = 0,
+            .chain_sync_protected = false,
+            .advertise_node_bloom = false,
+            .transport_version = .v1,
+            .v2_cipher = null,
+        };
+    }
+
+    /// Wrap an already-connected stream (e.g. one returned by ProxyManager's
+    /// SOCKS5 / I2P SAM CONNECT) as an outbound Peer.  Used by the
+    /// proxy-dispatch path in PeerManager so the SOCKS5 negotiation can run
+    /// upstream of the Bitcoin handshake.
+    ///
+    /// `address` is the LOGICAL peer address used for bookkeeping (eclipse
+    /// protection, ban lookups, RPC display).  For IPv4/IPv6 it is the real
+    /// endpoint; for Tor v3 / I2P it is a placeholder std.net.Address
+    /// constructed from the loopback IP plus the overlay port — the real
+    /// hostname lives only in the proxy CONNECT, so std.net.Address cannot
+    /// represent it.  Callers should pair this with a parallel
+    /// MultiNetworkAddress in the candidate queue if they need to round-trip
+    /// the overlay address.
+    pub fn fromOutboundStream(
+        stream: std.net.Stream,
+        address: std.net.Address,
+        params: *const consensus.NetworkParams,
+        allocator: std.mem.Allocator,
+    ) Peer {
+        const now = std.time.timestamp();
+        // Match the timeouts set by Peer.connect so a proxied stream behaves
+        // the same as a direct one once the application handshake starts.
+        const timeout = std.posix.timeval{ .tv_sec = 30, .tv_usec = 0 };
+        std.posix.setsockopt(
+            stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&timeout),
+        ) catch {};
+        std.posix.setsockopt(
+            stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            std.mem.asBytes(&timeout),
+        ) catch {};
         return Peer{
             .stream = stream,
             .address = address,
@@ -2342,6 +2420,26 @@ pub const PeerManager = struct {
     /// Only meaningful when asmap_data is non-null.
     last_asmap_health_check: i64 = 0,
 
+    /// Optional proxy dispatcher for anonymous networks (Tor v3 / I2P /
+    /// CJDNS) and for proxied clearnet dialing.  When null, all dials use
+    /// the direct TCP path in Peer.connect.  When set, outbound dispatch
+    /// branches on the network type (see selectAndConnectOutbound /
+    /// connectOutboundNegotiated below).
+    ///
+    /// Lifetime: owned by the PeerManager.  Lazy-initialised SOCKS5 / I2P
+    /// SAM clients live inside it; deinit() flushes them on shutdown.
+    /// Plumbed from main.zig via initProxy() at startup based on the
+    /// --proxy / --onion / --i2psam CLI flags.
+    proxy_manager: ?proxy_mod.ProxyManager = null,
+
+    /// When true, the fc00::/7 ULA range is treated as routable rather than
+    /// rejected as RFC-4193 private.  Mirrors Core's -cjdnsreachable: CJDNS
+    /// is the only legitimate consumer of fc00::/8 today, and operators
+    /// running a CJDNS-enabled stack want their CJDNS peers actually dialled.
+    /// Plumbed from main.zig's Config.cjdnsreachable.  Default false (Core
+    /// default is also false — opt-in).
+    cjdnsreachable: bool = false,
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
@@ -2387,6 +2485,8 @@ pub const PeerManager = struct {
             .block_source_peers = std.AutoHashMap(types.Hash256, usize).init(allocator),
             .last_orphan_sweep = 0,
             .asmap_data = null,
+            .proxy_manager = null,
+            .cjdnsreachable = false,
         };
     }
 
@@ -2426,6 +2526,167 @@ pub const PeerManager = struct {
         if (self.pending_reorg) |*pr| pr.deinit();
         self.block_source_peers.deinit();
         if (self.asmap_data) |data| self.allocator.free(data);
+        if (self.proxy_manager) |*pm| pm.deinit();
+    }
+
+    /// Default SOCKS5 proxy port when none is given (matches Core's default
+    /// of 9050 for Tor and 9150 for Tor Browser; we pick the daemon port).
+    pub const DEFAULT_SOCKS5_PORT: u16 = 9050;
+
+    /// Default I2P SAM bridge port (Core constant DEFAULT_I2P_SAM_PORT = 7656).
+    pub const DEFAULT_I2P_SAM_PORT: u16 = 7656;
+
+    /// Parse a "host:port" or "host" string into (host, port).  When no
+    /// `:port` suffix is present `default_port` is returned.  IPv6 literals
+    /// must be bracketed (e.g. "[::1]:9050"); for the bracketed form the
+    /// inner host has the brackets stripped.  Returns null on malformed
+    /// input (e.g. unparseable port).
+    fn parseProxyHostPort(spec: []const u8, default_port: u16) ?struct {
+        host: []const u8,
+        port: u16,
+    } {
+        if (spec.len == 0) return null;
+        // Bracketed IPv6 form: [host]:port or [host]
+        if (spec[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, spec, ']') orelse return null;
+            const host = spec[1..close];
+            if (close + 1 == spec.len) {
+                return .{ .host = host, .port = default_port };
+            }
+            if (spec[close + 1] != ':') return null;
+            const port = std.fmt.parseInt(u16, spec[close + 2 ..], 10) catch return null;
+            return .{ .host = host, .port = port };
+        }
+        // Last-colon form (so "127.0.0.1:9050" works; bare IPv6 without
+        // brackets is rejected because it's ambiguous).
+        if (std.mem.lastIndexOfScalar(u8, spec, ':')) |colon| {
+            const host = spec[0..colon];
+            const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return null;
+            return .{ .host = host, .port = port };
+        }
+        return .{ .host = spec, .port = default_port };
+    }
+
+    /// Construct and install the ProxyManager from the parsed Config strings.
+    /// Idempotent: replaces any existing manager.  Returns true if at least
+    /// one proxy was configured (caller may log a startup line).
+    ///
+    /// Semantics mirror Bitcoin Core's init.cpp:
+    ///   * `proxy_spec` (=--proxy) is the SOCKS5 endpoint for clearnet and
+    ///     the fall-back proxy for Tor/I2P when their specific flags are
+    ///     omitted.
+    ///   * `onion_spec` (=--onion) is the SOCKS5 endpoint specifically for
+    ///     Tor v3 .onion addresses.  Defaults to `proxy_spec` if unset.
+    ///   * `i2psam_spec` (=--i2psam) is the I2P SAM bridge.  When omitted,
+    ///     I2P addresses cannot be dialled and shouldDial(.i2p) returns false.
+    pub fn initProxy(
+        self: *PeerManager,
+        proxy_spec: ?[]const u8,
+        onion_spec: ?[]const u8,
+        i2psam_spec: ?[]const u8,
+    ) void {
+        // If a previous manager exists, deinit it so we don't leak
+        // lazy-allocated SAM session strings.
+        if (self.proxy_manager) |*pm| pm.deinit();
+
+        var clearnet = proxy_mod.ProxyConfig{};
+        var tor = proxy_mod.ProxyConfig{};
+        var i2p = proxy_mod.ProxyConfig{};
+
+        if (proxy_spec) |s| {
+            if (parseProxyHostPort(s, DEFAULT_SOCKS5_PORT)) |hp| {
+                clearnet = .{
+                    .proxy_type = .socks5,
+                    .host = hp.host,
+                    .port = hp.port,
+                };
+                // -onion falls back to -proxy if not explicitly set (Core init.cpp).
+                tor = clearnet;
+            }
+        }
+        if (onion_spec) |s| {
+            if (parseProxyHostPort(s, DEFAULT_SOCKS5_PORT)) |hp| {
+                tor = .{
+                    .proxy_type = .socks5,
+                    .host = hp.host,
+                    .port = hp.port,
+                };
+            }
+        }
+        if (i2psam_spec) |s| {
+            if (parseProxyHostPort(s, DEFAULT_I2P_SAM_PORT)) |hp| {
+                i2p = .{
+                    .proxy_type = .i2p,
+                    .host = hp.host,
+                    .port = hp.port,
+                };
+            }
+        }
+
+        // Only install the manager if at least one network was actually
+        // configured — otherwise leave proxy_manager null so the dial path
+        // takes the existing direct route with zero overhead.
+        if (clearnet.proxy_type != .none or tor.proxy_type != .none or i2p.proxy_type != .none) {
+            self.proxy_manager = proxy_mod.ProxyManager.init(clearnet, tor, i2p, self.allocator);
+        }
+    }
+
+    /// Predicate: should we attempt to dial peers on the given BIP-155 network?
+    /// Returns true iff we have the transport for that network configured.
+    ///
+    ///   .ipv4 / .ipv6  → always (direct path, or via clearnet proxy)
+    ///   .torv3         → only if proxy_manager has a Tor SOCKS5 configured
+    ///   .i2p           → only if proxy_manager has an I2P SAM configured
+    ///   .cjdns         → only if cjdnsreachable is true (we treat fc00::/7
+    ///                    as routable; the dial itself uses the direct path
+    ///                    because CJDNS is a kernel-level overlay, not a proxy)
+    ///   .torv2         → never (deprecated by Tor in Oct 2021)
+    ///
+    /// Mirrors Core's CConnman::IsReachable() gate at net.cpp:
+    /// connections to unreachable networks are skipped during outbound
+    /// rotation before any TCP cost is incurred.
+    pub fn shouldDial(self: *const PeerManager, network: proxy_mod.NetworkId) bool {
+        return switch (network) {
+            .ipv4, .ipv6 => true,
+            .torv3 => blk: {
+                if (self.proxy_manager) |*pm| {
+                    break :blk pm.tor_config.proxy_type == .socks5 or
+                        pm.tor_config.proxy_type == .tor;
+                }
+                break :blk false;
+            },
+            .i2p => blk: {
+                if (self.proxy_manager) |*pm| {
+                    break :blk pm.i2p_config.proxy_type == .i2p;
+                }
+                break :blk false;
+            },
+            .cjdns => self.cjdnsreachable,
+            .torv2 => false,
+        };
+    }
+
+    /// Dial an overlay-network peer through the configured ProxyManager and
+    /// return the connected raw stream on success.  Caller is responsible
+    /// for running the Bitcoin handshake on top of the stream.
+    ///
+    /// Returns null when no proxy is configured for the network type, or
+    /// when the SOCKS5 / SAM connection attempt fails.  Errors are
+    /// downgraded to null so the maintainOutbound loop can continue to the
+    /// next candidate without unwinding.
+    pub fn connectViaProxy(
+        self: *PeerManager,
+        addr: *const proxy_mod.MultiNetworkAddress,
+    ) ?std.net.Stream {
+        if (!self.shouldDial(addr.network)) return null;
+        var pm = &(self.proxy_manager orelse return null);
+        return pm.connectTo(addr) catch |err| {
+            std.debug.print(
+                "P2P: proxy dial failed network={any} port={d} err={any}\n",
+                .{ addr.network, addr.port, err },
+            );
+            return null;
+        };
     }
 
     /// Cap on the BIP-324 v2 fall-back set (per-process).  Once exceeded
@@ -2437,6 +2698,55 @@ pub const PeerManager = struct {
     /// ~30s; we mirror that).  Short enough that a stalled remote
     /// doesn't wedge the maintainOutbound caller for long.
     pub const V2_PROBE_DEADLINE_MS: i64 = 30_000;
+
+    /// Open a clearnet (IPv4/IPv6) outbound TCP connection to `address`,
+    /// using the configured ProxyManager when --proxy is set, otherwise
+    /// going direct.  Returns a Peer wrapping the raw socket on success.
+    ///
+    /// This is the single dispatch point for IPv4/IPv6 outbound dials.  When
+    /// the operator wires up Tor as a clearnet proxy (--proxy=127.0.0.1:9050),
+    /// all clearnet dials transparently exit through Tor — matching Bitcoin
+    /// Core's -proxy semantics.
+    fn openClearnetOutbound(self: *PeerManager, address: std.net.Address) ?Peer {
+        // Direct path: no proxy configured, or proxy is configured but only
+        // for overlay networks (clearnet_config.proxy_type == .none).
+        const proxied = blk: {
+            if (self.proxy_manager) |pm| break :blk pm.clearnet_config.proxy_type == .socks5;
+            break :blk false;
+        };
+        if (!proxied) {
+            return Peer.connect(address, self.network_params, self.allocator) catch return null;
+        }
+
+        // Proxy path: convert std.net.Address to a MultiNetworkAddress and
+        // dispatch through ProxyManager.  ProxyManager handles the SOCKS5
+        // negotiation and returns a connected stream.
+        var addr_bytes_buf: [16]u8 = undefined;
+        const ma = switch (address.any.family) {
+            std.posix.AF.INET => mn: {
+                const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+                const ip = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                @memcpy(addr_bytes_buf[0..4], ip);
+                break :mn proxy_mod.MultiNetworkAddress{
+                    .network = .ipv4,
+                    .address = addr_bytes_buf[0..4],
+                    .port = std.mem.bigToNative(u16, ip4.port),
+                };
+            },
+            std.posix.AF.INET6 => mn: {
+                const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&address.any)));
+                @memcpy(addr_bytes_buf[0..16], &ip6.addr);
+                break :mn proxy_mod.MultiNetworkAddress{
+                    .network = .ipv6,
+                    .address = addr_bytes_buf[0..16],
+                    .port = std.mem.bigToNative(u16, ip6.port),
+                };
+            },
+            else => return null,
+        };
+        const stream = self.connectViaProxy(&ma) orelse return null;
+        return Peer.fromOutboundStream(stream, address, self.network_params, self.allocator);
+    }
 
     /// Try to open an outbound connection to `address`, negotiating BIP-324
     /// v2 if `Peer.bip324V2Enabled()` is true and the address is not in
@@ -2465,7 +2775,8 @@ pub const PeerManager = struct {
         // Phase 1: try BIP-324 v2 directly on a fresh socket.
         if (try_v2) {
             const peer = self.allocator.create(Peer) catch return null;
-            peer.* = Peer.connect(address, self.network_params, self.allocator) catch {
+            // Use openClearnetOutbound so --proxy is honoured for clearnet.
+            peer.* = self.openClearnetOutbound(address) orelse {
                 self.allocator.destroy(peer);
                 return null;
             };
@@ -2524,7 +2835,8 @@ pub const PeerManager = struct {
     /// socket cannot be reused).
     fn connectOutboundV1(self: *PeerManager, address: std.net.Address) ?*Peer {
         const peer = self.allocator.create(Peer) catch return null;
-        peer.* = Peer.connect(address, self.network_params, self.allocator) catch {
+        // Use openClearnetOutbound so --proxy is honoured for clearnet.
+        peer.* = self.openClearnetOutbound(address) orelse {
             self.allocator.destroy(peer);
             return null;
         };
