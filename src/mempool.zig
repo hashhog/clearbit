@@ -1405,22 +1405,38 @@ pub const Mempool = struct {
                     .reject_reason = "txn-same-nonwitness-data-in-mempool",
                 };
             }
-            // For test_accept, attempt validation via addTransaction on a copy
-            // isn't feasible without snapshot support, so just check basic rules.
-            self.checkStandard(&tx) catch return AcceptResult{
-                .accepted = false,
-                .txid = tx_hash,
-                .wtxid = wtxid,
-                .fee = 0,
-                .vsize = 0,
-                .reject_reason = "non-standard",
+            // For test_accept, check standard rules without persisting to mempool.
+            // This mirrors Bitcoin Core's ProcessTransaction(test_accept=true) path:
+            // run policy checks and return the result without modifying mempool state.
+            self.checkStandard(&tx) catch |err| {
+                const reason: []const u8 = switch (err) {
+                    MempoolError.NonStandard => "non-standard",
+                    MempoolError.TxWeightTooLarge => "tx-size",
+                    MempoolError.TxTooSmall => "tx-size-small",
+                    MempoolError.ScriptSigTooLarge => "scriptsig-size",
+                    MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
+                    MempoolError.DatacarrierTooLarge => "datacarrier",
+                    MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
+                    else => "non-standard",
+                };
+                return AcceptResult{
+                    .accepted = false,
+                    .txid = tx_hash,
+                    .wtxid = wtxid,
+                    .fee = 0,
+                    .vsize = 0,
+                    .reject_reason = reason,
+                };
             };
+            // Compute vsize for the response (weight / 4 rounded up).
+            const weight = computeTxWeight(&tx, self.allocator) catch 0;
+            const vsize = (weight + 3) / 4;
             return AcceptResult{
                 .accepted = true,
                 .txid = tx_hash,
                 .wtxid = wtxid,
                 .fee = 0,
-                .vsize = 0,
+                .vsize = vsize,
                 .reject_reason = null,
             };
         }
