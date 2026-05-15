@@ -1018,6 +1018,36 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w119_tests.step);
     }
 
+    // FIX-62 — BIP-21 URI parser tests.
+    // `bip21.zig` is intentionally self-contained (depends only on
+    // `address.zig`, which depends on `crypto.zig` + `types.zig`).  No
+    // wallet.zig dependency, so we can fold this into the default `test`
+    // step without tripping the long-standing selectCoins anonymous-struct
+    // compile error.  Run with `zig build test-bip21`.
+    {
+        const bip21_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_fix62_bip21.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        bip21_tests.linkSystemLibrary("secp256k1");
+        bip21_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        bip21_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            bip21_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        bip21_tests.root_module.addOptions("build_options", build_options);
+
+        const run_bip21_tests = b.addRunArtifact(bip21_tests);
+        const bip21_test_step = b.step("test-bip21", "Run FIX-62 BIP-21 URI parser tests");
+        bip21_test_step.dependOn(&run_bip21_tests.step);
+        // Fold into the default `test` step.
+        test_step.dependOn(&run_bip21_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",

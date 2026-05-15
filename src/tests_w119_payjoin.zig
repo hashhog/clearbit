@@ -519,33 +519,39 @@ test "w119/G27: sendpayjoinrequest RPC absent" {
 }
 
 // ===========================================================================
-// G28: BIP-21 `pj=` extraction — MISSING ENTIRELY
+// G28: BIP-21 `pj=` extraction — CLOSED in FIX-62
 //
-// BUG-27 (HIGH): BIP-21 (`bitcoin:address?amount=…&pj=…`) is the
-//   delivery channel for PayJoin endpoints.  clearbit has no BIP-21
-//   parser anywhere (grepping for "bitcoin:" returns zero source hits).
-//   Senders cannot discover a receiver endpoint from a payment URI.
+// FIX-62 added `src/bip21.zig` (parseBip21 + Bip21Uri), re-exported from
+// `address.zig` and `wallet.zig`.  Full test coverage in
+// `src/tests_fix62_bip21.zig` (run via `zig build test-bip21`).  The W119
+// audit absence assertions are converted to presence checks below.
+//
+// BUG-27 (HIGH) — original audit text retained for cross-impl traceability:
+//   BIP-21 (`bitcoin:address?amount=…&pj=…`) is the delivery channel for
+//   PayJoin endpoints.  clearbit had no BIP-21 parser anywhere.  Senders
+//   could not discover a receiver endpoint from a payment URI.
 //
 // Spec ref: bips/bip-0021.mediawiki + BIP-78 `pj=` extension
 // ===========================================================================
-test "w119/G28: BIP-21 parser + pj= extraction absent" {
-    try testing.expect(!@hasDecl(address_mod, "parseBip21"));
-    try testing.expect(!@hasDecl(address_mod, "Bip21Uri"));
-    try testing.expect(!@hasDecl(wallet_mod, "parseBip21"));
+test "w119/G28: BIP-21 parser + pj= extraction present (FIX-62)" {
+    try testing.expect(@hasDecl(address_mod, "parseBip21"));
+    try testing.expect(@hasDecl(address_mod, "Bip21Uri"));
+    try testing.expect(@hasDecl(wallet_mod, "parseBip21"));
 }
 
 // ===========================================================================
-// G29: BIP-21 `pjos=` extraction — MISSING ENTIRELY
+// G29: BIP-21 `pjos=` extraction — CLOSED in FIX-62
 //
-// BUG-28 (MED): The `pjos=0|1` parameter is the BIP-21 toggle for
-//   `disableoutputsubstitution`.  No parser to extract it (G28 is the
-//   parent gate; G29 is the specific param).
+// BUG-28 (MED) — original audit text retained:
+//   The `pjos=0|1` parameter is the BIP-21 toggle for
+//   `disableoutputsubstitution`.  FIX-62 adds `parseBip21Pjos` on
+//   address.zig and `parsePjosParam` on wallet.zig.
 //
 // Spec ref: bips/bip-0078.mediawiki, "BIP-21 extension"
 // ===========================================================================
-test "w119/G29: BIP-21 pjos= extraction absent" {
-    try testing.expect(!@hasDecl(address_mod, "parseBip21Pjos"));
-    try testing.expect(!@hasDecl(wallet_mod, "parsePjosParam"));
+test "w119/G29: BIP-21 pjos= extraction present (FIX-62)" {
+    try testing.expect(@hasDecl(address_mod, "parseBip21Pjos"));
+    try testing.expect(@hasDecl(wallet_mod, "parsePjosParam"));
 }
 
 // ===========================================================================
@@ -568,11 +574,13 @@ test "w119/G30: receiver replay-protect cache absent" {
 // W119 summary integrity gate
 // ===========================================================================
 
-test "w119: complete BIP-78 surface MISSING ENTIRELY (no payjoin strings/decls)" {
-    // The audit is honest: every symbolic decl referenced in G1-G30 must be
-    // absent.  This summary gate would fail loudly if any future fix added
-    // even a single PayJoin decl without removing the corresponding @hasDecl
-    // assertion above — which is exactly the desired CI signal.
+test "w119: BIP-78 surface remains MISSING (except FIX-62 BIP-21 prereq)" {
+    // The audit was originally honest about 10/10 MISSING ENTIRELY.  FIX-62
+    // closed G28 + G29 (BIP-21 URI parser) as the universal prereq for any
+    // future PayJoin work.  Every OTHER PayJoin-specific decl is still
+    // expected absent; this summary gate now fails loudly if any future fix
+    // adds a PayJoin decl without removing the corresponding `@hasDecl`
+    // assertion above — exactly the desired CI signal.
     const all_absent = !@hasDecl(rpc_mod, "PayjoinServer") and
         !@hasDecl(rpc_mod, "handlePayjoinRequest") and
         !@hasDecl(wallet_mod, "sendPayjoinRequest") and
@@ -580,7 +588,6 @@ test "w119: complete BIP-78 surface MISSING ENTIRELY (no payjoin strings/decls)"
         !@hasDecl(psbt_mod, "validatePayjoinProposal") and
         !@hasDecl(rpc_mod, "PayjoinError") and
         !@hasDecl(rpc_mod, "PAYJOIN_VERSION") and
-        !@hasDecl(address_mod, "parseBip21") and
         !@hasDecl(rpc_mod, "handleGetPayjoinRequest") and
         !@hasDecl(rpc_mod, "handleSendPayjoinRequest");
     try testing.expect(all_absent);
