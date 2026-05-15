@@ -296,7 +296,7 @@ pub const Socks5Client = struct {
         errdefer stream.close();
 
         // Set socket timeout
-        const timeout = std.posix.timeval{ .sec = @intCast(SOCKS5_RECV_TIMEOUT_SEC), .usec = 0 };
+        const timeout = std.posix.timeval{ .tv_sec = @intCast(SOCKS5_RECV_TIMEOUT_SEC), .tv_usec = 0 };
         std.posix.setsockopt(
             stream.handle,
             std.posix.SOL.SOCKET,
@@ -658,7 +658,7 @@ pub const I2pSamClient = struct {
         errdefer stream.close();
 
         // Set socket timeout
-        const timeout = std.posix.timeval{ .sec = @intCast(I2P_RECV_TIMEOUT_SEC), .usec = 0 };
+        const timeout = std.posix.timeval{ .tv_sec = @intCast(I2P_RECV_TIMEOUT_SEC), .tv_usec = 0 };
         std.posix.setsockopt(
             stream.handle,
             std.posix.SOL.SOCKET,
@@ -697,7 +697,7 @@ pub const I2pSamClient = struct {
         errdefer stream.close();
 
         // Set socket timeout
-        const timeout = std.posix.timeval{ .sec = @intCast(I2P_RECV_TIMEOUT_SEC), .usec = 0 };
+        const timeout = std.posix.timeval{ .tv_sec = @intCast(I2P_RECV_TIMEOUT_SEC), .tv_usec = 0 };
         std.posix.setsockopt(
             stream.handle,
             std.posix.SOL.SOCKET,
