@@ -4479,11 +4479,21 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":0.0,\"maxmempool\":{d},\"mempoolminfee\":0.00001,\"minrelaytxfee\":0.00001,\"incrementalrelayfee\":0.00001,\"unbroadcastcount\":0,\"fullrbf\":true}}", .{
+        // FIX-68 (W120 BUG-6 partner): align `fullrbf` field with the actual
+        // operator-configured policy on the mempool. Previously this was
+        // hardcoded `true` while `Mempool.full_rbf` defaults to `false`, so a
+        // wallet driving fee bumps would believe every mempool tx is
+        // replaceable and could generate replacements that Core peers reject
+        // with `txn-mempool-conflict`. Mirrors Bitcoin Core rpc/mempool.cpp
+        // GetMempoolInfo, which pushes the actual mempool policy state.
+        const fullrbf_str: []const u8 = if (self.mempool.full_rbf) "true" else "false";
+
+        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":0.0,\"maxmempool\":{d},\"mempoolminfee\":0.00001,\"minrelaytxfee\":0.00001,\"incrementalrelayfee\":0.00001,\"unbroadcastcount\":0,\"fullrbf\":{s}}}", .{
             mempool_stats.count,
             mempool_stats.size,
             mempool_stats.size,
             mempool_mod.MAX_MEMPOOL_SIZE,
+            fullrbf_str,
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -4526,9 +4536,17 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        // Compute BIP125 replaceability: with full RBF, all transactions are replaceable
-        // However, we still track if the tx signals RBF for the bip125-replaceable field
-        const bip125_replaceable = true; // Full RBF: all mempool txs are replaceable
+        // FIX-68 (W120 BUG-6): compute BIP-125 replaceability for the entry
+        // rather than hardcoding `true`. Mirrors Bitcoin Core's
+        // rpc/mempool.cpp `entryToJSON`, which calls `IsRBFOptIn(tx, pool)`
+        // and pushes the result. `Mempool.isRBFOptIn(txid)` honours the
+        // `full_rbf` override and otherwise returns the cached `entry.is_rbf`
+        // bit, which was set at admission to
+        // (isRBFSignaled(tx) || hasRBFAncestor(tx) || tx.version == TRUC_VERSION).
+        // We just looked the entry up so the txid lookup cannot return null
+        // here, but be defensive — fall back to `false` (FINAL) on miss
+        // rather than continuing to lie.
+        const bip125_replaceable: bool = self.mempool.isRBFOptIn(txid) orelse false;
 
         try writer.print("{{\"vsize\":{d},\"weight\":{d},\"fee\":{d}.{d:0>8},\"modifiedfee\":{d}.{d:0>8},\"time\":{d},\"height\":{d},\"descendantcount\":{d},\"descendantsize\":{d},\"descendantfees\":{d},\"ancestorcount\":{d},\"ancestorsize\":{d},\"ancestorfees\":{d},\"wtxid\":\"", .{
             entry.vsize,

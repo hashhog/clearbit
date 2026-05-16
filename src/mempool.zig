@@ -2087,6 +2087,37 @@ pub const Mempool = struct {
         return false;
     }
 
+    /// Compute the BIP-125 replaceability of a mempool transaction by txid.
+    ///
+    /// Mirrors Bitcoin Core's `IsRBFOptIn(tx, pool)` from `policy/rbf.cpp`:
+    ///   1. If the tx itself signals (any input nSequence <= 0xFFFFFFFD) → REPLACEABLE.
+    ///   2. Otherwise walk the unconfirmed mempool ancestors; if ANY signals → REPLACEABLE.
+    ///   3. Otherwise → FINAL.
+    /// Additionally, BIP-431 TRUC v3 transactions are always replaceable.
+    /// When `self.full_rbf` is true the answer is unconditionally true (matches
+    /// the operational semantics of `-mempoolfullrbf=1`, under which the
+    /// mempool admits replacements regardless of opt-in signalling).
+    ///
+    /// Returns `null` when the txid is not in the mempool (Core's
+    /// `RBFTransactionState::UNKNOWN`), letting callers decide how to surface
+    /// that to the wire (Core's getmempoolentry raises RPC_MISC_ERROR).
+    ///
+    /// This is the canonical helper for tx-level RPC fields like
+    /// `bip125-replaceable`. The cached `entry.is_rbf` already captures
+    /// (self ∨ ancestors ∨ TRUC v3) because it is set at admission via
+    /// `isRBFSignaled(tx) or hasRBFAncestor(tx) or tx.version == TRUC_VERSION`
+    /// (see addTransaction). We expose a dedicated helper so the wire path
+    /// has a single named source of truth that maps cleanly to Core's
+    /// `IsRBFOptIn` semantics.
+    pub fn isRBFOptIn(self: *Mempool, txid: types.Hash256) ?bool {
+        const entry = self.entries.get(txid) orelse return null;
+        // full_rbf operator override (matches Core's mempool-policy semantics
+        // where every tx is treated as replaceable for getmempoolentry purposes
+        // when fullrbf is in force).
+        if (self.full_rbf) return true;
+        return entry.is_rbf;
+    }
+
     /// Run script verification on every input of a transaction using
     /// STANDARD_SCRIPT_VERIFY_FLAGS (consensus + policy). Mirrors Bitcoin
     /// Core's `PolicyScriptChecks` invocation inside `AcceptToMemoryPool`
