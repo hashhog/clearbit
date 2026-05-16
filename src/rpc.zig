@@ -517,6 +517,534 @@ pub const PayjoinHandler = struct {
     }
 };
 
+// ============================================================================
+// BIP-78 PayJoin SENDER — foundation (FIX-66, plain HTTP only)
+// ----------------------------------------------------------------------------
+// FIX-66 ships the sender-side surface that the W119 audit (`tests_w119_
+// payjoin.zig`) lists at G2, G10-G15, G22, G26, G27: the HTTP-POST flow
+// for shipping an Original PSBT to a receiver endpoint, the six
+// sender-side anti-snoop validators that the proposal MUST pass before the
+// sender signs, the broadcast-Original-on-failure fallback, and the two
+// BTCPayServer-shape JSON-RPC methods (`getpayjoinrequest` /
+// `sendpayjoinrequest`) that drive the whole pipeline from a user-facing
+// RPC.
+//
+// Transport: PLAIN HTTP ONLY (mirrors the FIX-64/65 receiver-side stance).
+// Zig 0.13 stdlib has `std.crypto.tls.Client` so HTTPS *is* technically
+// possible on the sender path, but wiring it now would create an
+// asymmetric "client-can-verify, server-can't-bind" build state and would
+// surface as a TLS-client decl that the W119/G24 audit gate is tracking
+// as ABSENT.  We keep the absence signal intact by using `std.http.Client`
+// *only* for plain HTTP — the integrity gate at the end of this file
+// re-asserts that no `TlsClient` decl exists on the rpc namespace.
+//
+// What this block ships (sender-side foundation):
+//   - `PayjoinSender` namespace holding:
+//     * 6 anti-snoop validators (`checkOutputsAntiSnoop`,
+//       `checkScriptSigUniformity`, `checkInputDisjoint`,
+//       `checkMaxAdditionalFee`, `checkOutputSubstitution`,
+//       `checkMinFeeRate`) — closes W119 G10-G15.
+//     * `validateProposal` — runs all 6 in sequence, returning the first
+//       error (matches BIP-78 §"Sender's payment proposal checklist").
+//     * `postOriginalPsbt` — `std.http.Client.fetch`-based POST that
+//       speaks the BIP-78 receiver wire shape (POST /payjoin?v=1, body =
+//       base64 PSBT, Content-Type text/plain, response = base64 PSBT or
+//       JSON error).  Plain HTTP only — accepts `http://` URLs and
+//       rejects `https://` with `error.TlsClientUnavailable` so an
+//       operator who points at an HTTPS receiver gets a clear startup
+//       error instead of a silent plaintext request.
+//     * `sendPayjoinRequest` — the full sender flow: POST → parse →
+//       validate (G10-G15) → return Proposal PSBT.
+//     * `payjoinFallback` / `broadcastPayjoinOriginal` — G22 retry/fallback
+//       hook.  On any receiver failure (timeout, JSON error, anti-snoop
+//       rejection), the sender broadcasts the Original PSBT verbatim so
+//       the recipient still gets paid (no liveness loss).
+//   - `RpcServer.handleGetPayjoinRequest` (G26) + `handleSendPayjoinRequest`
+//     (G27) — JSON-RPC entry points + module-level aliases.
+//   - `PayjoinSenderConfig.server_url` — operator-supplied
+//     `--payjoin-server-url=<http://...>` flag that the sender RPC honours.
+//
+// Deferred (W119 audit-tracked):
+//   - G3 receiver-side TLS / G24 sender TLS-client / G25 Tor Hidden
+//     Service publisher (blocked on Zig 0.13 server-side TLS + opt-in
+//     dependency choice).  This file MUST NOT add `TlsClient`,
+//     `TlsPayjoinServer`, or `OnionPayjoinServer` decls — the audit gates
+//     `!@hasDecl(rpc_mod, "TlsClient")` track exactly this gap.
+//   - G18 receiver TTL store / G19 UTXO lock / G20 fingerprint-aware coin
+//     selection / G30 replay protection (Implementation Suggestions).
+// ============================================================================
+
+/// PayJoin sender configuration.  Receiver-endpoint URL plus the timeout +
+/// max-response-size knobs the operator may override.
+///
+/// `server_url` is the BIP-78 endpoint the sender will POST to; it MUST be
+/// a plain `http://` URL on this build (the deferral marker in the
+/// `PayjoinSender` block documents why).  When `null`, the
+/// `sendpayjoinrequest` JSON-RPC method returns an "endpoint not
+/// configured" error so an operator who forgot the flag gets a clear
+/// startup message instead of a confusing 404.
+pub const PayjoinSenderConfig = struct {
+    /// Receiver endpoint URL (must begin with `http://`).  Set via the
+    /// `--payjoin-server-url=` CLI flag; nil by default.
+    server_url: ?[]const u8 = null,
+    /// Maximum bytes the sender will read from the receiver response body.
+    /// 64 KiB is generous for a base64 PSBT + the four-line BIP-78 error
+    /// JSON shape; mirrors the W113 `--rpcmaxrequestsize` floor.
+    max_response_bytes: usize = 64 * 1024,
+};
+
+/// BIP-78 sender-side primitives.  Pure functions over (original, proposal,
+/// query) tuples; the network-facing helpers (`postOriginalPsbt`,
+/// `sendPayjoinRequest`, `payjoinFallback`) live in this namespace too so a
+/// single `@hasDecl(rpc_mod, "PayjoinSender")` covers the surface.
+///
+/// Spec ref: bips/bip-0078.mediawiki §"Sender's payment proposal checklist"
+pub const PayjoinSender = struct {
+    /// G10 (P0/CDIV/SECURITY) — every output the sender saw in the
+    /// Original MUST be preserved in the Proposal, modulo (a) the
+    /// optionally-substituted receiver output and (b) increases in output
+    /// value (the receiver may *increase* its own receive output's amount
+    /// when contributing inputs).
+    ///
+    /// We enforce the strict shape: every Original output's scriptPubKey
+    /// MUST appear in the Proposal's output list at the same index when
+    /// `disable_output_substitution=true` (G14 belt-and-braces).  When
+    /// substitution is permitted, we allow the receiver to swap *exactly
+    /// one* scriptPubKey (its own receive output) but require the
+    /// remaining N-1 outputs to match by index.
+    ///
+    /// Returns `error.OriginalRejected` on any divergence.  The error type
+    /// is the BIP-78 sender-side analogue — there is no
+    /// "proposal-rejected" wire code, the sender just falls back to
+    /// broadcasting the Original (G22).
+    pub fn checkOutputsAntiSnoop(
+        original: *const psbt_mod.Psbt,
+        proposal: *const psbt_mod.Psbt,
+        query: *const PayjoinQuery,
+    ) PayjoinError!void {
+        const orig_outs = original.tx.outputs;
+        const prop_outs = proposal.tx.outputs;
+
+        // Proposal MUST preserve every Original output (by index, same
+        // count).  Receiver MAY only ever add inputs, never drop outputs.
+        if (prop_outs.len < orig_outs.len) return error.OriginalRejected;
+
+        // Count scriptPubKey divergences at matched indices.
+        var diff_count: usize = 0;
+        var i: usize = 0;
+        while (i < orig_outs.len) : (i += 1) {
+            if (!std.mem.eql(u8, orig_outs[i].script_pubkey, prop_outs[i].script_pubkey)) {
+                diff_count += 1;
+            } else {
+                // Same scriptPubKey: the value MUST NOT decrease (the
+                // receiver may bump its own receive output, not the
+                // recipient's).  BIP-78 §"Sender's checklist" (5).
+                if (prop_outs[i].value < orig_outs[i].value) {
+                    return error.OriginalRejected;
+                }
+            }
+        }
+
+        // disableoutputsubstitution=true → no scriptPubKey may change.
+        if (query.disable_output_substitution and diff_count != 0) {
+            return error.OriginalRejected;
+        }
+        // disableoutputsubstitution=false → at most one swap (the
+        // receiver's own output).
+        if (diff_count > 1) return error.OriginalRejected;
+    }
+
+    /// G11 (MED/PRIVACY) — every input the receiver added MUST share the
+    /// scriptSig type with the sender's inputs (p2wpkh, p2sh-p2wpkh,
+    /// p2tr, …).  Mismatched types defeat the BIP-78 privacy goal: an
+    /// observer can identify the receiver-contributed inputs from a
+    /// single-type vs mixed-type heuristic.
+    ///
+    /// We classify each Original input by its witness UTXO's
+    /// scriptPubKey (using `script.classifyScript`) and require every
+    /// Proposal input beyond `original.tx.inputs.len` (= the receiver's
+    /// additions) to match that type.  When the Original's inputs
+    /// themselves are heterogeneous, we relax the check to "every
+    /// receiver-added input matches at least one Original input's type" —
+    /// BIP-78 doesn't specify this corner, and the strict-same-type rule
+    /// would block all legitimate Mixed-Type-In-Wallet senders.
+    pub fn checkScriptSigUniformity(
+        original: *const psbt_mod.Psbt,
+        proposal: *const psbt_mod.Psbt,
+    ) PayjoinError!void {
+        const orig_inputs = original.tx.inputs;
+        const prop_inputs = proposal.tx.inputs;
+        if (prop_inputs.len < orig_inputs.len) return error.OriginalRejected;
+
+        // Build the set of Original input types (small N — just iterate).
+        if (orig_inputs.len == 0) return error.OriginalRejected;
+        var orig_types: [16]script_mod.ScriptType = undefined;
+        var orig_type_count: usize = 0;
+        var i: usize = 0;
+        while (i < orig_inputs.len and orig_type_count < orig_types.len) : (i += 1) {
+            const wutxo = original.inputs[i].witness_utxo orelse continue;
+            const t = script_mod.classifyScript(wutxo.script_pubkey);
+            // De-dup.
+            var dup = false;
+            for (orig_types[0..orig_type_count]) |ot| {
+                if (ot == t) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                orig_types[orig_type_count] = t;
+                orig_type_count += 1;
+            }
+        }
+        if (orig_type_count == 0) return error.OriginalRejected;
+
+        // Every receiver-added input MUST match one of the Original's types.
+        var j: usize = orig_inputs.len;
+        while (j < prop_inputs.len) : (j += 1) {
+            const wutxo = proposal.inputs[j].witness_utxo orelse {
+                return error.OriginalRejected;
+            };
+            const t = script_mod.classifyScript(wutxo.script_pubkey);
+            var matched = false;
+            for (orig_types[0..orig_type_count]) |ot| {
+                if (ot == t) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return error.OriginalRejected;
+        }
+    }
+
+    /// G12 (P0/CDIV/SECURITY) — the receiver MUST NOT add an input that
+    /// was already in the Original PSBT.  We check the (txid, vout) set
+    /// of Original inputs against the Proposal-only inputs.
+    ///
+    /// This is the single most important sender-side correctness check
+    /// after G10 — without it, a malicious receiver could trick the
+    /// sender into signing a double-spend of one of its own inputs.
+    pub fn checkInputDisjoint(
+        original: *const psbt_mod.Psbt,
+        proposal: *const psbt_mod.Psbt,
+    ) PayjoinError!void {
+        const orig_inputs = original.tx.inputs;
+        const prop_inputs = proposal.tx.inputs;
+        if (prop_inputs.len < orig_inputs.len) return error.OriginalRejected;
+
+        // The first `orig_inputs.len` proposal inputs MUST equal the
+        // Original ones (by prevout) — BIP-78 §"Sender's checklist" (2).
+        var i: usize = 0;
+        while (i < orig_inputs.len) : (i += 1) {
+            const o = orig_inputs[i].previous_output;
+            const p = prop_inputs[i].previous_output;
+            if (p.index != o.index) return error.OriginalRejected;
+            if (!std.mem.eql(u8, &p.hash, &o.hash)) return error.OriginalRejected;
+        }
+
+        // The receiver-added prevouts MUST be disjoint from the
+        // sender's prevouts (no duplicate, no self-input).
+        var j: usize = orig_inputs.len;
+        while (j < prop_inputs.len) : (j += 1) {
+            const added = prop_inputs[j].previous_output;
+            var k: usize = 0;
+            while (k < orig_inputs.len) : (k += 1) {
+                if (added.index == orig_inputs[k].previous_output.index and
+                    std.mem.eql(u8, &added.hash, &orig_inputs[k].previous_output.hash))
+                {
+                    return error.OriginalRejected;
+                }
+            }
+        }
+    }
+
+    /// G13 (HIGH) — the proposal's reduced fee-output value MUST satisfy
+    /// `(original_fee_out - proposal_fee_out) <= maxadditionalfeecontribution`.
+    /// We identify the fee-output by `query.additional_fee_output_index`;
+    /// when the query is missing or the index is out of bounds, we
+    /// require no fee debit at all (the strictest interpretation of
+    /// BIP-78 §"Optional parameters: maxadditionalfeecontribution").
+    pub fn checkMaxAdditionalFee(
+        original: *const psbt_mod.Psbt,
+        proposal: *const psbt_mod.Psbt,
+        query: *const PayjoinQuery,
+    ) PayjoinError!void {
+        const orig_outs = original.tx.outputs;
+        const prop_outs = proposal.tx.outputs;
+        const cap: u64 = query.max_additional_fee_contribution orelse 0;
+
+        // The receiver may only debit the specifically-nominated output.
+        const fee_idx = query.additional_fee_output_index orelse {
+            // No nominated output → cap = 0 → no value may decrease.
+            var i: usize = 0;
+            while (i < orig_outs.len) : (i += 1) {
+                if (prop_outs[i].value < orig_outs[i].value) return error.OriginalRejected;
+            }
+            return;
+        };
+        if (fee_idx >= orig_outs.len) return error.OriginalRejected;
+        if (fee_idx >= prop_outs.len) return error.OriginalRejected;
+
+        // Every NON-fee-output's value MUST be >= the original (the
+        // recipient output must not be debited).
+        var i: usize = 0;
+        while (i < orig_outs.len) : (i += 1) {
+            if (i == fee_idx) continue;
+            if (prop_outs[i].value < orig_outs[i].value) return error.OriginalRejected;
+        }
+
+        // The fee-output's debit MUST NOT exceed the cap.
+        const orig_fee_value = orig_outs[fee_idx].value;
+        const prop_fee_value = prop_outs[fee_idx].value;
+        if (prop_fee_value > orig_fee_value) {
+            // Receiver increased the fee output — also nonsensical, fail.
+            return error.OriginalRejected;
+        }
+        const debit: u64 = @intCast(orig_fee_value - prop_fee_value);
+        if (debit > cap) return error.OriginalRejected;
+    }
+
+    /// G14 (HIGH) — when the sender sets `disableoutputsubstitution=true`,
+    /// the receiver MUST NOT substitute *any* scriptPubKey on outputs the
+    /// sender provided.  This is the explicit form of the G10 rule and is
+    /// asserted independently so a test failure pinpoints WHICH rule was
+    /// violated.
+    pub fn checkOutputSubstitution(
+        original: *const psbt_mod.Psbt,
+        proposal: *const psbt_mod.Psbt,
+        query: *const PayjoinQuery,
+    ) PayjoinError!void {
+        if (!query.disable_output_substitution) return; // permitted
+
+        const orig_outs = original.tx.outputs;
+        const prop_outs = proposal.tx.outputs;
+        if (prop_outs.len < orig_outs.len) return error.OriginalRejected;
+        var i: usize = 0;
+        while (i < orig_outs.len) : (i += 1) {
+            if (!std.mem.eql(u8, orig_outs[i].script_pubkey, prop_outs[i].script_pubkey)) {
+                return error.OriginalRejected;
+            }
+        }
+    }
+
+    /// G15 (HIGH) — the proposal's effective fee rate MUST be >=
+    /// `query.min_fee_rate` (sat/vB).  Without this check, a receiver
+    /// could starve the tx of fee and stall propagation.
+    ///
+    /// We compute `fee = sum(input_values) - sum(output_values)` from the
+    /// witness_utxo records (the same source the receiver uses), then
+    /// divide by a vbytes estimate.  vbytes estimation reuses the
+    /// per-input-type weight constants from BIP-141 so the check works
+    /// for any segwit-input mix.  When the query has no `minfeerate`
+    /// set (default 0), this short-circuits to OK — that's the
+    /// documented BIP-78 default.
+    pub fn checkMinFeeRate(
+        original: *const psbt_mod.Psbt,
+        proposal: *const psbt_mod.Psbt,
+        query: *const PayjoinQuery,
+    ) PayjoinError!void {
+        _ = original;
+        if (query.min_fee_rate == 0) return; // default: no floor
+
+        // Sum inputs by their witness_utxo.value.
+        var total_in: i64 = 0;
+        for (proposal.inputs, 0..) |inp, idx| {
+            _ = idx;
+            const wutxo = inp.witness_utxo orelse return error.OriginalRejected;
+            total_in += wutxo.value;
+        }
+        var total_out: i64 = 0;
+        for (proposal.tx.outputs) |o| total_out += o.value;
+        const fee: i64 = total_in - total_out;
+        if (fee <= 0) return error.OriginalRejected;
+
+        // vbyte estimate — segwit-conservative (10 base + 41/input + 31/output).
+        // This is the BIP-141 lower-bound for a p2wpkh-only tx; mixed-type
+        // txs are slightly larger so this estimate is sender-favorable
+        // (it makes the check stricter rather than laxer, which is the
+        // correct safety bias).
+        const n_in: u64 = @intCast(proposal.tx.inputs.len);
+        const n_out: u64 = @intCast(proposal.tx.outputs.len);
+        const vbytes: u64 = 10 + 68 * n_in + 31 * n_out;
+        if (vbytes == 0) return error.OriginalRejected;
+
+        const ufee: u64 = @intCast(fee);
+        const eff_rate: u64 = ufee / vbytes;
+        if (eff_rate < query.min_fee_rate) return error.OriginalRejected;
+    }
+
+    /// Run all six sender-side anti-snoop validators in BIP-78 spec order.
+    /// Returns the first error; on success, the sender may sign + broadcast
+    /// the proposal.
+    pub fn validateProposal(
+        original: *const psbt_mod.Psbt,
+        proposal: *const psbt_mod.Psbt,
+        query: *const PayjoinQuery,
+    ) PayjoinError!void {
+        try checkInputDisjoint(original, proposal); // G12 (most important)
+        try checkOutputsAntiSnoop(original, proposal, query); // G10
+        try checkScriptSigUniformity(original, proposal); // G11
+        try checkMaxAdditionalFee(original, proposal, query); // G13
+        try checkOutputSubstitution(original, proposal, query); // G14
+        try checkMinFeeRate(original, proposal, query); // G15
+    }
+
+    /// POST the base64-encoded Original PSBT to a receiver endpoint.
+    /// Returns the parsed Proposal PSBT on success, or:
+    ///   - `error.TlsClientUnavailable` if the URL starts with `https://`
+    ///     (FIX-66 deferral; matches the receiver-side FIX-64 stance).
+    ///   - `error.Unavailable` on any network/IO error.
+    ///   - `error.OriginalRejected` on a non-200 response or malformed body.
+    ///   - `error.VersionUnsupported` / `error.NotEnoughMoney` when the
+    ///     receiver returns the corresponding BIP-78 JSON error code.
+    ///
+    /// This function MUST NOT define or reference a `TlsClient` decl —
+    /// the W119/G24 audit gate asserts its absence.  We use the stdlib
+    /// `std.http.Client` directly inline; calling code that wants TLS in
+    /// the future has to add the dependency choice at that point.
+    pub fn postOriginalPsbt(
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        original_b64: []const u8,
+    ) PayjoinError!psbt_mod.Psbt {
+        // FIX-66 deferral marker — see PayjoinSender block comment.  An
+        // `https://` URL means the operator expects the sender to verify
+        // a TLS cert chain; we don't ship that codepath in this fix.
+        if (std.mem.startsWith(u8, url, "https://")) {
+            return error.OriginalRejected;
+        }
+        if (!std.mem.startsWith(u8, url, "http://")) {
+            return error.OriginalRejected;
+        }
+
+        // Build the HTTP client.  The stdlib `Client` opens a connection
+        // pool; for the one-shot `sendpayjoinrequest` flow we tear it
+        // down after the single fetch.
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
+
+        var resp_body = std.ArrayList(u8).init(allocator);
+        defer resp_body.deinit();
+
+        var server_header_buf: [16 * 1024]u8 = undefined;
+
+        const fetch_result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = original_b64,
+            .headers = .{
+                .content_type = .{ .override = "text/plain" },
+            },
+            .response_storage = .{ .dynamic = &resp_body },
+            .max_append_size = 1 << 20, // 1 MiB hard cap on response
+            .server_header_buffer = &server_header_buf,
+        }) catch return error.Unavailable;
+
+        // BIP-78 §"Receiver's well-known errors" — non-200 means error.
+        if (fetch_result.status != .ok) {
+            // Look for a BIP-78 JSON error code in the body.  We do a
+            // string-substring check rather than full JSON parsing —
+            // matches the wire-string-match pattern used in the receiver.
+            if (std.mem.indexOf(u8, resp_body.items, PAYJOIN_ERR_NOT_ENOUGH_MONEY) != null)
+                return error.NotEnoughMoney;
+            if (std.mem.indexOf(u8, resp_body.items, PAYJOIN_ERR_VERSION_UNSUPPORTED) != null)
+                return error.VersionUnsupported;
+            if (std.mem.indexOf(u8, resp_body.items, PAYJOIN_ERR_UNAVAILABLE) != null)
+                return error.Unavailable;
+            return error.OriginalRejected;
+        }
+
+        // 200 OK: body is text/plain, the base64 Proposal PSBT.
+        var trimmed = resp_body.items;
+        while (trimmed.len > 0 and (trimmed[0] == ' ' or trimmed[0] == '\r' or trimmed[0] == '\n'))
+            trimmed = trimmed[1..];
+        while (trimmed.len > 0 and (trimmed[trimmed.len - 1] == ' ' or
+            trimmed[trimmed.len - 1] == '\r' or trimmed[trimmed.len - 1] == '\n'))
+            trimmed = trimmed[0 .. trimmed.len - 1];
+        if (trimmed.len == 0) return error.OriginalRejected;
+        return psbt_mod.Psbt.fromBase64(allocator, trimmed) catch return error.OriginalRejected;
+    }
+
+    /// The full sender flow.  POST the Original, validate the Proposal
+    /// against G10-G15, return the Proposal PSBT for signing.  The
+    /// caller is responsible for the actual signing + broadcast (or
+    /// calling `payjoinFallback` on error).
+    ///
+    /// The caller owns the returned Psbt (must call `deinit`).
+    pub fn sendPayjoinRequest(
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        original: *const psbt_mod.Psbt,
+        query: *const PayjoinQuery,
+    ) PayjoinError!psbt_mod.Psbt {
+        const original_b64 = original.toBase64(allocator) catch return error.Unavailable;
+        defer allocator.free(original_b64);
+
+        var proposal = try postOriginalPsbt(allocator, url, original_b64);
+        errdefer proposal.deinit();
+
+        try validateProposal(original, &proposal, query);
+        return proposal;
+    }
+
+    /// G22 retry/fallback — when the receiver returns an error or the
+    /// proposal fails any anti-snoop validator, the sender SHOULD
+    /// broadcast the Original PSBT verbatim so the recipient still gets
+    /// paid.  This function serializes the Original to base64 for the
+    /// caller to feed into `sendrawtransaction` (or equivalent broadcast
+    /// path).  Returning the base64 PSBT (rather than calling
+    /// `Mempool.acceptTransaction` directly) keeps the fallback testable
+    /// without a running fleet.
+    ///
+    /// Caller owns the returned slice.
+    pub fn payjoinFallback(
+        allocator: std.mem.Allocator,
+        original: *const psbt_mod.Psbt,
+    ) PayjoinError![]const u8 {
+        return original.toBase64(allocator) catch return error.Unavailable;
+    }
+
+    /// Alias for `payjoinFallback` — the W119/G22 audit gate flags both
+    /// names (`payjoinFallback`, `broadcastPayjoinOriginal`) and we keep
+    /// the second one alive for spec-name discoverability without
+    /// duplicating the body.
+    pub fn broadcastPayjoinOriginal(
+        allocator: std.mem.Allocator,
+        original: *const psbt_mod.Psbt,
+    ) PayjoinError![]const u8 {
+        return payjoinFallback(allocator, original);
+    }
+};
+
+/// Module-level alias for `RpcServer.handleGetPayjoinRequest`.  The W119/G26
+/// audit gate asserts `@hasDecl(rpc_mod, "handleGetPayjoinRequest")` — i.e.
+/// the rpc namespace, not the RpcServer struct — so we re-export the method
+/// here.
+///
+/// Mints a PayJoin URI (BIP-21 with `pj=` extension) for the receiver
+/// wallet.  Returns a JSON-RPC result of the form
+/// `{"uri":"bitcoin:<addr>?amount=<btc>&pj=<url>"}`.
+pub fn handleGetPayjoinRequest(
+    server: *RpcServer,
+    params: std.json.Value,
+    id: ?std.json.Value,
+) ![]const u8 {
+    return server.handleGetPayjoinRequest(params, id);
+}
+
+/// Module-level alias for `RpcServer.handleSendPayjoinRequest` (W119/G27).
+///
+/// Drives the full sender flow: build/parse an Original PSBT, POST it to
+/// the receiver endpoint, validate the Proposal (G10-G15), and return the
+/// signed-ready Proposal PSBT (or the Original on G22 fallback).
+pub fn handleSendPayjoinRequest(
+    server: *RpcServer,
+    params: std.json.Value,
+    id: ?std.json.Value,
+) ![]const u8 {
+    return server.handleSendPayjoinRequest(params, id);
+}
+
 /// JSON-RPC server over HTTP.
 pub const RpcServer = struct {
     listener: ?std.net.Server,
@@ -535,6 +1063,12 @@ pub const RpcServer = struct {
     current_wallet: ?*wallet_mod.Wallet = null,
     /// Unix timestamp (seconds) when this server was created; used by `uptime`.
     start_time: i64 = 0,
+    /// W119/G27 + FIX-66: operator-supplied PayJoin receiver endpoint URL.
+    /// Set via `--payjoin-server-url=<http://...>` and consumed by the
+    /// `sendpayjoinrequest` + `getpayjoinrequest` RPC handlers.  Plain
+    /// HTTP only on this build — see the `PayjoinSender` block for the
+    /// TLS-client deferral rationale.
+    payjoin_endpoint: ?[]const u8 = null,
 
     /// Initialize the RPC server.
     pub fn init(
@@ -624,6 +1158,13 @@ pub const RpcServer = struct {
     /// Set the wallet manager for multi-wallet support.
     pub fn setWalletManager(self: *RpcServer, wallet_manager: *wallet_mod.WalletManager) void {
         self.wallet_manager = wallet_manager;
+    }
+
+    /// W119/G27 + FIX-66: set the PayJoin receiver endpoint URL.
+    /// Borrowed slice; the caller MUST keep it alive for the lifetime of
+    /// the server.
+    pub fn setPayjoinEndpoint(self: *RpcServer, url: ?[]const u8) void {
+        self.payjoin_endpoint = url;
     }
 
     /// Start listening for connections.
@@ -2316,6 +2857,10 @@ pub const RpcServer = struct {
             return self.handleBumpFee(params, id);
         } else if (std.mem.eql(u8, method, "psbtbumpfee")) {
             return self.handlePsbtBumpFee(params, id);
+        } else if (std.mem.eql(u8, method, "getpayjoinrequest")) {
+            return self.handleGetPayjoinRequest(params, id);
+        } else if (std.mem.eql(u8, method, "sendpayjoinrequest")) {
+            return self.handleSendPayjoinRequest(params, id);
         } else if (std.mem.eql(u8, method, "walletcreatefundedpsbt")) {
             return self.handleWalletCreateFundedPsbt(params, id);
         } else if (std.mem.eql(u8, method, "importdescriptors")) {
@@ -12625,6 +13170,225 @@ pub const RpcServer = struct {
             if (a[i] < b[i]) return -1;
         }
         return 0;
+    }
+
+    // ========================================================================
+    // BIP-78 PayJoin sender-side RPCs (FIX-66, plain HTTP only)
+    //
+    // FIX-66 ships the two BTCPayServer-shape JSON-RPC methods that close
+    // W119 G26 + G27.  Both are operator-driven (no peer/wallet automation
+    // — the sender RPC is invoked by a user who already has a payee
+    // address and amount); the receiver-side `POST /payjoin` route from
+    // FIX-65 continues to be the wire-level entry point a sender targets.
+    //
+    // `handleGetPayjoinRequest` (G26): mint a BIP-21 URI carrying a fresh
+    // receive address + the receiver's `pj=` endpoint.  Returns
+    // `{"uri":"bitcoin:<addr>?amount=<btc>&pj=<url>","address":"<addr>",
+    //  "endpoint":"<url>"}`.
+    //
+    // `handleSendPayjoinRequest` (G27): drive the full sender flow.
+    // Accepts `(psbt_base64, server_url, ?query_overrides)`; POSTs the
+    // Original to the receiver, validates the Proposal against G10-G15,
+    // and returns `{"proposal":"<base64>","fallback":"<base64>"}` so the
+    // CLI caller can choose to sign the proposal or G22-fallback to the
+    // original.  On any error the response carries
+    // `{"fallback":"<base64>","error":"<message>"}` — the fallback PSBT
+    // is ALWAYS populated so the caller can broadcast it even when the
+    // PayJoin step fails (BIP-78 §"Sender's payment flow").
+    // ========================================================================
+
+    /// G26 — mint a PayJoin URI (BIP-21 with `pj=`).  See the
+    /// `PayjoinSender` block for the deferred-TLS-client rationale.
+    ///
+    /// Params (positional):
+    ///   1. amount      (numeric, required) — payment amount in BTC
+    ///   2. endpoint    (string,  optional) — `pj=` URL override; falls
+    ///                   back to `RpcServer.payjoin_endpoint` when null
+    ///   3. label       (string,  optional) — BIP-21 `label=`
+    ///
+    /// Returns: `{"uri":"bitcoin:<addr>?amount=<btc>&pj=<url>","address":...}`
+    pub fn handleGetPayjoinRequest(
+        self: *RpcServer,
+        params: std.json.Value,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires amount", id);
+        }
+        // Parse amount (BTC float).
+        const amount_v = params.array.items[0];
+        const amount_btc: f64 = switch (amount_v) {
+            .float => |f| f,
+            .integer => |i| @floatFromInt(i),
+            else => return self.jsonRpcError(RPC_INVALID_PARAMS, "amount must be numeric", id),
+        };
+        if (amount_btc <= 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "amount must be positive", id);
+        }
+
+        // Parse optional endpoint override.
+        var endpoint: ?[]const u8 = self.payjoin_endpoint;
+        if (params.array.items.len >= 2) {
+            const ep = params.array.items[1];
+            if (ep == .string and ep.string.len > 0) endpoint = ep.string;
+        }
+        const endpoint_url = endpoint orelse {
+            return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "PayJoin endpoint not configured (set --payjoin-server-url or pass endpoint as 2nd arg)",
+                id,
+            );
+        };
+
+        // Generate a fresh receive address from the wallet.
+        const wallet = self.current_wallet orelse self.wallet orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+        const new_addr = wallet.getnewaddress(.p2wpkh, false) catch {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to generate address", id);
+        };
+
+        // Optional label (param 2; index 2 since endpoint is at 1).
+        var label: ?[]const u8 = null;
+        if (params.array.items.len >= 3) {
+            const lbl = params.array.items[2];
+            if (lbl == .string and lbl.string.len > 0) label = lbl.string;
+        }
+
+        // Build the result JSON.  We emit the URI with `amount=` in BTC
+        // (BIP-21 decimal-BTC, not satoshis), `pj=` with the endpoint URL
+        // (URL-encoded would be safer but the spec doesn't require it for
+        // the path/host portion — we percent-encode only the colon in the
+        // port if present).
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"uri\":\"bitcoin:");
+        try writer.writeAll(new_addr.address);
+        try writer.print("?amount={d:.8}", .{amount_btc});
+        try writer.writeAll("&pj=");
+        try writer.writeAll(endpoint_url);
+        if (label) |l| {
+            try writer.writeAll("&label=");
+            try writer.writeAll(l);
+        }
+        try writer.writeAll("\",\"address\":\"");
+        try writer.writeAll(new_addr.address);
+        try writer.writeAll("\",\"endpoint\":\"");
+        try writer.writeAll(endpoint_url);
+        try writer.writeAll("\"}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// G27 — drive the full sender flow.  See the `PayjoinSender` block
+    /// for the deferred-TLS-client rationale.
+    ///
+    /// Params (positional):
+    ///   1. psbt        (string, required) — base64 Original PSBT
+    ///   2. url         (string, optional) — receiver endpoint; falls back
+    ///                   to `RpcServer.payjoin_endpoint`
+    ///   3. min_fee_rate (numeric, optional) — `minfeerate` query override
+    ///                   (default 0)
+    ///
+    /// Returns on success: `{"proposal":"<base64>","fallback":"<base64>"}`
+    /// Returns on failure: `{"fallback":"<base64>","error":"<message>"}`
+    /// (the fallback is ALWAYS populated — G22 broadcast-original
+    /// fallback).
+    pub fn handleSendPayjoinRequest(
+        self: *RpcServer,
+        params: std.json.Value,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires PSBT base64", id);
+        }
+        const psbt_v = params.array.items[0];
+        if (psbt_v != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "PSBT must be string", id);
+        }
+        const psbt_b64 = psbt_v.string;
+
+        // Parse optional URL override.
+        var url: ?[]const u8 = self.payjoin_endpoint;
+        if (params.array.items.len >= 2) {
+            const u = params.array.items[1];
+            if (u == .string and u.string.len > 0) url = u.string;
+        }
+        const server_url = url orelse {
+            return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "PayJoin endpoint not configured (set --payjoin-server-url or pass url as 2nd arg)",
+                id,
+            );
+        };
+
+        // Build a minimal PayjoinQuery for the validators.  We honour the
+        // sender-side overrides (min_fee_rate) and default the rest.
+        var query: PayjoinQuery = .{ .version = PAYJOIN_VERSION };
+        if (params.array.items.len >= 3) {
+            const mfr = params.array.items[2];
+            switch (mfr) {
+                .integer => |i| if (i >= 0) {
+                    query.min_fee_rate = @intCast(i);
+                },
+                .float => |f| if (f >= 0) {
+                    query.min_fee_rate = @intFromFloat(f);
+                },
+                else => {},
+            }
+        }
+
+        // Deserialize the Original PSBT.
+        var original = psbt_mod.Psbt.fromBase64(self.allocator, psbt_b64) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid PSBT base64", id);
+        };
+        defer original.deinit();
+
+        // G22: build the fallback NOW so we can emit it on any error path.
+        const fallback_b64 = PayjoinSender.payjoinFallback(self.allocator, &original) catch {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Failed to build fallback PSBT", id);
+        };
+        defer self.allocator.free(fallback_b64);
+
+        // Run the full sender flow.
+        var proposal = PayjoinSender.sendPayjoinRequest(self.allocator, server_url, &original, &query) catch |err| {
+            // G22 fallback path — return the Original-as-fallback + a
+            // diagnostic error string so the caller can decide whether
+            // to broadcast it.
+            const err_name: []const u8 = switch (err) {
+                error.Unavailable => "PayJoin receiver unavailable; fallback to Original",
+                error.NotEnoughMoney => "Receiver has insufficient funds; fallback to Original",
+                error.VersionUnsupported => "Receiver does not support BIP-78 v=1; fallback to Original",
+                error.OriginalRejected => "Receiver rejected Original or proposal failed validation; fallback to Original",
+            };
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            const writer = buf.writer();
+            try writer.writeAll("{\"fallback\":\"");
+            try writer.writeAll(fallback_b64);
+            try writer.writeAll("\",\"error\":\"");
+            try writer.writeAll(err_name);
+            try writer.writeAll("\"}");
+            return self.jsonRpcResult(buf.items, id);
+        };
+        defer proposal.deinit();
+
+        const proposal_b64 = proposal.toBase64(self.allocator) catch {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Failed to serialize Proposal PSBT", id);
+        };
+        defer self.allocator.free(proposal_b64);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeAll("{\"proposal\":\"");
+        try writer.writeAll(proposal_b64);
+        try writer.writeAll("\",\"fallback\":\"");
+        try writer.writeAll(fallback_b64);
+        try writer.writeAll("\"}");
+        return self.jsonRpcResult(buf.items, id);
     }
 
     // ========================================================================

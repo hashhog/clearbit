@@ -1117,6 +1117,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_fix65_tests.step);
     }
 
+    // FIX-66 — BIP-78 PayJoin sender foundation (plain HTTP only).
+    // `tests_fix66_payjoin_sender.zig` imports rpc.zig + wallet.zig +
+    // psbt.zig + types.zig (mirror the FIX-65 link config — the wallet
+    // pulls in secp256k1 transitively for AES-GCM/BIP-32 init paths).
+    // Run with `zig build test-fix66`.
+    {
+        const fix66_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_fix66_payjoin_sender.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"fix66"},
+        });
+        fix66_tests.linkSystemLibrary("rocksdb");
+        fix66_tests.linkSystemLibrary("secp256k1");
+        fix66_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        fix66_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            fix66_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            fix66_tests.linkSystemLibrary("minisketch");
+            fix66_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        fix66_tests.root_module.addOptions("build_options", build_options);
+
+        const run_fix66_tests = b.addRunArtifact(fix66_tests);
+        const fix66_test_step = b.step("test-fix66", "Run FIX-66 BIP-78 PayJoin sender foundation tests");
+        fix66_test_step.dependOn(&run_fix66_tests.step);
+        // Fold into the default `test` step.
+        test_step.dependOn(&run_fix66_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
