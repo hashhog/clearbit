@@ -57,6 +57,9 @@ const types = @import("types.zig");
 const rpc_mod = @import("rpc.zig");
 const wallet_mod = @import("wallet.zig");
 const crypto_mod = @import("crypto.zig");
+const storage = @import("storage.zig");
+const peer_mod = @import("peer.zig");
+const consensus = @import("consensus.zig");
 
 // ===========================================================================
 // G1: BIP-125 Rule 1 — replacement signals opt-in (or full-RBF override)
@@ -222,28 +225,51 @@ test "w120 G7: descendant collection — getDescendantTxids called from checkRBF
 
 // ===========================================================================
 // G8: Package RBF (1p1c) wiring
-// Status: PARTIAL.
+// Status: PRESENT (FIX-73 W120 BUG-5 closed; was PARTIAL).
 //
 // `submitpackage` is wired in `RpcServer.handleSubmitPackage` (rpc.zig:6823)
-// and the mempool has package-acceptance helpers, but the `replaced-transactions`
-// field in `submitpackage` output is hard-coded empty (per the W116 audit
-// in tests_w116_package_relay.zig:804: "submitpackage: replaced-transactions
-// always empty (no RBF wiring)").  Package replacement runs inside
-// `addTransaction` per child, but the outer caller does not collect the
-// list of replaced txids and propagate them to JSON.
+// and the mempool has package-acceptance helpers. FIX-73 added
+// `PackageResult.replaced_transactions: []types.Hash256` populated by
+// `acceptPackage` from the union of `MempoolEntry.replaces` across every
+// admitted tx; the handler now emits it in the JSON `replaced-transactions`
+// field. Mirrors Bitcoin Core's submitpackage path (rpc/mempool.cpp), which
+// aggregates each tx's `MempoolAcceptResult.m_replaced_transactions`.
 
-// BUG-3 (MEDIUM): submitpackage output never reports replaced txs.
-// Reference: src/tests_w116_package_relay.zig:804-823.  Even when the
-// child tx triggers an RBF replacement via the per-tx path, the
-// `replaced-transactions` array in the JSON return is empty.  Operators
-// scripting against submitpackage cannot detect RBF inside a package.
+// BUG-5 (MEDIUM) FIXED in FIX-73 (W120 follow-up):
+// submitpackage now reports replaced txs via the `replaced-transactions`
+// array; operators scripting against submitpackage can detect package RBF.
 
-test "w120 G8: package RBF — submitpackage handler exists" {
-    // We can't easily exercise the full package path without a UTXO set,
-    // but we verify the dispatch string is present in rpc.zig.
-    // (Compile-only smoke — if submitpackage were absent the file wouldn't
-    // build).
+test "w120 G8 (FIX-73): submitpackage handler exists" {
     try testing.expect(true);
+}
+
+test "w120 G8 (FIX-73): PackageResult exposes replaced_transactions field" {
+    // Forward-regression guard. Future drive-by refactors that drop the
+    // field must fail this test FIRST inside the W120 file.
+    comptime {
+        const PR = mempool_mod.PackageResult;
+        const info = @typeInfo(PR).Struct;
+        var has_field = false;
+        for (info.fields) |f| {
+            if (std.mem.eql(u8, f.name, "replaced_transactions")) {
+                has_field = true;
+            }
+        }
+        if (!has_field) @compileError("PackageResult missing replaced_transactions — FIX-73 regression");
+    }
+    try testing.expect(true);
+}
+
+test "w120 G8 (FIX-73): handleSubmitPackage emits dynamic replaced-transactions" {
+    // Source-level guard. The handler previously hardcoded
+    // `"replaced-transactions":[]`. The fix walks `result.replaced_transactions`
+    // and emits each txid hex. Pin the new shape so a future revert that
+    // re-hardcodes empty fails FIRST inside the W120 file.
+    const src = @embedFile("rpc.zig");
+    const bad_literal = "\"replaced-transactions\":[],\"package_feerate\"";
+    try testing.expect(std.mem.indexOf(u8, src, bad_literal) == null);
+    const good_marker = "for (result.replaced_transactions, 0..) |rtxid, ri|";
+    try testing.expect(std.mem.indexOf(u8, src, good_marker) != null);
 }
 
 // ===========================================================================
@@ -309,23 +335,127 @@ test "w120 G12: replacement-feerate — no helper exported (PARTIAL)" {
 
 // ===========================================================================
 // G13: Conflicts list returned to caller / RPC
-// Status: PARTIAL.
+// Status: PRESENT (FIX-73 W120 BUG-3 closed; was PARTIAL).
 //
-// `addTransaction` (mempool.zig:1018) builds `conflicting_txids` locally
-// and removes them inside the same call (line 1191-1193). The list is NOT
-// returned to the caller or threaded into the JSON output of
-// `sendrawtransaction` / `submitpackage`.  Bitcoin Core does surface the
-// `replaces` array.  See BUG-3 + BUG-5.
+// `addTransaction` still returns `void` on success (Core parity — Core's
+// `AcceptToMemoryPool` writes results via the `MempoolAcceptResult` struct,
+// not the return value), but FIX-73 now records the evicted-txids set
+// (direct conflicts ∪ all descendants) on `MempoolEntry.replaces` at
+// admission. The new-tx entry is then queryable for its `replaces` slice
+// from any RPC handler. `sendrawtransaction` reads the field and either:
+//   - returns the bare hex txid string (Core-compat) when no RBF happened,
+//   - returns `{"txid":"<hex>","replaces":["<hex>",...]}` when RBF did.
 
-// BUG-5 (MEDIUM): sendrawtransaction does not expose the replaced-txids
-// array. Wallets watching for confirmations of replaced txs cannot detect
-// the replacement from the JSON return.
+// BUG-3 (MEDIUM) FIXED in FIX-73 (W120 follow-up):
+// sendrawtransaction now surfaces the evicted-txids array on the RBF
+// replacement path so wallets watching for confirmations of replaced txs
+// can detect the replacement from the JSON return.
 
-test "w120 G13: conflicts list — not returned by addTransaction (PARTIAL)" {
-    // addTransaction returns void on success; no replaced list.
+test "w120 G13 (FIX-73): conflicts list reachable via MempoolEntry.replaces" {
+    // Forward-regression guard.
+    comptime {
+        const E = mempool_mod.MempoolEntry;
+        const info = @typeInfo(E).Struct;
+        var has_field = false;
+        for (info.fields) |f| {
+            if (std.mem.eql(u8, f.name, "replaces")) {
+                has_field = true;
+            }
+        }
+        if (!has_field) @compileError("MempoolEntry missing replaces field — FIX-73 regression");
+    }
+    // addTransaction still returns void (Core parity).
     const T = @TypeOf(mempool_mod.Mempool.addTransaction);
     _ = T;
     try testing.expect(true);
+}
+
+test "w120 G13 (FIX-73): MempoolEntry.replaces is null when no RBF happened" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const spk = w120FixP2WPKHScript();
+    const prev: [32]u8 = .{0x55} ** 32;
+    const out = types.TxOut{ .value = 100_000, .script_pubkey = &spk };
+    const inp = types.TxIn{
+        .previous_output = .{ .hash = prev, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{inp},
+        .outputs = &[_]types.TxOut{out},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx);
+    const txid = try crypto_mod.computeTxid(&tx, allocator);
+    const entry = mempool.entries.get(txid).?;
+    // Common no-replacement path: `replaces` is null (no allocation cost).
+    try testing.expect(entry.replaces == null);
+}
+
+test "w120 G13 (FIX-73): MempoolEntry.replaces captures direct RBF conflict" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const spk = w120FixP2WPKHScript();
+    const shared_outpoint: [32]u8 = .{0x66} ** 32;
+
+    // Admit tx A (signaling opt-in RBF).
+    const out_a = types.TxOut{ .value = 90_000, .script_pubkey = &spk };
+    const in_a = types.TxIn{
+        .previous_output = .{ .hash = shared_outpoint, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_a = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{in_a},
+        .outputs = &[_]types.TxOut{out_a},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx_a);
+    const txid_a = try crypto_mod.computeTxid(&tx_a, allocator);
+
+    // Replacement tx B spending the SAME outpoint (also signaling RBF) —
+    // triggers RBF eviction of A.
+    const out_b = types.TxOut{ .value = 80_000, .script_pubkey = &spk };
+    const in_b = types.TxIn{
+        .previous_output = .{ .hash = shared_outpoint, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_b = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{in_b},
+        .outputs = &[_]types.TxOut{out_b},
+        .lock_time = 0,
+    };
+    // With chain_state=null, fees are computed as 0; RBF Rule 4 needs
+    // additional_fee > 0. Pre-prioritise to give modified-fee headroom.
+    const txid_b = try crypto_mod.computeTxid(&tx_b, allocator);
+    _ = try mempool.prioritiseTransaction(txid_b, 1_000_000);
+    try mempool.addTransaction(tx_b);
+
+    // Tx A should be evicted.
+    try testing.expect(!mempool.entries.contains(txid_a));
+
+    // Tx B's `replaces` field should now reference txid_a.
+    const entry_b = mempool.entries.get(txid_b).?;
+    try testing.expect(entry_b.replaces != null);
+    const replaces = entry_b.replaces.?;
+    try testing.expect(replaces.len >= 1);
+    var found_a = false;
+    for (replaces) |rtxid| {
+        if (std.mem.eql(u8, &rtxid, &txid_a)) found_a = true;
+    }
+    try testing.expect(found_a);
 }
 
 // ===========================================================================
@@ -576,18 +706,185 @@ test "w120 G17: error codes — all four BIP-125 variants exist in enum" {
 
 // ===========================================================================
 // G18: `replaces` field in JSON-RPC mempool / submitpackage output
-// Status: MISSING ENTIRELY.
+// Status: PRESENT (FIX-73 W120 BUG-8 closed; was MISSING ENTIRELY).
 //
-// Neither getrawmempool / getmempoolentry / sendrawtransaction /
-// submitpackage emit a `replaces` array.  Operators cannot detect via
-// JSON-RPC which mempool txs replaced which.
+// FIX-73 wired the `replaces` field on three RPC paths:
+//   - `sendrawtransaction`: object form `{"txid":"<hex>","replaces":[...]}`
+//     when RBF replacement happened; bare hex string otherwise (Core-compat).
+//   - `submitpackage`: `replaced-transactions:[...]` top-level array, union
+//     across every admitted package tx; was previously hardcoded `[]`.
+//   - `getmempoolentry`: `replaces:[...]` array of the txids THIS entry
+//     replaced when admitted; always emitted (empty array on no-RBF entry).
+// All three read `MempoolEntry.replaces` which is set at admission inside
+// `addTransaction` / `addTransactionWithPackageRate` from the eviction
+// snapshot (direct conflicts ∪ all descendants).
 
-// BUG-8 (MEDIUM): No `replaces` field in any JSON-RPC mempool output.
-// Core's getrawmempool with verbosity=2 surfaces a `replaces` array;
-// submitpackage emits `replaced-transactions`.
+// BUG-8 (MEDIUM) FIXED in FIX-73 (W120 follow-up):
+// Operators can now detect RBF events via JSON-RPC.
 
-test "w120 G18: replaces field — MISSING ENTIRELY" {
-    return error.SkipZigTest;
+test "w120 G18 (FIX-73): getmempoolentry handler emits replaces array" {
+    // Source-level guard. The handler now appends `,"replaces":[...]` after
+    // the `mining_score` field. Future drive-by changes that drop this must
+    // fail FIRST inside the W120 file.
+    const src = @embedFile("rpc.zig");
+    const marker = "// FIX-73 / W120 BUG-8: emit the `replaces` array";
+    try testing.expect(std.mem.indexOf(u8, src, marker) != null);
+    const emit_marker = "try writer.writeAll(\",\\\"replaces\\\":[\");";
+    try testing.expect(std.mem.indexOf(u8, src, emit_marker) != null);
+}
+
+test "w120 G18 (FIX-73): sendrawtransaction emits replaces on RBF replacement" {
+    // Source-level guard. The handler now switches to object-form return on
+    // RBF replacement via `returnTxidWithReplaces`. Pin the new helper +
+    // call site so a future revert that strips replacement-aware output
+    // fails FIRST.
+    const src = @embedFile("rpc.zig");
+    const helper_decl = "fn returnTxidWithReplaces(";
+    try testing.expect(std.mem.indexOf(u8, src, helper_decl) != null);
+    const call_marker = "return self.returnTxidWithReplaces(txid, replaced_set, id);";
+    try testing.expect(std.mem.indexOf(u8, src, call_marker) != null);
+}
+
+// End-to-end RPC dispatch test for `getmempoolentry` — proves the wire-format
+// output contains the `replaces` key whether the entry replaced anything or
+// not (empty array on the no-RBF entry; populated on the replacement). This
+// catches drift between the entry-level wiring and the JSON emission.
+test "w120 G18 (FIX-73): getmempoolentry JSON contains replaces key (empty when no RBF)" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = rpc_mod.RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Admit a non-RBF tx (no chain state ⇒ fees are 0).
+    const spk = w120FixP2WPKHScript();
+    const prev: [32]u8 = .{0x88} ** 32;
+    const out = types.TxOut{ .value = 100_000, .script_pubkey = &spk };
+    const inp = types.TxIn{
+        .previous_output = .{ .hash = prev, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{inp},
+        .outputs = &[_]types.TxOut{out},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx);
+    const txid = try crypto_mod.computeTxid(&tx, allocator);
+
+    // Build hex txid in Bitcoin display order (reversed).
+    var hex_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        const b = txid[31 - i];
+        _ = try std.fmt.bufPrint(hex_buf[i * 2 ..][0..2], "{x:0>2}", .{b});
+    }
+
+    var req_buf: [200]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":1,\"method\":\"getmempoolentry\",\"params\":[\"{s}\"]}}", .{hex_buf});
+
+    const result = try server.dispatch(req);
+    defer allocator.free(result);
+
+    // Field MUST exist; MUST be empty array for non-RBF entry.
+    try testing.expect(std.mem.indexOf(u8, result, "\"replaces\":[]") != null);
+}
+
+test "w120 G18 (FIX-73): getmempoolentry JSON populates replaces on RBF entry" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = rpc_mod.RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Admit tx A (signaling RBF on shared outpoint).
+    const spk = w120FixP2WPKHScript();
+    const shared: [32]u8 = .{0x91} ** 32;
+    const out_a = types.TxOut{ .value = 90_000, .script_pubkey = &spk };
+    const in_a = types.TxIn{
+        .previous_output = .{ .hash = shared, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_a = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{in_a},
+        .outputs = &[_]types.TxOut{out_a},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx_a);
+    const txid_a = try crypto_mod.computeTxid(&tx_a, allocator);
+
+    // Replacement tx B (also signals RBF; lower value but same outpoint).
+    const out_b = types.TxOut{ .value = 80_000, .script_pubkey = &spk };
+    const in_b = types.TxIn{
+        .previous_output = .{ .hash = shared, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_b = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{in_b},
+        .outputs = &[_]types.TxOut{out_b},
+        .lock_time = 0,
+    };
+    // With chain_state=null, fees are computed as 0 for both txs, so RBF Rule
+    // 4 (additional_fee >= INCREMENTAL_RELAY_FEE * vsize / 1000) would reject
+    // the replacement (0 < min_additional_fee). Pre-prioritise the replacement
+    // txid so getModifiedFee(txid_b) = 0 + delta gives positive headroom.
+    // Matches the working pattern at line ~1130 (fix72_rule3_source test).
+    // Core supports pre-setting deltas on absent txids (txmempool.cpp:630).
+    const txid_b = try crypto_mod.computeTxid(&tx_b, allocator);
+    _ = try mempool.prioritiseTransaction(txid_b, 1_000_000);
+    try mempool.addTransaction(tx_b);
+
+    // Hex txid of B in display order.
+    var hex_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        _ = try std.fmt.bufPrint(hex_buf[i * 2 ..][0..2], "{x:0>2}", .{txid_b[31 - i]});
+    }
+    var req_buf: [200]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":1,\"method\":\"getmempoolentry\",\"params\":[\"{s}\"]}}", .{hex_buf});
+
+    const result = try server.dispatch(req);
+    defer allocator.free(result);
+
+    // Display-order hex of txid_a; the replaces array must contain it.
+    var hex_a_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        _ = try std.fmt.bufPrint(hex_a_buf[i * 2 ..][0..2], "{x:0>2}", .{txid_a[31 - i]});
+    }
+
+    // The `replaces` array must be non-empty AND include txid_a.
+    try testing.expect(std.mem.indexOf(u8, result, "\"replaces\":[]") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"replaces\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, result, &hex_a_buf) != null);
 }
 
 // ===========================================================================
