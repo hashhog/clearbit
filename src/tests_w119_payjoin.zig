@@ -127,17 +127,25 @@ test "w119/G1: receiver HTTP endpoint present (FIX-65 foundation)" {
 }
 
 // ===========================================================================
-// G2: Sender HTTP client — MISSING ENTIRELY
+// G2: Sender HTTP client — CLOSED in FIX-66 (plain HTTP only)
 //
-// BUG-2 (HIGH): The sender POSTs the Original PSBT and reads the proposal
-//   back.  clearbit has no HTTP client whatsoever (the v2 transport in
-//   v2_transport.zig is raw TCP for BIP-324, not HTTP).
+// FIX-66 adds `wallet_mod.sendPayjoinRequest` + `wallet_mod.postOriginalPsbt`
+// + the parallel `rpc.PayjoinSender.{sendPayjoinRequest,postOriginalPsbt}`
+// helpers.  Both use `std.http.Client` directly for plain HTTP only —
+// `https://` URLs are rejected at call time with `OriginalRejected` so
+// the W119/G24 TLS-client absence gate stays intact.  Test coverage:
+// `src/tests_fix66_payjoin_sender.zig` G2 cluster.
+//
+// `wallet_mod.PayjoinClient` deliberately stays absent — adding it would
+// be an API-sprawl alias on top of `sendPayjoinRequest` that the audit
+// gate is tracking as the "no convenience-aliases-without-impl" rule.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Sender's HTTP request"
 // ===========================================================================
-test "w119/G2: sender HTTP client absent (no sendPayjoinRequest)" {
-    try testing.expect(!@hasDecl(wallet_mod, "sendPayjoinRequest"));
-    try testing.expect(!@hasDecl(wallet_mod, "postOriginalPsbt"));
+test "w119/G2: sender HTTP client present (FIX-66)" {
+    try testing.expect(@hasDecl(wallet_mod, "sendPayjoinRequest"));
+    try testing.expect(@hasDecl(wallet_mod, "postOriginalPsbt"));
+    // No alias decl — keeps the API surface tight.
     try testing.expect(!@hasDecl(wallet_mod, "PayjoinClient"));
 }
 
@@ -267,97 +275,133 @@ test "w119/G9: receiver-fee-adjust primitive absent" {
 }
 
 // ===========================================================================
-// G10: Sender anti-snoop on outputs — MISSING ENTIRELY
+// G10: Sender anti-snoop on outputs — CLOSED in FIX-66 (P0/CDIV/SECURITY)
 //
-// BUG-10 (P0/CDIV/SECURITY): The single most important sender check.
-//   After the proposal returns, the sender MUST verify that every
-//   original output (modulo the optional substituted receiver output) is
-//   preserved verbatim.  Without this check, a malicious receiver could
-//   redirect the recipient output to itself and the sender would sign it
-//   away.  No anti-snoop function exists.
+// FIX-66 adds the sender-side checklist: every Original output is
+// preserved in the Proposal (modulo at most one substituted receiver
+// output when `disable_output_substitution=false`).  Exposed as
+// `wallet_mod.payjoinAntiSnoop` (G10-specific) and
+// `wallet_mod.validatePayjoinProposal` (runs G10-G15 in sequence).  Also
+// available on `rpc.PayjoinSender.checkOutputsAntiSnoop` + `validateProposal`.
+// Test coverage: `src/tests_fix66_payjoin_sender.zig` G10 cluster.
+//
+// BUG-10 (P0/CDIV/SECURITY) — original audit text retained for cross-impl
+// traceability:
+//   The single most important sender check.  After the proposal returns,
+//   the sender MUST verify that every original output is preserved
+//   verbatim.  Without this check, a malicious receiver could redirect
+//   the recipient output to itself and the sender would sign it away.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Sender's payment proposal checklist"
 // ===========================================================================
-test "w119/G10: sender anti-snoop output validator absent" {
+test "w119/G10: sender anti-snoop output validator present (FIX-66)" {
+    // psbt_mod still doesn't host the validator (it's a sender-side
+    // workflow concern, not a PSBT-format concern — kept off psbt.zig
+    // intentionally).
     try testing.expect(!@hasDecl(psbt_mod, "validatePayjoinProposal"));
-    try testing.expect(!@hasDecl(wallet_mod, "validatePayjoinProposal"));
-    try testing.expect(!@hasDecl(wallet_mod, "payjoinAntiSnoop"));
+    try testing.expect(@hasDecl(wallet_mod, "validatePayjoinProposal"));
+    try testing.expect(@hasDecl(wallet_mod, "payjoinAntiSnoop"));
 }
 
 // ===========================================================================
-// G11: Sender scriptSig-type preservation — MISSING ENTIRELY
+// G11: Sender scriptSig-type preservation — CLOSED in FIX-66 (MED/PRIVACY)
 //
-// BUG-11 (MED/PRIVACY): BIP-78 §"Sender's checklist (3)" — every input
-//   the receiver added MUST use the same scriptSig type as the sender's
-//   inputs (p2wpkh, p2sh-p2wpkh, …).  Mismatched types defeat the
-//   privacy goal.  No type-equality check exists.
+// FIX-66 adds `wallet_mod.payjoinInputTypeCheck` +
+// `rpc.PayjoinSender.checkScriptSigUniformity`.  Classifies each
+// Original input by its witness UTXO's scriptPubKey (via
+// `script.classifyScript`) and requires every receiver-added input to
+// match one of the Original's types.  Test coverage:
+// `src/tests_fix66_payjoin_sender.zig` G11 cluster (positive: p2wpkh +
+// p2wpkh; negative: receiver-added p2tr on a p2wpkh-only Original).
+//
+// BUG-11 (MED/PRIVACY) — original audit text retained.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Sender's payment proposal checklist"
 // ===========================================================================
-test "w119/G11: sender scriptSig-type uniformity check absent" {
+test "w119/G11: sender scriptSig-type uniformity check present (FIX-66)" {
+    try testing.expect(@hasDecl(wallet_mod, "payjoinInputTypeCheck"));
+    // psbt-side variants stay absent — the check is wallet-workflow,
+    // not a PSBT-format concern.
     try testing.expect(!@hasDecl(psbt_mod, "checkScriptSigUniformity"));
     try testing.expect(!@hasDecl(psbt_mod, "validateInputTypes"));
-    try testing.expect(!@hasDecl(wallet_mod, "payjoinInputTypeCheck"));
 }
 
 // ===========================================================================
-// G12: Sender "no new sender inputs" check — MISSING ENTIRELY
+// G12: Sender "no new sender inputs" check — CLOSED in FIX-66 (P0/CDIV/SECURITY)
 //
-// BUG-12 (P0/CDIV/SECURITY): The receiver MUST NOT add an input that was
-//   already in the Original PSBT (= one of the sender's inputs).  More
-//   subtly, the receiver MUST NOT add an input the sender owns.  Without
-//   this check (compare prevout sets), the receiver could trick the
-//   sender into signing a duplicate or self-input.
+// FIX-66 adds `wallet_mod.payjoinInputDisjoint` +
+// `rpc.PayjoinSender.checkInputDisjoint`.  Verifies that (a) the first N
+// inputs of the Proposal match the Original by prevout, and (b) every
+// receiver-added prevout is disjoint from the Original input set.  Test
+// coverage: `src/tests_fix66_payjoin_sender.zig` G12 cluster (positive:
+// disjoint inputs; negatives: duplicate prevout, dropped sender input).
+//
+// BUG-12 (P0/CDIV/SECURITY) — original audit text retained.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Sender's payment proposal checklist"
 // ===========================================================================
-test "w119/G12: sender input-set-disjoint check absent" {
+test "w119/G12: sender input-set-disjoint check present (FIX-66)" {
+    try testing.expect(@hasDecl(wallet_mod, "payjoinInputDisjoint"));
     try testing.expect(!@hasDecl(psbt_mod, "checkInputDisjoint"));
-    try testing.expect(!@hasDecl(wallet_mod, "payjoinInputDisjoint"));
 }
 
 // ===========================================================================
-// G13: Sender maxadditionalfeecontribution honored — MISSING ENTIRELY
+// G13: Sender maxadditionalfeecontribution honored — CLOSED in FIX-66 (HIGH)
 //
-// BUG-13 (HIGH): The sender quotes a maximum extra fee it will pay.
-//   The proposal's reduced fee-output value MUST satisfy
-//   `(original_fee_out - proposal_fee_out) <= maxadditionalfeecontribution`.
-//   No primitive evaluates this bound.
+// FIX-66 adds `wallet_mod.payjoinFeeContribCheck` +
+// `rpc.PayjoinSender.checkMaxAdditionalFee`.  Enforces the BIP-78 bound
+// `(orig_fee_out - prop_fee_out) <= maxadditionalfeecontribution` AND
+// the implicit "non-fee-output values may not decrease" rule.  Test
+// coverage: `src/tests_fix66_payjoin_sender.zig` G13 cluster (within
+// cap; exceeding cap; wrong fee_idx; default-0 cap).
+//
+// BUG-13 (HIGH) — original audit text retained.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Sender's payment proposal checklist (7)"
 // ===========================================================================
-test "w119/G13: sender max-fee-contrib enforcement absent" {
+test "w119/G13: sender max-fee-contrib enforcement present (FIX-66)" {
+    try testing.expect(@hasDecl(wallet_mod, "payjoinFeeContribCheck"));
     try testing.expect(!@hasDecl(psbt_mod, "checkMaxAdditionalFee"));
-    try testing.expect(!@hasDecl(wallet_mod, "payjoinFeeContribCheck"));
 }
 
 // ===========================================================================
-// G14: Sender disableoutputsubstitution honored — MISSING ENTIRELY
+// G14: Sender disableoutputsubstitution honored — CLOSED in FIX-66 (HIGH)
 //
-// BUG-14 (HIGH): When the sender sets `disableoutputsubstitution=true`
-//   (or BIP-21 `pjos=1`), the receiver MUST NOT substitute its receive
-//   output's scriptPubKey.  The sender SHOULD also re-check this in the
-//   proposal.  No such gate exists.
+// FIX-66 adds `wallet_mod.payjoinDisableOutSub` +
+// `rpc.PayjoinSender.checkOutputSubstitution`.  When the sender query
+// has `disable_output_substitution=true`, no Original output's
+// scriptPubKey may change in the Proposal.  Test coverage:
+// `src/tests_fix66_payjoin_sender.zig` G14 cluster (substitution
+// disabled + echo passes; disabled + spk changed rejects; permitted +
+// spk changed passes).
+//
+// BUG-14 (HIGH) — original audit text retained.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Optional parameters: disableoutputsubstitution"
 // ===========================================================================
-test "w119/G14: sender disable-output-substitution enforcement absent" {
+test "w119/G14: sender disable-output-substitution enforcement present (FIX-66)" {
+    try testing.expect(@hasDecl(wallet_mod, "payjoinDisableOutSub"));
     try testing.expect(!@hasDecl(psbt_mod, "checkOutputSubstitution"));
-    try testing.expect(!@hasDecl(wallet_mod, "payjoinDisableOutSub"));
 }
 
 // ===========================================================================
-// G15: Sender minfeerate floor — MISSING ENTIRELY
+// G15: Sender minfeerate floor — CLOSED in FIX-66 (HIGH)
 //
-// BUG-15 (HIGH): The sender provides `minfeerate` (sat/vB).  The
-//   proposal's effective fee rate MUST be >= minfeerate.  Without this
-//   floor, a receiver could starve the tx of fee and stall propagation.
+// FIX-66 adds `wallet_mod.payjoinMinFeeRate` +
+// `rpc.PayjoinSender.checkMinFeeRate`.  Sums input values from
+// witness-UTXO records, subtracts output values to get the fee, and
+// divides by a BIP-141 vbyte estimate (`10 + 68*n_in + 31*n_out`,
+// segwit-conservative).  Test coverage:
+// `src/tests_fix66_payjoin_sender.zig` G15 cluster (zero floor passes;
+// below floor rejects; above floor passes).
+//
+// BUG-15 (HIGH) — original audit text retained.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Optional parameters: minfeerate"
 // ===========================================================================
-test "w119/G15: sender min-fee-rate floor enforcement absent" {
+test "w119/G15: sender min-fee-rate floor enforcement present (FIX-66)" {
+    try testing.expect(@hasDecl(wallet_mod, "payjoinMinFeeRate"));
     try testing.expect(!@hasDecl(psbt_mod, "checkMinFeeRate"));
-    try testing.expect(!@hasDecl(wallet_mod, "payjoinMinFeeRate"));
 }
 
 // ===========================================================================
@@ -461,18 +505,25 @@ test "w119/G21: v=1 version-pin handler present (FIX-65)" {
 }
 
 // ===========================================================================
-// G22: Sender fallback to broadcast Original — MISSING ENTIRELY
+// G22: Sender fallback to broadcast Original — CLOSED in FIX-66 (HIGH)
 //
-// BUG-21 (HIGH): If the receiver returns an error or times out, the
-//   sender SHOULD broadcast the Original PSBT (signed) so the recipient
-//   still gets paid.  Without this fallback, a flaky PayJoin endpoint
-//   silently fails the payment.
+// FIX-66 adds `wallet_mod.payjoinFallback` +
+// `wallet_mod.broadcastPayjoinOriginal` (alias), mirrored on
+// `rpc.PayjoinSender`.  Both return a base64-serialized clone of the
+// Original PSBT so the caller can broadcast it via `sendrawtransaction`
+// after extracting the tx.  The `handleSendPayjoinRequest` JSON-RPC
+// method ALWAYS populates the `fallback` field of its response — even
+// when the PayJoin step succeeds — so callers can decide between
+// broadcasting the Proposal or the fallback at the very end.  Test
+// coverage: `src/tests_fix66_payjoin_sender.zig` G22 cluster.
+//
+// BUG-21 (HIGH) — original audit text retained.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Sender's payment flow"
 // ===========================================================================
-test "w119/G22: sender fallback-broadcast absent" {
-    try testing.expect(!@hasDecl(wallet_mod, "payjoinFallback"));
-    try testing.expect(!@hasDecl(wallet_mod, "broadcastPayjoinOriginal"));
+test "w119/G22: sender fallback-broadcast present (FIX-66)" {
+    try testing.expect(@hasDecl(wallet_mod, "payjoinFallback"));
+    try testing.expect(@hasDecl(wallet_mod, "broadcastPayjoinOriginal"));
 }
 
 // ===========================================================================
@@ -522,32 +573,47 @@ test "w119/G25: Tor onion-receiver publisher absent (Tor client present)" {
 }
 
 // ===========================================================================
-// G26: getpayjoinrequest RPC — MISSING ENTIRELY
+// G26: getpayjoinrequest RPC — CLOSED in FIX-66 (HIGH)
 //
-// BUG-25 (HIGH): Receivers expose this RPC to mint a fresh PayJoin URI
-//   (with embedded `pj=` endpoint).  clearbit has `getnewaddress` but no
-//   PayJoin URI generator.
+// FIX-66 adds `RpcServer.handleGetPayjoinRequest` + a module-level
+// `rpc.handleGetPayjoinRequest` alias.  Wired into the JSON-RPC
+// dispatcher as `getpayjoinrequest`.  Mints a BIP-21 URI carrying a
+// fresh receive address + the receiver's `pj=` endpoint (from the
+// `--payjoin-server-url` CLI flag or per-call override).  Test
+// coverage: `src/tests_fix66_payjoin_sender.zig` G26-G27 cluster.
+//
+// BUG-25 (HIGH) — original audit text retained.
 //
 // Spec ref: BTCPayServer payjoin reference: getpayjoinrequest
 // ===========================================================================
-test "w119/G26: getpayjoinrequest RPC absent" {
-    try testing.expect(!@hasDecl(rpc_mod, "handleGetPayjoinRequest"));
+test "w119/G26: getpayjoinrequest RPC present (FIX-66)" {
+    try testing.expect(@hasDecl(rpc_mod, "handleGetPayjoinRequest"));
+    // The lowercase spelling stays absent — Zig + the dispatcher use the
+    // PascalCase form; the camelCase alias would be sprawl.
     try testing.expect(!@hasDecl(rpc_mod, "handleGetpayjoinrequest"));
+    try testing.expect(@hasDecl(rpc_mod.RpcServer, "handleGetPayjoinRequest"));
 }
 
 // ===========================================================================
-// G27: sendpayjoinrequest RPC — MISSING ENTIRELY
+// G27: sendpayjoinrequest RPC — CLOSED in FIX-66 (HIGH)
 //
-// BUG-26 (HIGH): Senders use this RPC to: (a) construct an Original
-//   PSBT, (b) POST it to the receiver endpoint, (c) validate the
-//   proposal, (d) sign, (e) broadcast.  Roughly bumpfee-sized scope.
-//   Absent.
+// FIX-66 adds `RpcServer.handleSendPayjoinRequest` + a module-level
+// `rpc.handleSendPayjoinRequest` alias.  Wired into the JSON-RPC
+// dispatcher as `sendpayjoinrequest`.  Drives the full sender flow:
+// parse the supplied Original PSBT, POST to the receiver, validate the
+// Proposal against G10-G15, return `{"proposal":..., "fallback":...}`.
+// On any error path the response still carries the fallback PSBT for
+// G22 broadcast-Original behaviour.  Test coverage:
+// `src/tests_fix66_payjoin_sender.zig` G26-G27 cluster.
+//
+// BUG-26 (HIGH) — original audit text retained.
 //
 // Spec ref: BTCPayServer payjoin reference: sendpayjoinrequest
 // ===========================================================================
-test "w119/G27: sendpayjoinrequest RPC absent" {
-    try testing.expect(!@hasDecl(rpc_mod, "handleSendPayjoinRequest"));
+test "w119/G27: sendpayjoinrequest RPC present (FIX-66)" {
+    try testing.expect(@hasDecl(rpc_mod, "handleSendPayjoinRequest"));
     try testing.expect(!@hasDecl(rpc_mod, "handleSendpayjoinrequest"));
+    try testing.expect(@hasDecl(rpc_mod.RpcServer, "handleSendPayjoinRequest"));
 }
 
 // ===========================================================================
@@ -606,36 +672,72 @@ test "w119/G30: receiver replay-protect cache absent" {
 // W119 summary integrity gate
 // ===========================================================================
 
-test "w119: BIP-78 surface partial after FIX-62 (BIP-21) + FIX-65 (receiver foundation)" {
-    // The audit was originally honest about 10/10 MISSING ENTIRELY.  Two
+test "w119: BIP-78 surface partial after FIX-62 (BIP-21) + FIX-65 (receiver) + FIX-66 (sender)" {
+    // The audit was originally honest about 10/10 MISSING ENTIRELY.  Three
     // fix waves have flipped a strict subset of gates:
     //   - FIX-62 closed G28 + G29 (BIP-21 URI parser, universal prereq).
     //   - FIX-65 closed G1 + G16 + G17 + G21 (receiver-side foundation:
     //     POST /payjoin route, query parser, 4 error codes, v=1 pin).
+    //   - FIX-66 closed G2 + G10-G15 + G22 + G26 + G27 (sender HTTP +
+    //     6 anti-snoop validators + G22 fallback + 2 RPCs).
     // Every other PayJoin-specific decl remains expected absent.  This
     // summary gate fails loudly if a future fix adds a deferred-shape
     // decl without removing the corresponding `@hasDecl` assertion in
     // its per-gate test above — exactly the desired CI signal.
     //
-    // What MUST be present (closed by FIX-65):
-    const foundation_present = @hasDecl(rpc_mod, "PayjoinHandler") and
+    // What MUST be present (closed by FIX-65 + FIX-66):
+    const receiver_foundation_present = @hasDecl(rpc_mod, "PayjoinHandler") and
         @hasDecl(rpc_mod.RpcServer, "handlePayjoinRequest") and
         @hasDecl(rpc_mod, "parsePayjoinQuery") and
         @hasDecl(rpc_mod, "PayjoinQuery") and
         @hasDecl(rpc_mod, "PayjoinError") and
         @hasDecl(rpc_mod, "PAYJOIN_VERSION") and
         @hasDecl(rpc_mod, "checkPayjoinVersion");
-    try testing.expect(foundation_present);
+    try testing.expect(receiver_foundation_present);
+    const sender_foundation_present = @hasDecl(rpc_mod, "PayjoinSender") and
+        @hasDecl(rpc_mod, "handleGetPayjoinRequest") and
+        @hasDecl(rpc_mod, "handleSendPayjoinRequest") and
+        @hasDecl(rpc_mod, "PayjoinSenderConfig") and
+        @hasDecl(rpc_mod.RpcServer, "setPayjoinEndpoint") and
+        @hasDecl(wallet_mod, "sendPayjoinRequest") and
+        @hasDecl(wallet_mod, "postOriginalPsbt") and
+        @hasDecl(wallet_mod, "validatePayjoinProposal") and
+        @hasDecl(wallet_mod, "payjoinAntiSnoop") and
+        @hasDecl(wallet_mod, "payjoinInputTypeCheck") and
+        @hasDecl(wallet_mod, "payjoinInputDisjoint") and
+        @hasDecl(wallet_mod, "payjoinFeeContribCheck") and
+        @hasDecl(wallet_mod, "payjoinDisableOutSub") and
+        @hasDecl(wallet_mod, "payjoinMinFeeRate") and
+        @hasDecl(wallet_mod, "payjoinFallback") and
+        @hasDecl(wallet_mod, "broadcastPayjoinOriginal");
+    try testing.expect(sender_foundation_present);
 
     // What MUST remain absent (deferred to future fix waves):
-    const still_absent = !@hasDecl(rpc_mod, "PayjoinServer") and
-        !@hasDecl(wallet_mod, "sendPayjoinRequest") and
-        !@hasDecl(psbt_mod, "validateOriginalPsbt") and
-        !@hasDecl(psbt_mod, "validatePayjoinProposal") and
-        !@hasDecl(rpc_mod, "handleGetPayjoinRequest") and
-        !@hasDecl(rpc_mod, "handleSendPayjoinRequest") and
+    //   - PayjoinServer namespace + Tls* / Onion* receivers (G3/G24/G25)
+    //   - Implementation Suggestions (G18/G19/G20/G30)
+    //   - psbt-side validator (would be API sprawl — kept on wallet)
+    //
+    // CRITICAL: `TlsClient` MUST stay absent.  FIX-66 introduces an HTTP
+    // client *without* a `TlsClient` decl — `std.http.Client` is used
+    // inline.  This is the smart-deferral marker the W119/G24 audit gate
+    // is tracking.  Adding a `pub const TlsClient = ...` alias would
+    // silently mute the gate without delivering working TLS.
+    const tls_client_still_absent =
+        !@hasDecl(rpc_mod, "TlsClient") and
+        !@hasDecl(rpc_mod, "TlsRpcServer") and
         !@hasDecl(rpc_mod, "TlsPayjoinServer") and
         !@hasDecl(rpc_mod, "OnionPayjoinServer") and
-        !@hasDecl(rpc_mod, "PayjoinReplayCache");
-    try testing.expect(still_absent);
+        !@hasDecl(rpc_mod, "publishOnionService") and
+        !@hasDecl(wallet_mod, "validateTlsCert");
+    try testing.expect(tls_client_still_absent);
+
+    const other_deferrals_still_absent =
+        !@hasDecl(rpc_mod, "PayjoinServer") and
+        !@hasDecl(psbt_mod, "validateOriginalPsbt") and
+        !@hasDecl(psbt_mod, "validatePayjoinProposal") and
+        !@hasDecl(rpc_mod, "PayjoinReplayCache") and
+        !@hasDecl(rpc_mod, "PayjoinRequestCache") and
+        !@hasDecl(wallet_mod, "PayjoinClient") and
+        !@hasDecl(wallet_mod, "lockPayjoinUtxo");
+    try testing.expect(other_deferrals_still_absent);
 }

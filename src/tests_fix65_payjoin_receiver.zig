@@ -373,20 +373,25 @@ test "fix65/audit: receiver-foundation decls present (G1+G16+G17+G21 flipped)" {
     try testing.expect(@hasDecl(rpc, "checkPayjoinVersion"));
 }
 
-test "fix65/audit: deferred sender + Implementation Suggestions decls remain ABSENT" {
-    // G2: sender HTTP client — deferred.
+test "fix65/audit: deferred Implementation Suggestions + transport-TLS decls remain ABSENT" {
+    // G2 + G10-G15 + G22 + G26 + G27 closed in FIX-66.  See the
+    // `fix66/integrity` test for the load-bearing assertion that the
+    // sender foundation is present.  Here we keep only the assertions
+    // that have NOT been closed by FIX-65 OR FIX-66:
     const wallet_mod = @import("wallet.zig");
-    try testing.expect(!@hasDecl(wallet_mod, "sendPayjoinRequest"));
-    try testing.expect(!@hasDecl(wallet_mod, "postOriginalPsbt"));
-    // G10/G12/G13/G14/G15: sender anti-snoop validators — deferred.
-    try testing.expect(!@hasDecl(wallet_mod, "validatePayjoinProposal"));
-    try testing.expect(!@hasDecl(wallet_mod, "payjoinAntiSnoop"));
     // G18/G19/G20/G30: implementation suggestions — deferred.
     try testing.expect(!@hasDecl(rpc, "PayjoinRequestCache"));
     try testing.expect(!@hasDecl(rpc, "PayjoinReplayCache"));
     try testing.expect(!@hasDecl(wallet_mod, "lockPayjoinUtxo"));
-    // G25 Tor / G24 TLS receiver-side — deferred (W119/G3 + G24).
+    // G25 Tor / G24 TLS receiver-side / G24 TLS client-side — deferred
+    // (W119/G3 + G24).  FIX-66 added the HTTP client without a
+    // `TlsClient` alias, preserving the gate.
     try testing.expect(!@hasDecl(rpc, "TlsPayjoinServer"));
     try testing.expect(!@hasDecl(rpc, "OnionPayjoinServer"));
     try testing.expect(!@hasDecl(rpc, "publishOnionService"));
+    try testing.expect(!@hasDecl(rpc, "TlsClient"));
+    // `PayjoinClient` (the wallet-side alias) deliberately stays absent
+    // — `sendPayjoinRequest` covers the same surface without adding a
+    // namespace just to mirror BTCPayServer's package layout.
+    try testing.expect(!@hasDecl(wallet_mod, "PayjoinClient"));
 }

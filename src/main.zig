@@ -64,6 +64,12 @@ pub const Config = struct {
     rpc_tls_cert: ?[]const u8 = null,
     rpc_tls_key: ?[]const u8 = null,
 
+    // BIP-78 PayJoin sender endpoint URL (FIX-66 + W119/G27).  Plain HTTP
+    // only on this build — `https://` is rejected at startup with a
+    // TLS-client-deferral message.  Consumed by the JSON-RPC methods
+    // `getpayjoinrequest` (G26) + `sendpayjoinrequest` (G27).
+    payjoin_server_url: ?[]const u8 = null,
+
     // Storage
     datadir: []const u8 = "~/.clearbit",
     prune: u64 = 0, // 0 = no pruning, else target size in MiB
@@ -239,6 +245,12 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             config.rpc_tls_cert = arg["--rpc-tls-cert=".len..];
         } else if (std.mem.startsWith(u8, arg, "--rpc-tls-key=")) {
             config.rpc_tls_key = arg["--rpc-tls-key=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--payjoin-server-url=")) {
+            // W119/G27 + FIX-66 — operator-supplied BIP-78 PayJoin
+            // receiver endpoint.  Must start with `http://` (plain HTTP
+            // only on this build; `https://` is rejected at the sender
+            // RPC layer with a TLS-client-deferral message).
+            config.payjoin_server_url = arg["--payjoin-server-url=".len..];
         } else if (std.mem.startsWith(u8, arg, "--metricsport=")) {
             config.metrics_port = std.fmt.parseInt(u16, arg["--metricsport=".len..], 10) catch
                 return ArgParseError.InvalidPortNumber;
@@ -478,6 +490,14 @@ pub fn printUsage() void {
         \\                         both flags today fails fast with a clear
         \\                         TlsServerUnavailable error at startup so
         \\                         operators do not silently get plain HTTP.
+        \\  --payjoin-server-url=<url> BIP-78 PayJoin receiver endpoint
+        \\                         consumed by the `sendpayjoinrequest` +
+        \\                         `getpayjoinrequest` JSON-RPC methods.
+        \\                         Plain HTTP only (W119/G24 deferral) — an
+        \\                         `https://` URL is rejected at RPC call
+        \\                         time with a TlsClientUnavailable-shape
+        \\                         JSON error.  Front receiver endpoints
+        \\                         with nginx / Caddy / Tor for production.
         \\
         \\Storage options:
         \\  --datadir=<dir>        Data directory (default: ~/.clearbit)
@@ -660,6 +680,10 @@ pub fn loadConfigFile(
                 config.rpc_tls_cert = value;
             } else if (std.mem.eql(u8, key, "rpc-tls-key") or std.mem.eql(u8, key, "rpctlskey")) {
                 config.rpc_tls_key = value;
+            }
+            // W119 + FIX-66: BIP-78 PayJoin receiver endpoint URL.
+            else if (std.mem.eql(u8, key, "payjoin-server-url") or std.mem.eql(u8, key, "payjoinserverurl")) {
+                config.payjoin_server_url = value;
             }
             // P2P settings
             else if (std.mem.eql(u8, key, "port")) {
@@ -1899,6 +1923,10 @@ pub fn main() !void {
     );
     defer rpc_server.deinit();
     rpc_server.setChainManager(&chain_manager);
+    // W119/G27 + FIX-66: wire the PayJoin receiver endpoint URL so the
+    // `getpayjoinrequest` + `sendpayjoinrequest` RPC handlers can pick
+    // it up.  Borrowed slice — kept alive by the config block above.
+    rpc_server.setPayjoinEndpoint(config.payjoin_server_url);
 
     // 7b. Daemonize BEFORE installing signal handlers so the pre-daemon
     // parent never sees them. This must also run before any thread is
