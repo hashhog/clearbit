@@ -722,19 +722,272 @@ test "w120 G25: bumpfee — wallet.bumpFee + wallet.psbtBumpFee exported" {
 
 // ===========================================================================
 // G26: `prioritisetransaction` RPC
-// Status: MISSING ENTIRELY.
+// Status: PRESENT (FIX-72 W120 BUG-11 closed).
 //
-// No `prioritisetransaction` method dispatch in rpc.zig.  Mempool has no
-// `priority_delta` per-entry field.  Operators cannot manually bump fee
-// for mining-template purposes (which is the Core RPC's purpose, distinct
-// from BIP-125 RBF but in the same operational surface).
+// FIX-72 W120 BUG-11 closed: `Mempool.prioritiseTransaction(txid, delta)`
+// records the delta in `map_deltas`. `Mempool.getModifiedFee(entry)`
+// returns `entry.fee + applyDelta(txid)`. The dispatch table now
+// recognises `prioritisetransaction` and `getprioritisedtransactions`,
+// and the modified fee is consulted on every Core-equivalent path:
+//   - RBF Rule 3 / 4 absolute-fee comparison (checkRBFRules) — uses
+//     modified fees on BOTH sides (evicted set + new tx). Mirrors
+//     Core validation.cpp:930/1006/1090.
+//   - Mempool min-fee admission gate (addTransaction step 6) — Core
+//     CheckFeeRate(ws.m_vsize, ws.m_modified_fees) at validation.cpp:948.
+//   - Cluster linearisation `mining_score` — Core m_txgraph SetTransactionFee
+//     called inside PrioritiseTransaction (txmempool.cpp:641).
+//   - block_template.zig block_min_fee_rate gate uses modified fee.
+//   - getmempoolentry `modifiedfee` and `fees.modified` JSON fields —
+//     Core rpc/mempool.cpp:529 fees.pushKV("modified", GetModifiedFee).
+//
+// Deltas are NOT persisted across restarts (mempool_persist.zig still
+// emits an empty mapDeltas section), matching the FIX-72 task spec.
 
-// BUG-11 (MEDIUM): prioritisetransaction RPC completely absent. Operators
-// running a miner cannot bump a stuck tx's priority without an actual
-// on-chain RBF replacement.
+test "w120 G26 (FIX-72): prioritiseTransaction adds delta; getModifiedFee reflects it" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
 
-test "w120 G26: prioritisetransaction RPC — MISSING ENTIRELY" {
-    return error.SkipZigTest;
+    // Build a non-signalling tx and admit it.
+    const spk = w120FixP2WPKHScript();
+    const prev: [32]u8 = .{0x77} ** 32;
+    const out = types.TxOut{ .value = 100_000, .script_pubkey = &spk };
+    const inp = types.TxIn{
+        .previous_output = .{ .hash = prev, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{inp},
+        .outputs = &[_]types.TxOut{out},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx);
+    const txid = try crypto_mod.computeTxid(&tx, allocator);
+
+    // No delta yet — modified fee == base fee.
+    const entry = mempool.entries.get(txid).?;
+    try testing.expectEqual(entry.fee, mempool.getModifiedFee(entry));
+    try testing.expectEqual(@as(i64, 0), mempool.applyDelta(txid));
+
+    // Add +5000 sats.
+    const post = try mempool.prioritiseTransaction(txid, 5000);
+    try testing.expectEqual(@as(i64, 5000), post);
+    try testing.expectEqual(@as(i64, 5000), mempool.applyDelta(txid));
+
+    const entry2 = mempool.entries.get(txid).?;
+    try testing.expectEqual(entry2.fee + @as(i64, 5000), mempool.getModifiedFee(entry2));
+
+    // Stacking: prioritise again with +3000; total should be 8000.
+    const post2 = try mempool.prioritiseTransaction(txid, 3000);
+    try testing.expectEqual(@as(i64, 8000), post2);
+    try testing.expectEqual(@as(i64, 8000), mempool.applyDelta(txid));
+}
+
+test "w120 G26 (FIX-72): RBF Rule 3 modified fee — positive delta wins against equal-base-fee competitor" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const spk = w120FixP2WPKHScript();
+
+    // Admit existing tx A signaling opt-in RBF, spending outpoint X.
+    const outpoint_x: [32]u8 = .{0xAA} ** 32;
+    const out_a = types.TxOut{ .value = 90_000, .script_pubkey = &spk };
+    const in_a = types.TxIn{
+        .previous_output = .{ .hash = outpoint_x, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD, // signals RBF
+        .witness = &[_][]const u8{},
+    };
+    const tx_a = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{in_a},
+        .outputs = &[_]types.TxOut{out_a},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx_a);
+    const txid_a = try crypto_mod.computeTxid(&tx_a, allocator);
+
+    // Build replacement tx B that also spends outpoint X but with EQUAL base
+    // fees — the only thing that could let it pass Rule 3 is a priority delta
+    // on the replacement. Without FIX-72 this would be `new_fee == evicted_fee`
+    // which passes >= equality but Rule 4 ("additional_fee >= incremental")
+    // strictly requires headroom from the modified-fee delta.
+    //
+    // With chain_state=null, fees are computed as 0 for both, so we cannot
+    // exercise the fee comparison in checkRBFRules through addTransaction
+    // (which uses fee=0 → comparison degenerates to 0 vs 0). We verify the
+    // wiring at the unit level instead: prioritising the replacement txid
+    // before checkRBFRules is invoked makes getModifiedFee(new_txid)
+    // strictly greater than getModifiedFee(evicted_set).
+    const out_b = types.TxOut{ .value = 80_000, .script_pubkey = &spk };
+    const in_b = types.TxIn{
+        .previous_output = .{ .hash = outpoint_x, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_b = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{in_b},
+        .outputs = &[_]types.TxOut{out_b},
+        .lock_time = 0,
+    };
+    const txid_b = try crypto_mod.computeTxid(&tx_b, allocator);
+
+    // Pre-set a +1000 delta on the (not-yet-admitted) replacement txid —
+    // Core supports pre-setting deltas on absent txids (txmempool.cpp:630).
+    _ = try mempool.prioritiseTransaction(txid_b, 1000);
+
+    // Sanity: replacement's modified fee = base + 1000; evicted (a) base = 0
+    // (chain_state==null). The RBF Rule 3 path inside checkRBFRules sums
+    // modified fees on both sides, so the relevant invariant is:
+    //   new_modified_fee > total_evicted_modified_fee
+    const entry_a = mempool.entries.get(txid_a).?;
+    const total_evicted_modified: i64 = mempool.getModifiedFee(entry_a);
+    const new_modified: i64 = 0 + mempool.applyDelta(txid_b); // fee=0 in test env
+    try testing.expect(new_modified > total_evicted_modified);
+
+    // Invoke checkRBFRules directly to exercise the comparison branch.
+    // Note: total_evicted_modified is 0 here, new_modified=1000 → Rule 3 PASSES
+    // because of the priority delta. Without FIX-72 wiring, the rule path
+    // would use the raw replacement fee (0) and the rule path would still
+    // accept (0 >= 0); we re-check this with a richer scenario in the next test.
+    const result = mempool.checkRBFRules(&tx_b, txid_b, 0, 100, &[_]types.Hash256{txid_a});
+    // No error: replacement (modified fee 1000) >= evicted (0) and additional
+    // fee 1000 >= INCREMENTAL_RELAY_FEE * 100 / 1000 = 100 INCREMENTAL_RELAY_FEE.
+    // INCREMENTAL_RELAY_FEE = 1000 sat/kvB → for vsize=100, min_additional_fee = 100.
+    // 1000 >= 100 ✓.
+    try result;
+}
+
+test "w120 G26 (FIX-72): RBF Rule 3 negative delta loses" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const spk = w120FixP2WPKHScript();
+    const outpoint_y: [32]u8 = .{0xBB} ** 32;
+
+    // Admit signalling tx A with base fee 0 (no chain state).
+    const out_a = types.TxOut{ .value = 50_000, .script_pubkey = &spk };
+    const in_a = types.TxIn{
+        .previous_output = .{ .hash = outpoint_y, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_a = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{in_a},
+        .outputs = &[_]types.TxOut{out_a},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx_a);
+    const txid_a = try crypto_mod.computeTxid(&tx_a, allocator);
+
+    // Give the EVICTED tx A a positive priority delta so its modified fee is
+    // 10_000. The replacement has fee=0 (test env) and no delta. checkRBFRules
+    // should reject under Rule 3 because new_modified (0) < evicted_modified (10_000).
+    _ = try mempool.prioritiseTransaction(txid_a, 10_000);
+
+    const out_b = types.TxOut{ .value = 40_000, .script_pubkey = &spk };
+    const in_b = types.TxIn{
+        .previous_output = .{ .hash = outpoint_y, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_b = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{in_b},
+        .outputs = &[_]types.TxOut{out_b},
+        .lock_time = 0,
+    };
+    const txid_b = try crypto_mod.computeTxid(&tx_b, allocator);
+
+    const result = mempool.checkRBFRules(&tx_b, txid_b, 0, 100, &[_]types.Hash256{txid_a});
+    try testing.expectError(mempool_mod.MempoolError.ReplacementFeeTooLow, result);
+}
+
+test "w120 G26 (FIX-72): delta + opposite delta = zero (cancellation erases entry)" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const txid: [32]u8 = .{0xCC} ** 32;
+
+    _ = try mempool.prioritiseTransaction(txid, 7500);
+    try testing.expectEqual(@as(i64, 7500), mempool.applyDelta(txid));
+    try testing.expect(mempool.map_deltas.contains(txid));
+
+    _ = try mempool.prioritiseTransaction(txid, -7500);
+    try testing.expectEqual(@as(i64, 0), mempool.applyDelta(txid));
+    // Core erases the entry from mapDeltas when the running sum becomes 0
+    // (txmempool.cpp:644).
+    try testing.expect(!mempool.map_deltas.contains(txid));
+}
+
+test "w120 G26 (FIX-72): delta lost on re-init (matches Core 'not persisted' invariant)" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    const txid: [32]u8 = .{0xDD} ** 32;
+    _ = try mempool.prioritiseTransaction(txid, 12345);
+    try testing.expectEqual(@as(i64, 12345), mempool.applyDelta(txid));
+    mempool.deinit();
+
+    // Fresh mempool — `map_deltas` is initialised empty on init(). Core's
+    // mapDeltas is in-memory only; mempool_persist.zig already writes an
+    // empty mapDeltas section on dumpmempool, so a load+restart drops every
+    // delta.
+    var mempool2 = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool2.deinit();
+    try testing.expectEqual(@as(i64, 0), mempool2.applyDelta(txid));
+    try testing.expect(!mempool2.map_deltas.contains(txid));
+}
+
+test "w120 G26 (FIX-72): forward-regression guard — checkRBFRules uses MODIFIED fees on both sides" {
+    // Source-level guard pinning the FIX-72 wiring inside checkRBFRules. A
+    // future drive-by change that swapped EITHER side of the Rule 3 comparison
+    // back to raw `entry.fee` (instead of `getModifiedFee(entry)`) would
+    // silently disable prioritisetransaction's effect on RBF. We assert:
+    //   1. checkRBFRules's evicted accumulator uses `getModifiedFee(entry)`.
+    //   2. checkRBFRules computes `new_modified_fee = new_fee + applyDelta(new_txid)`.
+    //   3. The Rule 3 comparison reads `new_modified_fee`, not `new_fee`.
+    const src = @embedFile("mempool.zig");
+
+    // Marker for the evicted-side modified-fee accumulation.
+    const evicted_marker = "total_evicted_fee += self.getModifiedFee(entry)";
+    try testing.expect(std.mem.indexOf(u8, src, evicted_marker) != null);
+
+    // Marker for the replacement-side modified fee.
+    const new_marker = "const new_modified_fee: i64 = new_fee + self.applyDelta(new_txid)";
+    try testing.expect(std.mem.indexOf(u8, src, new_marker) != null);
+
+    // The Rule 3 comparison must reference new_modified_fee, not the raw new_fee.
+    const rule3_marker = "if (new_modified_fee < total_evicted_fee)";
+    try testing.expect(std.mem.indexOf(u8, src, rule3_marker) != null);
+
+    // And the legacy `if (new_fee < total_evicted_fee)` form — which would
+    // silently bypass priority deltas — must NOT be present.
+    const bad_form = "if (new_fee < total_evicted_fee)";
+    try testing.expect(std.mem.indexOf(u8, src, bad_form) == null);
+}
+
+test "w120 G26 (FIX-72): prioritisetransaction RPC dispatch is wired" {
+    // Source-level guard pinning the new dispatch entries. A revert that
+    // dropped the RPC dispatch (so operators can't call the method) would
+    // fail this test FIRST inside the W120 file.
+    const src = @embedFile("rpc.zig");
+    const dispatch_marker = "std.mem.eql(u8, method, \"prioritisetransaction\")";
+    const handler_call = "self.handlePrioritiseTransaction(params, id)";
+    const handler_decl = "fn handlePrioritiseTransaction";
+    try testing.expect(std.mem.indexOf(u8, src, dispatch_marker) != null);
+    try testing.expect(std.mem.indexOf(u8, src, handler_call) != null);
+    try testing.expect(std.mem.indexOf(u8, src, handler_decl) != null);
 }
 
 // ===========================================================================
