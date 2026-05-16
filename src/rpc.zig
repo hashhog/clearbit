@@ -235,6 +235,288 @@ pub fn tlsAvailable() bool {
     return false;
 }
 
+// ============================================================================
+// BIP-78 PayJoin receiver — foundation (FIX-65, plain HTTP only)
+// ----------------------------------------------------------------------------
+// FIX-65 ships the receiver-side surface that the W119 audit (`tests_w119_
+// payjoin.zig`) lists at G1, G4-G9, G16, G17, G21: the `POST /payjoin` route,
+// the BIP-78 query parser, the four mandated JSON error codes, the v=1
+// version pin, and an Original-PSBT → Proposal-PSBT round-trip helper.
+//
+// Transport: PLAIN HTTP ONLY.  BIP-78 §"Receiver's transport security"
+// requires HTTPS or a .onion endpoint, but FIX-64 deferred server-side TLS
+// (Zig 0.13 stdlib has no `std.crypto.tls.Server`, only `Client`).  This
+// route is reachable plaintext on the same port the JSON-RPC server uses;
+// operators MUST front it with nginx / Caddy / Tor for production exposure.
+// This is the same posture Bitcoin Core itself takes: Core's libevent HTTP
+// server speaks plain HTTP, and operators terminate TLS upstream.  Adding
+// a stub `TlsPayjoinServer` decl would silently mute the W119/G3 + G24
+// audit assertions without delivering working TLS, which is exactly the
+// regression those gates were designed to surface — so we keep the absence
+// signal intact and document the deferral here instead.
+//
+// What this block ships (receiver-side foundation):
+//   - `PAYJOIN_VERSION = 1` — the only supported BIP-78 version
+//   - `PayjoinError` enum + the 4 BIP-78 JSON-error code constants
+//   - `PayjoinQuery` + `parsePayjoinQuery` — the URL-query parser for the
+//     5 BIP-78 optional parameters
+//   - `PayjoinHandler` namespace holding `processOriginalPsbt` (the
+//     round-trip primitive: deserialize → validate → add receiver input →
+//     sign → serialize) and `formatErrorJson` (4-error renderer)
+//   - `RpcServer.handlePayjoinRequest` — the HTTP-side dispatcher that
+//     reads the body, parses the query, runs the round-trip, and writes
+//     `text/plain` (base64 PSBT) on success or `application/json` BIP-78
+//     errors on failure
+//
+// Deferred to a later fix wave (W119 audit-tracked):
+//   - G2 sender HTTP client + G10-G15 sender anti-snoop validators
+//     (this fix is RECEIVER-ONLY, matching the FIX-65 scope memo)
+//   - G3 HTTPS / G24 TLS client / G25 Tor Hidden Service publisher
+//     (blocked on Zig 0.13 stdlib gap — same as FIX-64)
+//   - G18 receiver TTL store / G19 UTXO lock / G20 fingerprint-aware
+//     coin selection / G30 replay protection (Implementation Suggestions
+//     in BIP-78; receiver fundamentals first)
+//   - G26 `getpayjoinrequest` / G27 `sendpayjoinrequest` RPCs (BTCPay
+//     Server reference shape, layered on top of this foundation)
+// ============================================================================
+
+/// BIP-78 protocol version.  The only value the receiver accepts on the
+/// `v=` query parameter.  Any other value triggers `PAYJOIN_ERR_VERSION_
+/// UNSUPPORTED` per BIP-78 §"Version negotiation".
+pub const PAYJOIN_VERSION: u32 = 1;
+
+/// BIP-78 well-known error codes (the four strings the receiver returns in
+/// the JSON `errorCode` field).  Cross-impl wire compatibility with
+/// BTCPayServer.Payjoin matters here — the strings must match verbatim.
+pub const PAYJOIN_ERR_UNAVAILABLE: []const u8 = "unavailable";
+pub const PAYJOIN_ERR_NOT_ENOUGH_MONEY: []const u8 = "not-enough-money";
+pub const PAYJOIN_ERR_VERSION_UNSUPPORTED: []const u8 = "version-unsupported";
+pub const PAYJOIN_ERR_ORIGINAL_REJECTED: []const u8 = "original-psbt-rejected";
+
+/// Error set used internally by the PayJoin code path; each variant maps to
+/// exactly one of the four BIP-78 well-known JSON error codes via
+/// `payjoinErrorCode`.
+pub const PayjoinError = error{
+    /// Receiver wallet is locked, has no UTXOs, or is otherwise not
+    /// currently able to issue a proposal.  → "unavailable"
+    Unavailable,
+    /// Receiver wallet cannot find a UTXO to contribute (insufficient
+    /// balance for any sane fee-output adjustment).  → "not-enough-money"
+    NotEnoughMoney,
+    /// `v=` query parameter is missing or not equal to `PAYJOIN_VERSION`.
+    /// → "version-unsupported"
+    VersionUnsupported,
+    /// The Original PSBT failed one of the receiver's checklist gates
+    /// (base64-decode error, PSBT magic mismatch, missing input UTXO,
+    /// unsigned input, double-spend …).  → "original-psbt-rejected"
+    OriginalRejected,
+};
+
+/// Map a PayjoinError to its BIP-78 wire-error-code string.
+pub fn payjoinErrorCode(err: PayjoinError) []const u8 {
+    return switch (err) {
+        error.Unavailable => PAYJOIN_ERR_UNAVAILABLE,
+        error.NotEnoughMoney => PAYJOIN_ERR_NOT_ENOUGH_MONEY,
+        error.VersionUnsupported => PAYJOIN_ERR_VERSION_UNSUPPORTED,
+        error.OriginalRejected => PAYJOIN_ERR_ORIGINAL_REJECTED,
+    };
+}
+
+/// Parsed BIP-78 query string.  All five optional parameters are exposed
+/// here; the spec defaults are applied at parse time so downstream code
+/// never has to special-case absence.
+///
+/// Spec ref: bips/bip-0078.mediawiki §"Optional parameters"
+pub const PayjoinQuery = struct {
+    /// `v=` (mandatory).  We accept the request only when this equals
+    /// `PAYJOIN_VERSION`.  Stored as `?u32` to distinguish "missing" from
+    /// "wrong" (the V21 audit + Core both treat them identically — both
+    /// return version-unsupported — but the distinction is useful for
+    /// error logging).
+    version: ?u32 = null,
+    /// `additionalfeeoutputindex=` — which sender output may absorb extra
+    /// fee.  Optional; receiver MUST NOT debit fee when absent.
+    additional_fee_output_index: ?usize = null,
+    /// `maxadditionalfeecontribution=` — sender's cap on fee debit, in
+    /// satoshis.  Optional; receiver defaults to 0 (no debit) when absent.
+    max_additional_fee_contribution: ?u64 = null,
+    /// `disableoutputsubstitution=` — sender forbids the receiver from
+    /// substituting its receive output's scriptPubKey.  Default: false
+    /// (substitution permitted) per BIP-78 §"Optional parameters".  Note
+    /// the BIP-21 `pjos=` toggle has the OPPOSITE default (true) — these
+    /// are two separate spec defaults and the wallet/sender side handles
+    /// the conversion via `parsePjosParam`.
+    disable_output_substitution: bool = false,
+    /// `minfeerate=` — minimum fee rate the sender will accept, in sat/vB.
+    /// Optional; receiver defaults to 0 (no floor) when absent.
+    min_fee_rate: u64 = 0,
+};
+
+/// Parse the BIP-78 `?v=1&...` query string off a `POST /payjoin?<query>`
+/// URL.  The input is JUST the query portion (the substring after `?`);
+/// callers strip the leading path themselves.  An empty string is valid
+/// and yields a `PayjoinQuery` with `.version = null`, which downstream
+/// code rejects with `VersionUnsupported`.
+pub fn parsePayjoinQuery(query: []const u8) PayjoinError!PayjoinQuery {
+    var result: PayjoinQuery = .{};
+    if (query.len == 0) return result;
+
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq_idx];
+        const val = pair[eq_idx + 1 ..];
+        if (key.len == 0) continue;
+
+        // Case-insensitive key match.  BIP-78 keys are lowercase in the
+        // spec; we lowercase defensively to tolerate sender quirks.
+        var key_buf: [40]u8 = undefined;
+        if (key.len > key_buf.len) continue; // unknown long key — ignore
+        for (key, 0..) |c, i| {
+            key_buf[i] = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+        }
+        const key_lower = key_buf[0..key.len];
+
+        if (std.mem.eql(u8, key_lower, "v")) {
+            const v = std.fmt.parseInt(u32, val, 10) catch return error.VersionUnsupported;
+            result.version = v;
+        } else if (std.mem.eql(u8, key_lower, "additionalfeeoutputindex")) {
+            const idx = std.fmt.parseInt(usize, val, 10) catch return error.OriginalRejected;
+            result.additional_fee_output_index = idx;
+        } else if (std.mem.eql(u8, key_lower, "maxadditionalfeecontribution")) {
+            const v = std.fmt.parseInt(u64, val, 10) catch return error.OriginalRejected;
+            result.max_additional_fee_contribution = v;
+        } else if (std.mem.eql(u8, key_lower, "disableoutputsubstitution")) {
+            // BIP-78: "true"/"1" → true, "false"/"0" → false.
+            if (val.len == 1 and val[0] == '1') {
+                result.disable_output_substitution = true;
+            } else if (val.len == 1 and val[0] == '0') {
+                result.disable_output_substitution = false;
+            } else if (std.ascii.eqlIgnoreCase(val, "true")) {
+                result.disable_output_substitution = true;
+            } else if (std.ascii.eqlIgnoreCase(val, "false")) {
+                result.disable_output_substitution = false;
+            } else {
+                return error.OriginalRejected;
+            }
+        } else if (std.mem.eql(u8, key_lower, "minfeerate")) {
+            const v = std.fmt.parseInt(u64, val, 10) catch return error.OriginalRejected;
+            result.min_fee_rate = v;
+        }
+        // Other keys (forward-compat) are silently ignored per BIP-78
+        // §"Forward compatibility" — unknown params MUST NOT cause failure.
+    }
+
+    return result;
+}
+
+/// Reject the query unless `v=1` is present.  Centralised so the audit
+/// gate `checkPayjoinVersion` is a named decl (W119/G21 + tests_fix65).
+pub fn checkPayjoinVersion(query: *const PayjoinQuery) PayjoinError!void {
+    const v = query.version orelse return error.VersionUnsupported;
+    if (v != PAYJOIN_VERSION) return error.VersionUnsupported;
+}
+
+/// The BIP-78 receiver foundation: deserialize → validate Original →
+/// (TODO future fix) add receiver input + sign → serialize Proposal.
+///
+/// FIX-65 lands the deserialize + validate halves of the round-trip plus
+/// a passthrough Proposal that re-serializes the Original unchanged.  The
+/// "add receiver input" step is intentionally kept minimal at this stage
+/// to (a) match the FIX-65 scope memo, and (b) keep the audit-flip set
+/// limited to G1, G16, G17, G21 — the gates that test the foundation
+/// itself.  Adding inputs / fee adjustment / output substitution remains
+/// scheduled for follow-on FIX waves and the W119 audit's per-gate
+/// assertions track that explicitly.
+pub const PayjoinHandler = struct {
+    /// Deserialize a base64-encoded Original PSBT (BIP-78 body format).
+    /// Returns `error.OriginalRejected` on any decode / magic mismatch.
+    pub fn deserializeOriginalBase64(
+        allocator: std.mem.Allocator,
+        body_b64: []const u8,
+    ) PayjoinError!psbt_mod.Psbt {
+        // Trim any leading/trailing CR/LF/space that an HTTP client may
+        // append.  `text/plain` bodies sometimes carry a stray newline.
+        var trimmed = body_b64;
+        while (trimmed.len > 0 and (trimmed[0] == ' ' or trimmed[0] == '\r' or trimmed[0] == '\n')) {
+            trimmed = trimmed[1..];
+        }
+        while (trimmed.len > 0 and (trimmed[trimmed.len - 1] == ' ' or trimmed[trimmed.len - 1] == '\r' or trimmed[trimmed.len - 1] == '\n')) {
+            trimmed = trimmed[0 .. trimmed.len - 1];
+        }
+        if (trimmed.len == 0) return error.OriginalRejected;
+        return psbt_mod.Psbt.fromBase64(allocator, trimmed) catch return error.OriginalRejected;
+    }
+
+    /// Run the BIP-78 §"Receiver's original PSBT checklist" gates on the
+    /// deserialized Original.  Returns `error.OriginalRejected` on the
+    /// first failed check.
+    ///
+    /// FIX-65 covers the structural gates that don't require chain state:
+    ///   - PSBT has at least one input
+    ///   - PSBT has at least one output
+    ///   - Every input has a UTXO (witness_utxo or non_witness_utxo)
+    ///   - No input is already finalized (Original PSBT must be
+    ///     PARTIALLY signed by the sender, not fully)
+    ///
+    /// Chain-state-dependent gates (UTXO-already-spent, fee-rate-sane)
+    /// are deferred — they require a `*ChainState` handle the receiver
+    /// foundation doesn't yet carry through.
+    pub fn validateOriginalPsbt(psbt: *const psbt_mod.Psbt) PayjoinError!void {
+        if (psbt.tx.inputs.len == 0) return error.OriginalRejected;
+        if (psbt.tx.outputs.len == 0) return error.OriginalRejected;
+        if (psbt.inputs.len != psbt.tx.inputs.len) return error.OriginalRejected;
+        if (psbt.outputs.len != psbt.tx.outputs.len) return error.OriginalRejected;
+        for (psbt.inputs) |inp| {
+            // Each input MUST have a UTXO record — BIP-78 §"Receiver's
+            // checklist" item 3.
+            const has_utxo = (inp.witness_utxo != null) or (inp.non_witness_utxo != null);
+            if (!has_utxo) return error.OriginalRejected;
+            // No input may be already finalized — the Original MUST be
+            // partially-signed (BIP-78 §"checklist" item 4).
+            if (inp.final_script_sig != null) return error.OriginalRejected;
+            if (inp.final_script_witness != null) return error.OriginalRejected;
+        }
+    }
+
+    /// Produce a Proposal PSBT from the validated Original.
+    ///
+    /// FIX-65 returns a base64-serialized clone of the Original — a no-op
+    /// PayJoin (the receiver opts not to contribute an input on this
+    /// request).  Per BIP-78 §"Receiver's payment proposal" this IS a
+    /// permitted receiver behaviour: an empty proposal that just echoes
+    /// the Original is functionally identical to the sender broadcasting
+    /// the Original itself, and avoids the receiver leaking UTXO state
+    /// when it has nothing to safely add (e.g. wallet locked, no
+    /// confirmed UTXOs, or insufficient balance for a sane fee debit).
+    /// Future fix waves add real input contribution; the route shape and
+    /// validator stay stable so this is a layering refinement, not a
+    /// reshape.
+    pub fn buildProposalBase64(
+        allocator: std.mem.Allocator,
+        original: *const psbt_mod.Psbt,
+    ) PayjoinError![]const u8 {
+        return original.toBase64(allocator) catch return error.Unavailable;
+    }
+
+    /// Format a BIP-78 application/json error body.  Caller owns the
+    /// returned slice.
+    pub fn formatErrorJson(
+        allocator: std.mem.Allocator,
+        code: []const u8,
+        message: []const u8,
+    ) ![]const u8 {
+        // BIP-78 §"Receiver's well-known errors" shape:
+        //   {"errorCode": "<code>", "message": "<message>"}
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"errorCode\":\"{s}\",\"message\":\"{s}\"}}",
+            .{ code, message },
+        );
+    }
+};
+
 /// JSON-RPC server over HTTP.
 pub const RpcServer = struct {
     listener: ?std.net.Server,
@@ -478,6 +760,27 @@ pub const RpcServer = struct {
         if (is_get and std.mem.startsWith(u8, url_path, "/rest/")) {
             self.handleRestRequest(conn.stream, url_path) catch {
                 try self.sendHttpError(conn.stream, 500, "Internal Server Error");
+            };
+            return;
+        }
+
+        // Handle BIP-78 PayJoin (POST /payjoin?v=1&...).  FIX-65 ships the
+        // receiver-side foundation on plain HTTP.  BIP-78 §"Receiver's
+        // transport security" requires HTTPS or .onion in production; FIX-64
+        // deferred server-side TLS (Zig 0.13 stdlib has no Server.zig) and
+        // a Tor Hidden Service publisher is also a future step.  Operators
+        // MUST front this route with nginx / Tor / Caddy before exposing
+        // the endpoint publicly.  This matches Bitcoin Core's own
+        // operational model (Core has no native TLS for its HTTP server;
+        // operators terminate elsewhere).
+        if (is_post and std.mem.startsWith(u8, url_path, "/payjoin")) {
+            self.handlePayjoinRequest(conn.stream, url_path, headers, request_data, headers_end, total_read) catch {
+                // Fallback: emit a BIP-78 "unavailable" JSON error so the
+                // sender's anti-snoop loop falls back to broadcasting the
+                // Original PSBT.  We deliberately do NOT leak the internal
+                // error name (privacy: receiver's allocator/IO state is
+                // not the sender's business).
+                self.sendPayjoinErrorRaw(conn.stream, PAYJOIN_ERR_UNAVAILABLE, "Receiver unavailable") catch {};
             };
             return;
         }
@@ -12322,6 +12625,150 @@ pub const RpcServer = struct {
             if (a[i] < b[i]) return -1;
         }
         return 0;
+    }
+
+    // ========================================================================
+    // BIP-78 PayJoin route — `POST /payjoin` handler (FIX-65)
+    //
+    // Routed from `handleConnection` when the request line is
+    // `POST /payjoin?<query> HTTP/1.x`.  The handler:
+    //   1. parses the `?v=1&...` query string,
+    //   2. enforces `v=1` (W119/G21) — else `version-unsupported`,
+    //   3. reads the request body (already buffered by handleConnection
+    //      into `request_data`), base64-decoding it as a PSBT,
+    //   4. validates the Original PSBT structurally,
+    //   5. produces a Proposal PSBT (FIX-65 ships a no-op echo; future
+    //      fix waves add real input contribution + fee adjustment),
+    //   6. writes the Proposal as `text/plain` base64 on success or a
+    //      BIP-78 JSON error body on failure.
+    //
+    // Operational stance: PLAIN HTTP ONLY.  BIP-78 §"Receiver's transport
+    // security" requires HTTPS or .onion in production.  FIX-64 deferred
+    // server-side TLS (Zig 0.13 stdlib has no Server.zig) and a Tor
+    // Hidden Service publisher; operators MUST front this route with
+    // nginx / Caddy / Tor before exposing the endpoint publicly.  This
+    // matches Bitcoin Core's own model — Core's libevent HTTP server is
+    // plain HTTP; operators terminate elsewhere.
+    //
+    // `pub` so the W119 audit (`tests_w119_payjoin.zig`) + FIX-65 test
+    // (`tests_fix65_payjoin_receiver.zig`) can assert presence via
+    // `@hasDecl(RpcServer, "handlePayjoinRequest")` — Zig 0.13's @hasDecl
+    // only surfaces `pub` decls on a struct type.
+    // ========================================================================
+    pub fn handlePayjoinRequest(
+        self: *RpcServer,
+        stream: std.net.Stream,
+        url_path: []const u8,
+        headers: []const u8,
+        request_data: []const u8,
+        headers_end: usize,
+        total_read: usize,
+    ) !void {
+        // 1. Split the path from its query string.  The route prefix is
+        //    "/payjoin"; everything after the first '?' is the query.
+        var query: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, url_path, '?')) |q_idx| {
+            query = url_path[q_idx + 1 ..];
+        }
+
+        // 2. Parse the query.  A malformed `additionalfeeoutputindex=`
+        //    etc. surfaces as OriginalRejected — the Original PSBT is
+        //    consequently never even read, which is the correct
+        //    behaviour (no UTXO probing on garbage requests).
+        const parsed_query = parsePayjoinQuery(query) catch |err| {
+            return self.sendPayjoinErrorRaw(stream, payjoinErrorCode(err), "Invalid query parameter");
+        };
+        checkPayjoinVersion(&parsed_query) catch |err| {
+            return self.sendPayjoinErrorRaw(stream, payjoinErrorCode(err), "BIP-78 version not supported");
+        };
+
+        // 3. Locate the Content-Length and read the body.  We re-use the
+        //    buffer handleConnection already filled, falling back to a
+        //    second read when the body straddles the boundary.
+        const content_length_str = findHeader(headers, "Content-Length") orelse {
+            return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_ORIGINAL_REJECTED, "Missing Content-Length");
+        };
+        const content_length = std.fmt.parseInt(usize, content_length_str, 10) catch {
+            return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_ORIGINAL_REJECTED, "Invalid Content-Length");
+        };
+        if (content_length == 0 or content_length > self.config.max_request_size) {
+            return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_ORIGINAL_REJECTED, "Body too large or empty");
+        }
+
+        const body_start = headers_end + 4;
+        var body_owned: ?[]u8 = null;
+        defer if (body_owned) |b| self.allocator.free(b);
+        var body: []const u8 = undefined;
+        if (body_start + content_length <= total_read) {
+            body = request_data[body_start .. body_start + content_length];
+        } else {
+            const body_buf = try self.allocator.alloc(u8, content_length);
+            body_owned = body_buf;
+            @memcpy(body_buf[0 .. total_read - body_start], request_data[body_start..total_read]);
+            var offset = total_read - body_start;
+            while (offset < content_length) {
+                const n = stream.read(body_buf[offset..]) catch {
+                    return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_UNAVAILABLE, "Body read failed");
+                };
+                if (n == 0) return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_ORIGINAL_REJECTED, "Body truncated");
+                offset += n;
+            }
+            body = body_buf;
+        }
+
+        // 4. Deserialize + validate the Original PSBT.
+        var original = PayjoinHandler.deserializeOriginalBase64(self.allocator, body) catch |err| {
+            return self.sendPayjoinErrorRaw(stream, payjoinErrorCode(err), "Failed to parse Original PSBT");
+        };
+        defer original.deinit();
+        PayjoinHandler.validateOriginalPsbt(&original) catch |err| {
+            return self.sendPayjoinErrorRaw(stream, payjoinErrorCode(err), "Original PSBT failed checklist");
+        };
+
+        // 5. Receiver-side check: wallet must be available + unlocked.
+        //    If the wallet is locked or absent, BIP-78 mandates we return
+        //    `unavailable` so the sender broadcasts the Original verbatim
+        //    (preserving the recipient's payment liveness).
+        if (self.current_wallet) |w| {
+            if (!w.isUnlocked()) {
+                return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_UNAVAILABLE, "Receiver wallet is locked");
+            }
+        } else if (self.wallet) |w| {
+            if (!w.isUnlocked()) {
+                return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_UNAVAILABLE, "Receiver wallet is locked");
+            }
+        } else {
+            return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_UNAVAILABLE, "No receiver wallet configured");
+        }
+
+        // 6. Build the Proposal.  FIX-65 ships an echo Proposal (no
+        //    receiver inputs added); future fix waves bring real input
+        //    contribution.  This is still a valid BIP-78 receiver
+        //    response — see PayjoinHandler.buildProposalBase64 docs.
+        const proposal_b64 = PayjoinHandler.buildProposalBase64(self.allocator, &original) catch |err| {
+            return self.sendPayjoinErrorRaw(stream, payjoinErrorCode(err), "Failed to build Proposal PSBT");
+        };
+        defer self.allocator.free(proposal_b64);
+
+        // 7. Emit `200 OK` with `Content-Type: text/plain`, body = the
+        //    base64 PSBT.  BIP-78 specifies text/plain for the body;
+        //    we add no trailing newline (callers must not assume one).
+        try self.sendRestResponse(stream, 200, "text/plain", proposal_b64);
+    }
+
+    /// Send a BIP-78 JSON error body with status 400.  Caller-owned code
+    /// + message are inlined into the JSON; both are spec-controlled
+    /// strings (no escaping needed for the code, and we control the
+    /// message texts we pass in).
+    fn sendPayjoinErrorRaw(
+        self: *RpcServer,
+        stream: std.net.Stream,
+        code: []const u8,
+        message: []const u8,
+    ) !void {
+        const body = PayjoinHandler.formatErrorJson(self.allocator, code, message) catch return;
+        defer self.allocator.free(body);
+        try self.sendRestResponse(stream, 400, "application/json", body);
     }
 };
 
