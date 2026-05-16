@@ -698,6 +698,17 @@ pub const MempoolEntry = struct {
     /// Mining score: effective fee rate based on chunk linearization.
     /// This is the chunk fee rate for the chunk containing this transaction.
     mining_score: f64,
+    /// FIX-73 / W120 BUG-3+5+8: txids that this entry replaced when it was
+    /// admitted via BIP-125 RBF (= direct conflicts + their descendants).
+    /// `null` when the tx did not replace anything (the common case);
+    /// owned by `self.allocator` and freed in `removeTransaction` /
+    /// `Mempool.deinit`. Surfaced via `sendrawtransaction`,
+    /// `submitpackage` (`replaced-transactions`), and
+    /// `getmempoolentry` (`replaces`). Mirrors Bitcoin Core's
+    /// `MempoolAcceptResult.m_replaced_transactions`
+    /// (validation.h `MempoolAcceptResult`) which is collected from
+    /// `MemPoolAccept::PreChecks` and stored alongside the workspace.
+    replaces: ?[]types.Hash256 = null,
 
     /// Compute the ancestor fee rate (used for mining prioritization).
     /// This is the fee rate of the transaction including all unconfirmed ancestors.
@@ -926,6 +937,8 @@ pub const Mempool = struct {
     pub fn deinit(self: *Mempool) void {
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
+            // FIX-73 / W120 BUG-3+5+8: free the heap-owned `replaces` slice.
+            if (entry.value_ptr.*.replaces) |rs| self.allocator.free(rs);
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.entries.deinit();
@@ -1225,8 +1238,38 @@ pub const Mempool = struct {
         try self.verifyInputScripts(&tx);
 
         // 7. Handle RBF conflicts
+        // FIX-73 / W120 BUG-3+5+8: collect the full evicted set (direct
+        // conflicts + their descendants) BEFORE removal so we can populate
+        // `MempoolEntry.replaces` on the newly admitted tx. Mirrors Core's
+        // `MempoolAcceptResult.m_replaced_transactions` which is constructed
+        // from `MemPoolAccept::Workspace::m_all_conflicting` before the
+        // workspace mutates the mempool (validation.cpp ~line 1085).
+        var replaced_collected = std.ArrayList(types.Hash256).init(self.allocator);
+        defer replaced_collected.deinit();
         if (conflicting_txids.items.len > 0) {
             try self.checkRBFRules(&tx, tx_hash, fee, vsize, conflicting_txids.items);
+
+            // Build the union of (direct conflicts ∪ all descendants) BEFORE
+            // mutating the mempool. Descendants are also lost on
+            // replacement (Core BIP-125 §5).
+            var seen = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+            defer seen.deinit();
+            for (conflicting_txids.items) |conflicting_txid| {
+                if (!seen.contains(conflicting_txid)) {
+                    seen.put(conflicting_txid, {}) catch return MempoolError.OutOfMemory;
+                    replaced_collected.append(conflicting_txid) catch return MempoolError.OutOfMemory;
+                }
+                const descs = self.getDescendantTxids(conflicting_txid);
+                defer self.allocator.free(descs);
+                for (descs) |d| {
+                    // `getDescendantTxids` includes the root; dedupe.
+                    if (std.mem.eql(u8, &d, &conflicting_txid)) continue;
+                    if (!seen.contains(d)) {
+                        seen.put(d, {}) catch return MempoolError.OutOfMemory;
+                        replaced_collected.append(d) catch return MempoolError.OutOfMemory;
+                    }
+                }
+            }
 
             // Remove conflicting transactions (and their descendants)
             for (conflicting_txids.items) |conflicting_txid| {
@@ -1301,6 +1344,13 @@ pub const Mempool = struct {
 
         // 12. Create entry and add to mempool
         const entry = self.allocator.create(MempoolEntry) catch return MempoolError.OutOfMemory;
+        // FIX-73 / W120 BUG-3+5+8: hand the captured evicted-txids set off to
+        // the entry. Pre-RBF this slice is empty; for an RBF replacement it
+        // holds the full evicted set (direct conflicts ∪ all descendants).
+        const replaces_owned: ?[]types.Hash256 = if (replaced_collected.items.len > 0)
+            (replaced_collected.toOwnedSlice() catch return MempoolError.OutOfMemory)
+        else
+            null;
         entry.* = MempoolEntry{
             .tx = tx,
             .txid = tx_hash,
@@ -1325,6 +1375,7 @@ pub const Mempool = struct {
             .is_rbf = tx.version == TRUC_VERSION or isRBFSignaled(&tx) or self.hasRBFAncestor(&tx),
             .cluster_index = cluster_idx,
             .mining_score = fee_rate, // Initial score is individual fee rate
+            .replaces = replaces_owned,
         };
 
         self.entries.put(tx_hash, entry) catch return MempoolError.OutOfMemory;
@@ -1643,6 +1694,9 @@ pub const Mempool = struct {
             self.linearization_dirty = true;
 
             self.total_size -|= entry.vsize;
+            // FIX-73 / W120 BUG-3+5+8: free the heap-owned `replaces` slice
+            // captured at admission (BIP-125 RBF evicted txids).
+            if (entry.replaces) |rs| self.allocator.free(rs);
             self.allocator.destroy(entry);
         }
     }
@@ -3778,8 +3832,32 @@ pub const Mempool = struct {
         try self.verifyInputScripts(&tx);
 
         // 7. Handle RBF conflicts
+        // FIX-73 / W120 BUG-3+5+8: capture evicted-txids set before removal
+        // (same approach as `addTransaction`). Surfaces as `replaces` on
+        // the new entry → wired into `replaced-transactions` of
+        // submitpackage and `replaces` of getmempoolentry.
+        var replaced_collected_pkg = std.ArrayList(types.Hash256).init(self.allocator);
+        defer replaced_collected_pkg.deinit();
         if (conflicting_txids.items.len > 0) {
             try self.checkRBFRules(&tx, tx_hash, fee, vsize, conflicting_txids.items);
+
+            var seen_pkg = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+            defer seen_pkg.deinit();
+            for (conflicting_txids.items) |conflicting_txid| {
+                if (!seen_pkg.contains(conflicting_txid)) {
+                    seen_pkg.put(conflicting_txid, {}) catch return MempoolError.OutOfMemory;
+                    replaced_collected_pkg.append(conflicting_txid) catch return MempoolError.OutOfMemory;
+                }
+                const descs = self.getDescendantTxids(conflicting_txid);
+                defer self.allocator.free(descs);
+                for (descs) |d| {
+                    if (std.mem.eql(u8, &d, &conflicting_txid)) continue;
+                    if (!seen_pkg.contains(d)) {
+                        seen_pkg.put(d, {}) catch return MempoolError.OutOfMemory;
+                        replaced_collected_pkg.append(d) catch return MempoolError.OutOfMemory;
+                    }
+                }
+            }
 
             // Remove conflicting transactions (and their descendants)
             for (conflicting_txids.items) |conflicting_txid| {
@@ -3841,6 +3919,11 @@ pub const Mempool = struct {
 
         // 12. Create entry and add to mempool
         const entry = self.allocator.create(MempoolEntry) catch return MempoolError.OutOfMemory;
+        // FIX-73 / W120 BUG-3+5+8: stash captured evicted-txids on the entry.
+        const replaces_owned_pkg: ?[]types.Hash256 = if (replaced_collected_pkg.items.len > 0)
+            (replaced_collected_pkg.toOwnedSlice() catch return MempoolError.OutOfMemory)
+        else
+            null;
         entry.* = MempoolEntry{
             .tx = tx,
             .txid = tx_hash,
@@ -3865,6 +3948,7 @@ pub const Mempool = struct {
             .is_rbf = tx.version == TRUC_VERSION or isRBFSignaled(&tx) or self.hasRBFAncestor(&tx),
             .cluster_index = cluster_idx,
             .mining_score = individual_fee_rate, // Initial score
+            .replaces = replaces_owned_pkg,
         };
 
         self.entries.put(tx_hash, entry) catch return MempoolError.OutOfMemory;
@@ -8709,11 +8793,20 @@ pub const PackageResult = struct {
     total_vsize: usize,
     /// Package fee rate (total_fee / total_vsize).
     package_fee_rate: f64,
+    /// FIX-73 / W120 BUG-5: top-level union of all txids evicted via
+    /// BIP-125 RBF across every admitted tx in this package. Mirrors
+    /// Bitcoin Core's `submitpackage` response field
+    /// `replaced-transactions` (rpc/mempool.cpp), built from each
+    /// `MempoolAcceptResult.m_replaced_transactions`. Empty slice when
+    /// no RBF happened. Owned by `allocator`; freed in `deinit`.
+    replaced_transactions: []types.Hash256,
     /// Allocator for cleanup.
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PackageResult) void {
         self.allocator.free(self.tx_results);
+        // FIX-73: free heap-owned replaced_transactions slice.
+        self.allocator.free(self.replaced_transactions);
     }
 };
 
@@ -9074,6 +9167,8 @@ pub fn acceptPackage(
             .total_fee = total_fee,
             .total_vsize = total_vsize,
             .package_fee_rate = package_fee_rate,
+            // FIX-73: nothing admitted on this short-circuit, so no replacements.
+            .replaced_transactions = allocator.alloc(types.Hash256, 0) catch return PackageError.OutOfMemory,
             .allocator = allocator,
         };
     }
@@ -9106,6 +9201,27 @@ pub fn acceptPackage(
         }
     }
 
+    // FIX-73 / W120 BUG-5: collect the union of `MempoolEntry.replaces`
+    // across every admitted package tx and surface as `replaced_transactions`
+    // (-> JSON `replaced-transactions`). Mirrors Core's submitpackage path
+    // which aggregates each tx's `MempoolAcceptResult.m_replaced_transactions`
+    // (rpc/mempool.cpp ~submitpackage handler).
+    var replaced_seen = std.AutoHashMap(types.Hash256, void).init(allocator);
+    defer replaced_seen.deinit();
+    var replaced_union = std.ArrayList(types.Hash256).init(allocator);
+    errdefer replaced_union.deinit();
+    for (tx_results) |r| {
+        if (!r.accepted) continue;
+        const entry = mempool.entries.get(r.txid) orelse continue;
+        const rs = entry.replaces orelse continue;
+        for (rs) |txid| {
+            if (replaced_seen.contains(txid)) continue;
+            replaced_seen.put(txid, {}) catch return PackageError.OutOfMemory;
+            replaced_union.append(txid) catch return PackageError.OutOfMemory;
+        }
+    }
+    const replaced_owned = replaced_union.toOwnedSlice() catch return PackageError.OutOfMemory;
+
     return PackageResult{
         .package_accepted = all_accepted,
         .package_hash = package_hash,
@@ -9113,6 +9229,7 @@ pub fn acceptPackage(
         .total_fee = total_fee,
         .total_vsize = total_vsize,
         .package_fee_rate = package_fee_rate,
+        .replaced_transactions = replaced_owned,
         .allocator = allocator,
     };
 }

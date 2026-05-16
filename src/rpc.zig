@@ -4591,7 +4591,7 @@ pub const RpcServer = struct {
         const mining_score_whole = @divTrunc(mining_score_int, 100_000_000);
         const mining_score_frac = @as(u64, @intCast(@mod(mining_score_int, 100_000_000)));
 
-        try writer.print("\",\"depends\":[],\"spentby\":[],\"bip125-replaceable\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}}}", .{
+        try writer.print("\",\"depends\":[],\"spentby\":[],\"bip125-replaceable\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}", .{
             if (bip125_replaceable) "true" else "false",
             // fees.base
             @divTrunc(entry.fee, 100_000_000),
@@ -4609,6 +4609,24 @@ pub const RpcServer = struct {
             mining_score_whole,
             mining_score_frac,
         });
+
+        // FIX-73 / W120 BUG-8: emit the `replaces` array of txids this entry
+        // replaced via BIP-125 RBF when admitted. Empty array when the tx
+        // didn't replace anything (clearer for operator scripts than
+        // omitting the field). Mirrors the W120 audit gate G18 requirement;
+        // Bitcoin Core itself does NOT emit this field on getmempoolentry —
+        // this is an impl-convenient extension to surface RBF visibility
+        // (see `bitcoin-core/src/rpc/mempool.cpp entryToJSON`).
+        try writer.writeAll(",\"replaces\":[");
+        if (entry.replaces) |rset| {
+            for (rset, 0..) |rtxid, ri| {
+                if (ri > 0) try writer.writeByte(',');
+                try writer.writeByte('"');
+                try writeHashHex(writer, &rtxid);
+                try writer.writeByte('"');
+            }
+        }
+        try writer.writeAll("]}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -5620,8 +5638,56 @@ pub const RpcServer = struct {
             };
         };
 
+        // FIX-73 / W120 BUG-3: when this admission replaced BIP-125 conflicts,
+        // surface the evicted-txids set so wallets watching for confirmation
+        // of replaced txs can detect the replacement directly from the JSON
+        // return. Mirrors Bitcoin Core's `MempoolAcceptResult.m_replaced_transactions`
+        // (validation.h / validation.cpp ~line 1085).
+        //
+        // Shape: Core's `sendrawtransaction` returns just a hex txid string.
+        // We preserve that shape in the common no-replacement path
+        // (backward-compatible for every existing wallet client) and switch
+        // to the object form `{txid, replaces}` only when an RBF replacement
+        // actually happened.
+        if (self.mempool.entries.get(txid)) |entry| {
+            if (entry.replaces) |replaced_set| {
+                if (replaced_set.len > 0) {
+                    self.broadcastTxInv(&txid);
+                    return self.returnTxidWithReplaces(txid, replaced_set, id);
+                }
+            }
+        }
+
         // Transaction accepted - broadcast inv to peers and return txid
         return self.returnTxidAndBroadcast(txid, id);
+    }
+
+    /// FIX-73 / W120 BUG-3: return an object `{"txid":"<hex>","replaces":["<hex>",...]}`
+    /// for the RBF-replacement subset of `sendrawtransaction` admissions.
+    /// Display order: txids reversed (Bitcoin display convention).
+    fn returnTxidWithReplaces(
+        self: *RpcServer,
+        txid: types.Hash256,
+        replaces: []const types.Hash256,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('{');
+        try writer.writeAll("\"txid\":\"");
+        try writeHashHex(writer, &txid);
+        try writer.writeAll("\",\"replaces\":[");
+        for (replaces, 0..) |rtxid, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            try writeHashHex(writer, &rtxid);
+            try writer.writeByte('"');
+        }
+        try writer.writeAll("]}");
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     /// Check if a transaction is already confirmed in the blockchain.
@@ -7122,7 +7188,19 @@ pub const RpcServer = struct {
             try writer.writeByte('}');
         }
 
-        try writer.writeAll("},\"replaced-transactions\":[],\"package_feerate\":");
+        // FIX-73 / W120 BUG-5: emit the union of evicted txids across every
+        // admitted package tx. Mirrors Bitcoin Core's submitpackage
+        // `replaced-transactions` field (rpc/mempool.cpp), built by
+        // aggregating each tx's `MempoolAcceptResult.m_replaced_transactions`.
+        // Was previously hardcoded `[]` (BUG-5 carry-forward from W116).
+        try writer.writeAll("},\"replaced-transactions\":[");
+        for (result.replaced_transactions, 0..) |rtxid, ri| {
+            if (ri > 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            try writeHashHex(writer, &rtxid);
+            try writer.writeByte('"');
+        }
+        try writer.writeAll("],\"package_feerate\":");
         try writer.print("{d:.8}", .{result.package_fee_rate / 100000.0}); // Convert sat/vB to BTC/kvB
         try writer.writeByte('}');
 
