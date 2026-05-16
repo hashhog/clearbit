@@ -434,12 +434,19 @@ test "w106 G5: BUG-1 removeTransaction does not update ancestor descendant_count
 // G6 — nModFeesWithDescendants: nFeeDelta support absent (BUG-2)
 // ============================================================================
 
-test "w106 G6: BUG-2 nFeeDelta/PrioritiseTransaction absent — modified fee always equals base fee" {
+test "w106 G6: BUG-2 closed in FIX-72 — modified fee comes from Mempool.map_deltas, not a per-entry field" {
     // Bitcoin Core: CTxMemPool::PrioritiseTransaction adjusts mapDeltas[txid] and
-    // modified fees used in mining/eviction.  Clearbit has no such mechanism.
-    // Verify: no fee_delta field on MempoolEntry.
-    const entry: mempool_mod.MempoolEntry = undefined;
-    // If a fee_delta field existed, this compile-time check would catch it.
+    // CTxMemPoolEntry::GetModifiedFee returns entry.fee + mapDeltas[txid].
+    //
+    // FIX-72 W120 BUG-11 closed this gap. The design choice is deliberate:
+    // the delta lives on the Mempool struct in `map_deltas` (HashMap), not on
+    // MempoolEntry. This mirrors Core's exact storage shape (mapDeltas is a
+    // CTxMemPool member, not a CTxMemPoolEntry field — txmempool.h:299) and
+    // keeps `entry.fee` as the on-wire raw fee. The modified fee is computed
+    // on demand via `Mempool.getModifiedFee(entry)`.
+    //
+    // Verify: still no fee_delta / modified_fee field on MempoolEntry, but
+    // the Mempool-level delta map exists (asserted in G28 below).
     const info = @typeInfo(mempool_mod.MempoolEntry);
     var has_fee_delta = false;
     inline for (info.Struct.fields) |field| {
@@ -449,9 +456,7 @@ test "w106 G6: BUG-2 nFeeDelta/PrioritiseTransaction absent — modified fee alw
             has_fee_delta = true;
         }
     }
-    _ = entry;
-    // BUG-2: fee_delta is absent → PrioritiseTransaction is impossible.
-    try testing.expect(!has_fee_delta); // Documents the absence
+    try testing.expect(!has_fee_delta);
 }
 
 // ============================================================================
@@ -1197,25 +1202,35 @@ test "w106 G27: MAX_PACKAGE_WEIGHT is 404,000 WU" {
 // G28 — nFeeDelta: ApplyDelta absent (BUG-7)
 // ============================================================================
 
-test "w106 G28: BUG-7 package fee rate ignores nFeeDelta (ApplyDelta absent)" {
+test "w106 G28: BUG-7 closed in FIX-72 — Mempool now has map_deltas / PrioritiseTransaction wired" {
     // Core: CTxMemPool::PrioritiseTransaction / ApplyDelta adjusts per-tx fee
-    // deltas used in package fee-rate calculation.  Clearbit's acceptPackage
-    // uses only raw tx fees with no delta map.  This means prioritised txs
-    // will not have their delta reflected in the package rate check.
+    // deltas used in package fee-rate, RBF Rule 3, and mining-template
+    // ordering.
     //
-    // Verify by checking that Mempool has no mapDeltas or fee_deltas field.
+    // FIX-72 W120 BUG-11 closed the gap: `Mempool.map_deltas`
+    // (std.AutoHashMap(Hash256, i64)) is the in-memory delta store, and
+    // `Mempool.prioritiseTransaction` / `Mempool.applyDelta` /
+    // `Mempool.getModifiedFee` implement Core's PrioritiseTransaction /
+    // ApplyDelta / GetModifiedFee semantics. RBF Rule 3 / 4, mempool min-fee
+    // admission, cluster linearisation (mining_score), block_template, and
+    // getmempoolentry's modifiedfee field all read the modified fee.
+    //
+    // Note: the field is named `map_deltas` (snake_case Zig convention) — not
+    // `mapDeltas` (Core's C++ name). The assertion below now pins the FIX-72
+    // shape so a future revert that drops the delta map fails HERE first.
     const info = @typeInfo(mempool_mod.Mempool);
     var has_deltas = false;
     inline for (info.Struct.fields) |field| {
-        if (std.mem.eql(u8, field.name, "mapDeltas") or
-            std.mem.eql(u8, field.name, "fee_deltas") or
-            std.mem.eql(u8, field.name, "delta_map"))
-        {
+        if (std.mem.eql(u8, field.name, "map_deltas")) {
             has_deltas = true;
         }
     }
-    // BUG-7: no delta map → PrioritiseTransaction unimplemented.
-    try testing.expect(!has_deltas);
+    try testing.expect(has_deltas);
+
+    // Sanity that the public helpers are still exported with their FIX-72 names.
+    try testing.expect(@hasDecl(mempool_mod.Mempool, "prioritiseTransaction"));
+    try testing.expect(@hasDecl(mempool_mod.Mempool, "applyDelta"));
+    try testing.expect(@hasDecl(mempool_mod.Mempool, "getModifiedFee"));
 }
 
 // ============================================================================
