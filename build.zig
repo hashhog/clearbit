@@ -1051,6 +1051,40 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w120_tests.step);
     }
 
+    // W121 — BIP-157/158 compact block filter 30-gate audit.
+    // Reference: bitcoin-core/src/blockfilter.{cpp,h}, index/blockfilterindex.{cpp,h};
+    // BIP-157/158.
+    // Run with `zig build test-w121`.
+    {
+        const w121_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w121_compact_filters.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w121"},
+        });
+        w121_tests.linkSystemLibrary("rocksdb");
+        w121_tests.linkSystemLibrary("secp256k1");
+        w121_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w121_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w121_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w121_tests.linkSystemLibrary("minisketch");
+            w121_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w121_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w121_tests = b.addRunArtifact(w121_tests);
+        const w121_test_step = b.step("test-w121", "Run W121 BIP-157/158 compact filter 30-gate audit tests");
+        w121_test_step.dependOn(&run_w121_tests.step);
+        // Fold into the main `test` step so CI exercises W121.
+        test_step.dependOn(&run_w121_tests.step);
+    }
+
     // FIX-62 — BIP-21 URI parser tests.
     // `bip21.zig` is intentionally self-contained (depends only on
     // `address.zig`, which depends on `crypto.zig` + `types.zig`).  No
