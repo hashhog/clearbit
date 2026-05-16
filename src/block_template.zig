@@ -285,7 +285,12 @@ pub fn createBlockTemplate(
             // fee_rate in sat per 1000 vbytes = fee * 4000 / weight
             // compare fee * 4000 / weight < block_min_fee_rate
             // ↔ fee * 4000 < block_min_fee_rate * weight
-            const fee_u: u64 = if (entry.fee >= 0) @intCast(entry.fee) else 0;
+            //
+            // FIX-72 / W120 BUG-11: compare against the MODIFIED fee so a
+            // prioritisetransaction-boosted tx isn't filtered out at the
+            // block_min_fee_rate gate even when its raw fee is below.
+            const modified_fee = mempool.getModifiedFee(entry);
+            const fee_u: u64 = if (modified_fee >= 0) @intCast(modified_fee) else 0;
             if (fee_u * 4000 < opts.block_min_fee_rate * entry.weight) {
                 // All remaining entries have equal or lower fee rate; stop.
                 break;

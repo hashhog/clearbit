@@ -2954,6 +2954,13 @@ pub const RpcServer = struct {
             return self.handleGetMempoolInfo(id);
         } else if (std.mem.eql(u8, method, "getmempoolentry")) {
             return self.handleGetMempoolEntry(params, id);
+        } else if (std.mem.eql(u8, method, "prioritisetransaction")) {
+            // FIX-72 / W120 BUG-11 — operator-priority RPC, Core's mining.cpp:502.
+            return self.handlePrioritiseTransaction(params, id);
+        } else if (std.mem.eql(u8, method, "getprioritisedtransactions")) {
+            // FIX-72 / W120 BUG-11 — companion RPC to prioritisetransaction,
+            // Core's mining.cpp:547.
+            return self.handleGetPrioritisedTransactions(id);
         } else if (std.mem.eql(u8, method, "dumpmempool")) {
             return self.handleDumpMempool(params, id);
         } else if (std.mem.eql(u8, method, "savemempool")) {
@@ -4548,13 +4555,21 @@ pub const RpcServer = struct {
         // rather than continuing to lie.
         const bip125_replaceable: bool = self.mempool.isRBFOptIn(txid) orelse false;
 
+        // FIX-72 / W120 BUG-11: surface the modified fee (= entry.fee +
+        // mapDeltas[txid]) in the `modifiedfee` and `fees.modified` fields.
+        // Mirrors Bitcoin Core's entryToJSON (rpc/mempool.cpp:529:
+        // `fees.pushKV("modified", ValueFromAmount(e.GetModifiedFee()))`).
+        // When no prioritise() has been called on this txid the delta is
+        // zero so this collapses to the raw fee — backward compatible.
+        const modified_fee_sat: i64 = self.mempool.getModifiedFee(entry);
+
         try writer.print("{{\"vsize\":{d},\"weight\":{d},\"fee\":{d}.{d:0>8},\"modifiedfee\":{d}.{d:0>8},\"time\":{d},\"height\":{d},\"descendantcount\":{d},\"descendantsize\":{d},\"descendantfees\":{d},\"ancestorcount\":{d},\"ancestorsize\":{d},\"ancestorfees\":{d},\"wtxid\":\"", .{
             entry.vsize,
             entry.weight,
             @divTrunc(entry.fee, 100_000_000),
             @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
-            @divTrunc(entry.fee, 100_000_000),
-            @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
+            @divTrunc(modified_fee_sat, 100_000_000),
+            @as(u64, @intCast(@mod(if (modified_fee_sat >= 0) modified_fee_sat else -modified_fee_sat, 100_000_000))),
             entry.time_added,
             entry.height_added,
             entry.descendant_count,
@@ -4581,9 +4596,9 @@ pub const RpcServer = struct {
             // fees.base
             @divTrunc(entry.fee, 100_000_000),
             @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
-            // fees.modified
-            @divTrunc(entry.fee, 100_000_000),
-            @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
+            // fees.modified — FIX-72 / W120 BUG-11: includes prioritise delta.
+            @divTrunc(modified_fee_sat, 100_000_000),
+            @as(u64, @intCast(@mod(if (modified_fee_sat >= 0) modified_fee_sat else -modified_fee_sat, 100_000_000))),
             // fees.ancestor
             @divTrunc(entry.ancestor_fees, 100_000_000),
             @as(u64, @intCast(@mod(entry.ancestor_fees, 100_000_000))),
@@ -4595,6 +4610,142 @@ pub const RpcServer = struct {
             mining_score_frac,
         });
 
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `prioritisetransaction txid (dummy_fee_delta_btc) fee_delta_sats` —
+    /// add a fee delta to a mempool entry's modified fee, used by miners /
+    /// operators to boost or lower transactions in the mining template
+    /// without producing an on-chain replacement.
+    ///
+    /// FIX-72 / W120 BUG-11. Mirrors Bitcoin Core's `prioritisetransaction`
+    /// (rpc/mining.cpp:502):
+    ///   - Param 0: txid (hex, big-endian per Bitcoin display order).
+    ///   - Param 1: dummy fee delta (BTC). API-compat. Must be 0 or omitted.
+    ///   - Param 2: fee_delta in satoshis (positive or negative i64).
+    /// Returns boolean `true` on success. Deltas accumulate ("stack on
+    /// previous ones" — txmempool.cpp:638) and a sum-to-zero result erases
+    /// the entry from mapDeltas.
+    fn handlePrioritiseTransaction(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Param 0: txid (required hex string).
+        const txid_hex = blk: {
+            if (params) |p| {
+                if (p == .array and p.array.items.len > 0) {
+                    if (p.array.items[0] == .string) {
+                        break :blk p.array.items[0].string;
+                    }
+                }
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "prioritisetransaction requires (txid, dummy, fee_delta)", id);
+        };
+        if (txid_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
+        }
+        var txid: types.Hash256 = undefined;
+        for (0..32) |i| {
+            const high = std.fmt.charToDigit(txid_hex[i * 2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            const low = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+            };
+            // Bitcoin txids are displayed in reverse byte order
+            txid[31 - i] = (high << 4) | low;
+        }
+
+        // Param 1: dummy (BTC). Optional; must be 0 / null if present.
+        // Core (mining.cpp:529): "Priority is no longer supported, dummy
+        // argument to prioritisetransaction must be 0." Reject non-zero
+        // explicit values, accept null / omitted / 0.
+        if (params) |p| {
+            if (p == .array and p.array.items.len > 1) {
+                const dummy = p.array.items[1];
+                switch (dummy) {
+                    .null => {},
+                    .integer => |n| if (n != 0) {
+                        return self.jsonRpcError(RPC_INVALID_PARAMETER, "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.", id);
+                    },
+                    .float => |f| if (f != 0.0) {
+                        return self.jsonRpcError(RPC_INVALID_PARAMETER, "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.", id);
+                    },
+                    .number_string => |s| {
+                        // Treat any literal other than "0" / "0.0" as non-zero.
+                        if (!std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "0.0")) {
+                            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.", id);
+                        }
+                    },
+                    else => return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid dummy parameter type", id),
+                }
+            }
+        }
+
+        // Param 2: fee_delta (required i64 satoshis).
+        const delta_sats: i64 = blk2: {
+            if (params) |p| {
+                if (p == .array and p.array.items.len > 2) {
+                    const v = p.array.items[2];
+                    switch (v) {
+                        .integer => |n| break :blk2 n,
+                        .float => |f| break :blk2 @as(i64, @intFromFloat(f)),
+                        .number_string => |s| {
+                            const parsed = std.fmt.parseInt(i64, s, 10) catch {
+                                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid fee_delta", id);
+                            };
+                            break :blk2 parsed;
+                        },
+                        else => return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid fee_delta type", id),
+                    }
+                }
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "prioritisetransaction requires (txid, dummy, fee_delta)", id);
+        };
+
+        // Apply the delta. Works whether or not the tx is in the mempool —
+        // Core's PrioritiseTransaction sets the pending delta regardless
+        // (txmempool.cpp:630).
+        _ = self.mempool.prioritiseTransaction(txid, delta_sats) catch {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Out of memory", id);
+        };
+
+        return self.jsonRpcResult("true", id);
+    }
+
+    /// `getprioritisedtransactions` — return all current priority deltas.
+    /// Mirrors Bitcoin Core's `getprioritisedtransactions` (rpc/mining.cpp:547):
+    /// returns `{ "<txid>": { "fee_delta": <sats>, "in_mempool": <bool>,
+    /// "modified_fee": <sats, optional> } }`.
+    fn handleGetPrioritisedTransactions(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const w = buf.writer();
+
+        try w.writeAll("{");
+        var first = true;
+        var iter = self.mempool.map_deltas.iterator();
+        while (iter.next()) |kv| {
+            if (!first) try w.writeAll(",");
+            first = false;
+            // txid is displayed in reverse byte order.
+            try w.writeByte('"');
+            const tx = kv.key_ptr.*;
+            for (0..32) |i| {
+                try w.print("{x:0>2}", .{tx[31 - i]});
+            }
+            try w.writeByte('"');
+            try w.writeAll(":{\"fee_delta\":");
+            try w.print("{d}", .{kv.value_ptr.*});
+            const in_pool = self.mempool.entries.contains(tx);
+            try w.writeAll(",\"in_mempool\":");
+            try w.writeAll(if (in_pool) "true" else "false");
+            if (in_pool) {
+                if (self.mempool.entries.get(tx)) |e| {
+                    const modf = self.mempool.getModifiedFee(e);
+                    try w.print(",\"modified_fee\":{d}", .{modf});
+                }
+            }
+            try w.writeAll("}");
+        }
+        try w.writeAll("}");
         return self.jsonRpcResult(buf.items, id);
     }
 
@@ -12740,6 +12891,8 @@ pub const RpcServer = struct {
             try writer.writeAll("\\n== Mining ==\\n");
             try writer.writeAll("getblocktemplate\\n");
             try writer.writeAll("getmininginfo\\n");
+            try writer.writeAll("getprioritisedtransactions\\n");
+            try writer.writeAll("prioritisetransaction\\n");
             try writer.writeAll("submitblock\\n");
             try writer.writeAll("\\n== Network ==\\n");
             try writer.writeAll("addnode\\n");

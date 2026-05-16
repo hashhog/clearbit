@@ -858,6 +858,32 @@ pub const Mempool = struct {
     /// support O(N) cleanup when a peer disconnects.
     orphans_by_peer: std.AutoHashMap(u64, u32),
 
+    // ========================================================================
+    // Priority deltas (FIX-72 / W120 BUG-11)
+    // (Bitcoin Core: CTxMemPool::mapDeltas, txmempool.{cpp,h})
+    // ========================================================================
+
+    /// Per-txid fee delta in satoshis, settable via the `prioritisetransaction`
+    /// RPC.  Adds (or subtracts) from the entry's base fee for every comparison
+    /// that should respect operator priority — RBF Rule 3, mining selection,
+    /// mempool min-fee admission, and the `modifiedfee` / `fees.modified`
+    /// JSON-RPC fields.  Stored separately so the entry's `fee` remains the
+    /// raw on-wire fee.
+    ///
+    /// Mirrors Bitcoin Core's `mapDeltas` (`std::map<Txid, CAmount>`,
+    /// txmempool.h:299).  Like Core's mapDeltas this is in-memory only and is
+    /// emitted as an empty section in `dumpmempool` (see
+    /// `mempool_persist.zig`); deltas are deliberately lost across restarts —
+    /// matching the Core spec invariant the FIX-72 wave pins.
+    ///
+    /// Semantics (Core txmempool.cpp:630):
+    ///   - `prioritise(txid, delta)` does `mapDeltas[txid] += delta` (saturating).
+    ///   - If the result is zero, the entry is erased (no zero entries kept).
+    ///   - `getModifiedFee(entry) = entry.fee + (mapDeltas.get(txid) orelse 0)`.
+    ///   - Works whether the tx is in the mempool yet or not (Core sets a
+    ///     pending delta that applies on subsequent admission).
+    map_deltas: std.AutoHashMap(types.Hash256, i64),
+
     /// Initialize a new mempool.
     pub fn init(
         chain_state: ?*storage.ChainState,
@@ -890,6 +916,9 @@ pub const Mempool = struct {
             .rolling_minimum_fee_rate = 0.0,
             .last_rolling_fee_update = std.time.timestamp(),
             .block_since_last_rolling_fee_bump = false,
+            // FIX-72 / W120 BUG-11 — prioritisetransaction fee deltas.
+            // Empty on init; deltas are not persisted across restarts (Core parity).
+            .map_deltas = std.AutoHashMap(types.Hash256, i64).init(allocator),
         };
     }
 
@@ -935,6 +964,9 @@ pub const Mempool = struct {
         self.orphans.deinit();
         self.orphans_by_txid.deinit();
         self.orphans_by_peer.deinit();
+
+        // FIX-72 / W120 BUG-11 — prioritisetransaction fee deltas.
+        self.map_deltas.deinit();
     }
 
     /// Attempt to add a transaction to the mempool.
@@ -1166,9 +1198,18 @@ pub const Mempool = struct {
         // MIN_RELAY_FEE constant here would accept txs that pay less than what was just
         // evicted — a correctness gap vs Core's GetMinFee(sizelimit) gate in
         // MemPoolAccept::PreChecks (validation.cpp:~1050).
+        //
+        // FIX-72 / W120 BUG-11: include any pre-set priority delta on this txid
+        // (set via `prioritisetransaction` before broadcast). Core does this via
+        // `CheckFeeRate(ws.m_vsize, ws.m_modified_fees, state)` at validation.cpp:948.
         if (total_in > 0) {
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
-            if (fee_rate * 1000.0 < min_fee_sat_kvb) {
+            const modified_fee = fee + self.applyDelta(tx_hash);
+            const modified_fee_rate: f64 = if (vsize > 0)
+                @as(f64, @floatFromInt(modified_fee)) / @as(f64, @floatFromInt(vsize))
+            else
+                0;
+            if (modified_fee_rate * 1000.0 < min_fee_sat_kvb) {
                 return MempoolError.InsufficientFee;
             }
         }
@@ -2118,6 +2159,67 @@ pub const Mempool = struct {
         return entry.is_rbf;
     }
 
+    // ========================================================================
+    // FIX-72 / W120 BUG-11 — prioritisetransaction wiring
+    // (Bitcoin Core: CTxMemPool::PrioritiseTransaction / ApplyDelta /
+    //  GetModifiedFee, txmempool.cpp:630)
+    // ========================================================================
+
+    /// Apply a fee delta (in satoshis) to `mapDeltas[txid]`.
+    ///
+    /// Mirrors Bitcoin Core's `CTxMemPool::PrioritiseTransaction`
+    /// (txmempool.cpp:630):
+    ///   1. `mapDeltas[txid] += delta_sats` (saturating add against `i64`).
+    ///   2. If the resulting delta is exactly zero the entry is erased so
+    ///      `map_deltas.count()` reflects the live priority set.
+    ///   3. Works regardless of whether `txid` is currently in the mempool.
+    ///      Core lets operators pre-set a priority for a tx that has not
+    ///      arrived yet; when it does, `getModifiedFee` picks the delta up.
+    ///
+    /// The mempool's own `entry.fee` is left untouched — the modified value
+    /// is computed on demand via `getModifiedFee` / `applyDelta` so a future
+    /// `prioritise(txid, -delta)` cleanly cancels.  This matches the Core
+    /// "stacking" semantics quoted in the spec ("PrioritiseTransaction calls
+    /// stack on previous ones").
+    ///
+    /// Returns the post-update delta value (0 means the entry was erased).
+    pub fn prioritiseTransaction(self: *Mempool, txid: types.Hash256, delta_sats: i64) std.mem.Allocator.Error!i64 {
+        // Saturating add — Core uses SaturatingAdd(delta, nFeeDelta).
+        const existing: i64 = self.map_deltas.get(txid) orelse 0;
+        const new_delta: i64 = saturatingAddI64(existing, delta_sats);
+
+        if (new_delta == 0) {
+            // Cancellation — drop the entry so map_deltas only contains
+            // live priorities. Matches Core's `mapDeltas.erase(hash)` branch.
+            _ = self.map_deltas.remove(txid);
+        } else {
+            try self.map_deltas.put(txid, new_delta);
+        }
+        return new_delta;
+    }
+
+    /// Return the priority delta for `txid` (0 if none set).
+    /// Mirrors Core's `CTxMemPool::ApplyDelta` (txmempool.cpp:657) read-out.
+    pub fn applyDelta(self: *const Mempool, txid: types.Hash256) i64 {
+        return self.map_deltas.get(txid) orelse 0;
+    }
+
+    /// Compute the modified fee for a mempool entry: `entry.fee + mapDeltas[txid]`.
+    /// Mirrors Core's `CTxMemPoolEntry::GetModifiedFee()` (txmempool.h:354).
+    pub fn getModifiedFee(self: *const Mempool, entry: *const MempoolEntry) i64 {
+        return entry.fee + self.applyDelta(entry.txid);
+    }
+
+    /// Saturating signed 64-bit addition.  Mirrors Core's `SaturatingAdd`
+    /// (util/check.h).  Used by `prioritiseTransaction` so an operator
+    /// cannot wrap the delta accumulator with repeated overflow calls.
+    fn saturatingAddI64(a: i64, b: i64) i64 {
+        const r = @addWithOverflow(a, b);
+        if (r[1] == 0) return r[0];
+        // Overflow → saturate to the signed bound in the direction of b.
+        return if (b > 0) std.math.maxInt(i64) else std.math.minInt(i64);
+    }
+
     /// Run script verification on every input of a transaction using
     /// STANDARD_SCRIPT_VERIFY_FLAGS (consensus + policy). Mirrors Bitcoin
     /// Core's `PolicyScriptChecks` invocation inside `AcceptToMemoryPool`
@@ -2810,8 +2912,6 @@ pub const Mempool = struct {
         new_vsize: usize,
         conflicting_txids: []const types.Hash256,
     ) MempoolError!void {
-        _ = new_txid;
-
         // Gate 1 (BIP-125 opt-in): unless full-RBF mode is enabled, every
         // directly-conflicting tx must have is_rbf=true.  is_rbf already
         // incorporates ancestor signaling (set at admission time).
@@ -2826,7 +2926,13 @@ pub const Mempool = struct {
             }
         }
 
-        // Collect all transactions to be evicted (direct conflicts + all descendants)
+        // Collect all transactions to be evicted (direct conflicts + all descendants).
+        //
+        // FIX-72 / W120 BUG-11: sum up the MODIFIED fees (entry.fee + ApplyDelta)
+        // rather than raw fees, matching Bitcoin Core's
+        // `m_subpackage.m_conflicting_fees += it->GetModifiedFee()` accumulation
+        // at validation.cpp:1006 / 1090. Without this, prioritisetransaction
+        // would silently fail to influence the RBF comparison.
         var all_evicted = std.AutoHashMap(types.Hash256, void).init(self.allocator);
         defer all_evicted.deinit();
 
@@ -2838,7 +2944,7 @@ pub const Mempool = struct {
                 all_evicted.put(conflicting_txid, {}) catch return MempoolError.OutOfMemory;
 
                 if (self.entries.get(conflicting_txid)) |entry| {
-                    total_evicted_fee += entry.fee;
+                    total_evicted_fee += self.getModifiedFee(entry);
                 }
             }
 
@@ -2851,7 +2957,7 @@ pub const Mempool = struct {
                     all_evicted.put(desc_txid, {}) catch return MempoolError.OutOfMemory;
 
                     if (self.entries.get(desc_txid)) |entry| {
-                        total_evicted_fee += entry.fee;
+                        total_evicted_fee += self.getModifiedFee(entry);
                     }
                 }
             }
@@ -2875,18 +2981,29 @@ pub const Mempool = struct {
             return MempoolError.TooManyEvictions;
         }
 
+        // FIX-72 / W120 BUG-11: also fold any pre-set priority delta on the
+        // not-yet-admitted replacement txid into its effective fee. Core
+        // computes `ws.m_modified_fees = ws.m_tx_handle->GetModifiedFee()`
+        // immediately after staging, so an operator who runs
+        // `prioritisetransaction <new_txid> 0 +k` before broadcast can
+        // boost the replacement's effective fee for the Rule 3 comparison.
+        const new_modified_fee: i64 = new_fee + self.applyDelta(new_txid);
+
         // Gate 6 / Rule 3: Replacement must pay >= absolute fee of all evicted txs.
         // Core uses strict `<` (equal fees are ALLOWED here; Rule 4 enforces
         // the incremental bandwidth requirement).
         // Reference: policy/rbf.cpp::PaysForRBF, line `if (replacement_fees < original_fees)`.
-        if (new_fee < total_evicted_fee) {
+        // FIX-72 forward-regression guard: BOTH sides are modified fees so a
+        // future drive-by change that swaps either side back to entry.fee
+        // would silently disable prioritisetransaction's effect on RBF.
+        if (new_modified_fee < total_evicted_fee) {
             return MempoolError.ReplacementFeeTooLow;
         }
 
         // Gate 7 / Rule 4: Replacement must pay for its own bandwidth.
-        // new_fee - sum(old_fees) >= incremental_relay_fee * new_vsize
+        // additional_fee = new_modified_fee - sum(modified_old_fees) >= incremental_relay_fee * new_vsize.
         // Reference: policy/rbf.cpp::PaysForRBF, line `if (additional_fees < relay_fee.GetFee(...))`.
-        const additional_fee = new_fee - total_evicted_fee;
+        const additional_fee = new_modified_fee - total_evicted_fee;
         const min_additional_fee = @divTrunc(@as(i64, @intCast(new_vsize)) * INCREMENTAL_RELAY_FEE, 1000);
         if (additional_fee < min_additional_fee) {
             return MempoolError.ReplacementFeeTooLow;
@@ -2904,7 +3021,9 @@ pub const Mempool = struct {
         // UTXO sets).
         //
         // Reference: policy/rbf.cpp::ImprovesFeerateDiagram + util/feefrac.cpp::CompareChunks.
-        if (new_fee > 0 or total_evicted_fee > 0) {
+        // FIX-72: diagram uses modified fees on both sides for the same reason
+        // as Rules 3/4 above.
+        if (new_modified_fee > 0 or total_evicted_fee > 0) {
             // Collect evicted total vsize.
             var evicted_vsize: u64 = 0;
             var evicted_iter = all_evicted.keyIterator();
@@ -2923,7 +3042,7 @@ pub const Mempool = struct {
 
             const new_diagram = buildSingleChunkDiagram(
                 self.allocator,
-                new_fee,
+                new_modified_fee,
                 @as(u64, @intCast(new_vsize)),
             ) catch return MempoolError.OutOfMemory;
             defer self.allocator.free(new_diagram);
@@ -3939,7 +4058,14 @@ pub const Mempool = struct {
             local_to_txid[i] = txid;
 
             const entry = self.entries.get(txid) orelse continue;
-            fees[i] = entry.fee;
+            // FIX-72 / W120 BUG-11: cluster linearisation (and therefore the
+            // `mining_score` that block_template uses to order the template)
+            // operates on MODIFIED fees so prioritisetransaction influences
+            // mining selection. Mirrors Bitcoin Core which calls
+            // `m_txgraph->SetTransactionFee(*it, it->GetModifiedFee())` inside
+            // PrioritiseTransaction (txmempool.cpp:641) so the cluster graph
+            // always sees modified fees.
+            fees[i] = self.getModifiedFee(entry);
             vsizes[i] = entry.vsize;
             ancestors[i] = std.bit_set.IntegerBitSet(64).initEmpty();
             ancestors[i].set(i); // Each tx is its own ancestor
