@@ -801,26 +801,26 @@ test "w116 G12 BUG-8+9: PackageTxResult missing vsize and fees fields" {
 }
 
 // ============================================================================
-// G13 — submitpackage: replaced-transactions always empty (no RBF wiring)
+// G13 — submitpackage: replaced-transactions now wired via FIX-73 (W120 BUG-5).
+// Audit-flip: prior assertion was "no replaced_txids field exists"; FIX-73
+// adds `PackageResult.replaced_transactions: []types.Hash256` populated by
+// the union of evicted-tx sets across all admitted package txs. This test
+// now asserts the field is PRESENT — forward-regression guard so future
+// refactors don't accidentally drop the field.
 // ============================================================================
 
-test "w116 G13: PackageResult has no replaced_txids field (hardcoded [] in RPC)" {
-    // Core: replaced-transactions lists txids removed via RBF during package submission.
-    // clearbit: always emits "replaced-transactions":[] (no dynamic population).
+test "w116 G13 (FIX-73 audit-flip): PackageResult exposes replaced_transactions field" {
     comptime {
         const PR = mempool_mod.PackageResult;
         const info = @typeInfo(PR).Struct;
         var has_replaced = false;
         for (info.fields) |f| {
-            if (std.mem.eql(u8, f.name, "replaced_txids") or
-                std.mem.eql(u8, f.name, "replaced_transactions"))
-            {
+            if (std.mem.eql(u8, f.name, "replaced_transactions")) {
                 has_replaced = true;
             }
         }
-        if (has_replaced) @compileError("PackageResult has replaced_txids — update this test");
+        if (!has_replaced) @compileError("PackageResult is missing replaced_transactions — FIX-73 regression");
     }
-    // Fix: collect replaced txids during package RBF and return them.
     try testing.expect(true);
 }
 
