@@ -1018,6 +1018,39 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w119_tests.step);
     }
 
+    // W120 — Mempool strict RBF rules 1-5 30-gate audit.
+    // Reference: bitcoin-core/src/policy/rbf.{cpp,h}; BIP-125.
+    // Run with `zig build test-w120`.
+    {
+        const w120_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w120_mempool_rbf.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w120"},
+        });
+        w120_tests.linkSystemLibrary("rocksdb");
+        w120_tests.linkSystemLibrary("secp256k1");
+        w120_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w120_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w120_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w120_tests.linkSystemLibrary("minisketch");
+            w120_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w120_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w120_tests = b.addRunArtifact(w120_tests);
+        const w120_test_step = b.step("test-w120", "Run W120 mempool strict RBF rules 1-5 30-gate audit tests");
+        w120_test_step.dependOn(&run_w120_tests.step);
+        // Fold into the main `test` step so CI exercises W120.
+        test_step.dependOn(&run_w120_tests.step);
+    }
+
     // FIX-62 — BIP-21 URI parser tests.
     // `bip21.zig` is intentionally self-contained (depends only on
     // `address.zig`, which depends on `crypto.zig` + `types.zig`).  No
