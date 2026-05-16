@@ -83,21 +83,47 @@ const rpc_mod = @import("rpc.zig");
 const address_mod = @import("address.zig");
 
 // ===========================================================================
-// G1: Receiver HTTP endpoint — MISSING ENTIRELY
+// G1: Receiver HTTP endpoint — CLOSED in FIX-65 (foundation, plain HTTP)
 //
-// BUG-1 (HIGH): BIP-78 requires the receiver to publish an HTTPS or
-//   .onion endpoint that accepts an Original PSBT via POST and returns a
-//   PayJoin Proposal PSBT.  clearbit has only the JSON-RPC HTTP server in
-//   src/rpc.zig — there is no second HTTP server, no `/payjoin` route, no
-//   `application/payjoin-psbt` Content-Type handler.
+// FIX-65 adds `PayjoinHandler` (namespace with deserialize / validate /
+// build-proposal / format-error helpers) and `RpcServer.handlePayjoinRequest`
+// — the `POST /payjoin?v=1&...` route, reachable on the existing JSON-RPC
+// HTTP server's port.  Plain HTTP only: BIP-78 §"Receiver's transport
+// security" requires HTTPS or .onion in production, but FIX-64 deferred
+// server-side TLS (Zig 0.13 stdlib has no Server.zig).  Operators MUST
+// front the route with nginx / Caddy / Tor before exposure — same posture
+// as Bitcoin Core's own HTTP server.  Test coverage:
+// `src/tests_fix65_payjoin_receiver.zig` (`zig build test-fix65`).
+//
+// BUG-1 (HIGH) — original audit text retained for cross-impl traceability:
+//   BIP-78 requires the receiver to publish an HTTPS or .onion endpoint
+//   that accepts an Original PSBT via POST and returns a PayJoin Proposal
+//   PSBT.  clearbit had only the JSON-RPC HTTP server in src/rpc.zig with
+//   no `/payjoin` route.
+//
+// We deliberately do NOT add `PayjoinServer` / `payjoinServer` /
+// `startPayjoinServer` as separate decls — the route lives on the
+// existing `RpcServer` (named `handlePayjoinRequest` per BUG-1's enum),
+// and adding stub aliases would just sprawl the API surface.  Future
+// fix waves layer a sender HTTP client (G2) + Implementation Suggestions
+// (G18/G19/G20/G30) on top of this foundation.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Receiver's HTTP request handling"
 // ===========================================================================
-test "w119/G1: receiver HTTP endpoint absent (no payjoin server in rpc.zig)" {
+test "w119/G1: receiver HTTP endpoint present (FIX-65 foundation)" {
+    // The "server" is the existing RpcServer; the route lives there as a
+    // private method.  PayjoinHandler is the namespaced helper module the
+    // route delegates to.
+    try testing.expect(@hasDecl(rpc_mod, "PayjoinHandler"));
+    // handlePayjoinRequest is a private fn on RpcServer; assert the
+    // namespace contains a fn by that name (Zig surfaces all decls,
+    // including pub-and-private, via @hasDecl on the struct type).
+    try testing.expect(@hasDecl(rpc_mod.RpcServer, "handlePayjoinRequest"));
+    // Other audit-flagged decl shapes still absent (kept as the W119
+    // tracking signal for future API-sprawl avoidance).
     try testing.expect(!@hasDecl(rpc_mod, "PayjoinServer"));
     try testing.expect(!@hasDecl(rpc_mod, "payjoinServer"));
     try testing.expect(!@hasDecl(rpc_mod, "startPayjoinServer"));
-    try testing.expect(!@hasDecl(rpc_mod, "handlePayjoinRequest"));
 }
 
 // ===========================================================================
@@ -335,37 +361,41 @@ test "w119/G15: sender min-fee-rate floor enforcement absent" {
 }
 
 // ===========================================================================
-// G16: Query-parameter parser — MISSING ENTIRELY
+// G16: Query-parameter parser — CLOSED in FIX-65
 //
-// The receiver endpoint URL takes 5 query-string params:
-// v, additionalfeeoutputindex, maxadditionalfeecontribution,
-// disableoutputsubstitution, minfeerate.  No URL/query parser exists in
-// clearbit.
+// FIX-65 adds `parsePayjoinQuery` + `PayjoinQuery` (a struct exposing all
+// 5 BIP-78 optional parameters with spec defaults applied at parse time).
+// Test coverage: `src/tests_fix65_payjoin_receiver.zig` G16 cluster.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Optional parameters"
 // ===========================================================================
-test "w119/G16: query-parameter parser absent" {
-    try testing.expect(!@hasDecl(rpc_mod, "parsePayjoinQuery"));
-    try testing.expect(!@hasDecl(rpc_mod, "PayjoinQuery"));
+test "w119/G16: query-parameter parser present (FIX-65)" {
+    try testing.expect(@hasDecl(rpc_mod, "parsePayjoinQuery"));
+    try testing.expect(@hasDecl(rpc_mod, "PayjoinQuery"));
+    // `parseQueryString` deliberately NOT added — we want the BIP-78-
+    // specific parser, not a generic URL-query helper that would invite
+    // misuse outside the PayJoin path.
     try testing.expect(!@hasDecl(rpc_mod, "parseQueryString"));
 }
 
 // ===========================================================================
-// G17: 4 BIP-78 error codes — MISSING ENTIRELY
+// G17: 4 BIP-78 error codes — CLOSED in FIX-65
 //
-// BUG-16 (MED): BIP-78 mandates 4 application/json error codes:
-//   `unavailable`, `not-enough-money`, `version-unsupported`,
-//   `original-psbt-rejected`.  None are defined.  A shim would have to
-//   invent codes and lose wire compatibility with btcpayserver/payjoin.
+// FIX-65 adds `PayjoinError` (Zig error set) + the 4 wire-string code
+// constants (`PAYJOIN_ERR_UNAVAILABLE` etc).  Verbatim wire-string match
+// to BTCPayServer.Payjoin is asserted in
+// `src/tests_fix65_payjoin_receiver.zig`.
+//
+// BUG-16 (MED) — original audit text retained.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Receiver's well-known errors"
 // ===========================================================================
-test "w119/G17: 4 BIP-78 error codes absent" {
-    try testing.expect(!@hasDecl(rpc_mod, "PayjoinError"));
-    try testing.expect(!@hasDecl(rpc_mod, "PAYJOIN_ERR_UNAVAILABLE"));
-    try testing.expect(!@hasDecl(rpc_mod, "PAYJOIN_ERR_NOT_ENOUGH_MONEY"));
-    try testing.expect(!@hasDecl(rpc_mod, "PAYJOIN_ERR_VERSION_UNSUPPORTED"));
-    try testing.expect(!@hasDecl(rpc_mod, "PAYJOIN_ERR_ORIGINAL_REJECTED"));
+test "w119/G17: 4 BIP-78 error codes present (FIX-65)" {
+    try testing.expect(@hasDecl(rpc_mod, "PayjoinError"));
+    try testing.expect(@hasDecl(rpc_mod, "PAYJOIN_ERR_UNAVAILABLE"));
+    try testing.expect(@hasDecl(rpc_mod, "PAYJOIN_ERR_NOT_ENOUGH_MONEY"));
+    try testing.expect(@hasDecl(rpc_mod, "PAYJOIN_ERR_VERSION_UNSUPPORTED"));
+    try testing.expect(@hasDecl(rpc_mod, "PAYJOIN_ERR_ORIGINAL_REJECTED"));
 }
 
 // ===========================================================================
@@ -415,17 +445,19 @@ test "w119/G20: receiver UTXO anti-fingerprint selector absent" {
 }
 
 // ===========================================================================
-// G21: v=1 version-pin header — MISSING ENTIRELY
+// G21: v=1 version-pin header — CLOSED in FIX-65
 //
-// BUG-20 (MED): Query-string MUST include `v=1`.  The receiver MUST
-//   return `version-unsupported` for any other value.  Without a version
-//   gate, future BIP-78 v2 endpoints could be parsed by v1 code.
+// FIX-65 adds `PAYJOIN_VERSION = 1` + `checkPayjoinVersion`, returning
+// `error.VersionUnsupported` for any other value.  `handlePayjoinRequest`
+// calls the checker before reading the body, so a malformed `v=` short-
+// circuits to a `version-unsupported` JSON error.  Test coverage:
+// `src/tests_fix65_payjoin_receiver.zig` G21 cluster.
 //
 // Spec ref: bips/bip-0078.mediawiki, "Version negotiation"
 // ===========================================================================
-test "w119/G21: v=1 version-pin handler absent" {
-    try testing.expect(!@hasDecl(rpc_mod, "PAYJOIN_VERSION"));
-    try testing.expect(!@hasDecl(rpc_mod, "checkPayjoinVersion"));
+test "w119/G21: v=1 version-pin handler present (FIX-65)" {
+    try testing.expect(@hasDecl(rpc_mod, "PAYJOIN_VERSION"));
+    try testing.expect(@hasDecl(rpc_mod, "checkPayjoinVersion"));
 }
 
 // ===========================================================================
@@ -574,21 +606,36 @@ test "w119/G30: receiver replay-protect cache absent" {
 // W119 summary integrity gate
 // ===========================================================================
 
-test "w119: BIP-78 surface remains MISSING (except FIX-62 BIP-21 prereq)" {
-    // The audit was originally honest about 10/10 MISSING ENTIRELY.  FIX-62
-    // closed G28 + G29 (BIP-21 URI parser) as the universal prereq for any
-    // future PayJoin work.  Every OTHER PayJoin-specific decl is still
-    // expected absent; this summary gate now fails loudly if any future fix
-    // adds a PayJoin decl without removing the corresponding `@hasDecl`
-    // assertion above — exactly the desired CI signal.
-    const all_absent = !@hasDecl(rpc_mod, "PayjoinServer") and
-        !@hasDecl(rpc_mod, "handlePayjoinRequest") and
+test "w119: BIP-78 surface partial after FIX-62 (BIP-21) + FIX-65 (receiver foundation)" {
+    // The audit was originally honest about 10/10 MISSING ENTIRELY.  Two
+    // fix waves have flipped a strict subset of gates:
+    //   - FIX-62 closed G28 + G29 (BIP-21 URI parser, universal prereq).
+    //   - FIX-65 closed G1 + G16 + G17 + G21 (receiver-side foundation:
+    //     POST /payjoin route, query parser, 4 error codes, v=1 pin).
+    // Every other PayJoin-specific decl remains expected absent.  This
+    // summary gate fails loudly if a future fix adds a deferred-shape
+    // decl without removing the corresponding `@hasDecl` assertion in
+    // its per-gate test above — exactly the desired CI signal.
+    //
+    // What MUST be present (closed by FIX-65):
+    const foundation_present = @hasDecl(rpc_mod, "PayjoinHandler") and
+        @hasDecl(rpc_mod.RpcServer, "handlePayjoinRequest") and
+        @hasDecl(rpc_mod, "parsePayjoinQuery") and
+        @hasDecl(rpc_mod, "PayjoinQuery") and
+        @hasDecl(rpc_mod, "PayjoinError") and
+        @hasDecl(rpc_mod, "PAYJOIN_VERSION") and
+        @hasDecl(rpc_mod, "checkPayjoinVersion");
+    try testing.expect(foundation_present);
+
+    // What MUST remain absent (deferred to future fix waves):
+    const still_absent = !@hasDecl(rpc_mod, "PayjoinServer") and
         !@hasDecl(wallet_mod, "sendPayjoinRequest") and
         !@hasDecl(psbt_mod, "validateOriginalPsbt") and
         !@hasDecl(psbt_mod, "validatePayjoinProposal") and
-        !@hasDecl(rpc_mod, "PayjoinError") and
-        !@hasDecl(rpc_mod, "PAYJOIN_VERSION") and
         !@hasDecl(rpc_mod, "handleGetPayjoinRequest") and
-        !@hasDecl(rpc_mod, "handleSendPayjoinRequest");
-    try testing.expect(all_absent);
+        !@hasDecl(rpc_mod, "handleSendPayjoinRequest") and
+        !@hasDecl(rpc_mod, "TlsPayjoinServer") and
+        !@hasDecl(rpc_mod, "OnionPayjoinServer") and
+        !@hasDecl(rpc_mod, "PayjoinReplayCache");
+    try testing.expect(still_absent);
 }

@@ -1083,6 +1083,40 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_fix64_tests.step);
     }
 
+    // FIX-65 — BIP-78 PayJoin receiver foundation (plain HTTP only).
+    // `tests_fix65_payjoin_receiver.zig` imports rpc.zig + psbt.zig + types.zig
+    // (mirror the W119 / FIX-64 link config so the test binary actually links).
+    // Run with `zig build test-fix65`.
+    {
+        const fix65_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_fix65_payjoin_receiver.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"fix65"},
+        });
+        fix65_tests.linkSystemLibrary("rocksdb");
+        fix65_tests.linkSystemLibrary("secp256k1");
+        fix65_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        fix65_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            fix65_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            fix65_tests.linkSystemLibrary("minisketch");
+            fix65_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        fix65_tests.root_module.addOptions("build_options", build_options);
+
+        const run_fix65_tests = b.addRunArtifact(fix65_tests);
+        const fix65_test_step = b.step("test-fix65", "Run FIX-65 BIP-78 PayJoin receiver foundation tests");
+        fix65_test_step.dependOn(&run_fix65_tests.step);
+        // Fold into the default `test` step.
+        test_step.dependOn(&run_fix65_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
