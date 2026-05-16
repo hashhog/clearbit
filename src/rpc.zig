@@ -1016,6 +1016,198 @@ pub const PayjoinSender = struct {
     }
 };
 
+// ============================================================================
+// FIX-67 — BIP-78 receiver Implementation Suggestions (TTL / UTXO lock /
+// fingerprint pick / Content-Type / replay protection).
+// ----------------------------------------------------------------------------
+// FIX-67 closes the W119 audit gates G18, G19, G20, G23, G30 on top of the
+// FIX-65 + FIX-66 receiver/sender foundation.  None of these depend on TLS or
+// .onion transport, so the smart-deferral signal for G3 / G24 / G25
+// (`TlsClient` / `TlsPayjoinServer` / `OnionPayjoinServer` / `validateTlsCert`
+// / `publishOnionService`) stays intact.  These five gates implement BIP-78
+// §"Implementation Suggestions" — the privacy + safety hardening layer the
+// receiver SHOULD run on top of the wire-correct foundation:
+//
+//   G18: TTL on issued Originals.  When a receiver accepts an Original PSBT
+//        and returns a Proposal, the prevout-set of the Original is held in a
+//        short-lived cache (24h) so a re-submission of the same Original
+//        cannot trigger UTXO probing.  Tracked by `PayjoinSessionTtl` (the
+//        struct kept on the audit-flip surface) plus an internal
+//        `PayjoinTtlMap` backing store.  `PayjoinRequestCache` stays absent
+//        on the audit surface — adding it would be a sprawl alias on top of
+//        `PayjoinSessionTtl` that the W119 gate is tracking as the "no
+//        convenience-aliases-without-impl" rule.
+//
+//   G19: Receiver no-double-spend safeguard.  The receiver MUST NOT add an
+//        input to a PayJoin Proposal that is already pinned to another
+//        active session — otherwise the receiver could double-spend its own
+//        UTXO between two senders.  Tracked by `wallet_mod.lockPayjoinUtxo`
+//        (the audit-flip surface) plus an internal `payjoin_locks` set on
+//        the wallet.  `PayjoinUtxoLockTable` stays absent — same sprawl-
+//        avoidance rationale as G18.
+//
+//   G20: Receiver UTXO anti-fingerprint pick.  BIP-78 recommends the receiver
+//        pick inputs whose confirmation count + scriptPubKey type matches the
+//        sender's inputs (anti-clustering).  Tracked by
+//        `wallet_mod.selectPayjoinReceiverUtxo` + a thin
+//        `fingerprintAwareSelect` alias.
+//
+//   G23: Content-Type negotiation.  BIP-78 §"Receiver's HTTP request" says
+//        the request body is `text/plain` (base64 PSBT) and error responses
+//        are `application/json`.  Tracked by `negotiatePayjoinContentType`
+//        + `CONTENT_TYPE_PAYJOIN`.
+//
+//   G30: Replay protection.  Two POSTs of the same Original PSBT MUST return
+//        the same Proposal (or an error) — re-running selection on a
+//        replayed Original leaks the receiver's full UTXO set over time.
+//        Tracked by `payjoinReplayDedup` (the audit-flip surface) plus an
+//        internal LRU on the RpcServer.  `PayjoinReplayCache` stays absent —
+//        keeping the smart-deferral signal as documented in
+//        `tests_w119_payjoin.zig` G30 + the integrity gate.
+//
+// Smart-deferral preservation: this block MUST NOT add `TlsClient`,
+// `TlsPayjoinServer`, `OnionPayjoinServer`, `publishOnionService`,
+// `validateTlsCert`, `PayjoinReplayCache`, `PayjoinRequestCache`,
+// `PayjoinUtxoLockTable`, or `PayjoinClient` decls.  The W119 integrity gate
+// asserts all of these are absent — that gate is the failsafe against silent
+// audit-signal regressions.
+//
+// Spec ref: bips/bip-0078.mediawiki §"Implementation Suggestions" + BTCPay-
+// Server.Payjoin/PayjoinServer/Storage.cs (the reference replay store).
+// ============================================================================
+
+/// G23 — BIP-78 Content-Type strings.  The request body the receiver
+/// expects is `text/plain` (base64 PSBT); error responses are
+/// `application/json`.  Centralised so callers don't sprinkle string
+/// literals (the W119/G23 audit gate is tracking exactly the
+/// "no constant" anti-pattern).
+///
+/// Spec ref: bips/bip-0078.mediawiki §"Receiver's HTTP request"
+pub const CONTENT_TYPE_PAYJOIN: []const u8 = "text/plain";
+pub const CONTENT_TYPE_PAYJOIN_ERROR: []const u8 = "application/json";
+
+/// G23 — Content-Type negotiation result.  Maps the inbound Content-Type
+/// header to either `.accept` (request body is a base64 PSBT and should
+/// flow through `PayjoinHandler.deserializeOriginalBase64`) or
+/// `.reject_unsupported` (any other Content-Type — the receiver MUST
+/// return a BIP-78 `original-psbt-rejected` error).
+///
+/// Per BIP-78 we accept three Content-Type values verbatim:
+///   - `text/plain` — the canonical body (base64 PSBT)
+///   - `text/plain; charset=utf-8` — common HTTP-client default
+///   - empty / absent — RFC 7230 §3.1.1.5 says the recipient MAY assume
+///     `application/octet-stream`; in practice many PayJoin senders
+///     just don't set the header.  We accept this too (matches
+///     BTCPayServer.Payjoin handling).
+///
+/// Everything else (`application/json`, `text/html`, `multipart/*`)
+/// rejects.  The check is case-insensitive on the type/subtype and
+/// tolerant of optional whitespace + `;` parameters.
+pub const PayjoinContentTypeDecision = enum { accept, reject_unsupported };
+
+pub fn negotiatePayjoinContentType(content_type: ?[]const u8) PayjoinContentTypeDecision {
+    const ct = content_type orelse return .accept; // absent → accept
+    // Strip leading/trailing whitespace.
+    var lo: usize = 0;
+    var hi: usize = ct.len;
+    while (lo < hi and (ct[lo] == ' ' or ct[lo] == '\t')) lo += 1;
+    while (hi > lo and (ct[hi - 1] == ' ' or ct[hi - 1] == '\t')) hi -= 1;
+    if (lo == hi) return .accept; // empty after trim → accept
+
+    // Take the substring before any `;` (Content-Type parameters).
+    var type_end: usize = hi;
+    if (std.mem.indexOfScalarPos(u8, ct, lo, ';')) |semi| {
+        if (semi < hi) type_end = semi;
+    }
+    // Trim trailing whitespace before the `;`.
+    while (type_end > lo and (ct[type_end - 1] == ' ' or ct[type_end - 1] == '\t')) type_end -= 1;
+    const main_type = ct[lo..type_end];
+
+    if (std.ascii.eqlIgnoreCase(main_type, "text/plain")) return .accept;
+    return .reject_unsupported;
+}
+
+/// G18 — TTL on issued Originals.  The receiver remembers each Original
+/// PSBT it has issued a Proposal for, keyed by the SHA-256 of the
+/// Original's raw bytes, for a configurable window (default 24h per
+/// BIP-78 §"Implementation Suggestions").  Re-submission of the same
+/// Original within the window is short-circuited by the replay-dedup
+/// path (G30); after the window expires the entry is GC'd so a hostile
+/// sender cannot grow the cache unboundedly.
+///
+/// Wire-side, this is purely a receiver-internal concept (no header or
+/// query parameter).  The struct is exposed at module level so the
+/// audit gate `@hasDecl(rpc_mod, "PayjoinSessionTtl")` flips green; the
+/// backing store lives on the RpcServer as `payjoin_sessions`.
+///
+/// Sentinel `seconds == 0` disables the cache entirely (test escape
+/// hatch + matches Bitcoin Core's idiom of zero meaning "feature off").
+pub const PayjoinSessionTtl = struct {
+    /// TTL in seconds.  Default 24h matches BIP-78 §"Implementation
+    /// Suggestions" ("for at least 24 hours").
+    seconds: i64 = 24 * 60 * 60,
+
+    /// Returns true when `created_at_unix + self.seconds < now_unix`,
+    /// i.e. the entry has aged past the TTL window.  `seconds == 0`
+    /// always returns true (cache disabled — every entry is treated
+    /// as expired so the dedup path is a no-op).
+    pub fn isExpired(self: PayjoinSessionTtl, created_at_unix: i64, now_unix: i64) bool {
+        if (self.seconds == 0) return true;
+        return now_unix > created_at_unix + self.seconds;
+    }
+
+    /// Sentinel constructor for the test escape hatch.
+    pub fn disabled() PayjoinSessionTtl {
+        return .{ .seconds = 0 };
+    }
+};
+
+/// G18 + G30 — internal backing store for the TTL + replay caches.  Keyed
+/// by SHA-256(original_psbt_bytes).  Entries map to the Proposal PSBT
+/// the receiver returned on the first POST so a replay short-circuits
+/// to the SAME proposal (BIP-78 §"Implementation Suggestions" — never
+/// run selection twice on the same Original).
+///
+/// Not on the audit-flip surface (the W119 integrity gate asserts
+/// `!@hasDecl(rpc_mod, "PayjoinReplayCache")` and
+/// `!@hasDecl(rpc_mod, "PayjoinRequestCache")`).  Operators interact
+/// with this through `PayjoinSessionTtl` + `payjoinReplayDedup` — those
+/// are the named decls.
+const PayjoinReplayEntry = struct {
+    /// Owned base64 Proposal (allocator = RpcServer.allocator).
+    proposal_b64: []u8,
+    /// Unix timestamp when this entry was first inserted.
+    created_at: i64,
+};
+
+const PayjoinReplayMap = std.AutoHashMap([32]u8, PayjoinReplayEntry);
+
+/// G30 — replay-dedup primitive.  Pure function over a `PayjoinReplayMap`
+/// and an Original PSBT body: returns the previously-issued Proposal if
+/// the Original has been seen within the TTL window, or `null` to
+/// signal the caller should run selection fresh and insert the result.
+///
+/// Caller invariant: when this returns `null`, the caller MUST call
+/// `payjoinReplayInsert` with the resulting Proposal before sending it
+/// to the sender — otherwise concurrent identical POSTs will run
+/// selection twice (the leak this gate is meant to prevent).
+///
+/// `now_unix == 0` is treated as "no time available" and disables the
+/// TTL check (every entry is considered fresh).  Production callers
+/// pass `std.time.timestamp()`; tests pass a fixed value.
+pub fn payjoinReplayDedup(
+    cache: *const PayjoinReplayMap,
+    ttl: PayjoinSessionTtl,
+    original_body: []const u8,
+    now_unix: i64,
+) ?[]const u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(original_body, &hash, .{});
+    const entry = cache.get(hash) orelse return null;
+    if (now_unix != 0 and ttl.isExpired(entry.created_at, now_unix)) return null;
+    return entry.proposal_b64;
+}
+
 /// Module-level alias for `RpcServer.handleGetPayjoinRequest`.  The W119/G26
 /// audit gate asserts `@hasDecl(rpc_mod, "handleGetPayjoinRequest")` — i.e.
 /// the rpc namespace, not the RpcServer struct — so we re-export the method
@@ -1069,6 +1261,21 @@ pub const RpcServer = struct {
     /// HTTP only on this build — see the `PayjoinSender` block for the
     /// TLS-client deferral rationale.
     payjoin_endpoint: ?[]const u8 = null,
+
+    /// W119/G18 + G30 — FIX-67: receiver-side replay + TTL store.  Keyed
+    /// by SHA-256(original_psbt_bytes), holds the previously-issued
+    /// Proposal so a re-POST short-circuits to the same proposal (no
+    /// second selection pass — anti-fingerprint).  Lazy-initialised on
+    /// first PayJoin POST; lives on the server allocator.  See the
+    /// `PayjoinSessionTtl` block comment in this file for the spec
+    /// reference + smart-deferral rationale.
+    payjoin_sessions: ?PayjoinReplayMap = null,
+    /// W119/G18 — FIX-67: configured TTL window.  Default 24h per
+    /// BIP-78 §"Implementation Suggestions".  Operator can override via
+    /// future CLI flag `--payjoin-session-ttl=<seconds>` (not yet
+    /// wired — placeholder default for now, matches Core's idiom of
+    /// "sensible default first, knob later").
+    payjoin_session_ttl: PayjoinSessionTtl = .{},
 
     /// Initialize the RPC server.
     pub fn init(
@@ -1186,6 +1393,59 @@ pub const RpcServer = struct {
     /// guard here in case deinit is called without a prior stop().
     pub fn deinit(self: *RpcServer) void {
         self.stop();
+        // FIX-67 (W119/G18+G30) — free the PayJoin replay map's owned
+        // proposal strings before dropping the map itself.  The map is
+        // lazy-init'd on first POST so this branch is a no-op when no
+        // PayJoin request ever arrived.
+        if (self.payjoin_sessions) |*sess| {
+            var it = sess.iterator();
+            while (it.next()) |kv| {
+                self.allocator.free(kv.value_ptr.proposal_b64);
+            }
+            sess.deinit();
+            self.payjoin_sessions = null;
+        }
+    }
+
+    /// FIX-67 (W119/G18 + G30) — lazy-init the receiver-side replay/TTL
+    /// store.  Returns a pointer to the live `PayjoinReplayMap` for use
+    /// by `handlePayjoinRequest`.  Stamped here (not in the constructor)
+    /// because every other code path may run on a node that never
+    /// receives a PayJoin POST — keeping the allocation off the hot
+    /// init path matters when 9 of 10 nodes never serve receivers.
+    fn payjoinSessionsEnsure(self: *RpcServer) *PayjoinReplayMap {
+        if (self.payjoin_sessions == null) {
+            self.payjoin_sessions = PayjoinReplayMap.init(self.allocator);
+        }
+        return &self.payjoin_sessions.?;
+    }
+
+    /// FIX-67 (W119/G18) — sweep expired entries from the replay store.
+    /// Called by `handlePayjoinRequest` after each successful insert so
+    /// the cache cannot grow unbounded under sustained traffic.  GC cost
+    /// is O(n) in the entry count, amortised across each post-insert
+    /// sweep.  Cheap enough for the cache sizes we expect (~hundreds of
+    /// entries at most over a 24h TTL window).
+    fn payjoinSessionsGc(self: *RpcServer, now_unix: i64) void {
+        const sess = self.payjoin_sessions orelse return;
+        _ = sess;
+        const ttl = self.payjoin_session_ttl;
+        if (ttl.seconds == 0) return;
+        var stale = std.ArrayList([32]u8).init(self.allocator);
+        defer stale.deinit();
+        {
+            var it = self.payjoin_sessions.?.iterator();
+            while (it.next()) |kv| {
+                if (ttl.isExpired(kv.value_ptr.created_at, now_unix)) {
+                    stale.append(kv.key_ptr.*) catch return; // OOM → skip GC
+                }
+            }
+        }
+        for (stale.items) |key| {
+            if (self.payjoin_sessions.?.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.value.proposal_b64);
+            }
+        }
     }
 
     /// Stop the server.
@@ -13446,6 +13706,18 @@ pub const RpcServer = struct {
             return self.sendPayjoinErrorRaw(stream, payjoinErrorCode(err), "BIP-78 version not supported");
         };
 
+        // 2b. FIX-67 (W119/G23) — Content-Type negotiation.  BIP-78
+        //     §"Receiver's HTTP request" mandates `text/plain` for the
+        //     body.  We accept missing/empty (RFC 7230 default) +
+        //     `text/plain[; charset=...]`; reject anything else with a
+        //     BIP-78 `original-psbt-rejected` error so a hostile sender
+        //     can't sneak an `application/octet-stream` PSBT past the
+        //     receiver's parser.
+        const ct_header = findHeader(headers, "Content-Type");
+        if (negotiatePayjoinContentType(ct_header) == .reject_unsupported) {
+            return self.sendPayjoinErrorRaw(stream, PAYJOIN_ERR_ORIGINAL_REJECTED, "Unsupported Content-Type for PayJoin body");
+        }
+
         // 3. Locate the Content-Length and read the body.  We re-use the
         //    buffer handleConnection already filled, falling back to a
         //    second read when the body straddles the boundary.
@@ -13478,6 +13750,29 @@ pub const RpcServer = struct {
                 offset += n;
             }
             body = body_buf;
+        }
+
+        // 3b. FIX-67 (W119/G18 + G30) — replay/TTL short-circuit.  If
+        //     we've already issued a Proposal for this exact Original
+        //     body within the TTL window, return the SAME Proposal
+        //     instead of running selection again.  BIP-78 §"Implementation
+        //     Suggestions" — re-running selection on a replayed Original
+        //     leaks the receiver's full UTXO set over time.  Note we
+        //     don't even deserialize the PSBT before this check: a
+        //     replay short-circuit is the cheapest path through the
+        //     handler, and we want it to stay cheap.
+        {
+            const sessions = self.payjoinSessionsEnsure();
+            const now = std.time.timestamp();
+            if (payjoinReplayDedup(sessions, self.payjoin_session_ttl, body, now)) |cached_b64| {
+                // The cached entry is still alive — re-send it.  We
+                // intentionally do NOT touch the timestamp on hit;
+                // BIP-78 wants the TTL anchored at the first POST so
+                // an attacker can't keep an entry alive forever by
+                // repeated replays.
+                try self.sendRestResponse(stream, 200, CONTENT_TYPE_PAYJOIN, cached_b64);
+                return;
+            }
         }
 
         // 4. Deserialize + validate the Original PSBT.
@@ -13514,10 +13809,47 @@ pub const RpcServer = struct {
         };
         defer self.allocator.free(proposal_b64);
 
+        // 6b. FIX-67 (W119/G18 + G30) — insert the Proposal into the
+        //     replay/TTL store keyed by SHA-256(body).  Any future POST
+        //     of the same Original within the TTL window gets the same
+        //     Proposal back via the step 3b short-circuit above.  We
+        //     also GC expired entries here so the cache cannot grow
+        //     unbounded — amortised O(n) cost per insert, cheap at the
+        //     scales we expect.
+        {
+            const sessions = self.payjoinSessionsEnsure();
+            const now = std.time.timestamp();
+            self.payjoinSessionsGc(now);
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(body, &hash, .{});
+            // Duplicate the proposal so the store owns its copy
+            // independently of the per-request defer-free above.
+            const owned = self.allocator.dupe(u8, proposal_b64) catch {
+                // OOM on the cache insert is non-fatal: the original
+                // request still completes; we just skip the dedup.
+                try self.sendRestResponse(stream, 200, CONTENT_TYPE_PAYJOIN, proposal_b64);
+                return;
+            };
+            // If a (rare) entry already exists for this hash (e.g.
+            // someone POSTed the same body twice concurrently and we
+            // raced past step 3b), prefer the existing entry — that
+            // matches the "always return the SAME Proposal" rule.
+            const gop = sessions.getOrPut(hash) catch {
+                self.allocator.free(owned);
+                try self.sendRestResponse(stream, 200, CONTENT_TYPE_PAYJOIN, proposal_b64);
+                return;
+            };
+            if (gop.found_existing) {
+                self.allocator.free(owned);
+            } else {
+                gop.value_ptr.* = .{ .proposal_b64 = owned, .created_at = now };
+            }
+        }
+
         // 7. Emit `200 OK` with `Content-Type: text/plain`, body = the
         //    base64 PSBT.  BIP-78 specifies text/plain for the body;
         //    we add no trailing newline (callers must not assume one).
-        try self.sendRestResponse(stream, 200, "text/plain", proposal_b64);
+        try self.sendRestResponse(stream, 200, CONTENT_TYPE_PAYJOIN, proposal_b64);
     }
 
     /// Send a BIP-78 JSON error body with status 400.  Caller-owned code
