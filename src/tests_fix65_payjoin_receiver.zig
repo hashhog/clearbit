@@ -373,18 +373,26 @@ test "fix65/audit: receiver-foundation decls present (G1+G16+G17+G21 flipped)" {
     try testing.expect(@hasDecl(rpc, "checkPayjoinVersion"));
 }
 
-test "fix65/audit: deferred Implementation Suggestions + transport-TLS decls remain ABSENT" {
-    // G2 + G10-G15 + G22 + G26 + G27 closed in FIX-66.  See the
-    // `fix66/integrity` test for the load-bearing assertion that the
-    // sender foundation is present.  Here we keep only the assertions
-    // that have NOT been closed by FIX-65 OR FIX-66:
+test "fix65/audit: deferred transport-TLS decls remain ABSENT (post-FIX-67)" {
+    // G2 + G10-G15 + G22 + G26 + G27 closed in FIX-66.
+    // G18 + G19 + G20 + G23 + G30 closed in FIX-67 (Implementation
+    // Suggestions: TTL store, UTXO lock, fingerprint pick, Content-Type,
+    // replay protection).  See the `fix67/integrity` test for the
+    // foundation-present assertions.  Here we keep only the assertions
+    // that have NOT been closed by FIX-65 OR FIX-66 OR FIX-67 — i.e. the
+    // transport-TLS surface (G3/G24/G25) the smart-deferral pattern
+    // preserves as the audit signal.
     const wallet_mod = @import("wallet.zig");
-    // G18/G19/G20/G30: implementation suggestions — deferred.
+    // G18/G30 type-name aliases stay absent — backing store is private
+    // and the audit-flip surface is `PayjoinSessionTtl` +
+    // `payjoinReplayDedup`.  Adding either of these would be a sprawl
+    // alias the W119 integrity gate explicitly rejects.
     try testing.expect(!@hasDecl(rpc, "PayjoinRequestCache"));
     try testing.expect(!@hasDecl(rpc, "PayjoinReplayCache"));
-    try testing.expect(!@hasDecl(wallet_mod, "lockPayjoinUtxo"));
+    // G19 type-name alias stays absent — backing store is private.
+    try testing.expect(!@hasDecl(rpc, "PayjoinUtxoLockTable"));
     // G25 Tor / G24 TLS receiver-side / G24 TLS client-side — deferred
-    // (W119/G3 + G24).  FIX-66 added the HTTP client without a
+    // (W119/G3 + G24).  FIX-66/67 added all the HTTP code without a
     // `TlsClient` alias, preserving the gate.
     try testing.expect(!@hasDecl(rpc, "TlsPayjoinServer"));
     try testing.expect(!@hasDecl(rpc, "OnionPayjoinServer"));
