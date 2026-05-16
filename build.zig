@@ -1152,6 +1152,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_fix66_tests.step);
     }
 
+    // FIX-67 — BIP-78 PayJoin receiver Implementation Suggestions
+    // (TTL / UTXO lock / fingerprint pick / Content-Type / replay).
+    // `tests_fix67_payjoin_suggestions.zig` imports rpc.zig + wallet.zig +
+    // psbt.zig + types.zig + script.zig (mirror the FIX-65/66 link config).
+    // Run with `zig build test-fix67`.
+    {
+        const fix67_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_fix67_payjoin_suggestions.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"fix67"},
+        });
+        fix67_tests.linkSystemLibrary("rocksdb");
+        fix67_tests.linkSystemLibrary("secp256k1");
+        fix67_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        fix67_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            fix67_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            fix67_tests.linkSystemLibrary("minisketch");
+            fix67_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        fix67_tests.root_module.addOptions("build_options", build_options);
+
+        const run_fix67_tests = b.addRunArtifact(fix67_tests);
+        const fix67_test_step = b.step("test-fix67", "Run FIX-67 BIP-78 PayJoin Implementation Suggestions tests");
+        fix67_test_step.dependOn(&run_fix67_tests.step);
+        // Fold into the default `test` step.
+        test_step.dependOn(&run_fix67_tests.step);
+    }
+
     // Sighash test harness (links secp256k1 since crypto.zig requires it)
     const sighash_test = b.addExecutable(.{
         .name = "test_sighash",
