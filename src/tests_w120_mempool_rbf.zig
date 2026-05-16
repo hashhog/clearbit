@@ -56,6 +56,7 @@ const mempool_mod = @import("mempool.zig");
 const types = @import("types.zig");
 const rpc_mod = @import("rpc.zig");
 const wallet_mod = @import("wallet.zig");
+const crypto_mod = @import("crypto.zig");
 
 // ===========================================================================
 // G1: BIP-125 Rule 1 — replacement signals opt-in (or full-RBF override)
@@ -337,25 +338,195 @@ test "w120 G14: 100-cap constant matches Core" {
 
 // ===========================================================================
 // G15: getmempoolentry `bip125-replaceable` field
-// Status: PARTIAL (wire-incompat).
+// Status: PRESENT (FIX-68 W120 BUG-6 closed).
 //
-// `RpcServer.handleGetMempoolEntry` emits `"bip125-replaceable":true`
-// UNCONDITIONALLY (rpc.zig:4531: `const bip125_replaceable = true;`
-// "Full RBF: all mempool txs are replaceable").  This is true in Core only
-// when `-mempoolfullrbf=1`; the default-off behavior should report the
-// actual `entry.is_rbf` flag.
+// `RpcServer.handleGetMempoolEntry` (rpc.zig ~4541) now delegates to
+// `Mempool.isRBFOptIn(txid)`, which honours the `full_rbf` operator
+// override and otherwise returns the per-entry `is_rbf` bit (set at
+// admission via isRBFSignaled || hasRBFAncestor || tx.version == TRUC_VERSION).
+// Mirrors Bitcoin Core rpc/mempool.cpp `entryToJSON` which calls
+// `IsRBFOptIn(tx, pool)` from policy/rbf.cpp.
 
-// BUG-6 (HIGH-CDIV): getmempoolentry always reports `bip125-replaceable=true`
-// regardless of the entry's actual signalling.  Even though
-// `mempool.full_rbf` defaults to false (mempool.zig:885), the RPC lies to
-// the caller.  Combined with the missing CLI plumbing (G23 BUG-9), wallets
-// driving fee bumps will believe every mempool tx is replaceable and may
-// generate replacements that Core peers will reject.
+// BUG-6 (HIGH-CDIV) FIXED in FIX-68 (W120 follow-up):
+// getmempoolentry now reports `bip125-replaceable=true` only when the
+// entry actually signals opt-in or has a signalling ancestor (or when
+// full_rbf is enabled). The hardcoded `true` literal that previously made
+// every mempool tx look replaceable has been removed.
 
-test "w120 G15: bip125-replaceable field is hardcoded true (BUG-6)" {
-    // Direct grep proof: rpc.zig contains the literal hardcoded true.
-    // We can't compile-time check string contents, but we can document.
-    try testing.expect(true);
+test "w120 G15 (FIX-68): isRBFOptIn returns null for missing txid" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const missing: [32]u8 = .{0xAA} ** 32;
+    try testing.expectEqual(@as(?bool, null), mempool.isRBFOptIn(missing));
+}
+
+// Helper: build a standard P2WPKH output so checkStandard doesn't reject.
+fn w120FixP2WPKHScript() [22]u8 {
+    return [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+}
+
+test "w120 G15 (FIX-68): isRBFOptIn — signaling tx → true" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Build a tx whose only input has nSequence 0xFFFFFFFD (opt-in RBF).
+    const spk = w120FixP2WPKHScript();
+    const prev: [32]u8 = .{0x11} ** 32;
+    const out = types.TxOut{ .value = 100_000, .script_pubkey = &spk };
+    const inp = types.TxIn{
+        .previous_output = .{ .hash = prev, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{inp},
+        .outputs = &[_]types.TxOut{out},
+        .lock_time = 0,
+    };
+
+    // No chain state -> addTransaction's verifyInputScripts step is skipped
+    // (mempool.zig:2103 contract: "No chain state - for testing, assume
+    // inputs exist"), which is the standard W120/W106 test pattern.
+    try mempool.addTransaction(tx);
+    const txid = try crypto_mod.computeTxid(&tx, allocator);
+
+    const rbf = mempool.isRBFOptIn(txid);
+    try testing.expect(rbf != null);
+    try testing.expect(rbf.?);
+}
+
+test "w120 G15 (FIX-68): isRBFOptIn — non-signaling tx with no ancestors → false" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Tx with nSequence 0xFFFFFFFE (the canonical "non-signaling, non-final"
+    // value — anything > MAX_BIP125_RBF_SEQUENCE qualifies). Tx version 1
+    // (not TRUC v3) and no ancestor in the pool, so the entry must report
+    // bip125-replaceable=false.
+    const spk = w120FixP2WPKHScript();
+    const prev: [32]u8 = .{0x22} ** 32;
+    const out = types.TxOut{ .value = 100_000, .script_pubkey = &spk };
+    const inp = types.TxIn{
+        .previous_output = .{ .hash = prev, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFE,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{inp},
+        .outputs = &[_]types.TxOut{out},
+        .lock_time = 0,
+    };
+
+    try mempool.addTransaction(tx);
+    const txid = try crypto_mod.computeTxid(&tx, allocator);
+
+    const rbf = mempool.isRBFOptIn(txid);
+    try testing.expect(rbf != null);
+    try testing.expect(!rbf.?);
+}
+
+test "w120 G15 (FIX-68): isRBFOptIn — non-signaling tx with signaling ancestor → true" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // Parent: signals RBF (nSequence 0xFFFFFFFD).
+    const spk = w120FixP2WPKHScript();
+    const parent_prev: [32]u8 = .{0x33} ** 32;
+    const parent_out = types.TxOut{ .value = 200_000, .script_pubkey = &spk };
+    const parent_in = types.TxIn{
+        .previous_output = .{ .hash = parent_prev, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const parent_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{parent_in},
+        .outputs = &[_]types.TxOut{parent_out},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent_tx);
+    const parent_txid = try crypto_mod.computeTxid(&parent_tx, allocator);
+
+    // Child: does NOT signal (0xFFFFFFFE) and is not TRUC, but spends the
+    // signaling parent's output. BIP-125 §"Specification" rule 1 says a tx
+    // is replaceable if "any of its unconfirmed ancestors signals" → child
+    // must report bip125-replaceable=true.
+    const child_out = types.TxOut{ .value = 100_000, .script_pubkey = &spk };
+    const child_in = types.TxIn{
+        .previous_output = .{ .hash = parent_txid, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFE,
+        .witness = &[_][]const u8{},
+    };
+    const child_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{child_in},
+        .outputs = &[_]types.TxOut{child_out},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(child_tx);
+    const child_txid = try crypto_mod.computeTxid(&child_tx, allocator);
+
+    // Parent must obviously still be replaceable.
+    const parent_rbf = mempool.isRBFOptIn(parent_txid);
+    try testing.expect(parent_rbf != null);
+    try testing.expect(parent_rbf.?);
+
+    // Child must inherit replaceability from the parent.
+    const child_rbf = mempool.isRBFOptIn(child_txid);
+    try testing.expect(child_rbf != null);
+    try testing.expect(child_rbf.?);
+}
+
+test "w120 G15 (FIX-68): isRBFOptIn — full_rbf operator override forces true" {
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    mempool.full_rbf = true; // operator opt-in: every tx treated as replaceable.
+
+    // Build a deliberately non-signaling tx that would normally report false.
+    const spk = w120FixP2WPKHScript();
+    const prev: [32]u8 = .{0x44} ** 32;
+    const out = types.TxOut{ .value = 80_000, .script_pubkey = &spk };
+    const inp = types.TxIn{
+        .previous_output = .{ .hash = prev, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{inp},
+        .outputs = &[_]types.TxOut{out},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx);
+    const txid = try crypto_mod.computeTxid(&tx, allocator);
+
+    const rbf = mempool.isRBFOptIn(txid);
+    try testing.expect(rbf != null);
+    try testing.expect(rbf.?);
+}
+
+test "w120 G15 (FIX-68): handleGetMempoolEntry no longer hardcodes bip125-replaceable=true" {
+    // Source-level guard: the literal `const bip125_replaceable = true;`
+    // assignment that produced the pre-FIX-68 wire-incompat must be gone.
+    // Reading rpc.zig at build time pins the regression so a future "drive
+    // by" revert resurrecting the hardcode fails this test FIRST inside the
+    // W120 file, before any cross-impl differential test catches it.
+    const src = @embedFile("rpc.zig");
+    const bad_literal = "const bip125_replaceable = true;";
+    try testing.expect(std.mem.indexOf(u8, src, bad_literal) == null);
 }
 
 // ===========================================================================
@@ -485,6 +656,19 @@ test "w120 G22: full_rbf field present, defaults to false" {
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();
     try testing.expect(!mempool.full_rbf);
+}
+
+test "w120 G22 (FIX-68): getmempoolinfo `fullrbf` no longer hardcodes true" {
+    // FIX-68 secondary fix: getmempoolinfo previously emitted
+    //   "...,\"fullrbf\":true}"
+    // unconditionally while `Mempool.full_rbf` defaults to false. Wallets
+    // driving fee bumps would believe every mempool tx is replaceable and
+    // could generate replacements that Core peers reject. The handler now
+    // formats the actual `mempool.full_rbf` state via {s} interpolation.
+    // Source-level guard: the offending literal must be gone.
+    const src = @embedFile("rpc.zig");
+    const bad_literal = "\"unbroadcastcount\":0,\"fullrbf\":true}";
+    try testing.expect(std.mem.indexOf(u8, src, bad_literal) == null);
 }
 
 // ===========================================================================
