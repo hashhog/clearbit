@@ -51,6 +51,28 @@ pub const MAX_BLOCKTXN_DEPTH: u32 = 10;
 /// otherwise force unbounded `Hash256` allocation.
 pub const MAX_LOCATOR_SIZE: usize = 101;
 
+// ============================================================================
+// BIP-157 Compact Filter P2P Limits (Core net_processing.cpp:184-186)
+// ============================================================================
+
+/// Maximum height range that may be requested in a single `getcfilters`
+/// message: a peer must not ask for more than 1000 filters at once.
+/// Reference: bitcoin-core/src/net_processing.cpp:184
+///   static constexpr uint32_t MAX_GETCFILTERS_SIZE = 1000;
+/// Violations trigger Misbehaving(100)+disconnect via PrepareBlockFilterRequest.
+pub const MAX_GETCFILTERS_SIZE: u32 = 1000;
+
+/// Maximum height range that may be requested in a single `getcfheaders`
+/// message: 2000 filter hashes per response.
+/// Reference: bitcoin-core/src/net_processing.cpp:186
+///   static constexpr uint32_t MAX_GETCFHEADERS_SIZE = 2000;
+pub const MAX_GETCFHEADERS_SIZE: u32 = 2000;
+
+/// Spacing between checkpointed filter headers in `cfcheckpt` responses.
+/// Reference: bitcoin-core/src/index/blockfilterindex.h:31
+///   static constexpr int CFCHECKPT_INTERVAL = 1000;
+pub const CFCHECKPT_INTERVAL: u32 = 1000;
+
 /// Network magic bytes for different networks
 pub const NetworkMagic = struct {
     pub const MAINNET: u32 = 0xD9B4BEF9;
@@ -178,6 +200,18 @@ pub const Message = union(enum) {
     // (buggy peer).  We keep the variant to avoid ParseError.UnknownCommand
     // and log+drop it in the handler.
     merkleblock: BloomFilterRawMessage,
+    // BIP-157 Compact Block Filter messages (FIX-84).
+    // getcfilters / getcfheaders / getcfcheckpt are inbound requests we serve
+    // from the block-filter index; cfilter / cfheaders / cfcheckpt are the
+    // matching responses.  We support both directions so peers can act as
+    // BIP-157 clients OR servers, and so test harnesses can round-trip the
+    // wire encoding.
+    getcfilters: GetCFiltersMessage,
+    cfilter: CFilterMessage,
+    getcfheaders: GetCFHeadersMessage,
+    cfheaders: CFHeadersMessage,
+    getcfcheckpt: GetCFCheckPtMessage,
+    cfcheckpt: CFCheckPtMessage,
 };
 
 /// Version message - exchanged during handshake.
@@ -423,6 +457,75 @@ pub const BloomFilterRawMessage = struct {
 };
 
 // ============================================================================
+// BIP-157 Compact Block Filter Messages (FIX-84)
+// ============================================================================
+//
+// Reference: bitcoin-core/src/net_processing.cpp
+//   ProcessGetCFilters / ProcessGetCFHeaders / ProcessGetCFCheckPt.
+// All six payload encodings exactly mirror Core's wire format.
+
+/// `getcfilters` — request filters for the height range
+/// `[start_height, stop_index.height]` where `stop_index = LookupBlockIndex(stop_hash)`.
+/// Wire payload: filter_type (u8) || start_height (u32 LE) || stop_hash (32B).
+pub const GetCFiltersMessage = struct {
+    filter_type: u8,
+    start_height: u32,
+    stop_hash: types.Hash256,
+};
+
+/// `cfilter` — single filter response.  One sent per height in
+/// the requested range (so a getcfilters covering 5 heights yields
+/// 5 cfilter messages).
+/// Wire payload: filter_type (u8) || block_hash (32B) || filter (var_str).
+pub const CFilterMessage = struct {
+    filter_type: u8,
+    block_hash: types.Hash256,
+    /// Raw GCS-encoded filter bytes (already includes the CompactSize(N)
+    /// prefix per BIP-158).  Owned by the message; freed by the receiver.
+    filter: []const u8,
+};
+
+/// `getcfheaders` — request filter-header chain for a height range.
+/// Wire payload: filter_type (u8) || start_height (u32 LE) || stop_hash (32B).
+pub const GetCFHeadersMessage = struct {
+    filter_type: u8,
+    start_height: u32,
+    stop_hash: types.Hash256,
+};
+
+/// `cfheaders` — filter-header chain response.  `prev_filter_header` is
+/// the chained header at (start_height - 1) so the requester can verify
+/// the entire chain back to genesis without refetching earlier filters;
+/// `filter_hashes` are the 32-byte filter content hashes (NOT chained
+/// headers — Core's CFHEADERS message format).
+/// Wire payload: filter_type (u8) || stop_hash (32B) || prev_filter_header (32B)
+///               || count (CompactSize) || filter_hashes (32B each).
+pub const CFHeadersMessage = struct {
+    filter_type: u8,
+    stop_hash: types.Hash256,
+    prev_filter_header: types.Hash256,
+    filter_hashes: []const types.Hash256,
+};
+
+/// `getcfcheckpt` — request checkpointed filter headers
+/// (every CFCHECKPT_INTERVAL=1000 blocks).
+/// Wire payload: filter_type (u8) || stop_hash (32B).
+pub const GetCFCheckPtMessage = struct {
+    filter_type: u8,
+    stop_hash: types.Hash256,
+};
+
+/// `cfcheckpt` — checkpointed filter-header response.  One header per
+/// CFCHECKPT_INTERVAL blocks up to (but not including) stop_index.
+/// Wire payload: filter_type (u8) || stop_hash (32B)
+///               || count (CompactSize) || headers (32B each).
+pub const CFCheckPtMessage = struct {
+    filter_type: u8,
+    stop_hash: types.Hash256,
+    filter_headers: []const types.Hash256,
+};
+
+// ============================================================================
 // Encoding
 // ============================================================================
 
@@ -477,6 +580,13 @@ pub fn encodeMessage(
         .filteradd => "filteradd",
         .filterclear => "filterclear",
         .merkleblock => "merkleblock",
+        // BIP-157 compact filter messages (FIX-84).
+        .getcfilters => "getcfilters",
+        .cfilter => "cfilter",
+        .getcfheaders => "getcfheaders",
+        .cfheaders => "cfheaders",
+        .getcfcheckpt => "getcfcheckpt",
+        .cfcheckpt => "cfcheckpt",
     };
 
     // Encode payload based on message type
@@ -651,6 +761,44 @@ pub fn encodeMessage(
         },
         .filterclear => {
             // filterclear has an empty payload per BIP-37.
+        },
+        // BIP-157 compact filter messages (FIX-84).
+        .getcfilters => |gc| {
+            try payload_writer.writeBytes(&[_]u8{gc.filter_type});
+            try payload_writer.writeInt(u32, gc.start_height);
+            try payload_writer.writeBytes(&gc.stop_hash);
+        },
+        .cfilter => |cf| {
+            try payload_writer.writeBytes(&[_]u8{cf.filter_type});
+            try payload_writer.writeBytes(&cf.block_hash);
+            try payload_writer.writeCompactSize(cf.filter.len);
+            try payload_writer.writeBytes(cf.filter);
+        },
+        .getcfheaders => |gch| {
+            try payload_writer.writeBytes(&[_]u8{gch.filter_type});
+            try payload_writer.writeInt(u32, gch.start_height);
+            try payload_writer.writeBytes(&gch.stop_hash);
+        },
+        .cfheaders => |cfh| {
+            try payload_writer.writeBytes(&[_]u8{cfh.filter_type});
+            try payload_writer.writeBytes(&cfh.stop_hash);
+            try payload_writer.writeBytes(&cfh.prev_filter_header);
+            try payload_writer.writeCompactSize(cfh.filter_hashes.len);
+            for (cfh.filter_hashes) |h| {
+                try payload_writer.writeBytes(&h);
+            }
+        },
+        .getcfcheckpt => |gcc| {
+            try payload_writer.writeBytes(&[_]u8{gcc.filter_type});
+            try payload_writer.writeBytes(&gcc.stop_hash);
+        },
+        .cfcheckpt => |cfc| {
+            try payload_writer.writeBytes(&[_]u8{cfc.filter_type});
+            try payload_writer.writeBytes(&cfc.stop_hash);
+            try payload_writer.writeCompactSize(cfc.filter_headers.len);
+            for (cfc.filter_headers) |h| {
+                try payload_writer.writeBytes(&h);
+            }
         },
     }
 
@@ -891,6 +1039,92 @@ pub fn decodePayload(
     } else if (std.mem.eql(u8, command, "merkleblock")) {
         const owned = try allocator.dupe(u8, payload);
         return Message{ .merkleblock = .{ .payload = owned } };
+    }
+
+    // ========================================================================
+    // BIP-157 Compact Filter Messages (FIX-84)
+    // ========================================================================
+    //
+    // Wire formats mirror Bitcoin Core's net_processing.cpp exactly so a
+    // BIP-157 light client (Neutrino, BFD, rust-lightning) can round-trip
+    // requests + responses against clearbit identically to Core.
+    if (std.mem.eql(u8, command, "getcfilters")) {
+        const filter_type = (try reader.readBytes(1))[0];
+        const start_height = try reader.readInt(u32);
+        const stop_hash = try reader.readHash();
+        return Message{ .getcfilters = .{
+            .filter_type = filter_type,
+            .start_height = start_height,
+            .stop_hash = stop_hash,
+        } };
+    } else if (std.mem.eql(u8, command, "cfilter")) {
+        const filter_type = (try reader.readBytes(1))[0];
+        const block_hash = try reader.readHash();
+        const flen = try reader.readCompactSize();
+        // Safety: cap at MAX_MESSAGE_SIZE; the header.length check upstream
+        // already bounds this but a malicious encoder could embed a too-large
+        // CompactSize without the actual bytes.  readBytes will error if the
+        // payload is short — that's the real guard.
+        const fbytes = try reader.readBytes(@intCast(flen));
+        const owned = try allocator.dupe(u8, fbytes);
+        return Message{ .cfilter = .{
+            .filter_type = filter_type,
+            .block_hash = block_hash,
+            .filter = owned,
+        } };
+    } else if (std.mem.eql(u8, command, "getcfheaders")) {
+        const filter_type = (try reader.readBytes(1))[0];
+        const start_height = try reader.readInt(u32);
+        const stop_hash = try reader.readHash();
+        return Message{ .getcfheaders = .{
+            .filter_type = filter_type,
+            .start_height = start_height,
+            .stop_hash = stop_hash,
+        } };
+    } else if (std.mem.eql(u8, command, "cfheaders")) {
+        const filter_type = (try reader.readBytes(1))[0];
+        const stop_hash = try reader.readHash();
+        const prev_filter_header = try reader.readHash();
+        const count = try reader.readCompactSize();
+        // Anti-DoS: count is bounded by MAX_GETCFHEADERS_SIZE = 2000.  Reject
+        // BEFORE allocating to prevent unbounded memory allocation via a
+        // crafted message.
+        if (count > MAX_GETCFHEADERS_SIZE) return ParseError.InvalidData;
+        var hashes = try allocator.alloc(types.Hash256, @intCast(count));
+        for (0..@intCast(count)) |i| {
+            hashes[i] = try reader.readHash();
+        }
+        return Message{ .cfheaders = .{
+            .filter_type = filter_type,
+            .stop_hash = stop_hash,
+            .prev_filter_header = prev_filter_header,
+            .filter_hashes = hashes,
+        } };
+    } else if (std.mem.eql(u8, command, "getcfcheckpt")) {
+        const filter_type = (try reader.readBytes(1))[0];
+        const stop_hash = try reader.readHash();
+        return Message{ .getcfcheckpt = .{
+            .filter_type = filter_type,
+            .stop_hash = stop_hash,
+        } };
+    } else if (std.mem.eql(u8, command, "cfcheckpt")) {
+        const filter_type = (try reader.readBytes(1))[0];
+        const stop_hash = try reader.readHash();
+        const count = try reader.readCompactSize();
+        // Anti-DoS: bound by absolute height ceiling.  A peer claiming
+        // millions of checkpoints would overrun memory.  ~3.4M is the
+        // theoretical absolute max (UINT32_MAX/CFCHECKPT_INTERVAL ≈ 4.2M)
+        // — use 200_000 as a conservative cap (well above 2026 tip).
+        if (count > 200_000) return ParseError.InvalidData;
+        var hashes = try allocator.alloc(types.Hash256, @intCast(count));
+        for (0..@intCast(count)) |i| {
+            hashes[i] = try reader.readHash();
+        }
+        return Message{ .cfcheckpt = .{
+            .filter_type = filter_type,
+            .stop_hash = stop_hash,
+            .filter_headers = hashes,
+        } };
     }
 
     return ParseError.UnknownCommand;

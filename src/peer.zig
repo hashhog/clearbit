@@ -5384,8 +5384,324 @@ pub const PeerManager = struct {
                     .{peer.address},
                 );
             },
+            // ============================================================
+            // BIP-157 Compact Filter Messages (FIX-84 — W121 BUG-3..7 closure)
+            // ============================================================
+            //
+            // Inbound requests: getcfilters / getcfheaders / getcfcheckpt.
+            // We serve from the BIP-158 block-filter index (verified clean
+            // in W122 audit 17f8c40 / FIX-83 era).  Validation mirrors
+            // bitcoin-core/src/net_processing.cpp::PrepareBlockFilterRequest:
+            //   1. filter_type != 0          → Misbehaving + disconnect.
+            //   2. !NODE_COMPACT_FILTERS     → Misbehaving + disconnect.
+            //   3. LookupBlockIndex == None  → Misbehaving + disconnect.
+            //   4. start_height > stop.height → Misbehaving + disconnect.
+            //   5. range > MAX_GET*_SIZE     → Misbehaving + disconnect.
+            //   6. Walk stop_index.GetAncestor(h) for h in range
+            //      (stop-hash-anchor walk per FIX-74 universal pattern).
+            //
+            // Outbound responses (cfilter / cfheaders / cfcheckpt) are
+            // logged + dropped: clearbit is a serving full node, not a
+            // BIP-157 client.  Variant existence prevents UnknownCommand
+            // fall-through from severing the peer.
+            .getcfilters => |gc| {
+                self.processGetCFilters(peer, gc);
+            },
+            .getcfheaders => |gch| {
+                self.processGetCFHeaders(peer, gch);
+            },
+            .getcfcheckpt => |gcc| {
+                self.processGetCFCheckPt(peer, gcc);
+            },
+            .cfilter => |cf| {
+                // We are a server, not a BIP-157 client — log and free.
+                defer self.allocator.free(cf.filter);
+                std.log.debug(
+                    "unexpected cfilter from peer={any}, dropping (clearbit is server-side only)",
+                    .{peer.address},
+                );
+            },
+            .cfheaders => |cfh| {
+                defer self.allocator.free(cfh.filter_hashes);
+                std.log.debug(
+                    "unexpected cfheaders from peer={any}, dropping (clearbit is server-side only)",
+                    .{peer.address},
+                );
+            },
+            .cfcheckpt => |cfc| {
+                defer self.allocator.free(cfc.filter_headers);
+                std.log.debug(
+                    "unexpected cfcheckpt from peer={any}, dropping (clearbit is server-side only)",
+                    .{peer.address},
+                );
+            },
             else => {},
         }
+    }
+
+    // ========================================================================
+    // BIP-157 Compact Filter Server Handlers (FIX-84)
+    // ========================================================================
+    //
+    // Reference: bitcoin-core/src/net_processing.cpp
+    //   PrepareBlockFilterRequest (line 3262) +
+    //   ProcessGetCFilters (3315) + ProcessGetCFHeaders (3344) +
+    //   ProcessGetCFCheckPt (3386).
+    //
+    // Each handler returns silently on validation failure AFTER calling
+    // peer.misbehaving() + peer.disconnect() — Core's fDisconnect=true
+    // pattern.  No response is sent for a rejected request.
+
+    /// Resolve a `stop_hash` to a height on the active chain, validating
+    /// per Core's PrepareBlockFilterRequest: the hash must exist in our
+    /// header_index AND be on the active chain (or its on-chain history).
+    /// Returns null when the stop_hash is unknown or not on the active
+    /// chain.  The caller is expected to misbehave+disconnect on null.
+    fn resolveActiveChainStopHash(self: *PeerManager, stop_hash: *const types.Hash256) ?u32 {
+        const cs = self.chain_state orelse return null;
+        if (cs.best_height == 0) {
+            // Genesis-only chain: only the genesis hash is valid.
+            return null;
+        }
+        // First try our in-memory header_index.
+        if (self.header_index.get(stop_hash.*)) |entry| {
+            // Verify this hash is on the active chain at its claimed height.
+            const onchain = cs.getBlockHashByHeight(entry.height) orelse return null;
+            if (std.mem.eql(u8, &onchain, stop_hash)) {
+                return entry.height;
+            }
+            // Header known but on a fork branch — Core's BlockRequestAllowed
+            // would gate this on STALE_RELAY_AGE_LIMIT, but we conservatively
+            // reject non-active-chain stop_hashes (light clients always
+            // query the canonical chain).
+            return null;
+        }
+        // Fall back to a linear scan via getBlockHashByHeight.  This is
+        // O(tip) in the worst case but only happens when header_index has
+        // been pruned (LRU eviction past MAX_HEADER_INDEX = 65535).
+        // Practical mainnet impact: a probe for a deep historical block
+        // by a misbehaving light client.  Bounded by a safety cap.
+        const SCAN_CAP: u32 = 100_000;
+        const start: u32 = if (cs.best_height > SCAN_CAP) cs.best_height - SCAN_CAP else 0;
+        var h: u32 = cs.best_height;
+        while (h >= start) : (h -%= 1) {
+            const onchain = cs.getBlockHashByHeight(h) orelse {
+                if (h == 0) break;
+                continue;
+            };
+            if (std.mem.eql(u8, &onchain, stop_hash)) return h;
+            if (h == 0) break;
+        }
+        return null;
+    }
+
+    /// Look up the active-chain block hash at a given height.  Wraps
+    /// ChainState.getBlockHashByHeight so handlers can substitute a test
+    /// stub.  Returns null when height > tip.
+    fn activeChainHashAt(self: *PeerManager, height: u32) ?types.Hash256 {
+        const cs = self.chain_state orelse return null;
+        if (height > cs.best_height) return null;
+        return cs.getBlockHashByHeight(height);
+    }
+
+    /// Fetch the persisted filter blob for a block hash.  Returns null
+    /// when blockfilterindex is disabled, the db is absent, or the block
+    /// isn't indexed (race: peer asked for a block that disconnect-rewind
+    /// has not yet re-indexed).
+    fn fetchPersistedFilterBytes(self: *PeerManager, block_hash: *const types.Hash256) ?[]const u8 {
+        const cs = self.chain_state orelse return null;
+        const bytes = cs.getPersistedFilter(block_hash) catch return null;
+        return bytes;
+    }
+
+    /// Fetch the persisted filter-header (32 bytes) for a block hash.
+    fn fetchPersistedFilterHeader(self: *PeerManager, block_hash: *const types.Hash256) ?types.Hash256 {
+        const cs = self.chain_state orelse return null;
+        const h = cs.getPersistedFilterHeader(block_hash) catch return null;
+        return h;
+    }
+
+    /// `getcfilters` handler — Core ProcessGetCFilters.
+    /// On success: sends N `cfilter` messages, one per height in
+    /// [start_height, stop_height].  On any validation failure: misbehave
+    /// + disconnect, no response.
+    fn processGetCFilters(self: *PeerManager, peer: *Peer, gc: p2p.GetCFiltersMessage) void {
+        // (1) Filter type — only BASIC (=0) is supported per BIP-158.
+        if (gc.filter_type != 0) {
+            peer.misbehaving(100, "getcfilters with unsupported filter_type");
+            peer.disconnect();
+            return;
+        }
+        // (2) Service-bit gate — only serve filters when we ourselves
+        //     advertise NODE_COMPACT_FILTERS.  Otherwise the peer is
+        //     spec-violating by asking us.
+        if (!self.blockfilterindex_enabled) {
+            peer.misbehaving(100, "getcfilters but NODE_COMPACT_FILTERS not advertised");
+            peer.disconnect();
+            return;
+        }
+        // (3) Stop hash → active-chain height.
+        const stop_height = self.resolveActiveChainStopHash(&gc.stop_hash) orelse {
+            peer.misbehaving(100, "getcfilters: stop_hash not on active chain");
+            peer.disconnect();
+            return;
+        };
+        // (4) start_height > stop_height.
+        if (gc.start_height > stop_height) {
+            peer.misbehaving(100, "getcfilters: start_height > stop_height");
+            peer.disconnect();
+            return;
+        }
+        // (5) Range cap (MAX_GETCFILTERS_SIZE = 1000).  Core's check is
+        //     `(stop - start) >= MAX_GETCFILTERS_SIZE` — strictly less than.
+        const range = stop_height - gc.start_height;
+        if (range >= p2p.MAX_GETCFILTERS_SIZE) {
+            peer.misbehaving(100, "getcfilters: range exceeds MAX_GETCFILTERS_SIZE");
+            peer.disconnect();
+            return;
+        }
+        // (6) Walk active chain in [start_height, stop_height] and emit
+        //     one `cfilter` per block.  This is the stop-hash-anchor walk
+        //     from FIX-74 (lunarblock/blockbrew/rustoshi pattern): we walk
+        //     active-chain hashes (via getBlockHashByHeight which is the
+        //     post-reorg canonical map) rather than the in-memory
+        //     header_index (which can include fork branches).
+        var h: u32 = gc.start_height;
+        while (h <= stop_height) : (h += 1) {
+            const block_hash = self.activeChainHashAt(h) orelse {
+                // Active-chain hash should always exist for h <= tip;
+                // a miss here means the index is mid-rewind.  Defensive
+                // return per FIX-79 ouroboros pattern (no response).
+                return;
+            };
+            const filter_bytes = self.fetchPersistedFilterBytes(&block_hash) orelse {
+                // Filter not yet indexed at this height; bail without
+                // partial response (Core's behaviour when
+                // LookupFilterRange fails).
+                return;
+            };
+            defer self.allocator.free(filter_bytes);
+            const msg = p2p.Message{ .cfilter = .{
+                .filter_type = 0,
+                .block_hash = block_hash,
+                .filter = filter_bytes,
+            } };
+            peer.sendMessage(&msg) catch return;
+            if (h == std.math.maxInt(u32)) break;
+        }
+    }
+
+    /// `getcfheaders` handler — Core ProcessGetCFHeaders.
+    /// On success: sends a single `cfheaders` message with
+    /// `prev_filter_header` (the chained header at start_height-1) and
+    /// the filter content hashes for [start_height, stop_height].
+    fn processGetCFHeaders(self: *PeerManager, peer: *Peer, gch: p2p.GetCFHeadersMessage) void {
+        if (gch.filter_type != 0) {
+            peer.misbehaving(100, "getcfheaders with unsupported filter_type");
+            peer.disconnect();
+            return;
+        }
+        if (!self.blockfilterindex_enabled) {
+            peer.misbehaving(100, "getcfheaders but NODE_COMPACT_FILTERS not advertised");
+            peer.disconnect();
+            return;
+        }
+        const stop_height = self.resolveActiveChainStopHash(&gch.stop_hash) orelse {
+            peer.misbehaving(100, "getcfheaders: stop_hash not on active chain");
+            peer.disconnect();
+            return;
+        };
+        if (gch.start_height > stop_height) {
+            peer.misbehaving(100, "getcfheaders: start_height > stop_height");
+            peer.disconnect();
+            return;
+        }
+        const range = stop_height - gch.start_height;
+        if (range >= p2p.MAX_GETCFHEADERS_SIZE) {
+            peer.misbehaving(100, "getcfheaders: range exceeds MAX_GETCFHEADERS_SIZE");
+            peer.disconnect();
+            return;
+        }
+        // prev_filter_header: filter-header at (start_height - 1), or zeroes
+        // when start_height == 0 (genesis sentinel per BIP-157).
+        var prev_filter_header: types.Hash256 = [_]u8{0} ** 32;
+        if (gch.start_height > 0) {
+            const prev_hash = self.activeChainHashAt(gch.start_height - 1) orelse {
+                // Defensive return-on-miss per FIX-79 ouroboros pattern.
+                return;
+            };
+            prev_filter_header = self.fetchPersistedFilterHeader(&prev_hash) orelse {
+                return;
+            };
+        }
+        // Build filter-hash chain for [start_height, stop_height].
+        const count: usize = @intCast(stop_height - gch.start_height + 1);
+        var hashes = self.allocator.alloc(types.Hash256, count) catch return;
+        defer self.allocator.free(hashes);
+        var h: u32 = gch.start_height;
+        var i: usize = 0;
+        while (h <= stop_height) : (h += 1) {
+            const block_hash = self.activeChainHashAt(h) orelse return;
+            // Filter HASH (not the chained header) per Core's CFHEADERS
+            // payload — we hash the persisted filter bytes via
+            // BlockFilter.getHash() ≡ hash256(filter).  We avoid
+            // constructing a full GCSFilter object: SHA256d the raw
+            // persisted bytes directly.
+            const filter_bytes = self.fetchPersistedFilterBytes(&block_hash) orelse return;
+            defer self.allocator.free(filter_bytes);
+            hashes[i] = crypto.hash256(filter_bytes);
+            i += 1;
+            if (h == std.math.maxInt(u32)) break;
+        }
+        const msg = p2p.Message{ .cfheaders = .{
+            .filter_type = 0,
+            .stop_hash = gch.stop_hash,
+            .prev_filter_header = prev_filter_header,
+            .filter_hashes = hashes[0..i],
+        } };
+        peer.sendMessage(&msg) catch return;
+    }
+
+    /// `getcfcheckpt` handler — Core ProcessGetCFCheckPt.
+    /// On success: sends one `cfcheckpt` message with the chained filter
+    /// headers at heights {CFCHECKPT_INTERVAL, 2*CFCHECKPT_INTERVAL, ...}
+    /// up to (and not including) stop_index.height.
+    fn processGetCFCheckPt(self: *PeerManager, peer: *Peer, gcc: p2p.GetCFCheckPtMessage) void {
+        if (gcc.filter_type != 0) {
+            peer.misbehaving(100, "getcfcheckpt with unsupported filter_type");
+            peer.disconnect();
+            return;
+        }
+        if (!self.blockfilterindex_enabled) {
+            peer.misbehaving(100, "getcfcheckpt but NODE_COMPACT_FILTERS not advertised");
+            peer.disconnect();
+            return;
+        }
+        const stop_height = self.resolveActiveChainStopHash(&gcc.stop_hash) orelse {
+            peer.misbehaving(100, "getcfcheckpt: stop_hash not on active chain");
+            peer.disconnect();
+            return;
+        };
+        // Core: vector size = stop_index.nHeight / CFCHECKPT_INTERVAL.
+        const num_checkpoints: u32 = stop_height / p2p.CFCHECKPT_INTERVAL;
+        var headers = self.allocator.alloc(types.Hash256, num_checkpoints) catch return;
+        defer self.allocator.free(headers);
+        // Populate: headers[i] = filter_header at height (i+1) * CFCHECKPT_INTERVAL.
+        // Walk in DESCENDING order to mirror Core (intentional design:
+        // request-time the freshest segment first).  But the OUTPUT vector
+        // is in ASCENDING order — Core writes headers[i] indexed from 0.
+        var i: u32 = 0;
+        while (i < num_checkpoints) : (i += 1) {
+            const checkpoint_height: u32 = (i + 1) * p2p.CFCHECKPT_INTERVAL;
+            const block_hash = self.activeChainHashAt(checkpoint_height) orelse return;
+            headers[i] = self.fetchPersistedFilterHeader(&block_hash) orelse return;
+        }
+        const msg = p2p.Message{ .cfcheckpt = .{
+            .filter_type = 0,
+            .stop_hash = gcc.stop_hash,
+            .filter_headers = headers,
+        } };
+        peer.sendMessage(&msg) catch return;
     }
 
     /// Send known addresses to a peer.
