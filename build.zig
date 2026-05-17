@@ -1159,6 +1159,46 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w125_tests.step);
     }
 
+    // W128 — AddrMan + connman + peer selection 30-gate fleet audit.
+    // Reference: bitcoin-core/src/{addrman,net,banman,node/eviction}.{cpp,h}.
+    // Dedicated test root (tests_w128_addrman.zig) so the audit imports
+    // peer.zig + banlist.zig + p2p.zig + consensus.zig without pulling in
+    // unrelated peer.zig tests via the broad `test` step.
+    // Excludes BIP-155 (W117) + addrman storage/bucketing (W104) + ASMap
+    // health-check (W115); see audit/w128_addrman.md for the bug catalogue.
+    // Run with `zig build test-w128`.
+    {
+        const w128_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w128_addrman.zig"),
+            .target = target,
+            .optimize = optimize,
+            // Filter to only our W128 tests; exclude drifted peer.zig tests
+            // that this root transitively pulls in via the peer import.
+            .filters = &[_][]const u8{"w128", "tests_w128_addrman"},
+        });
+        w128_tests.linkSystemLibrary("rocksdb");
+        w128_tests.linkSystemLibrary("secp256k1");
+        w128_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w128_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w128_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w128_tests.linkSystemLibrary("minisketch");
+            w128_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w128_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w128_tests = b.addRunArtifact(w128_tests);
+        const w128_test_step = b.step("test-w128", "Run W128 AddrMan + connman + peer selection 30-gate audit");
+        w128_test_step.dependOn(&run_w128_tests.step);
+        // Fold into the main `test` step so CI exercises W128.
+        test_step.dependOn(&run_w128_tests.step);
+    }
+
     // W124 — Operator-experience 30-gate audit.
     // Reference: bitcoin-core/src/init.cpp (signals, Shutdown, Interrupt,
     //            SetupServerArgs, LockDirectory, InitLogging, WritePidFile);
@@ -1194,6 +1234,135 @@ pub fn build(b: *std.Build) void {
         w124_test_step.dependOn(&run_w124_tests.step);
         // Fold into the main `test` step so CI exercises W124.
         test_step.dependOn(&run_w124_tests.step);
+    }
+
+    // W126 — BIP-152 Compact Blocks 30-gate audit.
+    // Reference: bitcoin-core/src/blockencodings.{h,cpp} (CBlockHeaderAndShortTxIDs,
+    //            PartiallyDownloadedBlock, DifferenceFormatter);
+    //            bitcoin-core/src/net_processing.cpp (SENDCMPCT/CMPCTBLOCK/
+    //            GETBLOCKTXN/BLOCKTXN handlers, NewPoWValidBlock,
+    //            MaybeSetPeerAsAnnouncingHeaderAndIDs, ProcessCompactBlockTxns).
+    // XFAIL-style guards covering the BIP-152 subsystem end-to-end: sendcmpct
+    // version negotiation, cmpctblock receive + reconstruction, getblocktxn
+    // serve, blocktxn round-trip, HB-peer announce side, PartiallyDownloadedBlock
+    // persistence, short-tx-id siphash key + 48-bit mask.
+    // See audit/w126_bip152_compact_blocks.md.
+    // Run with `zig build test-w126`.
+    {
+        const w126_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w126_bip152_compact_blocks.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w126"},
+        });
+        w126_tests.linkSystemLibrary("rocksdb");
+        w126_tests.linkSystemLibrary("secp256k1");
+        w126_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w126_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w126_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w126_tests.linkSystemLibrary("minisketch");
+            w126_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w126_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w126_tests = b.addRunArtifact(w126_tests);
+        const w126_test_step = b.step("test-w126", "Run W126 BIP-152 Compact Blocks 30-gate audit tests");
+        w126_test_step.dependOn(&run_w126_tests.step);
+        // Fold into the main `test` step so CI exercises W126.
+        test_step.dependOn(&run_w126_tests.step);
+    }
+
+    // W127 — Taproot / Schnorr / Tapscript 30-gate audit.
+    // Reference: bitcoin-core/src/script/interpreter.{cpp,h} (EvalChecksigTapscript,
+    //            VerifyTaprootCommitment, VerifyWitnessProgram, CheckSchnorrSignature,
+    //            SignatureHashSchnorr, ComputeTapleafHash, TAPROOT_LEAF_TAPSCRIPT=0xc0);
+    //            bitcoin-core/src/script/script.h (ANNEX_TAG=0x50);
+    //            bitcoin-core/src/script/script_error.h (SCRIPT_ERR_TAPROOT_*,
+    //            SCRIPT_ERR_TAPSCRIPT_*, SCRIPT_ERR_SCHNORR_*);
+    //            bitcoin-core/src/pubkey.cpp (XOnlyPubKey::VerifySchnorr);
+    //            bitcoin-core/src/script/sigcache.cpp (CSignatureCache);
+    //            BIPs 340 (Schnorr) / 341 (Taproot) / 342 (Tapscript).
+    // XFAIL-style source-guard tests across script.zig, crypto.zig,
+    // taproot_sighash.zig, sig_cache.zig + a handful of round-trip smokes.
+    // See audit/w127_taproot.md.
+    // Run with `zig build test-w127`.
+    {
+        const w127_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w127_taproot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w127"},
+        });
+        w127_tests.linkSystemLibrary("rocksdb");
+        w127_tests.linkSystemLibrary("secp256k1");
+        w127_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w127_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w127_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w127_tests.linkSystemLibrary("minisketch");
+            w127_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w127_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w127_tests = b.addRunArtifact(w127_tests);
+        const w127_test_step = b.step("test-w127", "Run W127 Taproot / Schnorr / Tapscript 30-gate audit tests");
+        w127_test_step.dependOn(&run_w127_tests.step);
+        // Fold into the main `test` step so CI exercises W127.
+        test_step.dependOn(&run_w127_tests.step);
+    }
+
+    // W129 — Coin selection deep audit (30-gate, discovery).
+    // Reference: bitcoin-core/src/wallet/coinselection.{h,cpp}
+    //            (BnB, KnapsackSolver, SelectCoinsSRD, CoinGrinder,
+    //             GenerateChangeTarget, RecalculateWaste, OutputGroup);
+    //            bitcoin-core/src/wallet/spend.cpp
+    //            (AttemptSelection, ChooseSelectionResult,
+    //             cost_of_change / min_viable_change derivation,
+    //             SFFO plumbing);
+    //            bitcoin-core/src/wallet/feebumper.cpp;
+    //            bitcoin-core/src/policy/policy.cpp (GetDustThreshold).
+    // XFAIL-style guards over wallet.zig's BnB + Knapsack + change /
+    // SFFO / dust integration.  See audit/w129_coin_selection.md.
+    // Run with `zig build test-w129`.
+    {
+        const w129_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w129_coin_selection.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w129"},
+        });
+        w129_tests.linkSystemLibrary("rocksdb");
+        w129_tests.linkSystemLibrary("secp256k1");
+        w129_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w129_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w129_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w129_tests.linkSystemLibrary("minisketch");
+            w129_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w129_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w129_tests = b.addRunArtifact(w129_tests);
+        const w129_test_step = b.step("test-w129", "Run W129 Coin selection deep audit (30 gates)");
+        w129_test_step.dependOn(&run_w129_tests.step);
+        // Fold into the main `test` step so CI exercises W129.
+        test_step.dependOn(&run_w129_tests.step);
     }
 
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
