@@ -13663,11 +13663,15 @@ pub const RpcServer = struct {
     ///
     /// FIX-80: the daily consensus-diff (2026-05-16) flagged that
     /// `initialblockdownload` stayed `true` even at chain tip because
-    /// (a) we had no sticky latch and (b) the tip-age check considered
-    /// the recorded `tip.header.timestamp` (which can lag wallclock
-    /// briefly during a restart, before the next header arrives).
-    /// Sticky-OFF after the first observed satisfaction is the Core
-    /// behaviour and prevents flapping.
+    /// (a) we had no sticky latch, (b) `chain_state.total_work` is
+    /// never mutated after init (always zero, so chainwork < min always
+    /// returned true on mainnet), and (c) the tip-age check considered
+    /// the recorded `tip.header.timestamp` without any latch on the
+    /// successful exit.  We now prefer the chain manager's
+    /// `active_tip.chain_work` (which IS populated during validation),
+    /// fall back to `chain_state.total_work` only when no chain_manager
+    /// is wired, and latch sticky-OFF on the first successful exit to
+    /// mirror Core's `m_cached_is_ibd`.
     ///
     /// Reference: bitcoin-core/src/validation.cpp UpdateIBDStatus +
     /// chain.h CChain::IsTipRecent.
@@ -13675,8 +13679,23 @@ pub const RpcServer = struct {
         // Sticky-OFF latch: once we've reported IBD as false, stay false.
         if (self.ibd_latched_off.load(.monotonic)) return false;
 
+        // Source-of-truth for chainwork:  prefer the chain manager's
+        // `active_tip.chain_work` because `chain_state.total_work` is
+        // never mutated post-init in the current build.  When the
+        // manager is not yet wired (early boot / test path) we fall
+        // back to `chain_state.total_work`, accepting the conservative
+        // "stay in IBD" answer if chainwork is unknown.
+        const tip_chain_work_ptr: *const [32]u8 = blk: {
+            if (self.chain_manager) |cm| {
+                if (cm.active_tip) |tip| {
+                    break :blk &tip.chain_work;
+                }
+            }
+            break :blk &self.chain_state.total_work;
+        };
+
         // Condition 1: chainwork must meet the minimum chain-work bar.
-        if (self.compareChainWork(&self.chain_state.total_work, &self.network_params.min_chain_work) < 0) {
+        if (self.compareChainWork(tip_chain_work_ptr, &self.network_params.min_chain_work) < 0) {
             return true;
         }
 
@@ -16214,6 +16233,75 @@ test "FIX-80: initialblockdownload flips false at tip + sticky-OFF" {
 
     // Cleanup: the entry we allocated above is owned by ChainManager.deinit
     // which destroys every value pointer with its own allocator.
+}
+
+// FIX-80 (production bug repro): consensus-diff 2026-05-16 caught clearbit
+// reporting `initialblockdownload=true` on mainnet at chain tip 949619
+// because `chain_state.total_work` is never mutated after init (always
+// zero).  Core's `min_chain_work` is non-zero on mainnet, so the old code
+// path's chainwork comparison always returned true.  The fix prefers
+// `active_tip.chain_work` (which IS populated during validation) when a
+// chain manager is wired.  This test reproduces the exact production
+// shape: mainnet params, `chain_state.total_work` left at zero (the bug
+// surface), but active_tip carries the real persisted chain work.
+test "FIX-80: mainnet at tip exits IBD via active_tip.chain_work (chain_state.total_work-zero repro)" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 949619;
+    chain_state.best_hash = [_]u8{0xAB} ** 32;
+    // Mirror the production bug: total_work stays at zero.
+    chain_state.total_work = [_]u8{0x00} ** 32;
+
+    var cm = validation.ChainManager.init(&chain_state, null, allocator);
+    defer cm.deinit();
+
+    // Tip entry with the real persisted chain work (well above mainnet
+    // min_chain_work) and a fresh wallclock timestamp.
+    const tip_hash: types.Hash256 = [_]u8{0xAB} ** 32;
+    const tip_entry = try allocator.create(validation.BlockIndexEntry);
+    tip_entry.* = .{
+        .hash = tip_hash,
+        .header = blk: {
+            var h = std.mem.zeroes(types.BlockHeader);
+            h.timestamp = @intCast(std.time.timestamp());
+            break :blk h;
+        },
+        .height = 949619,
+        .status = .{},
+        // Saturate the high bytes so the BE comparison against
+        // MAINNET.min_chain_work passes regardless of its exact value.
+        .chain_work = [_]u8{0xFF} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try cm.block_index.put(tip_entry.hash, tip_entry);
+    cm.active_tip = tip_entry;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    // Pre-fix this returned true on mainnet because `chain_state.total_work`
+    // was zero and `min_chain_work` is non-zero.  Post-fix the function
+    // prefers `active_tip.chain_work` and returns false correctly.
+    try std.testing.expect(!server.isInitialBlockDownload());
+    try std.testing.expect(server.ibd_latched_off.load(.monotonic));
 }
 
 test "getblockcount returns height" {
