@@ -25,6 +25,16 @@
 //!   Txid := 32 raw bytes (internal byte order, NOT reversed)
 //!
 //! v1 (no XOR key) is also accepted on load for backwards compatibility.
+//!
+//! FIX-76 (2026-05-16): standalone mapDeltas tail block is now actively
+//! populated on dump and applied via `prioritiseTransaction` on load.
+//! Prior to FIX-76 the dump path emitted `CompactSize(0)` here and the load
+//! path read-and-discarded it, so an operator's priority deltas (set via
+//! the `prioritisetransaction` RPC) were dropped on restart. Core has
+//! always persisted these — see `bitcoin-core/src/node/mempool_persist.cpp`
+//! lines 101 (DumpMempool: `file << mapDeltas`) and 124-130 (LoadMempool:
+//! `for (const auto& i : mapDeltas) pool.PrioritiseTransaction(i.first, i.second)`).
+//! The on-disk layout is unchanged; only the contents are now correct.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -232,6 +242,13 @@ fn readObfuscatedTransaction(
 /// obfuscation). Writes to `<path>.new` then atomically renames to `path`,
 /// matching Core's Commit + RenameOver dance.
 ///
+/// FIX-76: persists operator-set priority deltas (set via the
+/// `prioritisetransaction` RPC) per Core's
+/// `bitcoin-core/src/node/mempool_persist.cpp` :88-101 — entries that ARE in
+/// the mempool carry their delta inline as the per-tx `nFeeDelta` field;
+/// entries that are NOT in the mempool (operator pre-prioritised a txid
+/// before it arrived) go into the standalone `mapDeltas` tail block.
+///
 /// Returns the number of transactions written.
 pub fn dumpMempool(
     pool: *mempool_mod.Mempool,
@@ -281,8 +298,15 @@ pub fn dumpMempool(
 
     // Snapshot the mempool under its mutex. We collect entries first so the
     // file write doesn't hold the mempool lock for I/O.
+    //
+    // FIX-76 / Core mempool_persist.cpp:88-95: we also snapshot mapDeltas
+    // into a working copy. The per-entry write loop drains entries that ARE
+    // in the mempool out of this map (matching Core's `mapDeltas.erase(...)`
+    // at :100), and the standalone-deltas tail block writes what remains.
     var entries = std.ArrayList(*mempool_mod.MempoolEntry).init(allocator);
     defer entries.deinit();
+    var working_deltas = std.AutoHashMap(types.Hash256, i64).init(allocator);
+    defer working_deltas.deinit();
     {
         pool.mutex.lock();
         defer pool.mutex.unlock();
@@ -291,14 +315,22 @@ pub fn dumpMempool(
         while (it.next()) |kv| {
             entries.appendAssumeCapacity(kv.value_ptr.*);
         }
+        try working_deltas.ensureTotalCapacity(pool.map_deltas.count());
+        var dit = pool.map_deltas.iterator();
+        while (dit.next()) |dkv| {
+            working_deltas.putAssumeCapacity(dkv.key_ptr.*, dkv.value_ptr.*);
+        }
     }
 
     try w.writeU64(@intCast(entries.items.len));
 
-    // Tx-with-witness + nTime + nFeeDelta per Core mempool_persist.cpp.
-    // We don't currently track nFeeDelta (priority deltas via PrioritiseTx),
-    // so emit 0 — this is what Core does for any tx whose mapDeltas entry
-    // has been erased after writing the per-tx record.
+    // Tx-with-witness + nTime + nFeeDelta per Core mempool_persist.cpp:98-101.
+    // FIX-76 / W120 BUG-11: the per-entry nFeeDelta is now sourced from the
+    // working mapDeltas snapshot. Entries whose txid has a recorded priority
+    // delta carry it inline and are removed from the working map so the tail
+    // block below contains only the truly standalone deltas (operator-set
+    // priorities for txids that are NOT currently in the mempool — Core
+    // allows pre-prioritising a txid before it arrives).
     var tx_writer = serialize.Writer.init(allocator);
     defer tx_writer.deinit();
     for (entries.items) |entry| {
@@ -306,11 +338,30 @@ pub fn dumpMempool(
         try serialize.writeTransaction(&tx_writer, &entry.tx);
         try w.writeObfuscated(tx_writer.getWritten());
         try w.writeI64(entry.time_added);
-        try w.writeI64(0); // nFeeDelta — not tracked yet
+        // Per-entry nFeeDelta from the operator-set priority map.
+        const fee_delta_for_entry: i64 = working_deltas.get(entry.txid) orelse 0;
+        try w.writeI64(fee_delta_for_entry);
+        // Match Core's `mapDeltas.erase(i.tx->GetHash())` (mempool_persist.cpp:100):
+        // we've consumed this delta inline, so it must NOT appear again in the
+        // standalone tail block.
+        _ = working_deltas.remove(entry.txid);
     }
 
-    // mapDeltas (empty — clearbit doesn't yet expose PrioritiseTransaction).
-    try w.writeCompactSize(0);
+    // FIX-76: standalone mapDeltas tail block — operator-set priorities for
+    // txids that are not currently in the mempool. Format matches Core's
+    // `std::map<Txid, CAmount>` serializer: CompactSize(N) || N * (32-byte
+    // txid || i64 LE delta). Sorted order is preserved by Core (std::map
+    // iterates in key order) but the on-load Apply step (PrioritiseTransaction)
+    // is order-independent, so we emit in whatever order the AutoHashMap
+    // iterator hands them back — interop with Core is preserved because Core
+    // reads the map into a std::map and then iterates regardless of write
+    // order.
+    try w.writeCompactSize(working_deltas.count());
+    var rem_it = working_deltas.iterator();
+    while (rem_it.next()) |rkv| {
+        try w.writeObfuscated(&rkv.key_ptr.*);
+        try w.writeI64(rkv.value_ptr.*);
+    }
 
     // unbroadcast_txids (empty — clearbit doesn't yet track unbroadcast set).
     try w.writeCompactSize(0);
@@ -443,7 +494,25 @@ pub fn loadMempool(
         };
         const tx_time: i64 = try reader.readI64();
         const fee_delta: i64 = try reader.readI64();
-        _ = fee_delta; // not yet wired into the mempool
+
+        // FIX-76: apply the per-entry priority delta BEFORE attempting to
+        // accept. Mirrors Core mempool_persist.cpp:100-103:
+        //     CAmount amountdelta = nFeeDelta;
+        //     if (amountdelta && opts.apply_fee_delta_priority) {
+        //         pool.PrioritiseTransaction(tx->GetHash(), amountdelta);
+        //     }
+        // The delta sticks in `map_deltas` regardless of whether the tx
+        // itself is accepted — Core's intent is that an operator's
+        // priority survives even if the tx is currently un-admitted.
+        if (fee_delta != 0) {
+            // Compute txid up-front since the delta sticks regardless of
+            // accept-outcome. `computeTxidStreaming` is alloc-free; we
+            // don't need to thread the allocator through.
+            const persisted_txid = crypto.computeTxidStreaming(&tx);
+            _ = pool.prioritiseTransaction(persisted_txid, fee_delta) catch |e| switch (e) {
+                error.OutOfMemory => return Error.OutOfMemory,
+            };
+        }
 
         // Drop expired txs before bothering to validate them — matches
         // Core's `if (nTime > now - expiry)` gate.
@@ -468,14 +537,21 @@ pub fn loadMempool(
         }
     }
 
-    // mapDeltas — read and discard for now (clearbit has no priority deltas).
+    // FIX-76 / Core mempool_persist.cpp:124-130: standalone mapDeltas tail
+    // block. Each (txid, delta) pair is applied via
+    // `pool.prioritiseTransaction(txid, delta)` so an operator's pre-
+    // prioritisation for a txid that has not yet hit the mempool survives
+    // a restart. Was: read-and-discard, dropping the delta silently.
     {
         const map_count = try reader.readCompactSize();
         var j: u64 = 0;
         while (j < map_count) : (j += 1) {
-            var txid: [32]u8 = undefined;
+            var txid: types.Hash256 = undefined;
             try reader.readObfuscated(&txid);
-            _ = try reader.readI64(); // CAmount
+            const delta: i64 = try reader.readI64();
+            _ = pool.prioritiseTransaction(txid, delta) catch |e| switch (e) {
+                error.OutOfMemory => return Error.OutOfMemory,
+            };
         }
     }
 
@@ -676,4 +752,258 @@ test "load: unsupported version errors out" {
     }
 
     try std.testing.expectError(Error.UnsupportedVersion, loadMempool(&pool, path, allocator));
+}
+
+// ============================================================================
+// FIX-76 — mapDeltas (operator-set priority deltas) persistence.
+// Reference: bitcoin-core/src/node/mempool_persist.cpp:88-103 (DumpMempool
+// writes the per-entry nFeeDelta + erases from mapDeltas; the surviving
+// mapDeltas entries are written as the standalone tail block) and :100-130
+// (LoadMempool calls PrioritiseTransaction for both the inline per-entry
+// delta and the standalone tail block entries).
+//
+// Pre-FIX-76 the dump path emitted CompactSize(0) for the tail block and
+// the load path read-and-discarded both inline + tail deltas — so an
+// operator's priority survived in-memory but was lost on restart.
+// ============================================================================
+
+test "FIX-76: standalone delta for absent txid survives dump+load" {
+    const allocator = std.testing.allocator;
+    var pool = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool.deinit();
+
+    // Pre-prioritise a txid that has NOT entered the mempool yet — Core
+    // explicitly supports this; the delta is parked in mapDeltas until the
+    // tx arrives.
+    const absent_txid: types.Hash256 = .{0xAB} ** 32;
+    const delta: i64 = 42_000;
+    _ = try pool.prioritiseTransaction(absent_txid, delta);
+    try std.testing.expectEqual(delta, pool.applyDelta(absent_txid));
+
+    var tmpdir = std.testing.tmpDir(.{});
+    defer tmpdir.cleanup();
+    const real_path = try tmpdir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(real_path);
+    const path = try std.fmt.allocPrint(allocator, "{s}/mempool.dat", .{real_path});
+    defer allocator.free(path);
+
+    const written = try dumpMempool(&pool, path, allocator);
+    try std.testing.expectEqual(@as(usize, 0), written); // no entries
+
+    // Fresh pool — the standalone delta should be applied during load.
+    var pool2 = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool2.deinit();
+    const r = try loadMempool(&pool2, path, allocator);
+    try std.testing.expectEqual(@as(usize, 0), r.total);
+    try std.testing.expectEqual(@as(usize, 0), r.accepted);
+
+    // The delta must be restored.
+    try std.testing.expectEqual(delta, pool2.applyDelta(absent_txid));
+    try std.testing.expect(pool2.map_deltas.contains(absent_txid));
+}
+
+test "FIX-76: in-mempool delta survives dump+load via per-entry nFeeDelta" {
+    const allocator = std.testing.allocator;
+    var pool = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool.deinit();
+
+    // Same standardness-passing tx shape as the single-tx round-trip test
+    // above (P2WPKH out, no chain state plumbed = no fee check fires).
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xCD} ** 20;
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x77} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const output = types.TxOut{
+        .value = 50_000,
+        .script_pubkey = &p2wpkh_script,
+    };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{output},
+        .lock_time = 0,
+    };
+    try pool.addTransaction(tx);
+
+    const txid = try crypto.computeTxid(&tx, allocator);
+    const delta: i64 = 9_999;
+    _ = try pool.prioritiseTransaction(txid, delta);
+
+    // Sanity: getModifiedFee reflects the delta pre-dump.
+    const entry_pre = pool.entries.get(txid) orelse return error.MissingEntry;
+    try std.testing.expectEqual(entry_pre.fee + delta, pool.getModifiedFee(entry_pre));
+
+    var tmpdir = std.testing.tmpDir(.{});
+    defer tmpdir.cleanup();
+    const real_path = try tmpdir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(real_path);
+    const path = try std.fmt.allocPrint(allocator, "{s}/mempool.dat", .{real_path});
+    defer allocator.free(path);
+
+    const written = try dumpMempool(&pool, path, allocator);
+    try std.testing.expectEqual(@as(usize, 1), written);
+
+    var pool2 = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool2.deinit();
+    const r = try loadMempool(&pool2, path, allocator);
+    try std.testing.expectEqual(@as(usize, 1), r.total);
+    try std.testing.expectEqual(@as(usize, 1), r.accepted);
+
+    // Delta must be restored AND the entry reflects the modified fee.
+    try std.testing.expectEqual(delta, pool2.applyDelta(txid));
+    const entry_post = pool2.entries.get(txid) orelse return error.MissingEntry;
+    try std.testing.expectEqual(entry_post.fee + delta, pool2.getModifiedFee(entry_post));
+
+    // Free the slices owned by the reloaded mempool entries — testing
+    // allocator is strict.
+    var iter = pool2.entries.iterator();
+    while (iter.next()) |kv| {
+        serialize.freeTransaction(allocator, &kv.value_ptr.*.tx);
+    }
+}
+
+test "FIX-76: empty map_deltas survives dump+load (negative case)" {
+    const allocator = std.testing.allocator;
+    var pool = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), pool.map_deltas.count());
+
+    var tmpdir = std.testing.tmpDir(.{});
+    defer tmpdir.cleanup();
+    const real_path = try tmpdir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(real_path);
+    const path = try std.fmt.allocPrint(allocator, "{s}/mempool.dat", .{real_path});
+    defer allocator.free(path);
+
+    _ = try dumpMempool(&pool, path, allocator);
+
+    var pool2 = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool2.deinit();
+    _ = try loadMempool(&pool2, path, allocator);
+    try std.testing.expectEqual(@as(u32, 0), pool2.map_deltas.count());
+}
+
+test "FIX-76: mixed in-mempool + standalone deltas round-trip independently" {
+    // The dump path partitions map_deltas into (a) per-entry inline (txid
+    // currently in mempool) and (b) standalone tail (txid absent). Both
+    // paths must restore the delta on load without overlap.
+    const allocator = std.testing.allocator;
+    var pool = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool.deinit();
+
+    // (a) in-mempool entry with a positive delta.
+    const p2wpkh = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xEF} ** 20;
+    const tx_in_pool = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0xAA} ** 32, .index = 1 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 60_000, .script_pubkey = &p2wpkh }},
+        .lock_time = 0,
+    };
+    try pool.addTransaction(tx_in_pool);
+    const live_txid = try crypto.computeTxid(&tx_in_pool, allocator);
+    const live_delta: i64 = 12345;
+    _ = try pool.prioritiseTransaction(live_txid, live_delta);
+
+    // (b) absent txid with a negative delta — exercises sign preservation
+    // through the i64 LE round-trip.
+    const absent_txid: types.Hash256 = .{0xBE} ** 32;
+    const absent_delta: i64 = -777;
+    _ = try pool.prioritiseTransaction(absent_txid, absent_delta);
+
+    // map_deltas now has 2 entries; one live, one absent.
+    try std.testing.expectEqual(@as(u32, 2), pool.map_deltas.count());
+
+    var tmpdir = std.testing.tmpDir(.{});
+    defer tmpdir.cleanup();
+    const real_path = try tmpdir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(real_path);
+    const path = try std.fmt.allocPrint(allocator, "{s}/mempool.dat", .{real_path});
+    defer allocator.free(path);
+
+    _ = try dumpMempool(&pool, path, allocator);
+
+    var pool2 = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool2.deinit();
+    _ = try loadMempool(&pool2, path, allocator);
+
+    try std.testing.expectEqual(live_delta, pool2.applyDelta(live_txid));
+    try std.testing.expectEqual(absent_delta, pool2.applyDelta(absent_txid));
+    try std.testing.expectEqual(@as(u32, 2), pool2.map_deltas.count());
+
+    // Free reloaded tx slices.
+    var iter = pool2.entries.iterator();
+    while (iter.next()) |kv| {
+        serialize.freeTransaction(allocator, &kv.value_ptr.*.tx);
+    }
+}
+
+test "FIX-76: old-format file (pre-FIX-76 empty tail) loads cleanly" {
+    // Pre-FIX-76 dumps wrote CompactSize(0) for both mapDeltas and
+    // unbroadcast_txids tails. The format is unchanged — FIX-76 only changes
+    // CONTENTS. A pre-FIX-76 file written by the OLD dump path therefore
+    // has an empty tail block. We assert that the FIX-76 load path handles
+    // this without error and leaves map_deltas empty.
+    //
+    // We simulate by writing a file with the current dump path while the
+    // mempool has no deltas; that is bitwise-identical to a pre-FIX-76 dump
+    // of an empty-delta mempool.
+    const allocator = std.testing.allocator;
+    var pool = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool.deinit();
+    try std.testing.expectEqual(@as(u32, 0), pool.map_deltas.count());
+
+    var tmpdir = std.testing.tmpDir(.{});
+    defer tmpdir.cleanup();
+    const real_path = try tmpdir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(real_path);
+    const path = try std.fmt.allocPrint(allocator, "{s}/old_fmt.dat", .{real_path});
+    defer allocator.free(path);
+
+    _ = try dumpMempool(&pool, path, allocator);
+
+    var pool2 = mempool_mod.Mempool.init(null, null, allocator);
+    defer pool2.deinit();
+    _ = try loadMempool(&pool2, path, allocator);
+    try std.testing.expectEqual(@as(u32, 0), pool2.map_deltas.count());
+}
+
+test "FIX-76: forward-regression source guard" {
+    // Pin the FIX-76 wiring at the source level. A drive-by revert that
+    // re-introduces a hardcoded `writeI64(0)` for the per-entry nFeeDelta,
+    // or that drops the prioritiseTransaction call on load, would fail
+    // this test FIRST (before silently dropping operator deltas in prod).
+    const src = @embedFile("mempool_persist.zig");
+
+    // Dump path: per-entry delta lookup from working snapshot.
+    const dump_inline = "const fee_delta_for_entry: i64 = working_deltas.get(entry.txid)";
+    try std.testing.expect(std.mem.indexOf(u8, src, dump_inline) != null);
+
+    // Dump path: standalone tail loop emits the remaining deltas.
+    const dump_tail = "try w.writeCompactSize(working_deltas.count());";
+    try std.testing.expect(std.mem.indexOf(u8, src, dump_tail) != null);
+
+    // Load path: per-entry prioritiseTransaction call.
+    const load_inline = "pool.prioritiseTransaction(persisted_txid, fee_delta)";
+    try std.testing.expect(std.mem.indexOf(u8, src, load_inline) != null);
+
+    // Load path: standalone-tail prioritiseTransaction call.
+    const load_tail = "pool.prioritiseTransaction(txid, delta)";
+    try std.testing.expect(std.mem.indexOf(u8, src, load_tail) != null);
+
+    // The legacy "not tracked yet" form for the per-entry nFeeDelta write
+    // must NOT be present in the dump path — its survival means an in-
+    // mempool entry's delta is silently zeroed on dump. We split the
+    // literal across two `++` halves so this guard test does NOT trip
+    // over its OWN source string when @embedFile-scanning the module.
+    const dead_form = "writeI64(0); " ++ "// nFeeDelta — not tracked yet";
+    try std.testing.expect(std.mem.indexOf(u8, src, dead_form) == null);
 }

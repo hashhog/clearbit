@@ -53,6 +53,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const mempool_mod = @import("mempool.zig");
+const mempool_persist = @import("mempool_persist.zig");
 const types = @import("types.zig");
 const rpc_mod = @import("rpc.zig");
 const wallet_mod = @import("wallet.zig");
@@ -1037,8 +1038,11 @@ test "w120 G25: bumpfee — wallet.bumpFee + wallet.psbtBumpFee exported" {
 //   - getmempoolentry `modifiedfee` and `fees.modified` JSON fields —
 //     Core rpc/mempool.cpp:529 fees.pushKV("modified", GetModifiedFee).
 //
-// Deltas are NOT persisted across restarts (mempool_persist.zig still
-// emits an empty mapDeltas section), matching the FIX-72 task spec.
+// Deltas ARE persisted across restarts via mempool.dat (FIX-76 closure of
+// the FIX-72 brief-error). The dump path writes per-entry inline nFeeDelta
+// for in-mempool entries and a standalone mapDeltas tail block for absent
+// txids; the load path applies both via prioritiseTransaction. Matches
+// bitcoin-core/src/node/mempool_persist.cpp:88-103 + :124-130.
 
 test "w120 G26 (FIX-72): prioritiseTransaction adds delta; getModifiedFee reflects it" {
     const allocator = std.testing.allocator;
@@ -1228,7 +1232,11 @@ test "w120 G26 (FIX-72): delta + opposite delta = zero (cancellation erases entr
     try testing.expect(!mempool.map_deltas.contains(txid));
 }
 
-test "w120 G26 (FIX-72): delta lost on re-init (matches Core 'not persisted' invariant)" {
+test "w120 G26 (FIX-72): fresh-init mempool starts with empty map_deltas" {
+    // A fresh `Mempool.init` always starts with an empty mapDeltas — the
+    // in-memory store is not auto-restored. Restart-time restoration goes
+    // through `mempool_persist.loadMempool`, which is covered by the
+    // FIX-76 dump+load round-trip tests in src/mempool_persist.zig.
     const allocator = std.testing.allocator;
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     const txid: [32]u8 = .{0xDD} ** 32;
@@ -1236,14 +1244,42 @@ test "w120 G26 (FIX-72): delta lost on re-init (matches Core 'not persisted' inv
     try testing.expectEqual(@as(i64, 12345), mempool.applyDelta(txid));
     mempool.deinit();
 
-    // Fresh mempool — `map_deltas` is initialised empty on init(). Core's
-    // mapDeltas is in-memory only; mempool_persist.zig already writes an
-    // empty mapDeltas section on dumpmempool, so a load+restart drops every
-    // delta.
+    // Fresh mempool with no on-disk load — `map_deltas` is empty.
     var mempool2 = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool2.deinit();
     try testing.expectEqual(@as(i64, 0), mempool2.applyDelta(txid));
     try testing.expect(!mempool2.map_deltas.contains(txid));
+}
+
+test "w120 G26 (FIX-76): delta SURVIVES mempool.dat dump+load (matches Core)" {
+    // FIX-76 closure of the FIX-72 brief-error: operator priority deltas
+    // are persisted in mempool.dat per
+    // bitcoin-core/src/node/mempool_persist.cpp:88-103 + :124-130. This
+    // test exercises a standalone delta (txid not in mempool) — exactly
+    // the "pre-prioritise before tx arrives" workflow Core supports.
+    const allocator = std.testing.allocator;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const txid: [32]u8 = .{0xEE} ** 32;
+    _ = try mempool.prioritiseTransaction(txid, 54321);
+    try testing.expect(mempool.map_deltas.contains(txid));
+
+    var tmpdir = std.testing.tmpDir(.{});
+    defer tmpdir.cleanup();
+    const real_path = try tmpdir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(real_path);
+    const path = try std.fmt.allocPrint(allocator, "{s}/mempool.dat", .{real_path});
+    defer allocator.free(path);
+
+    _ = try mempool_persist.dumpMempool(&mempool, path, allocator);
+
+    var mempool2 = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool2.deinit();
+    _ = try mempool_persist.loadMempool(&mempool2, path, allocator);
+
+    try testing.expectEqual(@as(i64, 54321), mempool2.applyDelta(txid));
+    try testing.expect(mempool2.map_deltas.contains(txid));
 }
 
 test "w120 G26 (FIX-72): forward-regression guard — checkRBFRules uses MODIFIED fees on both sides" {
