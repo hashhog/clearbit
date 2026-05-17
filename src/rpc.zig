@@ -1277,6 +1277,18 @@ pub const RpcServer = struct {
     /// "sensible default first, knob later").
     payjoin_session_ttl: PayjoinSessionTtl = .{},
 
+    /// FIX-80 — IBD sticky-OFF latch.  Mirrors Bitcoin Core's
+    /// `m_cached_is_ibd` (validation.cpp).  Once IBD has been observed
+    /// to be `false` (chainwork >= min_chain_work AND tip wallclock age
+    /// < max_tip_age), latches forever in this run — never flips back
+    /// to `true` even if natural lag pushes the tip wallclock age over
+    /// the 24h threshold.  Without this latch, `initialblockdownload`
+    /// flapped back to true when the node fell briefly behind, which
+    /// the daily consensus-diff flagged on 2026-05-16 against Core.
+    /// Atomic so the read-only-shaped `*const RpcServer` callers from
+    /// future code paths don't have to re-thread mutability.
+    ibd_latched_off: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     /// Initialize the RPC server.
     pub fn init(
         allocator: std.mem.Allocator,
@@ -13638,34 +13650,60 @@ pub const RpcServer = struct {
     }
 
     /// Check if the node is in Initial Block Download (IBD) mode.
-    /// IBD is true if:
-    /// 1. Total chain work < minimum chain work (anti-DoS), OR
-    /// 2. Tip timestamp < current time - 24 hours
-    /// Once cleared, it latches to false and cannot flip back to true.
-    /// Reference: Bitcoin Core validation.cpp ChainstateManager::UpdateIBDStatus()
-    fn isInitialBlockDownload(self: *const RpcServer) bool {
-        // Check if total chain work is below minimum
+    ///
+    /// Mirrors Bitcoin Core's `ChainstateManager::IsInitialBlockDownload()`
+    /// (validation.cpp), backed by the `m_cached_is_ibd` latch updated
+    /// by `UpdateIBDStatus()`:
+    ///
+    ///   - returns `true` while chainwork < min_chain_work OR
+    ///     tip wallclock age > max_tip_age (24h),
+    ///   - once both conditions are satisfied, latches to `false`
+    ///     PERMANENTLY for the rest of the process — never flips back
+    ///     to `true` even if natural lag pushes the tip stale.
+    ///
+    /// FIX-80: the daily consensus-diff (2026-05-16) flagged that
+    /// `initialblockdownload` stayed `true` even at chain tip because
+    /// (a) we had no sticky latch and (b) the tip-age check considered
+    /// the recorded `tip.header.timestamp` (which can lag wallclock
+    /// briefly during a restart, before the next header arrives).
+    /// Sticky-OFF after the first observed satisfaction is the Core
+    /// behaviour and prevents flapping.
+    ///
+    /// Reference: bitcoin-core/src/validation.cpp UpdateIBDStatus +
+    /// chain.h CChain::IsTipRecent.
+    fn isInitialBlockDownload(self: *RpcServer) bool {
+        // Sticky-OFF latch: once we've reported IBD as false, stay false.
+        if (self.ibd_latched_off.load(.monotonic)) return false;
+
+        // Condition 1: chainwork must meet the minimum chain-work bar.
         if (self.compareChainWork(&self.chain_state.total_work, &self.network_params.min_chain_work) < 0) {
             return true;
         }
 
-        // Check if we have a chain tip with timestamp information
+        // Condition 2: tip wallclock age must be < max_tip_age (24h).
+        // Core's IsTipRecent uses the tip's own block time vs now, which
+        // is what we replicate here.  When no chain_manager is wired
+        // (test-only path), we cannot evaluate tip age and conservatively
+        // stay in IBD until the manager is attached.
+        const max_tip_age_seconds: i64 = 24 * 60 * 60;
+        const now = std.time.timestamp();
         if (self.chain_manager) |cm| {
             if (cm.active_tip) |tip| {
-                // Get current time
-                const now = std.time.timestamp();
-                const tip_time = tip.header.timestamp;
-
-                // Max tip age is 24 hours (86400 seconds)
-                const max_tip_age_seconds: i64 = 24 * 60 * 60;
-
-                // If tip is older than 24 hours, we're in IBD
-                if (now - @as(i64, @intCast(tip_time)) > max_tip_age_seconds) {
+                const tip_time: i64 = @intCast(tip.header.timestamp);
+                if (now - tip_time > max_tip_age_seconds) {
                     return true;
                 }
+            } else {
+                // chain_manager present but no active_tip: still booting.
+                return true;
             }
+        } else {
+            // No chain_manager yet: don't latch — let later calls flip.
+            return true;
         }
 
+        // Both conditions satisfied: latch sticky-OFF and report false.
+        self.ibd_latched_off.store(true, .monotonic);
         return false;
     }
 
@@ -16096,6 +16134,86 @@ test "getblockchaininfo includes initialblockdownload field" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"initialblockdownload\"") != null);
     // With zero work, should be in IBD (true)
     try std.testing.expect(std.mem.indexOf(u8, result, "\"initialblockdownload\":true") != null);
+}
+
+// FIX-80: initialblockdownload must flip to false at tip + sticky-OFF.
+//
+// Pre-fix behaviour: clearbit's `isInitialBlockDownload` returned true any
+// time the chain tip wallclock age exceeded ~24h (or when chain_manager
+// wasn't wired), and crucially had NO sticky-OFF latch — meaning a node
+// that briefly fell behind (or saw its tip get stale during a chain idle
+// period) would flap back to true.  Daily consensus-diff 2026-05-16
+// flagged this against Core's `validation.cpp::IsInitialBlockDownload`
+// (which uses an `m_cached_is_ibd` latch updated by `UpdateIBDStatus`).
+//
+// Post-fix: with regtest's zero `min_chain_work` and an active_tip whose
+// timestamp is "now", IBD reports false; once it has reported false even
+// once, mutating the tip timestamp back to "an old block" must NOT flip
+// IBD back to true — the latch is sticky-OFF.
+test "FIX-80: initialblockdownload flips false at tip + sticky-OFF" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 100;
+    chain_state.best_hash = [_]u8{0x33} ** 32;
+    chain_state.total_work = [_]u8{0xFF} ** 32; // Trivially >= regtest min (0).
+
+    var cm = validation.ChainManager.init(&chain_state, null, allocator);
+    defer cm.deinit();
+
+    // Build a single tip entry with a recent timestamp (== now).  Regtest
+    // has min_chain_work=0, so the chainwork side of IBD trivially passes.
+    const tip_hash: types.Hash256 = [_]u8{0x33} ** 32;
+    const tip_entry = try allocator.create(validation.BlockIndexEntry);
+    tip_entry.* = .{
+        .hash = tip_hash,
+        .header = blk: {
+            var h = std.mem.zeroes(types.BlockHeader);
+            h.timestamp = @intCast(std.time.timestamp());
+            break :blk h;
+        },
+        .height = 100,
+        .status = .{},
+        .chain_work = [_]u8{0xFF} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try cm.block_index.put(tip_entry.hash, tip_entry);
+    cm.active_tip = tip_entry;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.REGTEST,
+        .{},
+    );
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    // Step 1: tip is fresh + chainwork meets min.  IBD must report false.
+    try std.testing.expect(!server.isInitialBlockDownload());
+
+    // Step 2: latch must have flipped.
+    try std.testing.expect(server.ibd_latched_off.load(.monotonic));
+
+    // Step 3: sticky-OFF — mutate the tip to look very old (30 days ago),
+    // representing the natural-lag flap that Core's latch is designed to
+    // suppress.  IBD must STILL report false because of the latch.
+    tip_entry.header.timestamp = @intCast(std.time.timestamp() - (30 * 24 * 60 * 60));
+    try std.testing.expect(!server.isInitialBlockDownload());
+
+    // Cleanup: the entry we allocated above is owned by ChainManager.deinit
+    // which destroys every value pointer with its own allocator.
 }
 
 test "getblockcount returns height" {
