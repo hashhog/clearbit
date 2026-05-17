@@ -1456,6 +1456,54 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w131_tests.step);
     }
 
+    // W132 — BIP-68 / BIP-112 / BIP-113 nSequence / OP_CSV / MTP audit
+    // (30-gate, discovery).
+    // Reference: bitcoin-core/src/consensus/tx_verify.cpp (IsFinalTx,
+    //            CalculateSequenceLocks, EvaluateSequenceLocks,
+    //            SequenceLocks);
+    //            bitcoin-core/src/script/interpreter.cpp (OP_CSV opcode
+    //            body, CheckSequence, CheckLockTime);
+    //            bitcoin-core/src/chain.h (GetMedianTimePast,
+    //            nMedianTimeSpan=11);
+    //            bitcoin-core/src/primitives/transaction.h (SEQUENCE_FINAL,
+    //            SEQUENCE_LOCKTIME_* constants);
+    //            bitcoin-core/src/validation.cpp (ConnectBlock BIP-68).
+    // XFAIL-style guards across validation.zig (calculateSequenceLocks,
+    // checkSequenceLocks, isFinalTx, medianTimePast), script.zig
+    // (OP_CSV / OP_CLTV opcodes), peer.zig (computePrevMtp /
+    // computeMtpAtHeight), and mempool.zig (BIP-68 mempool path).
+    // See audit/w132_nsequence_csv_mtp.md.
+    // Run with `zig build test-w132`.
+    {
+        const w132_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w132_nsequence_csv_mtp.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w132"},
+        });
+        w132_tests.linkSystemLibrary("rocksdb");
+        w132_tests.linkSystemLibrary("secp256k1");
+        w132_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w132_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w132_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w132_tests.linkSystemLibrary("minisketch");
+            w132_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w132_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w132_tests = b.addRunArtifact(w132_tests);
+        const w132_test_step = b.step("test-w132", "Run W132 BIP-68/112/113 nSequence/CSV/MTP 30-gate audit tests");
+        w132_test_step.dependOn(&run_w132_tests.step);
+        // Fold into the main `test` step so CI exercises W132.
+        test_step.dependOn(&run_w132_tests.step);
+    }
+
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
     // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
     // Run with `zig build test-fix84`.
