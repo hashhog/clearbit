@@ -1365,6 +1365,97 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w129_tests.step);
     }
 
+    // W130 — BIP-125 RBF feebumper Rule 3 audit (30-gate, discovery).
+    // Reference: bitcoin-core/src/wallet/feebumper.{h,cpp}
+    //            (CreateRateBumpTransaction, PreconditionChecks, CheckFeeRate,
+    //             EstimateFeeRate);
+    //            bitcoin-core/src/policy/rbf.{cpp,h}
+    //            (PaysForRBF, IsRBFOptIn, EntriesAndTxidsDisjoint);
+    //            bitcoin-core/src/policy/feerate.{cpp,h}
+    //            (CFeeRate::GetFee rounds UP via CeilDiv);
+    //            bitcoin-core/src/util/feefrac.h (EvaluateFeeUp / EvaluateFeeDown);
+    //            bitcoin-core/src/wallet/wallet.h:124 (WALLET_INCREMENTAL_RELAY_FEE).
+    // XFAIL-style guards over wallet bumpFee + mempool checkRBFRules.
+    // See audit/w130_bip125_feebumper_rule3.md.
+    // Run with `zig build test-w130`.
+    {
+        const w130_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w130_bip125_feebumper_rule3.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w130"},
+        });
+        w130_tests.linkSystemLibrary("rocksdb");
+        w130_tests.linkSystemLibrary("secp256k1");
+        w130_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w130_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w130_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w130_tests.linkSystemLibrary("minisketch");
+            w130_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w130_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w130_tests = b.addRunArtifact(w130_tests);
+        const w130_test_step = b.step("test-w130", "Run W130 BIP-125 RBF feebumper Rule 3 30-gate audit tests");
+        w130_test_step.dependOn(&run_w130_tests.step);
+        // Fold into the main `test` step so CI exercises W130.
+        test_step.dependOn(&run_w130_tests.step);
+    }
+
+    // W131 — Descriptors + Miniscript audit (30-gate, discovery).
+    // Reference: bitcoin-core/src/script/descriptor.cpp + descriptor.h
+    //            (DescriptorChecksum, PolyMod, ParseScript, ParsePubkey,
+    //             ParseKeyPath, ParseHDKeypath, multipath specifier,
+    //             MultisigDescriptor / TRDescriptor / RawTRDescriptor /
+    //             ComboDescriptor, MAX_PUBKEYS_PER_MULTISIG / MAX_PUBKEYS_PER_MULTI_A);
+    //            bitcoin-core/src/script/miniscript.cpp + miniscript.h
+    //            (Type, SanitizeType, ComputeType, ComputeScriptLen,
+    //             Fragment, Node::IsValid / IsSane / IsNonMalleable /
+    //             CheckTimeLocksMix);
+    //            BIPs 380 / 381 / 382 / 385 / 386 / 389 + ms-spec.
+    // XFAIL-style guards across descriptor.zig + miniscript.zig:
+    //   Group A — checksum / round-trip (G1..G4, G1+G2 PASS).
+    //   Group B — descriptor language coverage (G5..G20).
+    //   Group C — miniscript type system (G21..G27).
+    //   Group D — miniscript parser / script lowering (G28..G30).
+    // See audit/w131_descriptors_miniscript.md.
+    // Run with `zig build test-w131`.
+    {
+        const w131_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w131_descriptors_miniscript.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w131"},
+        });
+        w131_tests.linkSystemLibrary("rocksdb");
+        w131_tests.linkSystemLibrary("secp256k1");
+        w131_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w131_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w131_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w131_tests.linkSystemLibrary("minisketch");
+            w131_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w131_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w131_tests = b.addRunArtifact(w131_tests);
+        const w131_test_step = b.step("test-w131", "Run W131 Descriptors + Miniscript 30-gate audit tests");
+        w131_test_step.dependOn(&run_w131_tests.step);
+        // Fold into the main `test` step so CI exercises W131.
+        test_step.dependOn(&run_w131_tests.step);
+    }
+
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
     // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
     // Run with `zig build test-fix84`.
