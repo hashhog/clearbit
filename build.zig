@@ -1504,6 +1504,43 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w132_tests.step);
     }
 
+    // W133 — Index databases (txindex + coinstatsindex) — discovery audit.
+    // 30-gate matrix vs Bitcoin Core src/index/{base,txindex,coinstatsindex,
+    // disktxpos,db_key}.{h,cpp}. XFAIL-style guards over indexes.zig +
+    // storage.zig + main.zig + rpc.zig: 22 MISSING + 8 DIVERGE = 30 BUGs.
+    // Excludes BIP-157/158 blockfilterindex (W121 + W122 own it).
+    // See audit/w133_index_databases.md.
+    // Run with `zig build test-w133`.
+    {
+        const w133_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w133_index_databases.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w133"},
+        });
+        w133_tests.linkSystemLibrary("rocksdb");
+        w133_tests.linkSystemLibrary("secp256k1");
+        w133_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w133_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w133_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w133_tests.linkSystemLibrary("minisketch");
+            w133_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w133_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w133_tests = b.addRunArtifact(w133_tests);
+        const w133_test_step = b.step("test-w133", "Run W133 Index databases (txindex + coinstatsindex) 30-gate audit tests");
+        w133_test_step.dependOn(&run_w133_tests.step);
+        // Fold into the main `test` step so CI exercises W133.
+        test_step.dependOn(&run_w133_tests.step);
+    }
+
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
     // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
     // Run with `zig build test-fix84`.
