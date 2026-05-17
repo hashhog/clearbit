@@ -26,20 +26,22 @@
 //!   - CLI: `--blockfilterindex` toggles persistent index +
 //!     advertises `NODE_COMPACT_FILTERS` (1<<6) in version.
 //!
-//! P2P getcfilters / getcfheaders / getcfcheckpt: MISSING ENTIRELY.
-//!   - `p2p.Message` union has NO `getcfilters`/`cfilter`/`getcfheaders`/
-//!     `cfheaders`/`getcfcheckpt`/`cfcheckpt` variants (src/p2p.zig:131).
-//!   - `decodePayload` falls through to `ParseError.UnknownCommand` for
-//!     any of these six command names (src/p2p.zig:896) — wire-incompat
-//!     with BIP-157 light clients.
-//!   - BIP-324 v2 short-ID table in `v2_transport.zig` DOES register IDs
-//!     22-27 for the six BIP-157 commands → classic DEAD-HELPER pattern:
-//!     short-ID names present, message union + handler absent.
-//!   - `peer.zig` has no ProcessGetCFilters / ProcessGetCFHeaders /
-//!     ProcessGetCFCheckPt handlers; the catch-all `else => {}` in the
-//!     handler switch silently drops everything that reaches the
-//!     dispatch.  Combined with the decoder gap above, peers requesting
-//!     cfilters see the connection terminated (UnknownCommand → close).
+//! P2P getcfilters / getcfheaders / getcfcheckpt: PRESENT (FIX-84).
+//!   - `p2p.Message` union now has all six variants (`getcfilters`,
+//!     `cfilter`, `getcfheaders`, `cfheaders`, `getcfcheckpt`,
+//!     `cfcheckpt`); decoder + encoder + dispatch arms all wired.
+//!   - `peer.zig::processGetCFilters` + `processGetCFHeaders` +
+//!     `processGetCFCheckPt` implement Core's PrepareBlockFilterRequest
+//!     pattern: validate filter_type / NODE_COMPACT_FILTERS gate /
+//!     stop_hash on active chain / range vs MAX_GETCF{ILTERS,HEADERS}_SIZE,
+//!     then walk the active chain via getBlockHashByHeight and serve
+//!     filters from CF_BLOCK_FILTER+CF_BLOCK_FILTER_HEADER.
+//!   - BIP-324 v2 short-IDs 22-27 are no longer dead-helpers: they
+//!     decode into real Message-union variants that route to real
+//!     handlers.
+//!   - Per-violation peer.misbehaving(100) + peer.disconnect() matches
+//!     Core's `node.fDisconnect = true; return false;` from
+//!     PrepareBlockFilterRequest.
 //!
 //! JSON-RPC `getblockfilter` / `getindexinfo`: MISSING.
 //!   - Core's `getblockfilter(blockhash, filtertype="basic")` returning
@@ -129,36 +131,27 @@
 //!          NODE_COMPACT_FILTERS advertisement on BOTH flags; clearbit
 //!          advertises whenever the index is on, which is over-eager.
 //!
-//!   BUG-3  (G22, P0-CDIV-P2P): `p2p.Message` union has NO `getcfilters`
-//!          variant.  `decodePayload` returns `ParseError.UnknownCommand`
-//!          when a peer sends this message (p2p.zig:896), and the peer-
-//!          read loop treats UnknownCommand as a parse error which
-//!          drops the connection.  Light clients (Neutrino / BFD /
-//!          rust-lightning) CANNOT query filters from a clearbit peer
-//!          over P2P.  This is the headline bug of W121.
+//!   BUG-3  (G22, P0-CDIV-P2P): CLOSED by FIX-84.  `getcfilters`
+//!          variant added to `p2p.Message` union; decoder routes to
+//!          `peer.zig::processGetCFilters` (Core ProcessGetCFilters
+//!          parity — full PrepareBlockFilterRequest validation chain).
 //!
-//!   BUG-4  (G23, P0-CDIV-P2P): no `cfilter` send path.  Even if
-//!          getcfilters arrived, there is no encoder + writer to push
-//!          the response.  REST is the only filter-data egress.
+//!   BUG-4  (G23, P0-CDIV-P2P): CLOSED by FIX-84.  `cfilter` encoder
+//!          + send path wired; one message emitted per height in the
+//!          requested range.
 //!
-//!   BUG-5  (G24-G25, P0-CDIV-P2P): `getcfheaders` / `cfheaders` —
-//!          identical pattern to BUG-3 + BUG-4.  No message variant,
-//!          no handler, no encoder.  Light clients cannot bootstrap
-//!          the filter-header chain from clearbit.
+//!   BUG-5  (G24-G25, P0-CDIV-P2P): CLOSED by FIX-84.  `getcfheaders`
+//!          + `cfheaders` variants + handler + encoder all wired.
+//!          Filter-hash chain computed via SHA256d(persisted filter
+//!          bytes) per Core's CFHEADERS payload format.
 //!
-//!   BUG-6  (G26-G27, P0-CDIV-P2P): `getcfcheckpt` / `cfcheckpt` —
-//!          identical pattern.  No message variant, no handler, no
-//!          encoder.  Checkpoint-based fast sync of the header chain
-//!          (Core: every 1000 blocks at CFCHECKPT_INTERVAL) is unavailable.
+//!   BUG-6  (G26-G27, P0-CDIV-P2P): CLOSED by FIX-84.  `getcfcheckpt`
+//!          + `cfcheckpt` variants + handler wired; checkpoint walk
+//!          every CFCHECKPT_INTERVAL=1000 blocks.
 //!
-//!   BUG-7  (G28, DEAD-HELPER): `v2_transport.zig` registers the six
-//!          BIP-157 message names at short IDs 22-27 (v2_transport.zig:
-//!          156-161), enabling them in the BIP-324 v2 wire format.  But
-//!          with no Message-union variant and no handler, the
-//!          registration is purely cosmetic — a peer that successfully
-//!          short-ID-decodes a `getcfilters` request will hit the same
-//!          UnknownCommand dispatch as a v1 peer.  Classic dead-helper
-//!          (table populated, downstream unwired).
+//!   BUG-7  (G28, DEAD-HELPER): CLOSED by FIX-84.  BIP-324 v2 short-IDs
+//!          22-27 are no longer dead helpers — the codec now decodes
+//!          to real Message-union variants that route to real handlers.
 //!
 //!   BUG-8  (G29, MEDIUM): JSON-RPC `getblockfilter` method NOT
 //!          registered in rpc.zig's method dispatch.  Wallet RPC
@@ -172,11 +165,9 @@
 //!          monitor backfill progress over JSON-RPC — only the
 //!          REST endpoints surface any state.
 //!
-//!   BUG-10 (G22-G27, ARCHITECTURAL): No `MAX_GETCFILTERS_SIZE` (=1000)
-//!          / `MAX_GETCFHEADERS_SIZE` (=2000) / `CFCHECKPT_INTERVAL`
-//!          (=1000) constants defined anywhere in the codebase.  When
-//!          BUG-3..BUG-6 are eventually closed, these Core constants
-//!          must be ported alongside.
+//!   BUG-10 (G22-G27, ARCHITECTURAL): CLOSED by FIX-84.  Core constants
+//!          ported into `p2p.zig`: `MAX_GETCFILTERS_SIZE=1000`,
+//!          `MAX_GETCFHEADERS_SIZE=2000`, `CFCHECKPT_INTERVAL=1000`.
 //!
 //! ============================================================
 
@@ -592,20 +583,22 @@ test "w121 G21: NODE_COMPACT_FILTERS == (1 << 6)" {
 
 // ===========================================================================
 // G22: P2P `getcfilters` message decode + handler.
-// Status: MISSING ENTIRELY (BUG-3).  No Message-union variant; decoder
-// returns ParseError.UnknownCommand for "getcfilters".
+// Status: PRESENT — FIX-84 wired the Message-union variant + decoder +
+// handler (peer.zig::processGetCFilters).  Tests flipped from
+// "asserts UnknownCommand" → "asserts decodes to getcfilters variant".
 // ===========================================================================
 
-test "w121 G22: BUG-3 decodePayload returns UnknownCommand for getcfilters" {
-    // Synthesize a minimal payload (will fall through the type checks
-    // because the variant doesn't exist).
+test "w121 G22: FIX-84 decodePayload accepts getcfilters" {
+    // Synthesize a minimal payload (filter_type=0, start_height=0, stop_hash=0).
     const payload = [_]u8{
         0x00, // filter_type
         0x00, 0x00, 0x00, 0x00, // start_height
     } ++ [_]u8{0} ** 32; // stop_hash
 
-    const res = p2p.decodePayload("getcfilters", &payload, testing.allocator);
-    try testing.expectError(p2p.ParseError.UnknownCommand, res);
+    const decoded = try p2p.decodePayload("getcfilters", &payload, testing.allocator);
+    // No heap allocations to free for the getcfilters payload.
+    try testing.expectEqual(@as(u8, 0), decoded.getcfilters.filter_type);
+    try testing.expectEqual(@as(u32, 0), decoded.getcfilters.start_height);
 }
 
 /// Comptime check for a union tag name.  Zig 0.13 requires comptime
@@ -619,85 +612,124 @@ fn unionHasField(comptime U: type, comptime name: []const u8) bool {
     return false;
 }
 
-test "w121 G22: BUG-3 Message union has no getcfilters variant" {
-    try testing.expect(!unionHasField(p2p.Message, "getcfilters")); // confirms BUG-3
+test "w121 G22: FIX-84 Message union has getcfilters variant" {
+    try testing.expect(unionHasField(p2p.Message, "getcfilters")); // FIX-84
 }
 
 // ===========================================================================
 // G23: P2P `cfilter` message encode + response.
-// Status: MISSING ENTIRELY (BUG-4).  No Message-union variant.
+// Status: PRESENT (FIX-84).  Encoder + decoder + dispatch arm wired.
 // ===========================================================================
 
-test "w121 G23: BUG-4 Message union has no cfilter variant" {
-    try testing.expect(!unionHasField(p2p.Message, "cfilter")); // confirms BUG-4
+test "w121 G23: FIX-84 Message union has cfilter variant" {
+    try testing.expect(unionHasField(p2p.Message, "cfilter")); // FIX-84
+}
+
+test "w121 G23: FIX-84 cfilter encode/decode round-trip" {
+    const allocator = testing.allocator;
+    const filter_bytes = [_]u8{ 0x03, 0xaa, 0xbb, 0xcc }; // CompactSize(3) || bytes
+    const cf_msg = p2p.Message{ .cfilter = .{
+        .filter_type = 0,
+        .block_hash = [_]u8{0x42} ** 32,
+        .filter = &filter_bytes,
+    } };
+    const encoded = try p2p.encodeMessage(&cf_msg, p2p.NetworkMagic.MAINNET, allocator);
+    defer allocator.free(encoded);
+    const header = p2p.MessageHeader.decode(encoded[0..24]);
+    try testing.expectEqualStrings("cfilter", header.commandName());
+    const decoded = try p2p.decodePayload(header.commandName(), encoded[24..], allocator);
+    defer allocator.free(decoded.cfilter.filter);
+    try testing.expectEqual(@as(u8, 0), decoded.cfilter.filter_type);
+    try testing.expectEqualSlices(u8, &filter_bytes, decoded.cfilter.filter);
 }
 
 // ===========================================================================
 // G24: P2P `getcfheaders` message decode + handler.
-// Status: MISSING ENTIRELY (BUG-5a).
+// Status: PRESENT (FIX-84).
 // ===========================================================================
 
-test "w121 G24: BUG-5 decodePayload returns UnknownCommand for getcfheaders" {
+test "w121 G24: FIX-84 decodePayload accepts getcfheaders" {
     const payload = [_]u8{
         0x00,
         0x00, 0x00, 0x00, 0x00,
     } ++ [_]u8{0} ** 32;
-    const res = p2p.decodePayload("getcfheaders", &payload, testing.allocator);
-    try testing.expectError(p2p.ParseError.UnknownCommand, res);
+    const decoded = try p2p.decodePayload("getcfheaders", &payload, testing.allocator);
+    try testing.expectEqual(@as(u8, 0), decoded.getcfheaders.filter_type);
 }
 
-test "w121 G24: BUG-5 Message union has no getcfheaders variant" {
-    try testing.expect(!unionHasField(p2p.Message, "getcfheaders"));
+test "w121 G24: FIX-84 Message union has getcfheaders variant" {
+    try testing.expect(unionHasField(p2p.Message, "getcfheaders"));
 }
 
 // ===========================================================================
 // G25: P2P `cfheaders` response.
-// Status: MISSING ENTIRELY (BUG-5b).
+// Status: PRESENT (FIX-84).
 // ===========================================================================
 
-test "w121 G25: BUG-5 Message union has no cfheaders variant" {
-    try testing.expect(!unionHasField(p2p.Message, "cfheaders"));
+test "w121 G25: FIX-84 Message union has cfheaders variant" {
+    try testing.expect(unionHasField(p2p.Message, "cfheaders"));
+}
+
+test "w121 G25: FIX-84 cfheaders encode/decode round-trip" {
+    const allocator = testing.allocator;
+    const fhashes = [_]types.Hash256{ [_]u8{0x11} ** 32, [_]u8{0x22} ** 32 };
+    const msg = p2p.Message{ .cfheaders = .{
+        .filter_type = 0,
+        .stop_hash = [_]u8{0x33} ** 32,
+        .prev_filter_header = [_]u8{0x44} ** 32,
+        .filter_hashes = &fhashes,
+    } };
+    const encoded = try p2p.encodeMessage(&msg, p2p.NetworkMagic.MAINNET, allocator);
+    defer allocator.free(encoded);
+    const header = p2p.MessageHeader.decode(encoded[0..24]);
+    try testing.expectEqualStrings("cfheaders", header.commandName());
+    const decoded = try p2p.decodePayload(header.commandName(), encoded[24..], allocator);
+    defer allocator.free(decoded.cfheaders.filter_hashes);
+    try testing.expectEqual(@as(usize, 2), decoded.cfheaders.filter_hashes.len);
 }
 
 // ===========================================================================
 // G26: P2P `getcfcheckpt` message.
-// Status: MISSING ENTIRELY (BUG-6a).
+// Status: PRESENT (FIX-84).
 // ===========================================================================
 
-test "w121 G26: BUG-6 decodePayload returns UnknownCommand for getcfcheckpt" {
+test "w121 G26: FIX-84 decodePayload accepts getcfcheckpt" {
     const payload = [_]u8{0x00} ++ [_]u8{0} ** 32;
-    const res = p2p.decodePayload("getcfcheckpt", &payload, testing.allocator);
-    try testing.expectError(p2p.ParseError.UnknownCommand, res);
+    const decoded = try p2p.decodePayload("getcfcheckpt", &payload, testing.allocator);
+    try testing.expectEqual(@as(u8, 0), decoded.getcfcheckpt.filter_type);
 }
 
-test "w121 G26: BUG-6 Message union has no getcfcheckpt variant" {
-    try testing.expect(!unionHasField(p2p.Message, "getcfcheckpt"));
+test "w121 G26: FIX-84 Message union has getcfcheckpt variant" {
+    try testing.expect(unionHasField(p2p.Message, "getcfcheckpt"));
 }
 
 // ===========================================================================
 // G27: P2P `cfcheckpt` response (CFCHECKPT_INTERVAL = 1000).
-// Status: MISSING ENTIRELY (BUG-6b, BUG-10).
+// Status: PRESENT (FIX-84).
 // ===========================================================================
 
-test "w121 G27: BUG-6 Message union has no cfcheckpt variant" {
-    try testing.expect(!unionHasField(p2p.Message, "cfcheckpt"));
+test "w121 G27: FIX-84 Message union has cfcheckpt variant" {
+    try testing.expect(unionHasField(p2p.Message, "cfcheckpt"));
 }
 
-test "w121 G27: BUG-10 CFCHECKPT_INTERVAL constant not defined anywhere" {
-    // Core: index/blockfilterindex.h:31 — `static constexpr int
-    // CFCHECKPT_INTERVAL = 1000`.  No clearbit symbol mirrors it.
-    try testing.expect(!@hasDecl(indexes, "CFCHECKPT_INTERVAL"));
-    try testing.expect(!@hasDecl(indexes, "MAX_GETCFILTERS_SIZE"));
-    try testing.expect(!@hasDecl(indexes, "MAX_GETCFHEADERS_SIZE"));
+test "w121 G27: FIX-84 CFCHECKPT_INTERVAL + MAX_GET*_SIZE constants defined" {
+    // Core: net_processing.cpp:184-186 + index/blockfilterindex.h:31.
+    // FIX-84 ports these into p2p.zig (not indexes.zig — they are P2P
+    // protocol constants, not index-internal).
+    try testing.expectEqual(@as(u32, 1000), p2p.CFCHECKPT_INTERVAL);
+    try testing.expectEqual(@as(u32, 1000), p2p.MAX_GETCFILTERS_SIZE);
+    try testing.expectEqual(@as(u32, 2000), p2p.MAX_GETCFHEADERS_SIZE);
 }
 
 // ===========================================================================
 // G28: BIP-324 v2 short-ID registration for cfilter messages.
-// Status: DEAD-HELPER (BUG-7).  Short IDs 22-27 registered, but no
-// upstream handler — registration is purely cosmetic.
+// Status: PRESENT (FIX-84 closed BUG-7).  Short IDs 22-27 now route into
+// real Message-union variants + handlers; no longer a dead helper.
+// Test renamed for clarity but kept under the same gate number to
+// preserve the audit numbering across waves.
 // ===========================================================================
 
-test "w121 G28: BUG-7 BIP-324 short IDs 22-27 registered (dead-helper)" {
+test "w121 G28: FIX-84 BIP-324 short IDs 22-27 registered AND routed" {
     // v2_transport.V2_MESSAGE_IDS is the wire-name table.  Confirm names
     // are present (the dead half of the dead-helper).
     try testing.expectEqualStrings("getcfilters", v2_transport.V2_MESSAGE_IDS[22]);
