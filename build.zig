@@ -1121,6 +1121,39 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w122_tests.step);
     }
 
+    // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
+    // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
+    // Run with `zig build test-fix84`.
+    {
+        const fix84_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_fix84_bip157_dispatch.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"fix84"},
+        });
+        fix84_tests.linkSystemLibrary("rocksdb");
+        fix84_tests.linkSystemLibrary("secp256k1");
+        fix84_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        fix84_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            fix84_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            fix84_tests.linkSystemLibrary("minisketch");
+            fix84_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        fix84_tests.root_module.addOptions("build_options", build_options);
+
+        const run_fix84_tests = b.addRunArtifact(fix84_tests);
+        const fix84_test_step = b.step("test-fix84", "Run FIX-84 BIP-157 P2P handler wire-up tests");
+        fix84_test_step.dependOn(&run_fix84_tests.step);
+        // Fold into the default `test` step.
+        test_step.dependOn(&run_fix84_tests.step);
+    }
+
     // FIX-62 — BIP-21 URI parser tests.
     // `bip21.zig` is intentionally self-contained (depends only on
     // `address.zig`, which depends on `crypto.zig` + `types.zig`).  No
