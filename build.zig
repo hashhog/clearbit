@@ -1630,6 +1630,59 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w135_tests.step);
     }
 
+    // W137 — PSBT v0/v2 (BIP-174 / BIP-370 / BIP-371) 30-gate audit (discovery).
+    // References:
+    //   bitcoin-core/src/psbt.h (PSBTInput/PSBTOutput/PartiallySignedTransaction
+    //     serialize+unserialize templates; key_lookup duplicate-key detection;
+    //     non-witness UTXO hash check at psbt.h:1371-1378);
+    //   bitcoin-core/src/psbt.cpp (FinalizePSBT, CombinePSBTs, ExtractPSBT,
+    //     PSBTInputSignedAndVerified, RemoveUnnecessaryTransactions);
+    //   bitcoin-core/src/wallet/rpc/spend.cpp (walletprocesspsbt @ 1569,
+    //     walletcreatefundedpsbt @ 1653, psbtbumpfee @ 1163);
+    //   bitcoin-core/src/rpc/rawtransaction.cpp (decodepsbt @ 1013,
+    //     combinepsbt @ 1515, finalizepsbt @ 1563, createpsbt @ 1620,
+    //     converttopsbt @ 1663, utxoupdatepsbt @ 1731, joinpsbts @ 1778,
+    //     analyzepsbt @ 1880).
+    // BIPs 174, 370, 371, 373.
+    // XFAIL-style guards over psbt.zig + wallet.zig + rpc.zig: 28 BUGs
+    // across 30 gates (23 MISSING + 5 DIVERGE). Largest finding:
+    // declare-init-deinit-but-never-populate dead storage on the four
+    // hash-preimage maps (BUG-14); HIGH-CDIV bugs in deserialize-time
+    // invariants (no duplicate-key detection, no non-witness UTXO hash
+    // check, no DER-signature check, no IsFullyValid pubkey check) +
+    // parse-but-no-emit asymmetry on BIP-371 fields.
+    // See audit/w137_psbt.md.
+    // Run with `zig build test-w137`.
+    {
+        const w137_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w137_psbt.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w137"},
+        });
+        w137_tests.linkSystemLibrary("rocksdb");
+        w137_tests.linkSystemLibrary("secp256k1");
+        w137_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w137_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w137_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w137_tests.linkSystemLibrary("minisketch");
+            w137_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w137_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w137_tests = b.addRunArtifact(w137_tests);
+        const w137_test_step = b.step("test-w137", "Run W137 PSBT v0/v2 (BIP-174 / BIP-370 / BIP-371) 30-gate audit tests");
+        w137_test_step.dependOn(&run_w137_tests.step);
+        // Fold into the main `test` step so CI exercises W137.
+        test_step.dependOn(&run_w137_tests.step);
+    }
+
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
     // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
     // Run with `zig build test-fix84`.
