@@ -1683,6 +1683,51 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w137_tests.step);
     }
 
+    // W136 — BIP-130 sendheaders + BIP-133 feefilter + BIP-339 wtxidrelay
+    // 30-gate audit (discovery).  References:
+    //   bitcoin-core/src/net_processing.cpp (MaybeSendSendHeaders @ 5519,
+    //     MaybeSendFeefilter @ 5540, WTXIDRELAY handler @ 3921, SENDHEADERS
+    //     handler @ 3896, FEEFILTER handler @ 5035, inv-wtxid-filter @
+    //     4056-4063);
+    //   bitcoin-core/src/node/protocol_version.h (SENDHEADERS_VERSION=70012,
+    //     FEEFILTER_VERSION=70013, WTXID_RELAY_VERSION=70016);
+    //   bitcoin-core/src/policy/fees/block_policy_estimator.{cpp,h}
+    //     (FeeFilterRounder, MAX_FILTER_FEERATE=1e7, FEE_FILTER_SPACING=1.1).
+    // BIPs 130, 133, 339.
+    // XFAIL-style guards over peer.zig + p2p.zig: 17 BUGs across 30 gates.
+    // Largest single-impl finding: `maybeSendFeefilter` is dead code (no
+    // caller anywhere in src/).  See audit/w136_relay_flags.md.
+    // Run with `zig build test-w136`.
+    {
+        const w136_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w136_relay_flags.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w136"},
+        });
+        w136_tests.linkSystemLibrary("rocksdb");
+        w136_tests.linkSystemLibrary("secp256k1");
+        w136_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w136_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w136_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w136_tests.linkSystemLibrary("minisketch");
+            w136_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w136_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w136_tests = b.addRunArtifact(w136_tests);
+        const w136_test_step = b.step("test-w136", "Run W136 BIP-130 sendheaders + BIP-133 feefilter + BIP-339 wtxidrelay 30-gate audit tests");
+        w136_test_step.dependOn(&run_w136_tests.step);
+        // Fold into the main `test` step so CI exercises W136.
+        test_step.dependOn(&run_w136_tests.step);
+    }
+
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
     // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
     // Run with `zig build test-fix84`.
