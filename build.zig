@@ -1728,6 +1728,64 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w136_tests.step);
     }
 
+    // W139 — Fee estimation engine (CBlockPolicyEstimator) 30-gate audit
+    // (discovery, second pass after W114).  References:
+    //   bitcoin-core/src/policy/fees/block_policy_estimator.{cpp,h}
+    //     (CBlockPolicyEstimator, TxConfirmStats, FeeFilterRounder,
+    //      MAX_FILE_AGE=60h, FEE_FLUSH_INTERVAL=1h, OLDEST_ESTIMATE_HISTORY,
+    //      validForFeeEstimation, MaxUsableEstimate, BlockSpan,
+    //      HistoricalBlockSpan, estimateCombinedFee, estimateConservativeFee,
+    //      FlushUnconfirmed, processBlock reorg guard);
+    //   bitcoin-core/src/policy/fees/block_policy_estimator_args.{cpp,h}
+    //     (FeeestPath, FEE_ESTIMATES_FILENAME);
+    //   bitcoin-core/src/policy/feerate.{cpp,h}
+    //     (CFeeRate, FeePerVSize, FeeRateFormat, GetFee ceil-up,
+    //      GetFeePerK, CURRENCY_UNIT/ATOM);
+    //   bitcoin-core/src/rpc/fees.cpp
+    //     (estimatesmartfee + estimaterawfee, ParseConfirmTarget,
+    //      HighestTargetTracked, FeeReason/FeeCalculation).
+    // Source-grep + behavioral XFAIL guards over mempool.zig + rpc.zig:
+    // 29 BUGs across 30 gates (G28 PARTIAL/no-bug — fee_estimates.dat
+    // canonical filename already wired in main.zig).  Steers away from
+    // W114's already-closed gates (FIX-47/FIX-48) and toward Core-specific
+    // semantics W114 missed.  Largest findings:
+    //   BUG-9  no validForFeeEstimation four-gate skip before trackTransaction;
+    //   BUG-11 processBlock has no nBlockHeight<=nBestSeenHeight reorg guard
+    //          (double-decay observable on replay);
+    //   BUG-12 duplicate trackTransaction double-counts the bucket
+    //          (total_counts++ fires on both calls; HashMap put overwrites).
+    // See audit/w139_fee_estimation.md.
+    // Run with `zig build test-w139`.
+    {
+        const w139_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w139_fee_estimation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w139"},
+        });
+        w139_tests.linkSystemLibrary("rocksdb");
+        w139_tests.linkSystemLibrary("secp256k1");
+        w139_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w139_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w139_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w139_tests.linkSystemLibrary("minisketch");
+            w139_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w139_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w139_tests = b.addRunArtifact(w139_tests);
+        const w139_test_step = b.step("test-w139", "Run W139 Fee estimation engine (CBlockPolicyEstimator) 30-gate audit tests");
+        w139_test_step.dependOn(&run_w139_tests.step);
+        // Fold into the main `test` step so CI exercises W139.
+        test_step.dependOn(&run_w139_tests.step);
+    }
+
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
     // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
     // Run with `zig build test-fix84`.
