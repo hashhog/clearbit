@@ -1836,6 +1836,66 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w139_tests.step);
     }
 
+    // W140 — HTTP server + rpcauth + cookie auth + JSON-RPC dispatch
+    // 30-gate audit (discovery).  References:
+    //   bitcoin-core/src/httpserver.{cpp,h} (HTTPBindAddresses,
+    //     http_request_cb, ClientAllowed, InitHTTPAllowList, ThreadPool,
+    //     MAX_HEADERS_SIZE=8192, DEFAULT_HTTP_THREADS=16,
+    //     DEFAULT_HTTP_WORKQUEUE=64, DEFAULT_HTTP_SERVER_TIMEOUT=30);
+    //   bitcoin-core/src/httprpc.cpp (HTTPReq_JSONRPC, RPCAuthorized,
+    //     CheckUserAuthorized, JSONErrorReply HTTP-status mapping
+    //     (RPC_INVALID_REQUEST → 400, RPC_METHOD_NOT_FOUND → 404,
+    //      default → 500), InitRPCAuthentication, WWW_AUTH_HEADER_DATA,
+    //     250ms UninterruptibleSleep on failed auth, -rpcwhitelist,
+    //     -rpcauth HMAC-SHA-256);
+    //   bitcoin-core/src/rpc/request.{cpp,h} (COOKIEAUTH_USER,
+    //     GenerateAuthCookie .cookie.tmp + RenameOver, GetAuthCookieFile
+    //     (-rpccookiefile), JSONRPCRequest::parse jsonrpc-2.0 detection);
+    //   bitcoin-core/share/rpcauth/rpcauth.py (canonical user:salt$HMAC);
+    //   bitcoin-core/src/util/strencodings.h:202-210 (TimingResistantEqual);
+    //   bitcoin-core/src/init.cpp:706-720 (-rpc* argspec).
+    // BIPs: none.  XFAIL-style guards over rpc.zig + main.zig: 21 unique
+    // BUGs across 30 gates (3 P0-SEC + 8 P1 + 9 P2 + 1 PRESENT-by-design).
+    // Top P0-SEC findings:
+    //   BUG-1 (G3) std.mem.eql auth compare — not constant-time;
+    //   BUG-4 (G4) no -rpcauth HMAC-SHA-256 path (pushes operators to
+    //         plaintext credentials);
+    //   BUG-7 (G7) no -rpcallowip CIDR allow-list (W124 BUG-13 re-anchor);
+    //   BUG-9 (G13) no WWW-Authenticate header on 401 (RFC-7235 violation);
+    //   BUG-18 (G18) HTTP status mapping wholly absent — every reply is
+    //         200 OK (W125 BUG-15+17 re-anchor).
+    // See audit/w140_http_rpcauth.md.
+    // Run with `zig build test-w140`.
+    {
+        const w140_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w140_http_rpcauth.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w140"},
+        });
+        w140_tests.linkSystemLibrary("rocksdb");
+        w140_tests.linkSystemLibrary("secp256k1");
+        w140_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w140_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w140_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w140_tests.linkSystemLibrary("minisketch");
+            w140_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w140_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w140_tests = b.addRunArtifact(w140_tests);
+        const w140_test_step = b.step("test-w140", "Run W140 HTTP server + rpcauth + cookie auth + JSON-RPC dispatch 30-gate audit tests");
+        w140_test_step.dependOn(&run_w140_tests.step);
+        // Fold into the main `test` step so CI exercises W140.
+        test_step.dependOn(&run_w140_tests.step);
+    }
+
     // W141 — ZMQ + REST + notification-script 30-gate audit (discovery).
     // References:
     //   bitcoin-core/src/zmq/zmqpublishnotifier.cpp (SendZmqMessage @ 193,
