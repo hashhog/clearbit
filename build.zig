@@ -1683,6 +1683,56 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w137_tests.step);
     }
 
+    // W138 — assumeUTXO snapshots 30-gate audit (discovery). References:
+    //   bitcoin-core/src/node/utxo_snapshot.{h,cpp} (SnapshotMetadata,
+    //     SNAPSHOT_MAGIC_BYTES, SNAPSHOT_BLOCKHASH_FILENAME,
+    //     SNAPSHOT_CHAINSTATE_SUFFIX, WriteSnapshotBaseBlockhash,
+    //     ReadSnapshotBaseBlockhash, FindAssumeutxoChainstateDir);
+    //   bitcoin-core/src/validation.cpp (ActivateSnapshot @ 5588,
+    //     PopulateAndValidateSnapshot @ 5754, MaybeValidateSnapshot @ 5963,
+    //     InvalidateCoinsDBOnDisk, MaybeRebalanceCaches,
+    //     LoadBlockIndexDB(snapshot_blockhash));
+    //   bitcoin-core/src/rpc/blockchain.cpp (dumptxoutset @ 3074,
+    //     loadtxoutset @ 3368, getchainstates @ 3462,
+    //     PrepareUTXOSnapshot @ 3226, WriteUTXOSnapshot @ 3265).
+    // BIPs: none (assumeUTXO is a Core implementation feature, not a BIP).
+    // 30 BUGs across 30 gates: largest single-impl finding is BUG-1
+    // (CLI --load-snapshot skips the hash_serialized content-hash gate
+    // that the RPC/in-memory path enforces) + BUG-2 (ChainStateManager
+    // dead code) + BUG-3 (no getchainstates RPC) + BUG-4..5 (no
+    // snapshot persistence file / chainstate dir suffix).
+    // See audit/w138_assumeutxo.md.
+    // Run with `zig build test-w138`.
+    {
+        const w138_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w138_assumeutxo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w138"},
+        });
+        w138_tests.linkSystemLibrary("rocksdb");
+        w138_tests.linkSystemLibrary("secp256k1");
+        w138_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w138_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w138_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w138_tests.linkSystemLibrary("minisketch");
+            w138_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w138_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w138_tests = b.addRunArtifact(w138_tests);
+        const w138_test_step = b.step("test-w138", "Run W138 assumeUTXO snapshots 30-gate audit tests");
+        w138_test_step.dependOn(&run_w138_tests.step);
+        // Fold into the main `test` step so CI exercises W138.
+        test_step.dependOn(&run_w138_tests.step);
+    }
+
     // W136 — BIP-130 sendheaders + BIP-133 feefilter + BIP-339 wtxidrelay
     // 30-gate audit (discovery).  References:
     //   bitcoin-core/src/net_processing.cpp (MaybeSendSendHeaders @ 5519,
@@ -1784,6 +1834,59 @@ pub fn build(b: *std.Build) void {
         w139_test_step.dependOn(&run_w139_tests.step);
         // Fold into the main `test` step so CI exercises W139.
         test_step.dependOn(&run_w139_tests.step);
+    }
+
+    // W141 — ZMQ + REST + notification-script 30-gate audit (discovery).
+    // References:
+    //   bitcoin-core/src/zmq/zmqpublishnotifier.cpp (SendZmqMessage @ 193,
+    //     NotifyBlock @ 210, NotifyBlockDisconnect 'D' @ 274,
+    //     NotifyTransactionRemoval 'R' @ 288, IsZMQAddressIPV6 @ 82);
+    //   bitcoin-core/src/zmq/zmqnotificationinterface.cpp (unix:// -> ipc://
+    //     rewrite @ 62-64, per-topic hwm knob @ 69, IBD short-circuit @ 151-154,
+    //     BlockConnected per-tx fan-out @ 180-196);
+    //   bitcoin-core/src/rest.cpp (CheckWarmup @ 171-177, ParseDataFormat @ 129,
+    //     MAX_REST_HEADERS_RESULTS=2000, MAX_GETUTXOS_OUTPOINTS=15, dispatch
+    //     table @ 1141-1159 listing /rest/deploymentinfo, /rest/spenttxouts/,
+    //     /rest/blockpart/, query-param /rest/headers/<hash>?count=N);
+    //   bitcoin-core/src/init.cpp (-blocknotify @ 2008-2018,
+    //     -shutdownnotify @ 255-265, -startupnotify @ 737-745);
+    //   bitcoin-core/src/node/kernel_notifications.cpp (-alertnotify @ 30-47);
+    //   bitcoin-core/src/wallet/init.cpp:75 + wallet.cpp:1480 (-walletnotify).
+    // No BIPs.
+    // XFAIL-style guards over zmq.zig + rpc.zig (REST) + main.zig (notify
+    // absence): 30 BUGs across 30 gates (15 ZMQ + 9 REST + 6 NOTIFY).
+    // Largest single-impl findings: 'D'/'R' sequence labels missing,
+    // CheckWarmup short-circuit absent, all 5 notify-script hooks absent.
+    // See audit/w141_zmq_rest_notify.md.
+    // Run with `zig build test-w141`.
+    {
+        const w141_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w141_zmq_rest_notify.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w141"},
+        });
+        w141_tests.linkSystemLibrary("rocksdb");
+        w141_tests.linkSystemLibrary("secp256k1");
+        w141_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w141_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w141_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w141_tests.linkSystemLibrary("minisketch");
+            w141_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w141_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w141_tests = b.addRunArtifact(w141_tests);
+        const w141_test_step = b.step("test-w141", "Run W141 ZMQ + REST + notification-scripts 30-gate audit tests");
+        w141_test_step.dependOn(&run_w141_tests.step);
+        // Fold into the main `test` step so CI exercises W141.
+        test_step.dependOn(&run_w141_tests.step);
     }
 
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
