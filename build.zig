@@ -1587,6 +1587,49 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w134_tests.step);
     }
 
+    // W135 — Standardness rules (IsStandardTx) audit (30-gate, discovery).
+    // Reference: bitcoin-core/src/policy/policy.{h,cpp} (IsStandardTx,
+    //            IsStandard, GetDust, MAX_DUST_OUTPUTS_PER_TX);
+    //            bitcoin-core/src/script/solver.{h,cpp} (Solver,
+    //            MatchMultisig, MatchMultiA, TxoutType incl. WITNESS_UNKNOWN);
+    //            bitcoin-core/src/policy/truc_policy.h (TRUC_VERSION);
+    //            bitcoin-core/src/kernel/mempool_options.h
+    //            (permit_bare_multisig, max_datacarrier_bytes, dust_relay_feerate);
+    //            bitcoin-core/src/consensus/tx_check.cpp (CheckTransaction).
+    // XFAIL-style guards over mempool.zig:checkStandard /
+    // checkWitnessStandard and script.zig:classifyScript.  See
+    // audit/w135_standardness_rules.md.
+    // Run with `zig build test-w135`.
+    {
+        const w135_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w135_standardness.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w135"},
+        });
+        w135_tests.linkSystemLibrary("rocksdb");
+        w135_tests.linkSystemLibrary("secp256k1");
+        w135_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w135_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w135_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w135_tests.linkSystemLibrary("minisketch");
+            w135_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w135_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w135_tests = b.addRunArtifact(w135_tests);
+        const w135_test_step = b.step("test-w135", "Run W135 Standardness rules (IsStandardTx) 30-gate audit tests");
+        w135_test_step.dependOn(&run_w135_tests.step);
+        // Fold into the main `test` step so CI exercises W135.
+        test_step.dependOn(&run_w135_tests.step);
+    }
+
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
     // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
     // Run with `zig build test-fix84`.
