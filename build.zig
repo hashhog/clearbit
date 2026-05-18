@@ -1541,6 +1541,52 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w133_tests.step);
     }
 
+    // W134 — BIP-37 Bloom Filter + BIP-111 NODE_BLOOM 30-gate audit (discovery).
+    // Reference: bitcoin-core/src/common/bloom.{cpp,h} (CBloomFilter,
+    //            CRollingBloomFilter); bitcoin-core/src/merkleblock.{cpp,h}
+    //            (CMerkleBlock, CPartialMerkleTree, BitsToBytes / BytesToBits);
+    //            bitcoin-core/src/net_processing.cpp (FILTERLOAD/FILTERADD/
+    //            FILTERCLEAR handlers @ 4963-5033; MSG_FILTERED_BLOCK getdata
+    //            @ 2438-2458; TxRelay m_bloom_filter @ 293-297);
+    //            bitcoin-core/src/init.cpp (-peerbloomfilters NODE_BLOOM
+    //            wiring @ 1104-1105); bitcoin-core/src/protocol.h
+    //            (NODE_BLOOM = (1<<2) @ 317).
+    // Extends W110 with G15/G24/G25/G28/G29 + CRollingBloomFilter
+    // cross-link. XFAIL-style: BUG tests assert current (buggy/missing)
+    // state; PASS tests protect the NODE_BLOOM bit + -peerbloomfilters
+    // default + FIX-36 wire pipeline.
+    // See audit/w134_bip37_bloom_filter.md.
+    // Run with `zig build test-w134`.
+    {
+        const w134_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w134_bip37_bloom_filter.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w134"},
+        });
+        w134_tests.linkSystemLibrary("rocksdb");
+        w134_tests.linkSystemLibrary("secp256k1");
+        w134_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w134_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w134_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w134_tests.linkSystemLibrary("minisketch");
+            w134_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w134_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w134_tests = b.addRunArtifact(w134_tests);
+        const w134_test_step = b.step("test-w134", "Run W134 BIP-37 Bloom Filter + BIP-111 NODE_BLOOM 30-gate audit tests");
+        w134_test_step.dependOn(&run_w134_tests.step);
+        // Fold into the main `test` step so CI exercises W134.
+        test_step.dependOn(&run_w134_tests.step);
+    }
+
     // FIX-84 — BIP-157 P2P handler wire-up (W121 BUG-3..7 + BUG-10 closure).
     // Wire round-trip + dispatch-arm source guards + constants + DoS bounds.
     // Run with `zig build test-fix84`.
