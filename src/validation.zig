@@ -2506,21 +2506,65 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cac
     if (job.input_index >= tx.inputs.len) return false;
     const input = tx.inputs[job.input_index];
 
-    // Compute the txid as the sighash proxy for the sig cache key.
+    // W160 BUG-3 (P0-CDIV catastrophic) fix — SigCache key MUST bind to the
+    // per-input sighash, not the transaction id.
+    //
+    // Pre-fix shape (deleted comment-as-confession): "Compute the txid as the
+    // sighash proxy for the sig cache key." Using `txid` as the sighash proxy
+    // is a catastrophic short-circuit:
+    //
+    //   1. Two inputs of the same tx with the same (prev_script_pubkey,
+    //      script_sig+witness bytes, flags) but DIFFERENT per-input sighashes
+    //      shared a cache key. If input 0 verified, input 1 was treated as
+    //      verified WITHOUT actually running the signature check against its
+    //      sighash. Combined with the witness-truncation at 4096 bytes (also
+    //      a comment-as-confession discarding uniqueness), an unsigned /
+    //      wrong-signed input could be admitted as valid.
+    //   2. SIGHASH_NONE / SIGHASH_SINGLE branches on the same (tx, pubkey,
+    //      sig, flags) produce different sighashes; the pre-fix key did not
+    //      distinguish them.
+    //
+    // The actual BIP-143 / BIP-341 sighash is computed by ScriptEngine.verify
+    // (it depends on witness parsing, sighash_type byte, codeseparator
+    // position, etc.) and is not available here. Per Core's
+    // CSignatureCache::ComputeEntryECDSA (sigcache.cpp:39-50), the key must
+    // bind to the actual sighash + pubkey + sig + flags.
+    //
+    // Targeted fix: synthesise a 32-byte per-input sighash-proxy that binds
+    // all data the actual sighash is a function of from this input's side
+    // (outpoint, input_index, prevout amount, sequence) PLUS the txid (which
+    // collapses hashPrevouts / hashSequence / hashOutputs for the tx as a
+    // whole). Two different inputs of the same tx now derive DIFFERENT cache
+    // keys; two different SIGHASH_NONE/SINGLE branches on the same input
+    // produce different sig_bytes (the sighash_type byte is the trailing
+    // byte of the signature in script_sig/witness) and so also derive
+    // different keys. The catastrophic short-circuit is closed.
+    var sighash_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     const txid = crypto.computeTxidStreaming(&tx);
+    sighash_hasher.update(&txid);
+    var idx_le: [8]u8 = undefined;
+    std.mem.writeInt(u64, &idx_le, job.input_index, .little);
+    sighash_hasher.update(&idx_le);
+    sighash_hasher.update(&input.previous_output.hash);
+    var prevout_idx_le: [4]u8 = undefined;
+    std.mem.writeInt(u32, &prevout_idx_le, input.previous_output.index, .little);
+    sighash_hasher.update(&prevout_idx_le);
+    var amount_le: [8]u8 = undefined;
+    std.mem.writeInt(i64, &amount_le, job.amount, .little);
+    sighash_hasher.update(&amount_le);
+    var seq_le: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seq_le, input.sequence, .little);
+    sighash_hasher.update(&seq_le);
+    var per_input_sighash: [32]u8 = undefined;
+    sighash_hasher.final(&per_input_sighash);
+
     const flags_u32: u32 = @intCast(@as(u21, @bitCast(job.flags)));
 
-    // W105 G19/G20 fix: cache key is SHA256(nonce || sighash || pubkey || sig || flags_le).
-    // - sighash = txid (32 bytes)
-    // - pubkey_bytes = prev_script_pubkey (the scriptPubKey being unlocked)
-    // - sig_bytes = script_sig (legacy) concatenated with witness stack bytes
-    //   (covers SegWit inputs; empty slices for inputs that use neither)
-    // This binds the cache entry to the exact script material, preventing the
-    // G19 collision attack where a different pubkey/sig on the same txid could
-    // get a false cache hit.
-    //
     // Assemble witness bytes: flatten the witness stack items into a single
-    // contiguous buffer so the key covers all witness material.
+    // contiguous buffer so the key covers all witness material. NOTE: the
+    // 4096-byte truncation tracked separately as W160 BUG-19 is preserved
+    // here; bounding to a per-input synthetic sighash means a truncation
+    // collision can no longer cross input boundaries.
     var witness_buf: [4096]u8 = undefined;
     var witness_len: usize = 0;
     for (job.witness) |item| {
@@ -2528,7 +2572,7 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cac
         const copy_len = @min(item.len, space);
         @memcpy(witness_buf[witness_len..][0..copy_len], item[0..copy_len]);
         witness_len += copy_len;
-        if (copy_len < item.len) break; // truncate if oversized; hash still binds all material
+        if (copy_len < item.len) break;
     }
 
     // Concatenate script_sig + witness bytes as the "sig_bytes" material.
@@ -2541,7 +2585,7 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cac
 
     // SigCache lookup: skip ScriptEngine.verify() if the exact sig material
     // was already successfully verified (e.g. the tx was in the mempool).
-    if (cache.lookup(txid, job.prev_script_pubkey, sig_material, flags_u32)) {
+    if (cache.lookup(per_input_sighash, job.prev_script_pubkey, sig_material, flags_u32)) {
         return true;
     }
 
@@ -2569,8 +2613,9 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cac
     if (result) |valid| {
         if (valid) {
             // Cache the successful verification for future blocks/re-validation.
-            // Pass the same material used in the lookup above.
-            cache.insert(txid, job.prev_script_pubkey, sig_material, flags_u32);
+            // Pass the same per-input sighash-proxy material used in the lookup above
+            // (W160 BUG-3 fix — must match the key derived for the lookup).
+            cache.insert(per_input_sighash, job.prev_script_pubkey, sig_material, flags_u32);
         }
         return valid;
     } else |_| {

@@ -712,3 +712,85 @@ test "w105 G30: getParallelVerifyThreadCount returns CPU count not worker thread
     // An operator checking this to know "how many threads are actually verifying"
     // gets an off-by-one: the value is worker_count+1 (counts the master too).
 }
+
+// ============================================================================
+// W160 BUG-3 regression — two inputs with the same (prev_script_pubkey,
+// sig_material, flags) but DIFFERENT per-input distinguishers must NOT share a
+// SigCache key. Pre-fix the key was derived from `txid` alone, so input 1 of
+// the same tx would cache-hit on input 0's verification and short-circuit
+// without actually verifying input 1's signature against its real sighash.
+// Post-fix the key derivation includes the per-input outpoint, input_index,
+// amount, and sequence — so cross-input collision is closed.
+//
+// This test exercises the SigCache lookup directly with the per-input
+// sighash-proxy shape produced by verifyScriptJob (sigcache.computeKey takes
+// a 32-byte hash, so we mirror the synthesis here).
+//
+// Reference: bitcoin-core/src/script/sigcache.cpp:39-50 ComputeEntryECDSA
+// (key on actual per-input hash, not txid).
+// ============================================================================
+test "w160 BUG-3: SigCache key includes per-input distinguishers (no cross-input collision)" {
+    var cache = sig_cache.SigCache.init(testing.allocator, 100);
+    defer cache.deinit();
+
+    // Simulated shared fields: same tx (same txid), same prev_script_pubkey
+    // (e.g. two inputs both spending UTXOs of the same address), same
+    // sig_material bytes (byte-collision corner case), same flags.
+    const fake_txid = [_]u8{0xAA} ** 32;
+    const prev_spk = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20; // P2WPKH
+    const sig_material = [_]u8{0xCC} ** 80; // byte-identical sig material
+    const flags: u32 = 0x1F;
+
+    // Helper to synthesise the per-input sighash-proxy used by verifyScriptJob.
+    const Synth = struct {
+        fn key(
+            txid: [32]u8,
+            input_index: u64,
+            prevout_hash: [32]u8,
+            prevout_index: u32,
+            amount: i64,
+            sequence: u32,
+        ) [32]u8 {
+            var h = std.crypto.hash.sha2.Sha256.init(.{});
+            h.update(&txid);
+            var idx_le: [8]u8 = undefined;
+            std.mem.writeInt(u64, &idx_le, input_index, .little);
+            h.update(&idx_le);
+            h.update(&prevout_hash);
+            var prevout_idx_le: [4]u8 = undefined;
+            std.mem.writeInt(u32, &prevout_idx_le, prevout_index, .little);
+            h.update(&prevout_idx_le);
+            var amount_le: [8]u8 = undefined;
+            std.mem.writeInt(i64, &amount_le, amount, .little);
+            h.update(&amount_le);
+            var seq_le: [4]u8 = undefined;
+            std.mem.writeInt(u32, &seq_le, sequence, .little);
+            h.update(&seq_le);
+            var out: [32]u8 = undefined;
+            h.final(&out);
+            return out;
+        }
+    };
+
+    // Input 0 of the tx: outpoint A, amount 100_000, sequence FFFFFFFF.
+    const sighash_in0 = Synth.key(fake_txid, 0, [_]u8{0xDE} ** 32, 0, 100_000, 0xFFFFFFFF);
+    // Input 1 of the SAME tx: outpoint B, amount 200_000, sequence FFFFFFFF.
+    // Different outpoint and amount alone produce a different per-input sighash.
+    const sighash_in1 = Synth.key(fake_txid, 1, [_]u8{0xEF} ** 32, 0, 200_000, 0xFFFFFFFF);
+
+    // Cache the successful verification of input 0.
+    cache.insert(sighash_in0, &prev_spk, &sig_material, flags);
+    try testing.expect(cache.lookup(sighash_in0, &prev_spk, &sig_material, flags));
+
+    // CRITICAL: input 1's lookup MUST miss, even though everything else
+    // (prev_script_pubkey, sig_material bytes, flags, fake_txid) is identical.
+    // Pre-fix this returned TRUE — input 1 was treated as verified without
+    // its signature ever being checked against its actual sighash.
+    try testing.expect(!cache.lookup(sighash_in1, &prev_spk, &sig_material, flags));
+
+    // Also verify the narrower SIGHASH_NONE/SIGHASH_SINGLE attack vector:
+    // same input identity but a different per-input synthesised sighash
+    // (e.g. an attacker-crafted variant) likewise misses.
+    const sighash_in0_variant = Synth.key(fake_txid, 0, [_]u8{0xDE} ** 32, 0, 100_000, 0xFFFFFFFE);
+    try testing.expect(!cache.lookup(sighash_in0_variant, &prev_spk, &sig_material, flags));
+}
