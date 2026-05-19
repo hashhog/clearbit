@@ -6066,7 +6066,15 @@ pub const RpcServer = struct {
         _ = params; // Template request params (capabilities, rules) - not fully implemented
 
         // Create block template
-        const payout_script = [_]u8{ 0x6a }; // OP_RETURN (placeholder)
+        // OP_TRUE (anyone-can-spend) — Core's convention for unconfigured mining
+        // contexts. Previously OP_RETURN (0x6a), which permanently burns the
+        // block reward (~$250k mainnet/block) for any pool that consumes
+        // clearbit's full coinbase scaffolding. OP_TRUE is still wrong if a
+        // real pool consumes it (anyone-can-spend → race), but at least the
+        // funds are recoverable rather than burned. Real pools should
+        // construct their own coinbase per BIP-22; this placeholder exists
+        // only to allow the template to validate locally.
+        const payout_script = [_]u8{ 0x51 };
         var template = block_template.createBlockTemplate(
             self.chain_state,
             self.mempool,
