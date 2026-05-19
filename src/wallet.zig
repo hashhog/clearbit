@@ -841,6 +841,17 @@ pub const Wallet = struct {
     encryption_salt: ?[16]u8 = null,
     unlock_until: ?i64 = null, // Timestamp until which wallet is unlocked
 
+    // W161 BUG-5 fix: AES-256-GCM nonce + tag for the encrypted master_key.key
+    // (32 bytes) and master_key.chain_code (32 bytes).  When `encrypted` is
+    // true, master_key.key and master_key.chain_code hold CIPHERTEXT in memory
+    // and on disk; these nonces+tags are required to decrypt them via the same
+    // scrypt-derived key used for child keys.  Both are null on unencrypted
+    // wallets and on legacy (pre-W161-fix) plaintext wallet.dat reads.
+    master_key_nonce: ?[12]u8 = null,
+    master_key_tag: ?[16]u8 = null,
+    master_chain_code_nonce: ?[12]u8 = null,
+    master_chain_code_tag: ?[16]u8 = null,
+
     // Labels: address -> label mapping
     labels: std.StringHashMap([]const u8),
 
@@ -1061,8 +1072,18 @@ pub const Wallet = struct {
         var path_buf: [64]u8 = undefined;
         const path = try ExtendedKey.getStandardPath(purpose, coin_type, 0, change, index, &path_buf);
 
-        // Derive the key
-        const derived = try self.master_key.?.derivePath(self.ctx, path);
+        // Derive the key.  W161 BUG-5 fix: when the wallet is encrypted, the
+        // in-memory master_key.key + chain_code are AES-256-GCM ciphertext —
+        // resolve plaintext via getPlaintextMasterKey() (which requires the
+        // wallet to be unlocked).  We zero the temporary plaintext immediately
+        // after derivation so a long-lived plaintext seed never lives in the
+        // Wallet struct.
+        var master_plain = (try self.getPlaintextMasterKey()) orelse return error.NoMasterKey;
+        defer {
+            @memset(&master_plain.key, 0);
+            @memset(&master_plain.chain_code, 0);
+        }
+        const derived = try master_plain.derivePath(self.ctx, path);
 
         // Import the derived key
         const key_index = try self.importKey(derived.key);
@@ -1706,6 +1727,36 @@ pub const Wallet = struct {
         return decryptPrivateKey(&enc_key, &kp.secret_key, &nonce, &tag);
     }
 
+    /// W161 BUG-5 fix: return a plaintext copy of the HD master key for use
+    /// in BIP-32 derivation.  Mirrors getPlaintextSecretKey() but acts on the
+    /// 32-byte master.key + 32-byte chain_code stored as AES-256-GCM ciphertext
+    /// (with nonces+tags on the Wallet, not on ExtendedKey).  The returned
+    /// ExtendedKey is a temporary the caller MUST zero after derivation; we
+    /// do not keep a long-lived plaintext copy in the Wallet struct.
+    /// Returns null if the wallet has no master key.  Returns
+    /// error.WalletLocked if encrypted and the in-memory encryption_key is
+    /// absent.  Backward-compat: a wallet loaded from a legacy plaintext
+    /// wallet.dat has `encrypted=true` but null nonces/tags — in that case
+    /// the stored bytes ARE the plaintext and we return them directly.
+    fn getPlaintextMasterKey(self: *const Wallet) !?ExtendedKey {
+        const mk = self.master_key orelse return null;
+        if (!self.encrypted) return mk;
+        // Legacy plaintext-on-disk wallet read before the W161 fix landed:
+        // ciphertext fields missing → bytes are plaintext.
+        if (self.master_key_nonce == null or self.master_chain_code_nonce == null) {
+            return mk;
+        }
+        const enc_key = self.encryption_key orelse return error.WalletLocked;
+        const k_nonce = self.master_key_nonce.?;
+        const k_tag = self.master_key_tag orelse return error.WalletNotEncrypted;
+        const cc_nonce = self.master_chain_code_nonce.?;
+        const cc_tag = self.master_chain_code_tag orelse return error.WalletNotEncrypted;
+        var out = mk;
+        out.key = try decryptPrivateKey(&enc_key, &mk.key, &k_nonce, &k_tag);
+        out.chain_code = try decryptPrivateKey(&enc_key, &mk.chain_code, &cc_nonce, &cc_tag);
+        return out;
+    }
+
     /// Sign a transaction input using the appropriate signing algorithm.
     ///
     /// `all_prevouts`: optional slice of all spent prevouts in input order.
@@ -2151,6 +2202,25 @@ pub const Wallet = struct {
             keypair.encryption_tag = enc.tag;
         }
 
+        // W161 BUG-5 fix: also encrypt the HD master private key + chain code
+        // in place.  Previously these were left as plaintext in memory and on
+        // disk REGARDLESS of `encryptwallet`, so AES-256-GCM child-encryption
+        // was cosmetic — anyone reading wallet.dat recovered the seed of every
+        // child via BIP-32 derivation.  Now master_key.key and
+        // master_key.chain_code are stored as ciphertext with their own nonces
+        // and tags; plaintext is reconstructed on-demand via
+        // getPlaintextMasterKey() once the wallet is unlocked.
+        if (self.master_key) |*mk| {
+            const enc_key = encryptPrivateKey(&derived_key, &mk.key);
+            mk.key = enc_key.ciphertext;
+            self.master_key_nonce = enc_key.nonce;
+            self.master_key_tag = enc_key.tag;
+            const enc_cc = encryptPrivateKey(&derived_key, &mk.chain_code);
+            mk.chain_code = enc_cc.ciphertext;
+            self.master_chain_code_nonce = enc_cc.nonce;
+            self.master_chain_code_tag = enc_cc.tag;
+        }
+
         // Store encryption state
         self.encryption_salt = salt;
         self.encryption_key = null; // Key not stored for security
@@ -2271,6 +2341,34 @@ pub const Wallet = struct {
             keypair.secret_key = enc.ciphertext;
             keypair.encryption_nonce = enc.nonce;
             keypair.encryption_tag = enc.tag;
+        }
+
+        // W161 BUG-5 fix: re-encrypt the HD master key + chain code with the
+        // new derived key + fresh nonces.  If the master_key was loaded from a
+        // legacy plaintext wallet.dat (null nonces), treat the stored bytes as
+        // plaintext for the decrypt step — the re-encrypted form upgrades the
+        // wallet to the post-fix format on first changePassphrase.
+        if (self.master_key) |*mk| {
+            var k_plain: [32]u8 = mk.key;
+            var cc_plain: [32]u8 = mk.chain_code;
+            if (self.master_key_nonce) |kn| {
+                const kt = self.master_key_tag orelse return error.WalletNotEncrypted;
+                k_plain = try decryptPrivateKey(&old_key, &mk.key, &kn, &kt);
+            }
+            if (self.master_chain_code_nonce) |cn| {
+                const ct = self.master_chain_code_tag orelse return error.WalletNotEncrypted;
+                cc_plain = try decryptPrivateKey(&old_key, &mk.chain_code, &cn, &ct);
+            }
+            const enc_k = encryptPrivateKey(&new_key, &k_plain);
+            const enc_cc = encryptPrivateKey(&new_key, &cc_plain);
+            mk.key = enc_k.ciphertext;
+            mk.chain_code = enc_cc.ciphertext;
+            self.master_key_nonce = enc_k.nonce;
+            self.master_key_tag = enc_k.tag;
+            self.master_chain_code_nonce = enc_cc.nonce;
+            self.master_chain_code_tag = enc_cc.tag;
+            @memset(&k_plain, 0);
+            @memset(&cc_plain, 0);
         }
 
         // Update salt
@@ -3924,7 +4022,14 @@ pub const WalletManager = struct {
         const chg_idx = std.fmt.bufPrint(&buf, "\"next_change_index\":{d},", .{wallet.next_change_index}) catch return error.SerializationFailed;
         try json.appendSlice(chg_idx);
 
-        // Master key (if present and wallet is not encrypted, or encrypted master key)
+        // Master key.  When the wallet is encrypted, master_key.key and
+        // master_key.chain_code already hold AES-256-GCM ciphertext (see
+        // encryptWalletWithParams + W161 BUG-5 fix); we additionally emit the
+        // per-field nonces and tags required to decrypt them on load.  When
+        // unencrypted, the bytes are plaintext and no nonce/tag is written —
+        // deserializeWallet detects the absence of nonce/tag to know it must
+        // not attempt decryption (also the backward-compat path for legacy
+        // pre-fix wallet.dat files that wrote plaintext while encrypted).
         if (wallet.master_key) |master_key| {
             try json.appendSlice("\"master_key\":\"");
             var hex_buf: [128]u8 = undefined;
@@ -3936,6 +4041,35 @@ pub const WalletManager = struct {
             const cc_hex = std.fmt.bufPrint(&hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&master_key.chain_code)}) catch return error.SerializationFailed;
             try json.appendSlice(cc_hex);
             try json.appendSlice("\",");
+
+            if (wallet.master_key_nonce) |mn| {
+                try json.appendSlice("\"master_key_nonce\":\"");
+                var n_hex: [24]u8 = undefined;
+                const nh = std.fmt.bufPrint(&n_hex, "{s}", .{std.fmt.fmtSliceHexLower(&mn)}) catch return error.SerializationFailed;
+                try json.appendSlice(nh);
+                try json.appendSlice("\",");
+            }
+            if (wallet.master_key_tag) |mt| {
+                try json.appendSlice("\"master_key_tag\":\"");
+                var t_hex: [32]u8 = undefined;
+                const th = std.fmt.bufPrint(&t_hex, "{s}", .{std.fmt.fmtSliceHexLower(&mt)}) catch return error.SerializationFailed;
+                try json.appendSlice(th);
+                try json.appendSlice("\",");
+            }
+            if (wallet.master_chain_code_nonce) |cn| {
+                try json.appendSlice("\"master_chain_code_nonce\":\"");
+                var n_hex: [24]u8 = undefined;
+                const nh = std.fmt.bufPrint(&n_hex, "{s}", .{std.fmt.fmtSliceHexLower(&cn)}) catch return error.SerializationFailed;
+                try json.appendSlice(nh);
+                try json.appendSlice("\",");
+            }
+            if (wallet.master_chain_code_tag) |ct| {
+                try json.appendSlice("\"master_chain_code_tag\":\"");
+                var t_hex: [32]u8 = undefined;
+                const th = std.fmt.bufPrint(&t_hex, "{s}", .{std.fmt.fmtSliceHexLower(&ct)}) catch return error.SerializationFailed;
+                try json.appendSlice(th);
+                try json.appendSlice("\",");
+            }
         }
 
         // Encryption salt (if encrypted)
@@ -4068,7 +4202,13 @@ pub const WalletManager = struct {
             wallet.next_change_index = @intCast(idx.integer);
         }
 
-        // Master key
+        // Master key.  If the wallet was encrypted (post-W161-fix), the bytes
+        // are AES-256-GCM ciphertext and the JSON also carries
+        // master_key_nonce / master_key_tag / master_chain_code_nonce /
+        // master_chain_code_tag.  Legacy plaintext format (pre-W161 fix or
+        // unencrypted wallets) omits these fields — we load the bytes as-is;
+        // getPlaintextMasterKey() detects the null nonces and treats the
+        // bytes as plaintext for backward compatibility.
         if (obj.get("master_key")) |mk| {
             const mk_str = mk.string;
             var key_bytes: [32]u8 = undefined;
@@ -4087,6 +4227,27 @@ pub const WalletManager = struct {
                 .child_index = 0,
                 .is_private = true,
             };
+
+            if (obj.get("master_key_nonce")) |n| {
+                var nb: [12]u8 = undefined;
+                _ = std.fmt.hexToBytes(&nb, n.string) catch return error.WalletLoadFailed;
+                wallet.master_key_nonce = nb;
+            }
+            if (obj.get("master_key_tag")) |t| {
+                var tb: [16]u8 = undefined;
+                _ = std.fmt.hexToBytes(&tb, t.string) catch return error.WalletLoadFailed;
+                wallet.master_key_tag = tb;
+            }
+            if (obj.get("master_chain_code_nonce")) |n| {
+                var nb: [12]u8 = undefined;
+                _ = std.fmt.hexToBytes(&nb, n.string) catch return error.WalletLoadFailed;
+                wallet.master_chain_code_nonce = nb;
+            }
+            if (obj.get("master_chain_code_tag")) |t| {
+                var tb: [16]u8 = undefined;
+                _ = std.fmt.hexToBytes(&tb, t.string) catch return error.WalletLoadFailed;
+                wallet.master_chain_code_tag = tb;
+            }
         }
 
         // Encryption salt
