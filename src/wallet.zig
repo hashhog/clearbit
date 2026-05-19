@@ -865,6 +865,15 @@ pub const Wallet = struct {
         const ctx = secp256k1.secp256k1_context_create(
             secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
         ) orelse return error.Secp256k1ContextFailed;
+        // W159 BUG-4 fix: side-channel-blinding via secp256k1_context_randomize.
+        // Core key.cpp:572-587 does this with fresh GetRandBytes(32) and assert(ret).
+        // Per secp256k1.h:286-290 "highly recommended" after every context_create.
+        {
+            var seed: [32]u8 = undefined;
+            std.crypto.random.bytes(&seed);
+            const ret = secp256k1.secp256k1_context_randomize(ctx, &seed);
+            if (ret == 0) @panic("secp256k1_context_randomize failed");
+        }
 
         return Wallet{
             .ctx = ctx,
