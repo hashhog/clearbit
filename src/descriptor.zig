@@ -47,6 +47,14 @@ const secp256k1 = if (builtin.is_test or !@hasDecl(@import("root"), "secp256k1_e
         pub fn secp256k1_ec_pubkey_tweak_add(_: ?*secp256k1_context, _: *secp256k1_pubkey, _: *const [32]u8) c_int {
             return 0;
         }
+        // W159 BUG-4 stub: real header exports secp256k1_context_randomize for
+        // side-channel-blinding seed installation; the stub never runs (because
+        // secp256k1_context_create returns null and getSecpContext short-circuits
+        // with error.Secp256k1NotAvailable before reaching it), but we need it
+        // present so the production call site compiles in stub-builds too.
+        pub fn secp256k1_context_randomize(_: ?*secp256k1_context, _: *const [32]u8) c_int {
+            return 1;
+        }
     }
 else
     // Real implementation via @cImport when secp256k1 is linked
@@ -62,10 +70,20 @@ fn getSecpContext() !*secp256k1.secp256k1_context {
     if (secp_ctx) |ctx| {
         return ctx;
     }
-    secp_ctx = secp256k1.secp256k1_context_create(
+    const ctx = secp256k1.secp256k1_context_create(
         secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
     ) orelse return error.Secp256k1NotAvailable;
-    return secp_ctx.?;
+    // W159 BUG-4 fix: side-channel-blinding via secp256k1_context_randomize.
+    // Core key.cpp:572-587 does this with fresh GetRandBytes(32) and assert(ret).
+    // Per secp256k1.h:286-290 "highly recommended" after every context_create.
+    {
+        var seed: [32]u8 = undefined;
+        std.crypto.random.bytes(&seed);
+        const ret = secp256k1.secp256k1_context_randomize(ctx, &seed);
+        if (ret == 0) @panic("secp256k1_context_randomize failed");
+    }
+    secp_ctx = ctx;
+    return ctx;
 }
 
 // ============================================================================
