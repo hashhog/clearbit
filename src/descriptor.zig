@@ -4,86 +4,28 @@ const address = @import("address.zig");
 const wallet = @import("wallet.zig");
 const miniscript = @import("miniscript.zig");
 const builtin = @import("builtin");
+const secp = @import("secp.zig");
 
 // ============================================================================
-// libsecp256k1 bindings (optional)
+// libsecp256k1 bindings
 // ============================================================================
 //
-// To enable WIF and xpub/xprv key derivation in descriptors, build with:
-//   zig build -Dsecp256k1=true
+// Phase 2 (clearbit unfreeze plan): this module previously carried its own
+// `@cImport` block for libsecp256k1, producing a distinct opaque-type tree
+// from `wallet.zig` / `crypto.zig` / `v2_transport.zig`. We now alias
+// `secp.c` (the single tree-wide cImport) so every `secp256k1_context` /
+// `secp256k1_pubkey` produced here has the same compile-time identity as
+// every other module's. See `src/secp.zig` for design rationale.
 //
-// Without -Dsecp256k1=true, descriptor parsing works but resolving keys
-// from WIF or extended keys will return an error.
+// Test builds: the central `secp.zig` test stub already covers the call
+// sites we use here (`secp256k1_ec_pubkey_create`, `_parse`, `_serialize`,
+// `_seckey_tweak_add`, `_pubkey_tweak_add`, `_context_randomize`).
 // ============================================================================
 
-const secp256k1 = if (builtin.is_test or !@hasDecl(@import("root"), "secp256k1_enabled"))
-    // Stub implementation for testing without libsecp256k1
-    struct {
-        pub const secp256k1_context = opaque {};
-        pub const secp256k1_pubkey = extern struct {
-            data: [64]u8,
-        };
-        pub const SECP256K1_CONTEXT_SIGN: c_uint = 0x0201;
-        pub const SECP256K1_CONTEXT_VERIFY: c_uint = 0x0101;
-        pub const SECP256K1_EC_COMPRESSED: c_uint = 0x0102;
-        pub const SECP256K1_EC_UNCOMPRESSED: c_uint = 0x0002;
+const secp256k1 = secp.c;
 
-        // Stub functions that return failure
-        pub fn secp256k1_context_create(_: c_uint) ?*secp256k1_context {
-            return null;
-        }
-        pub fn secp256k1_ec_pubkey_create(_: ?*secp256k1_context, _: *secp256k1_pubkey, _: *const [32]u8) c_int {
-            return 0;
-        }
-        pub fn secp256k1_ec_pubkey_serialize(_: ?*secp256k1_context, _: [*]u8, _: *usize, _: *const secp256k1_pubkey, _: c_uint) c_int {
-            return 0;
-        }
-        pub fn secp256k1_ec_pubkey_parse(_: ?*secp256k1_context, _: *secp256k1_pubkey, _: [*]const u8, _: usize) c_int {
-            return 0;
-        }
-        pub fn secp256k1_ec_seckey_tweak_add(_: ?*secp256k1_context, _: *[32]u8, _: *const [32]u8) c_int {
-            return 0;
-        }
-        pub fn secp256k1_ec_pubkey_tweak_add(_: ?*secp256k1_context, _: *secp256k1_pubkey, _: *const [32]u8) c_int {
-            return 0;
-        }
-        // W159 BUG-4 stub: real header exports secp256k1_context_randomize for
-        // side-channel-blinding seed installation; the stub never runs (because
-        // secp256k1_context_create returns null and getSecpContext short-circuits
-        // with error.Secp256k1NotAvailable before reaching it), but we need it
-        // present so the production call site compiles in stub-builds too.
-        pub fn secp256k1_context_randomize(_: ?*secp256k1_context, _: *const [32]u8) c_int {
-            return 1;
-        }
-    }
-else
-    // Real implementation via @cImport when secp256k1 is linked
-    @cImport({
-        @cInclude("secp256k1.h");
-        @cInclude("secp256k1_extrakeys.h");
-    });
-
-// Thread-local secp256k1 context for descriptor key operations
-var secp_ctx: ?*secp256k1.secp256k1_context = null;
-
-fn getSecpContext() !*secp256k1.secp256k1_context {
-    if (secp_ctx) |ctx| {
-        return ctx;
-    }
-    const ctx = secp256k1.secp256k1_context_create(
-        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
-    ) orelse return error.Secp256k1NotAvailable;
-    // W159 BUG-4 fix: side-channel-blinding via secp256k1_context_randomize.
-    // Core key.cpp:572-587 does this with fresh GetRandBytes(32) and assert(ret).
-    // Per secp256k1.h:286-290 "highly recommended" after every context_create.
-    {
-        var seed: [32]u8 = undefined;
-        std.crypto.random.bytes(&seed);
-        const ret = secp256k1.secp256k1_context_randomize(ctx, &seed);
-        if (ret == 0) @panic("secp256k1_context_randomize failed");
-    }
-    secp_ctx = ctx;
-    return ctx;
+fn getSecpContext() !*secp.Context {
+    return secp.context() orelse error.Secp256k1NotAvailable;
 }
 
 // ============================================================================
@@ -2086,21 +2028,36 @@ test "derive P2TR script from x-only pubkey descriptor" {
     try std.testing.expectEqual(@as(u8, 0x20), script[1]); // Push 32 bytes
 }
 
-test "parse and resolve WIF key requires secp256k1" {
+test "parse and resolve WIF key produces P2PKH script" {
+    // Phase 2 (single-FFI secp module): the pre-Phase-2 version of this test
+    // was pinned to the test-mode stub's behavior of returning
+    // `error.Secp256k1NotAvailable` from `deriveScript`. The stub is gone
+    // (the central `secp` module always uses the real libsecp256k1, which
+    // build.zig always links) so derivation now succeeds. The test was
+    // testing the absence of libsecp256k1 in tests — a build-config
+    // assertion, not a descriptor-semantics assertion — and has been
+    // updated to verify the actually-useful property: that a WIF descriptor
+    // resolves to a well-formed P2PKH scriptPubKey.
     const allocator = std.testing.allocator;
 
-    // Parse a descriptor with a WIF key
-    // This is a testnet WIF key
+    // Parse a descriptor with a WIF key (testnet WIF format).
     var desc = try parseDescriptor(allocator, "pkh(cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy)");
     defer desc.deinit(allocator);
 
     try std.testing.expect(desc == .pkh);
     try std.testing.expect(desc.pkh.key == .wif);
 
-    // Attempting to derive the script will fail without secp256k1
-    // (in test mode, the stub implementation returns null context)
-    const result = deriveScript(allocator, &desc, 0);
-    try std.testing.expectError(error.Secp256k1NotAvailable, result);
+    // Derive the scriptPubKey at index 0 (non-ranged descriptor so index ignored).
+    const script = try deriveScript(allocator, &desc, 0);
+    defer allocator.free(script);
+
+    // P2PKH layout: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    try std.testing.expectEqual(@as(usize, 25), script.len);
+    try std.testing.expectEqual(@as(u8, 0x76), script[0]); // OP_DUP
+    try std.testing.expectEqual(@as(u8, 0xa9), script[1]); // OP_HASH160
+    try std.testing.expectEqual(@as(u8, 0x14), script[2]); // Push 20 bytes
+    try std.testing.expectEqual(@as(u8, 0x88), script[23]); // OP_EQUALVERIFY
+    try std.testing.expectEqual(@as(u8, 0xac), script[24]); // OP_CHECKSIG
 }
 
 test "parse xpub descriptor with derivation path" {

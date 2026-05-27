@@ -543,12 +543,20 @@ pub fn fingerprintAwareSelect(
 // ============================================================================
 // libsecp256k1 Bindings
 // ============================================================================
+//
+// Phase 2 (clearbit unfreeze plan): this module previously carried its own
+// `@cImport` block, producing a fourth distinct opaque-type tree for
+// `secp256k1_context` / `secp256k1_pubkey` / `secp256k1_keypair`. We now
+// alias the tree-wide `secp.c` so the Wallet's `ctx` field has the same
+// compile-time type as `crypto.zig`'s context and `descriptor.zig`'s
+// context. The shared process-global context is created at startup via
+// `crypto.initSecp256k1()` (which delegates to `secp.init()`); the
+// Wallet now BORROWS that context rather than creating its own, so
+// `Wallet.deinit()` no longer calls `secp256k1_context_destroy` (doing so
+// would shut down the shared context the rest of the process relies on).
 
-const secp256k1 = @cImport({
-    @cInclude("secp256k1.h");
-    @cInclude("secp256k1_extrakeys.h");
-    @cInclude("secp256k1_schnorrsig.h");
-});
+const secp = @import("secp.zig");
+const secp256k1 = secp.c;
 
 // ============================================================================
 // BIP-39 Mnemonic Support
@@ -623,13 +631,37 @@ pub const DerivationPurpose = enum(u32) {
     bip86 = 86, // P2TR (taproot)
 };
 
-/// BIP32 Extended Key - holds key material plus chain code for derivation
+/// BIP32 Extended Key — private-key form (CExtKey-equivalent).
+///
+/// Holds a 32-byte private scalar plus chain code for BIP-32 derivation.
+///
+/// **Phase 2 type-safety note**: prior to the 2026-05-27 single-FFI refactor,
+/// this struct's `key: [32]u8` field was documented as "Private or public
+/// key" — but a 32-byte buffer cannot hold a 33-byte compressed public key.
+/// That made watch-only / xpub-only wallets unimplementable. The fix is
+/// to split the type into `ExtendedKey` (private-only, this struct) and
+/// `ExtendedPubKey` (public-only, defined just below) — matching Bitcoin
+/// Core's `CExtKey` / `CExtPubKey` split. Code that needs to hold either
+/// form should use a tagged-union wrapper at the call site (Phase 4 P4-1
+/// will add such a wrapper for descriptor / wallet-import paths).
+///
+/// The `is_private` flag is now redundant — it's always `true` for any
+/// `ExtendedKey` value — but is kept on the struct for one release to
+/// avoid breaking the wallet.dat on-disk format (which serializes the
+/// flag). Removed in a follow-up after one wave of wallet.dat
+/// compatibility.
 pub const ExtendedKey = struct {
-    key: [32]u8, // Private or public key
-    chain_code: [32]u8, // Chain code for derivation
+    /// Private scalar (32 bytes). When the parent Wallet is encrypted,
+    /// holds AES-256-GCM ciphertext (see W161 BUG-5 fix; nonces+tags
+    /// live on `Wallet.master_key_nonce` / `_tag` etc.).
+    key: [32]u8,
+    chain_code: [32]u8,
     depth: u8,
     parent_fingerprint: [4]u8,
     child_index: u32,
+    /// Always `true` for any `ExtendedKey` constructed in this codebase.
+    /// Kept for wallet.dat on-disk compatibility; will be removed once
+    /// `Wallet.deserialize` migrates to inferring it from struct identity.
     is_private: bool,
 
     /// HMAC-SHA512 helper for BIP32 derivation
@@ -788,6 +820,35 @@ pub const ExtendedKey = struct {
     }
 };
 
+/// BIP32 Extended **Public** Key — public-key form (CExtPubKey-equivalent).
+///
+/// Phase 2 typed-buffer fix: this struct's `pub_key` field is `secp.PubKey`
+/// (`[33]u8` underneath) so a 33-byte compressed pubkey actually fits. The
+/// pre-Phase-2 `ExtendedKey.key: [32]u8` field was documented as "Private
+/// OR public" but a 32-byte buffer cannot hold a 33-byte compressed pubkey
+/// — that latent type-system bug had silently gated watch-only / xpub-only
+/// wallets for the entire history of clearbit's wallet module.
+///
+/// **Construction**: today, only `ExtendedKey.neuter()` (added in Phase 4
+/// P4-2 alongside `CKDpub`) produces `ExtendedPubKey` values. Until then,
+/// the type exists as a target for the upcoming refactor — defining it
+/// now lets reviewers see the intended end state and lets future code be
+/// written against `ExtendedPubKey` directly without churning callsites.
+///
+/// **Derivation**: non-hardened child derivation (`deriveChildPub`) is
+/// the Phase 4 P4-2 deliverable. Hardened derivation is, by BIP-32 design,
+/// impossible from a public key — `deriveChild(idx)` for `idx >= 2^31`
+/// must return `error.CannotDeriveHardenedFromPublic`.
+pub const ExtendedPubKey = struct {
+    /// Compressed SEC1 public key (33 bytes — 0x02/0x03 prefix + 32-byte x).
+    /// Typed via `secp.PubKey` so the buffer width is a compile-time invariant.
+    pub_key: secp.PubKey,
+    chain_code: [32]u8,
+    depth: u8,
+    parent_fingerprint: [4]u8,
+    child_index: u32,
+};
+
 // ============================================================================
 // Owned UTXO
 // ============================================================================
@@ -873,18 +934,11 @@ pub const Wallet = struct {
     payjoin_locks: ?std.AutoHashMap([36]u8, void) = null,
 
     pub fn init(allocator: std.mem.Allocator, network: Network) !Wallet {
-        const ctx = secp256k1.secp256k1_context_create(
-            secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
-        ) orelse return error.Secp256k1ContextFailed;
-        // W159 BUG-4 fix: side-channel-blinding via secp256k1_context_randomize.
-        // Core key.cpp:572-587 does this with fresh GetRandBytes(32) and assert(ret).
-        // Per secp256k1.h:286-290 "highly recommended" after every context_create.
-        {
-            var seed: [32]u8 = undefined;
-            std.crypto.random.bytes(&seed);
-            const ret = secp256k1.secp256k1_context_randomize(ctx, &seed);
-            if (ret == 0) @panic("secp256k1_context_randomize failed");
-        }
+        // Phase 2: borrow the process-global shared context (lazy-initialized
+        // via secp.init() / secp.context() with the W159 BUG-4 randomization
+        // applied exactly once at creation, not per-wallet). The Wallet does
+        // NOT own this context — `deinit` must not destroy it.
+        const ctx = secp.context() orelse return error.Secp256k1ContextFailed;
 
         return Wallet{
             .ctx = ctx,
@@ -937,7 +991,12 @@ pub const Wallet = struct {
     }
 
     pub fn deinit(self: *Wallet) void {
-        secp256k1.secp256k1_context_destroy(self.ctx);
+        // Phase 2: do NOT destroy self.ctx — it's the process-global shared
+        // context owned by the `secp` module. Destroying it here would shut
+        // down libsecp256k1 for crypto.zig / descriptor.zig / v2_transport.zig
+        // and the next wallet created in the same process. Lifecycle is
+        // owned by `crypto.initSecp256k1` / `crypto.deinitSecp256k1` at
+        // process startup / shutdown (see main.zig).
         self.keys.deinit();
         self.utxos.deinit();
 

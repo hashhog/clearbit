@@ -1012,6 +1012,7 @@ test "consensus constants" {
 
 // This ensures all tests from individual modules are also run
 comptime {
+    _ = @import("secp.zig"); // Phase 2: single-FFI libsecp256k1 wrapper module
     _ = @import("types.zig");
     _ = @import("serialize.zig");
     _ = @import("crypto.zig");
