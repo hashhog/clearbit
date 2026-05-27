@@ -4,10 +4,12 @@ const script = @import("script.zig");
 const crypto = @import("crypto.zig");
 const serialize = @import("serialize.zig");
 
-const secp256k1 = @cImport({
-    @cInclude("secp256k1.h");
-    @cInclude("secp256k1_extrakeys.h");
-});
+// Phase 2 (single-FFI secp module): see comment in tests_w111_wallet.zig
+// for rationale. This integration test never passes secp types across a
+// module boundary today, so the migration is cosmetic — but routing
+// through `secp.c` matches the rest of the test fleet and removes one
+// more @cImport block from the tree.
+const secp256k1 = @import("secp.zig").c;
 
 /// Fixed internal key for taproot test vectors (generator point x-coordinate).
 const INTERNAL_KEY_HEX = "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";

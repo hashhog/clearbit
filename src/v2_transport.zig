@@ -3,78 +3,46 @@ const crypto = @import("crypto.zig");
 const p2p = @import("p2p.zig");
 const types = @import("types.zig");
 const builtin = @import("builtin");
+const secp = @import("secp.zig");
 
 // ============================================================================
 // ElligatorSwift FFI (libsecp256k1)
 // ============================================================================
 //
-// libsecp256k1 with ellswift support is always linked into the clearbit
-// executable (see build.zig: exe.linkSystemLibrary("secp256k1") +
-// addIncludePath secp256k1_include, where the default include points at
-// bitcoin-core/src/secp256k1/include which carries secp256k1_ellswift.h).
-// We therefore always import the real C bindings when not running unit
-// tests.  Unit tests use a stub because the test binary may not have
-// the C symbols available in every environment (and the cipher unit
-// tests exercise the state machine with fixed test vectors, not real ECDH).
+// Phase 2 (clearbit unfreeze plan): the previous module-local `@cImport`
+// (with a separate test-mode stub) has been collapsed into the tree-wide
+// `secp` module. Every `*secp256k1_context` produced here now shares the
+// same opaque-type identity as the ones in `wallet.zig`, `crypto.zig`,
+// and `descriptor.zig`. Per-callsite code below is unchanged — the
+// `secp256k1` alias resolves to the central `secp.c` cImport.
+//
+// `getSecp256k1Context()` is kept as a thin wrapper so external callers
+// (currently none outside this file) continue to work; it now delegates
+// to the process-global `secp.context()`. The pre-existing
+// `builtin.is_test` short-circuit is preserved — the cipher state-machine
+// unit tests intentionally use a simulated shared secret rather than
+// real ECDH (see the comment in `initialize`), so returning `null` here
+// drives the fallback path that exercises the rest of the cipher.
 // ============================================================================
 
-/// libsecp256k1 C bindings for ElligatorSwift.
-/// In tests we use a minimal stub so the cipher state-machine tests can run
-/// without depending on the live secp256k1 library; the runtime build always
-/// gets the real C symbols.
+/// Alias for the tree-wide libsecp256k1 cImport. Same opaque-type tree as
+/// `crypto.zig`, `wallet.zig`, `descriptor.zig` — passing contexts and
+/// pubkeys between these modules now type-checks.
+pub const secp256k1 = struct {
+    pub usingnamespace secp.c;
+    pub const Context = secp.Context;
+    pub const EllswiftXdhHashFn = *const fn ([*]u8, [*]const u8, [*]const u8, [*]const u8, ?*anyopaque) callconv(.C) c_int;
+};
+
+/// Get the shared secp256k1 context for ellswift operations.
+/// Lazily initialized via the central `secp` module on first call.
 ///
-/// Note on type names: the real C header declares `secp256k1_context` (lower-
-/// snake-case).  Our stub declares the same name plus a friendly `Context`
-/// alias used by older internal call sites (initWithSecp256k1 / initialize-
-/// WithSecp256k1).  The runtime cimport carries `secp256k1_context` so we
-/// always reference that name in new code.
-pub const secp256k1 = if (builtin.is_test)
-    // Stub for unit tests.
-    struct {
-        pub const secp256k1_context = opaque {};
-        pub const Context = secp256k1_context;
-        pub const EllswiftXdhHashFn = *const fn ([*]u8, [*]const u8, [*]const u8, [*]const u8, ?*anyopaque) callconv(.C) c_int;
-    }
-else
-    // Runtime: real implementation via @cImport (libsecp256k1 always linked).
-    @cImport({
-        @cInclude("secp256k1.h");
-        @cInclude("secp256k1_ellswift.h");
-    });
-
-/// Process-global secp256k1 context for ellswift_create / ellswift_xdh.
-/// Lazily allocated on first use.  We use a verify+sign context because
-/// ellswift_create (private-key derivation) requires SECP256K1_CONTEXT_SIGN
-/// in the legacy context flag interpretation.
-var ellswift_ctx: ?*secp256k1.secp256k1_context = null;
-var ellswift_ctx_lock: std.Thread.Mutex = .{};
-
-/// Get or create the global secp256k1 context for ellswift operations.
-/// Returns null only in test mode (or in the unlikely event of an allocation
-/// failure inside libsecp256k1).
-pub fn getSecp256k1Context() ?*secp256k1.secp256k1_context {
+/// Returns null in test mode so the cipher unit tests fall through to the
+/// simulated-ECDH path (matching pre-Phase-2 behavior). Production code
+/// gets the real shared context.
+pub fn getSecp256k1Context() ?*secp.Context {
     if (builtin.is_test) return null;
-    ellswift_ctx_lock.lock();
-    defer ellswift_ctx_lock.unlock();
-    if (ellswift_ctx) |ctx| return ctx;
-    if (@hasDecl(secp256k1, "secp256k1_context_create")) {
-        // SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN
-        const flags: c_uint = secp256k1.SECP256K1_CONTEXT_VERIFY | secp256k1.SECP256K1_CONTEXT_SIGN;
-        const ctx = secp256k1.secp256k1_context_create(flags);
-        if (ctx == null) return null;
-        // W159 BUG-4 fix: side-channel-blinding via secp256k1_context_randomize.
-        // Core key.cpp:572-587 does this with fresh GetRandBytes(32) and assert(ret).
-        // Per secp256k1.h:286-290 "highly recommended" after every context_create.
-        if (@hasDecl(secp256k1, "secp256k1_context_randomize")) {
-            var seed: [32]u8 = undefined;
-            std.crypto.random.bytes(&seed);
-            const ret = secp256k1.secp256k1_context_randomize(ctx, &seed);
-            if (ret == 0) @panic("secp256k1_context_randomize failed");
-        }
-        ellswift_ctx = ctx;
-        return ellswift_ctx;
-    }
-    return null;
+    return secp.context();
 }
 
 // ============================================================================

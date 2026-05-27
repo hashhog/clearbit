@@ -108,11 +108,10 @@ const types = @import("types.zig");
 const address = @import("address.zig");
 const crypto = @import("crypto.zig");
 
-const secp256k1 = @cImport({
-    @cInclude("secp256k1.h");
-    @cInclude("secp256k1_extrakeys.h");
-    @cInclude("secp256k1_schnorrsig.h");
-});
+// Phase 2 (single-FFI secp module): see comment in tests_w111_wallet.zig
+// for rationale. Route through the tree-wide `secp.c` so types match
+// `wallet.zig`'s function signatures.
+const secp256k1 = @import("secp.zig").c;
 
 const Wallet = wallet_mod.Wallet;
 const ExtendedKey = wallet_mod.ExtendedKey;
