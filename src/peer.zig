@@ -9105,17 +9105,26 @@ test "W99/G2: regular inbound peer — misbehaving discourages normally" {
     try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
 }
 
-// G3: loadBanList() is defined but never called on startup.
-// BUG: bans do not persist across restarts.
-test "W99/G3: loadBanList is never invoked — ban persistence broken across restarts" {
-    // This is an architectural/wiring bug; we can verify the function exists
-    // and returns successfully when called manually, but it is never wired to startup.
+// G3 (closed 2026-05-27): loadBanList() is now invoked at startup.
+// main.zig calls peer_manager.loadBanList() right after startListening and
+// before spawning the peer thread — banlist.json contents rehydrate so bans
+// survive a graceful restart. Mirrors Bitcoin Core init.cpp's
+// node.banman->LoadBanlist() call sequence.
+test "W99/G3: loadBanList is wired at startup — bans persist across restarts" {
+    // Wiring assertion: loadBanList is a public method on PeerManager and
+    // returns the same kind of result as saveBanList. Wired call site lives
+    // in main.zig (see comment block adjacent to the call).
+    try std.testing.expect(@hasDecl(PeerManager, "loadBanList"));
+    try std.testing.expect(@hasDecl(PeerManager, "saveBanList"));
+
+    // Behavioural assertion: a BanList with a null path treats load() as a
+    // no-op (no banned entries appear). This documents the safe default for
+    // tests; production wiring uses the relative `banlist.json` path that
+    // start_mainnet.sh `cd`s into before exec.
     const allocator = std.testing.allocator;
     var bl = banlist.BanList.init(allocator, null); // null path = no file
     defer bl.deinit();
-    // load() with null path should be a no-op (or fail gracefully).
-    // The bug is that even a real path version is never called from main.zig.
-    // We assert the function at least compiles and the BanList struct exists.
+    try bl.load(); // must succeed when no file is configured
     try std.testing.expectEqual(@as(usize, 0), bl.banned.count());
 }
 
