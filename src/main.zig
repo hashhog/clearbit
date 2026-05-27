@@ -2123,6 +2123,18 @@ pub fn main() !void {
     std.debug.print("P2P listening on port {d}\n", .{config.listen_port});
     std.debug.print("RPC server on {s}:{d}\n", .{ config.rpc_bind, config.rpc_port });
 
+    // Load persisted ban list from disk (W99/G3 fix). Without this, every
+    // restart starts with an empty ban set even though deinit() persists it
+    // via saveBanList() — bans survive a graceful shutdown's serialization
+    // but never get rehydrated on the next launch, so misbehaving peers
+    // immediately reconnect and spam the next session. Mirrors Bitcoin Core
+    // init.cpp's `node.banman->LoadBanlist()` call before AppInitMain returns.
+    // File path is relative to cwd (banlist.json); start_mainnet.sh `cd`s
+    // into the datadir before exec, matching the saveBanList() write path.
+    peer_manager.loadBanList() catch |err| {
+        std.debug.print("Note: could not load ban list: {}\n", .{err});
+    };
+
     // Start peer manager in background thread
     const peer_thread = std.Thread.spawn(.{}, peer.PeerManager.run, .{&peer_manager}) catch |err| {
         std.debug.print("Warning: could not start peer thread: {}\n", .{err});

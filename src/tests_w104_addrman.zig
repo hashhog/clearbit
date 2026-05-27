@@ -591,13 +591,12 @@ test "w104/G29: getaddr has no per-peer one-shot guard (peer can poll repeatedly
     // The getaddr handler just calls sendAddresses() with no gate check.
 }
 
-// G30 BUG: loadBanList() is wired (live), but addr-book persistence absent.
-// In W99 loadBanList was found to be a dead helper in other implementations.
-// In clearbit, loadBanList IS live (called from the run() loop / startup).
-// However the addr-book has NO persistence — only the ban list is persisted.
-// This asymmetry means a crashed node loses all discovered peers but keeps
-// its bans.
-test "w104/G30: loadBanList is live; address-book persistence entirely absent" {
+// G30 (updated 2026-05-27): loadBanList() is now genuinely wired at startup
+// via main.zig (see the comment block adjacent to the new call). The earlier
+// version of this comment misclaimed live-wiring — the actual wiring landed
+// 2026-05-27 alongside the W99/G3 closure. Address-book persistence is still
+// absent, which remains the asymmetry this test documents.
+test "w104/G30: loadBanList is wired; address-book persistence entirely absent" {
     // loadBanList is wired:
     try testing.expect(@hasDecl(PeerManager, "loadBanList"));
     try testing.expect(@hasDecl(PeerManager, "saveBanList"));
