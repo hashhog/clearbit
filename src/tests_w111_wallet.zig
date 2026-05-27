@@ -48,11 +48,15 @@ const types = @import("types.zig");
 const address = @import("address.zig");
 const crypto = @import("crypto.zig");
 
-const secp256k1 = @cImport({
-    @cInclude("secp256k1.h");
-    @cInclude("secp256k1_extrakeys.h");
-    @cInclude("secp256k1_schnorrsig.h");
-});
+// Phase 2 (single-FFI secp module): use the tree-wide `secp.c` so this
+// test's `*secp256k1_context` shares opaque-type identity with the one
+// `wallet.ExtendedKey.deriveChild` accepts. Pre-Phase-2 this file had its
+// own `@cImport` that happened to be byte-identical to wallet.zig's so
+// Zig 0.13's cimport dedup made them silently compatible — that
+// coincidence was load-bearing for the type system and broke as soon as
+// wallet.zig added or reordered an include. Routing through `secp.c`
+// makes the type identity explicit.
+const secp256k1 = @import("secp.zig").c;
 
 // ---------------------------------------------------------------------------
 // Hex helpers

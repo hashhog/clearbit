@@ -657,55 +657,56 @@ pub fn computeMerkleRoot(hashes: []const Hash256, allocator: std.mem.Allocator) 
 // ============================================================================
 // libsecp256k1 Integration (C FFI)
 // ============================================================================
+//
+// Phase 2 (clearbit unfreeze plan): the previous `@cImport` block here has
+// been collapsed into the single tree-wide `secp` module. The `secp256k1`
+// constant below is a local alias for `secp.c` so the rest of this file
+// can continue to write `secp256k1.secp256k1_ec_pubkey_parse(...)` etc.
+// without churn — but every type produced by these calls is now in the
+// SAME opaque-type tree as `wallet.zig`, `descriptor.zig`, and
+// `v2_transport.zig`. That cross-module type identity is the primary
+// structural fix this commit lands.
+//
+// The process-global context is owned by `secp`; `initSecp256k1` /
+// `deinitSecp256k1` / `isSecp256k1Available` now delegate to that module.
+// The thin `secp_ctx()` accessor below preserves the pre-Phase-2 call
+// idiom (`secp_ctx() orelse return ...`) so the existing call sites in
+// this file change only in their parentheses, not their control flow.
 
-const secp256k1 = @cImport({
-    @cInclude("secp256k1.h");
-    @cInclude("secp256k1_extrakeys.h");
-    @cInclude("secp256k1_schnorrsig.h");
-    @cInclude("secp256k1_recovery.h");
-});
+const secp = @import("secp.zig");
+const secp256k1 = secp.c;
 
 /// Whether libsecp256k1 is available at link time
 pub const has_secp256k1: bool = true;
 
-/// Global secp256k1 context
-var secp_ctx: ?*secp256k1.secp256k1_context = null;
-var secp_initialized: bool = false;
+/// Get the shared secp256k1 context. Lazily initializes on first use.
+/// Returns `null` only when libsecp256k1 is unavailable (test-stub path).
+///
+/// Pre-Phase-2 callers wrote `secp_ctx() orelse return false`; now they
+/// write `secp_ctx() orelse return false`. The semantics are identical
+/// to the old optional variable — the only change is that all four
+/// production modules now resolve to the SAME context, not four distinct
+/// ones with four distinct opaque-type identities.
+inline fn secp_ctx() ?*secp.Context {
+    return secp.context();
+}
 
-/// Initialize the secp256k1 context for signature verification
-/// Returns true if initialization succeeded, false otherwise
+/// Initialize the secp256k1 context for signature verification.
+/// Now a thin wrapper over the process-global `secp.init()`.
+/// Returns true if initialization succeeded, false otherwise.
 pub fn initSecp256k1() bool {
-    if (secp_initialized) return true;
-    secp_ctx = secp256k1.secp256k1_context_create(
-        secp256k1.SECP256K1_CONTEXT_VERIFY | secp256k1.SECP256K1_CONTEXT_SIGN,
-    );
-    secp_initialized = (secp_ctx != null);
-    // W159 BUG-4 fix: side-channel-blinding via secp256k1_context_randomize.
-    // Core key.cpp:572-587 does this with fresh GetRandBytes(32) and assert(ret).
-    // Per secp256k1.h:286-290 "highly recommended" after every context_create.
-    if (secp_initialized) {
-        if (secp_ctx) |ctx| {
-            var seed: [32]u8 = undefined;
-            std.crypto.random.bytes(&seed);
-            const ret = secp256k1.secp256k1_context_randomize(ctx, &seed);
-            if (ret == 0) @panic("secp256k1_context_randomize failed");
-        }
-    }
-    return secp_initialized;
+    return secp.init();
 }
 
-/// Deinitialize the secp256k1 context
+/// Deinitialize the secp256k1 context.
+/// Now a thin wrapper over the process-global `secp.deinit()`.
 pub fn deinitSecp256k1() void {
-    if (secp_ctx) |ctx| {
-        secp256k1.secp256k1_context_destroy(ctx);
-        secp_ctx = null;
-    }
-    secp_initialized = false;
+    secp.deinit();
 }
 
-/// Check if secp256k1 is available and initialized
+/// Check if secp256k1 is available and initialized.
 pub fn isSecp256k1Available() bool {
-    return secp_initialized and secp_ctx != null;
+    return secp.isInitialized();
 }
 
 /// Lax DER signature parsing - extracts R and S values from a loosely-encoded
@@ -788,7 +789,7 @@ fn laxDerParse(sig_der: []const u8, compact: *[64]u8) bool {
 ///
 /// Returns true if signature is valid, false otherwise
 pub fn verifyEcdsa(sig_der: []const u8, pubkey_bytes: []const u8, msg_hash: *const [32]u8) bool {
-    const ctx = secp_ctx orelse return false;
+    const ctx = secp_ctx() orelse return false;
 
     // Parse public key
     var pubkey: secp256k1.secp256k1_pubkey = undefined;
@@ -827,7 +828,7 @@ pub fn verifyEcdsa(sig_der: []const u8, pubkey_bytes: []const u8, msg_hash: *con
 /// Check if a DER signature has low-S value.
 /// BIP-62 rule 5 / BIP-146: S must be at most half the curve order.
 pub fn isLowDERSignature(sig_der: []const u8) bool {
-    const ctx = secp_ctx orelse return false;
+    const ctx = secp_ctx() orelse return false;
 
     // Use lax DER parsing to extract R/S into compact format
     var compact: [64]u8 = undefined;
@@ -859,7 +860,7 @@ pub fn isLowDERSignature(sig_der: []const u8) bool {
 ///
 /// Returns the parsed pubkey bytes if valid, null otherwise.
 pub fn parseUncompressedPubkey65(pubkey_bytes: *const [65]u8) ?[65]u8 {
-    const ctx = secp_ctx orelse return null;
+    const ctx = secp_ctx() orelse return null;
     var pk: secp256k1.secp256k1_pubkey = undefined;
     if (secp256k1.secp256k1_ec_pubkey_parse(ctx, &pk, pubkey_bytes, 65) != 1) {
         return null;
@@ -874,7 +875,7 @@ pub fn parseUncompressedPubkey65(pubkey_bytes: *const [65]u8) ?[65]u8 {
 /// Returns the 65-byte serialization on success, null if the input does
 /// not decode to a valid curve point.
 pub fn decompressPubkey33(pubkey_bytes: *const [33]u8) ?[65]u8 {
-    const ctx = secp_ctx orelse return null;
+    const ctx = secp_ctx() orelse return null;
     var pk: secp256k1.secp256k1_pubkey = undefined;
     if (secp256k1.secp256k1_ec_pubkey_parse(ctx, &pk, pubkey_bytes, 33) != 1) {
         return null;
@@ -899,7 +900,7 @@ pub fn decompressPubkey33(pubkey_bytes: *const [33]u8) ?[65]u8 {
 ///
 /// Returns true if signature is valid, false otherwise
 pub fn verifySchnorr(sig: *const [64]u8, msg_hash: *const [32]u8, pubkey_x: *const [32]u8) bool {
-    const ctx = secp_ctx orelse return false;
+    const ctx = secp_ctx() orelse return false;
 
     // Parse the 32-byte x-only pubkey.
     var xonly: secp256k1.secp256k1_xonly_pubkey = undefined;
@@ -992,7 +993,7 @@ pub fn signMessageCompact(
     seckey: *const [32]u8,
     compressed: bool,
 ) ?[65]u8 {
-    const ctx = secp_ctx orelse return null;
+    const ctx = secp_ctx() orelse return null;
 
     var rsig: secp256k1.secp256k1_ecdsa_recoverable_signature = undefined;
     if (secp256k1.secp256k1_ecdsa_sign_recoverable(
@@ -1035,7 +1036,7 @@ pub fn recoverMessagePubkey(
     sig65: *const [65]u8,
     out_pubkey: *[65]u8,
 ) ?usize {
-    const ctx = secp_ctx orelse return null;
+    const ctx = secp_ctx() orelse return null;
 
     const header = sig65[0];
     if (header < 27 or header > 34) return null;
@@ -1591,7 +1592,7 @@ pub fn verifyTaprootControlBlock(control: []const u8, tap_script: []const u8, pr
     if (control.len < 33 or program.len != 32) return false;
     if ((control.len - 33) % 32 != 0) return false;
 
-    const ctx = secp_ctx orelse return false;
+    const ctx = secp_ctx() orelse return false;
 
     const leaf_version = control[0] & 0xfe;
     const internal_key = control[1..33];
@@ -2226,7 +2227,7 @@ test "verifySchnorr corrupted-byte tampering rejects" {
     if (!initSecp256k1()) return error.SkipZigTest;
     defer deinitSecp256k1();
 
-    const ctx = secp_ctx.?;
+    const ctx = secp_ctx().?;
 
     // Deterministic secret: 2.
     var sk: [32]u8 = [_]u8{0} ** 32;
@@ -2359,7 +2360,7 @@ test "signMessageCompact + recoverMessagePubkey round-trip" {
     try std.testing.expectEqual(@as(usize, 33), publen);
 
     // Recovered pubkey must match secp256k1_ec_pubkey_create(seckey).
-    const ctx = secp_ctx orelse return error.NoSecpCtx;
+    const ctx = secp_ctx() orelse return error.NoSecpCtx;
     var expected: secp256k1.secp256k1_pubkey = undefined;
     try std.testing.expectEqual(@as(c_int, 1), secp256k1.secp256k1_ec_pubkey_create(ctx, &expected, &seckey));
     var expected_compressed: [33]u8 = undefined;
