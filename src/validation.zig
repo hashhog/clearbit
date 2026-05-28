@@ -6090,14 +6090,19 @@ pub const ChainManager = struct {
 
     /// Disconnect blocks from the active chain until we reach the target block.
     ///
-    /// Uses `ChainState.disconnectBlockByHash` to load each block body from
-    /// CF_BLOCKS before disconnecting — replaces the pre-d35797b pattern of
-    /// passing `undefined` for the block, which was a Zig pre-init footgun
-    /// (disconnectBlockFromFile reads block.transactions immediately). If
-    /// CF_BLOCKS is missing the body for a block on the disconnect path we
-    /// surface DisconnectFailed rather than corrupt state. The caller is
-    /// expected to have run a CF_BLOCKS coverage check first
-    /// (see `handleDumpTxOutSet` in rpc.zig).
+    /// W101 Phase 3: prefer the CF_BLOCK_UNDO-backed disconnect path
+    /// (`disconnectBlockByHashCF`) when undo bytes are present, falling
+    /// back to the legacy file-based undo path (`disconnectBlockByHash`)
+    /// only for blocks predating the `connectBlockFastWithUndo` populator
+    /// commit `cdd9e20`.  The CF-based path mirrors the connect side
+    /// `connectBlockFastWithUndo` (which writes undo to CF_BLOCK_UNDO),
+    /// so the modern reorg path is symmetric: connect via CF undo,
+    /// disconnect via CF undo, single RocksDB WriteBatch each.
+    ///
+    /// Original (pre-d35797b) footgun: passing `undefined` for the block
+    /// would Undefined-Behaviour at runtime because `disconnectBlockFromFile`
+    /// reads `block.transactions` immediately.  The CF variant loads the
+    /// block bytes itself from CF_BLOCKS so this class of bug is gone.
     fn disconnectToBlock(self: *ChainManager, target: ?*BlockIndexEntry) ChainError!void {
         const chain_state = self.chain_state orelse return;
 
@@ -6110,28 +6115,45 @@ pub const ChainManager = struct {
                 break;
             }
 
-            // Disconnect the tip: load block bytes from CF_BLOCKS, deserialize,
-            // and apply undo via the file-based undo manager.
-            //
-            // W92 — both `error.DisconnectFailed` (Core DISCONNECT_FAILED)
-            // and `error.DisconnectUnclean` (Core DISCONNECT_UNCLEAN) are
-            // treated as fatal here, mirroring Bitcoin Core's
-            // DisconnectTip (validation.cpp:2949) which checks
-            // `!= DISCONNECT_OK`.  VerifyDB callers (RollbackBlock at
-            // validation.cpp:4824) may tolerate UNCLEAN but the reorg
-            // path must not — an UNCLEAN means the UTXO set diverged
-            // from the block-being-reversed, so continuing the rewind
-            // would build on top of inconsistent state.
+            // Prefer the CF_BLOCK_UNDO path: same undo source that the
+            // connect side writes (`connectBlockFastWithUndo`), so the
+            // disconnect path is symmetric and works in the same single-
+            // batch envelope as the connect path.  On `error.UndoDataNotFound`
+            // we fall through to the file-based undo path for backwards
+            // compatibility with blocks connected before CF_BLOCK_UNDO
+            // was populated.
             const prev_hash = tip.header.prev_block;
-            chain_state.disconnectBlockByHash(
-                &tip.hash,
-                tip.file_number,
-                tip.file_offset,
-                prev_hash,
-            ) catch |err| {
-                std.debug.print("disconnectToBlock: disconnect of {x} failed with {}\n", .{ std.fmt.fmtSliceHexLower(&tip.hash), err });
-                return ChainError.DisconnectFailed;
-            };
+            const cf_result = chain_state.disconnectBlockByHashCF(&tip.hash);
+            if (cf_result) |_| {
+                // CF path succeeded: tip + UTXO state rewound, undo
+                // bytes removed from CF_BLOCK_UNDO.  Move on.
+            } else |cf_err| switch (cf_err) {
+                error.UndoDataNotFound => {
+                    // No CF_BLOCK_UNDO entry — try the file-based path.
+                    // This is the pre-reorg-safe-IBD path, kept for
+                    // historical blocks that landed before
+                    // `connectBlockFastWithUndo` was the default.
+                    chain_state.disconnectBlockByHash(
+                        &tip.hash,
+                        tip.file_number,
+                        tip.file_offset,
+                        prev_hash,
+                    ) catch |file_err| {
+                        std.debug.print(
+                            "disconnectToBlock: file-path disconnect of {x} failed with {}\n",
+                            .{ std.fmt.fmtSliceHexLower(&tip.hash), file_err },
+                        );
+                        return ChainError.DisconnectFailed;
+                    };
+                },
+                else => {
+                    std.debug.print(
+                        "disconnectToBlock: CF-path disconnect of {x} failed with {}\n",
+                        .{ std.fmt.fmtSliceHexLower(&tip.hash), cf_err },
+                    );
+                    return ChainError.DisconnectFailed;
+                },
+            }
 
             // Update active tip
             self.active_tip = tip.parent;
@@ -6368,18 +6390,256 @@ pub const ChainManager = struct {
         }
 
         // If best is different from active_tip, we need to reorganize.
-        // Full reorg (disconnect + connect) is a separate TODO; here we
-        // update the pointer after the ancestor-walk guard has ensured the
-        // chain is valid.
+        // W101 Phase 3 (BUG-1 fix): wire the chain selection result to
+        // ChainState.reorgToChain, which atomically disconnects the old
+        // branch and connects the new one in a single Pattern-D
+        // WriteBatch.  If chain_state is null (in-memory unit tests
+        // without a backing store) we fall back to the pre-Phase-3
+        // pointer-only swap so the existing chain-selection tests still
+        // exercise the FindMostWorkChain logic in isolation.
         if (best) |b| {
             if (self.active_tip) |tip| {
                 if (!std.mem.eql(u8, &b.hash, &tip.hash)) {
-                    // TODO: Full reorg implementation (disconnect old, connect new).
-                    self.active_tip = b;
+                    if (self.chain_state != null) {
+                        // Full reorg via ChainState.reorgToChain.  On
+                        // success the active_tip is updated to b; on
+                        // failure b (and the broken path back to the
+                        // fork point) are marked failed_valid so the
+                        // chain is never re-selected (W101 BUG-4
+                        // InvalidBlockFound equivalent — Core
+                        // ActivateBestChainStep on ConnectTip failure).
+                        try self.executeReorg(tip, b);
+                    } else {
+                        // In-memory / no chain_state: legacy pointer swap.
+                        self.active_tip = b;
+                    }
                 }
             } else {
+                // No active tip yet — first activation is a pure pointer
+                // assign (the connect path runs as the first block lands
+                // through connectBlockFastWithUndo / submitblock).  This
+                // mirrors Core's first-activation case where genesis is
+                // the only candidate.
                 self.active_tip = b;
             }
+        }
+    }
+
+    /// Execute a chain-tip switch from `from` to `to`.
+    ///
+    /// Walks the block index to find the most-recent common ancestor
+    /// (fork point), collects the new chain's blocks from `fork_point +
+    /// 1` up to `to`, loads each block's serialized bytes from
+    /// CF_BLOCKS, and hands the entire (disconnect + connect) sequence
+    /// to `ChainState.reorgToChain` for atomic Pattern-D commit.
+    ///
+    /// On any failure before the commit fires, `to` and every block on
+    /// the new-chain segment back to (but not including) the fork point
+    /// are marked `failed_valid`.  This mirrors Bitcoin Core's
+    /// `InvalidChainFound` / `InvalidBlockFound` behaviour in
+    /// `ActivateBestChainStep` — a failed connect must prevent the
+    /// chain from being re-selected forever afterwards (W101 BUG-4).
+    ///
+    /// Reference: Bitcoin Core `ActivateBestChain` /
+    /// `ActivateBestChainStep` / `DisconnectTip` / `ConnectTip` in
+    /// `validation.cpp`.  clearbit collapses the disconnect+connect
+    /// sequence into a single call because `reorgToChain` already
+    /// handles the per-block disconnect and per-block connect via the
+    /// `NoFlush` variants that share one RocksDB `WriteBatch`.
+    fn executeReorg(
+        self: *ChainManager,
+        from: *BlockIndexEntry,
+        to: *BlockIndexEntry,
+    ) ChainError!void {
+        const chain_state = self.chain_state orelse return;
+
+        // Find the most-recent common ancestor.  Two-pointer walk:
+        // step the deeper side up first, then walk both up together
+        // until the parents match.  Same algorithm Bitcoin Core uses
+        // in `LastCommonAncestor` (chain.cpp:165).
+        const fork_point = self.findForkPoint(from, to) orelse {
+            // No common ancestor — `to` is on a disjoint chain (e.g.
+            // genesis mismatch).  Refuse to reorg; mark the candidate
+            // chain failed so we never re-select it.
+            self.markChainFailed(to);
+            return ChainError.DisconnectFailed;
+        };
+
+        // Collect new-chain segment (fork_point + 1 ... to) into a
+        // height-ordered array.  Walk parents from `to` back to (but
+        // not including) `fork_point`, then reverse to get ascending
+        // height.  Bound the depth at MAX_REORG_DEPTH so a pathological
+        // very-deep candidate can't allocate unbounded memory before
+        // `reorgToChain` would reject it anyway.
+        const max_depth: usize = @intCast(storage.ChainState.MAX_REORG_DEPTH);
+        var stack = std.ArrayList(*BlockIndexEntry).init(self.allocator);
+        defer stack.deinit();
+
+        var walk: *BlockIndexEntry = to;
+        while (!std.mem.eql(u8, &walk.hash, &fork_point.hash)) {
+            stack.append(walk) catch return ChainError.OutOfMemory;
+            if (stack.items.len > max_depth) {
+                std.debug.print(
+                    "executeReorg: new-chain segment exceeds MAX_REORG_DEPTH={d}; refusing\n",
+                    .{max_depth},
+                );
+                self.markChainFailed(to);
+                return ChainError.DisconnectFailed;
+            }
+            walk = walk.parent orelse {
+                // Walked off the top of the index without hitting
+                // fork_point — shouldn't happen because findForkPoint
+                // succeeded, but be defensive.
+                self.markChainFailed(to);
+                return ChainError.DisconnectFailed;
+            };
+        }
+
+        // Build the ReorgBlock array by loading each block's bytes
+        // from CF_BLOCKS and deserializing.  Heap-allocated; we free
+        // the Block struct's slabs after reorgToChain returns (the
+        // storage layer takes its own copies of the bytes via
+        // queueBlockWrite, so the in-memory Block can be freed).
+        var rb_list = std.ArrayList(storage.ChainState.ReorgBlock).init(self.allocator);
+        defer {
+            // Free any block bodies we deserialized.  Note that the
+            // bytes handed to queueBlockWrite are independently
+            // allocated and owned by the pending_block_writes queue
+            // (or freed by it on flush failure) — we only free our
+            // local Block-struct slabs here.
+            for (rb_list.items) |rb| {
+                var b = rb.block;
+                serialize.freeBlock(self.allocator, &b);
+            }
+            rb_list.deinit();
+        }
+
+        // Walk the stack in reverse (lowest height first).
+        var idx: usize = stack.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const entry = stack.items[idx];
+
+            const bytes_opt = chain_state.getBlockBytes(&entry.hash) catch {
+                std.debug.print(
+                    "executeReorg: getBlockBytes failed for {x}; aborting\n",
+                    .{std.fmt.fmtSliceHexLower(&entry.hash)},
+                );
+                self.markChainFailed(to);
+                return ChainError.DisconnectFailed;
+            };
+            const bytes = bytes_opt orelse {
+                std.debug.print(
+                    "executeReorg: CF_BLOCKS body missing for {x}; aborting\n",
+                    .{std.fmt.fmtSliceHexLower(&entry.hash)},
+                );
+                self.markChainFailed(to);
+                return ChainError.DisconnectFailed;
+            };
+            defer self.allocator.free(bytes);
+
+            var reader = serialize.Reader{ .data = bytes };
+            const block = serialize.readBlock(&reader, self.allocator) catch {
+                std.debug.print(
+                    "executeReorg: deserialize failed for {x}; aborting\n",
+                    .{std.fmt.fmtSliceHexLower(&entry.hash)},
+                );
+                self.markChainFailed(to);
+                return ChainError.DisconnectFailed;
+            };
+
+            rb_list.append(.{
+                .hash = entry.hash,
+                .block = block,
+                .height = entry.height,
+            }) catch {
+                var b_to_free = block;
+                serialize.freeBlock(self.allocator, &b_to_free);
+                return ChainError.OutOfMemory;
+            };
+        }
+
+        // Fire the atomic disconnect+connect.  reorgToChain refuses to
+        // disconnect below genesis and asserts each new block chains
+        // forward from the in-memory tip; on success best_hash /
+        // best_height in ChainState are updated to `to`.
+        const connected = chain_state.reorgToChain(&fork_point.hash, rb_list.items) catch |err| {
+            std.debug.print(
+                "executeReorg: reorgToChain failed with {} — marking candidate failed_valid\n",
+                .{err},
+            );
+            // Per W101 BUG-4: any block on the broken path must be
+            // marked invalid so it is never re-selected by the next
+            // activateBestChain.
+            self.markChainFailed(to);
+            return ChainError.DisconnectFailed;
+        };
+        _ = connected;
+
+        // Commit succeeded — adopt the new tip.  Both the on-disk
+        // chainstate and the in-memory ChainManager pointer now agree.
+        self.active_tip = to;
+    }
+
+    /// Find the most-recent common ancestor of two block index entries.
+    /// Returns null if they share no ancestor in the index (a fully
+    /// disjoint chain, e.g. a wrong genesis).
+    ///
+    /// Two-pointer walk: step the deeper side up first, then advance
+    /// both pointers in lockstep until they meet.  Bitcoin Core analog:
+    /// `LastCommonAncestor` in `chain.cpp:165`.
+    fn findForkPoint(
+        self: *ChainManager,
+        a: *BlockIndexEntry,
+        b: *BlockIndexEntry,
+    ) ?*BlockIndexEntry {
+        _ = self;
+        var pa: *BlockIndexEntry = a;
+        var pb: *BlockIndexEntry = b;
+
+        // Step the deeper side up to match heights.
+        while (pa.height > pb.height) pa = pa.parent orelse return null;
+        while (pb.height > pa.height) pb = pb.parent orelse return null;
+
+        // Lockstep walk up.
+        while (!std.mem.eql(u8, &pa.hash, &pb.hash)) {
+            pa = pa.parent orelse return null;
+            pb = pb.parent orelse return null;
+        }
+        return pa;
+    }
+
+    /// Mark a candidate chain failed_valid from `tip` back to the most
+    /// recent ancestor that is already on the active chain (or to
+    /// genesis if no common ancestor exists).  Mirrors Bitcoin Core's
+    /// `InvalidChainFound` behaviour: once a chain fails to connect, it
+    /// must never be re-selected.
+    ///
+    /// `best_invalid` is also updated to point at the highest-work
+    /// failed candidate so `getchaintips` / RPC can report it.
+    fn markChainFailed(self: *ChainManager, tip: *BlockIndexEntry) void {
+        var walk: ?*BlockIndexEntry = tip;
+        var depth: usize = 0;
+        const max_depth: usize = @intCast(storage.ChainState.MAX_REORG_DEPTH);
+        while (walk) |w| {
+            if (self.active_tip) |t| {
+                if (std.mem.eql(u8, &w.hash, &t.hash)) break;
+                if (w.isAncestorOf(t)) break;
+            }
+            w.status.failed_valid = true;
+            self.persistBlockStatus(w) catch {};
+            walk = w.parent;
+            depth += 1;
+            if (depth > max_depth) break;
+        }
+
+        // Update best_invalid if `tip` has the most work seen so far.
+        if (self.best_invalid) |bi| {
+            if (self.compareChainWork(&tip.chain_work, &bi.chain_work) > 0) {
+                self.best_invalid = tip;
+            }
+        } else {
+            self.best_invalid = tip;
         }
     }
 
@@ -11512,4 +11772,553 @@ test "W101 G15: invalidateBlock updates best_invalid when new chain has more wor
 
     // After invalidation, best_invalid should point to heavy (most work invalid).
     try std.testing.expectEqual(heavy, manager.best_invalid.?);
+}
+
+// ============================================================================
+// W101 Phase 3 — full reorg (executeReorg → ChainState.reorgToChain) tests
+// ============================================================================
+//
+// These exercise the freeze-lifting consensus path closed in
+// `_clearbit-unfreeze-plan-2026-05-27.md` Phase 3 / `_rewrite-design-
+// clearbit-2026-05-21.md` §5: ChainManager.activateBestChain now calls
+// ChainState.reorgToChain when the best candidate differs from the active
+// tip (instead of the pre-Phase-3 pointer-only swap that left the UTXO
+// set stale).
+//
+// Coverage scenarios:
+//   PR1 — fast-forward (best is a direct descendant of tip via one block)
+//   PR2 — fork-point at genesis (full chain swap, 3 disconnects + 5 connects)
+//   PR3 — fork-point mid-chain (2 disconnects + 3 connects)
+//   PR4 — missing CF_BLOCKS body → mark candidate failed_valid + abort
+//   PR5 — null chain_state (legacy path) preserves pointer-swap semantics
+//   PR6 — invalidateBlock end-to-end (reorg fires from invalidate flow)
+//
+// All PR1..PR4 use a real ChainState backed by std.testing.tmpDir so
+// reorgToChain's CF_BLOCKS / CF_BLOCK_UNDO / CF_UTXO writes can be
+// exercised end-to-end through the Pattern-D single-WriteBatch path.
+
+/// Build a coinbase-only block whose header has the given prev_hash, with
+/// a stable txid (matches storage.zig::makeReorgTestBlock pattern).  The
+/// `script_byte` controls the coinbase output's scriptPubKey marker so
+/// chain-A and chain-B coinbase outputs hash to distinct CF_UTXO entries.
+fn phase3MakeBlock(prev_hash: [32]u8, comptime script_byte: u8) types.Block {
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const p2wpkh_script: *const [22]u8 = &([_]u8{ 0x00, 0x14 } ++ [_]u8{script_byte} ** 20);
+    const coinbase_output = types.TxOut{
+        .value = 5_000_000_000,
+        .script_pubkey = p2wpkh_script,
+    };
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+    return types.Block{
+        .header = types.BlockHeader{
+            .version = 1,
+            .prev_block = prev_hash,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 0,
+            .bits = 0,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{coinbase_tx},
+    };
+}
+
+/// Connect a coinbase-only block through chain_state's reorg-safe path
+/// AND insert a matching BlockIndexEntry into the ChainManager.  Returns
+/// the heap-owned BlockIndexEntry so the caller can chain subsequent
+/// blocks off it.
+fn phase3ConnectAndIndex(
+    chain_state: *storage.ChainState,
+    manager: *ChainManager,
+    parent: *BlockIndexEntry,
+    hash: types.Hash256,
+    chain_work_byte: u8,
+    sequence_id: i64,
+    comptime script_byte: u8,
+) !*BlockIndexEntry {
+    const allocator = manager.allocator;
+    const block = phase3MakeBlock(parent.hash, script_byte);
+
+    var writer = serialize.Writer.init(allocator);
+    try serialize.writeBlock(&writer, &block);
+    const owned_const = try writer.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    const height = parent.height + 1;
+    try chain_state.queueBlockWrite(&hash, owned, height);
+    try chain_state.connectBlockFastWithUndo(&block, &hash, height);
+
+    const entry = try allocator.create(BlockIndexEntry);
+    entry.* = BlockIndexEntry{
+        .hash = hash,
+        .header = block.header,
+        .height = height,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{chain_work_byte},
+        .sequence_id = sequence_id,
+        .parent = parent,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(entry);
+    return entry;
+}
+
+/// Like phase3ConnectAndIndex but does NOT advance chain_state — the
+/// block body is stored in CF_BLOCKS (so executeReorg can load it) but
+/// the chainstate tip does not move.  Used to plant side-branch blocks
+/// that the chain_manager can later reorg to.
+fn phase3IndexOnly(
+    chain_state: *storage.ChainState,
+    manager: *ChainManager,
+    parent: *BlockIndexEntry,
+    hash: types.Hash256,
+    chain_work_byte: u8,
+    sequence_id: i64,
+    comptime script_byte: u8,
+) !*BlockIndexEntry {
+    const allocator = manager.allocator;
+    const block = phase3MakeBlock(parent.hash, script_byte);
+
+    var writer = serialize.Writer.init(allocator);
+    try serialize.writeBlock(&writer, &block);
+    const owned_const = try writer.toOwnedSlice();
+    const owned: []u8 = @constCast(owned_const);
+    const height = parent.height + 1;
+    try chain_state.queueBlockWrite(&hash, owned, height);
+    // Flush the queued body even though we don't connect.  queueBlockWrite
+    // alone leaves the bytes pending; executeReorg's getBlockBytes needs
+    // them committed to CF_BLOCKS.  Empty flush — no tip advance.
+    try chain_state.flush();
+
+    const entry = try allocator.create(BlockIndexEntry);
+    entry.* = BlockIndexEntry{
+        .hash = hash,
+        .header = block.header,
+        .height = height,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{chain_work_byte},
+        .sequence_id = sequence_id,
+        .parent = parent,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(entry);
+    return entry;
+}
+
+test "W101 PR1: fast-forward — activateBestChain extends tip via reorgToChain" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    var manager = ChainManager.init(&chain_state, null, allocator);
+    defer manager.deinit();
+
+    // genesis (height 0, work=0).
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    // Connect A1 directly through chain_state (so best_hash advances).
+    var a1_hash: types.Hash256 = [_]u8{0} ** 32;
+    a1_hash[0] = 0x01;
+    a1_hash[1] = 0xA0;
+    const a1 = try phase3ConnectAndIndex(&chain_state, &manager, genesis, a1_hash, 0x10, 1, 0xAA);
+    manager.active_tip = a1;
+
+    // Plant A2 in the index ONLY (chain_state stays at height 1) so
+    // activateBestChain has a higher-work candidate to extend to.
+    var a2_hash: types.Hash256 = [_]u8{0} ** 32;
+    a2_hash[0] = 0x02;
+    a2_hash[1] = 0xA0;
+    const a2 = try phase3IndexOnly(&chain_state, &manager, a1, a2_hash, 0x20, 2, 0xAA);
+
+    // Pre: chain_state tip is at A1; chain_manager tip is at A1.
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &a1_hash, &chain_state.best_hash);
+    try std.testing.expectEqual(a1, manager.active_tip.?);
+
+    // Activate — finds A2 as best (more work), fork_point = A1, fast-forward.
+    try manager.activateBestChain();
+
+    // Post: chain_state and chain_manager both at A2.
+    try std.testing.expectEqual(@as(u32, 2), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &a2_hash, &chain_state.best_hash);
+    try std.testing.expectEqual(a2, manager.active_tip.?);
+}
+
+test "W101 PR2: fork-point at genesis — 3-disconnect / 5-connect full reorg" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    var manager = ChainManager.init(&chain_state, null, allocator);
+    defer manager.deinit();
+
+    // genesis.
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    // Build chain A: genesis → A1 → A2 → A3 (3 blocks, all connected).
+    var prev_entry = genesis;
+    var a_entries: [3]*BlockIndexEntry = undefined;
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        var h: types.Hash256 = [_]u8{0} ** 32;
+        h[0] = @intCast(i + 1);
+        h[1] = 0xA0;
+        const cw_byte: u8 = @intCast(0x10 * (i + 1));
+        a_entries[i] = try phase3ConnectAndIndex(
+            &chain_state,
+            &manager,
+            prev_entry,
+            h,
+            cw_byte,
+            @intCast(i + 1),
+            0xAA,
+        );
+        prev_entry = a_entries[i];
+    }
+    manager.active_tip = a_entries[2];
+
+    // Pre: chain_state and manager at A3 (height 3).
+    try std.testing.expectEqual(@as(u32, 3), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &a_entries[2].hash, &chain_state.best_hash);
+
+    // Plant chain B (5 blocks off genesis) — store bodies in CF_BLOCKS
+    // but don't connect (chain_state stays at A3).
+    var b_prev = genesis;
+    var b_entries: [5]*BlockIndexEntry = undefined;
+    i = 0;
+    while (i < 5) : (i += 1) {
+        var h: types.Hash256 = [_]u8{0} ** 32;
+        h[0] = @intCast(i + 1);
+        h[1] = 0xB0;
+        // Give chain B higher chainwork so activateBestChain selects it.
+        const cw_byte: u8 = @intCast(0x40 + 0x10 * (i + 1));
+        b_entries[i] = try phase3IndexOnly(
+            &chain_state,
+            &manager,
+            b_prev,
+            h,
+            cw_byte,
+            @intCast(10 + i),
+            0xBB,
+        );
+        b_prev = b_entries[i];
+    }
+
+    // Activate — finds B5 as best, fork_point = genesis, requires 3
+    // disconnects (A3, A2, A1) + 5 connects (B1..B5).
+    try manager.activateBestChain();
+
+    // Post: chain_state and manager at B5 (height 5).
+    try std.testing.expectEqual(@as(u32, 5), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &b_entries[4].hash, &chain_state.best_hash);
+    try std.testing.expectEqual(b_entries[4], manager.active_tip.?);
+}
+
+test "W101 PR3: fork-point mid-chain — 2 disconnects / 3 connects" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    var manager = ChainManager.init(&chain_state, null, allocator);
+    defer manager.deinit();
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    // Connect F1 (shared by both chains — the fork point).
+    var f1_hash: types.Hash256 = [_]u8{0} ** 32;
+    f1_hash[0] = 0x01;
+    f1_hash[1] = 0xF0;
+    const f1 = try phase3ConnectAndIndex(&chain_state, &manager, genesis, f1_hash, 0x10, 1, 0xCC);
+    manager.active_tip = f1;
+
+    // Connect A2 and A3 on chain A (continuing from F1).
+    var a2_hash: types.Hash256 = [_]u8{0} ** 32;
+    a2_hash[0] = 0x02;
+    a2_hash[1] = 0xA0;
+    const a2 = try phase3ConnectAndIndex(&chain_state, &manager, f1, a2_hash, 0x20, 2, 0xAA);
+    manager.active_tip = a2;
+
+    var a3_hash: types.Hash256 = [_]u8{0} ** 32;
+    a3_hash[0] = 0x03;
+    a3_hash[1] = 0xA0;
+    const a3 = try phase3ConnectAndIndex(&chain_state, &manager, a2, a3_hash, 0x30, 3, 0xAA);
+    manager.active_tip = a3;
+
+    // Plant B2, B3, B4 on chain B (off F1 — 3-block alternative).
+    var b_prev = f1;
+    var b_entries: [3]*BlockIndexEntry = undefined;
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        var h: types.Hash256 = [_]u8{0} ** 32;
+        h[0] = @intCast(i + 2);
+        h[1] = 0xB0;
+        const cw_byte: u8 = @intCast(0x40 + 0x10 * (i + 1)); // beats A's 0x30
+        b_entries[i] = try phase3IndexOnly(
+            &chain_state,
+            &manager,
+            b_prev,
+            h,
+            cw_byte,
+            @intCast(10 + i),
+            0xBB,
+        );
+        b_prev = b_entries[i];
+    }
+
+    // Pre: chain_state at A3.
+    try std.testing.expectEqual(@as(u32, 3), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &a3_hash, &chain_state.best_hash);
+
+    // Activate — finds B4 as best (more work), fork_point = F1, requires 2
+    // disconnects (A3, A2) + 3 connects (B2, B3, B4).
+    try manager.activateBestChain();
+
+    // Post: chain_state and manager at B4 (height 4).
+    try std.testing.expectEqual(@as(u32, 4), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &b_entries[2].hash, &chain_state.best_hash);
+    try std.testing.expectEqual(b_entries[2], manager.active_tip.?);
+}
+
+test "W101 PR4: missing CF_BLOCKS body — candidate marked failed_valid" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    var manager = ChainManager.init(&chain_state, null, allocator);
+    defer manager.deinit();
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    // Connect A1.
+    var a1_hash: types.Hash256 = [_]u8{0} ** 32;
+    a1_hash[0] = 0x01;
+    a1_hash[1] = 0xA0;
+    const a1 = try phase3ConnectAndIndex(&chain_state, &manager, genesis, a1_hash, 0x10, 1, 0xAA);
+    manager.active_tip = a1;
+
+    // Build a side branch B1 — but do NOT plant the body in CF_BLOCKS.
+    // The BlockIndexEntry says has_data=true (so it's a valid candidate),
+    // but reorgToChain will fail at getBlockBytes time.
+    var b1_hash: types.Hash256 = [_]u8{0} ** 32;
+    b1_hash[0] = 0x01;
+    b1_hash[1] = 0xB0;
+    const b1 = try allocator.create(BlockIndexEntry);
+    b1.* = BlockIndexEntry{
+        .hash = b1_hash,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{0x80}, // more work than A1
+        .sequence_id = 2,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(b1);
+
+    // Pre: B1 is not marked failed.
+    try std.testing.expect(!b1.status.failed_valid);
+    try std.testing.expectEqual(a1, manager.active_tip.?);
+
+    // Activate — finds B1 as best, fork_point = genesis, tries to load
+    // body for B1 from CF_BLOCKS, fails, marks B1 failed_valid.
+    const result = manager.activateBestChain();
+    try std.testing.expectError(ChainManager.ChainError.DisconnectFailed, result);
+
+    // Post: B1 marked failed_valid; chain stays at A1 (chain_state did
+    // not advance because reorgToChain was never called).
+    try std.testing.expect(b1.status.failed_valid);
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &a1_hash, &chain_state.best_hash);
+
+    // best_invalid should now point at B1 (most-work failed candidate).
+    try std.testing.expectEqual(b1, manager.best_invalid.?);
+}
+
+test "W101 PR5: chain_state=null preserves legacy pointer-swap (in-memory tests)" {
+    // Verifies the pre-Phase-3 behavior is preserved for tests that
+    // construct ChainManager without a backing store.  The pointer-only
+    // swap is the path the W101 G1..G15 in-memory tests rely on.
+    const allocator = std.testing.allocator;
+    var chain = try makeLinearChain(allocator);
+    defer chain.manager.deinit();
+
+    // chain_state is null (init() called with null).
+    try std.testing.expect(chain.manager.chain_state == null);
+
+    chain.manager.active_tip = chain.block1;
+    try chain.manager.activateBestChain();
+
+    // Legacy behavior: pointer swap to block2 (higher chain_work).
+    try std.testing.expectEqual(chain.block2, chain.manager.active_tip.?);
+}
+
+test "W101 PR6: invalidateBlock end-to-end reorg via executeReorg" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    var manager = ChainManager.init(&chain_state, null, allocator);
+    defer manager.deinit();
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    // Chain A (connected): A1 → A2.
+    var a1_hash: types.Hash256 = [_]u8{0} ** 32;
+    a1_hash[0] = 0x01;
+    a1_hash[1] = 0xA0;
+    const a1 = try phase3ConnectAndIndex(&chain_state, &manager, genesis, a1_hash, 0x40, 1, 0xAA);
+    manager.active_tip = a1;
+
+    var a2_hash: types.Hash256 = [_]u8{0} ** 32;
+    a2_hash[0] = 0x02;
+    a2_hash[1] = 0xA0;
+    const a2 = try phase3ConnectAndIndex(&chain_state, &manager, a1, a2_hash, 0x80, 2, 0xAA);
+    manager.active_tip = a2;
+
+    // Chain B (planted only — lower work, not selectable while A2 is valid).
+    var b1_hash: types.Hash256 = [_]u8{0} ** 32;
+    b1_hash[0] = 0x01;
+    b1_hash[1] = 0xB0;
+    const b1 = try phase3IndexOnly(&chain_state, &manager, genesis, b1_hash, 0x20, 3, 0xBB);
+    _ = b1;
+
+    // Pre: chain_state at A2 (height 2).
+    try std.testing.expectEqual(@as(u32, 2), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &a2_hash, &chain_state.best_hash);
+
+    // Invalidate A1 — should mark A1 failed_valid, A2 failed_child, then
+    // reorg to B1 (lower work but only valid candidate).
+    try manager.invalidateBlock(&a1.hash);
+
+    try std.testing.expect(a1.status.failed_valid);
+    try std.testing.expect(a2.status.failed_child);
+    // Post: chain_state and manager at B1 (height 1).
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &b1_hash, &chain_state.best_hash);
 }
