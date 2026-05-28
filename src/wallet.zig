@@ -631,6 +631,53 @@ pub const DerivationPurpose = enum(u32) {
     bip86 = 86, // P2TR (taproot)
 };
 
+// ============================================================================
+// BIP-32 §"Serialization format" — version bytes (Phase 4 P4-3)
+// ============================================================================
+//
+// Per BIP-32 the 78-byte extended-key serialization opens with a 4-byte
+// version prefix that doubles as a base58check magic — when the payload is
+// base58check-encoded these bytes are what produces the human-visible
+// "xprv" / "xpub" / "tprv" / "tpub" prefixes. The mainnet values are the
+// canonical ones from the BIP; testnet matches bitcoin-core/src/kernel/
+// chainparams.cpp:261-262 (testnet3 / testnet4 / signet / regtest all share
+// the `tprv` / `tpub` prefix per Core).
+//
+// SegWit-version prefixes (`ypub`/`zpub`/`vpub`/etc., SLIP-132) are
+// deliberately not handled here — they are an out-of-spec convention some
+// wallets adopted before descriptors normalized everything to xpub +
+// descriptor type. Core itself does NOT emit SLIP-132 prefixes. If hashhog
+// ever needs them, add a separate `SlipVersion` table and a `Slip132Network`
+// wrapper rather than overloading this one.
+
+/// Version bytes for serialized private extended keys (xprv / tprv).
+pub const BIP32_VERSION_PRIV_MAIN: [4]u8 = .{ 0x04, 0x88, 0xAD, 0xE4 }; // "xprv"
+pub const BIP32_VERSION_PRIV_TEST: [4]u8 = .{ 0x04, 0x35, 0x83, 0x94 }; // "tprv"
+
+/// Version bytes for serialized public extended keys (xpub / tpub).
+pub const BIP32_VERSION_PUB_MAIN: [4]u8 = .{ 0x04, 0x88, 0xB2, 0x1E }; // "xpub"
+pub const BIP32_VERSION_PUB_TEST: [4]u8 = .{ 0x04, 0x35, 0x87, 0xCF }; // "tpub"
+
+/// Total byte length of a serialized BIP-32 extended key (pre-base58check).
+pub const BIP32_EXTKEY_SIZE: usize = 78;
+
+/// Return the 4 priv-key version bytes for the given network. Regtest piggybacks
+/// on testnet's `tprv` per Core's `CRegTestParams` (`chainparams.cpp:507`).
+fn bip32VersionPriv(network: Network) [4]u8 {
+    return switch (network) {
+        .mainnet => BIP32_VERSION_PRIV_MAIN,
+        .testnet, .regtest => BIP32_VERSION_PRIV_TEST,
+    };
+}
+
+/// Return the 4 pub-key version bytes for the given network.
+fn bip32VersionPub(network: Network) [4]u8 {
+    return switch (network) {
+        .mainnet => BIP32_VERSION_PUB_MAIN,
+        .testnet, .regtest => BIP32_VERSION_PUB_TEST,
+    };
+}
+
 /// BIP32 Extended Key — private-key form (CExtKey-equivalent).
 ///
 /// Holds a 32-byte private scalar plus chain code for BIP-32 derivation.
@@ -852,6 +899,160 @@ pub const ExtendedKey = struct {
             .child_index = self.child_index,
         };
     }
+
+    // ========================================================================
+    // BIP-32 78-byte serialization (Phase 4 P4-3)
+    // ========================================================================
+
+    /// Encode this private extended key into the raw 78-byte BIP-32 payload
+    /// (pre-base58check). Mirrors `CExtKey::Encode` in
+    /// `bitcoin-core/src/key.cpp:513` byte-for-byte:
+    ///
+    /// ```text
+    ///   off  len  field
+    ///   ---  ---  ------------------------------------------
+    ///    0    4   version (xprv = 0x0488ADE4, tprv = 0x04358394)
+    ///    4    1   depth
+    ///    5    4   parent fingerprint
+    ///    9    4   child number (big-endian)
+    ///   13   32   chain code
+    ///   45    1   0x00 (priv-key zero pad)
+    ///   46   32   private scalar
+    /// ```
+    ///
+    /// The result is what gets base58check-encoded to produce the standard
+    /// `xprv...` / `tprv...` strings via `toXprvString`. Callers that want the
+    /// human-visible form should prefer that wrapper.
+    ///
+    /// **Precondition**: `self.is_private == true`. Until P4-1 lands the
+    /// keypath-as-union refactor, every `ExtendedKey` in this codebase
+    /// satisfies that; the check is defensive.
+    pub fn toXprv(self: *const ExtendedKey, network: Network) ![BIP32_EXTKEY_SIZE]u8 {
+        if (!self.is_private) return error.NotPrivateKey;
+
+        var out: [BIP32_EXTKEY_SIZE]u8 = undefined;
+        const version = bip32VersionPriv(network);
+        @memcpy(out[0..4], &version);
+        out[4] = self.depth;
+        @memcpy(out[5..9], &self.parent_fingerprint);
+        std.mem.writeInt(u32, out[9..13], self.child_index, .big);
+        @memcpy(out[13..45], &self.chain_code);
+        out[45] = 0x00; // BIP-32 priv zero-pad
+        @memcpy(out[46..78], &self.key);
+        return out;
+    }
+
+    /// Encode this private extended key as a base58check-encoded `xprv...`
+    /// (mainnet) or `tprv...` (testnet/regtest) string. The caller owns the
+    /// returned slice and must `allocator.free(...)` it.
+    ///
+    /// Internally this is `base58Encode(toXprv() || hash256(toXprv())[0..4])`
+    /// — the BIP-32 78-byte payload concatenated with a 4-byte truncated
+    /// double-SHA256 checksum. Reuses `address.base58Encode` so we don't
+    /// fork a second implementation. (`address.base58CheckEncode` is *not*
+    /// reusable here: it takes a single-byte version, but BIP-32 uses a
+    /// 4-byte version baked into the payload itself.)
+    pub fn toXprvString(
+        self: *const ExtendedKey,
+        network: Network,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        const raw = try self.toXprv(network);
+        var payload: [BIP32_EXTKEY_SIZE + 4]u8 = undefined;
+        @memcpy(payload[0..BIP32_EXTKEY_SIZE], &raw);
+        const checksum = crypto.hash256(&raw);
+        @memcpy(payload[BIP32_EXTKEY_SIZE..][0..4], checksum[0..4]);
+        return address.base58Encode(&payload, allocator);
+    }
+
+    /// Parse a base58check-encoded BIP-32 private extended key string
+    /// (`xprv...` / `tprv...`) back into an `ExtendedKey`. The returned key
+    /// is allocator-free (all data is inline `[N]u8`); the temporary buffers
+    /// used during base58 decode are released before return.
+    ///
+    /// Validation matches `CExtKey::Decode` (`bitcoin-core/src/key.cpp:523`)
+    /// plus the standard base58check round (length, checksum, version) and
+    /// libsecp256k1 `ec_seckey_verify` (which is stricter than Core's
+    /// `CKey::Set` — Core's `key.Set(..., true)` silently zeroes an invalid
+    /// scalar; clearbit returns an error instead so the caller can surface a
+    /// useful message). The 4-byte version must match one of
+    /// `BIP32_VERSION_PRIV_MAIN` / `BIP32_VERSION_PRIV_TEST`.
+    ///
+    /// **Errors**:
+    /// - `error.InvalidBase58Character` / `error.InvalidBase58CheckChecksum`
+    ///   — passed through from `address.base58Decode`.
+    /// - `error.InvalidExtKeyLength` — decoded payload != 82 bytes (78 +
+    ///   4-byte checksum).
+    /// - `error.InvalidChecksum` — last 4 bytes don't match `hash256(first 78)[0..4]`.
+    /// - `error.UnknownExtKeyVersion` — first 4 bytes don't match a known
+    ///   xprv/tprv version.
+    /// - `error.InvalidExtKeyPrefix` — byte 45 (the priv zero-pad) != 0x00.
+    /// - `error.InvalidPrivateKey` — bytes 46..78 are 0 or ≥ secp256k1 n.
+    pub fn fromXprv(
+        ctx: *secp256k1.secp256k1_context,
+        encoded: []const u8,
+        allocator: std.mem.Allocator,
+    ) !ExtendedKey {
+        const decoded = try address.base58Decode(encoded, allocator);
+        defer allocator.free(decoded);
+
+        if (decoded.len != BIP32_EXTKEY_SIZE + 4) return error.InvalidExtKeyLength;
+
+        // Verify checksum: last 4 bytes == hash256(first 78)[0..4].
+        const payload = decoded[0..BIP32_EXTKEY_SIZE];
+        const checksum = decoded[BIP32_EXTKEY_SIZE..];
+        const computed = crypto.hash256(payload);
+        if (!std.mem.eql(u8, checksum, computed[0..4])) return error.InvalidChecksum;
+
+        // Verify version is a known xprv/tprv prefix.
+        const version = payload[0..4];
+        if (!std.mem.eql(u8, version, &BIP32_VERSION_PRIV_MAIN) and
+            !std.mem.eql(u8, version, &BIP32_VERSION_PRIV_TEST))
+        {
+            return error.UnknownExtKeyVersion;
+        }
+
+        // BIP-32 priv key must be prefixed with a single 0x00 byte at offset 45.
+        if (payload[45] != 0x00) return error.InvalidExtKeyPrefix;
+
+        var key: [32]u8 = undefined;
+        @memcpy(&key, payload[46..78]);
+
+        // Reject scalars outside [1, n-1]. secp256k1_ec_seckey_verify performs
+        // both checks (zero AND range against the curve order). Core's
+        // `CExtKey::Decode` does NOT do this — it calls `CKey::Set(..., true)`
+        // which silently zeroes the internal key. We surface an error instead
+        // so wallet import paths can complain loudly rather than holding a
+        // dud key. (P4-6 will wire this through `importprivkey` / `importmnemonic`.)
+        if (secp256k1.secp256k1_ec_seckey_verify(ctx, &key) != 1) {
+            return error.InvalidPrivateKey;
+        }
+
+        var fingerprint: [4]u8 = undefined;
+        @memcpy(&fingerprint, payload[5..9]);
+        const child_index = std.mem.readInt(u32, payload[9..13], .big);
+        var chain_code: [32]u8 = undefined;
+        @memcpy(&chain_code, payload[13..45]);
+
+        // Mirror Core's depth=0 sanity: if depth is 0 the child_index and
+        // parent fingerprint must both be zero (this is a master key). Core
+        // silently clears the key on violation; we reject. Matches
+        // `bitcoin-core/src/key.cpp:529`.
+        if (payload[4] == 0) {
+            if (child_index != 0) return error.InvalidMasterChildIndex;
+            const fp_zero = std.mem.eql(u8, &fingerprint, &[_]u8{ 0, 0, 0, 0 });
+            if (!fp_zero) return error.InvalidMasterFingerprint;
+        }
+
+        return ExtendedKey{
+            .key = key,
+            .chain_code = chain_code,
+            .depth = payload[4],
+            .parent_fingerprint = fingerprint,
+            .child_index = child_index,
+            .is_private = true,
+        };
+    }
 };
 
 /// BIP32 Extended **Public** Key — public-key form (CExtPubKey-equivalent).
@@ -1013,6 +1214,128 @@ pub const ExtendedPubKey = struct {
         // zero. If we ever do, it indicates a broken libsecp or a corrupted
         // chain code; either way the caller cannot safely proceed.
         return error.NoValidChildIndex;
+    }
+
+    // ========================================================================
+    // BIP-32 78-byte serialization (Phase 4 P4-3)
+    // ========================================================================
+
+    /// Encode this public extended key into the raw 78-byte BIP-32 payload
+    /// (pre-base58check). Mirrors `CExtPubKey::Encode` in
+    /// `bitcoin-core/src/pubkey.cpp:385` byte-for-byte:
+    ///
+    /// ```text
+    ///   off  len  field
+    ///   ---  ---  ------------------------------------------
+    ///    0    4   version (xpub = 0x0488B21E, tpub = 0x043587CF)
+    ///    4    1   depth
+    ///    5    4   parent fingerprint
+    ///    9    4   child number (big-endian)
+    ///   13   32   chain code
+    ///   45   33   compressed pubkey (no priv zero-pad — direct 33 bytes)
+    /// ```
+    ///
+    /// Note the trailing 33 bytes here vs the 1+32 bytes for the private form:
+    /// the pubkey IS 33 bytes (1 leading parity byte + 32 x-coordinate bytes),
+    /// so the layout slot is identical (`45..78`) but its interpretation
+    /// differs. This matches the assertion at `pubkey.cpp:390`
+    /// (`pubkey.size() == CPubKey::COMPRESSED_SIZE`).
+    pub fn toXpub(self: *const ExtendedPubKey, network: Network) [BIP32_EXTKEY_SIZE]u8 {
+        var out: [BIP32_EXTKEY_SIZE]u8 = undefined;
+        const version = bip32VersionPub(network);
+        @memcpy(out[0..4], &version);
+        out[4] = self.depth;
+        @memcpy(out[5..9], &self.parent_fingerprint);
+        std.mem.writeInt(u32, out[9..13], self.child_index, .big);
+        @memcpy(out[13..45], &self.chain_code);
+        @memcpy(out[45..78], &self.pub_key.bytes);
+        return out;
+    }
+
+    /// Encode this public extended key as a base58check-encoded `xpub...`
+    /// (mainnet) or `tpub...` (testnet/regtest) string. Caller owns the
+    /// returned slice. See `ExtendedKey.toXprvString` for the encoding shape.
+    pub fn toXpubString(
+        self: *const ExtendedPubKey,
+        network: Network,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        const raw = self.toXpub(network);
+        var payload: [BIP32_EXTKEY_SIZE + 4]u8 = undefined;
+        @memcpy(payload[0..BIP32_EXTKEY_SIZE], &raw);
+        const checksum = crypto.hash256(&raw);
+        @memcpy(payload[BIP32_EXTKEY_SIZE..][0..4], checksum[0..4]);
+        return address.base58Encode(&payload, allocator);
+    }
+
+    /// Parse a base58check-encoded BIP-32 public extended key string
+    /// (`xpub...` / `tpub...`) back into an `ExtendedPubKey`. Mirrors
+    /// `CExtPubKey::Decode` (`bitcoin-core/src/pubkey.cpp:394`).
+    ///
+    /// Note this is `pub fn fromXpub(s, allocator)` — no `ctx` parameter,
+    /// because validating a pubkey only requires checking it parses as a
+    /// compressed SEC1 point (via libsecp's static context). To keep the
+    /// API consistent with `fromXprv` and to avoid spinning up the static
+    /// context here, the caller passes one in.
+    ///
+    /// **Errors**: same as `fromXprv` plus:
+    /// - `error.InvalidPublicKey` — bytes 45..78 don't parse as a valid
+    ///   compressed pubkey on the secp256k1 curve.
+    pub fn fromXpub(
+        ctx: *secp256k1.secp256k1_context,
+        encoded: []const u8,
+        allocator: std.mem.Allocator,
+    ) !ExtendedPubKey {
+        const decoded = try address.base58Decode(encoded, allocator);
+        defer allocator.free(decoded);
+
+        if (decoded.len != BIP32_EXTKEY_SIZE + 4) return error.InvalidExtKeyLength;
+
+        const payload = decoded[0..BIP32_EXTKEY_SIZE];
+        const checksum = decoded[BIP32_EXTKEY_SIZE..];
+        const computed = crypto.hash256(payload);
+        if (!std.mem.eql(u8, checksum, computed[0..4])) return error.InvalidChecksum;
+
+        const version = payload[0..4];
+        if (!std.mem.eql(u8, version, &BIP32_VERSION_PUB_MAIN) and
+            !std.mem.eql(u8, version, &BIP32_VERSION_PUB_TEST))
+        {
+            return error.UnknownExtKeyVersion;
+        }
+
+        var pub_bytes: [33]u8 = undefined;
+        @memcpy(&pub_bytes, payload[45..78]);
+
+        // Verify it parses as a compressed point on the curve. Core does this
+        // via `CPubKey::IsFullyValid` at pubkey.cpp:400; we go through libsecp
+        // for the same effect. Compressed pubkeys must lead with 0x02 or 0x03,
+        // and the trailing 32 bytes must be an x-coordinate of a point on
+        // secp256k1; both conditions are checked by `ec_pubkey_parse`.
+        var parsed: secp256k1.secp256k1_pubkey = undefined;
+        if (secp256k1.secp256k1_ec_pubkey_parse(ctx, &parsed, &pub_bytes, 33) != 1) {
+            return error.InvalidPublicKey;
+        }
+
+        var fingerprint: [4]u8 = undefined;
+        @memcpy(&fingerprint, payload[5..9]);
+        const child_index = std.mem.readInt(u32, payload[9..13], .big);
+        var chain_code: [32]u8 = undefined;
+        @memcpy(&chain_code, payload[13..45]);
+
+        // Same depth=0 master-key sanity as fromXprv.
+        if (payload[4] == 0) {
+            if (child_index != 0) return error.InvalidMasterChildIndex;
+            const fp_zero = std.mem.eql(u8, &fingerprint, &[_]u8{ 0, 0, 0, 0 });
+            if (!fp_zero) return error.InvalidMasterFingerprint;
+        }
+
+        return ExtendedPubKey{
+            .pub_key = secp.PubKey.fromBytes(pub_bytes),
+            .chain_code = chain_code,
+            .depth = payload[4],
+            .parent_fingerprint = fingerprint,
+            .child_index = child_index,
+        };
     }
 };
 

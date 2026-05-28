@@ -425,17 +425,34 @@ test "W118 G9b: CKDpub rejects hardened indices (i >= 2^31)" {
 // interchange format for HD wallets.  Watch-only setup, descriptor
 // import / export, and hardware-wallet PSBT all rely on it.
 
-test "W118 G10: ExtendedKey base58check serialization — BUG-4 missing" {
-    const has_to_xprv = @hasDecl(ExtendedKey, "toXprv");
-    const has_to_xpub = @hasDecl(ExtendedKey, "toXpub");
-    const has_from_xprv = @hasDecl(ExtendedKey, "fromXprv");
-    const has_from_xpub = @hasDecl(ExtendedKey, "fromXpub");
+test "W118 G10: ExtendedKey base58check serialization — BUG-4 CLOSED by P4-3" {
+    // BUG-4 is fixed by Phase 4 P4-3 — toXprv / fromXprv live on
+    // `ExtendedKey`, toXpub / fromXpub live on `ExtendedPubKey` (the
+    // public-only sibling added in P4-2). Watch-only / descriptor / hardware-
+    // wallet / PSBT interop now works end-to-end via the standard 78-byte
+    // BIP-32 serialization format.
+    try std.testing.expect(@hasDecl(ExtendedKey, "toXprv"));
+    try std.testing.expect(@hasDecl(ExtendedKey, "toXprvString"));
+    try std.testing.expect(@hasDecl(ExtendedKey, "fromXprv"));
+    try std.testing.expect(@hasDecl(wallet_mod.ExtendedPubKey, "toXpub"));
+    try std.testing.expect(@hasDecl(wallet_mod.ExtendedPubKey, "toXpubString"));
+    try std.testing.expect(@hasDecl(wallet_mod.ExtendedPubKey, "fromXpub"));
 
-    // BUG-4: all four MUST be absent today.  Each presence flips this assertion.
-    try std.testing.expect(!has_to_xprv);
-    try std.testing.expect(!has_to_xpub);
-    try std.testing.expect(!has_from_xprv);
-    try std.testing.expect(!has_from_xpub);
+    // Smoke check: round-trip the BIP-32 TV1 master string through the API
+    // (the byte-identity vs spec is checked in tests_w111_wallet.zig).
+    const allocator = std.testing.allocator;
+    const tv1_xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+
+    const ctx_opt = makeContext() orelse return;
+    defer destroyContext(ctx_opt);
+
+    const parsed = try ExtendedKey.fromXprv(ctx_opt, tv1_xprv, allocator);
+    try std.testing.expectEqual(@as(u8, 0), parsed.depth);
+    try std.testing.expect(parsed.is_private);
+
+    const re_encoded = try parsed.toXprvString(.mainnet, allocator);
+    defer allocator.free(re_encoded);
+    try std.testing.expectEqualStrings(tv1_xprv, re_encoded);
 }
 
 // ===========================================================================

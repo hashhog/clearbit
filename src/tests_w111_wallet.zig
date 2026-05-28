@@ -96,7 +96,7 @@ fn hexToBytesAlloc(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
 //
 // xfail: BUG-1 — no xprv/xpub serialization method
 
-test "W111 G1: xprv/xpub serialization — BUG-1 MISSING (no toXprv/toXpub method)" {
+test "W111 G1: xprv/xpub serialization — BUG-1 CLOSED by Phase 4 P4-3" {
     // BIP-32 test vector 1 seed (hex)
     const seed = hexToBytes("000102030405060708090a0b0c0d0e0f");
     const master = try wallet_mod.ExtendedKey.fromSeed(&seed);
@@ -117,12 +117,216 @@ test "W111 G1: xprv/xpub serialization — BUG-1 MISSING (no toXprv/toXpub metho
     const expected_chain_code = hexToBytes("873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508");
     try std.testing.expectEqualSlices(u8, &expected_chain_code, &master.chain_code);
 
-    // BUG-1: There is no toXprv() / toXpub() / fromXprv() / fromXpub() method.
-    // The expected xprv string for mainnet TV1 master is:
-    //   xprvA41z7zogVVwxVSgdKUHDy1SKmdb533PjDz7J6N6mV6uS3ze1ai8FHa8kmHScGpWmj4WggLyQjgPie1rFSruoUihUZREPSL39UNdE3BBDu76
-    // Without this function we cannot test it here.
-    // xfail intentional: compile-check passes (we tested what IS there);
-    //   the missing serialization is documented as BUG-1.
+    // BUG-1 FIX: toXprv / toXpub now exist. Encode the master and check the
+    // 4 known structural bytes (version, depth, child index).
+    const xprv_raw = try master.toXprv(.mainnet);
+    try std.testing.expectEqualSlices(u8, &.{ 0x04, 0x88, 0xAD, 0xE4 }, xprv_raw[0..4]);
+    try std.testing.expectEqual(@as(u8, 0), xprv_raw[4]); // depth
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, xprv_raw[5..9]); // parent fp
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, xprv_raw[9..13]); // child index
+    try std.testing.expectEqualSlices(u8, &expected_chain_code, xprv_raw[13..45]);
+    try std.testing.expectEqual(@as(u8, 0x00), xprv_raw[45]); // priv zero-pad
+    try std.testing.expectEqualSlices(u8, &expected_master_key, xprv_raw[46..78]);
+}
+
+// W111 G1 (P4-3): xprv string TV1 master byte-identical to BIP-32 spec.
+test "W111 G1: BIP-32 TV1 master xprv string byte-identical to spec" {
+    const allocator = std.testing.allocator;
+
+    const seed = hexToBytes("000102030405060708090a0b0c0d0e0f");
+    const master = try wallet_mod.ExtendedKey.fromSeed(&seed);
+
+    // Spec test1 row 0, prv field from bitcoin-core/src/test/bip32_tests.cpp:44.
+    const expected_xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+
+    const got = try master.toXprvString(.mainnet, allocator);
+    defer allocator.free(got);
+
+    try std.testing.expectEqualStrings(expected_xprv, got);
+}
+
+// W111 G1 (P4-3): xpub string TV1 master byte-identical to BIP-32 spec.
+test "W111 G1: BIP-32 TV1 master xpub string byte-identical to spec" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const seed = hexToBytes("000102030405060708090a0b0c0d0e0f");
+    const master = try wallet_mod.ExtendedKey.fromSeed(&seed);
+    const master_pub = try master.neuter(ctx.?);
+
+    // Spec test1 row 0, pub field from bitcoin-core/src/test/bip32_tests.cpp:43.
+    const expected_xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+
+    const got = try master_pub.toXpubString(.mainnet, allocator);
+    defer allocator.free(got);
+
+    try std.testing.expectEqualStrings(expected_xpub, got);
+}
+
+// W111 G1 (P4-3): TV1 m/0h xprv + xpub strings byte-identical to spec.
+test "W111 G1: BIP-32 TV1 m/0h xprv and xpub strings match spec" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const seed = hexToBytes("000102030405060708090a0b0c0d0e0f");
+    const master = try wallet_mod.ExtendedKey.fromSeed(&seed);
+
+    const c0h = try master.deriveChild(ctx.?, 0x80000000);
+
+    // Spec test1 row 1 (m/0h), bip32_tests.cpp:46-48.
+    const expected_xprv_0h = "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7";
+    const expected_xpub_0h = "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw";
+
+    const got_xprv = try c0h.toXprvString(.mainnet, allocator);
+    defer allocator.free(got_xprv);
+    try std.testing.expectEqualStrings(expected_xprv_0h, got_xprv);
+
+    const c0h_pub = try c0h.neuter(ctx.?);
+    const got_xpub = try c0h_pub.toXpubString(.mainnet, allocator);
+    defer allocator.free(got_xpub);
+    try std.testing.expectEqualStrings(expected_xpub_0h, got_xpub);
+}
+
+// W111 G1 (P4-3): round-trip — string → ExtendedKey → string is byte-identical.
+test "W111 G1: xprv/xpub round-trip preserves byte-identity" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    // Round-trip the TV1 master xprv via fromXprv → toXprvString.
+    const input_xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+    const parsed_priv = try wallet_mod.ExtendedKey.fromXprv(ctx.?, input_xprv, allocator);
+
+    const expected_master_key = hexToBytes("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35");
+    try std.testing.expectEqualSlices(u8, &expected_master_key, &parsed_priv.key);
+    try std.testing.expectEqual(@as(u8, 0), parsed_priv.depth);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &parsed_priv.parent_fingerprint);
+    try std.testing.expectEqual(@as(u32, 0), parsed_priv.child_index);
+    try std.testing.expect(parsed_priv.is_private);
+
+    const reencoded = try parsed_priv.toXprvString(.mainnet, allocator);
+    defer allocator.free(reencoded);
+    try std.testing.expectEqualStrings(input_xprv, reencoded);
+
+    // Round-trip the TV1 master xpub via fromXpub → toXpubString.
+    const input_xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    const parsed_pub = try wallet_mod.ExtendedPubKey.fromXpub(ctx.?, input_xpub, allocator);
+
+    const reencoded_pub = try parsed_pub.toXpubString(.mainnet, allocator);
+    defer allocator.free(reencoded_pub);
+    try std.testing.expectEqualStrings(input_xpub, reencoded_pub);
+}
+
+// W111 G1 (P4-3): malformed inputs are rejected cleanly, not panicked on.
+test "W111 G1: xprv/xpub parse rejects flipped checksum byte" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    // Take the valid TV1 master xprv and mutate the LAST character (which
+    // sits inside the base58check checksum window). Should reject with
+    // InvalidChecksum, NOT crash.
+    const valid = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+    var corrupt: [valid.len]u8 = undefined;
+    @memcpy(&corrupt, valid);
+    // Flip a known character from 'i' to 'j' (both valid base58 chars so we
+    // hit the checksum check rather than the alphabet check).
+    corrupt[corrupt.len - 1] = if (corrupt[corrupt.len - 1] == 'i') 'j' else 'i';
+
+    const result = wallet_mod.ExtendedKey.fromXprv(ctx.?, &corrupt, allocator);
+    try std.testing.expectError(error.InvalidChecksum, result);
+}
+
+test "W111 G1: xprv parse rejects wrong version byte (xpub fed to fromXprv)" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    // Pass the TV1 master xpub to fromXprv. The base58check decode succeeds
+    // (the xpub is well-formed) but the version is 0x0488B21E (xpub mainnet),
+    // not 0x0488ADE4 (xprv mainnet) or 0x04358394 (tprv testnet) — so we
+    // should get UnknownExtKeyVersion.
+    const xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    const result = wallet_mod.ExtendedKey.fromXprv(ctx.?, xpub, allocator);
+    try std.testing.expectError(error.UnknownExtKeyVersion, result);
+}
+
+test "W111 G1: xpub parse rejects garbage input" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    // "0OIl" mixes characters that are NOT in the base58 alphabet (0, O, I, l).
+    // base58Decode rejects them with InvalidBase58Character before the
+    // length / checksum / version checks run.
+    const garbage = "0OIl0OIl0OIl0OIl0OIl";
+    const result = wallet_mod.ExtendedPubKey.fromXpub(ctx.?, garbage, allocator);
+    try std.testing.expectError(error.InvalidBase58Character, result);
+
+    // A short but base58-clean string fails the length check instead.
+    const short = "xpub111111";
+    const result2 = wallet_mod.ExtendedPubKey.fromXpub(ctx.?, short, allocator);
+    try std.testing.expectError(error.InvalidExtKeyLength, result2);
+}
+
+test "W111 G1: testnet tprv/tpub round-trip" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const allocator = std.testing.allocator;
+
+    const seed = hexToBytes("000102030405060708090a0b0c0d0e0f");
+    const master = try wallet_mod.ExtendedKey.fromSeed(&seed);
+
+    // Encode the same TV1 master at .testnet — the prefix must be "tprv"
+    // (mapped from version bytes 0x04358394). Round-trip back through
+    // fromXprv and verify byte-identity of the key material.
+    const tprv_str = try master.toXprvString(.testnet, allocator);
+    defer allocator.free(tprv_str);
+    try std.testing.expect(std.mem.startsWith(u8, tprv_str, "tprv"));
+
+    const parsed = try wallet_mod.ExtendedKey.fromXprv(ctx.?, tprv_str, allocator);
+    try std.testing.expectEqualSlices(u8, &master.key, &parsed.key);
+    try std.testing.expectEqualSlices(u8, &master.chain_code, &parsed.chain_code);
+
+    // And the matching tpub.
+    const master_pub = try master.neuter(ctx.?);
+    const tpub_str = try master_pub.toXpubString(.testnet, allocator);
+    defer allocator.free(tpub_str);
+    try std.testing.expect(std.mem.startsWith(u8, tpub_str, "tpub"));
+
+    const parsed_pub = try wallet_mod.ExtendedPubKey.fromXpub(ctx.?, tpub_str, allocator);
+    try std.testing.expectEqualSlices(u8, &master_pub.pub_key.bytes, &parsed_pub.pub_key.bytes);
+    try std.testing.expectEqualSlices(u8, &master_pub.chain_code, &parsed_pub.chain_code);
 }
 
 test "W111 G1: xprv/xpub BIP-32 TV1 child derivation key material (positive)" {
