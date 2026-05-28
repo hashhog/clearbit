@@ -818,6 +818,40 @@ pub const ExtendedKey = struct {
             index,
         }) catch return error.BufferTooSmall;
     }
+
+    /// "Neuter" this private extended key — return the matching public extended
+    /// key (xpub-equivalent in-memory form). BIP-32 §"Public parent key" calls
+    /// this `N(k, c) → (K, c)` where `K = point(k)` and `c` (chain code) is
+    /// unchanged.
+    ///
+    /// Required precondition: `self.is_private == true`. The stored 32-byte
+    /// scalar is fed through `secp256k1_ec_pubkey_create` and serialized as
+    /// 33-byte compressed SEC form via the shared Phase-2 secp context — no
+    /// new context is created.
+    pub fn neuter(self: *const ExtendedKey, ctx: *secp256k1.secp256k1_context) !ExtendedPubKey {
+        if (!self.is_private) return error.NotPrivateKey;
+
+        var pubkey: secp256k1.secp256k1_pubkey = undefined;
+        if (secp256k1.secp256k1_ec_pubkey_create(ctx, &pubkey, &self.key) != 1) {
+            return error.PubkeyCreationFailed;
+        }
+        var compressed: [33]u8 = undefined;
+        var len: usize = 33;
+        _ = secp256k1.secp256k1_ec_pubkey_serialize(
+            ctx,
+            &compressed,
+            &len,
+            &pubkey,
+            secp256k1.SECP256K1_EC_COMPRESSED,
+        );
+        return ExtendedPubKey{
+            .pub_key = secp.PubKey.fromBytes(compressed),
+            .chain_code = self.chain_code,
+            .depth = self.depth,
+            .parent_fingerprint = self.parent_fingerprint,
+            .child_index = self.child_index,
+        };
+    }
 };
 
 /// BIP32 Extended **Public** Key — public-key form (CExtPubKey-equivalent).
@@ -847,6 +881,139 @@ pub const ExtendedPubKey = struct {
     depth: u8,
     parent_fingerprint: [4]u8,
     child_index: u32,
+
+    /// BIP-32 CKDpub — derive a non-hardened child public extended key from
+    /// this parent public extended key. Mirrors `CExtPubKey::Derive` in
+    /// `bitcoin-core/src/pubkey.cpp:415` (which in turn calls
+    /// `CPubKey::Derive` at `pubkey.cpp:341`).
+    ///
+    /// ## Algorithm (BIP-32 §"Public parent key → public child key")
+    ///
+    /// 1. Reject `i >= 2^31` — hardened indices cannot be derived from a
+    ///    public key alone (the hardened CKDpriv path requires the parent
+    ///    private scalar). Returns `error.CannotDeriveHardenedFromPublic`.
+    /// 2. Reject parents at maximum depth (255) — the BIP-32 depth byte
+    ///    is `u8`. Returns `error.DepthOverflow`.
+    /// 3. Compute `I = HMAC-SHA512(Key=cpar, Data=serP(Kpar) || ser32(i))`.
+    /// 4. Split `I = IL || IR`. The child chain code is `IR`.
+    /// 5. The child public key is `Kpar + point(IL)`, computed via
+    ///    `secp256k1_ec_pubkey_tweak_add` over the shared Phase-2 context.
+    /// 6. **MUST-retry**: if `IL >= n` (curve order) or the tweak fails
+    ///    (resulting child is point-at-infinity), the spec REQUIRES
+    ///    advancing to the next index and trying again rather than
+    ///    returning an error. libsecp's `secp256k1_ec_pubkey_tweak_add`
+    ///    rejects both conditions with `0`, so a single retry loop
+    ///    handles both. The probability of one retry is ~2^-127; two is
+    ///    ~2^-254 — well below any realistic exploit budget. We cap the
+    ///    loop at 256 retries to prevent a pathological hang and surface
+    ///    a clear error if it ever fires.
+    ///
+    /// ## What this closes
+    ///
+    /// - W111 BUG-2 / W118 BUG-3: the legacy `ExtendedKey.deriveChild`
+    ///   path returned `error.NotImplemented` for public-only derivation
+    ///   because its `key: [32]u8` field couldn't hold a 33-byte compressed
+    ///   pubkey. This new method operates on the typed `ExtendedPubKey`
+    ///   (`pub_key: secp.PubKey` is `[33]u8`) so the buffer-width gap is
+    ///   eliminated at the type level.
+    /// - The two-pipeline split: `descriptor.zig::decodeExtendedKeyToPubkey`
+    ///   already implemented CKDpub internally for descriptor key paths.
+    ///   The wallet's HD path now uses the same algorithm via a single
+    ///   reusable method — closing the W118 "Same algorithm, two pipelines,
+    ///   only one finished" finding for the wallet half. (The descriptor
+    ///   copy stays as-is for now; folding it into this method is a
+    ///   follow-up P4 step.)
+    ///
+    /// ## Fleet-wide W161 pattern
+    ///
+    /// The MUST-retry on `IL >= n` requirement is a documented fleet-wide
+    /// defect — at least 4 of 10 hashhog impls (beamchain 6-WAVE longest
+    /// carry-forward, nimrod, ouroboros, plus clearbit pre-this-commit)
+    /// returned an error instead of retrying. This implementation follows
+    /// the spec.
+    pub fn deriveChild(
+        self: *const ExtendedPubKey,
+        ctx: *secp256k1.secp256k1_context,
+        index: u32,
+    ) !ExtendedPubKey {
+        // Reject hardened indices — CKDpub cannot derive them.
+        if (index >= 0x80000000) return error.CannotDeriveHardenedFromPublic;
+
+        // Reject depth overflow before doing any crypto work.
+        if (self.depth == std.math.maxInt(u8)) return error.DepthOverflow;
+
+        // Compute parent fingerprint = first 4 bytes of HASH160(parent pubkey).
+        const parent_fp_hash = crypto.hash160(&self.pub_key.bytes);
+        const fingerprint = parent_fp_hash[0..4].*;
+
+        var current_index = index;
+
+        // BIP-32 MUST-retry on IL >= n or pubkey_tweak_add failure. The cap
+        // prevents an unbounded loop in a degenerate libsecp implementation
+        // — in practice we expect zero retries at every realistic call.
+        var attempts: u16 = 0;
+        const max_attempts: u16 = 256;
+        while (attempts < max_attempts) : (attempts += 1) {
+            // Reject if we run out of the non-hardened range during retry.
+            // The spec says "if parsing the resulting key fails ... proceed
+            // with the next value for i"; once we cross into 2^31 we can't
+            // legally derive a non-hardened child from a pubkey.
+            if (current_index >= 0x80000000) return error.NoValidChildIndex;
+
+            // HMAC-SHA512(chain_code, serP(Kpar) || ser32(i))
+            var data: [37]u8 = undefined;
+            @memcpy(data[0..33], &self.pub_key.bytes);
+            std.mem.writeInt(u32, data[33..37], current_index, .big);
+
+            const hmac_result = ExtendedKey.hmacSha512(&self.chain_code, &data);
+            const il = hmac_result[0..32];
+            const ir = hmac_result[32..64].*;
+
+            // Parse parent pubkey into the secp internal representation.
+            var pubkey: secp256k1.secp256k1_pubkey = undefined;
+            if (secp256k1.secp256k1_ec_pubkey_parse(
+                ctx,
+                &pubkey,
+                &self.pub_key.bytes,
+                33,
+            ) != 1) {
+                return error.InvalidParentPubkey;
+            }
+
+            // Tweak: child_pubkey = parent_pubkey + IL * G.
+            // Returns 0 if IL >= n OR if the resulting point is infinity.
+            // BIP-32 says: both conditions MUST advance to the next index.
+            if (secp256k1.secp256k1_ec_pubkey_tweak_add(ctx, &pubkey, il) != 1) {
+                // MUST-retry: advance to the next index and try again.
+                current_index +%= 1;
+                continue;
+            }
+
+            // Serialize child pubkey back to 33-byte compressed SEC form.
+            var compressed: [33]u8 = undefined;
+            var len: usize = 33;
+            _ = secp256k1.secp256k1_ec_pubkey_serialize(
+                ctx,
+                &compressed,
+                &len,
+                &pubkey,
+                secp256k1.SECP256K1_EC_COMPRESSED,
+            );
+
+            return ExtendedPubKey{
+                .pub_key = secp.PubKey.fromBytes(compressed),
+                .chain_code = ir,
+                .depth = self.depth + 1,
+                .parent_fingerprint = fingerprint,
+                .child_index = current_index,
+            };
+        }
+
+        // The probability of reaching here is < 2^(-256 * 8) — effectively
+        // zero. If we ever do, it indicates a broken libsecp or a corrupted
+        // chain code; either way the caller cannot safely proceed.
+        return error.NoValidChildIndex;
+    }
 };
 
 // ============================================================================
@@ -4939,6 +5106,198 @@ test "BIP32 standard path generation" {
 
     const path86 = try ExtendedKey.getStandardPath(.bip86, 1, 0, 0, 10, &buf);
     try std.testing.expectEqualSlices(u8, "m/86'/1'/0'/0/10", path86);
+}
+
+// ============================================================================
+// Phase 4 P4-2: CKDpub + neuter — BIP-32 public-key child derivation
+// ============================================================================
+//
+// These tests assert the new `ExtendedKey.neuter()` constructor and the new
+// `ExtendedPubKey.deriveChild()` (CKDpub) method work correctly. See the
+// per-method doc comments for the BIP-32 references; the validations below
+// pin behaviour against the BIP-32 spec test vectors and against the
+// commutativity property `CKDpub(N(k, c), i) == N(CKDpriv(k, c, i))` for
+// non-hardened i — which is the property that makes xpub-driven address
+// generation possible at all.
+
+test "BIP32 CKDpub: TV1 chain m/0h xpub matches neuter(CKDpriv)" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+    const m0h = try master.deriveChild(ctx.?, 0x80000000);
+
+    // BIP-32 TV1 m/0h expected public key
+    // (https://en.bitcoin.it/wiki/BIP_0032_TestVectors — Chain m/0H)
+    const expected_pub_hex = [_]u8{
+        0x03, 0x5a, 0x78, 0x46, 0x62, 0xa4, 0xa2, 0x0a,
+        0x65, 0xbf, 0x6a, 0xab, 0x9a, 0xe9, 0x8a, 0x6c,
+        0x06, 0x8a, 0x81, 0xc5, 0x2e, 0x4b, 0x03, 0x2c,
+        0x0f, 0xb5, 0x40, 0x0c, 0x70, 0x6c, 0xfc, 0xcc, 0x56,
+    };
+    const m0h_pub = try m0h.neuter(ctx.?);
+    try std.testing.expectEqualSlices(u8, &expected_pub_hex, &m0h_pub.pub_key.bytes);
+    try std.testing.expectEqualSlices(u8, &m0h.chain_code, &m0h_pub.chain_code);
+    try std.testing.expectEqual(m0h.depth, m0h_pub.depth);
+    try std.testing.expectEqual(m0h.child_index, m0h_pub.child_index);
+}
+
+test "BIP32 CKDpub: m/0h/1 commutes with neuter" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+    const m0h_priv = try master.deriveChild(ctx.?, 0x80000000);
+    const m0h_pub = try m0h_priv.neuter(ctx.?);
+
+    // Path A: CKDpriv(m/0h, 1) then neuter.
+    const m0h_1_priv = try m0h_priv.deriveChild(ctx.?, 1);
+    const expected = try m0h_1_priv.neuter(ctx.?);
+
+    // Path B: CKDpub on the m/0h xpub at index 1.
+    const actual = try m0h_pub.deriveChild(ctx.?, 1);
+
+    try std.testing.expectEqualSlices(u8, &expected.pub_key.bytes, &actual.pub_key.bytes);
+    try std.testing.expectEqualSlices(u8, &expected.chain_code, &actual.chain_code);
+    try std.testing.expectEqual(@as(u8, 2), actual.depth);
+    try std.testing.expectEqual(@as(u32, 1), actual.child_index);
+    try std.testing.expectEqualSlices(u8, &expected.parent_fingerprint, &actual.parent_fingerprint);
+
+    // BIP-32 TV1 m/0H/1 expected public key
+    const expected_pub_hex = [_]u8{
+        0x03, 0x50, 0x1e, 0x45, 0x4b, 0xf0, 0x07, 0x51,
+        0xf2, 0x4b, 0x1b, 0x48, 0x9a, 0xa9, 0x25, 0x21,
+        0x5d, 0x66, 0xaf, 0x22, 0x34, 0xe3, 0x89, 0x1c,
+        0x3b, 0x21, 0xa5, 0x2b, 0xed, 0xb3, 0xcd, 0x71, 0x1c,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_pub_hex, &actual.pub_key.bytes);
+
+    // BIP-32 TV1 m/0H/1 expected chain code
+    const expected_cc_hex = [_]u8{
+        0x2a, 0x78, 0x57, 0x63, 0x13, 0x86, 0xba, 0x23,
+        0xda, 0xca, 0xc3, 0x41, 0x80, 0xdd, 0x19, 0x83,
+        0x73, 0x4e, 0x44, 0x4f, 0xdb, 0xf7, 0x74, 0x04,
+        0x15, 0x78, 0xe9, 0xb6, 0xad, 0xb3, 0x7c, 0x19,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_cc_hex, &actual.chain_code);
+}
+
+test "BIP32 CKDpub: rejects hardened indices (must come from privkey)" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+    const master_pub = try master.neuter(ctx.?);
+
+    // Lowest hardened index: 0x80000000.
+    try std.testing.expectError(
+        error.CannotDeriveHardenedFromPublic,
+        master_pub.deriveChild(ctx.?, 0x80000000),
+    );
+    // Highest possible u32 index — still hardened.
+    try std.testing.expectError(
+        error.CannotDeriveHardenedFromPublic,
+        master_pub.deriveChild(ctx.?, 0xFFFFFFFF),
+    );
+    // One below hardened — must succeed (last legal non-hardened index).
+    _ = try master_pub.deriveChild(ctx.?, 0x7FFFFFFF);
+}
+
+test "BIP32 CKDpub: rejects depth overflow at max depth 255" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+    var pub_at_max = try master.neuter(ctx.?);
+    pub_at_max.depth = 255;
+
+    try std.testing.expectError(
+        error.DepthOverflow,
+        pub_at_max.deriveChild(ctx.?, 0),
+    );
+}
+
+test "BIP32 CKDpub: MUST-retry wiring — manual sweep across many indices" {
+    // Sanity that the retry path is wired and the common case never hits
+    // it. Real IL>=n triggers occur with probability ~2^-127 per index, so
+    // we exercise breadth instead and confirm every result is a valid
+    // 33-byte SEC pubkey with the expected child_index.
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+    const master_pub = try master.neuter(ctx.?);
+
+    var i: u32 = 0;
+    while (i < 256) : (i += 1) {
+        const child = try master_pub.deriveChild(ctx.?, i);
+        // Compressed SEC1 marker byte must be 0x02 or 0x03.
+        try std.testing.expect(child.pub_key.bytes[0] == 0x02 or child.pub_key.bytes[0] == 0x03);
+        // child_index reflects either the requested index or (if the
+        // MUST-retry path ever fires) one strictly greater. In practice we
+        // expect exact-equality on every iteration.
+        try std.testing.expect(child.child_index >= i);
+        try std.testing.expectEqual(@as(u8, 1), child.depth);
+    }
+}
+
+test "BIP32 neuter: refuses public-only ExtendedKey input" {
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    const master = try ExtendedKey.fromSeed(&seed);
+    var as_pub = master;
+    as_pub.is_private = false;
+
+    try std.testing.expectError(error.NotPrivateKey, as_pub.neuter(ctx.?));
 }
 
 // ============================================================================

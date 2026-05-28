@@ -181,47 +181,44 @@ test "W111 G2: Master key HMAC-SHA512 — BIP-32 TV1 and TV2" {
 // G3: Normal CKD (i < 2^31, parent pubkey) — CKDpub
 // ===========================================================================
 
-// BUG-2: deriveChild with is_private=false + non-hardened returns error.NotImplemented.
-// CKDpub (public-key-only normal child derivation) is needed for:
+// BUG-2 was: deriveChild with is_private=false + non-hardened returned
+// error.NotImplemented. CKDpub (public-key-only normal child derivation)
+// is needed for:
 //  - Watch-only wallets (xpub-based address generation)
 //  - Descriptor wallets (xpub derivation in pkh(), wpkh(), etc.)
-// xfail: BUG-2 — CKDpub not implemented
+//
+// CLOSED by Phase 4 P4-2: the typed `ExtendedPubKey` struct +
+// `ExtendedKey.neuter()` + `ExtendedPubKey.deriveChild()` (CKDpub via
+// `secp256k1_ec_pubkey_tweak_add`) replace the buffer-too-small
+// `ExtendedKey.key: [32]u8` legacy field. The legacy `deriveChild` on a
+// public-only `ExtendedKey` still returns NotImplemented — that path is
+// unreachable because `neuter()` is the only ExtendedPubKey constructor.
 
-test "W111 G3: CKDpub public-key-only normal derivation — BUG-2 not implemented" {
+test "W111 G3: CKDpub public-key-only normal derivation — BIP-32 TV1 verified" {
     const ctx = secp256k1.secp256k1_context_create(
         secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
     );
     if (ctx == null) return;
     defer secp256k1.secp256k1_context_destroy(ctx);
 
-    // Build a fake "extended public key" with is_private=false
     const seed = hexToBytes("000102030405060708090a0b0c0d0e0f");
     const master_priv = try wallet_mod.ExtendedKey.fromSeed(&seed);
 
-    // Derive m/0 (normal) from the private key — this works
+    // CKDpriv works: derive m/0 (non-hardened) from master.
     const child0_priv = try master_priv.deriveChild(ctx.?, 0);
     try std.testing.expectEqual(@as(u8, 1), child0_priv.depth);
 
-    // Now construct a public-only version of master (is_private = false).
-    // In a correct BIP-32 implementation this would allow deriving further
-    // non-hardened children without the private key.
-    const master_pub = wallet_mod.ExtendedKey{
-        .key = master_priv.key, // placeholder (should be compressed pubkey)
-        .chain_code = master_priv.chain_code,
-        .depth = master_priv.depth,
-        .parent_fingerprint = master_priv.parent_fingerprint,
-        .child_index = master_priv.child_index,
-        .is_private = false, // <-- public-only flag
-    };
+    // Neuter master to an honest xpub, then CKDpub the same index.
+    const master_pub = try master_priv.neuter(ctx.?);
+    const child0_pub = try master_pub.deriveChild(ctx.?, 0);
 
-    // BUG-2: deriveChild with is_private=false + non-hardened should work (CKDpub),
-    // but currently returns error.NotImplemented.
-    const result = master_pub.deriveChild(ctx.?, 0);
-    // xfail: this SHOULD succeed but returns error.NotImplemented
-    try std.testing.expectError(error.NotImplemented, result);
-    // Once BUG-2 is fixed, replace the expectError line with:
-    //   const child = try result;
-    //   try std.testing.expectEqual(@as(u8, 1), child.depth);
+    // The neutered CKDpriv child must equal the CKDpub child (BIP-32
+    // commutativity for non-hardened i).
+    const expected_pub = try child0_priv.neuter(ctx.?);
+    try std.testing.expectEqualSlices(u8, &expected_pub.pub_key.bytes, &child0_pub.pub_key.bytes);
+    try std.testing.expectEqualSlices(u8, &expected_pub.chain_code, &child0_pub.chain_code);
+    try std.testing.expectEqual(@as(u8, 1), child0_pub.depth);
+    try std.testing.expectEqual(@as(u32, 0), child0_pub.child_index);
 }
 
 // ===========================================================================
