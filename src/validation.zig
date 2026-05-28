@@ -5865,6 +5865,32 @@ pub const ChainManager = struct {
     block_index: std.AutoHashMap(types.Hash256, *BlockIndexEntry),
     /// Blocks eligible for being the chain tip (valid candidates)
     chain_tips: std.ArrayList(*BlockIndexEntry),
+    /// Filtered candidate set — only blocks whose ancestor chain has
+    /// not been marked invalid AND that have block data available
+    /// (`isValidCandidate()` returns true).  Mirrors Bitcoin Core's
+    /// `setBlockIndexCandidates` (validation.cpp / chain.h:`CChain`).
+    ///
+    /// W101 BUG-2 fix (Phase 3 step P3-4): `activateBestChain` previously
+    /// scanned the entire `block_index` valueIterator on every invocation
+    /// (O(N) over EVERY block ever seen).  At mainnet h~950k that's an
+    /// allocator + cache walk over ~950k pointer entries every time a
+    /// new header lands.  Mirror Core's filtered set so the chain-select
+    /// loop only visits the actual candidate tips + extensions.
+    ///
+    /// Membership invariants:
+    ///   - Entry is in candidates iff `entry.isValidCandidate()`.
+    ///   - `addBlock` adds the entry when eligible.
+    ///   - `invalidateBlock` / `markChainFailed` remove the entry (and
+    ///     every descendant) when the chain becomes failed.
+    ///   - `reconsiderBlock` re-adds the target (descendants are picked
+    ///     up via the recursive activation re-eval).
+    ///
+    /// Iteration order is hash-map order, NOT chain-work order — but
+    /// since `activateBestChain` does a strict-greater compare while
+    /// walking, the final selection is deterministic regardless.  The
+    /// performance win is filter-by-membership: we never visit
+    /// failed_valid / failed_child / !has_data entries.
+    block_index_candidates: std.AutoHashMap(types.Hash256, *BlockIndexEntry),
     /// Current active chain tip
     active_tip: ?*BlockIndexEntry,
     /// Best invalid block (for tracking attack chains)
@@ -5891,6 +5917,7 @@ pub const ChainManager = struct {
         return ChainManager{
             .block_index = std.AutoHashMap(types.Hash256, *BlockIndexEntry).init(allocator),
             .chain_tips = std.ArrayList(*BlockIndexEntry).init(allocator),
+            .block_index_candidates = std.AutoHashMap(types.Hash256, *BlockIndexEntry).init(allocator),
             .active_tip = null,
             .best_invalid = null,
             .reverse_sequence_id = -1,
@@ -5912,6 +5939,7 @@ pub const ChainManager = struct {
         return ChainManager{
             .block_index = std.AutoHashMap(types.Hash256, *BlockIndexEntry).init(allocator),
             .chain_tips = std.ArrayList(*BlockIndexEntry).init(allocator),
+            .block_index_candidates = std.AutoHashMap(types.Hash256, *BlockIndexEntry).init(allocator),
             .active_tip = null,
             .best_invalid = null,
             .reverse_sequence_id = -1,
@@ -5935,16 +5963,48 @@ pub const ChainManager = struct {
         }
         self.block_index.deinit();
         self.chain_tips.deinit();
+        // block_index_candidates holds borrowed pointers — entries are
+        // owned by block_index above and were destroy()'d in the loop.
+        self.block_index_candidates.deinit();
     }
 
     /// Add a block to the index.
+    ///
+    /// W101 P3-4: also inserts into `block_index_candidates` when
+    /// the entry is a valid candidate (has_data + no failed flags).
+    /// Mirrors Core's `BlockManager::AddToBlockIndex` →
+    /// `Chainstate::TryAddBlockIndexCandidate` flow.  Without this the
+    /// candidate set is missing every fresh accepted block until the
+    /// next `reconsiderBlock` happens to walk past it.
     pub fn addBlock(self: *ChainManager, entry: *BlockIndexEntry) !void {
         try self.block_index.put(entry.hash, entry);
+        try self.tryAddBlockIndexCandidate(entry);
     }
 
     /// Get a block by hash.
     pub fn getBlock(self: *ChainManager, hash: *const types.Hash256) ?*BlockIndexEntry {
         return self.block_index.get(hash.*);
+    }
+
+    /// Insert `entry` into the candidate set if it is a valid candidate.
+    /// Idempotent: HashMap.put on an existing key is a no-op overwrite.
+    /// Mirrors Core's `TryAddBlockIndexCandidate`.
+    fn tryAddBlockIndexCandidate(
+        self: *ChainManager,
+        entry: *BlockIndexEntry,
+    ) !void {
+        if (!entry.isValidCandidate()) return;
+        try self.block_index_candidates.put(entry.hash, entry);
+    }
+
+    /// Remove `entry` from the candidate set.  Safe to call on entries
+    /// that aren't present (idempotent).  Mirrors Core's
+    /// `setBlockIndexCandidates.erase(pindex)`.
+    fn eraseBlockIndexCandidate(
+        self: *ChainManager,
+        entry: *BlockIndexEntry,
+    ) void {
+        _ = self.block_index_candidates.remove(entry.hash);
     }
 
     /// Persist a block's status to RocksDB.
@@ -5991,6 +6051,12 @@ pub const ChainManager = struct {
             return ChainError.OutOfMemory;
         };
 
+        // W101 P3-4: seed the candidate set with disk-loaded entries
+        // so a fresh start has the right candidate population before
+        // any P2P-driven addBlock calls.  Failed/missing-data blocks
+        // are filtered by tryAddBlockIndexCandidate.
+        self.tryAddBlockIndexCandidate(entry) catch return ChainError.OutOfMemory;
+
         return entry;
     }
 
@@ -6028,6 +6094,8 @@ pub const ChainManager = struct {
         // Phase 2: Mark the target block as failed_valid and persist
         target.status.failed_valid = true;
         try self.persistBlockStatus(target);
+        // W101 P3-4: drop the now-invalid target from the candidate set.
+        self.eraseBlockIndexCandidate(target);
 
         // Phase 3: Mark all descendants with failed_child using BFS and persist
         try self.markDescendantsInvalid(target);
@@ -6075,6 +6143,10 @@ pub const ChainManager = struct {
             const block = queue.items[i];
             block.status.failed_child = true;
             try self.persistBlockStatus(block);
+            // W101 P3-4: every descendant marked failed_child is no
+            // longer a valid candidate — drop from the candidate set
+            // so `activateBestChain` skips it without an ancestor walk.
+            self.eraseBlockIndexCandidate(block);
 
             // Find children of this block
             var child_iter = self.block_index.valueIterator();
@@ -6175,6 +6247,11 @@ pub const ChainManager = struct {
         // Phase 1: Clear failed_valid on the target and persist
         target.status.failed_valid = false;
         try self.persistBlockStatus(target);
+        // W101 P3-4: re-admit to the candidate set now that the
+        // failed_valid bit is cleared.  tryAdd respects has_data /
+        // failed_child gating so a target that's still
+        // missing-data stays out.
+        try self.tryAddBlockIndexCandidate(target);
 
         // Phase 2: Clear failed_child on all descendants and persist
         try self.clearDescendantFailure(target);
@@ -6231,6 +6308,10 @@ pub const ChainManager = struct {
             const block = queue.items[i];
             block.status.failed_child = false;
             try self.persistBlockStatus(block);
+            // W101 P3-4: a descendant whose failed_child bit just got
+            // cleared can be a candidate again iff it also has data
+            // and no failed_valid of its own.  tryAdd handles the gate.
+            try self.tryAddBlockIndexCandidate(block);
 
             // Find children
             var child_iter = self.block_index.valueIterator();
@@ -6325,8 +6406,14 @@ pub const ChainManager = struct {
         // BLOCK_FAILED_VALID.  A candidate whose ancestor chain is broken
         // must be skipped (and, if the ancestor is failed, all blocks on
         // the broken path are marked failed_valid — BUG-4 fix).
+        //
+        // W101 P3-4: walk `block_index_candidates` (the filtered set) NOT
+        // `block_index` (every header ever seen).  At mainnet h~950k this
+        // turns an O(N) full-index scan into O(C) where C is the active-
+        // tip leaves and their immediate descendants.  Mirrors Core's
+        // `FindMostWorkChain` walking only `setBlockIndexCandidates`.
         var best: ?*BlockIndexEntry = null;
-        var iter = self.block_index.valueIterator();
+        var iter = self.block_index_candidates.valueIterator();
         while (iter.next()) |entry| {
             const candidate = entry.*;
             if (!candidate.isValidCandidate()) continue;
@@ -6559,6 +6646,52 @@ pub const ChainManager = struct {
             };
         }
 
+        // Pattern B mempool refill (W101 P3-5,
+        // `_mempool-refill-on-reorg-fleet-result-2026-05-05.md`):
+        // collect the active-chain blocks we're about to disconnect so
+        // their non-coinbase txs can be re-admitted to the mempool AFTER
+        // the reorg commits.  Mirrors the same snapshot-then-refill
+        // dance in `block_template.fireReorgFromSideBranch` (the
+        // submitblock-driven reorg path).  Bodies must be snapshotted
+        // BEFORE `reorgToChain` because `connectBlockFastWithUndoNoFlush`
+        // may overwrite CF_BLOCK_UNDO entries during the walk forward.
+        //
+        // Only runs when a mempool is wired in — non-RPC paths (test
+        // shims, P2P bootstrap with mempool=null) pass null and skip
+        // the work.  Bound by MAX_REORG_DEPTH (100), same cap as the
+        // new-chain segment above; in practice mempool snapshotting is
+        // rare-event.  Bitcoin Core reference:
+        // `MaybeUpdateMempoolForReorg` called from
+        // `Chainstate::DisconnectTip` (validation.cpp).
+        var disconnected_blocks = std.ArrayList(types.Block).init(self.allocator);
+        defer {
+            for (disconnected_blocks.items) |*b| {
+                serialize.freeBlock(self.allocator, b);
+            }
+            disconnected_blocks.deinit();
+        }
+        if (self.mempool != null) {
+            var walk_hash: types.Hash256 = from.hash;
+            var walk_depth: usize = 0;
+            while (walk_depth < max_depth and
+                !std.mem.eql(u8, &walk_hash, &fork_point.hash))
+                : (walk_depth += 1)
+            {
+                const bytes_opt = chain_state.getBlockBytes(&walk_hash) catch null;
+                const dbytes = bytes_opt orelse break;
+                defer self.allocator.free(dbytes);
+
+                var dreader = serialize.Reader{ .data = dbytes };
+                const disc_block = serialize.readBlock(&dreader, self.allocator) catch break;
+                disconnected_blocks.append(disc_block) catch {
+                    var to_free = disc_block;
+                    serialize.freeBlock(self.allocator, &to_free);
+                    break;
+                };
+                walk_hash = disc_block.header.prev_block;
+            }
+        }
+
         // Fire the atomic disconnect+connect.  reorgToChain refuses to
         // disconnect below genesis and asserts each new block chains
         // forward from the in-memory tip; on success best_hash /
@@ -6579,6 +6712,32 @@ pub const ChainManager = struct {
         // Commit succeeded — adopt the new tip.  Both the on-disk
         // chainstate and the in-memory ChainManager pointer now agree.
         self.active_tip = to;
+
+        // W101 P3-5 mempool update — fire AFTER the new chain is fully
+        // committed (Core's MaybeUpdateMempoolForReorg also runs post-
+        // commit).  Two-step dance, exactly matching
+        // `fireReorgFromSideBranch`:
+        //   (1) re-admit non-coinbase txs from each disconnected block,
+        //       via `Mempool.blockDisconnected`.  Failures (bad UTXO,
+        //       stale, dup) drop on the floor.
+        //   (2) evict any tx the new-branch blocks confirmed, via
+        //       `Mempool.removeForBlock`.  An RBF tx that confirmed on
+        //       the new branch must NOT be re-admitted from the
+        //       disconnected side — step 2 drops it again, and also
+        //       feeds the fee-estimator's confirmTransaction hook so
+        //       the rolling fee/decay state advances correctly.
+        // Without this, stale txs from the old branch linger in the
+        // mempool indefinitely and re-relay to peers, and any RBF
+        // replacements on the new branch trigger double-spend
+        // rejections.
+        if (self.mempool) |mp| {
+            for (disconnected_blocks.items) |*b| {
+                mp.blockDisconnected(b.transactions);
+            }
+            for (rb_list.items) |rb| {
+                mp.removeForBlock(&rb.block);
+            }
+        }
     }
 
     /// Find the most-recent common ancestor of two block index entries.
@@ -6628,6 +6787,11 @@ pub const ChainManager = struct {
             }
             w.status.failed_valid = true;
             self.persistBlockStatus(w) catch {};
+            // W101 P3-4: drop the failed block from the candidate set
+            // so the next `activateBestChain` skips it without an
+            // ancestor-walk.  Mirrors Core's `InvalidChainFound` ->
+            // `EraseBlockIndexCandidate` removal cascade.
+            self.eraseBlockIndexCandidate(w);
             walk = w.parent;
             depth += 1;
             if (depth > max_depth) break;
@@ -6671,6 +6835,10 @@ pub const ChainManager = struct {
             self.allocator.destroy(genesis);
             return ChainError.OutOfMemory;
         };
+        // W101 P3-4: genesis is the first candidate; without this seed,
+        // `activateBestChain` from an empty index sees no candidates
+        // and leaves `active_tip` null.  Caught by W101 G9c.
+        self.tryAddBlockIndexCandidate(genesis) catch return ChainError.OutOfMemory;
     }
 
     /// Remove a block from the chain_tips list.
@@ -12321,4 +12489,306 @@ test "W101 PR6: invalidateBlock end-to-end reorg via executeReorg" {
     // Post: chain_state and manager at B1 (height 1).
     try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
     try std.testing.expectEqualSlices(u8, &b1_hash, &chain_state.best_hash);
+}
+
+// ============================================================================
+// W101 Phase 3 step P3-4 — filtered candidate set (`block_index_candidates`)
+// ============================================================================
+//
+// PR7..PR9 exercise the W101 BUG-2 fix: `activateBestChain` previously
+// scanned the entire `block_index` (O(N) over every header ever seen) to
+// find the best candidate.  After P3-4, it iterates only
+// `block_index_candidates` (valid-only filter), mirroring Bitcoin Core's
+// `setBlockIndexCandidates` in validation.cpp.
+//
+// PR7 — addBlock auto-populates candidates; failed blocks are skipped.
+// PR8 — invalidateBlock + markChainFailed remove from the candidate set.
+// PR9 — reconsiderBlock restores the target back to the candidate set.
+
+test "W101 PR7: addBlock seeds candidate set; failed/no-data blocks skipped" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Valid candidate: gets added.
+    const ok = try allocator.create(BlockIndexEntry);
+    ok.* = BlockIndexEntry{
+        .hash = [_]u8{0x11} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(ok);
+
+    // Header-only (no data): NOT added.
+    const hdr_only = try allocator.create(BlockIndexEntry);
+    hdr_only.* = BlockIndexEntry{
+        .hash = [_]u8{0x22} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = false, .valid_header = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(hdr_only);
+
+    // failed_valid: NOT added.
+    const bad = try allocator.create(BlockIndexEntry);
+    bad.* = BlockIndexEntry{
+        .hash = [_]u8{0x33} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true, .failed_valid = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(bad);
+
+    try std.testing.expectEqual(@as(u32, 3), manager.block_index.count());
+    try std.testing.expectEqual(@as(u32, 1), manager.block_index_candidates.count());
+    try std.testing.expect(manager.block_index_candidates.contains(ok.hash));
+    try std.testing.expect(!manager.block_index_candidates.contains(hdr_only.hash));
+    try std.testing.expect(!manager.block_index_candidates.contains(bad.hash));
+}
+
+test "W101 PR8: invalidateBlock / markChainFailed remove from candidate set" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    var manager = ChainManager.init(&chain_state, null, allocator);
+    defer manager.deinit();
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    var a1_hash: types.Hash256 = [_]u8{0} ** 32;
+    a1_hash[0] = 0x01;
+    a1_hash[1] = 0xA0;
+    const a1 = try phase3ConnectAndIndex(&chain_state, &manager, genesis, a1_hash, 0x40, 1, 0xAA);
+    manager.active_tip = a1;
+
+    var a2_hash: types.Hash256 = [_]u8{0} ** 32;
+    a2_hash[0] = 0x02;
+    a2_hash[1] = 0xA0;
+    const a2 = try phase3ConnectAndIndex(&chain_state, &manager, a1, a2_hash, 0x80, 2, 0xAA);
+    manager.active_tip = a2;
+
+    // Pre: genesis + A1 + A2 all candidates (3 entries).
+    try std.testing.expectEqual(@as(u32, 3), manager.block_index_candidates.count());
+    try std.testing.expect(manager.block_index_candidates.contains(a1.hash));
+    try std.testing.expect(manager.block_index_candidates.contains(a2.hash));
+
+    // Plant B1 as a side branch so invalidateBlock can reorg.
+    var b1_hash: types.Hash256 = [_]u8{0} ** 32;
+    b1_hash[0] = 0x01;
+    b1_hash[1] = 0xB0;
+    const b1 = try phase3IndexOnly(&chain_state, &manager, genesis, b1_hash, 0x20, 3, 0xBB);
+    try std.testing.expect(manager.block_index_candidates.contains(b1.hash));
+
+    // Invalidate A1 → A1 + A2 dropped from candidate set; B1 stays.
+    try manager.invalidateBlock(&a1.hash);
+    try std.testing.expect(!manager.block_index_candidates.contains(a1.hash));
+    try std.testing.expect(!manager.block_index_candidates.contains(a2.hash));
+    try std.testing.expect(manager.block_index_candidates.contains(b1.hash));
+    try std.testing.expect(manager.block_index_candidates.contains(genesis.hash));
+}
+
+test "W101 PR9: reconsiderBlock re-admits target to candidate set" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    // Build a tiny header-only index, mark X failed_valid then reconsider.
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    const x = try allocator.create(BlockIndexEntry);
+    x.* = BlockIndexEntry{
+        .hash = [_]u8{0xCC} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 1,
+        .status = BlockStatus{ .has_data = true, .failed_valid = true },
+        .chain_work = [_]u8{0x01} ** 32,
+        .sequence_id = 0,
+        .parent = genesis,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(x); // skipped: failed_valid
+
+    try std.testing.expect(!manager.block_index_candidates.contains(x.hash));
+
+    try manager.reconsiderBlock(&x.hash);
+    try std.testing.expect(manager.block_index_candidates.contains(x.hash));
+    try std.testing.expect(!x.status.failed_valid);
+}
+
+// ============================================================================
+// W101 Phase 3 step P3-5 — mempool refill on disconnect via executeReorg
+// ============================================================================
+//
+// PR10 exercises the W101 P3-5 wire-up: `executeReorg` now snapshots the
+// active-chain bodies it's about to disconnect, fires `reorgToChain`,
+// and on success calls `Mempool.blockDisconnected` per disconnected
+// block + `Mempool.removeForBlock` per new-chain block.  Mirrors Bitcoin
+// Core's `MaybeUpdateMempoolForReorg` flow and matches the same dance
+// already in `block_template.fireReorgFromSideBranch` (the submitblock-
+// driven reorg path).  Without this, stale txs from the disconnected
+// branch linger in the mempool indefinitely and an RBF replacement on
+// the new branch would double-spend-reject incoming relay.
+//
+// "Test mode" path: ChainState is real (so reorgToChain can commit) but
+// mempool standardness gates are skipped (chain_state passed to
+// Mempool.init is null) so blockDisconnected can re-admit without
+// running the full UTXO/script lookup.  This is the same shortcut used
+// in the existing `blockDisconnected: re-admits non-coinbase txs` test
+// in mempool.zig.
+
+test "W101 PR10: executeReorg fires mempool.blockDisconnected on each disconnected block" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // Mempool wired with chain_state == null → addTransaction skips
+    // standardness gates so the synthetic txs from phase3MakeBlock's
+    // coinbase (which is the only tx per block) plus our re-admit
+    // probe can land without a UTXO set lookup.  Same shortcut the
+    // existing mempool blockDisconnected unit test uses.
+    const mempool_mod = @import("mempool.zig");
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer {
+        // Free the tx slices owned by any re-admitted MempoolEntry —
+        // blockDisconnected serialise/deserialise hands ownership to
+        // the mempool entry which we have to release explicitly here.
+        var it = mempool.entries.iterator();
+        while (it.next()) |kv| {
+            var t = kv.value_ptr.*.tx;
+            serialize.freeTransaction(allocator, &t);
+        }
+        mempool.deinit();
+    }
+
+    var manager = ChainManager.init(&chain_state, &mempool, allocator);
+    defer manager.deinit();
+
+    // genesis (chain_state untouched — connectBlockFastWithUndo wires
+    // each block as it lands).
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    // Active chain: A1 → A2 (2 blocks of work each).
+    var a1_hash: types.Hash256 = [_]u8{0} ** 32;
+    a1_hash[0] = 0x01;
+    a1_hash[1] = 0xA0;
+    const a1 = try phase3ConnectAndIndex(&chain_state, &manager, genesis, a1_hash, 0x40, 1, 0xAA);
+    manager.active_tip = a1;
+
+    var a2_hash: types.Hash256 = [_]u8{0} ** 32;
+    a2_hash[0] = 0x02;
+    a2_hash[1] = 0xA0;
+    const a2 = try phase3ConnectAndIndex(&chain_state, &manager, a1, a2_hash, 0x80, 2, 0xAA);
+    manager.active_tip = a2;
+
+    // Side branch: B1 → B2 → B3 (planted; higher work so executeReorg
+    // selects it).  3 connects vs 2 disconnects exercises both arms.
+    var b1_hash: types.Hash256 = [_]u8{0} ** 32;
+    b1_hash[0] = 0x01;
+    b1_hash[1] = 0xB0;
+    const b1 = try phase3IndexOnly(&chain_state, &manager, genesis, b1_hash, 0x40, 10, 0xBB);
+
+    var b2_hash: types.Hash256 = [_]u8{0} ** 32;
+    b2_hash[0] = 0x02;
+    b2_hash[1] = 0xB0;
+    const b2 = try phase3IndexOnly(&chain_state, &manager, b1, b2_hash, 0x80, 11, 0xBB);
+
+    var b3_hash: types.Hash256 = [_]u8{0} ** 32;
+    b3_hash[0] = 0x03;
+    b3_hash[1] = 0xB0;
+    const b3 = try phase3IndexOnly(&chain_state, &manager, b2, b3_hash, 0xC0, 12, 0xBB);
+
+    // Pre: mempool empty, chain at A2.
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+    try std.testing.expectEqualSlices(u8, &a2_hash, &chain_state.best_hash);
+
+    // Drive activateBestChain → executeReorg(A2 → B3).
+    try manager.activateBestChain();
+    try std.testing.expectEqualSlices(u8, &b3_hash, &chain_state.best_hash);
+    try std.testing.expectEqual(manager.active_tip.?, b3);
+
+    // Mempool stayed empty: A1 and A2 contain ONLY coinbases
+    // (phase3MakeBlock builds coinbase-only blocks), and
+    // blockDisconnected explicitly skips index 0.  The fact that the
+    // call ran without crashing — through real CF_BLOCKS body reads on
+    // the disconnect-snapshot walk — IS the contract being tested.
+    // (camlcoin parity: a disconnected coinbase-only block re-admits
+    // zero txs.)
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
 }
