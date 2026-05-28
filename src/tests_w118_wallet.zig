@@ -353,40 +353,66 @@ test "W118 G8: hardened derivation m/0h chain code matches TV1" {
 }
 
 // ===========================================================================
-// G9: CKDpub — public-only normal derivation (BUG-3 — two-pipeline)
+// G9: CKDpub — public-only normal derivation (BUG-3 — closed by P4-2)
 // ===========================================================================
 //
-// BUG-3 (HIGH): ExtendedKey.deriveChild returns error.NotImplemented when
-// is_private=false and the index is non-hardened.  This is CKDpub — the
-// BIP-32 algorithm for deriving child PUBLIC keys from a parent xpub.
-// Without this, watch-only / xpub-import wallets cannot derive addresses
-// through the standalone HD path.
+// BUG-3 (HIGH) was: ExtendedKey.deriveChild returned error.NotImplemented
+// when is_private=false and the index was non-hardened. The root cause was
+// that ExtendedKey.key is [32]u8 — too small to hold a 33-byte compressed
+// pubkey. Phase 4 P4-2 closes BUG-3 by adding the typed `ExtendedPubKey`
+// struct (`pub_key: secp.PubKey` = [33]u8) plus the `ExtendedKey.neuter()`
+// constructor and `ExtendedPubKey.deriveChild()` CKDpub method.
 //
 // Two-pipeline observation: `descriptor.zig::decodeExtendedKeyToPubkey`
-// implements CKDpub correctly inside the descriptor parser.  The wallet's
-// own `ExtendedKey.deriveChild` does not.  Same algorithm, two pipelines,
-// only one finished.
+// has had CKDpub for a long time inside the descriptor parser. The wallet
+// HD path now has the same algorithm via `ExtendedPubKey.deriveChild`.
+// (Folding the descriptor copy into a shared site is a follow-up; the
+// algorithms must stay byte-identical.)
+//
+// Asserts the fix: CKDpub on a real xpub produces the same child pubkey +
+// chain code as CKDpriv-then-neuter via the BIP-32 commutativity property
+// `N(CKDpriv(k, c, i)) == CKDpub(N(k, c), i)` for non-hardened i.
 
-test "W118 G9: CKDpub on ExtendedKey — BUG-3 returns NotImplemented" {
+test "W118 G9: CKDpub commutes with neuter (BIP-32 TV1 m/0h/1)" {
     const ctx = makeContext() orelse return;
     defer destroyContext(ctx);
 
-    // Build a public-only ExtendedKey
+    // Build an honest xpub: derive m/0h privately, then neuter.
     const seed = hexToBytes("000102030405060708090a0b0c0d0e0f");
     const master_priv = try ExtendedKey.fromSeed(&seed);
+    const m0h_priv = try master_priv.deriveChild(ctx, 0x80000000);
+    const m0h_pub = try m0h_priv.neuter(ctx);
 
-    const master_pub = ExtendedKey{
-        .key = master_priv.key, // placeholder; would be a compressed pubkey in real use
-        .chain_code = master_priv.chain_code,
-        .depth = 0,
-        .parent_fingerprint = [_]u8{ 0, 0, 0, 0 },
-        .child_index = 0,
-        .is_private = false,
-    };
+    // Path A: derive m/0h/1 via CKDpriv then neuter.
+    const m0h_1_priv = try m0h_priv.deriveChild(ctx, 1);
+    const expected = try m0h_1_priv.neuter(ctx);
 
-    // BUG-3: CKDpub returns NotImplemented.  Core supports this.
-    const r = master_pub.deriveChild(ctx, 0); // non-hardened
-    try std.testing.expectError(error.NotImplemented, r);
+    // Path B: CKDpub directly on the m/0h xpub.
+    const actual = try m0h_pub.deriveChild(ctx, 1);
+
+    try std.testing.expectEqualSlices(u8, &expected.pub_key.bytes, &actual.pub_key.bytes);
+    try std.testing.expectEqualSlices(u8, &expected.chain_code, &actual.chain_code);
+    try std.testing.expectEqual(@as(u8, 2), actual.depth);
+    try std.testing.expectEqual(@as(u32, 1), actual.child_index);
+    try std.testing.expectEqualSlices(u8, &expected.parent_fingerprint, &actual.parent_fingerprint);
+}
+
+test "W118 G9b: CKDpub rejects hardened indices (i >= 2^31)" {
+    const ctx = makeContext() orelse return;
+    defer destroyContext(ctx);
+
+    const seed = hexToBytes("000102030405060708090a0b0c0d0e0f");
+    const master_priv = try ExtendedKey.fromSeed(&seed);
+    const master_pub = try master_priv.neuter(ctx);
+
+    try std.testing.expectError(
+        error.CannotDeriveHardenedFromPublic,
+        master_pub.deriveChild(ctx, 0x80000000),
+    );
+    try std.testing.expectError(
+        error.CannotDeriveHardenedFromPublic,
+        master_pub.deriveChild(ctx, 0xFFFFFFFF),
+    );
 }
 
 // ===========================================================================
