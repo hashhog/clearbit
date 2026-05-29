@@ -27,6 +27,32 @@
 //!             {"result":false,"reason":"..."}  (reject)
 //!             {"error":"..."}                  (could not evaluate /
 //!                                               unmapped flag / panic)
+//!
+//! Second op `verifytx` (for tx_valid.json / tx_invalid.json): unlike
+//! `verifyscript` (which rebuilds Core's synthetic credit/spend pair),
+//! these vectors give a REAL serialized multi-input tx, so the sighash
+//! must be computed over THAT tx. Mirrors
+//! bitcoin-core/src/test/transaction_tests.cpp::CheckTxScripts: decode
+//! tx_hex with clearbit's OWN deserializer (segwit marker/flag +
+//! witnesses), build the prevout map, then for EACH input run clearbit's
+//! real ScriptEngine.verify(scriptSig, matching prevout scriptPubKey,
+//! witness, flags, prevouts bound to THE REAL TX + this input index +
+//! amount + all-prevouts). The tx is valid iff ALL inputs pass; reject on
+//! the FIRST failing input (Core's loop is `i < vin.size() && tx_valid`).
+//!
+//!   request:  {"op":"verifytx",
+//!              "tx_hex":"...",
+//!              "prevouts":[{"txid":"<display-hex>","vout":N,
+//!                           "scriptPubKey_hex":"...","amount_sats":0},...],
+//!              "flags":["P2SH","WITNESS",...]}
+//!   response: {"valid":true}                   (all inputs verify)
+//!             {"valid":false,"reason":"..."}   (>=1 input failed)
+//!             {"error":"..."}                  (could not evaluate)
+//!
+//! KEY: the prevout `txid` in the request is DISPLAY-order hex (big-endian
+//! txid as shown by RPC); the deserialized tx stores prevout hashes in
+//! WIRE/internal order. We reverse the request txid to wire order before
+//! keying the map so it matches the tx's `previous_output.hash`.
 
 const std = @import("std");
 const script = @import("script.zig");
@@ -170,8 +196,128 @@ fn jsonEscape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return buf.toOwnedSlice();
 }
 
-/// Process one request line; on success writes the response, on failure
-/// returns an error which main() turns into {"error":...}.
+/// Key for the prevout map: wire-order txid + vout index.
+const OutPointKey = struct { hash: [32]u8, index: u32 };
+
+/// Value: the prevout's scriptPubKey bytes + amount in sats.
+const PrevoutVal = struct { spk: []const u8, amount: i64 };
+
+/// `verifytx` op: deserialize the REAL tx with clearbit's own
+/// deserializer, build the prevout map, then run clearbit's real
+/// ScriptEngine.verify per input over THAT tx (so legacy/BIP-143/BIP-341
+/// sighash commits to the actual surrounding transaction). Valid iff ALL
+/// inputs pass; reject on the FIRST failing input, mirroring Core's
+/// transaction_tests.cpp short-circuit `i < vin.size() && fValid`.
+fn processVerifytx(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const tx_hex = switch (obj.get("tx_hex") orelse return error.MissingTxHex) {
+        .string => |s| s,
+        else => return error.TxHexNotString,
+    };
+    const tx_bytes = try hexDecode(a, tx_hex);
+
+    var reader = serialize.Reader{ .data = tx_bytes };
+    const tx = serialize.readTransaction(&reader, a) catch |err| {
+        // Undeserializable tx => {"error"} so the driver SKIPS the row
+        // (never fake-pass / fake-reject on a parse failure we can't model).
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"tx deserialize: {s}\"}}\n", .{reason});
+        return;
+    };
+
+    const flags = try buildFlags((obj.get("flags") orelse return error.MissingFlags).array.items);
+
+    // Build the prevout map keyed by (wire-order txid, vout). The request
+    // txid is DISPLAY-order hex => reverse to wire order before keying so
+    // it matches the deserialized tx's previous_output.hash.
+    var prevout_map = std.AutoHashMap(OutPointKey, PrevoutVal).init(a);
+    const prevouts = (obj.get("prevouts") orelse return error.MissingPrevouts).array.items;
+    for (prevouts) |p| {
+        const po = p.object;
+        const txid_disp = switch (po.get("txid") orelse return error.PrevoutMissingTxid) {
+            .string => |s| s,
+            else => return error.PrevoutTxidNotString,
+        };
+        const txid_disp_bytes = try hexDecode(a, txid_disp);
+        if (txid_disp_bytes.len != 32) return error.PrevoutTxidLen;
+        // Reverse display-order -> wire-order.
+        var wire_hash: [32]u8 = undefined;
+        for (0..32) |i| wire_hash[i] = txid_disp_bytes[31 - i];
+
+        const vout: u32 = switch (po.get("vout") orelse return error.PrevoutMissingVout) {
+            .integer => |iv| @truncate(@as(u64, @bitCast(iv))),
+            else => return error.PrevoutVoutNotInt,
+        };
+
+        const spk = try hexDecode(a, switch (po.get("scriptPubKey_hex") orelse return error.PrevoutMissingSpk) {
+            .string => |s| s,
+            else => return error.PrevoutSpkNotString,
+        });
+
+        // amount defaults to 0 when absent (Core: map_prevout_values
+        // .contains(prevout) ? at(prevout) : 0).
+        const amount: i64 = blk: {
+            if (po.get("amount_sats")) |v| switch (v) {
+                .integer => |iv| break :blk iv,
+                else => break :blk 0,
+            };
+            break :blk 0;
+        };
+
+        try prevout_map.put(.{ .hash = wire_hash, .index = vout }, .{ .spk = spk, .amount = amount });
+    }
+
+    // Assemble per-input spent_scripts / spent_amounts in the tx's OWN
+    // input order, so spent_amounts[i]/spent_scripts[i] line up with input
+    // i (BIP-341 commits to ALL prevouts). A prevout missing from the map
+    // is a malformed row => {"error"} skip (never fake-pass).
+    const n = tx.inputs.len;
+    var spent_scripts = try a.alloc([]const u8, n);
+    var spent_amounts = try a.alloc(i64, n);
+    for (tx.inputs, 0..) |input, i| {
+        const key = OutPointKey{ .hash = input.previous_output.hash, .index = input.previous_output.index };
+        const val = prevout_map.get(key) orelse {
+            try out.writeAll("{\"error\":\"no prevout scriptPubKey for an input\"}\n");
+            return;
+        };
+        spent_scripts[i] = val.spk;
+        spent_amounts[i] = val.amount;
+    }
+
+    // Per-input VerifyScript over the real tx. Reject on first failure.
+    for (0..n) |i| {
+        const input = tx.inputs[i];
+        const spk = spent_scripts[i];
+        const amount = spent_amounts[i];
+
+        var engine = script.ScriptEngine.initWithPrevouts(
+            a,
+            &tx,
+            i,
+            amount,
+            flags,
+            spent_amounts,
+            spent_scripts,
+        );
+        defer engine.deinit();
+
+        if (engine.verify(input.script_sig, spk, input.witness)) |ok| {
+            if (!ok) {
+                try out.print("{{\"valid\":false,\"reason\":\"input {d}: VerifyFalse\"}}\n", .{i});
+                return;
+            }
+        } else |err| {
+            const reason = try jsonEscape(a, @errorName(err));
+            try out.print("{{\"valid\":false,\"reason\":\"input {d}: {s}\"}}\n", .{ i, reason });
+            return;
+        }
+    }
+
+    try out.writeAll("{\"valid\":true}\n");
+}
+
+/// Process one request line; dispatches on the JSON "op" field (default
+/// "verifyscript" for back-compat). On success writes the response, on
+/// failure returns an error which main() turns into {"error":...}.
 fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -179,6 +325,17 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
 
     const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
     const obj = parsed.value.object;
+
+    const op: []const u8 = if (obj.get("op")) |v| switch (v) {
+        .string => |s| s,
+        else => "verifyscript",
+    } else "verifyscript";
+
+    if (std.mem.eql(u8, op, "verifytx")) {
+        return processVerifytx(a, obj, out);
+    } else if (!std.mem.eql(u8, op, "verifyscript")) {
+        return error.UnknownOp;
+    }
 
     const ssig = try hexDecode(a, obj.get("scriptSig_hex").?.string);
     const spk = try hexDecode(a, obj.get("scriptPubKey_hex").?.string);
