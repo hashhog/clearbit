@@ -2209,6 +2209,23 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(bip341_shim);
 
+    // Phase B verifyscript shim (drives ScriptEngine.verify against the
+    // tools/phaseb-vectors harness; same link recipe as bip341_shim —
+    // libsecp256k1 + SHA-NI, no RocksDB).
+    const verifyscript_shim = b.addExecutable(.{
+        .name = "verifyscript_shim",
+        .root_source_file = b.path("src/verifyscript_shim.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    verifyscript_shim.addIncludePath(.{ .cwd_relative = secp256k1_include });
+    verifyscript_shim.linkSystemLibrary("secp256k1");
+    verifyscript_shim.linkLibC();
+    if (target.result.cpu.arch == .x86_64) {
+        verifyscript_shim.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+    }
+    b.installArtifact(verifyscript_shim);
+
     // RocksDB storage tests
     {
         const rocksdb_tests = b.addTest(.{
