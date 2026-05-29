@@ -49,6 +49,22 @@
 //!             {"valid":false,"reason":"..."}   (>=1 input failed)
 //!             {"error":"..."}                  (could not evaluate)
 //!
+//! Third op `checktx` (CheckTransaction-level, context-free structural
+//! validation): mirrors bitcoin-core/src/consensus/tx_check.cpp::
+//! CheckTransaction. These are the checks `verifytx` (per-input
+//! VerifyScript only) cannot catch — empty vin/vout, oversize (tx weight >
+//! MAX_BLOCK_WEIGHT), output value range and running total, duplicate
+//! inputs, coinbase scriptSig length [2,100], and null prevout in a
+//! non-coinbase. We deserialize tx_hex and call clearbit's OWN
+//! `checkTransactionSanity` (src/validation.zig:316) so the harness
+//! exercises clearbit's real consensus code, NOT a reimplementation in the
+//! shim. No UTXO / chain state is needed.
+//!
+//!   request:  {"op":"checktx","tx_hex":"..."}
+//!   response: {"valid":true}                   (structurally valid)
+//!             {"valid":false,"reason":"..."}   (CheckTransaction rejected)
+//!             {"error":"..."}                  (could not deserialize)
+//!
 //! KEY: the prevout `txid` in the request is DISPLAY-order hex (big-endian
 //! txid as shown by RPC); the deserialized tx stores prevout hashes in
 //! WIRE/internal order. We reverse the request txid to wire order before
@@ -59,6 +75,7 @@ const script = @import("script.zig");
 const serialize = @import("serialize.zig");
 const types = @import("types.zig");
 const crypto = @import("crypto.zig");
+const validation = @import("validation.zig");
 
 fn hexNibble(c: u8) !u8 {
     return switch (c) {
@@ -202,6 +219,37 @@ const OutPointKey = struct { hash: [32]u8, index: u32 };
 /// Value: the prevout's scriptPubKey bytes + amount in sats.
 const PrevoutVal = struct { spk: []const u8, amount: i64 };
 
+/// `checktx` op: CheckTransaction-level (context-free, structural)
+/// validation. Mirrors bitcoin-core/src/consensus/tx_check.cpp::
+/// CheckTransaction by delegating to clearbit's OWN
+/// `validation.checkTransactionSanity` (src/validation.zig:316), so a
+/// divergence here is a clearbit consensus bug, not a shim bug. No
+/// UTXO / chain state is needed. We deserialize tx_hex with clearbit's
+/// own deserializer; an undeserializable tx => {"error"} so the driver
+/// SKIPS the row (the driver counts that as a reject decision, never a
+/// fake-pass).
+fn processChecktx(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const tx_hex = switch (obj.get("tx_hex") orelse return error.MissingTxHex) {
+        .string => |s| s,
+        else => return error.TxHexNotString,
+    };
+    const tx_bytes = try hexDecode(a, tx_hex);
+
+    var reader = serialize.Reader{ .data = tx_bytes };
+    const tx = serialize.readTransaction(&reader, a) catch |err| {
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"tx deserialize: {s}\"}}\n", .{reason});
+        return;
+    };
+
+    if (validation.checkTransactionSanity(&tx)) |_| {
+        try out.writeAll("{\"valid\":true}\n");
+    } else |err| {
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"valid\":false,\"reason\":\"{s}\"}}\n", .{reason});
+    }
+}
+
 /// `verifytx` op: deserialize the REAL tx with clearbit's own
 /// deserializer, build the prevout map, then run clearbit's real
 /// ScriptEngine.verify per input over THAT tx (so legacy/BIP-143/BIP-341
@@ -333,6 +381,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
 
     if (std.mem.eql(u8, op, "verifytx")) {
         return processVerifytx(a, obj, out);
+    } else if (std.mem.eql(u8, op, "checktx")) {
+        return processChecktx(a, obj, out);
     } else if (!std.mem.eql(u8, op, "verifyscript")) {
         return error.UnknownOp;
     }
