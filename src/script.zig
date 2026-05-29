@@ -626,7 +626,19 @@ pub const ScriptEngine = struct {
     tx: *const types.Transaction,
     input_index: usize,
     amount: i64,
+    /// OPCODE INDEX of the most-recently-executed OP_CODESEPARATOR, used
+    /// ONLY for the BIP-341 tapscript sigmsg commitment (Core's
+    /// `execdata.m_codeseparator_pos` = `opcode_pos`, interpreter.cpp:1055).
     codesep_pos: u32,
+    /// BYTE OFFSET into the currently-executing script of the position
+    /// JUST AFTER the most-recently-executed OP_CODESEPARATOR — i.e. Core's
+    /// `pbegincodehash` (interpreter.cpp:422/1054), expressed as an offset
+    /// from script.begin(). 0xFFFFFFFF means "no codesep seen yet" → the
+    /// scriptCode is the whole script. Used to truncate the LEGACY (BASE)
+    /// and SegWit-v0 sighash scriptCode (`CScript(pbegincodehash, pend)`).
+    /// Distinct from `codesep_pos`: that is an OPCODE INDEX (tapscript), this
+    /// is a BYTE OFFSET (legacy / v0 subscript slice).
+    codesep_byte_offset: u32,
     sig_version: SigVersion,
     /// The scriptPubKey being spent, used as scriptCode for sighash computation.
     /// Set during verify() to the scriptPubKey (or redeem script for P2SH).
@@ -639,6 +651,16 @@ pub const ScriptEngine = struct {
     /// being verified. Empty slices for legacy / non-Taproot scripts.
     spent_amounts: []const i64,
     spent_scripts: []const []const u8,
+
+    /// CHECKMULTISIG (BASE / SegWit-v0) scriptCode override. Core's
+    /// OP_CHECKMULTISIG removes EVERY signature from the codesep-truncated
+    /// scriptCode via FindAndDelete (in BASE) BEFORE verifying any sig, and
+    /// then verifies ALL sigs against that one cleaned scriptCode
+    /// (interpreter.cpp:1138-1167). When this is non-null, `verifySignature`
+    /// uses it verbatim as the sighash scriptCode and SKIPS its own per-sig
+    /// FindAndDelete (which would only remove the single sig under test —
+    /// the wrong subscript for multisig). Null for single-sig CHECKSIG.
+    multisig_script_code: ?[]const u8 = null,
 
     /// Tapleaf hash for the currently executing tapscript leaf
     /// (BIP-341 ext_flag=1 sighash). Set by the script-path entry
@@ -696,6 +718,7 @@ pub const ScriptEngine = struct {
             .input_index = input_index,
             .amount = amount,
             .codesep_pos = 0xFFFFFFFF,
+            .codesep_byte_offset = 0xFFFFFFFF,
             .sig_version = .base,
             .script_pubkey_for_sighash = null,
             .spent_amounts = spent_amounts,
@@ -741,6 +764,15 @@ pub const ScriptEngine = struct {
         if (self.sig_version != .tapscript and script.len > MAX_SCRIPT_SIZE) {
             return ScriptError.InvalidScript;
         }
+
+        // Core re-creates `pbegincodehash = script.begin()` and resets
+        // `opcode_pos = 0` for every EvalScript invocation (interpreter.cpp:422,
+        // 433). clearbit calls execute() once per script phase (scriptSig,
+        // scriptPubKey, P2SH redeem, P2WSH witnessScript, tapscript), so reset
+        // both codesep trackers here so a codesep in one phase does not leak
+        // into the next phase's sighash scriptCode.
+        self.codesep_byte_offset = 0xFFFFFFFF;
+        self.codesep_pos = 0xFFFFFFFF;
 
         var pc: usize = 0;
         var op_count: usize = 0;
@@ -1295,7 +1327,22 @@ pub const ScriptEngine = struct {
                         }
                     }
                     // Unknown witness versions are anyone-can-spend (future soft fork)
-                    // BIP-141: if the version byte is 2-16, the script is anyone-can-spend
+                    // BIP-141: if the version byte is 2-16, the script is anyone-can-spend.
+                    //
+                    // Core's VerifyScript returns `true` from VerifyWitnessProgram for
+                    // this (and the P2A / Taproot-via-P2SH) case, then immediately
+                    // executes `stack.resize(1)` (interpreter.cpp:2047/2092) to
+                    // "bypass the cleanstack check ... the actual stack is obviously
+                    // not clean for witness programs". The v0 / Taproot script-exec
+                    // paths above all `return` directly and never reach the final
+                    // CLEANSTACK check, so this fall-through (had_witness == true,
+                    // no early return) is the ONLY path that must mirror the resize.
+                    // Truncate the MAIN stack (from the scriptSig+scriptPubKey eval)
+                    // to its bottom element so the CLEANSTACK predicate below sees
+                    // exactly one item, as Core does.
+                    if (self.stack.items.len > 1) {
+                        self.stack.shrinkRetainingCapacity(1);
+                    }
                 }
             }
 
@@ -1306,6 +1353,9 @@ pub const ScriptEngine = struct {
         }
 
         // 6. Clean stack check
+        // (Mirrors Core interpreter.cpp:2100-2107 — checked AFTER the witness
+        // stack.resize(1) bypass above; for witness programs the resize already
+        // forced the main stack to a single element.)
         if (self.flags.verify_clean_stack) {
             if (self.stack.items.len != 1) return ScriptError.CleanStack;
         }
@@ -1383,7 +1433,6 @@ pub const ScriptEngine = struct {
         opcode_pos: u32,
     ) ScriptError!void {
         _ = script;
-        _ = pc;
 
         switch (opcode) {
             // Constants
@@ -1841,14 +1890,23 @@ pub const ScriptEngine = struct {
             },
 
             .op_codeseparator => {
-                // BIP-341: record the OPCODE INDEX, not the byte position.
+                // BIP-341: record the OPCODE INDEX for the tapscript sigmsg.
                 // Core stores `opcode_pos` (interpreter.cpp:1055), the 0-based
                 // counter of opcodes seen so far, committed to the tapscript
                 // sigmsg at interpreter.cpp:1565.
+                self.codesep_pos = opcode_pos;
+                // LEGACY (BASE) + SegWit-v0: record the BYTE OFFSET just after
+                // this OP_CODESEPARATOR — Core's `pbegincodehash = pc`
+                // (interpreter.cpp:1054). `pc.*` was already advanced past the
+                // opcode byte in execute()'s loop before calling executeOpcode,
+                // so it is exactly the position of the first byte of the
+                // post-codesep subscript, expressed as an offset into the
+                // currently-executing script (which is what
+                // `script_pubkey_for_sighash` points at).
+                self.codesep_byte_offset = @intCast(pc.*);
                 // CONST_SCRIPTCODE: Core rejects OP_CODESEPARATOR in legacy
                 // (BASE) scripts when this flag is set — checked ABOVE the
                 // fExec gate in the main execute() loop, not here.
-                self.codesep_pos = opcode_pos;
             },
 
             .op_checksig => {
@@ -2130,6 +2188,53 @@ pub const ScriptEngine = struct {
             return ScriptError.NullDummy;
         }
 
+        // Build the CHECKMULTISIG scriptCode ONCE, matching Core
+        // (interpreter.cpp:1138-1150): take the codesep-truncated subscript
+        // `CScript(pbegincodehash, pend)`, then — for BASE sigversion only —
+        // FindAndDelete EVERY signature (not just the one under test). All
+        // sigs are then verified against this single cleaned scriptCode.
+        // `verifySignature` consults `multisig_script_code` and skips its own
+        // per-sig FindAndDelete while this is set.
+        var ms_clean_owned: ?[]u8 = null;
+        defer if (ms_clean_owned) |buf| self.allocator.free(buf);
+        if (self.script_pubkey_for_sighash) |full_sc| {
+            const truncated = scriptCodeFromByteOffset(full_sc, self.codesep_byte_offset);
+            if (self.sig_version == .base) {
+                // FindAndDelete each signature's push-encoding, in turn, from a
+                // mutable copy (Core applies them sequentially to `scriptCode`).
+                var cur = self.allocator.dupe(u8, truncated) catch return ScriptError.OutOfMemory;
+                for (0..n_sigs) |i| {
+                    const s = sigs[i];
+                    if (s.len == 0) continue;
+                    const push_sig = pushEncode(self.allocator, s) catch {
+                        self.allocator.free(cur);
+                        return ScriptError.OutOfMemory;
+                    };
+                    defer self.allocator.free(push_sig);
+                    // CONST_SCRIPTCODE: if FindAndDelete removed an occurrence and
+                    // the flag is set, Core aborts with SIG_FINDANDDELETE
+                    // (interpreter.cpp:1147-1148).
+                    if (self.flags.verify_const_scriptcode and findAndDeleteCount(cur, push_sig) > 0) {
+                        self.allocator.free(cur);
+                        return ScriptError.SigFindAndDelete;
+                    }
+                    const next = findAndDelete(self.allocator, cur, push_sig) catch {
+                        self.allocator.free(cur);
+                        return ScriptError.OutOfMemory;
+                    };
+                    self.allocator.free(cur);
+                    cur = next;
+                }
+                ms_clean_owned = cur;
+            } else {
+                // WITNESS_V0: no FindAndDelete; scriptCode is the truncated
+                // subscript serialized as-is (interpreter.cpp:1145 gate).
+                ms_clean_owned = self.allocator.dupe(u8, truncated) catch return ScriptError.OutOfMemory;
+            }
+            self.multisig_script_code = ms_clean_owned;
+        }
+        defer self.multisig_script_code = null;
+
         // Verify signatures
         var success = true;
         var key_idx: usize = 0;
@@ -2237,8 +2342,17 @@ pub const ScriptEngine = struct {
         // NOTE: this check is independent of the sighash subscript/codesep logic — it
         // operates on the same script_code we use for the sighash, but only inspects
         // whether the push-encoded sig appears; it does not alter the sighash path.
-        if (self.sig_version == .base and self.flags.verify_const_scriptcode) {
-            if (self.script_pubkey_for_sighash) |script_code| {
+        // (CHECKMULTISIG handles the CONST_SCRIPTCODE FindAndDelete reject for
+        // its own multi-sig subscript in executeCheckMultisig; skip it here when
+        // the multisig override is active to avoid a double/wrong-subscript check.)
+        if (self.multisig_script_code == null and self.sig_version == .base and self.flags.verify_const_scriptcode) {
+            if (self.script_pubkey_for_sighash) |full_script_code| {
+                // Core's FindAndDelete operates on the codesep-TRUNCATED
+                // subscript `CScript(pbegincodehash, pend)` (interpreter.cpp:326,
+                // 330), NOT the whole script. Slice at the last executed
+                // OP_CODESEPARATOR so the reject fires only when the pushed sig
+                // appears in the post-codesep subscript.
+                const script_code = scriptCodeFromByteOffset(full_script_code, self.codesep_byte_offset);
                 const push_encoded_sig = pushEncode(self.allocator, sig) catch return false;
                 defer self.allocator.free(push_encoded_sig);
                 if (findAndDeleteCount(script_code, push_encoded_sig) > 0) {
@@ -2293,15 +2407,27 @@ pub const ScriptEngine = struct {
             }
         }
 
-        // Compute sighash using the script_pubkey_for_sighash set during verify()
-        const script_code = self.script_pubkey_for_sighash orelse return false;
+        // Compute sighash using the script_pubkey_for_sighash set during verify().
+        // OP_CODESEPARATOR: the scriptCode is `CScript(pbegincodehash, pend)` —
+        // the currently-executing script sliced at the byte position JUST AFTER
+        // the most-recently-executed OP_CODESEPARATOR (interpreter.cpp:326/1139).
+        // This truncation applies to BOTH legacy (BASE) and SegWit-v0 sighashes.
+        // (Tapscript commits the codesep position differently — handled in
+        // verifyTaprootSignature via codesep_pos, not here.)
+        const full_script_code = self.script_pubkey_for_sighash orelse return false;
+        const script_code = scriptCodeFromByteOffset(full_script_code, self.codesep_byte_offset);
 
         if (self.sig_version == .witness_v0) {
-            // BIP-143: segwit v0 uses a different sighash algorithm
+            // BIP-143: segwit v0 uses a different sighash algorithm. The
+            // codesep-truncated scriptCode is serialized as-is (no FindAndDelete,
+            // no OP_CODESEPARATOR stripping — interpreter.cpp:1654 `ss << scriptCode`).
+            // CHECKMULTISIG passes the same truncated subscript via the override
+            // (v0 never FindAndDeletes), so either source yields identical bytes.
+            const v0_sc = self.multisig_script_code orelse script_code;
             const sighash = crypto.segwitSighash(
                 self.tx,
                 self.input_index,
-                script_code,
+                v0_sc,
                 self.amount,
                 @as(u32, hash_type),
                 self.allocator,
@@ -2309,14 +2435,30 @@ pub const ScriptEngine = struct {
             return crypto.verifyEcdsa(sig_data, pubkey, &sighash);
         }
 
-        const sighash = legacySignatureHashWithFindAndDelete(
-            self.allocator,
-            self.tx,
-            self.input_index,
-            script_code,
-            sig, // full sig including hashtype byte for FindAndDelete
-            @as(u32, hash_type),
-        ) catch return false;
+        // LEGACY (BASE). For CHECKMULTISIG, `multisig_script_code` is the
+        // scriptCode with ALL signatures already FindAndDelete'd (Core removes
+        // every sig once before verifying any — interpreter.cpp:1142-1150), so
+        // we must NOT FindAndDelete again here; compute the sighash directly
+        // (legacySignatureHash still strips OP_CODESEPARATORs internally, as
+        // CTransactionSignatureSerializer does). For single-sig CHECKSIG we
+        // FindAndDelete just this sig, as before.
+        const sighash = if (self.multisig_script_code) |ms_sc|
+            legacySignatureHash(
+                self.allocator,
+                self.tx,
+                self.input_index,
+                ms_sc,
+                @as(u32, hash_type),
+            ) catch return false
+        else
+            legacySignatureHashWithFindAndDelete(
+                self.allocator,
+                self.tx,
+                self.input_index,
+                script_code,
+                sig, // full sig including hashtype byte for FindAndDelete
+                @as(u32, hash_type),
+            ) catch return false;
 
         return crypto.verifyEcdsa(sig_data, pubkey, &sighash);
     }
@@ -3174,6 +3316,18 @@ pub fn getScriptCodeFromCodesepPos(script: []const u8, codesep_pos: u32) []const
         return &[_]u8{};
     }
     return script[start..];
+}
+
+/// Slice `script` at `byte_offset` = Core's `pbegincodehash` expressed as
+/// an offset from `script.begin()`: the position JUST AFTER the most-
+/// recently-executed OP_CODESEPARATOR (0xFFFFFFFF → no codesep, whole
+/// script). Mirrors `CScript scriptCode(pbegincodehash, pend)`
+/// (interpreter.cpp:326/1139). Unlike `getScriptCodeFromCodesepPos`, the
+/// offset is ALREADY past the codesep byte, so no +1 is applied.
+pub fn scriptCodeFromByteOffset(script: []const u8, byte_offset: u32) []const u8 {
+    if (byte_offset == 0xFFFFFFFF) return script;
+    if (byte_offset >= script.len) return &[_]u8{};
+    return script[byte_offset..];
 }
 
 // ============================================================================
