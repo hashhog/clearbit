@@ -170,6 +170,7 @@ pub const ScriptError = error{
     TapscriptValidationWeight, // BIP-342: validation-weight budget exhausted
     TapscriptMinimalIf, // BIP-342: non-minimal IF/NOTIF argument in tapscript (consensus)
     ConstScriptCode, // CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy (BASE) script
+    SigFindAndDelete, // CONST_SCRIPTCODE: FindAndDelete removed the pushed sig in legacy script (SCRIPT_ERR_SIG_FINDANDDELETE)
     StackSize, // MAX_STACK_SIZE exceeded (incl. tapscript-entry stack check)
     PushSize, // MAX_SCRIPT_ELEMENT_SIZE exceeded on a witness stack input element
     SchnorrSigSize, // BIP-340/341: Schnorr signature is not 64 or 65 bytes
@@ -891,6 +892,18 @@ pub const ScriptEngine = struct {
         if (self.flags.verify_sigpushonly and !isPushOnly(script_sig)) {
             return ScriptError.SigPushOnly;
         }
+
+        // Core's VerifyScript runs EvalScript(stack, scriptSig, ...) where the
+        // scriptCode for any CHECKSIG executed *inside* the scriptSig is the
+        // scriptSig itself (interpreter.cpp:422 pbegincodehash = script.begin()).
+        // clearbit derives the sighash/FindAndDelete scriptCode from
+        // script_pubkey_for_sighash, so it must point at the currently-executing
+        // script during each phase. Set it to the scriptSig here so the
+        // CONST_SCRIPTCODE FindAndDelete reject (interpreter.cpp:330-332) fires when
+        // a non-push-only scriptSig embeds CHECKSIG over a script that contains the
+        // pushed signature. It is overwritten with the scriptPubKey (and later the
+        // redeem script) below before those phases execute.
+        self.script_pubkey_for_sighash = script_sig;
 
         // 1. Execute scriptSig
         try self.execute(script_sig);
@@ -2000,8 +2013,13 @@ pub const ScriptEngine = struct {
                     return;
                 }
 
-                // Check version
-                if (self.tx.version < 2) {
+                // Check version. Core (interpreter.cpp:1790) tests `txTo->version < 2`
+                // where CTransaction::version is uint32_t — an UNSIGNED comparison.
+                // clearbit stores tx.version as i32 (correct on the wire: serialized as
+                // 4 LE bytes), so a raw signed `< 2` test treats version 0xffffffff as
+                // -1 and wrongly fails BIP-68. Compare as unsigned to match Core: bit-cast
+                // the i32 to u32 so 0xffffffff == 4294967295 >= 2 satisfies the gate.
+                if (@as(u32, @bitCast(self.tx.version)) < 2) {
                     return ScriptError.UnsatisfiedLocktime;
                 }
 
@@ -2208,6 +2226,26 @@ pub const ScriptEngine = struct {
         // enforced even for empty sigs when called from CHECKMULTISIG — the caller
         // (executeCheckMultisig) handles that path directly.
         if (sig.len == 0) return false;
+
+        // SCRIPT_VERIFY_CONST_SCRIPTCODE — FindAndDelete reject (interpreter.cpp:329-333).
+        // In pre-segwit (BASE) scripts Core drops the signature from the scriptCode via
+        // FindAndDelete BEFORE the sighash; if any occurrence is removed AND the
+        // CONST_SCRIPTCODE flag is set, the script fails with SCRIPT_ERR_SIG_FINDANDDELETE.
+        // This runs in EvalChecksigPreTapscript BEFORE CheckSignatureEncoding /
+        // CheckPubKeyEncoding (line 335), so we mirror that ordering here. Only BASE
+        // sigversion (witness_v0 and tapscript never FindAndDelete the signature).
+        // NOTE: this check is independent of the sighash subscript/codesep logic — it
+        // operates on the same script_code we use for the sighash, but only inspects
+        // whether the push-encoded sig appears; it does not alter the sighash path.
+        if (self.sig_version == .base and self.flags.verify_const_scriptcode) {
+            if (self.script_pubkey_for_sighash) |script_code| {
+                const push_encoded_sig = pushEncode(self.allocator, sig) catch return false;
+                defer self.allocator.free(push_encoded_sig);
+                if (findAndDeleteCount(script_code, push_encoded_sig) > 0) {
+                    return ScriptError.SigFindAndDelete;
+                }
+            }
+        }
 
         // DER signature encoding validation — Core: CheckSignatureEncoding (line 207).
         // Must come BEFORE pubkey check (matches Core's ordering in EvalChecksigPreTapscript
@@ -2793,6 +2831,28 @@ pub fn findAndDelete(allocator: std.mem.Allocator, script: []const u8, pattern: 
     }
 
     return result.toOwnedSlice() catch return SighashError.OutOfMemory;
+}
+
+/// Count occurrences of `pattern` that FindAndDelete would remove from `script`.
+/// Mirrors Bitcoin Core's FindAndDelete return value (nFound) — used only to
+/// implement the SCRIPT_VERIFY_CONST_SCRIPTCODE reject rule (interpreter.cpp:330-332):
+/// in a pre-segwit (BASE) CHECKSIG/CHECKMULTISIG, if the push-encoded signature
+/// is found in the scriptCode and the CONST_SCRIPTCODE flag is set, the script
+/// must fail with SCRIPT_ERR_SIG_FINDANDDELETE. Operates on raw bytes, exact
+/// non-overlapping match, identical scan to findAndDelete().
+pub fn findAndDeleteCount(script: []const u8, pattern: []const u8) usize {
+    if (pattern.len == 0) return 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < script.len) {
+        if (i + pattern.len <= script.len and std.mem.eql(u8, script[i .. i + pattern.len], pattern)) {
+            count += 1;
+            i += pattern.len;
+        } else {
+            i += 1;
+        }
+    }
+    return count;
 }
 
 /// Remove all OP_CODESEPARATOR opcodes from a script.
