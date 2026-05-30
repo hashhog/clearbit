@@ -76,6 +76,7 @@ const serialize = @import("serialize.zig");
 const types = @import("types.zig");
 const crypto = @import("crypto.zig");
 const validation = @import("validation.zig");
+const consensus = @import("consensus.zig");
 
 fn hexNibble(c: u8) !u8 {
     return switch (c) {
@@ -363,6 +364,106 @@ fn processVerifytx(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) 
     try out.writeAll("{\"valid\":true}\n");
 }
 
+/// Parse an 8-hex compact-bits string (Core getblockheader "bits" format,
+/// big-endian hex of the u32) into a u32. Errors (=> {"error"}, driver
+/// SKIPS) on any malformed input rather than fabricating a value.
+fn parseBits(hex: []const u8) !u32 {
+    if (hex.len != 8) return error.BitsHexLen;
+    var v: u32 = 0;
+    for (hex) |c| v = (v << 4) | @as(u32, try hexNibble(c));
+    return v;
+}
+
+/// Map the request "network" token to clearbit's consensus.Network enum.
+fn parseNetwork(name: []const u8) !consensus.Network {
+    if (std.mem.eql(u8, name, "mainnet")) return .mainnet;
+    if (std.mem.eql(u8, name, "testnet3")) return .testnet3;
+    if (std.mem.eql(u8, name, "testnet4")) return .testnet4;
+    if (std.mem.eql(u8, name, "regtest")) return .regtest;
+    if (std.mem.eql(u8, name, "signet")) return .signet;
+    return error.UnknownNetwork;
+}
+
+/// Read one {"height","bits","time"} chain node into a consensus.BlockIndexEntry.
+fn readNode(obj: std.json.ObjectMap) !consensus.BlockIndexEntry {
+    const h: u32 = switch (obj.get("height") orelse return error.NodeMissingHeight) {
+        .integer => |iv| @intCast(iv),
+        else => return error.NodeHeightNotInt,
+    };
+    const bits_hex = switch (obj.get("bits") orelse return error.NodeMissingBits) {
+        .string => |s| s,
+        else => return error.NodeBitsNotString,
+    };
+    const t: u32 = switch (obj.get("time") orelse return error.NodeMissingTime) {
+        .integer => |iv| @intCast(iv),
+        else => return error.NodeTimeNotInt,
+    };
+    return .{ .height = h, .timestamp = t, .bits = try parseBits(bits_hex) };
+}
+
+/// `nextwork` op: differential PoW. Drives clearbit's REAL
+/// consensus.getNextWorkRequired (src/consensus.zig:1031) — the
+/// BlockIndex/chain-generic entrypoint that does the retarget, the off-by-one
+/// (it reads pindexLast at height-1 and the period's first at
+/// (height-1)-(interval-1) = height-2016), the 4x timespan clamps, the
+/// powLimit ceiling, and the BIP-94 first-block selection — NOT a value-based
+/// or legacy twin.
+///
+/// We build a tiny 2-node chain in an ancestors map keyed by height:
+///   last  at height-1            (always)
+///   first at height-2016         (only on retarget boundaries; H%2016==0)
+/// and hand getNextWorkRequired a BlockIndexView whose getAtHeightFn closes
+/// over that map. On a passthrough (non-boundary) row only `last` is consulted
+/// and the impl returns last.bits unchanged.
+///
+///   request:  {"op":"nextwork","network":"mainnet","height":H,
+///              "block_time":<u32>,
+///              "last":{"height":..,"bits":"<8hex>","time":..},
+///              "first":{...}}     // first present ONLY when H%2016==0
+///   response: {"nbits":"<8hex>"}  (the impl's REAL computed required nBits)
+///             {"error":"..."}     (could not compute => driver SKIPS)
+fn processNextwork(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const network = try parseNetwork(switch (obj.get("network") orelse return error.MissingNetwork) {
+        .string => |s| s,
+        else => return error.NetworkNotString,
+    });
+    const height: u32 = switch (obj.get("height") orelse return error.MissingHeight) {
+        .integer => |iv| @intCast(iv),
+        else => return error.HeightNotInt,
+    };
+    const block_time: u32 = switch (obj.get("block_time") orelse return error.MissingBlockTime) {
+        .integer => |iv| @intCast(iv),
+        else => return error.BlockTimeNotInt,
+    };
+
+    // Build the ancestors map (height -> entry) from `last` (+ `first` on
+    // boundaries). getNextWorkRequired indexes by absolute height, so we key
+    // by each node's own height.
+    var ancestors = std.AutoHashMap(u32, consensus.BlockIndexEntry).init(a);
+    const last_node = try readNode((obj.get("last") orelse return error.MissingLast).object);
+    try ancestors.put(last_node.height, last_node);
+    if (obj.get("first")) |fv| {
+        const first_node = try readNode(fv.object);
+        try ancestors.put(first_node.height, first_node);
+    }
+
+    const params = consensus.getNetworkParams(network);
+
+    const view = consensus.BlockIndexView{
+        .context = @ptrCast(&ancestors),
+        .getAtHeightFn = struct {
+            fn get(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
+                const m: *std.AutoHashMap(u32, consensus.BlockIndexEntry) = @ptrCast(@alignCast(ctx));
+                return m.get(h);
+            }
+        }.get,
+        .pow_limit_bits = consensus.getPowLimitBits(params),
+    };
+
+    const nbits = consensus.getNextWorkRequired(height, block_time, &view, params);
+    try out.print("{{\"nbits\":\"{x:0>8}\"}}\n", .{nbits});
+}
+
 /// Process one request line; dispatches on the JSON "op" field (default
 /// "verifyscript" for back-compat). On success writes the response, on
 /// failure returns an error which main() turns into {"error":...}.
@@ -383,6 +484,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
         return processVerifytx(a, obj, out);
     } else if (std.mem.eql(u8, op, "checktx")) {
         return processChecktx(a, obj, out);
+    } else if (std.mem.eql(u8, op, "nextwork")) {
+        return processNextwork(a, obj, out);
     } else if (!std.mem.eql(u8, op, "verifyscript")) {
         return error.UnknownOp;
     }
