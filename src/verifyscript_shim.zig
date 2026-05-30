@@ -464,6 +464,76 @@ fn processNextwork(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) 
     try out.print("{{\"nbits\":\"{x:0>8}\"}}\n", .{nbits});
 }
 
+/// `merkleroot` op: differential transaction-merkle-root + CVE-2012-2459
+/// mutation reporting. Drives clearbit's REAL merkle primitive
+/// (crypto.computeMerkleRoot, src/crypto.zig:621) — the SAME function the
+/// block-accept path calls (src/validation.zig:800) to recompute the
+/// header merkle root.
+///
+/// The request `txids` are DISPLAY-order hex (Core getblock convention,
+/// big-endian as shown by RPC). The merkle primitive operates on
+/// WIRE/internal-order 32-byte hashes, so we reverse each txid to wire
+/// order before feeding it in (the exact reversal `verifytx` does on its
+/// prevout txids), then reverse the computed internal root back to display
+/// order so it matches Core's header `merkleroot`.
+///
+/// `mutated`: reports what clearbit's REAL block-accept path concludes about a
+/// CVE-2012-2459 duplicate-tx malleation. clearbit's merkle check
+/// (validation.zig checkBlock) now computes the root via the mutation-aware
+/// `computeMerkleRootMutated` (crypto.zig) — Core's adjacent-pair-equal scan at
+/// the TOP of each level BEFORE the odd-tail duplication (merkle.cpp:46-63) —
+/// and rejects a mutated block with `DuplicateTx` (Core "bad-txns-duplicate").
+/// We drive the SAME primitive here and report the real flag: honest rows
+/// (including odd-N) report mutated=false, a cve2459 duplicate-tail row reports
+/// mutated=true.
+///
+///   request:  {"op":"merkleroot","txids":["<64-hex display>",...]}
+///   response: {"root":"<64-hex display>","mutated":<bool>}
+///             {"error":"..."}   (could not compute => driver SKIPS)
+fn processMerkleroot(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const txids = switch (obj.get("txids") orelse return error.MissingTxids) {
+        .array => |arr| arr.items,
+        else => return error.TxidsNotArray,
+    };
+    if (txids.len == 0) return error.EmptyTxids;
+
+    // Reverse each DISPLAY-order txid -> WIRE-order Hash256 (same reversal
+    // verifytx applies to prevout txids), feeding the impl's merkle code the
+    // internal byte order it expects.
+    var hashes = try a.alloc(types.Hash256, txids.len);
+    for (txids, 0..) |t, i| {
+        const txid_disp = switch (t) {
+            .string => |s| s,
+            else => return error.TxidNotString,
+        };
+        const disp_bytes = try hexDecode(a, txid_disp);
+        if (disp_bytes.len != 32) return error.TxidLen;
+        var wire: types.Hash256 = undefined;
+        for (0..32) |j| wire[j] = disp_bytes[31 - j];
+        hashes[i] = wire;
+    }
+
+    // REAL merkle primitive (clearbit's block-accept path uses this exact fn,
+    // with the same mutation out-param it now consults to reject CVE-2012-2459).
+    var mutated: bool = false;
+    const internal_root = crypto.computeMerkleRootMutated(hashes, a, &mutated) catch |err| {
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"computeMerkleRoot: {s}\"}}\n", .{reason});
+        return;
+    };
+
+    // Reverse internal-order root -> DISPLAY order to match Core's header
+    // merkleroot.
+    var disp_root: [32]u8 = undefined;
+    for (0..32) |j| disp_root[j] = internal_root[31 - j];
+
+    // mutated: the REAL flag from clearbit's block-accept merkle check.
+    try out.print(
+        "{{\"root\":\"{s}\",\"mutated\":{s}}}\n",
+        .{ std.fmt.bytesToHex(disp_root, .lower), if (mutated) "true" else "false" },
+    );
+}
+
 /// Process one request line; dispatches on the JSON "op" field (default
 /// "verifyscript" for back-compat). On success writes the response, on
 /// failure returns an error which main() turns into {"error":...}.
@@ -486,6 +556,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
         return processChecktx(a, obj, out);
     } else if (std.mem.eql(u8, op, "nextwork")) {
         return processNextwork(a, obj, out);
+    } else if (std.mem.eql(u8, op, "merkleroot")) {
+        return processMerkleroot(a, obj, out);
     } else if (!std.mem.eql(u8, op, "verifyscript")) {
         return error.UnknownOp;
     }
