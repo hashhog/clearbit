@@ -1367,13 +1367,26 @@ pub const SegwitSighashCache = struct {
             std.mem.writeInt(i64, &value_buf, output.value, .little);
             outputs_hasher.update(&value_buf);
 
-            // CompactSize for script length
-            if (output.script_pubkey.len < 0xFD) {
-                outputs_hasher.update(&[_]u8{@intCast(output.script_pubkey.len)});
-            } else if (output.script_pubkey.len <= 0xFFFF) {
+            // CompactSize for script length (all four ranges — must match
+            // appendCompactSize / serialize.h::WriteCompactSize; the prior
+            // two-case form dropped the length entirely for scripts > 0xFFFF).
+            const spk_len = output.script_pubkey.len;
+            if (spk_len < 0xFD) {
+                outputs_hasher.update(&[_]u8{@intCast(spk_len)});
+            } else if (spk_len <= 0xFFFF) {
                 var size_buf: [3]u8 = undefined;
                 size_buf[0] = 0xFD;
-                std.mem.writeInt(u16, size_buf[1..3], @intCast(output.script_pubkey.len), .little);
+                std.mem.writeInt(u16, size_buf[1..3], @intCast(spk_len), .little);
+                outputs_hasher.update(&size_buf);
+            } else if (spk_len <= 0xFFFFFFFF) {
+                var size_buf: [5]u8 = undefined;
+                size_buf[0] = 0xFE;
+                std.mem.writeInt(u32, size_buf[1..5], @intCast(spk_len), .little);
+                outputs_hasher.update(&size_buf);
+            } else {
+                var size_buf: [9]u8 = undefined;
+                size_buf[0] = 0xFF;
+                std.mem.writeInt(u64, size_buf[1..9], spk_len, .little);
                 outputs_hasher.update(&size_buf);
             }
             outputs_hasher.update(output.script_pubkey);
@@ -1388,6 +1401,39 @@ pub const SegwitSighashCache = struct {
         };
     }
 };
+
+/// Append a CompactSize (Bitcoin "varint" in `serialize.h::WriteCompactSize`)
+/// to an ArrayList. MUST cover all four ranges — a previous inline encoder in
+/// `segwitSighash`'s hashOutputs only handled `< 0xFD` and `<= 0xFFFF`, which
+/// silently truncated and mis-prefixed any output script larger than 65535
+/// bytes (e.g. the 184309-byte OP_RETURN in mainnet tx
+/// 00000000000ad99639585eb5fb0dc0bb093575719ecd78cfede972637b65de07,
+/// block 949973): it emitted `0xFD` + truncated-u16 instead of `0xFE` + u32,
+/// producing a wrong hashOutputs → wrong BIP-143 sighash → valid signatures
+/// failed to verify. Mirrors `serialize.Writer.writeCompactSize`
+/// (src/serialize.zig:141) and Core's `WriteCompactSize` (serialize.h:301).
+/// (A hasher-targeted `appendCompactSize` exists elsewhere with the same
+/// encoding; this list variant targets the ArrayList preimage buffers.)
+fn appendCompactSizeList(list: *std.ArrayList(u8), value: u64) !void {
+    if (value < 0xFD) {
+        try list.append(@intCast(value));
+    } else if (value <= 0xFFFF) {
+        try list.append(0xFD);
+        var buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &buf, @intCast(value), .little);
+        try list.appendSlice(&buf);
+    } else if (value <= 0xFFFFFFFF) {
+        try list.append(0xFE);
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, @intCast(value), .little);
+        try list.appendSlice(&buf);
+    } else {
+        try list.append(0xFF);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, value, .little);
+        try list.appendSlice(&buf);
+    }
+}
 
 /// Compute BIP-143 segwit sighash for signature verification.
 /// This is used for P2WPKH and P2WSH inputs.
@@ -1464,15 +1510,8 @@ pub fn segwitSighash(
             std.mem.writeInt(i64, &val_buf, output.value, .little);
             try outputs_data.appendSlice(&val_buf);
 
-            // CompactSize
-            if (output.script_pubkey.len < 0xFD) {
-                try outputs_data.append(@intCast(output.script_pubkey.len));
-            } else {
-                try outputs_data.append(0xFD);
-                var len_buf: [2]u8 = undefined;
-                std.mem.writeInt(u16, &len_buf, @intCast(output.script_pubkey.len), .little);
-                try outputs_data.appendSlice(&len_buf);
-            }
+            // CompactSize (all four ranges — see appendCompactSize).
+            try appendCompactSizeList(&outputs_data, output.script_pubkey.len);
             try outputs_data.appendSlice(output.script_pubkey);
         }
         const hash_outputs = hash256(outputs_data.items);
@@ -1485,14 +1524,8 @@ pub fn segwitSighash(
         var val_buf: [8]u8 = undefined;
         std.mem.writeInt(i64, &val_buf, output.value, .little);
         try output_data.appendSlice(&val_buf);
-        if (output.script_pubkey.len < 0xFD) {
-            try output_data.append(@intCast(output.script_pubkey.len));
-        } else {
-            try output_data.append(0xFD);
-            var len_buf: [2]u8 = undefined;
-            std.mem.writeInt(u16, &len_buf, @intCast(output.script_pubkey.len), .little);
-            try output_data.appendSlice(&len_buf);
-        }
+        // CompactSize (all four ranges — see appendCompactSize).
+        try appendCompactSizeList(&output_data, output.script_pubkey.len);
         try output_data.appendSlice(output.script_pubkey);
         const hash_outputs = hash256(output_data.items);
         try writer.writeBytes(&hash_outputs);
