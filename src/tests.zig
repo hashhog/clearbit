@@ -633,20 +633,27 @@ test "Difficulty adjustment no change" {
 test "Difficulty adjustment clamps to 4x max" {
     const params = consensus.getNetworkParams(.mainnet);
 
-    // If blocks came in 8x too slow, difficulty should only decrease 4x (clamped)
+    // If blocks came in 8x too slow, difficulty should only decrease 4x (clamped).
+    // Start from a difficulty HARDER than the powLimit floor (0x1c00ffff =
+    // powLimit/256) so the easing is observable: easing from difficulty-1
+    // (0x1d00ffff = powLimit) is impossible — it clamps back to powLimit.
+    // (Pre-powLimit-fix this started at 0x1d00ffff and "passed" only because the
+    // powLimit ceiling was 2^16x too high, letting difficulty ease below the
+    // floor — that was the bug.)
     const header = types.BlockHeader{
         .version = 1,
         .prev_block = [_]u8{0} ** 32,
         .merkle_root = [_]u8{0} ** 32,
         .timestamp = consensus.TARGET_TIMESPAN * 8, // 8x target (should clamp to 4x)
-        .bits = 0x1d00ffff,
+        .bits = 0x1c00ffff,
         .nonce = 0,
     };
 
     const new_bits = consensus.calculateNextWorkRequired(&header, 0, params);
-    // Target should increase (easier difficulty) but capped at 4x
-    // The actual bits value depends on the calculation, but it should be different
-    try testing.expect(new_bits != 0x1d00ffff);
+    // Target increased (easier) — clamped to 4x and still below powLimit, so the
+    // floor clamp does not fire: new_bits differs from both start and powLimit.
+    try testing.expect(new_bits != 0x1c00ffff);
+    try testing.expect(new_bits != consensus.getPowLimitBits(&consensus.MAINNET));
 }
 
 test "Regtest no retarget" {
