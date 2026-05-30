@@ -508,8 +508,13 @@ test "w138 G17: testnet3/testnet4/signet assume_utxo tables are empty (BUG-17)" 
     try testing.expectEqual(@as(usize, 0), consensus.TESTNET3.assume_utxo.len);
     try testing.expectEqual(@as(usize, 0), consensus.TESTNET4.assume_utxo.len);
     try testing.expectEqual(@as(usize, 0), consensus.SIGNET.assume_utxo.len);
-    // Mainnet has 4 entries (Core v28).
+    // Mainnet has 4 entries (Core v28). The hashhog-only h=944_183 bootstrap
+    // snapshot lives in MAINNET.snapshot_bootstrap, NOT assume_utxo, so the
+    // canonical table stays byte-for-byte Core's m_assumeutxo_data.
     try testing.expectEqual(@as(usize, 4), consensus.MAINNET.assume_utxo.len);
+    // The hashhog-only bootstrap allowlist carries exactly the 944183 entry.
+    try testing.expectEqual(@as(usize, 1), consensus.MAINNET.snapshot_bootstrap.len);
+    try testing.expectEqual(@as(u32, 944_183), consensus.MAINNET.snapshot_bootstrap[0].height);
 }
 
 // ===========================================================================
