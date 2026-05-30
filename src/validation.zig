@@ -3451,13 +3451,17 @@ test "W83: checkDifficulty mainnet non-retarget rejects wrong bits" {
         .bits = 0x1d00ffff,
         .nonce = 0,
     };
-    // Any large timestamp gap — bits still must match
+    // Any large timestamp gap — bits still must match prev (0x1d00ffff).
     const new_hdr = types.BlockHeader{
         .version = 1,
         .prev_block = [_]u8{0} ** 32,
         .merkle_root = [_]u8{0} ** 32,
         .timestamp = 1000 + 3600, // 1 hour gap — doesn't matter for mainnet
-        .bits = consensus.getPowLimitBits(&consensus.MAINNET),
+        // A bits value DIFFERENT from prev's required bits. Do NOT use
+        // getPowLimitBits(MAINNET): post-powLimit-fix it correctly equals
+        // 0x1d00ffff (= prev.bits = the REQUIRED bits), which would no longer
+        // be a "wrong bits" probe.
+        .bits = 0x1b0404cb,
         .nonce = 0,
     };
     try std.testing.expectError(
