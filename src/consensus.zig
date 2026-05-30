@@ -391,7 +391,20 @@ pub const NetworkParams = struct {
     min_chain_work: [32]u8,
     /// assumeUTXO data: trusted snapshots for fast sync.
     /// Each entry contains a height, block hash, and UTXO set hash.
+    /// This table is byte-for-byte Core's `m_assumeutxo_data` and is the
+    /// source of truth for RPC / Core-parity checks — do NOT add hashhog-only
+    /// snapshots here (use `snapshot_bootstrap` below for those).
     assume_utxo: []const AssumeUtxoData,
+    /// hashhog-only snapshot-bootstrap allowlist (NOT in Bitcoin Core).
+    /// These are extra Core-format UTXO snapshots that the `--load-snapshot`
+    /// import path accepts, on top of Core's canonical `assume_utxo` table.
+    /// Used by the Phase B revalidation harness, which bootstraps every impl
+    /// from a height-944183 snapshot that post-dates Core's last canonical
+    /// entry (935000).  Kept separate from `assume_utxo` so the canonical
+    /// table stays Core-exact (the assumeutxo-count test pins it at 4) while
+    /// the import path can still accept the bootstrap snapshot.  Empty on
+    /// every network except mainnet.
+    snapshot_bootstrap: []const AssumeUtxoData = &.{},
     /// assumed-valid hash (Bitcoin Core v28.0 defaultAssumeValid).
     /// Script verification is SKIPPED for blocks that are ancestors of this
     /// hardcoded hash, provided the six safety conditions from Bitcoin Core
@@ -470,6 +483,17 @@ pub const AssumeUtxoData = struct {
     /// number of *transactions* up to this height, not the number of
     /// unspent coins in the UTXO set.
     chain_tx_count: u64,
+    /// Median-time-past (BIP-113 GetMedianTimePast) of the snapshot base
+    /// block, i.e. Core's `pindexPrev->GetMedianTimePast()` for the FIRST
+    /// post-snapshot block.  Used as the MTP proxy for the incomplete-window
+    /// band (base+1 .. base+11): the snapshot carries the UTXO set but not the
+    /// 11-ancestor header window, so an in-memory MTP walk over those blocks
+    /// would return 0, dropping nLockTimeCutoff to the block's own timestamp
+    /// and silently bypassing BIP-113.  Seeding from the base block's real MTP
+    /// reproduces Core's assumeUTXO behaviour until the post-snapshot window
+    /// fills with real timestamps (~base+11).  0 = unknown (canonical Core
+    /// entries leave it 0; only the hashhog snapshot_bootstrap entry sets it).
+    base_mtp: u32 = 0,
 };
 
 /// Mainnet parameters.
@@ -544,6 +568,24 @@ pub const MAINNET = NetworkParams{
             .block_hash = hexToHash("0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"),
             .hash_serialized = hexToHash("e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"),
             .chain_tx_count = 1_305_397_408,
+        },
+    },
+    // hashhog-only snapshot-bootstrap allowlist (NOT in Bitcoin Core's
+    // m_assumeutxo_data).  The Phase B revalidation harness bootstraps every
+    // impl from this height-944183 Core-format UTXO snapshot; it post-dates
+    // Core's last canonical entry (935000).  The `--load-snapshot` import path
+    // accepts a base hash present in EITHER `assume_utxo` (Core-canonical) or
+    // this list, so the canonical table above stays Core-exact (4 entries).
+    .snapshot_bootstrap = &[_]AssumeUtxoData{
+        .{
+            .height = 944_183,
+            .block_hash = hexToHash("0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"),
+            .hash_serialized = hexToHash("2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"),
+            .chain_tx_count = 1_334_000_000,
+            // GetMedianTimePast of block 944183 (Core getblockheader.mediantime).
+            // Seeds the post-snapshot MTP window so blocks 944184..~944194 enforce
+            // BIP-113 against the real base MTP instead of falling back to 0.
+            .base_mtp = 1_775_650_208,
         },
     },
     // Bitcoin Core v28.0 defaultAssumeValid for mainnet (height 938343).

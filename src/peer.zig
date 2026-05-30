@@ -2392,6 +2392,21 @@ pub const PeerManager = struct {
     /// no extra memory or CPU).
     header_index: std.AutoHashMap(types.Hash256, BlockHeaderEntry),
 
+    /// SNAPSHOT FORWARD-SYNC: median-time-past of the snapshot base block
+    /// (the height at which a `--load-snapshot` boot starts), and that base
+    /// height.  Both 0 when the node did not boot from a snapshot.
+    ///
+    /// Layer-3 fix: the snapshot carries the UTXO set but not the 11-ancestor
+    /// header window, so an MTP walk over the first ~11 post-snapshot blocks
+    /// (base+1..base+11) finds no ancestors in `header_index` and returns 0,
+    /// which drops nLockTimeCutoff to the block's own timestamp and bypasses
+    /// BIP-113.  Until the window refills with real post-snapshot timestamps
+    /// (~base+11), `computePrevMtp` falls back to `snapshot_base_mtp` for the
+    /// incomplete-window band — Core's assumeUTXO behaviour.  Set at startup
+    /// from MAINNET.snapshot_bootstrap[i].base_mtp via setSnapshotBaseMtp().
+    snapshot_base_mtp: u32 = 0,
+    snapshot_base_height: u32 = 0,
+
     /// Currently-pending reorg, if any.  Set by the headers handler when
     /// a competing-fork branch with strictly higher chainwork is detected;
     /// cleared (and the inner ArrayList freed) by the reorg trigger after
@@ -4532,7 +4547,45 @@ pub const PeerManager = struct {
                     const min_cw = self.network_params.min_chain_work;
                     // Fast path: skip gate when min_chain_work is all-zeros (regtest).
                     const zero: [32]u8 = [_]u8{0} ** 32;
-                    if (!std.mem.eql(u8, &min_cw, &zero)) {
+                    // assumeUTXO / snapshot-bootstrap anchor.
+                    //
+                    // When the node booted from a UTXO snapshot (--load-snapshot)
+                    // its active tip is the snapshot base block (e.g. height
+                    // 944183) but its header chain_work is NOT reconstructed: the
+                    // snapshot carries the UTXO set, not the header index, and the
+                    // placeholder block-index entry written at import time has
+                    // chain_work=0 (main.zig:1262).  lookupParentChainWork then
+                    // returns chainWorkFromHeight(best_height) — a tiny synthetic
+                    // value (~2^20), NOT the real ~2^245 mainnet chain_work — so a
+                    // genuine post-snapshot header batch (944184..) would compute
+                    // cum_work << min_chain_work and be rejected as
+                    // too-little-chainwork, banning every honest peer and wedging
+                    // forward sync at the snapshot base forever.
+                    //
+                    // Core does not hit this: a node that has adopted an
+                    // assumeUTXO snapshot is by construction already past
+                    // nMinimumChainWork (the snapshot base height has far more
+                    // cumulative work than min_chain_work), so min_pow_checked is
+                    // satisfied and AcceptBlockHeader never rejects on low work.
+                    // Reference: bitcoin-core/src/validation.cpp AcceptBlockHeader
+                    // min_pow_checked + node/chainstate snapshot activation.
+                    //
+                    // We mirror that: if our active tip height is at or above any
+                    // known snapshot base (canonical assume_utxo OR the hashhog
+                    // snapshot_bootstrap allowlist), the min-chain-work anti-DoS
+                    // gate has already been satisfied for this chain — skip it.
+                    const past_snapshot_base = blk: {
+                        const cs = self.chain_state orelse break :blk false;
+                        const params = self.network_params;
+                        for (params.assume_utxo) |e| {
+                            if (cs.best_height >= e.height) break :blk true;
+                        }
+                        for (params.snapshot_bootstrap) |e| {
+                            if (cs.best_height >= e.height) break :blk true;
+                        }
+                        break :blk false;
+                    };
+                    if (!std.mem.eql(u8, &min_cw, &zero) and !past_snapshot_base) {
                         // Compute cumulative chain work for this batch.
                         // Start from the parent's work (genesis = all-zeros).
                         var cum_work: [32]u8 = if (self.lookupParentChainWork(&h.headers[0].prev_block)) |p| p.work else [_]u8{0} ** 32;
@@ -6210,6 +6263,16 @@ pub const PeerManager = struct {
     /// which causes the caller to skip the MTP check.
     ///
     /// Reference: Bitcoin Core pindexPrev->GetMedianTimePast() (chain.h).
+    /// Set the snapshot-base MTP fallback (Layer-3 forward-sync fix).  Called
+    /// once at startup when the node booted from a `--load-snapshot` UTXO set,
+    /// with the base block's GetMedianTimePast (consensus.AssumeUtxoData.base_mtp)
+    /// and the base height.  No-op-safe to call with mtp==0 (leaves the
+    /// fallback disabled — non-snapshot boots).
+    pub fn setSnapshotBaseMtp(self: *PeerManager, base_mtp: u32, base_height: u32) void {
+        self.snapshot_base_mtp = base_mtp;
+        self.snapshot_base_height = base_height;
+    }
+
     fn computePrevMtp(self: *PeerManager, prev_hash: *const types.Hash256) u32 {
         var timestamps: [11]u32 = undefined;
         var n: usize = 0;
@@ -6220,8 +6283,35 @@ pub const PeerManager = struct {
             n += 1;
             cursor = entry.prev_hash;
         }
-        if (n == 0) return 0;
-        return validation.medianTimePast(timestamps[0..n]);
+        if (n > 0) return validation.medianTimePast(timestamps[0..n]);
+
+        // SNAPSHOT FORWARD-SYNC (Layer 3): the in-memory header_index walk
+        // found no ancestors.  After a `--load-snapshot` boot this is the
+        // common case for the first ~11 post-snapshot blocks (base+1..base+11):
+        // the snapshot carries the UTXO set, not the 11-ancestor header window,
+        // and (with reorg capture off) headers are not mirrored into
+        // header_index.  Prefer the chain-state ring buffer, which
+        // connectBlockInner fills with REAL post-snapshot block timestamps as
+        // they connect — once it holds 11 entries it is the exact Core MTP.
+        // Until then fall back to the snapshot base block's GetMedianTimePast
+        // (a true lower bound, never 0) so BIP-113 nLockTimeCutoff matches
+        // Core's assumeUTXO behaviour instead of collapsing to the block's own
+        // timestamp.  Returns 0 only for a genuinely fresh (non-snapshot) node,
+        // preserving the prior genesis-adjacent skip.
+        if (self.chain_state) |cs| {
+            // The ring buffer holds the MTP of the ACTIVE TIP only, so it is a
+            // valid answer for computePrevMtp solely when prev_hash IS the tip
+            // (the forward-sync connect case: block H's parent == tip H-1).
+            // For non-tip parents (e.g. far-ahead header-acceptance checks) the
+            // tip MTP would be a lower bound, which only ever relaxes the
+            // BIP-113 header check (safe direction) — but we still prefer the
+            // base MTP there to avoid implying a wrong window.
+            if (std.mem.eql(u8, &cs.best_hash, prev_hash)) {
+                const ring_mtp = cs.computeMTP();
+                if (ring_mtp != 0) return ring_mtp;
+            }
+        }
+        return self.snapshot_base_mtp;
     }
 
     /// Compute the median-time-past (GetMedianTimePast) OF block at `height`.
