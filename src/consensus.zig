@@ -142,10 +142,21 @@ pub const MAX_TIMESPAN: u32 = TARGET_TIMESPAN * 4;
 /// 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 pub const PROOF_OF_WORK_LIMIT: [32]u8 = blk: {
     var target: [32]u8 = [_]u8{0} ** 32;
-    // Big-endian representation stored in little-endian byte order
-    // Bytes 28-29 (from the end) are 0xFF
-    target[28] = 0xFF;
-    target[29] = 0xFF;
+    // Stored little-endian (byte[0] = LSB). The 0xFFFF mantissa of the
+    // mainnet powLimit 0x00000000FFFF0000...0000 sits at LE indices 26,27
+    // (= big-endian bytes 4,5), i.e. 0xFFFF << (8*26).
+    //
+    // BUG (fixed 2026-05-30): these were 28,29, i.e. 0xFFFF << (8*28) — a
+    // powLimit 2^16x too high. The retarget powLimit clamp
+    // (`if (!hashMeetsTarget(&new_target, &params.pow_limit)) ...`) therefore
+    // never fired at the difficulty floor, so GetNextWorkRequired returned a
+    // too-easy nBits at the first easing retarget (mainnet h=2016: returned
+    // 1d01b304, Core 1d00ffff) -> would accept a block Core rejects
+    // (bad-diffbits) = chain split. Latent on recent mainnet (difficulty is
+    // far above powLimit) but real at the floor and on testnet/regtest.
+    // Found by the PoW `nextwork` differential vs Core ground truth.
+    target[26] = 0xFF;
+    target[27] = 0xFF;
     break :blk target;
 };
 
