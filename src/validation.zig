@@ -797,9 +797,18 @@ pub fn checkBlock(
         };
     }
 
-    const computed_root = crypto.computeMerkleRoot(tx_hashes, allocator) catch {
+    // CVE-2012-2459: a duplicate-tx malleation can reproduce the same merkle
+    // root by repeating the odd-tail subtree. Core's BlockMerkleRoot reports a
+    // `mutated` flag (consensus/merkle.cpp:46-63) and CheckBlock rejects with
+    // "bad-txns-duplicate" (validation.cpp:3850-3858). We mirror both: compute
+    // the root with the mutation out-param and reject a mutated block.
+    var merkle_mutated: bool = false;
+    const computed_root = crypto.computeMerkleRootMutated(tx_hashes, allocator, &merkle_mutated) catch {
         return ValidationError.OutOfMemory;
     };
+    if (merkle_mutated) {
+        return ValidationError.DuplicateTx;
+    }
     if (!std.mem.eql(u8, &computed_root, &block.header.merkle_root)) {
         return ValidationError.BadMerkleRoot;
     }
