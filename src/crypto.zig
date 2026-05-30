@@ -618,7 +618,40 @@ const Ripemd160State = struct {
 /// 2. If the list has an odd number of elements, duplicate the last.
 /// 3. Pairwise hash256(concat(a, b)) to produce the next level.
 /// 4. Repeat until one hash remains.
+///
+/// Thin wrapper over `computeMerkleRootMutated` that discards the CVE-2012-2459
+/// mutation flag. Existing callers that only need the root keep this signature.
 pub fn computeMerkleRoot(hashes: []const Hash256, allocator: std.mem.Allocator) !Hash256 {
+    return computeMerkleRootMutated(hashes, allocator, null);
+}
+
+/// Compute the Merkle root, additionally reporting CVE-2012-2459 mutation.
+///
+/// `mutated` (optional out-param) mirrors Bitcoin Core's
+/// `ComputeMerkleRoot(std::vector<uint256>, bool* mutated)`
+/// (bitcoin-core/src/consensus/merkle.cpp:46-63). When non-null it is set to
+/// `true` iff, at the TOP of any level-collapse iteration (BEFORE the odd-tail
+/// duplication and BEFORE pairwise hashing), two *complete* adjacent hashes are
+/// byte-equal — `for (pos = 0; pos + 1 < len; pos += 2) if (h[pos] == h[pos+1])`.
+///
+/// CRITICAL parity points with Core (otherwise honest odd-N blocks false-reject):
+///   - The scan runs BEFORE the odd-tail duplication, so the lone trailing
+///     element at an odd level is NOT compared at this level (`pos+1 < len`
+///     excludes it). Once duplicated it becomes an identical adjacent pair that
+///     is caught on the NEXT level's scan — exactly Core's behavior.
+///   - Only complete pairs are compared; the loop step is +2 and the guard is
+///     `pos + 1 < len`.
+/// A block with a CVE-2012-2459 duplicate-tx malleation therefore sets
+/// `mutated = true`, and the block-accept path (validation.zig checkBlock)
+/// rejects it (`DuplicateTx`, Core "bad-txns-duplicate"). Honest blocks — even
+/// with an odd transaction count — leave `mutated = false`.
+pub fn computeMerkleRootMutated(
+    hashes: []const Hash256,
+    allocator: std.mem.Allocator,
+    mutated: ?*bool,
+) !Hash256 {
+    if (mutated) |m| m.* = false;
+
     if (hashes.len == 0) {
         return [_]u8{0} ** 32;
     }
@@ -631,9 +664,24 @@ pub fn computeMerkleRoot(hashes: []const Hash256, allocator: std.mem.Allocator) 
     defer allocator.free(current);
     @memcpy(current, hashes);
 
+    var mutation = false;
     var len = hashes.len;
 
     while (len > 1) {
+        // CVE-2012-2459 detection (Core merkle.cpp:49-53): at the TOP of this
+        // level, BEFORE the odd-tail duplication below, scan COMPLETE adjacent
+        // pairs only. The lone trailing element of an odd level is intentionally
+        // skipped here (pos+1 < len) and is caught on the next level once
+        // duplicated.
+        if (mutated != null) {
+            var pos: usize = 0;
+            while (pos + 1 < len) : (pos += 2) {
+                if (std.mem.eql(u8, &current[pos], &current[pos + 1])) {
+                    mutation = true;
+                }
+            }
+        }
+
         // If odd number of elements, duplicate the last
         const pair_count = (len + 1) / 2;
 
@@ -651,6 +699,7 @@ pub fn computeMerkleRoot(hashes: []const Hash256, allocator: std.mem.Allocator) 
         len = pair_count;
     }
 
+    if (mutated) |m| m.* = mutation;
     return current[0];
 }
 
