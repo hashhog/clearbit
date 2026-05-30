@@ -2367,6 +2367,23 @@ pub const ChainState = struct {
         }
     }
 
+    /// SNAPSHOT FORWARD-SYNC (Layer 3): seed the BIP-113 MTP ring buffer with
+    /// the snapshot base block's GetMedianTimePast after a `--load-snapshot`
+    /// boot.  The snapshot carries the UTXO set but not the 11-ancestor header
+    /// window, so the ring buffer would otherwise start empty (computeMTP()==0)
+    /// and the first post-snapshot block's lock-time cutoff would collapse to
+    /// the block's own timestamp, bypassing BIP-113.  Seeding a single entry
+    /// (the base MTP) gives a true lower bound that connectBlockInner then
+    /// refines toward the exact Core median as real post-snapshot timestamps
+    /// fill the window (~base+11).  Unconditionally replaces any prior seed
+    /// (genesis) — a snapshot node is past genesis by construction.  No-op if
+    /// base_mtp is 0.
+    pub fn seedSnapshotBaseTimestamp(self: *ChainState, base_mtp: u32) void {
+        if (base_mtp == 0) return;
+        self.recent_timestamps[0] = base_mtp;
+        self.recent_ts_count = 1;
+    }
+
     /// Wire up the UtxoSet back-reference so that cache eviction uses
     /// ChainState.flush() (which includes the chain tip) instead of the
     /// bare UtxoSet.flush().  Must be called AFTER the ChainState is at
@@ -3947,6 +3964,126 @@ pub const ChainState = struct {
                     .{ entry.height, self.best_height + 1 },
                 );
                 return error.HeightMismatch;
+            }
+
+            // FULL-VALIDATION on the reorg connect side (Core parity).
+            //
+            // Bitcoin Core connects side-branch blocks during a reorg through
+            // the SAME path the main chain uses: ActivateBestChainStep →
+            // ConnectTip → ConnectBlock → CheckInputScripts
+            // (validation.cpp:3236/3005/2295/2583).  There is NO
+            // connect-without-script-verify path — every block adopted onto
+            // the active chain has its inputs script-verified against the
+            // post-disconnect coins view, with the per-block consensus flags
+            // from GetBlockScriptFlags (validation.cpp:2250).  rustoshi
+            // (chain_state.rs reorganize → connect_block_with_sequence_locks)
+            // and blockbrew (ReorgTo → ConnectBlock) do the same.
+            //
+            // Pre-this-fix clearbit's reorg connect went straight to
+            // connectBlockFastWithUndoNoFlush → connectBlockInner, which only
+            // mutates the UTXO set + detects double-spends (MissingInput) and
+            // performs ZERO script verification.  A side branch with higher
+            // chainwork but consensus-invalid scripts (bad signature, NULLDUMMY
+            // violation, CLTV/CSV/segwit/taproot rule break) would be adopted
+            // as the active tip — a chain-split-class false-accept.  The
+            // routing audit flagged this; this is the routing fix.
+            //
+            // We validate against `self.utxo_set` exactly where Core's
+            // ConnectTip validates against its CCoinsViewCache: AFTER the
+            // disconnect walk rewound to the fork point AND after every
+            // earlier new-chain block in this loop already applied its UTXO
+            // mutations (connectBlockInner writes the cache in-place, and the
+            // disconnect side restored spent prevouts via applyTxInUndo → the
+            // cache).  So the prevout lookup below sees the correct per-block
+            // advancing coins view — including intra-fork spends.
+            //
+            // network_params is null only for the in-process reorg tests
+            // (synthetic blocks with trivial scripts / no real PoW that call
+            // ChainState.init without setNetworkParams) and memory-only paths;
+            // in those cases we preserve the legacy behaviour and skip script
+            // verification (the production node sets params via
+            // setNetworkParams at startup).  This avoids false-rejecting the
+            // synthetic test fixtures while closing the live consensus hole.
+            if (self.network_params) |params| {
+                const validation = @import("validation.zig");
+
+                // Per-call prevout lookup adapter over the chain state's
+                // utxo_set, identical in shape to the IBD/P2P path's adapter
+                // (peer.zig::validateBlockForIBDOrReject).  reconstructScript
+                // heap-allocates via self.allocator; validateBlockForIBD frees
+                // it through the owner_allocator channel on PrevOutInfo.
+                const Adapter = struct {
+                    cs: *ChainState,
+
+                    fn lookup(
+                        ctx_ptr: *anyopaque,
+                        outpoint: *const types.OutPoint,
+                    ) ?validation.PrevOutInfo {
+                        const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                        const compact_opt = me.cs.utxo_set.get(outpoint) catch return null;
+                        var compact = compact_opt orelse return null;
+                        defer compact.deinit(me.cs.allocator);
+                        const script = compact.reconstructScript(me.cs.allocator) catch return null;
+                        return .{
+                            .script_pubkey = script,
+                            .amount = compact.value,
+                            .height = compact.height,
+                            .is_coinbase = compact.is_coinbase,
+                            .owner_allocator = me.cs.allocator,
+                        };
+                    }
+                };
+                var adapter = Adapter{ .cs = self };
+
+                // Conservative MTP handling: the disconnect walk does NOT
+                // rewind the recent_timestamps ring buffer, so computeMTP()
+                // would return a stale (old-chain) MTP at the fork point.
+                // Rather than risk a FALSE-REJECT on a valid block (BIP-113
+                // timestamp / time-based BIP-68 locks), we pass prev_mtp=0 and
+                // no getMtpAtHeightFn — exactly the "MTP not available" mode
+                // validateBlockForIBD already handles for the IBD fast path.
+                // In that mode the BIP-113 strict-MTP check is skipped and
+                // sequence locks fall back to height-only enforcement, which
+                // the validation code documents as the safe direction (it can
+                // only false-ACCEPT a time-locked spend, never false-reject).
+                // Height-gated softfork flags (DERSIG/CLTV/CSV/NULLDUMMY +
+                // unconditional P2SH/WITNESS/TAPROOT) are unaffected — they key
+                // off `height`, not MTP — so script verification of those
+                // rules runs at full strength.  force_skip_scripts stays false
+                // and active_chain is left null, so scripts ALWAYS run here
+                // (reorg fork blocks are at/above the active tip, never an
+                // assumevalid ancestor we'd legitimately skip).
+                validation.acceptBlock(
+                    &entry.block,
+                    &entry.hash,
+                    entry.height,
+                    params,
+                    @ptrCast(&adapter),
+                    Adapter.lookup,
+                    self.allocator,
+                    .{
+                        .prev_mtp = 0,
+                        .prev_block_timestamp = 0,
+                        .current_time = 0,
+                        .force_skip_scripts = false,
+                        // Reorg fork bodies are explicitly requested via
+                        // getdata, so suppress the fTooFarAhead ceiling (the
+                        // same is_requested=true the IBD drain path uses).
+                        .active_tip_height = self.best_height,
+                        .is_requested = true,
+                    },
+                ) catch |err| {
+                    std.debug.print(
+                        "reorgToChain: REJECT side-branch block at height {d} validation={} — aborting reorg\n",
+                        .{ entry.height, err },
+                    );
+                    // errdefer abortReorgInProgress() drops the pending queues
+                    // and sets flush_error sticky; nothing has been flushed, so
+                    // the on-disk chain stays at the pre-reorg tip.  Map every
+                    // validation failure to a single reorg-abort error so the
+                    // caller (tryFireReorg) bans the source peer.
+                    return error.ReorgBlockInvalid;
+                };
             }
 
             // Queue the body for the atomic CF_BLOCKS put.
@@ -5799,11 +5936,25 @@ pub fn loadTxOutSet(
 
 /// Find an AssumeUtxo entry by block hash.
 /// Returns the entry if the hash matches a known snapshot, null otherwise.
+///
+/// This is the gate for the `--load-snapshot` import path: it accepts a base
+/// hash present in EITHER Core's canonical `assume_utxo` table OR the
+/// hashhog-only `snapshot_bootstrap` allowlist (the height-944183 Phase B
+/// revalidation snapshot, which is not in Bitcoin Core's m_assumeutxo_data).
+/// The canonical table is deliberately checked first so Core entries win on
+/// any (impossible) collision.  Keeping `snapshot_bootstrap` out of
+/// `assume_utxo` is what lets the canonical table stay Core-exact (4 entries)
+/// while still permitting the bootstrap import.
 pub fn findAssumeUtxoEntry(
     network_params: *const @import("consensus.zig").NetworkParams,
     block_hash: *const types.Hash256,
 ) ?@import("consensus.zig").AssumeUtxoData {
     for (network_params.assume_utxo) |entry| {
+        if (std.mem.eql(u8, &entry.block_hash, block_hash)) {
+            return entry;
+        }
+    }
+    for (network_params.snapshot_bootstrap) |entry| {
         if (std.mem.eql(u8, &entry.block_hash, block_hash)) {
             return entry;
         }

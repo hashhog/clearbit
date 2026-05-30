@@ -1176,8 +1176,9 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
                 std.debug.print("\nFATAL: Read error (script) at coin {d}: {}\n", .{ imported, err });
                 std.process.exit(1);
             };
-            // script_pubkey ownership transfers into UtxoEntry.toBytes (which
-            // copies), so free here after value_data is built.
+            // script_pubkey ownership transfers into CompactUtxo.encode (which
+            // copies the extracted hash/script), so free here after value_data
+            // is built.
 
             // Build UTXO key: txid (32) || vout_le (4).
             const key_alloc = allocator.alloc(u8, 36) catch {
@@ -1188,13 +1189,36 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
             @memcpy(key_alloc[0..32], &txid);
             std.mem.writeInt(u32, key_alloc[32..36], vout, .little);
 
-            const entry = storage.UtxoEntry{
-                .value = amount,
-                .script_pubkey = script_pubkey,
+            // SNAPSHOT FORWARD-SYNC FIX (UTXO serialization parity).
+            //
+            // The CF_UTXO read path (storage.UtxoSet.get → CompactUtxo.decode)
+            // expects the canonical compact layout
+            //   [u32 packed_height(coinbase<<31)] [i64 value] [u8 script_type] [hash|script]
+            // written by storage.UtxoSet.add → CompactUtxo.encode on the live
+            // connect path.  This CLI import path previously wrote the legacy
+            // storage.UtxoEntry.toBytes layout
+            //   [i64 value] [u32 height] [u8 coinbase] [compactsize len] [script]
+            // which is a DIFFERENT byte order.  Decoding a UtxoEntry blob as a
+            // CompactUtxo read the value's low 4 bytes as packed_height and the
+            // value's high 4 bytes ++ height as a bogus i64 ~4e18 — far above
+            // MAX_MONEY — so every prevout lookup for a spend of a snapshot
+            // coin returned an out-of-range amount and block 944184 was
+            // rejected with InputValuesOutOfRange, wedging forward sync at the
+            // snapshot base.  (See the validateAndLoadSnapshot reference path
+            // in storage.zig, which already uses utxo_set.add → CompactUtxo.)
+            //
+            // Write the SAME compact format the read path decodes so spends of
+            // snapshot UTXOs resolve to the correct value.
+            const script_type = storage.CompactUtxo.classifyScriptType(script_pubkey);
+            const hash_or_script = storage.CompactUtxo.extractHashFromScript(script_type, script_pubkey);
+            const compact = storage.CompactUtxo{
                 .height = utxo_height,
                 .is_coinbase = is_coinbase,
+                .value = amount,
+                .script_type = script_type,
+                .hash_or_script = hash_or_script,
             };
-            const value_data = entry.toBytes(allocator) catch {
+            const value_data = compact.encode(allocator) catch {
                 allocator.free(key_alloc);
                 allocator.free(script_pubkey);
                 std.debug.print("\nFATAL: Serialization failed at coin {d}\n", .{imported});
@@ -1263,6 +1287,20 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     std.mem.writeInt(u32, block_index_buf[0..4], block_height, .little);
     db.put(storage.CF_BLOCK_INDEX, &metadata.base_blockhash, &block_index_buf) catch |err| {
         std.debug.print("Warning: Failed to write block index entry: {}\n", .{err});
+    };
+
+    // SNAPSHOT FORWARD-SYNC (Layer 2): persist the height→hash index entry for
+    // the snapshot base so the base block is queryable by height
+    // (getblockhash, getBlockHashByHeight) and the BIP-68 sequence-lock
+    // MTP-at-height callback can resolve heights at/below the base.  The live
+    // connect path links new blocks via `best_hash` (which the chain_tip key
+    // above carries), so the base does not also need a header-bearing
+    // CF_BLOCK_INDEX row to connect 944184 — but without this H:<height> entry
+    // the base would be invisible to height-keyed lookups.  Key layout:
+    // "H:" ++ u32_LE(height) → 32-byte hash (storage.ChainStore.buildHeightHashKey).
+    const hh_key = storage.ChainStore.buildHeightHashKey(block_height);
+    db.put(storage.CF_DEFAULT, &hh_key, &metadata.base_blockhash) catch |err| {
+        std.debug.print("Warning: Failed to write base height→hash index entry: {}\n", .{err});
     };
 
     db.flush() catch |err| {
@@ -1759,6 +1797,18 @@ pub fn main() !void {
     var chain_state = storage.ChainState.init(db_ptr, @intCast(config.dbcache), allocator);
     defer chain_state.deinit();
     chain_state.wireUtxoParent();
+    // Wire the active network params into ChainState.  Two consumers depend
+    // on this being set on the live node:
+    //   1. the disconnect path's BIP-30 disconnect-exception list
+    //      (storage.zig isBip30DisconnectException), and
+    //   2. the reorg connect path's full block-validation / script
+    //      verification (storage.zig reorgToChain) — which skips script
+    //      verification entirely when network_params is null.  Without this
+    //      call the live reorg path would route side-branch blocks straight
+    //      to connectBlockInner with NO script verify (chain-split-class
+    //      false-accept).  Bitcoin Core always connects reorg side branches
+    //      through ConnectBlock → CheckInputScripts.
+    chain_state.setNetworkParams(params);
     // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
     // 2026-05-05.md): plumb --txindex from CLI/config into ChainState so
     // connectBlockInner queues CF_TX_INDEX writes and disconnectBlockByHashCF
@@ -2059,6 +2109,35 @@ pub fn main() !void {
     if (chain_state.best_height == 0) {
         chain_state.best_hash = params.genesis_hash;
         chain_state.best_height = 0;
+    }
+
+    // SNAPSHOT FORWARD-SYNC (Layer 3): if the loaded tip is a snapshot base
+    // (booted via `--load-snapshot`), seed the BIP-113 MTP window from the
+    // base block's GetMedianTimePast and arm the PeerManager fallback.  Without
+    // this, blocks base+1..base+~11 see an empty MTP window (computePrevMtp==0)
+    // and their lock-time cutoff collapses to the block's own timestamp,
+    // bypassing BIP-113.  Matched against the loaded best_hash so a normal
+    // (non-snapshot) tip at the same height is unaffected.  Core's assumeUTXO
+    // chainstate starts from the snapshot base's real header, so its MTP is
+    // available immediately; we reproduce that with the precomputed base_mtp.
+    {
+        var sb_mtp: u32 = 0;
+        for (params.snapshot_bootstrap) |e| {
+            if (chain_state.best_height == e.height and
+                std.mem.eql(u8, &chain_state.best_hash, &e.block_hash))
+            {
+                sb_mtp = e.base_mtp;
+                break;
+            }
+        }
+        if (sb_mtp != 0) {
+            chain_state.seedSnapshotBaseTimestamp(sb_mtp);
+            peer_manager.setSnapshotBaseMtp(sb_mtp, chain_state.best_height);
+            std.debug.print(
+                "Snapshot forward-sync: seeded BIP-113 MTP window from base block MTP {d} (height {d})\n",
+                .{ sb_mtp, chain_state.best_height },
+            );
+        }
     }
 
     // 9. Parse --connect address before starting threads
