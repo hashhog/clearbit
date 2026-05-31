@@ -667,6 +667,31 @@ fn processCheckblock(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype
     // recompute the merkle root; validation recomputes + compares it itself.
     const block_hash = crypto.computeBlockHash(&block.header);
 
+    const params = consensus.getNetworkParams(.mainnet);
+
+    // Synthesize the canonical-anchor active_chain so the BIP-30/BIP-34
+    // short-circuit gate runs EXACTLY as it does on the live node. clearbit's
+    // BIP-30 gate (validation.zig:1387) skips the HaveCoin scan once BIP-34 is
+    // active — but ONLY when ctx.active_chain holds the canonical BIP34Hash at
+    // index params.bip34_height (W79 gate G3; null => conservative gate G4
+    // which over-enforces). A real synced node ALWAYS has that anchor by the
+    // time it validates a post-BIP34 block, so the validate-only `checkblock`
+    // op reproduces it: an array of length spend_height+1 with index
+    // bip34_height set to params.bip34_hash (every other slot is irrelevant to
+    // the gate). Gated to the BIP-34-active range with a known anchor hash so
+    // pre-BIP34 vectors (e.g. h=91000) keep active_chain=null and the BIP-30
+    // scan still fires (R1 flagship). Core ref: validation.cpp:2460-2462
+    // (pindexBIP34height->GetBlockHash() == params.BIP34Hash).
+    var active_chain: ?[]const types.Hash256 = null;
+    if (params.bip34_hash) |anchor| {
+        if (spend_height >= params.bip34_height) {
+            const chain = try a.alloc(types.Hash256, spend_height + 1);
+            @memset(chain, [_]u8{0} ** 32);
+            chain[params.bip34_height] = anchor;
+            active_chain = chain;
+        }
+    }
+
     // Drive clearbit's REAL block-accept consensus pipeline at MAINNET params.
     // force_skip_pow mirrors Core's CheckBlock fCheckPOW=false (the FINAL bytes
     // miss the mainnet target by construction). force_skip_scripts honours the
@@ -675,11 +700,11 @@ fn processCheckblock(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype
         &block,
         &block_hash,
         spend_height,
-        consensus.getNetworkParams(.mainnet),
+        params,
         &view_ctx,
         View.lookup,
         a,
-        .{ .force_skip_scripts = skip_scripts, .force_skip_pow = skip_pow },
+        .{ .force_skip_scripts = skip_scripts, .force_skip_pow = skip_pow, .active_chain = active_chain },
     ) catch |err| {
         const reason = try jsonEscape(a, connectErrToReason(err));
         try out.print("{{\"valid\":false,\"reason\":\"{s}\"}}\n", .{reason});
