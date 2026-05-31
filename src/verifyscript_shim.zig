@@ -389,6 +389,12 @@ fn connectErrToReason(err: validation.ValidationError) []const u8 {
         error.ScriptVerificationFailed => "block-script-verify-flag-failed",
         error.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
         error.InsufficientFunds => "bad-txns-in-belowout",
+        // BIP-68 SequenceLocks + BIP-113/IsFinalTx finality (checkblock op):
+        // both surface as Core "bad-txns-nonfinal" (validation.cpp:2549-2561
+        // ConnectBlock SequenceLocks + ContextualCheckBlock IsFinalTx).
+        // rpc.zig:6316 validationErrToBip22 parity. Advisory only; the valid
+        // bool is what is scored.
+        error.NonFinalTx, error.SequenceLockNotSatisfied => "bad-txns-nonfinal",
         // Block-level (checkblock op) connect/check errors -> canonical Core
         // BIP22 reject tokens.  Advisory only; the valid bool is scored.
         error.BadCoinbaseValue => "bad-cb-amount",
