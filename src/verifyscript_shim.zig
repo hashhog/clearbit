@@ -77,6 +77,7 @@ const types = @import("types.zig");
 const crypto = @import("crypto.zig");
 const validation = @import("validation.zig");
 const consensus = @import("consensus.zig");
+const storage = @import("storage.zig");
 
 fn hexNibble(c: u8) !u8 {
     return switch (c) {
@@ -383,6 +384,9 @@ fn connectErrToReason(err: validation.ValidationError) []const u8 {
     return switch (err) {
         error.MissingInput, error.InputAlreadySpent => "bad-txns-inputs-missingorspent",
         error.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
+        // Connect-block script stage: Core validation.cpp:2122
+        // "block-script-verify-flag-failed" (rpc.zig:6321 parity).
+        error.ScriptVerificationFailed => "block-script-verify-flag-failed",
         error.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
         error.InsufficientFunds => "bad-txns-in-belowout",
         // Block-level (checkblock op) connect/check errors -> canonical Core
@@ -685,6 +689,531 @@ fn processCheckblock(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype
     try out.writeAll("{\"valid\":true}\n");
 }
 
+/// Parse a 32-byte big-endian hex work value into a [32]u8 (BE) buffer.
+fn parseWork256(hex: []const u8) ![32]u8 {
+    if (hex.len != 64) return error.WorkHexLen;
+    var out: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        out[i] = (try hexNibble(hex[i * 2]) << 4) | (try hexNibble(hex[i * 2 + 1]));
+    }
+    return out;
+}
+
+/// One coin parsed from a request "fork_utxo" / "undo[].vin" entry.
+const ReorgCoin = struct {
+    txid_wire: [32]u8,
+    vout: u32,
+    spk: []const u8,
+    value: i64,
+    height: u32,
+    is_coinbase: bool,
+};
+
+fn parseReorgCoin(a: std.mem.Allocator, po: std.json.ObjectMap) !ReorgCoin {
+    const txid_disp = switch (po.get("txid") orelse return error.CoinMissingTxid) {
+        .string => |s| s,
+        else => return error.CoinTxidNotString,
+    };
+    const disp = try hexDecode(a, txid_disp);
+    if (disp.len != 32) return error.CoinTxidLen;
+    var wire: [32]u8 = undefined;
+    for (0..32) |i| wire[i] = disp[31 - i];
+    const vout: u32 = switch (po.get("vout") orelse return error.CoinMissingVout) {
+        .integer => |iv| @truncate(@as(u64, @bitCast(iv))),
+        else => return error.CoinVoutNotInt,
+    };
+    const spk = try hexDecode(a, switch (po.get("scriptPubKey_hex") orelse return error.CoinMissingSpk) {
+        .string => |s| s,
+        else => return error.CoinSpkNotString,
+    });
+    const value: i64 = switch (po.get("value_sats") orelse return error.CoinMissingValue) {
+        .integer => |iv| iv,
+        else => return error.CoinValueNotInt,
+    };
+    const height: u32 = switch (po.get("height") orelse return error.CoinMissingHeight) {
+        .integer => |iv| @intCast(iv),
+        else => return error.CoinHeightNotInt,
+    };
+    const is_coinbase: bool = switch (po.get("is_coinbase") orelse return error.CoinMissingIsCoinbase) {
+        .bool => |b| b,
+        else => return error.CoinIsCoinbaseNotBool,
+    };
+    return .{ .txid_wire = wire, .vout = vout, .spk = spk, .value = value, .height = height, .is_coinbase = is_coinbase };
+}
+
+/// Append a coin's canonical digest bytes (matching the rustoshi-side
+/// view_digest format the corpus goldens were computed with):
+///   wire_txid[32] || vout u32 LE || height u32 LE || is_coinbase u8
+///   || value u64 LE || spk_len u32 LE || spk
+fn appendCoinDigestBytes(buf: *std.ArrayList(u8), c: ReorgCoin) !void {
+    try buf.appendSlice(&c.txid_wire);
+    var tmp4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &tmp4, c.vout, .little);
+    try buf.appendSlice(&tmp4);
+    std.mem.writeInt(u32, &tmp4, c.height, .little);
+    try buf.appendSlice(&tmp4);
+    try buf.append(if (c.is_coinbase) 1 else 0);
+    var tmp8: [8]u8 = undefined;
+    std.mem.writeInt(u64, &tmp8, @bitCast(c.value), .little);
+    try buf.appendSlice(&tmp8);
+    std.mem.writeInt(u32, &tmp4, @intCast(c.spk.len), .little);
+    try buf.appendSlice(&tmp4);
+    try buf.appendSlice(c.spk);
+}
+
+/// sha256 over the sorted (wire_txid, vout) canonical coins-view.
+fn coinsViewDigest(a: std.mem.Allocator, coins: []ReorgCoin) ![64]u8 {
+    std.mem.sort(ReorgCoin, coins, {}, struct {
+        fn lt(_: void, x: ReorgCoin, y: ReorgCoin) bool {
+            const c = std.mem.order(u8, &x.txid_wire, &y.txid_wire);
+            if (c != .eq) return c == .lt;
+            return x.vout < y.vout;
+        }
+    }.lt);
+    var buf = std.ArrayList(u8).init(a);
+    defer buf.deinit();
+    for (coins) |c| try appendCoinDigestBytes(&buf, c);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(buf.items, &digest, .{});
+    var hexbuf: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hexbuf, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch unreachable;
+    return hexbuf;
+}
+
+/// `reorg` op: DECISION-FIRST differential reorg. Drives clearbit's REAL
+/// mechanism-layer reorg (storage.zig::reorgToChainWithOptions →
+/// disconnectBlockByHashCFNoFlush + validation.acceptBlock +
+/// connectBlockFastWithUndoNoFlush + peer.zig::cmpChainWorkBE), NOT the
+/// P2P/activateBestChain decision layer (which reads live tip / first-seen).
+///
+/// Pipeline mirroring the reorgToChain contract exactly:
+///   (1) work-compare: cmpChainWorkBE(new, old) — STRICT new>old, else
+///       outcome=no-reorg-equal-or-less-work and the seeded view is untouched.
+///   (2) seed an explicit RocksDB-backed ChainState with the WORKING coins-view
+///       (fork_utxo), set network params so reorg-connect re-validation runs.
+///   (3) for the disconnect side, stage the old-branch block bodies + the
+///       explicit undo into CF_BLOCKS / CF_BLOCK_UNDO and set the tip, then
+///       reorgToChainWithOptions walks them tip-first through the REAL
+///       disconnectBlockByHashCFInner (4-field identity check + ApplyTxInUndo
+///       + BIP30 exemption).
+///   (4) connect side: each block re-validated via the REAL acceptBlock at its
+///       own height (full scripts+economics; force_skip_pow for the crafted
+///       headers), stopping at the first reject (connected_count = blocks that
+///       passed before it).
+///   (5) digest = sha256 over clearbit's REAL post-reorg coins-view.
+fn processReorg(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const network = try parseNetwork(switch (obj.get("network") orelse return error.MissingNetwork) {
+        .string => |s| s,
+        else => return error.NetworkNotString,
+    });
+    const old_work = try parseWork256(switch (obj.get("old_tip_work_hex") orelse return error.MissingOldWork) {
+        .string => |s| s,
+        else => return error.OldWorkNotString,
+    });
+    const new_work = try parseWork256(switch (obj.get("new_tip_work_hex") orelse return error.MissingNewWork) {
+        .string => |s| s,
+        else => return error.NewWorkNotString,
+    });
+
+    const peer = @import("peer.zig");
+
+    // Parse fork_utxo (the WORKING coins-view) into ReorgCoin[].
+    var fork_coins = std.ArrayList(ReorgCoin).init(a);
+    const fork_arr = (obj.get("fork_utxo") orelse return error.MissingForkUtxo).array.items;
+    for (fork_arr) |c| try fork_coins.append(try parseReorgCoin(a, c.object));
+
+    // ---- (1) work-compare: STRICT new>old via the REAL BE-256 comparator ----
+    if (peer.cmpChainWorkBE(&new_work, &old_work) <= 0) {
+        // No reorg: the view is UNTOUCHED. Digest the seeded fork_utxo directly
+        // (clearbit never opens a chainstate or evaluates any block here).
+        const digest = try coinsViewDigest(a, fork_coins.items);
+        try out.print(
+            "{{\"outcome\":\"no-reorg-equal-or-less-work\",\"connected_count\":0,\"fork_utxo_digest\":\"{s}\"}}\n",
+            .{digest},
+        );
+        return;
+    }
+
+    // ---- (2) seed an explicit RocksDB-backed ChainState ----
+    const params = consensus.getNetworkParams(network);
+
+    // Unique temp dir per request so concurrent runs never collide.
+    var seed_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&seed_bytes);
+    const tmp_path = try std.fmt.allocPrint(a, "/tmp/clearbit-reorg-{x}-{d}", .{
+        std.fmt.fmtSliceHexLower(&seed_bytes), std.time.milliTimestamp(),
+    });
+    std.fs.cwd().makePath(tmp_path) catch {};
+    defer std.fs.cwd().deleteTree(tmp_path) catch {};
+
+    var db = storage.Database.open(tmp_path, 64, a) catch |err| {
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"db open: {s}\"}}\n", .{reason});
+        return;
+    };
+    defer db.close();
+
+    var cs = storage.ChainState.initWithUndo(&db, 256, tmp_path, a);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    // CRITICAL: set network params so the reorg-connect side runs FULL script
+    // re-validation (else the network_params==null branch skips scripts and
+    // the flagship R1/R9 false-accept guard becomes a dead gate).
+    cs.setNetworkParams(params);
+
+    // Seed the WORKING coins-view (pre-disconnect view for disconnect vectors,
+    // fork-point view otherwise) into the REAL utxo_set.
+    for (fork_coins.items) |c| {
+        const op = types.OutPoint{ .hash = c.txid_wire, .index = c.vout };
+        const txout = types.TxOut{ .value = c.value, .script_pubkey = c.spk };
+        try cs.utxo_set.add(&op, &txout, c.height, c.is_coinbase);
+    }
+
+    const disc_arr: []const std.json.Value = if (obj.get("disconnect")) |d| switch (d) {
+        .array => |arr| arr.items,
+        else => &[_]std.json.Value{},
+    } else &[_]std.json.Value{};
+    const conn_arr: []const std.json.Value = if (obj.get("connect")) |c| switch (c) {
+        .array => |arr| arr.items,
+        else => &[_]std.json.Value{},
+    } else &[_]std.json.Value{};
+
+    var fork_point: types.Hash256 = [_]u8{0} ** 32;
+
+    // ---- (3) disconnect side ----
+    // Two faithful sub-paths into the SAME reorgToChainWithOptions:
+    //   (a) depth-cap probe (disconnect.len > MAX_REORG_DEPTH): build a REAL
+    //       linked coinbase-only old chain of that depth via the production
+    //       connectBlockFastWithUndo, so the disconnect WALK hits the
+    //       MAX_REORG_DEPTH=100 cap and returns error.ReorgTooDeep. The corpus
+    //       block bytes for this case are placeholders signalling "N deep".
+    //   (b) normal disconnect: stage each given old block body + explicit undo
+    //       into CF_BLOCKS/CF_BLOCK_UNDO and set the tip; reorgToChain walks
+    //       them through the REAL disconnectBlockByHashCFInner.
+    const depth_cap_probe = disc_arr.len > storage.ChainState.MAX_REORG_DEPTH;
+
+    if (depth_cap_probe) {
+        // Build a linked coinbase-only old chain of disc_arr.len blocks.
+        var prev: [32]u8 = [_]u8{0} ** 32;
+        var hh: u32 = 1;
+        while (hh <= disc_arr.len) : (hh += 1) {
+            const blk = try makeCoinbaseOnlyBlock(a, prev, hh);
+            const bh = crypto.computeBlockHash(&blk.header);
+            var w = serialize.Writer.init(a);
+            try serialize.writeBlock(&w, &blk);
+            const body: []u8 = @constCast(try w.toOwnedSlice());
+            try cs.queueBlockWrite(&bh, body, hh);
+            try cs.connectBlockFastWithUndo(&blk, &bh, hh);
+            prev = bh;
+        }
+        // fork_point = genesis (all-zero) so the walk must rewind every block.
+        fork_point = [_]u8{0} ** 32;
+    } else if (disc_arr.len > 0) {
+        // Stage each disconnect block (tip-first order in the corpus) into the
+        // CFs, chaining best_hash/best_height to the deepest. We push them so
+        // that block[0] is the tip; each block's prev_block is its parent.
+        // The corpus single-disconnect vectors use prev_block=0, so after
+        // disconnecting block[0] the tip rewinds to 0 = fork_point.
+        // For a multi-block (linked) disconnect, the corpus chains them.
+        var idx: usize = disc_arr.len;
+        // Store all bodies + undo first.
+        while (idx > 0) {
+            idx -= 1;
+            const dobj = disc_arr[idx].object;
+            const block_hex = switch (dobj.get("block_hex") orelse return error.DiscMissingBlockHex) {
+                .string => |s| s,
+                else => return error.DiscBlockHexNotString,
+            };
+            const block_bytes = try hexDecode(a, block_hex);
+            var rdr = serialize.Reader{ .data = block_bytes };
+            const blk = serialize.readBlock(&rdr, a) catch |err| {
+                const reason = try jsonEscape(a, @errorName(err));
+                try out.print("{{\"error\":\"disconnect block deserialize: {s}\"}}\n", .{reason});
+                return;
+            };
+            const bh = crypto.computeBlockHash(&blk.header);
+            const height: u32 = switch (dobj.get("height") orelse return error.DiscMissingHeight) {
+                .integer => |iv| @intCast(iv),
+                else => return error.DiscHeightNotInt,
+            };
+            // Store block body in CF_BLOCKS (disconnect reads it to remove
+            // created outputs).
+            try db.put(storage.CF_BLOCKS, &bh, block_bytes);
+            // Build + store the explicit undo in CF_BLOCK_UNDO.
+            const undo_bytes = try buildUndoBytes(a, dobj);
+            try db.put(storage.CF_BLOCK_UNDO, &bh, undo_bytes);
+            // The tip is the FIRST corpus entry (disc_arr[0]); the fork point
+            // is the parent of the LAST (deepest) entry.
+            if (idx == 0) {
+                cs.best_hash = bh;
+                cs.best_height = height;
+            }
+            if (idx == disc_arr.len - 1) {
+                fork_point = blk.header.prev_block;
+            }
+        }
+    }
+
+    // ---- forward-only fork-point + tip setup ----
+    // With no disconnect, the side branch grows directly from the fork point.
+    // The corpus crafts each connect block with prev_block=0 (the synthetic
+    // fork sentinel) and contiguous heights H, H+1, ...; the fork point is the
+    // synthetic parent of the FIRST connect block at height H-1.
+    if (disc_arr.len == 0 and conn_arr.len > 0) {
+        const first_h: u32 = switch (conn_arr[0].object.get("height") orelse return error.ConnMissingHeight) {
+            .integer => |iv| @intCast(iv),
+            else => return error.ConnHeightNotInt,
+        };
+        fork_point = [_]u8{0} ** 32;
+        cs.best_hash = fork_point;
+        cs.best_height = if (first_h > 0) first_h - 1 else 0;
+    }
+
+    // ---- build the new_chain ReorgBlock[] (ordered side-branch blocks) ----
+    // RELINK: clearbit's reorgToChain enforces a STRICT parent linkage
+    // (entry.block.header.prev_block == running tip) on every connect block —
+    // a real side branch is internally chained.  The crafted corpus blocks
+    // all carry prev_block=0 (rustoshi's op derived linkage implicitly from
+    // order), so we set each block's prev_block to its actual parent (fork
+    // point for the first, the prior connect block's recomputed hash for the
+    // rest) and recompute the hash.  This touches ONLY the header parent
+    // pointer — txids, scripts, amounts, merkle root and heights are
+    // unchanged, so the REAL re-validation (acceptBlock) runs over identical
+    // consensus content; we just give clearbit the explicit chaining its
+    // mechanism layer requires.
+    var new_chain = std.ArrayList(storage.ChainState.ReorgBlock).init(a);
+    var running_parent: types.Hash256 = fork_point;
+    for (conn_arr) |c| {
+        const cobj = c.object;
+        const block_hex = switch (cobj.get("block_hex") orelse return error.ConnMissingBlockHex) {
+            .string => |s| s,
+            else => return error.ConnBlockHexNotString,
+        };
+        const block_bytes = try hexDecode(a, block_hex);
+        var rdr = serialize.Reader{ .data = block_bytes };
+        var blk = serialize.readBlock(&rdr, a) catch |err| {
+            const reason = try jsonEscape(a, @errorName(err));
+            try out.print("{{\"error\":\"connect block deserialize: {s}\"}}\n", .{reason});
+            return;
+        };
+        const height: u32 = switch (cobj.get("height") orelse return error.ConnMissingHeight) {
+            .integer => |iv| @intCast(iv),
+            else => return error.ConnHeightNotInt,
+        };
+        blk.header.prev_block = running_parent;
+        const bh = crypto.computeBlockHash(&blk.header);
+        running_parent = bh;
+        try new_chain.append(.{ .hash = bh, .block = blk, .height = height });
+    }
+
+    // ---- (4) drive the REAL reorg mechanism ----
+    var drive_result = storage.ChainState.ReorgDriveResult{};
+    const drive_opts = storage.ChainState.ReorgDriveOptions{
+        .connect_force_skip_pow = true, // crafted nonce=0 headers (Core fCheckPOW=false)
+        .tolerate_unclean_disconnect = true, // UNCLEAN is logged-but-continue (Core ApplyTxInUndo)
+    };
+    const reorg_res = cs.reorgToChainWithOptions(&fork_point, new_chain.items, drive_opts, &drive_result);
+
+    const disc_result_str: []const u8 = if (drive_result.disconnect_unclean) "unclean" else "ok";
+
+    if (reorg_res) |connected| {
+        // reorg-applied. Compute the digest over clearbit's REAL final view.
+        const digest = try computeFinalDigest(a, &cs, fork_coins.items, disc_arr, conn_arr);
+        try out.print(
+            "{{\"outcome\":\"reorg-applied\",\"disconnect_result\":\"{s}\",\"connected_count\":{d},\"fork_utxo_digest\":\"{s}\"}}\n",
+            .{ disc_result_str, connected, digest },
+        );
+    } else |err| {
+        if (err == error.ReorgTooDeep) {
+            try out.print("{{\"outcome\":\"reorg-too-deep\",\"disconnect_result\":\"{s}\"}}\n", .{disc_result_str});
+            return;
+        }
+        // Connect-side validation reject (error.ReorgBlockInvalid) or a
+        // disconnect-side hard failure. Map the recorded validation error to
+        // the canonical Core reject token; the OUTCOME is what is scored.
+        const reason: []const u8 = if (drive_result.connect_reject_err) |verr|
+            connectErrToReason(verr)
+        else
+            @errorName(err);
+        const esc = try jsonEscape(a, reason);
+        try out.print(
+            "{{\"outcome\":\"reorg-rejected\",\"disconnect_result\":\"{s}\",\"connected_count\":{d},\"reject_reason\":\"{s}\"}}\n",
+            .{ disc_result_str, drive_result.connected_before_reject, esc },
+        );
+    }
+}
+
+/// Build a coinbase-only block at the given height with prev_block linkage.
+/// Used only to synthesize a deep linked old chain for the R10 depth-cap probe.
+fn makeCoinbaseOnlyBlock(a: std.mem.Allocator, prev: [32]u8, height: u32) !types.Block {
+    var ssig = std.ArrayList(u8).init(a);
+    // BIP34-ish height push + filler, kept >= 2 bytes.
+    var h = height;
+    var le = std.ArrayList(u8).init(a);
+    while (h > 0) {
+        try le.append(@intCast(h & 0xFF));
+        h >>= 8;
+    }
+    if (le.items.len == 0) try le.append(0);
+    try ssig.append(@intCast(le.items.len));
+    try ssig.appendSlice(le.items);
+    try ssig.append(0x00);
+    const cb_in = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = try ssig.toOwnedSlice(),
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_out = types.TxOut{ .value = 5000000000, .script_pubkey = try a.dupe(u8, &[_]u8{0x51}) };
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = try a.dupe(types.TxIn, &[_]types.TxIn{cb_in}),
+        .outputs = try a.dupe(types.TxOut, &[_]types.TxOut{cb_out}),
+        .lock_time = 0,
+    };
+    return types.Block{
+        .header = types.BlockHeader{
+            .version = 1,
+            .prev_block = prev,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 0x7FFFFFFE,
+            .bits = 0x207FFFFF,
+            .nonce = height, // unique nonce per height => unique block hash
+        },
+        .transactions = try a.dupe(types.Transaction, &[_]types.Transaction{cb_tx}),
+    };
+}
+
+/// Build CF_BLOCK_UNDO bytes for a disconnect block from its "undo" array.
+/// Each undo entry has tx_index + vin[] of coins (the prevouts that tx spent).
+/// We assemble a storage.BlockUndoData with one TxUndo per NON-coinbase tx in
+/// the block (tx_undo[i] ↔ block.transactions[i+1]), populating only the
+/// indices the corpus lists and leaving the rest empty.
+fn buildUndoBytes(a: std.mem.Allocator, dobj: std.json.ObjectMap) ![]const u8 {
+    const block_hex = switch (dobj.get("block_hex").?) {
+        .string => |s| s,
+        else => return error.DiscBlockHexNotString,
+    };
+    const block_bytes = try hexDecode(a, block_hex);
+    var rdr = serialize.Reader{ .data = block_bytes };
+    const blk = try serialize.readBlock(&rdr, a);
+    const n_noncoinbase = blk.transactions.len - 1;
+
+    var tx_undo = try a.alloc(storage.TxUndo, n_noncoinbase);
+    for (tx_undo) |*t| t.* = .{ .prev_outputs = &[_]storage.TxUndo.TxOut{} };
+
+    if (dobj.get("undo")) |uv| {
+        if (uv == .array) {
+            for (uv.array.items) |entry| {
+                const eobj = entry.object;
+                const tx_index: usize = switch (eobj.get("tx_index") orelse return error.UndoMissingTxIndex) {
+                    .integer => |iv| @intCast(iv),
+                    else => return error.UndoTxIndexNotInt,
+                };
+                if (tx_index == 0 or tx_index > n_noncoinbase) return error.UndoTxIndexRange;
+                const vin = (eobj.get("vin") orelse return error.UndoMissingVin).array.items;
+                var outs = try a.alloc(storage.TxUndo.TxOut, vin.len);
+                for (vin, 0..) |vc, vi| {
+                    const coin = try parseReorgCoin(a, vc.object);
+                    outs[vi] = .{
+                        .value = coin.value,
+                        .script_pubkey = coin.spk,
+                        .height = coin.height,
+                        .is_coinbase = coin.is_coinbase,
+                    };
+                }
+                tx_undo[tx_index - 1] = .{ .prev_outputs = outs };
+            }
+        }
+    }
+
+    var bud = storage.BlockUndoData{ .tx_undo = tx_undo };
+    return bud.toBytes(a);
+}
+
+/// Compute the digest over clearbit's REAL post-reorg coins-view by probing
+/// every candidate outpoint (fork_utxo ∪ disconnect-created ∪ undo-restored ∪
+/// connect-created ∪ connect-spent) against the REAL utxo_set and including
+/// only those clearbit reports LIVE — with clearbit's own stored coin data.
+fn computeFinalDigest(
+    a: std.mem.Allocator,
+    cs: *storage.ChainState,
+    fork_coins: []ReorgCoin,
+    disc_arr: []const std.json.Value,
+    conn_arr: []const std.json.Value,
+) ![64]u8 {
+    var candidates = std.AutoHashMap(OutPointKey, void).init(a);
+
+    // fork_utxo outpoints.
+    for (fork_coins) |c| try candidates.put(.{ .hash = c.txid_wire, .index = c.vout }, {});
+
+    // disconnect blocks: their created outputs + their undo-restored prevouts.
+    for (disc_arr) |dv| {
+        const dobj = dv.object;
+        if (dobj.get("block_hex")) |bh| {
+            if (bh == .string) {
+                const bytes = try hexDecode(a, bh.string);
+                var rdr = serialize.Reader{ .data = bytes };
+                if (serialize.readBlock(&rdr, a)) |blk| {
+                    for (blk.transactions) |tx| {
+                        const txid = crypto.computeTxidStreaming(&tx);
+                        for (0..tx.outputs.len) |o| try candidates.put(.{ .hash = txid, .index = @intCast(o) }, {});
+                        for (tx.inputs) |in| try candidates.put(.{ .hash = in.previous_output.hash, .index = in.previous_output.index }, {});
+                    }
+                } else |_| {}
+            }
+        }
+        if (dobj.get("undo")) |uv| {
+            if (uv == .array) for (uv.array.items) |entry| {
+                if (entry.object.get("vin")) |vv| if (vv == .array) for (vv.array.items) |vc| {
+                    const coin = try parseReorgCoin(a, vc.object);
+                    try candidates.put(.{ .hash = coin.txid_wire, .index = coin.vout }, {});
+                };
+            };
+        }
+    }
+
+    // connect blocks: their created outputs + spent inputs.
+    for (conn_arr) |cv| {
+        const cobj = cv.object;
+        if (cobj.get("block_hex")) |bh| if (bh == .string) {
+            const bytes = try hexDecode(a, bh.string);
+            var rdr = serialize.Reader{ .data = bytes };
+            if (serialize.readBlock(&rdr, a)) |blk| {
+                for (blk.transactions) |tx| {
+                    const txid = crypto.computeTxidStreaming(&tx);
+                    for (0..tx.outputs.len) |o| try candidates.put(.{ .hash = txid, .index = @intCast(o) }, {});
+                    for (tx.inputs) |in| try candidates.put(.{ .hash = in.previous_output.hash, .index = in.previous_output.index }, {});
+                }
+            } else |_| {}
+        };
+    }
+
+    // Probe each candidate against the REAL utxo_set; collect the live coins
+    // with clearbit's own stored value/height/is_coinbase + reconstructed spk.
+    var live = std.ArrayList(ReorgCoin).init(a);
+    var it = candidates.keyIterator();
+    while (it.next()) |k| {
+        const op = types.OutPoint{ .hash = k.hash, .index = k.index };
+        if (cs.utxo_set.get(&op) catch null) |compact_const| {
+            var compact = compact_const;
+            defer compact.deinit(a);
+            const spk = try compact.reconstructScript(a);
+            try live.append(.{
+                .txid_wire = k.hash,
+                .vout = k.index,
+                .spk = spk,
+                .value = compact.value,
+                .height = compact.height,
+                .is_coinbase = compact.is_coinbase,
+            });
+        }
+    }
+
+    return coinsViewDigest(a, live.items);
+}
+
 /// Parse an 8-hex compact-bits string (Core getblockheader "bits" format,
 /// big-endian hex of the u32) into a u32. Errors (=> {"error"}, driver
 /// SKIPS) on any malformed input rather than fabricating a value.
@@ -901,6 +1430,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
         return processConnecttx(a, obj, out);
     } else if (std.mem.eql(u8, op, "checkblock")) {
         return processCheckblock(a, obj, out);
+    } else if (std.mem.eql(u8, op, "reorg")) {
+        return processReorg(a, obj, out);
     } else if (std.mem.eql(u8, op, "nextwork")) {
         return processNextwork(a, obj, out);
     } else if (std.mem.eql(u8, op, "merkleroot")) {
