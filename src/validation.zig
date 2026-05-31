@@ -1439,6 +1439,19 @@ pub fn validateBlockForIBD(
     // locks are enforced (see step 7b below).
     var seq_lock_utxo_info = std.AutoHashMap(OutpointKey, UtxoInfo).init(arena_alloc);
 
+    // Track every prevout consumed so far in THIS block so a second spend of
+    // the same coin (an in-block double-spend, e.g. a CVE-2012-2459
+    // duplicate-tx malleation, or any two txs referencing the same outpoint)
+    // is rejected.  Core models this with CCoinsViewCache::SpendCoin removing
+    // the coin from the view; the next CheckTxInputs → view.HaveInputs miss
+    // yields "bad-txns-inputs-missingorspent" (validation.cpp:866 via
+    // ConnectBlock CheckTxInputs at 2535).  Our prevout view is read-only
+    // (the intra-block `prevouts` map is only added to, and the external
+    // lookup fn re-returns coins indefinitely), so without this explicit
+    // spent-set the same outpoint could be consumed twice and the block would
+    // false-ACCEPT.  Height-independent: this invariant holds at every height.
+    var spent = std.AutoHashMap(OutpointKey, void).init(arena_alloc);
+
     // Collect tx hashes upfront for intra-block stitching (output -> tx hash).
     const tx_hashes = arena_alloc.alloc(types.Hash256, block.transactions.len) catch
         return ValidationError.OutOfMemory;
@@ -1461,6 +1474,12 @@ pub fn validateBlockForIBD(
                 const idx_le = std.mem.nativeToLittle(u32, @intCast(input.previous_output.index));
                 @memcpy(key[32..36], std.mem.asBytes(&idx_le));
 
+                // In-block double-spend: this exact outpoint was already
+                // consumed by an earlier input/tx in this block.  Core's
+                // CCoinsViewCache::SpendCoin already removed it, so the
+                // re-spend misses HaveInputs → bad-txns-inputs-missingorspent.
+                if (spent.contains(key)) return ValidationError.InputAlreadySpent;
+
                 // Check intra-block first.
                 if (prevouts.get(key)) |entry| {
                     // Per-coin value range check (same as chainstate path).
@@ -1471,12 +1490,16 @@ pub fn validateBlockForIBD(
                     // Intra-block prevouts are never coinbase (coinbase is
                     // tx_idx == 0; non-coinbase outputs are spendable
                     // immediately within the same block per Core).
+                    spent.put(key, {}) catch return ValidationError.OutOfMemory;
                     continue;
                 }
 
                 // Resolve from the chainstate UTXO set via the lookup fn.
                 const info = ctx.prevout_lookupFn(ctx.prevout_lookup_ctx, &input.previous_output) orelse
                     return ValidationError.MissingInput;
+                // Mark consumed (Core view.SpendCoin); a later input in this
+                // block referencing the same outpoint now fails above.
+                spent.put(key, {}) catch return ValidationError.OutOfMemory;
                 defer if (info.owner_allocator) |a| a.free(info.script_pubkey);
 
                 // Coinbase maturity: use explicit < guard before subtraction to
