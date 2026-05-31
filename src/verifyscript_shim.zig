@@ -364,6 +364,153 @@ fn processVerifytx(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) 
     try out.writeAll("{\"valid\":true}\n");
 }
 
+/// In-memory coin for the connecttx UTXO view: the spent output's
+/// scriptPubKey + value + the metadata Core's CheckTxInputs needs
+/// (coin.nHeight + fCoinBase). One entry per request prevout; an OMITTED
+/// outpoint models a missing/spent input.
+const ConnectCoin = struct {
+    spk: []const u8,
+    value: i64,
+    height: u32,
+    is_coinbase: bool,
+};
+
+/// Map a connecttx ValidationError to the canonical Core "bad-txns-*" reject
+/// token. Mirrors rpc.zig:6307 validationErrToBip22 for the CheckTxInputs
+/// subset (the connecttx op only surfaces these economic errors). The reason
+/// is informational; the DECISION (valid=false) is what is scored.
+fn connectErrToReason(err: validation.ValidationError) []const u8 {
+    return switch (err) {
+        error.MissingInput, error.InputAlreadySpent => "bad-txns-inputs-missingorspent",
+        error.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
+        error.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
+        error.InsufficientFunds => "bad-txns-in-belowout",
+        else => @errorName(err),
+    };
+}
+
+/// `connecttx` op: drives clearbit's REAL connect-time economic check
+/// (validation.zig::checkTxInputs — the script-free extraction of the per-tx
+/// body in validateBlockForIBD / Core Consensus::CheckTxInputs,
+/// tx_verify.cpp:164-214): the no-inflation rule value-in >= value-out
+/// (bad-txns-in-belowout), per-input + running-sum MoneyRange
+/// (bad-txns-inputvalues-outofrange), coinbase maturity 100
+/// (bad-txns-premature-spend-of-coinbase), and missing/spent inputs
+/// (bad-txns-inputs-missingorspent).
+///
+/// Seeds an in-memory UTXO VIEW with one coin per request prevout entry
+/// (value + height + is_coinbase). An OMITTED prevout models a
+/// missing/spent input → MissingInput. We DO NOT run script verification
+/// here (this op isolates the economic verdict — a script failure must not
+/// mask the monetary decision), and we DO NOT re-implement value-in>=out in
+/// the shim: the decision comes entirely from checkTxInputs.
+///
+///   request:  {"op":"connecttx","tx_hex":"...",
+///              "prevouts":[{"txid":"<display-hex>","vout":N,
+///                           "scriptPubKey_hex":"...","value_sats":<i64>,
+///                           "height":<int>,"is_coinbase":<bool>},...],
+///              "spend_height":<int>}
+///   response: {"valid":true,"fee_sats":<i64>}   (CheckTxInputs accepts)
+///             {"valid":false,"reason":"bad-txns-*"} (economic reject)
+///             {"error":"..."}                   (could not evaluate → SKIP)
+fn processConnecttx(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const tx_hex = switch (obj.get("tx_hex") orelse return error.MissingTxHex) {
+        .string => |s| s,
+        else => return error.TxHexNotString,
+    };
+    const tx_bytes = try hexDecode(a, tx_hex);
+
+    var reader = serialize.Reader{ .data = tx_bytes };
+    const tx = serialize.readTransaction(&reader, a) catch |err| {
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"tx deserialize: {s}\"}}\n", .{reason});
+        return;
+    };
+
+    const spend_height: u32 = switch (obj.get("spend_height") orelse return error.MissingSpendHeight) {
+        .integer => |iv| @intCast(iv),
+        else => return error.SpendHeightNotInt,
+    };
+
+    // Seed the in-memory UTXO view: one coin per prevout entry, keyed by
+    // (wire-order txid, vout). Reuse the verifytx display->wire txid reversal.
+    var view = std.AutoHashMap(OutPointKey, ConnectCoin).init(a);
+    const prevouts = (obj.get("prevouts") orelse return error.MissingPrevouts).array.items;
+    for (prevouts) |p| {
+        const po = p.object;
+        const txid_disp = switch (po.get("txid") orelse return error.PrevoutMissingTxid) {
+            .string => |s| s,
+            else => return error.PrevoutTxidNotString,
+        };
+        const txid_disp_bytes = try hexDecode(a, txid_disp);
+        if (txid_disp_bytes.len != 32) return error.PrevoutTxidLen;
+        var wire_hash: [32]u8 = undefined;
+        for (0..32) |i| wire_hash[i] = txid_disp_bytes[31 - i];
+
+        const vout: u32 = switch (po.get("vout") orelse return error.PrevoutMissingVout) {
+            .integer => |iv| @truncate(@as(u64, @bitCast(iv))),
+            else => return error.PrevoutVoutNotInt,
+        };
+
+        const spk = try hexDecode(a, switch (po.get("scriptPubKey_hex") orelse return error.PrevoutMissingSpk) {
+            .string => |s| s,
+            else => return error.PrevoutSpkNotString,
+        });
+
+        const value: i64 = switch (po.get("value_sats") orelse return error.PrevoutMissingValue) {
+            .integer => |iv| iv,
+            else => return error.PrevoutValueNotInt,
+        };
+
+        const height: u32 = switch (po.get("height") orelse return error.PrevoutMissingHeight) {
+            .integer => |iv| @intCast(iv),
+            else => return error.PrevoutHeightNotInt,
+        };
+
+        const is_coinbase: bool = switch (po.get("is_coinbase") orelse return error.PrevoutMissingIsCoinbase) {
+            .bool => |b| b,
+            else => return error.PrevoutIsCoinbaseNotBool,
+        };
+
+        try view.put(.{ .hash = wire_hash, .index = vout }, .{
+            .spk = spk,
+            .value = value,
+            .height = height,
+            .is_coinbase = is_coinbase,
+        });
+    }
+
+    // Lookup closure over the seeded view. Returns the coin as a
+    // validation.PrevOutInfo (owner_allocator=null: scripts borrow the arena,
+    // never freed by checkTxInputs). A miss => null => MissingInput.
+    const View = struct {
+        map: *std.AutoHashMap(OutPointKey, ConnectCoin),
+        fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.PrevOutInfo {
+            const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const key = OutPointKey{ .hash = outpoint.hash, .index = outpoint.index };
+            const coin = me.map.get(key) orelse return null;
+            return .{
+                .script_pubkey = coin.spk,
+                .amount = coin.value,
+                .height = coin.height,
+                .is_coinbase = coin.is_coinbase,
+                .owner_allocator = null,
+            };
+        }
+    };
+    var view_ctx = View{ .map = &view };
+
+    // Drive clearbit's REAL connect-time economic check. NO script verify,
+    // NO shim-side re-implementation of value-in>=out / maturity / missing.
+    const fee = validation.checkTxInputs(&tx, spend_height, &view_ctx, View.lookup) catch |err| {
+        const reason = try jsonEscape(a, connectErrToReason(err));
+        try out.print("{{\"valid\":false,\"reason\":\"{s}\"}}\n", .{reason});
+        return;
+    };
+
+    try out.print("{{\"valid\":true,\"fee_sats\":{d}}}\n", .{fee});
+}
+
 /// Parse an 8-hex compact-bits string (Core getblockheader "bits" format,
 /// big-endian hex of the u32) into a u32. Errors (=> {"error"}, driver
 /// SKIPS) on any malformed input rather than fabricating a value.
@@ -576,6 +723,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
         return processVerifytx(a, obj, out);
     } else if (std.mem.eql(u8, op, "checktx")) {
         return processChecktx(a, obj, out);
+    } else if (std.mem.eql(u8, op, "connecttx")) {
+        return processConnecttx(a, obj, out);
     } else if (std.mem.eql(u8, op, "nextwork")) {
         return processNextwork(a, obj, out);
     } else if (std.mem.eql(u8, op, "merkleroot")) {

@@ -453,6 +453,72 @@ pub fn checkTransactionContextual(
     return total_in - total_out;
 }
 
+/// Connect-time per-tx economic check — a faithful, script-free extraction
+/// of Bitcoin Core's `Consensus::CheckTxInputs` (consensus/tx_verify.cpp:164-214)
+/// and of the per-tx body inside `validateBlockForIBD` (the same four
+/// invariants the block-connect path enforces):
+///   1. every input must resolve in the UTXO view (else MissingInput →
+///      "bad-txns-inputs-missingorspent");
+///   2. coinbase maturity: a spent coinbase coin must be at least
+///      COINBASE_MATURITY (100) blocks deep, i.e.
+///      spend_height - coin.height >= 100 (else ImmatureCoinbase →
+///      "bad-txns-premature-spend-of-coinbase");
+///   3. per-input AND running-sum MoneyRange (else InputValuesOutOfRange →
+///      "bad-txns-inputvalues-outofrange");
+///   4. no inflation: sum(value_in) >= sum(value_out) (else InsufficientFunds
+///      → "bad-txns-in-belowout").
+///
+/// SCRIPT verification is intentionally NOT performed here: this isolates the
+/// monetary verdict so a script failure can never mask the economic decision.
+/// The block-connect path (`validateBlockForIBD` / `checkTransactionContextual`)
+/// runs the SAME invariants; this is the shared logic exposed as a reusable
+/// unit, not a re-implementation. Returns the fee (value_in - value_out) on
+/// success. Coinbase txs short-circuit to fee 0 (Core's CheckTxInputs is
+/// only called on non-coinbase txs).
+///
+/// `prevout_lookupFn` resolves an outpoint to its coin (script not needed for
+/// the economic check, but PrevOutInfo carries value/height/is_coinbase which
+/// are). Returning null models a missing/spent input.
+pub fn checkTxInputs(
+    tx: *const types.Transaction,
+    spend_height: u32,
+    prevout_lookup_ctx: *anyopaque,
+    prevout_lookupFn: *const fn (ctx: *anyopaque, outpoint: *const types.OutPoint) ?PrevOutInfo,
+) ValidationError!i64 {
+    if (tx.isCoinbase()) return 0;
+
+    var value_in: i64 = 0;
+    for (tx.inputs) |input| {
+        const info = prevout_lookupFn(prevout_lookup_ctx, &input.previous_output) orelse
+            return ValidationError.MissingInput;
+        defer if (info.owner_allocator) |al| al.free(info.script_pubkey);
+
+        // Coinbase maturity. Core tx_verify.cpp:179-182:
+        //   nSpendHeight - coin.nHeight < COINBASE_MATURITY.
+        // Explicit < guard before the subtraction avoids u32 wrap-around.
+        if (info.is_coinbase and
+            (spend_height < info.height or
+            spend_height - info.height < consensus.COINBASE_MATURITY))
+        {
+            return ValidationError.ImmatureCoinbase;
+        }
+
+        // Per-input value range (CVE-2010-5139). tx_verify.cpp:186.
+        if (!consensus.isValidMoney(info.amount)) return ValidationError.InputValuesOutOfRange;
+        value_in += info.amount;
+        // Running-sum value range. tx_verify.cpp:186.
+        if (!consensus.isValidMoney(value_in)) return ValidationError.InputValuesOutOfRange;
+    }
+
+    var value_out: i64 = 0;
+    for (tx.outputs) |out| value_out += out.value;
+
+    // No inflation. tx_verify.cpp (bad-txns-in-belowout).
+    if (value_in < value_out) return ValidationError.InsufficientFunds;
+
+    return value_in - value_out;
+}
+
 // ============================================================================
 // Sigop Counting
 // ============================================================================
