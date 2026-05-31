@@ -3887,10 +3887,62 @@ pub const ChainState = struct {
     /// Returns the number of blocks connected on the new chain on
     /// success.  Errors are propagated from the underlying
     /// per-block helpers.
+    /// Flag-gated, default-OFF knobs for driving `reorgToChainWithOptions`
+    /// from the Phase B differential shim against crafted-synthetic blocks.
+    /// Every field defaults to the production behaviour, so the
+    /// `reorgToChain` wrapper below is byte-identical to the pre-refactor
+    /// function for the live node, the RPC submitblock reorg path, and the
+    /// in-process tests — none of which construct this struct.
+    pub const ReorgDriveOptions = struct {
+        /// Connect-side `acceptBlock` is called with `force_skip_pow=true`
+        /// (Core `CheckBlock(..., fCheckPOW=false)` parity, validation.cpp).
+        /// The crafted reorg vectors carry trivial nonce=0 headers that miss
+        /// even the regtest powLimit target by construction; without this the
+        /// re-validation would reject on `high-hash` and the script/economic
+        /// gate the vectors actually probe would be a silent dead-gate.
+        /// Production reorg blocks are real-mined, so default false keeps the
+        /// full PoW gate.
+        connect_force_skip_pow: bool = false,
+        /// Treat a DISCONNECT_UNCLEAN from the disconnect walk as non-fatal:
+        /// the undo mutations + tip rewind have already been applied by the
+        /// REAL `disconnectBlockByHashCFInner` (it returns
+        /// `error.DisconnectUnclean` only AFTER applying), so the reorg
+        /// proceeds to the connect phase.  Mirrors the rustoshi/Core-
+        /// DisconnectBlock convention that UNCLEAN is a logged-but-continue
+        /// signal; clearbit's production `reorgToChain` instead aborts on
+        /// UNCLEAN (Core DisconnectTip `!= DISCONNECT_OK`), so default false.
+        tolerate_unclean_disconnect: bool = false,
+    };
+
+    /// Out-param record filled by `reorgToChainWithOptions` so the shim can
+    /// report the decision-first fields (disconnect cleanliness, the connect
+    /// block that rejected and its validation error) without changing the
+    /// `!u32` return contract every production caller relies on.
+    pub const ReorgDriveResult = struct {
+        disconnect_unclean: bool = false,
+        connect_reject_err: ?@import("validation.zig").ValidationError = null,
+        /// Number of new-chain blocks that fully connected (passed
+        /// acceptBlock + connectBlockFastWithUndoNoFlush) BEFORE the reject.
+        /// On the success path this equals the function's `!u32` return value;
+        /// on the reject path the function returns error.ReorgBlockInvalid, so
+        /// this is how the shim recovers `connected_count`.
+        connected_before_reject: u32 = 0,
+    };
+
     pub fn reorgToChain(
         self: *ChainState,
         fork_point_hash: *const types.Hash256,
         new_chain: []const ReorgBlock,
+    ) !u32 {
+        return self.reorgToChainWithOptions(fork_point_hash, new_chain, .{}, null);
+    }
+
+    pub fn reorgToChainWithOptions(
+        self: *ChainState,
+        fork_point_hash: *const types.Hash256,
+        new_chain: []const ReorgBlock,
+        drive_opts: ReorgDriveOptions,
+        drive_result: ?*ReorgDriveResult,
     ) !u32 {
         // Pattern D bound: reject any reorg whose new-chain segment alone
         // would exceed the in-memory queue cap, before even starting the
@@ -3938,7 +3990,24 @@ pub const ChainState = struct {
                 return error.ForkPointNotOnChain;
             }
             const tip_hash_copy = self.best_hash;
-            try self.disconnectBlockByHashCFNoFlush(&tip_hash_copy);
+            if (drive_opts.tolerate_unclean_disconnect) {
+                // The REAL disconnect applies all undo mutations + tip rewind
+                // BEFORE it returns error.DisconnectUnclean (see
+                // disconnectBlockByHashCFInner G21/G22), so on UNCLEAN we
+                // record the signal and continue — the chain-state is already
+                // correctly rewound for this block.  Any OTHER error is still
+                // fatal (corrupt undo, missing body, height mismatch) and
+                // aborts via errdefer.
+                self.disconnectBlockByHashCFNoFlush(&tip_hash_copy) catch |err| {
+                    if (err == error.DisconnectUnclean) {
+                        if (drive_result) |dr| dr.disconnect_unclean = true;
+                    } else {
+                        return err;
+                    }
+                };
+            } else {
+                try self.disconnectBlockByHashCFNoFlush(&tip_hash_copy);
+            }
             disconnect_count += 1;
         }
 
@@ -4066,6 +4135,10 @@ pub const ChainState = struct {
                         .prev_block_timestamp = 0,
                         .current_time = 0,
                         .force_skip_scripts = false,
+                        // Flag-gated PoW skip for the crafted-synthetic Phase B
+                        // vectors (Core fCheckPOW=false parity); default false
+                        // keeps the full PoW gate for real-mined reorg blocks.
+                        .force_skip_pow = drive_opts.connect_force_skip_pow,
                         // Reorg fork bodies are explicitly requested via
                         // getdata, so suppress the fTooFarAhead ceiling (the
                         // same is_requested=true the IBD drain path uses).
@@ -4077,6 +4150,13 @@ pub const ChainState = struct {
                         "reorgToChain: REJECT side-branch block at height {d} validation={} — aborting reorg\n",
                         .{ entry.height, err },
                     );
+                    // Record the exact validation error for the shim's
+                    // decision-first reporting before collapsing it to the
+                    // single reorg-abort error the production callers expect.
+                    if (drive_result) |dr| {
+                        dr.connect_reject_err = err;
+                        dr.connected_before_reject = connect_count;
+                    }
                     // errdefer abortReorgInProgress() drops the pending queues
                     // and sets flush_error sticky; nothing has been flushed, so
                     // the on-disk chain stays at the pre-reorg tip.  Map every
