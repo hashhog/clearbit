@@ -1806,6 +1806,17 @@ pub const AcceptBlockOptions = struct {
     active_tip_height: u32 = 0,
     /// See IBDValidationContext.is_requested.  true = skip fTooFarAhead ceiling.
     is_requested: bool = false,
+    /// See IBDValidationContext.active_chain.  Optional height->hash map of the
+    /// active chain, used ONLY by the BIP-30/BIP-34 short-circuit gate to verify
+    /// that the block at params.bip34_height carries the canonical BIP34Hash.
+    /// Default null preserves the conservative "enforce BIP-30 when chain is
+    /// unavailable" behaviour (W79 gate G4); the live peer.zig/sync.zig callers
+    /// pass it through to validateBlockForIBD directly so they already get the
+    /// short-circuit (W79 gate G3).  Exposed here so the validate-only
+    /// differential `checkblock` shim can exercise the SAME short-circuit the
+    /// live node uses at post-BIP34 heights (Core validation.cpp:2460-2462:
+    /// pindexBIP34height->GetBlockHash() == BIP34Hash).
+    active_chain: ?[]const types.Hash256 = null,
 };
 
 /// Unified block consensus-validation entry point.
@@ -1841,7 +1852,7 @@ pub fn acceptBlock(
         .params = params,
         .prevout_lookup_ctx = prevout_lookup_ctx,
         .prevout_lookupFn = prevout_lookupFn,
-        .active_chain = null,
+        .active_chain = options.active_chain,
         .best_tip_chain_work = [_]u8{0} ** 32,
         .best_tip_timestamp = 0,
         .prev_mtp = options.prev_mtp,
