@@ -534,6 +534,28 @@ fn processMerkleroot(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype
     );
 }
 
+/// `subsidy` op: differential block-subsidy. Drives clearbit's REAL
+/// consensus.getBlockSubsidy (src/consensus.zig:865) at MAINNET params
+/// (consensus.getNetworkParams(.mainnet), halving interval 210000) — the
+/// SAME function block validation / ConnectBlock uses for the coinbase
+/// output cap. We do NOT reimplement the halving schedule here, so a bug in
+/// the impl's fn (halving-boundary off-by-one, missing >=64 zero-guard,
+/// shift overflow) surfaces as a divergence.
+///
+///   request:  {"op":"subsidy","height":<int>}
+///   response: {"subsidy_sats":<int>}   (the impl's REAL subsidy in sats)
+///             {"error":"..."}          (could not compute => driver SKIPS)
+fn processSubsidy(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    _ = a;
+    const height: u32 = switch (obj.get("height") orelse return error.MissingHeight) {
+        .integer => |iv| std.math.cast(u32, iv) orelse return error.HeightOutOfRange,
+        else => return error.HeightNotInt,
+    };
+    const params = consensus.getNetworkParams(.mainnet);
+    const subsidy = consensus.getBlockSubsidy(height, params);
+    try out.print("{{\"subsidy_sats\":{d}}}\n", .{subsidy});
+}
+
 /// Process one request line; dispatches on the JSON "op" field (default
 /// "verifyscript" for back-compat). On success writes the response, on
 /// failure returns an error which main() turns into {"error":...}.
@@ -558,6 +580,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
         return processNextwork(a, obj, out);
     } else if (std.mem.eql(u8, op, "merkleroot")) {
         return processMerkleroot(a, obj, out);
+    } else if (std.mem.eql(u8, op, "subsidy")) {
+        return processSubsidy(a, obj, out);
     } else if (!std.mem.eql(u8, op, "verifyscript")) {
         return error.UnknownOp;
     }
