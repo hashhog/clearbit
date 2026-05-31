@@ -832,8 +832,25 @@ pub fn checkBlock(
     params: *const consensus.NetworkParams,
     allocator: std.mem.Allocator,
 ) ValidationError!void {
+    return checkBlockPow(block, height, params, allocator, true);
+}
+
+/// CheckBlock with an explicit fCheckPOW flag, mirroring Core's
+/// `CheckBlock(block, state, params, fCheckPOW, fCheckMerkleRoot)`
+/// (validation.cpp).  `check_pow=false` bypasses ONLY the header PoW gate;
+/// every other structural check still runs.  The public `checkBlock` wrapper
+/// passes `check_pow=true` so existing callers/tests are unaffected.
+pub fn checkBlockPow(
+    block: *const types.Block,
+    height: u32,
+    params: *const consensus.NetworkParams,
+    allocator: std.mem.Allocator,
+    check_pow: bool,
+) ValidationError!void {
     // 1. Validate header
-    try checkBlockHeader(&block.header, params);
+    if (check_pow) {
+        try checkBlockHeader(&block.header, params);
+    }
 
     // 2. Must have at least one transaction (the coinbase)
     if (block.transactions.len == 0) return ValidationError.FirstTxNotCoinbase;
@@ -1150,6 +1167,18 @@ pub const IBDValidationContext = struct {
     /// set this to true so script verification is skipped.  Default false.
     /// Non-script consensus checks are NEVER skipped regardless.
     force_skip_scripts: bool = false,
+    /// Caller-provided override to SKIP the header proof-of-work check
+    /// (target ≤ powLimit AND hash ≤ target) in checkBlockHeader.  Faithful
+    /// parity with Core's `CheckBlock(block, state, params, fCheckPOW)` /
+    /// `CheckBlockHeader(..., fCheckPOW)` (validation.cpp): when fCheckPOW is
+    /// false the PoW gate is bypassed while EVERY other consensus check still
+    /// runs.  Default false = current behaviour (PoW always enforced); the
+    /// live IBD / submitblock / sync callers never set this, so they are
+    /// unaffected.  Used ONLY by the validate-only differential `checkblock`
+    /// shim, where the corpus block bytes are FINAL/mutated and intentionally
+    /// miss the mainnet target — without this skip a body mutant would reject
+    /// on high-hash and the body gate would be a silent dead-gate.
+    force_skip_pow: bool = false,
     /// Optional callback for BIP-68 time-based sequence lock evaluation.
     /// Given a block height H, returns the MTP of the block at height H
     /// (i.e. the median of block H and up to 10 of its ancestors), matching
@@ -1222,8 +1251,13 @@ pub fn validateBlockForIBD(
         }
     }
 
-    // 1. Header PoW.
-    try checkBlockHeader(&block.header, params);
+    // 1. Header PoW.  Flag-gated to mirror Core's CheckBlock(..., fCheckPOW):
+    // when force_skip_pow is set the PoW gate (target ≤ powLimit AND
+    // hash ≤ target) is bypassed while EVERY other consensus check below still
+    // runs.  Default false = current behaviour; live callers never set it.
+    if (!ctx.force_skip_pow) {
+        try checkBlockHeader(&block.header, params);
+    }
 
     // 1a. BIP-113 MTP-of-11 check (ContextualCheckBlockHeader in Core).
     // block.header.timestamp must be strictly greater than the median-time-past
@@ -1299,8 +1333,11 @@ pub fn validateBlockForIBD(
     }
 
     // 2. Per-block sanity: coinbase position, merkle root, weight, BIP-34,
-    // witness commitment, legacy sigop budget.
-    try checkBlock(block, height, params, allocator);
+    // witness commitment, legacy sigop budget.  PoW is gated by the SAME
+    // force_skip_pow flag as step 1 above (checkBlock re-runs CheckBlockHeader
+    // internally; without this the PoW gate would be an un-skippable second
+    // check and force_skip_pow would be a silent dead-gate on body mutants).
+    try checkBlockPow(block, height, params, allocator, !ctx.force_skip_pow);
 
     // 2b. BIP-30: reject any block whose transactions would overwrite an
     // existing unspent output (CVE-2012-1909).
@@ -1730,6 +1767,11 @@ pub fn validateBlockForIBD(
 pub const AcceptBlockOptions = struct {
     prev_mtp: u32 = 0,
     force_skip_scripts: bool = false,
+    /// See IBDValidationContext.force_skip_pow.  Default false = PoW always
+    /// enforced (current behaviour); live IBD / submitblock / sync callers
+    /// never set it, so they are unaffected.  Set true ONLY by the
+    /// validate-only differential `checkblock` shim (Core fCheckPOW parity).
+    force_skip_pow: bool = false,
     /// Optional: see IBDValidationContext.getMtpAtHeightFn.
     getMtpAtHeightFn: ?*const fn (ctx: *anyopaque, height: u32) u32 = null,
     getMtpAtHeightCtx: ?*anyopaque = null,
@@ -1783,6 +1825,7 @@ pub fn acceptBlock(
         .prev_block_timestamp = options.prev_block_timestamp,
         .current_time = options.current_time,
         .force_skip_scripts = options.force_skip_scripts,
+        .force_skip_pow = options.force_skip_pow,
         .getMtpAtHeightFn = options.getMtpAtHeightFn,
         .getMtpAtHeightCtx = options.getMtpAtHeightCtx,
         .active_tip_height = options.active_tip_height,
