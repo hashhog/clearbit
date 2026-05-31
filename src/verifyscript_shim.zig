@@ -385,6 +385,20 @@ fn connectErrToReason(err: validation.ValidationError) []const u8 {
         error.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
         error.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
         error.InsufficientFunds => "bad-txns-in-belowout",
+        // Block-level (checkblock op) connect/check errors -> canonical Core
+        // BIP22 reject tokens.  Advisory only; the valid bool is scored.
+        error.BadCoinbaseValue => "bad-cb-amount",
+        error.TooManySigops => "bad-blk-sigops",
+        error.BadBlockWeight => "bad-blk-length",
+        error.BadCoinbaseHeight => "bad-cb-height",
+        error.BadWitnessCommitment => "bad-witness-merkle-match",
+        error.UnexpectedWitness => "unexpected-witness",
+        error.BadMerkleRoot => "bad-txnmrklroot",
+        error.DuplicateTx => "bad-txns-duplicate",
+        error.FirstTxNotCoinbase => "bad-cb-missing",
+        error.MultipleCoinbase => "bad-cb-multiple",
+        error.BadProofOfWork => "high-hash",
+        error.BadDifficulty => "bad-diffbits",
         else => @errorName(err),
     };
 }
@@ -509,6 +523,166 @@ fn processConnecttx(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype)
     };
 
     try out.print("{{\"valid\":true,\"fee_sats\":{d}}}\n", .{fee});
+}
+
+/// `checkblock` op: DECISION-LEVEL block validation (VALIDATE-ONLY). Drives
+/// clearbit's REAL block-accept pipeline — validation.acceptBlock ->
+/// validateBlockForIBD — which runs Core's CheckBlock (coinbase position +
+/// sanity, merkle root, weight, BIP-34 height, BIP-141 witness commitment,
+/// legacy sigops) -> ContextualCheckBlock (IsFinalTx, version gates) ->
+/// ConnectBlock-equivalent (seeded UTXO view -> per-input value sums + fee,
+/// coinbase value <= subsidy + fees, full P2SH/witness sigop budget, REAL
+/// script verification) — at MAINNET params with spend_height 709742
+/// (post-Taproot: every mainnet deployment active).
+///
+/// VALIDATE-ONLY contract: the block_hex is FINAL/mutated bytes; we deserialize
+/// and validate AS-IS (do NOT recompute the merkle root, do NOT re-mutate).
+/// `skip_pow=true` (Core fCheckPOW=false parity) bypasses ONLY the header PoW
+/// gate via the new validation.AcceptBlockOptions.force_skip_pow flag — every
+/// other consensus check still runs. The corpus bytes miss the mainnet target
+/// by construction, so if skip_pow were not wired a body mutant would reject on
+/// high-hash and the body gate would be a SILENT DEAD-GATE.
+///
+/// Seeds the SAME in-memory UTXO View as connecttx — one coin per request
+/// prevout (one per NON-COINBASE input across all non-coinbase txs), keyed by
+/// (wire-order txid, vout). An OMITTED prevout models a missing/spent input.
+///
+///   request:  {"op":"checkblock","block_hex":"<FINAL block bytes>",
+///              "prevouts":[{"txid":"<display-hex>","vout":N,
+///                           "scriptPubKey_hex":"...","value_sats":<u64>,
+///                           "height":N,"is_coinbase":bool},...],
+///              "spend_height":709742,"skip_pow":true,"skip_scripts":false}
+///   response: {"valid":true}                    (block accepted)
+///             {"valid":false,"reason":"<token>"} (rejected; advisory token)
+///             {"error":"..."}                    (could not evaluate => SKIP)
+fn processCheckblock(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const block_hex = switch (obj.get("block_hex") orelse return error.MissingBlockHex) {
+        .string => |s| s,
+        else => return error.BlockHexNotString,
+    };
+    const block_bytes = try hexDecode(a, block_hex);
+
+    // Deserialize the FINAL block bytes with clearbit's OWN reader (80B header
+    // + CompactSize txcount + per-tx segwit-aware readTransaction loop). A
+    // parse failure => {"error"} so the driver SKIPS (never fake-decision).
+    var reader = serialize.Reader{ .data = block_bytes };
+    const block = serialize.readBlock(&reader, a) catch |err| {
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"block deserialize: {s}\"}}\n", .{reason});
+        return;
+    };
+
+    const spend_height: u32 = switch (obj.get("spend_height") orelse return error.MissingSpendHeight) {
+        .integer => |iv| @intCast(iv),
+        else => return error.SpendHeightNotInt,
+    };
+
+    const skip_pow: bool = blk: {
+        if (obj.get("skip_pow")) |v| switch (v) {
+            .bool => |b| break :blk b,
+            else => break :blk true,
+        };
+        break :blk true;
+    };
+    const skip_scripts: bool = blk: {
+        if (obj.get("skip_scripts")) |v| switch (v) {
+            .bool => |b| break :blk b,
+            else => break :blk false,
+        };
+        break :blk false;
+    };
+
+    // Seed the in-memory UTXO view: one coin per prevout entry, keyed by
+    // (wire-order txid, vout). VERBATIM the connecttx seeding plumbing.
+    var view = std.AutoHashMap(OutPointKey, ConnectCoin).init(a);
+    const prevouts = (obj.get("prevouts") orelse return error.MissingPrevouts).array.items;
+    for (prevouts) |p| {
+        const po = p.object;
+        const txid_disp = switch (po.get("txid") orelse return error.PrevoutMissingTxid) {
+            .string => |s| s,
+            else => return error.PrevoutTxidNotString,
+        };
+        const txid_disp_bytes = try hexDecode(a, txid_disp);
+        if (txid_disp_bytes.len != 32) return error.PrevoutTxidLen;
+        var wire_hash: [32]u8 = undefined;
+        for (0..32) |i| wire_hash[i] = txid_disp_bytes[31 - i];
+
+        const vout: u32 = switch (po.get("vout") orelse return error.PrevoutMissingVout) {
+            .integer => |iv| @truncate(@as(u64, @bitCast(iv))),
+            else => return error.PrevoutVoutNotInt,
+        };
+
+        const spk = try hexDecode(a, switch (po.get("scriptPubKey_hex") orelse return error.PrevoutMissingSpk) {
+            .string => |s| s,
+            else => return error.PrevoutSpkNotString,
+        });
+
+        const value: i64 = switch (po.get("value_sats") orelse return error.PrevoutMissingValue) {
+            .integer => |iv| iv,
+            else => return error.PrevoutValueNotInt,
+        };
+
+        const height: u32 = switch (po.get("height") orelse return error.PrevoutMissingHeight) {
+            .integer => |iv| @intCast(iv),
+            else => return error.PrevoutHeightNotInt,
+        };
+
+        const is_coinbase: bool = switch (po.get("is_coinbase") orelse return error.PrevoutMissingIsCoinbase) {
+            .bool => |b| b,
+            else => return error.PrevoutIsCoinbaseNotBool,
+        };
+
+        try view.put(.{ .hash = wire_hash, .index = vout }, .{
+            .spk = spk,
+            .value = value,
+            .height = height,
+            .is_coinbase = is_coinbase,
+        });
+    }
+
+    // SAME View.lookup closure as connecttx (PrevOutInfo over the seeded view).
+    const View = struct {
+        map: *std.AutoHashMap(OutPointKey, ConnectCoin),
+        fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.PrevOutInfo {
+            const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const key = OutPointKey{ .hash = outpoint.hash, .index = outpoint.index };
+            const coin = me.map.get(key) orelse return null;
+            return .{
+                .script_pubkey = coin.spk,
+                .amount = coin.value,
+                .height = coin.height,
+                .is_coinbase = coin.is_coinbase,
+                .owner_allocator = null,
+            };
+        }
+    };
+    var view_ctx = View{ .map = &view };
+
+    // Compute the block hash from the (final) header — used by acceptBlock for
+    // the BIP-30 exemption check + script-flag-for-hash selection. We do NOT
+    // recompute the merkle root; validation recomputes + compares it itself.
+    const block_hash = crypto.computeBlockHash(&block.header);
+
+    // Drive clearbit's REAL block-accept consensus pipeline at MAINNET params.
+    // force_skip_pow mirrors Core's CheckBlock fCheckPOW=false (the FINAL bytes
+    // miss the mainnet target by construction). force_skip_scripts honours the
+    // request (default false => REAL per-input script verification runs).
+    validation.acceptBlock(
+        &block,
+        &block_hash,
+        spend_height,
+        consensus.getNetworkParams(.mainnet),
+        &view_ctx,
+        View.lookup,
+        a,
+        .{ .force_skip_scripts = skip_scripts, .force_skip_pow = skip_pow },
+    ) catch |err| {
+        const reason = try jsonEscape(a, connectErrToReason(err));
+        try out.print("{{\"valid\":false,\"reason\":\"{s}\"}}\n", .{reason});
+        return;
+    };
+
+    try out.writeAll("{\"valid\":true}\n");
 }
 
 /// Parse an 8-hex compact-bits string (Core getblockheader "bits" format,
@@ -725,6 +899,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
         return processChecktx(a, obj, out);
     } else if (std.mem.eql(u8, op, "connecttx")) {
         return processConnecttx(a, obj, out);
+    } else if (std.mem.eql(u8, op, "checkblock")) {
+        return processCheckblock(a, obj, out);
     } else if (std.mem.eql(u8, op, "nextwork")) {
         return processNextwork(a, obj, out);
     } else if (std.mem.eql(u8, op, "merkleroot")) {
