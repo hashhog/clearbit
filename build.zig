@@ -2220,7 +2220,12 @@ pub fn build(b: *std.Build) void {
     });
     verifyscript_shim.addIncludePath(.{ .cwd_relative = secp256k1_include });
     verifyscript_shim.linkSystemLibrary("secp256k1");
+    // The `reorg` op drives the REAL RocksDB-backed ChainState reorg mechanism
+    // (storage.zig → storage_rocksdb.zig → -lrocksdb), so the shim now links
+    // rocksdb like the main exe.
+    verifyscript_shim.linkSystemLibrary("rocksdb");
     verifyscript_shim.linkLibC();
+    verifyscript_shim.root_module.addOptions("build_options", build_options);
     if (target.result.cpu.arch == .x86_64) {
         verifyscript_shim.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
     }
