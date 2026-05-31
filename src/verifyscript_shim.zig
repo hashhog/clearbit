@@ -1282,6 +1282,218 @@ fn readNode(obj: std.json.ObjectMap) !consensus.BlockIndexEntry {
     return .{ .height = h, .timestamp = t, .bits = try parseBits(bits_hex) };
 }
 
+/// Map a ContextualCheckBlockHeader / CheckBlockHeader ValidationError to the
+/// canonical Core BIP22 reject token for the `checkheader` op. CRITICAL: this
+/// DIFFERS from `connectErrToReason` on `BadDifficulty` — at the header level
+/// Core folds BOTH "nBits malformed / target > powLimit" (clearbit's
+/// `BadDifficulty` out of `checkBlockHeader`) AND "hash > target"
+/// (`BadProofOfWork`) into the SINGLE token "high-hash" (CheckBlockHeader,
+/// validation.cpp). `BadDifficulty` only means "bad-diffbits" when it comes
+/// out of the CONTEXTUAL nBits!=GetNextWorkRequired gate. The checkheader op
+/// distinguishes the two by WHICH stage raised it (see processCheckheader):
+/// the high-hash stage maps its `BadDifficulty` to "high-hash" before calling
+/// here, so by the time this maps `BadDifficulty` it is the contextual
+/// bad-diffbits gate. Reasons are advisory; the accept/reject DECISION is scored.
+fn checkheaderErrToReason(err: validation.ValidationError) []const u8 {
+    return switch (err) {
+        // Contextual nBits!=GetNextWorkRequired (validation.cpp:4088).
+        error.BadDifficulty => "bad-diffbits",
+        // CheckBlockHeader hash>target / target>powLimit (validation.cpp).
+        error.BadProofOfWork => "high-hash",
+        // ContextualCheckBlockHeader time / version gates.
+        error.BadTimestamp => "time-too-old",
+        error.TimewarpAttack => "time-timewarp-attack",
+        error.FutureTimestamp => "time-too-new",
+        error.BadVersion => "bad-version",
+        else => @errorName(err),
+    };
+}
+
+/// `checkheader` op: DECISION-FIRST header-level reject differential. Drives
+/// clearbit's REAL header gates over an EXPLICIT (header, prev-context) tuple —
+/// never a live tip/clock. This is the header-only differential the `checkblock`
+/// op cannot reach in isolation: it exercises Core's CheckBlockHeader (high-hash)
+/// + ContextualCheckBlockHeader (bad-diffbits / time-too-old / timewarp /
+/// time-too-new / bad-version) directly.
+///
+/// It drives the two REAL consensus functions:
+///   - `validation.checkBlockHeader(&header, params)` (validation.zig:642 — the
+///      STRICT path enforcing target<=powLimit AND hash<=target) for the
+///      `high-hash` class, when `skip_pow=false`. clearbit raises `BadDifficulty`
+///      for target>powLimit and `BadProofOfWork` for hash>target; BOTH are
+///      Core's single "high-hash" token, so we remap them to "high-hash" here.
+///   - `validation.contextualCheckBlockHeader(&header, height, params, ctx)`
+///      (validation.zig — the SAME function validateBlockForIBD calls, so the
+///      gate set cannot drift) for bad-diffbits / time-too-old / timewarp /
+///      time-too-new / bad-version.
+///
+/// `expected_bits` is computed HERE via the SAME `consensus.getNextWorkRequired`
+/// the `nextwork` op differentially tests, now at DECISION level: build a
+/// height-keyed ancestors map from the supplied `prev` (at height-1) plus an
+/// optional `first` (at the period start, for retarget-boundary rows) and
+/// recompute the mandated nBits, then let `contextualCheckBlockHeader` compare
+/// it against the header's claimed bits (the bad-diffbits gate — THE flagship
+/// false-accept guard). An explicit `expected_bits` request override isolates
+/// the timewarp gate (diffbits made a no-op) exactly as the corpus requires.
+///
+///   request:  {"op":"checkheader","network":"mainnet|testnet4|regtest|...",
+///              "header_hex":"<80-byte header>","height":<u32>,
+///              "prev":{"bits":"<8hex>","time":<u32>,"hash":"<display-hex>"},
+///              "first":{"height":<u32>,"time":<u32>,"bits":"<8hex>"}  // opt; boundary
+///              "mtp":<u32 median-time-past of prev's 11 ancestors>,
+///              "current_time":<i64; 0 = disable time-too-new (sentinel)>,
+///              "skip_pow":<bool; false = exercise high-hash, true = bypass>,
+///              "expected_bits":"<8hex>"  // opt override; else GetNextWorkRequired}
+///   response: {"accept":true} | {"accept":false,"reason":"<bip22 token>"}
+///             {"error":"..."}  (could not evaluate => driver SKIPS)
+fn processCheckheader(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const network = try parseNetwork(switch (obj.get("network") orelse return error.MissingNetwork) {
+        .string => |s| s,
+        else => return error.NetworkNotString,
+    });
+    const params = consensus.getNetworkParams(network);
+
+    const header_hex = switch (obj.get("header_hex") orelse return error.MissingHeaderHex) {
+        .string => |s| s,
+        else => return error.HeaderHexNotString,
+    };
+    const header_bytes = try hexDecode(a, header_hex);
+    if (header_bytes.len != 80) return error.HeaderHexLen;
+    var hdr_reader = serialize.Reader{ .data = header_bytes };
+    const header = serialize.readBlockHeader(&hdr_reader) catch |err| {
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"header deserialize: {s}\"}}\n", .{reason});
+        return;
+    };
+
+    const height: u32 = switch (obj.get("height") orelse return error.MissingHeight) {
+        .integer => |iv| @intCast(iv),
+        else => return error.HeightNotInt,
+    };
+    const current_time: i64 = blk: {
+        if (obj.get("current_time")) |v| switch (v) {
+            .integer => |iv| break :blk iv,
+            else => break :blk 0,
+        };
+        break :blk 0;
+    };
+    // skip_pow defaults FALSE for checkheader: the whole point is to drive the
+    // strict checkBlockHeader over a crafted header (unlike checkblock, whose
+    // mutated body no longer meets target so it defaults skip_pow=true).
+    const skip_pow: bool = blk: {
+        if (obj.get("skip_pow")) |v| switch (v) {
+            .bool => |b| break :blk b,
+            else => break :blk false,
+        };
+        break :blk false;
+    };
+
+    // prev-context: bits (bad-diffbits base / BIP-94 floor), time (timewarp
+    // prev-600 floor + min-difficulty walk-back).
+    const prev = switch (obj.get("prev") orelse return error.MissingPrev) {
+        .object => |o| o,
+        else => return error.PrevNotObject,
+    };
+    const prev_bits = try parseBits(switch (prev.get("bits") orelse return error.PrevMissingBits) {
+        .string => |s| s,
+        else => return error.PrevBitsNotString,
+    });
+    const prev_time: u32 = switch (prev.get("time") orelse return error.PrevMissingTime) {
+        .integer => |iv| @intCast(iv),
+        else => return error.PrevTimeNotInt,
+    };
+
+    // MTP of prev's 11 ancestors, supplied directly (drives time-too-old).
+    const mtp: u32 = blk: {
+        if (obj.get("mtp")) |v| switch (v) {
+            .integer => |iv| break :blk @intCast(iv),
+            else => break :blk 0,
+        };
+        break :blk 0;
+    };
+
+    // ---- Stage 1: high-hash (CheckBlockHeader, strict PoW path) ----
+    // Core CheckBlockHeader folds hash>target AND target>powLimit (nBits
+    // malformed) into the single "high-hash" token. clearbit raises
+    // BadProofOfWork for the former and BadDifficulty for the latter; remap
+    // BOTH to "high-hash" here so the contextual bad-diffbits gate is the ONLY
+    // source of the "bad-diffbits" token.
+    if (!skip_pow) {
+        if (validation.checkBlockHeader(&header, params)) |_| {
+            // PoW ok; fall through to the contextual gates.
+        } else |_| {
+            try out.writeAll("{\"accept\":false,\"reason\":\"high-hash\"}\n");
+            return;
+        }
+    }
+
+    // ---- expected_bits = GetNextWorkRequired(pindexPrev) ----
+    // Honor an explicit override; else recompute from a height-keyed ancestors
+    // map (prev at height-1, optional first at the period start) via clearbit's
+    // REAL retarget fn — the SAME getNextWorkRequired the nextwork op tests.
+    const expected_bits: u32 = blk: {
+        if (obj.get("expected_bits")) |v| {
+            switch (v) {
+                .string => |s| break :blk try parseBits(s),
+                else => {},
+            }
+        }
+        // Build ancestors: prev keyed at its OWN height (height-1), plus first
+        // (period start) on retarget boundaries so ancestor(h-2016) resolves.
+        var ancestors = std.AutoHashMap(u32, consensus.BlockIndexEntry).init(a);
+        const prev_height = if (height > 0) height - 1 else 0;
+        try ancestors.put(prev_height, .{ .height = prev_height, .timestamp = prev_time, .bits = prev_bits });
+        if (obj.get("first")) |fv| {
+            if (fv == .object) {
+                const first_node = try readNode(fv.object);
+                try ancestors.put(first_node.height, first_node);
+            }
+        }
+        const view = consensus.BlockIndexView{
+            .context = @ptrCast(&ancestors),
+            .getAtHeightFn = struct {
+                fn get(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
+                    const m: *std.AutoHashMap(u32, consensus.BlockIndexEntry) = @ptrCast(@alignCast(ctx));
+                    return m.get(h);
+                }
+            }.get,
+            .pow_limit_bits = consensus.getPowLimitBits(params),
+        };
+        // getNextWorkRequired takes the height of the block BEING validated
+        // (it derives prev_height = height-1 internally) and the new block's
+        // timestamp (for the testnet min-difficulty exception).
+        break :blk consensus.getNextWorkRequired(height, header.timestamp, &view, params);
+    };
+
+    // ---- Stage 2: ContextualCheckBlockHeader (REAL clearbit gate set) ----
+    // expected_bits drives the bad-diffbits gate; prev_block_timestamp (=prev.time)
+    // drives the BIP-94 timewarp floor; mtp drives time-too-old; current_time
+    // drives time-too-new. The SAME function validateBlockForIBD calls.
+    if (validation.contextualCheckBlockHeader(&header, height, params, .{
+        .prev_mtp = mtp,
+        .prev_block_timestamp = prev_time,
+        .current_time = current_time,
+        .expected_bits = expected_bits,
+    })) |_| {
+        try out.writeAll("{\"accept\":true}\n");
+    } else |err| {
+        // bad-version carries the offending nVersion in Core's token
+        // (strprintf("bad-version(0x%08x)", block.nVersion), validation.cpp:4116).
+        // clearbit's BadVersion error is value-free, so reconstruct the suffix
+        // here from the header version (the DECISION is scored; this keeps the
+        // advisory token byte-identical to Core for the corpus check).
+        if (err == error.BadVersion) {
+            try out.print(
+                "{{\"accept\":false,\"reason\":\"bad-version(0x{x:0>8})\"}}\n",
+                .{@as(u32, @bitCast(header.version))},
+            );
+            return;
+        }
+        const reason = try jsonEscape(a, checkheaderErrToReason(err));
+        try out.print("{{\"accept\":false,\"reason\":\"{s}\"}}\n", .{reason});
+    }
+}
+
 /// `nextwork` op: differential PoW. Drives clearbit's REAL
 /// consensus.getNextWorkRequired (src/consensus.zig:1031) — the
 /// BlockIndex/chain-generic entrypoint that does the retarget, the off-by-one
@@ -1463,6 +1675,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
         return processCheckblock(a, obj, out);
     } else if (std.mem.eql(u8, op, "reorg")) {
         return processReorg(a, obj, out);
+    } else if (std.mem.eql(u8, op, "checkheader")) {
+        return processCheckheader(a, obj, out);
     } else if (std.mem.eql(u8, op, "nextwork")) {
         return processNextwork(a, obj, out);
     } else if (std.mem.eql(u8, op, "merkleroot")) {
