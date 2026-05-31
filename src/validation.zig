@@ -1205,6 +1205,24 @@ pub const IBDValidationContext = struct {
     /// are always processed regardless of how far ahead they are).
     /// Default false — callers that know the block was requested must set this.
     is_requested: bool = false,
+    /// Expected nBits = GetNextWorkRequired(pindexPrev) — the mandated
+    /// difficulty for THIS block, recomputed by the caller from the previous
+    /// block index.  When non-zero, enforces Core's FIRST ContextualCheckBlockHeader
+    /// gate "bad-diffbits": the block is rejected if `block.header.bits` does
+    /// NOT equal this value.  This is the difficulty-manipulation guard — an
+    /// attacker who submits a block whose PoW is valid only against a *lower*
+    /// difficulty (so the hash meets the wrong, easier target) is rejected here
+    /// regardless of the header's own claimed bits.
+    /// 0 means "not available" (genesis / test fast-path that has no pindexPrev
+    /// to recompute from); the gate is skipped, preserving prior behaviour.
+    /// Live callers (peer.zig / sync.zig) populate it with the result of
+    /// `consensus.getNextWorkRequired` over the header index, so the gate fires
+    /// on the production path; default 0 keeps every existing caller byte-identical
+    /// until they opt in.
+    /// Reference: bitcoin-core/src/validation.cpp:4088 —
+    ///   `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))
+    ///        return state.Invalid(..., "bad-diffbits", "incorrect proof of work");`
+    expected_bits: u32 = 0,
 };
 
 /// Information about a previous output, returned by IBDValidationContext.
@@ -1218,6 +1236,113 @@ pub const PrevOutInfo = struct {
     /// back a heap-owned buffer they want freed (allocator non-null).
     owner_allocator: ?std.mem.Allocator,
 };
+
+/// The contextual (prev-relative) inputs ContextualCheckBlockHeader needs.
+/// Bundled so the header-only gate set can be driven both from
+/// `validateBlockForIBD` (full-block path) and from a header-only caller
+/// (the Phase B `checkheader` differential) without re-listing the fields.
+pub const ContextualHeaderCtx = struct {
+    /// Median-time-past of the previous 11 blocks (time-too-old floor).
+    /// 0 = not available (genesis / fast-path) -> gate skipped.
+    prev_mtp: u32 = 0,
+    /// nTime of the immediately preceding block (BIP-94 timewarp floor).
+    /// 0 = not available -> timewarp gate skipped.
+    prev_block_timestamp: u32 = 0,
+    /// Wall-clock receive time (Unix seconds). 0 = not available (sentinel)
+    /// -> time-too-new gate skipped (determinism).
+    current_time: i64 = 0,
+    /// Expected nBits = GetNextWorkRequired(pindexPrev). 0 = not available
+    /// -> bad-diffbits gate skipped (default-preserving). See the identically
+    /// named field on IBDValidationContext for the full rationale.
+    expected_bits: u32 = 0,
+};
+
+/// Core's ContextualCheckBlockHeader (validation.cpp:4080-4118), header-only.
+/// Runs the five prev-relative gates IN CORE ORDER:
+///   (1) bad-diffbits     — block.bits != GetNextWorkRequired(pindexPrev)  @4088
+///   (2) time-too-old     — block.time <= pindexPrev->GetMedianTimePast()  @4092
+///   (3) time-timewarp    — enforce_BIP94, first interval block, too early  @4097
+///   (4) time-too-new     — block.Time() > now + MAX_FUTURE_BLOCK_TIME      @4108
+///   (5) bad-version      — v<2/3/4 after HEIGHTINCB/DERSIG/CLTV            @4112
+/// PoW (CheckBlockHeader: target<=powLimit, hash<=target -> "high-hash") is a
+/// SEPARATE, earlier check (CheckBlockHeader, validation.cpp) and is NOT done
+/// here; the caller runs it first when it has the proof of work to check.
+/// Every gate is faithfully default-preserving: each is skipped when its
+/// context input is the 0 sentinel ("not available").
+pub fn contextualCheckBlockHeader(
+    header: *const types.BlockHeader,
+    height: u32,
+    params: *const consensus.NetworkParams,
+    ctx: ContextualHeaderCtx,
+) ValidationError!void {
+    // (1) bad-diffbits — Core's FIRST contextual gate (validation.cpp:4088).
+    // `block.nBits != GetNextWorkRequired(pindexPrev, &block, params)`.
+    // expected_bits is recomputed by the caller from the previous-block index
+    // via consensus.getNextWorkRequired; here we only compare.  An attacker who
+    // mines valid PoW against an *easier* (wrong) target is rejected here even
+    // though the hash meets the header's own claimed bits.
+    // 0 = not available -> skip (genesis / fast-path), preserving prior behaviour.
+    if (ctx.expected_bits != 0 and header.bits != ctx.expected_bits) {
+        return ValidationError.BadDifficulty;
+    }
+
+    // (2) BIP-113 time-too-old (ContextualCheckBlockHeader, validation.cpp:4092).
+    // header.timestamp must be strictly greater than the median-time-past of the
+    // previous 11 blocks.  ctx.prev_mtp 0 = genesis / not-yet-available, skip.
+    if (ctx.prev_mtp != 0 and header.timestamp <= ctx.prev_mtp) {
+        return ValidationError.BadTimestamp;
+    }
+
+    // (3) BIP-94 timewarp (ContextualCheckBlockHeader, validation.cpp:4097-4105).
+    // On testnet4/regtest (enforce_bip94=true), the first block of each
+    // difficulty adjustment period must not have a timestamp more than
+    // MAX_TIMEWARP (600s) earlier than the immediately preceding block.
+    //   if (consensusParams.enforce_BIP94) {
+    //     if (nHeight % DiffAdjInterval == 0 && block.time < pindexPrev->GetBlockTime() - MAX_TIMEWARP)
+    //       return INVALID "time-timewarp-attack"
+    //   }
+    if (params.enforce_bip94 and ctx.prev_block_timestamp != 0) {
+        const interval = consensus.difficultyAdjustmentInterval(params);
+        if (height % interval == 0) {
+            // Saturating lower bound: if prev_block_timestamp < MAX_TIMEWARP the
+            // floor is 0 (never reachable in practice, but safe).
+            const lower_bound: u32 = if (ctx.prev_block_timestamp >= consensus.MAX_TIMEWARP)
+                ctx.prev_block_timestamp - consensus.MAX_TIMEWARP
+            else
+                0;
+            if (header.timestamp < lower_bound) {
+                return ValidationError.TimewarpAttack;
+            }
+        }
+    }
+
+    // (4) time-too-new (ContextualCheckBlockHeader, validation.cpp:4108-4110).
+    // header.timestamp must not exceed current wall time + MAX_FUTURE_BLOCK_TIME
+    // (7200s).  Skipped when current_time == 0 (not available / determinism).
+    //   if (block.Time() > NodeClock::now() + 7200s) return INVALID "time-too-new"
+    if (ctx.current_time != 0) {
+        const max_allowed: i64 = ctx.current_time + @as(i64, consensus.MAX_FUTURE_BLOCK_TIME);
+        if (@as(i64, header.timestamp) > max_allowed) {
+            return ValidationError.FutureTimestamp;
+        }
+    }
+
+    // (5) bad-version (ContextualCheckBlockHeader, validation.cpp:4112-4118).
+    //   nVersion < 2 after BIP34/HEIGHTINCB (bip34_height)
+    //   nVersion < 3 after BIP66/DERSIG     (bip66_height)
+    //   nVersion < 4 after BIP65/CLTV       (bip65_height)
+    // Height-based activation thresholds (all three long locked in);
+    // "DeploymentActiveAfter(pindexPrev, ...)" means height >= activation.
+    if (height >= params.bip34_height and header.version < 2) {
+        return ValidationError.BadVersion;
+    }
+    if (height >= params.bip66_height and header.version < 3) {
+        return ValidationError.BadVersion;
+    }
+    if (height >= params.bip65_height and header.version < 4) {
+        return ValidationError.BadVersion;
+    }
+}
 
 /// Full IBD-time consensus validation.  See module-level comment above.
 ///
@@ -1259,78 +1384,18 @@ pub fn validateBlockForIBD(
         try checkBlockHeader(&block.header, params);
     }
 
-    // 1a. BIP-113 MTP-of-11 check (ContextualCheckBlockHeader in Core).
-    // block.header.timestamp must be strictly greater than the median-time-past
-    // of the previous 11 blocks.  ctx.prev_mtp is populated by peer.zig from the
-    // header_index walk; 0 means genesis / not-yet-available, skip the check.
-    // Reference: bitcoin-core/src/validation.cpp:4092-4093.
-    if (ctx.prev_mtp != 0 and block.header.timestamp <= ctx.prev_mtp) {
-        return ValidationError.BadTimestamp;
-    }
-
-    // 1b. BIP-94 timewarp check (ContextualCheckBlockHeader in Core).
-    // On testnet4 (enforce_bip94=true), the first block of each difficulty
-    // adjustment period must not have a timestamp more than MAX_TIMEWARP (600s)
-    // earlier than the immediately preceding block.  This prevents the
-    // "timewarp attack" that could be used to artificially manipulate difficulty.
-    // Reference: bitcoin-core/src/validation.cpp:4097-4105.
-    //   if (consensusParams.enforce_BIP94) {
-    //     if (nHeight % DiffAdjInterval == 0 && block.time < pindexPrev->GetBlockTime() - MAX_TIMEWARP)
-    //       return INVALID "time-timewarp-attack"
-    //   }
-    if (params.enforce_bip94 and ctx.prev_block_timestamp != 0) {
-        const interval = consensus.difficultyAdjustmentInterval(params);
-        if (height % interval == 0) {
-            // Use saturating subtraction: if prev_block_timestamp < MAX_TIMEWARP,
-            // the lower bound is 0 (never reachable in practice, but safe).
-            const lower_bound: u32 = if (ctx.prev_block_timestamp >= consensus.MAX_TIMEWARP)
-                ctx.prev_block_timestamp - consensus.MAX_TIMEWARP
-            else
-                0;
-            if (block.header.timestamp < lower_bound) {
-                return ValidationError.TimewarpAttack;
-            }
-        }
-    }
-
-    // 1c. Future-time gate (ContextualCheckBlockHeader in Core).
-    // Block timestamp must not exceed current wall time + 2 hours.
-    // In IBD we skip this check when current_time is 0 (not available).
-    // At live-tip (P2P path) peer.zig populates current_time via std.time.timestamp().
-    // Reference: bitcoin-core/src/validation.cpp:4108-4110.
-    //   if (block.Time() > NodeClock::now() + 7200s) return INVALID "time-too-new"
-    if (ctx.current_time != 0) {
-        const max_allowed: i64 = ctx.current_time + @as(i64, consensus.MAX_FUTURE_BLOCK_TIME);
-        if (@as(i64, block.header.timestamp) > max_allowed) {
-            return ValidationError.FutureTimestamp;
-        }
-    }
-
-    // 1d. Bad-version gates (ContextualCheckBlockHeader in Core).
-    // Reject blocks with a version number lower than the minimum required after
-    // each version-based softfork activates.
-    //   nVersion < 2 after BIP34/HEIGHTINCB (bip34_height)
-    //   nVersion < 3 after BIP66/DERSIG     (bip66_height)
-    //   nVersion < 4 after BIP65/CLTV       (bip65_height)
-    // Reference: bitcoin-core/src/validation.cpp:4113-4118.
-    //   if (block.nVersion < 2 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_HEIGHTINCB))
-    //       return INVALID "bad-version"
-    //   if (block.nVersion < 3 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_DERSIG))
-    //       return INVALID "bad-version"
-    //   if (block.nVersion < 4 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_CLTV))
-    //       return INVALID "bad-version"
-    // We use height-based activation thresholds (params.bip34/66/65_height) rather
-    // than BIP9 versionbits deployment because all three have long since locked in.
-    // "DeploymentActiveAfter(pindexPrev, ...)" means the rule applies at height >= activation.
-    if (height >= params.bip34_height and block.header.version < 2) {
-        return ValidationError.BadVersion;
-    }
-    if (height >= params.bip66_height and block.header.version < 3) {
-        return ValidationError.BadVersion;
-    }
-    if (height >= params.bip65_height and block.header.version < 4) {
-        return ValidationError.BadVersion;
-    }
+    // 1a-1e. ContextualCheckBlockHeader gates (Core validation.cpp:4080-4118):
+    // bad-diffbits, time-too-old, BIP-94 timewarp, time-too-new, bad-version.
+    // Extracted into a dedicated header-only function so the SAME gate set is
+    // reachable header-only (the Phase B `checkheader` differential) AND from
+    // this full-block path — they cannot drift.  Core's ordering is preserved
+    // exactly (bad-diffbits is the FIRST gate).
+    try contextualCheckBlockHeader(&block.header, height, params, .{
+        .prev_mtp = ctx.prev_mtp,
+        .prev_block_timestamp = ctx.prev_block_timestamp,
+        .current_time = ctx.current_time,
+        .expected_bits = ctx.expected_bits,
+    });
 
     // 2. Per-block sanity: coinbase position, merkle root, weight, BIP-34,
     // witness commitment, legacy sigop budget.  PoW is gated by the SAME
