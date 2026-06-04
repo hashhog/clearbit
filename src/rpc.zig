@@ -3114,6 +3114,8 @@ pub const RpcServer = struct {
             return self.handleListUnspent(params, id);
         } else if (std.mem.eql(u8, method, "listtransactions")) {
             return self.handleListTransactions(params, id);
+        } else if (std.mem.eql(u8, method, "gettransaction")) {
+            return self.handleGetTransaction(params, id);
         } else if (std.mem.eql(u8, method, "estimatesmartfee")) {
             return self.handleEstimateSmartFee(params, id);
         } else if (std.mem.eql(u8, method, "estimaterawfee")) {
@@ -11280,26 +11282,225 @@ pub const RpcServer = struct {
     /// Reference: Bitcoin Core wallet/rpc/transactions.cpp listtransactions
     ///
     /// Arguments:
-    ///   1. label (string, optional) - filter by label
+    ///   1. label (string, optional, default="*") - "*" lists all; otherwise
+    ///      filter to receive entries with that label.
     ///   2. count (numeric, optional, default=10) - number of transactions
+    ///   3. skip  (numeric, optional, default=0)  - entries to skip
     fn handleListTransactions(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        _ = params;
+        var count: usize = 10;
+        var skip: usize = 0;
+        if (params == .array) {
+            if (params.array.items.len >= 2 and params.array.items[1] == .integer) {
+                const c = params.array.items[1].integer;
+                if (c < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Negative count", id);
+                count = @intCast(c);
+            }
+            if (params.array.items.len >= 3 and params.array.items[2] == .integer) {
+                const s = params.array.items[2].integer;
+                if (s < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Negative from", id);
+                skip = @intCast(s);
+            }
+        }
 
         const wallet = self.current_wallet orelse {
             if (self.wallet) |w| {
-                return self.handleListTransactionsWithWallet(w, id);
+                return self.handleListTransactionsWithWallet(w, count, skip, id);
             }
             return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
         };
-        return self.handleListTransactionsWithWallet(wallet, id);
+        return self.handleListTransactionsWithWallet(wallet, count, skip, id);
     }
 
-    fn handleListTransactionsWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, id: ?std.json.Value) ![]const u8 {
-        _ = wallet;
+    /// Emit one ListTransactions entry (Core wallet/rpc/transactions.cpp
+    /// ListTransactions + WalletTxToJSON). `category`/`amount`/`vout`/`fee`
+    /// vary per detail; the trailing confirmation/block fields are the same
+    /// for every detail of the tx (fLong=true path).
+    fn writeWalletTxEntry(
+        self: *RpcServer,
+        writer: anytype,
+        wallet: *wallet_mod.Wallet,
+        rec: *const wallet_mod.WalletTxRecord,
+        detail: *const wallet_mod.WalletTxDetail,
+    ) !void {
+        const confirms = wallet.txConfirmations(rec);
+        const is_send = detail.category == .send;
+        // amount: negative for send (value that left), positive otherwise.
+        const amount_sats: i64 = if (is_send) -detail.amount else detail.amount;
+        const amount_btc = @as(f64, @floatFromInt(amount_sats)) / 100_000_000.0;
+        // Coinbase credit category is depth-dependent and must be recomputed at
+        // query time (Core: orphan/immature/generate by current confirmations),
+        // not frozen at scan time (when depth was always 0 -> "immature").
+        const cat = resolveCategory(rec, detail, confirms);
 
-        // In a full implementation, we would return wallet transaction history
-        // For now, return empty array
-        return self.jsonRpcResult("[]", id);
+        try writer.writeByte('{');
+        if (detail.address) |addr| {
+            try writer.writeAll("\"address\":\"");
+            try writer.writeAll(addr);
+            try writer.writeAll("\",");
+        }
+        try writer.print("\"category\":\"{s}\",", .{cat});
+        try writer.print("\"amount\":{d:.8},", .{amount_btc});
+        try writer.print("\"vout\":{d},", .{detail.vout});
+        if (is_send) {
+            // Core renders fee negative (ValueFromAmount(-nFee)).
+            const fee_btc = -@as(f64, @floatFromInt(rec.fee)) / 100_000_000.0;
+            try writer.print("\"fee\":{d:.8},", .{fee_btc});
+        }
+        if (rec.is_coinbase) try writer.writeAll("\"generated\":true,");
+        try writer.print("\"confirmations\":{d},", .{confirms});
+        try writer.writeAll("\"blockhash\":\"");
+        try writeHashHex(writer, &rec.block_hash);
+        try writer.print("\",\"blockheight\":{d},", .{rec.height});
+        try writer.print("\"blocktime\":{d},", .{rec.block_time});
+        try writer.writeAll("\"txid\":\"");
+        try writeHashHex(writer, &rec.txid);
+        try writer.print("\",\"time\":{d},", .{rec.block_time});
+        try writer.print("\"timereceived\":{d},", .{rec.block_time});
+        try writer.writeAll("\"bip125-replaceable\":\"no\",");
+        try writer.writeAll("\"abandoned\":false}");
+        _ = self;
+    }
+
+    fn handleListTransactionsWithWallet(
+        self: *RpcServer,
+        wallet: *wallet_mod.Wallet,
+        count: usize,
+        skip: usize,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        // Build the full flattened list of (record, detail) entries in Core's
+        // per-tx order (sent details first, then received), then apply
+        // skip/count over the most-recent window. Core orders by time
+        // ascending and returns the last `count` after skipping `skip` from
+        // the end; our history is append-order (oldest first), which is time
+        // order on regtest, so we mirror that.
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        // Flatten into a temporary index list: (tx_index, detail_index).
+        const Entry = struct { ti: usize, di: usize };
+        var entries = std.ArrayList(Entry).init(self.allocator);
+        defer entries.deinit();
+
+        for (wallet.tx_history.items, 0..) |*rec, ti| {
+            // Sent details first (Core lists listSent before listReceived).
+            for (rec.details.items, 0..) |*d, di| {
+                if (d.category == .send) try entries.append(.{ .ti = ti, .di = di });
+            }
+            for (rec.details.items, 0..) |*d, di| {
+                if (d.category != .send) try entries.append(.{ .ti = ti, .di = di });
+            }
+        }
+
+        // Apply skip from the end + take the most-recent `count` (Core's
+        // nFrom/nCount semantics: entries are time-ordered ascending; it
+        // returns [size - nFrom - nCount, size - nFrom)).
+        const total = entries.items.len;
+        const window_end = if (skip < total) total - skip else 0;
+        const window_start = if (window_end > count) window_end - count else 0;
+
+        try writer.writeByte('[');
+        var first = true;
+        var i = window_start;
+        while (i < window_end) : (i += 1) {
+            const e = entries.items[i];
+            const rec = &wallet.tx_history.items[e.ti];
+            const detail = &rec.details.items[e.di];
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try self.writeWalletTxEntry(writer, wallet, rec, detail);
+        }
+        try writer.writeByte(']');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Handle gettransaction RPC - detailed view of one wallet transaction.
+    /// Reference: Bitcoin Core wallet/rpc/transactions.cpp gettransaction
+    ///
+    /// Arguments:
+    ///   1. txid (string, required) - 64-hex display-order txid
+    /// Result: { amount, fee (send only, negative), confirmations, generated
+    ///           (coinbase only), blockhash, blockheight, blocktime, txid,
+    ///           time, details:[{address, category, amount, vout, fee}], hex }
+    fn handleGetTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 1 or params.array.items[0] != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "txid (string) required", id);
+        }
+        const txid_str = params.array.items[0].string;
+        if (txid_str.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid txid: must be 64 hex characters", id);
+        }
+        // Display order -> internal order (reverse byte order).
+        var txid_internal: types.Hash256 = undefined;
+        for (0..32) |k| {
+            txid_internal[31 - k] = std.fmt.parseInt(u8, txid_str[k * 2 ..][0..2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid txid: non-hex character", id);
+            };
+        }
+
+        const wallet = self.current_wallet orelse self.wallet orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+
+        const rec = wallet.findTxByHash(&txid_internal) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid or non-wallet transaction id", id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        // amount = (credit - debit) - fee  (Core: nNet - nFee). For a pure
+        // receive that is +credit; for a send it is the negative net that left
+        // the wallet. fee/nFee here is the negative of the positive `rec.fee`.
+        const n_net = rec.net_credit - rec.debit;
+        const n_fee_signed: i64 = if (rec.is_from_me) -rec.fee else 0; // Core's nFee = GetValueOut - nDebit (negative)
+        const amount_sats = n_net - n_fee_signed;
+        const amount_btc = @as(f64, @floatFromInt(amount_sats)) / 100_000_000.0;
+        const confirms = wallet.txConfirmations(rec);
+
+        try writer.print("{{\"amount\":{d:.8},", .{amount_btc});
+        if (rec.is_from_me) {
+            const fee_btc = @as(f64, @floatFromInt(n_fee_signed)) / 100_000_000.0;
+            try writer.print("\"fee\":{d:.8},", .{fee_btc});
+        }
+        if (rec.is_coinbase) try writer.writeAll("\"generated\":true,");
+        try writer.print("\"confirmations\":{d},", .{confirms});
+        try writer.writeAll("\"blockhash\":\"");
+        try writeHashHex(writer, &rec.block_hash);
+        try writer.print("\",\"blockheight\":{d},", .{rec.height});
+        try writer.print("\"blocktime\":{d},", .{rec.block_time});
+        try writer.writeAll("\"txid\":\"");
+        try writeHashHex(writer, &rec.txid);
+        try writer.print("\",\"time\":{d},", .{rec.block_time});
+        try writer.print("\"timereceived\":{d},", .{rec.block_time});
+        try writer.writeAll("\"bip125-replaceable\":\"no\",");
+
+        // details[]: same per-detail shape as listtransactions but fLong=false
+        // (no block/conf fields inside each detail — Core uses fLong=false here).
+        try writer.writeAll("\"details\":[");
+        var first = true;
+        // Sent details first, then received (Core ListTransactions order).
+        for (rec.details.items) |*d| {
+            if (d.category != .send) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writeDetailObject(writer, rec, d, confirms);
+        }
+        for (rec.details.items) |*d| {
+            if (d.category == .send) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writeDetailObject(writer, rec, d, confirms);
+        }
+        try writer.writeAll("],");
+
+        try writer.writeAll("\"hex\":\"");
+        try writer.writeAll(rec.raw_hex);
+        try writer.writeAll("\"}");
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     /// Handle estimatesmartfee RPC - estimate fee rate for confirmation target.
@@ -14874,6 +15075,54 @@ fn writeHashHex(writer: anytype, hash: *const types.Hash256) !void {
     for (0..32) |i| {
         try writer.print("{x:0>2}", .{hash[31 - i]});
     }
+}
+
+/// Emit one gettransaction `details[]` object (Core ListTransactions with
+/// fLong=false): {address?, category, amount, vout, fee?}. `amount` is
+/// negative for send, positive otherwise; `fee` (negative) is present only on
+/// send details.
+/// Resolve the *displayed* category for a detail at the current depth. Only
+/// coinbase credits are depth-dependent (Core: orphan if <1 conf, immature if
+/// below COINBASE_MATURITY, else generate). Sends and ordinary receives carry
+/// their stored category verbatim.
+fn resolveCategory(
+    rec: *const wallet_mod.WalletTxRecord,
+    detail: *const wallet_mod.WalletTxDetail,
+    confirmations: u32,
+) []const u8 {
+    if (detail.category == .send) return "send";
+    if (rec.is_coinbase) {
+        if (confirmations < 1) return "orphan";
+        if (confirmations < consensus.COINBASE_MATURITY) return "immature";
+        return "generate";
+    }
+    return "receive";
+}
+
+fn writeDetailObject(
+    writer: anytype,
+    rec: *const wallet_mod.WalletTxRecord,
+    detail: *const wallet_mod.WalletTxDetail,
+    confirmations: u32,
+) !void {
+    const is_send = detail.category == .send;
+    const amount_sats: i64 = if (is_send) -detail.amount else detail.amount;
+    const amount_btc = @as(f64, @floatFromInt(amount_sats)) / 100_000_000.0;
+    const cat = resolveCategory(rec, detail, confirmations);
+    try writer.writeByte('{');
+    if (detail.address) |addr| {
+        try writer.writeAll("\"address\":\"");
+        try writer.writeAll(addr);
+        try writer.writeAll("\",");
+    }
+    try writer.print("\"category\":\"{s}\",", .{cat});
+    try writer.print("\"amount\":{d:.8},", .{amount_btc});
+    try writer.print("\"vout\":{d}", .{detail.vout});
+    if (is_send) {
+        const fee_btc = -@as(f64, @floatFromInt(rec.fee)) / 100_000_000.0;
+        try writer.print(",\"fee\":{d:.8}", .{fee_btc});
+    }
+    try writer.writeByte('}');
 }
 
 /// Map the active NetworkParams to the wallet's Network enum. Used by the

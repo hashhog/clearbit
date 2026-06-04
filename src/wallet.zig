@@ -1368,6 +1368,142 @@ pub const OwnedUtxo = struct {
 };
 
 // ============================================================================
+// Wallet transaction history
+// ============================================================================
+//
+// Per-tx bookkeeping for `listtransactions` / `gettransaction`, mirroring
+// Bitcoin Core's CWalletTx + ListTransactions (wallet/rpc/transactions.cpp).
+// A record is appended by `scanBlockForWallet` for every wallet-relevant tx
+// in a connected block (a tx that credits a wallet output and/or debits a
+// wallet UTXO), and removed by `unscanBlockForWallet` on block-disconnect so
+// the history stays consistent across reorgs (symmetric to the UTXO unscan).
+
+/// One Core "category" for a wallet output/input detail line.
+pub const WalletTxCategory = enum {
+    /// A non-coinbase output paying the wallet.
+    receive,
+    /// A mature coinbase output paying the wallet (>= COINBASE_MATURITY confs).
+    generate,
+    /// A coinbase output paying the wallet, still immature (< maturity).
+    immature,
+    /// The wallet spent value (negative amount; carries the negative fee).
+    send,
+
+    pub fn toString(self: WalletTxCategory) []const u8 {
+        return switch (self) {
+            .receive => "receive",
+            .generate => "generate",
+            .immature => "immature",
+            .send => "send",
+        };
+    }
+};
+
+/// One detail line in a wallet tx (Core's COutputEntry -> ListTransactions
+/// entry). `address` is heap-owned (the wallet dup's it; the scanned block
+/// is freed after the scan). For a `send` the amount is the negative value
+/// that left the wallet at this output; for a receive/generate/immature it
+/// is the positive value credited at this vout.
+pub const WalletTxDetail = struct {
+    address: ?[]const u8,
+    category: WalletTxCategory,
+    amount: i64, // satoshis; negative for `send`, positive otherwise
+    vout: u32,
+};
+
+/// A wallet-relevant transaction recorded at block-connect time.
+///
+/// `is_from_me` is true when any of the tx's inputs spent a wallet UTXO (the
+/// "send" side); only then is `fee` meaningful. `net_credit` is the sum of
+/// the values of outputs paying the wallet; `debit` is the sum of the values
+/// of the wallet UTXOs this tx spent. Core's `gettransaction.amount` is
+/// `(credit - debit) - fee`, which for a pure receive is `+credit`, and for
+/// a send back to a foreign address is the negative (sent + fee).
+pub const WalletTxRecord = struct {
+    txid: types.Hash256, // internal byte order (display = reversed)
+    is_coinbase: bool,
+    is_from_me: bool,
+    height: u32,
+    block_hash: types.Hash256, // internal byte order
+    block_time: u32,
+    net_credit: i64, // Σ owned-output values
+    debit: i64, // Σ owned-input (spent UTXO) values
+    fee: i64, // satoshis, >0, only when is_from_me; else 0
+    raw_hex: []const u8, // wallet-owned serialized tx (witness form), display hex
+    details: std.ArrayList(WalletTxDetail),
+
+    pub fn deinit(self: *WalletTxRecord, allocator: std.mem.Allocator) void {
+        for (self.details.items) |d| {
+            if (d.address) |a| allocator.free(a);
+        }
+        self.details.deinit();
+        allocator.free(self.raw_hex);
+    }
+};
+
+/// Render a standard scriptPubKey to its address string, for the destination
+/// `address` field of a `send` history detail. Recognizes the five standard
+/// templates clearbit derives + spends to: P2PKH, P2SH, P2WPKH, P2WSH, P2TR.
+/// Returns null (caller omits the field) for non-standard / unspendable
+/// scripts — exactly Core's CNoDestination behavior in ListTransactions.
+/// Caller owns the returned string.
+pub fn scriptToAddress(spk: []const u8, network: Network, allocator: std.mem.Allocator) !?[]const u8 {
+    const hrp: []const u8 = switch (network) {
+        .mainnet => "bc",
+        .testnet => "tb",
+        .regtest => "bcrt",
+    };
+    // P2PKH: OP_DUP OP_HASH160 <0x14> <20> OP_EQUALVERIFY OP_CHECKSIG
+    if (spk.len == 25 and spk[0] == 0x76 and spk[1] == 0xa9 and spk[2] == 0x14 and
+        spk[23] == 0x88 and spk[24] == 0xac)
+    {
+        const ver: u8 = switch (network) {
+            .mainnet => 0x00,
+            .testnet, .regtest => 0x6F,
+        };
+        return try address.base58CheckEncode(ver, spk[3..23], allocator);
+    }
+    // P2SH: OP_HASH160 <0x14> <20> OP_EQUAL
+    if (spk.len == 23 and spk[0] == 0xa9 and spk[1] == 0x14 and spk[22] == 0x87) {
+        const ver: u8 = switch (network) {
+            .mainnet => 0x05,
+            .testnet, .regtest => 0xC4,
+        };
+        return try address.base58CheckEncode(ver, spk[2..22], allocator);
+    }
+    // P2WPKH: OP_0 <0x14> <20>
+    if (spk.len == 22 and spk[0] == 0x00 and spk[1] == 0x14) {
+        return try address.segwitEncode(hrp, 0, spk[2..22], allocator);
+    }
+    // P2WSH: OP_0 <0x20> <32>
+    if (spk.len == 34 and spk[0] == 0x00 and spk[1] == 0x20) {
+        return try address.segwitEncode(hrp, 0, spk[2..34], allocator);
+    }
+    // P2TR: OP_1 <0x20> <32>
+    if (spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20) {
+        return try address.segwitEncode(hrp, 1, spk[2..34], allocator);
+    }
+    return null;
+}
+
+/// Serialize a transaction (witness form, consensus encoding) into a freshly
+/// allocated lowercase-hex string for gettransaction's `hex` field. Caller
+/// owns the returned slice.
+fn serializeTxHex(tx: *const types.Transaction, allocator: std.mem.Allocator) ![]const u8 {
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try serialize.writeTransaction(&w, tx);
+    const raw = w.list.items;
+    const hex = try allocator.alloc(u8, raw.len * 2);
+    const lut = "0123456789abcdef";
+    for (raw, 0..) |b, i| {
+        hex[i * 2] = lut[b >> 4];
+        hex[i * 2 + 1] = lut[b & 0x0f];
+    }
+    return hex;
+}
+
+// ============================================================================
 // Wallet
 // ============================================================================
 
@@ -1405,6 +1541,12 @@ pub const Wallet = struct {
 
     // Labels: address -> label mapping
     labels: std.StringHashMap([]const u8),
+
+    /// Wallet transaction history (newest appended last). Populated by
+    /// `scanBlockForWallet` for each wallet-relevant tx in a connected block;
+    /// trimmed by `unscanBlockForWallet` on block-disconnect. Backs
+    /// `listtransactions` / `gettransaction`. See WalletTxRecord.
+    tx_history: std.ArrayList(WalletTxRecord),
 
     /// In-memory locked UTXO set (cleared on process exit, matching Core's
     /// non-persistent default). Key is a 36-byte packed outpoint
@@ -1446,6 +1588,7 @@ pub const Wallet = struct {
             .unlock_until = null,
             .labels = std.StringHashMap([]const u8).init(allocator),
             .locked_outpoints = std.AutoHashMap([36]u8, void).init(allocator),
+            .tx_history = std.ArrayList(WalletTxRecord).init(allocator),
         };
     }
 
@@ -1516,6 +1659,13 @@ pub const Wallet = struct {
         // process startup / shutdown (see main.zig).
         self.keys.deinit();
         self.utxos.deinit();
+
+        // Free wallet transaction history (each record owns its details'
+        // address strings + the serialized raw_hex).
+        for (self.tx_history.items) |*rec| {
+            rec.deinit(self.allocator);
+        }
+        self.tx_history.deinit();
 
         // Free label strings
         var it = self.labels.iterator();
@@ -3123,18 +3273,42 @@ pub const Wallet = struct {
             .p2wsh,
         };
 
+        const block_hash = crypto.computeBlockHash(&block.header);
+        const block_time = block.header.timestamp;
+
         for (block.transactions) |tx| {
             const is_cb = tx.isCoinbase();
+            const txid = try crypto.computeTxid(&tx, self.allocator);
 
-            // 1. DEBIT: remove any owned coins this tx spends.
+            // History accumulators for this tx (Core's CachedTxGetAmounts).
+            var net_credit: i64 = 0; // Σ values of outputs paying the wallet
+            var debit: i64 = 0; // Σ values of wallet UTXOs this tx spends
+            var details = std.ArrayList(WalletTxDetail).init(self.allocator);
+            // On any error past this point, free the partial details we built.
+            errdefer {
+                for (details.items) |d| {
+                    if (d.address) |a| self.allocator.free(a);
+                }
+                details.deinit();
+            }
+
+            // 1. DEBIT: remove any owned coins this tx spends, summing their
+            //    value first (Core's nDebit). The coinbase has only the null
+            //    prevout, so it never debits.
             if (!is_cb) {
                 for (tx.inputs) |input| {
+                    if (self.findUtxoValue(input.previous_output)) |v| {
+                        debit += v;
+                    }
                     _ = self.removeUtxo(input.previous_output);
                 }
             }
+            const is_from_me = debit > 0;
 
-            // 2. CREDIT: add any outputs paying a script we own.
-            const txid = try crypto.computeTxid(&tx, self.allocator);
+            // 2. Walk outputs: credit wallet-paying outputs to the UTXO ledger,
+            //    and build the per-output detail lines (send for foreign
+            //    outputs of a from-me tx; receive/generate/immature for
+            //    wallet-paying outputs).
             for (tx.outputs, 0..) |out, vout| {
                 var matched = false;
                 var match_key_index: usize = 0;
@@ -3152,43 +3326,173 @@ pub const Wallet = struct {
                         }
                     }
                 }
-                if (!matched) continue;
 
-                const outpoint = types.OutPoint{
-                    .hash = txid,
-                    .index = @intCast(vout),
-                };
+                if (matched) {
+                    // CREDIT: a wallet-paying output. Record the credit detail
+                    // (receive / generate / immature) and add the coin to the
+                    // ledger (idempotently).
+                    net_credit += out.value;
+                    const recv_addr = self.getAddress(match_key_index, match_addr_type) catch null;
+                    const depth = if (self.tip_height >= height) self.tip_height - height else 0;
+                    const cat: WalletTxCategory = if (is_cb)
+                        (if (depth >= consensus.COINBASE_MATURITY) .generate else .immature)
+                    else
+                        .receive;
+                    try details.append(.{
+                        .address = recv_addr,
+                        .category = cat,
+                        .amount = out.value,
+                        .vout = @intCast(vout),
+                    });
 
-                // Idempotent: skip if we already track this exact outpoint.
-                var already = false;
-                for (self.utxos.items) |u| {
-                    if (std.mem.eql(u8, &u.outpoint.hash, &outpoint.hash) and
-                        u.outpoint.index == outpoint.index)
-                    {
-                        already = true;
-                        break;
+                    const outpoint = types.OutPoint{ .hash = txid, .index = @intCast(vout) };
+
+                    // Idempotent ledger add: skip if we already track it.
+                    var already = false;
+                    for (self.utxos.items) |u| {
+                        if (std.mem.eql(u8, &u.outpoint.hash, &outpoint.hash) and
+                            u.outpoint.index == outpoint.index)
+                        {
+                            already = true;
+                            break;
+                        }
                     }
+                    if (!already) {
+                        // Copy the scriptPubKey into wallet-owned memory: the
+                        // scanned block lives in a temporary arena the caller
+                        // frees after the scan, so we must not alias it.
+                        const spk_copy = try self.allocator.dupe(u8, out.script_pubkey);
+                        errdefer self.allocator.free(spk_copy);
+                        try self.addUtxo(.{
+                            .outpoint = outpoint,
+                            .output = .{ .value = out.value, .script_pubkey = spk_copy },
+                            .key_index = match_key_index,
+                            .address_type = match_addr_type,
+                            .confirmations = depth + 1,
+                            .is_coinbase = is_cb,
+                            .height = height,
+                        });
+                    }
+                } else if (is_from_me) {
+                    // SEND: a foreign output of a tx we funded. Core lists this
+                    // as a "send" entry with the output value (rendered negative
+                    // at the RPC). Wallet-paying outputs are change and are NOT
+                    // listed as send (Core default include_change=false — they
+                    // are handled by the credit branch above).
+                    const dst_addr = scriptToAddress(out.script_pubkey, self.network, self.allocator) catch null;
+                    try details.append(.{
+                        .address = dst_addr,
+                        .category = .send,
+                        .amount = out.value,
+                        .vout = @intCast(vout),
+                    });
                 }
-                if (already) continue;
+            }
 
-                // Copy the output scriptPubKey into wallet-owned memory: the
-                // block we scanned is deserialized into a temporary arena the
-                // caller frees after the scan, so we must not alias it.
-                const spk_copy = try self.allocator.dupe(u8, out.script_pubkey);
-                errdefer self.allocator.free(spk_copy);
+            // 3. Record a history entry iff this tx touched the wallet (it
+            //    credited an output and/or spent a wallet coin). Pure
+            //    third-party txs in the block are ignored.
+            if (net_credit == 0 and !is_from_me) {
+                details.deinit();
+                continue;
+            }
 
-                const depth = if (self.tip_height >= height) self.tip_height - height else 0;
-                try self.addUtxo(.{
-                    .outpoint = outpoint,
-                    .output = .{ .value = out.value, .script_pubkey = spk_copy },
-                    .key_index = match_key_index,
-                    .address_type = match_addr_type,
-                    .confirmations = depth + 1,
-                    .is_coinbase = is_cb,
-                    .height = height,
-                });
+            // Fee (Core CachedTxGetAmounts: nFee = nDebit - GetValueOut), only
+            // meaningful when from-me. Stored positive here; the RPC renders it
+            // negative per Core's sign convention.
+            var fee: i64 = 0;
+            if (is_from_me) {
+                var value_out: i64 = 0;
+                for (tx.outputs) |o| value_out += o.value;
+                const f = debit - value_out;
+                fee = if (f > 0) f else 0;
+            }
+
+            // Serialize the tx (witness form) into wallet-owned display hex for
+            // gettransaction's `hex` field.
+            const raw_hex = try serializeTxHex(&tx, self.allocator);
+            errdefer self.allocator.free(raw_hex);
+
+            try self.recordOrReplaceTx(.{
+                .txid = txid,
+                .is_coinbase = is_cb,
+                .is_from_me = is_from_me,
+                .height = height,
+                .block_hash = block_hash,
+                .block_time = block_time,
+                .net_credit = net_credit,
+                .debit = debit,
+                .fee = fee,
+                .raw_hex = raw_hex,
+                .details = details,
+            });
+        }
+    }
+
+    /// Return the value (sats) of the wallet UTXO at `outpoint`, or null if
+    /// the wallet does not own that coin. Used by `scanBlockForWallet` to sum
+    /// the debit before the coin is removed from the ledger.
+    fn findUtxoValue(self: *const Wallet, outpoint: types.OutPoint) ?i64 {
+        for (self.utxos.items) |u| {
+            if (std.mem.eql(u8, &u.outpoint.hash, &outpoint.hash) and
+                u.outpoint.index == outpoint.index)
+            {
+                return u.output.value;
             }
         }
+        return null;
+    }
+
+    /// Append a wallet tx record, replacing (idempotently) any existing record
+    /// with the same txid so a re-scan of the same block does not duplicate
+    /// the history (mirrors the idempotent-credit guarantee of the UTXO scan).
+    fn recordOrReplaceTx(self: *Wallet, rec: WalletTxRecord) !void {
+        for (self.tx_history.items, 0..) |*old, i| {
+            if (std.mem.eql(u8, &old.txid, &rec.txid)) {
+                old.deinit(self.allocator);
+                self.tx_history.items[i] = rec;
+                return;
+            }
+        }
+        try self.tx_history.append(rec);
+    }
+
+    /// Remove from the history every tx contained in a disconnected block,
+    /// symmetric to the credit-recording in `scanBlockForWallet`. Reorg
+    /// safety: when a block leaves the active chain its wallet txs must stop
+    /// being reported by listtransactions / gettransaction. Mirrors the
+    /// (currently connect-only) UTXO scan — the capability is provided so a
+    /// disconnect hook can call it once wired. Best-effort: never fails the
+    /// chain (matching scanBlockForWallet's contract).
+    pub fn unscanBlockForWallet(self: *Wallet, block: *const types.Block) !void {
+        for (block.transactions) |tx| {
+            const txid = try crypto.computeTxid(&tx, self.allocator);
+            var i: usize = 0;
+            while (i < self.tx_history.items.len) {
+                if (std.mem.eql(u8, &self.tx_history.items[i].txid, &txid)) {
+                    var rec = self.tx_history.orderedRemove(i);
+                    rec.deinit(self.allocator);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Depth (confirmations) of a recorded tx at the current tip:
+    /// tip_height - height + 1, clamped at 0 for a tx ahead of our tip.
+    pub fn txConfirmations(self: *const Wallet, rec: *const WalletTxRecord) u32 {
+        if (self.tip_height < rec.height) return 0;
+        return self.tip_height - rec.height + 1;
+    }
+
+    /// Look up a recorded wallet tx by display-order (reversed) txid hex.
+    /// Returns null if absent. `txid_internal` is the 32-byte internal order.
+    pub fn findTxByHash(self: *Wallet, txid_internal: *const types.Hash256) ?*WalletTxRecord {
+        for (self.tx_history.items) |*rec| {
+            if (std.mem.eql(u8, &rec.txid, txid_internal)) return rec;
+        }
+        return null;
     }
 };
 
