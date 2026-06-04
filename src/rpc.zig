@@ -6610,6 +6610,12 @@ pub const RpcServer = struct {
         };
         defer self.allocator.free(payout_script);
 
+        // Capture the chain height BEFORE mining so we can assign the correct
+        // height to each freshly connected block when scanning it into the
+        // wallet UTXO ledger below (block at result index i is at
+        // start_height + 1 + i).
+        const start_height = self.chain_state.best_height;
+
         // Generate blocks
         var result = block_template.generateBlocks(
             self.chain_state,
@@ -6639,6 +6645,15 @@ pub const RpcServer = struct {
             std.log.info("announced block to peers (BIP-130 sendheaders honored)", .{});
         }
 
+        // Wallet UTXO ledger: scan every block we just connected for outputs
+        // paying wallet addresses (credit) and inputs spending wallet coins
+        // (debit). Mirrors Bitcoin Core's CWallet::blockConnected. This is the
+        // "block-connect -> wallet-scan" hook that turns getbalance /
+        // listunspent / sendtoaddress GREEN. Best-effort: a wallet bookkeeping
+        // failure must never fail a fully validated block, so errors are
+        // swallowed (the ledger is reconstructible via scantxoutset / rescan).
+        self.scanMinedBlocksIntoWallets(result.serialized_blocks.items, start_height);
+
         // Format response as JSON array of block hashes
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
@@ -6657,6 +6672,51 @@ pub const RpcServer = struct {
         try writer.writeByte(']');
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Scan a set of freshly mined+connected blocks (in connect order) into
+    /// every loaded wallet's UTXO ledger. `serialized_blocks[i]` is the block
+    /// connected at height `start_height + 1 + i`. Best-effort: deserialize
+    /// failures and per-wallet scan errors are logged and skipped so a wallet
+    /// bookkeeping problem never disturbs the chain. Mirrors the symmetric
+    /// hook in beamchain's do_connect_block_inner (reference impl 6cfaef6).
+    fn scanMinedBlocksIntoWallets(
+        self: *RpcServer,
+        serialized_blocks: []const []const u8,
+        start_height: u32,
+    ) void {
+        for (serialized_blocks, 0..) |raw, i| {
+            const height: u32 = start_height + 1 + @as(u32, @intCast(i));
+
+            // Deserialize the connected block into a temporary arena we free
+            // immediately after scanning (the wallet dup's anything it keeps).
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var reader = serialize.Reader{ .data = raw };
+            const block = serialize.readBlock(&reader, arena.allocator()) catch |err| {
+                std.log.warn("wallet-scan: failed to deserialize mined block at height {d}: {s}", .{ height, @errorName(err) });
+                continue;
+            };
+
+            // Legacy single-wallet handle.
+            if (self.wallet) |w| {
+                w.scanBlockForWallet(&block, height) catch |err| {
+                    std.log.warn("wallet-scan: scan failed for default wallet at height {d}: {s}", .{ height, @errorName(err) });
+                };
+            }
+
+            // All wallets loaded via the multi-wallet manager.
+            if (self.wallet_manager) |wm| {
+                wm.mutex.lock();
+                defer wm.mutex.unlock();
+                var it = wm.wallets.iterator();
+                while (it.next()) |entry| {
+                    entry.value_ptr.*.scanBlockForWallet(&block, height) catch |err| {
+                        std.log.warn("wallet-scan: scan failed for wallet '{s}' at height {d}: {s}", .{ entry.key_ptr.*, height, @errorName(err) });
+                    };
+                }
+            }
+        }
     }
 
     /// Handle generatetodescriptor RPC.
@@ -10753,6 +10813,19 @@ pub const RpcServer = struct {
         return self.handleSendToAddressWithWallet(wallet, params, id);
     }
 
+    /// Wallet-native sendtoaddress: coin-select over the wallet's mature
+    /// spendable UTXOs, build + sign a transaction paying `amount` to the
+    /// destination address (change returns to a fresh wallet address), submit
+    /// it to the mempool, broadcast the inv, and return the display txid.
+    ///
+    /// Replaces the historical placeholder that ignored the wallet, never
+    /// built a transaction, and returned an all-zero dummy txid. The wallet
+    /// already had the machinery (selectCoinsWithOptions / signInput); the
+    /// only missing piece — populating the UTXO ledger from block-connect —
+    /// is wired in handleGenerateToAddress -> wallet.scanBlockForWallet.
+    ///
+    /// Reference: bitcoin-core/src/wallet/spend.cpp CreateTransaction +
+    /// rpc/spend.cpp sendtoaddress.
     fn handleSendToAddressWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         const addr_param = params.array.items[0];
         const amount_param = params.array.items[1];
@@ -10769,28 +10842,122 @@ pub const RpcServer = struct {
         } else {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
         }
-
-        // Check balance
-        const balance = wallet.getBalance();
-        if (balance < amount_sats) {
-            return self.jsonRpcError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds", id);
+        if (amount_sats <= 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
         }
 
-        // In a full implementation, we would:
-        // 1. Create transaction
-        // 2. Sign it
-        // 3. Broadcast to network
-        // For now, return a placeholder txid
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
-        const writer = buf.writer();
+        // Destination scriptPubKey from the address.
+        const dest_spk = scriptPubKeyForAddress(self.allocator, addr_param.string) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        };
+        // Ownership of dest_spk transfers to the tx outputs list below.
+        var dest_spk_owned = true;
+        defer if (dest_spk_owned) self.allocator.free(dest_spk);
 
-        try writer.writeAll("\"");
-        // Return a dummy txid (in real impl would be the actual txid)
-        try writer.writeAll("0000000000000000000000000000000000000000000000000000000000000000");
-        try writer.writeAll("\"");
+        // Fee rate: 5 sat/vB. Comfortably clears the 0.1 sat/vB (MIN_RELAY_FEE
+        // = 100 sat/kvB) relay floor the mempool enforces in addTransaction,
+        // while keeping the implied fee small (a 1-input/2-output P2WPKH spend
+        // is ~140 vB -> a few hundred sats). The coin selector charges this
+        // rate per input when computing change.
+        const fee_rate: u64 = 5;
 
-        return self.jsonRpcResult(buf.items, id);
+        // Coin selection over the wallet's mature spendable set.
+        const sel = wallet.selectCoinsWithOptions(amount_sats, .{ .fee_rate = fee_rate }) catch |e| switch (e) {
+            error.InsufficientFunds => return self.jsonRpcError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds", id),
+            else => return self.jsonRpcError(RPC_WALLET_ERROR, "Coin selection failed", id),
+        };
+        defer self.allocator.free(sel.selected);
+
+        // Build the inputs (unsigned for now; signInput fills script_sig /
+        // witness in place).
+        var tx_inputs = std.ArrayList(types.TxIn).init(self.allocator);
+        defer tx_inputs.deinit();
+        for (sel.selected) |u| {
+            try tx_inputs.append(types.TxIn{
+                .previous_output = u.outpoint,
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFD, // BIP-125 opt-in replaceable
+                .witness = &[_][]const u8{},
+            });
+        }
+
+        // Build the outputs: recipient first, change (if any) second.
+        var tx_outputs = std.ArrayList(types.TxOut).init(self.allocator);
+        defer tx_outputs.deinit();
+        try tx_outputs.append(types.TxOut{ .value = amount_sats, .script_pubkey = dest_spk });
+        dest_spk_owned = false; // tx_outputs now owns dest_spk
+
+        var change_addr_alloc: ?[]const u8 = null;
+        defer if (change_addr_alloc) |ca| self.allocator.free(ca);
+        if (sel.change >= 546) {
+            const change_addr = wallet.getnewaddress(.p2wpkh, true) catch {
+                return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to derive change address", id);
+            };
+            change_addr_alloc = change_addr.address;
+            const change_spk = scriptPubKeyForAddress(self.allocator, change_addr.address) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to build change scriptPubKey", id);
+            };
+            try tx_outputs.append(types.TxOut{ .value = sel.change, .script_pubkey = change_spk });
+        }
+
+        // Materialize the transaction. The slices below are duped so the tx
+        // owns memory independent of the ArrayLists' backing storage; the
+        // mempool takes ownership of `tx` on a successful addTransaction.
+        const inputs_slice = try self.allocator.dupe(types.TxIn, tx_inputs.items);
+        const outputs_slice = try self.allocator.dupe(types.TxOut, tx_outputs.items);
+        var tx = types.Transaction{
+            .version = 2,
+            .inputs = inputs_slice,
+            .outputs = outputs_slice,
+            .lock_time = 0,
+        };
+
+        // Sign each input in place. P2WPKH/P2SH-P2WPKH don't need the full
+        // prevout set, but pass it so a P2TR coin would also sign correctly.
+        for (sel.selected, 0..) |u, idx| {
+            wallet.signInput(&tx, idx, u, @intFromEnum(types.SigHashType.all), sel.selected) catch {
+                // Free the duped slices + recipient/change scripts on failure.
+                for (outputs_slice) |o| self.allocator.free(o.script_pubkey);
+                self.allocator.free(outputs_slice);
+                self.allocator.free(inputs_slice);
+                return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to sign transaction", id);
+            };
+        }
+
+        const txid = crypto.computeTxid(&tx, self.allocator) catch {
+            for (tx.inputs) |in| {
+                if (in.script_sig.len > 0) self.allocator.free(in.script_sig);
+                for (in.witness) |w| self.allocator.free(w);
+                if (in.witness.len > 0) self.allocator.free(in.witness);
+            }
+            for (outputs_slice) |o| self.allocator.free(o.script_pubkey);
+            self.allocator.free(outputs_slice);
+            self.allocator.free(inputs_slice);
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to compute txid", id);
+        };
+
+        // Submit to the mempool. On success the mempool owns `tx`; on failure
+        // we free the witness/script_sig/output memory we allocated.
+        self.mempool.addTransaction(tx) catch |err| {
+            for (tx.inputs) |in| {
+                if (in.script_sig.len > 0) self.allocator.free(in.script_sig);
+                for (in.witness) |w| self.allocator.free(w);
+                if (in.witness.len > 0) self.allocator.free(in.witness);
+            }
+            for (outputs_slice) |o| self.allocator.free(o.script_pubkey);
+            self.allocator.free(outputs_slice);
+            self.allocator.free(inputs_slice);
+            return switch (err) {
+                mempool_mod.MempoolError.InsufficientFee => self.jsonRpcError(RPC_WALLET_ERROR, "min relay fee not met", id),
+                mempool_mod.MempoolError.ImmatureCoinbase => self.jsonRpcError(RPC_WALLET_ERROR, "bad-txns-premature-spend-of-coinbase", id),
+                mempool_mod.MempoolError.MissingInputs => self.jsonRpcError(RPC_WALLET_ERROR, "missing inputs", id),
+                else => self.jsonRpcError(RPC_WALLET_ERROR, "Transaction rejected by mempool", id),
+            };
+        };
+
+        // Broadcast + return the Core-style display (reversed) txid, matching
+        // sendrawtransaction / getrawmempool.
+        return self.returnTxidAndBroadcast(txid, id);
     }
 
     /// Handle listunspent RPC - list unspent transaction outputs.

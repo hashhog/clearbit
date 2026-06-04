@@ -1592,10 +1592,17 @@ pub fn mineBlock(
     submit_block: bool,
     allocator: std.mem.Allocator,
 ) !?types.Hash256 {
-    return mineBlockWithIndex(template, chain_state, params, max_tries, submit_block, null, allocator);
+    return mineBlockWithIndex(template, chain_state, params, max_tries, submit_block, null, null, allocator);
 }
 
 /// Mine a single block, optionally inserting into the block index.
+///
+/// `mempool` (optional): when provided, confirmed transactions are dropped
+/// from the mempool as the block connects (Core's ConnectTip ->
+/// removeForBlock). Without it, a wallet-native spend that confirms via
+/// generatetoaddress would linger in the mempool indefinitely (mempool
+/// wedge / re-relay). The generatetoaddress / generatetodescriptor callers
+/// thread their mempool through; the bare `mineBlock` wrapper passes null.
 pub fn mineBlockWithIndex(
     template: *BlockTemplate,
     chain_state: *storage.ChainState,
@@ -1603,6 +1610,7 @@ pub fn mineBlockWithIndex(
     max_tries: u64,
     submit_block: bool,
     chain_manager: ?*validation.ChainManager,
+    mempool: ?*mempool_mod.Mempool,
     allocator: std.mem.Allocator,
 ) !?types.Hash256 {
     // 1. Compute merkle root
@@ -1631,8 +1639,12 @@ pub fn mineBlockWithIndex(
                     allocator.free(block.transactions);
                 }
 
-                // Submit to chain (with block index update when chain_manager is available)
-                const result = try submitBlockWithIndex(&block, chain_state, params, chain_manager, allocator);
+                // Submit to chain (with block index update when chain_manager
+                // is available). Route through the mempool-aware entry point so
+                // confirmed txs are evicted on connect (removeForBlock) — keeps
+                // generatetoaddress from leaving a wallet spend wedged in the
+                // mempool after it confirms.
+                const result = try submitBlockWithIndexAndMempool(&block, chain_state, params, chain_manager, mempool, allocator);
                 if (!result.accepted) {
                     return null;
                 }
@@ -1716,6 +1728,7 @@ pub fn generateBlocks(
             max_tries,
             true, // submit to chain
             chain_manager,
+            mempool, // evict confirmed txs from the mempool on connect
             allocator,
         );
 
@@ -1825,6 +1838,7 @@ pub fn generateBlockWithTxs(
         max_tries,
         submit_block,
         chain_manager,
+        mempool, // evict confirmed txs from the mempool on connect
         allocator,
     );
 
