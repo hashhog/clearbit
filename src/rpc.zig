@@ -3152,6 +3152,12 @@ pub const RpcServer = struct {
             return self.handleGetTxOut(params, id);
         } else if (std.mem.eql(u8, method, "scantxoutset")) {
             return self.handleScanTxOutSet(params, id);
+        } else if (std.mem.eql(u8, method, "rescanblockchain")) {
+            return self.handleRescanBlockchain(params, id);
+        } else if (std.mem.eql(u8, method, "importprivkey")) {
+            return self.handleImportPrivKey(params, id);
+        } else if (std.mem.eql(u8, method, "dumpprivkey")) {
+            return self.handleDumpPrivKey(params, id);
         } else if (std.mem.eql(u8, method, "sethdseed")) {
             return self.handleSetHdSeed(params, id);
         } else if (std.mem.eql(u8, method, "getmempoolancestors")) {
@@ -13087,6 +13093,275 @@ pub const RpcServer = struct {
         const total_btc: f64 = @as(f64, @floatFromInt(total_amount)) / 100_000_000.0;
         try writer.print("],\"total_amount\":{d:.8}}}", .{total_btc});
 
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// rescanblockchain ( start_height stop_height )
+    ///
+    /// Rescan the local block chain for transactions affecting the active
+    /// wallet — the BACKWARD counterpart of the block-connect wallet scan
+    /// (`scanMinedBlocksIntoWallets` -> `Wallet.scanBlockForWallet`). Walks
+    /// every connected block in `[start_height, stop_height]` in ascending
+    /// height order, reads the raw block bytes from CF_BLOCKS, and feeds each
+    /// block through the SAME scan logic the connect hook uses, crediting every
+    /// wallet-owned output found in the range (and debiting spent owned inputs)
+    /// into the wallet's UTXO ledger + transaction history.
+    ///
+    /// This is the REAL wallet rescan: a wallet restored from seed
+    /// (sethdseed) derives its keys but does NOT scan the chain, so its
+    /// getbalance/listunspent are empty until this runs. Unlike scantxoutset
+    /// (which queries the chain UTXO set and bypasses the wallet entirely),
+    /// rescanblockchain reconstructs the wallet's own ledger from the blocks.
+    ///
+    /// Returns Core-shaped `{start_height, stop_height}`.
+    ///
+    /// Reference: bitcoin-core/src/wallet/rpc/transactions.cpp::rescanblockchain
+    ///            + CWallet::ScanForWalletTransactions (wallet/wallet.cpp).
+    fn handleRescanBlockchain(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wallet = self.current_wallet orelse self.wallet orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+
+        const tip_height = self.chain_state.best_height;
+
+        // start_height (param 0, default 0) and stop_height (param 1, default
+        // tip). Both clamped to [0, tip]. Core errors if start_height > tip or
+        // stop_height < start_height.
+        var start_height: u32 = 0;
+        var stop_height: u32 = tip_height;
+        if (params == .array) {
+            if (params.array.items.len >= 1) {
+                const sh = params.array.items[0];
+                switch (sh) {
+                    .integer => |v| {
+                        if (v < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid start_height", id);
+                        start_height = @intCast(v);
+                    },
+                    .null => {},
+                    else => return self.jsonRpcError(RPC_INVALID_PARAMS, "start_height must be an integer", id),
+                }
+            }
+            if (params.array.items.len >= 2) {
+                const st = params.array.items[1];
+                switch (st) {
+                    .integer => |v| {
+                        if (v < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid stop_height", id);
+                        stop_height = @intCast(v);
+                    },
+                    .null => {},
+                    else => return self.jsonRpcError(RPC_INVALID_PARAMS, "stop_height must be an integer", id),
+                }
+            }
+        }
+
+        if (start_height > tip_height) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid start_height (beyond tip)", id);
+        }
+        if (stop_height > tip_height) stop_height = tip_height;
+        if (stop_height < start_height) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "stop_height must be greater than start_height", id);
+        }
+
+        const db = self.chain_state.utxo_set.db orelse {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block database not available", id);
+        };
+
+        // Walk the requested height range, ascending (connect order), feeding
+        // each block through the same wallet scan the connect hook uses. Each
+        // block is parsed into a throwaway arena that is freed immediately
+        // after the scan (the wallet dup's anything it keeps). Best-effort per
+        // block: a missing/undeserializable block is skipped, not fatal —
+        // matching the connect hook's contract.
+        var h: u32 = start_height;
+        while (h <= stop_height) : (h += 1) {
+            const hash = self.chain_state.getBlockHashByHeight(h) orelse continue;
+            const raw = (db.get(storage.CF_BLOCKS, &hash) catch null) orelse continue;
+            defer self.allocator.free(raw);
+
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var reader = serialize.Reader{ .data = raw };
+            const block = serialize.readBlock(&reader, arena.allocator()) catch |err| {
+                std.log.warn("rescanblockchain: failed to deserialize block at height {d}: {s}", .{ h, @errorName(err) });
+                if (h == std.math.maxInt(u32)) break;
+                continue;
+            };
+
+            wallet.scanBlockForWallet(&block, h) catch |err| {
+                std.log.warn("rescanblockchain: scan failed at height {d}: {s}", .{ h, @errorName(err) });
+            };
+
+            if (h == std.math.maxInt(u32)) break;
+        }
+
+        // Pin the wallet's tip view at the real chain tip so coinbase-maturity
+        // / confirmation arithmetic (getBalanceMinConf, getSpendableBalance) is
+        // correct even when the rescanned range stops short of the tip.
+        if (tip_height > wallet.tip_height) wallet.setTipHeight(tip_height);
+
+        var buf: [96]u8 = undefined;
+        const result = std.fmt.bufPrint(
+            &buf,
+            "{{\"start_height\":{d},\"stop_height\":{d}}}",
+            .{ start_height, stop_height },
+        ) catch return error.OutOfMemory;
+        return self.jsonRpcResult(result, id);
+    }
+
+    /// importprivkey "privkey" ( "label" rescan )
+    ///
+    /// Decode a WIF private key, add the key (and thereby its addresses across
+    /// every standard script type) to the active wallet, and — when `rescan`
+    /// is true (Core default) — rescan the whole chain so the wallet credits
+    /// any funds already paid to that key's scripts.
+    ///
+    /// clearbit's wallet scan tries p2wpkh / p2sh-p2wpkh / p2pkh / p2tr / p2wsh
+    /// scripts for every wallet key, so a single imported key picks up funds on
+    /// any of those address forms — no per-address-type bookkeeping needed.
+    ///
+    /// Returns null on success (matching Core). The `label` argument is
+    /// accepted and, if present, applied to the imported key's primary
+    /// (p2wpkh) address.
+    ///
+    /// Reference: bitcoin-core/src/wallet/rpc/backup.cpp::importprivkey.
+    fn handleImportPrivKey(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wallet = self.current_wallet orelse self.wallet orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+
+        if (params != .array or params.array.items.len < 1 or params.array.items[0] != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "importprivkey requires a WIF private key string", id);
+        }
+        const wif = params.array.items[0].string;
+
+        // Optional label (param 1). Core also accepts an empty string / "*".
+        var label: ?[]const u8 = null;
+        if (params.array.items.len >= 2) {
+            const l = params.array.items[1];
+            if (l == .string and l.string.len > 0) label = l.string;
+        }
+
+        // Optional rescan flag (param 2, default true per Core).
+        var rescan = true;
+        if (params.array.items.len >= 3) {
+            const r = params.array.items[2];
+            if (r == .bool) rescan = r.bool;
+        }
+
+        // An encrypted+locked wallet cannot accept new keys (importKey would
+        // fail at the encrypt step). Surface Core's wallet-unlock error.
+        if (wallet.encrypted and !wallet.isUnlocked()) {
+            return self.jsonRpcError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.", id);
+        }
+
+        const decoded = self.decodeWifPrivkey(wif) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key encoding", id);
+        };
+
+        const key_index = wallet.importKey(decoded.secret) catch |err| {
+            return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
+        };
+
+        // Apply the label to the imported key's primary (p2wpkh) address.
+        if (label) |lbl| {
+            const addr = wallet.getAddress(key_index, .p2wpkh) catch null;
+            if (addr) |a| {
+                defer self.allocator.free(a);
+                wallet.setLabel(a, lbl) catch {};
+            }
+        }
+
+        // Rescan the chain so the imported key picks up its existing funds.
+        if (rescan) {
+            const tip_height = self.chain_state.best_height;
+            if (self.chain_state.utxo_set.db) |db| {
+                var h: u32 = 0;
+                while (h <= tip_height) : (h += 1) {
+                    const hash = self.chain_state.getBlockHashByHeight(h) orelse continue;
+                    const raw = (db.get(storage.CF_BLOCKS, &hash) catch null) orelse continue;
+                    defer self.allocator.free(raw);
+
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    var reader = serialize.Reader{ .data = raw };
+                    const block = serialize.readBlock(&reader, arena.allocator()) catch {
+                        if (h == std.math.maxInt(u32)) break;
+                        continue;
+                    };
+                    wallet.scanBlockForWallet(&block, h) catch {};
+                    if (h == std.math.maxInt(u32)) break;
+                }
+                if (tip_height > wallet.tip_height) wallet.setTipHeight(tip_height);
+            }
+        }
+
+        // Core returns null on success.
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// dumpprivkey "address"
+    ///
+    /// Export the WIF (Wallet Import Format) private key for a wallet-owned
+    /// address. The key is located by matching the address's hash160(pubkey)
+    /// against every wallet key (covering p2pkh / p2wpkh / p2sh-p2wpkh, which
+    /// all commit to hash160 of the compressed pubkey). The WIF version byte
+    /// follows the wallet's network (0x80 mainnet, 0xEF testnet/regtest) and
+    /// the compressed-flag (0x01) suffix is always set since clearbit stores
+    /// only compressed pubkeys.
+    ///
+    /// Reference: bitcoin-core/src/wallet/rpc/backup.cpp::dumpprivkey.
+    fn handleDumpPrivKey(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wallet = self.current_wallet orelse self.wallet orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+        if (wallet.encrypted and !wallet.isUnlocked()) {
+            return self.jsonRpcError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.", id);
+        }
+
+        if (params != .array or params.array.items.len < 1 or params.array.items[0] != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "dumpprivkey requires an address string", id);
+        }
+        const addr_str = params.array.items[0].string;
+
+        const addr = address_mod.Address.decode(addr_str, self.allocator) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        };
+        defer addr.deinit(self.allocator);
+        if (addr.hash.len != 20) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "dumpprivkey only supports hash160-committing addresses (p2pkh/p2wpkh/p2sh-p2wpkh)", id);
+        }
+
+        // Locate the wallet key whose hash160(compressed pubkey) matches.
+        var secret: ?[32]u8 = null;
+        for (wallet.keys.items, 0..) |k, ki| {
+            const h = crypto.hash160(&k.public_key);
+            if (std.mem.eql(u8, &h, addr.hash)) {
+                // If encrypted+unlocked, the stored secret_key is ciphertext —
+                // decode the plaintext via the wallet's exporter.
+                secret = wallet.exportSecretKey(ki) catch return self.jsonRpcError(RPC_WALLET_ERROR, "Private key not available", id);
+                break;
+            }
+        }
+        const sk = secret orelse {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Private key for address is not known", id);
+        };
+
+        // Build the WIF payload: 32-byte secret + 0x01 compressed flag.
+        var payload: [33]u8 = undefined;
+        @memcpy(payload[0..32], &sk);
+        payload[32] = 0x01;
+        const version: u8 = switch (wallet.network) {
+            .mainnet => 0x80,
+            .testnet, .regtest => 0xEF,
+        };
+        const wif = address_mod.base58CheckEncode(version, &payload, self.allocator) catch return error.OutOfMemory;
+        defer self.allocator.free(wif);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        try buf.append('"');
+        try buf.appendSlice(wif);
+        try buf.append('"');
         return self.jsonRpcResult(buf.items, id);
     }
 
