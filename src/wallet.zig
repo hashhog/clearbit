@@ -2453,6 +2453,15 @@ pub const Wallet = struct {
         return decryptPrivateKey(&enc_key, &kp.secret_key, &nonce, &tag);
     }
 
+    /// Public export of the plaintext secret key for `key_index` (the WIF
+    /// backing for `dumpprivkey`). Delegates to `getPlaintextSecretKey`, which
+    /// returns the stored bytes for an unencrypted wallet and the AES-256-GCM
+    /// plaintext for an encrypted+unlocked one (error.WalletLocked otherwise).
+    pub fn exportSecretKey(self: *const Wallet, key_index: usize) ![32]u8 {
+        if (key_index >= self.keys.items.len) return error.KeyNotFound;
+        return self.getPlaintextSecretKey(key_index);
+    }
+
     /// W161 BUG-5 fix: return a plaintext copy of the HD master key for use
     /// in BIP-32 derivation.  Mirrors getPlaintextSecretKey() but acts on the
     /// 32-byte master.key + 32-byte chain_code stored as AES-256-GCM ciphertext
