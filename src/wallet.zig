@@ -3078,6 +3078,118 @@ pub const Wallet = struct {
         }
         return total;
     }
+
+    /// Scan a block that just connected to the active chain and update the
+    /// wallet's UTXO ledger, mirroring Bitcoin Core's
+    /// `CWallet::blockConnected` notification (wallet/wallet.cpp).
+    ///
+    /// The wallet has the full coin-select -> build -> sign -> broadcast
+    /// machinery (selectCoinsWithOptions / signInput), but the UTXO ledger
+    /// (`self.utxos`) was never populated from chain connect, so getbalance
+    /// / listunspent / sendtoaddress saw an empty wallet. This is the missing
+    /// "block-connect -> wallet-scan" hook: the caller invokes it for every
+    /// block connected to the active tip (here, from generatetoaddress).
+    ///
+    /// For each transaction, in block order:
+    ///   1. DEBIT — delete any wallet UTXO this tx's inputs spend (a coin we
+    ///      own that is now consumed on-chain). Skipped for the coinbase
+    ///      (its single input is the null prevout).
+    ///   2. CREDIT — for each output whose scriptPubKey matches one of our
+    ///      derived scripts (across the address types we support), record an
+    ///      OwnedUtxo with the matching key_index + address_type so the coin
+    ///      is later spendable via signInput. Coinbase outputs are flagged so
+    ///      coin-selection / getbalance enforce the 100-confirmation maturity
+    ///      rule (consensus.COINBASE_MATURITY).
+    ///
+    /// `self.tip_height` is advanced to `height` so the maturity / depth
+    /// arithmetic in getBalanceMinConf / selectCoinsWithOptions is correct.
+    ///
+    /// Idempotent on credits: re-scanning the same block does not double-count
+    /// (a UTXO already present at the same outpoint is not re-added). Best-
+    /// effort by contract: the caller treats a failure as non-fatal (a fully
+    /// validated block is never rolled back because a wallet bookkeeping step
+    /// failed — the ledger is reconstructible via rescan / scantxoutset).
+    pub fn scanBlockForWallet(self: *Wallet, block: *const types.Block, height: u32) !void {
+        // Advance the wallet's view of the chain tip first so depth/maturity
+        // checks performed by callers immediately after the scan are correct.
+        if (height > self.tip_height) self.tip_height = height;
+
+        // Address types whose scriptPubKey we can derive + later sign.
+        const types_to_try = [_]AddressType{
+            .p2wpkh,
+            .p2sh_p2wpkh,
+            .p2pkh,
+            .p2tr,
+            .p2wsh,
+        };
+
+        for (block.transactions) |tx| {
+            const is_cb = tx.isCoinbase();
+
+            // 1. DEBIT: remove any owned coins this tx spends.
+            if (!is_cb) {
+                for (tx.inputs) |input| {
+                    _ = self.removeUtxo(input.previous_output);
+                }
+            }
+
+            // 2. CREDIT: add any outputs paying a script we own.
+            const txid = try crypto.computeTxid(&tx, self.allocator);
+            for (tx.outputs, 0..) |out, vout| {
+                var matched = false;
+                var match_key_index: usize = 0;
+                var match_addr_type: AddressType = .p2wpkh;
+
+                outer: for (0..self.keys.items.len) |ki| {
+                    for (types_to_try) |at| {
+                        const spk = self.getScriptPubKey(ki, at) catch continue;
+                        defer self.allocator.free(spk);
+                        if (std.mem.eql(u8, spk, out.script_pubkey)) {
+                            matched = true;
+                            match_key_index = ki;
+                            match_addr_type = at;
+                            break :outer;
+                        }
+                    }
+                }
+                if (!matched) continue;
+
+                const outpoint = types.OutPoint{
+                    .hash = txid,
+                    .index = @intCast(vout),
+                };
+
+                // Idempotent: skip if we already track this exact outpoint.
+                var already = false;
+                for (self.utxos.items) |u| {
+                    if (std.mem.eql(u8, &u.outpoint.hash, &outpoint.hash) and
+                        u.outpoint.index == outpoint.index)
+                    {
+                        already = true;
+                        break;
+                    }
+                }
+                if (already) continue;
+
+                // Copy the output scriptPubKey into wallet-owned memory: the
+                // block we scanned is deserialized into a temporary arena the
+                // caller frees after the scan, so we must not alias it.
+                const spk_copy = try self.allocator.dupe(u8, out.script_pubkey);
+                errdefer self.allocator.free(spk_copy);
+
+                const depth = if (self.tip_height >= height) self.tip_height - height else 0;
+                try self.addUtxo(.{
+                    .outpoint = outpoint,
+                    .output = .{ .value = out.value, .script_pubkey = spk_copy },
+                    .key_index = match_key_index,
+                    .address_type = match_addr_type,
+                    .confirmations = depth + 1,
+                    .is_coinbase = is_cb,
+                    .height = height,
+                });
+            }
+        }
+    }
 };
 
 // ============================================================================
