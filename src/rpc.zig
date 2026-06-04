@@ -3148,6 +3148,10 @@ pub const RpcServer = struct {
             return self.handleValidateAddress(params, id);
         } else if (std.mem.eql(u8, method, "gettxout")) {
             return self.handleGetTxOut(params, id);
+        } else if (std.mem.eql(u8, method, "scantxoutset")) {
+            return self.handleScanTxOutSet(params, id);
+        } else if (std.mem.eql(u8, method, "sethdseed")) {
+            return self.handleSetHdSeed(params, id);
         } else if (std.mem.eql(u8, method, "getmempoolancestors")) {
             return self.handleGetMempoolAncestors(params, id);
         } else if (std.mem.eql(u8, method, "getmempooldescendants")) {
@@ -12506,6 +12510,218 @@ pub const RpcServer = struct {
 
     /// gettxout "txid" n ( include_mempool )
     /// Returns details about an unspent transaction output.
+    /// sethdseed ( newkeypool "seed" )
+    ///
+    /// Recovery entry point: (re)set the active wallet's HD seed from a
+    /// fixed BIP-32 seed so a wallet created/loaded with NO seed (or a
+    /// fresh blank wallet) can be deterministically restored from
+    /// backup.  clearbit accepts the seed as a hex string in the second
+    /// positional argument (16..64 bytes per BIP-32).  This is a
+    /// pragmatic divergence from Core's `sethdseed` (which takes a WIF
+    /// key as the 256-bit seed) chosen so the recovery flow can restore a
+    /// *known* seed byte-for-byte and re-derive an identical address
+    /// sequence.  The first argument (`newkeypool`) is accepted and
+    /// ignored — clearbit derives keys on demand, it has no keypool to
+    /// flush.
+    ///
+    /// Operates on UNENCRYPTED wallets only (see `Wallet.setHdSeed`).
+    fn handleSetHdSeed(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wallet = self.current_wallet orelse self.wallet orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        };
+
+        // Locate the seed argument: accept it at index 0 (seed-only call)
+        // or index 1 (Core-shaped `sethdseed true "<seed>"`).
+        var seed_hex: ?[]const u8 = null;
+        if (params == .array) {
+            for (params.array.items) |p| {
+                if (p == .string and p.string.len > 0) {
+                    seed_hex = p.string;
+                    break;
+                }
+            }
+        }
+        const hex = seed_hex orelse {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMS,
+                "sethdseed requires a hex seed argument (clearbit divergence: "
+                    ++ "16..64-byte BIP-32 seed as hex)",
+                id,
+            );
+        };
+
+        if (hex.len < 32 or hex.len > 128 or (hex.len % 2) != 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid seed length (expect 16..64 bytes hex)", id);
+        }
+
+        var seed_buf: [64]u8 = undefined;
+        const seed_len = hex.len / 2;
+        for (0..seed_len) |i| {
+            const high = std.fmt.charToDigit(hex[i * 2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid seed hex", id);
+            };
+            const low = std.fmt.charToDigit(hex[i * 2 + 1], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid seed hex", id);
+            };
+            seed_buf[i] = (high << 4) | low;
+        }
+        defer @memset(seed_buf[0..seed_len], 0);
+
+        wallet.setHdSeed(seed_buf[0..seed_len]) catch |err| {
+            if (err == error.WalletEncrypted) {
+                return self.jsonRpcError(RPC_WALLET_ERROR, "Cannot sethdseed on an encrypted wallet (unlock + rotate unsupported)", id);
+            }
+            return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
+        };
+
+        // Core's sethdseed returns null on success.
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// scantxoutset "action" [ scanobjects ]
+    ///
+    /// Scan the UTXO set for outputs whose scriptPubKey matches one of the
+    /// supplied scan objects.  Mirrors Bitcoin Core's
+    /// `rpc/blockchain.cpp::scantxoutset`.  This is the recovery primitive:
+    /// a wallet restored from seed re-derives its addresses, then asks the
+    /// node "which UTXOs pay these scripts?" — no wallet-side rescan or
+    /// birthday-height bookkeeping required.
+    ///
+    /// Scan-object forms supported (the two Core forms used by the
+    /// recovery harness, plus single-key descriptors):
+    ///   - `addr(<address>)` — match the address's scriptPubKey.
+    ///   - `raw(<scriptPubKey-hex>)` — match this exact scriptPubKey.
+    ///   - a bare hex string — treated as `raw()` shorthand.
+    ///
+    /// Iterates the in-memory UTXO cache (the source of truth on regtest,
+    /// where the small chain never evicts) exactly like
+    /// `storage.computeHashSerializedTxOutSet` / `dumpTxOutSet`.
+    ///
+    /// Actions: `start` performs the scan; `abort`/`status` return false
+    /// (no background scan is tracked), matching Core when nothing runs.
+    fn handleScanTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // --- action ---
+        var action: []const u8 = "start";
+        if (params == .array and params.array.items.len >= 1) {
+            const a = params.array.items[0];
+            if (a == .string) action = a.string;
+        }
+        if (std.mem.eql(u8, action, "abort") or std.mem.eql(u8, action, "status")) {
+            return self.jsonRpcResult("false", id);
+        }
+        if (!std.mem.eql(u8, action, "start")) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid action; expected start/abort/status", id);
+        }
+
+        // --- scanobjects ---
+        if (params != .array or params.array.items.len < 2 or params.array.items[1] != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "scanobjects array required for the start action", id);
+        }
+        const scanobjects = params.array.items[1].array;
+        if (scanobjects.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "scanobjects array required for the start action", id);
+        }
+
+        // Resolve every scan object to its scriptPubKey bytes (the
+        // "needles").  Each needle keeps the descriptor string it came
+        // from so it can be echoed back in the matched unspent.
+        const Needle = struct { spk: []u8, desc: []const u8 };
+        var needles = std.ArrayList(Needle).init(self.allocator);
+        defer {
+            for (needles.items) |n| self.allocator.free(n.spk);
+            needles.deinit();
+        }
+
+        for (scanobjects.items) |obj| {
+            var spec: []const u8 = "";
+            if (obj == .string) {
+                spec = obj.string;
+            } else if (obj == .object) {
+                const d = obj.object.get("desc") orelse {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Scan object missing desc", id);
+                };
+                if (d != .string) return self.jsonRpcError(RPC_INVALID_PARAMS, "desc must be a string", id);
+                spec = d.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Scan object must be a descriptor string", id);
+            }
+
+            // Strip a trailing #checksum if present.
+            var clean = spec;
+            if (std.mem.indexOfScalar(u8, clean, '#')) |h| clean = clean[0..h];
+
+            const spk: []u8 = blk: {
+                if (std.mem.startsWith(u8, clean, "addr(") and std.mem.endsWith(u8, clean, ")")) {
+                    const addr = clean["addr(".len .. clean.len - 1];
+                    break :blk descriptor.decodeAddressToScript(self.allocator, addr) catch {
+                        return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address in addr()", id);
+                    };
+                } else if (std.mem.startsWith(u8, clean, "raw(") and std.mem.endsWith(u8, clean, ")")) {
+                    const hexstr = clean["raw(".len .. clean.len - 1];
+                    break :blk hexToBytesAlloc(self.allocator, hexstr) catch {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid raw() scriptPubKey hex", id);
+                    };
+                } else {
+                    // Bare hex shorthand for raw().
+                    break :blk hexToBytesAlloc(self.allocator, clean) catch {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Unsupported scan object (expect addr()/raw()/hex)", id);
+                    };
+                }
+            };
+            needles.append(.{ .spk = spk, .desc = spec }) catch return error.OutOfMemory;
+        }
+
+        // --- single-pass UTXO cache walk (mirrors computeHashSerializedTxOutSet) ---
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"success\":true,\"txouts\":");
+        try writer.print("{d}", .{self.chain_state.utxo_set.total_utxos});
+        try writer.print(",\"height\":{d},\"bestblock\":\"", .{self.chain_state.best_height});
+        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writer.writeAll("\",\"unspents\":[");
+
+        var total_amount: i64 = 0;
+        var match_count: usize = 0;
+        var iter = self.chain_state.utxo_set.cache.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const utxo = entry.value_ptr.*.utxo;
+            const script = utxo.reconstructScript(self.allocator) catch continue;
+            defer self.allocator.free(script);
+
+            var matched_desc: ?[]const u8 = null;
+            for (needles.items) |n| {
+                if (std.mem.eql(u8, n.spk, script)) {
+                    matched_desc = n.desc;
+                    break;
+                }
+            }
+            const desc = matched_desc orelse continue;
+
+            if (match_count > 0) try writer.writeByte(',');
+            match_count += 1;
+            total_amount += utxo.value;
+
+            // key = txid(32, internal order) || LE32(vout). JSON reports
+            // txid in display (reversed) order, matching gettxout / Core.
+            try writer.writeAll("{\"txid\":\"");
+            for (0..32) |j| try writer.print("{x:0>2}", .{key[31 - j]});
+            const vout = std.mem.readInt(u32, key[32..36], .little);
+            try writer.print("\",\"vout\":{d},\"scriptPubKey\":\"", .{vout});
+            for (script) |b| try writer.print("{x:0>2}", .{b});
+            try writer.print("\",\"desc\":\"{s}\",\"amount\":", .{desc});
+            const amt_btc: f64 = @as(f64, @floatFromInt(utxo.value)) / 100_000_000.0;
+            try writer.print("{d:.8},\"coinbase\":{},\"height\":{d}}}", .{ amt_btc, utxo.is_coinbase, utxo.height });
+        }
+
+        const total_btc: f64 = @as(f64, @floatFromInt(total_amount)) / 100_000_000.0;
+        try writer.print("],\"total_amount\":{d:.8}}}", .{total_btc});
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     fn handleGetTxOut(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Parse txid
         const txid_hex = blk: {
@@ -15338,6 +15554,20 @@ fn writeOpcodeName(writer: anytype, op: u8) !void {
 /// the magic is unrecognised (regtest scripts simply use the testnet HRP /
 /// version bytes in clearbit's address module — `bcrt` is signaled by
 /// callers, not by `Network` here).
+/// Decode a hex string into a freshly-allocated byte slice. Caller owns
+/// the result.  Returns error.InvalidHex on odd length or non-hex chars.
+fn hexToBytesAlloc(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
+    if (hex.len == 0 or (hex.len % 2) != 0) return error.InvalidHex;
+    const out = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(out);
+    for (0..out.len) |i| {
+        const high = std.fmt.charToDigit(hex[i * 2], 16) catch return error.InvalidHex;
+        const low = std.fmt.charToDigit(hex[i * 2 + 1], 16) catch return error.InvalidHex;
+        out[i] = (high << 4) | low;
+    }
+    return out;
+}
+
 fn networkFromMagic(magic: u32) address_mod.Network {
     return switch (magic) {
         consensus.MAINNET.magic => .mainnet,
