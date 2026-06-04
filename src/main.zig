@@ -1951,12 +1951,36 @@ pub fn main() !void {
         std.debug.print("Warning: could not seed genesis block in ChainManager: {}\n", .{err});
     };
 
-    var rpc_server = rpc.RpcServer.init(
+    // Wire a multi-wallet manager so the wallet RPCs (createwallet,
+    // getnewaddress, sethdseed, scantxoutset-driven recovery, …) are
+    // reachable on the live node.  Without this the RPC server came up
+    // with `wallet = null, wallet_manager = null` and every wallet RPC
+    // returned "Multi-wallet not enabled".  Wallets live under
+    // <full_datadir>/wallets and are created lazily by `createwallet`;
+    // constructing the manager costs nothing until a wallet exists.
+    const wallets_dir = std.fmt.allocPrint(allocator, "{s}/wallets", .{full_datadir}) catch {
+        std.debug.print("Out of memory allocating wallets dir\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(wallets_dir);
+    const wallet_net: wallet.Network = switch (config.network) {
+        .mainnet => .mainnet,
+        .testnet, .testnet4 => .testnet,
+        .regtest => .regtest,
+    };
+    var wallet_manager = wallet.WalletManager.init(allocator, wallets_dir, wallet_net) catch |err| {
+        std.debug.print("FATAL: could not initialize wallet manager: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer wallet_manager.deinit();
+
+    var rpc_server = rpc.RpcServer.initWithWalletManager(
         allocator,
         &chain_state,
         &mempool_instance,
         &peer_manager,
         params,
+        &wallet_manager,
         .{
             .bind_address = config.rpc_bind,
             .port = config.rpc_port,

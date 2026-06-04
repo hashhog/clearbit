@@ -1480,6 +1480,33 @@ pub const Wallet = struct {
         return try initFromSeed(allocator, network, &seed);
     }
 
+    /// Restore the wallet's HD seed from a fixed BIP-32 seed (the
+    /// `sethdseed`-style recovery entry point).  Sets `master_key` from
+    /// the seed via BIP-32 master-key generation and RESETS the
+    /// derivation cursors + the in-memory derived-key list so that a
+    /// fresh wallet restored from the same seed re-derives a
+    /// byte-identical address sequence.
+    ///
+    /// Operates only on UNENCRYPTED wallets: the encrypted path would
+    /// require unlocking, re-encrypting the new master_key with the
+    /// scrypt-derived key, and rotating the nonces/tags — that surface is
+    /// part of the frozen wallet-encryption rewrite and is intentionally
+    /// out of scope here.  Returns `error.WalletEncrypted` in that case.
+    pub fn setHdSeed(self: *Wallet, seed: []const u8) !void {
+        if (self.encrypted) return error.WalletEncrypted;
+        const new_master = try ExtendedKey.fromSeed(seed);
+        // Drop any previously derived keys so derivation restarts from
+        // index 0 and the address sequence is reproducible.
+        self.keys.clearRetainingCapacity();
+        self.master_key = new_master;
+        self.next_external_index = 0;
+        self.next_change_index = 0;
+        self.master_key_nonce = null;
+        self.master_key_tag = null;
+        self.master_chain_code_nonce = null;
+        self.master_chain_code_tag = null;
+    }
+
     pub fn deinit(self: *Wallet) void {
         // Phase 2: do NOT destroy self.ctx — it's the process-global shared
         // context owned by the `secp` module. Destroying it here would shut
