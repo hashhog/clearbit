@@ -211,6 +211,11 @@ pub const MempoolError = error{
     MempoolFull,
     /// Transaction violates standardness rules.
     NonStandard,
+    /// Transaction nVersion is outside the standard range [1, TX_MAX_STANDARD_VERSION].
+    /// Distinct from NonStandard so the reject reason maps to Core's "version"
+    /// token (policy/policy.cpp IsStandardTx: `reason = "version"`), not the
+    /// generic "non-standard". Mirrors Bitcoin Core's per-rule reject strings.
+    NonStandardVersion,
     /// Output value is below the dust threshold.
     DustOutput,
     /// Pay-to-Anchor output has non-zero value.
@@ -1497,18 +1502,32 @@ pub const Mempool = struct {
                     .reject_reason = "txn-same-nonwitness-data-in-mempool",
                 };
             }
-            // For test_accept, check standard rules without persisting to mempool.
-            // This mirrors Bitcoin Core's ProcessTransaction(test_accept=true) path:
-            // run policy checks and return the result without modifying mempool state.
-            self.checkStandard(&tx) catch |err| {
+            // For test_accept, run the SAME relay-policy floor as the full
+            // addTransaction path, but WITHOUT persisting to the mempool. This
+            // mirrors Bitcoin Core's testmempoolaccept, which runs the complete
+            // MemPoolAccept::PreChecks (IsStandardTx + dust + min-relay-fee)
+            // and only skips the final commit (rpc/mempool.cpp, test_accept=true).
+            //
+            // BUG (pre-fix): this path previously called ONLY checkStandard(),
+            // so a dust output, an out-of-range nVersion, and a below-min-relay
+            // (zero-fee) tx all returned allowed=true here even though the full
+            // addTransaction path rejects them — a testmempoolaccept-only policy
+            // hole. checkTestAcceptPolicy() closes it by also running the dust
+            // gate and the min-relay-fee gate (read-only UTXO lookup, no state
+            // mutation), exactly as the full path does.
+            const fee_out = self.checkTestAcceptPolicy(&tx, tx_hash) catch |err| {
                 const reason: []const u8 = switch (err) {
                     MempoolError.NonStandard => "non-standard",
+                    MempoolError.NonStandardVersion => "version",
                     MempoolError.TxWeightTooLarge => "tx-size",
                     MempoolError.TxTooSmall => "tx-size-small",
                     MempoolError.ScriptSigTooLarge => "scriptsig-size",
                     MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
                     MempoolError.DatacarrierTooLarge => "datacarrier",
                     MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
+                    MempoolError.DustOutput => "dust",
+                    MempoolError.InsufficientFee => "min relay fee not met",
+                    MempoolError.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
                     else => "non-standard",
                 };
                 return AcceptResult{
@@ -1527,7 +1546,7 @@ pub const Mempool = struct {
                 .accepted = true,
                 .txid = tx_hash,
                 .wtxid = wtxid,
-                .fee = 0,
+                .fee = fee_out,
                 .vsize = vsize,
                 .reject_reason = null,
             };
@@ -1546,6 +1565,7 @@ pub const Mempool = struct {
                 MempoolError.TooManyEvictions => "too many potential replacements",
                 MempoolError.MempoolFull => "mempool full",
                 MempoolError.NonStandard => "non-standard",
+                MempoolError.NonStandardVersion => "version",
                 MempoolError.TxWeightTooLarge => "tx-size",
                 MempoolError.TxTooSmall => "tx-size-small",
                 MempoolError.TxOversize => "bad-txns-oversize",
@@ -2772,8 +2792,11 @@ pub const Mempool = struct {
 
     /// Check standardness rules.
     fn checkStandard(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
-        // Version must be 1, 2, or 3 (TRUC)
-        if (tx.version < 1 or tx.version > TRUC_VERSION) return MempoolError.NonStandard;
+        // Version must be 1, 2, or 3 (TRUC). Core: IsStandardTx() rejects an
+        // out-of-range nVersion with reason "version" (policy/policy.cpp), so we
+        // return the dedicated NonStandardVersion error (not the generic
+        // NonStandard) to preserve that per-rule reject string at the RPC layer.
+        if (tx.version < 1 or tx.version > TRUC_VERSION) return MempoolError.NonStandardVersion;
 
         // Relay-policy weight cap (BIP-141 / policy.cpp IsStandardTx):
         // reject any tx whose serialized weight exceeds MAX_STANDARD_TX_WEIGHT
@@ -2920,6 +2943,110 @@ pub const Mempool = struct {
                 }
             }
         }
+    }
+
+    /// Run the relay-policy floor for testmempoolaccept (test_accept=true)
+    /// WITHOUT mutating mempool state, returning the computed fee in satoshis.
+    ///
+    /// Mirrors the subset of Bitcoin Core's MemPoolAccept::PreChecks that
+    /// testmempoolaccept exercises: IsStandardTx (checkStandard), the dust gate,
+    /// and the min-relay-fee gate. These are exactly the always-on standardness
+    /// rules; the full addTransaction path additionally runs RBF / ancestor /
+    /// cluster / persistence logic which a dry run must NOT perform.
+    ///
+    /// Without this helper the dry-run path ran only checkStandard, so dust and
+    /// below-min-relay transactions returned allowed=true even though the real
+    /// mempool rejects them — a testmempoolaccept-only policy hole. The dust and
+    /// fee computations here are read-only (UTXO-set lookups + mempool-parent
+    /// lookups; no inserts, no eviction, no rolling-fee bump).
+    ///
+    /// Reference: Bitcoin Core policy/policy.cpp (GetDust / IsStandardTx) and
+    /// validation.cpp MemPoolAccept::PreChecks (CheckFeeRate / GetMinFee).
+    fn checkTestAcceptPolicy(self: *Mempool, tx: *const types.Transaction, tx_hash: types.Hash256) MempoolError!i64 {
+        // 1. Standardness (version / weight / scriptSig / sigops / datacarrier /
+        //    bare-multisig / script-type). Same gate the full path runs first.
+        try self.checkStandard(tx);
+
+        // 2. Dust gate — Core folds this into IsStandardTx (GetDust). clearbit
+        //    keeps the dust loop out of checkStandard for the full path, so we
+        //    apply it explicitly here to match the full path's reject.
+        for (tx.outputs) |output| {
+            if (isDust(&output)) return MempoolError.DustOutput;
+        }
+
+        // 3. Min-relay-fee gate. Compute the fee read-only by summing input
+        //    values from the UTXO set (and any unconfirmed mempool parents),
+        //    exactly as addTransaction does, then compare the modified fee rate
+        //    against getMinFee(). Only enforced when input values are resolvable
+        //    (total_in > 0); with no chain state the dry run can only check
+        //    standardness, which matches the full path's `if (total_in > 0)`
+        //    guard.
+        var total_in: i64 = 0;
+        var have_inputs = false;
+        for (tx.inputs) |input| {
+            if (self.getOutputFromMempool(&input.previous_output)) |mempool_output| {
+                if (!consensus.isValidMoney(mempool_output.value)) {
+                    return MempoolError.InputValuesOutOfRange;
+                }
+                total_in += mempool_output.value;
+                if (!consensus.isValidMoney(total_in)) {
+                    return MempoolError.InputValuesOutOfRange;
+                }
+                have_inputs = true;
+            } else if (self.chain_state) |cs| {
+                const utxo = cs.utxo_set.get(&input.previous_output) catch null;
+                if (utxo) |u| {
+                    defer {
+                        var mut_u = u;
+                        mut_u.deinit(self.allocator);
+                    }
+                    if (!consensus.isValidMoney(u.value)) {
+                        return MempoolError.InputValuesOutOfRange;
+                    }
+                    total_in += u.value;
+                    if (!consensus.isValidMoney(total_in)) {
+                        return MempoolError.InputValuesOutOfRange;
+                    }
+                    have_inputs = true;
+                } else {
+                    // Input not found: the full path would reject as MissingInputs,
+                    // but testmempoolaccept reports missing-inputs separately and
+                    // a dry run must not over-reject standardness-clean txs whose
+                    // inputs we simply cannot resolve. Treat as "fee unknown" and
+                    // skip the fee gate (matches the full path's total_in==0 case).
+                    have_inputs = false;
+                    total_in = 0;
+                    break;
+                }
+            } else {
+                // No chain state (unit-test context): fee unknown, skip fee gate.
+                have_inputs = false;
+                total_in = 0;
+                break;
+            }
+        }
+
+        var fee: i64 = 0;
+        if (have_inputs and total_in > 0) {
+            var total_out: i64 = 0;
+            for (tx.outputs) |output| total_out += output.value;
+            fee = total_in - total_out;
+            if (fee < 0) return MempoolError.InsufficientFee;
+
+            const weight = computeTxWeight(tx, self.allocator) catch return MempoolError.OutOfMemory;
+            const vsize = (weight + 3) / 4;
+            const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
+            const modified_fee = fee + self.applyDelta(tx_hash);
+            const modified_fee_rate: f64 = if (vsize > 0)
+                @as(f64, @floatFromInt(modified_fee)) / @as(f64, @floatFromInt(vsize))
+            else
+                0;
+            if (modified_fee_rate * 1000.0 < min_fee_sat_kvb) {
+                return MempoolError.InsufficientFee;
+            }
+        }
+
+        return fee;
     }
 
     /// Check BIP-125 RBF replacement rules (policy/rbf.cpp).
@@ -4947,7 +5074,11 @@ test "nonstandard version rejection" {
     };
 
     const result = mempool.addTransaction(tx);
-    try std.testing.expectError(MempoolError.NonStandard, result);
+    // An out-of-range nVersion now returns the dedicated NonStandardVersion
+    // error so the RPC layer can emit Core's "version" reject token (rather than
+    // the generic "non-standard"). checkStandard returns NonStandardVersion for
+    // tx.version outside [1, TRUC_VERSION].
+    try std.testing.expectError(MempoolError.NonStandardVersion, result);
 }
 
 test "MAX_STANDARD_TX_WEIGHT: oversize tx rejected from mempool" {
