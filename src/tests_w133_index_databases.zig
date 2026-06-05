@@ -423,15 +423,48 @@ test "w133 G18: no AllowPrune / prune-lock for txindex (BUG-18)" {
 
 // ===========================================================================
 // G19 — `getindexinfo` RPC reports per-index sync status
-// Status: MISSING (BUG-19). No handler in rpc.zig.
+// Status: FIXED (BUG-19 closed). Core-shaped handler in rpc.zig.
+//   Core ref: src/rpc/node.cpp:363-410 (getindexinfo) + :351-361
+//   (SummaryToJSON). Each running index emits EXACTLY
+//   { "<name>": { "synced": <bool>, "best_block_height": <int> } } — the two
+//   value-fields in THAT order, no best_block_hash / name-inside-the-value.
+//   clearbit reports its observable index set: "txindex" (gated by
+//   chain_state.txindex_enabled) + "basic block filter index" (gated by
+//   chain_state.blockfilterindex_enabled). The optional positional arg filters
+//   to one index; a non-matching name yields {} (empty object, not an error).
 // ===========================================================================
-test "w133 G19: no getindexinfo RPC (BUG-19)" {
+test "w133 G19: getindexinfo RPC present + Core-shaped (BUG-19 FIXED)" {
     const allocator = testing.allocator;
     const src = try loadSrc(allocator, "rpc");
     defer allocator.free(src);
 
-    try testing.expect(!containsLine(src, "getindexinfo"));
-    try testing.expect(!containsLine(src, "handleGetIndexInfo"));
+    // Dispatch arm + handler both wired.
+    try testing.expect(containsLine(src, "getindexinfo"));
+    try testing.expect(containsLine(src, "handleGetIndexInfo"));
+
+    // Isolate the handler body for shape assertions.
+    const start = std.mem.indexOf(u8, src, "fn handleGetIndexInfo(") orelse return error.HandlerNotFound;
+    const end = std.mem.indexOf(u8, src[start..], "\n    // ====") orelse src[start..].len;
+    const body = src[start .. start + end];
+
+    // Core-exact value shape: "synced" then "best_block_height", in this order.
+    try testing.expect(std.mem.indexOf(u8, body, "\\\"synced\\\":") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\\\"best_block_height\\\":") != null);
+    const synced_at = std.mem.indexOf(u8, body, "\\\"synced\\\":").?;
+    const best_at = std.mem.indexOf(u8, body, "\\\"best_block_height\\\":").?;
+    try testing.expect(synced_at < best_at);
+
+    // The literal Core GetName() strings clearbit reports.
+    try testing.expect(std.mem.indexOf(u8, body, "\"txindex\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"basic block filter index\"") != null);
+
+    // getindexinfo must NEVER emit best_block_hash / best_hash.
+    try testing.expect(std.mem.indexOf(u8, body, "best_block_hash") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "best_hash") == null);
+
+    // Both index entries are gated on their chain_state enable flags.
+    try testing.expect(std.mem.indexOf(u8, body, "chain_state.txindex_enabled") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "chain_state.blockfilterindex_enabled") != null);
 }
 
 // ===========================================================================
