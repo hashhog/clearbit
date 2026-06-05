@@ -2962,6 +2962,10 @@ pub const RpcServer = struct {
             return self.handleGetPeerInfo(id);
         } else if (std.mem.eql(u8, method, "getnetworkinfo")) {
             return self.handleGetNetworkInfo(id);
+        } else if (std.mem.eql(u8, method, "getnodeaddresses")) {
+            return self.handleGetNodeAddresses(params, id);
+        } else if (std.mem.eql(u8, method, "addpeeraddress")) {
+            return self.handleAddPeerAddress(params, id);
         } else if (std.mem.eql(u8, method, "getmempoolinfo")) {
             return self.handleGetMempoolInfo(id);
         } else if (std.mem.eql(u8, method, "getmempoolentry")) {
@@ -4596,6 +4600,257 @@ pub const RpcServer = struct {
             outbound,
         });
 
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Map a stored address to its Core network-name string.
+    ///
+    /// Core: GetNetworkName(addr.GetNetClass()) (netbase.cpp:114-128). clearbit's
+    /// addrman (PeerManager.known_addresses) only carries IPv4/IPv6
+    /// `std.net.Address` values today (overlay-network addresses — onion / i2p /
+    /// cjdns — are not representable as a `std.net.Address` and never enter the
+    /// known-address map), so the only Core net classes we can emit are `ipv4`,
+    /// `ipv6`, and the catch-all `not_publicly_routable` for any other family
+    /// (Core's NET_UNROUTABLE name). This mirrors the GetNetworkName switch.
+    fn networkNameForAddress(address: std.net.Address) []const u8 {
+        return switch (address.any.family) {
+            std.posix.AF.INET => "ipv4",
+            std.posix.AF.INET6 => "ipv6",
+            else => "not_publicly_routable",
+        };
+    }
+
+    /// Write the bare IP literal (NO port) of `address` to `writer`.
+    ///
+    /// Core's `CAddress::ToStringAddr()` emits the address without the port;
+    /// `getnodeaddresses` carries the port in a separate `"port"` field. Zig's
+    /// default `std.net.Address` formatter appends `:port` (and wraps IPv6 in
+    /// `[...]`), so we render the literal ourselves from the raw sockaddr bytes.
+    fn writeAddrLiteral(writer: anytype, address: std.net.Address) !void {
+        switch (address.any.family) {
+            std.posix.AF.INET => {
+                const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+                const b = @as(*const [4]u8, @ptrCast(&ip4.addr));
+                try writer.print("{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
+            },
+            std.posix.AF.INET6 => {
+                const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&address.any)));
+                const b = ip6.addr;
+                // RFC 5952-ish: lowercase hextets, no zero-compression (Core's
+                // ToStringAddr applies canonical compression, but for the
+                // differential we only inject/compare IPv4; this path is a
+                // best-effort literal so the field is always present + valid).
+                var i: usize = 0;
+                while (i < 16) : (i += 2) {
+                    if (i != 0) try writer.writeByte(':');
+                    const hextet = (@as(u16, b[i]) << 8) | @as(u16, b[i + 1]);
+                    try writer.print("{x}", .{hextet});
+                }
+            },
+            else => try writer.writeAll("unknown"),
+        }
+    }
+
+    /// Return the host-order port of `address`.
+    fn portForAddress(address: std.net.Address) u16 {
+        return switch (address.any.family) {
+            std.posix.AF.INET => blk: {
+                const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&address.any)));
+                break :blk std.mem.bigToNative(u16, ip4.port);
+            },
+            std.posix.AF.INET6 => blk: {
+                const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&address.any)));
+                break :blk std.mem.bigToNative(u16, ip6.port);
+            },
+            else => 0,
+        };
+    }
+
+    /// getnodeaddresses ( count "network" ) — dump known addrman addresses.
+    ///
+    /// Reference: Bitcoin Core rpc/net.cpp:911-970 (getnodeaddresses) +
+    /// netbase.cpp:100-128 (ParseNetwork / GetNetworkName). Returns a JSON ARRAY
+    /// of objects, each with EXACTLY 5 keys in this order:
+    ///   "time" (NUM, unix seconds INT), "services" (NUM, raw bitfield INT —
+    ///   NOT hex, unlike getpeerinfo), "address" (STR, ip literal w/o port),
+    ///   "port" (NUM), "network" (STR: ipv4/ipv6/onion/i2p/cjdns/
+    ///   not_publicly_routable/internal).
+    ///
+    /// Params (both optional positional):
+    ///   0. count   — max to return; default 1; 0 = return ALL; <0 -> RPC error
+    ///                -8 "Address count out of range".
+    ///   1. network — filter; ParseNetwork lowercases + accepts only
+    ///                ipv4|ipv6|onion|i2p|cjdns; anything else -> RPC error -8
+    ///                "Network not recognized: <raw arg>".
+    ///
+    /// Source = PeerManager.known_addresses (peer.zig:2274). Core's
+    /// GetAddressesUnsafe shuffles its result, so callers must not depend on
+    /// order; we iterate the hash map (already non-deterministic order) and apply
+    /// the count cap as a hard max.
+    fn handleGetNodeAddresses(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // ── Param 0: count (default 1; 0 = all; <0 -> error -8). ──────────────
+        var count: i64 = 1;
+        if (params == .array and params.array.items.len > 0) {
+            const p0 = params.array.items[0];
+            if (p0 == .integer) {
+                count = p0.integer;
+            } else if (p0 == .float) {
+                count = @intFromFloat(p0.float);
+            } else if (p0 != .null) {
+                return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value of type string is not of expected type number", id);
+            }
+        }
+        if (count < 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Address count out of range", id);
+        }
+
+        // ── Param 1: network filter (default = all). ──────────────────────────
+        // ParseNetwork (netbase.cpp:100-112): lowercase + accept only the five
+        // routable net names. Anything else -> NET_UNROUTABLE -> error -8.
+        var filter: ?[]const u8 = null; // canonical lowercased network name
+        if (params == .array and params.array.items.len > 1 and params.array.items[1] != .null) {
+            const p1 = params.array.items[1];
+            if (p1 != .string) {
+                return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value of type number is not of expected type string", id);
+            }
+            const raw = p1.string;
+            var lower_buf: [64]u8 = undefined;
+            const lower = blk: {
+                if (raw.len > lower_buf.len) break :blk raw; // too long -> won't match -> error path
+                for (raw, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
+                break :blk lower_buf[0..raw.len];
+            };
+            if (std.mem.eql(u8, lower, "ipv4")) {
+                filter = "ipv4";
+            } else if (std.mem.eql(u8, lower, "ipv6")) {
+                filter = "ipv6";
+            } else if (std.mem.eql(u8, lower, "onion")) {
+                filter = "onion";
+            } else if (std.mem.eql(u8, lower, "i2p")) {
+                filter = "i2p";
+            } else if (std.mem.eql(u8, lower, "cjdns")) {
+                filter = "cjdns";
+            } else {
+                // NET_UNROUTABLE -> "Network not recognized: <raw arg>".
+                var msg_buf = std.ArrayList(u8).init(self.allocator);
+                defer msg_buf.deinit();
+                try msg_buf.writer().print("Network not recognized: {s}", .{raw});
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, msg_buf.items, id);
+            }
+        }
+
+        // ── Walk the addrman, emitting at most `count` matching entries. ──────
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+
+        const limit: usize = if (count == 0) std.math.maxInt(usize) else @intCast(count);
+        var emitted: usize = 0;
+        var iter = self.peer_manager.known_addresses.iterator();
+        while (iter.next()) |entry| {
+            if (emitted >= limit) break;
+            const info = entry.value_ptr;
+            const net_name = networkNameForAddress(info.address);
+
+            // Apply the network filter (when set). Core only returns addrs whose
+            // GetNetClass() == the requested Network.
+            if (filter) |f| {
+                if (!std.mem.eql(u8, f, net_name)) continue;
+            }
+
+            if (emitted > 0) try writer.writeByte(',');
+            // EXACT 5-key order: time, services, address, port, network.
+            try writer.print("{{\"time\":{d},\"services\":{d},\"address\":\"", .{
+                info.last_seen,
+                info.services,
+            });
+            try writeAddrLiteral(writer, info.address);
+            try writer.print("\",\"port\":{d},\"network\":\"{s}\"}}", .{
+                portForAddress(info.address),
+                net_name,
+            });
+            emitted += 1;
+        }
+
+        try writer.writeByte(']');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// addpeeraddress "address" port ( tried ) — companion test-only injector.
+    ///
+    /// Reference: Bitcoin Core rpc/net.cpp:972-1031 (addpeeraddress). Inserts an
+    /// address into the address manager and returns `{"success": bool}` (plus an
+    /// optional "error" string when the insert fails). clearbit's addrman keys on
+    /// IPv4/IPv6 `std.net.Address`, so we parse the literal + port, build the
+    /// address, and route it through PeerManager.addAddress with NODE_NETWORK |
+    /// NODE_WITNESS services (matching Core's CAddress{..., NODE_NETWORK |
+    /// NODE_WITNESS}).
+    ///
+    /// Optional 3rd positional `services` (clearbit extension, NOT in Core) lets
+    /// the differential pin a known services bitfield; when omitted we default to
+    /// NODE_NETWORK | NODE_WITNESS = 9, exactly like Core's addpeeraddress.
+    fn handleAddPeerAddress(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "addpeeraddress requires address and port", id);
+        }
+        const addr_param = params.array.items[0];
+        const port_param = params.array.items[1];
+        if (addr_param != .string) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "address must be a string", id);
+        }
+        if (port_param != .integer) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "port must be an integer", id);
+        }
+        const addr_str = addr_param.string;
+        const port_i = port_param.integer;
+        if (port_i < 0 or port_i > 65535) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "port out of range", id);
+        }
+        const port: u16 = @intCast(port_i);
+
+        // Optional clearbit-only services override (3rd positional).
+        // Core hardcodes NODE_NETWORK | NODE_WITNESS (= 9).
+        var services: u64 = 9; // NODE_NETWORK (1) | NODE_WITNESS (8)
+        if (params.array.items.len > 2 and params.array.items[2] != .null) {
+            const sv = params.array.items[2];
+            if (sv == .integer and sv.integer >= 0) {
+                services = @intCast(sv.integer);
+            } else if (sv == .float and sv.float >= 0) {
+                services = @intFromFloat(sv.float);
+            }
+        }
+
+        // Parse the IP literal -> std.net.Address. Core: LookupHost(...) with no
+        // DNS; on failure it throws RPC_CLIENT_INVALID_IP_OR_SUBNET "Invalid IP
+        // address". We mirror with a success:false + "error" body which keeps the
+        // RPC shape Core-compatible ({"success":bool[,"error":str]}).
+        const address = std.net.Address.parseIp(addr_str, port) catch {
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            try buf.writer().writeAll("{\"success\":false,\"error\":\"Invalid IP address\"}");
+            return self.jsonRpcResult(buf.items, id);
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        // addAddress drops non-routable addresses (Core: AddSingle rejects
+        // !IsRoutable) and silently no-ops on a duplicate key. Report success
+        // when the address is present in the map afterward.
+        self.peer_manager.addAddress(address, services, .manual) catch {
+            try writer.writeAll("{\"success\":false,\"error\":\"failed-adding-to-new\"}");
+            return self.jsonRpcResult(buf.items, id);
+        };
+        const key = peer_mod.PeerManager.addressKey(address);
+        if (self.peer_manager.known_addresses.contains(key)) {
+            try writer.writeAll("{\"success\":true}");
+        } else {
+            // Not present -> addAddress rejected it (non-routable / banned).
+            try writer.writeAll("{\"success\":false,\"error\":\"failed-adding-to-new\"}");
+        }
         return self.jsonRpcResult(buf.items, id);
     }
 
