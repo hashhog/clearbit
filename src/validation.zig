@@ -7036,6 +7036,115 @@ pub const ChainManager = struct {
     /// BUG-9 fix: genesis was previously created with default BlockStatus{}
     /// (has_data=false), causing isValidCandidate() to return false and
     /// activateBestChain() to never advance past the empty index.
+    //
+    // (helper below — keep adjacent to loadGenesis, its only caller)
+
+    /// GetBlockProof(genesis) — Core's `(~target / (target + 1)) + 1` on the
+    /// genesis nBits, as a 32-byte big-endian work value.  Mirrors
+    /// peer.zig::workFromBits byte-for-byte; replicated here (rather than
+    /// imported) because peer.zig imports validation.zig and a top-level
+    /// `@import("peer.zig")` would form an import cycle.
+    ///
+    /// Core seeds the genesis CBlockIndex with `nChainWork = GetBlockProof(genesis)`
+    /// (validation.cpp AddToBlockIndex / LoadBlockIndexDB), so every descendant's
+    /// cumulative chainwork includes the genesis term.  Seeding genesis with zero
+    /// here previously made getblockheader's `chainwork` low by exactly one block
+    /// of proof at every height (e.g. regtest height-60 read `…0078`=120 instead
+    /// of Core's `…007a`=122).
+    fn genesisBlockProof(bits: u32) [32]u8 {
+        const zero: [32]u8 = [_]u8{0} ** 32;
+        const target_le = consensus.bitsToTarget(bits);
+        var target_be: [32]u8 = undefined;
+        {
+            var i: usize = 0;
+            while (i < 32) : (i += 1) target_be[i] = target_le[31 - i];
+        }
+        var nonzero = false;
+        for (target_be) |b| {
+            if (b != 0) {
+                nonzero = true;
+                break;
+            }
+        }
+        if (!nonzero) return zero;
+
+        // ~target
+        var nt: [32]u8 = undefined;
+        {
+            var i: usize = 0;
+            while (i < 32) : (i += 1) nt[i] = ~target_be[i];
+        }
+        // target + 1
+        var t_plus_1: [32]u8 = target_be;
+        {
+            var carry: u16 = 1;
+            var j: usize = 32;
+            while (j > 0 and carry != 0) {
+                j -= 1;
+                const sum = @as(u16, t_plus_1[j]) + carry;
+                t_plus_1[j] = @intCast(sum & 0xFF);
+                carry = sum >> 8;
+            }
+        }
+        // quotient = nt / t_plus_1 via 256-bit shift-and-subtract.
+        var quotient: [32]u8 = [_]u8{0} ** 32;
+        var remainder: [32]u8 = [_]u8{0} ** 32;
+        var bit_i: usize = 0;
+        while (bit_i < 256) : (bit_i += 1) {
+            var carry_bit: u8 = 0;
+            var j: usize = 32;
+            while (j > 0) {
+                j -= 1;
+                const new_carry: u8 = (remainder[j] >> 7) & 1;
+                remainder[j] = (remainder[j] << 1) | carry_bit;
+                carry_bit = new_carry;
+            }
+            const byte_i: usize = bit_i / 8;
+            const bit_off: u3 = @intCast(7 - (bit_i % 8));
+            const next_bit: u8 = (nt[byte_i] >> bit_off) & 1;
+            remainder[31] |= next_bit;
+
+            // remainder >= t_plus_1 ?  (big-endian compare)
+            var ge = true;
+            var ci: usize = 0;
+            while (ci < 32) : (ci += 1) {
+                if (remainder[ci] > t_plus_1[ci]) break;
+                if (remainder[ci] < t_plus_1[ci]) {
+                    ge = false;
+                    break;
+                }
+            }
+            if (ge) {
+                var borrow: i16 = 0;
+                var k: usize = 32;
+                while (k > 0) {
+                    k -= 1;
+                    const diff: i16 = @as(i16, remainder[k]) - @as(i16, t_plus_1[k]) - borrow;
+                    if (diff < 0) {
+                        remainder[k] = @intCast(diff + 256);
+                        borrow = 1;
+                    } else {
+                        remainder[k] = @intCast(diff);
+                        borrow = 0;
+                    }
+                }
+                quotient[byte_i] |= (@as(u8, 1) << bit_off);
+            }
+        }
+        // quotient += 1
+        {
+            var carry: u16 = 1;
+            var j: usize = 32;
+            while (j > 0 and carry != 0) {
+                j -= 1;
+                const sum = @as(u16, quotient[j]) + carry;
+                quotient[j] = @intCast(sum & 0xFF);
+                carry = sum >> 8;
+            }
+        }
+        return quotient;
+    }
+
     pub fn loadGenesis(self: *ChainManager, params: *const @import("consensus.zig").NetworkParams) ChainError!void {
         // Skip if genesis is already in the index.
         if (self.block_index.get(params.genesis_hash) != null) return;
@@ -7046,7 +7155,8 @@ pub const ChainManager = struct {
             .header = params.genesis_header,
             .height = 0,
             .status = BlockStatus{ .has_data = true },
-            .chain_work = [_]u8{0} ** 32,
+            // Core: genesis nChainWork = GetBlockProof(genesis), NOT zero.
+            .chain_work = genesisBlockProof(params.genesis_header.bits),
             .sequence_id = 0,
             .parent = null,
             .file_number = 0,
