@@ -14915,61 +14915,93 @@ pub const RpcServer = struct {
             }
         }
 
+        // params[1] = hash_or_height. clearbit has no coinstatsindex, so a
+        // specific block can never be queried. Core
+        // (rpc/blockchain.cpp:1085-1098) rejects the request BEFORE touching
+        // the chainstate. Mirror its two relevant guards:
+        //   * hash_serialized_3 + specific block -> RPC_INVALID_PARAMETER (-8)
+        //     "hash_serialized_3 hash type cannot be queried for a specific block"
+        //   * any other hash_type + specific block (no index) ->
+        //     RPC_INVALID_PARAMETER (-8) "Querying specific block heights
+        //     requires coinstatsindex".
+        if (params == .array and params.array.items.len >= 2 and
+            params.array.items[1] != .null)
+        {
+            if (hash_type == .hash_serialized) {
+                return self.jsonRpcError(
+                    RPC_INVALID_PARAMETER,
+                    "hash_serialized_3 hash type cannot be queried for a specific block",
+                    id,
+                );
+            }
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "Querying specific block heights requires coinstatsindex",
+                id,
+            );
+        }
+
+        // Single cache walk producing the Core aggregate stats (txouts,
+        // transactions, bogosize, total_amount) AND the requested set hash.
+        const hash_kind: u8 = switch (hash_type) {
+            .none => 0,
+            .hash_serialized => 1,
+            .muhash => 2,
+        };
+        var set_hash: types.Hash256 = undefined;
+        const stats = storage.computeTxOutSetStats(
+            &self.chain_state.utxo_set,
+            self.allocator,
+            hash_kind,
+            &set_hash,
+        ) catch {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Failed to compute UTXO set stats", id);
+        };
+
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
         const height = self.chain_state.best_height;
-        const txouts = self.chain_state.utxo_set.total_utxos;
-        const total_amount = self.chain_state.utxo_set.total_amount;
 
         try writer.writeAll("{\"height\":");
         try writer.print("{d}", .{height});
         try writer.writeAll(",\"bestblock\":\"");
         try writeHashHex(writer, &self.chain_state.best_hash);
-        try writer.print("\",\"txouts\":{d},\"bogosize\":0", .{txouts});
+        try writer.print("\",\"txouts\":{d},\"bogosize\":{d}", .{ stats.txouts, stats.bogosize });
 
-        // Compute the requested UTXO-set hash. The harness reads
-        // (hash_serialized_2 | hash_serialized_3 | hash_serialized) in
-        // order, so we emit `hash_serialized_3` (matching Core 31.99)
-        // and ALSO mirror it under `hash_serialized_2` for
-        // backward-compatible harness scrapes.
+        // Emit the requested UTXO-set hash. For hash_serialized we also mirror
+        // it under `hash_serialized_2` for backward-compatible harness scrapes
+        // (Core renamed the field but old harnesses read either).
         switch (hash_type) {
             .hash_serialized => {
-                const h = storage.computeHashSerializedTxOutSet(
-                    &self.chain_state.utxo_set,
-                    self.allocator,
-                ) catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Failed to compute hash_serialized", id);
-                };
                 try writer.writeAll(",\"hash_serialized_2\":\"");
-                try writeHashHex(writer, &h);
+                try writeHashHex(writer, &set_hash);
                 try writer.writeAll("\",\"hash_serialized_3\":\"");
-                try writeHashHex(writer, &h);
+                try writeHashHex(writer, &set_hash);
                 try writer.writeAll("\"");
             },
             .muhash => {
-                const h = storage.computeMuHashTxOutSet(
-                    &self.chain_state.utxo_set,
-                    self.allocator,
-                ) catch {
-                    return self.jsonRpcError(RPC_MISC_ERROR, "Failed to compute muhash", id);
-                };
                 try writer.writeAll(",\"muhash\":\"");
-                try writeHashHex(writer, &h);
+                try writeHashHex(writer, &set_hash);
                 try writer.writeAll("\"");
             },
             .none => {},
         }
 
+        // transactions — Core emits this (number of distinct txids with unspent
+        // outputs) only when coinstatsindex is NOT used. clearbit has no index,
+        // so it is always present. Reference: rpc/blockchain.cpp:1128.
+        try writer.print(",\"transactions\":{d}", .{stats.transactions});
+
         // total_amount — Core emits this as a fixed-8-decimal BTC value
         // (i64 satoshis / 1e8). Use 64-bit float division then format.
-        const total_btc: f64 = @as(f64, @floatFromInt(total_amount)) / 100_000_000.0;
+        const total_btc: f64 = @as(f64, @floatFromInt(stats.total_amount)) / 100_000_000.0;
         try writer.print(",\"total_amount\":{d:.8}", .{total_btc});
 
         // disk_size — Core reports the LevelDB size on disk; clearbit
-        // does not surface that cheaply, so we emit 0 (matches what we
-        // returned before; non-load-bearing for the harness).
+        // does not surface that cheaply, so we emit 0 (impl-specific per the
+        // RPC contract; non-load-bearing for the harness).
         try writer.writeAll(",\"disk_size\":0}");
 
         return self.jsonRpcResult(buf.items, id);

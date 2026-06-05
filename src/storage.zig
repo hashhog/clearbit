@@ -5820,14 +5820,11 @@ pub fn computeHashSerializedTxOutSet(utxo_set: *UtxoSet, allocator: std.mem.Allo
     var iter = utxo_set.cache.iterator();
     while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
 
-    // Canonical (txid, vout) order — matches Core's CCoinsViewCursor walk.
-    // The 36-byte key is `txid || LE32(vout)`, so byte-lex order is the
-    // same iteration order as Core's RocksDB cursor.
-    std.mem.sort([36]u8, keys.items, {}, struct {
-        fn lessThan(_: void, a: [36]u8, b: [36]u8) bool {
-            return std.mem.order(u8, &a, &b) == .lt;
-        }
-    }.lessThan);
+    // Canonical (txid, numeric-vout) order — matches Core's CCoinsViewCursor
+    // walk. The 36-byte key is `txid || LE32(vout)`; sorting it lexically would
+    // mis-order vouts >= 256 (LE32 byte order != numeric order), so we compare
+    // txid bytes first then numeric vout (see utxoKeyLessThan).
+    std.mem.sort([36]u8, keys.items, {}, utxoKeyLessThan);
 
     var hw = crypto.Sha256Writer.init();
 
@@ -5856,6 +5853,142 @@ pub fn computeHashSerializedTxOutSet(utxo_set: *UtxoSet, allocator: std.mem.Allo
     }
 
     return hw.finalHash256();
+}
+
+/// Aggregate UTXO-set statistics reported by `gettxoutsetinfo`.
+///
+/// Mirrors `bitcoin-core/src/kernel/coinstats.cpp` `CCoinsStats`
+/// (`ApplyStats` accumulators) so that the RPC can report Core-identical
+/// `txouts`, `transactions`, `bogosize`, and `total_amount` together with the
+/// chosen set hash from a SINGLE pass over the cache.
+pub const TxOutSetStats = struct {
+    /// Number of unspent transaction outputs (`stats.nTransactionOutputs`).
+    txouts: u64,
+    /// Number of distinct txids with at least one unspent output
+    /// (`stats.nTransactions`).
+    transactions: u64,
+    /// Database-independent UTXO-set size metric (`stats.nBogoSize`).
+    bogosize: u64,
+    /// Sum of every unspent output value, in satoshis (`stats.total_amount`).
+    total_amount: i64,
+};
+
+/// `GetBogoSize` — Core `kernel/coinstats.cpp:35-43`.
+///   32 (txid) + 4 (vout) + 4 (height+coinbase) + 8 (amount)
+///   + 2 (scriptPubKey len) + scriptPubKey.size().
+fn coinBogoSize(script_len: usize) u64 {
+    return 32 + 4 + 4 + 8 + 2 + @as(u64, script_len);
+}
+
+/// Order two 36-byte UTXO keys (`txid || LE32(vout)`) the way Bitcoin Core's
+/// `CCoinsViewCursor` walk does: primary by the 32-byte txid in byte order,
+/// secondary by ASCENDING NUMERIC vout. The naive lexicographic compare of the
+/// raw 36-byte key gets the txid prefix right but mis-orders vouts >= 256
+/// (LE32 byte order != numeric order), which would change `hash_serialized_3`.
+/// Within a txid Core iterates a `std::map<uint32_t, Coin>` (numeric vout), so
+/// we replicate that here. Reference: `kernel/coinstats.cpp:87-94 ApplyHash` +
+/// `ComputeUTXOStats` cursor loop.
+fn utxoKeyLessThan(_: void, a: [36]u8, b: [36]u8) bool {
+    const txid_order = std.mem.order(u8, a[0..32], b[0..32]);
+    if (txid_order != .eq) return txid_order == .lt;
+    const va = std.mem.readInt(u32, a[32..36], .little);
+    const vb = std.mem.readInt(u32, b[32..36], .little);
+    return va < vb;
+}
+
+/// Single-pass UTXO-set walk producing both the Core aggregate stats and the
+/// requested set hash. `hash_kind` selects which hash to compute:
+///   0 = none (no hash), 1 = hash_serialized_3 (SHA256d, ordered),
+///   2 = muhash (MuHash3072, order-independent).
+/// On return `out_hash` holds the computed hash for kinds 1/2 (undefined for 0).
+///
+/// Walks `utxo_set.cache` (the in-memory layer). For regtest / short chains the
+/// cache holds the full set; this matches `dumpTxOutSet` /
+/// `computeHashSerializedTxOutSet` scope. Reference:
+/// `bitcoin-core/src/kernel/coinstats.cpp:96-146` `ApplyStats` + `ApplyHash`.
+pub fn computeTxOutSetStats(
+    utxo_set: *UtxoSet,
+    allocator: std.mem.Allocator,
+    hash_kind: u8,
+    out_hash: *types.Hash256,
+) !TxOutSetStats {
+    const crypto = @import("crypto.zig");
+    const muhash = @import("muhash.zig");
+
+    var keys = std.ArrayList([36]u8).init(allocator);
+    defer keys.deinit();
+    var iter = utxo_set.cache.iterator();
+    while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
+
+    // Core (txid, numeric-vout) cursor order. MuHash is order-independent so
+    // the sort is harmless there; for hash_serialized_3 it is load-bearing.
+    std.mem.sort([36]u8, keys.items, {}, utxoKeyLessThan);
+
+    var stats = TxOutSetStats{
+        .txouts = 0,
+        .transactions = 0,
+        .bogosize = 0,
+        .total_amount = 0,
+    };
+
+    var hw = crypto.Sha256Writer.init();
+    var acc = muhash.MuHash3072.init();
+    var per_coin = serialize.Writer.init(allocator);
+    defer per_coin.deinit();
+
+    var have_prev_txid = false;
+    var prev_txid: [32]u8 = undefined;
+
+    for (keys.items) |key| {
+        const entry = utxo_set.cache.get(key) orelse continue;
+
+        // ── aggregate stats ──────────────────────────────────────────────
+        const txid = key[0..32];
+        if (!have_prev_txid or !std.mem.eql(u8, &prev_txid, txid)) {
+            stats.transactions += 1;
+            @memcpy(&prev_txid, txid);
+            have_prev_txid = true;
+        }
+        stats.txouts += 1;
+        stats.total_amount +%= entry.utxo.value;
+
+        const script = try entry.utxo.reconstructScript(allocator);
+        defer allocator.free(script);
+        stats.bogosize += coinBogoSize(script.len);
+
+        if (hash_kind == 0) continue;
+
+        // ── per-coin serialization (TxOutSer) shared by both hash kinds ───
+        const vout = std.mem.readInt(u32, key[32..36], .little);
+        const code: u32 = (@as(u32, entry.utxo.height) << 1) |
+            (if (entry.utxo.is_coinbase) @as(u32, 1) else 0);
+
+        if (hash_kind == 1) {
+            try hw.writeBytes(txid);
+            try hw.writeInt(u32, vout);
+            try hw.writeInt(u32, code);
+            try hw.writeInt(i64, entry.utxo.value);
+            try hw.writeCompactSize(script.len);
+            try hw.writeBytes(script);
+        } else { // hash_kind == 2 (muhash)
+            per_coin.list.clearRetainingCapacity();
+            try per_coin.writeBytes(txid);
+            try per_coin.writeInt(u32, vout);
+            try per_coin.writeInt(u32, code);
+            try per_coin.writeInt(i64, entry.utxo.value);
+            try per_coin.writeCompactSize(script.len);
+            try per_coin.writeBytes(script);
+            acc.insert(per_coin.getWritten());
+        }
+    }
+
+    if (hash_kind == 1) {
+        out_hash.* = hw.finalHash256();
+    } else if (hash_kind == 2) {
+        out_hash.* = acc.finalize();
+    }
+
+    return stats;
 }
 
 /// Compute a deterministic hash of a UTXO set for snapshot verification.
