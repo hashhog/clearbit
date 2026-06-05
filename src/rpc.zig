@@ -6003,7 +6003,14 @@ pub const RpcServer = struct {
                 mempool_mod.MempoolError.AncestorSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "ancestor size limit exceeded", id),
                 mempool_mod.MempoolError.DescendantSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "descendant size limit exceeded", id),
                 mempool_mod.MempoolError.NonBIP125Replaceable => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),
-                mempool_mod.MempoolError.ReplacementFeeTooLow => self.jsonRpcError(RPC_VERIFY_REJECTED, "insufficient fee for replacement", id),
+                // BIP-125 Rule 3/4 (PaysForRBF): Core's category is "insufficient
+                // fee". Keep the bare token so it normalizes identically to the
+                // testmempoolaccept reject-reason and matches Core's category.
+                mempool_mod.MempoolError.ReplacementFeeTooLow => self.jsonRpcError(RPC_VERIFY_REJECTED, "insufficient fee", id),
+                // BIP-125 Rule 8 (ImprovesFeerateDiagram): also an insufficient-fee category reject.
+                mempool_mod.MempoolError.DiagramNotImproved => self.jsonRpcError(RPC_VERIFY_REJECTED, "insufficient fee", id),
+                // BIP-125 Rule 2 (EntriesAndTxidsDisjoint): replacement adds a new unconfirmed input.
+                mempool_mod.MempoolError.ReplacementSpendsConflicting => self.jsonRpcError(RPC_VERIFY_REJECTED, "replacement-adds-unconfirmed", id),
                 mempool_mod.MempoolError.TooManyEvictions => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many potential replacements", id),
                 mempool_mod.MempoolError.MempoolFull => self.jsonRpcError(RPC_VERIFY_REJECTED, "mempool full", id),
                 mempool_mod.MempoolError.ConflictsWithMempool => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),

@@ -1528,6 +1528,16 @@ pub const Mempool = struct {
                     MempoolError.DustOutput => "dust",
                     MempoolError.InsufficientFee => "min relay fee not met",
                     MempoolError.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
+                    // BIP-125 RBF rejections from the dry-run conflict gate
+                    // (checkTestAcceptPolicy now runs checkRBFRules). These MUST
+                    // map to the SAME reject-reason tokens the full-acceptance
+                    // path emits below, so testmempoolaccept and
+                    // sendrawtransaction agree (and match Core's category).
+                    MempoolError.NonBIP125Replaceable => "txn-mempool-conflict",
+                    MempoolError.ReplacementFeeTooLow => "insufficient fee",
+                    MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
+                    MempoolError.TooManyEvictions => "too many potential replacements",
+                    MempoolError.DiagramNotImproved => "insufficient fee",
                     else => "non-standard",
                 };
                 return AcceptResult{
@@ -3026,6 +3036,11 @@ pub const Mempool = struct {
             }
         }
 
+        // Hoisted so the RBF conflict gate below can reuse it (Core computes
+        // ws.m_vsize once in PreChecks and threads it into ReplacementChecks).
+        const weight = computeTxWeight(tx, self.allocator) catch return MempoolError.OutOfMemory;
+        const vsize = (weight + 3) / 4;
+
         var fee: i64 = 0;
         if (have_inputs and total_in > 0) {
             var total_out: i64 = 0;
@@ -3033,8 +3048,6 @@ pub const Mempool = struct {
             fee = total_in - total_out;
             if (fee < 0) return MempoolError.InsufficientFee;
 
-            const weight = computeTxWeight(tx, self.allocator) catch return MempoolError.OutOfMemory;
-            const vsize = (weight + 3) / 4;
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
             const modified_fee = fee + self.applyDelta(tx_hash);
             const modified_fee_rate: f64 = if (vsize > 0)
@@ -3044,6 +3057,44 @@ pub const Mempool = struct {
             if (modified_fee_rate * 1000.0 < min_fee_sat_kvb) {
                 return MempoolError.InsufficientFee;
             }
+        }
+
+        // 4. RBF / mempool-conflict gate (read-only, no mempool mutation).
+        //
+        // The full addTransaction path detects that an incoming tx spends an
+        // outpoint already spent by a mempool tx (§7) and runs checkRBFRules
+        // (BIP-125 Rules 1-5 + the Core 28+ feerate-diagram refinement) BEFORE
+        // committing. testmempoolaccept(test_accept=true) must report the SAME
+        // verdict — otherwise a low-fee replacement that sendrawtransaction
+        // rejects ("insufficient fee" / "txn-mempool-conflict") would be
+        // reported allowed=true here, a dry-run-only RBF parity hole.
+        //
+        // checkRBFRules is purely read-only (it reads self.entries /
+        // self.spenders / descendants and accumulates into local maps; it never
+        // mutates mempool state), so it is safe to invoke in the dry run.
+        // Mirrors Bitcoin Core's MemPoolAccept::PreChecks conflict collection +
+        // ReplacementChecks, which run identically under ATMPArgs::TestAccept
+        // (validation.cpp: only the final commit is skipped under test_accept).
+        var conflicting_txids = std.ArrayList(types.Hash256).init(self.allocator);
+        defer conflicting_txids.deinit();
+        for (tx.inputs) |input| {
+            if (self.spenders.get(input.previous_output)) |conflicting_txid| {
+                // Dedupe: a multi-input replacement may conflict with the same
+                // mempool tx on more than one input.
+                var already_seen = false;
+                for (conflicting_txids.items) |existing| {
+                    if (std.mem.eql(u8, &existing, &conflicting_txid)) {
+                        already_seen = true;
+                        break;
+                    }
+                }
+                if (!already_seen) {
+                    conflicting_txids.append(conflicting_txid) catch return MempoolError.OutOfMemory;
+                }
+            }
+        }
+        if (conflicting_txids.items.len > 0) {
+            try self.checkRBFRules(tx, tx_hash, fee, vsize, conflicting_txids.items);
         }
 
         return fee;
