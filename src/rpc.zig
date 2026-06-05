@@ -9691,9 +9691,31 @@ pub const RpcServer = struct {
                     try writer.writeAll("true");
                     try writer.writeAll(",\"vsize\":");
                     try writer.print("{d}", .{result.vsize});
-                    // fees object: base fee in BTC (satoshis / 1e8)
+                    // fees object: base fee in BTC (satoshis / 1e8), 8 dp.
+                    // NOTE: a combined "{d}.{d:0>8}" format string is MISPARSED
+                    // by Zig 0.13's formatter when a literal '.' separates two
+                    // placeholders — it emitted e.g. "0.000000+0", which is
+                    // invalid JSON and broke every accepted-tx response. Emit the
+                    // whole part, the '.', and an explicit 8-char zero-padded
+                    // fractional part (each placeholder formatted on its own) so
+                    // the value is always valid JSON (matches Core's
+                    // "base": d.dddddddd).
                     try writer.writeAll(",\"fees\":{\"base\":");
-                    try writer.print("{d}.{d:0>8}", .{ @divTrunc(result.fee, 100_000_000), @mod(result.fee, 100_000_000) });
+                    {
+                        const whole = @divTrunc(result.fee, 100_000_000);
+                        const frac: u64 = @intCast(@mod(result.fee, 100_000_000));
+                        try writer.print("{d}", .{whole});
+                        try writer.writeByte('.');
+                        var fbuf: [8]u8 = undefined;
+                        var i: usize = 8;
+                        var f = frac;
+                        while (i > 0) {
+                            i -= 1;
+                            fbuf[i] = '0' + @as(u8, @intCast(f % 10));
+                            f /= 10;
+                        }
+                        try writer.writeAll(&fbuf);
+                    }
                     try writer.writeByte('}');
                 } else {
                     try writer.writeAll("false");
