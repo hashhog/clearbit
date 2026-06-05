@@ -274,6 +274,24 @@ pub const ChainStore = struct {
         return key;
     }
 
+    /// Prefix for cumulative-tx-count-by-height index keys in CF_DEFAULT.
+    /// Key layout: "X:" ++ u32_LE(height) (6 bytes total).
+    /// Value: 8-byte u64_LE cumulative #txs from genesis..height on the
+    /// active chain (Bitcoin Core CBlockIndex::m_chain_tx_count analog).
+    /// Written by `ChainState.connectBlockInner` as each block connects and
+    /// consumed by getchaintxstats to compute window_tx_count = X(tip) -
+    /// X(tip - nblocks).  Idempotent on the active chain.
+    pub const TX_COUNT_PREFIX = "X:";
+    pub const TX_COUNT_KEY_LEN: usize = 6;
+
+    pub fn buildTxCountKey(height: u32) [TX_COUNT_KEY_LEN]u8 {
+        var key: [TX_COUNT_KEY_LEN]u8 = undefined;
+        key[0] = 'X';
+        key[1] = ':';
+        std.mem.writeInt(u32, key[2..6], height, .little);
+        return key;
+    }
+
     pub fn init(datadir: []const u8, allocator: std.mem.Allocator) StorageError!ChainStore {
         // Default block cache (64 MiB) — callers that want larger should
         // construct the Database directly via Database.open with their --dbcache value.
@@ -1928,6 +1946,17 @@ pub const ChainState = struct {
     best_hash: types.Hash256,
     best_height: u32,
     total_work: [32]u8,
+    /// Cumulative number of transactions in the active chain from genesis
+    /// up to and including `best_height`.  Bitcoin Core analog:
+    /// CBlockIndex::m_chain_tx_count (chain.h:129) — the running total used
+    /// by getchaintxstats.  Maintained as an O(1) running counter in
+    /// `connectBlockInner` (prev_cumulative + block.transactions.len) and
+    /// rewound in the disconnect path.  Persisted per-height in CF_DEFAULT
+    /// under the "X:" prefix so getchaintxstats(blockhash, nblocks) can look
+    /// up the cumulative count at both ends of the MTP window and survive a
+    /// restart.  0 means "unknown" (memory-only mode / pre-index datadir),
+    /// matching Core's assumeutxo m_chain_tx_count==0 sentinel.
+    chain_tx_count: u64 = 0,
     utxo_set: UtxoSet,
     undo_manager: ?UndoFileManager,
     allocator: std.mem.Allocator,
@@ -2928,6 +2957,71 @@ pub const ChainState = struct {
         const db = self.utxo_set.db orelse return;
         const key_bytes = ChainStore.buildHeightHashKey(height);
         db.put(CF_DEFAULT, &key_bytes, hash) catch return;
+    }
+
+    /// Persist the cumulative-tx-count (Core m_chain_tx_count) for `height`.
+    /// Best-effort, idempotent on the active chain — same race-tolerance
+    /// reasoning as putBlockHashByHeight.  No-op in DB-less mode.
+    pub fn putCumulativeTxCount(self: *ChainState, height: u32, count: u64) void {
+        const db = self.utxo_set.db orelse return;
+        const key_bytes = ChainStore.buildTxCountKey(height);
+        var val: [8]u8 = undefined;
+        std.mem.writeInt(u64, &val, count, .little);
+        db.put(CF_DEFAULT, &key_bytes, &val) catch return;
+    }
+
+    /// Look up the cumulative #txs from genesis..`height` on the active
+    /// chain (Core's pindex->m_chain_tx_count at that height).  Returns null
+    /// when the height has no persisted entry (above tip, DB-less mode, or a
+    /// pre-index datadir whose blocks were connected before this index
+    /// existed), matching Core's m_chain_tx_count==0 "unknown" sentinel.
+    /// Height 0 (genesis) is the single coinbase tx — answered as 1 without
+    /// a DB hit so getchaintxstats over an early window still computes a
+    /// window_tx_count.
+    pub fn getCumulativeTxCount(self: *ChainState, height: u32) ?u64 {
+        if (height == 0) return 1;
+        const db = self.utxo_set.db orelse return null;
+        const key_bytes = ChainStore.buildTxCountKey(height);
+        const data = db.get(CF_DEFAULT, &key_bytes) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        if (bytes.len != 8) return null;
+        return std.mem.readInt(u64, bytes[0..8], .little);
+    }
+
+    /// Seed the cumulative-tx-count (Core CBlockIndex::m_chain_tx_count) for the
+    /// genesis block.  Genesis is the chain root and is NOT connected through
+    /// `connectBlockInner`, so the running counter would otherwise start at 0 —
+    /// making every getchaintxstats txcount off-by-one (missing the genesis
+    /// coinbase).  Genesis carries exactly one tx on every Bitcoin network.
+    ///
+    /// Only acts when the chain is at height 0 (a freshly-started node).  A node
+    /// resumed past genesis keeps whatever the restart-restore set, so this is
+    /// safe to call unconditionally at startup before the tip is loaded.  Also
+    /// persists the height-0 "X:" entry so getCumulativeTxCount(0) is durable
+    /// (the in-memory accessor already special-cases 0 → 1, but persisting keeps
+    /// the index complete for tooling that scans it).
+    pub fn seedGenesisTxCount(self: *ChainState) void {
+        if (self.best_height == 0) {
+            self.chain_tx_count = 1;
+            self.putCumulativeTxCount(0, 1);
+        }
+    }
+
+    /// Restore the in-memory cumulative-tx-count running counter from the
+    /// persisted per-height "X:" entry at the current `best_height`.  Called at
+    /// startup AFTER the chain tip is loaded so getchaintxstats and the next
+    /// block connect resume from the correct base.  Falls back to the genesis
+    /// seed (1) when the tip's entry is absent (pre-index datadir) so the
+    /// counter is never left at 0 for a non-empty chain.
+    pub fn restoreChainTxCount(self: *ChainState) void {
+        if (self.best_height == 0) {
+            self.chain_tx_count = 1;
+            return;
+        }
+        if (self.getCumulativeTxCount(self.best_height)) |c| {
+            if (c != 0) self.chain_tx_count = c;
+        }
     }
 
     /// Estimate live-data size of CF_BLOCKS in bytes via RocksDB property.
@@ -4413,6 +4507,23 @@ pub const ChainState = struct {
 
         self.best_hash = hash.*;
         self.best_height = height;
+
+        // m_chain_tx_count maintenance (Bitcoin Core CBlockIndex::m_chain_tx_count,
+        // chain.h:129 / SetChainTxCount validation.cpp).  Running cumulative
+        // count of all txs genesis..height = prev_cumulative + nTx(block).
+        // At genesis (height 0) Core seeds m_chain_tx_count = nTx; every later
+        // block adds its own nTx.  We keep the in-memory running counter and
+        // persist the per-height value (CF_DEFAULT "X:" index) so
+        // getchaintxstats can read the cumulative at both ends of its window
+        // and survive a restart.  Reorg-safe: the disconnect path rewinds the
+        // counter symmetrically.
+        const block_ntx: u64 = @intCast(block.transactions.len);
+        if (height == 0) {
+            self.chain_tx_count = block_ntx;
+        } else {
+            self.chain_tx_count += block_ntx;
+        }
+        self.putCumulativeTxCount(height, self.chain_tx_count);
 
         // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
         // 2026-05-05.md): queue per-tx CF_TX_INDEX writes for this block so
