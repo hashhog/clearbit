@@ -2854,6 +2854,26 @@ pub const RpcServer = struct {
             return persisted;
         }
 
+        // Genesis special-case: the genesis block body is never stored in
+        // CF_BLOCKS (it is synthesized from chainparams in handleGetBlock), so
+        // a CF_BLOCKS lookup would miss and we would (wrongly) report the
+        // genesis filter as absent.  Build it directly from the known genesis
+        // coinbase output scriptPubKey.  Core includes this element too (the
+        // genesis P2PK output is neither empty nor OP_RETURN); there are no
+        // spent prevouts (the coinbase input is never a filter element).
+        // BIP-158 elements for genesis = { genesis_output_script }.
+        if (std.mem.eql(u8, block_hash, &self.network_params.genesis_hash)) {
+            const gscript = self.network_params.genesis_output_script;
+            var filter = indexes_mod.buildBasicBlockFilter(
+                block_hash,
+                &[_][]const u8{gscript},
+                &[_][]const u8{},
+                self.allocator,
+            ) catch return null;
+            defer filter.deinit();
+            return try self.allocator.dupe(u8, filter.filter.getEncoded());
+        }
+
         // Load raw block from CF_BLOCKS.
         const raw = (db.get(storage.CF_BLOCKS, block_hash) catch return null) orelse return null;
         defer self.allocator.free(raw);
@@ -2997,6 +3017,8 @@ pub const RpcServer = struct {
             return self.handleGetDifficulty(id);
         } else if (std.mem.eql(u8, method, "getindexinfo")) {
             return self.handleGetIndexInfo(params, id);
+        } else if (std.mem.eql(u8, method, "getblockfilter")) {
+            return self.handleGetBlockFilter(params, id);
         } else if (std.mem.eql(u8, method, "listbanned")) {
             return self.handleListBanned(id);
         } else if (std.mem.eql(u8, method, "setban")) {
@@ -4508,6 +4530,144 @@ pub const RpcServer = struct {
         }
 
         try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `getblockfilter "blockhash" ( "filtertype" )` — BIP-157 content filter
+    /// for a block.
+    ///
+    /// Bitcoin Core reference: src/rpc/blockchain.cpp:2956-3031 (getblockfilter).
+    /// Returns { "filter": <hex GCS>, "header": <hex 32-byte> } where:
+    ///   - "filter"  = HexStr(BlockFilter::GetEncodedFilter()) — the BIP-158
+    ///     basic filter (CompactSize(N) ++ Golomb-Rice bitstream).
+    ///   - "header"  = the BIP-157 chained filter header at this block,
+    ///     header_n = SHA256d( SHA256d(rawFilter_n) || header_{n-1} ),
+    ///     all-zero parent header for genesis.
+    ///
+    /// Error parity with Core:
+    ///   - unknown filtertype                  -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+    ///                                            "Unknown filtertype"
+    ///   - filter index not enabled            -> RPC_MISC_ERROR (-1)
+    ///                                            "Index is not enabled for filtertype basic"
+    ///   - block hash not found / not on chain -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+    ///                                            "Block not found"
+    ///
+    /// The filter bytes come from `computeBasicFilterBytes` (which prefers the
+    /// persisted BlockFilterIndex and falls back to compute-on-demand from
+    /// CF_BLOCKS + CF_BLOCK_UNDO).  The header is computed by walking the active
+    /// chain from genesis to the target block, threading the chained-header
+    /// recurrence — independent of how far the persistent index has advanced,
+    /// so the bytes match Core regardless of index sync state.
+    fn handleGetBlockFilter(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // ── Parse params ────────────────────────────────────────────────────
+        var blockhash_hex: []const u8 = undefined;
+        var filtertype: []const u8 = "basic"; // Core default
+
+        if (params == .array) {
+            if (params.array.items.len > 0) {
+                const h = params.array.items[0];
+                if (h == .string) {
+                    blockhash_hex = h.string;
+                } else {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash", id);
+                }
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash", id);
+            }
+            if (params.array.items.len > 1) {
+                const ft = params.array.items[1];
+                if (ft == .string) filtertype = ft.string;
+            }
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid params", id);
+        }
+
+        // ── filtertype validation (Core: BlockFilterTypeByName) ─────────────
+        // Only "basic" (BIP-158 type 0x00) is defined.
+        if (!std.mem.eql(u8, filtertype, "basic")) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype", id);
+        }
+
+        // ── index-enabled gate (Core: GetBlockFilterIndex == nullptr) ───────
+        if (!self.chain_state.blockfilterindex_enabled) {
+            return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "Index is not enabled for filtertype basic",
+                id,
+            );
+        }
+
+        if (blockhash_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+        }
+
+        // Parse display-order hex → internal little-endian bytes.
+        var hash: types.Hash256 = undefined;
+        for (0..32) |i| {
+            hash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 .. i * 2 + 2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+            };
+        }
+
+        // ── locate the block + confirm it is on the active chain ────────────
+        const cm = self.chain_manager orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+        };
+        const target_entry = cm.getBlock(&hash) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+        };
+        const tip = cm.active_tip orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+        };
+        const at_target = tip.getAncestor(target_entry.height) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+        };
+        if (!std.mem.eql(u8, &at_target.hash, &target_entry.hash)) {
+            // Block exists but is on a side chain — Core's LookupFilter would
+            // fail too (block_was_connected == false).
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+        }
+
+        // ── filter bytes for the target block ───────────────────────────────
+        const filter_bytes = (self.computeBasicFilterBytes(&hash) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Filter computation error", id);
+        }) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+        };
+        defer self.allocator.free(filter_bytes);
+
+        // ── chained filter header: walk genesis → target ───────────────────
+        // header_n = SHA256d( SHA256d(rawFilter_n) || header_{n-1} ),
+        // header_{-1} (genesis parent) = all-zero (BIP-157).
+        var filter_header: types.Hash256 = [_]u8{0} ** 32;
+        var h: u32 = 0;
+        while (h <= target_entry.height) : (h += 1) {
+            const e = tip.getAncestor(h) orelse {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Filter chain walk failed", id);
+            };
+            const fb = (self.computeBasicFilterBytes(&e.hash) catch null) orelse {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+            };
+            defer self.allocator.free(fb);
+            const fhash = crypto.hash256(fb);
+            var combined: [64]u8 = undefined;
+            @memcpy(combined[0..32], &fhash);
+            @memcpy(combined[32..64], &filter_header);
+            filter_header = crypto.hash256(&combined);
+        }
+
+        // ── emit { "filter": <hex>, "header": <hex> } ───────────────────────
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const w = buf.writer();
+        try w.writeAll("{\"filter\":\"");
+        for (filter_bytes) |b| try w.print("{x:0>2}", .{b});
+        try w.writeAll("\",\"header\":\"");
+        // Core emits the header as a uint256 .GetHex() — display (reversed)
+        // byte order, same as block hashes.
+        try writeHashHex(w, &filter_header);
+        try w.writeAll("\"}");
 
         return self.jsonRpcResult(buf.items, id);
     }

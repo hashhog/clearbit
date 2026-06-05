@@ -374,6 +374,13 @@ pub const NetworkParams = struct {
     default_port: u16,
     genesis_hash: types.Hash256,
     genesis_header: types.BlockHeader,
+    /// The genesis coinbase's single output scriptPubKey (raw bytes).
+    /// Needed to compute the genesis block's BIP-158 basic filter element set
+    /// (the genesis block body is never stored in CF_BLOCKS — it is synthesized
+    /// from chainparams).  Standard Satoshi P2PK script for mainnet/testnet3/
+    /// signet/regtest; the 33-zero-byte P2PK variant for testnet4.
+    /// Reference: bitcoin-core/src/kernel/chainparams.cpp CreateGenesisBlock.
+    genesis_output_script: []const u8,
     dns_seeds: []const []const u8,
     bip34_height: u32,
     bip65_height: u32,
@@ -507,11 +514,34 @@ pub const AssumeUtxoData = struct {
     base_mtp: u32 = 0,
 };
 
+/// Standard Satoshi genesis coinbase output scriptPubKey (P2PK):
+///   PUSH(65-byte pubkey 04678afdb0fe...6bf11d5f) OP_CHECKSIG
+/// Used verbatim by mainnet, testnet3, signet and regtest.
+/// Reference: bitcoin-core/src/kernel/chainparams.cpp CreateGenesisBlock (no-arg).
+pub const GENESIS_OUTPUT_SCRIPT_SATOSHI: []const u8 = &[_]u8{
+    0x41, 0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, 0x48, 0x27, 0x19, 0x67, 0xf1,
+    0xa6, 0x71, 0x30, 0xb7, 0x10, 0x5c, 0xd6, 0xa8, 0x28, 0xe0, 0x39, 0x09, 0xa6,
+    0x79, 0x62, 0xe0, 0xea, 0x1f, 0x61, 0xde, 0xb6, 0x49, 0xf6, 0xbc, 0x3f, 0x4c,
+    0xef, 0x38, 0xc4, 0xf3, 0x55, 0x04, 0xe5, 0x1e, 0xc1, 0x12, 0xde, 0x5c, 0x38,
+    0x4d, 0xf7, 0xba, 0x0b, 0x8d, 0x57, 0x8a, 0x4c, 0x70, 0x2b, 0x6b, 0xf1, 0x1d,
+    0x5f, 0xac,
+};
+
+/// Testnet4 genesis coinbase output scriptPubKey (P2PK with a 33-zero-byte key):
+///   PUSH(33 zero bytes) OP_CHECKSIG
+/// Reference: bitcoin-core/src/kernel/chainparams.cpp testnet4_genesis_script.
+pub const GENESIS_OUTPUT_SCRIPT_TESTNET4: []const u8 = &[_]u8{
+    0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac,
+};
+
 /// Mainnet parameters.
 pub const MAINNET = NetworkParams{
     .magic = 0xD9B4BEF9,
     .default_port = 8333,
     .genesis_hash = hexToHash("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"),
+    .genesis_output_script = GENESIS_OUTPUT_SCRIPT_SATOSHI,
     .genesis_header = types.BlockHeader{
         .version = 1,
         .prev_block = [_]u8{0} ** 32,
@@ -652,6 +682,7 @@ pub const TESTNET3 = NetworkParams{
     .magic = 0x0709110B,
     .default_port = 18333,
     .genesis_hash = hexToHash("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"),
+    .genesis_output_script = GENESIS_OUTPUT_SCRIPT_SATOSHI,
     .genesis_header = types.BlockHeader{
         .version = 1,
         .prev_block = [_]u8{0} ** 32,
@@ -708,6 +739,7 @@ pub const TESTNET4 = NetworkParams{
     .magic = 0x283f161c,
     .default_port = 48333,
     .genesis_hash = hexToHash("00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"),
+    .genesis_output_script = GENESIS_OUTPUT_SCRIPT_TESTNET4,
     .genesis_header = types.BlockHeader{
         .version = 1,
         .prev_block = [_]u8{0} ** 32,
@@ -760,6 +792,7 @@ pub const SIGNET = NetworkParams{
     .magic = 0x0a03cf40, // Derived from challenge script hash
     .default_port = 38333,
     .genesis_hash = hexToHash("00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"),
+    .genesis_output_script = GENESIS_OUTPUT_SCRIPT_SATOSHI,
     .genesis_header = types.BlockHeader{
         .version = 1,
         .prev_block = [_]u8{0} ** 32,
@@ -811,6 +844,7 @@ pub const REGTEST = NetworkParams{
     .magic = 0xDAB5BFFA,
     .default_port = 18444,
     .genesis_hash = hexToHash("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"),
+    .genesis_output_script = GENESIS_OUTPUT_SCRIPT_SATOSHI,
     .genesis_header = types.BlockHeader{
         .version = 1,
         .prev_block = [_]u8{0} ** 32,
