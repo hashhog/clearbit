@@ -1839,6 +1839,17 @@ pub fn main() !void {
     // the buffer as blocks are connected.
     chain_state.initGenesisTimestamp(params.genesis_header.timestamp);
 
+    // Seed the cumulative-tx-count (Core CBlockIndex::m_chain_tx_count) for the
+    // genesis block.  Genesis is NOT connected via connectBlockInner (it is the
+    // chain root), so without this the running counter would start at 0 and
+    // every getchaintxstats txcount would be off-by-one (missing the genesis
+    // coinbase).  Genesis carries exactly one tx on every Bitcoin network, so
+    // we seed m_chain_tx_count(genesis) = 1 and persist the height-0 "X:" entry.
+    // Restart-safe: seedGenesisTxCount only seeds when at height 0 (a freshly-
+    // started chain); a node resumed past genesis restores the running counter
+    // from the persisted tip entry instead (see ChainState.restoreChainTxCount).
+    chain_state.seedGenesisTxCount();
+
     // Plumb pruning policy from CLI/config-file into the chain state. The
     // pruner runs lazily from the IBD loop / RPC tip-update path; this just
     // configures the watermark + target. 0 = disabled (default).
@@ -2089,6 +2100,13 @@ pub fn main() !void {
                     @memcpy(&chain_state.best_hash, data[0..32]);
                     chain_state.best_height = std.mem.readInt(u32, data[32..36], .little);
                     std.debug.print("Loaded chain tip from DB: height {d}\n", .{chain_state.best_height});
+                    // Restore the in-memory cumulative-tx-count running counter
+                    // (Core m_chain_tx_count) from the persisted "X:" entry at
+                    // the loaded tip, so getchaintxstats + the next connect see
+                    // the correct base after a restart.  Falls back to the
+                    // genesis seed (1) when the per-height entry is absent
+                    // (pre-index datadir) — matching Core's "unknown" sentinel.
+                    chain_state.restoreChainTxCount();
                 }
             }
         } else |_| {}
