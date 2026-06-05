@@ -2991,6 +2991,8 @@ pub const RpcServer = struct {
             return self.handleSubmitBlock(params, id);
         } else if (std.mem.eql(u8, method, "getdifficulty")) {
             return self.handleGetDifficulty(id);
+        } else if (std.mem.eql(u8, method, "getindexinfo")) {
+            return self.handleGetIndexInfo(params, id);
         } else if (std.mem.eql(u8, method, "listbanned")) {
             return self.handleListBanned(id);
         } else if (std.mem.eql(u8, method, "setban")) {
@@ -4412,6 +4414,98 @@ pub const RpcServer = struct {
         var buf: [64]u8 = undefined;
         const result = std.fmt.bufPrint(&buf, "{d}", .{getDifficulty(self.network_params.genesis_header.bits)}) catch return error.OutOfMemory;
         return self.jsonRpcResult(result, id);
+    }
+
+    /// `getindexinfo ( "index_name" )` — status of one or all running indices.
+    ///
+    /// Bitcoin Core reference: src/rpc/node.cpp:363-410 (getindexinfo) +
+    /// :351-361 (SummaryToJSON), src/index/base.h:30-35 (IndexSummary), and
+    /// src/index/base.cpp:472-484 (GetSummary).
+    ///
+    /// Returns a dynamic JSON OBJECT keyed BY INDEX NAME.  For each *running*
+    /// index Core pushes one entry whose value carries EXACTLY two fields, in
+    /// THIS ORDER: `"synced"` then `"best_block_height"`.  Nothing else —
+    /// IndexSummary also holds best_block_hash internally, but getindexinfo
+    /// never emits it.  An index appears ONLY if it is enabled (Core guards each
+    /// with `if (g_txindex){...}` / `ForEachBlockFilterIndex(...)` etc.), so a
+    /// node with txindex on but no filter index emits just the one `"txindex"`
+    /// key.
+    ///
+    /// clearbit's observable index substrate (chain_state) runs:
+    ///   - txindex                  — gated by `chain_state.txindex_enabled`.
+    ///       Written inline into the same WriteBatch as every block flush
+    ///       (storage.zig queueTxIndexWritesForBlock / flush), so its best
+    ///       block always tracks the active tip exactly: best_block_height =
+    ///       best_height, synced = true.
+    ///   - basic block filter index — gated by `chain_state.blockfilterindex_enabled`.
+    ///       Its reached height is tracked separately as
+    ///       `chain_state.blockfilterindex_height` (advanced per block in
+    ///       queueFilterIndexWriteForBlock; backfilled on startup): synced =
+    ///       (blockfilterindex_height >= best_height).
+    ///       Core's GetName() for the BASIC filter is the literal string
+    ///       "basic block filter index" (blockfilterindex.cpp:78 =
+    ///       BlockFilterTypeName(BASIC) + " block filter index").
+    ///
+    /// coinstatsindex is NOT wired onto chain_state (no enabled/height field
+    /// the RPC can observe), so — exactly like Core, which only lists indices
+    /// whose global is set — it is never reported here.  We do NOT fabricate
+    /// indices the node does not run.
+    ///
+    /// Optional positional arg 0 ("index_name") filters to a single index:
+    /// SummaryToJSON drops the entry when index_name is non-empty AND !=
+    /// summary.name.  So `getindexinfo "txindex"` returns only the txindex key;
+    /// `getindexinfo "no-such-index"` returns `{}` (empty object, NOT an error).
+    /// Empty/omitted arg = all running indices.
+    fn handleGetIndexInfo(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Optional positional arg 0: the index-name filter ("" when omitted).
+        const filter: []const u8 = blk: {
+            if (params) |p| {
+                if (p == .array and p.array.items.len > 0) {
+                    if (p.array.items[0] == .string) break :blk p.array.items[0].string;
+                }
+            }
+            break :blk "";
+        };
+
+        const best_height = self.chain_state.best_height;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('{');
+        var wrote_any = false;
+
+        // --- txindex --------------------------------------------------------
+        // GetName() == "txindex" (txindex.cpp:69). Written inline with the tip,
+        // so its reached height == best_height and it is always caught up.
+        if (self.chain_state.txindex_enabled) {
+            const name = "txindex";
+            if (filter.len == 0 or std.mem.eql(u8, filter, name)) {
+                const synced = true; // tracks the tip per-flush
+                const height = best_height;
+                if (wrote_any) try writer.writeByte(',');
+                try writer.print("\"{s}\":{{\"synced\":{},\"best_block_height\":{d}}}", .{ name, synced, height });
+                wrote_any = true;
+            }
+        }
+
+        // --- basic block filter index --------------------------------------
+        // GetName() == "basic block filter index" (blockfilterindex.cpp:78).
+        if (self.chain_state.blockfilterindex_enabled) {
+            const name = "basic block filter index";
+            if (filter.len == 0 or std.mem.eql(u8, filter, name)) {
+                const height = self.chain_state.blockfilterindex_height;
+                const synced = height >= best_height;
+                if (wrote_any) try writer.writeByte(',');
+                try writer.print("\"{s}\":{{\"synced\":{},\"best_block_height\":{d}}}", .{ name, synced, height });
+                wrote_any = true;
+            }
+        }
+
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     // ========================================================================
