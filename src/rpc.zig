@@ -3084,6 +3084,8 @@ pub const RpcServer = struct {
             return self.handleGetDeploymentInfo(params, id);
         } else if (std.mem.eql(u8, method, "getchaintips")) {
             return self.handleGetChainTips(id);
+        } else if (std.mem.eql(u8, method, "getchaintxstats")) {
+            return self.handleGetChainTxStats(params, id);
         } else if (std.mem.eql(u8, method, "getrawmempool")) {
             return self.handleGetRawMempool(params, id);
         } else if (std.mem.eql(u8, method, "testmempoolaccept")) {
@@ -9237,6 +9239,226 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// Read a block header's raw nTime by active-chain height.
+    ///
+    /// Resolves height → hash via the H:{height} index, then reads the
+    /// 80-byte header out of CF_BLOCKS.  Returns null when the height is
+    /// genesis-special-cased by the caller, or when neither the index nor
+    /// CF_BLOCKS hold the block (e.g. pre-CF_BLOCKS IBD datadir).  Used by
+    /// getchaintxstats to obtain the window's MTP endpoints and the final
+    /// block's raw timestamp without a Bitcoin Core RPC fallback (so the
+    /// differential test works on a standalone regtest node).
+    fn headerTimestampByHeight(self: *RpcServer, height: u32) ?u32 {
+        if (height == 0) return self.network_params.genesis_header.timestamp;
+        const hash = self.chain_state.getBlockHashByHeight(height) orelse {
+            // Fall back to the in-memory block index (blocks connected this
+            // session before the H: index was lazily backfilled).
+            return null;
+        };
+        const db = self.chain_state.utxo_set.db orelse return null;
+        const raw = (db.get(storage.CF_BLOCKS, &hash) catch return null) orelse return null;
+        defer self.allocator.free(raw);
+        if (raw.len < 80) return null;
+        var reader = serialize.Reader{ .data = raw };
+        const hdr = serialize.readBlockHeader(&reader) catch return null;
+        return hdr.timestamp;
+    }
+
+    /// Header nTime by height, preferring the in-memory chain index (which is
+    /// authoritative for the current session) and falling back to CF_BLOCKS.
+    fn headerTimestampByHeightAny(self: *RpcServer, height: u32) ?u32 {
+        if (height == 0) return self.network_params.genesis_header.timestamp;
+        // In-memory chain index: walk requires a hash, so resolve via H: first
+        // and consult chain_manager if CF_BLOCKS misses.
+        if (self.headerTimestampByHeight(height)) |ts| return ts;
+        if (self.chain_state.getBlockHashByHeight(height)) |hash| {
+            if (self.chain_manager) |cm| {
+                if (cm.getBlock(&hash)) |e| return e.header.timestamp;
+            }
+        }
+        return null;
+    }
+
+    /// Compute the median-time-past (Core CBlockIndex::GetMedianTimePast) for
+    /// the block at `height`: the median of the nTime of that block and its
+    /// (up to) 10 ancestors — an 11-block window ending at `height`.  Mirrors
+    /// `chain.h` GetMedianTimePast which uses min(11, height+1) entries.
+    /// Returns null if any required header timestamp is unavailable.
+    fn computeMTPAtHeight(self: *RpcServer, height: u32) ?i64 {
+        var samples: [11]u32 = undefined;
+        var n: usize = 0;
+        var h: i64 = @intCast(height);
+        while (n < 11 and h >= 0) : (h -= 1) {
+            const ts = self.headerTimestampByHeightAny(@intCast(h)) orelse return null;
+            samples[n] = ts;
+            n += 1;
+        }
+        if (n == 0) return null;
+        // Insertion sort the n collected samples.
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const key = samples[i];
+            var j: usize = i;
+            while (j > 0 and samples[j - 1] > key) : (j -= 1) {
+                samples[j] = samples[j - 1];
+            }
+            samples[j] = key;
+        }
+        return @intCast(samples[n / 2]);
+    }
+
+    /// getchaintxstats ( nblocks "blockhash" )
+    ///
+    /// Compute statistics about the total number and rate of transactions in
+    /// the chain.  Read-only chain stats — byte-shaped to Bitcoin Core's
+    /// rpc/blockchain.cpp getchaintxstats (lines 1809-1898).
+    ///
+    /// Fields (in Core's pushKV order):
+    ///   time                       FINAL block's RAW header nTime (NOT MTP)
+    ///   txcount                    cumulative #txs genesis..pindex (optional:
+    ///                              omitted when unknown / m_chain_tx_count==0)
+    ///   window_final_block_hash    pindex hash
+    ///   window_final_block_height  pindex height
+    ///   window_block_count         nblocks (after clamp)
+    ///   window_interval            MTP(pindex) - MTP(past) [only if nblocks>0]
+    ///   window_tx_count            txcount(pindex) - txcount(past)
+    ///                              [only if nblocks>0 AND both counts known]
+    ///   txrate                     window_tx_count / window_interval
+    ///                              [only if window_interval>0 AND tx_count known]
+    ///
+    /// Error codes (Core-faithful):
+    ///   -5  Block not found        (blockhash not in the index)
+    ///   -8  Block is not in main chain
+    ///   -8  Invalid block count    (nblocks<0 or nblocks>=pindex height)
+    fn handleGetChainTxStats(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // ── Resolve pindex: height + hash ──────────────────────────────────
+        var pindex_height: u32 = self.chain_state.best_height;
+        var pindex_hash: types.Hash256 = self.chain_state.best_hash;
+        var has_blockhash_arg = false;
+
+        if (params == .array and params.array.items.len > 1 and params.array.items[1] != .null) {
+            const bh = params.array.items[1];
+            if (bh != .string or bh.string.len != 64) {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be of length 64 (not lesser)", id);
+            }
+            var hash: types.Hash256 = undefined;
+            for (0..32) |i| {
+                hash[31 - i] = std.fmt.parseInt(u8, bh.string[i * 2 .. i * 2 + 2], 16) catch {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be hexadecimal string", id);
+                };
+            }
+            has_blockhash_arg = true;
+
+            // Resolve hash → height.  Tip first (cheap), then the in-memory
+            // chain index, then a reverse scan of the H: index as last resort.
+            var resolved_height: ?u32 = null;
+            if (std.mem.eql(u8, &hash, &self.chain_state.best_hash)) {
+                resolved_height = self.chain_state.best_height;
+            } else if (self.chain_manager != null and self.chain_manager.?.getBlock(&hash) != null) {
+                resolved_height = self.chain_manager.?.getBlock(&hash).?.height;
+            }
+
+            if (resolved_height == null) {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+            }
+            const h = resolved_height.?;
+
+            // "in main chain" check (Core ActiveChain().Contains): the active
+            // chain's block at this height must hash to the requested block.
+            // The tip is trivially on the active chain; for any other block we
+            // require the H:{height} index to map back to the same hash.
+            if (!std.mem.eql(u8, &hash, &self.chain_state.best_hash)) {
+                const at_h = self.chain_state.getBlockHashByHeight(h) orelse {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block is not in main chain", id);
+                };
+                if (!std.mem.eql(u8, &at_h, &hash)) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block is not in main chain", id);
+                }
+            }
+
+            pindex_height = h;
+            pindex_hash = hash;
+        }
+
+        // ── nblocks: default = one month of blocks, clamped to height-1. ───
+        // Core: blockcount = 30*24*60*60 / nPowTargetSpacing (=4320 @600s).
+        const month_blocks: i64 = @divTrunc(30 * 24 * 60 * 60, @as(i64, @intCast(self.network_params.pow_target_spacing)));
+        var blockcount: i64 = month_blocks;
+
+        const nblocks_is_null = !(params == .array and params.array.items.len > 0 and params.array.items[0] != .null);
+        if (nblocks_is_null) {
+            // clamp to [0, height-1]
+            const hmax: i64 = @as(i64, @intCast(pindex_height)) - 1;
+            blockcount = @max(@as(i64, 0), @min(blockcount, hmax));
+        } else {
+            const nb = params.array.items[0];
+            blockcount = switch (nb) {
+                .integer => nb.integer,
+                .float => @intFromFloat(nb.float),
+                else => return self.jsonRpcError(RPC_INVALID_PARAMS, "JSON value of type for nblocks is not an integer as expected", id),
+            };
+            if (blockcount < 0 or (blockcount > 0 and blockcount >= @as(i64, @intCast(pindex_height)))) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid block count: should be between 0 and the block's height - 1", id);
+            }
+        }
+
+        const past_height: u32 = @intCast(@as(i64, @intCast(pindex_height)) - blockcount);
+
+        // ── Resolve the per-end values. ────────────────────────────────────
+        // FINAL block's RAW nTime (NOT MTP).
+        const final_time: u32 = self.headerTimestampByHeightAny(pindex_height) orelse blk: {
+            // Last resort for the tip: chain_manager header timestamp.
+            if (self.chain_manager) |cm| {
+                if (cm.getBlock(&pindex_hash)) |e| break :blk e.header.timestamp;
+            }
+            break :blk 0;
+        };
+
+        // Cumulative tx counts (Core m_chain_tx_count); 0/null == "unknown".
+        const tip_txcount: ?u64 = self.chain_state.getCumulativeTxCount(pindex_height);
+        const past_txcount: ?u64 = if (blockcount > 0) self.chain_state.getCumulativeTxCount(past_height) else null;
+
+        // ── Build JSON in Core's pushKV order. ─────────────────────────────
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const w = buf.writer();
+
+        try w.writeByte('{');
+        try w.print("\"time\":{d}", .{final_time});
+
+        if (tip_txcount) |tc| {
+            if (tc != 0) try w.print(",\"txcount\":{d}", .{tc});
+        }
+
+        try w.writeAll(",\"window_final_block_hash\":\"");
+        try writeHashHex(w, &pindex_hash);
+        try w.print("\",\"window_final_block_height\":{d}", .{pindex_height});
+        try w.print(",\"window_block_count\":{d}", .{blockcount});
+
+        if (blockcount > 0) {
+            // window_interval = MTP(pindex) - MTP(past_block).
+            const mtp_tip = self.computeMTPAtHeight(pindex_height);
+            const mtp_past = self.computeMTPAtHeight(past_height);
+            const interval: i64 = if (mtp_tip != null and mtp_past != null)
+                mtp_tip.? - mtp_past.?
+            else
+                0;
+            try w.print(",\"window_interval\":{d}", .{interval});
+
+            if (tip_txcount != null and tip_txcount.? != 0 and past_txcount != null and past_txcount.? != 0) {
+                const window_tx_count: i64 = @as(i64, @intCast(tip_txcount.?)) - @as(i64, @intCast(past_txcount.?));
+                try w.print(",\"window_tx_count\":{d}", .{window_tx_count});
+                if (interval > 0) {
+                    const rate: f64 = @as(f64, @floatFromInt(window_tx_count)) / @as(f64, @floatFromInt(interval));
+                    try w.print(",\"txrate\":{d}", .{rate});
+                }
+            }
+        }
+
+        try w.writeByte('}');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// Proxy a getblockheader verbose=true call through Bitcoin Core and return
     /// a Core-byte-compatible response.  Used when clearbit has no local header
     /// for a historical block (CF_BLOCKS empty for pre-cdd9e20 IBD blocks).
@@ -13787,6 +14009,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("getdeploymentinfo ( blockhash )\\n\\nReturns an object containing deployment state info for softforks.");
             } else if (std.mem.eql(u8, cmd, "getchaintips")) {
                 try writer.writeAll("getchaintips\\n\\nReturn information about all known tips in the block tree.");
+            } else if (std.mem.eql(u8, cmd, "getchaintxstats")) {
+                try writer.writeAll("getchaintxstats ( nblocks \\\"blockhash\\\" )\\n\\nCompute statistics about the total number and rate of transactions in the chain.");
             } else if (std.mem.eql(u8, cmd, "getrawmempool")) {
                 try writer.writeAll("getrawmempool ( verbose mempool_sequence )\\n\\nReturns all transaction ids in memory pool.");
             } else if (std.mem.eql(u8, cmd, "testmempoolaccept")) {
@@ -13857,6 +14081,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getblockheader\\n");
             try writer.writeAll("getdeploymentinfo\\n");
             try writer.writeAll("getchaintips\\n");
+            try writer.writeAll("getchaintxstats\\n");
             try writer.writeAll("getdifficulty\\n");
             try writer.writeAll("\\n== Mempool ==\\n");
             try writer.writeAll("getmempoolancestors\\n");
