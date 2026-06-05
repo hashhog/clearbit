@@ -9502,8 +9502,20 @@ pub const RpcServer = struct {
 
             try w.writeAll("{\"bits\":\"");
             try w.print("{x:0>8}", .{genesis.bits});
-            try w.writeAll("\",\"chainwork\":\"0000000000000000000000000000000000000000000000000000000100010001\"");
-            try w.print(",\"confirmations\":{d}", .{self.chain_state.best_height + 1});
+            // chainwork = GetBlockProof(genesis): Core seeds the genesis index
+            // entry with this (NOT the mainnet-specific 0x100010001 literal that
+            // was hardcoded here, which was wrong on regtest=0x2 / testnet4).
+            // Read the ChainManager's Core-seeded genesis chain_work; fall back
+            // to the network's per-network value if the manager isn't wired.
+            try w.writeAll("\",\"chainwork\":\"");
+            {
+                var gw: [32]u8 = peer_mod.workFromBits(genesis.bits);
+                if (self.chain_manager) |cm| {
+                    if (cm.getBlock(&hash)) |ge| gw = ge.chain_work;
+                }
+                for (gw) |byte| try w.print("{x:0>2}", .{byte});
+            }
+            try w.print("\",\"confirmations\":{d}", .{self.chain_state.best_height + 1});
             try w.writeAll(",\"difficulty\":");
             try writeDifficultyCore(w, getDifficultyCore(genesis.bits));
             try w.writeAll(",\"hash\":\"");
@@ -9573,11 +9585,13 @@ pub const RpcServer = struct {
         // Path B: in-memory chain_manager (blocks connected this session).
         var cm_height: ?u32 = null;
         var cm_chainwork: ?[32]u8 = null;
+        var cm_entry: ?*validation.BlockIndexEntry = null;
         if (self.chain_manager) |cm| {
             if (cm.getBlock(&hash)) |entry| {
                 if (header_opt == null) header_opt = entry.header;
                 cm_height = entry.height;
                 cm_chainwork = entry.chain_work;
+                cm_entry = entry;
             }
         }
 
@@ -9625,16 +9639,51 @@ pub const RpcServer = struct {
         }
 
         var chainwork_str: [64]u8 = [_]u8{'0'} ** 64;
-        var mediantime: u32 = header.timestamp;
         var ntx: u64 = raw_ntx;
         var nextblockhash_opt: ?[64]u8 = null;
 
-        // Apply Core meta where available.
+        // mediantime = Core's CBlockIndex::GetMedianTimePast (11-block MTP),
+        // computed LOCALLY so a standalone node (regtest / no live Core) emits
+        // the Core-correct value.  Resolution order:
+        //   1. ChainManager parent walk (authoritative for this session).
+        //   2. By-height MTP over CF_BLOCKS + H: index (historical blocks).
+        //   3. The header's own nTime (last resort: only correct when ancestors
+        //      are unavailable AND share this block's timestamp; we still prefer
+        //      Core meta over this when proxying — handled in the no-local-header
+        //      arm).  Core meta supplies the value only as a tie-break here.
+        var mediantime: u32 = header.timestamp;
+        var mtp_resolved = false;
+        if (cm_entry) |e| {
+            if (self.computeMTPViaChainManager(e)) |mtp| {
+                mediantime = @intCast(mtp);
+                mtp_resolved = true;
+            }
+        }
+        if (!mtp_resolved) {
+            if (height) |h| {
+                if (self.computeMTPAtHeight(h)) |mtp| {
+                    mediantime = @intCast(mtp);
+                    mtp_resolved = true;
+                }
+            }
+        }
+
+        // Apply Core meta where available — but never override a locally
+        // computed MTP / chainwork (same chain, but local is authoritative
+        // and works offline).
         if (core_meta) |m| {
             if (height == null) height = m.height;
             if (ntx == 0) ntx = m.ntx;
-            mediantime = m.mediantime;
+            if (!mtp_resolved) mediantime = m.mediantime;
             @memcpy(&chainwork_str, &m.chainwork);
+            if (cm_chainwork) |cw| {
+                // Prefer in-memory chainwork (Core-seeded genesis included).
+                var tmp_buf: [64]u8 = undefined;
+                for (cw, 0..) |byte, i| {
+                    _ = try std.fmt.bufPrint(tmp_buf[i * 2 ..][0..2], "{x:0>2}", .{byte});
+                }
+                @memcpy(&chainwork_str, &tmp_buf);
+            }
             if (nextblockhash_opt == null) nextblockhash_opt = m.nextblockhash;
         } else if (cm_chainwork) |cw| {
             // Use in-memory chainwork if Core was unavailable.
@@ -9765,6 +9814,41 @@ pub const RpcServer = struct {
         }
         if (n == 0) return null;
         // Insertion sort the n collected samples.
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const key = samples[i];
+            var j: usize = i;
+            while (j > 0 and samples[j - 1] > key) : (j -= 1) {
+                samples[j] = samples[j - 1];
+            }
+            samples[j] = key;
+        }
+        return @intCast(samples[n / 2]);
+    }
+
+    /// Median-time-past for a block, walking the in-memory ChainManager parent
+    /// chain (the authoritative source for blocks connected this session, e.g.
+    /// regtest blocks mined via generatetoaddress).  Collects this block's nTime
+    /// plus those of up to 10 ancestors — an 11-block window — and returns the
+    /// median.  Mirrors Bitcoin Core CBlockIndex::GetMedianTimePast
+    /// (chain.h: min(11, height+1) entries, median of the sorted window).
+    ///
+    /// Returns null when the parent chain isn't fully linked in memory (caller
+    /// then falls back to CF_BLOCKS / H:-index MTP or, last, the header's own
+    /// nTime).  This is what lets getblockheader emit a Core-correct `mediantime`
+    /// on a standalone node WITHOUT proxying to a live Bitcoin Core.
+    fn computeMTPViaChainManager(self: *RpcServer, entry: *validation.BlockIndexEntry) ?i64 {
+        _ = self;
+        var samples: [11]u32 = undefined;
+        var n: usize = 0;
+        var cur: ?*validation.BlockIndexEntry = entry;
+        while (n < 11) {
+            const e = cur orelse break;
+            samples[n] = e.header.timestamp;
+            n += 1;
+            cur = e.parent;
+        }
+        if (n == 0) return null;
         var i: usize = 1;
         while (i < n) : (i += 1) {
             const key = samples[i];
