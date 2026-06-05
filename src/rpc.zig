@@ -6156,164 +6156,278 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid params", id);
         }
 
-        const verbose = verbosity >= 1;
-
-        // Parse txid
+        // Parse txid.  Core parses with ParseHashV; a malformed length/hex
+        // is a parse error.  We keep the parse-level errors (-8) but route a
+        // well-formed-but-not-found txid to -5 (RPC_INVALID_ADDRESS_OR_KEY)
+        // exactly like Core (rpc/rawtransaction.cpp:329).
         if (txid_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "parameter 1 must be of length 64", id);
         }
 
         var txid: types.Hash256 = undefined;
         for (0..32) |i| {
             txid[31 - i] = std.fmt.parseInt(u8, txid_hex[i * 2 ..][0..2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "parameter 1 must be hexadecimal string", id);
             };
         }
 
-        // Check mempool first
-        if (self.mempool.get(txid)) |entry| {
+        // ── Special exception for the genesis-block coinbase ─────────────────
+        // Core: rpc/rawtransaction.cpp:290-293.  The genesis coinbase txid
+        // equals the genesis block's merkle root and is not retrievable.
+        if (std.mem.eql(u8, &txid, &self.network_params.genesis_header.merkle_root)) {
+            return self.jsonRpcError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
+                id,
+            );
+        }
+
+        // ── Resolve an optional blockhash argument ───────────────────────────
+        // Core: when a blockhash arg is passed (rpc/rawtransaction.cpp:297-305)
+        // the lookup is confined to that block; a hash not in the block index
+        // is "Block hash not found" (-5).  in_active_chain is then reported.
+        var have_blockhash_arg = false;
+        var arg_blockhash: types.Hash256 = undefined;
+        if (blockhash_hex_param) |bh_hex| {
+            have_blockhash_arg = true;
+            if (bh_hex.len != 64) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "parameter 3 must be of length 64", id);
+            }
+            for (0..32) |i| {
+                arg_blockhash[31 - i] = std.fmt.parseInt(u8, bh_hex[i * 2 ..][0..2], 16) catch {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "parameter 3 must be hexadecimal string", id);
+                };
+            }
+            // The block must exist in the index (or be genesis).  Otherwise
+            // Core throws "Block hash not found".
+            const arg_is_genesis = std.mem.eql(u8, &arg_blockhash, &self.network_params.genesis_hash);
+            var block_known = arg_is_genesis;
+            if (!block_known) {
+                if (self.chain_manager) |cm| {
+                    if (cm.getBlock(&arg_blockhash) != null) block_known = true;
+                }
+            }
+            if (!block_known) {
+                if (self.chain_state.utxo_set.db) |db| {
+                    if (db.get(storage.CF_BLOCK_INDEX, &arg_blockhash) catch null) |bytes| {
+                        self.allocator.free(bytes);
+                        block_known = true;
+                    }
+                }
+            }
+            if (!block_known) {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block hash not found", id);
+            }
+        }
+
+        // ── Locate the transaction ───────────────────────────────────────────
+        // Resolution result: the decoded tx plus optional block context.  We
+        // own `found_tx` (must be freed via serialize.freeTransaction) only
+        // when it came from a block we decoded; mempool entries are borrowed.
+        var found_tx: ?types.Transaction = null;
+        var found_tx_owned = false;
+        defer if (found_tx_owned) {
+            if (found_tx) |*ft| serialize.freeTransaction(self.allocator, ft);
+        };
+
+        // Block context (set when the tx is confirmed in a known block).
+        var ctx_block_hash: ?types.Hash256 = null;
+        var ctx_block_height: u32 = 0;
+        var ctx_block_time: u32 = 0;
+        var ctx_in_active_chain: bool = false;
+
+        // Helper closure (inline): given a block hash, load its raw bytes,
+        // decode it, and search for `txid`.  On hit, copies the tx out (owned)
+        // and records block context.  Returns true on hit.
+        const tryBlock = struct {
+            fn run(
+                srv: *RpcServer,
+                want_txid: *const types.Hash256,
+                block_hash: *const types.Hash256,
+                out_tx: *?types.Transaction,
+                out_owned: *bool,
+                out_height: *u32,
+                out_time: *u32,
+                out_in_chain: *bool,
+                out_ctx_hash: *?types.Hash256,
+            ) !bool {
+                const db = srv.chain_state.utxo_set.db orelse return false;
+                const block_bytes = (db.get(storage.CF_BLOCKS, block_hash) catch return false) orelse return false;
+                defer srv.allocator.free(block_bytes);
+
+                var block_reader = serialize.Reader{ .data = block_bytes };
+                var block_data = serialize.readBlock(&block_reader, srv.allocator) catch return false;
+                defer serialize.freeBlock(srv.allocator, &block_data);
+
+                for (block_data.transactions) |btx| {
+                    const this_txid = crypto.computeTxidStreaming(&btx);
+                    if (std.mem.eql(u8, &this_txid, want_txid)) {
+                        // Resolve height + active-chain membership for the block.
+                        var height: u32 = 0;
+                        var height_known = false;
+                        if (srv.chain_manager) |cm| {
+                            if (cm.getBlock(block_hash)) |bi| {
+                                height = bi.height;
+                                height_known = true;
+                            }
+                        }
+                        if (!height_known) {
+                            if (db.get(storage.CF_BLOCK_INDEX, block_hash) catch null) |idx_bytes| {
+                                defer srv.allocator.free(idx_bytes);
+                                var ir = serialize.Reader{ .data = idx_bytes };
+                                if (ir.readInt(u32)) |h| {
+                                    height = h;
+                                    height_known = true;
+                                } else |_| {}
+                            }
+                        }
+                        var in_chain = false;
+                        if (height_known) {
+                            if (srv.chain_state.getBlockHashByHeight(height)) |canonical| {
+                                in_chain = std.mem.eql(u8, &canonical, block_hash);
+                            }
+                        }
+
+                        // Deep-copy the matching tx so it survives freeBlock.
+                        out_tx.* = try copyTransaction(srv.allocator, &btx);
+                        out_owned.* = true;
+                        out_height.* = height;
+                        out_time.* = block_data.header.timestamp;
+                        out_in_chain.* = in_chain;
+                        out_ctx_hash.* = block_hash.*;
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }.run;
+
+        if (have_blockhash_arg) {
+            // Blockhash arg given: search ONLY that block (Core confines the
+            // lookup to the provided block; mempool/txindex are not consulted).
+            _ = try tryBlock(
+                self,
+                &txid,
+                &arg_blockhash,
+                &found_tx,
+                &found_tx_owned,
+                &ctx_block_height,
+                &ctx_block_time,
+                &ctx_in_active_chain,
+                &ctx_block_hash,
+            );
+        } else {
+            // No blockhash arg: mempool first, then txindex → block.
+            if (self.mempool.get(txid)) |entry| {
+                found_tx = entry.tx; // borrowed; not owned
+                found_tx_owned = false;
+                // Mempool tx is unconfirmed: no block context.
+            } else if (try self.chain_state.getTxIndexEntry(&txid)) |idx_entry| {
+                // Pattern C0: the indexed block_hash is consulted, and the tx
+                // is confirmed only if that block is still canonical at its
+                // indexed height (Core's tip->GetAncestor(...) == blockindex).
+                _ = try tryBlock(
+                    self,
+                    &txid,
+                    &idx_entry.block_hash,
+                    &found_tx,
+                    &found_tx_owned,
+                    &ctx_block_height,
+                    &ctx_block_time,
+                    &ctx_in_active_chain,
+                    &ctx_block_hash,
+                );
+            }
+        }
+
+        // ── Not found ────────────────────────────────────────────────────────
+        if (found_tx == null) {
+            // verbosity=2 Core-proxy fallback (W60): CF_TX_INDEX/CF_BLOCKS can
+            // be empty for blocks synced before the queueBlockWrite fix.
+            if (verbosity == 2) {
+                const bh_hex = blockhash_hex_param orelse "";
+                if (try self.proxyGetRawTx2FromCore(txid_hex, bh_hex, id)) |result| {
+                    return result;
+                }
+            }
+            // Core's error-message family (rpc/rawtransaction.cpp:314-329), all
+            // RPC code -5.  We pick the wording by whether txindex is on, since
+            // the exact suffix is not consensus-relevant.
+            const errmsg: []const u8 = if (have_blockhash_arg)
+                "No such transaction found in the provided block. Use gettransaction for wallet transactions."
+            else if (!self.chain_state.txindex_enabled)
+                "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
+            else
+                "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, errmsg, id);
+        }
+
+        const tx_ptr: *const types.Transaction = &found_tx.?;
+
+        // ── Verbosity 0: raw hex (EncodeHexTx) ───────────────────────────────
+        if (verbosity == 0) {
             var buf = std.ArrayList(u8).init(self.allocator);
             defer buf.deinit();
             const writer = buf.writer();
 
-            if (verbose) {
-                try writer.print("{{\"txid\":\"", .{});
-                try writeHashHex(writer, &entry.txid);
-                try writer.print("\",\"size\":{d},\"vsize\":{d},\"weight\":{d},\"version\":{d},\"locktime\":{d}}}", .{
-                    entry.size,
-                    entry.vsize,
-                    entry.weight,
-                    entry.tx.version,
-                    entry.tx.lock_time,
-                });
-            } else {
-                // Return raw hex
-                var tx_writer = serialize.Writer.init(self.allocator);
-                defer tx_writer.deinit();
-                serialize.writeTransaction(&tx_writer, &entry.tx) catch {
-                    return self.jsonRpcError(RPC_INTERNAL_ERROR, "Serialization failed", id);
-                };
-                const tx_bytes = tx_writer.getWritten();
+            var tx_writer = serialize.Writer.init(self.allocator);
+            defer tx_writer.deinit();
+            serialize.writeTransaction(&tx_writer, tx_ptr) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Serialization failed", id);
+            };
+            const tx_bytes = tx_writer.getWritten();
 
-                try writer.writeByte('"');
-                for (tx_bytes) |byte| {
-                    try writer.print("{x:0>2}", .{byte});
-                }
-                try writer.writeByte('"');
-            }
-
+            try writer.writeByte('"');
+            for (tx_bytes) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeByte('"');
             return self.jsonRpcResult(buf.items, id);
         }
 
-        // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
-        // 2026-05-05.md): consult CF_TX_INDEX for confirmed txs.  Bitcoin
-        // Core analog: rpc/rawtransaction.cpp::getrawtransaction →
-        // GetTransaction(txid) → g_txindex->FindTx(...) → block bytes →
-        // tx body.
-        //
-        // Confirmations gate (Pattern C invariant — see
-        // bitcoin-core/src/rpc/rawtransaction.cpp lines around the
-        // GetAncestor() check): we additionally verify the indexed
-        // block_hash equals the canonical block hash at the indexed
-        // height (chain_state.getBlockHashByHeight).  When they differ
-        // the indexed block is no longer on the active chain (a reorg
-        // disconnected it before the txindex revert flushed, or the
-        // txindex revert is racing this lookup), so we report
-        // confirmations=0 — matching Core's `tip->GetAncestor(...) ==
-        // blockindex` else-branch in CRawTransaction.
-        //
-        // Disconnect-side coverage: disconnectBlockByHashCF queues a
-        // CF_TX_INDEX delete for every tx in the disconnected block, so
-        // a successful reorg returns "no such tx" (RPC_INVALID_ADDRESS_
-        // OR_KEY) rather than a stale confs>0 entry — exercising the
-        // canonical Pattern C revert.
-        if (try self.chain_state.getTxIndexEntry(&txid)) |entry| {
-            const db_opt = self.chain_state.utxo_set.db;
-            if (db_opt) |db| {
-                if (try db.get(storage.CF_BLOCKS, &entry.block_hash)) |block_bytes| {
-                    defer self.allocator.free(block_bytes);
+        // ── Verbosity >= 1: decoded object + TxToJSON envelope ───────────────
+        // Field order matches Core exactly:
+        //   in_active_chain (only when a blockhash arg was given), then the
+        //   TxToUniv body (txid..hex), then blockhash/confirmations/time/
+        //   blocktime (only when confirmed in the active chain).
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
 
-                    var block_reader = serialize.Reader{ .data = block_bytes };
-                    var block_data = serialize.readBlock(&block_reader, self.allocator) catch {
-                        return self.jsonRpcError(RPC_INTERNAL_ERROR, "Block decode failed", id);
-                    };
-                    defer serialize.freeBlock(self.allocator, &block_data);
+        // We need in_active_chain pushed FIRST (Core pushes it before TxToJSON),
+        // but the body helper opens the object with '{'.  So emit the opening
+        // brace + in_active_chain manually, then have the helper continue.
+        if (have_blockhash_arg) {
+            try writer.print("{{\"in_active_chain\":{s},", .{if (ctx_in_active_chain) "true" else "false"});
+            // Re-open: writeTxToUnivWithHexOpen starts with '{"txid"...'.  We
+            // already wrote the '{', so emit the body without its leading brace.
+            try writeTxToUnivWithHexOpenNoBrace(self, writer, tx_ptr);
+        } else {
+            try writeTxToUnivWithHexOpen(self, writer, tx_ptr);
+        }
 
-                    if (entry.tx_index_in_block >= block_data.transactions.len) {
-                        return self.jsonRpcError(RPC_INTERNAL_ERROR, "Tx index out of range", id);
-                    }
-                    const tx = block_data.transactions[entry.tx_index_in_block];
-
-                    // Compute confirmations.  If the indexed block_hash
-                    // matches the canonical hash at the indexed height,
-                    // confirmations = tip_height - block_height + 1.
-                    // Otherwise confirmations=0 (block disconnected; the
-                    // txindex CF_TX_INDEX entry is stale, e.g. a flush()
-                    // race window between disconnect and the delete
-                    // hitting durable storage).
-                    var confirmations: u32 = 0;
-                    if (self.chain_state.getBlockHashByHeight(entry.block_height)) |canonical_hash| {
-                        if (std.mem.eql(u8, &canonical_hash, &entry.block_hash)) {
-                            if (self.chain_state.best_height >= entry.block_height) {
-                                confirmations = self.chain_state.best_height - entry.block_height + 1;
-                            }
-                        }
-                    }
-
-                    var buf = std.ArrayList(u8).init(self.allocator);
-                    defer buf.deinit();
-                    const writer = buf.writer();
-
-                    if (verbose) {
-                        // Compute txid (matches what we looked up by) +
-                        // emit confirmations + blockhash so the corpus
-                        // probe can read both fields.
-                        try writer.print("{{\"txid\":\"", .{});
-                        try writeHashHex(writer, &txid);
-                        try writer.print("\",\"version\":{d},\"locktime\":{d}", .{
-                            tx.version,
-                            tx.lock_time,
-                        });
-                        try writer.print(",\"blockhash\":\"", .{});
-                        try writeHashHex(writer, &entry.block_hash);
-                        try writer.print("\",\"confirmations\":{d}", .{confirmations});
-                        try writer.print(",\"in_active_chain\":{s}}}", .{
-                            if (confirmations > 0) "true" else "false",
-                        });
-                    } else {
-                        // Return raw hex.
-                        var tx_writer = serialize.Writer.init(self.allocator);
-                        defer tx_writer.deinit();
-                        serialize.writeTransaction(&tx_writer, &tx) catch {
-                            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Serialization failed", id);
-                        };
-                        const tx_bytes = tx_writer.getWritten();
-
-                        try writer.writeByte('"');
-                        for (tx_bytes) |byte| {
-                            try writer.print("{x:0>2}", .{byte});
-                        }
-                        try writer.writeByte('"');
-                    }
-
-                    return self.jsonRpcResult(buf.items, id);
-                }
+        // TxToJSON envelope: only when the tx is in a block.  Core emits
+        // confirmations/time/blocktime only when the block is in the active
+        // chain; otherwise just blockhash + confirmations:0.
+        if (ctx_block_hash) |bh| {
+            try writer.writeAll(",\"blockhash\":\"");
+            try writeHashHex(writer, &bh);
+            try writer.writeByte('"');
+            if (ctx_in_active_chain) {
+                const confirmations: i64 = if (self.chain_state.best_height >= ctx_block_height)
+                    @as(i64, @intCast(self.chain_state.best_height)) - @as(i64, @intCast(ctx_block_height)) + 1
+                else
+                    0;
+                try writer.print(",\"confirmations\":{d},\"time\":{d},\"blocktime\":{d}", .{
+                    confirmations,
+                    ctx_block_time,
+                    ctx_block_time,
+                });
+            } else {
+                try writer.writeAll(",\"confirmations\":0");
             }
         }
 
-        // verbosity=2 Core proxy fallback (W60): CF_TX_INDEX is empty for blocks
-        // synced before the queueBlockWrite fix (same gap as W57/W59).  Delegate
-        // to proxyGetRawTx2FromCore which passes Core's JSON verbatim (raw-string
-        // pass-through to preserve float precision, e.g. fee=0.0001578) and only
-        // substitutes the confirmations field with clearbit's own count.
-        if (verbosity == 2) {
-            const bh_hex = blockhash_hex_param orelse "";
-            if (try self.proxyGetRawTx2FromCore(txid_hex, bh_hex, id)) |result| {
-                return result;
-            }
-        }
-
-        return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "No such mempool or blockchain transaction", id);
+        try writer.writeByte('}');
+        return self.jsonRpcResult(buf.items, id);
     }
 
     /// Core proxy for getrawtransaction verbosity=2 (W60).
@@ -17011,6 +17125,20 @@ fn writeBip32Path(writer: anytype, path: []const u32) !void {
 
 /// W53 — emit a full TxToUniv-style JSON object for a Transaction, mirroring
 /// Bitcoin Core's `TxToUniv(*tx, uint256(), entry, include_hex=false)` in
+/// Deep-copy a transaction so it survives the freeing of the block/buffer it
+/// was decoded from.  Implemented as a serialize→deserialize round-trip so the
+/// resulting copy is owned exactly the way `serialize.freeTransaction` expects
+/// (every script_sig / witness item / script_pubkey separately heap-allocated).
+/// Caller must free with `serialize.freeTransaction`.
+fn copyTransaction(allocator: std.mem.Allocator, tx: *const types.Transaction) !types.Transaction {
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try serialize.writeTransaction(&w, tx);
+    const bytes = w.getWritten();
+    var r = serialize.Reader{ .data = bytes };
+    return try serialize.readTransaction(&r, allocator);
+}
+
 /// the decodepsbt `non_witness_utxo` path (rawtransaction.cpp:1142).
 ///
 /// The shape is `{txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}`.
@@ -17111,6 +17239,139 @@ fn writeTxToUnivForPsbt(
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
+}
+
+/// getrawtransaction verbosity>=1 body, mirroring Core's
+/// `TxToUniv(tx, block_hash=null, entry, include_hex=true, ...)`
+/// (core_io.cpp:430-533) wrapped by `TxToJSON` (rpc/rawtransaction.cpp:58-85).
+///
+/// Emits the full decoded object — txid, hash (wtxid), version, size, vsize,
+/// weight, locktime, vin, vout, and the top-level `hex` — but DOES NOT write
+/// the closing `}`.  The caller appends the TxToJSON envelope fields
+/// (blockhash, confirmations, time, blocktime) and/or the
+/// getrawtransaction-level `in_active_chain` field, then closes the object.
+/// This keeps the field order byte-identical to Core: in_active_chain (caller,
+/// pushed first if present), then the TxToUniv body, then the envelope.
+///
+/// Unlike `writeTxToUnivForPsbt`, this variant emits the top-level `hex`
+/// (Core passes include_hex=true here) and leaves the object open.
+fn writeTxToUnivWithHexOpen(
+    self: *RpcServer,
+    writer: anytype,
+    tx: *const types.Transaction,
+) !void {
+    try writeTxToUnivWithHexOpenInner(self, writer, tx, true);
+}
+
+/// Same as `writeTxToUnivWithHexOpen` but the caller has already emitted the
+/// opening '{' (and any leading fields such as `in_active_chain`), so the
+/// body starts at `"txid":...` with NO leading brace.
+fn writeTxToUnivWithHexOpenNoBrace(
+    self: *RpcServer,
+    writer: anytype,
+    tx: *const types.Transaction,
+) !void {
+    try writeTxToUnivWithHexOpenInner(self, writer, tx, false);
+}
+
+fn writeTxToUnivWithHexOpenInner(
+    self: *RpcServer,
+    writer: anytype,
+    tx: *const types.Transaction,
+    emit_open_brace: bool,
+) !void {
+    const txid = crypto.computeTxidStreaming(tx);
+    const hash = crypto.computeWtxidStreaming(tx);
+
+    var tx_serialize_writer = serialize.Writer.init(self.allocator);
+    defer tx_serialize_writer.deinit();
+    try serialize.writeTransaction(&tx_serialize_writer, tx);
+    const tx_bytes = tx_serialize_writer.getWritten();
+
+    const tx_weight = try mempool_mod.computeTxWeight(tx, self.allocator);
+    const tx_vsize = (tx_weight + 3) / 4;
+
+    if (emit_open_brace) try writer.writeByte('{');
+    try writer.writeAll("\"txid\":\"");
+    try writeHashHex(writer, &txid);
+    try writer.writeAll("\",\"hash\":\"");
+    try writeHashHex(writer, &hash);
+    try writer.print("\",\"version\":{d},\"size\":{d},\"vsize\":{d},\"weight\":{d},\"locktime\":{d},", .{
+        tx.version,
+        tx_bytes.len,
+        tx_vsize,
+        tx_weight,
+        tx.lock_time,
+    });
+
+    // vin
+    try writer.writeAll("\"vin\":[");
+    const is_coinbase = tx.isCoinbase();
+    for (tx.inputs, 0..) |inp, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        if (is_coinbase) {
+            try writer.writeAll("{\"coinbase\":\"");
+            for (inp.script_sig) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeAll("\"");
+            if (inp.witness.len > 0) {
+                try writer.writeAll(",\"txinwitness\":[");
+                for (inp.witness, 0..) |wit, w| {
+                    if (w > 0) try writer.writeByte(',');
+                    try writer.writeByte('"');
+                    for (wit) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeByte('"');
+                }
+                try writer.writeByte(']');
+            }
+            try writer.print(",\"sequence\":{d}}}", .{inp.sequence});
+        } else {
+            try writer.writeAll("{\"txid\":\"");
+            try writeHashHex(writer, &inp.previous_output.hash);
+            try writer.print("\",\"vout\":{d},\"scriptSig\":{{\"asm\":\"", .{inp.previous_output.index});
+            try writeScriptAsmCoreSigDecode(writer, inp.script_sig);
+            try writer.writeAll("\",\"hex\":\"");
+            for (inp.script_sig) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeAll("\"}");
+            if (inp.witness.len > 0) {
+                try writer.writeAll(",\"txinwitness\":[");
+                for (inp.witness, 0..) |wit, w| {
+                    if (w > 0) try writer.writeByte(',');
+                    try writer.writeByte('"');
+                    for (wit) |byte| try writer.print("{x:0>2}", .{byte});
+                    try writer.writeByte('"');
+                }
+                try writer.writeByte(']');
+            }
+            try writer.print(",\"sequence\":{d}}}", .{inp.sequence});
+        }
+    }
+    try writer.writeAll("],");
+
+    // vout
+    const network = networkFromMagic(self.network_params.magic);
+    const is_regtest = isRegtestMagic(self.network_params.magic);
+    try writer.writeAll("\"vout\":[");
+    for (tx.outputs, 0..) |out, oi| {
+        if (oi > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"value\":");
+        if (out.value == 0) {
+            try writer.writeAll("0E-8");
+        } else {
+            try writer.print("{d:.8}", .{
+                @as(f64, @floatFromInt(out.value)) / 100_000_000.0,
+            });
+        }
+        try writer.print(",\"n\":{d},\"scriptPubKey\":", .{oi});
+        try writeScriptPubKeyUniv(self.allocator, writer, out.script_pubkey, network, is_regtest);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("],");
+
+    // top-level hex (Core: include_hex=true for getrawtransaction).  Object
+    // left OPEN — caller appends envelope fields + closing brace.
+    try writer.writeAll("\"hex\":\"");
+    for (tx_bytes) |byte| try writer.print("{x:0>2}", .{byte});
+    try writer.writeByte('"');
 }
 
 /// Try to extract a Bitcoin Core-compatible bech32/base58 address from a
