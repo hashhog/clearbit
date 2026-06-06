@@ -920,6 +920,60 @@ fn shutdownWatchdog() void {
     std.posix.exit(1);
 }
 
+/// Heap-allocated context for the background wallet-reconcile thread.
+///
+/// The startup wallet rescan (reconcileToTip) used to run synchronously on
+/// the boot path, BEFORE the RPC server bound and P2P started.  When a
+/// wallet's persisted `last_synced_height` is 0 — which is the default for a
+/// freshly-loaded wallet, the first restart after the wallet-recovery fix
+/// deploys, and any legacy wallet file lacking the watermark key
+/// (wallet.zig:1532 / 5545-5551) — the reconcile walks the ENTIRE chain
+/// 0..tip (~950k blocks on mainnet) and the node looks DOWN for many minutes
+/// while it does so.  Mirroring Bitcoin Core's CWallet::AttachChain, the
+/// rescan is deferred to this non-blocking background thread that is spawned
+/// AFTER rpc_server.start(), so RPC binds (and getwalletinfo stays
+/// responsive) while the wallet history rebuilds underneath.
+///
+/// All fields are pointers into `main`-locals (chain_state, wallet_manager)
+/// that outlive this thread: the thread is JOINED during graceful shutdown
+/// (before the `defer wallet_manager.deinit()` / chainstate flush run when
+/// `main` returns), so these pointers never dangle.  The struct itself is
+/// heap-allocated by the spawner so it does not reference any stack-local of
+/// the startup block; the thread frees it on exit.
+const ReconcileCtx = struct {
+    allocator: std.mem.Allocator,
+    wm: *wallet.WalletManager,
+    cs: *storage.ChainState,
+    tip_height: u32,
+
+    /// FetchCtx closure source for reconcileToTip — reads CF_BLOCKS by
+    /// height, the same source rescanblockchain uses.  Returns null when a
+    /// block is unavailable OR a shutdown has been requested; reconcileToTip
+    /// treats null as "stop here, leave the watermark" (it persists progress
+    /// via flushDirty and the live connect loop / next start resumes the
+    /// gap), which makes the long full-chain scan promptly interruptible so
+    /// the shutdown join returns quickly.
+    fn fetch(ctx_ptr: *anyopaque, height: u32, arena: std.mem.Allocator) ?types.Block {
+        const self: *ReconcileCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (shutdown_requested.load(.acquire)) return null;
+        const hash = self.cs.getBlockHashByHeight(height) orelse return null;
+        const block_db = self.cs.utxo_set.db orelse return null;
+        const raw = (block_db.get(storage.CF_BLOCKS, &hash) catch null) orelse return null;
+        defer self.cs.allocator.free(raw);
+        var reader = serialize.Reader{ .data = raw };
+        return serialize.readBlock(&reader, arena) catch null;
+    }
+};
+
+/// Background entry point: run the wallet reconcile, then free the context.
+fn reconcileWalletsBackground(ctx: *ReconcileCtx) void {
+    defer ctx.allocator.destroy(ctx);
+    const scanned = ctx.wm.reconcileToTip(ctx.tip_height, @ptrCast(ctx), ReconcileCtx.fetch);
+    if (scanned > 0) {
+        std.debug.print("Wallet reconcile (background): scanned {d} block(s) up to tip {d}\n", .{ scanned, ctx.tip_height });
+    }
+}
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -2018,35 +2072,18 @@ pub fn main() !void {
     // wallet dir like Bitcoin Core's LoadWallets.  Fault-tolerant per wallet: a
     // missing / corrupt / partially-written file is recovered-or-skipped and can
     // NEVER crash startup.  Runs single-threaded before the peer/RPC threads.
-    {
-        const loaded = wallet_manager.loadWalletsOnStartup(config.walletNames());
-        if (loaded > 0) {
-            std.debug.print("Loaded {d} wallet(s) at startup\n", .{loaded});
-
-            // Reconcile each loaded wallet's UTXO ledger up to the chain tip:
-            // scan the gap (last_synced_height, tip] so a crash between the last
-            // on-mutation save and the chain tip never silently leaves the
-            // ledger behind.  The fetch closure reads CF_BLOCKS by height — the
-            // same source rescanblockchain uses.
-            const tip_h = chain_state.best_height;
-            const FetchCtx = struct {
-                cs: *storage.ChainState,
-                fn fetch(ctx_ptr: *anyopaque, height: u32, arena: std.mem.Allocator) ?types.Block {
-                    const fctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                    const hash = fctx.cs.getBlockHashByHeight(height) orelse return null;
-                    const block_db = fctx.cs.utxo_set.db orelse return null;
-                    const raw = (block_db.get(storage.CF_BLOCKS, &hash) catch null) orelse return null;
-                    defer fctx.cs.allocator.free(raw);
-                    var reader = serialize.Reader{ .data = raw };
-                    return serialize.readBlock(&reader, arena) catch null;
-                }
-            };
-            var fctx = FetchCtx{ .cs = &chain_state };
-            const scanned = wallet_manager.reconcileToTip(tip_h, @ptrCast(&fctx), FetchCtx.fetch);
-            if (scanned > 0) {
-                std.debug.print("Wallet reconcile: scanned {d} block(s) up to tip {d}\n", .{ scanned, tip_h });
-            }
-        }
+    // Whether any wallet was loaded — gates spawning the background reconcile
+    // thread below (after RPC binds).  The reconcile itself is NO LONGER run
+    // synchronously here: when a wallet's persisted last_synced_height is 0
+    // (default / first-restart-after-the-wallet-fix / legacy file / restored
+    // from seed) reconcileToTip walks the entire chain 0..tip (~950k blocks
+    // on mainnet), which would block the boot path and leave the node looking
+    // DOWN for minutes before RPC binds.  See ReconcileCtx / Bitcoin Core
+    // CWallet::AttachChain — it is deferred to a background thread spawned
+    // after rpc_server.start().
+    const wallets_loaded = wallet_manager.loadWalletsOnStartup(config.walletNames());
+    if (wallets_loaded > 0) {
+        std.debug.print("Loaded {d} wallet(s) at startup\n", .{wallets_loaded});
     }
 
     // Feed the live P2P/IBD block-connect loop into the wallets so getbalance /
@@ -2374,6 +2411,36 @@ pub fn main() !void {
         return;
     };
 
+    // Deferred wallet reconcile (Bitcoin Core CWallet::AttachChain): now that
+    // RPC has bound and P2P is running, kick off the startup history rescan in
+    // a background thread instead of on the boot path.  This still rebuilds
+    // each wallet's UTXO ledger over the gap (last_synced_height, tip] — a
+    // crash between the last on-mutation save and the chain tip never silently
+    // leaves the ledger behind — but it no longer makes the node look DOWN for
+    // the minutes a full-chain (0..tip) scan takes.  ReconcileCtx is
+    // heap-allocated so the thread captures no stack-locals; the thread is
+    // joined during graceful shutdown (below) so chain_state / wallet_manager
+    // outlive it.  fetch() returns null on shutdown_requested, so a SIGTERM
+    // mid-scan unwinds the rescan promptly (watermark progress is persisted).
+    const reconcile_thread: ?std.Thread = blk: {
+        if (wallets_loaded == 0) break :blk null;
+        const ctx = allocator.create(ReconcileCtx) catch {
+            std.debug.print("Warning: OOM allocating wallet reconcile context; skipping background reconcile\n", .{});
+            break :blk null;
+        };
+        ctx.* = .{
+            .allocator = allocator,
+            .wm = &wallet_manager,
+            .cs = &chain_state,
+            .tip_height = chain_state.best_height,
+        };
+        break :blk std.Thread.spawn(.{}, reconcileWalletsBackground, .{ctx}) catch |err| {
+            std.debug.print("Warning: could not start wallet reconcile thread: {}\n", .{err});
+            allocator.destroy(ctx);
+            break :blk null;
+        };
+    };
+
     // Start Prometheus metrics server
     if (config.metrics_port > 0) {
         _ = std.Thread.spawn(.{}, metricsServerThread, .{
@@ -2477,6 +2544,18 @@ pub fn main() !void {
     rpc_thread.join();
     std.debug.print("joining P2P thread\n", .{});
     peer_thread.join();
+
+    // Join the background wallet-reconcile thread if it is still running.
+    // shutdown_requested is already set by this point, so its fetch() callback
+    // returns null on the next block, reconcileToTip breaks + persists the
+    // watermark, and the thread frees its heap context and exits promptly.
+    // Joining (rather than detaching) guarantees the thread has stopped
+    // touching wallet_manager / chain_state before their `defer` deinit/flush
+    // run when main returns.
+    if (reconcile_thread) |t| {
+        std.debug.print("joining wallet reconcile thread\n", .{});
+        t.join();
+    }
 
     // Phase 3: persist auxiliary state (fee estimates + mempool.dat) before
     // flushing the main chainstate so any error here doesn't leave the
