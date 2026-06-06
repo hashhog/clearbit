@@ -70,6 +70,16 @@ pub const Config = struct {
     // `getpayjoinrequest` (G26) + `sendpayjoinrequest` (G27).
     payjoin_server_url: ?[]const u8 = null,
 
+    // Wallet auto-load list.  `-wallet=<name>` (repeatable) selects exactly
+    // which wallets to load at startup, mirroring Bitcoin Core's `-wallet`
+    // (init.cpp / wallet settings).  When empty, the wallet directory is
+    // enumerated and every discovered wallet is auto-loaded.  Stored in a
+    // fixed-size backing array so `parseArgs` stays allocation-free; the
+    // borrowed `arg` slices outlive the load (the ArgIterator is freed at the
+    // very end of main()).  An empty name ("") is the default wallet.
+    wallet_names_buf: [64][]const u8 = undefined,
+    wallet_names_len: usize = 0,
+
     // Storage
     datadir: []const u8 = "~/.clearbit",
     prune: u64 = 0, // 0 = no pruning, else target size in MiB
@@ -187,6 +197,12 @@ pub const Config = struct {
         }
         return base;
     }
+
+    /// The explicit `-wallet=` list (possibly empty).  Empty → enumerate the
+    /// wallet directory and auto-load everything found.
+    pub fn walletNames(self: *const Config) []const []const u8 {
+        return self.wallet_names_buf[0..self.wallet_names_len];
+    }
 };
 
 // ============================================================================
@@ -224,6 +240,17 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         else if (std.mem.startsWith(u8, arg, "--datadir=") or std.mem.startsWith(u8, arg, "-datadir=")) {
             if (std.mem.indexOf(u8, arg, "=")) |eq| {
                 config.datadir = arg[eq + 1 ..];
+            } else {
+                return ArgParseError.MissingValue;
+            }
+        }
+        // Wallet auto-load list (repeatable).  `-wallet=<name>` / `--wallet=`.
+        else if (std.mem.startsWith(u8, arg, "--wallet=") or std.mem.startsWith(u8, arg, "-wallet=")) {
+            if (std.mem.indexOf(u8, arg, "=")) |eq| {
+                if (config.wallet_names_len < config.wallet_names_buf.len) {
+                    config.wallet_names_buf[config.wallet_names_len] = arg[eq + 1 ..];
+                    config.wallet_names_len += 1;
+                }
             } else {
                 return ArgParseError.MissingValue;
             }
@@ -1984,6 +2011,47 @@ pub fn main() !void {
         std.process.exit(1);
     };
     defer wallet_manager.deinit();
+
+    // Auto-load wallets at startup (the missing piece that left wallets silently
+    // unloaded after a restart, and crashed the node when a partial wallet.dat
+    // was reloaded).  Honors `-wallet=<name>` flags; otherwise enumerates the
+    // wallet dir like Bitcoin Core's LoadWallets.  Fault-tolerant per wallet: a
+    // missing / corrupt / partially-written file is recovered-or-skipped and can
+    // NEVER crash startup.  Runs single-threaded before the peer/RPC threads.
+    {
+        const loaded = wallet_manager.loadWalletsOnStartup(config.walletNames());
+        if (loaded > 0) {
+            std.debug.print("Loaded {d} wallet(s) at startup\n", .{loaded});
+
+            // Reconcile each loaded wallet's UTXO ledger up to the chain tip:
+            // scan the gap (last_synced_height, tip] so a crash between the last
+            // on-mutation save and the chain tip never silently leaves the
+            // ledger behind.  The fetch closure reads CF_BLOCKS by height — the
+            // same source rescanblockchain uses.
+            const tip_h = chain_state.best_height;
+            const FetchCtx = struct {
+                cs: *storage.ChainState,
+                fn fetch(ctx_ptr: *anyopaque, height: u32, arena: std.mem.Allocator) ?types.Block {
+                    const fctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                    const hash = fctx.cs.getBlockHashByHeight(height) orelse return null;
+                    const block_db = fctx.cs.utxo_set.db orelse return null;
+                    const raw = (block_db.get(storage.CF_BLOCKS, &hash) catch null) orelse return null;
+                    defer fctx.cs.allocator.free(raw);
+                    var reader = serialize.Reader{ .data = raw };
+                    return serialize.readBlock(&reader, arena) catch null;
+                }
+            };
+            var fctx = FetchCtx{ .cs = &chain_state };
+            const scanned = wallet_manager.reconcileToTip(tip_h, @ptrCast(&fctx), FetchCtx.fetch);
+            if (scanned > 0) {
+                std.debug.print("Wallet reconcile: scanned {d} block(s) up to tip {d}\n", .{ scanned, tip_h });
+            }
+        }
+    }
+
+    // Feed the live P2P/IBD block-connect loop into the wallets so getbalance /
+    // listunspent stay current on a synced node (not just the mining/RPC path).
+    peer_manager.wallet_manager = &wallet_manager;
 
     var rpc_server = rpc.RpcServer.initWithWalletManager(
         allocator,

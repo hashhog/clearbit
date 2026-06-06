@@ -1522,6 +1522,22 @@ pub const Wallet = struct {
     // Chain tip height for coinbase maturity checks
     tip_height: u32 = 0,
 
+    /// Highest block height whose connect/disconnect this wallet's UTXO ledger
+    /// has already incorporated, persisted to disk.  On restart the wallet
+    /// rescans the gap (last_synced_height+1 .. chain tip) so a SIGKILL / OOM /
+    /// power-loss between the last on-mutation save and the chain tip can never
+    /// silently leave the ledger behind the chain.  Mirrors Bitcoin Core's
+    /// CWallet::m_last_block_processed_height (wallet/wallet.h).  Zero means
+    /// "synced through genesis only" (a fresh wallet).
+    last_synced_height: u32 = 0,
+
+    /// Set true by every state-mutating wallet op (new key/address, label set,
+    /// per-block scan credit/debit).  The WalletManager's save-on-mutation /
+    /// periodic-flush path checks + clears it so a clean wallet isn't rewritten
+    /// every tick.  Purely an optimisation hint — correctness never depends on
+    /// it (a forced save always persists current state).
+    dirty: bool = false,
+
     // Encryption state
     encrypted: bool = false,
     encryption_key: ?[32]u8 = null,
@@ -1694,6 +1710,24 @@ pub const Wallet = struct {
         self.tip_height = height;
     }
 
+    /// Mark the in-memory wallet state as needing a durable save.  Called by
+    /// every mutating op; cleared by the WalletManager when it persists.
+    pub fn markDirty(self: *Wallet) void {
+        self.dirty = true;
+    }
+
+    /// Record that the wallet's ledger has incorporated every block up to and
+    /// including `height` (the connect-loop calls this after each scanned
+    /// block).  Monotonic — a re-scan of an already-seen block does not rewind
+    /// the marker.  Marks the wallet dirty so the new watermark is persisted.
+    pub fn markSynced(self: *Wallet, height: u32) void {
+        if (height > self.last_synced_height) {
+            self.last_synced_height = height;
+            self.dirty = true;
+        }
+        if (height > self.tip_height) self.tip_height = height;
+    }
+
     /// Generate a new random keypair.
     pub fn generateKey(self: *Wallet) !usize {
         var secret: [32]u8 = undefined;
@@ -1755,6 +1789,10 @@ pub const Wallet = struct {
         }
 
         try self.keys.append(key);
+        // New key material is durable state — flag for save-on-mutation so a
+        // SIGKILL after `getnewaddress` / `importprivkey` cannot lose the key
+        // (and the funds it may later receive).
+        self.markDirty();
         return self.keys.items.len - 1;
     }
 
@@ -1823,6 +1861,9 @@ pub const Wallet = struct {
         } else {
             self.next_external_index += 1;
         }
+        // Keypool cursor advanced — persist so a restart re-derives the SAME
+        // next address rather than handing out an already-issued one.
+        self.markDirty();
 
         return .{ .address = addr, .key_index = key_index };
     }
@@ -3130,6 +3171,7 @@ pub const Wallet = struct {
             const owned_label = try self.allocator.dupe(u8, label);
             try self.labels.put(owned_addr, owned_label);
         }
+        self.markDirty();
     }
 
     /// Get the label for an address.
@@ -3142,6 +3184,7 @@ pub const Wallet = struct {
         if (self.labels.fetchRemove(addr)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value);
+            self.markDirty();
         }
     }
 
@@ -3272,6 +3315,10 @@ pub const Wallet = struct {
         // Advance the wallet's view of the chain tip first so depth/maturity
         // checks performed by callers immediately after the scan are correct.
         if (height > self.tip_height) self.tip_height = height;
+        // Record that the ledger has now incorporated this block and flag the
+        // wallet for a durable save.  markSynced is monotonic so a re-scan
+        // (rescanblockchain / startup gap-fill) never rewinds the watermark.
+        self.markSynced(height);
 
         // Address types whose scriptPubKey we can derive + later sign.
         const types_to_try = [_]AddressType{
@@ -4928,6 +4975,21 @@ pub const WalletManager = struct {
         }
     }
 
+    /// Durable, atomic wallet save.  Mirrors this node's own
+    /// `mempool_persist.dumpMempool` (write `<path>.tmp` → fsync → rename) and
+    /// Bitcoin Core's BerkeleyBatch::Flush / RenameOver dance:
+    ///
+    ///   1. serialize to JSON,
+    ///   2. write the full bytes to `wallet.dat.tmp`,
+    ///   3. fsync the temp file (the bytes are on stable storage),
+    ///   4. atomically rename tmp → `wallet.dat` (readers always see a complete
+    ///      file — never a half-written one),
+    ///   5. fsync the containing directory (the rename itself is durable).
+    ///
+    /// On any failure the partial temp file is unlinked so a later load never
+    /// mistakes it for valid data, and the previous `wallet.dat` is left intact.
+    /// Clears the wallet's `dirty` flag on success so the periodic flusher
+    /// doesn't rewrite an unchanged wallet.
     fn saveWalletInternal(self: *WalletManager, name: []const u8, wallet: *Wallet) !void {
         const wallet_dir = try self.getWalletDir(name);
         defer self.allocator.free(wallet_dir);
@@ -4946,23 +5008,80 @@ pub const WalletManager = struct {
         const json = try self.serializeWallet(wallet);
         defer self.allocator.free(json);
 
-        // Write atomically (write to temp, then rename)
+        // Write atomically + durably: write to temp, fsync, rename, fsync dir.
         const temp_file = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat.tmp", .{wallet_dir});
         defer self.allocator.free(temp_file);
 
-        const file = std.fs.createFileAbsolute(temp_file, .{}) catch {
-            return error.WalletSaveFailed;
-        };
-        defer file.close();
+        {
+            const file = std.fs.createFileAbsolute(temp_file, .{ .truncate = true }) catch {
+                return error.WalletSaveFailed;
+            };
+            // From here on, any error must clean up the partial temp file so a
+            // crash-and-restart load never sees a truncated tmp.
+            errdefer {
+                file.close();
+                std.fs.deleteFileAbsolute(temp_file) catch {};
+            }
+            file.writeAll(json) catch return error.WalletSaveFailed;
+            // Durability: force the bytes to stable storage BEFORE the rename.
+            file.sync() catch return error.WalletSaveFailed;
+            file.close();
+        }
 
-        file.writeAll(json) catch {
-            return error.WalletSaveFailed;
-        };
-
-        // Rename temp file to final
+        // Atomic publish.  On failure unlink the temp file (the prior
+        // wallet.dat is untouched, so state is never corrupted).
         std.fs.renameAbsolute(temp_file, wallet_file) catch {
+            std.fs.deleteFileAbsolute(temp_file) catch {};
             return error.WalletSaveFailed;
         };
+
+        // Make the rename itself durable by fsync'ing the directory (POSIX:
+        // fsync the dir fd so the new directory entry survives power-loss).
+        // The dir is opened `.iterate = true` so we get a real readable fd
+        // rather than an O_PATH fd (an O_PATH fd returns EBADF on fsync, which
+        // std.posix.fsync treats as `unreachable`).  Best effort: a failure
+        // here doesn't corrupt anything (the data file is already complete +
+        // renamed), it only weakens the power-loss guarantee for the directory
+        // entry, so we don't fail the save.
+        if (std.fs.openDirAbsolute(wallet_dir, .{ .iterate = true })) |dir| {
+            var d = dir;
+            defer d.close();
+            std.posix.fsync(d.fd) catch {};
+        } else |_| {}
+
+        wallet.dirty = false;
+    }
+
+    /// Public save entry point used by the save-on-mutation / periodic-flush
+    /// path and by RPC handlers after a state change.  Takes the manager mutex.
+    pub fn saveWallet(self: *WalletManager, name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const wallet = self.wallets.get(name) orelse return error.WalletNotLoaded;
+        try self.saveWalletInternal(name, wallet);
+    }
+
+    /// Persist every loaded wallet whose `dirty` flag is set.  Cheap when no
+    /// wallet changed (the common idle tick).  Intended to be called on a short
+    /// timer from the node's main loop AND opportunistically after block
+    /// connects, so a SIGKILL/OOM/power-loss loses at most the few seconds of
+    /// wallet state since the last flush — never the whole wallet, and never
+    /// only-at-clean-shutdown.  Best effort: a per-wallet save failure is
+    /// logged and does not stop the others.  Returns the number saved.
+    pub fn flushDirty(self: *WalletManager) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var saved: usize = 0;
+        var it = self.wallets.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.*.dirty) continue;
+            self.saveWalletInternal(entry.key_ptr.*, entry.value_ptr.*) catch |err| {
+                std.log.warn("wallet flush: save failed for '{s}': {s}", .{ entry.key_ptr.*, @errorName(err) });
+                continue;
+            };
+            saved += 1;
+        }
+        return saved;
     }
 
     fn loadWalletFromDisk(self: *WalletManager, name: []const u8) !*Wallet {
@@ -4972,15 +5091,30 @@ pub const WalletManager = struct {
         const wallet_file = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat", .{wallet_dir});
         defer self.allocator.free(wallet_file);
 
-        // Read wallet file
-        const file = std.fs.openFileAbsolute(wallet_file, .{}) catch {
-            return error.WalletNotFound;
+        const w = try self.loadWalletFromPath(wallet_file);
+        // A successful load reflects on-disk state exactly — not dirty.
+        w.dirty = false;
+        return w;
+    }
+
+    /// Read + deserialize a wallet from an explicit absolute path.  Returns
+    /// `error.WalletNotFound` if the file is absent, `error.WalletLoadFailed`
+    /// for an unreadable / malformed file (so the caller can quarantine it).
+    fn loadWalletFromPath(self: *WalletManager, path: []const u8) !*Wallet {
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.WalletNotFound,
+            else => return error.WalletLoadFailed,
         };
         defer file.close();
 
         const stat = file.stat() catch {
             return error.WalletLoadFailed;
         };
+
+        // Guard against an absurd size (a corrupt length / truncated FS entry)
+        // turning into a multi-GiB allocation that OOMs node startup.
+        const MAX_WALLET_BYTES: u64 = 256 * 1024 * 1024;
+        if (stat.size > MAX_WALLET_BYTES) return error.WalletLoadFailed;
 
         const content = self.allocator.alloc(u8, stat.size) catch {
             return error.OutOfMemory;
@@ -4991,8 +5125,188 @@ pub const WalletManager = struct {
             return error.WalletLoadFailed;
         };
 
-        // Parse JSON and create wallet
+        // Parse JSON and create wallet.
         return self.deserializeWallet(content[0..bytes_read]);
+    }
+
+    /// Fault-tolerant load for the auto-loader.  Handles every recoverable
+    /// failure mode without ever propagating an error that could crash node
+    /// startup:
+    ///
+    ///   * `wallet.dat` missing but a `wallet.dat.tmp` is present  → a crash
+    ///     happened between the temp write and the rename.  If the tmp parses,
+    ///     promote it (rename → wallet.dat) and load it.
+    ///   * `wallet.dat` corrupt / partially written  → move it aside to
+    ///     `wallet.dat.bak`, then try to recover from a sibling `.tmp` (the
+    ///     last-known-good in-progress write) before giving up.
+    ///   * neither present / both corrupt  → return null; the auto-loader logs
+    ///     and SKIPS this wallet (the operator can `loadwallet` it manually
+    ///     after inspecting the `.bak`).
+    ///
+    /// Returns the loaded `*Wallet` (already inserted into `self.wallets`) or
+    /// null when nothing recoverable exists.  NEVER returns an error.
+    fn loadWalletFaultTolerant(self: *WalletManager, name: []const u8) ?*Wallet {
+        const wallet_dir = self.getWalletDir(name) catch return null;
+        defer self.allocator.free(wallet_dir);
+
+        const wallet_file = std.fmt.allocPrint(self.allocator, "{s}/wallet.dat", .{wallet_dir}) catch return null;
+        defer self.allocator.free(wallet_file);
+        const tmp_file = std.fmt.allocPrint(self.allocator, "{s}/wallet.dat.tmp", .{wallet_dir}) catch return null;
+        defer self.allocator.free(tmp_file);
+        const bak_file = std.fmt.allocPrint(self.allocator, "{s}/wallet.dat.bak", .{wallet_dir}) catch return null;
+        defer self.allocator.free(bak_file);
+
+        // 1. Try the canonical file.
+        if (self.loadWalletFromPath(wallet_file)) |w| {
+            w.dirty = false;
+            self.insertLoaded(name, w) catch {
+                w.deinit();
+                self.allocator.destroy(w);
+                return null;
+            };
+            return w;
+        } else |err| switch (err) {
+            error.WalletNotFound => {
+                // 1a. No canonical file — maybe a crash left only a `.tmp`
+                // (write succeeded, rename didn't).  Try to promote it.
+                if (self.loadWalletFromPath(tmp_file)) |w| {
+                    std.log.warn("wallet '{s}': recovering from interrupted write (wallet.dat.tmp)", .{name});
+                    std.fs.renameAbsolute(tmp_file, wallet_file) catch {};
+                    w.dirty = false;
+                    self.insertLoaded(name, w) catch {
+                        w.deinit();
+                        self.allocator.destroy(w);
+                        return null;
+                    };
+                    return w;
+                } else |_| {
+                    return null; // genuinely nothing to load
+                }
+            },
+            else => {
+                // 2. Canonical file exists but is corrupt / unreadable.
+                // Quarantine it to `.bak` (overwriting any previous bak) so the
+                // operator can inspect it, and try the sibling `.tmp`.
+                std.log.warn("wallet '{s}': wallet.dat unreadable/corrupt ({s}); quarantining to wallet.dat.bak", .{ name, @errorName(err) });
+                std.fs.deleteFileAbsolute(bak_file) catch {};
+                std.fs.renameAbsolute(wallet_file, bak_file) catch {};
+
+                if (self.loadWalletFromPath(tmp_file)) |w| {
+                    std.log.warn("wallet '{s}': recovered from wallet.dat.tmp after corrupt wallet.dat", .{name});
+                    std.fs.renameAbsolute(tmp_file, wallet_file) catch {};
+                    w.dirty = false;
+                    self.insertLoaded(name, w) catch {
+                        w.deinit();
+                        self.allocator.destroy(w);
+                        return null;
+                    };
+                    return w;
+                } else |_| {
+                    std.log.warn("wallet '{s}': no recoverable copy; SKIPPING (inspect wallet.dat.bak)", .{name});
+                    return null;
+                }
+            },
+        }
+    }
+
+    /// Insert an already-constructed wallet into the loaded set under a
+    /// freshly-duplicated name key.  Caller holds (or doesn't need) the mutex —
+    /// this is only used from the single-threaded startup auto-loader, which
+    /// runs before the peer/RPC threads spawn.
+    fn insertLoaded(self: *WalletManager, name: []const u8, wallet: *Wallet) !void {
+        if (self.wallets.contains(name)) return error.WalletAlreadyLoaded;
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        try self.wallets.put(name_copy, wallet);
+    }
+
+    /// Auto-load wallets at node startup — the missing piece that left wallets
+    /// silently unloaded after a restart (and crashed the node when a partial
+    /// wallet.dat was reloaded).  Mirrors Bitcoin Core's `LoadWallets` /
+    /// settings-driven wallet list (wallet/load.cpp): when `wallet_names` is
+    /// non-empty (the `-wallet=` flags) ONLY those are loaded; otherwise the
+    /// wallet directory is enumerated and every discovered wallet is loaded.
+    ///
+    /// Every load goes through `loadWalletFaultTolerant`, so a missing / corrupt
+    /// / partially-written wallet is recovered-or-skipped — it can NEVER crash
+    /// startup.  Runs single-threaded before the peer/RPC threads spawn.
+    /// Returns the number of wallets successfully loaded.
+    pub fn loadWalletsOnStartup(self: *WalletManager, wallet_names: []const []const u8) usize {
+        var loaded: usize = 0;
+        if (wallet_names.len > 0) {
+            // Explicit -wallet list: load exactly these.
+            for (wallet_names) |name| {
+                if (self.loadWalletFaultTolerant(name) != null) loaded += 1;
+            }
+            return loaded;
+        }
+
+        // No explicit list: enumerate the wallet directory like Core's
+        // ListDatabases.  listWalletDir() already finds the default wallet
+        // (wallets_dir/wallet.dat → "") and every subdir containing a
+        // wallet.dat.  Best effort — enumeration failure just means nothing
+        // is auto-loaded.
+        const names = self.listWalletDir(self.allocator) catch return 0;
+        defer {
+            for (names) |n| self.allocator.free(n);
+            self.allocator.free(names);
+        }
+        for (names) |name| {
+            if (self.loadWalletFaultTolerant(name) != null) loaded += 1;
+        }
+        return loaded;
+    }
+
+    /// Bring every loaded wallet's UTXO ledger up to the chain tip after
+    /// startup.  For each wallet, scan the gap (last_synced_height, tip] by
+    /// fetching each block via the supplied callback and feeding it through
+    /// `scanBlockForWallet` (the same path the live connect loop uses), then
+    /// pin the wallet's tip view at the real tip so confirmation/maturity
+    /// arithmetic is correct.  Persists the advanced watermark via flushDirty.
+    ///
+    /// `ctx` + `fetchBlock` decouple the wallet module from storage: the caller
+    /// (main.zig) supplies a closure that reads CF_BLOCKS by height.  A null
+    /// return for a height is treated as "block unavailable" and skipped (the
+    /// live connect loop will catch it up).  Returns total blocks scanned.
+    pub fn reconcileToTip(
+        self: *WalletManager,
+        tip_height: u32,
+        ctx: *anyopaque,
+        fetchBlock: *const fn (ctx: *anyopaque, height: u32, arena: std.mem.Allocator) ?types.Block,
+    ) usize {
+        self.mutex.lock();
+        var scanned: usize = 0;
+        {
+            var it = self.wallets.iterator();
+            while (it.next()) |entry| {
+                const wallet = entry.value_ptr.*;
+                if (wallet.last_synced_height >= tip_height) {
+                    if (tip_height > wallet.tip_height) wallet.setTipHeight(tip_height);
+                    continue;
+                }
+                var h: u32 = wallet.last_synced_height + 1;
+                while (h <= tip_height) : (h += 1) {
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    const block = fetchBlock(ctx, h, arena.allocator()) orelse {
+                        // Block not yet available on disk: stop here, the live
+                        // connect loop will fill the rest.  Leave the watermark
+                        // where it is so the gap is retried.
+                        break;
+                    };
+                    wallet.scanBlockForWallet(&block, h) catch |err| {
+                        std.log.warn("wallet '{s}': reconcile scan failed at height {d}: {s}", .{ entry.key_ptr.*, h, @errorName(err) });
+                    };
+                    scanned += 1;
+                    if (h == std.math.maxInt(u32)) break;
+                }
+                if (tip_height > wallet.tip_height) wallet.setTipHeight(tip_height);
+            }
+        }
+        self.mutex.unlock();
+        // Persist the advanced sync watermark + any newly credited coins.
+        _ = self.flushDirty();
+        return scanned;
     }
 
     fn serializeWallet(self: *WalletManager, wallet: *Wallet) ![]const u8 {
@@ -5022,6 +5336,14 @@ pub const WalletManager = struct {
 
         const chg_idx = std.fmt.bufPrint(&buf, "\"next_change_index\":{d},", .{wallet.next_change_index}) catch return error.SerializationFailed;
         try json.appendSlice(chg_idx);
+
+        // Persisted sync watermark — the highest block height already folded
+        // into the UTXO ledger.  On load the wallet rescans (last_synced_height,
+        // chain tip] so a crash between the last mutation save and the tip can
+        // never silently leave funds out of the ledger.  Absent in legacy
+        // files (treated as 0 on load → triggers a full reconcile).
+        const synced = std.fmt.bufPrint(&buf, "\"last_synced_height\":{d},", .{wallet.last_synced_height}) catch return error.SerializationFailed;
+        try json.appendSlice(synced);
 
         // Master key.  When the wallet is encrypted, master_key.key and
         // master_key.chain_code already hold AES-256-GCM ciphertext (see
@@ -5132,16 +5454,34 @@ pub const WalletManager = struct {
             try json.appendSlice(t_hex);
             try json.appendSlice("\",");
 
-            var utxo_buf: [256]u8 = undefined;
-            const utxo_fields = std.fmt.bufPrint(&utxo_buf, "\"vout\":{d},\"value\":{d},\"key_index\":{d},\"confirmations\":{d},\"is_coinbase\":{s},\"height\":{d}", .{
+            var utxo_buf: [320]u8 = undefined;
+            const addr_type_str: []const u8 = switch (utxo.address_type) {
+                .p2pkh => "p2pkh",
+                .p2sh_p2wpkh => "p2sh_p2wpkh",
+                .p2wpkh => "p2wpkh",
+                .p2tr => "p2tr",
+                .p2wsh => "p2wsh",
+            };
+            const utxo_fields = std.fmt.bufPrint(&utxo_buf, "\"vout\":{d},\"value\":{d},\"key_index\":{d},\"confirmations\":{d},\"is_coinbase\":{s},\"height\":{d},\"address_type\":\"{s}\"", .{
                 utxo.outpoint.index,
                 utxo.output.value,
                 utxo.key_index,
                 utxo.confirmations,
                 if (utxo.is_coinbase) "true" else "false",
                 utxo.height,
+                addr_type_str,
             }) catch return error.SerializationFailed;
             try json.appendSlice(utxo_fields);
+            // Persist the scriptPubKey so a reloaded coin is immediately
+            // spendable (signInput needs it) without waiting for a rescan.
+            // Omitted when empty (legacy / reconstructed-on-rescan entries).
+            if (utxo.output.script_pubkey.len > 0) {
+                try json.appendSlice(",\"script\":\"");
+                const spk_hex = try std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(utxo.output.script_pubkey)});
+                defer self.allocator.free(spk_hex);
+                try json.appendSlice(spk_hex);
+                try json.append('"');
+            }
             try json.append('}');
         }
         try json.appendSlice("]");
@@ -5201,6 +5541,13 @@ pub const WalletManager = struct {
         }
         if (obj.get("next_change_index")) |idx| {
             wallet.next_change_index = @intCast(idx.integer);
+        }
+        // Sync watermark (absent in legacy files → stays 0, forcing a full
+        // reconcile to tip on startup).
+        if (obj.get("last_synced_height")) |idx| {
+            if (idx == .integer and idx.integer >= 0) {
+                wallet.last_synced_height = @intCast(idx.integer);
+            }
         }
 
         // Master key.  If the wallet was encrypted (post-W161-fix), the bytes
@@ -5296,42 +5643,97 @@ pub const WalletManager = struct {
             }
         }
 
-        // UTXOs
+        // UTXOs.  Fault-tolerant per entry: a single malformed coin record is
+        // skipped (logged) rather than aborting the whole load — recovering
+        // what's valid is preferable to losing the entire wallet, and the
+        // startup reconcile rebuilds the ledger from chain anyway.  The
+        // mandatory-field misses use orelse-continue so a truncated trailing
+        // object (the classic partial-write tail) doesn't sink the load.
         if (obj.get("utxos")) |utxos_arr| {
-            for (utxos_arr.array.items) |utxo_obj| {
-                const uobj = utxo_obj.object;
+            if (utxos_arr == .array) {
+                for (utxos_arr.array.items) |utxo_obj| {
+                    if (utxo_obj != .object) continue;
+                    const uobj = utxo_obj.object;
 
-                // Parse txid (reverse from display)
-                var txid: [32]u8 = undefined;
-                const txid_str = uobj.get("txid").?.string;
-                var temp_txid: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&temp_txid, txid_str) catch return error.WalletLoadFailed;
-                for (temp_txid, 0..) |b, j| {
-                    txid[31 - j] = b;
+                    // Parse txid (reverse from display).
+                    const txid_val = uobj.get("txid") orelse continue;
+                    if (txid_val != .string) continue;
+                    var temp_txid: [32]u8 = undefined;
+                    _ = std.fmt.hexToBytes(&temp_txid, txid_val.string) catch continue;
+                    var txid: [32]u8 = undefined;
+                    for (temp_txid, 0..) |b, j| {
+                        txid[31 - j] = b;
+                    }
+
+                    const vout_v = uobj.get("vout") orelse continue;
+                    const value_v = uobj.get("value") orelse continue;
+                    const key_index_v = uobj.get("key_index") orelse continue;
+                    const confirmations_v = uobj.get("confirmations") orelse continue;
+                    const is_coinbase_v = uobj.get("is_coinbase") orelse continue;
+                    const height_v = uobj.get("height") orelse continue;
+                    if (vout_v != .integer or value_v != .integer or
+                        key_index_v != .integer or confirmations_v != .integer or
+                        is_coinbase_v != .bool or height_v != .integer) continue;
+
+                    const vout: u32 = @intCast(vout_v.integer);
+                    const value: i64 = value_v.integer;
+                    const key_index: usize = @intCast(key_index_v.integer);
+                    const confirmations: u32 = @intCast(confirmations_v.integer);
+                    const is_coinbase = is_coinbase_v.bool;
+                    const height: u32 = @intCast(height_v.integer);
+
+                    // address_type (default p2wpkh for legacy files).
+                    var addr_type: AddressType = .p2wpkh;
+                    if (uobj.get("address_type")) |at| {
+                        if (at == .string) {
+                            if (std.mem.eql(u8, at.string, "p2pkh")) {
+                                addr_type = .p2pkh;
+                            } else if (std.mem.eql(u8, at.string, "p2sh_p2wpkh")) {
+                                addr_type = .p2sh_p2wpkh;
+                            } else if (std.mem.eql(u8, at.string, "p2tr")) {
+                                addr_type = .p2tr;
+                            } else if (std.mem.eql(u8, at.string, "p2wsh")) {
+                                addr_type = .p2wsh;
+                            } else {
+                                addr_type = .p2wpkh;
+                            }
+                        }
+                    }
+
+                    // scriptPubKey (persisted so the coin is spendable without a
+                    // rescan).  Wallet-owned copy, matching scanBlockForWallet.
+                    var spk: []const u8 = &[_]u8{};
+                    if (uobj.get("script")) |s| {
+                        if (s == .string and s.string.len > 0 and s.string.len % 2 == 0) {
+                            const raw = self.allocator.alloc(u8, s.string.len / 2) catch continue;
+                            if (std.fmt.hexToBytes(raw, s.string)) |decoded| {
+                                spk = decoded;
+                            } else |_| {
+                                self.allocator.free(raw);
+                                spk = &[_]u8{};
+                            }
+                        }
+                    }
+
+                    wallet.utxos.append(OwnedUtxo{
+                        .outpoint = types.OutPoint{
+                            .hash = txid,
+                            .index = vout,
+                        },
+                        .output = types.TxOut{
+                            .value = value,
+                            .script_pubkey = spk,
+                        },
+                        .key_index = key_index,
+                        .address_type = addr_type,
+                        .confirmations = confirmations,
+                        .is_coinbase = is_coinbase,
+                        .height = height,
+                    }) catch {
+                        if (spk.len > 0) self.allocator.free(spk);
+                        continue;
+                    };
                 }
-
-                const vout: u32 = @intCast(uobj.get("vout").?.integer);
-                const value: i64 = uobj.get("value").?.integer;
-                const key_index: usize = @intCast(uobj.get("key_index").?.integer);
-                const confirmations: u32 = @intCast(uobj.get("confirmations").?.integer);
-                const is_coinbase = uobj.get("is_coinbase").?.bool;
-                const height: u32 = @intCast(uobj.get("height").?.integer);
-
-                try wallet.utxos.append(OwnedUtxo{
-                    .outpoint = types.OutPoint{
-                        .hash = txid,
-                        .index = vout,
-                    },
-                    .output = types.TxOut{
-                        .value = value,
-                        .script_pubkey = &[_]u8{}, // Empty for now
-                    },
-                    .key_index = key_index,
-                    .address_type = .p2wpkh, // Default
-                    .confirmations = confirmations,
-                    .is_coinbase = is_coinbase,
-                    .height = height,
-                });
             }
         }
 

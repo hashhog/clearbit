@@ -846,6 +846,43 @@ pub fn build(b: *std.Build) void {
         w118_step.dependOn(&run_w118_tests.step);
     }
 
+    // Wallet restart-persistence regression tests (sweep wa0fq5wtk). Same
+    // wrapper pattern as tests_wallet_w111.zig: project-root wrapper so
+    // wallet.zig's @embedFile("../resources/bip39-english.txt") resolves.
+    // Run with `zig build test-wallet-persistence`.
+    // NOT folded into the default `test` step — same reason as W111 (wallet.zig
+    // as a test root drags in the selectCoins anonymous-struct compile error).
+    {
+        const wp_tests = b.addTest(.{
+            .root_source_file = b.path("tests_wallet_persistence.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"wallet-persistence"},
+        });
+        wp_tests.linkSystemLibrary("rocksdb");
+        wp_tests.linkSystemLibrary("secp256k1");
+        wp_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        wp_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            wp_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            wp_tests.linkSystemLibrary("minisketch");
+            wp_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        wp_tests.root_module.addOptions("build_options", build_options);
+
+        const run_wp_tests = b.addRunArtifact(wp_tests);
+        const wp_step = b.step(
+            "test-wallet-persistence",
+            "Run wallet restart-persistence regression tests (auto-load, atomic+durable save, fault-tolerant load, sync watermark)",
+        );
+        wp_step.dependOn(&run_wp_tests.step);
+    }
+
     // W113 Coin selection audit tests. Same wrapper pattern as
     // tests_wallet_w111.zig: project-root wrapper so wallet.zig's
     // @embedFile("../resources/bip39-english.txt") resolves correctly.

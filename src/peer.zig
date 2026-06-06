@@ -11,6 +11,7 @@ const mempool_mod = @import("mempool.zig");
 const validation = @import("validation.zig");
 const asmap_mod = @import("asmap.zig");
 const proxy_mod = @import("proxy.zig");
+const wallet_mod = @import("wallet.zig");
 
 // ============================================================================
 // Peer Manager Constants
@@ -309,6 +310,11 @@ pub const MANUAL_RECONNECT_INTERVAL: i64 = 30;
 
 /// Ping interval for idle peers (2 minutes).
 pub const PING_INTERVAL: i64 = 2 * 60;
+
+/// How often the run loop durably flushes wallets the connect loop marked
+/// dirty (seconds).  Bounds wallet-state loss on an unclean exit to roughly
+/// this window.  Cheap: a no-op when no wallet changed since the last flush.
+pub const WALLET_FLUSH_INTERVAL_SECS: i64 = 30;
 
 // ============================================================================
 // Stale Peer Eviction Constants (Bitcoin Core net_processing.cpp)
@@ -2305,6 +2311,13 @@ pub const PeerManager = struct {
     /// Mempool for transaction relay and acceptance.
     mempool: ?*mempool_mod.Mempool,
 
+    /// Wallet manager so the live block-connect loop feeds every loaded wallet
+    /// (credit/debit + sync-watermark advance), not just the mining/RPC path.
+    /// Null in the test harness / when no wallet support is wired.  Set by
+    /// main.zig after the manager is constructed; the live drain loop calls
+    /// `scanConnectedBlockIntoWallets` after each successful connect.
+    wallet_manager: ?*wallet_mod.WalletManager = null,
+
     // ========================================================================
     // Block Download Pipeline (IBD acceleration)
     // ========================================================================
@@ -2338,6 +2351,13 @@ pub const PeerManager = struct {
 
     /// Last time we logged sync progress.
     last_progress_log: i64,
+
+    /// Last time we durably flushed dirty wallets (unix seconds).  The live
+    /// connect loop marks wallets dirty as it credits/debits coins; this gate
+    /// persists them on a short period so a SIGKILL/OOM/power-loss loses at most
+    /// a few seconds of wallet state — never the whole wallet, never only at
+    /// clean shutdown.  Initialised to 0 so the first idle tick flushes.
+    last_wallet_flush: i64 = 0,
 
     /// Total blocks connected since last progress log.
     blocks_since_log: u32,
@@ -2480,6 +2500,7 @@ pub const PeerManager = struct {
             .served_blocks = std.AutoHashMap(types.Hash256, []const u8).init(allocator),
             .connect_address = null,
             .mempool = null,
+            .wallet_manager = null,
             .block_buffer = std.AutoHashMap(types.Hash256, types.Block).init(allocator),
             .expected_blocks = std.ArrayList(types.Hash256).init(allocator),
             .download_cursor = 0,
@@ -2489,6 +2510,7 @@ pub const PeerManager = struct {
             .blocks_in_flight = 0,
             .max_blocks_in_flight = 128,
             .last_progress_log = 0,
+            .last_wallet_flush = 0,
             .blocks_since_log = 0,
             .last_stall_recovery = 0,
             .in_drain = false,
@@ -6812,6 +6834,16 @@ pub const PeerManager = struct {
                 mp.removeForBlock(&block);
             }
 
+            // Wallet bookkeeping: feed the just-connected block into every
+            // loaded wallet so getbalance / listunspent / listtransactions stay
+            // current during live sync and IBD — not only when blocks arrive via
+            // the mining/RPC path (scanMinedBlocksIntoWallets).  Mirrors Bitcoin
+            // Core's CWallet::blockConnected hook off ConnectTip.  Best-effort by
+            // contract: a wallet bookkeeping failure must never fail a fully
+            // validated block, so errors are swallowed inside the helper.  Also
+            // advances each wallet's persisted last_synced_height watermark.
+            self.scanConnectedBlockIntoWallets(&block, height);
+
             const block_elapsed_ns = std.time.nanoTimestamp() - block_start;
             const block_elapsed_ms = @divTrunc(block_elapsed_ns, 1_000_000);
             if (block_elapsed_ms > 50) {
@@ -7131,6 +7163,19 @@ pub const PeerManager = struct {
             //     Reference: bitcoin-core/src/net.cpp:3570-3573
             self.runAsmapHealthCheck();
 
+            // 6d. Periodic durable wallet flush.  Persists wallets the connect
+            //     loop marked dirty, so wallet state survives an unclean exit
+            //     (SIGKILL / OOM / power-loss) — not only a clean shutdown.
+            //     Gated to ~every WALLET_FLUSH_INTERVAL_SECS; cheap no-op when
+            //     no wallet changed since the last flush.
+            if (self.wallet_manager) |wm| {
+                const now = std.time.timestamp();
+                if (now - self.last_wallet_flush >= WALLET_FLUSH_INTERVAL_SECS) {
+                    self.last_wallet_flush = now;
+                    _ = wm.flushDirty();
+                }
+            }
+
             // 7. Peer rotation (skip if --connect mode)
             if (self.connect_address == null) {
                 self.rotatePeers();
@@ -7295,6 +7340,26 @@ pub const PeerManager = struct {
             } else {
                 peer.sendMessage(&inv_msg) catch continue;
             }
+        }
+    }
+
+    /// Feed a just-connected block into every loaded wallet.  Called from the
+    /// live block-connect path (drainBlockBuffer) so the wallet ledger tracks
+    /// real chain progress, not just locally mined blocks.  Best-effort: a
+    /// per-wallet scan failure is logged and skipped — a wallet bookkeeping
+    /// problem must never disturb a fully validated chain (the ledger is
+    /// reconstructible via rescan / the startup reconcile).  `scanBlockForWallet`
+    /// advances each wallet's persisted last_synced_height watermark and marks
+    /// it dirty; the periodic flush (or a clean shutdown) persists it durably.
+    fn scanConnectedBlockIntoWallets(self: *PeerManager, block: *const types.Block, height: u32) void {
+        const wm = self.wallet_manager orelse return;
+        wm.mutex.lock();
+        defer wm.mutex.unlock();
+        var it = wm.wallets.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.scanBlockForWallet(block, height) catch |err| {
+                std.log.warn("wallet-scan(connect): scan failed for wallet '{s}' at height {d}: {s}", .{ entry.key_ptr.*, height, @errorName(err) });
+            };
         }
     }
 };
