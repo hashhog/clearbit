@@ -8265,6 +8265,31 @@ test "isFinalTx: height-based locktime not satisfied, non-final sequence → non
     try std.testing.expect(!isFinalTx(&tx, 100, 900_000_001));
 }
 
+test "isFinalTx: block-952421 shape — nLockTime == parent height, RBF sequence (final at H, non-final at H-1)" {
+    // Mirrors mainnet block 952421: an RBF tx with nLockTime = 952420 (the
+    // PARENT height) and nSequence = 0xFFFFFFFD (non-final).  Core's IsFinalTx
+    // uses a STRICT `nLockTime < nBlockHeight`, so:
+    //   - at the block's own height (952421): 952420 < 952421 => FINAL
+    //   - at the parent height       (952420): 952420 < 952420 => NON-FINAL
+    // This is the exact off-by-one boundary that wedges if the finality check
+    // is fed the parent height instead of parent+1.
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint{ .hash = [_]u8{0xEE} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD, // BIP-125 non-final / RBF-signalling
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 952_420, // parent height
+    };
+    // FINAL when evaluated at the connecting block's own height (parent + 1).
+    try std.testing.expect(isFinalTx(&tx, 952_421, 0));
+    // NON-FINAL when evaluated at the parent height (the off-by-one).
+    try std.testing.expect(!isFinalTx(&tx, 952_420, 0));
+}
+
 test "isFinalTx: SEQUENCE_FINAL on all inputs overrides unsatisfied locktime" {
     const input = types.TxIn{
         .previous_output = types.OutPoint{ .hash = [_]u8{0} ** 32, .index = 0 },
@@ -8875,6 +8900,171 @@ test "submitblock-gate: rejects block with non-final tx" {
             err == ValidationError.NonFinalTx or
                 err == ValidationError.MissingInput,
         );
+    }
+}
+
+// Seeded prevout lookup for the finality-height regression test below.  Returns
+// a single anyone-can-spend (OP_TRUE) non-coinbase coin worth 50 BTC for the
+// spender's input so prevout resolution succeeds and the IsFinalTx gate (not
+// MissingInput) is what decides accept/reject.  force_skip_scripts=true means
+// the OP_TRUE script is never actually run; the coin only needs to resolve.
+const FinalityRegSpentOutpoint = types.OutPoint{ .hash = [_]u8{0xEE} ** 32, .index = 0 };
+fn finalityRegLookup(_: *anyopaque, outpoint: *const types.OutPoint) ?PrevOutInfo {
+    if (std.mem.eql(u8, &outpoint.hash, &FinalityRegSpentOutpoint.hash) and
+        outpoint.index == FinalityRegSpentOutpoint.index)
+    {
+        return PrevOutInfo{
+            .script_pubkey = &[_]u8{0x51}, // OP_TRUE
+            .amount = 50 * 100_000_000, // 50 BTC
+            .height = 1, // matured (block height below is well above 1+COINBASE_MATURITY)
+            .is_coinbase = false,
+            .owner_allocator = null, // static slice, do not free
+        };
+    }
+    return null;
+}
+
+// Build the regtest block + ctx used by both arms of the finality-height
+// regression below.  `connect_height` is the height of the block being
+// CONNECTED (i.e. parent height + 1).  The non-coinbase tx carries
+// nLockTime == connect_height - 1 (the PARENT height) and nSequence ==
+// 0xFFFFFFFD (the RBF non-final sequence).  Core's IsFinalTx uses a STRICT
+// `nLockTime < nBlockHeight` comparison, so this tx is:
+//   - FINAL  when IsFinalTx is evaluated at connect_height       (H-1 < H  => true)
+//   - NON-FINAL when evaluated at the parent height connect_height-1 (H-1 < H-1 => false)
+// Exactly mirrors mainnet block 952421 (136 RBF txs, nLockTime=952420,
+// connecting at height 952421 => final; the off-by-one feeds 952420 => wedge).
+fn buildFinalityRegBlock(allocator: std.mem.Allocator, connect_height: u32) !types.Block {
+    // Coinbase: BIP-34 height prefix (OP_N for connect_height) + a 0x00 filler
+    // byte so the scriptSig clears the 2-byte coinbase minimum.  connect_height
+    // is chosen <= 16 by the caller so the height encodes as a single OP_N byte
+    // (0x50 + height); BIP-34 validation is a prefix match so the filler is
+    // ignored.
+    const cb_script = try allocator.dupe(u8, &[_]u8{ @intCast(0x50 + connect_height), 0x00 });
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = try allocator.dupe(types.TxIn, &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = cb_script,
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }}),
+        .outputs = try allocator.dupe(types.TxOut, &[_]types.TxOut{.{
+            // subsidy + the 0.1 BTC fee the spender below leaves on the table
+            .value = consensus.getBlockSubsidy(connect_height, &consensus.REGTEST) + 10_000_000,
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }}),
+        .lock_time = 0,
+    };
+
+    // RBF-style spender: height-based locktime == the PARENT height
+    // (connect_height - 1), with the BIP-125 non-final sequence (0xFFFFFFFD).
+    // Final only when IsFinalTx sees the block's own height (H-1 < H); rejected
+    // as NonFinalTx when the parent height is fed (H-1 < H-1 is false).
+    const spender = types.Transaction{
+        .version = 2,
+        .inputs = try allocator.dupe(types.TxIn, &[_]types.TxIn{.{
+            .previous_output = FinalityRegSpentOutpoint,
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD, // RBF non-final (signals replaceability + respects locktime)
+            .witness = &[_][]const u8{},
+        }}),
+        .outputs = try allocator.dupe(types.TxOut, &[_]types.TxOut{.{
+            .value = 50 * 100_000_000 - 10_000_000, // 49.9 BTC (0.1 BTC fee)
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xCD} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }}),
+        .lock_time = connect_height - 1, // == parent height (mirrors block 952421's nLockTime=952420)
+    };
+
+    const txid_cb = try crypto.computeTxid(&coinbase, allocator);
+    const txid_sp = try crypto.computeTxid(&spender, allocator);
+    const merkle = try crypto.computeMerkleRoot(&[_]types.Hash256{ txid_cb, txid_sp }, allocator);
+
+    var header = consensus.REGTEST.genesis_header;
+    header.version = 4;
+    header.merkle_root = merkle;
+    header.bits = 0x207fffff;
+    header.timestamp = consensus.REGTEST.genesis_header.timestamp + 1000;
+    ibdTestMineNonce(&header, &consensus.REGTEST);
+
+    return types.Block{
+        .header = header,
+        .transactions = try allocator.dupe(types.Transaction, &[_]types.Transaction{ coinbase, spender }),
+    };
+}
+
+// REGRESSION (finality-height off-by-one): a block whose tx has
+// nLockTime == the_block's_own_height and a non-final sequence MUST be ACCEPTED
+// at connect — IsFinalTx is evaluated at the height of the block being connected
+// (Core ContextualCheckBlock nBlockHeight = pindexPrev->nHeight + 1), NOT the
+// parent height.  Feeding the parent height (the bug) makes 952420 < 952420
+// false => NonFinalTx => permanent wedge on mainnet block 952421.
+//
+// Two arms, sharing one block:
+//   ACCEPT arm: ctx.height = connect_height (correct)  => block accepted.
+//   REJECT arm: ctx.height = connect_height - 1 (the off-by-one) => NonFinalTx.
+// The REJECT arm documents the exact failure the live caller must avoid; the
+// ACCEPT arm is the property that was wedging before the fix.
+test "validateBlockForIBD: tx with nLockTime == block height is final at connect (Core ContextualCheckBlock parity)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const connect_height: u32 = 12; // <= 16 so BIP-34 height is a single OP_N byte
+    var view_state: u8 = 0;
+
+    // --- ACCEPT arm: validate at the block's own height (correct behaviour). ---
+    {
+        const block = try buildFinalityRegBlock(a, connect_height);
+        const block_hash = crypto.computeBlockHash(&block.header);
+        var ctx = IBDValidationContext{
+            .block_hash = block_hash,
+            .height = connect_height, // parent + 1 — the block being connected
+            .params = &consensus.REGTEST,
+            .prevout_lookup_ctx = @ptrCast(&view_state),
+            .prevout_lookupFn = finalityRegLookup,
+            .active_chain = null,
+            .best_tip_chain_work = [_]u8{0} ** 32,
+            .best_tip_timestamp = 0,
+            .prev_mtp = 0, // -> lock_time_cutoff = block timestamp (irrelevant for height-based locktime)
+            .force_skip_scripts = true, // isolate the IsFinalTx gate from script eval
+        };
+        // MUST accept.  Pre-fix (height fed as parent) this returned NonFinalTx.
+        try validateBlockForIBD(&block, &ctx, std.testing.allocator);
+    }
+
+    // --- REJECT arm: the off-by-one (validate at parent height) MUST reject. ---
+    {
+        const block = try buildFinalityRegBlock(a, connect_height);
+        const block_hash = crypto.computeBlockHash(&block.header);
+        var ctx = IBDValidationContext{
+            .block_hash = block_hash,
+            .height = connect_height - 1, // BUG: parent height instead of parent+1
+            .params = &consensus.REGTEST,
+            .prevout_lookup_ctx = @ptrCast(&view_state),
+            .prevout_lookupFn = finalityRegLookup,
+            .active_chain = null,
+            .best_tip_chain_work = [_]u8{0} ** 32,
+            .best_tip_timestamp = 0,
+            .prev_mtp = 0,
+            .force_skip_scripts = true,
+        };
+        const res = validateBlockForIBD(&block, &ctx, std.testing.allocator);
+        // Feeding the parent height rejects the block.  Two rejections are
+        // reachable at this wrong height and BOTH are consequences of the
+        // off-by-one: NonFinalTx (the IsFinalTx gate at H-1) and
+        // BadCoinbaseHeight (the BIP-34 coinbase encodes H, not H-1).  The
+        // coinbase-height gate happens to fire first; either way the block is
+        // wrongly rejected, which is the wedge the ACCEPT arm above proves the
+        // live (parent+1) path avoids.
+        if (res) |_| {
+            try std.testing.expect(false); // must NOT accept at the wrong height
+        } else |err| {
+            try std.testing.expect(
+                err == ValidationError.NonFinalTx or
+                    err == ValidationError.BadCoinbaseHeight,
+            );
+        }
     }
 }
 
