@@ -6341,13 +6341,29 @@ pub const PeerManager = struct {
     ///
     /// Implementation: looks up the block hash via getBlockHashByHeight
     /// (CF_DEFAULT height→hash index), then walks the in-memory header_index
-    /// up to 11 steps collecting timestamps.  Returns 0 when:
-    ///   - the chain state is not available,
-    ///   - the height→hash DB entry is missing (pre-IBD, pruned, etc.), or
-    ///   - the header_index has evicted those entries (header_index is capped
-    ///     at MAX_HEADER_INDEX and LRU-evicts; old heights may be missing).
+    /// up to 11 steps collecting timestamps, falling back to the persisted
+    /// block index (cs.getPersistedHeader) on any in-memory miss.  Returns 0
+    /// only when:
+    ///   - the chain state is not available, or
+    ///   - the height→hash DB entry is missing (pre-IBD, pruned, etc.).
     /// A 0 return causes the caller to skip time-based BIP-68 enforcement for
     /// that UTXO (safe: height-based locks are still checked).
+    ///
+    /// Restart correctness (twin of computePrevMtp): the in-memory
+    /// header_index is empty until headers re-sync after a restart, and is
+    /// LRU-capped at MAX_HEADER_INDEX so old heights may be absent even at
+    /// steady state.  Without the persisted fallback this returned 0 (or a
+    /// short, wrong-low MTP) for an in-chain ancestor, which the BIP-68 path
+    /// turns into nCoinTime≈0 → required_time collapses to ~(lock<<9)-1 →
+    /// time-based relative sequence locks are judged satisfied when Core would
+    /// reject (CONSENSUS FALSE-ACCEPT of "bad-txns-nonfinal").  Read the
+    /// ancestor header from CF_BLOCK_INDEX instead — it covers every connected
+    /// block and survives the restart.
+    ///
+    /// Reference: bitcoin-core/src/consensus/tx_verify.cpp:74
+    ///   nCoinTime = GetAncestor(max(nCoinHeight-1,0))->GetMedianTimePast()
+    /// — Core's GetAncestor walks the persistent block index and never
+    /// silently fails for an in-chain ancestor.
     fn computeMtpAtHeight(self: *PeerManager, height: u32) u32 {
         const cs = self.chain_state orelse return 0;
         // Retrieve the hash of block at `height` from the persistent index.
@@ -6357,10 +6373,23 @@ pub const PeerManager = struct {
         var n: usize = 0;
         var cursor = block_hash;
         while (n < 11) {
-            const entry = self.header_index.get(cursor) orelse break;
-            timestamps[n] = entry.timestamp;
-            n += 1;
-            cursor = entry.prev_hash;
+            if (self.header_index.get(cursor)) |entry| {
+                timestamps[n] = entry.timestamp;
+                cursor = entry.prev_hash;
+                n += 1;
+                continue;
+            }
+            // In-memory miss (post-restart, or LRU-evicted height): read the
+            // ancestor header from the persisted block index and continue,
+            // exactly as computePrevMtp does.  This keeps the BIP-68 per-coin
+            // MTP correct across a restart instead of collapsing to ~0.
+            if (cs.getPersistedHeader(&cursor)) |hdr| {
+                timestamps[n] = hdr.timestamp;
+                cursor = hdr.prev_block;
+                n += 1;
+                continue;
+            }
+            break;
         }
         if (n == 0) return 0;
         return validation.medianTimePast(timestamps[0..n]);
@@ -7815,6 +7844,101 @@ test "peer manager initialization" {
     try std.testing.expectEqual(@as(usize, 0), manager.connectedCount());
     try std.testing.expectEqual(@as(usize, 0), manager.knownAddressCount());
     try std.testing.expectEqual(@as(i32, 0), manager.our_height);
+}
+
+// CONSENSUS REGRESSION (BIP-68 per-coin MTP, restart false-accept).
+//
+// computeMtpAtHeight supplies nCoinTime for TIME-based relative sequence
+// locks (Core tx_verify.cpp:74 GetAncestor(max(coinHeight-1,0))->GetMedianTimePast()).
+// Before the persisted fallback, an EMPTY in-memory header_index (the state
+// right after a process restart, before headers re-sync — and any time an old
+// height has been LRU-evicted) made the ancestor walk `break` on the first
+// miss → n==0 → return 0.  A nCoinTime of 0 collapses required_time to
+// ~(lock<<9)-1, so a time-based relative lock is judged satisfied when Core,
+// using the true ancestor MTP, would reject the block (bad-txns-nonfinal) —
+// a CONSENSUS FALSE-ACCEPT.
+//
+// This test reproduces the post-restart state: 11 ancestor headers persisted
+// in CF_BLOCK_INDEX + the H:{height}→hash index in CF_DEFAULT, with the
+// in-memory header_index left EMPTY.  computeMtpAtHeight must still return the
+// true median of the 11 timestamps via the getPersistedHeader fallback.
+//
+// PRE-FIX: header_index miss → break → n==0 → returns 0 (test FAILS).
+// POST-FIX: persisted fallback walks CF_BLOCK_INDEX → returns the true MTP.
+test "computeMtpAtHeight: persisted fallback yields true MTP with empty header_index (restart false-accept guard)" {
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    // Unique temp dir per run so concurrent / repeated `zig build test`
+    // invocations don't collide on the RocksDB lock.
+    var path_buf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(
+        &path_buf,
+        "/tmp/clearbit_mtp_restart_test_{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+
+    var db = try storage.Database.open(db_path, 64, allocator);
+    defer db.close();
+
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+    manager.chain_state = &cs;
+    // header_index is intentionally left EMPTY — this is the post-restart /
+    // post-eviction condition the fix must survive.
+
+    // Build a synthetic 11-block chain (heights 0..10) with strictly
+    // increasing timestamps.  Hashes are synthetic-but-consistent: the
+    // height→hash index points at hash_h, and each persisted header's
+    // prev_block points at hash_{h-1}, so the ancestor walk chains correctly.
+    const base_ts: u32 = 1_700_000_000;
+    var hashes: [11]types.Hash256 = undefined;
+    for (0..11) |h| {
+        hashes[h] = [_]u8{0} ** 32;
+        hashes[h][0] = @intCast(h + 1); // distinct, non-zero per height
+    }
+
+    for (0..11) |h| {
+        const prev = if (h == 0) ([_]u8{0} ** 32) else hashes[h - 1];
+        const hdr = types.BlockHeader{
+            .version = 1,
+            .prev_block = prev,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = base_ts + @as(u32, @intCast(h)),
+            .bits = 0x1d00ffff,
+            .nonce = 0,
+        };
+        // Persist CF_BLOCK_INDEX record: u32 height prefix + 80-byte header,
+        // exactly the layout getPersistedHeader reads.
+        var w = serialize.Writer.init(allocator);
+        defer w.deinit();
+        try w.writeInt(u32, @intCast(h));
+        try serialize.writeBlockHeader(&w, &hdr);
+        try db.put(storage.CF_BLOCK_INDEX, &hashes[h], w.getWritten());
+
+        // Persist H:{height}→hash index in CF_DEFAULT.
+        const hh_key = storage.ChainStore.buildHeightHashKey(@intCast(h));
+        try db.put(storage.CF_DEFAULT, &hh_key, &hashes[h]);
+    }
+
+    // MTP at height 10 = median of timestamps for heights 0..10 = ts[5].
+    const expected = validation.medianTimePast(&[_]u32{
+        base_ts + 0, base_ts + 1, base_ts + 2,  base_ts + 3,
+        base_ts + 4, base_ts + 5, base_ts + 6,  base_ts + 7,
+        base_ts + 8, base_ts + 9, base_ts + 10,
+    });
+    try std.testing.expectEqual(base_ts + 5, expected); // sanity: median is ts[5]
+
+    const got = manager.computeMtpAtHeight(10);
+    // PRE-FIX this is 0 (empty header_index → break → n==0).  POST-FIX it is
+    // the true median read via the persisted-header fallback.
+    try std.testing.expect(got != 0);
+    try std.testing.expectEqual(expected, got);
 }
 
 test "peer direction enum" {
