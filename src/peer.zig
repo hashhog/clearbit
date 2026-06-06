@@ -6278,10 +6278,30 @@ pub const PeerManager = struct {
         var n: usize = 0;
         var cursor = prev_hash.*;
         while (n < 11) {
-            const entry = self.header_index.get(cursor) orelse break;
-            timestamps[n] = entry.timestamp;
-            n += 1;
-            cursor = entry.prev_hash;
+            if (self.header_index.get(cursor)) |entry| {
+                timestamps[n] = entry.timestamp;
+                cursor = entry.prev_hash;
+                n += 1;
+                continue;
+            }
+            // The in-memory header_index is empty until headers re-sync after a
+            // restart, and the MTP ring buffer is empty until blocks connect —
+            // so right after a restart neither is available. Falling through to
+            // snapshot_base_mtp below would yield the GENESIS timestamp
+            // (1231006505) as the BIP-113 cutoff, which false-rejects any block
+            // containing a time-based nLockTime tx with a non-final sequence
+            // (the 2026-06-06 wedge at h=952421: a locktime=1580624834 RBF tx).
+            // Read the ancestor header from the persisted block index instead —
+            // it covers every connected block and survives the restart.
+            if (self.chain_state) |cs2| {
+                if (cs2.getPersistedHeader(&cursor)) |hdr| {
+                    timestamps[n] = hdr.timestamp;
+                    cursor = hdr.prev_block;
+                    n += 1;
+                    continue;
+                }
+            }
+            break;
         }
         if (n > 0) return validation.medianTimePast(timestamps[0..n]);
 

@@ -2901,6 +2901,24 @@ pub const ChainState = struct {
         return hash;
     }
 
+    /// Read a persisted block header by hash from CF_BLOCK_INDEX (the
+    /// height-prefixed header record written on connect; same layout
+    /// ChainStore.getBlockIndex reads). Unlike the in-memory header_index this
+    /// survives a process restart, so computePrevMtp can derive a correct
+    /// BIP-113 median-time-past for an in-chain ancestor immediately on restart
+    /// instead of falling back to snapshot_base_mtp (= genesis timestamp), which
+    /// otherwise false-rejects blocks carrying a time-based nLockTime tx with a
+    /// non-final sequence. Returns null if the hash is not in the block index.
+    pub fn getPersistedHeader(self: *ChainState, hash: *const types.Hash256) ?types.BlockHeader {
+        const db = self.utxo_set.db orelse return null;
+        const data = db.get(CF_BLOCK_INDEX, hash) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        var reader = serialize.Reader{ .data = bytes };
+        _ = reader.readInt(u32) catch return null; // height prefix (see getBlockIndex)
+        return serialize.readBlockHeader(&reader) catch return null;
+    }
+
     /// Compute the median-time-past for the active chain tip.
     ///
     /// Returns the median timestamp of the last min(recent_ts_count, 11) blocks
