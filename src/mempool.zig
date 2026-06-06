@@ -12235,6 +12235,85 @@ test "W86-G11: removeExpired evicts descendants of expired transactions" {
     try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
 }
 
+test "block-connect sweeps expired txs (removeForBlock + removeExpired live ordering)" {
+    // Pins the wiring added to peer.zig drainBlockBuffer: on block-connect the
+    // node now performs `mp.removeForBlock(&block)` *and then* `mp.removeExpired()`
+    // — the Core ConnectTip → LimitMempoolSize → Expire ordering.  This test
+    // reproduces that exact two-call sequence and asserts:
+    //   (1) a stale tx NOT confirmed by the block is swept by the expiry pass,
+    //   (2) a fresh tx NOT confirmed by the block survives,
+    //   (3) the two passes do not double-evict / corrupt the pool.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20;
+
+    // Stale tx: will be backdated past MEMPOOL_EXPIRY.
+    const stale_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 90_000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(stale_tx);
+    const stale_txid = try crypto.computeTxid(&stale_tx, allocator);
+
+    // Fresh tx: stays well within the expiry window.
+    const fresh_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 80_000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(fresh_tx);
+    const fresh_txid = try crypto.computeTxid(&fresh_tx, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+
+    // Backdate the stale tx so the expiry pass will sweep it.
+    if (mempool.entries.getPtr(stale_txid)) |entry_ptr| {
+        entry_ptr.*.time_added = std.time.timestamp() - MEMPOOL_EXPIRY - 1;
+    }
+
+    // A block that confirms NEITHER mempool tx (only a coinbase) — the expiry
+    // sweep must be what removes the stale tx, not removeForBlock.
+    const cb_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 5_000_000_000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 0,
+    };
+    const block = types.Block{
+        .header = std.mem.zeroes(types.BlockHeader),
+        .transactions = &[_]types.Transaction{cb_tx},
+    };
+
+    // Exact live-path block-connect ordering (peer.zig drainBlockBuffer).
+    mempool.removeForBlock(&block);
+    mempool.removeExpired();
+
+    // Stale tx swept by the expiry pass; fresh tx untouched.
+    try std.testing.expect(!mempool.entries.contains(stale_txid));
+    try std.testing.expect(mempool.entries.contains(fresh_txid));
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+}
+
 test "W86-G12: removeForBlock sets block_since_last_rolling_fee_bump" {
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);

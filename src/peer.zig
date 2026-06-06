@@ -6832,6 +6832,21 @@ pub const PeerManager = struct {
             // failure-path semantics (mempool untouched on rejected blocks).
             if (self.mempool) |mp| {
                 mp.removeForBlock(&block);
+
+                // W*: tx-expiry sweep on block-connect — mirror of Bitcoin
+                // Core's ConnectTip → LimitMempoolSize → CTxMemPool::Expire
+                // (validation.cpp:269 inside LimitMempoolSize, invoked off
+                // ConnectTip).  removeExpired() drops every entry older than
+                // MEMPOOL_EXPIRY *and* its in-mempool descendants (it calls
+                // removeTransactionWithDescendants, idempotent on already-
+                // removed txids), so there is no double-eviction hazard with
+                // the removeForBlock() above: removeForBlock only touches txs
+                // confirmed by this block, removeExpired only touches stale
+                // ones, and removeTransactionWithDescendants is a no-op on an
+                // absent entry.  This is the only live driver of the expiry
+                // policy; without it stale txs accumulate unbounded (DoS
+                // vector).  Relay-policy only — never affects block validity.
+                mp.removeExpired();
             }
 
             // Wallet bookkeeping: feed the just-connected block into every
