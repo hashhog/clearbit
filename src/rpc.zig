@@ -3019,6 +3019,8 @@ pub const RpcServer = struct {
             return self.handleGetIndexInfo(params, id);
         } else if (std.mem.eql(u8, method, "getblockfilter")) {
             return self.handleGetBlockFilter(params, id);
+        } else if (std.mem.eql(u8, method, "scanblocks")) {
+            return self.handleScanBlocks(params, id);
         } else if (std.mem.eql(u8, method, "listbanned")) {
             return self.handleListBanned(id);
         } else if (std.mem.eql(u8, method, "setban")) {
@@ -4672,6 +4674,230 @@ pub const RpcServer = struct {
         // byte order, same as block hashes.
         try writeHashHex(w, &filter_header);
         try w.writeAll("\"}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `scanblocks "action" ( [scanobjects] start_height stop_height
+    ///                        "filtertype" options )`
+    ///
+    /// Bitcoin Core reference: src/rpc/blockchain.cpp::scanblocks
+    /// (action start/status/abort). scanblocks drives the BIP-157 basic block
+    /// filter index to find blocks whose GCS filter MATCHES any of the given
+    /// scanobjects' scriptPubKeys, returning
+    ///   { from_height:int, to_height:int, relevant_blocks:[blockhash...],
+    ///     completed:bool }.
+    /// It is the index-side counterpart to scantxoutset (which walks the UTXO
+    /// set): scanblocks walks compact block filters, so it can locate the block
+    /// a script was funded/spent in even after the coin is gone.
+    ///
+    /// clearbit scans SYNCHRONOUSLY (there is never an in-progress scan), so:
+    ///   - action=status -> JSON null  (Core: NullUniValue when no reserver)
+    ///   - action=abort  -> false      (nothing to abort)
+    ///   - action=start  -> does the real work
+    ///   - unknown action -> error
+    ///
+    /// Error parity with Core (codes are the hard requirement):
+    ///   - unknown filtertype     -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+    ///                               "Unknown filtertype"
+    ///   - index not enabled      -> RPC_MISC_ERROR (-1)
+    ///                               "Index is not enabled for filtertype basic"
+    ///   - bad start/stop heights -> RPC_MISC_ERROR (-1)
+    ///                               "Invalid start_height" / "Invalid stop_height"
+    ///
+    /// CAVEAT: GCS filters have FALSE POSITIVES, so relevant_blocks may carry
+    /// EXTRA blocks. The contract is membership: a block that genuinely contains
+    /// a needle's scriptPubKey (as an output, or as a spent prevout via undo
+    /// data) MUST appear. We never assert set-equality.
+    ///
+    /// Block hashes are emitted in DISPLAY (reversed) order via writeHashHex,
+    /// matching Core's uint256.GetHex().
+    fn handleScanBlocks(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // ── action dispatch (Core: action start/status/abort) ──────────────
+        var action: []const u8 = "";
+        if (params == .array and params.array.items.len >= 1) {
+            const a = params.array.items[0];
+            if (a == .string) action = a.string;
+        }
+        if (std.mem.eql(u8, action, "status")) {
+            // No background scan is tracked; Core returns NullUniValue.
+            return self.jsonRpcResult("null", id);
+        }
+        if (std.mem.eql(u8, action, "abort")) {
+            // Nothing running -> nothing aborted.
+            return self.jsonRpcResult("false", id);
+        }
+        if (!std.mem.eql(u8, action, "start")) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid action; expected start/abort/status", id);
+        }
+
+        // ── scanobjects (required for start; Core get_array on params[1]) ───
+        if (params != .array or params.array.items.len < 2 or params.array.items[1] != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "scanobjects array required for the start action", id);
+        }
+        const scanobjects = params.array.items[1].array;
+        if (scanobjects.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "scanobjects array required for the start action", id);
+        }
+
+        // ── filtertype validation (params[4], default "basic"; Core:
+        //    BlockFilterTypeByName). Only "basic" (BIP-158 type 0) is defined.
+        //    Validate BEFORE heights so the unknown-filtertype -5 path fires
+        //    regardless of the height arguments. ─────────────────────────────
+        var filtertype: []const u8 = "basic";
+        if (params.array.items.len > 4) {
+            const ft = params.array.items[4];
+            if (ft == .string) filtertype = ft.string;
+        }
+        if (!std.mem.eql(u8, filtertype, "basic")) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype", id);
+        }
+
+        // ── index-enabled gate (Core: GetBlockFilterIndex == nullptr ->
+        //    RPC_MISC_ERROR "Index is not enabled for filtertype basic"). ────
+        if (!self.chain_state.blockfilterindex_enabled) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Index is not enabled for filtertype basic", id);
+        }
+
+        // ── height range (Core: RPC_MISC_ERROR -1 for bad heights). Default
+        //    start = genesis (0), default stop = tip. ───────────────────────
+        const tip: i64 = @intCast(self.chain_state.best_height);
+        var start_h: i64 = 0;
+        if (params.array.items.len > 2) {
+            const sv = params.array.items[2];
+            switch (sv) {
+                .integer => |n| start_h = n,
+                .float => |f| start_h = @intFromFloat(f),
+                else => {},
+            }
+        }
+        if (start_h < 0 or start_h > tip) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Invalid start_height", id);
+        }
+        var stop_h: i64 = tip;
+        if (params.array.items.len > 3) {
+            const ev = params.array.items[3];
+            switch (ev) {
+                .integer => |n| stop_h = n,
+                .float => |f| stop_h = @intFromFloat(f),
+                else => {},
+            }
+        }
+        if (stop_h < start_h or stop_h > tip) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Invalid stop_height", id);
+        }
+
+        // ── build the needle set (mirrors scantxoutset's descriptor parse:
+        //    addr() / raw() / bare-hex). Each needle is a scriptPubKey we test
+        //    against every block's GCS filter. ──────────────────────────────
+        var needles = std.ArrayList([]u8).init(self.allocator);
+        defer {
+            for (needles.items) |n| self.allocator.free(n);
+            needles.deinit();
+        }
+
+        for (scanobjects.items) |obj| {
+            var spec: []const u8 = "";
+            if (obj == .string) {
+                spec = obj.string;
+            } else if (obj == .object) {
+                const d = obj.object.get("desc") orelse {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Scan object missing desc", id);
+                };
+                if (d != .string) return self.jsonRpcError(RPC_INVALID_PARAMS, "desc must be a string", id);
+                spec = d.string;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Scan object must be a descriptor string", id);
+            }
+
+            // Strip a trailing #checksum if present.
+            var clean = spec;
+            if (std.mem.indexOfScalar(u8, clean, '#')) |h| clean = clean[0..h];
+
+            const spk: []u8 = blk: {
+                if (std.mem.startsWith(u8, clean, "addr(") and std.mem.endsWith(u8, clean, ")")) {
+                    const addr = clean["addr(".len .. clean.len - 1];
+                    break :blk descriptor.decodeAddressToScript(self.allocator, addr) catch {
+                        return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address in addr()", id);
+                    };
+                } else if (std.mem.startsWith(u8, clean, "raw(") and std.mem.endsWith(u8, clean, ")")) {
+                    const hexstr = clean["raw(".len .. clean.len - 1];
+                    break :blk hexToBytesAlloc(self.allocator, hexstr) catch {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid raw() scriptPubKey hex", id);
+                    };
+                } else {
+                    // Bare hex shorthand for raw().
+                    break :blk hexToBytesAlloc(self.allocator, clean) catch {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Unsupported scan object (expect addr()/raw()/hex)", id);
+                    };
+                }
+            };
+            needles.append(spk) catch return error.OutOfMemory;
+        }
+
+        // Build the const-slice view matchAny expects ([]const []const u8).
+        var needle_views = std.ArrayList([]const u8).init(self.allocator);
+        defer needle_views.deinit();
+        for (needles.items) |n| try needle_views.append(n);
+
+        // ── scan loop (Core: iterate [start_height, stop_height] over the
+        //    active chain, test each block's filter against the needles). ────
+        var relevant = std.ArrayList(types.Hash256).init(self.allocator);
+        defer relevant.deinit();
+
+        var h_i: i64 = start_h;
+        while (h_i <= stop_h) : (h_i += 1) {
+            const height: u32 = @intCast(h_i);
+            const bh = self.resolveBlockHashAtHeight(height) orelse {
+                return self.jsonRpcError(RPC_MISC_ERROR, "Filter not found. Block filters are still in the process of being indexed.", id);
+            };
+
+            // Encoded filter bytes for this block (persisted index fast path,
+            // compute-on-demand fallback). Genesis is handled inside.
+            const encoded = (self.computeBasicFilterBytes(&bh) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Filter computation error", id);
+            }) orelse {
+                return self.jsonRpcError(RPC_MISC_ERROR, "Filter not found. Block filters are still in the process of being indexed.", id);
+            };
+            defer self.allocator.free(encoded);
+
+            // GCS params are derived from the block hash (siphash keys =
+            // first 16 bytes LE), matching buildBasicBlockFilter / Core.
+            const k0 = std.mem.readInt(u64, bh[0..8], .little);
+            const k1 = std.mem.readInt(u64, bh[8..16], .little);
+            const gparams = indexes_mod.GCSParams{
+                .siphash_k0 = k0,
+                .siphash_k1 = k1,
+                .p = indexes_mod.BASIC_FILTER_P,
+                .m = indexes_mod.BASIC_FILTER_M,
+            };
+            var gcs = indexes_mod.GCSFilter.fromEncoded(gparams, encoded, self.allocator) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Filter decode error", id);
+            };
+            defer gcs.deinit();
+
+            const matched = gcs.matchAny(needle_views.items, self.allocator) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Filter match error", id);
+            };
+            if (matched) {
+                try relevant.append(bh);
+            }
+        }
+
+        // ── emit Core shape: {from_height, to_height, relevant_blocks, completed}
+        //    The synchronous scan is never aborted, so completed is always true.
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.print("{{\"from_height\":{d},\"to_height\":{d},\"relevant_blocks\":[", .{ start_h, stop_h });
+        for (relevant.items, 0..) |bh, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            try writeHashHex(writer, &bh);
+            try writer.writeByte('"');
+        }
+        try writer.writeAll("],\"completed\":true}");
 
         return self.jsonRpcResult(buf.items, id);
     }
