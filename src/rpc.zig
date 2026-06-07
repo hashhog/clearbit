@@ -3114,6 +3114,8 @@ pub const RpcServer = struct {
             return self.handleGetChainTips(id);
         } else if (std.mem.eql(u8, method, "getchaintxstats")) {
             return self.handleGetChainTxStats(params, id);
+        } else if (std.mem.eql(u8, method, "getblockstats")) {
+            return self.handleGetBlockStats(params, id);
         } else if (std.mem.eql(u8, method, "getrawmempool")) {
             return self.handleGetRawMempool(params, id);
         } else if (std.mem.eql(u8, method, "testmempoolaccept")) {
@@ -10173,6 +10175,248 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// getblockstats hash_or_height ( stats )
+    ///
+    /// Compute per-block statistics — fees, feerates, sizes, weights and
+    /// UTXO-set deltas — for a single block.  Faithful port of Bitcoin Core's
+    /// rpc/blockchain.cpp::getblockstats (RPCHelpMan + lambda, lines
+    /// 1956-2215).  All amounts are in satoshis; feerates are satoshis per
+    /// virtual byte (vsize = weight / WITNESS_SCALE_FACTOR).
+    ///
+    /// First arg resolves EITHER as a block height (JSON integer / numeric
+    /// string) into the active chain OR as a block hash (64-hex string),
+    /// matching Core's ParseHashOrHeight.  The optional second arg is an array
+    /// of stat names; when present the response contains only those keys (an
+    /// unknown name is RPC_INVALID_PARAMETER, as in Core).  Omitted/empty =
+    /// all 31 statistics.
+    ///
+    /// Fee math (per non-coinbase tx): fee = sum(spent prevout values) -
+    /// sum(output values).  Input prevout values come from the block's undo
+    /// data (CF_BLOCK_UNDO; one TxUndo per non-coinbase tx, prev_outputs[].value
+    /// is the spent output's value).  The coinbase is excluded from every
+    /// fee/feerate statistic and from feerate_percentiles, but still counts
+    /// toward txs / outs / utxo_size_inc, exactly as Core does.
+    ///
+    /// If the block body is missing (e.g. pre-cdd9e20 fast-IBD blocks never
+    /// populated CF_BLOCKS) we return RPC_INVALID_ADDRESS_OR_KEY rather than
+    /// fabricate stats.  If the body is present but undo data is missing for a
+    /// block that DOES contain non-coinbase txs, we fail loudly (Core's
+    /// GetUndoChecked throws) — wrong fee stats are worse than a missing method.
+    ///
+    /// Error codes (Core-faithful):
+    ///   -8  Target block height %d is negative
+    ///   -8  Target block height %d after current tip %d
+    ///   -5  Block not found            (hash not in the index / body absent)
+    ///   -8  Invalid selected statistic '%s'
+    fn handleGetBlockStats(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing hash_or_height parameter", id);
+        }
+
+        // ── 1. Resolve the target block (Core ParseHashOrHeight). ───────────
+        var height: u32 = 0;
+        var blockhash: types.Hash256 = undefined;
+        {
+            const arg0 = params.array.items[0];
+            // Numeric height: JSON integer/float, OR a string of digits (Core's
+            // RPC frontend coerces a numeric string to the NUM arg type).
+            const as_height: ?i64 = switch (arg0) {
+                .integer => arg0.integer,
+                .float => @as(i64, @intFromFloat(arg0.float)),
+                .string => blk: {
+                    // A 64-char string is treated as a hash, never a height
+                    // (Core's get_str path), even though "0000…" is all digits.
+                    if (arg0.string.len == 64) break :blk null;
+                    break :blk std.fmt.parseInt(i64, arg0.string, 10) catch null;
+                },
+                else => null,
+            };
+
+            if (as_height) |h| {
+                if (h < 0) {
+                    var ebuf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&ebuf, "Target block height {d} is negative", .{h}) catch "Target block height is negative";
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                }
+                const tip: i64 = @intCast(self.chain_state.best_height);
+                if (h > tip) {
+                    var ebuf: [160]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&ebuf, "Target block height {d} after current tip {d}", .{ h, tip }) catch "Target block height after current tip";
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                }
+                height = @intCast(h);
+                if (height == 0) {
+                    blockhash = self.network_params.genesis_hash;
+                } else if (self.chain_state.getBlockHashByHeight(height)) |hh| {
+                    blockhash = hh;
+                } else {
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+                }
+            } else {
+                // Block hash path.
+                const hex = switch (arg0) {
+                    .string => arg0.string,
+                    else => return self.jsonRpcError(RPC_INVALID_PARAMS, "hash_or_height must be a height or block hash", id),
+                };
+                if (hex.len != 64) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be of length 64 (not lesser)", id);
+                }
+                for (0..32) |i| {
+                    blockhash[31 - i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be hexadecimal string", id);
+                    };
+                }
+                // Resolve hash → height: tip, then in-memory chain index, then
+                // the persisted CF_BLOCK_INDEX record (height-prefixed header).
+                var resolved: ?u32 = null;
+                if (std.mem.eql(u8, &blockhash, &self.chain_state.best_hash)) {
+                    resolved = self.chain_state.best_height;
+                } else if (std.mem.eql(u8, &blockhash, &self.network_params.genesis_hash)) {
+                    resolved = 0;
+                } else if (self.chain_manager != null and self.chain_manager.?.getBlock(&blockhash) != null) {
+                    resolved = self.chain_manager.?.getBlock(&blockhash).?.height;
+                } else if (self.chain_state.utxo_set.db) |db| {
+                    if (db.get(storage.CF_BLOCK_INDEX, &blockhash) catch null) |bytes| {
+                        defer self.allocator.free(bytes);
+                        var ir = serialize.Reader{ .data = bytes };
+                        if (ir.readInt(u32)) |h| resolved = h else |_| {}
+                    }
+                }
+                if (resolved == null) {
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+                }
+                height = resolved.?;
+            }
+        }
+
+        // ── 2. Parse the optional stats filter. ─────────────────────────────
+        // null/absent → all stats (do_all).  Otherwise restrict the response to
+        // the named stats; an unknown name is an error AFTER computation (Core).
+        var selected: ?std.json.Value = null;
+        if (params.array.items.len >= 2 and params.array.items[1] != .null) {
+            const s = params.array.items[1];
+            if (s != .array) {
+                return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value of type for stats is not an array as expected", id);
+            }
+            if (s.array.items.len > 0) selected = s; // empty array == all (do_all)
+            // Validate entries are strings up-front.
+            if (selected != null) {
+                for (s.array.items) |entry| {
+                    if (entry != .string) {
+                        return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value of type for selected statistic is not a string as expected", id);
+                    }
+                }
+            }
+        }
+
+        // ── 3. Load the block body + undo data from local storage. ──────────
+        const db = self.chain_state.utxo_set.db orelse {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Block store not available", id);
+        };
+
+        const raw_block = (db.get(storage.CF_BLOCKS, &blockhash) catch null) orelse {
+            // Body absent on disk (pruned, or pre-cdd9e20 fast-IBD block that
+            // never wrote CF_BLOCKS).  Mirror Core's GetBlockChecked which
+            // surfaces a not-found / pruned error rather than fabricating.
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not available (not fully downloaded)", id);
+        };
+        defer self.allocator.free(raw_block);
+
+        var block = blk: {
+            var reader = serialize.Reader{ .data = raw_block };
+            break :blk serialize.readBlock(&reader, self.allocator) catch {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Block corrupt on disk", id);
+            };
+        };
+        defer serialize.freeBlock(self.allocator, &block);
+
+        // Undo data carries the spent-prevout values needed for fee stats.
+        // Genesis (and a coinbase-only block) has an empty/absent undo. If undo
+        // is missing for a block that DOES have non-coinbase txs we cannot
+        // compute fees correctly — computeBlockStats fails loudly.
+        var owned_undo: ?storage.BlockUndoData = null;
+        defer if (owned_undo) |*u| u.deinit(self.allocator);
+        if (db.get(storage.CF_BLOCK_UNDO, &blockhash) catch null) |undo_bytes| {
+            defer self.allocator.free(undo_bytes);
+            owned_undo = storage.BlockUndoData.fromBytes(undo_bytes, self.allocator) catch null;
+        }
+
+        // ── 4. Compute every statistic. ─────────────────────────────────────
+        const stats = computeBlockStats(
+            &block,
+            if (owned_undo) |*u| u else null,
+            height,
+            self.network_params,
+        ) catch |err| switch (err) {
+            error.UndoUnavailable => return self.jsonRpcError(RPC_MISC_ERROR, "Undo data not available (cannot compute fees)", id),
+            error.MoneyRange => return self.jsonRpcError(RPC_MISC_ERROR, "Transaction fee out of range", id),
+            else => return self.jsonRpcError(RPC_INTERNAL_ERROR, "Internal error computing block stats", id),
+        };
+
+        // mediantime is the median-time-past of the target block (Core
+        // pindex.GetMedianTimePast()), which needs ancestor headers, not the
+        // block body — computed here through the same helper getchaintxstats uses.
+        const mediantime: i64 = self.computeMTPAtHeight(height) orelse @intCast(block.header.timestamp);
+
+        // ── 5. Serialize (full ret_all, or the filtered subset). ────────────
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const w = buf.writer();
+
+        if (selected) |sel| {
+            // Filtered: validate every requested name first (Core throws on the
+            // first unknown via the std::set lookup), then emit the matching
+            // stats in Core's std::set iteration order: alphabetically sorted +
+            // deduped (Core stores the requested names in a std::set<string>).
+            for (sel.array.items) |entry| {
+                if (!blockStatNameIsValid(entry.string)) {
+                    var ebuf: [160]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&ebuf, "Invalid selected statistic '{s}'", .{entry.string}) catch "Invalid selected statistic";
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                }
+            }
+            // Collect the requested names, dedup, and sort alphabetically
+            // (mirrors std::set<std::string>).
+            var names = std.ArrayList([]const u8).init(self.allocator);
+            defer names.deinit();
+            for (sel.array.items) |entry| {
+                var dup = false;
+                for (names.items) |existing| {
+                    if (std.mem.eql(u8, existing, entry.string)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) try names.append(entry.string);
+            }
+            std.mem.sort([]const u8, names.items, {}, struct {
+                fn lt(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lt);
+
+            try w.writeByte('{');
+            for (names.items, 0..) |name, i| {
+                if (i != 0) try w.writeByte(',');
+                try w.print("\"{s}\":", .{name});
+                try writeBlockStatValue(w, name, &stats, &blockhash, height, mediantime);
+            }
+            try w.writeByte('}');
+        } else {
+            // do_all: emit every statistic in Core's exact ret_all pushKV order.
+            try w.writeByte('{');
+            const all_names = blockStatAllNames();
+            for (all_names, 0..) |name, i| {
+                if (i != 0) try w.writeByte(',');
+                try w.print("\"{s}\":", .{name});
+                try writeBlockStatValue(w, name, &stats, &blockhash, height, mediantime);
+            }
+            try w.writeByte('}');
+        }
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// Proxy a getblockheader verbose=true call through Bitcoin Core and return
     /// a Core-byte-compatible response.  Used when clearbit has no local header
     /// for a historical block (CF_BLOCKS empty for pre-cdd9e20 IBD blocks).
@@ -14725,6 +14969,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("getchaintips\\n\\nReturn information about all known tips in the block tree.");
             } else if (std.mem.eql(u8, cmd, "getchaintxstats")) {
                 try writer.writeAll("getchaintxstats ( nblocks \\\"blockhash\\\" )\\n\\nCompute statistics about the total number and rate of transactions in the chain.");
+            } else if (std.mem.eql(u8, cmd, "getblockstats")) {
+                try writer.writeAll("getblockstats hash_or_height ( stats )\\n\\nCompute per block statistics for a given window. All amounts are in satoshis.\\nIt won't work for some heights with pruning.");
             } else if (std.mem.eql(u8, cmd, "getrawmempool")) {
                 try writer.writeAll("getrawmempool ( verbose mempool_sequence )\\n\\nReturns all transaction ids in memory pool.");
             } else if (std.mem.eql(u8, cmd, "testmempoolaccept")) {
@@ -14796,6 +15042,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getdeploymentinfo\\n");
             try writer.writeAll("getchaintips\\n");
             try writer.writeAll("getchaintxstats\\n");
+            try writer.writeAll("getblockstats\\n");
             try writer.writeAll("getdifficulty\\n");
             try writer.writeAll("\\n== Mempool ==\\n");
             try writer.writeAll("getmempoolancestors\\n");
@@ -16336,6 +16583,435 @@ fn extractJsonResult(json_rpc_response: []const u8) ?[]const u8 {
     const end_idx = std.mem.indexOf(u8, json_rpc_response[value_start..], error_marker) orelse return null;
 
     return json_rpc_response[value_start .. value_start + end_idx];
+}
+
+// ============================================================================
+// getblockstats — per-block statistics (Core rpc/blockchain.cpp::getblockstats)
+// ============================================================================
+
+/// Number of feerate percentiles computed by getblockstats: 10th, 25th, 50th,
+/// 75th, 90th weight-unit percentiles.  Mirrors Core's
+/// NUM_GETBLOCKSTATS_PERCENTILES.
+const NUM_GETBLOCKSTATS_PERCENTILES: usize = 5;
+
+/// Per-UTXO on-disk overhead used by getblockstats' utxo_size_inc statistics:
+///   sizeof(COutPoint) + sizeof(uint32_t) + sizeof(bool)
+///     = (uint256(32) + uint32(4)) + uint32(4) + bool(1) = 41
+/// Reference: bitcoin-core/src/rpc/blockchain.cpp PER_UTXO_OVERHEAD.
+const PER_UTXO_OVERHEAD: u64 = 41;
+
+/// Fully-computed getblockstats result (all 31 statistics).  All amounts are
+/// satoshis; feerates are sat/vB.  height/blockhash/mediantime are filled by the
+/// caller (they come from the block index, not the per-tx loop).
+const BlockStats = struct {
+    avgfee: i64,
+    avgfeerate: i64,
+    avgtxsize: i64,
+    feerate_percentiles: [NUM_GETBLOCKSTATS_PERCENTILES]i64,
+    ins: i64,
+    maxfee: i64,
+    maxfeerate: i64,
+    maxtxsize: i64,
+    medianfee: i64,
+    mediantxsize: i64,
+    minfee: i64,
+    minfeerate: i64,
+    mintxsize: i64,
+    outs: i64,
+    subsidy: i64,
+    swtotal_size: i64,
+    swtotal_weight: i64,
+    swtxs: i64,
+    time: i64,
+    total_out: i64,
+    total_size: i64,
+    total_weight: i64,
+    totalfee: i64,
+    txs: i64,
+    utxo_increase: i64,
+    utxo_size_inc: i64,
+    utxo_increase_actual: i64,
+    utxo_size_inc_actual: i64,
+};
+
+const BlockStatsError = error{
+    /// A non-coinbase tx has no matching undo entry — fees can't be computed.
+    UndoUnavailable,
+    /// A computed tx fee fell outside MoneyRange (Core CHECK_NONFATAL).
+    MoneyRange,
+};
+
+/// Serialized size of a CTxOut: GetSerializeSize(out) =
+///   8 (nValue) + CompactSize(scriptlen) + scriptlen.
+/// Matches Core's CTxOut serialization for the utxo_size_inc delta.
+fn txOutSerializeSize(script_len: usize) u64 {
+    const cs: u64 = if (script_len < 0xFD) 1 else if (script_len <= 0xFFFF) 3 else if (script_len <= 0xFFFFFFFF) 5 else 9;
+    return 8 + cs + @as(u64, script_len);
+}
+
+/// CScript::IsUnspendable: script begins with OP_RETURN (0x6a) or exceeds
+/// MAX_SCRIPT_SIZE (10000).  Such outputs never enter the UTXO set, so they are
+/// excluded from utxo_increase_actual / utxo_size_inc_actual.
+/// Reference: bitcoin-core/src/script/script.h:563.
+fn isUnspendableScript(script_bytes: []const u8) bool {
+    return (script_bytes.len > 0 and script_bytes[0] == 0x6a) or (script_bytes.len > 10000);
+}
+
+/// Compute the non-witness ("base") serialized byte length of a transaction
+/// (Core GetSerializeSize(TX_NO_WITNESS(tx))).
+fn txBaseSize(tx: *const types.Transaction) u64 {
+    var sz: u64 = 4; // version
+    sz += compactSizeBytes(tx.inputs.len);
+    for (tx.inputs) |inp| {
+        sz += 32 + 4; // prevout
+        sz += compactSizeBytes(inp.script_sig.len) + inp.script_sig.len;
+        sz += 4; // sequence
+    }
+    sz += compactSizeBytes(tx.outputs.len);
+    for (tx.outputs) |out| {
+        sz += 8;
+        sz += compactSizeBytes(out.script_pubkey.len) + out.script_pubkey.len;
+    }
+    sz += 4; // locktime
+    return sz;
+}
+
+/// Compute the total ("with witness") serialized byte length of a transaction
+/// (Core ComputeTotalSize() = GetSerializeSize(TX_WITH_WITNESS(tx))).  When the
+/// tx carries no witness this equals the base size (no marker/flag emitted).
+fn txTotalSize(tx: *const types.Transaction) u64 {
+    if (!tx.hasWitness()) return txBaseSize(tx);
+    var sz: u64 = txBaseSize(tx);
+    sz += 2; // segwit marker + flag
+    for (tx.inputs) |inp| {
+        sz += compactSizeBytes(inp.witness.len);
+        for (inp.witness) |item| {
+            sz += compactSizeBytes(item.len) + item.len;
+        }
+    }
+    return sz;
+}
+
+/// Transaction weight (BIP-141 / Core GetTransactionWeight):
+///   weight = base_size * (WITNESS_SCALE_FACTOR - 1) + total_size.
+fn txWeight(tx: *const types.Transaction) u64 {
+    return txBaseSize(tx) * (@as(u64, consensus.WITNESS_SCALE_FACTOR) - 1) + txTotalSize(tx);
+}
+
+/// Byte length of a CompactSize encoding for `value`.
+fn compactSizeBytes(value: usize) u64 {
+    if (value < 0xFD) return 1;
+    if (value <= 0xFFFF) return 3;
+    if (value <= 0xFFFFFFFF) return 5;
+    return 9;
+}
+
+/// Truncated median of a slice (Core CalculateTruncatedMedian): sort, then for
+/// even size return floor((a+b)/2) of the two middle elements, else the middle.
+/// Empty → 0.  Sorts in place.
+fn calculateTruncatedMedian(scores: []i64) i64 {
+    const n = scores.len;
+    if (n == 0) return 0;
+    std.mem.sort(i64, scores, {}, std.sort.asc(i64));
+    if (n % 2 == 0) {
+        // Match Core's integer (a+b)/2 truncation toward zero.
+        return @divTrunc(scores[n / 2 - 1] + scores[n / 2], 2);
+    }
+    return scores[n / 2];
+}
+
+/// (feerate, weight) pair for weight-ranked percentile selection.
+const FeerateScore = struct { rate: i64, weight: i64 };
+
+/// Compute [10th,25th,50th,75th,90th] feerate percentiles selected by
+/// cumulative WEIGHT (not count).  Faithful port of Core
+/// CalculatePercentilesByWeight: sort by feerate ascending; cross each
+/// percentile boundary at total_weight*p by accumulating weights; fill any
+/// remaining percentiles with the largest feerate.  Empty scores → all zeros.
+fn calculatePercentilesByWeight(scores: []FeerateScore, total_weight: i64) [NUM_GETBLOCKSTATS_PERCENTILES]i64 {
+    var result = [_]i64{0} ** NUM_GETBLOCKSTATS_PERCENTILES;
+    if (scores.len == 0) return result;
+
+    std.mem.sort(FeerateScore, scores, {}, struct {
+        fn lt(_: void, a: FeerateScore, b: FeerateScore) bool {
+            if (a.rate != b.rate) return a.rate < b.rate;
+            return a.weight < b.weight;
+        }
+    }.lt);
+
+    const tw: f64 = @floatFromInt(total_weight);
+    const weights = [NUM_GETBLOCKSTATS_PERCENTILES]f64{
+        tw / 10.0, tw / 4.0, tw / 2.0, (tw * 3.0) / 4.0, (tw * 9.0) / 10.0,
+    };
+
+    var next: usize = 0;
+    var cumulative: i64 = 0;
+    for (scores) |el| {
+        cumulative += el.weight;
+        const cum_f: f64 = @floatFromInt(cumulative);
+        while (next < NUM_GETBLOCKSTATS_PERCENTILES and cum_f >= weights[next]) : (next += 1) {
+            result[next] = el.rate;
+        }
+    }
+    var i: usize = next;
+    while (i < NUM_GETBLOCKSTATS_PERCENTILES) : (i += 1) {
+        result[i] = scores[scores.len - 1].rate;
+    }
+    return result;
+}
+
+/// Core's per-block statistics loop, factored out as a pure function so it is
+/// directly unit-testable.  `undo` provides spent-prevout values for fee math;
+/// pass null only when the block has no non-coinbase txs (genesis / coinbase-only
+/// block) — otherwise a non-coinbase tx without an undo entry yields
+/// error.UndoUnavailable (Core's GetUndoChecked throws).
+///
+/// `undo.tx_undo[i]` corresponds to `block.transactions[i+1]` (non-coinbase txs
+/// in order).  Faithful port of bitcoin-core/src/rpc/blockchain.cpp:2052-2198.
+fn computeBlockStats(
+    block: *const types.Block,
+    undo: ?*const storage.BlockUndoData,
+    height: u32,
+    params: *const consensus.NetworkParams,
+) (BlockStatsError || std.mem.Allocator.Error)!BlockStats {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var maxfee: i64 = 0;
+    var maxfeerate: i64 = 0;
+    var minfee: i64 = consensus.MAX_MONEY;
+    var minfeerate: i64 = consensus.MAX_MONEY;
+    var total_out: i64 = 0;
+    var totalfee: i64 = 0;
+    var inputs: i64 = 0;
+    var maxtxsize: i64 = 0;
+    // Sentinel: rendered as 0 if no non-coinbase tx updates it (Core idiom).
+    const MAX_BLOCK_SER_SIZE_I64: i64 = consensus.MAX_BLOCK_SERIALIZED_SIZE;
+    var mintxsize: i64 = MAX_BLOCK_SER_SIZE_I64;
+    var outputs: i64 = 0;
+    var swtotal_size: i64 = 0;
+    var swtotal_weight: i64 = 0;
+    var swtxs: i64 = 0;
+    var total_size: i64 = 0;
+    var total_weight: i64 = 0;
+    var utxos: i64 = 0;
+    var utxo_size_inc: i64 = 0;
+    var utxo_size_inc_actual: i64 = 0;
+
+    var fee_array = std.ArrayList(i64).init(a);
+    var feerate_array = std.ArrayList(FeerateScore).init(a);
+    var txsize_array = std.ArrayList(i64).init(a);
+
+    const is_genesis = height == 0;
+    // tx_undo[] holds one entry per NON-coinbase tx, in block order. We index it
+    // independently of the block-tx index since the coinbase has no undo entry.
+    var undo_idx: usize = 0;
+
+    for (block.transactions) |*tx| {
+        const is_coinbase = tx.isCoinbase();
+        outputs += @intCast(tx.outputs.len);
+
+        var tx_total_out: i64 = 0;
+        for (tx.outputs) |out| {
+            tx_total_out += out.value;
+
+            const out_size = txOutSerializeSize(out.script_pubkey.len) + PER_UTXO_OVERHEAD;
+            utxo_size_inc += @intCast(out_size);
+
+            // Genesis (and BIP30-repeat coinbases, n/a on these networks) don't
+            // change the UTXO-set counts → excluded from the actual counters.
+            if (is_genesis) continue;
+            // Unspendable outputs never enter the UTXO set.
+            if (isUnspendableScript(out.script_pubkey)) continue;
+
+            utxos += 1;
+            utxo_size_inc_actual += @intCast(out_size);
+        }
+
+        if (is_coinbase) continue;
+
+        inputs += @intCast(tx.inputs.len); // coinbase's fake input not counted
+        total_out += tx_total_out; // coinbase reward not counted
+
+        const tx_size: i64 = @intCast(txTotalSize(tx));
+        try txsize_array.append(tx_size);
+        maxtxsize = @max(maxtxsize, tx_size);
+        mintxsize = @min(mintxsize, tx_size);
+        total_size += tx_size;
+
+        const weight: i64 = @intCast(txWeight(tx));
+        total_weight += weight;
+
+        if (tx.hasWitness()) {
+            swtxs += 1;
+            swtotal_size += tx_size;
+            swtotal_weight += weight;
+        }
+
+        // Fee math from undo data: one TxUndo per non-coinbase tx, in order.
+        const u = undo orelse return error.UndoUnavailable;
+        if (undo_idx >= u.tx_undo.len) return error.UndoUnavailable;
+        const txundo = u.tx_undo[undo_idx];
+        undo_idx += 1;
+
+        var tx_total_in: i64 = 0;
+        for (txundo.prev_outputs) |prevout| {
+            tx_total_in += prevout.value;
+            const prevout_size = txOutSerializeSize(prevout.script_pubkey.len) + PER_UTXO_OVERHEAD;
+            utxo_size_inc -= @intCast(prevout_size);
+            utxo_size_inc_actual -= @intCast(prevout_size);
+        }
+
+        const txfee: i64 = tx_total_in - tx_total_out;
+        if (txfee < 0 or txfee > consensus.MAX_MONEY) return error.MoneyRange;
+        try fee_array.append(txfee);
+        maxfee = @max(maxfee, txfee);
+        minfee = @min(minfee, txfee);
+        totalfee += txfee;
+
+        // Feerate is sat/vB: fee * WITNESS_SCALE_FACTOR / weight.
+        const feerate: i64 = if (weight != 0)
+            @divTrunc(txfee * @as(i64, consensus.WITNESS_SCALE_FACTOR), weight)
+        else
+            0;
+        try feerate_array.append(.{ .rate = feerate, .weight = weight });
+        maxfeerate = @max(maxfeerate, feerate);
+        minfeerate = @min(minfeerate, feerate);
+    }
+
+    const feerate_percentiles = calculatePercentilesByWeight(feerate_array.items, total_weight);
+
+    const ntx: i64 = @intCast(block.transactions.len);
+    const n_noncoinbase: i64 = if (ntx > 1) ntx - 1 else 0;
+
+    const avgfee: i64 = if (n_noncoinbase > 0) @divTrunc(totalfee, n_noncoinbase) else 0;
+    const avgtxsize: i64 = if (n_noncoinbase > 0) @divTrunc(total_size, n_noncoinbase) else 0;
+    const avgfeerate: i64 = if (total_weight != 0)
+        @divTrunc(totalfee * @as(i64, consensus.WITNESS_SCALE_FACTOR), total_weight)
+    else
+        0;
+
+    return BlockStats{
+        .avgfee = avgfee,
+        .avgfeerate = avgfeerate,
+        .avgtxsize = avgtxsize,
+        .feerate_percentiles = feerate_percentiles,
+        .ins = inputs,
+        .maxfee = maxfee,
+        .maxfeerate = maxfeerate,
+        .maxtxsize = maxtxsize,
+        .medianfee = calculateTruncatedMedian(fee_array.items),
+        .mediantxsize = calculateTruncatedMedian(txsize_array.items),
+        .minfee = if (minfee == consensus.MAX_MONEY) 0 else minfee,
+        .minfeerate = if (minfeerate == consensus.MAX_MONEY) 0 else minfeerate,
+        .mintxsize = if (mintxsize == MAX_BLOCK_SER_SIZE_I64) 0 else mintxsize,
+        .outs = outputs,
+        .subsidy = consensus.getBlockSubsidy(height, params),
+        .swtotal_size = swtotal_size,
+        .swtotal_weight = swtotal_weight,
+        .swtxs = swtxs,
+        .time = @intCast(block.header.timestamp),
+        .total_out = total_out,
+        .total_size = total_size,
+        .total_weight = total_weight,
+        .totalfee = totalfee,
+        .txs = ntx,
+        .utxo_increase = outputs - inputs,
+        .utxo_size_inc = utxo_size_inc,
+        .utxo_increase_actual = utxos - inputs,
+        .utxo_size_inc_actual = utxo_size_inc_actual,
+    };
+}
+
+/// The 31 getblockstats statistic names in Core's exact ret_all pushKV order
+/// (mostly alphabetical; the trailing utxo_* block follows Core's pushKV order:
+/// utxo_increase, utxo_size_inc, utxo_increase_actual, utxo_size_inc_actual).
+fn blockStatAllNames() []const []const u8 {
+    return &[_][]const u8{
+        "avgfee",      "avgfeerate",      "avgtxsize",        "blockhash",
+        "feerate_percentiles", "height",  "ins",              "maxfee",
+        "maxfeerate",  "maxtxsize",       "medianfee",        "mediantime",
+        "mediantxsize", "minfee",         "minfeerate",       "mintxsize",
+        "outs",        "subsidy",         "swtotal_size",     "swtotal_weight",
+        "swtxs",       "time",            "total_out",        "total_size",
+        "total_weight", "totalfee",       "txs",              "utxo_increase",
+        "utxo_size_inc", "utxo_increase_actual", "utxo_size_inc_actual",
+    };
+}
+
+/// True if `name` is one of the 31 valid getblockstats statistic names.
+fn blockStatNameIsValid(name: []const u8) bool {
+    for (blockStatAllNames()) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// Write the JSON value (no key) for statistic `name` from `stats`.  blockhash,
+/// height and mediantime are supplied separately (they come from the block index
+/// rather than the per-tx loop).
+fn writeBlockStatValue(
+    writer: anytype,
+    name: []const u8,
+    stats: *const BlockStats,
+    blockhash: *const types.Hash256,
+    height: u32,
+    mediantime: i64,
+) !void {
+    if (std.mem.eql(u8, name, "blockhash")) {
+        try writer.writeByte('"');
+        try writeHashHex(writer, blockhash);
+        try writer.writeByte('"');
+        return;
+    }
+    if (std.mem.eql(u8, name, "height")) {
+        try writer.print("{d}", .{height});
+        return;
+    }
+    if (std.mem.eql(u8, name, "mediantime")) {
+        try writer.print("{d}", .{mediantime});
+        return;
+    }
+    if (std.mem.eql(u8, name, "feerate_percentiles")) {
+        try writer.writeByte('[');
+        for (stats.feerate_percentiles, 0..) |p, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{d}", .{p});
+        }
+        try writer.writeByte(']');
+        return;
+    }
+    const v: i64 =
+        if (std.mem.eql(u8, name, "avgfee")) stats.avgfee
+        else if (std.mem.eql(u8, name, "avgfeerate")) stats.avgfeerate
+        else if (std.mem.eql(u8, name, "avgtxsize")) stats.avgtxsize
+        else if (std.mem.eql(u8, name, "ins")) stats.ins
+        else if (std.mem.eql(u8, name, "maxfee")) stats.maxfee
+        else if (std.mem.eql(u8, name, "maxfeerate")) stats.maxfeerate
+        else if (std.mem.eql(u8, name, "maxtxsize")) stats.maxtxsize
+        else if (std.mem.eql(u8, name, "medianfee")) stats.medianfee
+        else if (std.mem.eql(u8, name, "mediantxsize")) stats.mediantxsize
+        else if (std.mem.eql(u8, name, "minfee")) stats.minfee
+        else if (std.mem.eql(u8, name, "minfeerate")) stats.minfeerate
+        else if (std.mem.eql(u8, name, "mintxsize")) stats.mintxsize
+        else if (std.mem.eql(u8, name, "outs")) stats.outs
+        else if (std.mem.eql(u8, name, "subsidy")) stats.subsidy
+        else if (std.mem.eql(u8, name, "swtotal_size")) stats.swtotal_size
+        else if (std.mem.eql(u8, name, "swtotal_weight")) stats.swtotal_weight
+        else if (std.mem.eql(u8, name, "swtxs")) stats.swtxs
+        else if (std.mem.eql(u8, name, "time")) stats.time
+        else if (std.mem.eql(u8, name, "total_out")) stats.total_out
+        else if (std.mem.eql(u8, name, "total_size")) stats.total_size
+        else if (std.mem.eql(u8, name, "total_weight")) stats.total_weight
+        else if (std.mem.eql(u8, name, "totalfee")) stats.totalfee
+        else if (std.mem.eql(u8, name, "txs")) stats.txs
+        else if (std.mem.eql(u8, name, "utxo_increase")) stats.utxo_increase
+        else if (std.mem.eql(u8, name, "utxo_size_inc")) stats.utxo_size_inc
+        else if (std.mem.eql(u8, name, "utxo_increase_actual")) stats.utxo_increase_actual
+        else if (std.mem.eql(u8, name, "utxo_size_inc_actual")) stats.utxo_size_inc_actual
+        else 0;
+    try writer.print("{d}", .{v});
 }
 
 /// Write a hash as hex in reverse byte order (big-endian display).
@@ -20875,4 +21551,190 @@ test "W41: decodepsbt emits txid in canonical big-endian display order" {
     // 6. version + locktime emitted (existing behavior, just a guard).
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"version\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"locktime\":0") != null);
+}
+
+// ============================================================================
+// getblockstats unit tests — fee math + percentiles, against a constructed block
+// ============================================================================
+
+test "getblockstats: calculateTruncatedMedian matches Core truncation" {
+    var odd = [_]i64{ 5, 1, 3 };
+    try std.testing.expectEqual(@as(i64, 3), calculateTruncatedMedian(&odd));
+
+    var even = [_]i64{ 10, 2, 4, 6 }; // sorted: 2,4,6,10 → (4+6)/2 = 5
+    try std.testing.expectEqual(@as(i64, 5), calculateTruncatedMedian(&even));
+
+    var empty = [_]i64{};
+    try std.testing.expectEqual(@as(i64, 0), calculateTruncatedMedian(&empty));
+
+    // Core's (a+b)/2 truncates toward zero on odd sums.
+    var odd_sum = [_]i64{ 1, 2 }; // (1+2)/2 = 1 (truncated)
+    try std.testing.expectEqual(@as(i64, 1), calculateTruncatedMedian(&odd_sum));
+}
+
+test "getblockstats: calculatePercentilesByWeight is weight-ranked (Core algorithm)" {
+    // Two feerates: rate 1 with weight 90 (heavy/cheap), rate 100 with weight 10
+    // (light/expensive).  total_weight = 100.  Boundaries (weights): 10, 25, 50,
+    // 75, 90.  Sorted by rate ascending: [{1,90},{100,10}].
+    //   After {1,90}: cumulative=90 ≥ 10,25,50,75,90 → percentiles 0..3 (10/25/50/75)
+    //                 AND 90th (boundary exactly 90) all become rate 1.
+    //   After {100,10}: cumulative=100, no boundaries left.
+    // Hence all five percentiles = 1 (the heavy-but-cheap tx dominates by weight).
+    var scores = [_]FeerateScore{ .{ .rate = 100, .weight = 10 }, .{ .rate = 1, .weight = 90 } };
+    const p = calculatePercentilesByWeight(&scores, 100);
+    try std.testing.expectEqual([_]i64{ 1, 1, 1, 1, 1 }, p);
+
+    // Empty → all zeros.
+    var none = [_]FeerateScore{};
+    const pz = calculatePercentilesByWeight(&none, 0);
+    try std.testing.expectEqual([_]i64{ 0, 0, 0, 0, 0 }, pz);
+}
+
+test "getblockstats: computeBlockStats fee + size math on a constructed block" {
+    // Build a block: coinbase + two non-coinbase txs, no witness.
+    //   coinbase: 1 fake input → 1 output (50 BTC). Excluded from fee stats.
+    //   txA: 1 input, 1 output value 9000; spent prevout value 10000 → fee 1000.
+    //   txB: 1 input, 1 output value 5000; spent prevout value 5500  → fee  500.
+    const empty_witness: []const []const u8 = &[_][]const u8{};
+
+    const cb_in = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x02, 0x03 },
+        .sequence = 0xFFFFFFFF,
+        .witness = empty_witness,
+    };
+    const cb_out = types.TxOut{ .value = 5_000_000_000, .script_pubkey = &[_]u8{ 0x51 } }; // OP_TRUE
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{cb_in},
+        .outputs = &[_]types.TxOut{cb_out},
+        .lock_time = 0,
+    };
+
+    const a_in = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+        .script_sig = &[_]u8{ 0x47, 0xAA, 0xBB }, // arbitrary scriptSig bytes
+        .sequence = 0xFFFFFFFF,
+        .witness = empty_witness,
+    };
+    const a_spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ ([_]u8{0xCC} ** 20) ++ [_]u8{ 0x88, 0xac }; // P2PKH (25 bytes)
+    const a_out = types.TxOut{ .value = 9000, .script_pubkey = &a_spk };
+    const txA = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{a_in},
+        .outputs = &[_]types.TxOut{a_out},
+        .lock_time = 0,
+    };
+
+    const b_in = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x22} ** 32, .index = 1 },
+        .script_sig = &[_]u8{ 0x48, 0xDD },
+        .sequence = 0xFFFFFFFF,
+        .witness = empty_witness,
+    };
+    const b_spk = [_]u8{ 0x00, 0x14 } ++ ([_]u8{0xEE} ** 20); // P2WPKH spk (22 bytes)
+    const b_out = types.TxOut{ .value = 5000, .script_pubkey = &b_spk };
+    const txB = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{b_in},
+        .outputs = &[_]types.TxOut{b_out},
+        .lock_time = 0,
+    };
+
+    const block = types.Block{
+        .header = .{
+            .version = 0x20000000,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 1_700_000_000,
+            .bits = 0x1d00ffff,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{ coinbase, txA, txB },
+    };
+
+    // Undo data: one TxUndo per non-coinbase tx, in order (txA, txB).  The
+    // BlockUndoData / TxUndo slice fields are mutable ([]T), so the backing
+    // arrays must be `var` to form non-const slices via `&`.
+    var a_prevs = [_]storage.TxUndo.TxOut{
+        .{ .value = 10000, .script_pubkey = &[_]u8{ 0x76, 0xa9 }, .height = 100, .is_coinbase = false },
+    };
+    var b_prevs = [_]storage.TxUndo.TxOut{
+        .{ .value = 5500, .script_pubkey = &[_]u8{ 0x00, 0x14 }, .height = 101, .is_coinbase = false },
+    };
+    var undo_txs = [_]storage.TxUndo{
+        .{ .prev_outputs = &a_prevs },
+        .{ .prev_outputs = &b_prevs },
+    };
+    const undo = storage.BlockUndoData{ .tx_undo = &undo_txs };
+
+    const stats = try computeBlockStats(&block, &undo, 500, &consensus.MAINNET);
+
+    // ── Fee math (the load-bearing assertions). ──────────────────────────────
+    try std.testing.expectEqual(@as(i64, 1500), stats.totalfee); // 1000 + 500
+    try std.testing.expectEqual(@as(i64, 750), stats.avgfee); // 1500 / 2
+    try std.testing.expectEqual(@as(i64, 1000), stats.maxfee);
+    try std.testing.expectEqual(@as(i64, 500), stats.minfee);
+    // medianfee of {1000,500}: sorted 500,1000 → (500+1000)/2 = 750.
+    try std.testing.expectEqual(@as(i64, 750), stats.medianfee);
+
+    // ── Counts. ──────────────────────────────────────────────────────────────
+    try std.testing.expectEqual(@as(i64, 3), stats.txs); // includes coinbase
+    try std.testing.expectEqual(@as(i64, 2), stats.ins); // coinbase fake input excluded
+    try std.testing.expectEqual(@as(i64, 3), stats.outs); // all outputs incl. coinbase
+    try std.testing.expectEqual(@as(i64, 14000), stats.total_out); // 9000 + 5000 (coinbase reward excluded)
+    try std.testing.expectEqual(@as(i64, 0), stats.swtxs); // no witness in fixture
+
+    // ── Size / weight cross-check against the serializer helpers. ────────────
+    const a_size: i64 = @intCast(txTotalSize(&txA));
+    const b_size: i64 = @intCast(txTotalSize(&txB));
+    try std.testing.expectEqual(a_size + b_size, stats.total_size);
+    try std.testing.expectEqual(@max(a_size, b_size), stats.maxtxsize);
+    try std.testing.expectEqual(@min(a_size, b_size), stats.mintxsize);
+    const a_wt: i64 = @intCast(txWeight(&txA));
+    const b_wt: i64 = @intCast(txWeight(&txB));
+    try std.testing.expectEqual(a_wt + b_wt, stats.total_weight);
+
+    // ── Feerates: fee*4/weight, truncated. ───────────────────────────────────
+    const a_feerate = @divTrunc(@as(i64, 1000) * 4, a_wt);
+    const b_feerate = @divTrunc(@as(i64, 500) * 4, b_wt);
+    try std.testing.expectEqual(@max(a_feerate, b_feerate), stats.maxfeerate);
+    try std.testing.expectEqual(@min(a_feerate, b_feerate), stats.minfeerate);
+    // avgfeerate = totalfee*4/total_weight.
+    try std.testing.expectEqual(@divTrunc(@as(i64, 1500) * 4, a_wt + b_wt), stats.avgfeerate);
+
+    // ── UTXO deltas. ─────────────────────────────────────────────────────────
+    // utxo_increase = outs - ins = 3 - 2 = 1.
+    try std.testing.expectEqual(@as(i64, 1), stats.utxo_increase);
+    // Spendable outputs created (none unspendable here) minus inputs:
+    //   coinbase OP_TRUE + txA P2PKH + txB P2WPKH = 3 spendable, ins = 2 → 1.
+    try std.testing.expectEqual(@as(i64, 1), stats.utxo_increase_actual);
+
+    // subsidy at height 500 (no halving on mainnet) = 50 BTC.
+    try std.testing.expectEqual(@as(i64, 5_000_000_000), stats.subsidy);
+
+    // header time passthrough.
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), stats.time);
+}
+
+test "getblockstats: non-coinbase tx without undo entry is a hard error (no fabricated fees)" {
+    const empty_witness: []const []const u8 = &[_][]const u8{};
+    const cb = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{ .previous_output = types.OutPoint.COINBASE, .script_sig = &[_]u8{0x01}, .sequence = 0xFFFFFFFF, .witness = empty_witness }},
+        .outputs = &[_]types.TxOut{.{ .value = 5_000_000_000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    const spend = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{ .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFF, .witness = empty_witness }},
+        .outputs = &[_]types.TxOut{.{ .value = 9000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    const block = types.Block{
+        .header = .{ .version = 1, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32, .timestamp = 1, .bits = 0x1d00ffff, .nonce = 0 },
+        .transactions = &[_]types.Transaction{ cb, spend },
+    };
+    // Undo is null but the block has a non-coinbase tx → must fail loudly.
+    try std.testing.expectError(error.UndoUnavailable, computeBlockStats(&block, null, 1, &consensus.MAINNET));
 }
