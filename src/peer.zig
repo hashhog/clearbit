@@ -5078,12 +5078,43 @@ pub const PeerManager = struct {
                 // full block download, we shouldn't receive these. Ignore.
             },
             .tx => |tx_msg| {
-                // addTransaction copies the tx struct, so we always free the received message.
-                defer serialize.freeTransaction(self.allocator, &tx_msg);
+                // OWNERSHIP CONTRACT (use-after-free fix):
+                //   `Mempool.addTransaction` stores the tx struct BY VALUE
+                //   (`.tx = tx`) and RETAINS its input/output/witness/script
+                //   slices — it does NOT deep-copy them (see mempool.zig:1360
+                //   and the contract documented at mempool.zig:1791-1801,
+                //   mempool_persist.zig:525-537, rpc.zig:6069-6072 / 12113-12115).
+                //   On a SUCCESSFUL accept, ownership of those allocations
+                //   transfers to the mempool; the caller must NOT free them or
+                //   the mempool's `MempoolEntry.tx` (and every script slice it
+                //   exposes via `getOutputFromMempool`) is left dangling.
+                //
+                //   The previous `defer serialize.freeTransaction(&tx_msg)`
+                //   freed the buffer UNCONDITIONALLY — including on success —
+                //   which left every admitted P2P tx's output scriptPubKeys
+                //   pointing at freed (then reused) heap. A later tx spending
+                //   such an output resolved its prevout via
+                //   `getOutputFromMempool` → returned a dangling `script_pubkey`
+                //   slice → `verifyInputScripts`/`checkWitnessStandard` read
+                //   `script[0]` of a wild pointer → SIGSEGV (live mainnet,
+                //   core.3313851: spent_scripts[0]={ptr=garbage,len=22}).
+                //
+                //   Fix: free `tx_msg` only when the mempool did NOT take
+                //   ownership. The not-accepted branch is always safe to free —
+                //   the orphan path (`addOrphan`) makes its own serialize
+                //   round-trip deep copy, so it never borrows `tx_msg`.
+                //   This matches Bitcoin Core: CTxMemPool keeps an independent
+                //   CTransactionRef for every admitted tx; net_processing's
+                //   reference is dropped after the message is handled, but the
+                //   underlying transaction data lives as long as the mempool
+                //   entry does.
+                var tx_taken_by_mempool = false;
+                defer if (!tx_taken_by_mempool) serialize.freeTransaction(self.allocator, &tx_msg);
                 if (self.mempool) |pool| {
                     // Accept transaction into mempool via AcceptToMemoryPool
                     const result = pool.acceptToMemoryPool(tx_msg, false);
                     if (result.accepted) {
+                        tx_taken_by_mempool = true;
                         // After admitting a parent, see if any orphan
                         // transactions are now resolvable.  Successfully
                         // promoted orphans drain into the mempool
