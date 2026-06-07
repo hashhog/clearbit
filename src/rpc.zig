@@ -22004,3 +22004,239 @@ test "getblockstats: non-coinbase tx without undo entry is a hard error (no fabr
     // Undo is null but the block has a non-coinbase tx → must fail loudly.
     try std.testing.expectError(error.UndoUnavailable, computeBlockStats(&block, null, 1, &consensus.MAINNET));
 }
+
+// ===========================================================================
+// getnodeaddresses — Core-parity regression (rpc/net.cpp:911-970)
+// ---------------------------------------------------------------------------
+// Locks the SERIALIZED contract, not just the value set:
+//   * exactly 5 keys, in Core's pushKV order time,services,address,port,network;
+//   * services emitted as a RAW INTEGER (NOT a hex string — distinct from
+//     getpeerinfo's "services":"000...09");
+//   * address as a bare IP literal (no :port);
+//   * count semantics: default 1, 0 = ALL, <0 -> RPC -8 "Address count out of
+//     range";
+//   * network filter: lowercased, only ipv4|ipv6|onion|i2p|cjdns accepted, an
+//     unknown name -> RPC -8 "Network not recognized: <raw arg>"; a matching
+//     filter that no stored addr satisfies -> [] (not an error);
+//   * empty addrman -> [].
+// These are byte-substring assertions against the dispatch envelope so a future
+// switch to an alphabetising JSON encoder (which would reorder the keys to
+// address,network,port,services,time) trips this test immediately.
+// ===========================================================================
+
+/// Inject a deterministic IPv4 AddressInfo straight into the addrman map so the
+/// emitted time/services/port are exact known constants (addAddress would stamp
+/// last_seen with the wall clock and force services). Returns nothing; asserts
+/// the put succeeded via the caller's subsequent dispatch.
+fn gnaTestInjectIpv4(
+    pm: *peer_mod.PeerManager,
+    a: u8,
+    b: u8,
+    c: u8,
+    d: u8,
+    port: u16,
+    services: u64,
+    time: i64,
+) !void {
+    const addr = std.net.Address.initIp4(.{ a, b, c, d }, port);
+    const key = peer_mod.PeerManager.addressKey(addr);
+    try pm.known_addresses.put(key, .{
+        .address = addr,
+        .services = services,
+        .last_seen = time,
+        .last_tried = 0,
+        .attempts = 0,
+        .success = false,
+        .source = .manual,
+    });
+}
+
+test "getnodeaddresses: serialized key order + integer services + bare-IP address" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    // 1.2.3.4:8333, services=1033 (NODE_NETWORK|NODE_WITNESS|NODE_NETWORK_LIMITED),
+    // time=1700000000. 1.2.3.4 is publicly routable so addrman accepts it.
+    try gnaTestInjectIpv4(&peer_manager, 1, 2, 3, 4, 8333, 1033, 1_700_000_000);
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const result = try server.dispatch("{\"id\":1,\"method\":\"getnodeaddresses\",\"params\":[0]}");
+    defer allocator.free(result);
+
+    // Exact serialized object: byte-for-byte key order is the contract.
+    const expected_obj = "{\"time\":1700000000,\"services\":1033,\"address\":\"1.2.3.4\",\"port\":8333,\"network\":\"ipv4\"}";
+    try std.testing.expect(std.mem.indexOf(u8, result, expected_obj) != null);
+
+    // The whole result must be the array wrapped in the standard envelope.
+    const expected_full = "{\"result\":[" ++ expected_obj ++ "],\"error\":null,\"id\":1}";
+    try std.testing.expectEqualStrings(expected_full, result);
+
+    // services is an INTEGER, never a hex string (the getpeerinfo trap).
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"services\":\"") == null);
+    // address carries NO port (port lives in its own field).
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"address\":\"1.2.3.4:8333\"") == null);
+}
+
+test "getnodeaddresses: default count=1 caps the result" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    try gnaTestInjectIpv4(&peer_manager, 1, 2, 3, 4, 8333, 9, 1_700_000_000);
+    try gnaTestInjectIpv4(&peer_manager, 5, 6, 7, 8, 8333, 9, 1_700_000_001);
+    try gnaTestInjectIpv4(&peer_manager, 9, 10, 11, 12, 8333, 9, 1_700_000_002);
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    // No params -> count default 1 -> exactly one object emitted.
+    const result = try server.dispatch("{\"id\":1,\"method\":\"getnodeaddresses\",\"params\":[]}");
+    defer allocator.free(result);
+
+    // Exactly one '{' inside the array (count the per-object brace).
+    var objs: usize = 0;
+    for (result) |ch| {
+        if (ch == '{') objs += 1;
+    }
+    // One brace for the envelope + one per address object => 2 total for count=1.
+    try std.testing.expectEqual(@as(usize, 2), objs);
+}
+
+test "getnodeaddresses: count<0 -> RPC -8 'Address count out of range'" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const result = try server.dispatch("{\"id\":1,\"method\":\"getnodeaddresses\",\"params\":[-1]}");
+    defer allocator.free(result);
+
+    const expected = "{\"result\":null,\"error\":{\"code\":-8,\"message\":\"Address count out of range\"},\"id\":1}";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "getnodeaddresses: unknown network -> RPC -8 'Network not recognized: <raw>'" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    // raw arg interpolated verbatim (Core strprintf), even though the parse path
+    // lowercases for the accept check.
+    const result = try server.dispatch("{\"id\":1,\"method\":\"getnodeaddresses\",\"params\":[1,\"Bogus\"]}");
+    defer allocator.free(result);
+
+    const expected = "{\"result\":null,\"error\":{\"code\":-8,\"message\":\"Network not recognized: Bogus\"},\"id\":1}";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "getnodeaddresses: matching filter that selects nothing -> [] (not an error)" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    // One IPv4 stored, but caller filters for onion -> empty array, no error.
+    try gnaTestInjectIpv4(&peer_manager, 1, 2, 3, 4, 8333, 9, 1_700_000_000);
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const result = try server.dispatch("{\"id\":1,\"method\":\"getnodeaddresses\",\"params\":[0,\"onion\"]}");
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("{\"result\":[],\"error\":null,\"id\":1}", result);
+}
+
+test "getnodeaddresses: empty addrman -> []" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const result = try server.dispatch("{\"id\":1,\"method\":\"getnodeaddresses\",\"params\":[0]}");
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("{\"result\":[],\"error\":null,\"id\":1}", result);
+}
+
+test "getnodeaddresses: ipv4 filter selects the IPv4 address (case-insensitive name)" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    try gnaTestInjectIpv4(&peer_manager, 8, 8, 8, 8, 8333, 1033, 1_700_000_000);
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    // Mixed-case "IPv4" must be lowercased and accepted (ParseNetwork).
+    const result = try server.dispatch("{\"id\":1,\"method\":\"getnodeaddresses\",\"params\":[0,\"IPv4\"]}");
+    defer allocator.free(result);
+
+    const expected = "{\"result\":[{\"time\":1700000000,\"services\":1033,\"address\":\"8.8.8.8\",\"port\":8333,\"network\":\"ipv4\"}],\"error\":null,\"id\":1}";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "getnodeaddresses: non-string network -> RPC -3 type error" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const result = try server.dispatch("{\"id\":1,\"method\":\"getnodeaddresses\",\"params\":[1,123]}");
+    defer allocator.free(result);
+
+    const expected = "{\"result\":null,\"error\":{\"code\":-3,\"message\":\"JSON value of type number is not of expected type string\"},\"id\":1}";
+    try std.testing.expectEqualStrings(expected, result);
+}
