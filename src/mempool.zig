@@ -4823,6 +4823,145 @@ test "fee rate calculation" {
     try std.testing.expectEqual(@as(f64, 5.0), entry.descendantFeeRate());
 }
 
+// ============================================================================
+// REGRESSION: P2P tx use-after-free (live mainnet crash, core.3313851).
+//
+// The P2P `.tx` handler (peer.zig) used to `defer freeTransaction(&tx_msg)`
+// UNCONDITIONALLY — including after a SUCCESSFUL `acceptToMemoryPool`. But
+// `addTransaction` stores the tx struct BY VALUE (`.tx = tx`) and RETAINS its
+// output/script slices; it does NOT deep-copy. So freeing the wire buffer on
+// accept left every admitted tx's `MempoolEntry.tx.outputs[*].script_pubkey`
+// dangling. A later tx spending such an output resolved its prevout via
+// `getOutputFromMempool` → returned a freed `script_pubkey` slice →
+// `verifyInputScripts`/`checkWitnessStandard` read `script[0]` of a wild
+// pointer → SIGSEGV (gdb: spent_scripts[0]={ptr=0xd6bb..garbage, len=22}).
+//
+// Contract (honored by the RPC + mempool_persist callers, now also by peer.zig):
+//   acceptToMemoryPool takes ownership of the tx's slices ON SUCCESS; the
+//   caller must NOT free them — the mempool keeps them valid for the entry's
+//   lifetime, exactly as Core's CTxMemPool holds an independent
+//   CTransactionRef (validation.cpp:417 `pool.get(prevout.hash)`).
+//
+// This test pins that contract: after a successful accept, a script slice
+// exposed via getOutputFromMempool must still read correctly even after the
+// caller drops its local view of the tx (i.e. the mempool, not the wire
+// buffer, owns the bytes). It mirrors the peer handler's "free only when the
+// mempool did NOT take ownership" decision and asserts no leak / no UAF under
+// the testing allocator.
+test "regression: mempool retains output scripts after accept (P2P UAF core.3313851)" {
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    // The accept path borrows the wire-deserialized slices into MempoolEntry.tx;
+    // mempool.deinit() destroys the entry struct but NOT the inner tx data
+    // (documented contract — slices are "freed at pool.deinit / shutdown").
+    // Free the retained entry tx data here, exactly like the blockDisconnected
+    // round-trip test does, so the testing allocator sees no leak.
+    defer {
+        var it = mempool.entries.iterator();
+        while (it.next()) |kv| {
+            var t = kv.value_ptr.*.tx;
+            serialize.freeTransaction(allocator, &t);
+        }
+        mempool.deinit();
+    }
+
+    // A parent tx with a P2WPKH (OP_0 <20-byte>) output — the exact 22-byte
+    // scriptPubKey shape seen in the crash. ≥65 non-witness bytes so it clears
+    // the MIN_STANDARD_TX_NONWITNESS_SIZE (CVE-2017-12842) gate.
+    const p2wpkh_spk = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAB} ** 20; // 22 bytes
+    const parent_literal = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{
+            .{ .value = 100_000, .script_pubkey = &p2wpkh_spk },
+        },
+        .lock_time = 0,
+    };
+
+    // Reproduce the wire path: serialize then deserialize so the tx we hand to
+    // the mempool owns heap-allocated slices (just like a tx parsed off the
+    // network — the buffer the old peer handler would have freed on accept).
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try serialize.writeTransaction(&w, &parent_literal);
+    var r = serialize.Reader{ .data = w.list.items };
+    const wire_tx = try serialize.readTransaction(&r, allocator);
+    // Snapshot what we EXPECT the mempool to keep readable.
+    const expected_spk = wire_tx.outputs[0].script_pubkey;
+    var freed_wire = false;
+    // Mirror the peer handler's ownership decision precisely.
+    defer if (!freed_wire) {
+        var t = wire_tx;
+        serialize.freeTransaction(allocator, &t);
+    };
+
+    const parent_txid = crypto.computeTxid(&wire_tx, allocator) catch unreachable;
+
+    // chain_state == null → admission skips UTXO/script verify but still stores
+    // the entry (test-only path). This is the "accept" branch.
+    const result = mempool.acceptToMemoryPool(wire_tx, false);
+    try std.testing.expect(result.accepted);
+    // Mempool took ownership: the handler MUST NOT free the wire buffer now.
+    freed_wire = true;
+
+    // Now resolve the parent's output exactly as verifyInputScripts does for a
+    // child whose input-0 prevout is mempool-resolved. The returned
+    // script_pubkey must still be valid (owned by the mempool entry) and match.
+    const prevout = types.OutPoint{ .hash = parent_txid, .index = 0 };
+    const out = mempool.getOutputFromMempool(&prevout) orelse
+        return error.PrevoutNotResolvedFromMempool;
+    try std.testing.expectEqual(@as(usize, 22), out.script_pubkey.len);
+    try std.testing.expectEqualSlices(u8, &p2wpkh_spk, out.script_pubkey);
+    // It must point into the mempool-owned entry tx, NOT the (no-longer-owned)
+    // local snapshot — i.e. the bytes survive because the mempool kept them.
+    try std.testing.expectEqualSlices(u8, expected_spk, out.script_pubkey);
+
+    // Drive the real consumer: isWitnessProgram must read script[0] safely
+    // (this is the exact call site that segfaulted in core.3313851).
+    try std.testing.expect(script.isWitnessProgram(out.script_pubkey) != null);
+
+    // ---- Reject arm: a tx the mempool REJECTS must be freed by the caller
+    //      (no ownership transfer) and leave no leak. A coinbase prevout makes
+    //      addTransaction reject up-front ("coinbase") without storing an entry.
+    const reject_wire = blk: {
+        const cb = types.Transaction{
+            .version = 2,
+            .inputs = &[_]types.TxIn{.{
+                .previous_output = .{ .hash = [_]u8{0} ** 32, .index = 0xFFFF_FFFF },
+                .script_sig = &[_]u8{0x00},
+                .sequence = 0xFFFFFFFF,
+                .witness = &[_][]const u8{},
+            }},
+            .outputs = &[_]types.TxOut{
+                .{ .value = 100_000, .script_pubkey = &p2wpkh_spk },
+            },
+            .lock_time = 0,
+        };
+        var rw = serialize.Writer.init(allocator);
+        defer rw.deinit();
+        try serialize.writeTransaction(&rw, &cb);
+        var rr = serialize.Reader{ .data = rw.list.items };
+        break :blk try serialize.readTransaction(&rr, allocator);
+    };
+    var freed_reject = false;
+    defer if (!freed_reject) {
+        var t = reject_wire;
+        serialize.freeTransaction(allocator, &t);
+    };
+    const reject_result = mempool.acceptToMemoryPool(reject_wire, false);
+    try std.testing.expect(!reject_result.accepted);
+    // Not accepted → no ownership transfer → caller frees (mirrors the handler).
+    var rt = reject_wire;
+    serialize.freeTransaction(allocator, &rt);
+    freed_reject = true;
+}
+
 test "dust detection for different output types" {
     // P2PKH dust threshold: 3 * (148 + 34) = 546 satoshis
     const p2pkh_script = [_]u8{0x76} ++ [_]u8{0xa9} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20 ++ [_]u8{0x88} ++ [_]u8{0xac};
