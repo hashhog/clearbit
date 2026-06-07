@@ -3118,6 +3118,8 @@ pub const RpcServer = struct {
             return self.handleGetBlockStats(params, id);
         } else if (std.mem.eql(u8, method, "getrawmempool")) {
             return self.handleGetRawMempool(params, id);
+        } else if (std.mem.eql(u8, method, "getorphantxs")) {
+            return self.handleGetOrphanTxs(params, id);
         } else if (std.mem.eql(u8, method, "testmempoolaccept")) {
             return self.handleTestMempoolAccept(params, id);
         } else if (std.mem.eql(u8, method, "decoderawtransaction")) {
@@ -10763,6 +10765,71 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// Handle getorphantxs RPC — list transactions in the tx orphanage.
+    /// Reference: Bitcoin Core rpc/mempool.cpp getorphantxs (added in v28),
+    /// node/txorphanage.{h,cpp} (GetOrphanTransactions / OrphanInfo).
+    ///
+    /// EXPERIMENTAL (Core marks it so; interface may change).
+    ///
+    /// Arguments:
+    ///   1. verbosity (numeric, optional, default=0) — Core accepts 0, 1, 2.
+    ///      0 → array of txid strings (may contain duplicates).
+    ///      1 → array of {txid, wtxid, bytes, vsize, weight, from}.
+    ///      2 → verbosity-1 fields plus "hex" (the serialized, hex-encoded tx).
+    ///
+    /// Out-of-range verbosity → RPC_INVALID_PARAMETER (-8) with Core's message
+    /// "Invalid verbosity value N".
+    ///
+    /// Core does NOT accept a bool here (ParseVerbosity allow_bool=false), so a
+    /// JSON boolean is rejected as an invalid parameter type, matching Core.
+    ///
+    /// from-array note: clearbit's orphan pool tracks a single announcing
+    /// peer per orphan (OrphanTx.peer_id, where 0 means "no peer / test"),
+    /// not Core's std::set<NodeId> announcers.  We therefore emit a 1-element
+    /// array [peer_id] when peer_id != 0, and an empty array [] when peer_id
+    /// == 0.  (Core has no expiration field in OrphanToJSON, so we emit none.)
+    fn handleGetOrphanTxs(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        var verbosity: i64 = 0;
+
+        if (params == .array and params.array.items.len > 0) {
+            const v = params.array.items[0];
+            switch (v) {
+                .integer => verbosity = v.integer,
+                // Some JSON clients encode a small integer as a float (e.g. 1.0).
+                // Guard the cast: anything non-finite or outside the valid
+                // 0..2 window resolves to an out-of-range sentinel (3) so it
+                // falls through to the "Invalid verbosity value" error path
+                // below instead of tripping @intFromFloat's range check.
+                .float => verbosity = if (v.float >= 0 and v.float <= 2)
+                    @intFromFloat(v.float)
+                else
+                    3,
+                .null => {}, // explicit null → default
+                // Core's ParseVerbosity is called with allow_bool=false, so a
+                // bool (or any other type) is not a valid verbosity.
+                else => return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value of type bool is not of expected type number", id),
+            }
+        }
+
+        if (verbosity < 0 or verbosity > 2) {
+            var msg = std.ArrayList(u8).init(self.allocator);
+            defer msg.deinit();
+            try msg.writer().print("Invalid verbosity value {d}", .{verbosity});
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg.items, id);
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+
+        try writeOrphanArray(self.allocator, writer, self.mempool, verbosity);
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// Handle testmempoolaccept RPC - test if raw transactions would be accepted.
     /// Reference: Bitcoin Core rpc/mempool.cpp testmempoolaccept
     ///
@@ -14973,6 +15040,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("getblockstats hash_or_height ( stats )\\n\\nCompute per block statistics for a given window. All amounts are in satoshis.\\nIt won't work for some heights with pruning.");
             } else if (std.mem.eql(u8, cmd, "getrawmempool")) {
                 try writer.writeAll("getrawmempool ( verbose mempool_sequence )\\n\\nReturns all transaction ids in memory pool.");
+            } else if (std.mem.eql(u8, cmd, "getorphantxs")) {
+                try writer.writeAll("getorphantxs ( verbosity )\\n\\nShows transactions in the tx orphanage.\\n\\nEXPERIMENTAL warning: this call may be changed in future releases.");
             } else if (std.mem.eql(u8, cmd, "testmempoolaccept")) {
                 try writer.writeAll("testmempoolaccept [\\\"rawtx\\\"] ( maxfeerate )\\n\\nTest if raw transactions would be accepted by mempool.");
             } else if (std.mem.eql(u8, cmd, "decoderawtransaction")) {
@@ -15049,6 +15118,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getmempooldescendants\\n");
             try writer.writeAll("getmempoolentry\\n");
             try writer.writeAll("getmempoolinfo\\n");
+            try writer.writeAll("getorphantxs\\n");
             try writer.writeAll("getrawmempool\\n");
             try writer.writeAll("gettxout\\n");
             try writer.writeAll("savemempool\\n");
@@ -16696,6 +16766,77 @@ fn txTotalSize(tx: *const types.Transaction) u64 {
 ///   weight = base_size * (WITNESS_SCALE_FACTOR - 1) + total_size.
 fn txWeight(tx: *const types.Transaction) u64 {
     return txBaseSize(tx) * (@as(u64, consensus.WITNESS_SCALE_FACTOR) - 1) + txTotalSize(tx);
+}
+
+/// Emit the getorphantxs result array for the given `verbosity` (0, 1, or 2)
+/// to `writer`.  Mirrors Bitcoin Core rpc/mempool.cpp getorphantxs +
+/// OrphanToJSON / OrphanDescription.  Caller must hold mempool.mutex.
+///
+/// Field shape per verbosity (matches Core exactly — there is NO expiration
+/// field in Core's OrphanToJSON):
+///   0 → ["<txid>", ...]
+///   1 → [{txid, wtxid, bytes, vsize, weight, from}, ...]
+///   2 → verbosity-1 object plus "hex" (serialized, hex-encoded tx)
+///
+/// txid/wtxid are display-order (byte-reversed) hex.  bytes is the total
+/// serialized size (with witness), vsize is the BIP-141 virtual size derived
+/// from weight, weight is the BIP-141 weight — all computed exactly as
+/// getrawtransaction / getmempoolentry compute them (txTotalSize / txWeight /
+/// consensus.getVirtualTransactionSize).  from is the announcing peer id(s):
+/// [peer_id] when peer_id != 0, else [].
+fn writeOrphanArray(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    mempool: *mempool_mod.Mempool,
+    verbosity: i64,
+) !void {
+    try writer.writeByte('[');
+    var first = true;
+    var it = mempool.orphans.iterator();
+    while (it.next()) |entry| {
+        const orphan = entry.value_ptr.*;
+        if (!first) try writer.writeByte(',');
+        first = false;
+
+        if (verbosity == 0) {
+            // Array of txid strings.  Core pushes orphan.tx->GetHash() — the
+            // NON-witness txid (rpc/mempool.cpp getorphantxs verbosity 0; help
+            // text: "0 for an array of txids (may contain duplicates)").
+            try writer.writeByte('"');
+            try writeHashHex(writer, &orphan.txid);
+            try writer.writeByte('"');
+            continue;
+        }
+
+        // verbosity 1 and 2 share the OrphanDescription object.
+        const total_size = txTotalSize(&orphan.tx);
+        const weight = txWeight(&orphan.tx);
+        const vsize = consensus.getVirtualTransactionSize(weight, 0, 0);
+
+        try writer.writeAll("{\"txid\":\"");
+        try writeHashHex(writer, &orphan.txid);
+        try writer.writeAll("\",\"wtxid\":\"");
+        try writeHashHex(writer, &orphan.wtxid);
+        try writer.print("\",\"bytes\":{d},\"vsize\":{d},\"weight\":{d},\"from\":[", .{ total_size, vsize, weight });
+        if (orphan.peer_id != 0) {
+            try writer.print("{d}", .{orphan.peer_id});
+        }
+        try writer.writeByte(']');
+
+        if (verbosity == 2) {
+            // Append the serialized, hex-encoded transaction (Core: EncodeHexTx).
+            var tx_writer = serialize.Writer.init(allocator);
+            defer tx_writer.deinit();
+            try serialize.writeTransaction(&tx_writer, &orphan.tx);
+            const tx_bytes = tx_writer.getWritten();
+            try writer.writeAll(",\"hex\":\"");
+            for (tx_bytes) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeByte('"');
+        }
+
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
 }
 
 /// Byte length of a CompactSize encoding for `value`.
@@ -18826,6 +18967,131 @@ test "dispatch parse error" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "-32700") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Parse error") != null);
+}
+
+test "getorphantxs verbosity 0/1/2 + invalid verbosity" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // Build a minimal legacy (no-witness) orphan tx and insert it into the
+    // orphan pool with a non-zero announcing peer id.  addOrphan deep-copies
+    // via a serialize round-trip, so the stack-allocated slices below are safe
+    // and the orphan is freed by mempool.deinit().
+    const prev_hash = [_]u8{0xAB} ** 32;
+    var inputs = [_]types.TxIn{.{
+        .previous_output = .{ .hash = prev_hash, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    }};
+    var outputs = [_]types.TxOut{.{
+        .value = 50_000,
+        .script_pubkey = &[_]u8{ 0x51, 0x52 }, // OP_1 OP_2 (arbitrary)
+    }};
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &inputs,
+        .outputs = &outputs,
+        .lock_time = 0,
+    };
+    const peer_id: u64 = 42;
+    try std.testing.expect(mempool.addOrphan(&tx, peer_id));
+
+    // Compute the expected display-order txid the handler should emit at
+    // verbosity 0 (Core pushes orphan.tx->GetHash() = the non-witness txid).
+    const txid = try crypto.computeTxid(&tx, allocator);
+    var txid_hex_buf: [64]u8 = undefined;
+    {
+        var stream = std.io.fixedBufferStream(&txid_hex_buf);
+        try writeHashHex(stream.writer(), &txid);
+    }
+    const txid_hex: []const u8 = &txid_hex_buf;
+
+    // ── verbosity 0: array of txid strings ───────────────────────────────
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getorphantxs\",\"params\":[0]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"error\":null") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, txid_hex) != null);
+        // Result is a bare array, not an object of objects.
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"result\":[\"") != null);
+    }
+
+    // ── default (no arg) behaves like verbosity 0 ────────────────────────
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getorphantxs\",\"params\":[]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, txid_hex) != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"result\":[\"") != null);
+    }
+
+    // ── verbosity 1: object array with all OrphanDescription fields ──────
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getorphantxs\",\"params\":[1]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"txid\":\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"wtxid\":\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"bytes\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"vsize\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"weight\":") != null);
+        // Core has NO expiration field in OrphanToJSON — must be absent.
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"expiration\":") == null);
+        // Single announcer → 1-element from array containing the peer id.
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"from\":[42]") != null);
+        // No hex field at verbosity 1.
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"hex\":") == null);
+    }
+
+    // ── verbosity 2: verbosity-1 fields plus hex ────────────────────────
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getorphantxs\",\"params\":[2]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"from\":[42]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"hex\":\"") != null);
+    }
+
+    // ── invalid verbosity (3) → RPC_INVALID_PARAMETER (-8) ──────────────
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getorphantxs\",\"params\":[3]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"code\":-8") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "Invalid verbosity value 3") != null);
+    }
+
+    // ── bool arg → ERROR (Core ParseVerbosity allow_bool=false) ──────────
+    // A boolean must NOT be silently mapped to 0/1; it is rejected with a
+    // type error.  We assert an error result and that it did NOT return a
+    // success array.
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getorphantxs\",\"params\":[true]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"error\":null") == null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"code\":") != null);
+    }
 }
 
 test "getblockchaininfo returns correct height and hash" {
