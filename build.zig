@@ -554,6 +554,42 @@ pub fn build(b: *std.Build) void {
         // live in `src/crypto.zig` and run via `zig build test`.
     }
 
+    // getnodeaddresses Core-parity regression. Same wrapper as test-rpc
+    // (tests_rpc.zig re-exposes src/rpc.zig's tests), filtered to just the
+    // getnodeaddresses test names so the run isn't contaminated by the
+    // pre-existing src/peer.zig test failures that surface when peer.zig is
+    // pulled in as part of an rpc.zig test root. Run with
+    // `zig build test-getnodeaddresses`.
+    {
+        const gna_tests = b.addTest(.{
+            .root_source_file = b.path("tests_rpc.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"getnodeaddresses"},
+        });
+        gna_tests.linkSystemLibrary("rocksdb");
+        gna_tests.linkSystemLibrary("secp256k1");
+        gna_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        gna_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            gna_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            gna_tests.linkSystemLibrary("minisketch");
+            gna_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        gna_tests.root_module.addOptions("build_options", build_options);
+
+        const run_gna_tests = b.addRunArtifact(gna_tests);
+        const gna_step = b.step("test-getnodeaddresses", "Run getnodeaddresses Core-parity regression tests");
+        gna_step.dependOn(&run_gna_tests.step);
+        // NOT folded into the default `test` step — same wallet.zig selectCoins
+        // gotcha as test-rpc above.
+    }
+
     // Wallet Taproot tests — BIP-86 tweak + BIP-341 sighash wire-up (W20).
     // Same wrapper pattern as tests_rpc.zig: the test root lives at the
     // project root so `src/wallet.zig`'s `@embedFile("../resources/bip39-english.txt")`
