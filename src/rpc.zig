@@ -14242,6 +14242,35 @@ pub const RpcServer = struct {
     ///
     /// Actions: `start` performs the scan; `abort`/`status` return false
     /// (no background scan is tracked), matching Core when nothing runs.
+    /// Resolve the active-chain block hash at `height`, mirroring the full
+    /// resolution chain of handleGetBlockHash (rpc.zig:3520):
+    ///   (1) the H:{height}→hash index (ChainState.getBlockHashByHeight);
+    ///   (2) on a miss, walk active_tip back via `parent` to the entry at
+    ///       `height`, use its hash, and lazy-backfill the index;
+    ///   (3) when `height == best_height`, fall back to best_hash.
+    /// Returns null only when the height is genuinely unresolvable.
+    fn resolveBlockHashAtHeight(self: *RpcServer, height: u32) ?types.Hash256 {
+        // (1) fast H:{height}→hash index.
+        if (self.chain_state.getBlockHashByHeight(height)) |h| return h;
+
+        // (2) walk the in-memory active chain from the tip.
+        if (self.chain_manager) |cm| {
+            var entry: ?*validation.BlockIndexEntry = cm.active_tip;
+            while (entry) |e| {
+                if (e.height == height) {
+                    self.chain_state.putBlockHashByHeight(e.height, &e.hash);
+                    return e.hash;
+                }
+                entry = e.parent;
+            }
+        }
+
+        // (3) tip fallback.
+        if (height == self.chain_state.best_height) return self.chain_state.best_hash;
+
+        return null;
+    }
+
     fn handleScanTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // --- action ---
         var action: []const u8 = "start";
@@ -14356,7 +14385,20 @@ pub const RpcServer = struct {
             for (script) |b| try writer.print("{x:0>2}", .{b});
             try writer.print("\",\"desc\":\"{s}\",\"amount\":", .{desc});
             const amt_btc: f64 = @as(f64, @floatFromInt(utxo.value)) / 100_000_000.0;
-            try writer.print("{d:.8},\"coinbase\":{},\"height\":{d}}}", .{ amt_btc, utxo.is_coinbase, utxo.height });
+            try writer.print("{d:.8},\"coinbase\":{},\"height\":{d}", .{ amt_btc, utxo.is_coinbase, utxo.height });
+
+            // blockhash: hash of the block at the coin's height, rendered as
+            // big-endian DISPLAY hex (Core: coinb_block.GetBlockHash().GetHex()).
+            try writer.writeAll(",\"blockhash\":\"");
+            if (self.resolveBlockHashAtHeight(utxo.height)) |bh| {
+                try writeHashHex(writer, &bh);
+            }
+            try writer.writeByte('"');
+
+            // confirmations = tip height - coin height + 1 (Core:
+            // tip->nHeight - coin.nHeight + 1; signed to match Core).
+            const confs: i64 = @as(i64, self.chain_state.best_height) - @as(i64, utxo.height) + 1;
+            try writer.print(",\"confirmations\":{d}}}", .{confs});
         }
 
         const total_btc: f64 = @as(f64, @floatFromInt(total_amount)) / 100_000_000.0;
