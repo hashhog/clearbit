@@ -35,10 +35,13 @@ pub const CF_BLOCK_FILTER: usize = storage.CF_BLOCK_FILTER;
 /// hash256(filter_hash || prev_header) keyed by block hash.
 pub const CF_BLOCK_FILTER_HEADER: usize = storage.CF_BLOCK_FILTER_HEADER;
 
-/// Column family index for coin statistics — not yet wired into the storage
-/// CF table; this constant is a placeholder for the eventual coinstatsindex.
-/// Reserving 8 = CF_COUNT keeps it out of the active range until then.
-pub const CF_COINSTATS: usize = storage.CF_COUNT;
+/// Column family index for coin statistics — per-height UTXO-set running
+/// MuHash3072 + cumulative totals.  Sourced from storage.zig so it stays in
+/// the live CF range.  Pre-2026-06-08 this aliased `storage.CF_COUNT` (= 8),
+/// which is OUT OF RANGE (`cf_handles[8]` was OOB) — the stub never wrote to
+/// it, so the bug was latent, but any real write would have segfaulted.  Now
+/// points at the real CF_COINSTATS slot.
+pub const CF_COINSTATS: usize = storage.CF_COINSTATS;
 
 // ============================================================================
 // SipHash-2-4 Implementation (BIP-158)
@@ -718,147 +721,149 @@ pub const TxIndex = struct {
 // Coin Statistics Index
 // ============================================================================
 
-/// Per-block UTXO set statistics.
+/// Per-height UTXO-set statistics record — the clearbit analog of Bitcoin
+/// Core `index/coinstatsindex.cpp`'s `DBVal`, extended with the block hash so
+/// a single record self-describes which block it belongs to (Core pairs the
+/// hash separately in the height/hash keys; we inline it for a flat encoding).
+///
+/// All cumulative `total_*` fields are running totals from genesis..height (NOT
+/// per-block deltas) — exactly as Core stores them.  Per-block values shown by
+/// `gettxoutsetinfo`'s `block_info` are derived at RPC time by differencing
+/// against the previous height's record.
+///
+/// `muhash` holds the UN-finalized MuHash3072 accumulator (768 bytes:
+/// numerator ‖ denominator) so the multiset can keep growing across restarts
+/// and be reversed byte-exactly on reorg.  The 32-byte SHA256 digest Core
+/// reports as `gettxoutsetinfo`'s `muhash` is computed on demand via
+/// `MuHash3072.finalize()` (which mutates a copy).
 pub const CoinStats = struct {
     block_hash: Hash256,
     height: u32,
-    utxo_count: u64,
-    total_amount: i64, // Total satoshis in UTXO set
-    total_subsidy: i64, // Cumulative subsidy minted
-    bogo_size: u64, // Approximate serialized UTXO set size
+    /// Un-finalized MuHash3072 accumulator (numerator ‖ denominator, 768 LE).
+    muhash: [muhash_mod.MuHash3072.SERIALIZED_SIZE]u8,
+    /// `stats.nTransactionOutputs` — count of spendable UTXOs.
+    txouts: u64,
+    /// `stats.nBogoSize` — database-independent UTXO-set size metric.
+    bogo_size: u64,
+    /// `stats.total_amount` — sum of every unspent output value (satoshis).
+    total_amount: i64,
+    /// Cumulative block subsidy minted genesis..height.
+    total_subsidy: i64,
+    /// Cumulative value of all prevouts ever spent.
+    total_prevout_spent_amount: i64,
+    /// Cumulative value of non-coinbase outputs created (excl. coinbase).
+    total_new_outputs_ex_coinbase_amount: i64,
+    /// Cumulative value of coinbase outputs created.
+    total_coinbase_amount: i64,
+    /// Cumulative unspendable value: genesis coinbase (height-0 subsidy).
+    total_unspendables_genesis_block: i64,
+    /// Cumulative unspendable value: BIP30 duplicate-coinbase blocks.
+    total_unspendables_bip30: i64,
+    /// Cumulative unspendable value: OP_RETURN / oversized scripts.
+    total_unspendables_scripts: i64,
+    /// Cumulative unspendable value: fees a miner did not claim.
+    total_unspendables_unclaimed_rewards: i64,
 
-    /// Serialize to bytes for storage.
+    /// Serialize to bytes for CF_COINSTATS.  Field order is load-bearing
+    /// (it is our own on-disk format, but the disconnect-revert + restart
+    /// paths read it back and must agree).  Layout:
+    ///   block_hash(32) ‖ height(u32 LE) ‖ muhash(768)
+    ///   ‖ txouts(u64) ‖ bogo_size(u64) ‖ total_amount(i64)
+    ///   ‖ total_subsidy(i64) ‖ total_prevout_spent(i64)
+    ///   ‖ total_new_outputs_ex_coinbase(i64) ‖ total_coinbase(i64)
+    ///   ‖ unspendables_genesis(i64) ‖ unspendables_bip30(i64)
+    ///   ‖ unspendables_scripts(i64) ‖ unspendables_unclaimed(i64)
     pub fn toBytes(self: *const CoinStats, allocator: std.mem.Allocator) ![]const u8 {
         var writer = serialize.Writer.init(allocator);
         errdefer writer.deinit();
 
         try writer.writeBytes(&self.block_hash);
         try writer.writeInt(u32, self.height);
-        try writer.writeInt(u64, self.utxo_count);
+        try writer.writeBytes(&self.muhash);
+        try writer.writeInt(u64, self.txouts);
+        try writer.writeInt(u64, self.bogo_size);
         try writer.writeInt(i64, self.total_amount);
         try writer.writeInt(i64, self.total_subsidy);
-        try writer.writeInt(u64, self.bogo_size);
+        try writer.writeInt(i64, self.total_prevout_spent_amount);
+        try writer.writeInt(i64, self.total_new_outputs_ex_coinbase_amount);
+        try writer.writeInt(i64, self.total_coinbase_amount);
+        try writer.writeInt(i64, self.total_unspendables_genesis_block);
+        try writer.writeInt(i64, self.total_unspendables_bip30);
+        try writer.writeInt(i64, self.total_unspendables_scripts);
+        try writer.writeInt(i64, self.total_unspendables_unclaimed_rewards);
 
         return writer.toOwnedSlice();
     }
 
-    /// Deserialize from bytes.
+    /// Deserialize from CF_COINSTATS bytes (inverse of `toBytes`).
     pub fn fromBytes(data: []const u8) !CoinStats {
         var reader = serialize.Reader{ .data = data };
         const hash_bytes = try reader.readBytes(32);
         var block_hash: Hash256 = undefined;
         @memcpy(&block_hash, hash_bytes);
 
+        const height = try reader.readInt(u32);
+        const mu_bytes = try reader.readBytes(muhash_mod.MuHash3072.SERIALIZED_SIZE);
+        var mu: [muhash_mod.MuHash3072.SERIALIZED_SIZE]u8 = undefined;
+        @memcpy(&mu, mu_bytes);
+
         return CoinStats{
             .block_hash = block_hash,
-            .height = try reader.readInt(u32),
-            .utxo_count = try reader.readInt(u64),
+            .height = height,
+            .muhash = mu,
+            .txouts = try reader.readInt(u64),
+            .bogo_size = try reader.readInt(u64),
             .total_amount = try reader.readInt(i64),
             .total_subsidy = try reader.readInt(i64),
-            .bogo_size = try reader.readInt(u64),
+            .total_prevout_spent_amount = try reader.readInt(i64),
+            .total_new_outputs_ex_coinbase_amount = try reader.readInt(i64),
+            .total_coinbase_amount = try reader.readInt(i64),
+            .total_unspendables_genesis_block = try reader.readInt(i64),
+            .total_unspendables_bip30 = try reader.readInt(i64),
+            .total_unspendables_scripts = try reader.readInt(i64),
+            .total_unspendables_unclaimed_rewards = try reader.readInt(i64),
         };
+    }
+
+    /// Total cumulative unspendable amount (sum of the four breakdowns).
+    /// Mirrors Core `gettxoutsetinfo`'s `total_unspendable_amount`.
+    pub fn totalUnspendableAmount(self: *const CoinStats) i64 {
+        return self.total_unspendables_genesis_block +
+            self.total_unspendables_bip30 +
+            self.total_unspendables_scripts +
+            self.total_unspendables_unclaimed_rewards;
     }
 };
 
-/// UTXO value and script length for statistics tracking.
-pub const UtxoInfo = struct {
-    value: i64,
-    script_len: usize,
-};
+const muhash_mod = @import("muhash.zig");
 
-/// Coin statistics index tracking UTXO set state per block.
+/// `GetBogoSize` — Bitcoin Core `kernel/coinstats.cpp:35-43`.  Fixed 50-byte
+/// overhead + scriptPubKey length:
+///   32 (txid) + 4 (vout) + 4 (height+coinbase) + 8 (amount)
+///   + 2 (nominal scriptPubKey-len field) + scriptPubKey.size().
+/// Pre-2026-06-08 the stub omitted the +4 height code AND the +2 len field
+/// (W133 gate G11), undercounting by 6 bytes/coin; this matches
+/// `storage.coinBogoSize` exactly so the index agrees with the tip walk.
+pub fn coinStatsBogoSize(script_len: usize) u64 {
+    return 32 + 4 + 4 + 8 + 2 + @as(u64, script_len);
+}
+
+/// Coin statistics index handle.  As of 2026-06-08 the per-height MuHash3072 +
+/// cumulative-totals maintenance, persistence, reorg-revert, backfill, and
+/// startup-restore all live in `storage.ChainState` (wired into the SAME
+/// connect/disconnect/reorg/flush machinery as txindex + blockfilterindex), so
+/// this struct is now just a thin enable-flag handle consumed by the
+/// `BackgroundIndexer` stub below — it carries no UTXO-set state of its own.
+/// See `storage.ChainState.queueCoinStatsWriteForBlock` /
+/// `queueCoinStatsDeleteForBlock` / `backfillCoinStatsIndex` for the real
+/// implementation, and `indexes.CoinStats` above for the per-height record.
 pub const CoinStatsIndex = struct {
     db: ?*storage.Database,
     allocator: std.mem.Allocator,
     enabled: bool,
 
-    // Running totals
-    utxo_count: u64,
-    total_amount: i64,
-    total_subsidy: i64,
-    bogo_size: u64,
-    best_height: u32,
-
     pub fn init(db: ?*storage.Database, allocator: std.mem.Allocator, enabled: bool) CoinStatsIndex {
-        return CoinStatsIndex{
-            .db = db,
-            .allocator = allocator,
-            .enabled = enabled,
-            .utxo_count = 0,
-            .total_amount = 0,
-            .total_subsidy = 0,
-            .bogo_size = 0,
-            .best_height = 0,
-        };
-    }
-
-    /// Get approximate bogo size for a scriptPubKey (similar to Bitcoin Core).
-    fn getBogoSize(script_len: usize) u64 {
-        // 32 bytes for outpoint + 4 for height/coinbase + 8 for value + script
-        return 32 + 4 + 8 + script_len;
-    }
-
-    /// Update statistics for a block connection.
-    pub fn connectBlock(
-        self: *CoinStatsIndex,
-        block_hash: *const Hash256,
-        height: u32,
-        subsidy: i64,
-        created_utxos: []const UtxoInfo,
-        spent_utxos: []const UtxoInfo,
-    ) !void {
-        if (!self.enabled) return;
-
-        // Update running totals
-        self.total_subsidy += subsidy;
-
-        for (created_utxos) |utxo| {
-            self.utxo_count += 1;
-            self.total_amount += utxo.value;
-            self.bogo_size += getBogoSize(utxo.script_len);
-        }
-
-        for (spent_utxos) |utxo| {
-            self.utxo_count -= 1;
-            self.total_amount -= utxo.value;
-            self.bogo_size -= getBogoSize(utxo.script_len);
-        }
-
-        self.best_height = height;
-
-        // Persist to database
-        if (self.db) |db| {
-            const stats = CoinStats{
-                .block_hash = block_hash.*,
-                .height = height,
-                .utxo_count = self.utxo_count,
-                .total_amount = self.total_amount,
-                .total_subsidy = self.total_subsidy,
-                .bogo_size = self.bogo_size,
-            };
-
-            const data = try stats.toBytes(self.allocator);
-            defer self.allocator.free(data);
-
-            // Key by height
-            var key: [4]u8 = undefined;
-            std.mem.writeInt(u32, &key, height, .big);
-            try db.put(CF_COINSTATS, &key, data);
-        }
-    }
-
-    /// Look up statistics for a specific height.
-    pub fn getStats(self: *CoinStatsIndex, height: u32) !?CoinStats {
-        if (!self.enabled or self.db == null) return null;
-
-        var key: [4]u8 = undefined;
-        std.mem.writeInt(u32, &key, height, .big);
-
-        const data = try self.db.?.get(CF_COINSTATS, &key);
-        if (data == null) return null;
-        defer self.allocator.free(data.?);
-
-        return CoinStats.fromBytes(data.?);
+        return CoinStatsIndex{ .db = db, .allocator = allocator, .enabled = enabled };
     }
 };
 
@@ -1174,14 +1179,27 @@ test "TxLocation serialization" {
 test "CoinStats serialization" {
     const allocator = std.testing.allocator;
 
+    var mu = muhash_mod.MuHash3072.init();
+    mu.insert("a-coin");
+    var mu_bytes: [muhash_mod.MuHash3072.SERIALIZED_SIZE]u8 = undefined;
+    mu.toBytes(&mu_bytes);
+
     const block_hash: Hash256 = [_]u8{0xCD} ** 32;
     const stats = CoinStats{
         .block_hash = block_hash,
         .height = 100000,
-        .utxo_count = 50000000,
+        .muhash = mu_bytes,
+        .txouts = 50000000,
+        .bogo_size = 4000000000,
         .total_amount = 1850000000000000,
         .total_subsidy = 50000000000,
-        .bogo_size = 4000000000,
+        .total_prevout_spent_amount = 12345,
+        .total_new_outputs_ex_coinbase_amount = 67890,
+        .total_coinbase_amount = 11111,
+        .total_unspendables_genesis_block = 5000000000,
+        .total_unspendables_bip30 = 0,
+        .total_unspendables_scripts = 7,
+        .total_unspendables_unclaimed_rewards = 3,
     };
 
     const bytes = try stats.toBytes(allocator);
@@ -1191,10 +1209,13 @@ test "CoinStats serialization" {
 
     try std.testing.expectEqualSlices(u8, &stats.block_hash, &recovered.block_hash);
     try std.testing.expectEqual(stats.height, recovered.height);
-    try std.testing.expectEqual(stats.utxo_count, recovered.utxo_count);
+    try std.testing.expect(std.mem.eql(u8, &stats.muhash, &recovered.muhash));
+    try std.testing.expectEqual(stats.txouts, recovered.txouts);
     try std.testing.expectEqual(stats.total_amount, recovered.total_amount);
     try std.testing.expectEqual(stats.total_subsidy, recovered.total_subsidy);
     try std.testing.expectEqual(stats.bogo_size, recovered.bogo_size);
+    try std.testing.expectEqual(stats.total_coinbase_amount, recovered.total_coinbase_amount);
+    try std.testing.expectEqual(stats.total_unspendables_scripts, recovered.total_unspendables_scripts);
 }
 
 test "buildBasicBlockFilter" {
@@ -1395,23 +1416,51 @@ test "TxIndex without database" {
     try std.testing.expect(result == null);
 }
 
-test "CoinStatsIndex without database" {
-    const allocator = std.testing.allocator;
+test "CoinStats record serialize/deserialize round-trip" {
+    // The per-height record (block hash + un-finalized MuHash3072 accumulator +
+    // the full Core DBVal field set) must round-trip byte-exactly so the
+    // disconnect-revert + startup-restore paths read back the exact snapshot.
+    var mu = muhash_mod.MuHash3072.init();
+    mu.insert("coin-a");
+    mu.insert("coin-b");
+    var mu_bytes: [muhash_mod.MuHash3072.SERIALIZED_SIZE]u8 = undefined;
+    mu.toBytes(&mu_bytes);
 
-    var index = CoinStatsIndex.init(null, allocator, true);
-
-    const block_hash: Hash256 = [_]u8{0xEF} ** 32;
-    const created: []const UtxoInfo = &.{
-        .{ .value = 5000000000, .script_len = 25 },
+    const stats = CoinStats{
+        .block_hash = [_]u8{0xEF} ** 32,
+        .height = 100,
+        .muhash = mu_bytes,
+        .txouts = 100,
+        .bogo_size = 100 * coinStatsBogoSize(22),
+        .total_amount = 5000000000 * 100,
+        .total_subsidy = 5000000000 * 101,
+        .total_prevout_spent_amount = 0,
+        .total_new_outputs_ex_coinbase_amount = 0,
+        .total_coinbase_amount = 5000000000 * 100,
+        .total_unspendables_genesis_block = 5000000000,
+        .total_unspendables_bip30 = 0,
+        .total_unspendables_scripts = 0,
+        .total_unspendables_unclaimed_rewards = 0,
     };
-    const spent: []const UtxoInfo = &.{};
 
-    // Should update in-memory stats
-    try index.connectBlock(&block_hash, 1, 5000000000, created, spent);
+    const bytes = try stats.toBytes(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const back = try CoinStats.fromBytes(bytes);
 
-    try std.testing.expectEqual(@as(u64, 1), index.utxo_count);
-    try std.testing.expectEqual(@as(i64, 5000000000), index.total_amount);
-    try std.testing.expectEqual(@as(u32, 1), index.best_height);
+    try std.testing.expectEqual(stats.height, back.height);
+    try std.testing.expectEqual(stats.txouts, back.txouts);
+    try std.testing.expectEqual(stats.bogo_size, back.bogo_size);
+    try std.testing.expectEqual(stats.total_amount, back.total_amount);
+    try std.testing.expectEqual(stats.total_subsidy, back.total_subsidy);
+    try std.testing.expectEqual(stats.total_unspendables_genesis_block, back.total_unspendables_genesis_block);
+    try std.testing.expect(std.mem.eql(u8, &stats.muhash, &back.muhash));
+    try std.testing.expect(std.mem.eql(u8, &stats.block_hash, &back.block_hash));
+
+    // The un-finalized accumulator must reconstruct to the same finalized
+    // digest as the original (proves the 768-byte serialization is faithful).
+    var orig = mu;
+    var reread = muhash_mod.MuHash3072.fromBytes(&back.muhash);
+    try std.testing.expect(std.mem.eql(u8, &orig.finalize(), &reread.finalize()));
 }
 
 test "BlockFilterIndex without database" {
