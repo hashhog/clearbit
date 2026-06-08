@@ -7160,21 +7160,51 @@ pub const RpcServer = struct {
 
     /// Compute the median-time-past for BIP-113 header validation in submitblock.
     ///
-    /// Delegates to `ChainState.computeMTP()` which reads the DB-backed block
-    /// index (CF_BLOCK_INDEX, keyed by hash).  This is correct for the submitblock
-    /// path because every context block has already been connected and persisted to
-    /// the block index before the candidate block is submitted.  Returns 0 near
-    /// genesis (best_height == 0) or when the DB is absent, matching Core's
-    /// `CBlockIndex::GetMedianTimePast` genesis-adjacent skip.
+    /// Walks prev_hash and up to 10 of its ancestors (11 blocks total, the same
+    /// window as Core CBlockIndex::GetMedianTimePast in bitcoin-core/src/chain.h:233)
+    /// and returns the median timestamp.  This is computed from the ACTUAL
+    /// ancestors of the submitted block's parent, NOT the in-memory tip ring.
     ///
-    /// The `prev_hash` argument is not used — the canonical chain state tip IS
-    /// the correct parent of the next submitted block (submitblock rejects
-    /// non-sequential submissions at the `best_height + 1` check upstream).
+    /// Using the tip ring (`chain_state.computeMTP()`) is incorrect after a reorg:
+    /// the ring is NOT rewound on block disconnect (storage.zig:4827 comment), so
+    /// it holds stale chain-A post-fork timestamps after `invalidateblock` rewinds
+    /// the tip -> inflated MTP -> false-rejects valid chain-B blocks.
     ///
-    /// Reference: bitcoin-core/src/chain.h CBlockIndex::GetMedianTimePast.
+    /// Lookup strategy (mirrors clearbit 4aeb681 / storage.zig getPersistedHeader):
+    ///   1. chain_manager.block_index -- in-memory entries, fast, covers blocks
+    ///      connected this session and any block connected via the active chain.
+    ///   2. chain_state.getPersistedHeader -- CF_BLOCK_INDEX, survives restarts,
+    ///      covers all blocks ever connected (same DB used by the prior MTP fix).
+    /// Returns 0 if no ancestor is found at all (genesis-adjacent / DB absent),
+    /// preserving the existing "mtp==0 -> skip check" semantics.
+    ///
+    /// Reference: bitcoin-core/src/chain.h CBlockIndex::GetMedianTimePast (line 233).
     fn computeSubmitBlockMtp(self: *RpcServer, prev_hash: *const types.Hash256) u32 {
-        _ = prev_hash; // parent is always chain_state.best_hash for submitblock
-        return self.chain_state.computeMTP();
+        var timestamps: [11]u32 = undefined;
+        var n: usize = 0;
+        var cursor = prev_hash.*;
+
+        while (n < 11) {
+            // Path 1: in-memory chain_manager block_index (covers blocks connected
+            // this session, including both sides of a reorg).
+            if (self.chain_manager) |cm| {
+                if (cm.block_index.get(cursor)) |entry| {
+                    timestamps[n] = entry.header.timestamp;
+                    n += 1;
+                    cursor = entry.header.prev_block;
+                    continue;
+                }
+            }
+            // Path 2: persisted CF_BLOCK_INDEX (survives restarts; same lookup
+            // the clearbit 4aeb681 MTP-at-boot fix uses).
+            const hdr = self.chain_state.getPersistedHeader(&cursor) orelse break;
+            timestamps[n] = hdr.timestamp;
+            n += 1;
+            cursor = hdr.prev_block;
+        }
+
+        if (n == 0) return 0;
+        return validation.medianTimePast(timestamps[0..n]);
     }
 
     /// submitblock-time consensus validation gate.  Mirrors
@@ -22685,4 +22715,100 @@ test "getnodeaddresses: non-string network -> RPC -3 type error" {
 
     const expected = "{\"result\":null,\"error\":{\"code\":-3,\"message\":\"JSON value of type number is not of expected type string\"},\"id\":1}";
     try std.testing.expectEqualStrings(expected, result);
+}
+
+// computeSubmitBlockMtp: walks prev_hash ancestors (NOT the stale in-memory tip
+// ring) and returns the correct median.
+//
+// REORG SCENARIO: after a reorg the in-memory recent_timestamps ring holds
+// chain-A's post-fork timestamps.  With the old code computeSubmitBlockMtp()
+// ignored prev_hash and returned chain_state.computeMTP() — the ring's median
+// — which could be higher than the chain-B block's timestamp -> false-reject
+// "time-too-old".  The fix walks prev_hash via chain_manager.block_index (and
+// falls back to chain_state.getPersistedHeader), matching Bitcoin Core's
+// CBlockIndex::GetMedianTimePast (chain.h:233).
+//
+// This test sets up a chain_manager whose block_index has 11 chain-B ancestors
+// with known timestamps, poisons chain_state.recent_timestamps with
+// inflated chain-A values, then asserts that computeSubmitBlockMtp returns
+// the correct median from chain-B ancestors — NOT the inflated ring value.
+test "computeSubmitBlockMtp: uses prev_hash ancestors, not stale tip ring (reorg case)" {
+    const allocator = std.testing.allocator;
+
+    // Build chain_manager with 11 chain-B block index entries.
+    // Timestamps: 1000, 1100, 1200, ..., 2000 (step 100; 11 entries).
+    // Median of sorted [1000..2000 step 100] = 1500 (index 5 of 11).
+    var cm = validation.ChainManager.init(allocator, &consensus.MAINNET);
+    defer cm.deinit();
+
+    const N_ANCESTORS: usize = 11;
+    var entries: [N_ANCESTORS]validation.BlockIndexEntry = undefined;
+    for (0..N_ANCESTORS) |i| {
+        entries[i] = .{
+            .hash = [_]u8{@intCast(i + 1)} ** 32, // distinct hashes: 0x01..0x0B
+            .header = blk: {
+                var h = std.mem.zeroes(types.BlockHeader);
+                h.timestamp = @as(u32, @intCast(1000 + i * 100)); // 1000, 1100, ..., 2000
+                if (i + 1 < N_ANCESTORS) {
+                    h.prev_block = [_]u8{@intCast(i + 2)} ** 32; // points to the next entry
+                }
+                break :blk h;
+            },
+            .height = @intCast(i + 1),
+            .status = .{},
+            .chain_work = [_]u8{0} ** 32,
+            .sequence_id = 0,
+            .parent = null,
+            .file_number = 0,
+            .file_offset = 0,
+        };
+    }
+    // Link parent pointers so computeMTPViaChainManager could also work, though
+    // computeSubmitBlockMtp uses block_index.get(), not entry.parent.
+    for (0..N_ANCESTORS - 1) |i| {
+        entries[i].parent = &entries[i + 1];
+    }
+    // Add all entries to the block_index, keyed by hash.
+    for (0..N_ANCESTORS) |i| {
+        try cm.block_index.put(entries[i].hash, &entries[i]);
+    }
+
+    // chain-B prev_hash: the youngest entry (entry[0] = timestamp 1000; its
+    // ancestors are entry[1..10] = timestamps 1100..2000).  A submitted chain-B
+    // block's header.prev_block = entry[0].hash.
+    const chain_b_prev = entries[0].hash;
+
+    // Poison chain_state.recent_timestamps with inflated chain-A values.
+    // All 11 slots = 9_999_999; computeMTP() would return 9_999_999.
+    // If the old code were in place, computeSubmitBlockMtp would return 9_999_999
+    // and any chain-B block with a normal timestamp would be false-rejected.
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    for (0..11) |i| {
+        chain_state.recent_timestamps[i] = 9_999_999;
+    }
+    chain_state.recent_ts_count = 11;
+    chain_state.best_height = 11;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    // The stale ring's computeMTP() would return 9_999_999.
+    const ring_mtp = chain_state.computeMTP();
+    try std.testing.expectEqual(@as(u32, 9_999_999), ring_mtp);
+
+    // The fix: walk entry[0]..entry[10] (timestamps 1000..2000), median = 1500.
+    const got_mtp = server.computeSubmitBlockMtp(&chain_b_prev);
+    // Sorted [1000,1100,1200,1300,1400,1500,1600,1700,1800,1900,2000], n=11.
+    // Core median: index n/2 = 5 -> 1500.
+    try std.testing.expectEqual(@as(u32, 1500), got_mtp);
+
+    // The fix must NOT return the stale ring value.
+    try std.testing.expect(got_mtp != ring_mtp);
 }
