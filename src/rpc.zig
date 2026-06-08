@@ -4535,6 +4535,20 @@ pub const RpcServer = struct {
             }
         }
 
+        // --- coinstatsindex ------------------------------------------------
+        // GetName() == "coinstatsindex" (coinstatsindex.cpp:78).  synced when
+        // the index has reached the active tip (best_block_height == best_height).
+        if (self.chain_state.coinstatsindex_enabled) {
+            const name = "coinstatsindex";
+            if (filter.len == 0 or std.mem.eql(u8, filter, name)) {
+                const height = self.chain_state.coinstatsindex_height;
+                const synced = height >= best_height;
+                if (wrote_any) try writer.writeByte(',');
+                try writer.print("\"{s}\":{{\"synced\":{},\"best_block_height\":{d}}}", .{ name, synced, height });
+                wrote_any = true;
+            }
+        }
+
         try writer.writeByte('}');
 
         return self.jsonRpcResult(buf.items, id);
@@ -15500,15 +15514,14 @@ pub const RpcServer = struct {
             }
         }
 
-        // params[1] = hash_or_height. clearbit has no coinstatsindex, so a
-        // specific block can never be queried. Core
-        // (rpc/blockchain.cpp:1085-1098) rejects the request BEFORE touching
-        // the chainstate. Mirror its two relevant guards:
-        //   * hash_serialized_3 + specific block -> RPC_INVALID_PARAMETER (-8)
-        //     "hash_serialized_3 hash type cannot be queried for a specific block"
-        //   * any other hash_type + specific block (no index) ->
-        //     RPC_INVALID_PARAMETER (-8) "Querying specific block heights
-        //     requires coinstatsindex".
+        // params[1] = hash_or_height.  Core (rpc/blockchain.cpp:1085-1098)
+        // guards a specific-block query BEFORE touching the chainstate:
+        //   * hash_serialized_3 + specific block -> -8 (always rejected, even
+        //     with the index — the full-set SHA256d genuinely needs the walk).
+        //   * muhash / none + specific block, NO coinstatsindex -> -8
+        //     "Querying specific block heights requires coinstatsindex".
+        //   * muhash / none + specific block, WITH coinstatsindex -> resolve
+        //     the per-height CoinStats record and emit from it.
         if (params == .array and params.array.items.len >= 2 and
             params.array.items[1] != .null)
         {
@@ -15519,11 +15532,90 @@ pub const RpcServer = struct {
                     id,
                 );
             }
-            return self.jsonRpcError(
-                RPC_INVALID_PARAMETER,
-                "Querying specific block heights requires coinstatsindex",
-                id,
-            );
+            if (!self.chain_state.coinstatsindex_enabled) {
+                return self.jsonRpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Querying specific block heights requires coinstatsindex",
+                    id,
+                );
+            }
+            // Resolve hash_or_height -> (height, block_hash).  Integer => a
+            // height (Core ParseHashOrHeight: reject <0 / > tip); string => a
+            // block hash looked up in the block index.
+            const hor = params.array.items[1];
+            var target_height: u32 = 0;
+            var target_hash: types.Hash256 = undefined;
+            if (hor == .integer) {
+                const h_i = hor.integer;
+                if (h_i < 0) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Target block height negative", id);
+                }
+                if (h_i > @as(i64, @intCast(self.chain_state.best_height))) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Target block height after current tip", id);
+                }
+                target_height = @intCast(h_i);
+                target_hash = self.chain_state.getBlockHashByHeight(target_height) orelse
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+            } else if (hor == .string) {
+                const hs = hor.string;
+                if (hs.len != 64) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be of length 64", id);
+                }
+                // Parse the display-order hex into internal (reversed) byte order.
+                var disp: [32]u8 = undefined;
+                for (0..32) |i| {
+                    const hi: u8 = hexDigitToInt(hs[i * 2]) orelse
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash", id);
+                    const lo: u8 = hexDigitToInt(hs[i * 2 + 1]) orelse
+                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash", id);
+                    disp[i] = (hi << 4) | lo;
+                }
+                for (0..32) |i| target_hash[i] = disp[31 - i];
+                const hdr = self.chain_state.getPersistedHeader(&target_hash) orelse
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+                _ = hdr;
+                // Resolve the height from the persisted block-index record.
+                target_height = self.chain_state.getBlockHeightByHash(&target_hash) orelse
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "hash_or_height must be a height or a block hash", id);
+            }
+
+            // Look up the per-height CoinStats record (height-keyed first, then
+            // the orphan hash-keyed fallback for a disconnected block).
+            var rec_opt = self.chain_state.getCoinStatsByHeight(target_height) catch null;
+            if (rec_opt) |r| {
+                if (!std.mem.eql(u8, &r.block_hash, &target_hash)) {
+                    // Height slot was overwritten by a new-chain block (reorg);
+                    // fall back to the orphan hash-keyed record (Core LookUpOne).
+                    rec_opt = self.chain_state.getCoinStatsByHash(&target_hash) catch null;
+                }
+            } else {
+                rec_opt = self.chain_state.getCoinStatsByHash(&target_hash) catch null;
+            }
+            const rec = rec_opt orelse
+                return self.jsonRpcError(
+                    RPC_INTERNAL_ERROR,
+                    "Unable to get data because coinstatsindex is still syncing.",
+                    id,
+                );
+
+            return self.emitCoinStatsResult(&rec, hash_type, id);
+        }
+
+        // No-arg / tip query.  When the index is enabled and synced to the tip,
+        // prefer the index's running accumulator (authoritative + correct on a
+        // partial-cache mainnet view) for muhash/none.  hash_serialized_3 still
+        // needs the full-set walk below.
+        if (self.chain_state.coinstatsindex_enabled and hash_type != .hash_serialized and
+            self.chain_state.coinstatsindex_height == self.chain_state.best_height and
+            self.chain_state.best_height > 0)
+        {
+            if (self.chain_state.getCoinStatsByHeight(self.chain_state.best_height) catch null) |rec| {
+                if (std.mem.eql(u8, &rec.block_hash, &self.chain_state.best_hash)) {
+                    return self.emitCoinStatsResult(&rec, hash_type, id);
+                }
+            }
         }
 
         // Single cache walk producing the Core aggregate stats (txouts,
@@ -15588,6 +15680,92 @@ pub const RpcServer = struct {
         // does not surface that cheaply, so we emit 0 (impl-specific per the
         // RPC contract; non-load-bearing for the harness).
         try writer.writeAll(",\"disk_size\":0}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Emit a gettxoutsetinfo result from a coinstatsindex per-height record,
+    /// in Core's exact pushKV order for the index path (rpc/blockchain.cpp:
+    /// 1115-1172).  Used both for a historical hash_or_height query and for
+    /// the at-tip query when the index is synced.
+    ///
+    /// Field order (muhash hash_type):
+    ///   height, bestblock, txouts, bogosize, [muhash], total_amount,
+    ///   total_unspendable_amount, block_info{ prevout_spent, coinbase,
+    ///   new_outputs_ex_coinbase, unspendable, unspendables{...} }
+    /// `transactions` and `disk_size` are OMITTED on the index path (Core emits
+    /// them only when !stats.index_used).  `none` hash_type omits `muhash`.
+    fn emitCoinStatsResult(
+        self: *RpcServer,
+        rec: *const indexes_mod.CoinStats,
+        hash_type: anytype,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        const muhash_mod = @import("muhash.zig");
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"height\":");
+        try writer.print("{d}", .{rec.height});
+        try writer.writeAll(",\"bestblock\":\"");
+        try writeHashHex(writer, &rec.block_hash);
+        try writer.print("\",\"txouts\":{d},\"bogosize\":{d}", .{ rec.txouts, rec.bogo_size });
+
+        // muhash — finalize a COPY of the un-finalized accumulator (finalize
+        // mutates) so the stored running state is untouched.  Emitted only for
+        // the muhash hash_type; `none` omits it (Core rpc/blockchain.cpp:1122).
+        switch (hash_type) {
+            .muhash => {
+                var acc = muhash_mod.MuHash3072.fromBytes(&rec.muhash);
+                const digest = acc.finalize();
+                try writer.writeAll(",\"muhash\":\"");
+                try writeHashHex(writer, &digest);
+                try writer.writeAll("\"");
+            },
+            else => {},
+        }
+
+        const total_btc: f64 = @as(f64, @floatFromInt(rec.total_amount)) / 100_000_000.0;
+        try writer.print(",\"total_amount\":{d:.8}", .{total_btc});
+
+        const total_unspendable_btc: f64 =
+            @as(f64, @floatFromInt(rec.totalUnspendableAmount())) / 100_000_000.0;
+        try writer.print(",\"total_unspendable_amount\":{d:.8}", .{total_unspendable_btc});
+
+        // block_info — per-block deltas = this height minus prev height.  Prev
+        // record is the height-1 entry on the active chain (default-zero for
+        // height 0).  Read it best-effort; on a miss the deltas degrade to the
+        // cumulative values (still well-defined, only block_info is affected
+        // and the harness does not gate on it).
+        var prev = std.mem.zeroes(indexes_mod.CoinStats);
+        if (rec.height > 0) {
+            if (self.chain_state.getCoinStatsByHeight(rec.height - 1) catch null) |p| {
+                prev = p;
+            }
+        }
+        const d_prevout_spent: f64 =
+            @as(f64, @floatFromInt(rec.total_prevout_spent_amount - prev.total_prevout_spent_amount)) / 1e8;
+        const d_coinbase: f64 =
+            @as(f64, @floatFromInt(rec.total_coinbase_amount - prev.total_coinbase_amount)) / 1e8;
+        const d_new_ex_cb: f64 =
+            @as(f64, @floatFromInt(rec.total_new_outputs_ex_coinbase_amount - prev.total_new_outputs_ex_coinbase_amount)) / 1e8;
+        const d_unspendable: f64 =
+            @as(f64, @floatFromInt(rec.totalUnspendableAmount() - prev.totalUnspendableAmount())) / 1e8;
+        const d_genesis: f64 =
+            @as(f64, @floatFromInt(rec.total_unspendables_genesis_block - prev.total_unspendables_genesis_block)) / 1e8;
+        const d_bip30: f64 =
+            @as(f64, @floatFromInt(rec.total_unspendables_bip30 - prev.total_unspendables_bip30)) / 1e8;
+        const d_scripts: f64 =
+            @as(f64, @floatFromInt(rec.total_unspendables_scripts - prev.total_unspendables_scripts)) / 1e8;
+        const d_unclaimed: f64 =
+            @as(f64, @floatFromInt(rec.total_unspendables_unclaimed_rewards - prev.total_unspendables_unclaimed_rewards)) / 1e8;
+
+        try writer.print(
+            ",\"block_info\":{{\"prevout_spent\":{d:.8},\"coinbase\":{d:.8},\"new_outputs_ex_coinbase\":{d:.8},\"unspendable\":{d:.8},\"unspendables\":{{\"genesis_block\":{d:.8},\"bip30\":{d:.8},\"scripts\":{d:.8},\"unclaimed_rewards\":{d:.8}}}}}}}",
+            .{ d_prevout_spent, d_coinbase, d_new_ex_cb, d_unspendable, d_genesis, d_bip30, d_scripts, d_unclaimed },
+        );
 
         return self.jsonRpcResult(buf.items, id);
     }

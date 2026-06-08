@@ -339,6 +339,30 @@ pub const MuHash3072 = struct {
         self.numerator.toBytes(&bytes);
         return crypto.sha256(&bytes);
     }
+
+    /// Byte size of the UN-finalized accumulator (numerator ‖ denominator),
+    /// each a 384-byte little-endian `Num3072`.  This is what Core persists in
+    /// `DBVal`/`DB_MUHASH` (the un-finalized `MuHash3072`), NOT the 32-byte
+    /// finalized digest — so that the multiset accumulator can keep growing
+    /// across restarts and be exactly reversed on reorg.
+    pub const SERIALIZED_SIZE: usize = Num3072.BYTE_SIZE * 2;
+
+    /// Serialize the un-finalized accumulator into `out` (768 bytes):
+    /// numerator (384 LE) ‖ denominator (384 LE).  Non-mutating, unlike
+    /// `finalize` — call this to checkpoint a still-accumulating MuHash.
+    pub fn toBytes(self: *const MuHash3072, out: *[SERIALIZED_SIZE]u8) void {
+        self.numerator.toBytes(out[0..Num3072.BYTE_SIZE]);
+        self.denominator.toBytes(out[Num3072.BYTE_SIZE..][0..Num3072.BYTE_SIZE]);
+    }
+
+    /// Inverse of `toBytes`: reconstruct an un-finalized accumulator from its
+    /// 768-byte numerator ‖ denominator serialization.
+    pub fn fromBytes(data: *const [SERIALIZED_SIZE]u8) MuHash3072 {
+        return .{
+            .numerator = Num3072.fromBytes(data[0..Num3072.BYTE_SIZE]),
+            .denominator = Num3072.fromBytes(data[Num3072.BYTE_SIZE..][0..Num3072.BYTE_SIZE]),
+        };
+    }
 };
 
 /// Map an arbitrary-length byte string to a Num3072 element.

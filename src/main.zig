@@ -1914,6 +1914,18 @@ pub fn main() !void {
     if (config.blockfilterindex) {
         std.debug.print("Block filter index enabled (--blockfilterindex)\n", .{});
     }
+    // CoinStatsIndex (2026-06-08) — wire --coinstatsindex into ChainState so
+    // connectBlockInner advances the running MuHash3072 + cumulative UTXO-set
+    // totals and queues a per-height CF_COINSTATS record (and disconnect
+    // queues the revert), atomic with the chainstate advance via the shared
+    // flush() WriteBatch.  Bitcoin Core analog: -coinstatsindex toggling
+    // CoinStatsIndex base-index registration in init.cpp (DEFAULT_COINSTATSINDEX
+    // = false).  Pre-this-commit the flag was parsed-but-dead (BUG-8); the only
+    // gettxoutsetinfo path was the partial in-memory cache walk at the tip.
+    chain_state.coinstatsindex_enabled = config.coinstatsindex;
+    if (config.coinstatsindex) {
+        std.debug.print("Coin statistics index enabled (--coinstatsindex)\n", .{});
+    }
     // Seed the BIP-113 MTP ring buffer with the genesis timestamp so that
     // blocks at heights 1..10 see the correct MTP window (which includes
     // genesis).  connectBlockInner pushes subsequent block timestamps into
@@ -2252,6 +2264,44 @@ pub fn main() !void {
                 }
             }
         }
+        // CoinStatsIndex (2026-06-08): load the persisted coinstatsindex tip
+        // height, then restore the full running accumulator + cumulative totals
+        // from the per-height CF_COINSTATS record at that tip.  This is the
+        // crash-safe reconcile: because the tip key, the per-height records, and
+        // the chain tip all commit in one WriteBatch, the restored running state
+        // is exactly the snapshot the index last durably reached.  Backfill
+        // (below) then resumes from coinstatsindex_height+1 to best_height.
+        if (config.coinstatsindex) {
+            if (dbp.get(storage.CF_DEFAULT, storage.ChainState.COINSTATSINDEX_TIP_KEY)) |cs_data| {
+                if (cs_data) |data| {
+                    defer allocator.free(data);
+                    if (data.len == 4) {
+                        chain_state.coinstatsindex_height = std.mem.readInt(u32, data[0..4], .little);
+                        std.debug.print(
+                            "Loaded coinstatsindex tip from DB: height {d}\n",
+                            .{chain_state.coinstatsindex_height},
+                        );
+                    }
+                }
+            } else |_| {}
+            if (chain_state.coinstatsindex_height > 0) {
+                if (chain_state.getCoinStatsByHeight(chain_state.coinstatsindex_height) catch null) |rec| {
+                    chain_state.restoreCoinStatsFromRecord(&rec);
+                } else {
+                    // Tip key present but record missing/corrupt — reset to
+                    // genesis-seeded empty so backfill rebuilds from scratch.
+                    std.debug.print("CoinStatsIndex: persisted tip record missing; rebuilding from genesis\n", .{});
+                    chain_state.coinstatsindex_height = 0;
+                    chain_state.seedCoinStatsGenesis(consensus.getBlockSubsidy(0, params));
+                }
+            } else {
+                // Fresh index — seed the genesis-block accounting (Core books
+                // the genesis subsidy into total_unspendables_genesis_block and
+                // total_subsidy; the genesis coinbase output is never in the
+                // UTXO set so muhash/txouts/total_amount are unaffected).
+                chain_state.seedCoinStatsGenesis(consensus.getBlockSubsidy(0, params));
+            }
+        }
     }
     if (chain_state.best_height == 0) {
         chain_state.best_hash = params.genesis_hash;
@@ -2337,6 +2387,18 @@ pub fn main() !void {
     if (config.blockfilterindex) {
         chain_state.backfillBlockFilterIndex() catch |err| {
             std.debug.print("Warning: BlockFilterIndex backfill failed: {}\n", .{err});
+        };
+    }
+    // 9c. CoinStatsIndex IBD-time backfill (2026-06-08).  When --coinstatsindex
+    // is on AND the persisted index lags the loaded chain tip, walk forward
+    // block-by-block reading CF_BLOCKS + CF_BLOCK_UNDO and advancing the running
+    // MuHash3072 + cumulative totals into per-height CF_COINSTATS records.  Runs
+    // synchronously here (before the P2P thread spawns) so the index is
+    // consistent with the tip the moment connectBlockInner starts queuing live
+    // coinstats writes.
+    if (config.coinstatsindex) {
+        chain_state.backfillCoinStatsIndex() catch |err| {
+            std.debug.print("Warning: CoinStatsIndex backfill failed: {}\n", .{err});
         };
     }
 

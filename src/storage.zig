@@ -42,9 +42,17 @@ pub const CF_BLOCK_FILTER: usize = 6;
 /// Per-block BIP-157 filter header (chained hash256(filter_hash || prev_header))
 /// keyed by block hash.  Populated alongside CF_BLOCK_FILTER.
 pub const CF_BLOCK_FILTER_HEADER: usize = 7;
+/// Per-height coinstatsindex record keyed by big-endian u32 height (primary)
+/// and by 32-byte block hash (orphan-preserving secondary on reorg).  Value
+/// is the serialized `indexes.CoinStats` (block hash + un-finalized MuHash3072
+/// accumulator + cumulative UTXO-set totals + the Core unspendables breakdown).
+/// Populated by the persistent CoinStatsIndex on block connect when
+/// `--coinstatsindex` is enabled.  Bitcoin Core analog:
+/// `index/coinstatsindex.cpp` (DBHeightKey/DBHashKey + DBVal).
+pub const CF_COINSTATS: usize = 8;
 /// Total number of column families. Must match `cf_names` length in
 /// storage_rocksdb.zig and the array sizes in DbState.
-pub const CF_COUNT: usize = 8;
+pub const CF_COUNT: usize = 9;
 
 pub const StorageError = error{
     OpenFailed,
@@ -2194,6 +2202,61 @@ pub const ChainState = struct {
     pending_filter_deletes: std.ArrayList(types.Hash256) = undefined,
 
     // ----------------------------------------------------------------------
+    // CoinStatsIndex (2026-06-08): mirror the CF_TX_INDEX / CF_BLOCK_FILTER
+    // wiring above.  When `coinstatsindex_enabled` is true, connectBlockInner
+    // maintains a running MuHash3072 accumulator + cumulative UTXO-set totals
+    // and queues a per-height CF_COINSTATS record (block hash + un-finalized
+    // accumulator + counters) into pending_coinstats_writes.  flush() drains
+    // it into the same WriteBatch as the UTXO mutations + tip so a crash leaves
+    // the chainstate and the index advanced-or-rewound together.
+    //
+    // The disconnect path queues the height-keyed delete, preserves the
+    // now-orphan block's record under its hash key (so a query by the orphan
+    // hash still resolves — Core CopyHeightIndexToHashIndex), and rewinds the
+    // running accumulator + totals to the parent height's persisted snapshot
+    // (Core RevertBlock).  Both land in the shared reorg WriteBatch.
+    //
+    // Bitcoin Core analog: index/coinstatsindex.cpp CustomAppend / CustomRemove
+    // / RevertBlock + kernel/coinstats.cpp (TxOutSer / ApplyCoinHash).  When
+    // the flag is OFF the index is fully inert — zero change to validation,
+    // sync, or the UTXO set.
+
+    /// True when `--coinstatsindex` is on; gates queue-append + lookup.
+    coinstatsindex_enabled: bool = false,
+    /// Highest block height for which CF_COINSTATS is populated.  Loaded on
+    /// startup from COINSTATSINDEX_TIP_KEY and advanced by connectBlockInner.
+    /// Used by the IBD-time backfill walker to know where to resume + by
+    /// getindexinfo's `synced` (== best_height).
+    coinstatsindex_height: u32 = 0,
+    /// In-memory running UTXO-set accumulator (un-finalized; numerator ‖
+    /// denominator).  Advanced per connected block, rewound per disconnect.
+    /// Persisted into each per-height record so it survives restart + so a
+    /// reorg can restore the exact prior-height value.
+    coinstats_acc: @import("muhash.zig").MuHash3072 = @import("muhash.zig").MuHash3072.init(),
+    /// Running cumulative UTXO-set totals (mirror Core coinstatsindex members).
+    coinstats_txouts: u64 = 0,
+    coinstats_bogo_size: u64 = 0,
+    coinstats_total_amount: i64 = 0,
+    coinstats_total_subsidy: i64 = 0,
+    coinstats_total_prevout_spent: i64 = 0,
+    coinstats_total_new_outputs_ex_coinbase: i64 = 0,
+    coinstats_total_coinbase: i64 = 0,
+    coinstats_unspendables_genesis: i64 = 0,
+    coinstats_unspendables_bip30: i64 = 0,
+    coinstats_unspendables_scripts: i64 = 0,
+    coinstats_unspendables_unclaimed: i64 = 0,
+    /// Per-block CF_COINSTATS writes pending durable commit.  Each entry is a
+    /// (height, block_hash, serialized-CoinStats) tuple; flush() emits one
+    /// CF_COINSTATS put keyed by BE(height) plus the persisted tip/acc keys.
+    /// Record bytes are heap-owned until flush() drains them.
+    pending_coinstats_writes: std.ArrayList(PendingCoinStatsWrite) = undefined,
+    /// Per-block CF_COINSTATS reverts pending durable commit (disconnect side).
+    /// Each carries the orphan's height + its full record bytes so flush() can
+    /// (a) delete the height key and (b) re-key the same bytes under the hash
+    /// key (orphan-preserving), exactly as Core CopyHeightIndexToHashIndex.
+    pending_coinstats_reverts: std.ArrayList(PendingCoinStatsRevert) = undefined,
+
+    // ----------------------------------------------------------------------
     // Pattern D (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-
     // 2026-05-05.md): multi-block reorg disconnect+reconnect must commit in
     // ONE atomic RocksDB WriteBatch.  Previously (3f3ba26-and-prior),
@@ -2255,6 +2318,39 @@ pub const ChainState = struct {
     /// as a 4-byte little-endian u32 alongside the chain tip so an opened
     /// datadir knows how far the index reached before the last shutdown.
     pub const FILTERINDEX_TIP_KEY: []const u8 = "filterindex_tip";
+
+    /// CF_DEFAULT key for the persisted coinstatsindex tip height (4-byte LE
+    /// u32).  Committed only inside flush() WriteBatches that also carry a
+    /// coinstats write/revert, so it stays in lockstep with the per-height
+    /// records + the chain tip (Core: best-block key batched with the MuHash key).
+    pub const COINSTATSINDEX_TIP_KEY: []const u8 = "coinstatsindex_tip";
+
+    /// Per-block CF_COINSTATS record pending durable commit.  `record_bytes`
+    /// is the serialized `indexes.CoinStats`, heap-owned by ChainState until
+    /// flush() drains it (frees on success, retains for retry on failure).
+    pub const PendingCoinStatsWrite = struct {
+        height: u32,
+        hash: types.Hash256,
+        record_bytes: []u8,
+    };
+
+    /// Per-block CF_COINSTATS revert pending durable commit (disconnect side).
+    /// Carries the orphan height + its full record bytes so flush() can delete
+    /// the height key and re-store the same bytes under the hash key (Core
+    /// CopyHeightIndexToHashIndex — keeps the orphan stats queryable by hash).
+    pub const PendingCoinStatsRevert = struct {
+        height: u32,
+        hash: types.Hash256,
+        record_bytes: []u8,
+    };
+
+    /// Build the big-endian CF_COINSTATS height key (Core DBHeightKey uses BE
+    /// so sequential heights are adjacent in the keyspace).
+    pub fn buildCoinStatsHeightKey(height: u32) [4]u8 {
+        var key: [4]u8 = undefined;
+        std.mem.writeInt(u32, &key, height, .big);
+        return key;
+    }
 
     /// Undo data for a connected block — needed for disconnection during reorgs.
     /// This is the in-memory representation used during block connection.
@@ -2356,6 +2452,8 @@ pub const ChainState = struct {
             .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_filter_writes = std.ArrayList(PendingFilterWrite).init(allocator),
             .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
+            .pending_coinstats_writes = std.ArrayList(PendingCoinStatsWrite).init(allocator),
+            .pending_coinstats_reverts = std.ArrayList(PendingCoinStatsRevert).init(allocator),
         };
     }
 
@@ -2375,6 +2473,8 @@ pub const ChainState = struct {
             .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_filter_writes = std.ArrayList(PendingFilterWrite).init(allocator),
             .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
+            .pending_coinstats_writes = std.ArrayList(PendingCoinStatsWrite).init(allocator),
+            .pending_coinstats_reverts = std.ArrayList(PendingCoinStatsRevert).init(allocator),
         };
     }
 
@@ -2459,6 +2559,17 @@ pub const ChainState = struct {
         }
         self.pending_filter_writes.deinit();
         self.pending_filter_deletes.deinit();
+        // CoinStatsIndex (2026-06-08): both queues hold heap-owned record
+        // bytes until flush() drains them; free any still queued on a
+        // flush_error / process-exit path (clean shutdowns already drained).
+        for (self.pending_coinstats_writes.items) |entry| {
+            self.allocator.free(entry.record_bytes);
+        }
+        self.pending_coinstats_writes.deinit();
+        for (self.pending_coinstats_reverts.items) |entry| {
+            self.allocator.free(entry.record_bytes);
+        }
+        self.pending_coinstats_reverts.deinit();
         self.utxo_set.deinit();
     }
 
@@ -2859,6 +2970,479 @@ pub const ChainState = struct {
         return hdr;
     }
 
+    // ======================================================================
+    // CoinStatsIndex (2026-06-08) — per-height UTXO-set running MuHash3072 +
+    // cumulative totals.  Bitcoin Core analog: index/coinstatsindex.cpp +
+    // kernel/coinstats.cpp.  See the field declarations near the top of
+    // ChainState for the persistence + reorg-safety model.
+    // ======================================================================
+
+    /// A coin descriptor for muhash insert/remove + counter maintenance.
+    /// Mirrors the fields Core's `Coin` carries into TxOutSer/ApplyCoinHash.
+    /// `script` is borrowed (not owned) — valid only for the duration of the
+    /// queueCoinStats* call that consumes it.
+    pub const CoinStatsCoin = struct {
+        txid: types.Hash256,
+        vout: u32,
+        value: i64,
+        script: []const u8,
+        height: u32,
+        is_coinbase: bool,
+    };
+
+    /// Serialize one coin into the canonical TxOutSer byte string and apply it
+    /// to `acc` (insert = add to set, !insert = remove).  Byte layout MUST be
+    /// identical to `computeTxOutSetStats`'s muhash branch and Core's TxOutSer:
+    ///   txid(32) ‖ LE32 vout ‖ LE32 code ‖ LE i64 value
+    ///   ‖ CompactSize(script.len) ‖ script
+    /// where code = (height << 1) | coinbase-bit.  MuHash is a commutative
+    /// multiset hash, so insert/remove order is irrelevant to the final digest.
+    fn coinStatsApplyHash(
+        self: *ChainState,
+        acc: *@import("muhash.zig").MuHash3072,
+        coin: *const CoinStatsCoin,
+        insert: bool,
+    ) !void {
+        var w = serialize.Writer.init(self.allocator);
+        defer w.deinit();
+        try w.writeBytes(&coin.txid);
+        try w.writeInt(u32, coin.vout);
+        const code: u32 = (@as(u32, coin.height) << 1) | (if (coin.is_coinbase) @as(u32, 1) else 0);
+        try w.writeInt(u32, code);
+        try w.writeInt(i64, coin.value);
+        try w.writeCompactSize(coin.script.len);
+        try w.writeBytes(coin.script);
+        const bytes = w.getWritten();
+        if (insert) acc.insert(bytes) else acc.remove(bytes);
+    }
+
+    /// Apply one created coin to the running accumulator + counters (forward).
+    /// Caller must have already filtered unspendable scripts.
+    fn coinStatsAddCoin(self: *ChainState, coin: *const CoinStatsCoin) !void {
+        const indexes_mod = @import("indexes.zig");
+        try self.coinStatsApplyHash(&self.coinstats_acc, coin, true);
+        if (coin.is_coinbase) {
+            self.coinstats_total_coinbase += coin.value;
+        } else {
+            self.coinstats_total_new_outputs_ex_coinbase += coin.value;
+        }
+        self.coinstats_txouts += 1;
+        self.coinstats_total_amount += coin.value;
+        self.coinstats_bogo_size += indexes_mod.coinStatsBogoSize(coin.script.len);
+    }
+
+    /// Apply one spent prevout to the running accumulator + counters (forward).
+    fn coinStatsSpendCoin(self: *ChainState, coin: *const CoinStatsCoin) !void {
+        const indexes_mod = @import("indexes.zig");
+        try self.coinStatsApplyHash(&self.coinstats_acc, coin, false);
+        self.coinstats_total_prevout_spent += coin.value;
+        self.coinstats_txouts -= 1;
+        self.coinstats_total_amount -= coin.value;
+        self.coinstats_bogo_size -= indexes_mod.coinStatsBogoSize(coin.script.len);
+    }
+
+    /// Build the per-height CoinStats record from the current running state.
+    fn coinStatsSnapshot(self: *ChainState, hash: *const types.Hash256, height: u32) @import("indexes.zig").CoinStats {
+        const indexes_mod = @import("indexes.zig");
+        // We persist the UN-finalized accumulator (numerator ‖ denominator), so
+        // no copy/finalize is needed here — toBytes is non-mutating.
+        var mu_bytes: [@import("muhash.zig").MuHash3072.SERIALIZED_SIZE]u8 = undefined;
+        self.coinstats_acc.toBytes(&mu_bytes);
+        return indexes_mod.CoinStats{
+            .block_hash = hash.*,
+            .height = height,
+            .muhash = mu_bytes,
+            .txouts = self.coinstats_txouts,
+            .bogo_size = self.coinstats_bogo_size,
+            .total_amount = self.coinstats_total_amount,
+            .total_subsidy = self.coinstats_total_subsidy,
+            .total_prevout_spent_amount = self.coinstats_total_prevout_spent,
+            .total_new_outputs_ex_coinbase_amount = self.coinstats_total_new_outputs_ex_coinbase,
+            .total_coinbase_amount = self.coinstats_total_coinbase,
+            .total_unspendables_genesis_block = self.coinstats_unspendables_genesis,
+            .total_unspendables_bip30 = self.coinstats_unspendables_bip30,
+            .total_unspendables_scripts = self.coinstats_unspendables_scripts,
+            .total_unspendables_unclaimed_rewards = self.coinstats_unspendables_unclaimed,
+        };
+    }
+
+    /// Load the running coinstats state FROM a persisted per-height snapshot
+    /// (used on startup-restore and reorg-rewind).  Sets the in-memory totals
+    /// + accumulator + tip height to exactly what the record holds.
+    fn coinStatsLoadFromRecord(self: *ChainState, rec: *const @import("indexes.zig").CoinStats) void {
+        self.coinstats_acc = @import("muhash.zig").MuHash3072.fromBytes(&rec.muhash);
+        self.coinstats_txouts = rec.txouts;
+        self.coinstats_bogo_size = rec.bogo_size;
+        self.coinstats_total_amount = rec.total_amount;
+        self.coinstats_total_subsidy = rec.total_subsidy;
+        self.coinstats_total_prevout_spent = rec.total_prevout_spent_amount;
+        self.coinstats_total_new_outputs_ex_coinbase = rec.total_new_outputs_ex_coinbase_amount;
+        self.coinstats_total_coinbase = rec.total_coinbase_amount;
+        self.coinstats_unspendables_genesis = rec.total_unspendables_genesis_block;
+        self.coinstats_unspendables_bip30 = rec.total_unspendables_bip30;
+        self.coinstats_unspendables_scripts = rec.total_unspendables_scripts;
+        self.coinstats_unspendables_unclaimed = rec.total_unspendables_unclaimed_rewards;
+        self.coinstatsindex_height = rec.height;
+    }
+
+    /// Reset the running coinstats state to the empty multiset (height -1 /
+    /// pre-genesis).  Used when a reorg rewinds to genesis or when no parent
+    /// record exists.
+    fn coinStatsResetToEmpty(self: *ChainState) void {
+        self.coinstats_acc = @import("muhash.zig").MuHash3072.init();
+        self.coinstats_txouts = 0;
+        self.coinstats_bogo_size = 0;
+        self.coinstats_total_amount = 0;
+        self.coinstats_total_subsidy = 0;
+        self.coinstats_total_prevout_spent = 0;
+        self.coinstats_total_new_outputs_ex_coinbase = 0;
+        self.coinstats_total_coinbase = 0;
+        self.coinstats_unspendables_genesis = 0;
+        self.coinstats_unspendables_bip30 = 0;
+        self.coinstats_unspendables_scripts = 0;
+        self.coinstats_unspendables_unclaimed = 0;
+        self.coinstatsindex_height = 0;
+    }
+
+    /// Is (height, hash) one of the two BIP30 duplicate-coinbase blocks whose
+    /// coinbase outputs are never added to the UTXO set?  Core
+    /// IsBIP30Unspendable: mainnet h=91722 (0e3e...) / h=91812 (0050...).
+    fn isCoinStatsBip30Unspendable(self: *ChainState, height: u32, hash: *const types.Hash256) bool {
+        _ = self;
+        const BIP30_91722 = [_]u8{
+            0xc7, 0x68, 0xff, 0x4f, 0x3e, 0x9c, 0x4c, 0x39, 0xb8, 0xc4, 0x73, 0x2c, 0xa6, 0x52, 0x52, 0xc0,
+            0xa8, 0x7e, 0x7d, 0x18, 0x12, 0x5e, 0xfd, 0x18, 0x4d, 0xc1, 0x95, 0x14, 0x71, 0x59, 0xe0, 0x00,
+        };
+        const BIP30_91812 = [_]u8{
+            0x14, 0x18, 0xc9, 0x8b, 0xa0, 0x35, 0xb9, 0x0c, 0x71, 0x6d, 0x71, 0xa3, 0xb4, 0x6d, 0xf6, 0x42,
+            0xbc, 0x2c, 0xf7, 0x37, 0x4c, 0x9d, 0xae, 0xc9, 0xa7, 0x07, 0x52, 0xfd, 0xd0, 0xc4, 0x09, 0x00,
+        };
+        if (height == 91722) return std.mem.eql(u8, hash, &BIP30_91722);
+        if (height == 91812) return std.mem.eql(u8, hash, &BIP30_91812);
+        return false;
+    }
+
+    /// Queue the per-height CF_COINSTATS record for the just-connected block,
+    /// advancing the running MuHash3072 accumulator + cumulative totals.  No-op
+    /// when `coinstatsindex_enabled = false` or in memory-only mode.  Genesis
+    /// (height 0) routes its subsidy to `unspendables_genesis` and adds no
+    /// UTXOs (its coinbase output is not in the set), matching Core CustomAppend
+    /// height-0 short-circuit.
+    ///
+    /// `created` and `spent` are the spendable created coins and spent prevouts
+    /// of this block, captured by connectBlockInner.  The block subsidy is
+    /// derived from `consensus.getBlockSubsidy`.  Caller must invoke with the
+    /// block being connected at height = (prior coinstatsindex_height + 1) so
+    /// the running accumulator is the correct forward input.
+    ///
+    /// Atomicity: the record bytes + the persisted tip key land in the same
+    /// flush() WriteBatch as the UTXO mutations + tip (Core: best-block key
+    /// batched with the MuHash key).  Advances `coinstatsindex_height` eagerly so
+    /// the next in-batch block sees the right height; flush_error rewinds.
+    fn queueCoinStatsWriteForBlock(
+        self: *ChainState,
+        block: *const types.Block,
+        hash: *const types.Hash256,
+        height: u32,
+        created: []const CoinStatsCoin,
+        spent: []const CoinStatsCoin,
+    ) !void {
+        if (!self.coinstatsindex_enabled) return;
+        if (self.utxo_set.db == null) return;
+        const consensus = @import("consensus.zig");
+
+        const params = self.network_params orelse {
+            std.debug.print("queueCoinStatsWriteForBlock: network_params unset at height {d}; skipping\n", .{height});
+            return;
+        };
+        const subsidy = consensus.getBlockSubsidy(height, params);
+        self.coinstats_total_subsidy += subsidy;
+
+        if (height == 0) {
+            // Genesis coinbase output is unspendable / absent from the set.
+            self.coinstats_unspendables_genesis += subsidy;
+        } else {
+            const is_bip30 = self.isCoinStatsBip30Unspendable(height, hash);
+            if (is_bip30) {
+                // Duplicate-coinbase block: its coinbase outputs were never
+                // added; route the subsidy to the bip30 bucket and add NO
+                // created coins for tx 0.  (Non-coinbase txs in such a block
+                // would still be processed, but the two historical BIP30
+                // blocks contained only the duplicate coinbase.)
+                self.coinstats_unspendables_bip30 += subsidy;
+            }
+            // Apply created coins (already filtered for unspendable scripts by
+            // connectBlockInner; the unspendable-script value was accumulated
+            // into coinstats_unspendables_scripts there).  Skip the coinbase's
+            // created coins entirely on a BIP30 block.
+            for (created) |*coin| {
+                if (is_bip30 and coin.is_coinbase) continue;
+                try self.coinStatsAddCoin(coin);
+            }
+            // Apply spent prevouts.
+            for (spent) |*coin| {
+                try self.coinStatsSpendCoin(coin);
+            }
+
+            // Unclaimed-reward accounting (Core CustomAppend:181-188).  Fees a
+            // miner did not claim in its coinbase.  Computed every block from
+            // the running cumulative totals:
+            //   unclaimed = (prevout_spent + subsidy_total)
+            //             - (new_ex_coinbase + coinbase_total + unspendable_total)
+            // i.e. the incremental shortfall this block introduced.  We compute
+            // it directly as a per-block delta against the prior unclaimed total
+            // by using the running cumulatives (Core does the same in 256-bit;
+            // regtest/mainnet values stay well within i64).
+            const unspendable_total = self.coinstats_unspendables_genesis +
+                self.coinstats_unspendables_bip30 +
+                self.coinstats_unspendables_scripts +
+                self.coinstats_unspendables_unclaimed;
+            const lhs = self.coinstats_total_prevout_spent + self.coinstats_total_subsidy;
+            const rhs = self.coinstats_total_new_outputs_ex_coinbase +
+                self.coinstats_total_coinbase + unspendable_total;
+            // (lhs - rhs) is the cumulative unclaimed delta NOT yet booked.
+            const delta = lhs - rhs;
+            self.coinstats_unspendables_unclaimed += delta;
+        }
+        _ = block; // block body not needed beyond the captured coin lists
+
+        // Snapshot + queue the per-height record.
+        const rec = self.coinStatsSnapshot(hash, height);
+        const record_bytes = try rec.toBytes(self.allocator);
+        errdefer self.allocator.free(@constCast(record_bytes));
+        try self.pending_coinstats_writes.append(.{
+            .height = height,
+            .hash = hash.*,
+            .record_bytes = @constCast(record_bytes),
+        });
+        self.coinstatsindex_height = height;
+    }
+
+    /// Queue the CF_COINSTATS revert for a disconnected block: delete its
+    /// height-keyed record, preserve it under its hash key (Core
+    /// CopyHeightIndexToHashIndex), and rewind the running accumulator +
+    /// totals to the PARENT height's persisted snapshot (Core RevertBlock).
+    /// No-op when `coinstatsindex_enabled = false`.
+    ///
+    /// `disc_height` = the height of the block being disconnected; on return
+    /// the running state reflects (disc_height - 1).  All writes land in the
+    /// same flush() WriteBatch as the UTXO restores + tip rewind.
+    fn queueCoinStatsDeleteForBlock(
+        self: *ChainState,
+        hash: *const types.Hash256,
+        disc_height: u32,
+    ) !void {
+        if (!self.coinstatsindex_enabled) return;
+        const db = self.utxo_set.db orelse return;
+
+        // Read the orphan's own record so we can re-key it under its hash for
+        // post-reorg query-by-orphan-hash.  If absent (datadir upgraded mid-
+        // flight / never indexed this far) there is nothing to preserve.
+        var orphan_bytes: ?[]u8 = null;
+        {
+            const hk = buildCoinStatsHeightKey(disc_height);
+            if (try db.get(CF_COINSTATS, &hk)) |data| {
+                // db.get returns heap-owned bytes typed const; we own + free
+                // them via the revert queue, so cast to the mutable slice the
+                // queue entry holds.
+                orphan_bytes = @constCast(data); // transferred to the revert queue
+            }
+        }
+        try self.pending_coinstats_reverts.append(.{
+            .height = disc_height,
+            .hash = hash.*,
+            .record_bytes = orphan_bytes orelse try self.allocator.alloc(u8, 0),
+        });
+
+        // Rewind the running state to the parent height.  At (disc_height-1)
+        // the persisted snapshot is already the rolled-back state, so we load
+        // it directly rather than reversing muhash ops by hand — equivalent to
+        // Core RevertBlock reading DBHeightKey(height-1) then asserting the
+        // recomputed muhash matches.  Falling back to empty at genesis.
+        if (disc_height <= 1) {
+            self.coinStatsResetToEmpty();
+            return;
+        }
+        const parent_height = disc_height - 1;
+        const pk = buildCoinStatsHeightKey(parent_height);
+        if (try db.get(CF_COINSTATS, &pk)) |pdata| {
+            defer self.allocator.free(pdata);
+            const indexes_mod = @import("indexes.zig");
+            const prec = indexes_mod.CoinStats.fromBytes(pdata) catch {
+                std.debug.print("queueCoinStatsDeleteForBlock: corrupt parent record at height {d}; resetting index state\n", .{parent_height});
+                self.coinStatsResetToEmpty();
+                return;
+            };
+            self.coinStatsLoadFromRecord(&prec);
+        } else {
+            std.debug.print("queueCoinStatsDeleteForBlock: no parent record at height {d}; resetting index state\n", .{parent_height});
+            self.coinStatsResetToEmpty();
+        }
+    }
+
+    /// Public startup-restore wrapper: set the running coinstats state from a
+    /// persisted per-height snapshot (called by main.zig after loading the
+    /// persisted tip).  Crash-safe reconcile: the loaded snapshot is exactly
+    /// the last durably-committed state (tip key + records + chain tip all
+    /// committed in one WriteBatch).
+    pub fn restoreCoinStatsFromRecord(self: *ChainState, rec: *const @import("indexes.zig").CoinStats) void {
+        self.coinStatsLoadFromRecord(rec);
+    }
+
+    /// Seed the genesis-block coinstats accounting on a FRESH index (no
+    /// persisted tip).  Books the genesis subsidy into total_subsidy +
+    /// total_unspendables_genesis_block (Core CustomAppend height-0 branch).
+    /// The genesis coinbase output is never in the UTXO set, so muhash/txouts/
+    /// total_amount stay at the empty-multiset baseline.  Idempotent only when
+    /// the running state is still empty (height 0); callers must invoke before
+    /// any block is connected / backfilled.
+    pub fn seedCoinStatsGenesis(self: *ChainState, genesis_subsidy: i64) void {
+        if (self.coinstatsindex_height != 0) return;
+        self.coinStatsResetToEmpty();
+        self.coinstats_total_subsidy = genesis_subsidy;
+        self.coinstats_unspendables_genesis = genesis_subsidy;
+    }
+
+    /// Look up the per-height CoinStats record by height (active chain).
+    /// Returns null when the index is off / the height isn't indexed.
+    pub fn getCoinStatsByHeight(self: *ChainState, height: u32) !?@import("indexes.zig").CoinStats {
+        if (!self.coinstatsindex_enabled) return null;
+        const db = self.utxo_set.db orelse return null;
+        const indexes_mod = @import("indexes.zig");
+        const hk = buildCoinStatsHeightKey(height);
+        const data = (try db.get(CF_COINSTATS, &hk)) orelse return null;
+        defer self.allocator.free(data);
+        return indexes_mod.CoinStats.fromBytes(data) catch null;
+    }
+
+    /// Look up the per-height CoinStats record by block hash.  Tries the
+    /// height-keyed record first (resolving the hash→height via the H: index
+    /// and confirming the stored hash matches), then the orphan hash-keyed
+    /// record written on disconnect (Core LookUpOne fallback).
+    pub fn getCoinStatsByHash(self: *ChainState, hash: *const types.Hash256) !?@import("indexes.zig").CoinStats {
+        if (!self.coinstatsindex_enabled) return null;
+        const db = self.utxo_set.db orelse return null;
+        const indexes_mod = @import("indexes.zig");
+        // Orphan hash-keyed record (32-byte key) — written only on disconnect.
+        if (try db.get(CF_COINSTATS, hash)) |data| {
+            defer self.allocator.free(data);
+            if (indexes_mod.CoinStats.fromBytes(data) catch null) |rec| return rec;
+        }
+        return null;
+    }
+
+    /// IBD-time backfill — populate CF_COINSTATS for every block in
+    /// [coinstatsindex_height+1 .. best_height] using on-disk data (CF_BLOCKS +
+    /// CF_BLOCK_UNDO), advancing the running accumulator block-by-block.
+    /// Mirrors `backfillBlockFilterIndex`.  Flushes every 256 blocks.  Must be
+    /// called after the running state is restored from the persisted tip.
+    pub fn backfillCoinStatsIndex(self: *ChainState) !void {
+        if (!self.coinstatsindex_enabled) return;
+        const db = self.utxo_set.db orelse return;
+        if (self.best_height == 0) return;
+        if (self.coinstatsindex_height >= self.best_height) return;
+
+        const start_height: u32 = self.coinstatsindex_height + 1;
+        const tip_height: u32 = self.best_height;
+        std.debug.print(
+            "CoinStatsIndex backfill: scanning heights {d}..{d} ({d} blocks)\n",
+            .{ start_height, tip_height, tip_height - start_height + 1 },
+        );
+
+        const crypto = @import("crypto.zig");
+        const FLUSH_EVERY: u32 = 256;
+        var written_since_flush: u32 = 0;
+        var h: u32 = start_height;
+        while (h <= tip_height) : (h += 1) {
+            const hash = self.getBlockHashByHeight(h) orelse {
+                std.debug.print("CoinStatsIndex backfill: missing height→hash for {d}; stopping at {d}\n", .{ h, self.coinstatsindex_height });
+                break;
+            };
+            const raw = (try db.get(CF_BLOCKS, &hash)) orelse {
+                std.debug.print("CoinStatsIndex backfill: missing block body for height {d} (pruned?); stopping at {d}\n", .{ h, self.coinstatsindex_height });
+                break;
+            };
+            defer self.allocator.free(raw);
+            var reader = serialize.Reader{ .data = raw };
+            var block = serialize.readBlock(&reader, self.allocator) catch {
+                std.debug.print("CoinStatsIndex backfill: corrupt block body at height {d}; stopping\n", .{h});
+                break;
+            };
+            defer serialize.freeBlock(self.allocator, &block);
+
+            // Load undo data (created/spent) from CF_BLOCK_UNDO.
+            var owned_undo: ?BlockUndoData = null;
+            defer if (owned_undo) |*u| u.deinit(self.allocator);
+            if (try db.get(CF_BLOCK_UNDO, &hash)) |undo_bytes| {
+                defer self.allocator.free(undo_bytes);
+                owned_undo = BlockUndoData.fromBytes(undo_bytes, self.allocator) catch null;
+            }
+
+            // Build the created + spent coin lists (same shape connectBlockInner
+            // captures live).
+            var created = std.ArrayList(CoinStatsCoin).init(self.allocator);
+            defer created.deinit();
+            var spent = std.ArrayList(CoinStatsCoin).init(self.allocator);
+            defer spent.deinit();
+            // Owned reconstructed spent scripts (freed after the queue call).
+            var spent_scripts = std.ArrayList([]const u8).init(self.allocator);
+            defer {
+                for (spent_scripts.items) |s| self.allocator.free(@constCast(s));
+                spent_scripts.deinit();
+            }
+
+            var unspendable_scripts_value: i64 = 0;
+            for (block.transactions, 0..) |tx, tx_idx| {
+                const txid = crypto.computeTxidStreaming(&tx);
+                const is_cb = tx_idx == 0;
+                for (tx.outputs, 0..) |o, out_idx| {
+                    if (isScriptUnspendable(o.script_pubkey)) {
+                        unspendable_scripts_value += o.value;
+                        continue;
+                    }
+                    try created.append(.{
+                        .txid = txid,
+                        .vout = @intCast(out_idx),
+                        .value = o.value,
+                        .script = o.script_pubkey,
+                        .height = h,
+                        .is_coinbase = is_cb,
+                    });
+                }
+                if (is_cb) continue;
+                const tu = if (owned_undo) |u| (if (tx_idx - 1 < u.tx_undo.len) u.tx_undo[tx_idx - 1] else null) else null;
+                if (tu) |t| {
+                    for (tx.inputs, 0..) |input, in_idx| {
+                        if (in_idx >= t.prev_outputs.len) break;
+                        const p = t.prev_outputs[in_idx];
+                        try spent.append(.{
+                            .txid = input.previous_output.hash,
+                            .vout = input.previous_output.index,
+                            .value = p.value,
+                            .script = p.script_pubkey,
+                            .height = p.height,
+                            .is_coinbase = p.is_coinbase,
+                        });
+                    }
+                }
+            }
+            // Account unspendable-script value before the running totals step.
+            self.coinstats_unspendables_scripts += unspendable_scripts_value;
+
+            try self.queueCoinStatsWriteForBlock(&block, &hash, h, created.items, spent.items);
+            written_since_flush += 1;
+            if (written_since_flush >= FLUSH_EVERY) {
+                try self.flush();
+                written_since_flush = 0;
+            }
+        }
+        if (written_since_flush > 0) try self.flush();
+        std.debug.print(
+            "CoinStatsIndex backfill: complete, indexed up to height {d}\n",
+            .{self.coinstatsindex_height},
+        );
+    }
+
     /// CF_TX_INDEX lookup helper used by `getrawtransaction`.  Returns the
     /// (block_hash, block_height, tx_index_in_block) triple stored at
     /// connect time, or null when the txid isn't indexed (txindex disabled,
@@ -2917,6 +3501,19 @@ pub const ChainState = struct {
         var reader = serialize.Reader{ .data = bytes };
         _ = reader.readInt(u32) catch return null; // height prefix (see getBlockIndex)
         return serialize.readBlockHeader(&reader) catch return null;
+    }
+
+    /// Read the persisted height for a block hash from CF_BLOCK_INDEX (the
+    /// 4-byte LE height prefix written ahead of the header on connect).
+    /// Returns null if the hash is not in the block index.  Used by
+    /// gettxoutsetinfo to resolve a hash_or_height block-hash argument.
+    pub fn getBlockHeightByHash(self: *ChainState, hash: *const types.Hash256) ?u32 {
+        const db = self.utxo_set.db orelse return null;
+        const data = db.get(CF_BLOCK_INDEX, hash) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        var reader = serialize.Reader{ .data = bytes };
+        return reader.readInt(u32) catch null;
     }
 
     /// Compute the median-time-past for the active chain tip.
@@ -3892,6 +4489,17 @@ pub const ChainState = struct {
         // queues above.  No-op when blockfilterindex_enabled is false.
         try self.queueFilterIndexDeleteForBlock(hash, &block.header.prev_block, self.best_height);
 
+        // CoinStatsIndex (2026-06-08): queue the CF_COINSTATS revert — delete
+        // the disconnected block's height-keyed record, preserve it under its
+        // hash key (so a post-reorg query by the now-orphan hash still
+        // resolves), and rewind the running accumulator + cumulative totals to
+        // the parent height's persisted snapshot.  `disc_height` was captured
+        // before the tip rewind above.  Same single-WriteBatch atomicity as the
+        // txindex/undo/filter revert queues.  No-op when coinstatsindex_enabled
+        // is false.  Bitcoin Core analog: CustomRemove → CopyHeightIndexToHash
+        // Index + RevertBlock.
+        try self.queueCoinStatsDeleteForBlock(hash, disc_height);
+
         if (do_flush) {
             // Flush so the tip rewind + UTXO mutations land on disk
             // immediately.  Without this, a caller that runs disconnect
@@ -4424,6 +5032,28 @@ pub const ChainState = struct {
             spent_scripts_owned.deinit();
         }
 
+        // CoinStatsIndex (2026-06-08): capture this block's spendable created
+        // coins + spent prevouts (value, script, height, is_coinbase) for the
+        // per-height MuHash3072 + counters.  Decoupled from skip_undo so the
+        // IBD fast path still maintains the index without the full BlockUndo
+        // capture cost — same pattern as `want_filters` above.  Spent-coin
+        // scripts are reconstructed from the CompactUtxo into
+        // `coinstats_spent_scripts_owned` (freed after the queue call); created-
+        // coin scripts borrow `output.script_pubkey` (valid for the queue call).
+        // Unspendable-script value is accumulated separately into
+        // `coinstats_unspendables_scripts` as the create loop skips them.
+        const want_coinstats = self.coinstatsindex_enabled and self.utxo_set.db != null and height > 0;
+        var coinstats_created = std.ArrayList(CoinStatsCoin).init(self.allocator);
+        defer coinstats_created.deinit();
+        var coinstats_spent = std.ArrayList(CoinStatsCoin).init(self.allocator);
+        defer coinstats_spent.deinit();
+        var coinstats_spent_scripts_owned = std.ArrayList([]const u8).init(self.allocator);
+        defer {
+            for (coinstats_spent_scripts_owned.items) |s| self.allocator.free(@constCast(s));
+            coinstats_spent_scripts_owned.deinit();
+        }
+        var coinstats_unspendable_scripts_value: i64 = 0;
+
         // W73 per-block phase accumulators.  Written to ChainState scratch
         // fields on success; connectBlockFast reads them.
         var spend_ns_block: u64 = 0;
@@ -4473,6 +5103,21 @@ pub const ChainState = struct {
                             const script = try s.reconstructScript(self.allocator);
                             try spent_scripts_owned.append(script);
                         }
+                        // CoinStatsIndex: capture the spent prevout for the
+                        // muhash `remove` even on the fast path (the coin is
+                        // about to be freed).  Owns its reconstructed script.
+                        if (want_coinstats) {
+                            const cs_script = try s.reconstructScript(self.allocator);
+                            try coinstats_spent_scripts_owned.append(cs_script);
+                            try coinstats_spent.append(.{
+                                .txid = input.previous_output.hash,
+                                .vout = input.previous_output.index,
+                                .value = s.value,
+                                .script = cs_script,
+                                .height = s.height,
+                                .is_coinbase = s.is_coinbase,
+                            });
+                        }
                         s.deinit(self.allocator);
                     } else {
                         const spent = try self.utxo_set.spend(&input.previous_output)
@@ -4480,6 +5125,18 @@ pub const ChainState = struct {
                         if (want_filters) {
                             const script = try spent.reconstructScript(self.allocator);
                             try spent_scripts_owned.append(script);
+                        }
+                        if (want_coinstats) {
+                            const cs_script = try spent.reconstructScript(self.allocator);
+                            try coinstats_spent_scripts_owned.append(cs_script);
+                            try coinstats_spent.append(.{
+                                .txid = input.previous_output.hash,
+                                .vout = input.previous_output.index,
+                                .value = spent.value,
+                                .script = cs_script,
+                                .height = spent.height,
+                                .is_coinbase = spent.is_coinbase,
+                            });
                         }
                         try spent_list.append(.{
                             .outpoint = input.previous_output,
@@ -4507,7 +5164,13 @@ pub const ChainState = struct {
                 // used the full helper; this loop now matches it.
                 // Reference: bitcoin-core/src/coins.cpp:91 (AddCoin IsUnspendable)
                 //            bitcoin-core/src/script/script.h:563 (IsUnspendable)
-                if (isScriptUnspendable(output.script_pubkey)) continue;
+                if (isScriptUnspendable(output.script_pubkey)) {
+                    // CoinStatsIndex: unspendable outputs are excluded from the
+                    // muhash/txouts/total_amount; their value goes to the
+                    // unspendables_scripts bucket (Core CustomAppend:140-143).
+                    if (want_coinstats) coinstats_unspendable_scripts_value += output.value;
+                    continue;
+                }
 
                 const outpoint = types.OutPoint{
                     .hash = tx_hash,
@@ -4516,6 +5179,19 @@ pub const ChainState = struct {
                 try self.utxo_set.add(&outpoint, &output, height, tx_idx == 0);
                 if (!skip_undo) {
                     try created_list.append(outpoint);
+                }
+                // CoinStatsIndex: capture the spendable created coin for the
+                // muhash `insert`.  Script borrows `output.script_pubkey`,
+                // valid until the queueCoinStatsWriteForBlock call below.
+                if (want_coinstats) {
+                    try coinstats_created.append(.{
+                        .txid = tx_hash,
+                        .vout = @intCast(out_idx),
+                        .value = output.value,
+                        .script = output.script_pubkey,
+                        .height = height,
+                        .is_coinbase = tx_idx == 0,
+                    });
                 }
             }
             const t_create_end = std.time.nanoTimestamp();
@@ -4562,6 +5238,17 @@ pub const ChainState = struct {
         // UTXO mutations + tip update so a crash leaves all four pieces
         // either advanced together or rewound together.
         try self.queueFilterIndexWriteForBlock(block, hash, height, spent_scripts_owned.items);
+
+        // CoinStatsIndex (2026-06-08): book the unspendable-script value the
+        // create loop skipped, then advance the running MuHash3072 + counters
+        // and queue the per-height CF_COINSTATS record.  Same single-WriteBatch
+        // atomicity as the txindex/filter writes above.  No-op when
+        // coinstatsindex_enabled is false (default) — `want_coinstats` is also
+        // false then, so the capture lists are empty and this is a cheap skip.
+        if (want_coinstats) {
+            self.coinstats_unspendables_scripts += coinstats_unspendable_scripts_value;
+        }
+        try self.queueCoinStatsWriteForBlock(block, hash, height, coinstats_created.items, coinstats_spent.items);
 
         // BIP-113: push the new block's timestamp into the ring buffer so
         // computeMTP() can serve the correct MTP for the NEXT submitted block
@@ -5059,6 +5746,73 @@ pub const ChainState = struct {
             } });
         }
 
+        // 11. CoinStatsIndex reverts (disconnect side).  For each disconnected
+        //     block: delete its BE(height)-keyed CF_COINSTATS record, then
+        //     (if a record was preserved) re-store it under the 32-byte hash
+        //     key so a post-reorg query by the now-orphan hash still resolves
+        //     (Core CopyHeightIndexToHashIndex).  Append BEFORE the connect-
+        //     side puts so a reorg's delete-then-rewrite at the same height in
+        //     one flush window sees the put win (RocksDB applies in array
+        //     order).  Record bytes here are FRESH copies; the queue entry's
+        //     own bytes are freed in the cleanup loop after a successful write.
+        for (self.pending_coinstats_reverts.items) |entry| {
+            const hk = try self.allocator.alloc(u8, 4);
+            const hk_arr = buildCoinStatsHeightKey(entry.height);
+            @memcpy(hk, &hk_arr);
+            try batch.append(.{ .delete = .{
+                .cf = CF_COINSTATS,
+                .key = hk,
+            } });
+            if (entry.record_bytes.len > 0) {
+                const ohk = try self.allocator.alloc(u8, 32);
+                @memcpy(ohk, &entry.hash);
+                const ov = try self.allocator.alloc(u8, entry.record_bytes.len);
+                @memcpy(ov, entry.record_bytes);
+                try batch.append(.{ .put = .{
+                    .cf = CF_COINSTATS,
+                    .key = ohk,
+                    .value = ov,
+                } });
+            }
+        }
+
+        // 12. CoinStatsIndex writes (connect side).  One CF_COINSTATS put per
+        //     entry keyed by BE(height), value = serialized per-height record
+        //     (block hash + un-finalized MuHash3072 accumulator + cumulative
+        //     totals).  Fresh value copies; the queue entry's own bytes are
+        //     freed in the cleanup loop.  Empty queue when coinstatsindex is
+        //     off.  Bitcoin Core analog: m_db->Write(DBHeightKey, {hash, DBVal}).
+        for (self.pending_coinstats_writes.items) |entry| {
+            const k = try self.allocator.alloc(u8, 4);
+            const k_arr = buildCoinStatsHeightKey(entry.height);
+            @memcpy(k, &k_arr);
+            const v = try self.allocator.alloc(u8, entry.record_bytes.len);
+            @memcpy(v, entry.record_bytes);
+            try batch.append(.{ .put = .{
+                .cf = CF_COINSTATS,
+                .key = k,
+                .value = v,
+            } });
+        }
+
+        // 12b. Persisted coinstatsindex tip — emit only when a coinstats
+        //      write/revert is in flight, batched with everything else so it
+        //      stays in lockstep with the per-height records + chain tip
+        //      (Core: best-block key committed with the MuHash key).
+        if (self.coinstatsindex_enabled and
+            (self.pending_coinstats_writes.items.len > 0 or self.pending_coinstats_reverts.items.len > 0))
+        {
+            const cs_key = try self.allocator.alloc(u8, COINSTATSINDEX_TIP_KEY.len);
+            @memcpy(cs_key, COINSTATSINDEX_TIP_KEY);
+            const cs_val = try self.allocator.alloc(u8, 4);
+            std.mem.writeInt(u32, cs_val[0..4], self.coinstatsindex_height, .little);
+            try batch.append(.{ .put = .{
+                .cf = CF_DEFAULT,
+                .key = cs_key,
+                .value = cs_val,
+            } });
+        }
+
         flush_build_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_build_start));
 
         if (batch.items.len > 0) {
@@ -5149,6 +5903,19 @@ pub const ChainState = struct {
             }
             self.pending_filter_writes.clearRetainingCapacity();
             self.pending_filter_deletes.clearRetainingCapacity();
+
+            // CoinStatsIndex (2026-06-08): CF_COINSTATS records committed.  The
+            // batch carried FRESH value copies (freed by the generic BatchOp
+            // cleanup below), so here we free the queue entries' own heap-owned
+            // record_bytes exactly once and clear both queues.
+            for (self.pending_coinstats_writes.items) |entry| {
+                self.allocator.free(entry.record_bytes);
+            }
+            self.pending_coinstats_writes.clearRetainingCapacity();
+            for (self.pending_coinstats_reverts.items) |entry| {
+                self.allocator.free(entry.record_bytes);
+            }
+            self.pending_coinstats_reverts.clearRetainingCapacity();
 
             // Free allocated keys and values
             for (batch.items) |op| {

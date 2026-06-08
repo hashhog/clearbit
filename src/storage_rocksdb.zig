@@ -31,6 +31,11 @@ const cf_names = [_][*:0]const u8{
     // in place on next open.
     "block_filter",
     "block_filter_header",
+    // Added 2026-06-08 — persistent CoinStatsIndex (per-height UTXO-set
+    // running MuHash3072 + cumulative totals).  Backwards-compatible: the
+    // existing-CF reopen branch (rocksdb_list_column_families) upgrades
+    // legacy datadirs missing this CF in place on next open.
+    "coinstats",
 };
 
 /// Internal database state
