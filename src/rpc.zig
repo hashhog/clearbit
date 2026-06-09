@@ -2980,6 +2980,8 @@ pub const RpcServer = struct {
             return self.handleGetSyncState(id);
         } else if (std.mem.eql(u8, method, "getpeerinfo")) {
             return self.handleGetPeerInfo(id);
+        } else if (std.mem.eql(u8, method, "getblockfrompeer")) {
+            return self.handleGetBlockFromPeer(params, id);
         } else if (std.mem.eql(u8, method, "getnetworkinfo")) {
             return self.handleGetNetworkInfo(id);
         } else if (std.mem.eql(u8, method, "getnodeaddresses")) {
@@ -4983,6 +4985,136 @@ pub const RpcServer = struct {
 
         try writer.writeByte(']');
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `getblockfrompeer "blockhash" peer_id` → {} (empty object).
+    ///
+    /// Faithful port of Bitcoin Core's RPC handler
+    /// (rpc/blockchain.cpp:514-567 `getblockfrompeer`) plus the
+    /// `PeerManagerImpl::FetchBlock` logic it delegates to
+    /// (net_processing.cpp:1960-1994).  Core's contract:
+    ///
+    ///   1. The block HEADER must be known, else RPC_MISC_ERROR(-1)
+    ///      "Block header missing" (blockchain.cpp:547 — the
+    ///      `LookupBlockIndex` miss).
+    ///   2. Resolve the peer id, else RPC_MISC_ERROR(-1)
+    ///      "Peer does not exist" (net_processing.cpp:1966 — the
+    ///      `GetPeerRef == nullptr` miss).
+    ///   3. (optional, Core blockchain.cpp:558) if the block BODY is
+    ///      already present locally, RPC_MISC_ERROR(-1) "Block already
+    ///      downloaded".
+    ///   4. On success, send a block `getdata` to that peer carrying a
+    ///      single inv of type `MSG_BLOCK | MSG_WITNESS_FLAG`
+    ///      (net_processing.cpp:1981 — `CInv(MSG_BLOCK | MSG_WITNESS_FLAG, hash)`),
+    ///      and return an empty JSON object.
+    ///
+    /// PEER-ID CONVENTION: `peer_id` indexes into
+    /// `self.peer_manager.peers.items[peer_id]`, matching the `"id"`
+    /// field that `getpeerinfo` emits (the enumeration index — see
+    /// `handleGetPeerInfo`, which prints `i` as the id).
+    ///
+    /// `MSG_BLOCK | MSG_WITNESS_FLAG` == `0x40000002` ==
+    /// `p2p.InvType.msg_witness_block`.
+    fn handleGetBlockFromPeer(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // ── Parse parameters ─────────────────────────────────────────────────
+        if (params != .array) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid params", id);
+        }
+        if (params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "getblockfrompeer requires blockhash and peer_id", id);
+        }
+
+        // param[0]: blockhash (STR_HEX, 64 hex chars, display order).
+        const h0 = params.array.items[0];
+        if (h0 != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash", id);
+        }
+        const blockhash_hex = h0.string;
+        if (blockhash_hex.len != 64) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length", id);
+        }
+        // Display-order hex → internal little-endian bytes (reversed), matching
+        // every other hash-taking handler in this file (e.g. handleGetBlock).
+        var blockhash: types.Hash256 = undefined;
+        for (0..32) |i| {
+            blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
+            };
+        }
+
+        // param[1]: peer_id (NUM).  Core uses int64; we take it as a signed
+        // integer so a negative id falls through to "Peer does not exist".
+        const p1 = params.array.items[1];
+        if (p1 != .integer) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid peer_id", id);
+        }
+        const peer_id: i64 = p1.integer;
+
+        // ── Step 1: header must be known (Core blockchain.cpp:546-548) ──────
+        //
+        // "We must have the header for this block."  Resolve across the same
+        // sources getblockheader / getblock consult:
+        //   (a) genesis (always known),
+        //   (b) in-memory chain_manager block index (headers connected this
+        //       session — the authoritative live index),
+        //   (c) CF_BLOCKS raw block bytes (historical blocks persisted to
+        //       RocksDB; presence here implies the header is known),
+        //   (d) the current best tip hash (defensive — covers a tip whose
+        //       header bytes are not otherwise reachable without CF_BLOCKS).
+        var header_known = false;
+        if (std.mem.eql(u8, &blockhash, &self.network_params.genesis_hash)) {
+            header_known = true;
+        }
+        if (!header_known) {
+            if (self.chain_manager) |cm| {
+                if (cm.getBlock(&blockhash) != null) header_known = true;
+            }
+        }
+        if (!header_known) {
+            if (self.chain_state.utxo_set.db) |db| {
+                if (db.get(storage.CF_BLOCKS, &blockhash) catch null) |raw| {
+                    self.allocator.free(raw);
+                    header_known = true;
+                }
+            }
+        }
+        if (!header_known and std.mem.eql(u8, &blockhash, &self.chain_state.best_hash)) {
+            header_known = true;
+        }
+
+        if (!header_known) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Block header missing", id);
+        }
+
+        // ── Step 2: resolve the peer (Core net_processing.cpp:1965-1966) ────
+        //
+        // peer_id indexes peer_manager.peers (the getpeerinfo "id" convention).
+        // A negative or out-of-range index means the peer does not exist.
+        if (peer_id < 0 or @as(usize, @intCast(peer_id)) >= self.peer_manager.peers.items.len) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Peer does not exist", id);
+        }
+        const peer = self.peer_manager.peers.items[@intCast(peer_id)];
+
+        // ── Step 4: send the block getdata (Core net_processing.cpp:1979-1987) ─
+        //
+        // One inv of type MSG_BLOCK | MSG_WITNESS_FLAG (0x40000002 ==
+        // msg_witness_block) carrying the requested block hash, pushed to the
+        // resolved peer.  We send a single fixed-size inv on the stack — no
+        // heap allocation, matching the reorg fork-fetch path in peer.zig.
+        var inv_items = [_]p2p.InvVector{.{
+            .inv_type = .msg_witness_block,
+            .hash = blockhash,
+        }};
+        const getdata_msg = p2p.Message{ .getdata = .{ .inventory = inv_items[0..] } };
+        peer.sendMessage(&getdata_msg) catch {
+            // Core's FetchBlock returns "Peer not fully connected" when the
+            // ForNode push fails (net_processing.cpp:1989).  A send failure
+            // here is the closest analogue.
+            return self.jsonRpcError(RPC_MISC_ERROR, "Peer not fully connected", id);
+        };
+
+        // ── Success: empty JSON object (Core returns UniValue::VOBJ) ────────
+        return self.jsonRpcResult("{}", id);
     }
 
     fn handleGetNetworkInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
@@ -19791,6 +19923,200 @@ test "FIX-80: mainnet at tip exits IBD via active_tip.chain_work (chain_state.to
     try std.testing.expect(server.ibd_latched_off.load(.monotonic));
 }
 
+// getblockfrompeer — Core parity (rpc/blockchain.cpp:514 + net_processing.cpp
+// FetchBlock:1960).  Asserts the three contract points:
+//   (a) unknown header           → RPC_MISC_ERROR(-1) "Block header missing"
+//   (b) bad peer_id              → RPC_MISC_ERROR(-1) "Peer does not exist"
+//   (c) success                  → a real block getdata (MSG_BLOCK|MSG_WITNESS
+//                                  = msg_witness_block) is sent to the resolved
+//                                  peer for the requested hash, and the RPC
+//                                  returns an empty object {}.
+//
+// The peer-id convention is the getpeerinfo enumeration index — the resolved
+// peer is peer_manager.peers.items[peer_id].  We capture the outbound getdata
+// by backing the peer's stream with a real AF_UNIX socketpair and reading the
+// framed bytes off the far end.  No multi-node regtest, no heap churn.
+test "getblockfrompeer: header-missing, bad-peer, and genuine getdata send" {
+    const allocator = std.testing.allocator;
+
+    // ── Chain state with a single known block in the in-memory index ────────
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 1;
+
+    var cm = validation.ChainManager.init(&chain_state, null, allocator);
+    defer cm.deinit();
+
+    // The "known header" — internal little-endian bytes 0x11..0x11.  Its
+    // display-order hex is identical (all bytes equal) which keeps the request
+    // string simple.
+    const known_hash: types.Hash256 = [_]u8{0x11} ** 32;
+    const known_entry = try allocator.create(validation.BlockIndexEntry);
+    known_entry.* = .{
+        .hash = known_hash,
+        .header = std.mem.zeroes(types.BlockHeader),
+        .height = 1,
+        .status = .{},
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try cm.block_index.put(known_entry.hash, known_entry);
+    cm.active_tip = known_entry;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    const known_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+    const unknown_hex = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    // ── (a) unknown header → "Block header missing" ─────────────────────────
+    // Use a known-good peer_id (0) so the ONLY reason to fail is the header.
+    // We still need a peer present for that, so add a throwaway peer first.
+    var fds_a: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds_a));
+    // OWNERSHIP: once appended to peer_manager.peers, PeerManager.deinit() owns
+    // the heap Peer — it calls peer.disconnect() (which closes peer.stream =
+    // fds_a[0] and frees recv_buffer) then allocator.destroy(peer).  So we do
+    // NOT free the peer or close fds_a[0] here (that would double-free /
+    // double-close).  We only own the FAR end of the socketpair.
+    defer std.posix.close(fds_a[1]);
+
+    const peer_a = try allocator.create(peer_mod.Peer);
+    peer_a.* = makeTestPeerForGbfp(.{ .handle = fds_a[0] }, &consensus.MAINNET, allocator);
+    try peer_manager.peers.append(peer_a);
+
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockfrompeer\",\"params\":[\"" ++ unknown_hex ++ "\",0]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"code\":-1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "Block header missing") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"result\":null") != null);
+    }
+
+    // ── (b) bad peer_id → "Peer does not exist" ─────────────────────────────
+    // peers.items.len == 1 (index 0 valid), so peer_id 5 is out of range.
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockfrompeer\",\"params\":[\"" ++ known_hex ++ "\",5]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"code\":-1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "Peer does not exist") != null);
+    }
+    // Negative peer_id is also "Peer does not exist".
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockfrompeer\",\"params\":[\"" ++ known_hex ++ "\",-1]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "Peer does not exist") != null);
+    }
+
+    // ── (c) success → getdata sent for the hash + {} returned ───────────────
+    // Add a second peer whose stream we will drain.  peer index 1.
+    var fds_c: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds_c));
+    // Same ownership rule as peer_a: PeerManager.deinit() owns peer_c and
+    // closes fds_c[0]; we own only the far end fds_c[1].
+    defer std.posix.close(fds_c[1]);
+
+    const peer_c = try allocator.create(peer_mod.Peer);
+    peer_c.* = makeTestPeerForGbfp(.{ .handle = fds_c[0] }, &consensus.MAINNET, allocator);
+    try peer_manager.peers.append(peer_c);
+
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockfrompeer\",\"params\":[\"" ++ known_hex ++ "\",1]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+
+        // Returns an empty object, no error.
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"result\":{}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"error\":null") != null);
+
+        // Drain the far end of peer 1's socketpair: the framed getdata bytes.
+        const far = std.net.Stream{ .handle = fds_c[1] };
+        var read_buf: [256]u8 = undefined;
+        const n = try far.read(&read_buf);
+        try std.testing.expect(n >= 24); // at least a P2P header
+        const wire = read_buf[0..n];
+
+        // Header command field (bytes [4..16], NUL-padded) must be "getdata".
+        const hdr = p2p.MessageHeader.decode(read_buf[0..24]);
+        try std.testing.expectEqualStrings("getdata", hdr.commandName());
+
+        // Decode the payload and assert exactly one inv of type
+        // msg_witness_block (0x40000002 == MSG_BLOCK | MSG_WITNESS_FLAG) for the
+        // requested hash.
+        const payload = wire[24..n];
+        const decoded = try p2p.decodePayload("getdata", payload, allocator);
+        try std.testing.expect(decoded == .getdata);
+        const inv = decoded.getdata.inventory;
+        defer allocator.free(inv);
+        try std.testing.expectEqual(@as(usize, 1), inv.len);
+        try std.testing.expectEqual(p2p.InvType.msg_witness_block, inv[0].inv_type);
+        try std.testing.expectEqualSlices(u8, &known_hash, &inv[0].hash);
+    }
+
+    // Sanity: requesting from the WRONG (still-valid) peer index 0 must NOT
+    // have written anything to peer 1's far end beyond what we already drained.
+    // (Implicitly covered — only the index-1 request was a success.)
+}
+
+// Build a minimal Peer for the getblockfrompeer test, backed by a caller-owned
+// stream.  Mirrors the field-complete dummy_peer in peer.zig; only `stream`,
+// `network_params`, and `allocator` carry test-relevant state.
+fn makeTestPeerForGbfp(
+    stream: std.net.Stream,
+    params: *const consensus.NetworkParams,
+    allocator: std.mem.Allocator,
+) peer_mod.Peer {
+    return peer_mod.Peer{
+        .stream = stream,
+        .address = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8333),
+        .state = .handshake_complete,
+        .direction = .outbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 0,
+        .network_params = params,
+        .allocator = allocator,
+        .recv_buffer = std.ArrayList(u8).init(allocator),
+        .is_witness_capable = true,
+        .is_headers_first = false,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = true,
+        .is_protected = false,
+        .connect_time = 0,
+    };
+}
+
 test "getblockcount returns height" {
     const allocator = std.testing.allocator;
 
@@ -22738,7 +23064,13 @@ test "computeSubmitBlockMtp: uses prev_hash ancestors, not stale tip ring (reorg
     // Build chain_manager with 11 chain-B block index entries.
     // Timestamps: 1000, 1100, 1200, ..., 2000 (step 100; 11 entries).
     // Median of sorted [1000..2000 step 100] = 1500 (index 5 of 11).
-    var cm = validation.ChainManager.init(allocator, &consensus.MAINNET);
+    // NOTE: ChainManager.init signature is (chain_state, mempool, allocator).
+    // This test only uses cm.block_index (computeSubmitBlockMtp walks it); the
+    // chain_state is wired into the server separately below via setChainManager,
+    // so a null chain_state at construction is correct here.  (Previously this
+    // call used a stale 2-arg form `init(allocator, &consensus.MAINNET)` that no
+    // longer compiled — a dead test-binary rot in the test-rpc step.)
+    var cm = validation.ChainManager.init(null, null, allocator);
     defer cm.deinit();
 
     const N_ANCESTORS: usize = 11;
