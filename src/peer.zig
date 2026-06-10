@@ -4382,7 +4382,7 @@ pub const PeerManager = struct {
                         // Headers synced but blocks still behind: keep the block
                         // download pipeline running.
                         std.debug.print("P2P: headers synced at height {d}, blocks at {d} (queue={d}), continuing block download\n",
-                            .{ our_height + self.expected_blocks.items.len, our_height, self.expected_blocks.items.len - self.connect_cursor });
+                            .{ our_height + (self.expected_blocks.items.len - self.connect_cursor), our_height, self.expected_blocks.items.len - self.connect_cursor });
                         self.pipelineBlockRequests() catch {};
                     }
                     return;
