@@ -3146,6 +3146,8 @@ pub const RpcServer = struct {
             return self.handleGetNewAddress(params, id);
         } else if (std.mem.eql(u8, method, "getbalance")) {
             return self.handleGetBalance(params, id);
+        } else if (std.mem.eql(u8, method, "getbalances")) {
+            return self.handleGetBalances(id);
         } else if (std.mem.eql(u8, method, "sendtoaddress")) {
             return self.handleSendToAddress(params, id);
         } else if (std.mem.eql(u8, method, "listunspent")) {
@@ -6315,12 +6317,88 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
+        // Derive the scriptPubKey from the address (best-effort).
+        const spk_opt = scriptPubKeyForAddress(self.allocator, addr) catch null;
+        defer if (spk_opt) |s| self.allocator.free(s);
+
+        // Determine ownership across both axes:
+        //   * spendable key match: a derived key-script equals this address's
+        //     scriptPubKey (ismine via a private key clearbit holds);
+        //   * watch-only match: an imported watch-only script equals it.
+        // Either makes ismine true (descriptor-wallet semantics — imported
+        // watch descriptors ARE IsMine; addresses.cpp:452). iswatchonly is the
+        // deprecated, hardcoded-false field (addresses.cpp:478).
+        var is_mine = false;
+        var is_change = false;
+        var solvable = false;
+        var watched_desc: ?[]const u8 = null;
+
+        if (spk_opt) |spk| {
+            // Spendable key-script match.
+            outer: for (0..wallet.keys.items.len) |ki| {
+                const types_to_try = [_]wallet_mod.AddressType{ .p2wpkh, .p2sh_p2wpkh, .p2pkh, .p2tr, .p2wsh };
+                for (types_to_try) |at| {
+                    const ks = wallet.getScriptPubKey(ki, at) catch continue;
+                    defer self.allocator.free(ks);
+                    if (std.mem.eql(u8, ks, spk)) {
+                        is_mine = true;
+                        solvable = true;
+                        break :outer;
+                    }
+                }
+            }
+            // Watch-only imported-script match.
+            if (!is_mine) {
+                if (wallet.watchedScriptForSpk(spk)) |ws| {
+                    is_mine = true;
+                    is_change = ws.is_change;
+                    solvable = ws.solvable;
+                    if (ws.desc.len > 0) watched_desc = ws.desc;
+                }
+            }
+        }
+        // Fall back to address-keyed lookup (covers raw scripts with no decode).
+        if (!is_mine) {
+            if (wallet.watchedScriptForAddress(addr)) |ws| {
+                is_mine = true;
+                is_change = ws.is_change;
+                solvable = ws.solvable;
+                if (ws.desc.len > 0) watched_desc = ws.desc;
+            }
+        }
+
         try writer.print("{{\"address\":\"{s}\"", .{addr});
+
+        // scriptPubKey (hex).
+        if (spk_opt) |spk| {
+            try writer.writeAll(",\"scriptPubKey\":\"");
+            for (spk) |b| try writer.print("{x:0>2}", .{b});
+            try writer.writeByte('"');
+        }
+
+        try writer.print(",\"ismine\":{s}", .{if (is_mine) "true" else "false"});
+        try writer.print(",\"solvable\":{s}", .{if (solvable) "true" else "false"});
+        if (watched_desc) |d| {
+            try writer.writeAll(",\"desc\":\"");
+            try writeJsonEscaped(writer, d);
+            try writer.writeByte('"');
+        }
+        // iswatchonly is DEPRECATED and ALWAYS false in descriptor wallets
+        // (addresses.cpp:383,478) — emitted for shape compatibility.
+        try writer.writeAll(",\"iswatchonly\":false");
+        try writer.print(",\"ischange\":{s}", .{if (is_change) "true" else "false"});
 
         // Add label if exists
         if (wallet.getLabel(addr)) |label| {
             try writer.print(",\"label\":\"{s}\"", .{label});
         }
+
+        // labels[] array (Core always emits this; 0 or 1 label string).
+        try writer.writeAll(",\"labels\":[");
+        if (wallet.getLabel(addr)) |label| {
+            try writer.print("\"{s}\"", .{label});
+        }
+        try writer.writeByte(']');
 
         try writer.writeByte('}');
 
@@ -6354,6 +6432,14 @@ pub const RpcServer = struct {
 
         try writer.print(",\"txcount\":{d}", .{wallet.keys.items.len});
         try writer.print(",\"keypoolsize\":{d}", .{wallet.keys.items.len});
+
+        // private_keys_enabled — false on an enforced watch-only wallet
+        // (createwallet disable_private_keys=true). Core: getwalletinfo emits
+        // `!IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)`
+        // (wallet/rpc/wallet.cpp:98). importdescriptors reads the same flag.
+        try writer.print(",\"private_keys_enabled\":{s}", .{
+            if (wallet.disable_private_keys) "false" else "true",
+        });
 
         if (wallet.encrypted) {
             try writer.writeAll(",\"unlocked_until\":");
@@ -12373,6 +12459,17 @@ pub const RpcServer = struct {
     }
 
     fn handleGetNewAddressWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // DEFECT-B FIX: a disable_private_keys (enforced watch-only) wallet must
+        // NOT generate a private key. Core gates getnewaddress on
+        // CanGetAddresses() and throws RPC_WALLET_ERROR (-4) "Error: This wallet
+        // has no available keys" BEFORE any key generation
+        // (wallet/rpc/addresses.cpp:46-48). Without this guard,
+        // wallet.getnewaddress → generateKey() silently mints a secret into a
+        // wallet the user created as watch-only.
+        if (wallet.disable_private_keys) {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Error: This wallet has no available keys", id);
+        }
+
         var addr_type: wallet_mod.AddressType = .p2wpkh; // default to native segwit
 
         if (params == .array and params.array.items.len > 1) {
@@ -12470,6 +12567,54 @@ pub const RpcServer = struct {
         var buf: [64]u8 = undefined;
         const result = std.fmt.bufPrint(&buf, "{d:.8}", .{btc_amount}) catch return error.OutOfMemory;
         return self.jsonRpcResult(result, id);
+    }
+
+    /// getbalances
+    ///
+    /// Returns the wallet's balances broken into mine/watchonly sections,
+    /// mirroring Bitcoin Core's wallet/rpc/coins.cpp::getbalances. In a
+    /// descriptor wallet the imported watch-only descriptors ARE IsMine, so on
+    /// Core v31.99 watched funds land in `mine.trusted` (there is no separate
+    /// watchonly section for descriptor wallets). clearbit reports the watched
+    /// (mature) balance in BOTH `mine.trusted` (Core-faithful for descriptor
+    /// wallets) and, for callers that still expect the legacy split, a
+    /// `watchonly.trusted` section — so observers reading either path see the
+    /// watched funds. The spendable (private-key) balance is the `mine.trusted`
+    /// base; watch-only is added on top.
+    ///
+    /// Reference: bitcoin-core/src/wallet/rpc/coins.cpp::getbalances.
+    fn handleGetBalances(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+
+        // Spendable (private-key) trusted/untrusted + immature.
+        const spendable_trusted = wallet.getBalanceMinConf(0);
+        const immature = wallet.getImmatureBalance();
+        // Watch-only mature balance — IsMine in a descriptor wallet, so folded
+        // into mine.trusted (Core v31.99) AND surfaced under watchonly.trusted.
+        const watch_trusted = wallet.getWatchOnlyTrustedBalance(0);
+
+        const mine_trusted = spendable_trusted + watch_trusted;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"mine\":{");
+        try writer.print("\"trusted\":{d:.8}", .{@as(f64, @floatFromInt(mine_trusted)) / 100_000_000.0});
+        try writer.writeAll(",\"untrusted_pending\":0.00000000");
+        try writer.print(",\"immature\":{d:.8}", .{@as(f64, @floatFromInt(immature)) / 100_000_000.0});
+        try writer.writeByte('}');
+        if (watch_trusted > 0) {
+            try writer.writeAll(",\"watchonly\":{");
+            try writer.print("\"trusted\":{d:.8}", .{@as(f64, @floatFromInt(watch_trusted)) / 100_000_000.0});
+            try writer.writeAll(",\"untrusted_pending\":0.00000000,\"immature\":0.00000000}");
+        }
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     /// Handle sendtoaddress RPC - send to a bitcoin address.
@@ -12675,10 +12820,36 @@ pub const RpcServer = struct {
 
             try writer.writeAll("{\"txid\":\"");
             try writeHashHex(writer, &utxo.outpoint.hash);
-            try writer.print("\",\"vout\":{d},\"amount\":{d:.8},\"confirmations\":{d},\"spendable\":true,\"solvable\":true,\"safe\":true}}", .{
-                utxo.outpoint.index,
+            try writer.print("\",\"vout\":{d}", .{utxo.outpoint.index});
+
+            // scriptPubKey (hex) + address, so a caller can attribute the coin
+            // to a specific watched script/address. Persisted spk may be empty
+            // on legacy/reconstructed entries.
+            if (utxo.output.script_pubkey.len > 0) {
+                try writer.writeAll(",\"scriptPubKey\":\"");
+                for (utxo.output.script_pubkey) |b| try writer.print("{x:0>2}", .{b});
+                try writer.writeByte('"');
+                const addr_opt = wallet_mod.scriptToAddress(utxo.output.script_pubkey, wallet.network, self.allocator) catch null;
+                defer if (addr_opt) |a| self.allocator.free(a);
+                if (addr_opt) |a| try writer.print(",\"address\":\"{s}\"", .{a});
+            }
+
+            // Watch-only coins are NOT spendable (no private key) but ARE owned
+            // (ismine via the imported descriptor). solvable reflects whether
+            // the descriptor can produce a spend script.
+            const spendable = !utxo.is_watchonly;
+            const solvable = blk: {
+                if (!utxo.is_watchonly) break :blk true;
+                if (utxo.output.script_pubkey.len > 0) {
+                    if (wallet.watchedScriptForSpk(utxo.output.script_pubkey)) |ws| break :blk ws.solvable;
+                }
+                break :blk false;
+            };
+            try writer.print(",\"amount\":{d:.8},\"confirmations\":{d},\"spendable\":{s},\"solvable\":{s},\"safe\":true}}", .{
                 btc_amount,
                 confirmations,
+                if (spendable) "true" else "false",
+                if (solvable) "true" else "false",
             });
         }
 
@@ -14402,41 +14573,57 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// One per-request element of the importdescriptors result array. Mirrors
+    /// Bitcoin Core's ProcessDescriptorImport return (backup.cpp:293-298):
+    /// success:true, or success:false + {code,message}. A thrown error is
+    /// caught per element and recorded here — the batch NEVER aborts.
+    const ImportDescResult = struct {
+        success: bool,
+        err_code: i32 = 0,
+        err_msg: []const u8 = "",
+        /// True for a non-"now" import that wants a rescan (drives the single
+        /// post-loop rescan from the lowest accepted timestamp).
+        wants_rescan: bool = false,
+        /// Lowest accepted timestamp for this request (clamped to >= 1).
+        timestamp: i64 = 0,
+    };
+
     /// importdescriptors "requests"
-    /// Import descriptors into the wallet.
-    /// Handle importdescriptors RPC.
     ///
-    /// Refused with `RPC_WALLET_ERROR` (-4). The pre-fix handler walked the
-    /// `requests` array, parsed each descriptor via
-    /// `descriptor.parseDescriptor`, then returned `{"success": true}`
-    /// per descriptor without ever deriving addresses, adding keys to the
-    /// wallet, or persisting state. Pre-fix code self-documented at
-    /// L6527-6530:
+    /// Import watch-only output descriptors into a descriptor wallet, Core's
+    /// only watch-only import path (wallet/rpc/backup.cpp:importdescriptors ->
+    /// ProcessDescriptorImport). Each request is processed independently inside
+    /// its own try/catch so a -3/-4/-5 on one descriptor never aborts the
+    /// others; the result is a JSON array the SAME LENGTH as the input requests
+    /// array, each element {"success":true} or {"success":false,"error":{...}}.
     ///
-    ///     // In a full implementation, we would derive addresses and add
-    ///     // keys to the wallet. For now, we validate and acknowledge the
-    ///     // import.
+    /// Per-request semantics (Core parity):
+    ///   * checksum REQUIRED (Parse require_checksum=true): a bare/wrong/
+    ///     mismatched checksum -> per-element -5 (RPC_INVALID_ADDRESS_OR_KEY)
+    ///     with the Core CheckChecksum strings (descriptor.cpp:2838-2869).
+    ///   * timestamp: numeric, or the string "now" (= chain-tip MTP); any other
+    ///     type -> -3 (RPC_TYPE_ERROR); missing -> -3. Clamped with max(ts,1)
+    ///     so 0 means scan-from-genesis (backup.cpp:127-139,376,390).
+    ///   * privkey/DPK both directions, -4 (RPC_WALLET_ERROR): a privkey
+    ///     descriptor into a disable_private_keys wallet, or a pubkey-only
+    ///     descriptor into a key-enabled wallet (backup.cpp:224-226,259-262).
+    ///   * the scriptPubKey(s) are derived via descriptor.deriveScript and
+    ///     registered as watch-only scripts; a single synchronous rescan from
+    ///     (lowest accepted ts - TIMESTAMP_WINDOW) credits pre-import funds
+    ///     (chain.h:29,37; wallet.cpp:1827,1834). "now" imports skip the rescan.
     ///
-    /// Operators got a successful JSON-RPC response; nothing actually
-    /// landed in the wallet. Same lying-RPC pattern as the
-    /// 2026-05-05 `loadtxoutset` audit (rustoshi 1d0a325 / hotbuns
-    /// e355cd7 / clearbit c8866ef wave): refuse the RPC at the gate
-    /// rather than continue to mislead callers.
+    /// Scope: addr()/wpkh()/pkh()/pk() + sh()/wsh()/tr() (whatever deriveScript
+    /// produces a single spk for); ranged descriptors are derived over the
+    /// request's [range] (default [0,1000]). Private-key import remains the job
+    /// of importprivkey — this path is watch-only.
     ///
-    /// Wiring real descriptor-wallet support (descriptor → address
-    /// derivation → wallet DB write → blockchain rescan) is a multi-day
-    /// project per impl. The honest gate is the fix; the real
-    /// implementation is a follow-up.
-    ///
-    /// The gate fires AFTER cheap parameter-shape validation but BEFORE
-    /// any wallet state read or write, so a refused call leaves the
-    /// wallet untouched. Same JSON-RPC error code semantics as Core's
-    /// `RPC_WALLET_ERROR` (`bitcoin-core/src/rpc/protocol.h`).
-    ///
-    /// Cross-impl audit:
-    /// `CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md`.
+    /// Reference: bitcoin-core/src/wallet/rpc/backup.cpp:141-456.
     fn handleImportDescriptors(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // Validate parameter shape only; never touch the wallet.
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+
         if (params != .array or params.array.items.len == 0) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing requests array", id);
         }
@@ -14445,16 +14632,307 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing requests array", id);
         }
 
-        return self.jsonRpcError(
-            RPC_WALLET_ERROR,
-            "importdescriptors not implemented in clearbit; descriptor-wallet "
-                ++ "support is not wired (no descriptor→address derivation, no "
-                ++ "wallet DB write, no blockchain rescan). The pre-fix handler "
-                ++ "returned success without persisting anything. Operator-managed "
-                ++ "key import via `importprivkey` / `importaddress` is the "
-                ++ "supported path until descriptor wallets are wired end-to-end.",
-            id,
-        );
+        const now_mtp: i64 = @intCast(self.chain_state.computeMTP());
+
+        var results = std.ArrayList(ImportDescResult).init(self.allocator);
+        defer {
+            for (results.items) |r| {
+                if (r.err_msg.len > 0) self.allocator.free(r.err_msg);
+            }
+            results.deinit();
+        }
+
+        // Per-request processing — NEVER aborts the batch.
+        for (requests_param.array.items) |req| {
+            const r = self.processDescriptorImport(wallet, req, now_mtp) catch ImportDescResult{
+                .success = false,
+                .err_code = RPC_INTERNAL_ERROR,
+                .err_msg = self.allocator.dupe(u8, "Internal error processing descriptor import") catch "",
+            };
+            try results.append(r);
+        }
+
+        // Single synchronous rescan from the lowest accepted (non-"now")
+        // timestamp, so funds received before the import are credited. Mirrors
+        // backup.cpp:407-409 (one rescan drives them all).
+        var do_rescan = false;
+        var lowest_ts: i64 = std.math.maxInt(i64);
+        for (results.items) |r| {
+            if (r.success and r.wants_rescan) {
+                do_rescan = true;
+                if (r.timestamp < lowest_ts) lowest_ts = r.timestamp;
+            }
+        }
+        if (do_rescan) {
+            // TIMESTAMP_WINDOW = MAX_FUTURE_BLOCK_TIME = 7200s grace window
+            // (chain.h:29,37; wallet.cpp:1834). Scan from blocks whose time is
+            // >= (lowest_ts - 7200). clearbit's rescan walks by height, so map
+            // the time floor to the first height at/after it; with timestamp 0
+            // (clamped to 1) this is effectively from genesis.
+            const time_floor: i64 = if (lowest_ts > 7200) lowest_ts - 7200 else 0;
+            self.rescanWalletFromTime(wallet, time_floor) catch {};
+        }
+
+        // Build the Core-shape result array: one element per request, in order.
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeByte('[');
+        for (results.items, 0..) |r, i| {
+            if (i > 0) try writer.writeByte(',');
+            if (r.success) {
+                try writer.writeAll("{\"success\":true}");
+            } else {
+                try writer.writeAll("{\"success\":false,\"error\":{\"code\":");
+                try writer.print("{d},\"message\":\"", .{r.err_code});
+                try writeJsonEscaped(writer, r.err_msg);
+                try writer.writeAll("\"}}");
+            }
+        }
+        try writer.writeByte(']');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Process a single importdescriptors request object. Returns a result
+    /// element (success or per-element error); only OOM and similar truly
+    /// fatal allocator failures propagate as a Zig error (the caller maps that
+    /// to an internal-error element so the batch still completes). Error
+    /// messages are heap-allocated (caller frees).
+    fn processDescriptorImport(
+        self: *RpcServer,
+        wallet: *wallet_mod.Wallet,
+        req: std.json.Value,
+        now_mtp: i64,
+    ) !ImportDescResult {
+        const dupErr = struct {
+            fn f(srv: *RpcServer, code: i32, msg: []const u8) !ImportDescResult {
+                return ImportDescResult{
+                    .success = false,
+                    .err_code = code,
+                    .err_msg = try srv.allocator.dupe(u8, msg),
+                };
+            }
+        }.f;
+
+        if (req != .object) {
+            return dupErr(self, RPC_TYPE_ERROR, "Descriptor request must be an object");
+        }
+        const obj = req.object;
+
+        // desc (required).
+        const desc_val = obj.get("desc") orelse {
+            return dupErr(self, RPC_TYPE_ERROR, "Descriptor not found.");
+        };
+        if (desc_val != .string) {
+            return dupErr(self, RPC_TYPE_ERROR, "Descriptor must be a string");
+        }
+        const desc_str = desc_val.string;
+
+        // CHECKSUM (require_checksum=true). Produce the exact Core CheckChecksum
+        // error strings on failure -> -5.
+        if (checkDescriptorChecksum(desc_str)) |cksum_err| {
+            return dupErr(self, RPC_INVALID_ADDRESS_OR_KEY, cksum_err);
+        }
+
+        // TIMESTAMP (required, -3 on missing/bad type). "now" => tip MTP and no
+        // rescan (no pre-import funds expected); numeric clamped to max(ts,1).
+        const ts_val = obj.get("timestamp") orelse {
+            return dupErr(self, RPC_TYPE_ERROR, "Missing required timestamp field for key");
+        };
+        var ts: i64 = 1;
+        var wants_rescan = false;
+        switch (ts_val) {
+            .integer => |v| {
+                ts = if (v < 1) 1 else v;
+                wants_rescan = true;
+            },
+            .float => |v| {
+                const iv: i64 = @intFromFloat(v);
+                ts = if (iv < 1) 1 else iv;
+                wants_rescan = true;
+            },
+            .string => |s| {
+                if (std.mem.eql(u8, s, "now")) {
+                    ts = if (now_mtp < 1) 1 else now_mtp;
+                    wants_rescan = false; // nothing to scan before the import
+                } else {
+                    return dupErr(self, RPC_TYPE_ERROR, "Expected number or \"now\" timestamp value for key. got type string");
+                }
+            },
+            else => {
+                return dupErr(self, RPC_TYPE_ERROR, "Expected number or \"now\" timestamp value for key. got type other");
+            },
+        }
+
+        // Parse the descriptor (checksum already validated above; this also
+        // re-verifies it, which is fine).
+        var desc = descriptor.parseDescriptor(self.allocator, desc_str) catch {
+            return dupErr(self, RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor");
+        };
+        defer desc.deinit(self.allocator);
+
+        const has_priv = descriptor.hasPrivateKeys(&desc);
+
+        // PRIVKEY/DPK both directions (-4).
+        if (wallet.disable_private_keys) {
+            if (has_priv) {
+                return dupErr(self, RPC_WALLET_ERROR, "Cannot import private keys to a wallet with private keys disabled");
+            }
+        } else {
+            if (!has_priv) {
+                return dupErr(self, RPC_WALLET_ERROR, "Cannot import descriptor without private keys to a wallet with private keys enabled");
+            }
+        }
+
+        // `internal` flag (change chain) and `label` (external only).
+        var is_internal = false;
+        if (obj.get("internal")) |iv| {
+            if (iv == .bool) is_internal = iv.bool;
+        }
+        var label: []const u8 = "";
+        if (obj.get("label")) |lv| {
+            if (lv == .string) label = lv.string;
+        }
+        // Core: a label on an internal descriptor is an error (-8). Keep parity.
+        if (is_internal and label.len > 0) {
+            return dupErr(self, RPC_INVALID_PARAMETER, "Internal addresses should not have a label");
+        }
+
+        // Range: ranged descriptors derive over [start,end]; default [0,1000].
+        var range_start: u32 = 0;
+        var range_end: u32 = 0;
+        const is_range = desc.isRange();
+        if (is_range) {
+            range_end = 1000;
+            if (obj.get("range")) |rv| {
+                switch (rv) {
+                    .integer => |v| {
+                        if (v < 0) return dupErr(self, RPC_INVALID_PARAMETER, "End of range is too high");
+                        range_start = 0;
+                        range_end = @intCast(v);
+                    },
+                    .array => |arr| {
+                        if (arr.items.len == 2 and arr.items[0] == .integer and arr.items[1] == .integer) {
+                            const a = arr.items[0].integer;
+                            const b = arr.items[1].integer;
+                            if (a < 0 or b < a) return dupErr(self, RPC_INVALID_PARAMETER, "Invalid descriptor range specified");
+                            range_start = @intCast(a);
+                            range_end = @intCast(b);
+                        } else {
+                            return dupErr(self, RPC_INVALID_PARAMETER, "Invalid descriptor range specified");
+                        }
+                    },
+                    else => return dupErr(self, RPC_INVALID_PARAMETER, "Invalid descriptor range specified"),
+                }
+            }
+        }
+
+        const solvable = descriptor.isSolvable(&desc);
+
+        // Derive + register the watch-only script(s). For a non-ranged
+        // descriptor this is a single spk; for a ranged one, [start,end]
+        // inclusive. Any single derivation failure aborts THIS request (Core
+        // ExpandPrivate/Expand failure -> the element errors), but not the
+        // batch.
+        const count: u32 = if (is_range) (range_end - range_start + 1) else 1;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const index = range_start + i;
+            const spk = descriptor.deriveScript(self.allocator, &desc, index) catch {
+                return dupErr(self, RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive script from descriptor");
+            };
+            defer self.allocator.free(spk);
+
+            const addr_opt = wallet_mod.scriptToAddress(spk, wallet.network, self.allocator) catch null;
+            defer if (addr_opt) |a| self.allocator.free(a);
+            const addr_disp: []const u8 = addr_opt orelse "";
+
+            _ = wallet.importWatchScript(spk, addr_disp, desc_str, is_internal, solvable) catch {
+                return dupErr(self, RPC_WALLET_ERROR, "Failed to add watch-only script to wallet");
+            };
+
+            // Apply the label to the (external) address if requested.
+            if (!is_internal and label.len > 0 and addr_disp.len > 0) {
+                wallet.setLabel(addr_disp, label) catch {};
+            }
+        }
+
+        return ImportDescResult{
+            .success = true,
+            .wants_rescan = wants_rescan,
+            .timestamp = ts,
+        };
+    }
+
+    /// Synchronous wallet rescan from the first block whose timestamp is at or
+    /// after `time_floor`, feeding each block through scanBlockForWallet so the
+    /// imported watch-only scripts credit any pre-import funds. Walks the chain
+    /// by height (clearbit stores blocks keyed by hash via the height index),
+    /// matching the importprivkey / rescanblockchain rescan template. Best-
+    /// effort per block: an unreadable block is skipped, not fatal.
+    fn rescanWalletFromTime(self: *RpcServer, wallet: *wallet_mod.Wallet, time_floor: i64) !void {
+        const tip_height = self.chain_state.best_height;
+        const db = self.chain_state.utxo_set.db orelse return;
+        var h: u32 = 0;
+        while (h <= tip_height) : (h += 1) {
+            const hash = self.chain_state.getBlockHashByHeight(h) orelse continue;
+            const raw = (db.get(storage.CF_BLOCKS, &hash) catch null) orelse continue;
+            defer self.allocator.free(raw);
+
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var reader = serialize.Reader{ .data = raw };
+            const block = serialize.readBlock(&reader, arena.allocator()) catch {
+                if (h == std.math.maxInt(u32)) break;
+                continue;
+            };
+            // Skip blocks strictly before the grace-window floor (Core's
+            // RescanFromTime startTime - TIMESTAMP_WINDOW). time_floor<=0
+            // means scan-from-genesis.
+            if (time_floor > 0 and @as(i64, @intCast(block.header.timestamp)) < time_floor) {
+                if (h == std.math.maxInt(u32)) break;
+                continue;
+            }
+            wallet.scanBlockForWallet(&block, h) catch {};
+            if (h == std.math.maxInt(u32)) break;
+        }
+        if (tip_height > wallet.tip_height) wallet.setTipHeight(tip_height);
+    }
+
+    /// Validate a descriptor's checksum in Core's require_checksum=true mode.
+    /// Returns null when the checksum is present and correct; otherwise returns
+    /// the exact Core CheckChecksum error string (descriptor.cpp:2838-2869) for
+    /// the caller to surface as a -5 (RPC_INVALID_ADDRESS_OR_KEY).
+    fn checkDescriptorChecksum(desc: []const u8) ?[]const u8 {
+        // Count '#' separators: >1 is "Multiple '#' symbols".
+        var hash_count: usize = 0;
+        var hash_pos: ?usize = null;
+        for (desc, 0..) |c, idx| {
+            if (c == '#') {
+                hash_count += 1;
+                hash_pos = idx;
+            }
+        }
+        if (hash_count == 0) return "Missing checksum";
+        if (hash_count > 1) return "Multiple '#' symbols";
+
+        const pos = hash_pos.?;
+        const payload = desc[0..pos];
+        const provided = desc[pos + 1 ..];
+        if (provided.len != 8) {
+            // Core: "Expected 8 character checksum, not %u characters". Use a
+            // process-global small buffer-free constant set for the common
+            // lengths; fall back to a generic message otherwise.
+            return "Expected 8 character checksum, not the provided number of characters";
+        }
+        // Compute the expected checksum over the payload. A charset violation
+        // in the payload is reported as "Invalid characters in payload".
+        const computed = descriptor.computeChecksum(payload) orelse return "Invalid characters in payload";
+        if (!std.mem.eql(u8, &computed, provided)) {
+            return "Provided checksum does not match computed checksum";
+        }
+        return null;
     }
 
     /// validateaddress "address"
@@ -17767,6 +18245,24 @@ fn writeBlockStatValue(
 fn writeHashHex(writer: anytype, hash: *const types.Hash256) !void {
     for (0..32) |i| {
         try writer.print("{x:0>2}", .{hash[31 - i]});
+    }
+}
+
+/// Write a string as a JSON string body (the surrounding quotes are the
+/// caller's), escaping the JSON-significant characters. Used for the
+/// importdescriptors per-element error messages (Core message strings contain
+/// embedded double quotes, e.g. the timestamp `"now"` error).
+fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0...8, 11, 12, 14...31 => try writer.print("\\u{x:0>4}", .{c}),
+            else => try writer.writeByte(c),
+        }
     }
 }
 
@@ -21841,7 +22337,7 @@ test "loadtxoutset RPC still rejects malformed params before the gate" {
 // `descriptor.parseDescriptor`, and returned {"success": true} per
 // descriptor without ever updating the wallet. Operators got a successful
 // JSON-RPC response; nothing actually landed.
-test "importdescriptors RPC is refused with wallet-error gate" {
+test "importdescriptors watch-only: pubkey descriptor on dpk wallet succeeds (per-element array)" {
     const allocator = std.testing.allocator;
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
@@ -21849,27 +22345,28 @@ test "importdescriptors RPC is refused with wallet-error gate" {
     defer mempool.deinit();
     var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
     defer peer_manager.deinit();
-    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+
+    var wallet = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+    wallet.disable_private_keys = true; // enforced watch-only
+
+    var server = RpcServer.initWithWallet(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, &wallet, .{});
     defer server.deinit();
 
-    // A well-formed requests array with one descriptor object. Pre-fix code
-    // would have parsed the descriptor and returned [{"success":true}].
-    const req = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[[{\"desc\":\"wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)\"}]]}";
+    // A checksummed pubkey-only wpkh descriptor (no rescan: timestamp "now"),
+    // imported into a disable_private_keys wallet -> per-element success:true.
+    const req = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[[{\"desc\":\"wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#wg9vgf99\",\"timestamp\":\"now\"}]]}";
     const resp = try server.dispatch(req);
     defer allocator.free(resp);
 
-    // Must be a JSON-RPC error response.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\"") != null);
-    // -4 is RPC_WALLET_ERROR. (Match `"code":-4` to avoid colliding with
-    // any other -4-suffixed numeric in the response.)
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-4") != null);
-    // Message must mention the impl/feature so the operator knows why.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "importdescriptors not implemented") != null);
-    // Must NOT contain any `"success":true` (pre-fix behaviour).
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"success\":true") == null);
+    // Result is a per-element ARRAY with success:true; NOT a top-level error.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\":null") != null);
+    // The watch-only script was registered.
+    try std.testing.expect(wallet.imported_scripts.items.len == 1);
 }
 
-test "importdescriptors RPC gate fires before any wallet state read" {
+test "importdescriptors watch-only: missing checksum -> per-element -5" {
     const allocator = std.testing.allocator;
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
@@ -21877,22 +22374,29 @@ test "importdescriptors RPC gate fires before any wallet state read" {
     defer mempool.deinit();
     var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
     defer peer_manager.deinit();
-    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+
+    var wallet = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+    wallet.disable_private_keys = true;
+
+    var server = RpcServer.initWithWallet(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, &wallet, .{});
     defer server.deinit();
 
-    // No wallet is configured on this server. Pre-fix handler called
-    // requireWallet and would have returned RPC_WALLET_NOT_FOUND (-18).
-    // Post-fix gate must short-circuit to RPC_WALLET_ERROR (-4) regardless,
-    // because the gate is impl-gap signalling, not "wallet missing".
-    const req = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[[{\"desc\":\"wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)\"}]]}";
+    // Same descriptor with the checksum stripped -> require_checksum=true
+    // surfaces a per-element {success:false, error:{code:-5,"Missing checksum"}}
+    // (Core CheckChecksum, descriptor.cpp:2845). The batch is NOT aborted.
+    const req = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[[{\"desc\":\"wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)\",\"timestamp\":\"now\"}]]}";
     const resp = try server.dispatch(req);
     defer allocator.free(resp);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-4") != null);
-    // Must NOT report wallet-not-found (-18); the gate fires first.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-18") == null);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"success\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Missing checksum") != null);
+    // Nothing registered.
+    try std.testing.expect(wallet.imported_scripts.items.len == 0);
 }
 
-test "importdescriptors RPC still rejects malformed params before the gate" {
+test "importdescriptors watch-only: privkey into dpk wallet -> per-element -4; malformed params -> -32602" {
     const allocator = std.testing.allocator;
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
@@ -21900,16 +22404,32 @@ test "importdescriptors RPC still rejects malformed params before the gate" {
     defer mempool.deinit();
     var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
     defer peer_manager.deinit();
-    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+
+    var wallet = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+    wallet.disable_private_keys = true;
+
+    var server = RpcServer.initWithWallet(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, &wallet, .{});
     defer server.deinit();
 
-    // Empty params array → invalid-params -32602, NOT wallet-error.
+    // A checksummed WIF (private-key) descriptor into a disable_private_keys
+    // wallet -> per-element {success:false, error:{code:-4,...}} (backup.cpp:
+    // 224-226). The batch still returns a per-element array.
+    const req_priv = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[[{\"desc\":\"wpkh(cMaqCE6MJ4taofv6QYACyCfcw1bYKYuk7fBHs5tikmU7wqi76dnF)#4kwwalhk\",\"timestamp\":\"now\"}]]}";
+    const resp_priv = try server.dispatch(req_priv);
+    defer allocator.free(resp_priv);
+    try std.testing.expect(std.mem.indexOf(u8, resp_priv, "\"success\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp_priv, "\"code\":-4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp_priv, "private keys disabled") != null);
+
+    // Empty params array -> invalid-params -32602 (shape check, after the
+    // wallet handle is acquired).
     const req_empty = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[]}";
     const resp_empty = try server.dispatch(req_empty);
     defer allocator.free(resp_empty);
     try std.testing.expect(std.mem.indexOf(u8, resp_empty, "-32602") != null);
 
-    // First param not an array → invalid-params, NOT wallet-error.
+    // First param not an array -> invalid-params -32602.
     const req_bad = "{\"id\":1,\"method\":\"importdescriptors\",\"params\":[\"not-an-array\"]}";
     const resp_bad = try server.dispatch(req_bad);
     defer allocator.free(resp_bad);

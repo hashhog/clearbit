@@ -1343,6 +1343,45 @@ pub const ExtendedPubKey = struct {
 // Owned UTXO
 // ============================================================================
 
+/// Sentinel `key_index` for a watch-only OwnedUtxo — there is no backing
+/// private key, so this value must never be used to index `keys`. Chosen as
+/// the max usize so any accidental `keys[key_index]` panics loudly rather than
+/// silently mis-signing.
+pub const WATCHONLY_KEY_INDEX: usize = std.math.maxInt(usize);
+
+/// A watch-only script imported via `importdescriptors` on a
+/// disable_private_keys (enforced watch-only) wallet. The wallet has no
+/// private key for these scripts: they describe *which outputs to watch* so
+/// `scanBlockForWallet` can credit incoming coins to the ledger (flagged
+/// `is_watchonly`), but they are deliberately NOT spendable — coin selection,
+/// signing and the spendable-balance accounting all skip watch-only coins.
+///
+/// This is the script-set ownership axis the keys-only Wallet otherwise
+/// lacks; mirrors Bitcoin Core's descriptor SPKM watch-only semantics
+/// (wallet/scriptpubkeyman.cpp) at the minimal level needed for
+/// addr()/wpkh()/pkh()/pk() imports.
+pub const ImportedScript = struct {
+    /// The output scriptPubKey to match (wallet-owned bytes).
+    spk: []const u8,
+    /// The address (if derivable) for getaddressinfo/listunspent display
+    /// (wallet-owned bytes, may be empty for raw scripts).
+    address: []const u8,
+    /// The full descriptor string the script came from (wallet-owned bytes).
+    desc: []const u8,
+    /// Whether the import targeted an internal/change chain (importdescriptors
+    /// `internal` flag). Display-only.
+    is_change: bool = false,
+    /// Whether the descriptor is solvable (addr()/raw() are NOT — they describe
+    /// a script but carry no spend info). Surfaced via getaddressinfo.solvable.
+    solvable: bool = false,
+
+    pub fn deinit(self: *ImportedScript, allocator: std.mem.Allocator) void {
+        if (self.spk.len > 0) allocator.free(self.spk);
+        if (self.address.len > 0) allocator.free(self.address);
+        if (self.desc.len > 0) allocator.free(self.desc);
+    }
+};
+
 pub const OwnedUtxo = struct {
     outpoint: types.OutPoint,
     output: types.TxOut,
@@ -1351,6 +1390,13 @@ pub const OwnedUtxo = struct {
     confirmations: u32,
     is_coinbase: bool = false, // Whether this UTXO is from a coinbase transaction
     height: u32 = 0, // Block height where this UTXO was confirmed
+    /// Watch-only coin: credited by an imported watch-only script (no private
+    /// key). `key_index` is a sentinel (see WATCHONLY_KEY_INDEX) and MUST NOT
+    /// be used to index `keys`. Watch-only coins are excluded from
+    /// getBalance/getBalanceMinConf/getSpendableBalance and from coin
+    /// selection / signing (Core keeps watch-only out of the spendable
+    /// balance). Reported only via listunspent.
+    is_watchonly: bool = false,
     /// W29-C: Optional witness script for P2WSH and P2SH-P2WSH inputs.
     /// When set on a `.p2wsh` UTXO, the witness script becomes the BIP-143
     /// scriptCode for the per-input sighash and the last element of the
@@ -1486,6 +1532,20 @@ pub fn scriptToAddress(spk: []const u8, network: Network, allocator: std.mem.All
     return null;
 }
 
+/// Classify a scriptPubKey into its AddressType by output-script shape, or
+/// null for non-standard / unrecognised scripts. Used to tag watch-only
+/// coins with a sensible address_type for display (they are never signed, so
+/// the tag is informational). Mirrors the shape checks in scriptToAddress.
+pub fn scriptToAddressType(spk: []const u8) ?AddressType {
+    if (spk.len == 25 and spk[0] == 0x76 and spk[1] == 0xa9 and spk[2] == 0x14 and
+        spk[23] == 0x88 and spk[24] == 0xac) return .p2pkh;
+    if (spk.len == 23 and spk[0] == 0xa9 and spk[1] == 0x14 and spk[22] == 0x87) return .p2sh_p2wpkh;
+    if (spk.len == 22 and spk[0] == 0x00 and spk[1] == 0x14) return .p2wpkh;
+    if (spk.len == 34 and spk[0] == 0x00 and spk[1] == 0x20) return .p2wsh;
+    if (spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20) return .p2tr;
+    return null;
+}
+
 /// Serialize a transaction (witness form, consensus encoding) into a freshly
 /// allocated lowercase-hex string for gettransaction's `hex` field. Caller
 /// owns the returned slice.
@@ -1555,6 +1615,21 @@ pub const Wallet = struct {
     master_chain_code_nonce: ?[12]u8 = null,
     master_chain_code_tag: ?[16]u8 = null,
 
+    /// Watch-only imported scripts (the script-set ownership axis used by
+    /// `importdescriptors` on a disable_private_keys wallet). `scanBlockForWallet`
+    /// matches incoming outputs against these (in addition to derived key
+    /// scripts) and credits matches as watch-only coins. Persisted across
+    /// restart so watch-only balances survive. See ImportedScript.
+    imported_scripts: std.ArrayList(ImportedScript),
+
+    /// Enforced watch-only flag (createwallet `disable_private_keys`). When
+    /// true, the wallet reports `private_keys_enabled=false` and
+    /// `importdescriptors` refuses any descriptor carrying a private key with
+    /// RPC_WALLET_ERROR (Core backup.cpp:224-226). When false (the default,
+    /// key-enabled wallet), `importdescriptors` refuses pubkey-only descriptors
+    /// (backup.cpp:259-262). Persisted across restart.
+    disable_private_keys: bool = false,
+
     // Labels: address -> label mapping
     labels: std.StringHashMap([]const u8),
 
@@ -1603,6 +1678,7 @@ pub const Wallet = struct {
             .encryption_salt = null,
             .unlock_until = null,
             .labels = std.StringHashMap([]const u8).init(allocator),
+            .imported_scripts = std.ArrayList(ImportedScript).init(allocator),
             .locked_outpoints = std.AutoHashMap([36]u8, void).init(allocator),
             .tx_history = std.ArrayList(WalletTxRecord).init(allocator),
         };
@@ -1690,6 +1766,12 @@ pub const Wallet = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.labels.deinit();
+
+        // Free watch-only imported scripts (each owns its spk/address/desc).
+        for (self.imported_scripts.items) |*s| {
+            s.deinit(self.allocator);
+        }
+        self.imported_scripts.deinit();
 
         self.locked_outpoints.deinit();
         // FIX-67 (W119/G19) — free the PayJoin session lock set if it
@@ -2025,10 +2107,45 @@ pub const Wallet = struct {
         return false;
     }
 
-    /// Get total balance of all UTXOs.
+    /// Get total balance of all UTXOs (excluding watch-only coins — Core keeps
+    /// watch-only out of the spendable balance; they surface only via
+    /// listunspent / getbalances watchonly fields).
     pub fn getBalance(self: *const Wallet) i64 {
         var total: i64 = 0;
         for (self.utxos.items) |utxo| {
+            if (utxo.is_watchonly) continue;
+            total += utxo.output.value;
+        }
+        return total;
+    }
+
+    /// Sum of watch-only UTXO values (no maturity/conf filter). Surfaced via
+    /// getbalances watchonly accounting; never part of the spendable balance.
+    pub fn getWatchOnlyBalance(self: *const Wallet) i64 {
+        var total: i64 = 0;
+        for (self.utxos.items) |utxo| {
+            if (utxo.is_watchonly) total += utxo.output.value;
+        }
+        return total;
+    }
+
+    /// Sum of MATURE (and >=minconf) watch-only UTXO values — the watch-only
+    /// counterpart of getBalanceMinConf, used to report the watched funds in
+    /// getbalances. Immature coinbase watch-only coins are excluded, matching
+    /// the spendable-side maturity rule.
+    pub fn getWatchOnlyTrustedBalance(self: *const Wallet, minconf: u32) i64 {
+        var total: i64 = 0;
+        for (self.utxos.items) |utxo| {
+            if (!utxo.is_watchonly) continue;
+            if (self.tip_height < utxo.height) {
+                if (minconf > 0) continue;
+                if (utxo.is_coinbase) continue;
+                total += utxo.output.value;
+                continue;
+            }
+            const depth = self.tip_height - utxo.height;
+            if (utxo.is_coinbase and depth < consensus.COINBASE_MATURITY) continue;
+            if (depth < minconf) continue;
             total += utxo.output.value;
         }
         return total;
@@ -2120,6 +2237,11 @@ pub const Wallet = struct {
         defer mature_utxos.deinit();
 
         for (self.utxos.items) |utxo| {
+            // Watch-only coins have no private key — never selectable for spend
+            // (selecting one would index `keys[WATCHONLY_KEY_INDEX]` and crash
+            // signing). They are excluded here so coin selection only ever
+            // touches truly spendable coins.
+            if (utxo.is_watchonly) continue;
             // Skip immature coinbase outputs (BIP-30/consensus rule)
             // Coinbase outputs require COINBASE_MATURITY (100) confirmations
             if (utxo.is_coinbase) {
@@ -3200,10 +3322,79 @@ pub const Wallet = struct {
         return addrs.toOwnedSlice();
     }
 
-    /// Get spendable balance (excluding immature coinbase outputs).
+    // ========================================================================
+    // Watch-only imported scripts (the script-set ownership axis)
+    // ========================================================================
+
+    /// Return true if `spk` matches an already-imported watch-only script.
+    pub fn isWatchedScript(self: *const Wallet, spk: []const u8) bool {
+        for (self.imported_scripts.items) |s| {
+            if (std.mem.eql(u8, s.spk, spk)) return true;
+        }
+        return false;
+    }
+
+    /// Return the imported watch-only script entry whose scriptPubKey equals
+    /// `spk`, or null. Used by getaddressinfo / listunspent to surface
+    /// descriptor / solvable / address metadata.
+    pub fn watchedScriptForSpk(self: *const Wallet, spk: []const u8) ?*const ImportedScript {
+        for (self.imported_scripts.items) |*s| {
+            if (std.mem.eql(u8, s.spk, spk)) return s;
+        }
+        return null;
+    }
+
+    /// Return the imported watch-only script entry whose address equals
+    /// `addr`, or null. Used by getaddressinfo.
+    pub fn watchedScriptForAddress(self: *const Wallet, addr: []const u8) ?*const ImportedScript {
+        for (self.imported_scripts.items) |*s| {
+            if (s.address.len > 0 and std.mem.eql(u8, s.address, addr)) return s;
+        }
+        return null;
+    }
+
+    /// Register a watch-only script for the wallet to credit on chain scan.
+    /// Idempotent: re-importing the same scriptPubKey is a no-op (returns
+    /// false). All byte arguments are duplicated into wallet-owned memory.
+    /// Marks the wallet dirty so the new script persists.
+    ///
+    /// Reference: Bitcoin Core descriptor SPKM `AddDescriptorKey` /
+    /// `TopUp` watch path (wallet/scriptpubkeyman.cpp); here reduced to the
+    /// single-script (non-ranged + simple-ranged-via-multiple-calls) case.
+    pub fn importWatchScript(
+        self: *Wallet,
+        spk: []const u8,
+        addr_str: []const u8,
+        desc: []const u8,
+        is_change: bool,
+        solvable: bool,
+    ) !bool {
+        if (self.isWatchedScript(spk)) return false;
+
+        const spk_copy = try self.allocator.dupe(u8, spk);
+        errdefer self.allocator.free(spk_copy);
+        const addr_copy = if (addr_str.len > 0) try self.allocator.dupe(u8, addr_str) else &[_]u8{};
+        errdefer if (addr_copy.len > 0) self.allocator.free(addr_copy);
+        const desc_copy = if (desc.len > 0) try self.allocator.dupe(u8, desc) else &[_]u8{};
+        errdefer if (desc_copy.len > 0) self.allocator.free(desc_copy);
+
+        try self.imported_scripts.append(.{
+            .spk = spk_copy,
+            .address = addr_copy,
+            .desc = desc_copy,
+            .is_change = is_change,
+            .solvable = solvable,
+        });
+        self.markDirty();
+        return true;
+    }
+
+    /// Get spendable balance (excluding immature coinbase + watch-only).
     pub fn getSpendableBalance(self: *const Wallet) i64 {
         var total: i64 = 0;
         for (self.utxos.items) |utxo| {
+            // Watch-only coins are never spendable (no private key).
+            if (utxo.is_watchonly) continue;
             // Skip immature coinbase outputs
             if (utxo.is_coinbase) {
                 if (self.tip_height < utxo.height) continue;
@@ -3217,10 +3408,12 @@ pub const Wallet = struct {
         return total;
     }
 
-    /// Get immature balance (coinbase outputs not yet mature).
+    /// Get immature balance (coinbase outputs not yet mature, excluding
+    /// watch-only coins which never count toward the spendable accounting).
     pub fn getImmatureBalance(self: *const Wallet) i64 {
         var total: i64 = 0;
         for (self.utxos.items) |utxo| {
+            if (utxo.is_watchonly) continue;
             if (utxo.is_coinbase) {
                 if (self.tip_height >= utxo.height) {
                     const confirmations = self.tip_height - utxo.height;
@@ -3259,6 +3452,8 @@ pub const Wallet = struct {
     pub fn getBalanceMinConf(self: *const Wallet, minconf: u32) i64 {
         var total: i64 = 0;
         for (self.utxos.items) |utxo| {
+            // Watch-only coins are never part of the spendable balance.
+            if (utxo.is_watchonly) continue;
             // A UTXO whose recorded height is in the future of our tip is
             // treated as unconfirmed (depth 0).
             if (self.tip_height < utxo.height) {
@@ -3369,6 +3564,7 @@ pub const Wallet = struct {
                 var matched = false;
                 var match_key_index: usize = 0;
                 var match_addr_type: AddressType = .p2wpkh;
+                var match_watchonly = false;
 
                 outer: for (0..self.keys.items.len) |ki| {
                     for (types_to_try) |at| {
@@ -3383,12 +3579,30 @@ pub const Wallet = struct {
                     }
                 }
 
+                // No spendable key matched — try the watch-only imported-script
+                // set. A hit is credited as a watch-only coin (no private key;
+                // excluded from balance / coin-selection / signing).
+                if (!matched and self.isWatchedScript(out.script_pubkey)) {
+                    matched = true;
+                    match_watchonly = true;
+                    match_key_index = WATCHONLY_KEY_INDEX;
+                    match_addr_type = scriptToAddressType(out.script_pubkey) orelse .p2wpkh;
+                }
+
                 if (matched) {
                     // CREDIT: a wallet-paying output. Record the credit detail
                     // (receive / generate / immature) and add the coin to the
-                    // ledger (idempotently).
+                    // ledger (idempotently). Watch-only coins still count toward
+                    // net_credit so a touching tx is recorded in history, but
+                    // they are flagged so spend/balance accounting excludes them.
                     net_credit += out.value;
-                    const recv_addr = self.getAddress(match_key_index, match_addr_type) catch null;
+                    const recv_addr = if (match_watchonly) blk: {
+                        // Use the imported script's recorded address (if any).
+                        if (self.watchedScriptForSpk(out.script_pubkey)) |s| {
+                            if (s.address.len > 0) break :blk self.allocator.dupe(u8, s.address) catch null;
+                        }
+                        break :blk scriptToAddress(out.script_pubkey, self.network, self.allocator) catch null;
+                    } else self.getAddress(match_key_index, match_addr_type) catch null;
                     const depth = if (self.tip_height >= height) self.tip_height - height else 0;
                     const cat: WalletTxCategory = if (is_cb)
                         (if (depth >= consensus.COINBASE_MATURITY) .generate else .immature)
@@ -3427,6 +3641,7 @@ pub const Wallet = struct {
                             .confirmations = depth + 1,
                             .is_coinbase = is_cb,
                             .height = height,
+                            .is_watchonly = match_watchonly,
                         });
                     }
                 } else if (is_from_me) {
@@ -4764,8 +4979,11 @@ pub const WalletManager = struct {
         const wallet = try self.allocator.create(Wallet);
         errdefer self.allocator.destroy(wallet);
 
-        if (options.blank) {
-            // Blank wallet - no seed
+        if (options.blank or options.disable_private_keys) {
+            // Blank wallet — no seed. A disable_private_keys (enforced
+            // watch-only) wallet is also seedless: it can only ever hold
+            // watch-only descriptors, so generating an HD seed (and the
+            // private keys it implies) would contradict the flag.
             wallet.* = try Wallet.init(self.allocator, self.network);
         } else {
             // Generate BIP32 seed
@@ -4774,6 +4992,11 @@ pub const WalletManager = struct {
             wallet.* = try Wallet.initFromSeed(self.allocator, self.network, &seed);
             @memset(&seed, 0); // Clear seed from memory
         }
+
+        // Persist the enforced watch-only flag so getwalletinfo reports
+        // private_keys_enabled=false and importdescriptors enforces the
+        // privkey/DPK -4 rules against it.
+        wallet.disable_private_keys = options.disable_private_keys;
 
         // Encrypt if passphrase provided
         if (options.passphrase) |passphrase| {
@@ -5462,7 +5685,7 @@ pub const WalletManager = struct {
                 .p2tr => "p2tr",
                 .p2wsh => "p2wsh",
             };
-            const utxo_fields = std.fmt.bufPrint(&utxo_buf, "\"vout\":{d},\"value\":{d},\"key_index\":{d},\"confirmations\":{d},\"is_coinbase\":{s},\"height\":{d},\"address_type\":\"{s}\"", .{
+            const utxo_fields = std.fmt.bufPrint(&utxo_buf, "\"vout\":{d},\"value\":{d},\"key_index\":{d},\"confirmations\":{d},\"is_coinbase\":{s},\"height\":{d},\"address_type\":\"{s}\",\"is_watchonly\":{s}", .{
                 utxo.outpoint.index,
                 utxo.output.value,
                 utxo.key_index,
@@ -5470,6 +5693,7 @@ pub const WalletManager = struct {
                 if (utxo.is_coinbase) "true" else "false",
                 utxo.height,
                 addr_type_str,
+                if (utxo.is_watchonly) "true" else "false",
             }) catch return error.SerializationFailed;
             try json.appendSlice(utxo_fields);
             // Persist the scriptPubKey so a reloaded coin is immediately
@@ -5500,6 +5724,36 @@ pub const WalletManager = struct {
             try json.append('"');
         }
         try json.appendSlice("}");
+
+        // Enforced watch-only flag (createwallet disable_private_keys). Absent
+        // in legacy files → defaults to false (key-enabled) on load.
+        try json.appendSlice(",\"disable_private_keys\":");
+        try json.appendSlice(if (wallet.disable_private_keys) "true" else "false");
+
+        // Watch-only imported scripts (the script-set ownership axis). Each
+        // entry carries the scriptPubKey hex + display address + descriptor so
+        // a reloaded wallet credits incoming coins (via scanBlockForWallet) and
+        // answers getaddressinfo without re-importing. Absent in legacy files.
+        try json.appendSlice(",\"imported_scripts\":[");
+        for (wallet.imported_scripts.items, 0..) |s, i| {
+            if (i > 0) try json.append(',');
+            try json.appendSlice("{\"spk\":\"");
+            const spk_hex = try std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(s.spk)});
+            defer self.allocator.free(spk_hex);
+            try json.appendSlice(spk_hex);
+            try json.appendSlice("\",\"address\":\"");
+            try json.appendSlice(s.address);
+            try json.appendSlice("\",\"desc\":\"");
+            // The descriptor string is restricted to descriptor charset (no
+            // quotes/backslashes), so a raw copy is JSON-safe.
+            try json.appendSlice(s.desc);
+            try json.appendSlice("\",\"is_change\":");
+            try json.appendSlice(if (s.is_change) "true" else "false");
+            try json.appendSlice(",\"solvable\":");
+            try json.appendSlice(if (s.solvable) "true" else "false");
+            try json.append('}');
+        }
+        try json.appendSlice("]");
 
         try json.append('}');
 
@@ -5672,12 +5926,35 @@ pub const WalletManager = struct {
                     const is_coinbase_v = uobj.get("is_coinbase") orelse continue;
                     const height_v = uobj.get("height") orelse continue;
                     if (vout_v != .integer or value_v != .integer or
-                        key_index_v != .integer or confirmations_v != .integer or
+                        confirmations_v != .integer or
                         is_coinbase_v != .bool or height_v != .integer) continue;
 
+                    // Watch-only flag (absent in legacy files → false, i.e.
+                    // treated as spendable, which is correct for pre-watch-only
+                    // wallets that never held watch-only coins).
+                    var is_watchonly = false;
+                    if (uobj.get("is_watchonly")) |w| {
+                        if (w == .bool) is_watchonly = w.bool;
+                    }
+
+                    // DEFECT-A FIX: a watch-only UTXO's `key_index` is the
+                    // WATCHONLY_KEY_INDEX sentinel (= maxInt(usize)), which is
+                    // > i64::MAX, so std.json parses it as `.number_string`, NOT
+                    // `.integer`. The old guard (`key_index_v != .integer →
+                    // continue`) therefore SILENTLY DROPPED every watch-only
+                    // UTXO on reload (on-disk file correct; load path broken).
+                    // Gate the key_index requirement on `is_watchonly`: a
+                    // watch-only coin never indexes `keys` (all spend/balance
+                    // paths skip it), so it can carry the in-range sentinel
+                    // regardless of how the on-disk key_index parsed. A
+                    // spendable coin still requires a valid integer key_index.
+                    const key_index: usize = blk: {
+                        if (is_watchonly) break :blk WATCHONLY_KEY_INDEX;
+                        if (key_index_v != .integer) continue;
+                        break :blk @intCast(key_index_v.integer);
+                    };
                     const vout: u32 = @intCast(vout_v.integer);
                     const value: i64 = value_v.integer;
-                    const key_index: usize = @intCast(key_index_v.integer);
                     const confirmations: u32 = @intCast(confirmations_v.integer);
                     const is_coinbase = is_coinbase_v.bool;
                     const height: u32 = @intCast(height_v.integer);
@@ -5729,6 +6006,7 @@ pub const WalletManager = struct {
                         .confirmations = confirmations,
                         .is_coinbase = is_coinbase,
                         .height = height,
+                        .is_watchonly = is_watchonly,
                     }) catch {
                         if (spk.len > 0) self.allocator.free(spk);
                         continue;
@@ -5742,6 +6020,62 @@ pub const WalletManager = struct {
             var label_iter = labels_obj.object.iterator();
             while (label_iter.next()) |entry| {
                 try wallet.setLabel(entry.key_ptr.*, entry.value_ptr.string);
+            }
+        }
+
+        // Enforced watch-only flag (absent in legacy files → false).
+        if (obj.get("disable_private_keys")) |dpk| {
+            if (dpk == .bool) wallet.disable_private_keys = dpk.bool;
+        }
+
+        // Watch-only imported scripts. Fault-tolerant per entry: a malformed
+        // record is skipped rather than sinking the load (the chain rescan
+        // re-credits coins from the surviving scripts anyway).
+        if (obj.get("imported_scripts")) |is_arr| {
+            if (is_arr == .array) {
+                for (is_arr.array.items) |se| {
+                    if (se != .object) continue;
+                    const sobj = se.object;
+                    const spk_v = sobj.get("spk") orelse continue;
+                    if (spk_v != .string or spk_v.string.len == 0 or spk_v.string.len % 2 != 0) continue;
+                    const spk = self.allocator.alloc(u8, spk_v.string.len / 2) catch continue;
+                    const decoded = std.fmt.hexToBytes(spk, spk_v.string) catch {
+                        self.allocator.free(spk);
+                        continue;
+                    };
+                    var addr_s: []const u8 = &[_]u8{};
+                    if (sobj.get("address")) |av| {
+                        if (av == .string and av.string.len > 0) {
+                            addr_s = self.allocator.dupe(u8, av.string) catch &[_]u8{};
+                        }
+                    }
+                    var desc_s: []const u8 = &[_]u8{};
+                    if (sobj.get("desc")) |dv| {
+                        if (dv == .string and dv.string.len > 0) {
+                            desc_s = self.allocator.dupe(u8, dv.string) catch &[_]u8{};
+                        }
+                    }
+                    var is_change = false;
+                    if (sobj.get("is_change")) |cv| {
+                        if (cv == .bool) is_change = cv.bool;
+                    }
+                    var solvable = false;
+                    if (sobj.get("solvable")) |sv| {
+                        if (sv == .bool) solvable = sv.bool;
+                    }
+                    wallet.imported_scripts.append(.{
+                        .spk = decoded,
+                        .address = addr_s,
+                        .desc = desc_s,
+                        .is_change = is_change,
+                        .solvable = solvable,
+                    }) catch {
+                        self.allocator.free(decoded);
+                        if (addr_s.len > 0) self.allocator.free(addr_s);
+                        if (desc_s.len > 0) self.allocator.free(desc_s);
+                        continue;
+                    };
+                }
             }
         }
 
