@@ -382,6 +382,14 @@ pub const NetworkParams = struct {
     /// Reference: bitcoin-core/src/kernel/chainparams.cpp CreateGenesisBlock.
     genesis_output_script: []const u8,
     dns_seeds: []const []const u8,
+    /// Hardcoded fixed-seed peers, dialled only as a last resort when the
+    /// address book is empty and DNS/-addnode/-seednode failed to populate it.
+    /// Mirrors Bitcoin Core's `vFixedSeeds` (chainparams.cpp) and the
+    /// ConvertSeeds/fixed-seed fallback in net.cpp:2604-2643 (ThreadOpenConnections).
+    /// Stored as "IP:port" string literals; parsed to std.net.Address at
+    /// injection time by PeerManager.addFixedSeeds.  MUST be empty for regtest
+    /// (Core clears vFixedSeeds for regtest so the fallback never fires there).
+    fixed_seeds: []const []const u8,
     bip34_height: u32,
     bip65_height: u32,
     bip66_height: u32,
@@ -561,6 +569,51 @@ pub const MAINNET = NetworkParams{
         "dnsseed.emzy.de",
         "seed.bitcoin.wiz.biz",
     },
+    // Hardcoded mainnet fixed seeds (curated IPv4:8333 set).  Dialled only
+    // as a last resort when the address book is empty and DNS/-addnode/
+    // -seednode failed — see PeerManager.maybeAddFixedSeeds (Core net.cpp:2604).
+    .fixed_seeds = &[_][]const u8{
+        "2.121.116.198:8333",
+        "3.86.179.235:8333",
+        "4.2.51.251:8333",
+        "5.2.23.226:8333",
+        "12.11.29.34:8333",
+        "14.49.142.41:8333",
+        "18.27.125.103:8333",
+        "23.93.18.82:8333",
+        "24.16.202.74:8333",
+        "27.83.109.113:8333",
+        "31.41.23.249:8333",
+        "34.65.45.157:8333",
+        "35.78.97.86:8333",
+        "37.15.61.236:8333",
+        "38.52.3.192:8333",
+        "40.160.1.232:8333",
+        "44.223.26.178:8333",
+        "45.19.130.200:8333",
+        "46.126.216.3:8333",
+        "47.90.137.13:8333",
+        "50.4.123.66:8333",
+        "51.154.0.142:8333",
+        "52.182.185.242:8333",
+        "60.241.1.72:8333",
+        "62.34.57.141:8333",
+        "63.247.147.166:8333",
+        "64.23.97.128:8333",
+        "65.94.134.253:8333",
+        "66.35.84.14:8333",
+        "67.4.139.122:8333",
+        "68.61.69.53:8333",
+        "69.4.94.226:8333",
+        "70.44.20.24:8333",
+        "71.56.178.136:8333",
+        "72.88.192.74:8333",
+        "73.42.33.255:8333",
+        "74.48.195.218:8333",
+        "75.80.3.4:8333",
+        "76.124.35.108:8333",
+        "77.38.72.37:8333",
+    },
     .bip34_height = 227_931,
     .bip65_height = 388_381,
     .bip66_height = 363_725,
@@ -697,6 +750,8 @@ pub const TESTNET3 = NetworkParams{
         "seed.testnet.bitcoin.sprovoost.nl",
         "testnet-seed.bluematt.me",
     },
+    // No hardcoded fixed seeds on testnet3 (DNS-only fallback).
+    .fixed_seeds = &[_][]const u8{},
     .bip34_height = 21111,
     .bip65_height = 581885,
     .bip66_height = 330776,
@@ -752,6 +807,8 @@ pub const TESTNET4 = NetworkParams{
         "seed.testnet4.bitcoin.sprovoost.nl",
         "seed.testnet4.wiz.biz",
     },
+    // No hardcoded fixed seeds on testnet4 (DNS-only fallback).
+    .fixed_seeds = &[_][]const u8{},
     .bip34_height = 1,
     .bip65_height = 1,
     .bip66_height = 1,
@@ -804,6 +861,8 @@ pub const SIGNET = NetworkParams{
     .dns_seeds = &[_][]const u8{
         "seed.signet.bitcoin.sprovoost.nl",
     },
+    // No hardcoded fixed seeds on signet (DNS-only fallback).
+    .fixed_seeds = &[_][]const u8{},
     .bip34_height = 1,
     .bip65_height = 1,
     .bip66_height = 1,
@@ -854,6 +913,9 @@ pub const REGTEST = NetworkParams{
         .nonce = 2,
     },
     .dns_seeds = &[_][]const u8{},
+    // Regtest MUST carry an empty fixed-seed list — Core clears vFixedSeeds for
+    // regtest so the fixed-seed fallback can never fire there.
+    .fixed_seeds = &[_][]const u8{},
     .bip34_height = 1, // Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1
     .bip65_height = 1, // Bitcoin Core kernel/chainparams.cpp:538: consensus.BIP65Height = 1
     .bip66_height = 1, // Bitcoin Core kernel/chainparams.cpp:539: consensus.BIP66Height = 1
