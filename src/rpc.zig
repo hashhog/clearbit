@@ -3393,7 +3393,6 @@ pub const RpcServer = struct {
         }
 
         const mtp = self.chain_state.computeMTP();
-        const difficulty = getDifficulty(tip_bits);
 
         try writer.print("{{\"chain\":\"{s}\",\"blocks\":{d},\"headers\":{d},\"bestblockhash\":\"", .{
             chain_name,
@@ -3403,8 +3402,12 @@ pub const RpcServer = struct {
         try writeHashHex(writer, &self.chain_state.best_hash);
         try writer.print("\",\"bits\":\"{x:0>8}\",\"target\":\"", .{tip_bits});
         try writeTargetHex(writer, tip_bits);
-        try writer.print("\",\"difficulty\":{d},\"time\":{d},\"mediantime\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"chainwork\":\"", .{
-            difficulty,
+        // difficulty: Core %.16g formatting via the shared helper (was {d},
+        // which emitted serde-shortest 4.6565423739069247e-10 not Core's
+        // 16-sig-digit 4.656542373906925e-10).
+        try writer.writeAll("\",\"difficulty\":");
+        try writeDifficultyCore(writer, getDifficultyCore(tip_bits));
+        try writer.print(",\"time\":{d},\"mediantime\":{d},\"verificationprogress\":1.0,\"initialblockdownload\":{},\"chainwork\":\"", .{
             tip_time,
             mtp,
             ibd,
@@ -3412,11 +3415,10 @@ pub const RpcServer = struct {
         for (tip_chain_work) |byte| {
             try writer.print("{x:0>2}", .{byte});
         }
-        try writer.writeAll("\",\"size_on_disk\":0,\"pruned\":false,\"softforks\":{");
-        // softforks uses the same canonical deployment helper as getdeploymentinfo,
-        // queried at the current best height.
-        try self.writeDeploymentsJson(writer, self.chain_state.best_height);
-        try writer.writeAll("},\"warnings\":\"\"}");
+        // v31.99 removed `softforks` from getblockchaininfo (moved to
+        // getdeploymentinfo). warnings is an ARRAY by default in v31.99
+        // (node::GetWarningsForRpc returns VARR).
+        try writer.writeAll("\",\"size_on_disk\":0,\"pruned\":false,\"warnings\":[]}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -3851,54 +3853,99 @@ pub const RpcServer = struct {
         }
         const block_weight: usize = if (size > 0) 3 * strippedsize + size else 0;
 
-        // ── Build JSON output (fields in alphabetical order per jq -S) ───────
+        // ── Build JSON output — Core blockToJSON key order
+        // (rpc/blockchain.cpp:202-260): the blockheaderToJSON fields (hash,
+        // confirmations, height, version, versionHex, merkleroot, time,
+        // mediantime, nonce, bits, target, difficulty, chainwork, nTx,
+        // [previousblockhash], [nextblockhash]) THEN strippedsize, size, weight,
+        // coinbase_tx, tx. (mediantime / chainwork value-plumbing and the v1
+        // coinbase_tx serializer + v2 tx[].fee are hard-deferred.) ─────────────
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const w = buf.writer();
 
-        try w.writeAll("{\"bits\":\"");
-        try w.print("{x:0>8}", .{header.bits});
-        try w.writeAll("\",\"chainwork\":\"");
-        try w.writeAll(&chainwork_str);
-        try w.print("\",\"confirmations\":{d},\"difficulty\":", .{local_confirmations});
-        try writeDifficultyCore(w, getDifficultyCore(header.bits));
-        try w.writeAll(",\"hash\":\"");
+        try w.writeAll("{\"hash\":\"");
         try writeHashHex(w, &blockhash);
-        try w.print("\",\"height\":{d},\"mediantime\":{d},\"merkleroot\":\"", .{ height, mediantime });
+        try w.print("\",\"confirmations\":{d},\"height\":{d},\"version\":{d},\"versionHex\":\"", .{
+            local_confirmations,
+            height,
+            header.version,
+        });
+        try w.print("{x:0>8}", .{@as(u32, @bitCast(header.version))});
+        try w.writeAll("\",\"merkleroot\":\"");
         try writeHashHex(w, &header.merkle_root);
-        try w.print("\",\"nTx\":{d},", .{ntx});
-        if (nextblockhash_opt) |nbh| {
-            try w.writeAll("\"nextblockhash\":\"");
-            try w.writeAll(&nbh);
-            try w.writeAll("\",");
-        }
-        try w.print("\"nonce\":{d},", .{header.nonce});
+        try w.print("\",\"time\":{d},\"mediantime\":{d},\"nonce\":{d},\"bits\":\"{x:0>8}\",\"target\":\"", .{
+            header.timestamp,
+            mediantime,
+            header.nonce,
+            header.bits,
+        });
+        try writeTargetHex(w, header.bits);
+        try w.writeAll("\",\"difficulty\":");
+        try writeDifficultyCore(w, getDifficultyCore(header.bits));
+        try w.writeAll(",\"chainwork\":\"");
+        try w.writeAll(&chainwork_str);
+        try w.print("\",\"nTx\":{d}", .{ntx});
         if (!is_genesis) {
             var prevhash_hex: [64]u8 = undefined;
             for (0..32) |i| {
                 _ = try std.fmt.bufPrint(prevhash_hex[i * 2 ..][0..2], "{x:0>2}", .{header.prev_block[31 - i]});
             }
-            try w.writeAll("\"previousblockhash\":\"");
+            try w.writeAll(",\"previousblockhash\":\"");
             try w.writeAll(&prevhash_hex);
-            try w.writeAll("\",");
+            try w.writeByte('"');
+        }
+        if (nextblockhash_opt) |nbh| {
+            try w.writeAll(",\"nextblockhash\":\"");
+            try w.writeAll(&nbh);
+            try w.writeByte('"');
         }
 
         if (size > 0) {
-            try w.print("\"size\":{d},\"strippedsize\":{d},", .{ size, strippedsize });
+            try w.print(",\"strippedsize\":{d},\"size\":{d},\"weight\":{d}", .{ strippedsize, size, block_weight });
         }
 
-        try w.writeAll("\"target\":\"");
-        try writeTargetHex(w, header.bits);
-        try w.print("\",\"time\":{d},", .{header.timestamp});
-
-        // ── tx array ─────────────────────────────────────────────────────────
+        // coinbase_tx — Core emits it (unconditionally) BEFORE the tx array, in
+        // both v1 and v2.  clearbit emits it for v2 only; the v1 coinbase_tx
+        // object is a hard-deferred new serializer path.
         if (verbosity >= 2) {
-            // Full TxToUniv shape for each tx (W59).
-            // coinbase_tx first (Core emits it before tx in getblock v2 output).
-            // We emit coinbase_tx here and include the coinbase tx in tx[] too.
+            try w.writeByte(',');
+            if (is_genesis) {
+                try w.writeAll("\"coinbase_tx\":{\"version\":1,\"locktime\":0,\"sequence\":4294967295,\"coinbase\":\"04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f6620736563636f6e64206261696c6f757420666f722062616e6b73\",\"witness\":null}");
+            } else if (block_opt) |blk| {
+                if (blk.transactions.len > 0) {
+                    const cb = &blk.transactions[0];
+                    // Core coinbaseTxToJSON key order (rpc/blockchain.cpp:185):
+                    // version, locktime, sequence, coinbase, witness.
+                    try w.print("\"coinbase_tx\":{{\"version\":{d},\"locktime\":{d}", .{ cb.version, cb.lock_time });
+                    if (cb.inputs.len > 0) {
+                        try w.print(",\"sequence\":{d},\"coinbase\":\"", .{cb.inputs[0].sequence});
+                        for (cb.inputs[0].script_sig) |b| try w.print("{x:0>2}", .{b});
+                        try w.writeByte('"');
+                    } else {
+                        try w.writeAll(",\"coinbase\":\"\"");
+                    }
+                    // witness: Core emits the first witness item as the witness
+                    // field (only if the coinbase has a witness stack).
+                    if (cb.inputs.len > 0 and cb.inputs[0].witness.len > 0) {
+                        try w.writeAll(",\"witness\":\"");
+                        for (cb.inputs[0].witness[0]) |b| try w.print("{x:0>2}", .{b});
+                        try w.writeByte('"');
+                    } else {
+                        try w.writeAll(",\"witness\":null");
+                    }
+                    try w.writeByte('}');
+                } else {
+                    try w.writeAll("\"coinbase_tx\":null");
+                }
+            } else {
+                try w.writeAll("\"coinbase_tx\":null");
+            }
+        }
 
-            // Emit tx array.
-            try w.writeAll("\"tx\":[");
+        // ── tx array (last field per Core blockToJSON) ───────────────────────
+        try w.writeAll(",\"tx\":[");
+        if (verbosity >= 2) {
             if (block_opt) |blk| {
                 for (blk.transactions, 0..) |*tx, ti| {
                     if (ti > 0) try w.writeByte(',');
@@ -3909,49 +3956,8 @@ pub const RpcServer = struct {
                 // Genesis coinbase txid placeholder.
                 try w.writeAll("{\"txid\":\"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b\"}");
             }
-            try w.writeAll("],");
-
-            // coinbase_tx: {coinbase, locktime, sequence, version, witness}.
-            if (is_genesis) {
-                try w.writeAll("\"coinbase_tx\":{\"coinbase\":\"04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f6620736563636f6e64206261696c6f757420666f722062616e6b73\",\"locktime\":0,\"sequence\":4294967295,\"version\":1,\"witness\":null},");
-            } else if (block_opt) |blk| {
-                if (blk.transactions.len > 0) {
-                    const cb = &blk.transactions[0];
-                    try w.writeAll("\"coinbase_tx\":{");
-                    // coinbase field: scriptSig hex of the first input.
-                    if (cb.inputs.len > 0) {
-                        try w.writeAll("\"coinbase\":\"");
-                        for (cb.inputs[0].script_sig) |b| try w.print("{x:0>2}", .{b});
-                        try w.writeByte('"');
-                    } else {
-                        try w.writeAll("\"coinbase\":\"\"");
-                    }
-                    try w.print(",\"locktime\":{d}", .{cb.lock_time});
-                    // sequence: from first input.
-                    if (cb.inputs.len > 0) {
-                        try w.print(",\"sequence\":{d}", .{cb.inputs[0].sequence});
-                    }
-                    try w.print(",\"version\":{d}", .{cb.version});
-                    // witness: coinbase witness stack (BIP141 commitment).
-                    if (cb.inputs.len > 0 and cb.inputs[0].witness.len > 0) {
-                        try w.writeByte(',');
-                        try w.writeAll("\"witness\":\"");
-                        // Core emits the first witness item as the witness field.
-                        for (cb.inputs[0].witness[0]) |b| try w.print("{x:0>2}", .{b});
-                        try w.writeByte('"');
-                    } else {
-                        try w.writeAll(",\"witness\":null");
-                    }
-                    try w.writeAll("},");
-                } else {
-                    try w.writeAll("\"coinbase_tx\":null,");
-                }
-            } else {
-                try w.writeAll("\"coinbase_tx\":null,");
-            }
         } else {
             // Verbosity 1: txid array only.
-            try w.writeAll("\"tx\":[");
             if (is_genesis) {
                 try w.writeAll("\"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b\"");
             } else if (block_opt) |blk| {
@@ -3963,16 +3969,8 @@ pub const RpcServer = struct {
                     try w.writeByte('"');
                 }
             }
-            try w.writeAll("],");
         }
-
-        try w.print("\"version\":{d},\"versionHex\":\"", .{header.version});
-        try w.print("{x:0>8}", .{@as(u32, @bitCast(header.version))});
-        if (size > 0) {
-            try w.print("\",\"weight\":{d}}}", .{block_weight});
-        } else {
-            try w.writeAll("\"}");
-        }
+        try w.writeAll("]}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -4006,13 +4004,19 @@ pub const RpcServer = struct {
         const tx_weight = 3 * tx_stripped_size + tx_size;
         const tx_vsize = (tx_weight + 3) / 4;
 
-        try writer.writeAll("{\"hash\":\"");
-        try writeHashHex(writer, &hash);
-        try writer.writeAll("\",\"hex\":\"");
-        for (tx_full_bytes) |b| try writer.print("{x:0>2}", .{b});
-        try writer.print("\",\"locktime\":{d},\"size\":{d},\"txid\":\"", .{ tx.lock_time, tx_size });
+        // Core TxToUniv key order (core_write.cpp TxToUniv): txid, hash,
+        // version, size, vsize, weight, locktime, vin, vout, hex.
+        try writer.writeAll("{\"txid\":\"");
         try writeHashHex(writer, &txid);
-        try writer.print("\",\"version\":{d},", .{tx.version});
+        try writer.writeAll("\",\"hash\":\"");
+        try writeHashHex(writer, &hash);
+        try writer.print("\",\"version\":{d},\"size\":{d},\"vsize\":{d},\"weight\":{d},\"locktime\":{d},", .{
+            tx.version,
+            tx_size,
+            tx_vsize,
+            tx_weight,
+            tx.lock_time,
+        });
 
         // vin
         try writer.writeAll("\"vin\":[");
@@ -4020,6 +4024,7 @@ pub const RpcServer = struct {
         for (tx.inputs, 0..) |inp, idx| {
             if (idx > 0) try writer.writeByte(',');
             if (is_coinbase) {
+                // Core coinbase vin order: coinbase, [txinwitness], sequence.
                 try writer.writeAll("{\"coinbase\":\"");
                 for (inp.script_sig) |byte| try writer.print("{x:0>2}", .{byte});
                 try writer.writeAll("\"");
@@ -4035,7 +4040,11 @@ pub const RpcServer = struct {
                 }
                 try writer.print(",\"sequence\":{d}}}", .{inp.sequence});
             } else {
-                try writer.writeAll("{\"scriptSig\":{\"asm\":\"");
+                // Core non-coinbase vin order: txid, vout, scriptSig,
+                // [txinwitness], sequence.
+                try writer.writeAll("{\"txid\":\"");
+                try writeHashHex(writer, &inp.previous_output.hash);
+                try writer.print("\",\"vout\":{d},\"scriptSig\":{{\"asm\":\"", .{inp.previous_output.index});
                 try writeScriptAsmCoreSigDecode(writer, inp.script_sig);
                 try writer.writeAll("\",\"hex\":\"");
                 for (inp.script_sig) |byte| try writer.print("{x:0>2}", .{byte});
@@ -4050,12 +4059,7 @@ pub const RpcServer = struct {
                     }
                     try writer.writeByte(']');
                 }
-                try writer.writeAll(",\"txid\":\"");
-                try writeHashHex(writer, &inp.previous_output.hash);
-                try writer.print("\",\"vout\":{d},\"sequence\":{d}}}", .{
-                    inp.previous_output.index,
-                    inp.sequence,
-                });
+                try writer.print(",\"sequence\":{d}}}", .{inp.sequence});
             }
         }
         try writer.writeAll("],");
@@ -4080,7 +4084,10 @@ pub const RpcServer = struct {
         }
         try writer.writeAll("],");
 
-        try writer.print("\"vsize\":{d},\"weight\":{d}}}", .{ tx_vsize, tx_weight });
+        // hex — last field in Core TxToUniv (include_hex=true for getblock v2).
+        try writer.writeAll("\"hex\":\"");
+        for (tx_full_bytes) |b| try writer.print("{x:0>2}", .{b});
+        try writer.writeAll("\"}");
     }
 
     /// Proxy a getblock verbose=2 call through Bitcoin Core and return a
@@ -4447,9 +4454,11 @@ pub const RpcServer = struct {
     }
 
     fn handleGetDifficulty(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        // Core %.16g formatting via the shared helper (was {d}, serde-shortest).
         var buf: [64]u8 = undefined;
-        const result = std.fmt.bufPrint(&buf, "{d}", .{getDifficulty(self.network_params.genesis_header.bits)}) catch return error.OutOfMemory;
-        return self.jsonRpcResult(result, id);
+        var fbs = std.io.fixedBufferStream(&buf);
+        try writeDifficultyCore(fbs.writer(), getDifficultyCore(self.network_params.genesis_header.bits));
+        return self.jsonRpcResult(fbs.getWritten(), id);
     }
 
     /// `getindexinfo ( "index_name" )` — status of one or all running indices.
@@ -5132,7 +5141,12 @@ pub const RpcServer = struct {
         }
         const outbound = total - inbound;
 
-        try writer.print("{{\"version\":250000,\"subversion\":\"/clearbit:0.1.0/\",\"protocolversion\":70016,\"localservices\":\"0000000000000009\",\"localservicesnames\":[\"NETWORK\",\"WITNESS\"],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":true,\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":0.00001,\"incrementalfee\":0.00001,\"localaddresses\":[],\"warnings\":\"\"}}", .{
+        // warnings is an ARRAY by default in v31.99 (node::GetWarningsForRpc
+        // returns VARR). version/subversion stay clearbit's identity (masked by
+        // the byte-diff; never set to Core's). localservices/localservicesnames/
+        // networks/relayfee/incrementalfee are deferred (real capability/policy
+        // surface, not literal cosmetics).
+        try writer.print("{{\"version\":250000,\"subversion\":\"/clearbit:0.1.0/\",\"protocolversion\":70016,\"localservices\":\"0000000000000009\",\"localservicesnames\":[\"NETWORK\",\"WITNESS\"],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":true,\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":0.00001,\"incrementalfee\":0.00001,\"localaddresses\":[],\"warnings\":[]}}", .{
             total,
             inbound,
             outbound,
@@ -5399,21 +5413,19 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        // FIX-68 (W120 BUG-6 partner): align `fullrbf` field with the actual
-        // operator-configured policy on the mempool. Previously this was
-        // hardcoded `true` while `Mempool.full_rbf` defaults to `false`, so a
-        // wallet driving fee bumps would believe every mempool tx is
-        // replaceable and could generate replacements that Core peers reject
-        // with `txn-mempool-conflict`. Mirrors Bitcoin Core rpc/mempool.cpp
-        // GetMempoolInfo, which pushes the actual mempool policy state.
-        const fullrbf_str: []const u8 = if (self.mempool.full_rbf) "true" else "false";
-
-        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":0.0,\"maxmempool\":{d},\"mempoolminfee\":0.00001,\"minrelaytxfee\":0.00001,\"incrementalrelayfee\":0.00001,\"unbroadcastcount\":0,\"fullrbf\":{s}}}", .{
+        // Core v31.99 (rpc/mempool.cpp MempoolInfoToJSON) hardcodes
+        // `fullrbf=true` — full RBF is the network default since v28; the field
+        // is now a static capability flag, not per-mempool policy state.
+        // Followed by 5 trailing v31.99 fields: permitbaremultisig,
+        // maxdatacarriersize, limitclustercount, limitclustersize, optimal.
+        // (mempoolminfee/minrelaytxfee/incrementalrelayfee fee values are a
+        // separate live-relay-policy change — intentionally left at clearbit's
+        // policy default here, not part of this byte-diff cosmetics pass.)
+        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":0.0,\"maxmempool\":{d},\"mempoolminfee\":0.00001,\"minrelaytxfee\":0.00001,\"incrementalrelayfee\":0.00001,\"unbroadcastcount\":0,\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
             mempool_stats.count,
             mempool_stats.size,
             mempool_stats.size,
             mempool_mod.MAX_MEMPOOL_SIZE,
-            fullrbf_str,
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -10147,19 +10159,39 @@ pub const RpcServer = struct {
                 return self.jsonRpcResult(buf.items, id);
             }
 
-            // Verbose: all 16 fields.  nextblockhash via H:{1}→hash index.
+            // Verbose: all fields in Core blockheaderToJSON key order
+            // (rpc/blockchain.cpp:159-180): hash, confirmations, height,
+            // version, versionHex, merkleroot, time, mediantime, nonce, bits,
+            // target, difficulty, chainwork, nTx, [nextblockhash]. Genesis has
+            // NO previousblockhash.
             var buf = std.ArrayList(u8).init(self.allocator);
             defer buf.deinit();
             const w = buf.writer();
 
-            try w.writeAll("{\"bits\":\"");
-            try w.print("{x:0>8}", .{genesis.bits});
+            try w.writeAll("{\"hash\":\"");
+            try writeHashHex(w, &hash);
+            try w.print("\",\"confirmations\":{d},\"height\":0,\"version\":{d},\"versionHex\":\"", .{
+                self.chain_state.best_height + 1,
+                genesis.version,
+            });
+            try w.print("{x:0>8}", .{@as(u32, @bitCast(genesis.version))});
+            try w.writeAll("\",\"merkleroot\":\"");
+            try writeHashHex(w, &genesis.merkle_root);
+            try w.print("\",\"time\":{d},\"mediantime\":{d},\"nonce\":{d},\"bits\":\"{x:0>8}\",\"target\":\"", .{
+                genesis.timestamp,
+                genesis.timestamp,
+                genesis.nonce,
+                genesis.bits,
+            });
+            try writeTargetHex(w, genesis.bits);
+            try w.writeAll("\",\"difficulty\":");
+            try writeDifficultyCore(w, getDifficultyCore(genesis.bits));
             // chainwork = GetBlockProof(genesis): Core seeds the genesis index
             // entry with this (NOT the mainnet-specific 0x100010001 literal that
             // was hardcoded here, which was wrong on regtest=0x2 / testnet4).
             // Read the ChainManager's Core-seeded genesis chain_work; fall back
             // to the network's per-network value if the manager isn't wired.
-            try w.writeAll("\",\"chainwork\":\"");
+            try w.writeAll(",\"chainwork\":\"");
             {
                 var gw: [32]u8 = peer_mod.workFromBits(genesis.bits);
                 if (self.chain_manager) |cm| {
@@ -10167,35 +10199,21 @@ pub const RpcServer = struct {
                 }
                 for (gw) |byte| try w.print("{x:0>2}", .{byte});
             }
-            try w.print("\",\"confirmations\":{d}", .{self.chain_state.best_height + 1});
-            try w.writeAll(",\"difficulty\":");
-            try writeDifficultyCore(w, getDifficultyCore(genesis.bits));
-            try w.writeAll(",\"hash\":\"");
-            try writeHashHex(w, &hash);
-            try w.print("\",\"height\":0,\"mediantime\":{d},\"merkleroot\":\"", .{genesis.timestamp});
-            try writeHashHex(w, &genesis.merkle_root);
-            try w.print("\",\"nTx\":1,", .{});
-            // nextblockhash (height 1 via H: index if available)
+            try w.writeAll("\",\"nTx\":1");
+            // nextblockhash (height 1 via H: index if available). Genesis has no
+            // previousblockhash (field absent, not null, per Core).
             if (self.chain_state.getBlockHashByHeight(1)) |nbh| {
-                try w.writeAll("\"nextblockhash\":\"");
+                try w.writeAll(",\"nextblockhash\":\"");
                 try writeHashHex(w, &nbh);
-                try w.writeAll("\",");
+                try w.writeByte('"');
             } else if (queryCoreBlockHeaderMeta(self.allocator, blockhash_hex)) |meta| {
                 if (meta.nextblockhash) |nbh| {
-                    try w.writeAll("\"nextblockhash\":\"");
+                    try w.writeAll(",\"nextblockhash\":\"");
                     try w.writeAll(&nbh);
-                    try w.writeAll("\",");
+                    try w.writeByte('"');
                 }
             }
-            try w.print("\"nonce\":{d},", .{genesis.nonce});
-            // No previousblockhash for genesis (field absent, not null, per Core).
-            try w.writeAll("\"target\":\"");
-            try writeTargetHex(w, genesis.bits);
-            try w.print("\",\"time\":{d},\"version\":{d},\"versionHex\":\"", .{
-                genesis.timestamp, genesis.version,
-            });
-            try w.print("{x:0>8}", .{@as(u32, @bitCast(genesis.version))});
-            try w.writeAll("\"}");
+            try w.writeByte('}');
 
             return self.jsonRpcResult(buf.items, id);
         }
@@ -10371,41 +10389,44 @@ pub const RpcServer = struct {
             _ = try std.fmt.bufPrint(prevhash_hex[i * 2 ..][0..2], "{x:0>2}", .{header.prev_block[31 - i]});
         }
 
-        // ── Build JSON response (fields in alphabetical order per jq -S) ────
+        // ── Build JSON response — Core blockheaderToJSON key order
+        // (rpc/blockchain.cpp:159-180): hash, confirmations, height, version,
+        // versionHex, merkleroot, time, mediantime, nonce, bits, target,
+        // difficulty, chainwork, nTx, [previousblockhash], [nextblockhash]. ──
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const w = buf.writer();
 
-        try w.writeAll("{\"bits\":\"");
-        try w.print("{x:0>8}", .{header.bits});
-        try w.writeAll("\",\"chainwork\":\"");
-        try w.writeAll(&chainwork_str);
-        try w.print("\",\"confirmations\":{d},\"difficulty\":", .{confirmations});
-        try writeDifficultyCore(w, getDifficultyCore(header.bits));
-        try w.writeAll(",\"hash\":\"");
+        try w.writeAll("{\"hash\":\"");
         try writeHashHex(w, &hash);
-        if (height) |h| {
-            try w.print("\",\"height\":{d}", .{h});
-        } else {
-            try w.writeAll("\",\"height\":0");
-        }
-        try w.print(",\"mediantime\":{d},\"merkleroot\":\"", .{mediantime});
-        try writeHashHex(w, &header.merkle_root);
-        try w.print("\",\"nTx\":{d},", .{ntx});
-        if (nextblockhash_opt) |nbh| {
-            try w.writeAll("\"nextblockhash\":\"");
-            try w.writeAll(&nbh);
-            try w.writeAll("\",");
-        }
-        try w.print("\"nonce\":{d},\"previousblockhash\":\"", .{header.nonce});
-        try w.writeAll(&prevhash_hex);
-        try w.writeAll("\",\"target\":\"");
-        try writeTargetHex(w, header.bits);
-        try w.print("\",\"time\":{d},\"version\":{d},\"versionHex\":\"", .{
-            header.timestamp, header.version,
+        try w.print("\",\"confirmations\":{d},\"height\":{d},\"version\":{d},\"versionHex\":\"", .{
+            confirmations,
+            if (height) |h| h else 0,
+            header.version,
         });
         try w.print("{x:0>8}", .{@as(u32, @bitCast(header.version))});
-        try w.writeAll("\"}");
+        try w.writeAll("\",\"merkleroot\":\"");
+        try writeHashHex(w, &header.merkle_root);
+        try w.print("\",\"time\":{d},\"mediantime\":{d},\"nonce\":{d},\"bits\":\"{x:0>8}\",\"target\":\"", .{
+            header.timestamp,
+            mediantime,
+            header.nonce,
+            header.bits,
+        });
+        try writeTargetHex(w, header.bits);
+        try w.writeAll("\",\"difficulty\":");
+        try writeDifficultyCore(w, getDifficultyCore(header.bits));
+        try w.writeAll(",\"chainwork\":\"");
+        try w.writeAll(&chainwork_str);
+        try w.print("\",\"nTx\":{d},\"previousblockhash\":\"", .{ntx});
+        try w.writeAll(&prevhash_hex);
+        try w.writeByte('"');
+        if (nextblockhash_opt) |nbh| {
+            try w.writeAll(",\"nextblockhash\":\"");
+            try w.writeAll(&nbh);
+            try w.writeByte('"');
+        }
+        try w.writeByte('}');
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -12421,23 +12442,28 @@ pub const RpcServer = struct {
                 tip_bits = entry.header.bits;
             }
         }
-        const difficulty = getDifficulty(tip_bits);
-
-        try writer.print("{{\"blocks\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":{d:.8},\"target\":\"", .{
+        try writer.print("{{\"blocks\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":", .{
             self.chain_state.best_height,
             tip_bits,
-            difficulty,
         });
+        // difficulty: Core %.16g (was {d:.8}, which collapsed regtest 4.65e-10
+        // to 0).
+        try writeDifficultyCore(writer, getDifficultyCore(tip_bits));
+        try writer.writeAll(",\"target\":\"");
         try writeTargetHex(writer, tip_bits);
-        try writer.print("\",\"networkhashps\":0,\"pooledtx\":{d},\"blockmintxfee\":0.00001,\"chain\":\"{s}\",\"next\":{{\"height\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":{d:.8},\"target\":\"", .{
+        // blockmintxfee: Core BLOCK_MIN_TX_FEE default = 0.00000001 BTC/kvB
+        // (1e-8), not the hardcoded 0.00001 used here previously.
+        try writer.print("\",\"networkhashps\":0,\"pooledtx\":{d},\"blockmintxfee\":0.00000001,\"chain\":\"{s}\",\"next\":{{\"height\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":", .{
             mempool_size,
             chain_name,
             self.chain_state.best_height + 1,
             tip_bits,
-            difficulty,
         });
+        try writeDifficultyCore(writer, getDifficultyCore(tip_bits));
+        try writer.writeAll(",\"target\":\"");
         try writeTargetHex(writer, tip_bits);
-        try writer.writeAll("\"},\"warnings\":\"\"}");
+        // warnings is an ARRAY by default in v31.99.
+        try writer.writeAll("\"},\"warnings\":[]}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -14952,8 +14978,9 @@ pub const RpcServer = struct {
 
         // Try to decode the address
         const addr = address_mod.Address.decode(addr_str, self.allocator) catch {
-            // Invalid address — Core 27+ format: error string + error_locations, NO address field
-            try writer.writeAll("{\"error\":\"Invalid or unsupported Segwit (Bech32) or Base58 encoding.\",\"error_locations\":[],\"isvalid\":false}");
+            // Invalid address — Core key order (output_script.cpp): isvalid,
+            // error_locations, error (NO address field).
+            try writer.writeAll("{\"isvalid\":false,\"error_locations\":[],\"error\":\"Invalid or unsupported Segwit (Bech32) or Base58 encoding.\"}");
             return self.jsonRpcResult(buf.items, id);
         };
         defer self.allocator.free(addr.hash);
@@ -15621,18 +15648,16 @@ pub const RpcServer = struct {
                 defer buf.deinit();
                 const writer = buf.writer();
 
-                // W61: Core-byte-identity shape — coinbase, scriptPubKey (full
-                // ScriptToUniv: asm/desc/hex/address?/type), value, bestblock,
-                // confirmations. bestblock+confirmations are stripped by the
-                // harness; emit them for completeness (matches Core's wire format).
+                // W61: Core-byte-identity shape. Core key order
+                // (rpc/blockchain.cpp:1245-1255): bestblock, confirmations,
+                // value, scriptPubKey, coinbase.
                 try writer.writeAll("{\"bestblock\":\"");
                 try writeHashHex(writer, &self.chain_state.best_hash);
-                try writer.writeAll("\",\"coinbase\":false,\"confirmations\":0,\"scriptPubKey\":");
-                try writeScriptPubKeyUniv(self.allocator, writer, output.script_pubkey, network, is_regtest);
-                try writer.print(",\"value\":{d:.8}", .{
+                try writer.print("\",\"confirmations\":0,\"value\":{d:.8},\"scriptPubKey\":", .{
                     @as(f64, @floatFromInt(output.value)) / 100_000_000.0,
                 });
-                try writer.writeByte('}');
+                try writeScriptPubKeyUniv(self.allocator, writer, output.script_pubkey, network, is_regtest);
+                try writer.writeAll(",\"coinbase\":false}");
 
                 return self.jsonRpcResult(buf.items, id);
             }
@@ -15661,22 +15686,21 @@ pub const RpcServer = struct {
             defer buf.deinit();
             const writer = buf.writer();
 
-            // W61: Core gettxout wire format — bestblock + confirmations are
-            // emitted for full Core parity (harness strips them for comparison).
-            // scriptPubKey uses writeScriptPubKeyUniv (W51) for full
-            // asm/desc/hex/address?/type shape, matching ScriptToUniv in Core's
-            // rpc/blockchain.cpp::gettxout.
+            // W61: Core gettxout wire format. Core key order
+            // (rpc/blockchain.cpp:1245-1255): bestblock, confirmations, value,
+            // scriptPubKey, coinbase. scriptPubKey uses writeScriptPubKeyUniv
+            // (W51) for full asm/desc/hex/address?/type shape, matching
+            // ScriptToUniv in Core's rpc/blockchain.cpp::gettxout.
             try writer.writeAll("{\"bestblock\":\"");
             try writeHashHex(writer, &self.chain_state.best_hash);
-            try writer.print("\",\"coinbase\":{s},\"confirmations\":{d},\"scriptPubKey\":", .{
-                if (utxo.is_coinbase) "true" else "false",
+            try writer.print("\",\"confirmations\":{d},\"value\":{d:.8},\"scriptPubKey\":", .{
                 confirmations,
-            });
-            try writeScriptPubKeyUniv(self.allocator, writer, script, network, is_regtest);
-            try writer.print(",\"value\":{d:.8}", .{
                 @as(f64, @floatFromInt(utxo.value)) / 100_000_000.0,
             });
-            try writer.writeByte('}');
+            try writeScriptPubKeyUniv(self.allocator, writer, script, network, is_regtest);
+            try writer.print(",\"coinbase\":{s}}}", .{
+                if (utxo.is_coinbase) "true" else "false",
+            });
 
             return self.jsonRpcResult(buf.items, id);
         }
@@ -16306,15 +16330,18 @@ pub const RpcServer = struct {
             .none => {},
         }
 
-        // transactions — Core emits this (number of distinct txids with unspent
-        // outputs) only when coinstatsindex is NOT used. clearbit has no index,
-        // so it is always present. Reference: rpc/blockchain.cpp:1128.
-        try writer.print(",\"transactions\":{d}", .{stats.transactions});
-
+        // Core key order (rpc/blockchain.cpp:1125-1129): total_amount BEFORE
+        // transactions (transactions/disk_size only emitted on the non-index
+        // path, which clearbit always is).
         // total_amount — Core emits this as a fixed-8-decimal BTC value
         // (i64 satoshis / 1e8). Use 64-bit float division then format.
         const total_btc: f64 = @as(f64, @floatFromInt(stats.total_amount)) / 100_000_000.0;
         try writer.print(",\"total_amount\":{d:.8}", .{total_btc});
+
+        // transactions — Core emits this (number of distinct txids with unspent
+        // outputs) only when coinstatsindex is NOT used. clearbit has no index,
+        // so it is always present. Reference: rpc/blockchain.cpp:1128.
+        try writer.print(",\"transactions\":{d}", .{stats.transactions});
 
         // disk_size — Core reports the LevelDB size on disk; clearbit
         // does not surface that cheaply, so we emit 0 (impl-specific per the
@@ -18498,48 +18525,158 @@ fn getDifficultyCore(bits: u32) f64 {
 /// places via a switch over the compile-time precision values.  Zig's {d:.N}
 /// rounds correctly at small N (verified against Core's C output for all five
 /// W57 corpus bits values).
+/// Format an f64 EXACTLY as Bitcoin Core serialises every JSON `double`:
+/// `std::ostringstream oss; oss << std::setprecision(16) << v;` (UniValue::
+/// setFloat). With the default float format (no std::fixed/std::scientific),
+/// `operator<<` with `setprecision(16)` is exactly C printf `%.16g` semantics:
+///   * 16 SIGNIFICANT digits (not 16 fractional),
+///   * fixed vs scientific chosen by the decimal exponent X of the leading
+///     significant digit: FIXED iff -4 <= X <= 15, else SCIENTIFIC,
+///   * trailing fractional zeros and a bare trailing decimal point stripped,
+///   * a C-style exponent with explicit sign and AT LEAST 2 digits (e+NN/e-NN,
+///     not capped — e.g. e+130).
+///
+/// This is a direct port of rustoshi's `format_double_g16`
+/// (rustoshi/crates/rpc/src/server.rs:2715) — written from scratch in Zig, not
+/// copied. The previous clearbit helper used a fixed-point `{d:.N}` switch which
+/// (a) emitted only 5-6 sig digits for the regtest powLimit difficulty
+/// (4.65654e-10) and (b) collapsed it to 0 at `{d:.8}`; Core emits the
+/// 16-sig-digit scientific form `4.656542373906925e-10`.
 fn writeDifficultyCore(writer: anytype, val: f64) !void {
-    const abs_val = @abs(val);
-    // Count integer digits: floor(log10(abs_val)) + 1, clamped to >= 1.
-    var int_digits: usize = 1;
-    {
-        var v = abs_val;
-        while (v >= 10.0) {
-            v /= 10.0;
-            int_digits += 1;
+    const P: usize = 16; // significant digits (setprecision(16))
+
+    if (!std.math.isFinite(val)) {
+        // Difficulty is always finite & positive; defensive only.
+        try writer.writeAll("0");
+        return;
+    }
+    if (val == 0.0) {
+        try writer.writeAll(if (std.math.signbit(val)) "-0" else "0");
+        return;
+    }
+
+    // Step 1: round to P significant digits via "{e:.15}" = 1 digit + dot +
+    // 15 digits = 16 sig digits, correctly rounded, as "d.ddddddddddddddd e X".
+    // Zig's {e} prints a minimal-digit, signed exponent (e.g. e-10, e16, e0).
+    var sci_buf: [64]u8 = undefined;
+    const sci = try std.fmt.bufPrint(&sci_buf, "{e:.15}", .{val});
+
+    // Split mantissa and exponent on 'e'.
+    const e_idx = std.mem.indexOfScalar(u8, sci, 'e') orelse {
+        try writer.writeAll(sci);
+        return;
+    };
+    const mant_signed = sci[0..e_idx];
+    const x: i32 = std.fmt.parseInt(i32, sci[e_idx + 1 ..], 10) catch 0;
+
+    const negative = mant_signed.len > 0 and mant_signed[0] == '-';
+    const mant = if (negative) mant_signed[1..] else mant_signed;
+
+    // Build the 16-digit significand D (dot removed): d0 d1 … d15.
+    var digits_buf: [P]u8 = undefined;
+    var dlen: usize = 0;
+    for (mant) |c| {
+        if (c != '.') {
+            if (dlen < P) digits_buf[dlen] = c;
+            dlen += 1;
         }
     }
-    // Number of fractional digits to emit = max(0, 16 - int_digits).
-    const frac: usize = if (int_digits >= 16) 0 else (16 - int_digits);
-    var buf: [64]u8 = undefined;
-    const s: []const u8 = switch (frac) {
-        0  => try std.fmt.bufPrint(&buf, "{d:.0}",  .{val}),
-        1  => try std.fmt.bufPrint(&buf, "{d:.1}",  .{val}),
-        2  => try std.fmt.bufPrint(&buf, "{d:.2}",  .{val}),
-        3  => try std.fmt.bufPrint(&buf, "{d:.3}",  .{val}),
-        4  => try std.fmt.bufPrint(&buf, "{d:.4}",  .{val}),
-        5  => try std.fmt.bufPrint(&buf, "{d:.5}",  .{val}),
-        6  => try std.fmt.bufPrint(&buf, "{d:.6}",  .{val}),
-        7  => try std.fmt.bufPrint(&buf, "{d:.7}",  .{val}),
-        8  => try std.fmt.bufPrint(&buf, "{d:.8}",  .{val}),
-        9  => try std.fmt.bufPrint(&buf, "{d:.9}",  .{val}),
-        10 => try std.fmt.bufPrint(&buf, "{d:.10}", .{val}),
-        11 => try std.fmt.bufPrint(&buf, "{d:.11}", .{val}),
-        12 => try std.fmt.bufPrint(&buf, "{d:.12}", .{val}),
-        13 => try std.fmt.bufPrint(&buf, "{d:.13}", .{val}),
-        14 => try std.fmt.bufPrint(&buf, "{d:.14}", .{val}),
-        15 => try std.fmt.bufPrint(&buf, "{d:.15}", .{val}),
-        else => try std.fmt.bufPrint(&buf, "{d}",   .{val}),
-    };
-    // Strip trailing zeros from the fractional part (and the dot if no decimals remain).
-    var result: []const u8 = s;
-    if (std.mem.indexOf(u8, s, ".") != null) {
-        var trim: usize = result.len;
-        while (trim > 1 and result[trim - 1] == '0') trim -= 1;
-        if (result[trim - 1] == '.') trim -= 1;
-        result = result[0..trim];
+    const digits = digits_buf[0..@min(dlen, P)];
+
+    if (negative) try writer.writeByte('-');
+
+    // Step 2: %g representation choice.  FIXED iff -4 <= X <= 15.
+    if (x >= -4 and x < @as(i32, @intCast(P))) {
+        try writeG16Fixed(writer, digits, x);
+    } else {
+        try writeG16Scientific(writer, digits, x);
     }
-    try writer.writeAll(result);
+}
+
+/// %g FIXED branch (-4 <= X <= 15): place the 16-digit significand with the
+/// decimal point after X+1 digits, strip trailing fractional zeros + bare dot.
+fn writeG16Fixed(writer: anytype, digits: []const u8, x: i32) !void {
+    var buf: [40]u8 = undefined;
+    var n: usize = 0;
+    const point = x + 1; // digits to the left of the decimal point
+    if (point <= 0) {
+        // "0." + (-point) zeros + all digits.
+        buf[n] = '0';
+        n += 1;
+        buf[n] = '.';
+        n += 1;
+        var z: i32 = 0;
+        while (z < -point) : (z += 1) {
+            buf[n] = '0';
+            n += 1;
+        }
+        for (digits) |c| {
+            buf[n] = c;
+            n += 1;
+        }
+    } else if (@as(usize, @intCast(point)) >= digits.len) {
+        // Integer value, pad with trailing zeros.
+        for (digits) |c| {
+            buf[n] = c;
+            n += 1;
+        }
+        var pad: usize = @as(usize, @intCast(point)) - digits.len;
+        while (pad > 0) : (pad -= 1) {
+            buf[n] = '0';
+            n += 1;
+        }
+    } else {
+        // Dot falls inside the digit run.
+        const p: usize = @intCast(point);
+        for (digits[0..p]) |c| {
+            buf[n] = c;
+            n += 1;
+        }
+        buf[n] = '.';
+        n += 1;
+        for (digits[p..]) |c| {
+            buf[n] = c;
+            n += 1;
+        }
+    }
+    try writer.writeAll(stripTrailingFractionZeros(buf[0..n]));
+}
+
+/// %g SCIENTIFIC branch (X < -4 or X >= 16): d0[.d1…d15] (trailing zeros
+/// stripped) + C-style exponent e±NN (sign always, >= 2 digits, not capped).
+fn writeG16Scientific(writer: anytype, digits: []const u8, x: i32) !void {
+    var buf: [40]u8 = undefined;
+    var n: usize = 0;
+    buf[n] = digits[0];
+    n += 1;
+    if (digits.len > 1) {
+        buf[n] = '.';
+        n += 1;
+        for (digits[1..]) |c| {
+            buf[n] = c;
+            n += 1;
+        }
+    }
+    const mantissa = stripTrailingFractionZeros(buf[0..n]);
+    try writer.writeAll(mantissa);
+    try writer.writeByte('e');
+    try writer.writeByte(if (x < 0) '-' else '+');
+    const ax: u32 = @intCast(if (x < 0) -x else x);
+    if (ax < 10) {
+        try writer.print("0{d}", .{ax}); // zero-pad to >= 2 digits
+    } else {
+        try writer.print("{d}", .{ax});
+    }
+}
+
+/// Strip trailing '0's after a decimal point, then a bare trailing '.'.
+/// No-op for a string with no decimal point.
+fn stripTrailingFractionZeros(s: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, s, '.') == null) return s;
+    var end = s.len;
+    while (end > 0 and s[end - 1] == '0') end -= 1;
+    if (end > 0 and s[end - 1] == '.') end -= 1;
+    return s[0..end];
 }
 
 /// Extract the transaction count (nTx) from a raw serialised block.
@@ -19176,7 +19313,12 @@ fn hexToBytesAlloc(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
 fn networkFromMagic(magic: u32) address_mod.Network {
     return switch (magic) {
         consensus.MAINNET.magic => .mainnet,
-        consensus.TESTNET.magic, consensus.TESTNET4.magic, consensus.SIGNET.magic => .testnet,
+        // regtest shares testnet's base58 version bytes (0xc4 p2sh / 0x6f
+        // p2pkh); bech32 regtest uses the `bcrt` HRP, handled separately via
+        // isRegtestMagic. Previously regtest fell through the else-arm to
+        // .mainnet, so buildP2SHAddress encoded p2sh with 0x05 (mainnet "3...")
+        // instead of 0xc4 (regtest/testnet "2...").
+        consensus.TESTNET.magic, consensus.TESTNET4.magic, consensus.SIGNET.magic, consensus.REGTEST.magic => .testnet,
         else => .mainnet,
     };
 }

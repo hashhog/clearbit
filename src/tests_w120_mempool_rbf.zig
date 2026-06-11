@@ -956,17 +956,20 @@ test "w120 G22: full_rbf field present, defaults to false" {
     try testing.expect(!mempool.full_rbf);
 }
 
-test "w120 G22 (FIX-68): getmempoolinfo `fullrbf` no longer hardcodes true" {
-    // FIX-68 secondary fix: getmempoolinfo previously emitted
-    //   "...,\"fullrbf\":true}"
-    // unconditionally while `Mempool.full_rbf` defaults to false. Wallets
-    // driving fee bumps would believe every mempool tx is replaceable and
-    // could generate replacements that Core peers reject. The handler now
-    // formats the actual `mempool.full_rbf` state via {s} interpolation.
-    // Source-level guard: the offending literal must be gone.
+test "w120 G22: getmempoolinfo `fullrbf` matches Core v31.99 (hardcoded true)" {
+    // Byte-diff fix: Core v31.99 MempoolInfoToJSON (rpc/mempool.cpp) hardcodes
+    // `fullrbf=true` — full RBF is the network default since v28, so the field
+    // is now a static capability flag, not per-mempool policy state.
+    // getmempoolinfo now emits `"fullrbf":true` followed by the 5 trailing
+    // v31.99 fields (permitbaremultisig, maxdatacarriersize, limitclustercount,
+    // limitclustersize, optimal). The old terminal `...,"fullrbf":true}` form
+    // (true as the final field) must NOT appear — there are always fields after.
     const src = @embedFile("rpc.zig");
-    const bad_literal = "\"unbroadcastcount\":0,\"fullrbf\":true}";
-    try testing.expect(std.mem.indexOf(u8, src, bad_literal) == null);
+    const terminal_literal = "\"unbroadcastcount\":0,\"fullrbf\":true}";
+    try testing.expect(std.mem.indexOf(u8, src, terminal_literal) == null);
+    // The 5 trailing fields must be present.
+    try testing.expect(std.mem.indexOf(u8, src, "\\\"fullrbf\\\":true,\\\"permitbaremultisig\\\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "\\\"optimal\\\":true") != null);
 }
 
 // ===========================================================================
