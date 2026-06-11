@@ -590,10 +590,15 @@ test "w123 G9 BUG-9 getmininginfo missing currentblockweight + currentblocktx" {
 // G10 — BUG-10 P1: getmininginfo blockmintxfee hardcoded 0.00001
 // ---------------------------------------------------------------------------
 
-test "w123 G10 BUG-10 getmininginfo blockmintxfee hardcoded" {
+test "w123 G10 BUG-10 getmininginfo blockmintxfee uses Core BLOCK_MIN_TX_FEE default" {
     const src = @embedFile("rpc.zig");
+    // Byte-diff fix: getmininginfo now emits the Core BLOCK_MIN_TX_FEE default
+    // (0.00000001 BTC/kvB = 1e-8), matching Core's
+    // assembler_options.blockMinFeeRate.GetFeePerK() default. The previous
+    // hardcoded 0.00001 (1e-5) byte-diffed against Core's 1e-8.
     // Source uses escaped quotes inside a Zig print-format literal.
-    try testing.expect(std.mem.indexOf(u8, src, "\\\"blockmintxfee\\\":0.00001") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "\\\"blockmintxfee\\\":0.00000001") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "\\\"blockmintxfee\\\":0.00001,") == null);
 }
 
 // ---------------------------------------------------------------------------
