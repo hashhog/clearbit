@@ -666,3 +666,156 @@ test "w104/isRoutable: addAddress rejects non-routable gossip addresses (W104 fi
     }
     try testing.expectEqual(@as(usize, 3), manager.knownAddressCount());
 }
+
+// ============================================================================
+// Fixed-seed fallback (Core net.cpp:2604-2643, ThreadOpenConnections)
+//
+// Hardcoded vFixedSeeds fallback: when the address book is empty and DNS/
+// -addnode/-seednode failed to populate it, dial the curated fixed-seed peers
+// as a last resort.  One-shot, layered AFTER the normal DNS bootstrap.
+// ============================================================================
+
+// FS1: the mainnet fixed-seed literal list parses to exactly 40 routable
+// IPv4:8333 addresses.  Proves the embedded list is well-formed (every entry
+// is a parseable IP:8333 literal) and that none is silently dropped by the
+// isRoutable gate in addAddress.
+test "fixedseeds/FS1: mainnet list parses to 40 routable IPv4:8333 peers" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+
+    // The raw literal list carries exactly 40 entries.
+    try testing.expectEqual(@as(usize, 40), consensus.MAINNET.fixed_seeds.len);
+
+    // Each entry is an IP:port literal; the host parses as IPv4 and the port
+    // is 8333.  Mirrors the parse PeerManager.addFixedSeeds performs.
+    for (consensus.MAINNET.fixed_seeds) |entry| {
+        const colon = std.mem.lastIndexOfScalar(u8, entry, ':') orelse return error.MissingPort;
+        const host = entry[0..colon];
+        const port = try std.fmt.parseInt(u16, entry[colon + 1 ..], 10);
+        try testing.expectEqual(@as(u16, 8333), port);
+        const addr = try std.net.Address.parseIp(host, port);
+        // IPv4 family + publicly routable (no curated entry is RFC1918/loopback).
+        try testing.expectEqual(@as(u16, std.posix.AF.INET), addr.any.family);
+        try testing.expect(PeerManager.isRoutable(addr));
+    }
+
+    // addFixedSeeds injects all 40 into a fresh, empty book (none dropped).
+    try testing.expectEqual(@as(usize, 0), manager.knownAddressCount());
+    const added = manager.addFixedSeeds();
+    try testing.expectEqual(@as(usize, 40), added);
+    try testing.expectEqual(@as(usize, 40), manager.knownAddressCount());
+}
+
+// FS2: the predicate FIRES on a DNS-empty boot — DNS seeding disabled, fixed
+// seeds enabled, empty address book → inject 40, then a second call is a no-op
+// (one-shot guard).  Core net.cpp:2620 "-dnsseed=0 ⇒ fire immediately".
+test "fixedseeds/FS2: fallback fires on DNS-empty book and is one-shot" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+
+    // DNS off, fixed seeds on, book empty — the immediate-fire shortcut.
+    manager.dns_seed_enabled = false;
+    manager.fixed_seed_enabled = true;
+    manager.run_loop_start_ts = std.time.timestamp();
+    try testing.expectEqual(@as(usize, 0), manager.knownAddressCount());
+
+    // First call fires and injects the 40 fixed seeds.
+    try testing.expect(manager.maybeAddFixedSeeds());
+    try testing.expectEqual(@as(usize, 40), manager.knownAddressCount());
+    try testing.expect(manager.fixed_seeds_added);
+
+    // Every injected address carries the .fixed_seed source tag.
+    var it = manager.known_addresses.valueIterator();
+    while (it.next()) |info| {
+        try testing.expectEqual(AddressSource.fixed_seed, info.source);
+    }
+
+    // Second call is a no-op (one-shot guard) — no double injection.
+    try testing.expect(!manager.maybeAddFixedSeeds());
+    try testing.expectEqual(@as(usize, 40), manager.knownAddressCount());
+}
+
+// FS3: the predicate does NOT fire when the address book is NON-empty.  Core's
+// reachable-empty-network gate (net.cpp:2607) — fixed seeds are a last resort,
+// never injected while we already know real peers.
+test "fixedseeds/FS3: fallback does NOT fire when book is non-empty" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+
+    // Populate the book with one real (routable) address — e.g. from DNS.
+    try manager.addAddress(std.net.Address.initIp4([4]u8{ 8, 8, 8, 8 }, 8333), p2p.NODE_NETWORK, .dns_seed);
+    try testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
+
+    // Even with DNS off + fixed seeds on, a non-empty book blocks the fallback.
+    manager.dns_seed_enabled = false;
+    manager.fixed_seed_enabled = true;
+    manager.run_loop_start_ts = std.time.timestamp() - 3600; // grace long elapsed too
+
+    try testing.expect(!manager.maybeAddFixedSeeds());
+    // Book unchanged — no fixed seeds injected.
+    try testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
+    try testing.expect(!manager.fixed_seeds_added);
+}
+
+// FS4: with DNS ENABLED and the 60s grace NOT yet elapsed, the fallback holds
+// off (Core net.cpp:2614 — give DNS/-addnode/-seednode time to populate first).
+// Once the grace window passes with the book still empty, it fires.
+test "fixedseeds/FS4: DNS-on holds off until the 60s grace elapses" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+
+    manager.dns_seed_enabled = true; // DNS on — must wait out the grace window
+    manager.fixed_seed_enabled = true;
+
+    // Loop just started — grace window not elapsed → do NOT fire.
+    manager.run_loop_start_ts = std.time.timestamp();
+    try testing.expect(!manager.maybeAddFixedSeeds());
+    try testing.expectEqual(@as(usize, 0), manager.knownAddressCount());
+    try testing.expect(!manager.fixed_seeds_added);
+
+    // Pretend >60s elapsed since loop start with the book still empty → fire.
+    manager.run_loop_start_ts = std.time.timestamp() - 61;
+    try testing.expect(manager.maybeAddFixedSeeds());
+    try testing.expectEqual(@as(usize, 40), manager.knownAddressCount());
+}
+
+// FS5: -fixedseeds=0 (fixed_seed_enabled=false) disables the fallback entirely,
+// even on a DNS-empty empty-book boot.  Also covers --connect mode, which
+// force-clears fixed_seed_enabled in PeerManager.run.
+test "fixedseeds/FS5: -fixedseeds=0 disables the fallback" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+
+    manager.dns_seed_enabled = false;
+    manager.fixed_seed_enabled = false; // operator opted out
+    manager.run_loop_start_ts = std.time.timestamp();
+
+    try testing.expect(!manager.maybeAddFixedSeeds());
+    try testing.expectEqual(@as(usize, 0), manager.knownAddressCount());
+    try testing.expect(!manager.fixed_seeds_added);
+}
+
+// FS6: regtest carries an EMPTY fixed-seed list (Core clears vFixedSeeds for
+// regtest), so the fallback can never fire there even on a DNS-empty boot.
+test "fixedseeds/FS6: regtest list is empty so the fallback never fires" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.REGTEST);
+    defer manager.deinit();
+
+    try testing.expectEqual(@as(usize, 0), consensus.REGTEST.fixed_seeds.len);
+
+    // Same fire conditions as FS2, but the empty list short-circuits.
+    manager.dns_seed_enabled = false;
+    manager.fixed_seed_enabled = true;
+    manager.run_loop_start_ts = std.time.timestamp();
+
+    try testing.expect(!manager.maybeAddFixedSeeds());
+    try testing.expectEqual(@as(usize, 0), manager.knownAddressCount());
+    // addFixedSeeds on an empty list adds nothing.
+    try testing.expectEqual(@as(usize, 0), manager.addFixedSeeds());
+}
