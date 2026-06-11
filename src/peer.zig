@@ -656,12 +656,14 @@ pub const Peer = struct {
     /// (net_processing.h:44).
     advertise_node_bloom: bool = false,
 
-    /// BIP-159: when true, OR `NODE_NETWORK_LIMITED` (1<<10) into the
-    /// outbound `services` bitfield in the version handshake.  Set when
-    /// prune mode is enabled (`-prune > 0`).  Mirrors Core's
-    /// `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
-    /// `IsPruneMode()` is true).  Peers seeing this bit must not request
-    /// blocks below the recent-`MIN_BLOCKS_TO_KEEP` (288) keep window.
+    /// BIP-159 prune-mode flag.  Set when prune mode is enabled
+    /// (`-prune > 0`).  NOTE: this is NO LONGER what controls advertising
+    /// of `NODE_NETWORK_LIMITED`.  Bitcoin Core seeds `g_local_services`
+    /// with `NODE_NETWORK_LIMITED | NODE_WITNESS` UNCONDITIONALLY for every
+    /// full node (init.cpp:863) — a non-pruned node still serves the
+    /// recent-`MIN_BLOCKS_TO_KEEP` (288) window — so `localServices()` now
+    /// sets that bit unconditionally regardless of this flag.  Retained for
+    /// future prune-specific behaviour (e.g. serving-window enforcement).
     advertise_node_network_limited: bool = false,
 
     /// BIP-157: when true, OR `NODE_COMPACT_FILTERS` (1<<6) into the
@@ -1172,6 +1174,47 @@ pub const Peer = struct {
         return true;
     }
 
+    /// Build the advertised local service flags for the VERSION handshake.
+    ///
+    /// Mirrors Bitcoin Core's `g_local_services` assembly in `init.cpp`:
+    ///   - NODE_NETWORK | NODE_WITNESS: full witness node, always set
+    ///     (Core init.cpp:863 seeds `NODE_NETWORK_LIMITED | NODE_WITNESS`
+    ///     and unconditionally adds NODE_NETWORK at init.cpp:1950).
+    ///   - NODE_NETWORK_LIMITED: set UNCONDITIONALLY for a full node.  A
+    ///     non-pruned full node serves the recent-288 window too, so Core
+    ///     advertises this bit in the default (non-prune) case as well —
+    ///     it is part of the init.cpp:863 seed and is NOT gated on prune.
+    ///     (The older clearbit gate that ORed it only under prune mode was
+    ///     wrong; a non-pruned node was under-advertising 0x809→missing the
+    ///     0x400 bit.)
+    ///   - NODE_BLOOM: gated on `advertise_node_bloom` (Core
+    ///     DEFAULT_PEERBLOOMFILTERS = false, net_processing.h:44).
+    ///   - NODE_COMPACT_FILTERS: gated on `advertise_compact_filters`
+    ///     (Core init.cpp:992-998: both blockfilterindex+peerblockfilters).
+    ///   - NODE_P2P_V2: advertised iff `bip324V2Enabled()` (BIP-324 v2
+    ///     transport, genuinely implemented in v2_transport.zig and
+    ///     wired into live peers; default ON since W90).  Core gates the
+    ///     equivalent bit on `-v2transport` (init.cpp:989).
+    ///
+    /// Result for a default (non-pruned, v2-on) full node: 0xC09 =
+    /// NODE_NETWORK(0x1) | NODE_WITNESS(0x8) | NODE_NETWORK_LIMITED(0x400)
+    /// | NODE_P2P_V2(0x800).
+    pub fn localServices(self: *const Peer) u64 {
+        var s: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
+        if (self.advertise_node_bloom) s |= p2p.NODE_BLOOM;
+        // BIP-159: a full node serves the recent-288 window, so Core sets
+        // NODE_NETWORK_LIMITED unconditionally (init.cpp:863), NOT only when
+        // pruning.  We do the same and advertise it for every full node.
+        s |= p2p.NODE_NETWORK_LIMITED;
+        // BIP-157: signal compact-filter serving when both --blockfilterindex
+        // and --peerblockfilters are enabled (Core init.cpp:992-998).
+        if (self.advertise_compact_filters) s |= p2p.NODE_COMPACT_FILTERS;
+        // BIP-324: advertise NODE_P2P_V2 only when we genuinely run the v2
+        // transport (default on; honest — we will speak v2 to any v2 peer).
+        if (bip324V2Enabled()) s |= p2p.NODE_P2P_V2;
+        return s;
+    }
+
     /// Read up to `out.len` bytes without consuming them from the kernel
     /// receive buffer (uses MSG_PEEK).  Returns the number of bytes peeked.
     /// May return less than `out.len` if data is currently unavailable;
@@ -1453,22 +1496,10 @@ pub const Peer = struct {
         }
 
         // Bitcoin Core builds the advertised services bitmap from the
-        // local services config; we do the same so NODE_BLOOM is gated
-        // on the `peerbloomfilters` config (default false, matching
-        // Core's DEFAULT_PEERBLOOMFILTERS in net_processing.h:44).
-        const our_services: u64 = blk: {
-            var s: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
-            if (self.advertise_node_bloom) s |= p2p.NODE_BLOOM;
-            // BIP-159: signal limited-archive serving when prune mode is on.
-            // Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in
-            // the auto-prune case (the node still has the recent-288 window),
-            // so we keep NODE_NETWORK set as well.
-            if (self.advertise_node_network_limited) s |= p2p.NODE_NETWORK_LIMITED;
-            // BIP-157: signal compact-filter serving when both --blockfilterindex
-            // and --peerblockfilters are enabled (Core init.cpp:992-998).
-            if (self.advertise_compact_filters) s |= p2p.NODE_COMPACT_FILTERS;
-            break :blk s;
-        };
+        // local services config; we do the same in `localServices()`.
+        // NODE_NETWORK_LIMITED is set unconditionally for this full node
+        // (Core init.cpp:863), NODE_P2P_V2 when v2 transport is enabled.
+        const our_services: u64 = self.localServices();
 
         if (self.direction == .outbound) {
             // Send our version
@@ -2380,10 +2411,11 @@ pub const PeerManager = struct {
     /// Core's `DEFAULT_PEERBLOOMFILTERS = false` (net_processing.h:44).
     peerbloomfilters: bool = false,
 
-    /// BIP-159: when true, advertise NODE_NETWORK_LIMITED (1<<10) in
-    /// outgoing VERSION messages.  Wired from `chain_state.prune_target_mib > 0`
-    /// at peer-creation time so peers know we serve only the recent
-    /// `MIN_BLOCKS_TO_KEEP` (288) keep window.
+    /// BIP-159 prune-mode flag, wired from `chain_state.prune_target_mib > 0`
+    /// at peer-creation time.  NOTE: NODE_NETWORK_LIMITED is now advertised
+    /// UNCONDITIONALLY for every full node in `Peer.localServices()` (Core
+    /// init.cpp:863), so this flag no longer gates that bit; retained for
+    /// future prune-specific behaviour.
     advertise_node_network_limited: bool = false,
 
     /// BIP-157: when true, advertise NODE_COMPACT_FILTERS (1<<6) in outgoing

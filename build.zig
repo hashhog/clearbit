@@ -255,6 +255,44 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_reorg_p2p_tests.step);
     }
 
+    // Advertised P2P service-flag tests (Peer.localServices()).
+    // Dedicated test root so it can import peer.zig and EXECUTE the real
+    // localServices() without dragging in the pre-existing (drifted)
+    // peer.zig inline tests.  The `.filters` substring matches our test
+    // names (`tests_service_flags.test.<name>`) and nothing in peer.zig.
+    {
+        const service_flags_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_service_flags.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_service_flags"},
+        });
+        service_flags_tests.linkSystemLibrary("rocksdb");
+        service_flags_tests.linkSystemLibrary("secp256k1");
+        service_flags_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        service_flags_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            service_flags_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            service_flags_tests.linkSystemLibrary("minisketch");
+            service_flags_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        service_flags_tests.root_module.addOptions("build_options", build_options);
+
+        const run_service_flags_tests = b.addRunArtifact(service_flags_tests);
+        const service_flags_test_step = b.step(
+            "test-service-flags",
+            "Run advertised P2P service-flag tests (Peer.localServices())",
+        );
+        service_flags_test_step.dependOn(&run_service_flags_tests.step);
+        // Fold into the main `test` step so CI exercises service flags.
+        test_step.dependOn(&run_service_flags_tests.step);
+    }
+
     // W103 — tx relay flow 30-gate fleet audit.
     // Uses a dedicated test root (tests_w103_tx_relay.zig) so it can import
     // peer.zig + mempool.zig without pulling in unrelated peer.zig tests.
