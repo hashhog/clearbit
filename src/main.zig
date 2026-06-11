@@ -50,6 +50,12 @@ pub const Config = struct {
     max_connections: u32 = 125,
     connect: ?[]const u8 = null, // Connect to specific peer only
     dns_seed: bool = true,
+    /// Enable the hardcoded fixed-seed fallback (Core `-fixedseeds`, default
+    /// true).  When the address book is empty and DNS/-addnode/-seednode failed
+    /// to populate it, dial the curated fixed-seed peers as a last resort.
+    /// Disabled with `--nofixedseeds` / `-fixedseeds=0`; also force-off in
+    /// `--connect` peer-pinned mode (handled in PeerManager.run).
+    fixed_seed: bool = true,
 
     // RPC
     rpc_bind: []const u8 = "127.0.0.1",
@@ -293,6 +299,12 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             config.connect = arg["--connect=".len..];
         } else if (std.mem.eql(u8, arg, "--nodnsseed") or std.mem.eql(u8, arg, "-nodnsseed")) {
             config.dns_seed = false;
+        } else if (std.mem.eql(u8, arg, "--nofixedseeds") or std.mem.eql(u8, arg, "-nofixedseeds") or
+            std.mem.eql(u8, arg, "-fixedseeds=0") or std.mem.eql(u8, arg, "--fixedseeds=0"))
+        {
+            config.fixed_seed = false;
+        } else if (std.mem.eql(u8, arg, "-fixedseeds=1") or std.mem.eql(u8, arg, "--fixedseeds=1")) {
+            config.fixed_seed = true;
         }
         // Storage settings
         else if (std.mem.startsWith(u8, arg, "--dbcache=")) {
@@ -504,6 +516,7 @@ pub fn printUsage() void {
         \\  --maxconnections=<n>   Maximum total connections (default: 125)
         \\  --connect=<addr>       Connect only to specified peer
         \\  --nodnsseed            Disable DNS seeding
+        \\  --nofixedseeds         Disable the hardcoded fixed-seed fallback
         \\
         \\RPC server options:
         \\  --rpcbind=<addr>       Bind RPC to address (default: 127.0.0.1)
@@ -721,6 +734,8 @@ pub fn loadConfigFile(
                 config.connect = value;
             } else if (std.mem.eql(u8, key, "dnsseed")) {
                 config.dns_seed = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "fixedseeds")) {
+                config.fixed_seed = std.mem.eql(u8, value, "1");
             }
             // Storage settings
             else if (std.mem.eql(u8, key, "dbcache")) {
@@ -1994,6 +2009,11 @@ pub fn main() !void {
     peer_manager.chain_state = &chain_state;
     peer_manager.mempool = &mempool_instance;
     peer_manager.peerbloomfilters = config.peerbloomfilters;
+    // Fixed-seed fallback gating (Core net.cpp:2604-2643).  fixed_seed_enabled
+    // is force-off in --connect mode inside PeerManager.run; dns_seed_enabled
+    // feeds the predicate's cheap "-dnsseed=0 ⇒ fire immediately" shortcut.
+    peer_manager.fixed_seed_enabled = config.fixed_seed;
+    peer_manager.dns_seed_enabled = config.dns_seed;
     // BIP-159: when prune mode is enabled (-prune > 0), advertise
     // NODE_NETWORK_LIMITED so peers know we serve only the recent-288
     // keep window.  Mirrors Core's init.cpp `IsPruneMode()` gate.

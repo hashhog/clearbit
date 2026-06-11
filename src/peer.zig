@@ -2257,6 +2257,10 @@ pub const AddressSource = enum {
     dns_seed,
     peer_addr,
     manual,
+    /// Hardcoded fixed-seed peer injected as a last-resort fallback when the
+    /// address book is empty and DNS/-addnode/-seednode failed to populate it.
+    /// Mirrors Core's CNetAddr::SetInternal("fixedseeds") source tag.
+    fixed_seed,
 };
 
 /// Tracked information about a known peer address.
@@ -2475,6 +2479,28 @@ pub const PeerManager = struct {
     /// default is also false — opt-in).
     cjdnsreachable: bool = false,
 
+    /// Fixed-seed fallback (Core net.cpp:2604-2643 ThreadOpenConnections).
+    /// When the address book is empty and DNS/-addnode/-seednode failed to
+    /// populate it, dial the hardcoded `network_params.fixed_seeds` list as a
+    /// last resort.  This is a fallback layered AFTER the normal DNS bootstrap
+    /// (dnsSeeds()) — it never replaces it.
+    ///
+    /// `fixed_seed_enabled`: gate from the `-fixedseeds` CLI flag (Core default
+    /// true).  Forced false in `--connect` peer-pinned mode (Core: -connect
+    /// bypasses the fixed-seed logic).  Plumbed from main.zig.
+    fixed_seed_enabled: bool = true,
+    /// `dns_seed_enabled`: mirror of config.dns_seed (Core `-dnsseed`).  Used by
+    /// the predicate's cheap `!dnsseed && !use_seednodes` immediate-fire branch.
+    /// Plumbed from main.zig.
+    dns_seed_enabled: bool = true,
+    /// One-shot guard — set true once the fixed seeds have been injected so
+    /// subsequent ticks are no-ops (Core sets `add_fixed_seeds = false`).
+    fixed_seeds_added: bool = false,
+    /// Unix-seconds timestamp anchored at connection-loop entry (Core
+    /// `auto start = GetTime()` in ThreadOpenConnections).  The 60-second grace
+    /// window in maybeAddFixedSeeds is measured from here.  0 until run() sets it.
+    run_loop_start_ts: i64 = 0,
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
@@ -2524,6 +2550,10 @@ pub const PeerManager = struct {
             .asmap_data = null,
             .proxy_manager = null,
             .cjdnsreachable = false,
+            .fixed_seed_enabled = true,
+            .dns_seed_enabled = true,
+            .fixed_seeds_added = false,
+            .run_loop_start_ts = 0,
         };
     }
 
@@ -2985,6 +3015,83 @@ pub const PeerManager = struct {
                 self.addAddress(addr, 0, .dns_seed) catch continue;
             }
         }
+    }
+
+    /// Inject the hardcoded `network_params.fixed_seeds` peers into the address
+    /// book.  Each entry is an "IP:port" literal; non-parseable / non-routable
+    /// entries are skipped (addAddress already drops non-routable + dedups).
+    /// Returns the number of addresses actually added.  One-shot caller is
+    /// `maybeAddFixedSeeds`, which sets `fixed_seeds_added`.
+    ///
+    /// Mirrors Core net.cpp:2629-2641: ConvertSeeds(m_params.FixedSeeds()) →
+    /// addrman.Add(seed_addrs, local /* SetInternal("fixedseeds") */).  The
+    /// per-impl reachable/dedup filter is addAddress's isRoutable gate (the
+    /// curated set is IPv4-only routable, so all entries pass).
+    pub fn addFixedSeeds(self: *PeerManager) usize {
+        var added: usize = 0;
+        for (self.network_params.fixed_seeds) |entry| {
+            // Split on the last ':' — everything after is the port.
+            const colon = std.mem.lastIndexOfScalar(u8, entry, ':') orelse continue;
+            const host = entry[0..colon];
+            const port_str = entry[colon + 1 ..];
+            const port = std.fmt.parseInt(u16, port_str, 10) catch continue;
+            // Literal IP only — fixed seeds are never hostnames (no DNS here).
+            const addr = std.net.Address.parseIp(host, port) catch continue;
+            const before = self.known_addresses.count();
+            self.addAddress(addr, p2p.NODE_NETWORK, .fixed_seed) catch continue;
+            if (self.known_addresses.count() > before) added += 1;
+        }
+        return added;
+    }
+
+    /// Core-faithful fixed-seed fallback predicate (net.cpp:2604-2643,
+    /// ThreadOpenConnections).  Fire the one-shot fixed-seed injection ONLY when
+    /// ALL hold:
+    ///   1. FIXED-SEEDS ENABLED: `-fixedseeds != 0` AND not in `--connect` mode
+    ///      (both folded into `fixed_seed_enabled`, set by main.zig).
+    ///   2. ADDRESS BOOK EMPTY: `known_addresses.count() == 0` — Core's
+    ///      `!GetReachableEmptyNetworks().empty()` proxy for this IPv4 set.
+    ///   3. EITHER (a) ~60s elapsed since the connection loop started (Core
+    ///      net.cpp:2614 — gives DNS/-addnode/-seednode time to populate first),
+    ///      OR (b) DNS seeding is disabled (Core net.cpp:2620 cheap shortcut —
+    ///      nothing to wait for, fire immediately).
+    /// After firing, set `fixed_seeds_added = true` so later ticks are no-ops.
+    ///
+    /// Does NOT bypass normal bootstrap: dnsSeeds() still runs first and
+    /// unchanged; this is a last-resort fallback layered after it.
+    /// Returns true if the injection fired on this call.
+    pub fn maybeAddFixedSeeds(self: *PeerManager) bool {
+        // One-shot guard (Core sets add_fixed_seeds = false after firing).
+        if (self.fixed_seeds_added) return false;
+        // (1) Fixed seeds enabled (covers -fixedseeds=0 and --connect mode).
+        if (!self.fixed_seed_enabled) return false;
+        // Nothing to inject (e.g. regtest, which carries an empty list).
+        if (self.network_params.fixed_seeds.len == 0) return false;
+        // (2) Address book must be empty (Core's reachable-empty-network proxy).
+        if (self.known_addresses.count() != 0) return false;
+
+        // (3) EITHER 60s elapsed since loop start, OR DNS seeding disabled.
+        var fire_now = false;
+        if (!self.dns_seed_enabled) {
+            // Cheap shortcut: no DNS source to wait for — fire immediately.
+            // (Core net.cpp:2620 also checks -addnode/-seednode; clearbit has
+            // no addnode-at-boot population path here, so DNS-off ⇒ fire.)
+            fire_now = true;
+        } else if (self.run_loop_start_ts != 0 and
+            std.time.timestamp() > self.run_loop_start_ts + 60)
+        {
+            // 60-second grace window elapsed and the book is still empty.
+            fire_now = true;
+        }
+        if (!fire_now) return false;
+
+        const added = self.addFixedSeeds();
+        // One-shot: never re-inject, even if addFixedSeeds added nothing
+        // (matches Core, which clears add_fixed_seeds unconditionally once the
+        // fire conditions are met).
+        self.fixed_seeds_added = true;
+        std.log.info("Added {d} fixed seeds (address book was empty)", .{added});
+        return true;
     }
 
     /// Return true if `address` is publicly routable on the global internet.
@@ -7132,6 +7239,18 @@ pub const PeerManager = struct {
     pub fn run(self: *PeerManager) !void {
         self.running.store(true, .release);
 
+        // Anchor the fixed-seed grace window at connection-loop entry, BEFORE
+        // the initial DNS resolve — matches Core net.cpp `auto start = GetTime()`
+        // in ThreadOpenConnections.  maybeAddFixedSeeds measures its 60s grace
+        // from here.
+        self.run_loop_start_ts = std.time.timestamp();
+
+        // --connect peer-pinned mode bypasses the fixed-seed fallback entirely
+        // (Core: -connect bypasses ThreadOpenConnections fixed-seed logic).
+        if (self.connect_address != null) {
+            self.fixed_seed_enabled = false;
+        }
+
         // Connect to --connect peer if specified (priority)
         if (self.connect_address) |addr| {
             std.debug.print("P2P: Attempting TCP connection to --connect peer...\n", .{});
@@ -7171,6 +7290,14 @@ pub const PeerManager = struct {
             // Separate from maintainOutbound so it runs even in --connect mode
             // and isn't starved by the 1-attempt-per-tick IBD throttle.
             self.maintainManualConnections();
+
+            // 0b. Fixed-seed fallback (Core net.cpp:2604-2643).  One-shot, fires
+            // ONLY when the address book is empty and either DNS seeding is off
+            // or the 60s grace window elapsed without DNS/-addnode populating it.
+            // Layered AFTER the initial dnsSeeds() bootstrap above — never
+            // replaces it.  Runs before maintainOutbound so freshly-injected
+            // seeds are dialled on this same tick.  No-op once it has fired.
+            _ = self.maybeAddFixedSeeds();
 
             // 1. Open new outbound connections if needed (skip if --connect mode)
             // During IBD, skip connection attempts if we already have peers (avoids blocking)
