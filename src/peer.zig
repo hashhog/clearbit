@@ -2533,6 +2533,27 @@ pub const PeerManager = struct {
     /// window in maybeAddFixedSeeds is measured from here.  0 until run() sets it.
     run_loop_start_ts: i64 = 0,
 
+    /// Build the advertised local service flags this node announces in its
+    /// outgoing VERSION handshakes — the manager-level mirror of
+    /// `Peer.localServices()` (the per-peer accessor reads the same config
+    /// values copied onto each Peer at creation time).  Used by
+    /// getnetworkinfo to report the REAL advertised `localservices` word
+    /// (and derive the names array from the SAME value, so they cannot drift).
+    ///
+    /// Default (non-pruned, v2-on, no bloom/cfilters) full node = 0xC09 =
+    /// NODE_NETWORK(0x1) | NODE_WITNESS(0x8) | NODE_NETWORK_LIMITED(0x400)
+    /// | NODE_P2P_V2(0x800).
+    pub fn localServices(self: *const PeerManager) u64 {
+        var s: u64 = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
+        if (self.peerbloomfilters) s |= p2p.NODE_BLOOM;
+        // NODE_NETWORK_LIMITED is advertised unconditionally for a full node
+        // (Core init.cpp:863), matching Peer.localServices().
+        s |= p2p.NODE_NETWORK_LIMITED;
+        if (self.blockfilterindex_enabled) s |= p2p.NODE_COMPACT_FILTERS;
+        if (Peer.bip324V2Enabled()) s |= p2p.NODE_P2P_V2;
+        return s;
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         params: *const consensus.NetworkParams,
