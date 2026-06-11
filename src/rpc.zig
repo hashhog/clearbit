@@ -3637,10 +3637,20 @@ pub const RpcServer = struct {
         // ── Path B: in-memory chain_manager (recent blocks this session) ─────
         var cm_header_opt: ?types.BlockHeader = null;
         var cm_height_opt: ?u32 = null;
+        // Capture the BlockIndexEntry + cumulative chain_work so the local
+        // emission path can compute mediantime (MTP-of-block) and chainwork
+        // from REAL in-memory state — the same source getblockheader uses —
+        // instead of leaving them 0 / all-zero (Core never proxies on regtest;
+        // the regtest oracle runs on a random port queryCoreBlockHeaderMeta
+        // can't reach).
+        var cm_entry_opt: ?*validation.BlockIndexEntry = null;
+        var cm_chainwork_opt: ?[32]u8 = null;
         if (self.chain_manager) |cm| {
             if (cm.getBlock(&blockhash)) |entry| {
                 cm_header_opt = entry.header;
                 cm_height_opt = entry.height;
+                cm_entry_opt = entry;
+                cm_chainwork_opt = entry.chain_work;
             }
         }
 
@@ -3820,6 +3830,36 @@ pub const RpcServer = struct {
             nextblockhash_opt = m.nextblockhash;
         }
 
+        // ── REAL computed mediantime + chainwork (local in-memory state) ─────
+        //
+        // Prefer the chain_manager's BlockIndexEntry for mediantime (MTP-of-
+        // block) and chainwork (cumulative chain_work) — the same authoritative
+        // source handleGetBlockHeader uses (rpc.zig:10326,10358). This is what
+        // makes the local regtest path emit Core-correct values without any
+        // Core proxy (which is null on regtest). Falls back to the core_meta /
+        // header.timestamp defaults set above only when chain_manager lacks the
+        // entry.
+        if (!is_genesis) {
+            var mtp_resolved = false;
+            if (cm_entry_opt) |e| {
+                if (self.computeMTPViaChainManager(e)) |mtp| {
+                    mediantime = @intCast(mtp);
+                    mtp_resolved = true;
+                }
+            }
+            if (!mtp_resolved and height_known) {
+                if (self.computeMTPAtHeight(height)) |mtp| {
+                    mediantime = @intCast(mtp);
+                    mtp_resolved = true;
+                }
+            }
+            if (cm_chainwork_opt) |cw| {
+                for (cw, 0..) |byte, i| {
+                    _ = std.fmt.bufPrint(chainwork_str[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch {};
+                }
+            }
+        }
+
         // Use genesis header fields when we have is_genesis.
         if (is_genesis) header = self.network_params.genesis_header;
 
@@ -3906,9 +3946,9 @@ pub const RpcServer = struct {
         }
 
         // coinbase_tx — Core emits it (unconditionally) BEFORE the tx array, in
-        // both v1 and v2.  clearbit emits it for v2 only; the v1 coinbase_tx
-        // object is a hard-deferred new serializer path.
-        if (verbosity >= 2) {
+        // both v1 and v2 (rpc/blockchain.cpp:211, pushed before the verbosity
+        // switch). clearbit now emits it for every verbose path (v>=1).
+        if (verbosity >= 1) {
             try w.writeByte(',');
             if (is_genesis) {
                 try w.writeAll("\"coinbase_tx\":{\"version\":1,\"locktime\":0,\"sequence\":4294967295,\"coinbase\":\"04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f6620736563636f6e64206261696c6f757420666f722062616e6b73\",\"witness\":null}");
@@ -3944,13 +3984,49 @@ pub const RpcServer = struct {
         }
 
         // ── tx array (last field per Core blockToJSON) ───────────────────────
+        //
+        // For v=2, Core's TxToUniv (SHOW_DETAILS) appends a per-tx `fee` field
+        // after vout for every non-coinbase tx (rpc/blockchain.cpp blockToJSON
+        // passes the block undo). Load CF_BLOCK_UNDO once and compute each
+        // non-coinbase fee = sum(spent prevout values) - sum(output values).
+        // BlockUndoData.tx_undo[i] corresponds to block.transactions[i+1]
+        // (one TxUndo per non-coinbase tx). Omit fee entirely when undo is
+        // missing/misaligned (Core degrades the same way for pruned blocks).
+        var owned_undo: ?storage.BlockUndoData = null;
+        defer if (owned_undo) |*u| u.deinit(self.allocator);
+        if (verbosity >= 2 and !is_genesis) {
+            if (self.chain_state.utxo_set.db) |db| {
+                if (db.get(storage.CF_BLOCK_UNDO, &blockhash) catch null) |undo_bytes| {
+                    defer self.allocator.free(undo_bytes);
+                    owned_undo = storage.BlockUndoData.fromBytes(undo_bytes, self.allocator) catch null;
+                }
+            }
+        }
+
         try w.writeAll(",\"tx\":[");
         if (verbosity >= 2) {
             if (block_opt) |blk| {
                 for (blk.transactions, 0..) |*tx, ti| {
                     if (ti > 0) try w.writeByte(',');
-                    // Write TxToUniv shape (like writeTxToUnivForPsbt) + hex field.
-                    try writeBlockTxToUniv(self, w, tx);
+                    // Per-tx fee from undo: tx_undo[ti-1] for non-coinbase tx ti.
+                    // Coinbase (ti==0) gets no fee. Misaligned/short undo => null.
+                    var fee_opt: ?i64 = null;
+                    if (ti > 0 and !tx.isCoinbase()) {
+                        if (owned_undo) |u| {
+                            if (ti - 1 < u.tx_undo.len) {
+                                const tu = u.tx_undo[ti - 1];
+                                if (tu.prev_outputs.len == tx.inputs.len) {
+                                    var spent: i64 = 0;
+                                    for (tu.prev_outputs) |po| spent += po.value;
+                                    var out_sum: i64 = 0;
+                                    for (tx.outputs) |o| out_sum += o.value;
+                                    fee_opt = spent - out_sum;
+                                }
+                            }
+                        }
+                    }
+                    // Write TxToUniv shape (like writeTxToUnivForPsbt) + fee + hex.
+                    try writeBlockTxToUniv(self, w, tx, fee_opt);
                 }
             } else if (is_genesis) {
                 // Genesis coinbase txid placeholder.
@@ -3979,10 +4055,14 @@ pub const RpcServer = struct {
     /// Like writeTxToUnivForPsbt but also emits the `hex` field (included in
     /// getblock v=2, excluded from decoderawtransaction).
     /// chain-context fields (blockhash/confirmations/time/blocktime) are omitted.
+    /// `fee_opt` (sats) — when non-null, Core's TxToUniv SHOW_DETAILS emits a
+    /// `fee` field (BTC) after vout, before hex (rpc/blockchain.cpp blockToJSON).
+    /// Coinbase and pruned-undo blocks pass null and the field is omitted.
     fn writeBlockTxToUniv(
         self: *RpcServer,
         writer: anytype,
         tx: *const types.Transaction,
+        fee_opt: ?i64,
     ) !void {
         const txid = crypto.computeTxidStreaming(tx);
         const hash = crypto.computeWtxidStreaming(tx);
@@ -4083,6 +4163,18 @@ pub const RpcServer = struct {
             try writer.writeByte('}');
         }
         try writer.writeAll("],");
+
+        // fee — Core TxToUniv SHOW_DETAILS appends fee (BTC) after vout, before
+        // hex, for non-coinbase txs when block undo is available.
+        if (fee_opt) |fee_sats| {
+            if (fee_sats == 0) {
+                try writer.writeAll("\"fee\":0E-8,");
+            } else {
+                try writer.print("\"fee\":{d:.8},", .{
+                    @as(f64, @floatFromInt(fee_sats)) / 100_000_000.0,
+                });
+            }
+        }
 
         // hex — last field in Core TxToUniv (include_hex=true for getblock v2).
         try writer.writeAll("\"hex\":\"");
@@ -5143,13 +5235,64 @@ pub const RpcServer = struct {
 
         // warnings is an ARRAY by default in v31.99 (node::GetWarningsForRpc
         // returns VARR). version/subversion stay clearbit's identity (masked by
-        // the byte-diff; never set to Core's). localservices/localservicesnames/
-        // networks/relayfee/incrementalfee are deferred (real capability/policy
-        // surface, not literal cosmetics).
-        try writer.print("{{\"version\":250000,\"subversion\":\"/clearbit:0.1.0/\",\"protocolversion\":70016,\"localservices\":\"0000000000000009\",\"localservicesnames\":[\"NETWORK\",\"WITNESS\"],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":true,\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":0.00001,\"incrementalfee\":0.00001,\"localaddresses\":[],\"warnings\":[]}}", .{
+        // the byte-diff; never set to Core's).
+        //
+        // localservices reflects clearbit's REAL advertised flags via
+        // PeerManager.localServices() (default 0xc09 = NODE_NETWORK |
+        // NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2). The hex word AND
+        // the names array are derived from the SAME value so they cannot drift.
+        // relayfee/incrementalfee source the v31.99 100-sat relay constants.
+        const local_services = self.peer_manager.localServices();
+
+        try writer.print("{{\"version\":250000,\"subversion\":\"/clearbit:0.1.0/\",\"protocolversion\":70016,\"localservices\":\"{x:0>16}\",\"localservicesnames\":[", .{local_services});
+        // Names array derived from the SAME local_services word (Core
+        // GetServicesNames order: NETWORK, ... WITNESS ... NETWORK_LIMITED,
+        // P2P_V2). Emit in Core's bit order to match.
+        var first_name = true;
+        if (local_services & p2p.NODE_NETWORK != 0) {
+            try writer.writeAll("\"NETWORK\"");
+            first_name = false;
+        }
+        if (local_services & p2p.NODE_BLOOM != 0) {
+            if (!first_name) try writer.writeByte(',');
+            try writer.writeAll("\"BLOOM\"");
+            first_name = false;
+        }
+        if (local_services & p2p.NODE_WITNESS != 0) {
+            if (!first_name) try writer.writeByte(',');
+            try writer.writeAll("\"WITNESS\"");
+            first_name = false;
+        }
+        if (local_services & p2p.NODE_COMPACT_FILTERS != 0) {
+            if (!first_name) try writer.writeByte(',');
+            try writer.writeAll("\"COMPACT_FILTERS\"");
+            first_name = false;
+        }
+        if (local_services & p2p.NODE_NETWORK_LIMITED != 0) {
+            if (!first_name) try writer.writeByte(',');
+            try writer.writeAll("\"NETWORK_LIMITED\"");
+            first_name = false;
+        }
+        if (local_services & p2p.NODE_P2P_V2 != 0) {
+            if (!first_name) try writer.writeByte(',');
+            try writer.writeAll("\"P2P_V2\"");
+            first_name = false;
+        }
+
+        const relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.MIN_RELAY_FEE)) / 100_000_000.0;
+        const incremental_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.INCREMENTAL_RELAY_FEE)) / 100_000_000.0;
+
+        // networks: Core GetNetworksInfo emits all 5 GetNetworkNames() entries
+        // (ipv4, ipv6, onion, i2p, cjdns). ipv4/ipv6 reachable + not-limited;
+        // the overlay networks (onion/i2p/cjdns) are not configured here so
+        // they report reachable=false, limited=true (no proxy). proxy="" and
+        // proxy_randomize_credentials=false throughout (no proxy configured).
+        try writer.print("],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":true,\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"onion\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"i2p\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"cjdns\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":{d:.8},\"incrementalfee\":{d:.8},\"localaddresses\":[],\"warnings\":[]}}", .{
             total,
             inbound,
             outbound,
+            relay_fee_btc,
+            incremental_fee_btc,
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -5418,14 +5561,28 @@ pub const RpcServer = struct {
         // is now a static capability flag, not per-mempool policy state.
         // Followed by 5 trailing v31.99 fields: permitbaremultisig,
         // maxdatacarriersize, limitclustercount, limitclustersize, optimal.
-        // (mempoolminfee/minrelaytxfee/incrementalrelayfee fee values are a
-        // separate live-relay-policy change — intentionally left at clearbit's
-        // policy default here, not part of this byte-diff cosmetics pass.)
-        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":0.0,\"maxmempool\":{d},\"mempoolminfee\":0.00001,\"minrelaytxfee\":0.00001,\"incrementalrelayfee\":0.00001,\"unbroadcastcount\":0,\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
+        //
+        // Fee fields are sourced from clearbit's REAL relay-policy constants so
+        // display == admission and cannot drift:
+        //   mempoolminfee   = mempool.getMinFee()  (rolling min, floored at
+        //                     MIN_RELAY_FEE=100 sat/kvB) -> 1e-06 on an empty
+        //                     mempool, matching Core v31.99.
+        //   minrelaytxfee   = MIN_RELAY_FEE (Core DEFAULT_MIN_RELAY_TX_FEE=100,
+        //                     LOWERED 1000->100 in v31.99) = 1e-06.
+        //   incrementalrelayfee = INCREMENTAL_RELAY_FEE (Core
+        //                     DEFAULT_INCREMENTAL_RELAY_FEE=100) = 1e-06.
+        // (Earlier this hardcoded the stale pre-v31.99 0.00001 display value.)
+        const mempool_min_fee_btc: f64 = @as(f64, @floatFromInt(self.mempool.getMinFee())) / 100_000_000.0;
+        const min_relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.MIN_RELAY_FEE)) / 100_000_000.0;
+        const incremental_relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.INCREMENTAL_RELAY_FEE)) / 100_000_000.0;
+        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":0.0,\"maxmempool\":{d},\"mempoolminfee\":{d:.8},\"minrelaytxfee\":{d:.8},\"incrementalrelayfee\":{d:.8},\"unbroadcastcount\":0,\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
             mempool_stats.count,
             mempool_stats.size,
             mempool_stats.size,
             mempool_mod.MAX_MEMPOOL_SIZE,
+            mempool_min_fee_btc,
+            min_relay_fee_btc,
+            incremental_relay_fee_btc,
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -16986,6 +17143,29 @@ pub const RpcServer = struct {
 
         // Condition 1: chainwork must meet the minimum chain-work bar.
         if (self.compareChainWork(tip_chain_work_ptr, &self.network_params.min_chain_work) < 0) {
+            return true;
+        }
+
+        // Regtest-scoped exit: regtest mines blocks under mocktime (years
+        // behind real wall-clock), so the Condition-2 24h tip-age check below
+        // would ALWAYS keep a freshly-mined regtest chain stuck in IBD. Core
+        // never reports IBD on a caught-up regtest tip; mirror rustoshi
+        // server.rs should_exit_ibd (network==Regtest && best==header => not in
+        // IBD). Gated STRICTLY on regtest — mainnet/testnet keep the real
+        // wall-clock+chainwork gate. Condition 1 has already passed (regtest
+        // min_chain_work=0), so a caught-up regtest tip latches sticky-OFF.
+        if (isRegtestMagic(self.network_params.magic)) {
+            const queued_count: usize = if (self.peer_manager.expected_blocks.items.len > self.peer_manager.connect_cursor)
+                self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor
+            else
+                0;
+            const header_tip_height = self.chain_state.best_height +
+                @as(u32, @intCast(queued_count));
+            if (self.chain_state.best_height == header_tip_height) {
+                self.ibd_latched_off.store(true, .monotonic);
+                return false;
+            }
+            // Headers ahead of validated tip: still catching up, stay in IBD.
             return true;
         }
 
