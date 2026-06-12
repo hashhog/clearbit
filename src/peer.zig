@@ -12,6 +12,7 @@ const validation = @import("validation.zig");
 const asmap_mod = @import("asmap.zig");
 const proxy_mod = @import("proxy.zig");
 const wallet_mod = @import("wallet.zig");
+const addrman_mod = @import("addrman.zig");
 
 // ============================================================================
 // Peer Manager Constants
@@ -2313,6 +2314,12 @@ pub const AddressInfo = struct {
 pub const PeerManager = struct {
     peers: std.ArrayList(*Peer),
     known_addresses: std.AutoHashMap(u64, AddressInfo),
+    /// Core-bucketed address manager (NEW/TRIED tables + nKey salt + peers.dat
+    /// persistence), wired UNDER known_addresses. `known_addresses` keeps the
+    /// rich getnodeaddresses / addr-sharing metadata; this is the real Core
+    /// placement + anti-Sybil + persistence engine (src/addrman.zig). Lazily
+    /// initialised so PeerManager.init stays infallible. See ensureAddrman().
+    addrman: ?addrman_mod.AddrMan,
     ban_list: banlist.BanList,
     listener: ?std.net.Server,
     network_params: *const consensus.NetworkParams,
@@ -2561,6 +2568,7 @@ pub const PeerManager = struct {
         return .{
             .peers = std.ArrayList(*Peer).init(allocator),
             .known_addresses = std.AutoHashMap(u64, AddressInfo).init(allocator),
+            .addrman = null,
             .ban_list = banlist.BanList.init(allocator, "banlist.json"),
             .listener = null,
             .network_params = params,
@@ -2614,6 +2622,11 @@ pub const PeerManager = struct {
         // Save ban list and anchors before shutdown
         self.ban_list.save() catch {};
         self.saveAnchors() catch {};
+        // Persist the bucketed addrman (peers.dat) if a data dir is set.
+        if (self.addrman) |*am| {
+            if (self.data_dir) |dir| am.save(dir);
+            am.deinit();
+        }
         for (self.peers.items) |peer| {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -3239,6 +3252,36 @@ pub const PeerManager = struct {
     }
 
     /// Add a known address.
+    /// Lazily construct (or load from peers.dat) the bucketed addrman. Called
+    /// before any addrman mutation. Keeps PeerManager.init infallible. On any
+    /// allocation/load failure the addrman stays null and the legacy
+    /// known_addresses map continues to function (the bucketed engine is a
+    /// transparent under-layer, never load-bearing for liveness).
+    fn ensureAddrman(self: *PeerManager) ?*addrman_mod.AddrMan {
+        if (self.addrman == null) {
+            const loaded: ?addrman_mod.AddrMan = blk: {
+                if (self.data_dir) |dir| {
+                    break :blk addrman_mod.AddrMan.load(self.allocator, dir) catch null;
+                }
+                break :blk addrman_mod.AddrMan.init(self.allocator) catch null;
+            };
+            self.addrman = loaded orelse return null;
+        }
+        return &self.addrman.?;
+    }
+
+    /// The /16 (v4) or /32 (v6) network group for the source of an address
+    /// record. clearbit feeds netGroup() (or the asmap ASN when loaded) as the
+    /// group input to the bucketed addrman, exactly as Core feeds
+    /// NetGroupManager::GetGroup.
+    fn addrManGroup(self: *const PeerManager, address: std.net.Address) u32 {
+        if (self.asmap_data) |data| {
+            const asn = getMappedAS(data, address);
+            if (asn != 0) return asn;
+        }
+        return netGroup(address);
+    }
+
     pub fn addAddress(
         self: *PeerManager,
         address: std.net.Address,
@@ -3252,16 +3295,34 @@ pub const PeerManager = struct {
         // via addr/addrv2 messages from polluting the address book.
         if (!isRoutable(address)) return;
 
-        const key = addressKey(address);
-        if (self.known_addresses.contains(key)) return;
-
         // Check if IP is banned
         if (self.ban_list.isAddressBanned(address)) return;
+
+        // Feed the Core-bucketed addrman (NEW table placement + anti-Sybil +
+        // persistence). The source group is the source's netgroup; for gossiped
+        // addresses we lack the relaying peer's address here, so we group by the
+        // address itself (Core groups new entries by source — clearbit's source
+        // metadata is per-AddressSource enum, not a CNetAddr, so this is the
+        // best-available group input and still spreads by /16). last_seen uses
+        // the same wall clock the legacy map records.
+        const now_i = std.time.timestamp();
+        const now: u64 = if (now_i < 0) 0 else @intCast(now_i);
+        if (self.ensureAddrman()) |am| {
+            const ag = self.addrManGroup(address);
+            // Source group: gossiped addrs carry no relayer addr in this API, so
+            // use the address's own group (Core uses the source's group; this
+            // degrades gracefully to per-/16 spread without a relayer addr).
+            const sg = ag;
+            _ = am.add(address, ag, sg, services, now, now) catch {};
+        }
+
+        const key = addressKey(address);
+        if (self.known_addresses.contains(key)) return;
 
         try self.known_addresses.put(key, AddressInfo{
             .address = address,
             .services = services,
-            .last_seen = std.time.timestamp(),
+            .last_seen = now_i,
             .last_tried = 0,
             .attempts = 0,
             .success = false,
@@ -3319,6 +3380,10 @@ pub const PeerManager = struct {
             if (self.known_addresses.getPtr(best_key)) |info_ptr| {
                 info_ptr.last_tried = now;
                 info_ptr.attempts += 1;
+            }
+            // Mirror the attempt into the bucketed addrman (Core Attempt_).
+            if (self.addrman) |*am| {
+                am.attempt(b.address, if (now < 0) 0 else @intCast(now));
             }
             return b.address;
         }
@@ -3502,6 +3567,10 @@ pub const PeerManager = struct {
             peer.conn_type = .manual;
             info.success = true;
             info.last_seen = now;
+            // Promote NEW -> TRIED in the bucketed addrman (Core Good).
+            if (self.ensureAddrman()) |am| {
+                _ = am.good(info.address, if (now < 0) 0 else @intCast(now)) catch {};
+            }
         }
     }
 
@@ -3690,9 +3759,15 @@ pub const PeerManager = struct {
 
             // Mark address as successful
             const key = addressKey(addr);
+            const succ_ts = std.time.timestamp();
             if (self.known_addresses.getPtr(key)) |info| {
                 info.success = true;
-                info.last_seen = std.time.timestamp();
+                info.last_seen = succ_ts;
+            }
+            // Promote NEW -> TRIED in the bucketed addrman (Core Good on a
+            // successful handshake).
+            if (self.ensureAddrman()) |am| {
+                _ = am.good(addr, if (succ_ts < 0) 0 else @intCast(succ_ts)) catch {};
             }
 
             // Track netgroup for diversity enforcement
