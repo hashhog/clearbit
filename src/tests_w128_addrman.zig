@@ -207,9 +207,14 @@ test "w128/G7: No getNewBucket / getTriedBucket pure functions" {
 test "w128/G8: No dedicated ThreadOpenConnections loop / timers" {
     try testing.expect(!@hasDecl(peer_mod, "threadOpenConnections"));
     try testing.expect(!@hasDecl(peer_mod, "ThreadOpenConnections"));
-    // FEELER_INTERVAL: Core net.h:61 = 2min
-    try testing.expect(!@hasDecl(peer_mod, "FEELER_INTERVAL"));
-    try testing.expect(!@hasDecl(peer_mod, "FEELER_INTERVAL_SECS"));
+    // FEELER timer PRESENT (anti-eclipse axis): Core net.h FEELER_INTERVAL = 2min.
+    // The feeler schedule is now wired (maybeOpenFeeler + last_feeler_time +
+    // FEELER_INTERVAL_SECS), so this assertion is FLIPPED to confirm-present.
+    try testing.expect(@hasDecl(peer_mod, "FEELER_INTERVAL_SECS"));
+    try testing.expectEqual(@as(i64, 120), peer_mod.FEELER_INTERVAL_SECS);
+    try testing.expect(@hasDecl(PeerManager, "maybeOpenFeeler"));
+    // The OTHER ThreadOpenConnections timers remain unimplemented (separate
+    // features, genuinely still absent):
     // EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL: Core net.h:63 = 5min
     try testing.expect(!@hasDecl(peer_mod, "EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL"));
     // EXTRA_NETWORK_PEER_INTERVAL: Core net.cpp:91 = 5min
@@ -308,22 +313,21 @@ test "w128/G12: No disadvantaged-network reservation in eviction protect-by-time
 // Feeler scheduling + extra-network outbound (G13-G14)
 // ============================================================================
 
-// G13 BUG-13: Feeler scheduling missing.
-// ConnectionType.feeler exists in the enum (peer.zig:548) but PeerManager
-// has no state to schedule feelers — no next_feeler timer, no
-// makeTriedOnFeelerSuccess, no select-new-only.
-// Overlap: W104 G14.  Re-tested here for the *scheduling* call site.
-test "w128/G13: ConnectionType.feeler enum variant exists but has no scheduler state" {
+// G13 FIXED (anti-eclipse axis): feeler scheduling present.
+// ConnectionType.feeler is wired to a real scheduler: PeerManager carries a
+// last_feeler_time timer, selectFeelerAddress (NEW-only), and
+// makeTriedOnFeelerSuccess (NEW->TRIED on a successful probe), driven from the
+// run() loop via maybeOpenFeeler. Overlap: W104 G14 (storage); here the
+// *scheduling* call site is confirmed present.
+test "w128/G13: ConnectionType.feeler has scheduler state + NEW-only select + promote" {
     // Variant exists in the enum.
     try testing.expect(@hasField(ConnectionType, "feeler"));
-    // No timer / scheduler state on PeerManager.
-    try testing.expect(!@hasField(PeerManager, "next_feeler_time"));
-    try testing.expect(!@hasField(PeerManager, "last_feeler_time"));
-    try testing.expect(!@hasField(PeerManager, "feeler_schedule"));
-    // No feeler-specific selection helper.
-    try testing.expect(!@hasDecl(PeerManager, "scheduleFeeler"));
-    try testing.expect(!@hasDecl(PeerManager, "selectFeelerAddress"));
-    try testing.expect(!@hasDecl(PeerManager, "makeTriedOnFeelerSuccess"));
+    // Timer / scheduler state on PeerManager.
+    try testing.expect(@hasField(PeerManager, "last_feeler_time"));
+    // Feeler-specific selection + promotion + open helpers.
+    try testing.expect(@hasDecl(PeerManager, "selectFeelerAddress"));
+    try testing.expect(@hasDecl(PeerManager, "makeTriedOnFeelerSuccess"));
+    try testing.expect(@hasDecl(PeerManager, "maybeOpenFeeler"));
 }
 
 // G14 BUG-14: MaybePickPreferredNetwork extra-network slot missing.

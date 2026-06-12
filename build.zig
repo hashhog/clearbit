@@ -1337,6 +1337,44 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w128_tests.step);
     }
 
+    // W142 — P2P anti-eclipse hardening proof suite (Bitcoin Core v31.99).
+    // Reference: bitcoin-core/src/net.cpp ThreadOpenConnections FEELER branch +
+    // net_processing.cpp GETADDR handler + ProcessAddrs token bucket.
+    // Dedicated test root (tests_w142_anti_eclipse.zig) so the suite imports
+    // peer.zig + addrman.zig + consensus.zig without pulling in unrelated
+    // peer.zig tests via the broad `test` step. Run with `zig build test-w142`.
+    {
+        const w142_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w142_anti_eclipse.zig"),
+            .target = target,
+            .optimize = optimize,
+            // Filter to only our W142 tests; exclude drifted peer.zig tests
+            // that this root transitively pulls in via the peer import.
+            .filters = &[_][]const u8{"w142", "tests_w142_anti_eclipse"},
+        });
+        w142_tests.linkSystemLibrary("rocksdb");
+        w142_tests.linkSystemLibrary("secp256k1");
+        w142_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w142_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w142_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w142_tests.linkSystemLibrary("minisketch");
+            w142_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w142_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w142_tests = b.addRunArtifact(w142_tests);
+        const w142_test_step = b.step("test-w142", "Run W142 P2P anti-eclipse hardening proof suite");
+        w142_test_step.dependOn(&run_w142_tests.step);
+        // Fold into the main `test` step so CI exercises W142.
+        test_step.dependOn(&run_w142_tests.step);
+    }
+
     // W124 — Operator-experience 30-gate audit.
     // Reference: bitcoin-core/src/init.cpp (signals, Shutdown, Interrupt,
     //            SetupServerArgs, LockDirectory, InitLogging, WritePidFile);
