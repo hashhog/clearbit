@@ -213,6 +213,33 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_bip35_tests.step);
     }
 
+    // AXIS #2: Core-bucketed addrman proof suite (src/addrman.zig). Lives in a
+    // dedicated test root (tests_addrman_axis2.zig) so it only pulls in
+    // addrman.zig + crypto.zig + types.zig — no rocksdb/zmq/peer.zig drift.
+    {
+        const addrman_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_addrman_axis2.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        addrman_tests.linkSystemLibrary("secp256k1");
+        addrman_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        addrman_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            addrman_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        addrman_tests.root_module.addOptions("build_options", build_options);
+
+        const run_addrman_tests = b.addRunArtifact(addrman_tests);
+        const addrman_test_step = b.step("test-addrman", "Run AXIS #2 Core-bucketed addrman proof suite");
+        addrman_test_step.dependOn(&run_addrman_tests.step);
+        // Also fold into the main `test` step.
+        test_step.dependOn(&run_addrman_tests.step);
+    }
+
     // Competing-fork detection + reorg-trigger tests (CLEARBIT_REORG=1).
     // Filter directly to "tests_reorg_p2p" so the test runner skips the
     // pre-existing peer.zig eclipse-protection tests that have drifted
