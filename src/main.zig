@@ -96,6 +96,7 @@ pub const Config = struct {
     txindex: bool = false,
     blockfilterindex: bool = false, // BIP-157/158 compact block filters
     coinstatsindex: bool = false, // Per-block UTXO statistics
+    txospenderindex: bool = false, // Spent outpoint -> spending tx index
 
     // Mempool
     maxmempool: u64 = 300, // Max mempool size in MiB
@@ -323,6 +324,8 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             config.blockfilterindex = true;
         } else if (std.mem.eql(u8, arg, "--coinstatsindex")) {
             config.coinstatsindex = true;
+        } else if (std.mem.eql(u8, arg, "--txospenderindex")) {
+            config.txospenderindex = true;
         }
         // Mempool settings
         else if (std.mem.startsWith(u8, arg, "--maxmempool=")) {
@@ -546,6 +549,7 @@ pub fn printUsage() void {
         \\  --txindex              Enable transaction index
         \\  --blockfilterindex     Enable BIP-157/158 block filter index
         \\  --coinstatsindex       Enable UTXO statistics index
+        \\  --txospenderindex      Enable spent-outpoint -> spending-tx index
         \\
         \\Mempool options:
         \\  --maxmempool=<MiB>     Max mempool size in MiB (default: 300)
@@ -749,6 +753,8 @@ pub fn loadConfigFile(
                 config.blockfilterindex = std.mem.eql(u8, value, "1");
             } else if (std.mem.eql(u8, key, "coinstatsindex")) {
                 config.coinstatsindex = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "txospenderindex")) {
+                config.txospenderindex = std.mem.eql(u8, value, "1");
             }
             // Mempool settings
             else if (std.mem.eql(u8, key, "maxmempool")) {
@@ -1941,6 +1947,16 @@ pub fn main() !void {
     if (config.coinstatsindex) {
         std.debug.print("Coin statistics index enabled (--coinstatsindex)\n", .{});
     }
+    // TxoSpenderIndex (2026-06-12) — wire --txospenderindex into ChainState so
+    // connectBlockInner records spent-outpoint → spending-tx entries and the
+    // disconnect path erases them, both atomic with the chainstate advance via
+    // the flush() WriteBatch.  Bitcoin Core analog: -txospenderindex toggling
+    // TxoSpenderIndex base-index registration (default off,
+    // DEFAULT_TXOSPENDERINDEX{false}).
+    chain_state.txospenderindex_enabled = config.txospenderindex;
+    if (config.txospenderindex) {
+        std.debug.print("Txo spender index enabled (--txospenderindex)\n", .{});
+    }
     // Seed the BIP-113 MTP ring buffer with the genesis timestamp so that
     // blocks at heights 1..10 see the correct MTP window (which includes
     // genesis).  connectBlockInner pushes subsequent block timestamps into
@@ -2322,6 +2338,27 @@ pub fn main() !void {
                 chain_state.seedCoinStatsGenesis(consensus.getBlockSubsidy(0, params));
             }
         }
+
+        // TxoSpenderIndex (2026-06-12): load the persisted txospenderindex tip
+        // height.  No running accumulator to restore (the index is a flat
+        // per-spend KV map), so this just tells the backfill walker (below)
+        // where to resume from.  Stays in lockstep with the chain tip because
+        // the tip key, the per-spend records, and the chain tip all commit in
+        // one WriteBatch.
+        if (config.txospenderindex) {
+            if (dbp.get(storage.CF_DEFAULT, storage.ChainState.TXOSPENDERINDEX_TIP_KEY)) |ts_data| {
+                if (ts_data) |data| {
+                    defer allocator.free(data);
+                    if (data.len == 4) {
+                        chain_state.txospenderindex_height = std.mem.readInt(u32, data[0..4], .little);
+                        std.debug.print(
+                            "Loaded txospenderindex tip from DB: height {d}\n",
+                            .{chain_state.txospenderindex_height},
+                        );
+                    }
+                }
+            } else |_| {}
+        }
     }
     if (chain_state.best_height == 0) {
         chain_state.best_hash = params.genesis_hash;
@@ -2419,6 +2456,17 @@ pub fn main() !void {
     if (config.coinstatsindex) {
         chain_state.backfillCoinStatsIndex() catch |err| {
             std.debug.print("Warning: CoinStatsIndex backfill failed: {}\n", .{err});
+        };
+    }
+    // 9d. TxoSpenderIndex IBD-time backfill (2026-06-12).  When
+    // --txospenderindex is on AND the persisted index lags the loaded chain
+    // tip, walk forward block-by-block reading CF_BLOCKS and populating
+    // CF_TXOSPENDER (spent outpoint → spending tx).  Runs synchronously here
+    // (before the P2P thread spawns) so the index is consistent with the tip
+    // the moment connectBlockInner starts queuing live spender writes.
+    if (config.txospenderindex) {
+        chain_state.backfillTxoSpenderIndex() catch |err| {
+            std.debug.print("Warning: TxoSpenderIndex backfill failed: {}\n", .{err});
         };
     }
 

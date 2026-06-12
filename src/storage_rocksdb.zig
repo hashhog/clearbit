@@ -36,6 +36,11 @@ const cf_names = [_][*:0]const u8{
     // existing-CF reopen branch (rocksdb_list_column_families) upgrades
     // legacy datadirs missing this CF in place on next open.
     "coinstats",
+    // Added 2026-06-12 — persistent TxoSpenderIndex (spent outpoint →
+    // spending txid ++ confirming block hash).  Backwards-compatible: the
+    // existing-CF reopen branch upgrades legacy datadirs missing this CF in
+    // place on next open.  Bitcoin Core analog: index/txospenderindex.cpp.
+    "txospender",
 };
 
 /// Internal database state

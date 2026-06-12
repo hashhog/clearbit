@@ -868,6 +868,55 @@ pub const CoinStatsIndex = struct {
 };
 
 // ============================================================================
+// Txo Spender Index
+// ============================================================================
+
+/// Decoded value of a CF_TXOSPENDER entry: which transaction (and in which
+/// block) spent a given outpoint on-chain.  Mirrors Bitcoin Core's
+/// `TxoSpender` struct (index/txospenderindex.h:26) — Core carries the full
+/// CTransactionRef + block_hash; we carry just the spending txid + block hash
+/// because the full tx (when `gettxspendingprevout return_spending_tx` is set)
+/// is read back from the confirming block via the existing block store, the
+/// same way the blockbrew/ouroboros/rustoshi templates do.
+pub const TxoSpender = struct {
+    spending_txid: Hash256,
+    block_hash: Hash256,
+
+    /// On-disk value layout: spending_txid[32] ++ block_hash[32] (64 bytes).
+    /// Big-endian-agnostic (raw 32-byte hashes); the same bytes round-trip
+    /// through `fromBytes`.
+    pub fn toBytes(self: *const TxoSpender) [64]u8 {
+        var buf: [64]u8 = undefined;
+        @memcpy(buf[0..32], &self.spending_txid);
+        @memcpy(buf[32..64], &self.block_hash);
+        return buf;
+    }
+
+    /// Inverse of `toBytes`.  Returns error.InvalidData on a short slice.
+    pub fn fromBytes(data: []const u8) !TxoSpender {
+        if (data.len < 64) return error.InvalidData;
+        var s: TxoSpender = undefined;
+        @memcpy(&s.spending_txid, data[0..32]);
+        @memcpy(&s.block_hash, data[32..64]);
+        return s;
+    }
+};
+
+/// Build the CF_TXOSPENDER key for a spent outpoint:
+///   prevout.hash[32] (raw little-endian txid bytes) ++ vout(4 BE).
+/// Big-endian on the vout keeps an outpoint's entries grouped by txid prefix
+/// in the keyspace, matching clearbit's MakeUTXO-style outpoint keys and the
+/// blockbrew template (MakeTxoSpenderKey).  The key is a pure function of the
+/// outpoint, so the disconnect path re-derives it from the orphan block's own
+/// inputs and deletes it (no separate undo data — Core CustomRemove).
+pub fn makeTxoSpenderKey(outpoint: types.OutPoint) [36]u8 {
+    var key: [36]u8 = undefined;
+    @memcpy(key[0..32], &outpoint.hash);
+    std.mem.writeInt(u32, key[32..36], outpoint.index, .big);
+    return key;
+}
+
+// ============================================================================
 // Block Filter Index
 // ============================================================================
 
@@ -1461,6 +1510,37 @@ test "CoinStats record serialize/deserialize round-trip" {
     var orig = mu;
     var reread = muhash_mod.MuHash3072.fromBytes(&back.muhash);
     try std.testing.expect(std.mem.eql(u8, &orig.finalize(), &reread.finalize()));
+}
+
+test "TxoSpender value round-trip" {
+    const stxid: Hash256 = [_]u8{0x11} ** 32;
+    const bhash: Hash256 = [_]u8{0x22} ** 32;
+    const s = TxoSpender{ .spending_txid = stxid, .block_hash = bhash };
+    const bytes = s.toBytes();
+    try std.testing.expectEqual(@as(usize, 64), bytes.len);
+    const back = try TxoSpender.fromBytes(&bytes);
+    try std.testing.expectEqualSlices(u8, &stxid, &back.spending_txid);
+    try std.testing.expectEqualSlices(u8, &bhash, &back.block_hash);
+    // Short slice is rejected.
+    try std.testing.expectError(error.InvalidData, TxoSpender.fromBytes(bytes[0..63]));
+}
+
+test "makeTxoSpenderKey layout (txid LE ++ vout BE)" {
+    var h: Hash256 = undefined;
+    for (0..32) |i| h[i] = @intCast(i);
+    const op = types.OutPoint{ .hash = h, .index = 0x01020304 };
+    const key = makeTxoSpenderKey(op);
+    try std.testing.expectEqual(@as(usize, 36), key.len);
+    try std.testing.expectEqualSlices(u8, &h, key[0..32]);
+    // Big-endian vout.
+    try std.testing.expectEqual(@as(u8, 0x01), key[32]);
+    try std.testing.expectEqual(@as(u8, 0x02), key[33]);
+    try std.testing.expectEqual(@as(u8, 0x03), key[34]);
+    try std.testing.expectEqual(@as(u8, 0x04), key[35]);
+    // Distinct vouts on the same txid produce distinct keys.
+    const op2 = types.OutPoint{ .hash = h, .index = 0x01020305 };
+    const key2 = makeTxoSpenderKey(op2);
+    try std.testing.expect(!std.mem.eql(u8, &key, &key2));
 }
 
 test "BlockFilterIndex without database" {
