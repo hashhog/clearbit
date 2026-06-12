@@ -302,7 +302,8 @@ pub const MAX_FEELER_CONNECTIONS: usize = 1;
 
 /// Percentage of the addrman shared in a getaddr response (Core
 /// net_processing.cpp `MAX_PCT_ADDR_TO_SEND` = 23). The getaddr response is
-/// capped at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size)).
+/// capped at min(MAX_ADDR_TO_SEND, floor(0.23 * addrman_size)) — integer
+/// truncating division, matching Core `CAddrMan::GetAddr_` exactly.
 pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
 
 /// Absolute cap on addresses returned in a single getaddr response (Core
@@ -318,16 +319,17 @@ pub const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 pub const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
 
 /// getaddr 23%-cap over an addrman of `size` shareable entries:
-/// min(MAX_ADDR_TO_SEND, ceil(0.23 * size)), with a floor of 1 when non-empty
-/// so a tiny addrman still answers with at least one address. Mirrors Core's
-/// `CAddrMan::GetAddr_` cap (addrman.cpp: `nNodes = MAX_PCT_ADDR_TO_SEND *
-/// nNodes / 100`, clamped to `max_addresses = MAX_ADDR_TO_SEND`).
+/// min(MAX_ADDR_TO_SEND, floor(0.23 * size)). Mirrors Core's
+/// `CAddrMan::GetAddr_` cap EXACTLY (addrman.cpp:800):
+///   `nNodes = max_pct * nNodes / 100;`            // integer (truncating) floor
+///   `nNodes = std::min(nNodes, max_addresses);`   // clamp to MAX_ADDR_TO_SEND
+/// Core applies NO floor-of-1: an addrman with size < 5 (where 23*size/100 == 0)
+/// yields ZERO addresses, identical to this helper. e.g. size=10 -> 2 (not 3),
+/// size=1 -> 0, size=4 -> 0.
 pub fn getaddrCap(size: usize) usize {
-    if (size == 0) return 0;
-    // ceil(0.23 * size) == (size*23 + 99) / 100
-    const pct = (size * MAX_PCT_ADDR_TO_SEND + 99) / 100;
-    const floored = if (pct < 1) 1 else pct;
-    return @min(floored, MAX_ADDR_TO_SEND);
+    // Core: max_pct * nNodes / 100 is integer floor; size==0 falls out as 0.
+    const pct = (size * MAX_PCT_ADDR_TO_SEND) / 100;
+    return @min(pct, MAX_ADDR_TO_SEND);
 }
 
 /// Peer rotation interval in seconds (30 minutes).
@@ -5270,8 +5272,10 @@ pub const PeerManager = struct {
                 } else {
                     peer.getaddr_recvd = true;
                     // 23%-cap (Core MAX_PCT_ADDR_TO_SEND): cap the response to
-                    // min(MAX_ADDR_TO_SEND, ceil(0.23 * shareable_size)). The
-                    // getnodeaddresses RPC dump path is separate and uncapped.
+                    // min(MAX_ADDR_TO_SEND, floor(0.23 * shareable_size)) using
+                    // integer division (Core GetAddr_ addrman.cpp:800: nNodes =
+                    // max_pct * nNodes / 100). The getnodeaddresses RPC dump path
+                    // is separate and uncapped.
                     const cap = getaddrCap(self.shareableAddrCount());
                     try self.sendAddresses(peer, cap);
                 }
@@ -6362,7 +6366,7 @@ pub const PeerManager = struct {
     }
 
     /// Send known addresses to a peer, capped at `cap` entries. `cap` is the
-    /// getaddr 23%-cap (min(MAX_ADDR_TO_SEND, ceil(0.23*size))) when answering a
+    /// getaddr 23%-cap (min(MAX_ADDR_TO_SEND, floor(0.23*size)), integer div) when answering a
     /// getaddr; callers that want the legacy behaviour pass MAX_ADDR_TO_SEND.
     fn sendAddresses(self: *PeerManager, peer: *Peer, cap: usize) !void {
         var addrs = std.ArrayList(p2p.TimestampedAddr).init(self.allocator);

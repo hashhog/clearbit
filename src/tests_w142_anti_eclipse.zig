@@ -7,7 +7,7 @@
 //!      MAX_FEELER_CONNECTIONS=1, off the outbound budget, 120s interval.
 //!   2. GETADDR-once guard (answer only the first getaddr per connection;
 //!      ignore from outbound peers).
-//!   3. GETADDR 23%-cap: min(1000, ceil(0.23 * addrman_size)).
+//!   3. GETADDR 23%-cap: min(1000, floor(0.23 * addrman_size)) (integer div, Core GetAddr_).
 //!   4. Inbound-addr token bucket (refill elapsed*0.1 cap 1000, spend 1/addr,
 //!      drop excess) shared by BOTH the addr and addrv2 handlers (one per-peer
 //!      bucket) — an addrv2 flood on a drained bucket is dropped.
@@ -75,24 +75,35 @@ fn makeInboundPeer(allocator: std.mem.Allocator) Peer {
 }
 
 // ============================================================================
-// 3. GETADDR 23%-cap formula: min(1000, ceil(0.23 * size))
+// 3. GETADDR 23%-cap formula: min(1000, floor(0.23 * size))
+//    Core CAddrMan::GetAddr_ (addrman.cpp:800):
+//      nNodes = max_pct * nNodes / 100;            // integer FLOOR (truncate)
+//      nNodes = std::min(nNodes, max_addresses);   // clamp to MAX_ADDR_TO_SEND
+//    Core applies NO floor-of-1: size<5 -> 0 addresses.
 // ============================================================================
 
-test "w142/cap: getaddrCap = min(1000, ceil(0.23*size)) — genuine Core formula" {
+test "w142/cap: getaddrCap = min(1000, floor(0.23*size)) — genuine Core FLOOR formula" {
     // Empty addrman → 0 (Core returns no addresses).
     try testing.expectEqual(@as(usize, 0), peer_mod.getaddrCap(0));
-    // ceil(0.23 * 1) = 1 (floor of 1 so a tiny addrman still answers).
-    try testing.expectEqual(@as(usize, 1), peer_mod.getaddrCap(1));
-    // ceil(0.23 * 10) = ceil(2.3) = 3.
-    try testing.expectEqual(@as(usize, 3), peer_mod.getaddrCap(10));
-    // ceil(0.23 * 100) = 23.
+    // DISTINGUISHING (no floor-of-1): floor(0.23*1) = floor(0.23) = 0.
+    // Core has no "answer at least one"; size 1 yields ZERO. (ceil would give 1.)
+    try testing.expectEqual(@as(usize, 0), peer_mod.getaddrCap(1));
+    // DISTINGUISHING (no floor-of-1): floor(0.23*4) = floor(0.92) = 0.
+    try testing.expectEqual(@as(usize, 0), peer_mod.getaddrCap(4));
+    // First non-zero: floor(0.23*5) = floor(1.15) = 1.
+    try testing.expectEqual(@as(usize, 1), peer_mod.getaddrCap(5));
+    // DISTINGUISHING (floor vs ceil): floor(0.23*10) = floor(2.3) = 2 (ceil=3).
+    try testing.expectEqual(@as(usize, 2), peer_mod.getaddrCap(10));
+    // floor(0.23*100) = 23 (exact; floor==ceil here, not distinguishing).
     try testing.expectEqual(@as(usize, 23), peer_mod.getaddrCap(100));
-    // ceil(0.23 * 1000) = 230.
+    // floor(0.23*1000) = 230.
     try testing.expectEqual(@as(usize, 230), peer_mod.getaddrCap(1000));
-    // ceil(0.23 * 4347) = ceil(999.81) = 1000 (just under the absolute cap).
-    try testing.expectEqual(@as(usize, 1000), peer_mod.getaddrCap(4347));
-    // 0.23 * 4348 = 1000.04 → clamped to the absolute MAX_ADDR_TO_SEND=1000.
+    // DISTINGUISHING (floor vs ceil): floor(0.23*4347)=floor(999.81)=999 (ceil=1000).
+    try testing.expectEqual(@as(usize, 999), peer_mod.getaddrCap(4347));
+    // floor(0.23*4348)=floor(1000.04)=1000 → also == the absolute cap.
     try testing.expectEqual(@as(usize, 1000), peer_mod.getaddrCap(4348));
+    // floor(0.23*4348)=1000 exactly hits the cap; one more stays clamped.
+    try testing.expectEqual(@as(usize, 1000), peer_mod.getaddrCap(4349));
     // Huge addrman → still clamped to 1000.
     try testing.expectEqual(@as(usize, 1000), peer_mod.getaddrCap(10_000_000));
     // The Core constants themselves.
@@ -207,7 +218,7 @@ test "w142/getaddr-cap: shareableAddrCount feeds the 23%-cap over successful add
     try testing.expectEqual(@as(usize, 0), peer_mod.getaddrCap(manager.shareableAddrCount()));
 
     // Promote 100 of them to "shareable" (a successful feeler/outbound marks
-    // success=true). Now the cap basis is 100 → ceil(0.23*100)=23.
+    // success=true). Now the cap basis is 100 → floor(0.23*100)=23.
     i = 0;
     while (i < 100) : (i += 1) {
         manager.makeTriedOnFeelerSuccess(ip(8, 8, i, 1));
