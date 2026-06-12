@@ -60,43 +60,40 @@ test "w104/G1: addAddress does not apply time_penalty — last_seen set to now u
     try testing.expect(info.last_seen > before - 7201);
 }
 
-// G2 BUG: sendAddresses() caps at 100, not Core's MAX_ADDR_TO_SEND = 1000.
-// Core ref: net_processing.cpp:190  static constexpr size_t MAX_ADDR_TO_SEND{1000};
-// clearbit peer.zig:4625  if (count >= 100) break;
-test "w104/G2: sendAddresses hard-coded 100-address cap (Core limit is 1000)" {
-    // The hard-coded cap is present in sendAddresses():
-    //   if (count >= 100) break;
-    // Bitcoin Core's MAX_ADDR_TO_SEND = 1000 — clearbit is 10× too small.
-    const clearbit_cap: usize = 100;
-    const core_cap: usize = 1000;
-    try testing.expect(clearbit_cap < core_cap);
-    // Verify the struct has no named constant for this limit.
-    try testing.expect(!@hasDecl(PeerManager, "MAX_ADDR_TO_SEND"));
+// G2 FIXED (anti-eclipse axis): sendAddresses() now uses the named
+// MAX_ADDR_TO_SEND = 1000 ceiling (Core net_processing.cpp), replacing the old
+// hard-coded `if (count >= 100) break`. A getaddr response is additionally
+// capped at the 23% getaddrCap; this confirms the absolute Core ceiling.
+test "w104/G2: sendAddresses uses MAX_ADDR_TO_SEND = 1000 (Core ceiling present)" {
+    // Bitcoin Core: static constexpr size_t MAX_ADDR_TO_SEND{1000};
+    try testing.expect(@hasDecl(peer_mod, "MAX_ADDR_TO_SEND"));
+    try testing.expectEqual(@as(usize, 1000), peer_mod.MAX_ADDR_TO_SEND);
+    // The 23%-cap helper clamps to this ceiling.
+    try testing.expectEqual(@as(usize, 1000), peer_mod.getaddrCap(10_000_000));
 }
 
-// G3 BUG: No per-peer addr relay rate limiting.
-// Core net_processing.cpp implements TokenBucket-style rate limits on how
-// many addr messages a single peer can trigger.  clearbit relays all
-// addresses received from any peer with no per-peer token bucket.
-// Absence indicator: PeerManager has no addr_token_budget / addr_rate_limit
-// fields; Peer struct has no addr_relay_token field.
-test "w104/G3: Peer struct has no addr relay token-bucket field" {
-    // Core: CNodeState has addr relay rate-limiting.
-    // clearbit: no such field exists on Peer or PeerManager.
-    try testing.expect(!@hasField(peer_mod.Peer, "addr_relay_tokens"));
-    try testing.expect(!@hasField(peer_mod.Peer, "addr_rate_limit"));
-    try testing.expect(!@hasField(PeerManager, "addr_token_budget"));
+// G3 FIXED (anti-eclipse axis): per-peer inbound-addr token-bucket present.
+// Core net_processing.cpp implements TokenBucket-style rate limits on how many
+// addresses a single peer can push (m_addr_token_bucket init 1.0, refill
+// elapsed*MAX_ADDR_RATE_PER_SECOND(0.1) cap MAX_ADDR_PROCESSING_TOKEN_BUCKET).
+// clearbit now carries the bucket on Peer and spends it in BOTH the addr and
+// addrv2 handlers (one shared bucket per peer).
+test "w104/G3: Peer carries an inbound-addr token-bucket field (Core m_addr_token_bucket)" {
+    try testing.expect(@hasField(peer_mod.Peer, "addr_token_bucket"));
+    try testing.expect(@hasField(peer_mod.Peer, "addr_token_timestamp"));
+    // The Core rate constants exist with their genuine v31.99 values.
+    try testing.expectEqual(@as(f64, 0.1), peer_mod.MAX_ADDR_RATE_PER_SECOND);
+    try testing.expectEqual(@as(f64, 1000.0), peer_mod.MAX_ADDR_PROCESSING_TOKEN_BUCKET);
 }
 
-// G4 BUG: No ONE_SHOT getaddr guard — getaddr triggers unlimited sendAddresses.
-// Core: each peer is allowed exactly one getaddr response per session.
-// CNode::fOneShot / m_addr_fetch flag.  clearbit handles .getaddr → sendAddresses
-// unconditionally (peer.zig:4140-4142) with no per-peer guard.
-test "w104/G4: Peer struct has no getaddr_one_shot / addr_fetch guard field" {
-    // Core CNode::fOneShot — once used, addr requests are ignored.
-    try testing.expect(!@hasField(peer_mod.Peer, "getaddr_sent"));
-    try testing.expect(!@hasField(peer_mod.Peer, "one_shot"));
-    try testing.expect(!@hasField(peer_mod.Peer, "addr_fetch"));
+// G4 FIXED (anti-eclipse axis): getaddr-once guard present.
+// Core: each peer is answered for exactly one getaddr per connection
+// (Peer::m_getaddr_recvd); repeats and getaddr from outbound peers are ignored.
+// clearbit now carries getaddr_recvd on Peer and gates the .getaddr handler.
+test "w104/G4: Peer carries a getaddr-once guard field (Core m_getaddr_recvd)" {
+    try testing.expect(@hasField(peer_mod.Peer, "getaddr_recvd"));
+    // The fRelay-self flag (false for feeler/block-relay) is also present.
+    try testing.expect(@hasField(peer_mod.Peer, "relay_self"));
 }
 
 // G5 BUG: addrv2 IPv6 entries (network_id == 2) are silently dropped.
@@ -298,42 +295,39 @@ test "w104/G12: addressKey IPv6 XOR folding can produce collisions" {
 // Selection gate tests (G13-G17)
 // ============================================================================
 
-// G13 BUG: No new_only selection mode for feeler connections.
-// Core's Select(bool new_only) can force selection exclusively from the new
-// table.  This is used for feeler connections to promote fresh addresses.
-// clearbit's selectPeerToConnect() has no such mode.
-// Core ref: addrman.h:171  Select(bool new_only, ...)
-test "w104/G13: selectPeerToConnect has no new_only parameter" {
-    // Core: std::pair<CAddress,NodeSeconds> Select(bool new_only, ...) const
-    // clearbit: selectPeerToConnect() always selects from the single flat map.
-    // Check there is no new_only or select_new function:
-    try testing.expect(!@hasDecl(PeerManager, "selectNewAddress"));
-    try testing.expect(!@hasDecl(PeerManager, "selectTriedAddress"));
-    // selectPeerToConnect exists but has no new_only toggle.
+// G13 FIXED (anti-eclipse axis): new-only feeler selection present.
+// Core's Select(bool new_only) forces selection exclusively from the NEW table
+// for feeler probes. clearbit's bucketed addrman exposes select(new_only) and
+// PeerManager.selectFeelerAddress() draws from NEW only.
+// Core ref: addrman.h Select(bool new_only, ...)
+test "w104/G13: feeler new-only address selection present" {
+    // PeerManager has a feeler-specific NEW-only selection helper.
+    try testing.expect(@hasDecl(PeerManager, "selectFeelerAddress"));
+    // selectPeerToConnect still exists (the normal outbound path).
     try testing.expect(@hasDecl(PeerManager, "selectPeerToConnect"));
+    // The bucketed addrman's Select takes a new_only flag.
+    const AddrMan = @import("addrman.zig").AddrMan;
+    try testing.expect(@hasDecl(AddrMan, "select"));
 }
 
-// G14 BUG (PARTIAL): feeler ConnectionType exists but is never used for tried-table promotion.
+// G14 FIXED (anti-eclipse axis): feeler scheduling + tried-table promotion.
 // Core dedicates FEELER connections to probe new-table addresses and move
-// successful ones to the tried table (AddrInfo::MakeTried path).
-// clearbit defines ConnectionType.feeler (peer.zig:501) but:
-//   (a) PeerManager never calls selectPeerToConnect(new_only=true) for feelers
-//   (b) There is no tried-table promotion on a successful feeler connection
-//   (c) No feeler scheduling logic in the run() loop
-// The enum variant is dead infrastructure — never exercised.
+// successful ones to the tried table (AddrInfo::MakeTried path). clearbit now:
+//   (a) selects NEW-only via selectFeelerAddress()
+//   (b) promotes NEW->TRIED on a successful feeler via makeTriedOnFeelerSuccess()
+//   (c) schedules feelers from the run() loop via maybeOpenFeeler() on a
+//       last_feeler_time / FEELER_INTERVAL_SECS timer.
 // Core ref: net.h ConnectionType::FEELER; addrman.cpp MakeTried()
-test "w104/G14: ConnectionType.feeler exists but no feeler scheduling in run() loop" {
-    // ConnectionType.feeler is defined (partial implementation):
+test "w104/G14: ConnectionType.feeler is scheduled and promotes NEW->TRIED" {
     const ct = peer_mod.ConnectionType;
-    const has_feeler = @hasField(ct, "feeler");
-    try testing.expect(has_feeler); // the variant exists...
-    // ...but PeerManager has no feeler scheduling or tried-table promotion:
-    try testing.expect(!@hasField(PeerManager, "last_feeler_time"));
-    try testing.expect(!@hasField(PeerManager, "feeler_timer"));
-    try testing.expect(!@hasDecl(PeerManager, "scheduleFeeler"));
-    try testing.expect(!@hasDecl(PeerManager, "makeTriedOnFeelerSuccess"));
-    // No tried table exists to promote addresses into:
-    try testing.expect(!@hasField(PeerManager, "tried_table"));
+    try testing.expect(@hasField(ct, "feeler")); // the variant exists...
+    // ...AND PeerManager now has feeler scheduling + tried-table promotion:
+    try testing.expect(@hasField(PeerManager, "last_feeler_time"));
+    try testing.expect(@hasDecl(PeerManager, "maybeOpenFeeler"));
+    try testing.expect(@hasDecl(PeerManager, "makeTriedOnFeelerSuccess"));
+    // Genuine Core constants are present.
+    try testing.expectEqual(@as(i64, 120), peer_mod.FEELER_INTERVAL_SECS);
+    try testing.expectEqual(@as(usize, 1), peer_mod.MAX_FEELER_CONNECTIONS);
 }
 
 // G15 BUG: No ResolveCollisions / test-before-evict for tried table.
@@ -577,18 +571,15 @@ test "w104/G28: sendAddresses loop breaks at 100 (Core MAX_ADDR_TO_SEND = 1000)"
     try testing.expect(clearbit_max < core_max);
 }
 
-// G29 BUG: No one-shot guard on getaddr — peer can trigger repeated addr sends.
-// Core allows exactly one getaddr per peer session (fOneShot / m_addr_fetch
-// flag set after first response).  clearbit's getaddr handler (peer.zig:4140)
-// calls sendAddresses() unconditionally every time, allowing a peer to
-// repeatedly drain the address book.
-test "w104/G29: getaddr has no per-peer one-shot guard (peer can poll repeatedly)" {
-    // Core: CNode::m_addr_fetch set to false after first getaddr response.
-    // clearbit: no equivalent flag on Peer.
-    try testing.expect(!@hasField(peer_mod.Peer, "getaddr_sent"));
-    try testing.expect(!@hasField(peer_mod.Peer, "addr_fetch_done"));
-    try testing.expect(!@hasField(peer_mod.Peer, "one_shot"));
-    // The getaddr handler just calls sendAddresses() with no gate check.
+// G29 FIXED (anti-eclipse axis): getaddr one-shot guard present.
+// Core answers exactly one getaddr per peer session (Peer::m_getaddr_recvd set
+// after the first response). clearbit now carries getaddr_recvd on Peer and the
+// .getaddr handler ignores both repeats and getaddr from outbound peers.
+test "w104/G29: getaddr has a per-peer one-shot guard (getaddr_recvd)" {
+    // Core: Peer::m_getaddr_recvd — only the first getaddr per connection is
+    // answered. clearbit's equivalent flag:
+    try testing.expect(@hasField(peer_mod.Peer, "getaddr_recvd"));
+    // The getaddr handler gates on this flag (and on direction != outbound).
 }
 
 // G30 (updated 2026-05-27): loadBanList() is now genuinely wired at startup

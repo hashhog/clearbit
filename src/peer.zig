@@ -285,6 +285,51 @@ pub fn chainWorkFromHeight(height: u32) [32]u8 {
 /// Maximum total connections (125 as per Bitcoin Core).
 pub const MAX_TOTAL_CONNECTIONS: usize = MAX_OUTBOUND_CONNECTIONS + MAX_INBOUND_CONNECTIONS;
 
+// ============================================================================
+// P2P anti-eclipse hardening — Bitcoin Core v31.99 (net.cpp ThreadOpenConnections
+// FEELER branch + net_processing.cpp getaddr/ProcessAddrs anti-DoS).
+// ============================================================================
+
+/// Feeler probe interval, seconds (Core net.h `FEELER_INTERVAL` = 120s / 2min).
+/// Every FEELER_INTERVAL the maintenance loop opens ONE short-lived feeler to a
+/// NEW-table address, handshakes, promotes it NEW->TRIED, and disconnects.
+pub const FEELER_INTERVAL_SECS: i64 = 120;
+
+/// Maximum simultaneous feeler connections (Core net.h `MAX_FEELER_CONNECTIONS`
+/// = 1). A feeler is short-lived and disconnects right after the handshake, so
+/// at most one is ever in flight.
+pub const MAX_FEELER_CONNECTIONS: usize = 1;
+
+/// Percentage of the addrman shared in a getaddr response (Core
+/// net_processing.cpp `MAX_PCT_ADDR_TO_SEND` = 23). The getaddr response is
+/// capped at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size)).
+pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
+
+/// Absolute cap on addresses returned in a single getaddr response (Core
+/// net_processing.cpp `MAX_ADDR_TO_SEND` = 1000). Also the token-bucket cap.
+pub const MAX_ADDR_TO_SEND: usize = 1000;
+
+/// Inbound-addr token-bucket refill rate, tokens/sec (Core net_processing.cpp
+/// `MAX_ADDR_RATE_PER_SECOND` = 0.1). One token is spent per processed address.
+pub const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
+
+/// Soft cap on the inbound-addr token bucket (Core net_processing.cpp
+/// `MAX_ADDR_PROCESSING_TOKEN_BUCKET` = MAX_ADDR_TO_SEND = 1000).
+pub const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
+
+/// getaddr 23%-cap over an addrman of `size` shareable entries:
+/// min(MAX_ADDR_TO_SEND, ceil(0.23 * size)), with a floor of 1 when non-empty
+/// so a tiny addrman still answers with at least one address. Mirrors Core's
+/// `CAddrMan::GetAddr_` cap (addrman.cpp: `nNodes = MAX_PCT_ADDR_TO_SEND *
+/// nNodes / 100`, clamped to `max_addresses = MAX_ADDR_TO_SEND`).
+pub fn getaddrCap(size: usize) usize {
+    if (size == 0) return 0;
+    // ceil(0.23 * size) == (size*23 + 99) / 100
+    const pct = (size * MAX_PCT_ADDR_TO_SEND + 99) / 100;
+    const floored = if (pct < 1) 1 else pct;
+    return @min(floored, MAX_ADDR_TO_SEND);
+}
+
 /// Peer rotation interval in seconds (30 minutes).
 pub const PEER_ROTATION_INTERVAL: i64 = 30 * 60;
 
@@ -731,6 +776,33 @@ pub const Peer = struct {
     /// Mirrors Bitcoin Core's NetPermissionFlags::NoBan.  Set for whitelisted
     /// peers (e.g. -whitelist/-addnode with noban permission).  Default false.
     no_ban: bool = false,
+
+    /// GETADDR anti-DoS: whether we have already answered a getaddr from this
+    /// peer. Mirrors Core's `Peer::m_getaddr_recvd` (net_processing.cpp): only
+    /// the FIRST getaddr per connection is answered; subsequent ones are
+    /// ignored to discourage addr stamping / repeated dumps. Reset only when
+    /// the peer reconnects and gets a fresh Peer struct.
+    getaddr_recvd: bool = false,
+
+    /// Whether OUR outbound version message advertises tx relay (`fRelay`).
+    /// True for full-relay connections, FALSE for block-relay-only and feeler
+    /// connections (Core sets fRelay=false for both — net.cpp builds the
+    /// version with `tx_relay = !block_relay_only` and feelers are block-relay
+    /// for this flag). Default true (the common full-relay case); set false on
+    /// the feeler connect path before the handshake runs.
+    relay_self: bool = true,
+
+    /// INBOUND addr token bucket (Core `Peer::m_addr_token_bucket`, init 1.0).
+    /// Refilled by `elapsed * MAX_ADDR_RATE_PER_SECOND` (capped at
+    /// MAX_ADDR_PROCESSING_TOKEN_BUCKET) on each addr/addrv2 message; each
+    /// processed address consumes one token, and addresses are dropped once it
+    /// runs dry. Shared by BOTH the addr and addrv2 handlers so an attacker
+    /// cannot bypass the rate limit by switching message type
+    /// (Core routes both through ProcessAddrs, net_processing.cpp).
+    addr_token_bucket: f64 = 1.0,
+    /// Unix-seconds timestamp of the last addr-bucket refill (Core
+    /// `Peer::m_addr_token_timestamp`). 0 means "not yet refilled".
+    addr_token_timestamp: i64 = 0,
 
     /// Connect to a remote peer.
     pub fn connect(
@@ -1521,7 +1593,10 @@ pub const Peer = struct {
                 .nonce = std.crypto.random.int(u64),
                 .user_agent = p2p.USER_AGENT,
                 .start_height = our_height,
-                .relay = true,
+                // fRelay: false for feeler / block-relay-only connections so the
+                // peer does not start an inv-based tx relay (Core net.cpp builds
+                // the version with tx_relay = !block_relay_only).
+                .relay = self.relay_self,
             } };
             try self.sendMessage(&version_msg);
             self.state = .version_sent;
@@ -2401,6 +2476,12 @@ pub const PeerManager = struct {
     /// clean shutdown.  Initialised to 0 so the first idle tick flushes.
     last_wallet_flush: i64 = 0,
 
+    /// Last time (unix seconds) we opened a feeler probe (Core net.cpp
+    /// ThreadOpenConnections `next_feeler` schedule). A feeler is opened at
+    /// most once per FEELER_INTERVAL_SECS (120s). Initialised to 0 so the
+    /// first eligible tick opens one.
+    last_feeler_time: i64 = 0,
+
     /// Total blocks connected since last progress log.
     blocks_since_log: u32,
 
@@ -2902,6 +2983,20 @@ pub const PeerManager = struct {
         self: *PeerManager,
         address: std.net.Address,
     ) ?*Peer {
+        // Default full-relay path (relay_self = true).
+        return self.connectOutboundNegotiatedRelay(address, true);
+    }
+
+    /// Like `connectOutboundNegotiated` but with an explicit `relay_self` flag
+    /// for the version handshake. `relay_self = false` is used by feeler
+    /// connections (Core sends fRelay=false on feelers). The relay flag must be
+    /// set on the Peer BEFORE `performHandshake` runs (it builds the version
+    /// message from `peer.relay_self`).
+    fn connectOutboundNegotiatedRelay(
+        self: *PeerManager,
+        address: std.net.Address,
+        relay_self: bool,
+    ) ?*Peer {
         const v2_enabled = Peer.bip324V2Enabled();
         const try_v2 = v2_enabled and !self.isV1Only(address);
 
@@ -2913,6 +3008,7 @@ pub const PeerManager = struct {
                 self.allocator.destroy(peer);
                 return null;
             };
+            peer.relay_self = relay_self;
             peer.advertise_node_bloom = self.peerbloomfilters;
             peer.advertise_node_network_limited = self.advertise_node_network_limited;
             peer.advertise_compact_filters = self.blockfilterindex_enabled;
@@ -2941,8 +3037,8 @@ pub const PeerManager = struct {
                 self.markV1Only(address);
                 peer.disconnect();
                 self.allocator.destroy(peer);
-                // Fall through to v1 path below.
-                return self.connectOutboundV1(address);
+                // Fall through to v1 path below (preserving relay_self).
+                return self.connectOutboundV1Relay(address, relay_self);
             };
 
             // V2 cipher handshake complete — run the application
@@ -2959,7 +3055,7 @@ pub const PeerManager = struct {
         }
 
         // Phase 2: v1 handshake on a fresh connection.
-        return self.connectOutboundV1(address);
+        return self.connectOutboundV1Relay(address, relay_self);
     }
 
     /// Open a fresh TCP connection and run the v1 handshake.  Used both as
@@ -2967,12 +3063,19 @@ pub const PeerManager = struct {
     /// negotiation (v2 garbage is destructive on a v1 peer so the original
     /// socket cannot be reused).
     fn connectOutboundV1(self: *PeerManager, address: std.net.Address) ?*Peer {
+        return self.connectOutboundV1Relay(address, true);
+    }
+
+    /// `connectOutboundV1` with an explicit `relay_self` flag for the version
+    /// handshake (false for feeler connections).
+    fn connectOutboundV1Relay(self: *PeerManager, address: std.net.Address, relay_self: bool) ?*Peer {
         const peer = self.allocator.create(Peer) catch return null;
         // Use openClearnetOutbound so --proxy is honoured for clearnet.
         peer.* = self.openClearnetOutbound(address) orelse {
             self.allocator.destroy(peer);
             return null;
         };
+        peer.relay_self = relay_self;
         peer.advertise_node_bloom = self.peerbloomfilters;
         peer.advertise_node_network_limited = self.advertise_node_network_limited;
         peer.advertise_compact_filters = self.blockfilterindex_enabled;
@@ -3787,6 +3890,172 @@ pub const PeerManager = struct {
         }
     }
 
+    // ========================================================================
+    // Feeler connections (anti-eclipse) — Core net.cpp ThreadOpenConnections
+    // FEELER branch. A feeler dials a NEW-table address, runs the handshake,
+    // promotes it NEW->TRIED via addrman.Good(), then disconnects. Keeps the
+    // TRIED table fresh = Core's primary eclipse-attack mitigation.
+    // ========================================================================
+
+    /// Count in-flight feeler connections. A feeler is short-lived (disconnects
+    /// right after the handshake) so this is normally 0; the bound exists to
+    /// guarantee at most MAX_FEELER_CONNECTIONS are ever open at once.
+    pub fn feelerCount(self: *const PeerManager) usize {
+        var n: usize = 0;
+        for (self.peers.items) |p| {
+            if (p.conn_type == .feeler) n += 1;
+        }
+        return n;
+    }
+
+    /// Select a NEW-table address for a feeler probe (Core net.cpp:
+    /// `addrman.Select(/*new_only=*/true)`). Draws ONLY from the bucketed
+    /// addrman's NEW table — the addresses a feeler exists to probe — skipping
+    /// any candidate we are already connected to or that is banned. Returns
+    /// null when the NEW table is empty / yields only ineligible candidates, so
+    /// the caller no-ops cleanly.
+    ///
+    /// Feelers deliberately read from NEW, not TRIED: on a successful handshake
+    /// the caller promotes the address NEW->TRIED via makeTriedOnFeelerSuccess.
+    pub fn selectFeelerAddress(self: *PeerManager) ?std.net.Address {
+        const am = self.ensureAddrman() orelse return null;
+        // A handful of attempts so a transiently-connected/banned pick does not
+        // starve the probe; bounded so an all-ineligible NEW table no-ops.
+        var tries: usize = 0;
+        while (tries < 8) : (tries += 1) {
+            const addr = am.select(true) orelse return null; // new_only = true
+            if (self.isConnected(addr)) continue;
+            if (self.ban_list.isAddressBanned(addr)) continue;
+            return addr;
+        }
+        return null;
+    }
+
+    /// Promote a feeler-probed address NEW->TRIED on a SUCCESSFUL handshake
+    /// (Core net.cpp FEELER branch `addrman.Good()`). Called ONLY after a
+    /// successful feeler handshake; on a dial/handshake FAILURE it is never
+    /// called, so the TRIED table is left unchanged — the falsification guard.
+    /// Also mirrors the success into the legacy known_addresses metadata so the
+    /// 23%-cap shareable count and getnodeaddresses reflect the probe.
+    pub fn makeTriedOnFeelerSuccess(self: *PeerManager, address: std.net.Address) void {
+        const now_i = std.time.timestamp();
+        const now: u64 = if (now_i < 0) 0 else @intCast(now_i);
+        if (self.ensureAddrman()) |am| {
+            _ = am.good(address, now) catch {};
+        }
+        // Reflect the success in the legacy address book (last_seen / success).
+        const key = addressKey(address);
+        if (self.known_addresses.getPtr(key)) |info| {
+            info.success = true;
+            info.last_seen = now_i;
+        }
+    }
+
+    /// Refill a peer's inbound-addr token bucket and return how many addresses
+    /// may be admitted out of `requested` (Core net_processing.cpp ProcessAddrs
+    /// token-bucket). The bucket refills at MAX_ADDR_RATE_PER_SECOND tokens/sec
+    /// since the last addr message (capped at MAX_ADDR_PROCESSING_TOKEN_BUCKET),
+    /// each admitted address spends one token, and the rest are dropped once it
+    /// runs dry. Shared by BOTH the addr and addrv2 handlers (one bucket per
+    /// peer) so the rate limit cannot be bypassed by switching message type.
+    ///
+    /// We hold no Addr-permission (NoBan/manual) peers on the inbound addr path,
+    /// so all inbound addr traffic is rate-limited, matching Core's default.
+    ///
+    /// DIVERGENCE (documented, not faked): Core tops the bucket up by
+    /// +MAX_ADDR_TO_SEND (1000) once when WE send a getaddr to a peer
+    /// (net_processing.cpp: `m_addr_token_bucket += MAX_ADDR_TO_SEND`), so the
+    /// large solicited response is not spuriously rate-limited. clearbit never
+    /// SENDS a getaddr to its peers (it only answers inbound getaddr), so there
+    /// is no solicited-response case and no top-up site. The bucket therefore
+    /// stays at its Core-exact init of 1.0 until traffic refills it at 0.1/s —
+    /// the same state Core is in for a peer it never solicited. We do NOT init
+    /// the bucket to 1000 (Core inits 1.0); a permissive init would let an
+    /// unsolicited peer push ~1000 addresses on its first message.
+    pub fn takeAddrTokens(self: *PeerManager, peer: *Peer, requested: usize) usize {
+        _ = self;
+        const now = std.time.timestamp();
+        // First message on this peer: stamp the clock, do not back-date refill.
+        if (peer.addr_token_timestamp == 0) {
+            peer.addr_token_timestamp = now;
+        }
+        // Refill (skip when already at/above the soft cap — Core's
+        // "don't increment if already full" guard).
+        if (peer.addr_token_bucket < MAX_ADDR_PROCESSING_TOKEN_BUCKET) {
+            const elapsed_i = now - peer.addr_token_timestamp;
+            const elapsed: f64 = if (elapsed_i > 0) @floatFromInt(elapsed_i) else 0.0;
+            const increment = elapsed * MAX_ADDR_RATE_PER_SECOND;
+            peer.addr_token_bucket = @min(
+                peer.addr_token_bucket + increment,
+                MAX_ADDR_PROCESSING_TOKEN_BUCKET,
+            );
+        }
+        peer.addr_token_timestamp = now;
+
+        // Admit up to floor(bucket) addresses, bounded by the request size.
+        const available: usize = @intFromFloat(@floor(peer.addr_token_bucket));
+        const admit = @min(available, requested);
+        peer.addr_token_bucket -= @floatFromInt(admit);
+        return admit;
+    }
+
+    /// Open at most ONE short-lived feeler connection (Core net.cpp
+    /// ThreadOpenConnections FEELER branch). Selects a NEW-table address, dials
+    /// it as a `.feeler` connection (which the version handshake sends with
+    /// relay=false), and on a successful handshake promotes the address
+    /// NEW->TRIED then disconnects WITHOUT appending it to `self.peers`.
+    ///
+    /// Because the probe peer is never appended to `self.peers`, a feeler is
+    /// inherently OFF the regular outbound budget: maintainOutbound counts only
+    /// `direction == .outbound` peers in `self.peers`, so a feeler can never
+    /// consume a full-relay/block-relay slot. It is also gated to one in flight
+    /// (feelerCount < MAX_FEELER_CONNECTIONS) and to one open per
+    /// FEELER_INTERVAL_SECS (120s).
+    ///
+    /// No-ops when `-connect` pinning is active (the addrman is intentionally
+    /// unused), when the interval has not elapsed, when a feeler is already in
+    /// flight, or when the NEW table yields no eligible candidate.
+    pub fn maybeOpenFeeler(self: *PeerManager) void {
+        // `-connect` mode makes no addrman-driven outbound (Core skips feelers
+        // when m_use_addrman_outgoing is false).
+        if (self.connect_address != null) return;
+        if (self.feelerCount() >= MAX_FEELER_CONNECTIONS) return;
+
+        const now = std.time.timestamp();
+        if (self.last_feeler_time != 0 and now - self.last_feeler_time < FEELER_INTERVAL_SECS) return;
+
+        const addr = self.selectFeelerAddress() orelse return;
+        // Stamp the schedule whether or not the dial succeeds, so a string of
+        // failing feelers cannot busy-loop dialing every tick.
+        self.last_feeler_time = now;
+
+        // Record the attempt in the bucketed addrman (Core records the Select
+        // attempt). A never-answering NEW entry ages toward terrible over time
+        // without being promoted; a failed feeler is NOT penalised beyond this.
+        if (self.ensureAddrman()) |am| {
+            am.attempt(addr, if (now < 0) 0 else @intCast(now));
+        }
+
+        std.log.debug("Making feeler connection to {}", .{addr});
+        // Dial with relay_self=false — a feeler must not start tx relay (Core
+        // sends fRelay=false on feelers). Returns a fully-handshaked *Peer or
+        // null on dial/handshake failure.
+        const peer = self.connectOutboundNegotiatedRelay(addr, false) orelse {
+            // Dial / handshake FAILED — do NOT promote. TRIED is unchanged.
+            std.log.debug("Feeler to {} failed; TRIED unchanged", .{addr});
+            return;
+        };
+        peer.conn_type = .feeler;
+
+        // Handshake SUCCEEDED — promote NEW->TRIED, then tear the probe down.
+        // We never append it to self.peers, so it consumes no outbound slot and
+        // the standard rotation/eviction paths never see it.
+        self.makeTriedOnFeelerSuccess(addr);
+        std.log.debug("Feeler to {} handshook; promoted NEW->TRIED, disconnecting", .{addr});
+        peer.disconnect();
+        self.allocator.destroy(peer);
+    }
+
     /// Accept a waiting inbound connection if available (non-blocking).
     /// When inbound slots are full, uses eviction protection algorithm.
     pub fn acceptInbound(self: *PeerManager) !void {
@@ -4500,7 +4769,15 @@ pub const PeerManager = struct {
             .pong => |pp| peer.handlePong(pp.nonce),
             .addr => |a| {
                 defer self.allocator.free(a.addrs);
-                for (a.addrs) |entry| {
+                // INBOUND addr token-bucket (Core net_processing.cpp
+                // ProcessAddrs): refill by elapsed*0.1 capped 1000, admit at
+                // most `tokens` addresses, drop the rest. Shared with the
+                // addrv2 handler below so the limit can't be bypassed by type.
+                const admit = self.takeAddrTokens(peer, a.addrs.len);
+                if (admit < a.addrs.len) {
+                    std.log.debug("addr rate-limit: dropped {d} of {d} addrs", .{ a.addrs.len - admit, a.addrs.len });
+                }
+                for (a.addrs[0..admit]) |entry| {
                     // Convert TimestampedAddr to std.net.Address
                     // Check if it's an IPv4-mapped IPv6 address
                     if (std.mem.eql(u8, entry.addr.ip[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
@@ -4514,8 +4791,16 @@ pub const PeerManager = struct {
             },
             .addrv2 => |a2| {
                 defer self.allocator.free(a2.entries);
+                // Same inbound token-bucket as the legacy addr handler above,
+                // sharing the SAME per-peer bucket (Core routes addr and addrv2
+                // through the same ProcessAddrs path) so an attacker cannot
+                // bypass the rate limit by sending addrv2 instead of addr.
+                const admit = self.takeAddrTokens(peer, a2.entries.len);
+                if (admit < a2.entries.len) {
+                    std.log.debug("addrv2 rate-limit: dropped {d} of {d} addrs", .{ a2.entries.len - admit, a2.entries.len });
+                }
                 // BIP155: Process addrv2 entries — extract IPv4/IPv6 and add to known addresses
-                for (a2.entries) |entry| {
+                for (a2.entries[0..admit]) |entry| {
                     if (entry.network_id == 1 and entry.addr_bytes.len == 4) {
                         // IPv4
                         const addr = std.net.Address.initIp4(
@@ -4971,8 +5256,25 @@ pub const PeerManager = struct {
                 self.pipelineBlockRequests() catch {};
             },
             .getaddr => {
-                // Send some known addresses back
-                try self.sendAddresses(peer);
+                // GETADDR anti-DoS (Core net_processing.cpp ProcessMessage
+                // GETADDR handler):
+                //   (1) ignore getaddr from OUTBOUND peers — we only answer
+                //       inbound peers' address requests (Core: "Ignoring
+                //       getaddr from outbound connection").
+                //   (2) answer only the FIRST getaddr per connection; repeats
+                //       are ignored (Core `peer.m_getaddr_recvd`).
+                if (peer.direction == .outbound) {
+                    std.log.debug("Ignoring getaddr from outbound peer", .{});
+                } else if (peer.getaddr_recvd) {
+                    std.log.debug("Ignoring repeated getaddr from peer", .{});
+                } else {
+                    peer.getaddr_recvd = true;
+                    // 23%-cap (Core MAX_PCT_ADDR_TO_SEND): cap the response to
+                    // min(MAX_ADDR_TO_SEND, ceil(0.23 * shareable_size)). The
+                    // getnodeaddresses RPC dump path is separate and uncapped.
+                    const cap = getaddrCap(self.shareableAddrCount());
+                    try self.sendAddresses(peer, cap);
+                }
             },
             .feefilter => |ff| {
                 // BIP-133: Store the peer's minimum fee rate (in sat/kvB).
@@ -6045,15 +6347,33 @@ pub const PeerManager = struct {
         peer.sendMessage(&msg) catch return;
     }
 
-    /// Send known addresses to a peer.
-    fn sendAddresses(self: *PeerManager, peer: *Peer) !void {
+    /// Number of addresses eligible to be shared in a getaddr response — the
+    /// pool the 23%-cap is computed over. Mirrors the `info.success` filter in
+    /// `sendAddresses` (Core computes the percentage over the addrman size; we
+    /// use the shareable subset clearbit would actually return). Reference:
+    /// Core `CAddrMan::GetAddr_` (addrman.cpp).
+    pub fn shareableAddrCount(self: *const PeerManager) usize {
+        var n: usize = 0;
+        var iter = self.known_addresses.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.success) n += 1;
+        }
+        return n;
+    }
+
+    /// Send known addresses to a peer, capped at `cap` entries. `cap` is the
+    /// getaddr 23%-cap (min(MAX_ADDR_TO_SEND, ceil(0.23*size))) when answering a
+    /// getaddr; callers that want the legacy behaviour pass MAX_ADDR_TO_SEND.
+    fn sendAddresses(self: *PeerManager, peer: *Peer, cap: usize) !void {
         var addrs = std.ArrayList(p2p.TimestampedAddr).init(self.allocator);
         defer addrs.deinit();
 
         var iter = self.known_addresses.iterator();
-        var count: usize = 0;
-        while (iter.next()) |entry| : (count += 1) {
-            if (count >= 100) break; // Limit to 100 addresses
+        while (iter.next()) |entry| {
+            // 23%-cap (Core MAX_PCT_ADDR_TO_SEND): stop once we have `cap`
+            // shareable addresses queued. Bound the absolute max at
+            // MAX_ADDR_TO_SEND (=1000) regardless of the requested cap.
+            if (addrs.items.len >= cap or addrs.items.len >= MAX_ADDR_TO_SEND) break;
 
             const info = entry.value_ptr;
             if (!info.success) continue; // Only send successfully connected addresses
@@ -7435,6 +7755,14 @@ pub const PeerManager = struct {
                 // Always try to maintain outbound diversity — a single peer
                 // is fragile and will stall if it disconnects.
                 self.maintainOutbound() catch {};
+
+                // 1b. Open a short-lived feeler probe (anti-eclipse). At most
+                // one feeler in flight, at most once per FEELER_INTERVAL_SECS;
+                // probes a NEW-table address and promotes it NEW->TRIED on a
+                // successful handshake, then disconnects (Core net.cpp
+                // ThreadOpenConnections FEELER branch). Off the outbound budget
+                // (never appended to self.peers) and skipped in --connect mode.
+                self.maybeOpenFeeler();
             }
 
             // 2. Accept inbound connections
@@ -9879,17 +10207,15 @@ test "W99/G25: Peer struct has wtxid_relay_negotiated flag (FIXED — W103 G6+G2
     try std.testing.expect(@hasField(Peer, "wtxid_relay_negotiated"));
 }
 
-// G28: sendAddresses() caps at 100 addresses, not Core's MAX_ADDR_TO_SEND = 1000.
-// BUG: Bitcoin Core net_processing.cpp:190 defines MAX_ADDR_TO_SEND = 1000.
-// clearbit's sendAddresses() loop breaks at count >= 100, sending 10× fewer.
-test "W99/G28: sendAddresses caps at 100 addresses (Core limit is 1000)" {
+// G28 FIXED (anti-eclipse axis): sendAddresses() now caps at the named
+// MAX_ADDR_TO_SEND = 1000 constant (Core net_processing.cpp), not an inline 100.
+// A getaddr response is additionally capped at the 23% getaddrCap; this checks
+// the absolute ceiling constant is the genuine Core value.
+test "W99/G28: sendAddresses uses MAX_ADDR_TO_SEND = 1000 (Core constant present)" {
     // Bitcoin Core: static constexpr size_t MAX_ADDR_TO_SEND{1000};
-    const CORE_MAX_ADDR: usize = 1000;
-    // clearbit inline constant in sendAddresses(): if (count >= 100) break;
-    const CLEARBIT_MAX_ADDR: usize = 100;
-    try std.testing.expectEqual(@as(usize, 100), CLEARBIT_MAX_ADDR);
-    // BUG: under-serving addr responses reduces peer discovery for requesting nodes.
-    try std.testing.expect(CLEARBIT_MAX_ADDR < CORE_MAX_ADDR);
+    try std.testing.expectEqual(@as(usize, 1000), MAX_ADDR_TO_SEND);
+    // The 23%-cap helper exists and clamps to this ceiling.
+    try std.testing.expectEqual(@as(usize, 1000), getaddrCap(1_000_000));
 }
 
 // G5: PRESYNC/REDOWNLOAD pipeline still absent (W88 gap, not yet fixed).
