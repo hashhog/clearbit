@@ -50,9 +50,25 @@ pub const CF_BLOCK_FILTER_HEADER: usize = 7;
 /// `--coinstatsindex` is enabled.  Bitcoin Core analog:
 /// `index/coinstatsindex.cpp` (DBHeightKey/DBHashKey + DBVal).
 pub const CF_COINSTATS: usize = 8;
+/// Per-spend txospenderindex record keyed by the 36-byte spent outpoint
+/// (32-byte prevout txid little-endian ++ 4-byte vout big-endian).  Value is
+/// the 64-byte (spending-txid ++ confirming-block-hash) pair.  Populated by
+/// the persistent TxoSpenderIndex on block connect when `--txospenderindex`
+/// is enabled (default off).  Lets `gettxspendingprevout` answer the
+/// confirmed-spend question for any on-chain outpoint.  Bitcoin Core analog:
+/// `index/txospenderindex.cpp` (DBKey siphash(outpoint)|CDiskTxPos → empty).
+/// Core stores the spending tx's on-disk LOCATION under a salted-siphash key
+/// and re-reads the tx from the block files on lookup; the txospenderindex.cpp
+/// header comment notes a from-scratch impl may legitimately store
+/// outpoint → spending-txid directly, which is what we do (matches the
+/// blockbrew/ouroboros/rustoshi templates and clearbit's own CF_TX_INDEX
+/// outpoint-keyed style).  No salt + no separate undo data: the disconnect
+/// path re-derives the exact keys from the orphan block's own inputs and
+/// erases them (Core CustomRemove(BuildSpenderPositions(block))).
+pub const CF_TXOSPENDER: usize = 9;
 /// Total number of column families. Must match `cf_names` length in
 /// storage_rocksdb.zig and the array sizes in DbState.
-pub const CF_COUNT: usize = 9;
+pub const CF_COUNT: usize = 10;
 
 pub const StorageError = error{
     OpenFailed,
@@ -2257,6 +2273,44 @@ pub const ChainState = struct {
     pending_coinstats_reverts: std.ArrayList(PendingCoinStatsRevert) = undefined,
 
     // ----------------------------------------------------------------------
+    // TxoSpenderIndex (2026-06-12): mirror the CF_TX_INDEX / CF_COINSTATS
+    // wiring above.  When `txospenderindex_enabled` is true, connectBlockInner
+    // records, for every input of every non-coinbase tx in the connected block,
+    // a (spent outpoint → spending txid ++ confirming block hash) entry into
+    // pending_txospender_writes.  flush() drains it into the same WriteBatch as
+    // the UTXO mutations + tip so a crash leaves the chainstate and the index
+    // advanced-or-rewound together.
+    //
+    // The disconnect path RE-DERIVES the exact same keys from the orphan
+    // block's own inputs and queues their deletes into pending_txospender_
+    // deletes (no separate undo data — Core CustomRemove(BuildSpenderPositions
+    // (block))).  Both the invalidateblock path AND the live-reorg path funnel
+    // through disconnectBlockByHashCFInner, and reorgToChain disconnects ALL
+    // orphaned blocks BEFORE connecting the new branch, so a reorg that spends
+    // the same outpoint by different txs on each branch erases the old key
+    // before writing the new one — the rustoshi reorg-safety lesson.
+    //
+    // Bitcoin Core analog: index/txospenderindex.cpp CustomAppend / CustomRemove.
+    // When the flag is OFF the index is fully inert — zero change to validation,
+    // sync, or the UTXO set (default off, mirroring DEFAULT_TXOSPENDERINDEX).
+
+    /// True when `--txospenderindex` is on; gates queue-append + lookup.
+    txospenderindex_enabled: bool = false,
+    /// Highest block height for which CF_TXOSPENDER is populated.  Loaded on
+    /// startup from TXOSPENDERINDEX_TIP_KEY and advanced by connectBlockInner.
+    /// Used by the IBD-time backfill walker + by getindexinfo's `synced`.
+    txospenderindex_height: u32 = 0,
+    /// Per-block CF_TXOSPENDER writes pending durable commit.  Each entry is a
+    /// (36-byte outpoint key, 64-byte spending-txid ++ block-hash value) pair.
+    pending_txospender_writes: std.ArrayList(PendingTxoSpenderWrite) = undefined,
+    /// Per-block CF_TXOSPENDER deletes pending durable commit (disconnect side).
+    /// Inline 36-byte outpoint keys re-derived from the orphan block's inputs;
+    /// drained alongside the writes (deletes appended BEFORE puts so a reorg's
+    /// delete-then-rewrite of the same outpoint in one flush window lets the
+    /// put win — RocksDB applies batch ops in array order).
+    pending_txospender_deletes: std.ArrayList([36]u8) = undefined,
+
+    // ----------------------------------------------------------------------
     // Pattern D (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-
     // 2026-05-05.md): multi-block reorg disconnect+reconnect must commit in
     // ONE atomic RocksDB WriteBatch.  Previously (3f3ba26-and-prior),
@@ -2343,6 +2397,24 @@ pub const ChainState = struct {
         hash: types.Hash256,
         record_bytes: []u8,
     };
+
+    /// CF_TXOSPENDER entry: a (36-byte spent-outpoint key, 64-byte value) pair.
+    /// Key layout matches `indexes.makeTxoSpenderKey` (prevout txid ++ BE vout);
+    /// value matches `indexes.TxoSpender.toBytes` (spending txid ++ block hash).
+    /// Both inline arrays — no heap inside the entry; flush() copies them into
+    /// per-op key/value allocations and frees those after the batch write.
+    pub const TXOSPENDER_KEY_LEN: usize = 36;
+    pub const TXOSPENDER_VAL_LEN: usize = 64;
+    pub const PendingTxoSpenderWrite = struct {
+        key: [TXOSPENDER_KEY_LEN]u8,
+        value: [TXOSPENDER_VAL_LEN]u8,
+    };
+
+    /// CF_DEFAULT key for the persisted txospenderindex tip height (4-byte LE
+    /// u32).  Committed only inside flush() WriteBatches that also carry a
+    /// txospender write/delete, so it stays in lockstep with the per-spend
+    /// records + the chain tip (Core: best-block key batched with the index).
+    pub const TXOSPENDERINDEX_TIP_KEY: []const u8 = "txospenderindex_tip";
 
     /// Build the big-endian CF_COINSTATS height key (Core DBHeightKey uses BE
     /// so sequential heights are adjacent in the keyspace).
@@ -2454,6 +2526,8 @@ pub const ChainState = struct {
             .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_coinstats_writes = std.ArrayList(PendingCoinStatsWrite).init(allocator),
             .pending_coinstats_reverts = std.ArrayList(PendingCoinStatsRevert).init(allocator),
+            .pending_txospender_writes = std.ArrayList(PendingTxoSpenderWrite).init(allocator),
+            .pending_txospender_deletes = std.ArrayList([36]u8).init(allocator),
         };
     }
 
@@ -2475,6 +2549,8 @@ pub const ChainState = struct {
             .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_coinstats_writes = std.ArrayList(PendingCoinStatsWrite).init(allocator),
             .pending_coinstats_reverts = std.ArrayList(PendingCoinStatsRevert).init(allocator),
+            .pending_txospender_writes = std.ArrayList(PendingTxoSpenderWrite).init(allocator),
+            .pending_txospender_deletes = std.ArrayList([36]u8).init(allocator),
         };
     }
 
@@ -2570,6 +2646,10 @@ pub const ChainState = struct {
             self.allocator.free(entry.record_bytes);
         }
         self.pending_coinstats_reverts.deinit();
+        // TxoSpenderIndex (2026-06-12): both queues hold only inline fixed-size
+        // arrays (no heap inside the entries), so a plain deinit() suffices.
+        self.pending_txospender_writes.deinit();
+        self.pending_txospender_deletes.deinit();
         self.utxo_set.deinit();
     }
 
@@ -2684,6 +2764,92 @@ pub const ChainState = struct {
             const tx_hash = crypto.computeTxidStreaming(&tx);
             try self.pending_tx_index_deletes.append(tx_hash);
         }
+    }
+
+    /// Queue CF_TXOSPENDER writes for every input of every non-coinbase tx in
+    /// the given block: (spent outpoint → spending txid ++ confirming block
+    /// hash).  Called by `connectBlockInner` after the per-tx UTXO loop
+    /// succeeds so a mid-block error doesn't leak orphan spender entries.
+    /// No-op when `txospenderindex_enabled = false` or in memory-only mode.
+    ///
+    /// Bitcoin Core analog: BaseIndex::BlockConnected → TxoSpenderIndex::
+    /// CustomAppend (index/txospenderindex.cpp), which calls WriteSpenderInfos
+    /// (BuildSpenderPositions(block)) — one key per non-coinbase input.  Genesis
+    /// is skipped (its only input is the null coinbase prevout), matching the
+    /// txindex/coinstats skip and the blockbrew template.  Advances
+    /// txospenderindex_height in-memory so the next in-batch block agrees;
+    /// flush() persists it via TXOSPENDERINDEX_TIP_KEY.
+    fn queueTxoSpenderWritesForBlock(
+        self: *ChainState,
+        block: *const types.Block,
+        block_hash: *const types.Hash256,
+        height: u32,
+    ) !void {
+        if (!self.txospenderindex_enabled) return;
+        if (self.utxo_set.db == null) return;
+        if (height == 0) return; // genesis coinbase has the null prevout only
+        const crypto = @import("crypto.zig");
+        const indexes_mod = @import("indexes.zig");
+        for (block.transactions, 0..) |tx, tx_idx| {
+            if (tx_idx == 0) continue; // coinbase: null prevout, no real spend
+            const spending_txid = crypto.computeTxidStreaming(&tx);
+            const spender = indexes_mod.TxoSpender{
+                .spending_txid = spending_txid,
+                .block_hash = block_hash.*,
+            };
+            const value = spender.toBytes();
+            for (tx.inputs) |input| {
+                const key = indexes_mod.makeTxoSpenderKey(input.previous_output);
+                try self.pending_txospender_writes.append(.{ .key = key, .value = value });
+            }
+        }
+        self.txospenderindex_height = height;
+    }
+
+    /// Queue CF_TXOSPENDER deletes for a disconnected block: RE-DERIVE the exact
+    /// keys from the orphan block's OWN non-coinbase inputs and delete them.  No
+    /// separate undo data is needed — the key is a pure function of the input
+    /// outpoint (Core CustomRemove(BuildSpenderPositions(block))).  Called by
+    /// `disconnectBlockByHashCFInner`, which is the SINGLE disconnect path both
+    /// invalidateblock (validation.disconnectToBlock) and the live reorg
+    /// (reorgToChain → disconnectBlockByHashCFNoFlush) flow through, so the
+    /// erase fires on both — the rustoshi reorg-safety lesson.  In a reorg the
+    /// disconnect runs BEFORE the new branch's connect (reorgToChain disconnects
+    /// all orphaned blocks first), so a same-outpoint-different-spender reorg
+    /// erases the old key before the new one is written.
+    fn queueTxoSpenderDeletesForBlock(
+        self: *ChainState,
+        block: *const types.Block,
+        height: u32,
+    ) !void {
+        if (!self.txospenderindex_enabled) return;
+        if (self.utxo_set.db == null) return;
+        if (height == 0) return; // genesis was never indexed
+        const indexes_mod = @import("indexes.zig");
+        for (block.transactions, 0..) |tx, tx_idx| {
+            if (tx_idx == 0) continue; // coinbase
+            for (tx.inputs) |input| {
+                const key = indexes_mod.makeTxoSpenderKey(input.previous_output);
+                try self.pending_txospender_deletes.append(key);
+            }
+        }
+        // Rewind the persisted index tip to the parent height.  height>0 here.
+        self.txospenderindex_height = height - 1;
+    }
+
+    /// Look up the on-chain transaction that spends `outpoint`.  Returns null
+    /// when the index is off or the outpoint has not been spent on-chain.
+    /// Mirrors Bitcoin Core TxoSpenderIndex::FindSpender (std::nullopt when
+    /// unspent).  The returned TxoSpender carries the spending txid + the hash
+    /// of the block that confirmed the spend.
+    pub fn findTxoSpender(self: *ChainState, outpoint: types.OutPoint) !?@import("indexes.zig").TxoSpender {
+        if (!self.txospenderindex_enabled) return null;
+        const db = self.utxo_set.db orelse return null;
+        const indexes_mod = @import("indexes.zig");
+        const key = indexes_mod.makeTxoSpenderKey(outpoint);
+        const data = (try db.get(CF_TXOSPENDER, &key)) orelse return null;
+        defer self.allocator.free(data);
+        return indexes_mod.TxoSpender.fromBytes(data) catch null;
     }
 
     /// Queue CF_BLOCK_FILTER + CF_BLOCK_FILTER_HEADER writes for the given
@@ -3440,6 +3606,60 @@ pub const ChainState = struct {
         std.debug.print(
             "CoinStatsIndex backfill: complete, indexed up to height {d}\n",
             .{self.coinstatsindex_height},
+        );
+    }
+
+    /// IBD-time backfill — populate CF_TXOSPENDER for every block in
+    /// [txospenderindex_height+1 .. best_height] using on-disk block bodies
+    /// (CF_BLOCKS).  Mirrors `backfillCoinStatsIndex` but needs ONLY the block
+    /// bodies (the spend keys are a pure function of each non-coinbase input's
+    /// prevout — no CF_BLOCK_UNDO required).  Flushes every 256 blocks.  Runs
+    /// synchronously at startup before the P2P thread spawns.  Bitcoin Core
+    /// analog: the BaseIndex catch-up scan driving CustomAppend per block.
+    pub fn backfillTxoSpenderIndex(self: *ChainState) !void {
+        if (!self.txospenderindex_enabled) return;
+        const db = self.utxo_set.db orelse return;
+        if (self.best_height == 0) return;
+        if (self.txospenderindex_height >= self.best_height) return;
+
+        const start_height: u32 = self.txospenderindex_height + 1;
+        const tip_height: u32 = self.best_height;
+        std.debug.print(
+            "TxoSpenderIndex backfill: scanning heights {d}..{d} ({d} blocks)\n",
+            .{ start_height, tip_height, tip_height - start_height + 1 },
+        );
+
+        const FLUSH_EVERY: u32 = 256;
+        var written_since_flush: u32 = 0;
+        var h: u32 = start_height;
+        while (h <= tip_height) : (h += 1) {
+            const hash = self.getBlockHashByHeight(h) orelse {
+                std.debug.print("TxoSpenderIndex backfill: missing height→hash for {d}; stopping at {d}\n", .{ h, self.txospenderindex_height });
+                break;
+            };
+            const raw = (try db.get(CF_BLOCKS, &hash)) orelse {
+                std.debug.print("TxoSpenderIndex backfill: missing block body for height {d} (pruned?); stopping at {d}\n", .{ h, self.txospenderindex_height });
+                break;
+            };
+            defer self.allocator.free(raw);
+            var reader = serialize.Reader{ .data = raw };
+            var block = serialize.readBlock(&reader, self.allocator) catch {
+                std.debug.print("TxoSpenderIndex backfill: corrupt block body at height {d}; stopping\n", .{h});
+                break;
+            };
+            defer serialize.freeBlock(self.allocator, &block);
+
+            try self.queueTxoSpenderWritesForBlock(&block, &hash, h);
+            written_since_flush += 1;
+            if (written_since_flush >= FLUSH_EVERY) {
+                try self.flush();
+                written_since_flush = 0;
+            }
+        }
+        if (written_since_flush > 0) try self.flush();
+        std.debug.print(
+            "TxoSpenderIndex backfill: complete, indexed up to height {d}\n",
+            .{self.txospenderindex_height},
         );
     }
 
@@ -4500,6 +4720,20 @@ pub const ChainState = struct {
         // Index + RevertBlock.
         try self.queueCoinStatsDeleteForBlock(hash, disc_height);
 
+        // TxoSpenderIndex (2026-06-12): RE-DERIVE the spent-outpoint keys from
+        // this orphan block's own inputs and queue their deletes (no separate
+        // undo data — Core CustomRemove(BuildSpenderPositions(block))).  This
+        // fires for BOTH invalidateblock (validation.disconnectToBlock →
+        // disconnectBlockByHashCF) AND the live reorg (reorgToChain →
+        // disconnectBlockByHashCFNoFlush), since both flow through this Inner.
+        // The reorg disconnects all orphaned blocks BEFORE connecting the new
+        // branch, so a same-outpoint-different-spender reorg erases the old key
+        // before the new one is written (rustoshi reorg-safety lesson).  Same
+        // single-WriteBatch atomicity as the txindex/coinstats reverts.  No-op
+        // when txospenderindex_enabled is false.  `disc_height` was captured
+        // before the tip rewind above.
+        try self.queueTxoSpenderDeletesForBlock(&block, disc_height);
+
         if (do_flush) {
             // Flush so the tip rewind + UTXO mutations land on disk
             // immediately.  Without this, a caller that runs disconnect
@@ -4958,6 +5192,12 @@ pub const ChainState = struct {
         self.pending_filter_writes.clearRetainingCapacity();
         self.pending_filter_deletes.clearRetainingCapacity();
 
+        // TxoSpenderIndex (2026-06-12): inline-only queues; drop them so a
+        // partially-built reorg batch doesn't carry stale spender entries
+        // into the next (post-restart) flush.
+        self.pending_txospender_writes.clearRetainingCapacity();
+        self.pending_txospender_deletes.clearRetainingCapacity();
+
         // utxo_set's pending_deletes / dirty_keys are NOT freed here:
         // they hold tracker entries pointing into the cache hashmap
         // (which still owns the byte buffers).  Drop the trackers so
@@ -5249,6 +5489,15 @@ pub const ChainState = struct {
             self.coinstats_unspendables_scripts += coinstats_unspendable_scripts_value;
         }
         try self.queueCoinStatsWriteForBlock(block, hash, height, coinstats_created.items, coinstats_spent.items);
+
+        // TxoSpenderIndex (2026-06-12): queue one (spent outpoint → spending
+        // txid ++ block hash) entry per non-coinbase input so they commit
+        // atomically with the UTXO mutations + tip in the next flush()
+        // WriteBatch.  Bitcoin Core analog: BaseIndex::BlockConnected →
+        // TxoSpenderIndex::CustomAppend.  No-op when txospenderindex_enabled is
+        // false (default) — same single-batch atomicity as the txindex/filter/
+        // coinstats writes above.
+        try self.queueTxoSpenderWritesForBlock(block, hash, height);
 
         // BIP-113: push the new block's timestamp into the ring buffer so
         // computeMTP() can serve the correct MTP for the NEXT submitted block
@@ -5813,6 +6062,55 @@ pub const ChainState = struct {
             } });
         }
 
+        // 13. TxoSpenderIndex deletes (disconnect side).  One CF_TXOSPENDER
+        //     delete per re-derived spent-outpoint key from each orphan block.
+        //     Append BEFORE the connect-side puts so a reorg's delete-then-
+        //     rewrite of the same outpoint in one flush window lets the put win
+        //     (RocksDB applies batch ops in array order).  Inline 36-byte keys.
+        for (self.pending_txospender_deletes.items) |k| {
+            const dk = try self.allocator.alloc(u8, TXOSPENDER_KEY_LEN);
+            @memcpy(dk, &k);
+            try batch.append(.{ .delete = .{
+                .cf = CF_TXOSPENDER,
+                .key = dk,
+            } });
+        }
+
+        // 14. TxoSpenderIndex writes (connect side).  One CF_TXOSPENDER put per
+        //     non-coinbase input: key = spent outpoint (36B), value = spending
+        //     txid ++ confirming block hash (64B).  Fresh copies; the per-op
+        //     key/value allocations are freed in the cleanup loop.  Empty queue
+        //     when txospenderindex is off.  Bitcoin Core analog:
+        //     WriteSpenderInfos → m_db->WriteBatch.
+        for (self.pending_txospender_writes.items) |entry| {
+            const k = try self.allocator.alloc(u8, TXOSPENDER_KEY_LEN);
+            @memcpy(k, &entry.key);
+            const v = try self.allocator.alloc(u8, TXOSPENDER_VAL_LEN);
+            @memcpy(v, &entry.value);
+            try batch.append(.{ .put = .{
+                .cf = CF_TXOSPENDER,
+                .key = k,
+                .value = v,
+            } });
+        }
+
+        // 14b. Persisted txospenderindex tip — emit only when a txospender
+        //      write/delete is in flight, batched with everything else so it
+        //      stays in lockstep with the per-spend records + chain tip.
+        if (self.txospenderindex_enabled and
+            (self.pending_txospender_writes.items.len > 0 or self.pending_txospender_deletes.items.len > 0))
+        {
+            const ts_key = try self.allocator.alloc(u8, TXOSPENDERINDEX_TIP_KEY.len);
+            @memcpy(ts_key, TXOSPENDERINDEX_TIP_KEY);
+            const ts_val = try self.allocator.alloc(u8, 4);
+            std.mem.writeInt(u32, ts_val[0..4], self.txospenderindex_height, .little);
+            try batch.append(.{ .put = .{
+                .cf = CF_DEFAULT,
+                .key = ts_key,
+                .value = ts_val,
+            } });
+        }
+
         flush_build_ns = @as(u64, @intCast(std.time.nanoTimestamp() - t_build_start));
 
         if (batch.items.len > 0) {
@@ -5916,6 +6214,14 @@ pub const ChainState = struct {
                 self.allocator.free(entry.record_bytes);
             }
             self.pending_coinstats_reverts.clearRetainingCapacity();
+
+            // TxoSpenderIndex (2026-06-12): CF_TXOSPENDER records committed.
+            // Entries hold only inline fixed-size arrays (no heap inside the
+            // queue entries); the per-op key/value copies are freed by the
+            // generic BatchOp cleanup loop below (CF_TXOSPENDER values are NOT
+            // skipped there, unlike CF_BLOCKS/CF_BLOCK_UNDO/CF_BLOCK_FILTER).
+            self.pending_txospender_writes.clearRetainingCapacity();
+            self.pending_txospender_deletes.clearRetainingCapacity();
 
             // Free allocated keys and values
             for (batch.items) |op| {

@@ -3019,6 +3019,8 @@ pub const RpcServer = struct {
             return self.handleGetDifficulty(id);
         } else if (std.mem.eql(u8, method, "getindexinfo")) {
             return self.handleGetIndexInfo(params, id);
+        } else if (std.mem.eql(u8, method, "gettxspendingprevout")) {
+            return self.handleGetTxSpendingPrevout(params, id);
         } else if (std.mem.eql(u8, method, "getblockfilter")) {
             return self.handleGetBlockFilter(params, id);
         } else if (std.mem.eql(u8, method, "scanblocks")) {
@@ -4654,9 +4656,272 @@ pub const RpcServer = struct {
             }
         }
 
+        // --- txospenderindex -----------------------------------------------
+        // GetName() == "txospenderindex" (txospenderindex.cpp).  synced when
+        // the index has reached the active tip.
+        if (self.chain_state.txospenderindex_enabled) {
+            const name = "txospenderindex";
+            if (filter.len == 0 or std.mem.eql(u8, filter, name)) {
+                const height = self.chain_state.txospenderindex_height;
+                const synced = height >= best_height;
+                if (wrote_any) try writer.writeByte(',');
+                try writer.print("\"{s}\":{{\"synced\":{},\"best_block_height\":{d}}}", .{ name, synced, height });
+                wrote_any = true;
+            }
+        }
+
         try writer.writeByte('}');
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `gettxspendingprevout [{"txid":..,"vout":..},..] ( {options} )`
+    ///
+    /// Scans the mempool (and the txospenderindex, if available) to find
+    /// transactions spending any of the given outputs.  Matches Bitcoin Core's
+    /// rpc/mempool.cpp::gettxspendingprevout (v31.99) exactly.
+    ///
+    /// Params:
+    ///   [0] outputs  (ARR, required): array of {"txid": hex, "vout": num>=0}.
+    ///       Empty           -> RPC_INVALID_PARAMETER "Invalid parameter, outputs are missing".
+    ///       Negative vout   -> "Invalid parameter, vout cannot be negative".
+    ///       Strict: only txid + vout keys accepted.
+    ///   [1] options  (OBJ, optional, strict): {mempool_only:bool, return_spending_tx:bool}.
+    ///       mempool_only default = (txospenderindex unavailable);
+    ///       return_spending_tx default false.
+    ///
+    /// Output: ARR of OBJ, pushKV order per object:
+    ///   txid, vout, [spendingtxid], [spendingtx], [blockhash].
+    /// blockhash is set ONLY on the confirmed/index path (never for a mempool
+    /// spender).  Unspent -> object carries only txid+vout.
+    ///
+    /// Algorithm (Core mempool.cpp:937-1039): scan the mempool FIRST via the
+    /// outpoint reverse-index (Core's GetConflictTx == our mempool.spenders).
+    /// For each entry, if a mempool spender is found OR mempool_only is set,
+    /// emit and drop from the worklist.  Return early if the worklist is empty.
+    /// Otherwise (mempool_only==false) the index must be available + synced,
+    /// else RPC_MISC_ERROR; for each remaining outpoint, look it up in the index.
+    fn handleGetTxSpendingPrevout(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // ── [0] outputs array (required, non-empty) ──────────────────────────
+        const output_params: []const std.json.Value = blk: {
+            if (params) |p| {
+                if (p == .array and p.array.items.len > 0 and p.array.items[0] == .array) {
+                    break :blk p.array.items[0].array.items;
+                }
+            }
+            // Either no params at all or params[0] is not an array → Core's
+            // get_array() would throw a type error; we surface the same family.
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, outputs are missing", id);
+        };
+        // Core: if (output_params.empty()) throw "Invalid parameter, outputs are missing".
+        if (output_params.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, outputs are missing", id);
+        }
+
+        // Index availability: mempool_only defaults to !index (Core: !g_txospenderindex).
+        const index_available = self.chain_state.txospenderindex_enabled;
+
+        // ── [1] options (optional, strict {mempool_only, return_spending_tx}) ─
+        var mempool_only: bool = !index_available;
+        var return_spending_tx: bool = false;
+        if (params) |p| {
+            if (p == .array and p.array.items.len >= 2 and p.array.items[1] != .null) {
+                const opts = p.array.items[1];
+                if (opts != .object) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid options object", id);
+                }
+                var it = opts.object.iterator();
+                while (it.next()) |kv| {
+                    const k = kv.key_ptr.*;
+                    if (!std.mem.eql(u8, k, "mempool_only") and !std.mem.eql(u8, k, "return_spending_tx")) {
+                        const msg = std.fmt.allocPrint(self.allocator, "Invalid parameter {s}", .{k}) catch
+                            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter", id);
+                        defer self.allocator.free(msg);
+                        return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                    }
+                }
+                if (opts.object.get("mempool_only")) |v| {
+                    if (v != .bool) return self.jsonRpcError(RPC_INVALID_PARAMETER, "JSON value is not of expected type bool", id);
+                    mempool_only = v.bool;
+                }
+                if (opts.object.get("return_spending_tx")) |v| {
+                    if (v != .bool) return self.jsonRpcError(RPC_INVALID_PARAMETER, "JSON value is not of expected type bool", id);
+                    return_spending_tx = v.bool;
+                }
+            }
+        }
+
+        // ── Parse the worklist of outpoints ──────────────────────────────────
+        const Entry = struct {
+            outpoint: types.OutPoint,
+            txid_hex: []const u8, // borrowed from the params arena
+            vout: i64,
+        };
+        var worklist = std.ArrayList(Entry).init(self.allocator);
+        defer worklist.deinit();
+
+        for (output_params) |raw| {
+            if (raw != .object) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, output must be an object", id);
+            }
+            // Strict: exactly txid + vout (Core RPCTypeCheckObj fStrict).
+            var oit = raw.object.iterator();
+            while (oit.next()) |kv| {
+                const k = kv.key_ptr.*;
+                if (!std.mem.eql(u8, k, "txid") and !std.mem.eql(u8, k, "vout")) {
+                    const msg = std.fmt.allocPrint(self.allocator, "Invalid parameter {s}", .{k}) catch
+                        return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter", id);
+                    defer self.allocator.free(msg);
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                }
+            }
+            const txid_val = raw.object.get("txid") orelse
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, missing txid", id);
+            if (txid_val != .string) return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, txid must be a string", id);
+            const txid_hex = txid_val.string;
+            const vout_val = raw.object.get("vout") orelse
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, missing vout", id);
+            if (vout_val != .integer) return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, vout must be a number", id);
+            const n_output: i64 = vout_val.integer;
+            if (n_output < 0) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, vout cannot be negative", id);
+            }
+            if (txid_hex.len != 64) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "txid must be of length 64 (not hex)", id);
+            }
+            var txid: types.Hash256 = undefined;
+            for (0..32) |i| {
+                // Display (big-endian) hex → internal little-endian byte order.
+                const hi = std.fmt.charToDigit(txid_hex[i * 2], 16) catch
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "txid must be hexadecimal string", id);
+                const lo = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "txid must be hexadecimal string", id);
+                txid[31 - i] = (hi << 4) | lo;
+            }
+            try worklist.append(.{
+                .outpoint = .{ .hash = txid, .index = @intCast(n_output) },
+                .txid_hex = txid_hex,
+                .vout = n_output,
+            });
+        }
+
+        // ── Build the result array ───────────────────────────────────────────
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeByte('[');
+        var wrote_any = false;
+
+        // Phase 1: scan the mempool first (Core GetConflictTx == spenders map).
+        // Track which worklist entries remain unresolved (deferred to the index).
+        var remaining = std.ArrayList(Entry).init(self.allocator);
+        defer remaining.deinit();
+
+        {
+            self.mempool.mutex.lock();
+            defer self.mempool.mutex.unlock();
+            for (worklist.items) |e| {
+                const spender_txid: ?types.Hash256 = self.mempool.spenders.get(e.outpoint);
+                if (spender_txid == null and !mempool_only) {
+                    // Not spent in mempool, and not a mempool-only request: defer.
+                    try remaining.append(e);
+                    continue;
+                }
+                if (wrote_any) try writer.writeByte(',');
+                wrote_any = true;
+                // txid + vout always emitted first (Core make_output copies the raw obj).
+                try writer.print("{{\"txid\":\"{s}\",\"vout\":{d}", .{ e.txid_hex, e.vout });
+                if (spender_txid) |stxid| {
+                    try writer.writeAll(",\"spendingtxid\":\"");
+                    try writeHashHex(writer, &stxid);
+                    try writer.writeByte('"');
+                    if (return_spending_tx) {
+                        if (self.mempool.get(stxid)) |entry| {
+                            try writer.writeAll(",\"spendingtx\":\"");
+                            var tx_writer = serialize.Writer.init(self.allocator);
+                            defer tx_writer.deinit();
+                            serialize.writeTransaction(&tx_writer, &entry.tx) catch {};
+                            for (tx_writer.getWritten()) |byte| try writer.print("{x:0>2}", .{byte});
+                            try writer.writeByte('"');
+                        }
+                    }
+                }
+                try writer.writeByte('}');
+            }
+        }
+
+        // Return early if the mempool scan resolved everything (Core early-return).
+        if (remaining.items.len == 0) {
+            try writer.writeByte(']');
+            return self.jsonRpcResult(buf.items, id);
+        }
+
+        // Phase 2: the request was not mempool-only and some outpoints remain.
+        // Require the index to be available AND synced to the active tip (Core
+        // gates on !g_txospenderindex OR the index not being caught up to the
+        // current chain; clearbit's index advances inline with each flush(), so
+        // "caught up" == txospenderindex_height >= best_height).
+        const tip_synced = index_available and
+            self.chain_state.txospenderindex_height >= self.chain_state.best_height;
+        if (!index_available or !tip_synced) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Mempool lacks a relevant spend, and txospenderindex is unavailable.", id);
+        }
+
+        for (remaining.items) |e| {
+            const spender = self.chain_state.findTxoSpender(e.outpoint) catch
+                return self.jsonRpcError(RPC_MISC_ERROR, "IO error finding spending tx for outpoint.", id);
+            if (wrote_any) try writer.writeByte(',');
+            wrote_any = true;
+            try writer.print("{{\"txid\":\"{s}\",\"vout\":{d}", .{ e.txid_hex, e.vout });
+            if (spender) |sp| {
+                try writer.writeAll(",\"spendingtxid\":\"");
+                try writeHashHex(writer, &sp.spending_txid);
+                try writer.writeByte('"');
+                if (return_spending_tx) {
+                    // Read the full spending tx back from its confirming block.
+                    if (try self.readTxFromBlock(&sp.spending_txid, &sp.block_hash)) |found| {
+                        var ftx = found;
+                        defer serialize.freeTransaction(self.allocator, &ftx);
+                        try writer.writeAll(",\"spendingtx\":\"");
+                        var tx_writer = serialize.Writer.init(self.allocator);
+                        defer tx_writer.deinit();
+                        serialize.writeTransaction(&tx_writer, &ftx) catch {};
+                        for (tx_writer.getWritten()) |byte| try writer.print("{x:0>2}", .{byte});
+                        try writer.writeByte('"');
+                    }
+                }
+                // blockhash ONLY on the confirmed/index path (Core).
+                try writer.writeAll(",\"blockhash\":\"");
+                try writeHashHex(writer, &sp.block_hash);
+                try writer.writeByte('"');
+            }
+            // Unspent on-chain: object carries only txid+vout (Core make_output(prevout)).
+            try writer.writeByte('}');
+        }
+
+        try writer.writeByte(']');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Read a confirmed transaction by txid from the block that confirmed it
+    /// (block hash recorded in the txospenderindex entry).  Returns a heap-owned
+    /// deep copy that survives freeBlock (caller frees via freeTransaction), or
+    /// null when the block/tx cannot be read.  Used by gettxspendingprevout's
+    /// return_spending_tx path.
+    fn readTxFromBlock(self: *RpcServer, txid: *const types.Hash256, block_hash: *const types.Hash256) !?types.Transaction {
+        const db = self.chain_state.utxo_set.db orelse return null;
+        const raw = (db.get(storage.CF_BLOCKS, block_hash) catch return null) orelse return null;
+        defer self.allocator.free(raw);
+        var reader = serialize.Reader{ .data = raw };
+        var block = serialize.readBlock(&reader, self.allocator) catch return null;
+        defer serialize.freeBlock(self.allocator, &block);
+        for (block.transactions) |btx| {
+            const this_txid = crypto.computeTxidStreaming(&btx);
+            if (std.mem.eql(u8, &this_txid, txid)) {
+                return try copyTransaction(self.allocator, &btx);
+            }
+        }
+        return null;
     }
 
     /// `getblockfilter "blockhash" ( "filtertype" )` — BIP-157 content filter

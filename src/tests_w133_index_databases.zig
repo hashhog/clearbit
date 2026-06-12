@@ -169,11 +169,15 @@ test "w133 G6: no BlockUntilSyncedToCurrentChain API (BUG-6)" {
 // coinstats CF is now a real in-range column family (cf_handles[8] valid).
 // ===========================================================================
 test "w133 G7: CF_COINSTATS is a valid in-range CF (FIXED)" {
-    try testing.expectEqual(@as(usize, 9), storage.CF_COUNT);
+    // CF_COUNT bumped 9→10 on 2026-06-12 when CF_TXOSPENDER (=9) was added.
+    try testing.expectEqual(@as(usize, 10), storage.CF_COUNT);
     try testing.expectEqual(@as(usize, 8), storage.CF_COINSTATS);
     try testing.expectEqual(@as(usize, 8), indexes.CF_COINSTATS);
     // The fix: CF_COINSTATS must be strictly < CF_COUNT (in-range).
     try testing.expect(indexes.CF_COINSTATS < storage.CF_COUNT);
+    // TxoSpenderIndex CF is also in-range.
+    try testing.expectEqual(@as(usize, 9), storage.CF_TXOSPENDER);
+    try testing.expect(storage.CF_TXOSPENDER < storage.CF_COUNT);
 }
 
 // ===========================================================================
