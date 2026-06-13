@@ -3118,6 +3118,8 @@ pub const RpcServer = struct {
             return self.handleGetDeploymentInfo(params, id);
         } else if (std.mem.eql(u8, method, "getchaintips")) {
             return self.handleGetChainTips(id);
+        } else if (std.mem.eql(u8, method, "getchainstates")) {
+            return self.handleGetChainStates(id);
         } else if (std.mem.eql(u8, method, "getchaintxstats")) {
             return self.handleGetChainTxStats(params, id);
         } else if (std.mem.eql(u8, method, "getblockstats")) {
@@ -3439,6 +3441,110 @@ pub const RpcServer = struct {
         try writer.writeByte('"');
         try writeHashHex(writer, &self.chain_state.best_hash);
         try writer.writeByte('"');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `getchainstates` — information about this node's chainstates.
+    ///
+    /// Bitcoin Core reference: src/rpc/blockchain.cpp::getchainstates (the
+    /// `make_chain_data` lambda) + the `RPCHelpForChainstate` field list.
+    /// Core returns:
+    ///   { "headers": <int>, "chainstates": [ {<per-chainstate fields>} ] }
+    /// with the array ordered by work, most-work (ACTIVE) chainstate LAST.
+    ///
+    /// clearbit runs a single, fully-validated chainstate — there is no
+    /// active AssumeUTXO snapshot chainstate in the live node (the snapshot
+    /// load path in handleLoadTxOutSet validates before promoting and keeps
+    /// no separate from-snapshot/background chainstate around). So the array
+    /// is always exactly one element: validated=true, snapshot_blockhash
+    /// OMITTED (Core only pushes that key for a from-snapshot chainstate).
+    /// The 1-element ordering requirement is trivially satisfied.
+    ///
+    /// Field shape is byte-exact to Core's make_chain_data, in Core's emit
+    /// order: blocks, bestblockhash, bits, target, difficulty,
+    /// verificationprogress, coins_db_cache_bytes, coins_tip_cache_bytes,
+    /// [snapshot_blockhash], validated. Doubles (difficulty,
+    /// verificationprogress) are serialised through writeDifficultyCore —
+    /// Core's `%.16g` (UniValue::setFloat / setprecision(16)) formatter.
+    ///
+    /// Cache-byte values are GENUINE, read from clearbit's real cache
+    /// configuration (NOT fabricated):
+    ///   - coins_tip_cache_bytes = chain_state.utxo_set.max_cache_size, the
+    ///     in-memory coins (UTXO) cache budget clearbit actually enforces
+    ///     (= --dbcache MiB in bytes; see UtxoSet.init / cacheMemoryUsage).
+    ///   - coins_db_cache_bytes  = the on-disk coins-DB (RocksDB) LRU block
+    ///     cache, sized at storage_rocksdb.zig:102 as block_cache_mib *
+    ///     1024*1024 where block_cache_mib == --dbcache (Database.open is
+    ///     called with config.dbcache, main.zig:1165/1477). clearbit budgets
+    ///     BOTH caches off the single --dbcache knob (it does NOT use Core's
+    ///     kernel::CacheSizes block_tree/coins_db/coins split), so the two
+    ///     real budgets are equal here. Both are read from the live
+    ///     UtxoSet.max_cache_size rather than fabricated.
+    fn handleGetChainStates(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        // headers: Core emits chainman.m_best_header->nHeight (-1 if none).
+        // clearbit always has at least the genesis header, so headers is the
+        // best-header height = validated tip + headers queued but not yet
+        // connected — the same source getblockchaininfo("headers") uses.
+        const queued_count: usize = if (self.peer_manager.expected_blocks.items.len > self.peer_manager.connect_cursor)
+            self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor
+        else
+            0;
+        const headers_height: i64 = @as(i64, self.chain_state.best_height) +
+            @as(i64, @intCast(queued_count));
+
+        // Active chainstate tip header (bits/difficulty/target). When the
+        // ChainManager is wired we read the live tip entry's nBits; otherwise
+        // fall back to the genesis bits, exactly as getblockchaininfo does.
+        var tip_bits: u32 = self.network_params.genesis_header.bits;
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
+                tip_bits = entry.header.bits;
+            }
+        }
+
+        // verificationprogress: clearbit has no Core GuessVerificationProgress
+        // (which integrates tx-rate); the genuine progress signal it tracks is
+        // tip_height / best_header_height (same as getsyncstate), clamped to
+        // [0,1]. 1.0 once fully synced.
+        const vp: f64 = if (headers_height <= 0)
+            0.0
+        else blk: {
+            const p = @as(f64, @floatFromInt(self.chain_state.best_height)) /
+                @as(f64, @floatFromInt(headers_height));
+            break :blk if (p > 1.0) 1.0 else p;
+        };
+
+        // Genuine cache budgets — see the doc comment. Both derive from the
+        // live UtxoSet.max_cache_size (= --dbcache MiB in bytes), which is the
+        // real budget for the in-memory coins-tip cache AND the on-disk
+        // RocksDB coins-DB block cache (both sized off the one --dbcache knob).
+        const coins_cache_bytes: u64 = @intCast(self.chain_state.utxo_set.max_cache_size);
+
+        try writer.print("{{\"headers\":{d},\"chainstates\":[", .{headers_height});
+
+        // Single fully-validated chainstate (the active one, "last").
+        try writer.print("{{\"blocks\":{d},\"bestblockhash\":\"", .{self.chain_state.best_height});
+        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writer.print("\",\"bits\":\"{x:0>8}\",\"target\":\"", .{tip_bits});
+        try writeTargetHex(writer, tip_bits);
+        try writer.writeAll("\",\"difficulty\":");
+        try writeDifficultyCore(writer, getDifficultyCore(tip_bits));
+        try writer.writeAll(",\"verificationprogress\":");
+        try writeDifficultyCore(writer, vp);
+        // coins_db_cache_bytes / coins_tip_cache_bytes are ALWAYS emitted
+        // (Core pushKVs them unconditionally). snapshot_blockhash is OMITTED:
+        // no active snapshot chainstate. validated is always true here.
+        try writer.print(",\"coins_db_cache_bytes\":{d},\"coins_tip_cache_bytes\":{d},\"validated\":true}}", .{
+            coins_cache_bytes,
+            coins_cache_bytes,
+        });
+
+        try writer.writeAll("]}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -20853,6 +20959,105 @@ test "getblockchaininfo returns correct height and hash" {
     // Should contain correct height
     try std.testing.expect(std.mem.indexOf(u8, result, "\"blocks\":100") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"chain\":\"main\"") != null);
+}
+
+test "getchainstates returns headers + a single validated chainstate (Core shape)" {
+    const allocator = std.testing.allocator;
+
+    // dbcache = 450 MiB → the genuine coins cache budget both fields report.
+    const dbcache_mib: usize = 450;
+    var chain_state = storage.ChainState.init(null, dbcache_mib, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 850000;
+    chain_state.best_hash = [_]u8{0xCD} ** 32;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getchainstates\",\"params\":[]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // Parse the JSON-RPC envelope and inspect the `result` object so we can
+    // assert genuine types (int vs float vs bool), not just substring shape.
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const res = root.get("result").?.object;
+
+    // headers: integer.
+    const headers = res.get("headers").?;
+    try std.testing.expect(headers == .integer);
+    // No queued headers in this test → headers == tip height.
+    try std.testing.expectEqual(@as(i64, 850000), headers.integer);
+
+    // chainstates: a 1-element array.
+    const chainstates = res.get("chainstates").?.array;
+    try std.testing.expectEqual(@as(usize, 1), chainstates.items.len);
+
+    const cs = chainstates.items[0].object;
+
+    // blocks: integer == tip height.
+    try std.testing.expect(cs.get("blocks").? == .integer);
+    try std.testing.expectEqual(@as(i64, 850000), cs.get("blocks").?.integer);
+
+    // bestblockhash: 64-hex string (display-order of 0xCD..CD).
+    const bbh = cs.get("bestblockhash").?;
+    try std.testing.expect(bbh == .string);
+    try std.testing.expectEqual(@as(usize, 64), bbh.string.len);
+
+    // bits: 8-hex string.
+    try std.testing.expect(cs.get("bits").? == .string);
+    try std.testing.expectEqual(@as(usize, 8), cs.get("bits").?.string.len);
+
+    // target: 64-hex string.
+    try std.testing.expect(cs.get("target").? == .string);
+    try std.testing.expectEqual(@as(usize, 64), cs.get("target").?.string.len);
+
+    // difficulty: a number (parses as float or integer — Core emits a double).
+    const diff = cs.get("difficulty").?;
+    try std.testing.expect(diff == .float or diff == .integer);
+
+    // verificationprogress: a number; with no queued headers it is exactly 1.0.
+    const vp = cs.get("verificationprogress").?;
+    try std.testing.expect(vp == .float or vp == .integer);
+    const vp_f: f64 = switch (vp) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => unreachable,
+    };
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), vp_f, 1e-12);
+
+    // coins_db_cache_bytes / coins_tip_cache_bytes: integers, ALWAYS present,
+    // both equal to the genuine --dbcache budget in bytes (450 MiB).
+    const want_bytes: i64 = @intCast(dbcache_mib * 1024 * 1024);
+    const cdb = cs.get("coins_db_cache_bytes").?;
+    try std.testing.expect(cdb == .integer);
+    try std.testing.expectEqual(want_bytes, cdb.integer);
+    const ctc = cs.get("coins_tip_cache_bytes").?;
+    try std.testing.expect(ctc == .integer);
+    try std.testing.expectEqual(want_bytes, ctc.integer);
+
+    // validated: bool true for the single fully-validated chainstate.
+    const validated = cs.get("validated").?;
+    try std.testing.expect(validated == .bool);
+    try std.testing.expect(validated.bool);
+
+    // snapshot_blockhash: OMITTED when no snapshot is active.
+    try std.testing.expect(cs.get("snapshot_blockhash") == null);
 }
 
 test "getblockchaininfo includes initialblockdownload field" {
