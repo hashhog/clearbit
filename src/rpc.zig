@@ -3194,6 +3194,8 @@ pub const RpcServer = struct {
             return self.handleFundRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "importdescriptors")) {
             return self.handleImportDescriptors(params, id);
+        } else if (std.mem.eql(u8, method, "listdescriptors")) {
+            return self.handleListDescriptors(params, id);
         } else if (std.mem.eql(u8, method, "validateaddress")) {
             return self.handleValidateAddress(params, id);
         } else if (std.mem.eql(u8, method, "gettxout")) {
@@ -15813,6 +15815,132 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// listdescriptors ( private )
+    ///
+    /// List all descriptors present in the wallet (Core
+    /// wallet/rpc/backup.cpp:listdescriptors). clearbit's only descriptor store
+    /// is the watch-only `imported_scripts` set populated by importdescriptors;
+    /// each entry carries the full descriptor string WITH its `#checksum` (the
+    /// import path requires a checksum, so the stored string is already in Core's
+    /// `desc` form). A ranged import expands into one ImportedScript per derived
+    /// index, all sharing the same descriptor string, so we DEDUPE by descriptor
+    /// string here to emit one object per distinct descriptor.
+    ///
+    /// Output shape (private=false default), Core parity but emitting ONLY the
+    /// fields clearbit's store actually holds:
+    ///   { "wallet_name": <string>,
+    ///     "descriptors": [ { "desc": <string with #checksum>,
+    ///                        "timestamp": <int>,
+    ///                        "active": <bool> }, ... ] }
+    /// sorted by descriptor string.
+    ///
+    /// Fields deliberately NOT fabricated: clearbit's watch-only descriptors are
+    /// never "active" (they do not generate new addresses), so `active` is always
+    /// false and — per Core, which emits `internal` only for active descriptors —
+    /// `internal` is omitted. The store does not retain a descriptor's range
+    /// bounds or next index (a ranged import is flattened into per-index scripts),
+    /// so `range`/`next`/`next_index` are omitted rather than invented.
+    ///
+    /// private=true against a watch-only / private-keys-disabled wallet ->
+    /// RPC_WALLET_ERROR (-4) "Can't get private descriptor string for watch-only
+    /// wallets" (backup.cpp:500-502). clearbit's wallets carry no private
+    /// descriptor strings, so any private=true request errors the same way.
+    ///
+    /// Reference: bitcoin-core/src/wallet/rpc/backup.cpp:464-572.
+    fn handleListDescriptors(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+
+        // private (optional bool, default false).
+        var priv = false;
+        if (params == .array and params.array.items.len > 0) {
+            const p0 = params.array.items[0];
+            if (p0 == .bool) {
+                priv = p0.bool;
+            } else if (p0 != .null) {
+                return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value of type other is not of expected type bool", id);
+            }
+        }
+
+        // private=true on a watch-only wallet -> -4 (Core backup.cpp:500-502).
+        // clearbit holds no private descriptor strings, so private=true always
+        // errors this way.
+        if (priv and wallet.disable_private_keys) {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Can't get private descriptor string for watch-only wallets", id);
+        }
+        if (priv) {
+            // A key-enabled clearbit wallet still has no private descriptor
+            // strings to surface; mirror the watch-only refusal rather than
+            // emitting public descriptors under a `private` request.
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Can't get private descriptor string for watch-only wallets", id);
+        }
+
+        // Collect distinct descriptor strings from the watch-only store.
+        // A ranged import expands into N ImportedScript entries that all share
+        // the same descriptor string, so dedupe by string.
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer seen.deinit();
+        var descs = std.ArrayList([]const u8).init(self.allocator);
+        defer descs.deinit();
+
+        for (wallet.imported_scripts.items) |s| {
+            if (s.desc.len == 0) continue;
+            if (seen.contains(s.desc)) continue;
+            try seen.put(s.desc, {});
+            try descs.append(s.desc);
+        }
+
+        // Sort by descriptor string (Core sorts by descriptor representation).
+        std.mem.sort([]const u8, descs.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+
+        // The store does not retain a per-descriptor creation time; Core uses
+        // "now" when a descriptor's timestamp is unknown. Use the current time.
+        const now = std.time.timestamp();
+
+        const wallet_name = self.walletNameFor(wallet);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"wallet_name\":\"");
+        try writeJsonEscaped(writer, wallet_name);
+        try writer.writeAll("\",\"descriptors\":[");
+        for (descs.items, 0..) |d, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"desc\":\"");
+            try writeJsonEscaped(writer, d);
+            // active is always false for clearbit's watch-only imports (they do
+            // not generate new addresses); `internal` is therefore omitted (Core
+            // emits it only for active descriptors). range/next/next_index are
+            // omitted — the store does not retain those for a flattened import.
+            try writer.print("\",\"timestamp\":{d},\"active\":false}}", .{now});
+        }
+        try writer.writeAll("]}");
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Best-effort reverse lookup of the loaded wallet's name for the
+    /// `wallet_name` response field. In manager mode the name is the key under
+    /// which `wallet` is registered; in single-wallet mode (and as the default)
+    /// it is the empty string, matching Core's default-wallet name "".
+    fn walletNameFor(self: *RpcServer, wallet: *const wallet_mod.Wallet) []const u8 {
+        if (self.wallet_manager) |wm| {
+            var it = wm.wallets.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* == wallet) return entry.key_ptr.*;
+            }
+        }
+        return "";
+    }
+
     /// Process a single importdescriptors request object. Returns a result
     /// element (success or per-element error); only OOM and similar truly
     /// fatal allocator failures propagate as a Zig error (the caller maps that
@@ -23960,6 +24088,90 @@ test "importdescriptors watch-only: privkey into dpk wallet -> per-element -4; m
     const resp_bad = try server.dispatch(req_bad);
     defer allocator.free(resp_bad);
     try std.testing.expect(std.mem.indexOf(u8, resp_bad, "-32602") != null);
+}
+
+// listdescriptors — list the watch-only descriptors imported via
+// importdescriptors, in Core's response shape (wallet/rpc/backup.cpp:464). The
+// stored `desc` strings already carry their `#checksum`; this asserts the Core
+// object shape, a CORRECT checksum recomputed with the existing descriptor
+// checksum routine (NOT hardcoded), descriptor-string sort order, and the
+// private=true -> -4 watch-only refusal.
+test "listdescriptors watch-only: Core shape + recomputed checksum + sort order + private=-4" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var wallet = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+    wallet.disable_private_keys = true; // enforced watch-only
+
+    var server = RpcServer.initWithWallet(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, &wallet, .{});
+    defer server.deinit();
+
+    // Two distinct watch-only descriptors. Recompute the checksum with the SAME
+    // routine the store/import path uses, so the test never hardcodes it.
+    const desc_a_body = "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)";
+    const desc_b_body = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)";
+    const ck_a = descriptor.computeChecksum(desc_a_body) orelse return std.testing.expect(false);
+    const ck_b = descriptor.computeChecksum(desc_b_body) orelse return std.testing.expect(false);
+
+    const full_a = try std.fmt.allocPrint(allocator, "{s}#{s}", .{ desc_a_body, &ck_a });
+    defer allocator.free(full_a);
+    const full_b = try std.fmt.allocPrint(allocator, "{s}#{s}", .{ desc_b_body, &ck_b });
+    defer allocator.free(full_b);
+
+    // Import in NON-sorted order: wpkh(...) ('w' > 'p') first, then pkh(...).
+    const import_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":1,\"method\":\"importdescriptors\",\"params\":[[{{\"desc\":\"{s}\",\"timestamp\":\"now\"}},{{\"desc\":\"{s}\",\"timestamp\":\"now\"}}]]}}",
+        .{ full_b, full_a },
+    );
+    defer allocator.free(import_req);
+    const import_resp = try server.dispatch(import_req);
+    defer allocator.free(import_resp);
+    try std.testing.expect(std.mem.indexOf(u8, import_resp, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, import_resp, "\"success\":false") == null);
+
+    // listdescriptors (private omitted -> default false).
+    const ld_resp = try server.dispatch("{\"id\":2,\"method\":\"listdescriptors\",\"params\":[]}");
+    defer allocator.free(ld_resp);
+
+    // Core object shape: wallet_name + descriptors array, with desc/timestamp/active.
+    try std.testing.expect(std.mem.indexOf(u8, ld_resp, "\"wallet_name\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ld_resp, "\"descriptors\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ld_resp, "\"timestamp\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ld_resp, "\"active\":false") != null);
+    // Watch-only, non-active descriptors: `internal` is NOT emitted (Core emits
+    // it only for active descriptors) and no fabricated range/next fields.
+    try std.testing.expect(std.mem.indexOf(u8, ld_resp, "\"internal\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ld_resp, "\"range\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ld_resp, "\"next\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ld_resp, "\"next_index\"") == null);
+
+    // Both descriptors appear, each WITH its recomputed #checksum (proves the
+    // stored desc carries the BIP-380 checksum and matches the routine).
+    const a_with_ck = try std.fmt.allocPrint(allocator, "\"desc\":\"{s}\"", .{full_a});
+    defer allocator.free(a_with_ck);
+    const b_with_ck = try std.fmt.allocPrint(allocator, "\"desc\":\"{s}\"", .{full_b});
+    defer allocator.free(b_with_ck);
+    const pos_a = std.mem.indexOf(u8, ld_resp, a_with_ck);
+    const pos_b = std.mem.indexOf(u8, ld_resp, b_with_ck);
+    try std.testing.expect(pos_a != null);
+    try std.testing.expect(pos_b != null);
+
+    // Sort order: pkh(...) ('p') sorts before wpkh(...) ('w') in the response,
+    // even though they were imported in the reverse order.
+    try std.testing.expect(pos_a.? < pos_b.?);
+
+    // private=true on a watch-only wallet -> -4 (Core RPC_WALLET_ERROR).
+    const priv_resp = try server.dispatch("{\"id\":3,\"method\":\"listdescriptors\",\"params\":[true]}");
+    defer allocator.free(priv_resp);
+    try std.testing.expect(std.mem.indexOf(u8, priv_resp, "\"code\":-4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, priv_resp, "Can't get private descriptor string for watch-only wallets") != null);
 }
 
 // ============================================================================
