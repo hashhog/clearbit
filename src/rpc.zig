@@ -3612,15 +3612,22 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid params", id);
         }
 
-        // Parse blockhash
+        // Parse blockhash.  Core parses with ParseHashV (rpc/util.cpp:117):
+        // a malformed (wrong-length OR non-hex) hash is RPC_INVALID_PARAMETER
+        // (-8) at the parse boundary, BEFORE any lookup.  A well-formed but
+        // absent hash is "Block not found" (-5) further down.
         if (blockhash_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length", id);
+            const msg = try std.fmt.allocPrint(self.allocator, "blockhash must be of length 64 (not {d}, for '{s}')", .{ blockhash_hex.len, blockhash_hex });
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         }
 
         var blockhash: types.Hash256 = undefined;
         for (0..32) |i| {
             blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
+                const msg = try std.fmt.allocPrint(self.allocator, "blockhash must be hexadecimal string (not '{s}')", .{blockhash_hex});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
             };
         }
 
@@ -5866,17 +5873,27 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid parameter", id);
         };
 
+        // ParseHashV parity (rpc/util.cpp:117): a malformed (wrong-length OR
+        // non-hex) txid is RPC_INVALID_PARAMETER (-8) at the parse boundary,
+        // before any mempool lookup.  A well-formed but absent txid stays
+        // "Transaction not in mempool" (-5) below.
         if (txid_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
+            const msg = try std.fmt.allocPrint(self.allocator, "txid must be of length 64 (not {d}, for '{s}')", .{ txid_hex.len, txid_hex });
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         }
 
         var txid: types.Hash256 = undefined;
         for (0..32) |i| {
             const high = std.fmt.charToDigit(txid_hex[i * 2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+                const msg = try std.fmt.allocPrint(self.allocator, "txid must be hexadecimal string (not '{s}')", .{txid_hex});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
             };
             const low = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+                const msg = try std.fmt.allocPrint(self.allocator, "txid must be hexadecimal string (not '{s}')", .{txid_hex});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
             };
             // Bitcoin txids are displayed in reverse byte order
             txid[31 - i] = (high << 4) | low;
@@ -10556,15 +10573,23 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid params", id);
         }
 
+        // ParseHashV parity (rpc/util.cpp:117): a malformed (wrong-length OR
+        // non-hex) blockhash is RPC_INVALID_PARAMETER (-8) at the parse
+        // boundary, before any block-index lookup.  A well-formed but absent
+        // hash stays "Block not found" (-5) further down.
         if (blockhash_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash length", id);
+            const msg = try std.fmt.allocPrint(self.allocator, "blockhash must be of length 64 (not {d}, for '{s}')", .{ blockhash_hex.len, blockhash_hex });
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         }
 
         // Parse display-order hex → internal little-endian bytes.
         var hash: types.Hash256 = undefined;
         for (0..32) |i| {
             hash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 .. i * 2 + 2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash hex", id);
+                const msg = try std.fmt.allocPrint(self.allocator, "blockhash must be hexadecimal string (not '{s}')", .{blockhash_hex});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
             };
         }
 
@@ -16015,17 +16040,27 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid and vout", id);
         };
 
+        // ParseHashV parity (rpc/util.cpp:117): a malformed (wrong-length OR
+        // non-hex) txid is RPC_INVALID_PARAMETER (-8) at the parse boundary,
+        // before any UTXO lookup.  A well-formed but absent txid returns
+        // null below, exactly like Core's gettxout.
         if (txid_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
+            const msg = try std.fmt.allocPrint(self.allocator, "txid must be of length 64 (not {d}, for '{s}')", .{ txid_hex.len, txid_hex });
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         }
 
         var txid: types.Hash256 = undefined;
         for (0..32) |i| {
             const high = std.fmt.charToDigit(txid_hex[i * 2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+                const msg = try std.fmt.allocPrint(self.allocator, "txid must be hexadecimal string (not '{s}')", .{txid_hex});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
             };
             const low = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
+                const msg = try std.fmt.allocPrint(self.allocator, "txid must be hexadecimal string (not '{s}')", .{txid_hex});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
             };
             txid[31 - i] = (high << 4) | low;
         }
@@ -21807,6 +21842,122 @@ test "getdeploymentinfo invalid blockhash returns error" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Invalid block hash length") != null);
+}
+
+test "ParseHashV parity: malformed txid/blockhash -> -8, well-formed-absent -> -5/null" {
+    // Bitcoin Core rpc/util.cpp:117 ParseHashV: a MALFORMED hash arg
+    // (wrong length OR non-hex chars) throws RPC_INVALID_PARAMETER (-8) at
+    // the parse boundary, BEFORE any lookup.  A well-formed 64-hex hash that
+    // is simply absent keeps the handler's not-found semantics:
+    //   - getrawtransaction / getmempoolentry -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+    //   - gettxout                            -> null
+    //   - getblock / getblockheader           -> "Block not found" (-5)
+    // This test asserts BOTH directions for each in-scope RPC.
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.REGTEST,
+        .{},
+    );
+    defer server.deinit();
+
+    // Helper: dispatch `method` with the first positional arg = `hash` plus an
+    // optional `extra` suffix (used so gettxout can carry its required vout
+    // positional, e.g. extra = ",0`).
+    const Probe = struct {
+        fn run(srv: *RpcServer, alloc: std.mem.Allocator, method: []const u8, hash: []const u8, extra: []const u8) ![]const u8 {
+            const req = try std.fmt.allocPrint(
+                alloc,
+                "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"{s}\",\"params\":[\"{s}\"{s}]}}",
+                .{ method, hash, extra },
+            );
+            defer alloc.free(req);
+            return srv.dispatch(req);
+        }
+    };
+
+    // Malformed inputs to probe each method with:
+    //  (a) too-short hex  -> wrong-length branch
+    //  (b) 64-char non-hex (64 'z') -> right-length, bad-hex-chars branch
+    const too_short = "abc";
+    const non_hex = "z" ** 64;
+    const absent = "0" ** 64; // well-formed 64-hex, simply not present
+
+    // Scope: each in-scope RPC + the positional suffix needed to reach its
+    // ParseHashV-style boundary.  gettxout requires a vout positional BEFORE
+    // it parses the txid (Core gettxout(txid, n)), so it carries ",0".
+    const Case = struct { method: []const u8, extra: []const u8 };
+    const cases = [_]Case{
+        .{ .method = "getrawtransaction", .extra = "" },
+        .{ .method = "gettxout", .extra = ",0" },
+        .{ .method = "getmempoolentry", .extra = "" },
+        .{ .method = "getblock", .extra = "" },
+        .{ .method = "getblockheader", .extra = "" },
+    };
+
+    inline for (cases) |c| {
+        // (a) wrong length -> -8
+        {
+            const r = try Probe.run(&server, allocator, c.method, too_short, c.extra);
+            defer allocator.free(r);
+            std.testing.expect(std.mem.indexOf(u8, r, "\"code\":-8") != null) catch |e| {
+                std.debug.print("{s} wrong-length expected -8, got: {s}\n", .{ c.method, r });
+                return e;
+            };
+        }
+        // (b) right length, bad hex -> -8
+        {
+            const r = try Probe.run(&server, allocator, c.method, non_hex, c.extra);
+            defer allocator.free(r);
+            std.testing.expect(std.mem.indexOf(u8, r, "\"code\":-8") != null) catch |e| {
+                std.debug.print("{s} non-hex expected -8, got: {s}\n", .{ c.method, r });
+                return e;
+            };
+        }
+    }
+
+    // Well-formed-but-absent must NOT regress to the -8 parse error.
+    //  - gettxout returns a JSON null result (no error object).
+    {
+        const r = try Probe.run(&server, allocator, "gettxout", absent, ",0");
+        defer allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"result\":null") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"code\":-8") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"error\":null") != null);
+    }
+    //  - getrawtransaction / getmempoolentry return -5 RPC_INVALID_ADDRESS_OR_KEY.
+    inline for ([_][]const u8{ "getrawtransaction", "getmempoolentry" }) |method| {
+        const r = try Probe.run(&server, allocator, method, absent, "");
+        defer allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"code\":-8") == null);
+        std.testing.expect(std.mem.indexOf(u8, r, "\"code\":-5") != null) catch |e| {
+            std.debug.print("{s} absent expected -5, got: {s}\n", .{ method, r });
+            return e;
+        };
+    }
+    //  - getblock / getblockheader: the only invariant this fix guards is that a
+    //    well-formed-but-absent hash MUST NOT collapse into the -8 malformed-parse
+    //    error.  (On a standalone regtest node with no Core proxy and an empty
+    //    chain_manager, getblock emits a degenerate stub rather than -5 — a
+    //    separate, pre-existing quirk outside this parse-boundary fix's scope.)
+    inline for ([_][]const u8{ "getblock", "getblockheader" }) |method| {
+        const r = try Probe.run(&server, allocator, method, absent, "");
+        defer allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"code\":-8") == null);
+    }
 }
 
 test "regtest: getblockchaininfo.softforks and getdeploymentinfo.deployments are consistent" {
