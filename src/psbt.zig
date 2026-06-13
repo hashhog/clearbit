@@ -1855,7 +1855,7 @@ fn parseOutputMap(allocator: std.mem.Allocator, reader: *serialize_mod.Reader, o
 }
 
 /// Clone a transaction
-fn cloneTransaction(allocator: std.mem.Allocator, tx: *const types.Transaction) !types.Transaction {
+pub fn cloneTransaction(allocator: std.mem.Allocator, tx: *const types.Transaction) !types.Transaction {
     const inputs = try allocator.alloc(types.TxIn, tx.inputs.len);
     errdefer allocator.free(inputs);
 
@@ -1894,7 +1894,7 @@ fn cloneTransaction(allocator: std.mem.Allocator, tx: *const types.Transaction) 
 }
 
 /// Free a cloned transaction
-fn freeTransaction(allocator: std.mem.Allocator, tx: *types.Transaction) void {
+pub fn freeTransaction(allocator: std.mem.Allocator, tx: *types.Transaction) void {
     for (tx.inputs) |input| {
         if (input.script_sig.len > 0) allocator.free(input.script_sig);
         if (input.witness.len > 0) {
