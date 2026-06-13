@@ -3188,6 +3188,8 @@ pub const RpcServer = struct {
             return self.handleSendPayjoinRequest(params, id);
         } else if (std.mem.eql(u8, method, "walletcreatefundedpsbt")) {
             return self.handleWalletCreateFundedPsbt(params, id);
+        } else if (std.mem.eql(u8, method, "walletprocesspsbt")) {
+            return self.handleWalletProcessPsbt(params, id);
         } else if (std.mem.eql(u8, method, "fundrawtransaction")) {
             return self.handleFundRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "importdescriptors")) {
@@ -15154,6 +15156,248 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// walletprocesspsbt "psbt" ( sign sighashtype bip32derivs finalize )
+    ///
+    /// Updater + Signer (+ optional Finalizer) over a base64 PSBT, using the
+    /// wallet's keys. For each input the wallet owns:
+    ///   - Updater: fill `witness_utxo` from the matched wallet UTXO (so the
+    ///     serialized PSBT carries the prevout amount/scriptPubKey a later
+    ///     signer would need) and record the requested sighash type.
+    ///   - Signer: produce a REAL BIP-143 (segwit v0) / BIP-341 (Taproot
+    ///     Schnorr) / legacy ECDSA signature by driving the SAME engine
+    ///     `signrawtransactionwithwallet` uses — `Wallet.signInput`
+    ///     (wallet.zig:2665). That helper produces a final scriptSig/witness
+    ///     directly on a working copy of the unsigned tx; when `finalize` is
+    ///     true we lift those into the PSBT input's `final_script_sig` /
+    ///     `final_script_witness` fields (Signer+Finalizer combined, matching
+    ///     Core's `finalize=true` default), and when `finalize` is false we
+    ///     park the signature as a `partial_sig` so a later finalizer can
+    ///     assemble it.
+    ///
+    /// `complete` is true iff EVERY input is finalized (Psbt.isComplete), and
+    /// only then do we extract + serialize the network tx into `hex`, mirroring
+    /// Core v31.99's `walletprocesspsbt` (psbt/complete[/hex]).
+    ///
+    /// Reference: bitcoin-core/src/wallet/rpc/spend.cpp::walletprocesspsbt (1569).
+    /// Reused engine: Wallet.signInput (src/wallet.zig:2665) — same sighash +
+    /// ECDSA/Schnorr signer behind signrawtransactionwithwallet.
+    fn handleWalletProcessPsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+
+        if (params != .array or params.array.items.len == 0 or params.array.items[0] != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "walletprocesspsbt requires a base64 psbt string", id);
+        }
+        const psbt_b64 = params.array.items[0].string;
+
+        // sign (param[1], default true)
+        var sign = true;
+        if (params.array.items.len > 1 and params.array.items[1] == .bool) {
+            sign = params.array.items[1].bool;
+        }
+
+        // sighashtype (param[2], default ALL = 0x01; DEFAULT/0x00 for Taproot
+        // is accepted and routed through signInput's per-type handling).
+        var sighash_type: u32 = 0x01; // SIGHASH_ALL
+        if (params.array.items.len > 2 and params.array.items[2] == .string) {
+            const sh = params.array.items[2].string;
+            if (std.mem.eql(u8, sh, "DEFAULT")) {
+                sighash_type = 0x00;
+            } else if (std.mem.eql(u8, sh, "ALL")) {
+                sighash_type = 0x01;
+            } else if (std.mem.eql(u8, sh, "NONE")) {
+                sighash_type = 0x02;
+            } else if (std.mem.eql(u8, sh, "SINGLE")) {
+                sighash_type = 0x03;
+            } else if (std.mem.eql(u8, sh, "ALL|ANYONECANPAY")) {
+                sighash_type = 0x81;
+            } else if (std.mem.eql(u8, sh, "NONE|ANYONECANPAY")) {
+                sighash_type = 0x82;
+            } else if (std.mem.eql(u8, sh, "SINGLE|ANYONECANPAY")) {
+                sighash_type = 0x83;
+            } else {
+                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid sighash type", id);
+            }
+        }
+
+        // bip32derivs (param[3], default true) — accepted; clearbit does not
+        // track xpub key origins for owned single-key UTXOs, so this is a
+        // no-op for the fields we emit. Kept positional for Core parity.
+        _ = if (params.array.items.len > 3 and params.array.items[3] == .bool)
+            params.array.items[3].bool
+        else
+            true;
+
+        // finalize (param[4], default true)
+        var finalize = true;
+        if (params.array.items.len > 4 and params.array.items[4] == .bool) {
+            finalize = params.array.items[4].bool;
+        }
+
+        var psbt = psbt_mod.Psbt.fromBase64(self.allocator, psbt_b64) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
+        };
+        defer psbt.deinit();
+
+        // --- Resolve each input to a wallet UTXO (Updater bookkeeping). A null
+        // entry marks a foreign input → it can never be finalized here, so the
+        // PSBT can't be complete. We keep the slot so indices stay aligned and
+        // Taproot can build a full prevouts vector when every input is owned.
+        const owned = self.allocator.alloc(?wallet_mod.OwnedUtxo, psbt.tx.inputs.len) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer self.allocator.free(owned);
+
+        var all_owned = psbt.tx.inputs.len > 0;
+        for (psbt.tx.inputs, 0..) |pin, idx| {
+            owned[idx] = null;
+            for (wallet.utxos.items) |u| {
+                if (u.is_watchonly) continue;
+                if (std.mem.eql(u8, &u.outpoint.hash, &pin.previous_output.hash) and
+                    u.outpoint.index == pin.previous_output.index)
+                {
+                    owned[idx] = u;
+                    break;
+                }
+            }
+            if (owned[idx] == null) all_owned = false;
+        }
+
+        // Updater: advertise witness_utxo for every owned input that doesn't
+        // already carry a UTXO, and record the per-input sighash type.
+        for (owned, 0..) |maybe, idx| {
+            if (maybe) |u| {
+                if (psbt.inputs[idx].witness_utxo == null and psbt.inputs[idx].non_witness_utxo == null) {
+                    psbt.addInputUtxo(idx, u.output) catch {};
+                }
+                if (psbt.inputs[idx].sighash_type == null) {
+                    psbt.inputs[idx].sighash_type = sighash_type;
+                }
+            }
+        }
+
+        // BIP-341 needs the full owned-prevouts vector (sha_amounts /
+        // sha_scriptPubKeys). Only build it when every input is owned — a mixed
+        // owned/foreign tx can't sign a Taproot input under BIP-341 anyway.
+        var flat_prevouts_buf: ?[]wallet_mod.OwnedUtxo = null;
+        defer if (flat_prevouts_buf) |b| self.allocator.free(b);
+        var flat_prevouts: ?[]const wallet_mod.OwnedUtxo = null;
+        if (all_owned) {
+            const buf = self.allocator.alloc(wallet_mod.OwnedUtxo, psbt.tx.inputs.len) catch {
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+            };
+            for (owned, 0..) |po, i| buf[i] = po.?;
+            flat_prevouts_buf = buf;
+            flat_prevouts = buf;
+        }
+
+        // Signer: for each owned input, drive Wallet.signInput on a working
+        // copy of the unsigned tx. signInput writes the final scriptSig/witness
+        // onto the copy's input; we then either finalize the PSBT input with
+        // those bytes or stash a partial_sig (finalize=false).
+        if (sign) {
+            for (owned, 0..) |maybe, idx| {
+                const u = maybe orelse continue;
+                if (psbt.inputs[idx].isFinalized()) continue;
+
+                // Build a single-input working tx that shares the PSBT's
+                // outpoints/sequences/outputs so the sighash matches the PSBT.
+                var work = psbt_mod.cloneTransaction(self.allocator, &psbt.tx) catch continue;
+                defer psbt_mod.freeTransaction(self.allocator, &work);
+
+                wallet.signInput(&work, idx, u, sighash_type, flat_prevouts) catch {
+                    // Unsignable input (e.g. missing witness script for a
+                    // bare P2WSH): leave it unfinalized → complete=false.
+                    continue;
+                };
+
+                const signed_in = work.inputs[idx];
+                if (finalize) {
+                    // Lift the produced final scriptSig/witness into the PSBT
+                    // input (Signer+Finalizer). Deep-copy so PSBT owns them.
+                    if (signed_in.script_sig.len > 0) {
+                        psbt.inputs[idx].final_script_sig =
+                            self.allocator.dupe(u8, signed_in.script_sig) catch continue;
+                    }
+                    if (signed_in.witness.len > 0) {
+                        const w = self.allocator.alloc([]const u8, signed_in.witness.len) catch continue;
+                        for (signed_in.witness, 0..) |item, k| {
+                            w[k] = self.allocator.dupe(u8, item) catch &[_]u8{};
+                        }
+                        psbt.inputs[idx].final_script_witness = w;
+                    }
+                } else {
+                    // finalize=false: record the raw signature as a partial_sig
+                    // keyed by the signing pubkey, so a later finalizer can
+                    // assemble the scriptSig/witness. Only the single-key
+                    // shapes (p2pkh/p2wpkh/p2sh-p2wpkh) carry a recoverable
+                    // (pubkey, sig) pair here.
+                    const ps = extractPartialSig(u.address_type, signed_in) orelse continue;
+                    psbt.addPartialSig(idx, ps.pubkey, ps.sig) catch {};
+                }
+            }
+        }
+
+        // Finalizer fallback: if the caller asked to finalize but an owned
+        // input already carried partial sigs/scripts from a prior round, let
+        // the PSBT module's structural finalizer try to complete it too.
+        if (finalize) psbt.finalize() catch {};
+
+        const complete = psbt.isComplete();
+
+        // Serialize the (possibly updated/signed) PSBT.
+        const out_b64 = psbt.toBase64(self.allocator) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to encode PSBT", id);
+        };
+        defer self.allocator.free(out_b64);
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeAll("{\"psbt\":\"");
+        try writer.writeAll(out_b64);
+        try writer.print("\",\"complete\":{s}", .{if (complete) "true" else "false"});
+
+        // v31.99 emits the finalized network tx hex when complete.
+        if (complete) {
+            const tx = psbt.extract() catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to extract transaction", id);
+            };
+            defer {
+                for (tx.inputs) |input| {
+                    if (input.script_sig.len > 0) self.allocator.free(input.script_sig);
+                    if (input.witness.len > 0) {
+                        for (input.witness) |item| {
+                            if (item.len > 0) self.allocator.free(item);
+                        }
+                        self.allocator.free(input.witness);
+                    }
+                }
+                self.allocator.free(tx.inputs);
+                for (tx.outputs) |output| {
+                    if (output.script_pubkey.len > 0) self.allocator.free(output.script_pubkey);
+                }
+                self.allocator.free(tx.outputs);
+            }
+
+            var tx_writer = serialize.Writer.init(self.allocator);
+            defer tx_writer.deinit();
+            try serialize.writeTransaction(&tx_writer, &tx);
+
+            try writer.writeAll(",\"hex\":\"");
+            for (tx_writer.getWritten()) |byte| {
+                try writer.print("{x:0>2}", .{byte});
+            }
+            try writer.writeByte('"');
+        }
+
+        try writer.writeByte('}');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// fundrawtransaction "hexstring" ( options iswitness )
     /// Decode a raw transaction, then add inputs (and, if needed, a change
     /// output) so the wallet funds all existing outputs plus the fee. Existing
@@ -20213,6 +20457,49 @@ fn isRegtestMagic(magic: u32) bool {
     return magic == consensus.REGTEST.magic;
 }
 
+/// walletprocesspsbt `finalize=false` helper: recover the (pubkey, sig) pair
+/// from the final scriptSig/witness that `Wallet.signInput` just produced, so
+/// it can be parked as a PSBT `partial_sig` instead of a finalized input.
+///
+/// Only the single-key shapes carry a recoverable pair:
+///   - p2pkh:        scriptSig = `<push sig+hashtype> <push 33-byte pubkey>`
+///   - p2wpkh /      witness   = `[sig+hashtype, 33-byte pubkey]`
+///     p2sh_p2wpkh
+/// Returns null (caller skips parking a partial sig, leaving the input
+/// unfinalized) for Taproot / P2WSH / multisig, which Core also represents
+/// differently (tap_key_sig / per-pubkey partial sigs in script order).
+fn extractPartialSig(
+    addr_type: wallet_mod.AddressType,
+    signed_in: types.TxIn,
+) ?struct { pubkey: [33]u8, sig: []const u8 } {
+    switch (addr_type) {
+        .p2wpkh, .p2sh_p2wpkh => {
+            if (signed_in.witness.len != 2) return null;
+            const sig = signed_in.witness[0];
+            const pk = signed_in.witness[1];
+            if (pk.len != 33 or sig.len == 0) return null;
+            var pubkey: [33]u8 = undefined;
+            @memcpy(&pubkey, pk[0..33]);
+            return .{ .pubkey = pubkey, .sig = sig };
+        },
+        .p2pkh => {
+            // scriptSig: [len(sig+ht)] sig+ht [33] pubkey
+            const ss = signed_in.script_sig;
+            if (ss.len < 1) return null;
+            const sig_len: usize = ss[0];
+            if (ss.len < 1 + sig_len + 1 + 33) return null;
+            const sig = ss[1 .. 1 + sig_len];
+            const pk_push_idx = 1 + sig_len;
+            if (ss[pk_push_idx] != 33) return null;
+            const pk = ss[pk_push_idx + 1 .. pk_push_idx + 1 + 33];
+            var pubkey: [33]u8 = undefined;
+            @memcpy(&pubkey, pk[0..33]);
+            return .{ .pubkey = pubkey, .sig = sig };
+        },
+        else => return null,
+    }
+}
+
 /// W53 — map a PSBT_IN_SIGHASH_TYPE value to the Core string emitted by
 /// `SighashToStr` (core_io.cpp:334-347). Unknown sighash types return "".
 fn sighashTypeToStr(sighash: u32) []const u8 {
@@ -23787,6 +24074,164 @@ test "lockunspent unlock-all clears every lock" {
     defer allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"result\":true") != null);
     try std.testing.expectEqual(@as(usize, 0), wallet.lockedCoinCount());
+}
+
+test "walletprocesspsbt signs + finalizes a single-wallet-input PSBT; sig verifies through the engine" {
+    if (!crypto.initSecp256k1()) return error.SkipZigTest;
+    defer crypto.deinitSecp256k1();
+
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var wallet = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    // Single 1 BTC P2WPKH UTXO owned by the wallet.
+    var sk: [32]u8 = [_]u8{0} ** 32;
+    sk[31] = 0x01;
+    const ki = try wallet.importKey(sk);
+    const utxo_spk = try wallet.getScriptPubKey(ki, .p2wpkh);
+    // Wallet.deinit() frees the utxos ArrayList but NOT each utxo's
+    // script_pubkey, so we own utxo_spk and free it here. It doubles as the
+    // prevout scriptPubKey for the verifier at the end of the test.
+    defer allocator.free(utxo_spk);
+    const prevout_spk = utxo_spk;
+    const prevout_amount: i64 = 100_000_000;
+    const utxo_hash: [32]u8 = [_]u8{0xab} ** 32;
+    try wallet.addUtxo(.{
+        .outpoint = .{ .hash = utxo_hash, .index = 0 },
+        .output = .{ .value = prevout_amount, .script_pubkey = utxo_spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+        .is_coinbase = false,
+        .height = 100,
+    });
+
+    var server = RpcServer.initWithWallet(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        &wallet,
+        .{},
+    );
+    defer server.deinit();
+
+    // Step 1: build an unsigned, funded PSBT spending the wallet UTXO.
+    const create_req =
+        "{\"id\":1,\"method\":\"walletcreatefundedpsbt\",\"params\":[" ++
+        "[{\"txid\":\"abababababababababababababababababababababababababababababababab\",\"vout\":0}]," ++
+        "[{\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\":0.5}]" ++
+        "]}";
+    const create_resp = try server.dispatch(create_req);
+    defer allocator.free(create_resp);
+
+    var create_parsed = try std.json.parseFromSlice(std.json.Value, allocator, create_resp, .{});
+    defer create_parsed.deinit();
+    const create_result_v = create_parsed.value.object.get("result") orelse {
+        std.debug.print("walletcreatefundedpsbt no result: {s}\n", .{create_resp});
+        return error.TestUnexpectedResult;
+    };
+    if (create_result_v != .object) {
+        std.debug.print("walletcreatefundedpsbt non-object result: {s}\n", .{create_resp});
+        return error.TestUnexpectedResult;
+    }
+    const unsigned_psbt = create_result_v.object.get("psbt").?.string;
+
+    // Step 2: walletprocesspsbt — sign + finalize (Core defaults).
+    var proc_req = std.ArrayList(u8).init(allocator);
+    defer proc_req.deinit();
+    try proc_req.appendSlice("{\"id\":2,\"method\":\"walletprocesspsbt\",\"params\":[\"");
+    try proc_req.appendSlice(unsigned_psbt);
+    try proc_req.appendSlice("\"]}");
+
+    const proc_resp = try server.dispatch(proc_req.items);
+    defer allocator.free(proc_resp);
+
+    var proc_parsed = try std.json.parseFromSlice(std.json.Value, allocator, proc_resp, .{});
+    defer proc_parsed.deinit();
+    const result = proc_parsed.value.object.get("result") orelse {
+        std.debug.print("walletprocesspsbt no result: {s}\n", .{proc_resp});
+        return error.TestUnexpectedResult;
+    };
+    if (result != .object) {
+        std.debug.print("walletprocesspsbt non-object result: {s}\n", .{proc_resp});
+        return error.TestUnexpectedResult;
+    }
+
+    // (b) the returned psbt is valid base64 that round-trips through the parser.
+    const out_psbt = result.object.get("psbt").?.string;
+    var round = try psbt_mod.Psbt.fromBase64(allocator, out_psbt);
+    round.deinit();
+
+    // (c) complete == true for a single-wallet-input PSBT.
+    try std.testing.expectEqual(true, result.object.get("complete").?.bool);
+
+    // v31.99 emits the finalized network tx hex when complete.
+    const hex = result.object.get("hex").?.string;
+    try std.testing.expect(hex.len > 0);
+
+    // Decode the finalized network tx.
+    var hex_bytes = try allocator.alloc(u8, hex.len / 2);
+    defer allocator.free(hex_bytes);
+    for (0..hex.len / 2) |i| {
+        hex_bytes[i] = try std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16);
+    }
+    var reader = serialize.Reader{ .data = hex_bytes };
+    const tx = try serialize.readTransaction(&reader, allocator);
+    defer serialize.freeTransaction(allocator, &tx);
+
+    // Locate the wallet input (the one spending our UTXO) and confirm the
+    // signer actually produced a witness for it (not just a non-empty field).
+    var wallet_in: ?usize = null;
+    for (tx.inputs, 0..) |in, i| {
+        if (std.mem.eql(u8, &in.previous_output.hash, &utxo_hash) and in.previous_output.index == 0) {
+            wallet_in = i;
+            break;
+        }
+    }
+    const wi = wallet_in orelse return error.TestUnexpectedResult;
+    try std.testing.expect(tx.inputs[wi].witness.len == 2); // [sig+hashtype, pubkey]
+    try std.testing.expect(tx.inputs[wi].witness[0].len > 0); // real signature bytes
+
+    // (d) ⭐ the produced signature VERIFIES against the prevout
+    //     scriptPubKey + BIP-143 sighash through clearbit's OWN script engine.
+    //     This runs CHECKSIG over the reconstructed P2WPKH scriptCode using the
+    //     witness sig — a fabricated/empty sig would fail here.
+    var engine = script_mod.ScriptEngine.init(
+        allocator,
+        &tx,
+        wi,
+        prevout_amount,
+        .{}, // default consensus flags (verify_witness on)
+    );
+    defer engine.deinit();
+    const ok = try engine.verify(
+        tx.inputs[wi].script_sig, // empty for native P2WPKH
+        prevout_spk, // OP_0 <20-byte hash>
+        tx.inputs[wi].witness,
+    );
+    try std.testing.expect(ok);
+
+    // Negative control: flipping a byte of the signature must make the engine
+    // reject — proves the verify above isn't vacuously passing.
+    {
+        const tampered_sig = try allocator.dupe(u8, tx.inputs[wi].witness[0]);
+        defer allocator.free(tampered_sig);
+        tampered_sig[10] ^= 0xFF;
+        var tampered_witness = [_][]const u8{ tampered_sig, tx.inputs[wi].witness[1] };
+        var bad_engine = script_mod.ScriptEngine.init(allocator, &tx, wi, prevout_amount, .{});
+        defer bad_engine.deinit();
+        const bad_ok = bad_engine.verify(tx.inputs[wi].script_sig, prevout_spk, &tampered_witness) catch false;
+        try std.testing.expect(!bad_ok);
+    }
 }
 
 test "selectCoinsWithOptions skips locked outpoints" {
