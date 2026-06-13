@@ -261,6 +261,56 @@ pub fn readTransaction(reader: *Reader, allocator: std.mem.Allocator) !types.Tra
     };
 }
 
+/// Read a transaction WITHOUT the segwit-marker heuristic — i.e. always parse
+/// the legacy (non-witness) wire form: version || vin || vout || locktime.
+///
+/// `readTransaction` treats a leading 0x00 input-count as the BIP-144 segwit
+/// marker, which is correct for on-the-wire / block transactions but
+/// AMBIGUOUS for a freshly-built raw tx that legitimately has zero inputs
+/// (e.g. the output of `createrawtransaction "[]" {...}`, the exact input
+/// `fundrawtransaction` is designed to consume). Bitcoin Core resolves this
+/// with the `iswitness` flag / its `try_no_witness`/`try_witness` heuristic in
+/// DecodeHexTx (core_io.cpp). This is the `iswitness=false` branch.
+pub fn readTransactionNoWitness(reader: *Reader, allocator: std.mem.Allocator) !types.Transaction {
+    @setRuntimeSafety(true);
+    const version = try reader.readInt(i32);
+
+    const input_count = try reader.readCompactSize();
+    const inputs = try allocator.alloc(types.TxIn, @intCast(input_count));
+    errdefer allocator.free(inputs);
+    for (inputs) |*input| {
+        const prev_hash = try reader.readHash();
+        const prev_index = try reader.readInt(u32);
+        const script_len = try reader.readCompactSize();
+        const script_sig = try allocator.dupe(u8, try reader.readBytes(@intCast(script_len)));
+        const sequence = try reader.readInt(u32);
+        input.* = .{
+            .previous_output = .{ .hash = prev_hash, .index = prev_index },
+            .script_sig = script_sig,
+            .sequence = sequence,
+            .witness = &[_][]const u8{},
+        };
+    }
+
+    const output_count = try reader.readCompactSize();
+    const outputs = try allocator.alloc(types.TxOut, @intCast(output_count));
+    errdefer allocator.free(outputs);
+    for (outputs) |*output| {
+        const value = try reader.readInt(i64);
+        const script_len = try reader.readCompactSize();
+        const script_pubkey = try allocator.dupe(u8, try reader.readBytes(@intCast(script_len)));
+        output.* = .{ .value = value, .script_pubkey = script_pubkey };
+    }
+
+    const lock_time = try reader.readInt(u32);
+    return .{
+        .version = version,
+        .inputs = inputs,
+        .outputs = outputs,
+        .lock_time = lock_time,
+    };
+}
+
 /// Read a block header from the binary stream (80 bytes)
 pub fn readBlockHeader(reader: *Reader) Error!types.BlockHeader {
     const version = try reader.readInt(i32);
