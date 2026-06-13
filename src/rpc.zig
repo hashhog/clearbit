@@ -3188,6 +3188,8 @@ pub const RpcServer = struct {
             return self.handleSendPayjoinRequest(params, id);
         } else if (std.mem.eql(u8, method, "walletcreatefundedpsbt")) {
             return self.handleWalletCreateFundedPsbt(params, id);
+        } else if (std.mem.eql(u8, method, "fundrawtransaction")) {
+            return self.handleFundRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "importdescriptors")) {
             return self.handleImportDescriptors(params, id);
         } else if (std.mem.eql(u8, method, "validateaddress")) {
@@ -15152,6 +15154,300 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// fundrawtransaction "hexstring" ( options iswitness )
+    /// Decode a raw transaction, then add inputs (and, if needed, a change
+    /// output) so the wallet funds all existing outputs plus the fee. Existing
+    /// inputs and outputs are preserved. This is the raw-tx sibling of
+    /// walletcreatefundedpsbt — it drives the SAME coin-selection engine
+    /// (`Wallet.selectCoinsWithOptions`, wallet.zig:2226) on the decoded tx and
+    /// serializes the funded tx to hex instead of emitting a PSBT.
+    ///
+    /// Reference: bitcoin-core/src/wallet/rpc/spend.cpp::fundrawtransaction (706)
+    /// / FundTransaction (470). Result object: {hex, fee, changepos} where
+    /// changepos is the index of the added change output, or -1 if none.
+    ///
+    /// Supported options: feeRate (BTC/kvB) / fee_rate (sat/vB), changeAddress,
+    /// changePosition (int), subtractFeeFromOutputs (array of output indices).
+    /// Other options (lockUnspents, includeWatching, change_type, conf_target,
+    /// estimate_mode, add_inputs, …) are accepted-and-ignored, matching the
+    /// conservative-port pattern of the rest of clearbit's wallet surface.
+    fn handleFundRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing hexstring", id);
+        }
+        const hex_param = params.array.items[0];
+        if (hex_param != .string) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "hexstring must be a string", id);
+        }
+        const hex_str = hex_param.string;
+        if (hex_str.len % 2 != 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length", id);
+        }
+
+        // Decode the raw tx hex into a Transaction we own (same path as
+        // decoderawtransaction). freeTransaction releases the slices below.
+        var tx_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+        };
+        defer self.allocator.free(tx_bytes);
+        for (0..hex_str.len / 2) |i| {
+            tx_bytes[i] = std.fmt.parseInt(u8, hex_str[i * 2 .. i * 2 + 2], 16) catch {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex", id);
+            };
+        }
+        // Decode honoring the optional `iswitness` flag (params[2]), matching
+        // Core's DecodeHexTx try_no_witness/try_witness heuristic. When the
+        // flag is absent we try the non-witness form first then the witness
+        // form — the non-witness path is what correctly decodes a 0-input raw
+        // tx (createrawtransaction output), whose 0x00 input-count would
+        // otherwise be misread as the BIP-144 segwit marker. A successful
+        // decode must consume the whole buffer (rejects trailing-garbage / a
+        // partial witness-misparse).
+        var try_witness = true;
+        var try_no_witness = true;
+        if (params.array.items.len > 2 and params.array.items[2] == .bool) {
+            try_witness = params.array.items[2].bool;
+            try_no_witness = !params.array.items[2].bool;
+        }
+        const decoded: types.Transaction = blk: {
+            if (try_no_witness) {
+                var r = serialize.Reader{ .data = tx_bytes };
+                if (serialize.readTransactionNoWitness(&r, self.allocator)) |tx| {
+                    if (r.isAtEnd()) break :blk tx;
+                    serialize.freeTransaction(self.allocator, &tx);
+                } else |_| {}
+            }
+            if (try_witness) {
+                var r = serialize.Reader{ .data = tx_bytes };
+                if (serialize.readTransaction(&r, self.allocator)) |tx| {
+                    if (r.isAtEnd()) break :blk tx;
+                    serialize.freeTransaction(self.allocator, &tx);
+                } else |_| {}
+            }
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
+        };
+        defer serialize.freeTransaction(self.allocator, &decoded);
+
+        // Parse options (params[1]).
+        var fee_rate: u64 = 1; // sat/vB
+        var change_address_opt: ?[]const u8 = null;
+        var change_position: ?i64 = null;
+        var sffo_param: ?std.json.Value = null;
+        if (params.array.items.len > 1 and params.array.items[1] == .object) {
+            const opts = params.array.items[1].object;
+            // fee_rate (sat/vB) takes precedence over feeRate (BTC/kvB) in Core.
+            if (opts.get("fee_rate")) |fr| {
+                if (fr == .float) {
+                    fee_rate = @max(1, @as(u64, @intFromFloat(fr.float)));
+                } else if (fr == .integer) {
+                    fee_rate = @max(1, @as(u64, @intCast(fr.integer)));
+                }
+            } else if (opts.get("feeRate")) |fr| {
+                if (fr == .float) {
+                    fee_rate = @max(1, @as(u64, @intFromFloat(fr.float * 100_000.0)));
+                } else if (fr == .integer) {
+                    fee_rate = @max(1, @as(u64, @intCast(fr.integer * 100_000)));
+                }
+            }
+            if (opts.get("changeAddress")) |ca| {
+                if (ca == .string) change_address_opt = ca.string;
+            }
+            if (opts.get("changePosition")) |cp| {
+                if (cp == .integer) change_position = cp.integer;
+            }
+            if (opts.get("subtractFeeFromOutputs")) |sffo| {
+                if (sffo == .array) sffo_param = sffo;
+            }
+        }
+
+        // Copy the decoded outputs into an owned, mutable list (we may add a
+        // change output, and subtractFeeFromOutputs mutates existing values).
+        // Each script_pubkey is duped so this list owns its memory independently
+        // of `decoded` (freed via freeTransaction above).
+        var tx_outputs = std.ArrayList(types.TxOut).init(self.allocator);
+        defer {
+            for (tx_outputs.items) |o| self.allocator.free(o.script_pubkey);
+            tx_outputs.deinit();
+        }
+        for (decoded.outputs) |o| {
+            try tx_outputs.append(types.TxOut{
+                .value = o.value,
+                .script_pubkey = try self.allocator.dupe(u8, o.script_pubkey),
+            });
+        }
+
+        // The funding target is the sum of all existing outputs. selectCoins
+        // reserves the per-input fee internally and returns the change residue.
+        var target_value: i64 = 0;
+        for (tx_outputs.items) |o| target_value += o.value;
+
+        // Copy the decoded inputs into an owned, mutable list and subtract any
+        // input whose prevout the wallet already holds from the target (a
+        // partially-funded raw tx tops up from coin selection).
+        var tx_inputs = std.ArrayList(types.TxIn).init(self.allocator);
+        defer {
+            for (tx_inputs.items) |in| {
+                if (in.script_sig.len > 0) self.allocator.free(in.script_sig);
+            }
+            tx_inputs.deinit();
+        }
+        // Inputs we can account for value-wise (existing wallet inputs +
+        // selected inputs). Used only for the fee/change arithmetic.
+        var input_total: i64 = 0;
+        for (decoded.inputs) |in| {
+            try tx_inputs.append(types.TxIn{
+                .previous_output = in.previous_output,
+                .script_sig = if (in.script_sig.len > 0) try self.allocator.dupe(u8, in.script_sig) else &[_]u8{},
+                .sequence = in.sequence,
+                .witness = &[_][]const u8{},
+            });
+            for (wallet.utxos.items) |u| {
+                if (std.mem.eql(u8, &u.outpoint.hash, &in.previous_output.hash) and
+                    u.outpoint.index == in.previous_output.index)
+                {
+                    target_value -= u.output.value;
+                    input_total += u.output.value;
+                    break;
+                }
+            }
+        }
+
+        // Run coin selection on the remaining (positive) target.
+        var selected: []wallet_mod.OwnedUtxo = &[_]wallet_mod.OwnedUtxo{};
+        var change_value: i64 = 0;
+        var did_select = false;
+        if (target_value > 0) {
+            const sel = wallet.selectCoinsWithOptions(target_value, .{ .fee_rate = fee_rate }) catch |e| switch (e) {
+                error.InsufficientFunds => return self.jsonRpcError(
+                    RPC_WALLET_INSUFFICIENT_FUNDS,
+                    "Insufficient funds",
+                    id,
+                ),
+                else => return self.jsonRpcError(RPC_INTERNAL_ERROR, "Coin selection failed", id),
+            };
+            selected = sel.selected;
+            change_value = sel.change;
+            did_select = true;
+        }
+        defer if (did_select) self.allocator.free(selected);
+
+        // Append the freshly-selected inputs.
+        for (selected) |u| {
+            try tx_inputs.append(types.TxIn{
+                .previous_output = u.outpoint,
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFD,
+                .witness = &[_][]const u8{},
+            });
+            input_total += u.output.value;
+        }
+
+        // subtractFeeFromOutputs: deduct the fee equally across the listed
+        // (pre-change) output indices. With SFFO set the recipient pays the fee
+        // and there is no extra change residue, so fold the change back in.
+        // (Core: CreateTransaction subtract-fee path.) Applied BEFORE inserting
+        // the change output so indices match the user's view of the raw tx.
+        if (sffo_param) |sffo| {
+            const n = sffo.array.items.len;
+            if (n > 0) {
+                var output_total_before: i64 = 0;
+                for (tx_outputs.items) |o| output_total_before += o.value;
+                const fee_to_subtract = input_total - output_total_before;
+                if (fee_to_subtract > 0) {
+                    const per: i64 = @divTrunc(fee_to_subtract, @as(i64, @intCast(n)));
+                    var rem: i64 = fee_to_subtract - per * @as(i64, @intCast(n));
+                    for (sffo.array.items) |idx_v| {
+                        if (idx_v != .integer) continue;
+                        const idx = idx_v.integer;
+                        if (idx < 0 or idx >= @as(i64, @intCast(tx_outputs.items.len))) continue;
+                        var deduct = per;
+                        if (rem > 0) {
+                            deduct += 1;
+                            rem -= 1;
+                        }
+                        tx_outputs.items[@intCast(idx)].value -= deduct;
+                    }
+                    // Fee now comes from the recipients; no separate change.
+                    change_value = 0;
+                }
+            }
+        }
+
+        // Insert a change output when the selector left dust-or-better residue.
+        // changePosition (if given and in range) controls where it lands;
+        // otherwise it is appended at the end. -1 / out-of-range → end.
+        var changepos: i64 = -1;
+        if (change_value >= 546) {
+            const change_spk = if (change_address_opt) |ca|
+                scriptPubKeyForAddress(self.allocator, ca) catch {
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid changeAddress", id);
+                }
+            else blk: {
+                const new_addr = wallet.getnewaddress(.p2wpkh, true) catch {
+                    return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to derive change address", id);
+                };
+                defer self.allocator.free(new_addr.address);
+                break :blk scriptPubKeyForAddress(self.allocator, new_addr.address) catch {
+                    return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to build change scriptPubKey", id);
+                };
+            };
+            const change_out = types.TxOut{ .value = change_value, .script_pubkey = change_spk };
+            if (change_position) |cp| {
+                if (cp >= 0 and cp <= @as(i64, @intCast(tx_outputs.items.len))) {
+                    try tx_outputs.insert(@intCast(cp), change_out);
+                    changepos = cp;
+                } else {
+                    try tx_outputs.append(change_out);
+                    changepos = @intCast(tx_outputs.items.len - 1);
+                }
+            } else {
+                try tx_outputs.append(change_out);
+                changepos = @intCast(tx_outputs.items.len - 1);
+            }
+        }
+
+        // Materialize the funded tx and serialize it to hex (no witness data;
+        // inputs are unsigned, so writeTransaction emits the legacy form).
+        const funded = types.Transaction{
+            .version = decoded.version,
+            .inputs = tx_inputs.items,
+            .outputs = tx_outputs.items,
+            .lock_time = decoded.lock_time,
+        };
+
+        var swriter = serialize.Writer.init(self.allocator);
+        defer swriter.deinit();
+        serialize.writeTransaction(&swriter, &funded) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Serialization failed", id);
+        };
+
+        // The fee is the genuine residue: selected/existing input value minus
+        // the final output total (which already includes change + any SFFO
+        // deductions). Matches Core's reported fee.
+        var output_total: i64 = 0;
+        for (tx_outputs.items) |o| output_total += o.value;
+        const fee = if (input_total > output_total) input_total - output_total else 0;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeAll("{\"hex\":\"");
+        for (swriter.getWritten()) |byte| {
+            try writer.print("{x:0>2}", .{byte});
+        }
+        try writer.print("\",\"fee\":{d:.8},\"changepos\":{d}}}", .{
+            @as(f64, @floatFromInt(fee)) / 100_000_000.0,
+            changepos,
+        });
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// One per-request element of the importdescriptors result array. Mirrors
     /// Bitcoin Core's ProcessDescriptorImport return (backup.cpp:293-298):
     /// success:true, or success:false + {code,message}. A thrown error is
@@ -23777,6 +24073,147 @@ test "walletcreatefundedpsbt rejects insufficient funds" {
     const resp = try server.dispatch(req);
     defer allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "Insufficient funds") != null);
+}
+
+test "fundrawtransaction funds a raw tx with real inputs + change" {
+    if (!crypto.initSecp256k1()) return error.SkipZigTest;
+    defer crypto.deinitSecp256k1();
+
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var wallet = try wallet_mod.Wallet.init(allocator, .mainnet);
+    defer wallet.deinit();
+
+    // Regtest-style funded wallet fixture: a single 1 BTC P2WPKH UTXO, the
+    // same fixture walletcreatefundedpsbt's test uses.
+    var sk: [32]u8 = [_]u8{0} ** 32;
+    sk[31] = 0x01;
+    const ki = try wallet.importKey(sk);
+    const spk = try wallet.getScriptPubKey(ki, .p2wpkh);
+    // addUtxo borrows the script slice; wallet.deinit never frees it, so this
+    // test owns it (the existing walletcreatefundedpsbt test leaks here — we
+    // keep our fixture clean for the leak-checking GPA).
+    defer allocator.free(spk);
+    const FUNDING_VALUE: i64 = 100_000_000; // 1 BTC
+    try wallet.addUtxo(.{
+        .outpoint = .{ .hash = [_]u8{0xab} ** 32, .index = 0 },
+        .output = .{ .value = FUNDING_VALUE, .script_pubkey = spk },
+        .key_index = ki,
+        .address_type = .p2wpkh,
+        .confirmations = 6,
+        .is_coinbase = false,
+        .height = 100,
+    });
+
+    var server = RpcServer.initWithWallet(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        &wallet,
+        .{},
+    );
+    defer server.deinit();
+
+    // Step 1: build a raw tx with ONE output (0.5 BTC) and NO inputs, the way
+    // the funding RPCs expect their caller to.
+    const create_req =
+        "{\"id\":1,\"method\":\"createrawtransaction\",\"params\":[" ++
+        "[]," ++
+        "[{\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\":0.5}]" ++
+        "]}";
+    const create_resp = try server.dispatch(create_req);
+    defer allocator.free(create_resp);
+
+    var create_parsed = try std.json.parseFromSlice(std.json.Value, allocator, create_resp, .{});
+    defer create_parsed.deinit();
+    const raw_hex = create_parsed.value.object.get("result").?.string;
+
+    // Step 2: fund it. No options → default path: add inputs from the wallet
+    // UTXO set + a change output.
+    var fund_req = std.ArrayList(u8).init(allocator);
+    defer fund_req.deinit();
+    try fund_req.appendSlice("{\"id\":2,\"method\":\"fundrawtransaction\",\"params\":[\"");
+    try fund_req.appendSlice(raw_hex);
+    try fund_req.appendSlice("\"]}");
+
+    const fund_resp = try server.dispatch(fund_req.items);
+    defer allocator.free(fund_resp);
+
+    var fund_parsed = try std.json.parseFromSlice(std.json.Value, allocator, fund_resp, .{});
+    defer fund_parsed.deinit();
+    const result = fund_parsed.value.object.get("result") orelse {
+        std.debug.print("fundrawtransaction no result key: {s}\n", .{fund_resp});
+        return error.TestUnexpectedResult;
+    };
+    if (result != .object) {
+        std.debug.print("fundrawtransaction non-object result, full resp: {s}\n", .{fund_resp});
+        return error.TestUnexpectedResult;
+    }
+
+    const funded_hex = result.object.get("hex").?.string;
+    const fee = result.object.get("fee").?.float;
+    const changepos = result.object.get("changepos").?.integer;
+
+    // fee must be a GENUINE positive value.
+    try std.testing.expect(fee > 0.0);
+    const fee_sats: i64 = @intFromFloat(fee * 100_000_000.0);
+    try std.testing.expect(fee_sats > 0);
+
+    // A change output must have been added (selecting 1 BTC for a 0.5 BTC
+    // target leaves ~0.5 BTC change), so changepos != -1.
+    try std.testing.expect(changepos != -1);
+
+    // Step 3: decode the returned hex back into a tx and validate it.
+    var hex_bytes = try allocator.alloc(u8, funded_hex.len / 2);
+    defer allocator.free(hex_bytes);
+    for (0..funded_hex.len / 2) |i| {
+        hex_bytes[i] = try std.fmt.parseInt(u8, funded_hex[i * 2 ..][0..2], 16);
+    }
+    var reader = serialize.Reader{ .data = hex_bytes };
+    const decoded = try serialize.readTransaction(&reader, allocator);
+    defer serialize.freeTransaction(allocator, &decoded);
+
+    // Inputs were added (vin non-empty) and at least one is the wallet UTXO.
+    try std.testing.expect(decoded.inputs.len >= 1);
+    var input_total: i64 = 0;
+    for (decoded.inputs) |in| {
+        for (wallet.utxos.items) |u| {
+            if (std.mem.eql(u8, &u.outpoint.hash, &in.previous_output.hash) and
+                u.outpoint.index == in.previous_output.index)
+            {
+                input_total += u.output.value;
+                break;
+            }
+        }
+    }
+    try std.testing.expectEqual(FUNDING_VALUE, input_total);
+
+    // changepos must index a real output in the returned hex.
+    try std.testing.expect(changepos >= 0 and changepos < @as(i64, @intCast(decoded.outputs.len)));
+    // The original 0.5 BTC recipient output is still present (existing outputs
+    // are preserved) → with the added change there are exactly 2 outputs.
+    try std.testing.expectEqual(@as(usize, 2), decoded.outputs.len);
+
+    var output_total: i64 = 0;
+    for (decoded.outputs) |o| output_total += o.value;
+    const change_value = decoded.outputs[@intCast(changepos)].value;
+    try std.testing.expect(change_value > 0);
+
+    // The core invariant: sum(inputs) == sum(outputs) + fee, i.e. the input
+    // value covers outputs+fee exactly, and change = inputs - outputs - fee.
+    try std.testing.expectEqual(input_total, output_total + fee_sats);
+    // change = inputs - (non-change outputs) - fee. Non-change output total is
+    // output_total - change_value.
+    const non_change_out = output_total - change_value;
+    try std.testing.expectEqual(change_value, input_total - non_change_out - fee_sats);
 }
 
 // ============================================================================
