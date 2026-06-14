@@ -2005,6 +2005,24 @@ pub const ChainState = struct {
     /// stuck-at-370001 corruption mode (Option A, wave2-2026-04-14).
     flush_error: bool = false,
 
+    // ── AssumeUTXO snapshot-activation state (Core Chainstate
+    //    m_from_snapshot_blockhash / m_assumeutxo) ────────────────────────────
+    // Populated when this chainstate was activated from an AssumeUTXO snapshot
+    // and the REAL background genesis→base re-derivation has run.  Read by
+    // getchainstates to report `snapshot_blockhash` + `validated` from the
+    // ACTUAL validation state (not a hard-coded `true`).  Default = no snapshot
+    // active (validated = true: a plain genesis-validated chainstate).
+    //
+    /// The snapshot base block hash this chainstate was activated from, or null
+    /// for a normal (non-snapshot) chainstate.  Core: m_from_snapshot_blockhash.
+    from_snapshot_blockhash: ?types.Hash256 = null,
+    /// Whether the background genesis→base re-derivation has completed AND its
+    /// HASH_SERIALIZED matched au_data.hash_serialized.  Core: m_assumeutxo ==
+    /// Assumeutxo::VALIDATED.  For a non-snapshot chainstate this is true (it is
+    /// validated from genesis).  For a freshly-activated snapshot it is false
+    /// until background validation succeeds.
+    snapshot_validated: bool = true,
+
     // W73 phase profiling — populated under connect_mutex so no atomics.
     // Summary line emitted every 100 blocks in connectBlockFast. Targets
     // the actual mainnet IBD bottleneck (UTXO ops + flush), not script
@@ -7588,6 +7606,87 @@ pub fn validateAndLoadSnapshot(
             .base_height = assume_entry.height,
         },
     };
+}
+
+// ===========================================================================
+// In-process AssumeUTXO two-stage activation (Core ActivateSnapshot path).
+//
+//   STAGE 1 — load-time hash gate: validateAndLoadSnapshot (above) authenticates
+//             the snapshot FILE (its own coins' HASH_SERIALIZED == au_data.hash).
+//   STAGE 2 — REAL background genesis→base re-derivation over a SEPARATE store
+//             (au_bg_chainstate.runBackgroundValidation), comparing the
+//             independently-derived HASH_SERIALIZED to au_data.hash_serialized.
+//
+// This is the part that makes the snapshot's hash meaningful: a tampered
+// snapshot committed to a hash-of-itself passes STAGE 1 but FAILS STAGE 2,
+// because the background replay re-derives the GENUINE set whose hash differs.
+// ===========================================================================
+
+/// A block provider for `au_bg_chainstate.runBackgroundValidation` that reads
+/// each block genesis→base from this ChainState's CF_BLOCKS bodies.  Owns a
+/// scratch buffer for the most-recently-parsed block so the borrowed
+/// `types.Block` stays valid until the next getBlock call.
+pub const ChainStateBlockProvider = struct {
+    chain_state: *ChainState,
+    /// Owned bytes / parsed block for the current height; freed on next call.
+    cur_bytes: ?[]const u8 = null,
+    cur_block: ?types.Block = null,
+
+    pub fn deinit(self: *ChainStateBlockProvider) void {
+        if (self.cur_block) |*b| serialize.freeBlock(self.chain_state.allocator, b);
+        if (self.cur_bytes) |bytes| self.chain_state.allocator.free(bytes);
+        self.cur_block = null;
+        self.cur_bytes = null;
+    }
+
+    fn getBlockImpl(ctx: *anyopaque, height: u32, out: *types.Block) anyerror!void {
+        const self: *ChainStateBlockProvider = @ptrCast(@alignCast(ctx));
+        // Release the previously-borrowed block.
+        if (self.cur_block) |*b| serialize.freeBlock(self.chain_state.allocator, b);
+        if (self.cur_bytes) |bytes| self.chain_state.allocator.free(bytes);
+        self.cur_block = null;
+        self.cur_bytes = null;
+
+        const hash = self.chain_state.getBlockHashByHeight(height) orelse return error.BlockNotFound;
+        const bytes = (try self.chain_state.getBlockBytes(&hash)) orelse return error.BlockBodyNotFound;
+        self.cur_bytes = bytes;
+        var reader = serialize.Reader{ .data = bytes };
+        const block = serialize.readBlock(&reader, self.chain_state.allocator) catch return error.CorruptBlockBytes;
+        self.cur_block = block;
+        out.* = block;
+    }
+
+    pub fn provider(self: *ChainStateBlockProvider) @import("au_bg_chainstate.zig").BlockProvider {
+        return .{ .ctx = self, .getBlockFn = getBlockImpl };
+    }
+};
+
+/// Run the STAGE-2 background validation for a snapshot whose FILE has already
+/// passed the STAGE-1 load-time hash gate.  Reads genesis→base block bodies
+/// from `active.utxo_set.db` (CF_BLOCKS) and re-derives the genuine UTXO set in
+/// a SEPARATE store, comparing its HASH_SERIALIZED to `au_data.hash_serialized`.
+///
+/// `active`: the live active chainstate (its coins cache is passed to the
+/// aliasing guard so the background store is proven distinct).
+/// Returns the validation decision + the re-derived hash + bg coin count.
+pub fn runInProcessBackgroundValidation(
+    active: *ChainState,
+    au_data: *const @import("consensus.zig").AssumeUtxoData,
+    base_height: u32,
+    allocator: std.mem.Allocator,
+) !@import("au_bg_chainstate.zig").ActivationResult {
+    const au = @import("au_bg_chainstate.zig");
+    var bp = ChainStateBlockProvider{ .chain_state = active };
+    defer bp.deinit();
+    const prov = bp.provider();
+    return au.runBackgroundValidation(
+        allocator,
+        &prov,
+        au_data,
+        base_height,
+        true, // STAGE 1 (load-time hash gate) authenticated the file
+        &active.utxo_set, // aliasing guard: bg store must differ from active coins
+    );
 }
 
 /// Result of dumping a snapshot.
