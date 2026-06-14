@@ -231,7 +231,7 @@ fn readObfuscatedTransaction(
     var inner = serialize.Reader{ .data = scratch.items };
     const tx = serialize.readTransaction(&inner, allocator) catch |e| switch (e) {
         error.EndOfStream => return Error.UnexpectedEof,
-        error.InvalidCompactSize, error.InvalidSegwitMarker, error.OversizedVector => return Error.InvalidFormat,
+        error.InvalidCompactSize, error.InvalidSegwitMarker, error.OversizedVector, error.SuperfluousWitnessRecord => return Error.InvalidFormat,
         error.OutOfMemory => return Error.OutOfMemory,
     };
     reader.pos += inner.pos;

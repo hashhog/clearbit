@@ -104,6 +104,7 @@ pub const PsbtError = error{
     MissingUtxo,
     InvalidCompactSize,
     InvalidSegwitMarker,
+    SuperfluousWitnessRecord,
     /// W31: finalizeP2SH refused to emit `final_script_sig` because
     /// `hash160(redeem_script)` did not equal the 20-byte payload of the
     /// witness UTXO's `OP_HASH160 <h> OP_EQUAL` scriptPubKey. Same shape as
