@@ -7,6 +7,7 @@ pub const Error = error{
     InvalidCompactSize,
     OversizedVector,
     InvalidSegwitMarker,
+    SuperfluousWitnessRecord,
     OutOfMemory,
 };
 
@@ -249,6 +250,18 @@ pub fn readTransaction(reader: *Reader, allocator: std.mem.Allocator) !types.Tra
             }
             input.witness = witness_items;
         }
+        // Core primitives/transaction.h:228-231: "It's illegal to encode witnesses
+        // when all witness stacks are empty." (HasWitness() == false after parse).
+        // Reject to avoid consensus split where two nodes compute the same txid
+        // but one accepted a superfluous-witness encoding the other rejected.
+        var has_witness = false;
+        for (inputs) |input| {
+            if (input.witness.len > 0) {
+                has_witness = true;
+                break;
+            }
+        }
+        if (!has_witness) return Error.SuperfluousWitnessRecord;
     }
 
     const lock_time = try reader.readInt(u32);
@@ -676,4 +689,18 @@ test "writer basics" {
     const data = writer.getWritten();
     try std.testing.expectEqual(@as(usize, 4), data.len);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x01, 0xAA, 0xBB }, data);
+}
+
+test "superfluous witness record rejected" {
+    // A transaction with segwit marker+flag (0x00 0x01) but all witness stacks
+    // empty MUST be rejected. Bitcoin Core primitives/transaction.h:228-231:
+    // "It's illegal to encode witnesses when all witness stacks are empty."
+    // This exact 63-byte encoding previously parsed successfully (false-accept).
+    const allocator = std.testing.allocator;
+    const hex = "0100000000010100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff0100f2052a01000000000000000000";
+    var tx_bytes: [63]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&tx_bytes, hex);
+    var reader = Reader{ .data = &tx_bytes };
+    const result = readTransaction(&reader, allocator);
+    try std.testing.expectError(Error.SuperfluousWitnessRecord, result);
 }
