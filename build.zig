@@ -1375,6 +1375,44 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w142_tests.step);
     }
 
+    // FIX-3G — ADDR/ADDRV2 peer-timestamp clamp (3G policy, fleet-wide).
+    // Reference: bitcoin-core/src/net_processing.cpp:5678-5679.
+    // Clamps peer-advertised nTime that is pre-2001 (≤100_000_000s) or more than
+    // 10 minutes in the future to (now − 5*24h) before storing in addrman /
+    // known_addresses.  Without this fix, clearbit ignored entry.timestamp
+    // entirely and always stored the current wall clock, allowing peers to
+    // inflate address freshness arbitrarily.
+    // Run with `zig build test-fix3g`.
+    {
+        const fix3g_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_fix3g_addr_timestamp_clamp.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"fix3g"},
+        });
+        fix3g_tests.linkSystemLibrary("rocksdb");
+        fix3g_tests.linkSystemLibrary("secp256k1");
+        fix3g_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        fix3g_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            fix3g_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            fix3g_tests.linkSystemLibrary("minisketch");
+            fix3g_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        fix3g_tests.root_module.addOptions("build_options", build_options);
+
+        const run_fix3g_tests = b.addRunArtifact(fix3g_tests);
+        const fix3g_step = b.step("test-fix3g", "Run FIX-3G ADDR/ADDRV2 peer-timestamp clamp tests");
+        fix3g_step.dependOn(&run_fix3g_tests.step);
+        // Fold into the main `test` step so CI exercises FIX-3G.
+        test_step.dependOn(&run_fix3g_tests.step);
+    }
+
     // W124 — Operator-experience 30-gate audit.
     // Reference: bitcoin-core/src/init.cpp (signals, Shutdown, Interrupt,
     //            SetupServerArgs, LockDirectory, InitLogging, WritePidFile);
