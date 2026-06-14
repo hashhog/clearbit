@@ -839,6 +839,7 @@ pub const ParseError = error{
     InvalidCompactSize,
     OversizedVector,
     InvalidSegwitMarker,
+    SuperfluousWitnessRecord,
     InvalidData,
     UnknownCommand,
     OutOfMemory,
