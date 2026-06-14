@@ -154,58 +154,58 @@ test "w138 G1b: validateAndLoadSnapshot rejects mismatched content (BUG-1 invers
 }
 
 // ===========================================================================
-// G2 — Production code constructs a ChainStateManager + calls activateSnapshot
-// Status: MISSING (BUG-2). ChainStateManager is dead code.
+// G2 — REAL background-validation second chainstate is wired into production
+// Status: CLOSED (was BUG-2: ChainStateManager dead code). The from-scratch
+// background chainstate (au_bg_chainstate.zig) is now constructed + run by the
+// live loadtxoutset RPC (storage.runInProcessBackgroundValidation), which seeds
+// an EMPTY separate store and re-derives genesis→base.
 // ===========================================================================
-test "w138 G2: ChainStateManager is unused in production code (BUG-2)" {
+test "w138 G2: REAL background-validation second chainstate wired into loadtxoutset (BUG-2 CLOSED)" {
     const allocator = testing.allocator;
     const storage_src = try loadSrc(allocator, "storage");
     defer allocator.free(storage_src);
-    const main_src = try loadSrc(allocator, "main");
-    defer allocator.free(main_src);
     const rpc_src = try loadSrc(allocator, "rpc");
     defer allocator.free(rpc_src);
+    const au_src = try loadSrc(allocator, "au_bg_chainstate");
+    defer allocator.free(au_src);
 
-    // Type and methods exist.
-    try testing.expect(contains(storage_src, "pub const ChainStateManager = struct"));
-    try testing.expect(contains(storage_src, "pub fn activateSnapshot"));
-    try testing.expect(contains(storage_src, "pub fn startBackgroundValidation"));
-    try testing.expect(contains(storage_src, "pub fn completeValidation"));
+    // The from-scratch background chainstate exists with the genuine pieces:
+    // a separate store, an aliasing guard, a real genesis→base connect, a
+    // HASH_SERIALIZED recompute, and a validate-against-au_data decision.
+    try testing.expect(contains(au_src, "pub const BgChainState = struct"));
+    try testing.expect(contains(au_src, "pub fn assertNotAliased"));
+    try testing.expect(contains(au_src, "pub fn connectBlock"));
+    try testing.expect(contains(au_src, "pub fn computeHashSerialized"));
+    try testing.expect(contains(au_src, "pub fn validateAgainst"));
+    try testing.expect(contains(au_src, "pub fn runBackgroundValidation"));
 
-    // But: ChainStateManager.init is never called from main.zig or
-    // rpc.zig (production callers). Only storage.zig's own tests construct
-    // them.
-    try testing.expect(!contains(main_src, "ChainStateManager.init"));
-    try testing.expect(!contains(rpc_src, "ChainStateManager.init"));
-    try testing.expect(!contains(main_src, "activateSnapshot"));
-    // Note: rpc.zig mentions `ChainStateManager.activateSnapshot()` in
-    // the handleLoadTxOutSet doc-comment (explaining why the RPC is
-    // gated and what wiring it would require). It is NOT actually
-    // called in code. Confirm by checking the doc-comment mention is
-    // the only one (a single `///` line):
-    try testing.expectEqual(
-        @as(usize, 1),
-        countOccurrences(rpc_src, "ChainStateManager.activateSnapshot()"),
-    );
-    // No code calls of the form `mgr.activateSnapshot(...)` or
-    // `manager.activateSnapshot(...)` in production code.
-    try testing.expect(!contains(rpc_src, "mgr.activateSnapshot"));
-    try testing.expect(!contains(rpc_src, "manager.activateSnapshot"));
-    try testing.expect(!contains(main_src, ".activateSnapshot("));
+    // It is WIRED into production: storage exposes the in-process driver and
+    // the loadtxoutset RPC calls it (no longer the disabled stub).
+    try testing.expect(contains(storage_src, "pub fn runInProcessBackgroundValidation"));
+    try testing.expect(contains(rpc_src, "runInProcessBackgroundValidation"));
+    // And the legacy ChainStateManager doc-comment stub is gone from the RPC.
+    try testing.expect(!contains(rpc_src, "ChainStateManager.activateSnapshot()"));
 }
 
 // ===========================================================================
-// G3 — getchainstates RPC implemented
-// Status: MISSING (BUG-3). No arm in dispatch table.
+// G3 — getchainstates RPC implemented + reports validated/snapshot_blockhash
+//       from the ACTUAL AssumeUTXO activation state.
+// Status: CLOSED (was BUG-3). Dispatch arm + handler present; the handler
+// reads chain_state.from_snapshot_blockhash / .snapshot_validated.
 // ===========================================================================
-test "w138 G3: getchainstates RPC is not implemented (BUG-3)" {
+test "w138 G3: getchainstates RPC implemented, reports real validation state (BUG-3 CLOSED)" {
     const allocator = testing.allocator;
     const rpc_src = try loadSrc(allocator, "rpc");
     defer allocator.free(rpc_src);
 
-    // No dispatch arm for "getchainstates".
-    try testing.expect(!contains(rpc_src, "\"getchainstates\""));
-    try testing.expect(!contains(rpc_src, "handleGetChainStates"));
+    // Dispatch arm + handler present.
+    try testing.expect(contains(rpc_src, "\"getchainstates\""));
+    try testing.expect(contains(rpc_src, "handleGetChainStates"));
+    // The handler emits snapshot_blockhash + validated FROM THE ACTUAL STATE
+    // (not a hard-coded `true`).
+    try testing.expect(contains(rpc_src, "self.chain_state.from_snapshot_blockhash"));
+    try testing.expect(contains(rpc_src, "self.chain_state.snapshot_validated"));
+    try testing.expect(contains(rpc_src, "\"snapshot_blockhash\""));
     // Sister methods ARE dispatched (sanity check the dispatch table works).
     try testing.expect(contains(rpc_src, "\"loadtxoutset\""));
     try testing.expect(contains(rpc_src, "\"dumptxoutset\""));
@@ -289,25 +289,33 @@ test "w138 G6: InvalidateCoinsDBOnDisk / rename-on-failure cleanup absent (BUG-6
 }
 
 // ===========================================================================
-// G7 — loadtxoutset RPC reaches Core's ActivateSnapshot equivalent
-// Status: DIVERGE (BUG-7). RPC is fully gated with RPC_INTERNAL_ERROR.
+// G7 — loadtxoutset RPC performs Core's two-stage AssumeUTXO activation.
+// Status: CLOSED (was BUG-7: RPC fully gated with RPC_INTERNAL_ERROR). The
+// handler now (1) authenticates the file via validateAndLoadSnapshot (load-time
+// hash gate) then (2) runs the REAL background genesis→base re-derivation.
 // ===========================================================================
-test "w138 G7: loadtxoutset RPC returns RPC_INTERNAL_ERROR (BUG-7)" {
+test "w138 G7: loadtxoutset RPC performs two-stage activation (BUG-7 CLOSED)" {
     const allocator = testing.allocator;
     const rpc_src = try loadSrc(allocator, "rpc");
     defer allocator.free(rpc_src);
 
     // The handler exists.
     try testing.expect(contains(rpc_src, "fn handleLoadTxOutSet"));
-    // Returns RPC_INTERNAL_ERROR (the gate).
-    try testing.expect(contains(rpc_src, "loadtxoutset RPC is disabled in this build"));
-    try testing.expect(contains(rpc_src, "RPC_INTERNAL_ERROR"));
-    // Does NOT call validateAndLoadSnapshot (the gate fires first).
+    // The disabled stub string is gone.
+    try testing.expect(!contains(rpc_src, "loadtxoutset RPC is disabled in this build"));
+
     const handler_start = std.mem.indexOf(u8, rpc_src, "fn handleLoadTxOutSet").?;
     const handler_end = std.mem.indexOfPos(u8, rpc_src, handler_start, "fn handleDumpTxOutSet") orelse rpc_src.len;
     const handler_body = rpc_src[handler_start..handler_end];
-    try testing.expect(!contains(handler_body, "validateAndLoadSnapshot("));
-    try testing.expect(!contains(handler_body, "activateSnapshot("));
+    // STAGE 1: load-time hash gate authenticates the file.
+    try testing.expect(contains(handler_body, "validateAndLoadSnapshot("));
+    // STAGE 2: real background genesis→base re-derivation.
+    try testing.expect(contains(handler_body, "runInProcessBackgroundValidation("));
+    // The invalid path NEVER silently accepts — it refuses with a hash-mismatch
+    // error and leaves the active chainstate untouched.
+    try testing.expect(contains(handler_body, "Background validation FAILED"));
+    // The validated path marks the real snapshot state for getchainstates.
+    try testing.expect(contains(handler_body, "from_snapshot_blockhash ="));
 }
 
 // ===========================================================================
@@ -423,23 +431,30 @@ test "w138 G12: SIGINT-safe abort hook absent in coin-load loop (BUG-12)" {
 }
 
 // ===========================================================================
-// G13 — LoadBlockIndexDB(snapshot_blockhash) analog on startup
-// Status: MISSING (BUG-13). No reconstruction-from-disk plumbing.
+// G13 — Chainstate AssumeUTXO data-model field (Core m_from_snapshot_blockhash).
+// Status: PARTIALLY CLOSED. The data-model field now exists on ChainState and
+// is set by the in-process activation; getchainstates reads it for the live
+// `snapshot_blockhash` / `validated` report.
+// STILL DEFERRED (honest): cross-restart persistence of the field to a
+// base_blockhash file + a LoadBlockIndexDB-style reader that re-attaches the
+// background chainstate after a daemon restart. In-process activation is fully
+// real; cross-restart resumption of background validation is not yet plumbed.
 // ===========================================================================
-test "w138 G13: LoadBlockIndexDB(snapshot_blockhash) analog absent (BUG-13)" {
+test "w138 G13: Chainstate carries m_from_snapshot_blockhash data-model field (BUG-13 partial)" {
     const allocator = testing.allocator;
     const main_src = try loadSrc(allocator, "main");
     defer allocator.free(main_src);
     const storage_src = try loadSrc(allocator, "storage");
     defer allocator.free(storage_src);
 
-    // No code that reads a base_blockhash file on startup.
+    // The data-model field now exists on ChainState (Core m_from_snapshot_blockhash).
+    try testing.expect(contains(storage_src, "from_snapshot_blockhash: ?types.Hash256"));
+    try testing.expect(contains(storage_src, "snapshot_validated: bool"));
+
+    // STILL DEFERRED: the on-startup base_blockhash file reader is not wired
+    // (cross-restart resumption of background validation is future work).
     try testing.expect(!contains(main_src, "ReadSnapshotBaseBlockhash"));
     try testing.expect(!contains(main_src, "readSnapshotBaseBlockhash"));
-    try testing.expect(!contains(main_src, "from_snapshot_blockhash"));
-    // No `m_from_snapshot_blockhash` field on ChainState.
-    try testing.expect(!contains(storage_src, "from_snapshot_blockhash"));
-    try testing.expect(!contains(storage_src, "m_from_snapshot_blockhash"));
 }
 
 // ===========================================================================
@@ -875,4 +890,406 @@ test "w138 sanity: SNAPSHOT_VERSION pinned to 2 (Core v28 current)" {
 // ===========================================================================
 test "w138 sanity: SnapshotMetadata.HEADER_SIZE pinned at 51 bytes" {
     try testing.expectEqual(@as(usize, 51), storage.SnapshotMetadata.HEADER_SIZE);
+}
+
+// ===========================================================================
+// AssumeUTXO REAL background-validation second chainstate (au_bg_chainstate.zig)
+//
+// These tests exercise the GENUINE genesis→base re-derivation in a SEPARATE
+// store (NOT the active coins, NOT a counter), per Core's
+// MaybeValidateSnapshot. They are built around an in-memory block chain so they
+// need no on-disk DB; the same `au.runBackgroundValidation` driver the live
+// loadtxoutset RPC uses is exercised here via the generic BlockProvider.
+// ===========================================================================
+
+const au = @import("au_bg_chainstate.zig");
+const crypto = @import("crypto.zig");
+
+/// A simple in-memory block chain + a BlockProvider over it.  Each block has a
+/// single coinbase tx whose txid is unique per height; block `spend_in` (if
+/// set) additionally spends a prior coinbase output to a P2PKH output.
+const TestChain = struct {
+    allocator: std.mem.Allocator,
+    blocks: []types.Block,
+
+    fn getBlockImpl(ctx: *anyopaque, height: u32, out: *types.Block) anyerror!void {
+        const self: *TestChain = @ptrCast(@alignCast(ctx));
+        if (height >= self.blocks.len) return error.BlockNotFound;
+        out.* = self.blocks[height];
+    }
+
+    fn provider(self: *TestChain) au.BlockProvider {
+        return .{ .ctx = self, .getBlockFn = getBlockImpl };
+    }
+};
+
+/// Build a coinbase tx that pays `value` to the given scriptPubKey, with a
+/// height-tagged scriptSig so the txid is unique per height.
+fn buildCoinbase(allocator: std.mem.Allocator, height: u32, value: i64, spk: []const u8) !types.Transaction {
+    const ss = try allocator.alloc(u8, 4);
+    std.mem.writeInt(u32, ss[0..4], height, .little);
+    const inputs = try allocator.alloc(types.TxIn, 1);
+    inputs[0] = .{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = ss,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const outs = try allocator.alloc(types.TxOut, 1);
+    outs[0] = .{ .value = value, .script_pubkey = try allocator.dupe(u8, spk) };
+    return .{ .version = 1, .inputs = inputs, .outputs = outs, .lock_time = 0 };
+}
+
+/// Build a spend tx: spends (prev_txid, prev_vout) to a single P2PKH output.
+fn buildSpend(
+    allocator: std.mem.Allocator,
+    prev_txid: types.Hash256,
+    prev_vout: u32,
+    value: i64,
+    spk: []const u8,
+) !types.Transaction {
+    const inputs = try allocator.alloc(types.TxIn, 1);
+    inputs[0] = .{
+        .previous_output = .{ .hash = prev_txid, .index = prev_vout },
+        .script_sig = try allocator.dupe(u8, &[_]u8{ 0x51 }), // OP_1 (dummy)
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const outs = try allocator.alloc(types.TxOut, 1);
+    outs[0] = .{ .value = value, .script_pubkey = try allocator.dupe(u8, spk) };
+    return .{ .version = 1, .inputs = inputs, .outputs = outs, .lock_time = 0 };
+}
+
+fn freeTx(allocator: std.mem.Allocator, tx: *const types.Transaction) void {
+    for (tx.inputs) |in| if (in.script_sig.len > 0) allocator.free(in.script_sig);
+    allocator.free(tx.inputs);
+    for (tx.outputs) |o| if (o.script_pubkey.len > 0) allocator.free(o.script_pubkey);
+    allocator.free(tx.outputs);
+}
+
+/// Build a fixed test chain of `n` blocks (heights 0..n-1).  Block 0 is genesis
+/// (coinbase output unspendable). Blocks 1..n-1 each mine a coinbase to a
+/// distinct P2PKH; block 2 spends block-1's coinbase output to a new P2PKH.
+/// Returns owned blocks (free with freeTestChain).
+fn buildTestChain(allocator: std.mem.Allocator, n: u32) ![]types.Block {
+    std.debug.assert(n >= 3);
+    var blocks = try allocator.alloc(types.Block, n);
+
+    const genesis_spk = p2pkh(); // value irrelevant, genesis coinbase unspendable
+    const block1_spk = blk: {
+        var s = p2pkh();
+        s[3] = 0x01; // make it distinct
+        break :blk s;
+    };
+
+    // height 0: genesis (coinbase unspendable)
+    {
+        const txs = try allocator.alloc(types.Transaction, 1);
+        txs[0] = try buildCoinbase(allocator, 0, 50 * 100_000_000, &genesis_spk);
+        blocks[0] = .{ .header = stdHeader(), .transactions = txs };
+    }
+
+    // height 1: coinbase to block1_spk
+    var b1_cb_txid: types.Hash256 = undefined;
+    {
+        const txs = try allocator.alloc(types.Transaction, 1);
+        txs[0] = try buildCoinbase(allocator, 1, 50 * 100_000_000, &block1_spk);
+        b1_cb_txid = try crypto.computeTxid(&txs[0], allocator);
+        blocks[1] = .{ .header = stdHeader(), .transactions = txs };
+    }
+
+    // height 2: coinbase + a spend of block 1's coinbase output (vout 0)
+    {
+        const txs = try allocator.alloc(types.Transaction, 2);
+        var cb_spk = p2pkh();
+        cb_spk[3] = 0x02;
+        txs[0] = try buildCoinbase(allocator, 2, 50 * 100_000_000, &cb_spk);
+        var spend_spk = p2pkh();
+        spend_spk[3] = 0x22;
+        txs[1] = try buildSpend(allocator, b1_cb_txid, 0, 49 * 100_000_000, &spend_spk);
+        blocks[2] = .{ .header = stdHeader(), .transactions = txs };
+    }
+
+    // heights 3..n-1: plain coinbase blocks (distinct spk per height)
+    var h: u32 = 3;
+    while (h < n) : (h += 1) {
+        const txs = try allocator.alloc(types.Transaction, 1);
+        var spk = p2pkh();
+        spk[3] = @intCast(0x30 + (h & 0x0f));
+        txs[0] = try buildCoinbase(allocator, h, 50 * 100_000_000, &spk);
+        blocks[h] = .{ .header = stdHeader(), .transactions = txs };
+    }
+
+    return blocks;
+}
+
+fn stdHeader() types.BlockHeader {
+    return .{
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1_700_000_000,
+        .bits = 0x207fffff,
+        .nonce = 0,
+    };
+}
+
+fn freeTestChain(allocator: std.mem.Allocator, blocks: []types.Block) void {
+    for (blocks) |*b| {
+        for (b.transactions) |*tx| freeTx(allocator, tx);
+        allocator.free(@constCast(b.transactions));
+    }
+    allocator.free(blocks);
+}
+
+// ---------------------------------------------------------------------------
+// AU-1: aliasing guard — a bg store bound to an active UtxoSet refuses to
+// operate when its backing map IS the active coins cache (hash-of-self guard).
+// ---------------------------------------------------------------------------
+test "w138 AU-1: aliasing guard rejects a bg store that aliases active coins" {
+    const allocator = testing.allocator;
+
+    var active = storage.UtxoSet.init(null, 8, allocator);
+    defer active.deinit();
+
+    // A genuinely-separate bg store passes the guard.
+    var bg = au.BgChainState.init(allocator, &active);
+    defer bg.deinit();
+    try bg.assertNotAliased();
+
+    // Forge the alias: point active_cache_addr at the bg store's own coins map.
+    bg.active_cache_addr = @intFromPtr(&bg.coins);
+    try testing.expectError(au.BgError.AliasesActiveChainstate, bg.assertNotAliased());
+}
+
+// ---------------------------------------------------------------------------
+// AU-2: the bg store is genuinely SEPARATE from the active coins — connecting
+// blocks to the bg store does NOT mutate the active UtxoSet, and the bg store
+// is empty until the replay runs.
+// ---------------------------------------------------------------------------
+test "w138 AU-2: bg store is a separate object, seeded empty, not the active coins" {
+    const allocator = testing.allocator;
+
+    var active = storage.UtxoSet.init(null, 8, allocator);
+    defer active.deinit();
+    // Put one coin in the active set.
+    const spk = p2pkh();
+    const op = types.OutPoint{ .hash = [_]u8{0xAB} ** 32, .index = 0 };
+    try active.add(&op, &types.TxOut{ .value = 1, .script_pubkey = &spk }, 1, false);
+    try testing.expectEqual(@as(usize, 1), active.cache.count());
+
+    var bg = au.BgChainState.init(allocator, &active);
+    defer bg.deinit();
+    // Background store seeded empty (NOT copied from the active set).
+    try testing.expectEqual(@as(usize, 0), bg.coinCount());
+
+    // Connect a 3-block chain to the bg store.
+    const blocks = try buildTestChain(allocator, 3);
+    defer freeTestChain(allocator, blocks);
+    var height: u32 = 0;
+    while (height < blocks.len) : (height += 1) try bg.connectBlock(&blocks[height], height);
+
+    // Active set is untouched (still exactly its one coin).
+    try testing.expectEqual(@as(usize, 1), active.cache.count());
+    // Background set has coins from the replay (genesis coinbase excluded).
+    try testing.expect(bg.coinCount() > 0);
+}
+
+// ---------------------------------------------------------------------------
+// AU-3 (CORRECT SNAPSHOT): a snapshot whose committed hash_serialized equals
+// the GENUINE genesis→base re-derivation hash → VALIDATED.
+// ---------------------------------------------------------------------------
+test "w138 AU-3: correct snapshot — genesis→base re-derivation MATCHES → validated" {
+    const allocator = testing.allocator;
+
+    const n: u32 = 5;
+    const blocks = try buildTestChain(allocator, n);
+    defer freeTestChain(allocator, blocks);
+    const base_height: u32 = n - 1;
+
+    // Derive the GENUINE hash by an independent replay (this is what an honest
+    // snapshot creator commits to). Use a throwaway bg store.
+    const genuine_hash = blk: {
+        var g = au.BgChainState.init(allocator, null);
+        defer g.deinit();
+        var h: u32 = 0;
+        while (h <= base_height) : (h += 1) try g.connectBlock(&blocks[h], h);
+        break :blk try g.computeHashSerialized();
+    };
+
+    const au_data = consensus.AssumeUtxoData{
+        .height = base_height,
+        .block_hash = [_]u8{0x11} ** 32,
+        .hash_serialized = genuine_hash, // honest: committed to the genuine set
+        .chain_tx_count = 0,
+    };
+
+    var chain = TestChain{ .allocator = allocator, .blocks = blocks };
+    const prov = chain.provider();
+
+    const activation = try au.runBackgroundValidation(
+        allocator,
+        &prov,
+        &au_data,
+        base_height,
+        true, // stage-1 load gate "passed"
+        null,
+    );
+    try testing.expectEqual(au.ValidationResult.validated, activation.result);
+    try testing.expectEqualSlices(u8, &genuine_hash, &activation.actual_hash);
+}
+
+// ---------------------------------------------------------------------------
+// AU-4 (THE NON-CIRCULAR REJECT FALSIFICATION):
+//
+//   Build a TAMPERED UTXO set = the genuine set PLUS a phantom coin the replay
+//   never creates. Commit the snapshot to its OWN tampered hash (hash-of-self).
+//   That self-committed hash PASSES the load-time gate (stage 1 hashes the
+//   file's own coins). BUT the background genesis→base re-derivation re-derives
+//   the GENUINE set, whose hash DIFFERS → INVALID. And the phantom coin is
+//   ABSENT from the bg store — proving an independent re-derivation, not a
+//   hash-of-self.
+// ---------------------------------------------------------------------------
+test "w138 AU-4: reject falsification — phantom-coin snapshot passes load gate, fails real re-derivation" {
+    const allocator = testing.allocator;
+
+    const n: u32 = 5;
+    const blocks = try buildTestChain(allocator, n);
+    defer freeTestChain(allocator, blocks);
+    const base_height: u32 = n - 1;
+
+    // The phantom coin the genuine replay NEVER creates.
+    const phantom_txid: types.Hash256 = [_]u8{0xDE} ** 32;
+    const phantom_vout: u32 = 7;
+    const phantom_spk = p2pkh();
+
+    // ── Build the TAMPERED hash = HASH_SERIALIZED over (genuine set + phantom).
+    // We replay the genuine set into a bg store, then insert the phantom coin
+    // directly into that store's map and hash it. This is the "hash-of-self"
+    // value a tampered snapshot would commit to.
+    const tampered_hash = blk: {
+        var t = au.BgChainState.init(allocator, null);
+        defer t.deinit();
+        var h: u32 = 0;
+        while (h <= base_height) : (h += 1) try t.connectBlock(&blocks[h], h);
+        // Inject the phantom coin directly into the store (bypassing replay):
+        try insertPhantom(&t, allocator, phantom_txid, phantom_vout, 1_000, &phantom_spk);
+        break :blk try t.computeHashSerialized();
+    };
+
+    // Sanity: the tampered hash MUST differ from the genuine hash (otherwise the
+    // test would be vacuous — the phantom must actually change the set hash).
+    const genuine_hash = blk: {
+        var g = au.BgChainState.init(allocator, null);
+        defer g.deinit();
+        var h: u32 = 0;
+        while (h <= base_height) : (h += 1) try g.connectBlock(&blocks[h], h);
+        break :blk try g.computeHashSerialized();
+    };
+    try testing.expect(!std.mem.eql(u8, &tampered_hash, &genuine_hash));
+
+    // The snapshot commits to its OWN tampered hash (hash-of-self).
+    const au_data = consensus.AssumeUtxoData{
+        .height = base_height,
+        .block_hash = [_]u8{0x11} ** 32,
+        .hash_serialized = tampered_hash,
+        .chain_tx_count = 0,
+    };
+
+    // STAGE 1 (conceptual): the load-time gate hashes the tampered FILE's own
+    // coins → tampered_hash == au_data.hash_serialized → PASSES. (We pass
+    // load_gate_passed=true to mirror that.)
+    //
+    // STAGE 2: the REAL background genesis→base re-derivation re-derives the
+    // GENUINE set (no phantom), whose hash != tampered_hash → INVALID.
+    var chain = TestChain{ .allocator = allocator, .blocks = blocks };
+    const prov = chain.provider();
+
+    const activation = try au.runBackgroundValidation(
+        allocator,
+        &prov,
+        &au_data,
+        base_height,
+        true,
+        null,
+    );
+    try testing.expectEqual(au.ValidationResult.invalid, activation.result);
+    // The re-derived hash is the GENUINE hash (not the tampered self-hash).
+    try testing.expectEqualSlices(u8, &genuine_hash, &activation.actual_hash);
+    try testing.expect(!std.mem.eql(u8, &activation.actual_hash, &au_data.hash_serialized));
+
+    // ── PROVE the phantom is ABSENT from a genuine bg re-derivation. ──────────
+    var bg = au.BgChainState.init(allocator, null);
+    defer bg.deinit();
+    var h: u32 = 0;
+    while (h <= base_height) : (h += 1) try bg.connectBlock(&blocks[h], h);
+    try testing.expect(!bg.hasCoin(&phantom_txid, phantom_vout));
+}
+
+/// Inject a phantom coin directly into a bg store (test-only — simulates a
+/// snapshot file containing a coin the genesis→base replay never creates).
+fn insertPhantom(
+    bg: *au.BgChainState,
+    allocator: std.mem.Allocator,
+    txid: types.Hash256,
+    vout: u32,
+    value: i64,
+    spk: []const u8,
+) !void {
+    _ = allocator;
+    try bg.addPhantomCoin(txid, vout, value, spk);
+}
+
+// ---------------------------------------------------------------------------
+// AU-5: validateAgainst refuses to validate before the base height is reached
+// (Core only validates once the background chainstate ReachedTarget()).
+// ---------------------------------------------------------------------------
+test "w138 AU-5: validateAgainst errors if base height not yet reached" {
+    const allocator = testing.allocator;
+    const blocks = try buildTestChain(allocator, 4);
+    defer freeTestChain(allocator, blocks);
+
+    var bg = au.BgChainState.init(allocator, null);
+    defer bg.deinit();
+    // Connect only up to height 1 (base is 3).
+    try bg.connectBlock(&blocks[0], 0);
+    try bg.connectBlock(&blocks[1], 1);
+
+    const au_data = consensus.AssumeUtxoData{
+        .height = 3,
+        .block_hash = [_]u8{0x11} ** 32,
+        .hash_serialized = [_]u8{0} ** 32,
+        .chain_tx_count = 0,
+    };
+    try testing.expectError(au.BgError.BaseNotReached, bg.validateAgainst(&au_data, 3, null));
+}
+
+// ---------------------------------------------------------------------------
+// AU-6: runtime-registerable regtest whitelist — register, find, clear.
+// mainnet/testnet4 m_assumeutxo_data UNTOUCHED (separate comptime table).
+// ---------------------------------------------------------------------------
+test "w138 AU-6: runtime regtest AssumeUTXO whitelist register/find/clear" {
+    const allocator = testing.allocator;
+    au.clearRegtestWhitelist(allocator);
+    defer au.clearRegtestWhitelist(allocator);
+
+    const base_hash: types.Hash256 = [_]u8{0x5A} ** 32;
+    const hs: types.Hash256 = [_]u8{0x99} ** 32;
+
+    // Not present before registration.
+    try testing.expect(au.findRegtestSnapshot(&base_hash) == null);
+
+    try au.registerRegtestSnapshot(allocator, .{
+        .height = 100,
+        .block_hash = base_hash,
+        .hash_serialized = hs,
+        .chain_tx_count = 0,
+    });
+    const found = au.findRegtestSnapshot(&base_hash) orelse return error.NotFound;
+    try testing.expectEqual(@as(u32, 100), found.height);
+    try testing.expectEqualSlices(u8, &hs, &found.hash_serialized);
+
+    // The canonical comptime tables are untouched (still Core-exact).
+    try testing.expectEqual(@as(usize, 4), consensus.MAINNET.assume_utxo.len);
+    try testing.expectEqual(@as(usize, 0), consensus.TESTNET4.assume_utxo.len);
 }

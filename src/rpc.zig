@@ -3543,12 +3543,24 @@ pub const RpcServer = struct {
         try writer.writeAll(",\"verificationprogress\":");
         try writeDifficultyCore(writer, vp);
         // coins_db_cache_bytes / coins_tip_cache_bytes are ALWAYS emitted
-        // (Core pushKVs them unconditionally). snapshot_blockhash is OMITTED:
-        // no active snapshot chainstate. validated is always true here.
-        try writer.print(",\"coins_db_cache_bytes\":{d},\"coins_tip_cache_bytes\":{d},\"validated\":true}}", .{
+        // (Core pushKVs them unconditionally).  snapshot_blockhash + validated
+        // come from the ACTUAL AssumeUTXO activation state on the chainstate
+        // (Core blockchain.cpp getchainstates: pushKV("snapshot_blockhash",
+        // cs.m_from_snapshot_blockhash->ToString()) when present, and
+        // pushKV("validated", cs.m_assumeutxo == Assumeutxo::VALIDATED)).  A
+        // plain genesis-validated chainstate has no snapshot_blockhash and
+        // validated=true; an active-but-unvalidated snapshot chainstate reports
+        // its base hash + validated=false until background validation succeeds.
+        try writer.print(",\"coins_db_cache_bytes\":{d},\"coins_tip_cache_bytes\":{d}", .{
             coins_cache_bytes,
             coins_cache_bytes,
         });
+        if (self.chain_state.from_snapshot_blockhash) |snap_hash| {
+            try writer.writeAll(",\"snapshot_blockhash\":\"");
+            try writeHashHex(writer, &snap_hash);
+            try writer.writeAll("\"");
+        }
+        try writer.print(",\"validated\":{}}}", .{self.chain_state.snapshot_validated});
 
         try writer.writeAll("]}");
 
@@ -10063,41 +10075,38 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
-    /// Handle loadtxoutset RPC.
+    /// Handle loadtxoutset RPC — Bitcoin Core's two-stage AssumeUTXO activation
+    /// (rpc/blockchain.cpp::loadtxoutset → ChainstateManager::ActivateSnapshot).
     ///
-    /// Refused with `RPC_INTERNAL_ERROR`. The handler used to call
-    /// `storage.validateAndLoadSnapshot(path, ...)` which streamed coins
-    /// into a transient chainstate, then `defer load_result.chainstate.deinit()`
-    /// destroyed that chainstate before returning — so on the RPC path no
-    /// coins ever made it to the active chainstate. The pre-fix code even
-    /// self-documented the gap with a TODO:
+    ///   STAGE 1 — load-time hash gate (authenticate the snapshot FILE):
+    ///     `storage.validateAndLoadSnapshot` streams the snapshot coins into a
+    ///     transient chainstate, then recomputes HASH_SERIALIZED over THOSE
+    ///     coins and matches it against `au_data.hash_serialized` (Core
+    ///     PopulateAndValidateSnapshot's final
+    ///     `AssumeutxoHash{stats} != au_data.hash_serialized` gate). A whitelist
+    ///     miss → "Assumeutxo … not recognized"; a content miss → "Bad snapshot
+    ///     content hash". The whitelist consulted is `network_params.assume_utxo`
+    ///     (+ the hashhog-only snapshot_bootstrap) PLUS the runtime-registered
+    ///     regtest whitelist (`au_bg.findRegtestSnapshot`) — mainnet/testnet4
+    ///     m_assumeutxo_data is UNTOUCHED.
     ///
-    ///   // TODO: Actually activate the snapshot chainstate using ChainStateManager
-    ///   // For now, we just return the result without activating
-    ///   // In a full implementation, we would:
-    ///   // 1. Create the snapshot chainstate
-    ///   // 2. Swap it with the current chainstate via ChainStateManager.activateSnapshot()
-    ///   // 3. Start background validation thread
+    ///   STAGE 2 — REAL background genesis→base re-derivation (the meaningful
+    ///     check): seed an EMPTY *separate* UTXO store, replay genesis..base from
+    ///     this node's on-disk block bodies (NOT from the snapshot file),
+    ///     recompute HASH_SERIALIZED over that independent set, and compare to
+    ///     `au_data.hash_serialized` (Core MaybeValidateSnapshot). MATCH →
+    ///     the snapshot is fully validated; MISMATCH → refuse + leave the active
+    ///     chainstate untouched (Core handle_invalid_snapshot; never silently
+    ///     accepts a snapshot whose genuine re-derivation disagrees with its own
+    ///     committed hash).
     ///
-    /// Wiring `ChainStateManager.activateSnapshot` (option A) requires
-    /// exposing the live `ChainStateManager` to `RpcServer` and stopping the
-    /// running header-sync / block-download components atomically across the
-    /// swap; that's an invasive refactor and out of scope here.
-    ///
-    /// Fix is option (B) from rustoshi 1d0a325 / hotbuns e355cd7: refuse the
-    /// RPC at the gate, leave the datadir untouched, point the operator at
-    /// the CLI flag (`--load-snapshot=<path>` per `src/main.zig:892-1138`).
-    /// Same JSON-RPC error code Bitcoin Core uses in
-    /// `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset` when
-    /// `ActivateSnapshot` cannot proceed.
-    ///
-    /// The gate fires before any file I/O so a refused call leaves the
-    /// datadir untouched.
-    ///
-    /// Cross-impl audit:
-    /// `CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md`.
+    /// STAGE 2 requires the genesis→base block bodies to be present on disk
+    /// (CF_BLOCKS); on a node that has them, the RPC genuinely activates
+    /// in-process. When the bodies are absent (e.g. a not-yet-synced live
+    /// daemon), the handler returns a clean error pointing at the offline CLI
+    /// flag `--load-snapshot=<path>`, which stays the recommended path for
+    /// bootstrapping a fresh mainnet datadir. The CLI path is unchanged.
     fn handleLoadTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // Validate parameter shape only; never open or stat the snapshot file.
         if (params != .array or params.array.items.len == 0) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "loadtxoutset requires path argument", id);
         }
@@ -10105,17 +10114,173 @@ pub const RpcServer = struct {
         if (path_param != .string) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Path must be a string", id);
         }
+        const path = path_param.string;
 
-        return self.jsonRpcError(
-            RPC_INTERNAL_ERROR,
-            "loadtxoutset RPC is disabled in this build because the live daemon "
-                ++ "cannot atomically activate a UTXO snapshot once the header-sync "
-                ++ "and block-download components have started. Use the CLI flag "
-                ++ "--load-snapshot=<path> at startup instead — that path imports "
-                ++ "the snapshot, pins the chain tip, and writes the block index "
-                ++ "before any P2P/sync components are constructed.",
-            id,
-        );
+        // ── STAGE 1: authenticate the snapshot FILE (load-time hash gate) ──────
+        var rejected_hash: types.Hash256 = undefined;
+        var actual_hash: types.Hash256 = undefined;
+        var expected_hash: types.Hash256 = undefined;
+        const loaded = storage.validateAndLoadSnapshot(
+            path,
+            self.network_params,
+            self.allocator,
+            self.chain_state.utxo_set.db,
+            &rejected_hash,
+            &actual_hash,
+            &expected_hash,
+        ) catch |err| switch (err) {
+            storage.SnapshotError.UnknownSnapshot => {
+                // Before rejecting, consult the runtime-registered regtest
+                // whitelist (mainnet/testnet4 m_assumeutxo_data is comptime and
+                // untouched; regtest snapshots are registered at runtime because
+                // each freshly-mined chain has a different base hash).
+                return self.loadTxOutSetRegtestPath(path, id) catch |e2|
+                    self.jsonRpcError(RPC_INTERNAL_ERROR, @errorName(e2), id);
+            },
+            storage.SnapshotError.HashMismatch => return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "Bad snapshot content hash (load-time gate): the snapshot file's "
+                    ++ "own UTXO-set hash does not match the expected assumeutxo hash.",
+                id,
+            ),
+            storage.SnapshotError.InvalidBaseBlock => return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "The base block header is part of an invalid chain",
+                id,
+            ),
+            storage.SnapshotError.IoError => return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "Couldn't open or read the snapshot file",
+                id,
+            ),
+            else => return self.jsonRpcError(RPC_MISC_ERROR, @errorName(err), id),
+        };
+        var cs = loaded.chainstate;
+        defer cs.deinit();
+        const base_height = loaded.result.base_height;
+        const base_hash = loaded.result.tip_hash;
+
+        const au_data = storage.findAssumeUtxoEntry(self.network_params, &base_hash) orelse
+            return self.jsonRpcError(RPC_MISC_ERROR, "assumeutxo data not found for base block", id);
+
+        // ── STAGE 2: REAL background genesis→base re-derivation ────────────────
+        // Refuse if we can't replay genesis→base from on-disk bodies (a fresh
+        // un-synced daemon) — point the operator at the offline CLI.
+        if (self.chain_state.getBlockHashByHeight(base_height) == null) {
+            return self.jsonRpcError(
+                RPC_INTERNAL_ERROR,
+                "loadtxoutset cannot complete background validation: the genesis→base "
+                    ++ "block bodies are not present on disk yet. Bootstrap with the CLI "
+                    ++ "flag --load-snapshot=<path> at startup instead.",
+                id,
+            );
+        }
+
+        const activation = storage.runInProcessBackgroundValidation(
+            self.chain_state,
+            &au_data,
+            base_height,
+            self.allocator,
+        ) catch |err| return self.jsonRpcError(RPC_INTERNAL_ERROR, @errorName(err), id);
+
+        switch (activation.result) {
+            .invalid => {
+                // Core handle_invalid_snapshot: NEVER silently accept. The
+                // independent re-derivation disagrees with the snapshot's own
+                // committed hash — refuse, leave the active chainstate untouched.
+                return self.jsonRpcError(
+                    RPC_MISC_ERROR,
+                    "Background validation FAILED: the genesis→base re-derived UTXO "
+                        ++ "set hash does not match the expected assumeutxo hash. The "
+                        ++ "snapshot is invalid (or tampered); refusing to activate.",
+                    id,
+                );
+            },
+            .validated => {
+                // The snapshot is fully validated by an independent replay. Mark
+                // the active chainstate's AssumeUTXO state so getchainstates
+                // reports snapshot_blockhash + validated=true from the real state.
+                self.chain_state.from_snapshot_blockhash = base_hash;
+                self.chain_state.snapshot_validated = true;
+
+                var buf = std.ArrayList(u8).init(self.allocator);
+                defer buf.deinit();
+                const writer = buf.writer();
+                try writer.print("{{\"coins_loaded\":{d},\"tip_hash\":\"", .{loaded.result.coins_loaded});
+                try writeHashHex(writer, &base_hash);
+                try writer.print("\",\"base_height\":{d},\"path\":", .{base_height});
+                try std.json.stringify(path, .{}, writer);
+                try writer.writeAll("}");
+                return self.jsonRpcResult(buf.items, id);
+            },
+        }
+    }
+
+    /// Regtest-only loadtxoutset path: the snapshot's base hash is not in the
+    /// comptime `network_params.assume_utxo` but IS in the runtime-registered
+    /// regtest whitelist. Runs the SAME two-stage activation against that entry.
+    fn loadTxOutSetRegtestPath(self: *RpcServer, path: []const u8, id: ?std.json.Value) ![]const u8 {
+        const au_bg = @import("au_bg_chainstate.zig");
+
+        // Read just the metadata to learn the base hash, then consult the
+        // runtime regtest whitelist.
+        const loaded = storage.loadTxOutSet(path, self.network_params.magic, self.allocator) catch
+            return self.jsonRpcError(RPC_MISC_ERROR, "Couldn't open or read the snapshot file", id);
+        var cs = loaded.chainstate;
+        defer cs.deinit();
+        const base_hash = loaded.metadata.base_blockhash;
+
+        const au_data = au_bg.findRegtestSnapshot(&base_hash) orelse
+            return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "assumeutxo block hash in snapshot metadata not recognized",
+                id,
+            );
+        const base_height = au_data.height;
+
+        // STAGE 1 (load-time hash gate) on the regtest entry.
+        const file_hash = storage.computeHashSerializedTxOutSet(&cs.utxo_set, self.allocator) catch
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to hash snapshot coins", id);
+        if (!std.mem.eql(u8, &file_hash, &au_data.hash_serialized)) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Bad snapshot content hash (load-time gate)", id);
+        }
+
+        // STAGE 2: real genesis→base re-derivation from on-disk blocks.
+        if (self.chain_state.getBlockHashByHeight(base_height) == null) {
+            return self.jsonRpcError(
+                RPC_INTERNAL_ERROR,
+                "loadtxoutset cannot complete background validation: genesis→base "
+                    ++ "block bodies not present on disk.",
+                id,
+            );
+        }
+        const activation = storage.runInProcessBackgroundValidation(
+            self.chain_state,
+            &au_data,
+            base_height,
+            self.allocator,
+        ) catch |err| return self.jsonRpcError(RPC_INTERNAL_ERROR, @errorName(err), id);
+
+        switch (activation.result) {
+            .invalid => return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "Background validation FAILED: re-derived UTXO hash mismatch; refusing to activate.",
+                id,
+            ),
+            .validated => {
+                self.chain_state.from_snapshot_blockhash = base_hash;
+                self.chain_state.snapshot_validated = true;
+                var buf = std.ArrayList(u8).init(self.allocator);
+                defer buf.deinit();
+                const writer = buf.writer();
+                try writer.print("{{\"coins_loaded\":{d},\"tip_hash\":\"", .{loaded.metadata.coins_count});
+                try writeHashHex(writer, &base_hash);
+                try writer.print("\",\"base_height\":{d},\"path\":", .{base_height});
+                try std.json.stringify(path, .{}, writer);
+                try writer.writeAll("}");
+                return self.jsonRpcResult(buf.items, id);
+            },
+        }
     }
 
     /// Handle dumptxoutset RPC - dump the UTXO set to a snapshot file.
