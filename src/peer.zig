@@ -347,6 +347,25 @@ pub const DNS_SEED_TIMEOUT: u32 = 10;
 /// Default ban duration in seconds (24 hours).
 pub const DEFAULT_BAN_DURATION: i64 = 24 * 60 * 60;
 
+/// Clamp a peer-advertised ADDR/ADDRV2 timestamp to a sane window.
+/// Mirrors Bitcoin Core net_processing.cpp:5678-5679:
+///   if (addr.nTime <= NodeSeconds{100000000s} || addr.nTime > current_time + 10min)
+///       addr.nTime = current_time - 5*24h;
+/// `peer_time` is the u32 timestamp from the wire; `now` is the current
+/// Unix time (i64).  Returns a u64 suitable for addrman / AddressInfo.last_seen.
+pub fn clampAddrTimestamp(peer_time: u32, now: i64) u64 {
+    const pt: i64 = @as(i64, peer_time);
+    const ten_minutes: i64 = 10 * 60;
+    const five_days: i64 = 5 * 24 * 60 * 60;
+    // pre-2001 sentinel: epoch + ~3.17 years (Core uses 100_000_000 seconds)
+    const pre2001: i64 = 100_000_000;
+    const clamped: i64 = if (pt <= pre2001 or pt > now + ten_minutes)
+        now - five_days
+    else
+        pt;
+    return if (clamped < 0) 0 else @intCast(clamped);
+}
+
 /// Minimum time between connection attempts to the same address (10 minutes).
 pub const MIN_RECONNECT_INTERVAL: i64 = 10 * 60;
 
@@ -3387,11 +3406,31 @@ pub const PeerManager = struct {
         return netGroup(address);
     }
 
+    /// Add an address to the address book.
+    ///
+    /// `peer_time_unix` is the peer-advertised timestamp (already clamped via
+    /// `clampAddrTimestamp`).  When null the current wall-clock is used, which
+    /// is correct for DNS seeds, fixed seeds, and manual addnode entries.
+    /// For gossip (addr/addrv2) callers MUST pass the clamped peer timestamp so
+    /// addrman records how recently the advertising peer claims to have seen the
+    /// address — matching Core's addrman.Add(addr, peer_addr, time_penalty=2h).
+    ///
+    /// Core reference: net_processing.cpp ProcessAddrs / addrman.cpp Add.
     pub fn addAddress(
         self: *PeerManager,
         address: std.net.Address,
         services: u64,
         source: AddressSource,
+    ) !void {
+        return self.addAddressWithTime(address, services, source, null);
+    }
+
+    pub fn addAddressWithTime(
+        self: *PeerManager,
+        address: std.net.Address,
+        services: u64,
+        source: AddressSource,
+        peer_time_unix: ?u64,
     ) !void {
         // Reject non-publicly-routable addresses from gossip.
         // Core: addrman.cpp AddrManImpl::AddSingle() line ~534:
@@ -3408,26 +3447,37 @@ pub const PeerManager = struct {
         // addresses we lack the relaying peer's address here, so we group by the
         // address itself (Core groups new entries by source — clearbit's source
         // metadata is per-AddressSource enum, not a CNetAddr, so this is the
-        // best-available group input and still spreads by /16). last_seen uses
-        // the same wall clock the legacy map records.
+        // best-available group input and still spreads by /16).
         const now_i = std.time.timestamp();
         const now: u64 = if (now_i < 0) 0 else @intCast(now_i);
+        // Use the peer-supplied (clamped) timestamp when available, so addrman
+        // records the address freshness as the advertising peer sees it.
+        // Core: addrman.Add(vAddrOk, pfrom.addr, time_penalty=2h); the
+        // per-address nTime is already clamped before Add is called.
+        const time_for_addrman: u64 = peer_time_unix orelse now;
         if (self.ensureAddrman()) |am| {
             const ag = self.addrManGroup(address);
             // Source group: gossiped addrs carry no relayer addr in this API, so
             // use the address's own group (Core uses the source's group; this
             // degrades gracefully to per-/16 spread without a relayer addr).
             const sg = ag;
-            _ = am.add(address, ag, sg, services, now, now) catch {};
+            _ = am.add(address, ag, sg, services, time_for_addrman, now) catch {};
         }
 
         const key = addressKey(address);
         if (self.known_addresses.contains(key)) return;
 
+        // Prefer the peer-supplied timestamp for the legacy map as well, so
+        // that selectPeerToConnect's freshness heuristic sees the same value.
+        const last_seen_i: i64 = if (peer_time_unix) |pt|
+            @intCast(pt)
+        else
+            now_i;
+
         try self.known_addresses.put(key, AddressInfo{
             .address = address,
             .services = services,
-            .last_seen = now_i,
+            .last_seen = last_seen_i,
             .last_tried = 0,
             .attempts = 0,
             .success = false,
@@ -4779,7 +4829,14 @@ pub const PeerManager = struct {
                 if (admit < a.addrs.len) {
                     std.log.debug("addr rate-limit: dropped {d} of {d} addrs", .{ a.addrs.len - admit, a.addrs.len });
                 }
+                const now_i = std.time.timestamp();
                 for (a.addrs[0..admit]) |entry| {
+                    // Clamp the peer-advertised timestamp before storing.
+                    // Core net_processing.cpp:5678-5679:
+                    //   if (addr.nTime <= NodeSeconds{100000000s} ||
+                    //       addr.nTime > current_time + 10min)
+                    //       addr.nTime = current_time - 5*24h;
+                    const clamped_ts = clampAddrTimestamp(entry.timestamp, now_i);
                     // Convert TimestampedAddr to std.net.Address
                     // Check if it's an IPv4-mapped IPv6 address
                     if (std.mem.eql(u8, entry.addr.ip[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
@@ -4787,7 +4844,7 @@ pub const PeerManager = struct {
                             entry.addr.ip[12..16].*,
                             entry.addr.port,
                         );
-                        self.addAddress(addr, entry.addr.services, .peer_addr) catch continue;
+                        self.addAddressWithTime(addr, entry.addr.services, .peer_addr, clamped_ts) catch continue;
                     }
                 }
             },
@@ -4801,15 +4858,18 @@ pub const PeerManager = struct {
                 if (admit < a2.entries.len) {
                     std.log.debug("addrv2 rate-limit: dropped {d} of {d} addrs", .{ a2.entries.len - admit, a2.entries.len });
                 }
+                const now_i_v2 = std.time.timestamp();
                 // BIP155: Process addrv2 entries — extract IPv4/IPv6 and add to known addresses
                 for (a2.entries[0..admit]) |entry| {
+                    // Clamp timestamp, same Core rule as for legacy addr.
+                    const clamped_ts = clampAddrTimestamp(entry.timestamp, now_i_v2);
                     if (entry.network_id == 1 and entry.addr_bytes.len == 4) {
                         // IPv4
                         const addr = std.net.Address.initIp4(
                             entry.addr_bytes[0..4].*,
                             entry.port,
                         );
-                        self.addAddress(addr, entry.services, .peer_addr) catch continue;
+                        self.addAddressWithTime(addr, entry.services, .peer_addr, clamped_ts) catch continue;
                     }
                 }
             },
