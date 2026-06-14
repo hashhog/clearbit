@@ -2336,6 +2336,29 @@ pub const BlockIndex = struct {
     prev_mtp: u32,
 };
 
+/// BIP-68 applies only when version >= 2. Bitcoin Core stores the version as
+/// uint32_t and compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2,
+/// consensus/tx_verify.cpp:51), so a high-bit version (e.g. 0x80000002) STILL
+/// enforces BIP-68. clearbit stores version as i32; a signed >= 2 would treat
+/// 0x80000002 as negative and SKIP enforcement, false-accepting a tx whose relative
+/// timelock is unmet (a chain split). Compare unsigned -- same as OP_CSV
+/// (script.zig:2080).
+pub fn bip68VersionActive(version: i32) bool {
+    return @as(u32, @bitCast(version)) >= 2;
+}
+
+test "bip68VersionActive compares version unsigned (Core uint32_t)" {
+    // 0x80000002 as i32 is -2147483646; a signed `>= 2` is false (the bug). Core
+    // compares unsigned, so a high-bit version still enforces BIP-68. Pure function,
+    // so this is immune to the flaky global-state pollution in clearbit's heavier tests.
+    try std.testing.expect(bip68VersionActive(@as(i32, @bitCast(@as(u32, 0x80000002)))));
+    try std.testing.expect(bip68VersionActive(@as(i32, @bitCast(@as(u32, 0xFFFFFFFF)))));
+    try std.testing.expect(bip68VersionActive(2));
+    try std.testing.expect(bip68VersionActive(3));
+    try std.testing.expect(!bip68VersionActive(1));
+    try std.testing.expect(!bip68VersionActive(0));
+}
+
 /// Calculate sequence locks for a transaction.
 ///
 /// For each input where BIP-68 is active (bit 31 not set in nSequence),
@@ -2367,8 +2390,8 @@ pub fn calculateSequenceLocks(
         .min_time = -1,
     };
 
-    // BIP-68 only applies to tx version >= 2
-    if (tx.version < 2) {
+    // BIP-68 applies only to version >= 2, compared UNSIGNED (bip68VersionActive).
+    if (!bip68VersionActive(tx.version)) {
         return result;
     }
 
