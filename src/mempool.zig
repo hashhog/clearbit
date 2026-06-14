@@ -1166,7 +1166,8 @@ pub const Mempool = struct {
             const next_height: u32 = cs.best_height + 1;
             const mtp: u32 = cs.computeMTP();
             if (cs.best_height >= p2.csv_height and
-                tx.version >= 2 and
+                // version compared UNSIGNED (Core uint32_t); see validation.bip68VersionActive.
+                validation.bip68VersionActive(tx.version) and
                 seq_utxo_infos.items.len == tx.inputs.len)
             {
                 // Build a UtxoView backed by the collected infos (indexed by input position).
