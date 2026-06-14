@@ -175,6 +175,7 @@ pub const ScriptError = error{
     PushSize, // MAX_SCRIPT_ELEMENT_SIZE exceeded on a witness stack input element
     SchnorrSigSize, // BIP-340/341: Schnorr signature is not 64 or 65 bytes
     SchnorrSigHashType, // BIP-340/341: invalid hashtype byte appended to 65-byte sig
+    WitnessMalleatedP2sh, // BIP-141: P2SH-wrapped witness scriptSig is not the minimal canonical push of the redeemScript
 };
 
 // ============================================================================
@@ -1021,6 +1022,47 @@ pub const ScriptEngine = struct {
                 if (saved_stack.items.len > 0) {
                     const redeem = saved_stack.items[saved_stack.items.len - 1];
                     if (isWitnessProgram(redeem)) |_| {
+                        // BIP-141 / Core interpreter.cpp:2082-2086: scriptSig must be EXACTLY the
+                        // minimal canonical single-push of the redeemScript bytes.  A non-minimal
+                        // encoding (e.g. OP_PUSHDATA1 for a 22-byte program) is push-only and
+                        // evaluates identically, but the byte sequences differ → chain split.
+                        // MINIMALDATA is policy-only and NOT in GetBlockScriptFlags, so this
+                        // byte-exact comparison is the ONLY guard under block/ConnectBlock validation.
+                        //
+                        // Reconstruct the expected scriptSig inline (no allocation needed): the
+                        // minimal push of `redeem` (n bytes) is:
+                        //   n == 0         → [0x00]          (OP_0)
+                        //   1 ≤ n ≤ 75    → [n] ++ redeem   (direct push)
+                        //   76 ≤ n ≤ 255  → [0x4c, n] ++ redeem  (OP_PUSHDATA1)
+                        //   256 ≤ n ≤ 65535 → [0x4d, lo, hi] ++ redeem  (OP_PUSHDATA2)
+                        // Redeemscripts are capped at MAX_SCRIPT_ELEMENT_SIZE (520), so
+                        // OP_PUSHDATA4 is unreachable here.
+                        const rlen = redeem.len;
+                        const canonical_ok = blk: {
+                            if (rlen == 0) {
+                                // Expected: [0x00]
+                                break :blk script_sig.len == 1 and script_sig[0] == 0x00;
+                            } else if (rlen <= 75) {
+                                // Expected: [rlen] ++ redeem
+                                if (script_sig.len != 1 + rlen) break :blk false;
+                                if (script_sig[0] != @as(u8, @intCast(rlen))) break :blk false;
+                                break :blk std.mem.eql(u8, script_sig[1..], redeem);
+                            } else if (rlen <= 255) {
+                                // Expected: [0x4c, rlen] ++ redeem  (OP_PUSHDATA1)
+                                if (script_sig.len != 2 + rlen) break :blk false;
+                                if (script_sig[0] != 0x4c) break :blk false;
+                                if (script_sig[1] != @as(u8, @intCast(rlen))) break :blk false;
+                                break :blk std.mem.eql(u8, script_sig[2..], redeem);
+                            } else {
+                                // Expected: [0x4d, lo, hi] ++ redeem  (OP_PUSHDATA2)
+                                if (script_sig.len != 3 + rlen) break :blk false;
+                                if (script_sig[0] != 0x4d) break :blk false;
+                                if (script_sig[1] != @as(u8, @intCast(rlen & 0xff))) break :blk false;
+                                if (script_sig[2] != @as(u8, @intCast((rlen >> 8) & 0xff))) break :blk false;
+                                break :blk std.mem.eql(u8, script_sig[3..], redeem);
+                            }
+                        };
+                        if (!canonical_ok) return ScriptError.WitnessMalleatedP2sh;
                         wit_program_script = redeem;
                         via_p2sh = true;
                     }
@@ -7337,4 +7379,136 @@ test "W95: SchnorrSigSize and SchnorrSigHashType are distinct ScriptError varian
     try std.testing.expect(e1 != e2);
     try std.testing.expect(e1 != e3);
     try std.testing.expect(e2 != e3);
+}
+
+// ============================================================================
+// WITNESS_MALLEATED_P2SH tests
+//
+// Reference: Bitcoin Core interpreter.cpp:2082-2086.
+// For a P2SH-wrapped witness program, scriptSig must be BYTE-FOR-BYTE equal to
+// the minimal canonical single-push of the redeemScript.  A non-minimal
+// encoding (e.g. OP_PUSHDATA1 for a 22-byte program) is push-only and evaluates
+// identically on the stack, but the bytes differ → chain split.
+// MINIMALDATA is policy-only and NOT included in GetBlockScriptFlags, so this
+// byte-exact check is the ONLY guard at block-validation time.
+// ============================================================================
+
+test "WITNESS_MALLEATED_P2SH: non-minimal OP_PUSHDATA1 scriptSig rejected for P2SH-P2WPKH" {
+    // Scenario: P2SH-wrapped P2WPKH output.  The redeemScript W is the 22-byte
+    // witness program OP_0 <20-byte-hash> (a P2WPKH program).  A spender that
+    // uses OP_PUSHDATA1 to push W (0x4c 0x16 <W>) instead of the minimal direct
+    // push (0x16 <W>) produces a scriptSig that is push-only and evaluates to
+    // [W] on the stack — but fails the byte-exact Core check.
+    //
+    // Under block flags (MINIMALDATA off), this MUST be rejected with
+    // WitnessMalleatedP2sh, not silently accepted.
+    const allocator = std.testing.allocator;
+
+    // Build the 22-byte P2WPKH redeemScript: OP_0 (0x00) + push20 (0x14) + 20-byte hash
+    var redeem: [22]u8 = undefined;
+    redeem[0] = 0x00; // OP_0 (witness version 0)
+    redeem[1] = 0x14; // push 20 bytes
+    @memset(redeem[2..22], 0xAB); // 20-byte pubkey hash (arbitrary, but non-zero so P2SH check passes)
+
+    // Compute hash160(redeemScript) for the P2SH scriptPubKey
+    const redeem_hash = crypto.hash160(&redeem);
+
+    // P2SH scriptPubKey: OP_HASH160 (0xa9) + push20 (0x14) + hash160 + OP_EQUAL (0x87)
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9; // OP_HASH160
+    script_pubkey[1] = 0x14; // push 20 bytes
+    @memcpy(script_pubkey[2..22], &redeem_hash);
+    script_pubkey[22] = 0x87; // OP_EQUAL
+
+    // NON-MINIMAL scriptSig: OP_PUSHDATA1 (0x4c) <len=22=0x16> <redeem>
+    // This is push-only and pushes [redeem] onto the stack, identical in
+    // effect to the minimal 0x16 <redeem> — but the bytes differ.
+    var non_minimal_sig: [24]u8 = undefined;
+    non_minimal_sig[0] = 0x4c; // OP_PUSHDATA1
+    non_minimal_sig[1] = 0x16; // length = 22
+    @memcpy(non_minimal_sig[2..24], &redeem);
+
+    // Dummy 2-item witness (sig + pubkey placeholders).  The malleation check
+    // fires before witness-script execution, so the values are irrelevant.
+    const dummy_sig = [_]u8{ 0x30, 0x01, 0x01 }; // syntactically invalid DER, but irrelevant
+    // Compressed-form pubkey shape: 0x02 prefix + 32 bytes
+    const dummy_pubkey = [_]u8{ 0x02, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD };
+    const witness_items = [_][]const u8{ &dummy_sig, &dummy_pubkey };
+
+    // Use block-level flags: P2SH + WITNESS enabled, MINIMALDATA disabled (not a block flag)
+    const flags = ScriptFlags{
+        .verify_p2sh = true,
+        .verify_witness = true,
+        .verify_minimaldata = false, // block flags do NOT include MINIMALDATA
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    const result = engine.verify(&non_minimal_sig, &script_pubkey, &witness_items);
+    // Must fail with WitnessMalleatedP2sh, not pass or fail for any other reason.
+    try std.testing.expectError(ScriptError.WitnessMalleatedP2sh, result);
+}
+
+test "WITNESS_MALLEATED_P2SH: minimal direct-push scriptSig passes malleation check for P2SH-P2WPKH" {
+    // Same setup as the REJECT test above, but with the CANONICAL minimal scriptSig:
+    // 0x16 <22-byte-redeem> (direct push, 23 bytes total).
+    // The malleation check must PASS; the spend then proceeds to witness
+    // verification which fails (dummy sig/key), but NOT with WitnessMalleatedP2sh.
+    const allocator = std.testing.allocator;
+
+    var redeem: [22]u8 = undefined;
+    redeem[0] = 0x00; // OP_0
+    redeem[1] = 0x14; // push 20 bytes
+    @memset(redeem[2..22], 0xAB);
+
+    const redeem_hash = crypto.hash160(&redeem);
+
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &redeem_hash);
+    script_pubkey[22] = 0x87;
+
+    // CANONICAL (minimal) scriptSig: 0x16 <redeem>  (direct push, 1-byte length prefix)
+    var canonical_sig: [23]u8 = undefined;
+    canonical_sig[0] = 0x16; // direct push of 22 bytes (22 < 76 → minimal)
+    @memcpy(canonical_sig[1..23], &redeem);
+
+    const dummy_sig = [_]u8{ 0x30, 0x01, 0x01 };
+    const dummy_pubkey = [_]u8{ 0x02, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD, 0xCD };
+    const witness_items = [_][]const u8{ &dummy_sig, &dummy_pubkey };
+
+    const flags = ScriptFlags{
+        .verify_p2sh = true,
+        .verify_witness = true,
+        .verify_minimaldata = false,
+    };
+
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, flags);
+    defer engine.deinit();
+
+    const result = engine.verify(&canonical_sig, &script_pubkey, &witness_items);
+    // The malleation check must PASS (not WitnessMalleatedP2sh).
+    // The spend will fail at witness verification (dummy sig/key), but that is
+    // a different error — confirming the malleation gate itself is cleared.
+    if (result) |_| {
+        // Unexpected success with dummy keys — secp256k1 stub accepted; still correct.
+    } else |err| {
+        try std.testing.expect(err != ScriptError.WitnessMalleatedP2sh);
+    }
 }
