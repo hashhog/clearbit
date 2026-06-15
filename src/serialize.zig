@@ -70,6 +70,44 @@ pub const Reader = struct {
         return value;
     }
 
+    /// Read a CompactSize WITHOUT the MAX_SIZE (0x02000000) range check.
+    ///
+    /// Use this for fields that are bitfields rather than container lengths —
+    /// specifically the `services` field in BIP-155 addrv2 entries.  Bitcoin
+    /// Core reads those with `CompactSizeFormatter<false>` (protocol.h:446),
+    /// where the `false` template parameter disables the range check.  Using
+    /// the range-checked `readCompactSize` here causes peers advertising a
+    /// service bit at position >= 26 (value > 0x02000000) to be wrongly
+    /// disconnected with OversizedVector.
+    ///
+    /// Non-canonical encodings are still rejected (same as `readCompactSize`).
+    pub fn readCompactSizeNoLimit(self: *Reader) Error!u64 {
+        @setRuntimeSafety(true);
+        const first = try self.readInt(u8);
+        // 1-byte form (0x00..0xFC): always canonical.  No MAX_SIZE check.
+        if (first < 0xFD) return first;
+        // Multi-byte forms: reject non-canonical encodings; allow all values.
+        const value: u64 = switch (first) {
+            0xFD => blk: {
+                const v = @as(u64, try self.readInt(u16));
+                if (v < 0xFD) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+            0xFE => blk: {
+                const v = @as(u64, try self.readInt(u32));
+                if (v < 0x10000) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+            else => blk: { // 0xFF
+                const v = try self.readInt(u64);
+                if (v < 0x100000000) return Error.InvalidCompactSize;
+                break :blk v;
+            },
+        };
+        // No MAX_SIZE check here (contrast readCompactSize above).
+        return value;
+    }
+
     /// Read a VARINT (Bitcoin Core's special MSB-continuation encoding,
     /// distinct from CompactSize). Used for Coin::code and CompressAmount.
     /// Reference: bitcoin-core/src/serialize.h ReadVarInt.

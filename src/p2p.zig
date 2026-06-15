@@ -1213,7 +1213,12 @@ fn decodeAddrV2(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseEr
     var entries = try allocator.alloc(AddrV2Entry, @intCast(count));
     for (0..@intCast(count)) |i| {
         const timestamp = try reader.readInt(u32);
-        const services = try reader.readCompactSize();
+        // BIP-155 §2 / Bitcoin Core protocol.h:446: the services field in
+        // addrv2 is a 64-bit bitfield encoded as CompactSize with NO range
+        // check (CompactSizeFormatter<false>).  Using the range-checked
+        // readCompactSize() here wrongly disconnects peers advertising any
+        // service bit >= 26 (value > MAX_SIZE = 0x02000000).
+        const services = try reader.readCompactSizeNoLimit();
         const network_id = (try reader.readBytes(1))[0];
         const addr_len = try reader.readCompactSize();
         if (addr_len > 512) return ParseError.InvalidData;
@@ -1628,4 +1633,64 @@ test "network magic values" {
     try std.testing.expectEqual(@as(u32, 0x0709110B), NetworkMagic.TESTNET);
     try std.testing.expectEqual(@as(u32, 0xDAB5BFFA), NetworkMagic.REGTEST);
     try std.testing.expectEqual(@as(u32, 0x40CF030A), NetworkMagic.SIGNET);
+}
+
+test "addrv2 services field accepts values above MAX_SIZE (7A regression)" {
+    // Bitcoin Core reads the addrv2 `services` field with CompactSizeFormatter<false>
+    // (protocol.h:446), i.e. NO range check.  Values > MAX_SIZE (0x02000000) are
+    // valid 64-bit service bitmasks, not container lengths.  Before this fix,
+    // decodeAddrV2 used readCompactSize() (range_check=true), which returned
+    // OversizedVector for any service bit >= 26 and caused the connection to be
+    // torn down — wrongly disconnecting well-behaved peers.
+    //
+    // This test encodes an addrv2 entry with services = 0x80000000 (bit 31 set,
+    // which encodes as a 5-byte CompactSize 0xFE + LE32) and verifies the decoder
+    // accepts it without error and preserves the value exactly.
+    // Without the fix: decodeAddrV2 returns OversizedVector (= ParseError.InvalidData).
+    // With the fix: decodes successfully, services == 0x80000000.
+    const allocator = std.testing.allocator;
+
+    // Manually encode an addrv2 payload:
+    //   compact_size(count=1)  = 0x01
+    //   timestamp(u32 LE)      = 00 00 00 00
+    //   services (CompactSize, no range check):
+    //     0x80000000 > 0xFFFF but fits in u32 → 0xFE prefix + LE32
+    //     = FE 00 00 00 80
+    //   network_id(u8)         = 0x01 (IPv4)
+    //   addr_len(CompactSize)  = 0x04
+    //   addr_bytes(4)          = 7F 00 00 01  (127.0.0.1)
+    //   port(u16 BE)           = 20 8D        (8333)
+    const payload = [_]u8{
+        0x01,                   // count = 1
+        0x00, 0x00, 0x00, 0x00, // timestamp = 0
+        0xFE, 0x00, 0x00, 0x00, 0x80, // services = 0x80000000 (5-byte CompactSize)
+        0x01,                   // network_id = 1 (IPv4)
+        0x04,                   // addr_len = 4
+        0x7F, 0x00, 0x00, 0x01, // 127.0.0.1
+        0x20, 0x8D,             // port = 8333 (big-endian)
+    };
+
+    const msg = try decodePayload("addrv2", &payload, allocator);
+    defer allocator.free(msg.addrv2.entries);
+
+    try std.testing.expectEqual(@as(usize, 1), msg.addrv2.entries.len);
+    try std.testing.expectEqual(@as(u64, 0x80000000), msg.addrv2.entries[0].services);
+    try std.testing.expectEqual(@as(u16, 8333), msg.addrv2.entries[0].port);
+
+    // Also verify the all-bits-set case (u64 max, 9-byte CompactSize FF + LE64).
+    // This would encode as: FF FF FF FF FF FF FF FF FF
+    const payload_allbits = [_]u8{
+        0x01,
+        0x00, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // services = u64::MAX
+        0x01,
+        0x04,
+        0x7F, 0x00, 0x00, 0x01,
+        0x20, 0x8D,
+    };
+
+    const msg2 = try decodePayload("addrv2", &payload_allbits, allocator);
+    defer allocator.free(msg2.addrv2.entries);
+
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), msg2.addrv2.entries[0].services);
 }
