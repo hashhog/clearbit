@@ -12464,6 +12464,7 @@ pub const RpcServer = struct {
             .p2pk     => "pubkey",
             .multisig => "multisig",
             .null_data=> "nulldata",
+            .witness_unknown => "witness_unknown",
             .nonstandard => "nonstandard",
         };
 
@@ -20963,6 +20964,7 @@ fn writeScriptUnivNoAddr(writer: anytype, script_bytes: []const u8) !void {
         .p2pk     => "pubkey",
         .multisig => "multisig",
         .null_data=> "nulldata",
+        .witness_unknown => "witness_unknown",
         .nonstandard => "nonstandard",
     };
     try writer.writeAll("{\"asm\":\"");
@@ -21296,7 +21298,7 @@ fn extractAddressForSpk(
             const hrp: []const u8 = if (is_regtest) "bcrt" else if (network == .mainnet) "bc" else "tb";
             return try address_mod.segwitEncode(hrp, 1, spk[2..4], allocator);
         },
-        .p2pk, .multisig, .null_data, .nonstandard => return null,
+        .p2pk, .multisig, .null_data, .witness_unknown, .nonstandard => return null,
     }
 }
 
@@ -21366,6 +21368,7 @@ fn writeScriptPubKeyUniv(
         .p2pk => "pubkey",
         .multisig => "multisig",
         .null_data => "nulldata",
+        .witness_unknown => "witness_unknown",
         .nonstandard => "nonstandard",
     };
 

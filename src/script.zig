@@ -2599,6 +2599,7 @@ pub const ScriptType = enum {
     p2pk, // <33 or 65> OP_CHECKSIG
     multisig, // OP_M <keys...> OP_N OP_CHECKMULTISIG
     null_data, // OP_RETURN <data>
+    witness_unknown, // valid witness program, version != 0, not a recognised type
     nonstandard,
 };
 
@@ -2722,6 +2723,26 @@ pub fn classifyScript(script: []const u8) ScriptType {
         {
             return .multisig;
         }
+    }
+
+    // WITNESS_UNKNOWN: a syntactically valid witness program whose version is
+    // non-zero and which is not one of the recognised witness types handled
+    // above (P2WPKH/P2WSH for v0, P2TR for v1/32, P2A for the v1 anchor). This
+    // mirrors Bitcoin Core's Solver() (script/solver.cpp:156-177): after the
+    // canonical types are ruled out, any remaining witness program with
+    // `witnessversion != 0` is WITNESS_UNKNOWN (e.g. a v1 program whose size is
+    // not 32, or any v2..v16 program). A v0 program with a non-{20,32} program
+    // size is NONSTANDARD (Core's `return TxoutType::NONSTANDARD` at :177).
+    //
+    // WITNESS_UNKNOWN outputs are standard to CREATE (relay-standard, possible
+    // future soft-forks) but non-standard to SPEND
+    // (ValidateInputsStandardness rejects them as prevouts). This is mempool
+    // RELAY standardness only — never consensus block/tx validation.
+    if (isWitnessProgram(script)) |wp| {
+        if (wp.version != 0) {
+            return .witness_unknown;
+        }
+        return .nonstandard;
     }
 
     return .nonstandard;
@@ -3471,10 +3492,13 @@ test "P2A (Pay-to-Anchor) template classification" {
     try std.testing.expect(!isPayToAnchor(&p2tr_script));
     try std.testing.expectEqual(ScriptType.p2tr, classifyScript(&p2tr_script));
 
-    // Wrong data (not "Ns")
+    // Wrong data (not "Ns"): OP_1 PUSH2 0x0000 is NOT the P2A anchor program,
+    // but it IS a syntactically valid v1 witness program (program size 2, in the
+    // [2,40] range). Core's Solver classifies it WITNESS_UNKNOWN (witnessversion
+    // != 0, not a recognised type — script/solver.cpp:172-175), not NONSTANDARD.
     const wrong_data = [_]u8{ 0x51, 0x02, 0x00, 0x00 };
     try std.testing.expect(!isPayToAnchor(&wrong_data));
-    try std.testing.expectEqual(ScriptType.nonstandard, classifyScript(&wrong_data));
+    try std.testing.expectEqual(ScriptType.witness_unknown, classifyScript(&wrong_data));
 }
 
 test "OP_RETURN script classified as null_data" {

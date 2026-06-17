@@ -2535,9 +2535,10 @@ pub const Mempool = struct {
     ///   1. NONSTANDARD prevout: classifyScript() == .nonstandard → reject.
     ///      Core error: "bad-txns-nonstandard-inputs".
     ///   2. WITNESS_UNKNOWN prevout: valid witness-program syntax but unknown
-    ///      version (2-16).  In clearbit these also classify as .nonstandard
-    ///      (classifyScript does not have a distinct witness_unknown variant),
-    ///      so gate 1 covers both.
+    ///      version (v1 non-32B or v2..v16).  classifyScript now returns the
+    ///      distinct .witness_unknown variant for these; gate 2 rejects them
+    ///      explicitly (Core treats WITNESS_UNKNOWN prevouts as non-standard to
+    ///      spend).
     ///   3. P2SH prevout with redeemScript > MAX_P2SH_SIGOPS (15) sigops → reject.
     ///      Uses the actual prevout type (from spent_scripts) so only real P2SH
     ///      inputs are gated, unlike the conservative approximation in checkStandard().
@@ -2553,7 +2554,10 @@ pub const Mempool = struct {
             const stype = script.classifyScript(prevout_script);
 
             // Gates 1 + 2: NONSTANDARD or WITNESS_UNKNOWN prevout → reject.
-            if (stype == .nonstandard) {
+            // WITNESS_UNKNOWN outputs are standard to CREATE but non-standard to
+            // SPEND (Core policy/policy.cpp ValidateInputsStandardness rejects
+            // the WITNESS_UNKNOWN prevout case).
+            if (stype == .nonstandard or stype == .witness_unknown) {
                 return MempoolError.NonStandard;
             }
 
@@ -5760,6 +5764,66 @@ test "W71: bare multisig 2-of-3 accepted (n≤3, m≤n)" {
         std.debug.print("Unexpected error for 2-of-3 multisig: {}\n", .{e});
         return error.TestUnexpectedResult;
     };
+}
+
+test "WITNESS_UNKNOWN: v1 16-byte witness-program output is standard to CREATE" {
+    // Relay-policy (NON-consensus) standardness. Core's Solver classifies a
+    // witness program with witnessversion != 0 that is not a recognised type
+    // (here a v1 program whose size is 16, not the 32-byte Taproot size) as
+    // WITNESS_UNKNOWN, which IsStandardTx ACCEPTS as an output to create.
+    // Pre-fix clearbit folded this into NONSTANDARD and checkStandard rejected
+    // it — this test fails without the fix (no .witness_unknown variant).
+    // Reference: bitcoin-core/src/script/solver.cpp:156-177.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // OP_1 (witversion 1) push16 <16 bytes> — a v1 non-32B program.
+    var v1_16: [18]u8 = undefined;
+    v1_16[0] = 0x51; // OP_1
+    v1_16[1] = 0x10; // push 16
+    for (2..18) |i| v1_16[i] = @intCast(i & 0xff);
+
+    try std.testing.expectEqual(script.ScriptType.witness_unknown, script.classifyScript(&v1_16));
+
+    const input = types.TxIn{
+        .previous_output = .{ .hash = [_]u8{0x66} ** 32, .index = 0 },
+        .script_sig = &[_]u8{0x00}, // OP_0 — push-only; pads tx to ≥65 bytes via outputs below
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    // Two outputs so the serialized tx clears MIN_STANDARD_TX_NONWITNESS_SIZE (65).
+    const wu_out = types.TxOut{ .value = 50_000, .script_pubkey = &v1_16 };
+    const p2wpkh = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xCD} ** 20;
+    const pad_out = types.TxOut{ .value = 40_000, .script_pubkey = &p2wpkh };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{ wu_out, pad_out },
+        .lock_time = 0,
+    };
+    // WITNESS_UNKNOWN is standard to CREATE → checkStandard must NOT reject it.
+    mempool.checkStandard(&tx) catch |e| {
+        std.debug.print("Unexpected error for v1 WITNESS_UNKNOWN output: {}\n", .{e});
+        return error.TestUnexpectedResult;
+    };
+
+    // Control: a v0 program of a non-{20,32} size is still NONSTANDARD (Core :177)
+    // → checkStandard rejects it. Proves the branch keys on witnessversion != 0,
+    // not accept-any-witness-shape.
+    var v0_16: [18]u8 = undefined;
+    v0_16[0] = 0x00; // OP_0 (witversion 0)
+    v0_16[1] = 0x10; // push 16
+    for (2..18) |i| v0_16[i] = @intCast(i & 0xff);
+    try std.testing.expectEqual(script.ScriptType.nonstandard, script.classifyScript(&v0_16));
+    const bad_out = types.TxOut{ .value = 50_000, .script_pubkey = &v0_16 };
+    const bad_tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{input},
+        .outputs = &[_]types.TxOut{ bad_out, pad_out },
+        .lock_time = 0,
+    };
+    try std.testing.expectError(MempoolError.NonStandard, mempool.checkStandard(&bad_tx));
 }
 
 test "wtxid lookup" {
@@ -13284,9 +13348,10 @@ test "FIX-12 G1: NONSTANDARD prevout rejects with NonStandard (gate 1)" {
 
 test "FIX-12 G2: WITNESS_UNKNOWN prevout (version 2) rejects with NonStandard (gate 2)" {
     // OP_2 (0x52) + push-20 (0x14) + 20 bytes = witness version 2 program.
-    // classifyScript has no .witness_unknown variant; this falls through to
-    // .nonstandard, so validateInputsStandardness rejects it as NonStandard.
-    // Reference: Bitcoin Core Solver() returning WITNESS_UNKNOWN for version != 0.
+    // classifyScript returns .witness_unknown (Core Solver: WITNESS_UNKNOWN for
+    // version != 0); validateInputsStandardness gate 2 rejects WITNESS_UNKNOWN
+    // prevouts as NonStandard (standard to create, non-standard to spend).
+    // Reference: Bitcoin Core Solver() + ValidateInputsStandardness().
     const witness_unknown_spk = [_]u8{0x52} ++ [_]u8{0x14} ++ [_]u8{0xCC} ** 20;
     const p2wpkh_out = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAB} ** 20;
     const input = types.TxIn{
