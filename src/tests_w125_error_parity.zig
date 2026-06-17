@@ -197,11 +197,13 @@ test "w125 G11 BUG-5 (HIGH-COMPAT): RPC_CLIENT_IN_INITIAL_DOWNLOAD constant MISS
 // Core uses this for addnode add-when-already-added (net.cpp:362) AND for
 // setban add-when-already-banned (net.cpp:785).
 // ---------------------------------------------------------------------------
-test "w125 G12 BUG-6 (HIGH-COMPAT): RPC_CLIENT_NODE_ALREADY_ADDED constant MISSING (xfail)" {
-    try testing.expect(!@hasDecl(rpc, "RPC_CLIENT_NODE_ALREADY_ADDED"));
-    // handleAddNode currently uses RPC_MISC_ERROR (-1) for "Failed to add
-    // node" instead of -23.  See rpc.zig:10484.
-    try testing.expectEqual(@as(i32, -1), rpc.RPC_MISC_ERROR);
+// FIX (ported from rustoshi 7b94ef1): the -23 constant is now defined and
+// handleAddNode returns it for `addnode "add"` of an already-added node, with
+// Core's exact message "Error: Node already added" (rpc/net.cpp:362). The
+// behaviour assertion (through dispatch) lives in src/rpc.zig's test block.
+test "w125 G12 BUG-6 (HIGH-COMPAT): RPC_CLIENT_NODE_ALREADY_ADDED = -23 (PRESENT)" {
+    try testing.expect(@hasDecl(rpc, "RPC_CLIENT_NODE_ALREADY_ADDED"));
+    try testing.expectEqual(@as(i32, -23), rpc.RPC_CLIENT_NODE_ALREADY_ADDED);
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +212,12 @@ test "w125 G12 BUG-6 (HIGH-COMPAT): RPC_CLIENT_NODE_ALREADY_ADDED constant MISSI
 // (net.cpp:368) and on `getaddednodeinfo` (net.cpp:534).  clearbit's
 // addnode remove silently succeeds (rpc.zig:10488 — no error path).
 // ---------------------------------------------------------------------------
-test "w125 G13 BUG-7 (HIGH-COMPAT): RPC_CLIENT_NODE_NOT_ADDED constant MISSING (xfail)" {
-    try testing.expect(!@hasDecl(rpc, "RPC_CLIENT_NODE_NOT_ADDED"));
+// FIX (ported from rustoshi 7b94ef1): the -24 constant is now defined and
+// handleAddNode returns it for `addnode "remove"` of a never-added node, with
+// Core's exact message (rpc/net.cpp:368). Behaviour assertion in src/rpc.zig.
+test "w125 G13 BUG-7 (HIGH-COMPAT): RPC_CLIENT_NODE_NOT_ADDED = -24 (PRESENT)" {
+    try testing.expect(@hasDecl(rpc, "RPC_CLIENT_NODE_NOT_ADDED"));
+    try testing.expectEqual(@as(i32, -24), rpc.RPC_CLIENT_NODE_NOT_ADDED);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +226,12 @@ test "w125 G13 BUG-7 (HIGH-COMPAT): RPC_CLIENT_NODE_NOT_ADDED constant MISSING (
 // connected-peer set (net.cpp:478).  clearbit returns RPC_INVALID_PARAMS
 // (rpc.zig:10546) which clients won't recognise as a P2P error.
 // ---------------------------------------------------------------------------
-test "w125 G14 BUG-8 (HIGH-COMPAT): RPC_CLIENT_NODE_NOT_CONNECTED constant MISSING (xfail)" {
-    try testing.expect(!@hasDecl(rpc, "RPC_CLIENT_NODE_NOT_CONNECTED"));
+// FIX (ported from rustoshi 845f7e4): the -29 constant is now defined and
+// handleDisconnectNode returns it (instead of -32602) when the address matches
+// no connected peer (rpc/net.cpp:478). Behaviour assertion in src/rpc.zig.
+test "w125 G14 BUG-8 (HIGH-COMPAT): RPC_CLIENT_NODE_NOT_CONNECTED = -29 (PRESENT)" {
+    try testing.expect(@hasDecl(rpc, "RPC_CLIENT_NODE_NOT_CONNECTED"));
+    try testing.expectEqual(@as(i32, -29), rpc.RPC_CLIENT_NODE_NOT_CONNECTED);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +242,13 @@ test "w125 G14 BUG-8 (HIGH-COMPAT): RPC_CLIENT_NODE_NOT_CONNECTED constant MISSI
 // — `LookupHost` failure surfaces as RPC_CLIENT_INVALID_IP_OR_SUBNET" but
 // the code still emits -32602 instead.
 // ---------------------------------------------------------------------------
-test "w125 G15 BUG-9 (HIGH-COMPAT): RPC_CLIENT_INVALID_IP_OR_SUBNET constant MISSING (xfail)" {
-    try testing.expect(!@hasDecl(rpc, "RPC_CLIENT_INVALID_IP_OR_SUBNET"));
+// FIX (ported from rustoshi 980a31d): the -30 constant is now defined and
+// handleSetBan returns it (instead of -32602) with Core's exact message
+// "Error: Invalid IP/Subnet" for an un-parseable IP (rpc/net.cpp:780).
+// Behaviour assertion in src/rpc.zig.
+test "w125 G15 BUG-9 (HIGH-COMPAT): RPC_CLIENT_INVALID_IP_OR_SUBNET = -30 (PRESENT)" {
+    try testing.expect(@hasDecl(rpc, "RPC_CLIENT_INVALID_IP_OR_SUBNET"));
+    try testing.expectEqual(@as(i32, -30), rpc.RPC_CLIENT_INVALID_IP_OR_SUBNET);
 }
 
 // ---------------------------------------------------------------------------
