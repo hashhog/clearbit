@@ -432,6 +432,93 @@ test "w104/G21: anchors.dat stores 2 block-relay peers; no peers.dat for full bo
     try testing.expect(!@hasField(PeerManager, "peers_dat_path"));
 }
 
+// ----------------------------------------------------------------------------
+// G18b WIRING (live lifecycle): bucketed addrman peers.dat persistence is now
+// activated through PeerManager.data_dir. main.zig sets
+//   peer_manager.data_dir = full_datadir
+// at daemon init, so the (already implemented + tested) bucketed CAddrMan save
+// (peer.zig deinit -> addrman.save) and load (peer.zig ensureAddrman ->
+// addrman.load) actually fire over the live shutdown/startup path. Before the
+// wiring, data_dir was hard-null and neither ever ran, so the node forgot its
+// learned peer set on every restart (eclipse / bootstrap fragility).
+//
+// This is the wiring proof, NOT a module-level addrman save/load unit test
+// (that lives in tests_addrman_axis2.zig "persistence roundtrip verbatim").
+// It exercises the SAME PeerManager paths the daemon uses:
+//   - shutdown:  PeerManager.deinit() -> if (data_dir) am.save(dir)
+//   - startup:   PeerManager.ensureAddrman() -> if (data_dir) am.load(dir)
+// triggered via the public addAddress() ingress.
+//
+// Core ref: init.cpp loads/saves peers.dat via CAddrMan (addrman.cpp Save/Load).
+test "w104/G18b: PeerManager.data_dir wires addrman peers.dat save->reload round-trip" {
+    const allocator = testing.allocator;
+
+    // Temp data dir (never touches a real datadir / live peers.dat).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    // A handful of genuinely-routable, distinct public addresses in distinct
+    // /16s (so they spread across NEW buckets, and none is dropped by the
+    // isRoutable guard — avoid RFC1918 / RFC5737 documentation / loopback /
+    // CGNAT / benchmarking ranges, which addAddress silently filters).
+    const seeds = [_]std.net.Address{
+        std.net.Address.initIp4([4]u8{ 8, 8, 8, 8 }, 8333),
+        std.net.Address.initIp4([4]u8{ 1, 2, 3, 4 }, 8333),
+        std.net.Address.initIp4([4]u8{ 9, 9, 9, 9 }, 8333),
+        std.net.Address.initIp4([4]u8{ 13, 107, 21, 200 }, 8333),
+        std.net.Address.initIp4([4]u8{ 151, 101, 1, 69 }, 8333),
+    };
+
+    // --- session 1: learn peers, then shut down (deinit saves peers.dat) ---
+    var saved_count: usize = 0;
+    {
+        var m1 = PeerManager.init(allocator, &consensus.MAINNET);
+        // The wiring under test: with data_dir set, deinit() persists peers.dat.
+        m1.data_dir = dir;
+        // errdefer guards against an allocator leak if an assert below throws
+        // before the explicit deinit() at the end of the block.
+        errdefer m1.deinit();
+        for (seeds) |addr| {
+            try m1.addAddress(addr, p2p.NODE_NETWORK, .peer_addr);
+        }
+        // ensureAddrman fired through addAddress; the bucketed table holds them.
+        try testing.expect(m1.addrman != null);
+        saved_count = m1.addrman.?.totalCount();
+        try testing.expectEqual(seeds.len, saved_count);
+        // deinit() runs the live shutdown path: save(dir) because data_dir != null.
+        m1.deinit();
+    }
+
+    // peers.dat must exist on disk after the shutdown save.
+    {
+        const f = try tmp.dir.openFile("peers.dat", .{});
+        f.close();
+    }
+
+    // --- session 2: fresh manager, same data_dir -> startup load restores them ---
+    {
+        var m2 = PeerManager.init(allocator, &consensus.MAINNET);
+        m2.data_dir = dir;
+        defer m2.deinit();
+        // The wiring under test: ensureAddrman() loads peers.dat because
+        // data_dir != null. addAddress() is the public trigger for it; use a
+        // brand-new address so we can also confirm the load happened BEFORE the
+        // add (the loaded peers must already be present alongside the new one).
+        const fresh = std.net.Address.initIp4([4]u8{ 172, 217, 14, 1 }, 8333);
+        try m2.addAddress(fresh, p2p.NODE_NETWORK, .peer_addr);
+        try testing.expect(m2.addrman != null);
+
+        // Every originally-learned peer survived the restart.
+        for (seeds) |addr| {
+            try testing.expect(m2.addrman.?.getEntry(addr) != null);
+        }
+        // ...and the new address coexists (count = restored + 1).
+        try testing.expectEqual(saved_count + 1, m2.addrman.?.totalCount());
+    }
+}
+
 // ============================================================================
 // Anti-DoS gate tests (G22-G30)
 // ============================================================================
