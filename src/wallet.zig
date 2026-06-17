@@ -753,6 +753,15 @@ pub const ExtendedKey = struct {
             return error.CannotDeriveHardenedFromPublic;
         }
 
+        // BIP-32 depth byte is a single u8. Core's CExtKey::Derive (key.cpp:483)
+        // / CExtPubKey::Derive (pubkey.cpp:416) refuse to derive once the parent
+        // is already at the max depth:
+        //   if (nDepth == std::numeric_limits<unsigned char>::max()) return false;
+        // Without this guard `self.depth + 1` would wrap (ReleaseFast) or panic
+        // (safe builds) and silently emit a wrong depth-0/255 child key that Core
+        // would never produce. Matches the ExtendedPubKey.deriveChild guard.
+        if (self.depth == std.math.maxInt(u8)) return error.DepthOverflow;
+
         var data: [37]u8 = undefined;
 
         if (hardened) {
@@ -6757,6 +6766,43 @@ test "BIP32 CKDpub: rejects depth overflow at max depth 255" {
     try std.testing.expectError(
         error.DepthOverflow,
         pub_at_max.deriveChild(ctx.?, 0),
+    );
+}
+
+test "BIP32 CKDpriv: rejects depth overflow at max depth 255" {
+    // Parity with Core CExtKey::Derive (key.cpp:483):
+    //   if (nDepth == std::numeric_limits<unsigned char>::max()) return false;
+    // The private CKDpriv path (ExtendedKey.deriveChild) must refuse to derive
+    // from a parent already at depth 255. Before the guard, `self.depth + 1`
+    // wrapped/panicked and produced a wrong-depth child Core never emits.
+    const ctx = secp256k1.secp256k1_context_create(
+        secp256k1.SECP256K1_CONTEXT_SIGN | secp256k1.SECP256K1_CONTEXT_VERIFY,
+    );
+    if (ctx == null) return;
+    defer secp256k1.secp256k1_context_destroy(ctx);
+
+    const seed = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+
+    var master = try ExtendedKey.fromSeed(&seed);
+
+    // A depth-254 parent must still derive cleanly to exactly depth 255
+    // (guards against an off-by-one in the boundary).
+    master.depth = 254;
+    const child_255 = try master.deriveChild(ctx.?, 0);
+    try std.testing.expectEqual(@as(u8, 255), child_255.depth);
+
+    // A depth-255 parent must be rejected (normal and hardened both).
+    master.depth = 255;
+    try std.testing.expectError(
+        error.DepthOverflow,
+        master.deriveChild(ctx.?, 0),
+    );
+    try std.testing.expectError(
+        error.DepthOverflow,
+        master.deriveChild(ctx.?, 0x80000000),
     );
 }
 
