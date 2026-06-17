@@ -99,6 +99,23 @@ pub const RPC_VERIFY_REJECTED: i32 = -26;
 pub const RPC_VERIFY_ALREADY_IN_CHAIN: i32 = -27;
 pub const RPC_IN_WARMUP: i32 = -28;
 
+/// P2P client errors (mirror bitcoin-core/src/rpc/protocol.h RPCErrorCode).
+/// `addnode "add"` for a node already on the added-node list
+/// (protocol.h:60 RPC_CLIENT_NODE_ALREADY_ADDED; raised at rpc/net.cpp:362).
+pub const RPC_CLIENT_NODE_ALREADY_ADDED: i32 = -23;
+/// `addnode "remove"` for a node that was never added
+/// (protocol.h:61 RPC_CLIENT_NODE_NOT_ADDED; raised at rpc/net.cpp:368).
+pub const RPC_CLIENT_NODE_NOT_ADDED: i32 = -24;
+/// `disconnectnode` for a peer not in the connected-nodes table
+/// (protocol.h:62 RPC_CLIENT_NODE_NOT_CONNECTED; raised at rpc/net.cpp:478
+/// when CConnman::DisconnectNode returns false). Distinct from the generic
+/// JSON-RPC transport code RPC_INVALID_PARAMS (-32602) clearbit previously
+/// collapsed the unknown-peer case into.
+pub const RPC_CLIENT_NODE_NOT_CONNECTED: i32 = -29;
+/// `setban` given an un-parseable IP/subnet (protocol.h:63
+/// RPC_CLIENT_INVALID_IP_OR_SUBNET; raised at rpc/net.cpp:780,811).
+pub const RPC_CLIENT_INVALID_IP_OR_SUBNET: i32 = -30;
+
 /// Wallet-specific errors.
 pub const RPC_WALLET_ERROR: i32 = -4;
 pub const RPC_WALLET_INSUFFICIENT_FUNDS: i32 = -6;
@@ -6416,18 +6433,22 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid command", id);
         };
 
-        // Parse IP address
+        // Parse IP address.  Core's setban raises RPC_CLIENT_INVALID_IP_OR_SUBNET
+        // (-30) with the exact message "Error: Invalid IP/Subnet" when the
+        // subnet/IP argument fails to resolve (rpc/net.cpp:779-781, on
+        // !LookupSubNet / !LookupHost), NOT the generic JSON-RPC transport code
+        // -32602.
         var ip_parts: [4]u8 = undefined;
         var part_iter = std.mem.splitSequence(u8, ip_str, ".");
         var i: usize = 0;
         while (part_iter.next()) |part| : (i += 1) {
             if (i >= 4) break;
             ip_parts[i] = std.fmt.parseInt(u8, part, 10) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid IP address format", id);
+                return self.jsonRpcError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet", id);
             };
         }
         if (i != 4) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid IP address format", id);
+            return self.jsonRpcError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet", id);
         }
 
         const address = std.net.Address.initIp4(ip_parts, 0);
@@ -13061,12 +13082,34 @@ pub const RpcServer = struct {
         const cmd = cmd_param.string;
 
         if (std.mem.eql(u8, cmd, "add")) {
-            // Add to manual connection list
+            // Core (rpc/net.cpp:358-363): if CConnman::AddNode reports the node
+            // is already on the added-node list, raise
+            // RPC_CLIENT_NODE_ALREADY_ADDED (-23) "Error: Node already added".
+            // The policy-list record is what dedup is checked against; the
+            // actual connect/reconnect lifecycle is owned by addManualNode and
+            // only runs once the node is newly recorded.
+            const newly_added = self.peer_manager.addAddedNode(node) catch {
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory adding node", id);
+            };
+            if (!newly_added) {
+                return self.jsonRpcError(RPC_CLIENT_NODE_ALREADY_ADDED, "Error: Node already added", id);
+            }
+            // Add to manual connection list (success-path behaviour unchanged).
             self.peer_manager.addManualNode(node) catch {
+                // Roll the policy-list record back so the operator can retry
+                // without first hitting a spurious "already added".
+                _ = self.peer_manager.removeAddedNode(node);
                 return self.jsonRpcError(RPC_MISC_ERROR, "Failed to add node", id);
             };
         } else if (std.mem.eql(u8, cmd, "remove")) {
-            // Remove from manual connection list
+            // Core (rpc/net.cpp:367-369): RemoveAddedNode returns false when the
+            // node was never added -> RPC_CLIENT_NODE_NOT_ADDED (-24) "Error:
+            // Node could not be removed. It has not been added previously."
+            if (!self.peer_manager.removeAddedNode(node)) {
+                return self.jsonRpcError(RPC_CLIENT_NODE_NOT_ADDED, "Error: Node could not be removed. It has not been added previously.", id);
+            }
+            // Remove from manual connection list (success-path behaviour
+            // unchanged).
             self.peer_manager.removeManualNode(node);
         } else if (std.mem.eql(u8, cmd, "onetry")) {
             // Fire-and-forget dial.  Per Bitcoin Core (rpc/net.cpp::addnode)
@@ -13125,7 +13168,11 @@ pub const RpcServer = struct {
         }
 
         if (!found) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Node not found in connected nodes", id);
+            // Core: disconnectnode raises RPC_CLIENT_NODE_NOT_CONNECTED (-29)
+            // "Node not found in connected nodes" when CConnman::DisconnectNode
+            // returns false (rpc/net.cpp:478; protocol.h:62), not the generic
+            // JSON-RPC transport code -32602.
+            return self.jsonRpcError(RPC_CLIENT_NODE_NOT_CONNECTED, "Node not found in connected nodes", id);
         }
 
         return self.jsonRpcResult("null", id);
@@ -22374,6 +22421,139 @@ test "getblockhash with height 0 returns genesis" {
 
     // Should contain genesis hash (reversed for display)
     try std.testing.expect(std.mem.indexOf(u8, result, "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f") != null);
+}
+
+// ===========================================================================
+// W125 RPC error-code parity (ported from rustoshi ee86d76/7b94ef1/980a31d/
+// 845f7e4). Each asserts a bad-input RPC case returns the SPECIFIC Bitcoin
+// Core JSON-RPC error code (bitcoin-core/src/rpc/protocol.h), driven through
+// the full dispatch() path. These FAIL against the pre-fix tree (which used
+// the generic -32602 / silent no-op) and PASS with the parity fix.
+// ===========================================================================
+
+/// Spin up a minimal RpcServer over a fresh chain/mempool/peer-manager for
+/// the net-management parity tests. Caller owns the returned trio + server.
+fn makeNetParityServer(
+    allocator: std.mem.Allocator,
+    chain_state: *storage.ChainState,
+    mempool: *mempool_mod.Mempool,
+    peer_manager: *peer_mod.PeerManager,
+) RpcServer {
+    return RpcServer.init(
+        allocator,
+        chain_state,
+        mempool,
+        peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+}
+
+test "w125 getblockhash height out of range -> RPC_INVALID_PARAMETER (-8)" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    // best_height is 0 in a fresh chain; height 999999 is out of range.
+    const req = "{\"id\":1,\"method\":\"getblockhash\",\"params\":[999999]}";
+    const result = try server.dispatch(req);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Block height out of range") != null);
+}
+
+test "w125 addnode add-then-already-added -> RPC_CLIENT_NODE_ALREADY_ADDED (-23)" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    // First add of a parseable IP:port succeeds (null result, no error code).
+    const add1 = try server.dispatch("{\"id\":1,\"method\":\"addnode\",\"params\":[\"192.0.2.7:8333\",\"add\"]}");
+    defer allocator.free(add1);
+    try std.testing.expect(std.mem.indexOf(u8, add1, "\"result\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, add1, "\"code\":") == null);
+
+    // Second add of the SAME node -> -23 with Core's exact message.
+    const add2 = try server.dispatch("{\"id\":1,\"method\":\"addnode\",\"params\":[\"192.0.2.7:8333\",\"add\"]}");
+    defer allocator.free(add2);
+    try std.testing.expect(std.mem.indexOf(u8, add2, "\"code\":-23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, add2, "Error: Node already added") != null);
+}
+
+test "w125 addnode remove-unknown -> RPC_CLIENT_NODE_NOT_ADDED (-24)" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    // remove of a node that was never added -> -24 with Core's exact message.
+    const rem = try server.dispatch("{\"id\":1,\"method\":\"addnode\",\"params\":[\"198.51.100.9:8333\",\"remove\"]}");
+    defer allocator.free(rem);
+    try std.testing.expect(std.mem.indexOf(u8, rem, "\"code\":-24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rem, "It has not been added previously") != null);
+
+    // Round-trip: add then remove of the SAME node succeeds (no error code).
+    const add = try server.dispatch("{\"id\":1,\"method\":\"addnode\",\"params\":[\"198.51.100.9:8333\",\"add\"]}");
+    defer allocator.free(add);
+    try std.testing.expect(std.mem.indexOf(u8, add, "\"code\":") == null);
+    const rem2 = try server.dispatch("{\"id\":1,\"method\":\"addnode\",\"params\":[\"198.51.100.9:8333\",\"remove\"]}");
+    defer allocator.free(rem2);
+    try std.testing.expect(std.mem.indexOf(u8, rem2, "\"result\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rem2, "\"code\":") == null);
+}
+
+test "w125 setban invalid IP -> RPC_CLIENT_INVALID_IP_OR_SUBNET (-30)" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    const req = "{\"id\":1,\"method\":\"setban\",\"params\":[\"not-an-ip\",\"add\"]}";
+    const result = try server.dispatch(req);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":-30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Error: Invalid IP/Subnet") != null);
+}
+
+test "w125 disconnectnode unknown peer -> RPC_CLIENT_NODE_NOT_CONNECTED (-29)" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    // No peers are connected, so any address is "not connected" -> -29.
+    const req = "{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"192.0.2.123:8333\"]}";
+    const result = try server.dispatch(req);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":-29") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Node not found in connected nodes") != null);
 }
 
 test "getmempoolinfo returns stats" {

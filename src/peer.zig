@@ -2642,6 +2642,21 @@ pub const PeerManager = struct {
     /// window in maybeAddFixedSeeds is measured from here.  0 until run() sets it.
     run_loop_start_ts: i64 = 0,
 
+    /// Operator-managed added-node list — the mirror of Bitcoin Core's
+    /// `CConnman::m_added_node_params` (net.cpp). Holds the raw, user-supplied
+    /// `node` strings from `addnode "<node>" "add"` (NOT resolved addresses, so
+    /// the round-trip is exactly what the operator typed, matching Core's
+    /// string-keyed dedup in `CConnman::AddNode`/`RemoveAddedNode`).
+    ///
+    /// This is deliberately SEPARATE from `known_addresses` (the connection/
+    /// reconnect machinery): Core keeps the added-node *policy* list distinct
+    /// from the live address book so `addnode add` of an already-added node and
+    /// `addnode remove` of a never-added node can return the specific RPC error
+    /// codes RPC_CLIENT_NODE_ALREADY_ADDED (-23) / RPC_CLIENT_NODE_NOT_ADDED
+    /// (-24) instead of silently no-op'ing. Strings are allocator-owned; freed
+    /// in deinit() and on removeAddedNode().
+    added_nodes: std.ArrayList([]const u8),
+
     /// Build the advertised local service flags this node announces in its
     /// outgoing VERSION handshakes — the manager-level mirror of
     /// `Peer.localServices()` (the per-peer accessor reads the same config
@@ -2717,6 +2732,7 @@ pub const PeerManager = struct {
             .dns_seed_enabled = true,
             .fixed_seeds_added = false,
             .run_loop_start_ts = 0,
+            .added_nodes = std.ArrayList([]const u8).init(allocator),
         };
     }
 
@@ -2762,6 +2778,9 @@ pub const PeerManager = struct {
         self.block_source_peers.deinit();
         if (self.asmap_data) |data| self.allocator.free(data);
         if (self.proxy_manager) |*pm| pm.deinit();
+        // Free the owned added-node strings (Core m_added_node_params).
+        for (self.added_nodes.items) |n| self.allocator.free(n);
+        self.added_nodes.deinit();
     }
 
     /// Default SOCKS5 proxy port when none is given (matches Core's default
@@ -3612,6 +3631,43 @@ pub const PeerManager = struct {
         defer addrs.deinit();
         if (addrs.addrs.len == 0) return error.InvalidAddress;
         return addrs.addrs[0];
+    }
+
+    /// Record `node` on the operator added-node list (Core
+    /// `CConnman::AddNode`, net.cpp). Returns `false` — WITHOUT mutating the
+    /// list — when an identical string is already present, exactly as Core's
+    /// string-collision check does; the RPC layer turns that `false` into
+    /// RPC_CLIENT_NODE_ALREADY_ADDED (-23). Returns `true` when a fresh entry
+    /// is recorded (an owned copy of the string is appended).
+    ///
+    /// This is a pure policy-list operation: the actual connect/reconnect
+    /// lifecycle is owned by addManualNode (called separately by the RPC
+    /// handler on the success path), so observable connection behaviour is
+    /// unchanged by this addition.
+    pub fn addAddedNode(self: *PeerManager, node: []const u8) !bool {
+        for (self.added_nodes.items) |existing| {
+            if (std.mem.eql(u8, existing, node)) return false;
+        }
+        const owned = try self.allocator.dupe(u8, node);
+        errdefer self.allocator.free(owned);
+        try self.added_nodes.append(owned);
+        return true;
+    }
+
+    /// Remove `node` from the operator added-node list (Core
+    /// `CConnman::RemoveAddedNode`, net.cpp). Returns `false` when the string
+    /// was never on the list (Core scans the whole vector and returns false on
+    /// a miss), which the RPC layer turns into RPC_CLIENT_NODE_NOT_ADDED (-24).
+    /// Returns `true` (and frees the owned copy) when an entry was found.
+    pub fn removeAddedNode(self: *PeerManager, node: []const u8) bool {
+        for (self.added_nodes.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing, node)) {
+                self.allocator.free(existing);
+                _ = self.added_nodes.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Add a node to the manual connection list.
