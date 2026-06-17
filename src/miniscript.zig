@@ -1753,6 +1753,7 @@ pub const ParseError = error{
     ExpectedCloseParen,
     ExpectedComma,
     InvalidNumber,
+    InvalidTimelock,
     InvalidKey,
     InvalidHash,
     OutOfMemory,
@@ -1913,6 +1914,16 @@ const Parser = struct {
 
             .older, .after => {
                 node.k = try self.parseNumber();
+                // Miniscript timelock bound: valid range is 1 <= n < 2^31.
+                // Core rejects `*num < 1 || *num >= 0x80000000L` at the parse
+                // site for both older() (miniscript.h:2034) and after()
+                // (miniscript.h:2027). For older(), bit 31 collides with the
+                // BIP-68 disable flag; for after() it is outside the
+                // expressible absolute-locktime range. n == 0 is also rejected.
+                // (node.k is u32, so n < 1 is exactly n == 0.)
+                if (node.k == 0 or node.k >= 0x80000000) {
+                    return ParseError.InvalidTimelock;
+                }
             },
 
             .sha256, .hash256 => {
@@ -2182,6 +2193,40 @@ test "miniscript parse older" {
     try std.testing.expectEqual(Fragment.older, node.fragment);
     try std.testing.expectEqual(@as(u32, 144), node.k);
     try std.testing.expectEqual(NodeType.B, node.typ.base_type);
+}
+
+test "miniscript older/after timelock bound 1 <= n < 2^31 (Core miniscript.h:2027,2034)" {
+    const allocator = std.testing.allocator;
+
+    // Largest in-range value (2^31 - 1) must parse for both fragments.
+    {
+        var n = try parse(allocator, "older(2147483647)", .p2wsh);
+        defer {
+            n.deinit();
+            allocator.destroy(n);
+        }
+        try std.testing.expectEqual(@as(u32, 0x7fffffff), n.k);
+    }
+    {
+        var n = try parse(allocator, "after(2147483647)", .p2wsh);
+        defer {
+            n.deinit();
+            allocator.destroy(n);
+        }
+        try std.testing.expectEqual(@as(u32, 0x7fffffff), n.k);
+    }
+
+    // n == 0 is meaningless and must be rejected for both.
+    try std.testing.expectError(error.InvalidTimelock, parse(allocator, "older(0)", .p2wsh));
+    try std.testing.expectError(error.InvalidTimelock, parse(allocator, "after(0)", .p2wsh));
+
+    // 2^31 has bit 31 set (BIP-68 disable-flag collision for older) — reject both.
+    try std.testing.expectError(error.InvalidTimelock, parse(allocator, "older(2147483648)", .p2wsh));
+    try std.testing.expectError(error.InvalidTimelock, parse(allocator, "after(2147483648)", .p2wsh));
+
+    // u32::MAX (bit 31 set) must also be rejected for both.
+    try std.testing.expectError(error.InvalidTimelock, parse(allocator, "older(4294967295)", .p2wsh));
+    try std.testing.expectError(error.InvalidTimelock, parse(allocator, "after(4294967295)", .p2wsh));
 }
 
 test "miniscript parse and_v" {

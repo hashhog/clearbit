@@ -213,6 +213,12 @@ const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const BECH32_CONST: u32 = 1; // Bech32
 const BECH32M_CONST: u32 = 0x2bc830a3; // Bech32m
 
+/// BIP-173/BIP-350 maximum bech32/bech32m address length in characters.
+/// Mirrors Bitcoin Core's `bech32::CharLimit::BECH32 = 90` (bech32.h:38-40),
+/// enforced in `bech32::Decode` (bech32.cpp:378). Beyond 89 chars the BCH
+/// code's 4-error-detection guarantee no longer holds.
+const BECH32_MAX_LENGTH: usize = 90;
+
 /// Reverse lookup table for Bech32 decoding
 const BECH32_DECODE_TABLE: [256]i8 = blk: {
     var table: [256]i8 = .{-1} ** 256;
@@ -446,6 +452,17 @@ pub fn segwitDecode(addr: []const u8, allocator: std.mem.Allocator) !struct {
     version: u5,
     program: []const u8,
 } {
+    // BIP-173/BIP-350 cap a bech32/bech32m address at 90 characters. Beyond this
+    // length the underlying BCH code can no longer guarantee detection of up to 4
+    // errors, so an over-long string must be rejected regardless of whether its
+    // checksum happens to verify. Core enforces this up front in bech32::Decode
+    // (bech32.cpp:378 `if (str.size() > limit) return {};`, CharLimit::BECH32 = 90
+    // in bech32.h:38-40), reached from key_io.cpp:132. Matches that ordering by
+    // checking before the separator / character / checksum logic.
+    if (addr.len > BECH32_MAX_LENGTH) {
+        return error.Bech32StringTooLong;
+    }
+
     // Find separator '1'
     var sep_pos: ?usize = null;
     for (0..addr.len) |i| {
@@ -829,6 +846,53 @@ test "bech32m decode - taproot" {
     try std.testing.expectEqualSlices(u8, "bc", result.hrp);
     try std.testing.expectEqual(@as(u5, 1), result.version);
     try std.testing.expectEqual(@as(usize, 32), result.program.len);
+}
+
+// Build a raw bech32m string `hrp + '1' + <n_data symbols> + <valid 6-symbol
+// checksum>` of an arbitrary total length, with a genuinely VALID checksum. Used
+// to prove the 90-char CharLimit guard fires regardless of checksum validity.
+fn buildValidBech32mOfDataLen(hrp: []const u8, n_data: usize, allocator: std.mem.Allocator) ![]u8 {
+    const data = try allocator.alloc(u5, n_data);
+    defer allocator.free(data);
+    // Arbitrary in-charset values; bit pattern is irrelevant to the length guard.
+    for (data, 0..) |*d, i| d.* = @intCast(i % 32);
+
+    const checksum = try createChecksum(hrp, data, true, allocator);
+
+    const total = hrp.len + 1 + n_data + 6;
+    const s = try allocator.alloc(u8, total);
+    @memcpy(s[0..hrp.len], hrp);
+    s[hrp.len] = '1';
+    for (data, 0..) |d, i| s[hrp.len + 1 + i] = BECH32_CHARSET[d];
+    for (checksum, 0..) |c, i| s[hrp.len + 1 + n_data + i] = BECH32_CHARSET[c];
+    return s;
+}
+
+test "bech32 decode rejects >90-char string regardless of valid checksum (Core CharLimit=90)" {
+    // Parity with Core bech32::Decode (bech32.cpp:378): `if (str.size() > limit)
+    // return {};` with CharLimit::BECH32 = 90. An over-long string must be
+    // rejected even when its checksum verifies — beyond 89 chars the BCH code's
+    // 4-error-detection guarantee no longer holds.
+    const allocator = std.testing.allocator;
+
+    // 91 chars: hrp("bc")=2 + sep(1) + data + checksum(6) = 9 + data, so data=82.
+    const overlong = try buildValidBech32mOfDataLen("bc", 82, allocator);
+    defer allocator.free(overlong);
+    try std.testing.expectEqual(@as(usize, 91), overlong.len);
+    try std.testing.expectError(error.Bech32StringTooLong, segwitDecode(overlong, allocator));
+
+    // 90 chars (data=81): exactly at the limit — the length guard must NOT fire.
+    // It is not a valid witness program, so it errors later, but the error must
+    // be anything OTHER than Bech32StringTooLong (proving the boundary is > not >=).
+    const at_limit = try buildValidBech32mOfDataLen("bc", 81, allocator);
+    defer allocator.free(at_limit);
+    try std.testing.expectEqual(@as(usize, 90), at_limit.len);
+    if (segwitDecode(at_limit, allocator)) |r| {
+        allocator.free(r.hrp);
+        allocator.free(r.program);
+    } else |err| {
+        try std.testing.expect(err != error.Bech32StringTooLong);
+    }
 }
 
 test "address encode - p2pkh mainnet" {
