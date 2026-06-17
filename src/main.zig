@@ -2024,6 +2024,15 @@ pub fn main() !void {
     defer peer_manager.deinit();
     peer_manager.chain_state = &chain_state;
     peer_manager.mempool = &mempool_instance;
+    // Wire the data directory so the bucketed addrman (peers.dat) is loaded on
+    // first use (ensureAddrman) and persisted on shutdown (deinit). Without this
+    // the node forgets its learned peer set on every restart (eclipse/bootstrap
+    // fragility). Core init.cpp loads peers.dat at startup and saves it on
+    // shutdown via CAddrMan (addrman.cpp Save/Load). `full_datadir` is the
+    // network-qualified dir where mempool.dat / fee_estimates.dat already live;
+    // it outlives peer_manager (both freed by deferred statements in this scope,
+    // and peer_manager.deinit runs before full_datadir is freed — LIFO defer).
+    peer_manager.data_dir = full_datadir;
     peer_manager.peerbloomfilters = config.peerbloomfilters;
     // Fixed-seed fallback gating (Core net.cpp:2604-2643).  fixed_seed_enabled
     // is force-off in --connect mode inside PeerManager.run; dns_seed_enabled
