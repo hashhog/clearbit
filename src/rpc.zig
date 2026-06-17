@@ -5478,7 +5478,14 @@ pub const RpcServer = struct {
 
             const ping_display: i64 = if (peer.min_ping_time == std.math.maxInt(i64)) 0 else peer.min_ping_time;
             const ping_f64: f64 = @as(f64, @floatFromInt(ping_display)) / 1000.0;
-            try writer.print("],\"relaytxes\":{},\"lastsend\":{d},\"lastrecv\":{d},\"last_transaction\":0,\"last_block\":0,\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d:.6},\"minping\":{d:.6},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"startingheight\":{d},\"presynced_headers\":-1,\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"addr_relay_enabled\":true,\"addr_processed\":0,\"addr_rate_limited\":0,\"permissions\":[],\"minfeefilter\":0.0,\"bytessent_per_msg\":{{}},\"bytesrecv_per_msg\":{{}},\"connection_type\":\"{s}\",\"transport_protocol_type\":\"v1\",\"session_id\":\"\",\"mapped_as\":{d}}}", .{
+            // Core v31.99 (rpc/net.cpp:242-245) emits last_inv_sequence then
+            // inv_to_send between relaytxes and lastsend; clearbit tracks
+            // neither at the manager layer, so it emits 0 for both (same
+            // pattern as the addr_processed/addr_rate_limited = 0 fields).
+            // Core v31.99 also REMOVED startingheight from getpeerinfo
+            // (net.cpp:269-270 goes bip152_hb_from -> presynced_headers with
+            // no startingheight pushKV), so it is no longer emitted here.
+            try writer.print("],\"relaytxes\":{},\"last_inv_sequence\":0,\"inv_to_send\":0,\"lastsend\":{d},\"lastrecv\":{d},\"last_transaction\":0,\"last_block\":0,\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d:.6},\"minping\":{d:.6},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"presynced_headers\":-1,\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"addr_relay_enabled\":true,\"addr_processed\":0,\"addr_rate_limited\":0,\"permissions\":[],\"minfeefilter\":0.0,\"bytessent_per_msg\":{{}},\"bytesrecv_per_msg\":{{}},\"connection_type\":\"{s}\",\"transport_protocol_type\":\"v1\",\"session_id\":\"\",\"mapped_as\":{d}}}", .{
                 peer.relay_txs,
                 peer.last_message_time,
                 peer.last_message_time,
@@ -5491,7 +5498,6 @@ pub const RpcServer = struct {
                 if (peer.version_info) |v| v.version else 0,
                 if (peer.version_info) |v| v.user_agent else "",
                 is_inbound,
-                peer.start_height,
                 peer.best_known_height,
                 peer.best_known_height,
                 if (is_inbound) "inbound" else "outbound-full-relay",
@@ -22322,6 +22328,62 @@ test "getblockfrompeer: header-missing, bad-peer, and genuine getdata send" {
     // Sanity: requesting from the WRONG (still-valid) peer index 0 must NOT
     // have written anything to peer 1's far end beyond what we already drained.
     // (Implicitly covered — only the index-1 request was a success.)
+}
+
+test "getpeerinfo: Core v31.99 wire order — adds last_inv_sequence/inv_to_send, drops startingheight" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // One peer so the getpeerinfo array is non-empty. Same ownership rule as
+    // the getblockfrompeer test: PeerManager.deinit() owns the heap Peer and
+    // closes its stream; we own only the far end of the socketpair.
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer std.posix.close(fds[1]);
+    const peer = try allocator.create(peer_mod.Peer);
+    peer.* = makeTestPeerForGbfp(.{ .handle = fds[0] }, &consensus.MAINNET, allocator);
+    try peer_manager.peers.append(peer);
+
+    const res = try server.handleGetPeerInfo(null);
+    defer allocator.free(res);
+
+    // The two NUM fields Core v31.99 emits between relaytxes and lastsend.
+    const i_relaytxes = std.mem.indexOf(u8, res, "\"relaytxes\":").?;
+    const i_last_inv = std.mem.indexOf(u8, res, "\"last_inv_sequence\":").?;
+    const i_inv_to_send = std.mem.indexOf(u8, res, "\"inv_to_send\":").?;
+    const i_lastsend = std.mem.indexOf(u8, res, "\"lastsend\":").?;
+    // Contiguous Core order: relaytxes -> last_inv_sequence -> inv_to_send -> lastsend.
+    try std.testing.expect(i_relaytxes < i_last_inv);
+    try std.testing.expect(i_last_inv < i_inv_to_send);
+    try std.testing.expect(i_inv_to_send < i_lastsend);
+    // Both are NUM 0 (clearbit tracks neither at the manager layer).
+    try std.testing.expect(std.mem.indexOf(u8, res, "\"last_inv_sequence\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "\"inv_to_send\":0") != null);
+
+    // startingheight was removed from getpeerinfo in Core v31.99 — it MUST NOT
+    // appear, and bip152_hb_from must be immediately followed by presynced_headers.
+    try std.testing.expect(std.mem.indexOf(u8, res, "\"startingheight\"") == null);
+    const i_hb_from = std.mem.indexOf(u8, res, "\"bip152_hb_from\":").?;
+    const i_presync = std.mem.indexOf(u8, res, "\"presynced_headers\":").?;
+    try std.testing.expect(i_hb_from < i_presync);
 }
 
 // Build a minimal Peer for the getblockfrompeer test, backed by a caller-owned
