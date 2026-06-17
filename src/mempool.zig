@@ -3288,38 +3288,66 @@ pub const Mempool = struct {
         }
     }
 
-    /// Check if an output is dust (below economic threshold).
+    /// Compute the dust threshold (in satoshis) for an output at the default
+    /// dust relay fee rate (DUST_RELAY_FEE, sat/kvB), faithful to Core
+    /// `GetDustThreshold` (policy/policy.cpp:27-63).
+    ///
+    /// An output whose value is below this threshold is "dust": it would cost
+    /// more in fees to spend than it is worth. Unspendable outputs (OP_RETURN,
+    /// P2A) return 0 — they can never be dust (Core: `IsUnspendable()` ⇒ 0).
+    ///
+    ///   nSize = GetSerializeSize(txout) + spending_cost
+    ///         = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
+    /// where the spending cost is a fixed estimate of the CTxIn needed to spend
+    /// it (Core's `IsWitnessProgram` test, uniform across all witness
+    /// versions/sizes — P2WPKH, P2WSH, P2TR and unknown witness all take the
+    /// segwit-discounted 67, NOT a per-script-type table):
+    ///   * witness program: 32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4 = 67
+    ///   * non-witness:     32 + 4 + 1 + 107 + 4                          = 148
+    ///
+    /// threshold = dustRelayFee.GetFee(nSize) = round-up(nSize * fee / 1000)
+    /// (Core CFeeRate::GetFee rounds the fee up, feefrac.h:212).
+    pub fn dustThreshold(output: *const types.TxOut, dust_relay_fee: i64) i64 {
+        const spk = output.script_pubkey;
+
+        // OP_RETURN and other unspendable scripts can never be dust
+        // (Core `txout.scriptPubKey.IsUnspendable()` ⇒ return 0).
+        if (spk.len > 0 and spk[0] == 0x6a) return 0;
+
+        // P2A (Pay-to-Anchor) outputs are exempt from the dust threshold.
+        if (script.classifyScript(spk) == .anchor) return 0;
+
+        const script_len: u64 = spk.len;
+        // CompactSize prefix for the script length (GetSerializeSize).
+        const script_len_prefix: u64 = if (script_len < 0xfd)
+            1
+        else if (script_len <= 0xffff)
+            3
+        else
+            5;
+        const txout_ser_size: u64 = 8 + script_len_prefix + script_len;
+
+        // WITNESS_SCALE_FACTOR = 4 (consensus/consensus.h).
+        const spending_cost: u64 = if (script.isWitnessProgram(spk) != null)
+            (32 + 4 + 1 + (107 / 4) + 4) // = 67
+        else
+            (32 + 4 + 1 + 107 + 4); // = 148
+        const n_size: u64 = txout_ser_size + spending_cost;
+
+        // Round (n_size * fee / 1000) UP, matching Core's CFeeRate::GetFee.
+        const fee: u64 = @intCast(dust_relay_fee);
+        const numer: u64 = n_size * fee;
+        return @intCast((numer + 999) / 1000);
+    }
+
+    /// Check if an output is dust (below the economic threshold).
+    ///
+    /// The earlier per-shape table (148/91/68/108/58) used wrong spending
+    /// sizes and the wrong CompactSize summand, under-rejecting dust by up to
+    /// 267 sat vs Core (P2TR 303 vs 330, P2WSH 453 vs 330, P2SH 369 vs 540).
+    /// Delegates to `dustThreshold` (Core GetDustThreshold / IsDust).
     pub fn isDust(output: *const types.TxOut) bool {
-        // OP_RETURN outputs are never dust (they're explicitly unspendable)
-        if (output.script_pubkey.len > 0 and output.script_pubkey[0] == 0x6a) return false;
-
-        const stype = script.classifyScript(output.script_pubkey);
-
-        // P2A (Pay-to-Anchor) outputs are exempt from dust if value is 0.
-        // They're designed for fee bumping and must have zero value.
-        // Reference: Bitcoin Core policy/policy.cpp
-        if (stype == .anchor) {
-            // Anchor outputs with value 0 are never dust
-            return output.value != 0;
-        }
-
-        // Spend size varies by script type
-        const spend_size: i64 = switch (stype) {
-            .p2pkh => 148, // ~148 vbytes to spend P2PKH
-            .p2sh => 91, // Minimum ~91 vbytes (varies by redeem script)
-            .p2wpkh => 68, // ~68 vbytes to spend P2WPKH
-            .p2wsh => 108, // Minimum ~108 vbytes (varies by witness script)
-            .p2tr => 58, // ~58 vbytes to spend P2TR (key path)
-            .p2pk => 114, // ~114 vbytes to spend P2PK
-            else => 148, // Default to P2PKH-like size
-        };
-
-        // Dust threshold = 3 * (spend_size + output_size)
-        // Output size = 8 (value) + 1 (script length) + script.len
-        const output_size: i64 = 8 + 1 + @as(i64, @intCast(output.script_pubkey.len));
-        const dust_threshold = 3 * (spend_size + output_size);
-
-        return output.value < dust_threshold;
+        return output.value < dustThreshold(output, consensus.DUST_RELAY_FEE);
     }
 
     /// Evict lowest-fee-rate transactions to make room.
@@ -4964,39 +4992,59 @@ test "regression: mempool retains output scripts after accept (P2P UAF core.3313
 }
 
 test "dust detection for different output types" {
-    // P2PKH dust threshold: 3 * (148 + 34) = 546 satoshis
+    // Exact Core GetDustThreshold values at the default 3000 sat/kvB rate
+    // (policy/policy.cpp): nSize = (8 + CompactSize(len) + len) + spend_cost,
+    // spend_cost = 67 (witness) / 148 (non-witness); threshold =
+    // round-up(nSize * 3000 / 1000). These FAIL against the pre-fix per-shape
+    // table (which gave P2SH 369, P2WPKH 297, P2WSH 453, P2TR 303).
+
+    // P2PKH (25-byte spk, non-witness): nSize = 34 + 148 = 182 → 546.
     const p2pkh_script = [_]u8{0x76} ++ [_]u8{0xa9} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20 ++ [_]u8{0x88} ++ [_]u8{0xac};
+    const p2pkh_out = types.TxOut{ .value = 0, .script_pubkey = &p2pkh_script };
+    try std.testing.expectEqual(@as(i64, 546), Mempool.dustThreshold(&p2pkh_out, consensus.DUST_RELAY_FEE));
+    // 545/546 boundary pin.
+    try std.testing.expect(Mempool.isDust(&types.TxOut{ .value = 545, .script_pubkey = &p2pkh_script }));
+    try std.testing.expect(!Mempool.isDust(&types.TxOut{ .value = 546, .script_pubkey = &p2pkh_script }));
 
-    // Just above dust
-    const p2pkh_output_ok = types.TxOut{ .value = 600, .script_pubkey = &p2pkh_script };
-    try std.testing.expect(!Mempool.isDust(&p2pkh_output_ok));
+    // P2SH (23-byte spk, non-witness): nSize = 32 + 148 = 180 → 540.
+    const p2sh_script = [_]u8{0xa9} ++ [_]u8{0x14} ++ [_]u8{0xDD} ** 20 ++ [_]u8{0x87};
+    const p2sh_out = types.TxOut{ .value = 0, .script_pubkey = &p2sh_script };
+    try std.testing.expectEqual(@as(i64, 540), Mempool.dustThreshold(&p2sh_out, consensus.DUST_RELAY_FEE));
+    try std.testing.expect(Mempool.isDust(&types.TxOut{ .value = 539, .script_pubkey = &p2sh_script }));
+    try std.testing.expect(!Mempool.isDust(&types.TxOut{ .value = 540, .script_pubkey = &p2sh_script }));
 
-    // Below dust
-    const p2pkh_output_dust = types.TxOut{ .value = 500, .script_pubkey = &p2pkh_script };
-    try std.testing.expect(Mempool.isDust(&p2pkh_output_dust));
-
-    // P2WPKH has lower dust threshold: 3 * (68 + 31) = 297 satoshis
+    // P2WPKH (22-byte spk, witness): nSize = 31 + 67 = 98 → 294.
     const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xBB} ** 20;
-    const p2wpkh_output_ok = types.TxOut{ .value = 300, .script_pubkey = &p2wpkh_script };
-    try std.testing.expect(!Mempool.isDust(&p2wpkh_output_ok));
+    const p2wpkh_out = types.TxOut{ .value = 0, .script_pubkey = &p2wpkh_script };
+    try std.testing.expectEqual(@as(i64, 294), Mempool.dustThreshold(&p2wpkh_out, consensus.DUST_RELAY_FEE));
+    try std.testing.expect(Mempool.isDust(&types.TxOut{ .value = 293, .script_pubkey = &p2wpkh_script }));
+    try std.testing.expect(!Mempool.isDust(&types.TxOut{ .value = 294, .script_pubkey = &p2wpkh_script }));
 
-    // P2TR has lowest dust threshold: 3 * (58 + 43) = 303 satoshis
+    // P2WSH (34-byte spk, witness): nSize = 43 + 67 = 110 → 330.
+    const p2wsh_script = [_]u8{0x00} ++ [_]u8{0x20} ++ [_]u8{0xEE} ** 32;
+    const p2wsh_out = types.TxOut{ .value = 0, .script_pubkey = &p2wsh_script };
+    try std.testing.expectEqual(@as(i64, 330), Mempool.dustThreshold(&p2wsh_out, consensus.DUST_RELAY_FEE));
+
+    // P2TR (34-byte spk, witness v1): nSize = 43 + 67 = 110 → 330.
     const p2tr_script = [_]u8{0x51} ++ [_]u8{0x20} ++ [_]u8{0xCC} ** 32;
-    const p2tr_output_ok = types.TxOut{ .value = 330, .script_pubkey = &p2tr_script };
-    try std.testing.expect(!Mempool.isDust(&p2tr_output_ok));
+    const p2tr_out = types.TxOut{ .value = 0, .script_pubkey = &p2tr_script };
+    try std.testing.expectEqual(@as(i64, 330), Mempool.dustThreshold(&p2tr_out, consensus.DUST_RELAY_FEE));
+    // 329 dust, 330 not — proves the old 303 threshold is gone (310 was OK before, dust now).
+    try std.testing.expect(Mempool.isDust(&types.TxOut{ .value = 310, .script_pubkey = &p2tr_script }));
+    try std.testing.expect(!Mempool.isDust(&types.TxOut{ .value = 330, .script_pubkey = &p2tr_script }));
 
-    // OP_RETURN is never dust
+    // OP_RETURN is unspendable → threshold 0 → never dust.
     const op_return_script = [_]u8{ 0x6a, 0x04, 0x01, 0x02, 0x03, 0x04 };
     const op_return_output = types.TxOut{ .value = 0, .script_pubkey = &op_return_script };
+    try std.testing.expectEqual(@as(i64, 0), Mempool.dustThreshold(&op_return_output, consensus.DUST_RELAY_FEE));
     try std.testing.expect(!Mempool.isDust(&op_return_output));
 
-    // P2A (Pay-to-Anchor) with value 0 is never dust
+    // P2A (Pay-to-Anchor) is exempt → threshold 0 → never dust (Core parity:
+    // ephemeral anchors handled via the ephemeral-dust mechanism, not here).
     const p2a_output_zero = types.TxOut{ .value = 0, .script_pubkey = &script.P2A_SCRIPT };
     try std.testing.expect(!Mempool.isDust(&p2a_output_zero));
-
-    // P2A with non-zero value is considered dust (actually an error, but isDust returns true)
     const p2a_output_nonzero = types.TxOut{ .value = 1, .script_pubkey = &script.P2A_SCRIPT };
-    try std.testing.expect(Mempool.isDust(&p2a_output_nonzero));
+    try std.testing.expect(!Mempool.isDust(&p2a_output_nonzero));
 }
 
 test "P2A (Pay-to-Anchor) standardness" {
