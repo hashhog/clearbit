@@ -122,10 +122,11 @@ test "w135/G9 BUG-12: MAX_TX_LEGACY_SIGOPS=2500 cap; in-tx-only accounting (PART
     try testing.expectEqual(@as(u32, 2_500), consensus.MAX_TX_LEGACY_SIGOPS);
 }
 
-// G10 PARTIAL: ValidateInputsStandardness folds WITNESS_UNKNOWN into
-// NONSTANDARD (BUG-8); classifyScript has no WITNESS_UNKNOWN variant.
-test "w135/G10 BUG-8: ScriptType has no witness_unknown variant (PARTIAL)" {
-    // Enumerate ScriptType variants; check that no "witness_unknown" exists.
+// G10 FIXED (BUG-8): classifyScript now has a distinct WITNESS_UNKNOWN
+// variant (Core Solver script/solver.cpp:172-175). v1-non-32B / v2..v16
+// witness programs are WITNESS_UNKNOWN, not NONSTANDARD.
+test "w135/G10 BUG-8 FIXED: ScriptType has a witness_unknown variant (PRESENT)" {
+    // Enumerate ScriptType variants; check that "witness_unknown" exists.
     const fields = @typeInfo(ScriptType).Enum.fields;
     comptime var seen_unknown = false;
     inline for (fields) |f| {
@@ -133,9 +134,9 @@ test "w135/G10 BUG-8: ScriptType has no witness_unknown variant (PARTIAL)" {
             seen_unknown = true;
         }
     }
-    try testing.expect(!seen_unknown);
-    // Cross-check that the canonical 10 variants are all present.
-    try testing.expectEqual(@as(usize, 10), fields.len);
+    try testing.expect(seen_unknown);
+    // Canonical 10 prior variants + the new witness_unknown = 11.
+    try testing.expectEqual(@as(usize, 11), fields.len);
 }
 
 // =========================================================================
@@ -310,20 +311,41 @@ test "w135/G23 BUG-7: classifyScript MULTISIG byte-shape only (PARTIAL)" {
     try testing.expectEqual(ScriptType.multisig, stype);
 }
 
-// G24 MISSING (BUG-8): no WITNESS_UNKNOWN variant.
-test "w135/G24 BUG-8: witversion=2 valid-shape witness program folds to nonstandard (MISSING)" {
+// G24 FIXED (BUG-8): witversion=2 valid-shape witness program → WITNESS_UNKNOWN.
+test "w135/G24 BUG-8 FIXED: witversion=2 valid-shape witness program → witness_unknown (PRESENT)" {
     // OP_2 (witversion 2) push2 "OK" — valid witness-program syntax.
-    // Core's Solver would return WITNESS_UNKNOWN with vSolutions=[2, "OK"].
-    // clearbit's classifyScript returns .nonstandard.
+    // Core's Solver returns WITNESS_UNKNOWN with vSolutions=[2, "OK"]
+    // (script/solver.cpp:172-175). clearbit now returns .witness_unknown.
     const s = [_]u8{ 0x52, 0x02, 0x4f, 0x4b };
     const stype = script.classifyScript(&s);
-    try testing.expectEqual(ScriptType.nonstandard, stype);
+    try testing.expectEqual(ScriptType.witness_unknown, stype);
 
-    // But isWitnessProgram should successfully parse it (it is one,
-    // structurally — just unknown version).
+    // isWitnessProgram parses it (it is one structurally — just unknown version).
     const wp = script.isWitnessProgram(&s);
     try testing.expect(wp != null);
     try testing.expectEqual(@as(u8, 2), wp.?.version);
+
+    // A v1 16-byte (non-32) program is also WITNESS_UNKNOWN, not P2TR/NONSTANDARD.
+    // OP_1 push16 <16 bytes>.
+    var v1_16: [18]u8 = undefined;
+    v1_16[0] = 0x51; // OP_1 (witversion 1)
+    v1_16[1] = 0x10; // push 16
+    for (2..18) |i| v1_16[i] = @intCast(i & 0xff);
+    try testing.expectEqual(ScriptType.witness_unknown, script.classifyScript(&v1_16));
+
+    // Control: a v0 program of non-{20,32} size stays NONSTANDARD (Core :177).
+    // OP_0 push16 <16 bytes>.
+    var v0_16: [18]u8 = undefined;
+    v0_16[0] = 0x00; // OP_0 (witversion 0)
+    v0_16[1] = 0x10; // push 16
+    for (2..18) |i| v0_16[i] = @intCast(i & 0xff);
+    try testing.expectEqual(ScriptType.nonstandard, script.classifyScript(&v0_16));
+
+    // Control: a non-witness blob that is NOT a witness program stays NONSTANDARD
+    // (proves the branch keys on isWitnessProgram, not accept-everything).
+    // 50-byte all-OP_1 (0x51) script: leading byte 0x51 but length 50 != 2+push.
+    const big = [_]u8{0x51} ** 50;
+    try testing.expectEqual(ScriptType.nonstandard, script.classifyScript(&big));
 }
 
 // G25 MISSING (BUG-9): P2PK with invalid pubkey prefix is mis-classified.
@@ -351,21 +373,21 @@ test "w135/G26 BUG-14: no MULTI_A classifier branch (MISSING)" {
     try testing.expect(!@hasDecl(script, "MAX_PUBKEYS_PER_MULTI_A"));
 }
 
-// G27 MISSING (BUG-8 + BUG-14): ScriptType has 10 variants where Core
-// has 11 (WITNESS_UNKNOWN distinct).  MULTI_A is also missing.
-test "w135/G27 BUG-8+BUG-14: ScriptType has 10 variants; Core's TxoutType has 11 (MISSING)" {
+// G27 PARTIAL (BUG-8 FIXED, BUG-14 still MISSING): ScriptType now has 11
+// variants (WITNESS_UNKNOWN landed). MULTI_A is still missing (separate fix).
+test "w135/G27 BUG-8 FIXED, BUG-14 MISSING: ScriptType has 11 variants incl witness_unknown" {
     const fields = @typeInfo(ScriptType).Enum.fields;
-    try testing.expectEqual(@as(usize, 10), fields.len);
+    try testing.expectEqual(@as(usize, 11), fields.len);
 
-    // Enumerate variant names at comptime; assert none is "witness_unknown"
-    // or "multi_a".
+    // Enumerate variant names at comptime; witness_unknown is now present,
+    // multi_a is still absent (out of scope for the WITNESS_UNKNOWN fix).
     comptime var has_witness_unknown = false;
     comptime var has_multi_a = false;
     inline for (fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "witness_unknown")) has_witness_unknown = true;
         if (comptime std.mem.eql(u8, f.name, "multi_a")) has_multi_a = true;
     }
-    try testing.expect(!has_witness_unknown);
+    try testing.expect(has_witness_unknown);
     try testing.expect(!has_multi_a);
 }
 
