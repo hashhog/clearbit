@@ -4432,6 +4432,22 @@ pub const PeerManager = struct {
         }
         if (is_zero) return .{ .work = [_]u8{0} ** 32, .height = 0 };
 
+        // Genesis-hash case: a fork rooting at the genesis block.  Genesis is
+        // height 0, but its BODY is never stored in CF_BLOCKS and — for a node
+        // that only ever mined locally (never P2P-synced) — genesis is not in
+        // header_index either.  Without this case lookupParentChainWork returns
+        // null for block-1's prev, insertHeader then drops EVERY genesis-rooted
+        // fork header (returns null), last_inserted stays null and maybeArmReorg
+        // is never called — so a full reorg back to a genesis-rooted heavier
+        // chain can never fire.  Report genesis at height 0 with the same
+        // placeholder chain_work base the active tip uses (chainWorkFromHeight),
+        // so the fork accumulates comparable work.  Mirrors the genesis
+        // special-cases in classifyHeaderBatch / getHeadersForkPoint /
+        // maybeArmReorg.
+        if (std.mem.eql(u8, prev_hash, &self.network_params.genesis_hash)) {
+            return .{ .work = chainWorkFromHeight(0), .height = 0 };
+        }
+
         // Active-chain tip is checked first because the index doesn't
         // include flushed-and-evicted ancestors.
         if (self.chain_state) |cs| {
@@ -4597,6 +4613,19 @@ pub const PeerManager = struct {
                 return .competing_fork;
             }
         }
+        // Genesis special-case: the genesis block is the universal active-chain
+        // ancestor at height 0, but its BODY is never stored in CF_BLOCKS
+        // (hasBlock reads CF_BLOCKS -> false) and, for a node that only ever
+        // mined locally (never P2P-synced), genesis is not in header_index
+        // either.  A heavier competing chain that forks at genesis (a full
+        // reorg back to the root) would therefore classify as unknown_parent
+        // and be dropped — never reaching the competing_fork / maybeArmReorg
+        // path.  getHeadersForkPoint already special-cases the genesis hash for
+        // exactly this reason (it must, to serve a disjoint-locator fork);
+        // mirror it here so a genesis-rooted competing fork is recognised.
+        if (std.mem.eql(u8, &first_header.prev_block, &self.network_params.genesis_hash)) {
+            return .competing_fork;
+        }
         return .unknown_parent;
     }
 
@@ -4647,6 +4676,18 @@ pub const PeerManager = struct {
                 break;
             }
             if (cs.best_height > 0 and cs.hasBlock(&cursor)) {
+                fork_point = cursor;
+                break;
+            }
+            // Genesis special-case: a fork that roots at the genesis block
+            // shares genesis with the active chain (every chain does).  But
+            // the genesis BODY is never stored in CF_BLOCKS (hasBlock=false)
+            // and, for a locally-mined never-P2P-synced node, genesis is not
+            // in header_index — so the walk-back would otherwise "fall off the
+            // index" at genesis and refuse the reorg.  Recognise the network
+            // genesis hash as a valid fork point (height 0), mirroring
+            // classifyHeaderBatch + getHeadersForkPoint.
+            if (std.mem.eql(u8, &cursor, &self.network_params.genesis_hash)) {
                 fork_point = cursor;
                 break;
             }
@@ -6045,6 +6086,12 @@ pub const PeerManager = struct {
             .getheaders => |gh| {
                 // Free the allocated locator hashes.
                 defer self.allocator.free(gh.block_locator_hashes);
+                // Serve our active-chain headers from the locator's fork
+                // point — Core ProcessGetHeaders.  This is the responder
+                // that lets a peer pull a competing/heavier chain off us and
+                // arm its own reorg (the missing serving side of the
+                // CLEARBIT_REORG fork pipeline).
+                self.processGetHeaders(peer, gh.block_locator_hashes, &gh.hash_stop);
             },
             .getblocks => |gb| {
                 // Free the allocated locator hashes.
@@ -6265,6 +6312,118 @@ pub const PeerManager = struct {
         const cs = self.chain_state orelse return null;
         if (height > cs.best_height) return null;
         return cs.getBlockHashByHeight(height);
+    }
+
+    /// Walk a peer's `getheaders` block-locator and return the height of
+    /// the fork point: the first locator hash that is on OUR active chain.
+    /// Mirrors Bitcoin Core's FindForkInGlobalIndex (net_processing.cpp
+    /// ProcessGetHeaders) / camlcoin handle_getheaders_request: the locator
+    /// is ordered tip→genesis, so the first match is the deepest common
+    /// ancestor we can serve from.  When no locator hash matches (the peer
+    /// is on a disjoint branch), the fork point is genesis (height 0) — the
+    /// caller then serves OUR active chain from height 1, which is exactly
+    /// what makes a cross-fork reorg announce reachable.
+    ///
+    /// "On the active chain" means: height H = getBlockHeightByHash(hash)
+    /// AND getBlockHashByHeight(H) == hash (the hash is canonical at H, not
+    /// a stale side-branch entry).  The network genesis hash is recognised
+    /// directly as height 0 (genesis is never written to the height→hash
+    /// index, so the canonical-at-height check would otherwise miss it).
+    pub fn getHeadersForkPoint(
+        self: *PeerManager,
+        locator_hashes: []const types.Hash256,
+    ) u32 {
+        const cs = self.chain_state orelse return 0;
+        for (locator_hashes) |loc_hash| {
+            // Genesis is a valid fork point but isn't in the height→hash
+            // index; recognise it explicitly.
+            if (std.mem.eql(u8, &loc_hash, &self.network_params.genesis_hash)) {
+                return 0;
+            }
+            const h = cs.getBlockHeightByHash(&loc_hash) orelse continue;
+            if (h > cs.best_height) continue;
+            const onchain = cs.getBlockHashByHeight(h) orelse continue;
+            if (std.mem.eql(u8, &onchain, &loc_hash)) {
+                return h;
+            }
+            // Hash is known but on a fork branch — not a fork point on the
+            // active chain; keep walking deeper into the locator.
+        }
+        return 0;
+    }
+
+    /// `getheaders` responder — Bitcoin Core ProcessGetHeaders
+    /// (net_processing.cpp) / camlcoin handle_getheaders_request.
+    ///
+    /// Find the fork point from the peer's block-locator, then send up to
+    /// MAX_HEADERS_RESULTS (2000) of OUR ACTIVE-chain headers starting at
+    /// fork_point+1, by height.  If `hash_stop` is non-zero, stop after the
+    /// header whose hash equals hash_stop.  An empty result sends nothing
+    /// (Core sends no `headers` when there is nothing to serve).
+    ///
+    /// Serving our OWN active best chain is what unblocks the reorg
+    /// scenario: a peer whose locator is on the lighter chain gets our
+    /// heavier chain back from the common ancestor (genesis in the disjoint
+    /// case), so its classifyHeaderBatch sees a competing_fork and arms the
+    /// reorg.  The active-chain-by-height walk (not header_index) guarantees
+    /// we serve canonical headers only.
+    fn processGetHeaders(
+        self: *PeerManager,
+        peer: *Peer,
+        locator_hashes: []const types.Hash256,
+        hash_stop: *const types.Hash256,
+    ) void {
+        const headers = self.collectHeadersFromForkPoint(locator_hashes, hash_stop) orelse return;
+        defer self.allocator.free(headers);
+        if (headers.len == 0) return;
+
+        const msg = p2p.Message{ .headers = .{ .headers = headers } };
+        peer.sendMessage(&msg) catch {};
+    }
+
+    /// Collect up to MAX_HEADERS_RESULTS (2000) of our ACTIVE-chain headers,
+    /// by height, starting at the locator's fork point + 1.  Returns an
+    /// owned slice the caller must free, or null when there is nothing to
+    /// serve (no chain_state, fork point already at the tip, or empty
+    /// result).  Honors a non-zero `hash_stop` (stops after the matching
+    /// header).  Split out from processGetHeaders so the locator-walk +
+    /// collection logic is unit-testable without a live socket.
+    pub fn collectHeadersFromForkPoint(
+        self: *PeerManager,
+        locator_hashes: []const types.Hash256,
+        hash_stop: *const types.Hash256,
+    ) ?[]types.BlockHeader {
+        const cs = self.chain_state orelse return null;
+
+        const fork_height = self.getHeadersForkPoint(locator_hashes);
+        if (fork_height >= cs.best_height) return null; // nothing past the fork point
+
+        // Is hash_stop the all-zero sentinel ("serve up to MAX")?
+        var stop_is_zero = true;
+        for (hash_stop) |b| {
+            if (b != 0) {
+                stop_is_zero = false;
+                break;
+            }
+        }
+
+        const MAX_HEADERS_RESULTS: u32 = 2000;
+        var collected = std.ArrayList(types.BlockHeader).init(self.allocator);
+        errdefer collected.deinit();
+
+        var h: u32 = fork_height + 1;
+        while (h <= cs.best_height and collected.items.len < MAX_HEADERS_RESULTS) : (h += 1) {
+            const hash = cs.getBlockHashByHeight(h) orelse break;
+            const header = cs.getPersistedHeader(&hash) orelse break;
+            collected.append(header) catch return null;
+            if (!stop_is_zero and std.mem.eql(u8, &hash, hash_stop)) break;
+        }
+
+        if (collected.items.len == 0) {
+            collected.deinit();
+            return null;
+        }
+        return collected.toOwnedSlice() catch null;
     }
 
     /// Fetch the persisted filter blob for a block hash.  Returns null

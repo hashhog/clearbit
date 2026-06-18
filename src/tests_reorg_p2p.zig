@@ -1177,3 +1177,273 @@ fn makePatternXEntryWithWork(
     };
     return entry;
 }
+
+// ====================================================================
+// getheaders responder (processGetHeaders / collectHeadersFromForkPoint)
+// ====================================================================
+//
+// The serving side of the CLEARBIT_REORG fork pipeline: an incoming
+// `getheaders` must walk the peer's locator to the fork point and reply
+// with OUR active-chain headers from fork_point+1 (cap 2000, honoring a
+// non-zero hash_stop).  Without this responder a peer that re-requests a
+// competing fork is starved and the reorg never fires.
+//
+// Reference: bitcoin-core/src/net_processing.cpp ProcessGetHeaders /
+// camlcoin lib/sync.ml handle_getheaders_request.
+
+/// Persist a header at `height` into a test ChainState's DB so that
+/// getBlockHashByHeight(height) and getPersistedHeader(hash) both resolve
+/// — exactly the two accessors the responder reads.  Mirrors the on-disk
+/// layout written by ChainStore.putBlockIndex (4-byte LE height prefix +
+/// 80-byte header in CF_BLOCK_INDEX) and ChainState.putBlockHashByHeight
+/// (H:height → hash in CF_DEFAULT).
+fn persistActiveHeader(
+    db: *storage.Database,
+    allocator: std.mem.Allocator,
+    height: u32,
+    hash: *const types.Hash256,
+    header: *const types.BlockHeader,
+) !void {
+    // CF_DEFAULT: H:height → hash
+    const hkey = storage.ChainStore.buildHeightHashKey(height);
+    try db.put(storage.CF_DEFAULT, &hkey, hash);
+
+    // CF_BLOCK_INDEX: hash → u32_LE(height) ++ header(80)
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try w.writeInt(u32, height);
+    try serialize.writeBlockHeader(&w, header);
+    try db.put(storage.CF_BLOCK_INDEX, hash, w.getWritten());
+}
+
+/// Build a 3-block active chain (heights 1..3) off genesis, persist it,
+/// and return the per-height hashes/headers + the cleanup list.  Caller
+/// must free every block in `to_free`.
+const BuiltChain = struct {
+    hashes: [3]types.Hash256,
+    headers: [3]types.BlockHeader,
+};
+
+fn buildAndPersistActiveChain(
+    db: *storage.Database,
+    cs: *storage.ChainState,
+    allocator: std.mem.Allocator,
+    to_free: *std.ArrayList(types.Block),
+    params: *const consensus.NetworkParams,
+) !BuiltChain {
+    var out: BuiltChain = undefined;
+    var prev: types.Hash256 = params.genesis_hash;
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        const blk = try makeForkTestBlock(allocator, prev, @as(u8, @intCast(0xA0 + i)), 0x207fffff, i);
+        try to_free.append(blk.block);
+        const height = i + 1;
+        try persistActiveHeader(db, allocator, height, &blk.hash, &blk.block.header);
+        out.hashes[i] = blk.hash;
+        out.headers[i] = blk.block.header;
+        prev = blk.hash;
+    }
+    cs.best_hash = out.hashes[2];
+    cs.best_height = 3;
+    return out;
+}
+
+test "getheaders responder: genesis locator → serves full active chain from height 1" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    var to_free = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (to_free.items) |b| freeTestBlock(allocator, b);
+        to_free.deinit();
+    }
+    const chain = try buildAndPersistActiveChain(&db, &cs, allocator, &to_free, &params);
+
+    const locator = [_]types.Hash256{params.genesis_hash};
+    const zero_stop = [_]u8{0} ** 32;
+    const served = pm.collectHeadersFromForkPoint(&locator, &zero_stop) orelse {
+        try testing.expect(false); // must serve something
+        return;
+    };
+    defer allocator.free(served);
+
+    try testing.expectEqual(@as(usize, 3), served.len);
+    // Headers must be the active chain, in height order 1,2,3.
+    for (0..3) |k| {
+        const got = crypto.computeBlockHash(&served[k]);
+        try testing.expectEqualSlices(u8, &chain.hashes[k], &got);
+    }
+}
+
+test "getheaders responder: cross-fork disjoint locator → falls back to genesis (reorg-enabling)" {
+    // This is the exact reorg scenario: the peer's locator names hashes on
+    // a DIFFERENT chain (chain A) that we (R3, on chain B) have never seen.
+    // The fork point must resolve to genesis so we serve our heavier chain
+    // B from height 1 — block 1's prev=genesis is KNOWN to the requester,
+    // so its classifyHeaderBatch returns competing_fork and the reorg arms.
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    var to_free = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (to_free.items) |b| freeTestBlock(allocator, b);
+        to_free.deinit();
+    }
+    const chain = try buildAndPersistActiveChain(&db, &cs, allocator, &to_free, &params);
+
+    // Locator from a disjoint chain A — hashes we have never persisted.
+    const locator = [_]types.Hash256{ [_]u8{0xC1} ** 32, [_]u8{0xC2} ** 32 };
+    const zero_stop = [_]u8{0} ** 32;
+
+    // Fork point must be genesis (0).
+    try testing.expectEqual(@as(u32, 0), pm.getHeadersForkPoint(&locator));
+
+    const served = pm.collectHeadersFromForkPoint(&locator, &zero_stop) orelse {
+        try testing.expect(false);
+        return;
+    };
+    defer allocator.free(served);
+
+    // Full chain B served from height 1, and crucially served[0].prev is
+    // genesis (KNOWN to the requester) — the reorg-enabling property.
+    try testing.expectEqual(@as(usize, 3), served.len);
+    try testing.expectEqualSlices(u8, &params.genesis_hash, &served[0].prev_block);
+    for (0..3) |k| {
+        const got = crypto.computeBlockHash(&served[k]);
+        try testing.expectEqualSlices(u8, &chain.hashes[k], &got);
+    }
+}
+
+test "getheaders responder: locator at active-chain mid-height → serves from fork_point+1" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    var to_free = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (to_free.items) |b| freeTestBlock(allocator, b);
+        to_free.deinit();
+    }
+    const chain = try buildAndPersistActiveChain(&db, &cs, allocator, &to_free, &params);
+
+    // Locator names our height-1 hash → fork point is 1, serve 2,3.
+    const locator = [_]types.Hash256{chain.hashes[0]};
+    const zero_stop = [_]u8{0} ** 32;
+    try testing.expectEqual(@as(u32, 1), pm.getHeadersForkPoint(&locator));
+
+    const served = pm.collectHeadersFromForkPoint(&locator, &zero_stop) orelse {
+        try testing.expect(false);
+        return;
+    };
+    defer allocator.free(served);
+
+    try testing.expectEqual(@as(usize, 2), served.len);
+    try testing.expectEqualSlices(u8, &chain.hashes[1], &crypto.computeBlockHash(&served[0]));
+    try testing.expectEqualSlices(u8, &chain.hashes[2], &crypto.computeBlockHash(&served[1]));
+}
+
+test "getheaders responder: non-zero hash_stop truncates at the matching header" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    var to_free = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (to_free.items) |b| freeTestBlock(allocator, b);
+        to_free.deinit();
+    }
+    const chain = try buildAndPersistActiveChain(&db, &cs, allocator, &to_free, &params);
+
+    // From genesis, stop at height-2's hash → serve only heights 1,2.
+    const locator = [_]types.Hash256{params.genesis_hash};
+    const served = pm.collectHeadersFromForkPoint(&locator, &chain.hashes[1]) orelse {
+        try testing.expect(false);
+        return;
+    };
+    defer allocator.free(served);
+
+    try testing.expectEqual(@as(usize, 2), served.len);
+    try testing.expectEqualSlices(u8, &chain.hashes[0], &crypto.computeBlockHash(&served[0]));
+    try testing.expectEqualSlices(u8, &chain.hashes[1], &crypto.computeBlockHash(&served[1]));
+}
+
+test "getheaders responder: fork point at tip → nothing to serve (null)" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    var to_free = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (to_free.items) |b| freeTestBlock(allocator, b);
+        to_free.deinit();
+    }
+    const chain = try buildAndPersistActiveChain(&db, &cs, allocator, &to_free, &params);
+
+    // Locator names the tip → fork point == best_height → serve nothing.
+    const locator = [_]types.Hash256{chain.hashes[2]};
+    const zero_stop = [_]u8{0} ** 32;
+    try testing.expectEqual(@as(u32, 3), pm.getHeadersForkPoint(&locator));
+    try testing.expect(pm.collectHeadersFromForkPoint(&locator, &zero_stop) == null);
+}
