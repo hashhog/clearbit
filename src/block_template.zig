@@ -427,11 +427,23 @@ pub fn createBlockTemplate(
             null, // no cache in block template path
         );
     };
+    // Block timestamp must be strictly greater than the median-time-past of
+    // the previous 11 blocks (BIP-113); Core's miner clamps the header time to
+    // max(GetAdjustedTime, MTP+1) (GetMinimumTime / UpdateTime, miner.cpp +
+    // pow GetNextWorkRequired).  Using the bare wall clock makes blocks mined
+    // in the same second (a regtest generatetoaddress burst) share a
+    // timestamp, so a strict peer rejects the 2nd+ block as an MTP violation
+    // when the chain is later served over P2P (the reorg-drop fork case).
+    const _wall_ts: i64 = std.time.timestamp();
+    const _min_ts: i64 = blk: {
+        const m = chain_state.computeMTP();
+        break :blk if (m != 0) @as(i64, m) + 1 else 0;
+    };
     const header = types.BlockHeader{
         .version = nVersion,
         .prev_block = chain_state.best_hash,
         .merkle_root = merkle_root,
-        .timestamp = @intCast(std.time.timestamp()),
+        .timestamp = @intCast(if (_wall_ts < _min_ts) _min_ts else _wall_ts),
         .bits = bits,
         .nonce = 0, // Miner will iterate this
     };
