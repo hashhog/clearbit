@@ -437,7 +437,20 @@ pub fn createBlockTemplate(
     const _wall_ts: i64 = std.time.timestamp();
     const _min_ts: i64 = blk: {
         const m = chain_state.computeMTP();
-        break :blk if (m != 0) @as(i64, m) + 1 else 0;
+        const mtp_min: i64 = if (m != 0) @as(i64, m) + 1 else 0;
+        // Also strictly exceed the IMMEDIATE parent's timestamp.  A peer
+        // validating a freshly-discovered competing fork computes MTP over a
+        // SHORTER ancestor window than the miner (e.g. genesis is absent from
+        // its header_index because it never P2P-synced), so its median lands
+        // higher and MTP+1 alone can leave block N with the same timestamp as
+        // block N-1 — which the peer then rejects as an MTP violation
+        // (BIP-113).  Strictly-increasing block timestamps clear any median
+        // window on either side.
+        const parent_min: i64 = if (chain_state.getPersistedHeader(&chain_state.best_hash)) |ph|
+            @as(i64, ph.timestamp) + 1
+        else
+            0;
+        break :blk if (mtp_min > parent_min) mtp_min else parent_min;
     };
     const header = types.BlockHeader{
         .version = nVersion,
