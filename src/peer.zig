@@ -654,6 +654,46 @@ pub const PeerError = error{
 };
 
 // ============================================================================
+// Subver (user-agent) sanitization
+// ============================================================================
+
+/// Maximum accepted subver length, matching Bitcoin Core's
+/// `MAX_SUBVERSION_LENGTH` (net.h:67).  Core rejects (throws on) a longer
+/// subver at receipt via `LIMITED_STRING`; clearbit accepts the VERSION but
+/// caps the stored CLEAN copy to this length so the operator-facing string can
+/// never grow unbounded.
+pub const MAX_SUBVERSION_LENGTH: usize = 256;
+
+/// Allocate an owned, sanitized copy of a peer-advertised user-agent string.
+///
+/// Faithful port of Bitcoin Core's `SanitizeString(str, SAFE_CHARS_DEFAULT)`
+/// (util/strencodings.cpp:31).  Core keeps ONLY the characters in
+///   `[A-Za-z0-9]` + " .,;-_/:?@()"
+/// and drops every other byte.  This guarantees the result is:
+///   - pure printable ASCII (no control chars, no non-UTF8 bytes), and
+///   - free of JSON metacharacters (`"`, `\`) and HTML-dangerous chars
+///     (`<`, `>`, `&`), so it is safe to splice directly into a JSON string
+///     literal without further escaping.
+///
+/// The input is first truncated to `MAX_SUBVERSION_LENGTH` bytes (Core bounds
+/// the raw subver before sanitizing).  Returns a freshly-allocated slice the
+/// caller owns; an empty input yields an empty (but non-null) allocation.
+pub fn sanitizeSubVer(allocator: std.mem.Allocator, raw: []const u8) std.mem.Allocator.Error![]u8 {
+    const bounded = raw[0..@min(raw.len, MAX_SUBVERSION_LENGTH)];
+    var out = try std.ArrayList(u8).initCapacity(allocator, bounded.len);
+    errdefer out.deinit();
+    for (bounded) |c| {
+        const safe = switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9' => true,
+            ' ', '.', ',', ';', '-', '_', '/', ':', '?', '@', '(', ')' => true,
+            else => false,
+        };
+        if (safe) out.appendAssumeCapacity(c);
+    }
+    return out.toOwnedSlice();
+}
+
+// ============================================================================
 // Peer Connection
 // ============================================================================
 
@@ -830,6 +870,28 @@ pub const Peer = struct {
     /// Unix-seconds timestamp of the last addr-bucket refill (Core
     /// `Peer::m_addr_token_timestamp`). 0 means "not yet refilled".
     addr_token_timestamp: i64 = 0,
+
+    /// Sanitized, owned copy of the peer-advertised user-agent ("subver").
+    ///
+    /// Mirrors Core's `CNode::cleanSubVer` (net.h:728): the raw subver byte
+    /// array a peer sends in its VERSION message is attacker-controlled and may
+    /// contain non-UTF8 bytes, control characters, or JSON metacharacters
+    /// (`"`, `\`).  Core runs it through `SanitizeString(strSubVer)`
+    /// (net_processing.cpp:3637, SAFE_CHARS_DEFAULT) once at receipt and stores
+    /// the cleaned result; everything downstream (RPC getpeerinfo, logging, GUI)
+    /// reads the CLEAN copy, never the raw bytes.
+    ///
+    /// clearbit previously surfaced `version_info.user_agent` raw into the
+    /// getpeerinfo JSON response — a peer with a crafted subver could emit a
+    /// literal `"`/`\`/control byte and produce INVALID JSON (a remote DoS on
+    /// the operator's RPC).  Worse, that raw slice pointed into the per-message
+    /// `payload` buffer, which `receiveMessage` frees on return (use-after-free).
+    /// We now clean-and-OWN at receipt, so the stored value is both valid for
+    /// the peer's lifetime AND printable-ASCII / JSON-safe.
+    ///
+    /// Allocated on the peer's `allocator`; freed in `disconnect`.  Null until
+    /// a VERSION has been received (matching Core's empty `cleanSubVer`).
+    clean_subver: ?[]u8 = null,
 
     /// Connect to a remote peer.
     pub fn connect(
@@ -1634,11 +1696,7 @@ pub const Peer = struct {
                 .version => |v| {
                     if (v.version < p2p.MIN_PROTOCOL_VERSION)
                         return PeerError.HandshakeFailed;
-                    self.version_info = v;
-                    self.services = v.services;
-                    self.start_height = v.start_height;
-                    self.is_witness_capable = (v.services & p2p.NODE_WITNESS) != 0;
-                    self.time_offset = v.timestamp - std.time.timestamp();
+                    self.recordVersion(v);
                 },
                 else => return PeerError.HandshakeFailed,
             }
@@ -1701,11 +1759,7 @@ pub const Peer = struct {
                 .version => |v| {
                     if (v.version < p2p.MIN_PROTOCOL_VERSION)
                         return PeerError.HandshakeFailed;
-                    self.version_info = v;
-                    self.services = v.services;
-                    self.start_height = v.start_height;
-                    self.is_witness_capable = (v.services & p2p.NODE_WITNESS) != 0;
-                    self.time_offset = v.timestamp - std.time.timestamp();
+                    self.recordVersion(v);
                 },
                 else => return PeerError.HandshakeFailed,
             }
@@ -1859,11 +1913,41 @@ pub const Peer = struct {
         return tx_fee_rate_sat_kvb >= self.fee_filter_received;
     }
 
+    /// Record a received VERSION message on this peer.
+    ///
+    /// Stores the version fields and computes the sanitized, OWNED `clean_subver`
+    /// (Core: `pfrom.cleanSubVer = SanitizeString(strSubVer)`,
+    /// net_processing.cpp:3637).  This must be the only place a received subver
+    /// is captured: the raw `v.user_agent` slice points into the per-message
+    /// receive buffer that `receiveMessage` frees on return, so we never retain
+    /// it — only the sanitized copy survives.
+    ///
+    /// On a re-received VERSION (shouldn't happen post-handshake, but be safe),
+    /// any prior clean_subver is freed first to avoid a leak.
+    fn recordVersion(self: *Peer, v: p2p.VersionMessage) void {
+        // Sanitize the attacker-controlled subver into an owned, printable copy.
+        // On allocation failure, fall back to no subver rather than failing the
+        // handshake (Core treats an empty cleanSubVer as "<no user agent>").
+        const cleaned = sanitizeSubVer(self.allocator, v.user_agent) catch null;
+        if (self.clean_subver) |old| self.allocator.free(old);
+        self.clean_subver = cleaned;
+
+        self.version_info = v;
+        self.services = v.services;
+        self.start_height = v.start_height;
+        self.is_witness_capable = (v.services & p2p.NODE_WITNESS) != 0;
+        self.time_offset = v.timestamp - std.time.timestamp();
+    }
+
     /// Disconnect from the peer.
     pub fn disconnect(self: *Peer) void {
         self.state = .disconnected;
         self.stream.close();
         self.recv_buffer.deinit();
+        if (self.clean_subver) |s| {
+            self.allocator.free(s);
+            self.clean_subver = null;
+        }
         if (self.v2_transport) |t| {
             t.deinit();
             self.allocator.destroy(t);
@@ -6721,7 +6805,11 @@ pub const PeerManager = struct {
                 const addr_str = self.peers.items[i].getAddressString(&addr_buf);
                 const now = std.time.timestamp();
                 const peer = self.peers.items[i];
-                const subver: []const u8 = if (peer.version_info) |v| v.user_agent else "?";
+                // Use the sanitized, owned copy: the raw user_agent is
+                // attacker-controlled (control chars / non-UTF8 could corrupt
+                // the log) and dangles into a freed receive buffer.  Core also
+                // logs only SanitizeString'd subvers.
+                const subver: []const u8 = if (peer.clean_subver) |s| s else "?";
                 std.log.info("Disconnecting stale peer={s} idle={d}s last_ping={d}s last_pong={d}s subver={s}", .{
                     addr_str,
                     now - peer.last_message_time,

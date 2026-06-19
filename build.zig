@@ -452,6 +452,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w107_tests.step);
     }
 
+    // Subver (user-agent) sanitization — getpeerinfo invalid-JSON DoS fix.
+    {
+        const subver_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_subver_sanitize.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"subver-sanitize"},
+        });
+        subver_tests.linkSystemLibrary("rocksdb");
+        subver_tests.linkSystemLibrary("secp256k1");
+        subver_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        subver_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            subver_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            subver_tests.linkSystemLibrary("minisketch");
+            subver_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        subver_tests.root_module.addOptions("build_options", build_options);
+
+        const run_subver_tests = b.addRunArtifact(subver_tests);
+        const subver_test_step = b.step("test-subver", "Run getpeerinfo subver sanitization (invalid-JSON DoS) regression tests");
+        subver_test_step.dependOn(&run_subver_tests.step);
+        // Fold into the main `test` step so CI exercises the subver DoS fix.
+        test_step.dependOn(&run_subver_tests.step);
+    }
+
     // W108 — BlockTemplate + GBT mining RPC 30-gate audit.
     {
         const w108_tests = b.addTest(.{
