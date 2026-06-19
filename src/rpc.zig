@@ -5496,7 +5496,14 @@ pub const RpcServer = struct {
                 ping_f64,
                 ping_f64,
                 if (peer.version_info) |v| v.version else 0,
-                if (peer.version_info) |v| v.user_agent else "",
+                // `subver` is the peer-advertised user-agent — attacker-controlled.
+                // Emit the sanitized, OWNED copy (Core's cleanSubVer), NOT the raw
+                // version_info.user_agent.  The raw bytes may contain control chars,
+                // non-UTF8, or JSON metacharacters (`"`/`\`) that would poison this
+                // JSON response (remote DoS); they also dangle into a freed receive
+                // buffer.  clean_subver is printable-ASCII and JSON-safe by
+                // construction (see peer.sanitizeSubVer / Peer.clean_subver).
+                if (peer.clean_subver) |s| s else "",
                 is_inbound,
                 peer.best_known_height,
                 peer.best_known_height,
