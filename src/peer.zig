@@ -383,6 +383,12 @@ pub const PING_INTERVAL: i64 = 2 * 60;
 /// this window.  Cheap: a no-op when no wallet changed since the last flush.
 pub const WALLET_FLUSH_INTERVAL_SECS: i64 = 30;
 
+/// Periodic addrman (peers.dat) dump cadence (seconds). Mirrors Core's
+/// DUMP_PEERS_INTERVAL = 900s (net.cpp scheduler.scheduleEvery(DumpAddresses)).
+/// Without this the learned-peer table was persisted ONLY on graceful shutdown
+/// (deinit), so a SIGKILL/OOM/power-loss lost every address learned since boot.
+pub const DUMP_PEERS_INTERVAL_SECS: i64 = 900;
+
 // ============================================================================
 // Stale Peer Eviction Constants (Bitcoin Core net_processing.cpp)
 // ============================================================================
@@ -2496,6 +2502,9 @@ pub const PeerManager = struct {
     /// a few seconds of wallet state — never the whole wallet, never only at
     /// clean shutdown.  Initialised to 0 so the first idle tick flushes.
     last_wallet_flush: i64 = 0,
+    /// Last periodic addrman (peers.dat) dump. Initialised to 0 so the first
+    /// idle tick after DUMP_PEERS_INTERVAL_SECS persists the learned-peer table.
+    last_addrman_dump: i64 = 0,
 
     /// Last time (unix seconds) we opened a feeler probe (Core net.cpp
     /// ThreadOpenConnections `next_feeler` schedule). A feeler is opened at
@@ -2715,6 +2724,7 @@ pub const PeerManager = struct {
             .max_blocks_in_flight = 128,
             .last_progress_log = 0,
             .last_wallet_flush = 0,
+            .last_addrman_dump = 0,
             .blocks_since_log = 0,
             .last_stall_recovery = 0,
             .in_drain = false,
@@ -8081,6 +8091,22 @@ pub const PeerManager = struct {
                 if (now - self.last_wallet_flush >= WALLET_FLUSH_INTERVAL_SECS) {
                     self.last_wallet_flush = now;
                     _ = wm.flushDirty();
+                }
+            }
+
+            // 6e. Periodic addrman (peers.dat) dump — Core DumpAddresses parity.
+            //     The learned-peer table was persisted ONLY in deinit() (clean
+            //     shutdown), so an unclean exit (SIGKILL/OOM) lost every address
+            //     learned since boot. Now also dumped every DUMP_PEERS_INTERVAL_SECS
+            //     while running. Atomic temp+rename, best-effort; cheap (serialises
+            //     an in-memory map). Sibling scope to the wallet flush above so its
+            //     `now` does not shadow. Use `|*am|` (not ensureAddrman) so we never
+            //     create+save an empty table before any peer is learned.
+            if (self.addrman) |*am| {
+                const now = std.time.timestamp();
+                if (now - self.last_addrman_dump >= DUMP_PEERS_INTERVAL_SECS) {
+                    self.last_addrman_dump = now;
+                    if (self.data_dir) |dir| am.save(dir);
                 }
             }
 
