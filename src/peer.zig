@@ -7376,7 +7376,23 @@ pub const PeerManager = struct {
             }
             break;
         }
-        if (n == 0) return 0;
+        // Incomplete window guard (2026-06-20). The walk broke before collecting
+        // Core's full GetMedianTimePast window of min(11, height+1) ancestors —
+        // i.e. a header is MISSING (below the AssumeUTXO snapshot base the
+        // genesis→base headers are absent, so a deep coin's window cannot be
+        // completed). Using the TRUNCATED median here injects a wrong (usually
+        // too-HIGH) value that FALSE-REJECTS valid blocks: the snapshot-resync
+        // wedges at h948454 (coin below base, partial window) and h948465 (coin
+        // base+10). Return 0 instead → the BIP-68 caller skips the time-based
+        // check for that coin (permissive, matching the pre-existing n==0
+        // behavior and Core's trust of already-validated assumed-valid snapshot
+        // coins; the OP_CSV script check still backstops CSV scripts). The baked
+        // base-tail headers (consensus.base_tail_headers) keep the [base+1,
+        // base+11] band's window FULL → those stay EXACT. A genuinely genesis-
+        // adjacent height (< 10) legitimately has fewer ancestors → partial
+        // median is correct there, so only guard when a full window was due.
+        const want: usize = @min(@as(usize, 11), @as(usize, height) + 1);
+        if (n < want) return 0;
         return validation.medianTimePast(timestamps[0..n]);
     }
 
