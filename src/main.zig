@@ -1382,14 +1382,44 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
         std.debug.print("Warning: Failed to persist UTXO count\n", .{});
     };
 
-    // Block-index entry. Header bytes are not in the snapshot (Core
-    // reconstructs them from the sibling block index); we write a
-    // placeholder that will be overwritten once headers are fetched.
-    var block_index_buf: [84]u8 = [_]u8{0} ** 84;
-    std.mem.writeInt(u32, block_index_buf[0..4], block_height, .little);
-    db.put(storage.CF_BLOCK_INDEX, &metadata.base_blockhash, &block_index_buf) catch |err| {
-        std.debug.print("Warning: Failed to write block index entry: {}\n", .{err});
-    };
+    // Block-index entry for the snapshot base (and its 11 preceding ancestors).
+    // The snapshot file carries the UTXO set but NOT headers. The OLD code wrote
+    // an all-zero PLACEHOLDER header for the base, which poisoned the BIP-68
+    // sequence-lock MTP window: computeMtpAtHeight for a coin confirmed in
+    // [base+1, base+11] walks back across the base, hits the placeholder's
+    // timestamp=0, and computes a WRONG median → FALSE-REJECTS a valid block with
+    // a time-based sequence lock on such a coin (the 2026-06-20 wedge at h948465,
+    // coin@944193 → MTP(944192) crosses base 944183). FIX: persist the REAL
+    // headers base-11..base from chainparams (assume_entry.base_tail_headers) so
+    // the MTP walk sees genuine timestamps across the base, matching Core (which
+    // keeps the full header chain from genesis even under AssumeUTXO). The base
+    // entry (last in the table) replaces the placeholder; its .hash equals
+    // metadata.base_blockhash by construction (both hexToHash of the base block).
+    const base_tail = assume_entry.?.base_tail_headers;
+    if (base_tail.len > 0) {
+        for (base_tail) |bh| {
+            var bidx: [84]u8 = undefined;
+            std.mem.writeInt(u32, bidx[0..4], bh.height, .little);
+            @memcpy(bidx[4..84], &bh.raw);
+            db.put(storage.CF_BLOCK_INDEX, &bh.hash, &bidx) catch |err| {
+                std.debug.print("Warning: Failed to write base-tail block index {d}: {}\n", .{ bh.height, err });
+            };
+            const tail_hh = storage.ChainStore.buildHeightHashKey(bh.height);
+            db.put(storage.CF_DEFAULT, &tail_hh, &bh.hash) catch |err| {
+                std.debug.print("Warning: Failed to write base-tail height index {d}: {}\n", .{ bh.height, err });
+            };
+        }
+        std.debug.print("Persisted {d} real base-tail headers ({d}..{d}) for BIP-68 MTP window.\n", .{ base_tail.len, base_tail[0].height, base_tail[base_tail.len - 1].height });
+    } else {
+        // Fallback (canonical Core assumeutxo entries bake no tail headers): the
+        // legacy all-zero placeholder. Safe for those because they are not used
+        // for hashhog's post-snapshot bulk resync.
+        var block_index_buf: [84]u8 = [_]u8{0} ** 84;
+        std.mem.writeInt(u32, block_index_buf[0..4], block_height, .little);
+        db.put(storage.CF_BLOCK_INDEX, &metadata.base_blockhash, &block_index_buf) catch |err| {
+            std.debug.print("Warning: Failed to write block index entry: {}\n", .{err});
+        };
+    }
 
     // SNAPSHOT FORWARD-SYNC (Layer 2): persist the height→hash index entry for
     // the snapshot base so the base block is queryable by height
