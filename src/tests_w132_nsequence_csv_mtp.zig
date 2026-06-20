@@ -724,3 +724,59 @@ test "w132 sanity: SEQUENCE_FINAL constant exercised by IsFinalTx and CLTV" {
     const src = @embedFile("script.zig");
     try testing.expect(std.mem.indexOf(u8, src, "0xFFFFFFFF") != null);
 }
+
+// ===========================================================================
+// BIP-68 sequence-lock MTP false-reject after snapshot bootstrap — 2026-06-20
+// regression. clearbit FALSE-REJECTED valid mainnet block 948465
+// (error.SequenceLockNotSatisfied) during a post-snapshot bulk resync: the
+// snapshot import wrote the base block 944183 as an ALL-ZERO placeholder header,
+// so computeMtpAtHeight for a coin confirmed in [base+1, base+11] walked back
+// across the base, INCLUDED the placeholder's timestamp=0 in a TRUNCATED window,
+// and produced a median +41s too HIGH → nMinTime over prev_mtp → false-reject.
+// FIX: bake the real headers base-11..base into chainparams
+// (AssumeUtxoData.base_tail_headers) and persist them to CF_BLOCK_INDEX at
+// snapshot import (main.zig loadSnapshotFromFile), so the MTP walk sees genuine
+// timestamps across the base (Core keeps the full header chain under AssumeUTXO).
+// ===========================================================================
+
+// Behavioral: a 0-timestamp injected into a truncated window shifts the median
+// UP relative to the true full 11-window — the exact mechanism of the false-
+// reject. medianTimePast over the real window is the correct (lower) value.
+test "w132-fix: zero-poisoned truncated MTP window medians HIGHER than the real 11-window" {
+    // A real, monotonically increasing 11-ancestor window (oldest..newest).
+    const real11 = [_]u32{ 1000, 1010, 1020, 1030, 1040, 1050, 1060, 1070, 1080, 1090, 1100 };
+    const real_mtp = validation.medianTimePast(&real11); // == 1050 (middle of 11)
+    try testing.expectEqual(@as(u32, 1050), real_mtp);
+
+    // What the all-zero base placeholder produced: the two OLDEST real samples
+    // (the ones at/below the snapshot base) are missing and a placeholder 0 is
+    // injected, truncating the window to 10. The median shifts UP — too high.
+    const poisoned = [_]u32{ 0, 1020, 1030, 1040, 1050, 1060, 1070, 1080, 1090, 1100 };
+    const poisoned_mtp = validation.medianTimePast(&poisoned);
+    // The bug: poisoned median is strictly GREATER than the true MTP, which is
+    // what pushed nMinTime over prev_mtp and false-rejected the block.
+    try testing.expect(poisoned_mtp > real_mtp);
+}
+
+// Guard: the fix's data is baked. consensus.zig carries BaseTailHeader +
+// the hexToBytes80 helper + the base_tail_headers table populated with the
+// band edges (944172 = base-11 and the base 944183 itself).
+test "w132-fix: consensus bakes real base-tail headers (944172..944183)" {
+    const src = @embedFile("consensus.zig");
+    try testing.expect(std.mem.indexOf(u8, src, "pub const BaseTailHeader") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "fn hexToBytes80") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "base_tail_headers") != null);
+    // The band edges must be present (base-11 and base).
+    try testing.expect(std.mem.indexOf(u8, src, "00000000000000000001fc4e424ba9c0b4f1d4e1ac48ee12ba62c645e8921250") != null); // 944172
+    try testing.expect(std.mem.indexOf(u8, src, "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817") != null); // 944183 (base)
+}
+
+// Guard: the import persists the baked headers instead of the all-zero
+// placeholder, so the MTP walk has real timestamps across the base.
+test "w132-fix: snapshot import persists base_tail_headers to CF_BLOCK_INDEX" {
+    const src = @embedFile("main.zig");
+    try testing.expect(std.mem.indexOf(u8, src, "base_tail_headers") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "base-tail block index") != null);
+    // The persisted header must carry the REAL 80-byte header (raw), not zeros.
+    try testing.expect(std.mem.indexOf(u8, src, "bh.raw") != null);
+}

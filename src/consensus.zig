@@ -495,6 +495,24 @@ pub const Bip30Exception = struct {
 /// Used for fast initial sync by loading a pre-validated UTXO set.
 /// Reference: Bitcoin Core kernel/chainparams.h AssumeutxoData (and
 /// kernel/chainparams.cpp m_assumeutxo_data for mainnet/testnet/signet values).
+/// A real block header for the band at/just below the snapshot base, baked into
+/// chainparams so the snapshot import can persist the genuine 11-ancestor MTP
+/// window. The snapshot file carries the UTXO set but no headers; without these,
+/// a post-snapshot bulk resync computes a WRONG median-time-past for any coin
+/// confirmed in [base+1, base+11] (the placeholder base header injects ts=0 into
+/// the partial window), which FALSE-REJECTS a valid block with a BIP-68 time-
+/// based sequence lock on such a coin (the clearbit 2026-06-20 wedge at h948465,
+/// coin at 944193 → needs MTP(944192) which walks across base 944183). Core keeps
+/// the full header chain from genesis even under AssumeUTXO; this reproduces the
+/// minimal tail of it needed for sequence-lock correctness across the base.
+pub const BaseTailHeader = struct {
+    height: u32,
+    /// Block hash in internal (RocksDB CF_BLOCK_INDEX key) byte order.
+    hash: types.Hash256,
+    /// 80-byte serialized block header (version|prev|merkle|time|bits|nonce).
+    raw: [80]u8,
+};
+
 pub const AssumeUtxoData = struct {
     /// Height of the snapshot block.
     height: u32,
@@ -520,6 +538,12 @@ pub const AssumeUtxoData = struct {
     /// fills with real timestamps (~base+11).  0 = unknown (canonical Core
     /// entries leave it 0; only the hashhog snapshot_bootstrap entry sets it).
     base_mtp: u32 = 0,
+    /// Real headers for the band [base-11, base], persisted to CF_BLOCK_INDEX at
+    /// snapshot import so computeMtpAtHeight can walk a genuine 11-ancestor window
+    /// for coins confirmed in [base+1, base+11]. Without these, the all-zero base
+    /// placeholder poisons the partial median → BIP-68 time-lock false-reject.
+    /// Empty = none baked (canonical Core assumeutxo entries leave it empty).
+    base_tail_headers: []const BaseTailHeader = &.{},
 };
 
 /// Standard Satoshi genesis coinbase output scriptPubKey (P2PK):
@@ -680,6 +704,24 @@ pub const MAINNET = NetworkParams{
             // Seeds the post-snapshot MTP window so blocks 944184..~944194 enforce
             // BIP-113 against the real base MTP instead of falling back to 0.
             .base_mtp = 1_775_650_208,
+            // Real headers base-11..base (944172..944183), Core getblockheader hex.
+            // Persisted at import so computeMtpAtHeight walks a genuine 11-window
+            // across the base for coins confirmed in [base+1, base+11] (fixes the
+            // BIP-68 time-lock false-reject; clearbit 2026-06-20 wedge at h948465).
+            .base_tail_headers = &[_]BaseTailHeader{
+                .{ .height = 944_172, .hash = hexToHash("00000000000000000001fc4e424ba9c0b4f1d4e1ac48ee12ba62c645e8921250"), .raw = hexToBytes80("00e0ff3f5bafc3bec927f605e24115267df8377096374dbee60501000000000000000000aa0a603c015cb25a0e61d3c1256e6f97fafd9f4546674a00ea2f5fee66f11ff6a531d66984060217ef625a9a") },
+                .{ .height = 944_173, .hash = hexToHash("000000000000000000008044332e117dd6bfdd54ab014a37ef2664454454efd0"), .raw = hexToBytes80("00c05824501292e845c662ba12ee48ace1d4f1b4c0a94b424efc01000000000000000000aab87e5ddb514cae1ddb25d76252e3e483781488a1a7a34d5d5e6b8af6af834a8131d66984060217773f2086") },
+                .{ .height = 944_174, .hash = hexToHash("00000000000000000000dd39e484d5a1602a57abb8dac2a1885469bec62b02da"), .raw = hexToBytes80("00e0aa2cd0ef5444456426ef374a01ab54ddbfd67d112e334480000000000000000000007bd660d407bfb300181fdceb1bc6ca2fc1a1710975c963fc70462b47419240758535d66984060217985d9ce2") },
+                .{ .height = 944_175, .hash = hexToHash("0000000000000000000185d2738563818200683d57c5a73553f07ee5adf8b2dc"), .raw = hexToBytes80("00402335da022bc6be695488a1c2dab8ab572a60a1d584e439dd00000000000000000000ce5be2057cde8a99b7ea689da726d4eb5bd7594367a45f2d6b41be12231f09a59536d6698406021721602d60") },
+                .{ .height = 944_176, .hash = hexToHash("00000000000000000000926607b5a520865fc61de6e91e8b1a9c4880c8736b0f"), .raw = hexToBytes80("00000020dcb2f8ade57ef05335a7c5573d68008281638573d2850100000000000000000000584fe2d9387db66177042b8f5e7781c5479be0be70fa06bd172a7296dec8773d3ad669840602176fcdd815") },
+                .{ .height = 944_177, .hash = hexToHash("0000000000000000000202739b3460175478a29475607e9d0438ebc790cf7817"), .raw = hexToBytes80("00a006200f6b73c880489c1a8b1ee9e61dc65f8620a5b5076692000000000000000000006048a172356ad2d9fcf662925aeaf83c808dc693c1955833c5f46cee09b21f3dfa3bd66984060217f9f1208b") },
+                .{ .height = 944_178, .hash = hexToHash("000000000000000000011860b51f2490339992b99d892204a6c18926080e18a3"), .raw = hexToBytes80("008096201778cf90c7eb38049d7e607594a278541760349b730202000000000000000000c36e97aca13e88ca84ae75c236a284e42269df46ee821c5aa8aaa0d79b7075d6a045d66984060217072a29d6") },
+                .{ .height = 944_179, .hash = hexToHash("00000000000000000000ffff18c64932e81c1661f86f95c27b18b355e4848273"), .raw = hexToBytes80("00200833a3180e082689c1a60422899db992993390241fb5601801000000000000000000ae4044c4d3a5ae9de47074b1a1ca6e3a3232b578edd7f978bbe1409354e5c9fdb546d669840602172cce6999") },
+                .{ .height = 944_180, .hash = hexToHash("000000000000000000009d7975efc16bc4ddaa3468287be076ba7040b2c047f9"), .raw = hexToBytes80("00e0ff3f738284e455b3187bc2956ff861161ce83249c618ffff00000000000000000000a73c694fdd9cfe12948e99c495cf78009725d9f0ec02cbe3030fa454b3430dc90349d6698406021732f7b318") },
+                .{ .height = 944_181, .hash = hexToHash("00000000000000000001cb578089adc0ab27429a1348f0a9b021e5ce02a709cd"), .raw = hexToBytes80("00204323f947c0b24070ba76e07b286834aaddc46bc1ef75799d000000000000000000004e0ec315dfa9ee4d2d85ce534c83ed428d2812a5c74b17a3887a12b722088ed22049d669840602176b109d5b") },
+                .{ .height = 944_182, .hash = hexToHash("00000000000000000000d6e603dff7e37cffedb78c4d090436cc428e956a6904"), .raw = hexToBytes80("00e0bb24cd09a702cee521b0a9f048139a4227abc0ad898057cb01000000000000000000dc10781f1c03095f45001d46da36722de16f76201e403ab8eabbbe24eab6d5d52e4cd66984060217ecc13f24") },
+                .{ .height = 944_183, .hash = hexToHash("0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"), .raw = hexToBytes80("00c0052004696a958e42cc3604094d8cb7edff7ce3f7df03e6d600000000000000000000a86bcf724ea11137002a564c761911343722766b19c268eb56ea2e58c1e4b20f5a4cd66984060217a0a5fbad") },
+            },
         },
     },
     // Bitcoin Core v28.0 defaultAssumeValid for mainnet (height 938343).
@@ -1436,6 +1478,21 @@ pub fn hexToHash(comptime hex: *const [64:0]u8) types.Hash256 {
             hash[31 - i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch unreachable;
         }
         return hash;
+    }
+}
+
+/// Comptime hex → 80-byte block-header bytes, decoded STRAIGHT (no byte reversal):
+/// the input is already in wire/serialized order (Core getblockheader hex). Used
+/// for AssumeUtxoData.base_tail_headers. (hexToHash above reverses because a
+/// display block hash is big-endian; a serialized header is not.)
+pub fn hexToBytes80(comptime hex: *const [160:0]u8) [80]u8 {
+    @setEvalBranchQuota(100000);
+    comptime {
+        var out: [80]u8 = undefined;
+        for (0..80) |i| {
+            out[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch unreachable;
+        }
+        return out;
     }
 }
 
