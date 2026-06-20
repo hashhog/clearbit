@@ -678,18 +678,23 @@ test "w132 G28: computePrevMtp walks 11 entries via header_index (PRESENT)" {
     try testing.expect(std.mem.indexOf(u8, src, "cursor = entry.prev_hash") != null);
 }
 
-// G29 BUG-1 (storage-layer side) — computeMtpAtHeight returns 0 silently
-// on index/cache miss.  The BIP-68 calculator then treats this as
-// "nCoinTime = 0" → permissive.  See BUG-1 above.
-test "w132 G29 BUG-1: computeMtpAtHeight returns 0 silently on cache miss (PARTIAL, P0-CDIV)" {
+// G29 (was BUG-1, FIXED 2026-06-20) — computeMtpAtHeight no longer uses a
+// TRUNCATED MTP window. The old code returned 0 ONLY on a full miss (n==0) and
+// otherwise computed medianTimePast over whatever partial window it collected —
+// which poisons the median (a missing base header injects ts=0 / drops the
+// oldest samples) and FALSE-REJECTS valid blocks during a post-snapshot resync
+// (h948454/h948465). The fix returns 0 (permissive) on ANY incomplete walk
+// (n < Core's full min(11, height+1) window); the [base+1,base+11] band keeps a
+// full window via consensus.base_tail_headers so those stay EXACT.
+test "w132 G29 (FIXED): computeMtpAtHeight guards the truncated MTP window" {
     const src = @embedFile("peer.zig");
-    // The pattern: function returns 0 on header_index miss without erroring.
     try testing.expect(std.mem.indexOf(u8, src, "fn computeMtpAtHeight") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "if (n == 0) return 0;") != null);
-    // The trampoline forwards into the same 0-on-miss path.
+    // The incomplete-window guard (replaces the old silent-on-n==0 path).
+    try testing.expect(std.mem.indexOf(u8, src, "if (n < want) return 0;") != null);
+    // It compares against Core's full GetMedianTimePast window size.
+    try testing.expect(std.mem.indexOf(u8, src, "@min(@as(usize, 11), @as(usize, height) + 1)") != null);
+    // The trampoline still forwards coin-side MTP into computeMtpAtHeight.
     try testing.expect(std.mem.indexOf(u8, src, "fn getMtpAtHeightTrampoline") != null);
-    // Comment acknowledging the issue:
-    try testing.expect(std.mem.indexOf(u8, src, "A 0 return causes the caller to skip time-based BIP-68") != null);
 }
 
 // G30 BUG-12 — ConnectBlock BIP-68 enforcement: error label.  Core emits
