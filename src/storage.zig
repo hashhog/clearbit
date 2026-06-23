@@ -4321,6 +4321,31 @@ pub const ChainState = struct {
         // 2. None → normal clean boot.
         if (surplus.items.len == 0) return;
 
+        // 2b. BOUND GUARD.  A genuine boot-rollback surplus is the unflushed
+        //     reorg/abort window and is bounded by MAX_REORG_DEPTH (a connect
+        //     flushes per block; only the reorg/abort path can leave the
+        //     durable tip behind, and that path is itself capped at
+        //     MAX_REORG_DEPTH).  A surplus far larger than that is NOT a clean
+        //     rollback — it is a STALE H: index left above a freshly-loaded
+        //     snapshot base (`--load-snapshot` sets tip=base but does not prune
+        //     the pre-snapshot H: entries) or a deeper corruption.  Disconnecting
+        //     those would be catastrophic: their blocks were never connected to
+        //     THIS UTXO state, so each disconnect's input-restoration injects
+        //     coins that do not belong (snapshot corruption).  Skip the
+        //     reconcile and let the forward-sync overwrite the stale H: entries
+        //     per block (the safe, pre-fix behavior).  Loud so an operator who
+        //     hit a real >100-deep inconsistency knows to reindex.
+        if (surplus.items.len > MAX_REORG_DEPTH) {
+            std.debug.print(
+                "boot-reconcile: SKIP — surplus of {d} block(s) above tip {d} " ++
+                "exceeds MAX_REORG_DEPTH={d}; treating as stale index (snapshot " ++
+                "base or deep corruption), NOT a clean rollback. Forward-sync " ++
+                "will overwrite stale H: entries; reindex if this recurs.\n",
+                .{ surplus.items.len, self.best_height, MAX_REORG_DEPTH },
+            );
+            return;
+        }
+
         const count: usize = surplus.items.len;
         const min_h: u32 = surplus.items[0].height;
         const max_h: u32 = surplus.items[count - 1].height;
