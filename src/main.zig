@@ -2404,6 +2404,18 @@ pub fn main() !void {
         chain_state.best_height = 0;
     }
 
+    // Boot-reconcile (2026-06-23): after an unclean restart the durable tip can
+    // be BEHIND surplus persisted blocks whose created UTXOs are still on disk;
+    // re-connecting the next block then false-rejects with a spurious BIP-30
+    // duplicate-output.  Disconnect every surplus block top-down (removing its
+    // created UTXOs + restoring spent inputs via the Core-faithful disconnect)
+    // and atomically delete its orphaned H:<height> entry.  Runs after the tip
+    // load + setNetworkParams (above) and BEFORE any peer/IBD thread spawns.
+    chain_state.reconcileSurplusBlocksOnBoot() catch |err| {
+        std.debug.print("FATAL boot-reconcile failed: {} — chainstate inconsistent; reindex required\n", .{err});
+        return err;
+    };
+
     // SNAPSHOT FORWARD-SYNC (Layer 3): if the loaded tip is a snapshot base
     // (booted via `--load-snapshot`), seed the BIP-113 MTP window from the
     // base block's GetMedianTimePast and arm the PeerManager fallback.  Without

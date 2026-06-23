@@ -2353,6 +2353,17 @@ pub const ChainState = struct {
     /// no disconnect is pending.
     pending_undo_deletes: std.ArrayList(types.Hash256) = undefined,
 
+    /// Boot-reconcile only (2026-06-23): per-block H:<height> index DELETEs
+    /// pending durable commit.  Populated EXCLUSIVELY by the boot-time
+    /// reconcileSurplusBlocksOnBoot path (via disconnectBlockByHashCFInner's
+    /// delete_height_index=true), never by reorg/invalidateblock — those
+    /// callers pass delete_height_index=false so their H: behavior is
+    /// untouched.  When a surplus persisted block is disconnected on boot its
+    /// now-orphaned H:<height>→hash entry must be removed atomically with the
+    /// UTXO restore + tip rewind; flush() drains this into the SAME WriteBatch
+    /// as the tip's H: put so a crash mid-flush leaves a consistent state.
+    pending_height_index_deletes: std.ArrayList(u32) = undefined,
+
     pub const PendingBlockWrite = struct {
         hash: types.Hash256,
         bytes: []u8,
@@ -2540,6 +2551,7 @@ pub const ChainState = struct {
             .pending_tx_index_writes = std.ArrayList(PendingTxIndexWrite).init(allocator),
             .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
+            .pending_height_index_deletes = std.ArrayList(u32).init(allocator),
             .pending_filter_writes = std.ArrayList(PendingFilterWrite).init(allocator),
             .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_coinstats_writes = std.ArrayList(PendingCoinStatsWrite).init(allocator),
@@ -2563,6 +2575,7 @@ pub const ChainState = struct {
             .pending_tx_index_writes = std.ArrayList(PendingTxIndexWrite).init(allocator),
             .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
+            .pending_height_index_deletes = std.ArrayList(u32).init(allocator),
             .pending_filter_writes = std.ArrayList(PendingFilterWrite).init(allocator),
             .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_coinstats_writes = std.ArrayList(PendingCoinStatsWrite).init(allocator),
@@ -2644,6 +2657,9 @@ pub const ChainState = struct {
         // queue on a flush_error path — the on-disk undo entries are
         // still resident and a restart-from-disk recovers cleanly.
         self.pending_undo_deletes.deinit();
+        // Boot-reconcile (2026-06-23): inline u32 heights, no heap — plain
+        // deinit() mirrors pending_undo_deletes.
+        self.pending_height_index_deletes.deinit();
         // BlockFilterIndex (2026-05-05): drain any unflushed filter bytes
         // (heap-owned by ChainState until flush() succeeds, mirrors
         // pending_block_writes / pending_undo_writes).  Deletes are
@@ -4274,6 +4290,85 @@ pub const ChainState = struct {
         return try db.get(CF_BLOCK_UNDO, hash);
     }
 
+    /// Boot-time chainstate reconciliation (Core DisconnectTip-to-last-valid-coins-tip parity).
+    /// After an unclean restart the durable tip can be BEHIND surplus persisted blocks whose
+    /// created UTXOs are still on disk; re-connecting then false-rejects with BIP-30 duplicate.
+    /// Disconnect every surplus block (height > best_height that still resolves via the H: index)
+    /// top-down, removing created outputs + restoring spent inputs via the existing Core-faithful
+    /// disconnect, and atomically delete its orphaned H:<height> entry (delete_height_index=true).
+    /// Tolerate DisconnectUnclean (we are cleaning an already-inconsistent state); propagate any
+    /// other error (UndoDataNotFound/BlockBodyNotFound/CorruptData) so the operator can reindex.
+    ///
+    /// Each disconnect flushes (do_flush=true) so every step is durable + idempotent: a crash
+    /// mid-reconcile leaves a LOWER consistent tip with the already-disconnected H: entries gone,
+    /// so the next boot resumes cleanly from there.
+    pub fn reconcileSurplusBlocksOnBoot(self: *ChainState) !void {
+        const SurplusBlock = struct {
+            height: u32,
+            hash: types.Hash256,
+        };
+
+        // 1. Collect surplus heights/hashes: start at best_height+1, walk while
+        //    getBlockHashByHeight resolves.  Stop at the first null.
+        var surplus = std.ArrayList(SurplusBlock).init(self.allocator);
+        defer surplus.deinit();
+
+        var h: u32 = self.best_height + 1;
+        while (self.getBlockHashByHeight(h)) |hh| : (h += 1) {
+            try surplus.append(.{ .height = h, .hash = hh });
+        }
+
+        // 2. None → normal clean boot.
+        if (surplus.items.len == 0) return;
+
+        const count: usize = surplus.items.len;
+        const min_h: u32 = surplus.items[0].height;
+        const max_h: u32 = surplus.items[count - 1].height;
+
+        // 3. Log.
+        std.debug.print(
+            "boot-reconcile: disconnecting {d} surplus block(s) {d}..{d}\n",
+            .{ count, max_h, min_h },
+        );
+
+        // 4. Disconnect top-down.  The disconnect asserts hash == best_hash and
+        //    uses best_height as disc_height, then on success rewinds the tip to
+        //    the parent.  Set the tip ONCE to the HIGHEST surplus block, then walk
+        //    from highest down to lowest; each call rewinds the tip to the next
+        //    parent.  Defensively verify best_hash matches the expected surplus
+        //    hash before each call.  Tolerate DisconnectUnclean (we are cleaning
+        //    an already-inconsistent state); propagate every other error.
+        self.best_hash = surplus.items[count - 1].hash;
+        self.best_height = surplus.items[count - 1].height;
+
+        var i: usize = count;
+        while (i > 0) : (i -= 1) {
+            const entry = surplus.items[i - 1];
+            if (!std.mem.eql(u8, &self.best_hash, &entry.hash)) {
+                std.debug.print(
+                    "boot-reconcile: tip/surplus mismatch at height {d} — aborting\n",
+                    .{entry.height},
+                );
+                return error.HeightMismatch;
+            }
+            var hash_copy: types.Hash256 = entry.hash;
+            self.disconnectBlockByHashCFInner(&hash_copy, true, true) catch |err| switch (err) {
+                error.DisconnectUnclean => {
+                    // Already-inconsistent state being cleaned — Core's VerifyDB
+                    // tolerates UNCLEAN; the tip + UTXO rewind already committed.
+                    std.debug.print(
+                        "boot-reconcile: DISCONNECT_UNCLEAN at height {d} (tolerated)\n",
+                        .{entry.height},
+                    );
+                },
+                else => return err,
+            };
+        }
+
+        // 5. best_height is now back at the original durable tip with a consistent
+        //    UTXO set and the surplus H: entries deleted atomically per step.
+    }
+
     /// Disconnect a block using undo data stored in CF_BLOCK_UNDO.
     ///
     /// Reverses the UTXO changes the block applied: removes outputs the
@@ -4297,7 +4392,7 @@ pub const ChainState = struct {
         self: *ChainState,
         hash: *const types.Hash256,
     ) !void {
-        return self.disconnectBlockByHashCFInner(hash, true);
+        return self.disconnectBlockByHashCFInner(hash, true, false);
     }
 
     /// Pattern D (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-
@@ -4314,7 +4409,7 @@ pub const ChainState = struct {
         self: *ChainState,
         hash: *const types.Hash256,
     ) !void {
-        return self.disconnectBlockByHashCFInner(hash, false);
+        return self.disconnectBlockByHashCFInner(hash, false, false);
     }
 
     /// W92 — set the active network parameters so the disconnect path can
@@ -4472,6 +4567,7 @@ pub const ChainState = struct {
         self: *ChainState,
         hash: *const types.Hash256,
         do_flush: bool,
+        delete_height_index: bool,
     ) !void {
         self.connect_mutex.lock();
         defer self.connect_mutex.unlock();
@@ -4718,6 +4814,19 @@ pub const ChainState = struct {
         // else.  Idempotent if the delete races with a re-connect (RocksDB
         // delete-of-missing-key is a no-op).
         try self.pending_undo_deletes.append(hash.*);
+
+        // Boot-reconcile (2026-06-23): when the caller is the boot-time
+        // reconcileSurplusBlocksOnBoot path (delete_height_index=true), the
+        // H:<disc_height>→hash index entry is now orphaned — the durable tip
+        // sits BELOW disc_height after the rewind — so queue its CF_DEFAULT
+        // delete for flush() to drain into the same WriteBatch as the UTXO
+        // restores + tip rewind + undo-delete.  `disc_height` was captured
+        // above as `self.best_height` BEFORE the tip rewind.  reorg/
+        // invalidateblock callers pass delete_height_index=false, so their
+        // H: behavior is completely unchanged.
+        if (delete_height_index) {
+            try self.pending_height_index_deletes.append(disc_height);
+        }
 
         // BlockFilterIndex (2026-05-05): queue CF_BLOCK_FILTER +
         // CF_BLOCK_FILTER_HEADER deletes for the disconnected block, and
@@ -5201,6 +5310,7 @@ pub const ChainState = struct {
         self.pending_tx_index_writes.clearRetainingCapacity();
         self.pending_tx_index_deletes.clearRetainingCapacity();
         self.pending_undo_deletes.clearRetainingCapacity();
+        self.pending_height_index_deletes.clearRetainingCapacity();
 
         // BlockFilterIndex (2026-05-05): heap-owned filter bytes need to be
         // freed alongside block bodies + undo bytes.  Header is inline.
@@ -5747,6 +5857,26 @@ pub const ChainState = struct {
             .value = hh_val,
         } });
 
+        // 4b. Boot-reconcile (2026-06-23): drain pending_height_index_deletes —
+        //     the orphaned H:<height>→hash entries for surplus persisted blocks
+        //     disconnected on boot.  Append CF_DEFAULT DELETEs into the SAME
+        //     `batch` as the tip H: put above, mirroring the pending_undo_deletes
+        //     drain's call convention (alloc key, memcpy, batch.append .delete).
+        //     Placed AFTER the tip H: put: best_height (the tip) is never in this
+        //     queue (only surplus heights strictly above the final durable tip
+        //     are), so the tip's own H: entry is preserved.  Empty for every
+        //     non-boot-reconcile flush (reorg/invalidateblock pass
+        //     delete_height_index=false).
+        for (self.pending_height_index_deletes.items) |hh| {
+            const del_key_bytes = ChainStore.buildHeightHashKey(hh);
+            const k = try self.allocator.alloc(u8, ChainStore.HEIGHT_HASH_KEY_LEN);
+            @memcpy(k, &del_key_bytes);
+            try batch.append(.{ .delete = .{
+                .cf = CF_DEFAULT,
+                .key = k,
+            } });
+        }
+
         // 5. Pending raw-block bodies (CF_BLOCKS).  Bytes were queued by
         //    queueBlockWrite() before connectBlockFast — putting the put into
         //    THIS batch makes the body-on-disk semantics atomic with the
@@ -6207,6 +6337,12 @@ pub const ChainState = struct {
             // values, no heap to free; the BatchOp cleanup loop handles
             // the per-op key copies.
             self.pending_undo_deletes.clearRetainingCapacity();
+
+            // Boot-reconcile (2026-06-23): H:<height> index deletes committed.
+            // Inline u32 heights, no heap; the BatchOp cleanup loop frees the
+            // per-op key copies.  Cleared ONLY on the successful-write path so
+            // a flush_error keeps the queue for the next retry.
+            self.pending_height_index_deletes.clearRetainingCapacity();
 
             // BlockFilterIndex (2026-05-05): CF_BLOCK_FILTER bytes
             // committed — free filter_bytes here exactly once (the BatchOp
@@ -14226,6 +14362,93 @@ test "W92 connect→disconnect roundtrip is clean (no UNCLEAN, tip restored)" {
 
     try std.testing.expectEqual(@as(u32, 0), chain_state.best_height);
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &chain_state.best_hash);
+}
+
+test "boot-reconcile disconnects surplus persisted blocks + deletes orphan H: entries" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    // Build a real 3-block chain (heights 1..3) on top of the genesis tip (0).
+    // Distinct comptime script bytes per block → distinct coinbase txids →
+    // distinct UTXOs we can assert on individually after the reconcile.
+    const script_bytes = [_]u8{ 0xA1, 0xA2, 0xA3 };
+    var prev_hash: [32]u8 = [_]u8{0} ** 32;
+    var hashes: [3]types.Hash256 = undefined;
+    var blocks: [3]types.Block = undefined;
+    inline for (0..3) |idx| {
+        const height: u32 = idx + 1;
+        const block = makeReorgTestBlock(prev_hash, @intCast(height), script_bytes[idx]);
+        blocks[idx] = block;
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(height);
+        hashes[idx] = bh;
+        var ww = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&ww, &block);
+        const oc = try ww.toOwnedSlice();
+        const owned: []u8 = @constCast(oc);
+        try chain_state.queueBlockWrite(&bh, owned, height);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, height);
+        prev_hash = bh;
+    }
+    try std.testing.expectEqual(@as(u32, 3), chain_state.best_height);
+
+    // Sanity: every surplus block's coinbase UTXO + H: entry is on disk, and
+    // the H: index resolves heights 1..3.
+    var cb_outpoints: [3]types.OutPoint = undefined;
+    inline for (0..3) |idx| {
+        cb_outpoints[idx] = types.OutPoint{
+            .hash = @import("crypto.zig").computeTxidStreaming(&blocks[idx].transactions[0]),
+            .index = 0,
+        };
+        const pre = try chain_state.utxo_set.get(&cb_outpoints[idx]);
+        try std.testing.expect(pre != null);
+        var pre_mut = pre.?;
+        pre_mut.deinit(allocator);
+    }
+    try std.testing.expect(chain_state.getBlockHashByHeight(1) != null);
+    try std.testing.expect(chain_state.getBlockHashByHeight(3) != null);
+
+    // Mimic the unclean-restart wedge: the durable tip rolled back to 0
+    // (genesis) but the surplus blocks' UTXOs + undo + H: entries survive on
+    // disk.  Force the in-memory tip back to the genesis durable tip WITHOUT
+    // disconnecting anything (no UTXO/H: cleanup), exactly the boot state the
+    // reconcile must repair.
+    chain_state.best_hash = [_]u8{0} ** 32;
+    chain_state.best_height = 0;
+
+    // Run the boot reconciliation.
+    try chain_state.reconcileSurplusBlocksOnBoot();
+
+    // (a) tip is back at the durable tip (genesis, height 0).
+    try std.testing.expectEqual(@as(u32, 0), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &chain_state.best_hash);
+
+    // (b) surplus H: entries deleted — getBlockHashByHeight(1..3) is null.
+    try std.testing.expect(chain_state.getBlockHashByHeight(1) == null);
+    try std.testing.expect(chain_state.getBlockHashByHeight(2) == null);
+    try std.testing.expect(chain_state.getBlockHashByHeight(3) == null);
+
+    // (c) every surplus block's created coinbase UTXO is gone from the set.
+    inline for (0..3) |idx| {
+        const post = try chain_state.utxo_set.get(&cb_outpoints[idx]);
+        if (post) |p| {
+            var p_mut = p;
+            p_mut.deinit(allocator);
+            std.debug.print("surplus coinbase UTXO {d} survived reconcile\n", .{idx + 1});
+            return error.SurplusUtxoSurvived;
+        }
+    }
 }
 
 test "W92 setNetworkParams idempotent + reflected in disconnect path" {
