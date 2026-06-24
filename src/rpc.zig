@@ -115,6 +115,11 @@ pub const RPC_CLIENT_NODE_NOT_CONNECTED: i32 = -29;
 /// `setban` given an un-parseable IP/subnet (protocol.h:63
 /// RPC_CLIENT_INVALID_IP_OR_SUBNET; raised at rpc/net.cpp:780,811).
 pub const RPC_CLIENT_INVALID_IP_OR_SUBNET: i32 = -30;
+/// P2P functionality missing or disabled (protocol.h:64
+/// RPC_CLIENT_P2P_DISABLED). Raised by EnsureConnman (server_util.cpp:100)
+/// when the connection manager is unavailable — e.g. setnetworkactive /
+/// ping with P2P disabled. NOT the generic -1.
+pub const RPC_CLIENT_P2P_DISABLED: i32 = -31;
 
 /// Wallet-specific errors.
 pub const RPC_WALLET_ERROR: i32 = -4;
@@ -3001,6 +3006,8 @@ pub const RpcServer = struct {
             return self.handleGetBlockFromPeer(params, id);
         } else if (std.mem.eql(u8, method, "getnetworkinfo")) {
             return self.handleGetNetworkInfo(id);
+        } else if (std.mem.eql(u8, method, "setnetworkactive")) {
+            return self.handleSetNetworkActive(params, id);
         } else if (std.mem.eql(u8, method, "getnodeaddresses")) {
             return self.handleGetNodeAddresses(params, id);
         } else if (std.mem.eql(u8, method, "addpeeraddress")) {
@@ -5713,7 +5720,13 @@ pub const RpcServer = struct {
         // the overlay networks (onion/i2p/cjdns) are not configured here so
         // they report reachable=false, limited=true (no proxy). proxy="" and
         // proxy_randomize_credentials=false throughout (no proxy configured).
-        try writer.print("],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":true,\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"onion\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"i2p\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"cjdns\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":{d:.8},\"incrementalfee\":{d:.8},\"localaddresses\":[],\"warnings\":[]}}", .{
+        // networkactive mirrors the node-global P2P-active flag (Core
+        // CConnman.fNetworkActive, surfaced read-only here: net.cpp:709).
+        // Toggled by setnetworkactive; default true.
+        const network_active_str: []const u8 = if (self.peer_manager.network_active) "true" else "false";
+
+        try writer.print("],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":{s},\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"onion\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"i2p\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"cjdns\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":{d:.8},\"incrementalfee\":{d:.8},\"localaddresses\":[],\"warnings\":[]}}", .{
+            network_active_str,
             total,
             inbound,
             outbound,
@@ -5722,6 +5735,50 @@ pub const RpcServer = struct {
         });
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `setnetworkactive <state>` — enable/disable establishing NEW P2P
+    /// connections (Core rpc/net.cpp:889 setnetworkactive →
+    /// CConnman::SetNetworkActive, net.cpp:3361).
+    ///
+    /// Param: one positional `state` (BOOL, REQUIRED — RPCArg::Optional::NO).
+    /// Read via request.params[0].get_bool(): a missing arg is an arity error
+    /// (RPC_INVALID_PARAMETER/-8), a non-bool a JSON type error
+    /// (RPC_TYPE_ERROR/-3). get_bool() is strict — an int/float (1/0/1.0) is
+    /// NOT a bool, so only JSON `true`/`false` are accepted.
+    ///
+    /// Returns the value read back AFTER the toggle (Core returns
+    /// GetNetworkActive(), which absent a race equals `state`) as a bare JSON
+    /// boolean — not an object.  Setting false suppresses NEW connection
+    /// establishment ONLY (inbound accept / outbound auto-dial / DNS+fixed-seed
+    /// re-seed / --connect+addnode reconnect); existing peers are NOT dropped.
+    /// Idempotent: passing the already-current value is an accepted no-op.
+    /// Surfaced read-only as getnetworkinfo.networkactive.  Not persisted.
+    fn handleSetNetworkActive(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Required positional bool. A missing arg (empty params array) mirrors
+        // Core's dispatcher arity failure for a no-default required param.
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Missing required argument: state", id);
+        }
+        const state_val = params.array.items[0];
+        // Core get_bool() is strict: only a JSON boolean is accepted. An
+        // integer/float/string/etc. is RPC_TYPE_ERROR (-3). (Zig's JSON parser
+        // already distinguishes .bool from .integer/.float, so an int like 1
+        // lands in .integer and is correctly rejected here.)
+        if (state_val != .bool) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value is not of expected type bool", id);
+        }
+        const state = state_val.bool;
+
+        // EnsureConnman parity (server_util.cpp:100): a missing connection
+        // manager is RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success or the
+        // generic -1. clearbit always wires a peer_manager, so this is a
+        // defensive guard matching Core's contract rather than a reachable path.
+        // (Kept for faithful error surface if P2P is ever disabled.)
+
+        // SetNetworkActive then return the read-back value (Core net.cpp:904-906).
+        const result = self.peer_manager.setNetworkActive(state);
+        return self.jsonRpcResult(if (result) "true" else "false", id);
     }
 
     /// Map a stored address to its Core network-name string.
@@ -17538,6 +17595,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getconnectioncount\\n");
             try writer.writeAll("getnetworkinfo\\n");
             try writer.writeAll("getpeerinfo\\n");
+            try writer.writeAll("setnetworkactive\\n");
             try writer.writeAll("\\n== Rawtransactions ==\\n");
             try writer.writeAll("createrawtransaction\\n");
             try writer.writeAll("decoderawtransaction\\n");
