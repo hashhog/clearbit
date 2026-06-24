@@ -46,6 +46,13 @@ fn isReorgEnabled() bool {
 /// risking running out of undo data.  Per BIP-37 / Core's MIN_BLOCKS_TO_KEEP.
 pub const MAX_REORG_DEPTH: u32 = 288;
 
+/// BIP-159 NODE_NETWORK_LIMITED window: a limited (pruned) peer keeps only the
+/// last ~288 blocks below its tip and cannot serve anything deeper. Mirrors
+/// Bitcoin Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS` (net_processing.cpp). Used by
+/// pipelineBlockRequests to skip requesting deep catch-up blocks from limited
+/// peers (the `- 2` is Core's race buffer).
+pub const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
+
 /// Hard cap on `header_index` size.  Once exceeded, oldest non-active-chain
 /// entries are evicted in batch.  10k entries × ~96B per entry = ~1MB
 /// resident — small enough to keep around even in a constrained datadir.
@@ -422,6 +429,15 @@ pub const BLOCK_DOWNLOAD_TIMEOUT: i64 = 20 * 60;
 /// drift-free: `pipelineBlockRequests` never re-issues a block still tracked
 /// in-flight, so only the cancelled front block is re-requested.
 pub const DRAIN_WEDGE_STALL_TIMEOUT: i64 = 2;
+
+/// Max drain-wedge timeout in seconds. The wedge timeout DOUBLES on each
+/// consecutive cancel of the same stuck front block (2→4→8→…→64), mirroring
+/// Core's `BLOCK_STALLING_TIMEOUT` 2s→64s doubling. A fixed 2s alone cancelled
+/// the front block before a public peer could finish delivering a 1-2 MB block
+/// (>2s over a slow link), so it bounced across peers without ever arriving; the
+/// doubling gives a slow-but-able peer progressively more time before rotating to
+/// the next peer.
+pub const DRAIN_WEDGE_STALL_TIMEOUT_MAX: i64 = 64;
 
 /// Maximum blocks in flight per peer, matching Bitcoin Core's
 /// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (src/net_processing.cpp).  The block
@@ -2704,9 +2720,24 @@ pub const PeerManager = struct {
 
     /// Timestamp (unix seconds) when `connect_cursor` got stuck on a missing
     /// front block while later blocks were buffered (head-of-line drain wedge);
-    /// 0 = not wedged. Drives the `DRAIN_WEDGE_STALL_TIMEOUT` cancel-and-rerequest
-    /// in `drainBlockBuffer`. Reset to 0 whenever a block connects.
+    /// 0 = not wedged. Drives the cancel-and-rerequest in `drainBlockBuffer`.
+    /// Reset to 0 whenever a block connects.
     wedge_since: i64,
+
+    /// Current drain-wedge cancel timeout in seconds for the in-progress wedge.
+    /// Starts at `DRAIN_WEDGE_STALL_TIMEOUT` (2s) and DOUBLES on each consecutive
+    /// cancel up to `DRAIN_WEDGE_STALL_TIMEOUT_MAX` (64s) so a slow-but-able peer
+    /// gets progressively more time to deliver before the front block rotates to
+    /// the next peer. Reset to the base whenever a block connects.
+    wedge_timeout: i64,
+
+    /// Rotating start offset for the per-peer block-request loop. Advanced once
+    /// per `pipelineBlockRequests` call so the FRONT block (lowest
+    /// download_cursor) is not always assigned to peers[0]; a slow peers[0] would
+    /// otherwise re-wedge the head-of-line block on every drain-wedge recovery
+    /// while later blocks stream from faster peers. Rotation + the adaptive
+    /// timeout together: each rotated re-request gets progressively more patience.
+    block_request_rotation: usize,
 
     /// ASMap binary bytecode for IP → ASN lookup.  Null when no --asmap file
     /// was loaded.  When non-null, `netGroupWithAsmap()` returns an ASN-keyed
@@ -2849,6 +2880,8 @@ pub const PeerManager = struct {
             .block_source_peers = std.AutoHashMap(types.Hash256, usize).init(allocator),
             .inflight_block_peer = std.AutoHashMap(types.Hash256, usize).init(allocator),
             .wedge_since = 0,
+            .wedge_timeout = DRAIN_WEDGE_STALL_TIMEOUT,
+            .block_request_rotation = 0,
             .last_orphan_sweep = 0,
             .asmap_data = null,
             .proxy_manager = null,
@@ -7257,7 +7290,18 @@ pub const PeerManager = struct {
         // No global counter gate — a slow peer self-throttles and is
         // disconnected by `checkBlockDownloadTimeouts` when its oldest
         // in-flight block exceeds `BLOCK_DOWNLOAD_TIMEOUT`.
-        for (self.peers.items) |tp| {
+        // Front-block rotation: rotate which peer is considered FIRST each call so
+        // the front block at download_cursor is offered to peers[rotation], not
+        // always peers[0]. Otherwise a slow/limited peers[0] re-wedges the
+        // head-of-line block on every drain-wedge recovery while later blocks
+        // stream from faster peers. Combined with the adaptive (doubling) wedge
+        // timeout, each rotated re-request also gets progressively more patience.
+        const peer_n = self.peers.items.len;
+        if (peer_n == 0) return;
+        self.block_request_rotation +%= 1;
+        var pidx: usize = 0;
+        while (pidx < peer_n) : (pidx += 1) {
+            const tp = self.peers.items[(self.block_request_rotation + pidx) % peer_n];
             if (tp.state != .handshake_complete) continue;
 
             // Compute this peer's remaining slot budget.  Saturating so a
@@ -7271,12 +7315,37 @@ pub const PeerManager = struct {
 
             var invs = std.ArrayList(p2p.InvVector).init(self.allocator);
 
+            // NODE_NETWORK_LIMITED filter (Core net_processing.cpp:1533): a pruned
+            // peer (advertises NODE_NETWORK_LIMITED but not NODE_NETWORK) keeps only
+            // ~288 recent blocks and cannot serve deep catch-up blocks. Requesting
+            // them from it burns the slot and re-wedges the head-of-line block
+            // (#29). Computed once per peer; the block-height check is per block.
+            const tp_limited = (tp.services & p2p.NODE_NETWORK) == 0 and
+                (tp.services & p2p.NODE_NETWORK_LIMITED) != 0;
+            const cs_tip: i64 = if (self.chain_state) |cs| @intCast(cs.best_height) else 0;
+
             var batch_count: u32 = 0;
             while (batch_count < peer_budget and
                 self.download_cursor < self.expected_blocks.items.len and
                 self.download_cursor < self.connect_cursor + max_ahead)
             {
                 const h = self.expected_blocks.items[self.download_cursor];
+                // Height of the block at download_cursor: the block at
+                // connect_cursor connects at our tip+1, so index i is at
+                // tip + 1 + (i - connect_cursor).
+                const h_height: i64 = cs_tip + 1 +
+                    (@as(i64, @intCast(self.download_cursor)) - @as(i64, @intCast(self.connect_cursor)));
+                // If THIS peer is limited and the block is deeper than its window
+                // below its announced tip, it can't serve it. BREAK (not advance)
+                // so the block is left for a full-node peer on the next rotation —
+                // during catch-up the whole window is deep, so a limited peer
+                // correctly contributes nothing this round.
+                if (tp_limited and tp.best_known_height != 0 and
+                    (@as(i64, @intCast(tp.best_known_height)) - h_height) >=
+                        NODE_NETWORK_LIMITED_MIN_BLOCKS - 2)
+                {
+                    break;
+                }
                 // SKIP if already buffered OR already in-flight to some peer
                 // (Core mapBlocksInFlight: never request the same block twice).
                 // This is what makes a download_cursor rewind drift-free — the
@@ -7778,7 +7847,8 @@ pub const PeerManager = struct {
                     // so it does not reintroduce the W15 throughput regression.
                     if (self.wedge_since == 0) {
                         self.wedge_since = now;
-                    } else if (now - self.wedge_since >= DRAIN_WEDGE_STALL_TIMEOUT) {
+                        self.wedge_timeout = DRAIN_WEDGE_STALL_TIMEOUT; // fresh wedge → base
+                    } else if (now - self.wedge_since >= self.wedge_timeout) {
                         if (self.inflight_block_peer.fetchRemove(expected_hash)) |kv| {
                             if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
                             for (self.peers.items) |p| {
@@ -7798,6 +7868,10 @@ pub const PeerManager = struct {
                             self.download_cursor = self.connect_cursor;
                         }
                         self.wedge_since = now; // rate-limit subsequent recoveries
+                        // Doubling backoff (Core BLOCK_STALLING_TIMEOUT 2s→64s):
+                        // give the next peer more time before cancelling again, so
+                        // a slow-but-able peer can finish delivering a 1-2 MB block.
+                        self.wedge_timeout = @min(self.wedge_timeout * 2, DRAIN_WEDGE_STALL_TIMEOUT_MAX);
                     }
                 }
                 break; // Not yet received, stop
