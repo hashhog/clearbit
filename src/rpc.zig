@@ -3014,6 +3014,8 @@ pub const RpcServer = struct {
             return self.handleAddPeerAddress(params, id);
         } else if (std.mem.eql(u8, method, "getaddrmaninfo")) {
             return self.handleGetAddrManInfo(id);
+        } else if (std.mem.eql(u8, method, "getmemoryinfo")) {
+            return self.handleGetMemoryInfo(params, id);
         } else if (std.mem.eql(u8, method, "getmempoolinfo")) {
             return self.handleGetMempoolInfo(id);
         } else if (std.mem.eql(u8, method, "getmempoolentry")) {
@@ -6137,6 +6139,107 @@ pub const RpcServer = struct {
         });
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// getmemoryinfo ( "mode" ) — information about the daemon's memory usage.
+    ///
+    /// Reference: Bitcoin Core rpc/node.cpp getmemoryinfo (:145-198) +
+    /// RPCLockedMemoryInfo (:113-124) + RPCMallocInfo (:126-143). Pure read-only
+    /// introspection of the daemon's own memory accounting; NO side effects, no
+    /// chain/mempool/peer locks — safe at any lifecycle stage.
+    ///
+    /// IMPORTANT SEMANTICS: the "stats" mode reports Core's SECURE LOCKED-MEMORY
+    /// POOL (`LockedPoolManager` — the `mlock()`-backed allocator that keeps
+    /// sensitive data such as wallet private keys OFF swap), NOT general process
+    /// or heap memory. Do NOT confuse the "locked" memory here with the
+    /// transaction "memory pool" (mempool).
+    ///
+    /// Param (single, optional positional):
+    ///   0. mode (STR, default "stats"): what kind of information is returned.
+    ///        - "stats":      general statistics about memory usage.
+    ///        - "mallocinfo": glibc malloc_info(3) XML (Core: glibc-only).
+    ///
+    /// Output (mode-dependent, matching Core exactly):
+    ///   - mode == "stats" (default) -> OBJECT, exactly one top-level key:
+    ///
+    ///         { "locked": { "used": int, "free": int, "total": int,
+    ///                       "locked": int, "chunks_used": int,
+    ///                       "chunks_free": int } }
+    ///
+    ///     The six inner counters are non-negative integers (Core `size_t`), in
+    ///     this exact pushKV order: used, free, total, locked, chunks_used,
+    ///     chunks_free. clearbit is a from-scratch Zig node with NO Core-style
+    ///     `mlock()`-backed secure pool (verified: no LockedPool / mlock /
+    ///     sodium_mlock / VirtualLock anywhere in src/*.zig), so the honest
+    ///     answer is all zeros — a node with an empty/absent locked pool
+    ///     legitimately reports zeros (Core itself emits 0/0/0/0/0/0 before any
+    ///     secure allocation), and the keys/structure are ALWAYS present and
+    ///     identical to Core (shape-match parity holds). We do NOT fabricate
+    ///     nonzero values for a pool that does not exist.
+    ///
+    ///   - mode == "mallocinfo" -> Core returns a glibc `malloc_info(0, ...)` XML
+    ///     string ONLY when built with glibc (HAVE_MALLOC_INFO); on every other
+    ///     build it raises -8 "mallocinfo mode not available". clearbit has no
+    ///     glibc `malloc_info(3)` plumbing, so we faithfully take Core's
+    ///     non-glibc path — the exact -8 error — rather than fabricate a stub XML
+    ///     string Core never emits.
+    ///
+    /// Errors (matching Core node.cpp:180-196):
+    ///   - mode == "mallocinfo" (no glibc support) -> RPC_INVALID_PARAMETER (-8),
+    ///     "mallocinfo mode not available".
+    ///   - any other mode string -> RPC_INVALID_PARAMETER (-8),
+    ///     "unknown mode <mode>" (Core's tfm::format("unknown mode %s", mode)).
+    ///   - non-string mode (number/bool/object/array) -> RPC_TYPE_ERROR (-3),
+    ///     a standard JSON type-check BEFORE the handler logic (Core resolves the
+    ///     arg as `self.Arg<std::string_view>("mode")`, which type-errors first).
+    fn handleGetMemoryInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Resolve the optional `mode` param. Absent / null -> Core's default
+        // "stats". A present-but-non-string value is Core's RPC_TYPE_ERROR (-3),
+        // raised before any handler logic (Arg<std::string_view> type check).
+        var mode: []const u8 = "stats";
+        if (params == .array and params.array.items.len > 0) {
+            const p0 = params.array.items[0];
+            if (p0 == .string) {
+                mode = p0.string;
+            } else if (p0 != .null) {
+                // Non-string mode (number / bool / object / array) -> -3.
+                return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value is not of expected type string", id);
+            }
+            // p0 == .null falls through with mode = "stats" (Core treats an
+            // explicit JSON null as "use the default").
+        }
+
+        if (std.mem.eql(u8, mode, "stats")) {
+            // Core RPCLockedMemoryInfo() reads
+            // LockedPoolManager::Instance().stats() and emits the six counters
+            // under "locked" in this exact order. clearbit has no mlock'd secure
+            // allocator, so every counter is an honest 0 — keys always present.
+            return self.jsonRpcResult(
+                "{\"locked\":{\"used\":0,\"free\":0,\"total\":0,\"locked\":0,\"chunks_used\":0,\"chunks_free\":0}}",
+                id,
+            );
+        }
+
+        if (std.mem.eql(u8, mode, "mallocinfo")) {
+            // Core returns glibc malloc_info(3) XML ONLY when built with glibc
+            // (HAVE_MALLOC_INFO); on every other build it raises
+            // -8 "mallocinfo mode not available". clearbit has no glibc
+            // malloc_info plumbing -> take Core's non-glibc path faithfully
+            // rather than fabricate a stub XML string Core never emits.
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "mallocinfo mode not available", id);
+        }
+
+        // Any other mode is Core's RPC_INVALID_PARAMETER (-8) "unknown mode %s".
+        // Build the message dynamically (same pattern as getnodeaddresses'
+        // "Network not recognized: <raw>"), JSON-escaping the user-supplied mode
+        // so a crafted value cannot break out of the error-message string. For
+        // an ordinary mode like "bogus" the escaped form is byte-identical to
+        // Core's literal "unknown mode bogus".
+        var msg_buf = std.ArrayList(u8).init(self.allocator);
+        defer msg_buf.deinit();
+        try msg_buf.writer().writeAll("unknown mode ");
+        try writeJsonEscaped(msg_buf.writer(), mode);
+        return self.jsonRpcError(RPC_INVALID_PARAMETER, msg_buf.items, id);
     }
 
     fn handleGetMempoolInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
@@ -22821,6 +22924,73 @@ test "getmempoolinfo returns stats" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "\"loaded\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"size\":0") != null);
+}
+
+test "getmemoryinfo: default + stats mode -> zero-shape locked object; error modes" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    // The exact zero-shape (all six counters 0, Core pushKV order). clearbit has
+    // no mlock'd secure pool, so every counter is honestly 0; keys always present.
+    const expected_stats = "{\"result\":{\"locked\":{\"used\":0,\"free\":0,\"total\":0,\"locked\":0,\"chunks_used\":0,\"chunks_free\":0}},\"error\":null,\"id\":1}";
+
+    // No args -> default "stats".
+    {
+        const r = try server.dispatch("{\"id\":1,\"method\":\"getmemoryinfo\",\"params\":[]}");
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings(expected_stats, r);
+    }
+    // Explicit "stats" -> identical.
+    {
+        const r = try server.dispatch("{\"id\":1,\"method\":\"getmemoryinfo\",\"params\":[\"stats\"]}");
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings(expected_stats, r);
+    }
+    // "mallocinfo" -> -8 "mallocinfo mode not available" (Core non-glibc path).
+    {
+        const r = try server.dispatch("{\"id\":1,\"method\":\"getmemoryinfo\",\"params\":[\"mallocinfo\"]}");
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings(
+            "{\"result\":null,\"error\":{\"code\":-8,\"message\":\"mallocinfo mode not available\"},\"id\":1}",
+            r,
+        );
+    }
+    // Unknown mode -> -8 "unknown mode <mode>".
+    {
+        const r = try server.dispatch("{\"id\":1,\"method\":\"getmemoryinfo\",\"params\":[\"bogus\"]}");
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings(
+            "{\"result\":null,\"error\":{\"code\":-8,\"message\":\"unknown mode bogus\"},\"id\":1}",
+            r,
+        );
+    }
+    // Non-string mode (number) -> -3 RPC_TYPE_ERROR, before handler logic.
+    {
+        const r = try server.dispatch("{\"id\":1,\"method\":\"getmemoryinfo\",\"params\":[123]}");
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings(
+            "{\"result\":null,\"error\":{\"code\":-3,\"message\":\"JSON value is not of expected type string\"},\"id\":1}",
+            r,
+        );
+    }
 }
 
 test "sendrawtransaction rejects invalid hex" {
