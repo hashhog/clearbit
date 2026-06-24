@@ -1953,6 +1953,93 @@ pub fn isBip30DisconnectException(
     return false;
 }
 
+/// Tip-change notifier — the clearbit analogue of Bitcoin Core's
+/// `KernelNotifications::blockTip` / `Mining::waitTipChanged` condition
+/// variable (rpc/blockchain.cpp waitfornewblock / waitforblock /
+/// waitforblockheight block on it).  The wait-family RPCs use it to sleep
+/// until the active-chain tip advances rather than busy-polling.
+///
+/// Concurrency model (clearbit-specific):
+///   * The RPC server is single-threaded (one worker), so a `waitfor*` call
+///     parks that one thread for the duration of its wait — exactly as Core
+///     blocks its RPC worker.  To keep this from wedging the server forever,
+///     the wait is bounded by `Condition.timedWait`; callers re-derive the
+///     remaining slice from an absolute deadline and ALSO respect the 30s
+///     SO_RCVTIMEO/SNDTIMEO client-socket timeout already enforced on the
+///     accept side (commit 28fb306) — the kernel evicts a parked client at
+///     ~30s independent of this notifier, so a wait can never wedge forever.
+///   * The connect/disconnect/reorg chokepoints run on the P2P or RPC thread
+///     under `ChainState.connect_mutex`.  This notifier uses its OWN mutex
+///     (NOT connect_mutex) so `notify()` from inside a held connect_mutex
+///     section never self-deadlocks against a waiter, and a waiter never
+///     blocks block connection (the waiter holds only `mutex` while sleeping
+///     on the condition, and reads the authoritative tip via plain field
+///     reads outside this lock — same as every other tip-reading handler).
+///
+/// Lost-wakeup safety: a monotonically increasing `generation` counter is
+/// bumped on every `notify()`.  A waiter snapshots `generation`, checks its
+/// predicate against the AUTHORITATIVE `ChainState` tip, and only then waits
+/// for the generation to advance past the snapshot.  A `notify()` that races
+/// in between the predicate check and the wait is therefore NOT lost — the
+/// waiter observes the bumped generation and re-checks immediately.  The
+/// notifier never carries a tip value; correctness depends only on the
+/// caller re-reading the real tip after each wake (so a coalesced/missed
+/// notify can never produce a wrong answer — same contract as the ouroboros
+/// `TipNotifier` pilot).
+pub const TipNotifier = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    /// Bumped on every tip advance.  64-bit so it never wraps in practice.
+    generation: u64 = 0,
+
+    /// Snapshot the current generation.  A waiter calls this BEFORE checking
+    /// its predicate so a notify racing in after the check is observed.
+    pub fn currentGeneration(self: *TipNotifier) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.generation;
+    }
+
+    /// Signal that the active-chain tip advanced (connect / disconnect /
+    /// reorg).  Bumps the generation under the lock and wakes every waiter.
+    /// Safe to call while holding `ChainState.connect_mutex` (distinct lock).
+    pub fn notify(self: *TipNotifier) void {
+        self.mutex.lock();
+        self.generation +%= 1;
+        self.mutex.unlock();
+        // Wake all parked waiters; each re-reads the authoritative tip.
+        self.cond.broadcast();
+    }
+
+    /// Wait until the generation advances past `last_generation`, or until
+    /// `timeout_ns` elapses (null = wait indefinitely).  Returns true if a
+    /// tip change was observed, false on timeout.  Either way the caller MUST
+    /// re-evaluate its predicate against the authoritative tip.  Spurious
+    /// wakeups are harmless: the caller re-checks the predicate + generation.
+    pub fn wait(self: *TipNotifier, last_generation: u64, timeout_ns: ?u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Fast path: a notify already raced in since the caller's snapshot.
+        if (self.generation != last_generation) return true;
+        if (timeout_ns) |ns| {
+            // timedWait returns error.Timeout when the deadline elapses with
+            // no broadcast; any return (incl. spurious) re-checks the guard.
+            self.cond.timedWait(&self.mutex, ns) catch {
+                // On timeout, report whether a notify nonetheless landed.
+                return self.generation != last_generation;
+            };
+            return self.generation != last_generation;
+        } else {
+            // Indefinite wait, but loop to swallow spurious wakeups until a
+            // real generation bump is observed.
+            while (self.generation == last_generation) {
+                self.cond.wait(&self.mutex);
+            }
+            return true;
+        }
+    }
+};
+
 /// Chain state tracks the current best chain and supports reorgs.
 pub const ChainState = struct {
     /// Block-keep horizon: blocks within this many heights of the tip are
@@ -2004,6 +2091,19 @@ pub const ChainState = struct {
     /// have a corresponding on-disk delete record — exactly the
     /// stuck-at-370001 corruption mode (Option A, wave2-2026-04-14).
     flush_error: bool = false,
+
+    /// Tip-change notifier for the wait-family RPCs (waitfornewblock /
+    /// waitforblock / waitforblockheight).  `notify()` is called from every
+    /// tip-advance chokepoint (block connect during IBD + post-IBD, the
+    /// submitblock accept path, and BOTH halves of a reorg — disconnect-to-
+    /// fork and connect-new-branch); the RPC handlers in rpc.zig snapshot
+    /// `tip_notifier.currentGeneration()`, check their predicate against the
+    /// authoritative `best_hash`/`best_height`, then `wait()` for a bump.
+    /// Default-initialised (zeroed mutex/condition + generation 0); valid
+    /// once the ChainState is at its final address (post-`wireUtxoParent`),
+    /// which is the same contract the existing self-referential fields rely
+    /// on.  Core analogue: KernelNotifications::blockTip / waitTipChanged.
+    tip_notifier: TipNotifier = .{},
 
     // ── AssumeUTXO snapshot-activation state (Core Chainstate
     //    m_from_snapshot_blockhash / m_assumeutxo) ────────────────────────────
@@ -4826,6 +4926,19 @@ pub const ChainState = struct {
         self.best_hash = block.header.prev_block;
         if (self.best_height > 0) self.best_height -= 1;
 
+        // Wake the wait-family RPCs on this tip change.  This is the
+        // disconnect-to-fork half of a reorg (the reorg loop calls
+        // disconnectBlockByHashCFNoFlush → here per rewound block) AND the
+        // standalone disconnect paths (invalidateblock, boot reconcile).
+        // The in-memory tip has just changed, so a waiter that re-reads
+        // best_hash/best_height now sees the new (lower) tip — Core's
+        // KernelNotifications::blockTip fires on the disconnect side of a
+        // reorg too.  Notifying right after the rewind (rather than at the
+        // very end of the function) means the wake still fires even on the
+        // tolerated DISCONNECT_UNCLEAN / no-flush reorg path, where the
+        // function returns early below.
+        self.tip_notifier.notify();
+
         // Pattern D: queue the CF_BLOCK_UNDO delete into pending_undo_deletes
         // so flush() drains it inside the same WriteBatch as the UTXO
         // restores + tip rewind + CF_TX_INDEX deletes.  Pre-Pattern-D
@@ -5696,6 +5809,19 @@ pub const ChainState = struct {
         self.profile_output_count += output_count_block;
         if (evict_fired) self.profile_evict_count += 1;
 
+        // Wake the wait-family RPCs on this tip advance.  This is the single
+        // connect chokepoint for EVERY path that advances the active tip:
+        // IBD block connect, post-IBD P2P connect, the submitblock/generate
+        // accept path, AND the connect-new-branch half of a reorg (the reorg
+        // loop calls connectBlockFastWithUndoNoFlush → connectBlockInner per
+        // block).  Core analogue: KernelNotifications::blockTip firing inside
+        // ConnectTip.  We run while holding connect_mutex; the notifier's own
+        // mutex is distinct, so this never self-deadlocks.  The waiter re-reads
+        // the authoritative best_hash/best_height after waking, so a notify
+        // here that coalesces with a near-simultaneous reorg-disconnect notify
+        // can never produce a wrong answer.
+        self.tip_notifier.notify();
+
         return BlockUndo{
             .spent_utxos = if (skip_undo) &[_]BlockUndo.SpentUtxo{} else try spent_list.toOwnedSlice(),
             .created_outpoints = if (skip_undo) &[_]types.OutPoint{} else try created_list.toOwnedSlice(),
@@ -5752,6 +5878,10 @@ pub const ChainState = struct {
         // G21 — tip rewind with underflow guard.
         self.best_hash = prev_hash;
         if (self.best_height > 0) self.best_height -= 1;
+
+        // Wake the wait-family RPCs on this tip change (legacy in-memory
+        // disconnect path).  Same rationale as disconnectBlockByHashCFInner.
+        self.tip_notifier.notify();
 
         // G22 — surface UNCLEAN.
         if (!f_clean) return error.DisconnectUnclean;
@@ -6636,6 +6766,10 @@ pub const ChainState = struct {
         // genesis (which shouldn't happen, but the guard is cheap).
         self.best_hash = prev_hash;
         if (self.best_height > 0) self.best_height -= 1;
+
+        // Wake the wait-family RPCs on this tip change (file-backed disconnect
+        // path).  Same rationale as disconnectBlockByHashCFInner.
+        self.tip_notifier.notify();
 
         // G22 — surface DISCONNECT_UNCLEAN.
         if (!f_clean) {
