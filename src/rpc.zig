@@ -3166,6 +3166,8 @@ pub const RpcServer = struct {
             return self.handleCreateRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "getconnectioncount")) {
             return self.handleGetConnectionCount(id);
+        } else if (std.mem.eql(u8, method, "ping")) {
+            return self.handlePing(params, id);
         } else if (std.mem.eql(u8, method, "addnode")) {
             return self.handleAddNode(params, id);
         } else if (std.mem.eql(u8, method, "getaddednodeinfo")) {
@@ -13323,6 +13325,43 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// Handle ping RPC - request that a BIP-31 PING be sent to all peers.
+    ///
+    /// Reference: Bitcoin Core rpc/net.cpp:84-107 (`ping`) ->
+    /// `PeerManager::SendPings()` (net_processing.cpp).
+    ///
+    /// Params: none. (Core takes `{}`; supplying any argument is a dispatcher
+    /// arity error there. clearbit's dispatcher does not strictly enforce
+    /// arity for nullary methods, so a trailing `[]`/extra arg is tolerated —
+    /// the method is a pure side-effect trigger regardless of params.)
+    ///
+    /// Output: JSON `null` (Core `UniValue::VNULL` / `RPCResult::Type::NONE`) —
+    /// literally `null`, NOT `{}` and NOT the string "null".
+    ///
+    /// Behaviour: side-effect-only control method. Iterates every connected
+    /// (handshake-complete) peer and triggers clearbit's per-peer BIP-31
+    /// PING-send primitive (fresh-nonce ping via `Peer.sendPing`). It is
+    /// fire-and-forget — it does NOT measure latency synchronously and does NOT
+    /// wait for the PONGs. The round-trip results surface LATER via
+    /// `getpeerinfo`'s `pingtime`/`minping` (clearbit updates `min_ping_time`
+    /// in `Peer.handlePong`). With zero connected peers it is a successful
+    /// no-op and still returns `null`.
+    ///
+    /// Error parity: Core's `EnsurePeerman` raises RPC_CLIENT_P2P_DISABLED
+    /// (-31) "Error: Peer-to-peer functionality missing or disabled" when the
+    /// peer manager is absent (P2P disabled). In clearbit the RPC server holds
+    /// a non-optional `peer_manager` pointer (it cannot be constructed without
+    /// one), so that path is structurally unreachable here; it is documented
+    /// for parity rather than wired to a runtime check that can never fire.
+    fn handlePing(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        _ = params; // ping takes no parameters; any are ignored (pure trigger).
+        // Queue/send a BIP-31 PING to every connected peer, fire-and-forget.
+        // peerless -> no-op -> still null (Core loops over an empty peer map).
+        self.peer_manager.pingAll();
+        // Core returns UniValue::VNULL -> JSON null.
+        return self.jsonRpcResult("null", id);
+    }
+
     /// Handle getconnectioncount RPC - return the number of connected peers.
     /// Reference: Bitcoin Core rpc/net.cpp getconnectioncount
     fn handleGetConnectionCount(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
@@ -17851,6 +17890,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("sendrawtransaction hexstring ( maxfeerate )\\n\\nSubmit a raw transaction to local node and network.");
             } else if (std.mem.eql(u8, cmd, "getconnectioncount")) {
                 try writer.writeAll("getconnectioncount\\n\\nReturns the number of connections to other nodes.");
+            } else if (std.mem.eql(u8, cmd, "ping")) {
+                try writer.writeAll("ping\\n\\nRequests that a ping be sent to all other nodes, to measure ping time.\\nResults are provided in getpeerinfo.");
             } else if (std.mem.eql(u8, cmd, "addnode")) {
                 try writer.writeAll("addnode node command\\n\\nAttempts to add or remove a node from the addnode list.");
             } else if (std.mem.eql(u8, cmd, "getaddednodeinfo")) {
@@ -17935,6 +17976,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getconnectioncount\\n");
             try writer.writeAll("getnetworkinfo\\n");
             try writer.writeAll("getpeerinfo\\n");
+            try writer.writeAll("ping\\n");
             try writer.writeAll("setnetworkactive\\n");
             try writer.writeAll("\\n== Rawtransactions ==\\n");
             try writer.writeAll("createrawtransaction\\n");

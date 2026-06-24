@@ -6910,6 +6910,27 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Send a BIP-31 PING to EVERY connected (handshake-complete) peer
+    /// immediately, ignoring the PING_INTERVAL idle gate.
+    ///
+    /// Reference: Bitcoin Core `PeerManagerImpl::SendPings()` (net_processing.cpp),
+    /// the callee of the `ping` RPC (rpc/net.cpp:103). Core takes `m_peer_mutex`
+    /// and sets `m_ping_queued = true` on every peer so the next message-
+    /// processing pass emits a fresh-nonce PING. clearbit has an on-demand
+    /// per-peer send primitive (`Peer.sendPing`), so we trigger it directly here
+    /// — fire-and-forget, no synchronous RTT, no waiting for the PONGs. The
+    /// round-trip surfaces LATER via `getpeerinfo`'s pingtime/minping
+    /// (`Peer.handlePong` updates `min_ping_time`). A per-peer send error must
+    /// not abort the sweep (matching Core's loop-over-the-map-and-return) — one
+    /// dropped peer cannot fail the others. With zero connected peers this is a
+    /// successful no-op.
+    pub fn pingAll(self: *PeerManager) void {
+        for (self.peers.items) |peer| {
+            if (peer.state != .handshake_complete) continue;
+            peer.sendPing() catch continue;
+        }
+    }
+
     /// Disconnect stale or timed-out peers.
     pub fn disconnectStale(self: *PeerManager) void {
         var i: usize = 0;
