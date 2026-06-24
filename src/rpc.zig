@@ -1554,13 +1554,55 @@ pub const RpcServer = struct {
     fn handleConnection(self: *RpcServer, conn: std.net.Server.Connection) !void {
         defer conn.stream.close();
 
+        // Per-connection read/write timeouts (the un-pin gate, Fault A).
+        //
+        // clearbit's RPC server is a single accept-one/serve-one thread. With no
+        // timeout on the client socket, ONE silent / slow / half-open client (no
+        // `\r\n\r\n`, a `Content-Length` larger than the bytes it sends, or a
+        // client that stops reading a large response) parks the only RPC thread in
+        // a blocking read()/writeAll() forever — every later request, including the
+        // fleet monitor's getblockcount, is never serviced ("RPC down", process
+        // alive, thread sleeping). See
+        // CORE-PARITY-AUDIT/_clearbit-rpc-deadlock-rootcause-2026-06-24.md.
+        //
+        // Mirror Bitcoin Core's `evhttp_set_timeout(http, -rpcservertimeout)` with
+        // DEFAULT_HTTP_SERVER_TIMEOUT = 30 (httpserver.{h,cpp}). With SO_RCVTIMEO /
+        // SO_SNDTIMEO set, a blocked read()/write() returns error.WouldBlock after
+        // 30s; every read/write arm below already drops the connection on error
+        // (`catch return` / `catch {}` + the `defer conn.stream.close()` above), so
+        // a stalled client can tie up the thread for at most ~30s, then is evicted.
+        // This makes the permanent single-stalled-client wedge impossible.
+        const rpc_io_timeout = std.posix.timeval{ .tv_sec = 30, .tv_usec = 0 };
+        std.posix.setsockopt(
+            conn.stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&rpc_io_timeout),
+        ) catch {};
+        std.posix.setsockopt(
+            conn.stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            std.mem.asBytes(&rpc_io_timeout),
+        ) catch {};
+
         // Read HTTP request
         var buf: [65536]u8 = undefined;
         var total_read: usize = 0;
 
-        // Read until we have the full headers
+        // Read until we have the full headers.
+        //
+        // `catch return` (with the `defer conn.stream.close()`) drops the
+        // connection on ANY read error, including error.WouldBlock — the
+        // SO_RCVTIMEO 30s timeout firing on a silent / half-open client. This is
+        // the eviction that un-wedges the thread; we log the timeout case so the
+        // public-peer soak can confirm stalled clients are being dropped.
         while (total_read < buf.len) {
-            const n = conn.stream.read(buf[total_read..]) catch return;
+            const n = conn.stream.read(buf[total_read..]) catch |err| {
+                if (err == error.WouldBlock)
+                    std.debug.print("RPC: dropping stalled client (header read timeout)\n", .{});
+                return;
+            };
             if (n == 0) return;
             total_read += n;
 
@@ -1703,7 +1745,12 @@ pub const RpcServer = struct {
             @memcpy(body_buf[0 .. total_read - body_start], request_data[body_start..total_read]);
             var offset = total_read - body_start;
             while (offset < content_length) {
-                const n = conn.stream.read(body_buf[offset..]) catch {
+                // A client that promises `Content-Length` bytes but then stalls
+                // trips SO_RCVTIMEO → error.WouldBlock after 30s; free the partial
+                // body buffer and drop the connection (no permanent wedge).
+                const n = conn.stream.read(body_buf[offset..]) catch |err| {
+                    if (err == error.WouldBlock)
+                        std.debug.print("RPC: dropping stalled client (body read timeout)\n", .{});
                     self.allocator.free(body_buf);
                     return;
                 };
@@ -1742,12 +1789,26 @@ pub const RpcServer = struct {
     }
 
     /// Send an HTTP response with JSON body.
+    ///
+    /// `writeAll(...) catch {}` drops the connection on any write error. With
+    /// SO_SNDTIMEO set on the client socket (handleConnection), a slow-reader
+    /// client that fills our kernel send buffer trips error.WouldBlock after 30s
+    /// instead of parking the single RPC thread forever — the un-pin gate's
+    /// write-side half. We log the timeout case for soak observability.
     fn sendHttpResponse(self: *RpcServer, stream: std.net.Stream, status: u16, body: []const u8) !void {
         _ = self;
         var header_buf: [256]u8 = undefined;
         const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 {d} OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, body.len }) catch return;
-        stream.writeAll(header) catch {};
-        stream.writeAll(body) catch {};
+        stream.writeAll(header) catch |err| {
+            if (err == error.WouldBlock)
+                std.debug.print("RPC: dropping stalled client (response write timeout)\n", .{});
+            return;
+        };
+        stream.writeAll(body) catch |err| {
+            if (err == error.WouldBlock)
+                std.debug.print("RPC: dropping stalled client (response write timeout)\n", .{});
+            return;
+        };
     }
 
     /// Send an HTTP response with custom content type.
@@ -5655,6 +5716,17 @@ pub const RpcServer = struct {
             .hash = blockhash,
         }};
         const getdata_msg = p2p.Message{ .getdata = .{ .inventory = inv_items[0..] } };
+        // LATENT HAZARD (deferred, see rootcause doc Part 2 "Optional hardening"):
+        // this RPC-thread send and the P2P thread can both write the SAME peer
+        // socket with no serialization. For this path the risk is small in
+        // practice — a getdata carrying one inv is ~37 bytes and `sendMessage`'s
+        // v1 `writeAll` completes in a single atomic syscall at that size, so two
+        // concurrent small sends do not interleave WITHIN a message. The proper
+        // fix is a per-peer send mutex (or routing all sends through one thread /
+        // the per-peer send buffer of Part 2b); that is a struct-lifecycle change
+        // left to the follow-up. Keeping the blocking send here preserves the
+        // existing "Peer not fully connected" error semantics for this explicit
+        // user-requested fetch.
         peer.sendMessage(&getdata_msg) catch {
             // Core's FetchBlock returns "Peer not fully connected" when the
             // ForNode push fails (net_processing.cpp:1989).  A send failure
