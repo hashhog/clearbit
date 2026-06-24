@@ -412,6 +412,17 @@ pub const HEADERS_RESPONSE_TIMEOUT: i64 = 5 * 60;
 /// If a block is in-flight and not received within this time, disconnect.
 pub const BLOCK_DOWNLOAD_TIMEOUT: i64 = 20 * 60;
 
+/// Drain-wedge staller timeout in seconds. When `connect_cursor` is stuck on a
+/// missing FRONT block while LATER blocks sit buffered (the head-of-line wedge a
+/// slow/unresponsive public peer causes), cancel that block's in-flight request
+/// after this long (decrement the holder + drop it from `inflight_block_peer`)
+/// so the pipeline re-requests it from another peer — instead of waiting the full
+/// `BLOCK_DOWNLOAD_TIMEOUT` (20 min). Mirrors Bitcoin Core's `BLOCK_STALLING_TIMEOUT`
+/// (net_processing.cpp, 2s initial). The per-block map makes the re-request
+/// drift-free: `pipelineBlockRequests` never re-issues a block still tracked
+/// in-flight, so only the cancelled front block is re-requested.
+pub const DRAIN_WEDGE_STALL_TIMEOUT: i64 = 2;
+
 /// Maximum blocks in flight per peer, matching Bitcoin Core's
 /// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (src/net_processing.cpp).  The block
 /// download pipeline is level-triggered per peer — every SendMessages tick
@@ -2679,6 +2690,24 @@ pub const PeerManager = struct {
     /// drain time so a disconnected peer is never dereferenced.
     block_source_peers: std.AutoHashMap(types.Hash256, usize),
 
+    /// Maps block hash → the peer we REQUESTED it from (as @intFromPtr(*Peer)).
+    /// Mirrors Bitcoin Core's `mapBlocksInFlight` (net_processing.cpp). This is
+    /// the source of truth for "is this block in-flight": pipelineBlockRequests
+    /// SKIPS any hash already present (never double-requests → a download_cursor
+    /// rewind is drift-free), an entry is removed when the block arrives or its
+    /// peer disconnects, and the drain-wedge recovery cancels a stuck front
+    /// block by decrementing its holder + removing its entry so it re-requests
+    /// cleanly from another peer. Invariant: global `blocks_in_flight` ==
+    /// number of live entries here, and each entry's peer has it counted in its
+    /// `blocks_in_flight_count`.
+    inflight_block_peer: std.AutoHashMap(types.Hash256, usize),
+
+    /// Timestamp (unix seconds) when `connect_cursor` got stuck on a missing
+    /// front block while later blocks were buffered (head-of-line drain wedge);
+    /// 0 = not wedged. Drives the `DRAIN_WEDGE_STALL_TIMEOUT` cancel-and-rerequest
+    /// in `drainBlockBuffer`. Reset to 0 whenever a block connects.
+    wedge_since: i64,
+
     /// ASMap binary bytecode for IP → ASN lookup.  Null when no --asmap file
     /// was loaded.  When non-null, `netGroupWithAsmap()` returns an ASN-keyed
     /// group instead of a /16 prefix group, providing AS-level eclipse
@@ -2818,6 +2847,8 @@ pub const PeerManager = struct {
             .header_index = std.AutoHashMap(types.Hash256, BlockHeaderEntry).init(allocator),
             .pending_reorg = null,
             .block_source_peers = std.AutoHashMap(types.Hash256, usize).init(allocator),
+            .inflight_block_peer = std.AutoHashMap(types.Hash256, usize).init(allocator),
+            .wedge_since = 0,
             .last_orphan_sweep = 0,
             .asmap_data = null,
             .proxy_manager = null,
@@ -2870,6 +2901,7 @@ pub const PeerManager = struct {
         self.header_index.deinit();
         if (self.pending_reorg) |*pr| pr.deinit();
         self.block_source_peers.deinit();
+        self.inflight_block_peer.deinit();
         if (self.asmap_data) |data| self.allocator.free(data);
         if (self.proxy_manager) |*pm| pm.deinit();
         // Free the owned added-node strings (Core m_added_node_params).
@@ -5423,14 +5455,29 @@ pub const PeerManager = struct {
             .block => |block| {
                 const block_hash = crypto.computeBlockHash(&block.header);
 
-                // Decrement in-flight counters (global and per-peer).
-                // This runs on EVERY block-response path — success, duplicate,
-                // orphan, buffer-full-drop, put-failure — so the pipeline can
-                // re-use the slot. Without this guarantee the counter drifts
-                // upward, hits max_blocks_in_flight, and wedges IBD (see wave 4
-                // wedge at height 29,953).
-                if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
-                peer.recordBlockReceived();
+                // Clear this block's in-flight record (Core RemoveBlockRequest).
+                // The per-block map is the source of truth: decrement the peer we
+                // REQUESTED it from (normally == this delivering peer; for an
+                // unsolicited block it may differ, in which case the deliverer was
+                // never counted for it and must NOT be decremented). A REQUESTED
+                // block stays in the map until it arrives, so this still runs on
+                // EVERY block-response path — success, duplicate, orphan,
+                // buffer-full-drop, put-failure — preserving the wave-4 guarantee
+                // (counter must not drift up, wedge at h=29,953). An untracked
+                // (unsolicited / already-cancelled) block has no counter to touch.
+                if (self.inflight_block_peer.fetchRemove(block_hash)) |kv| {
+                    if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
+                    if (@intFromPtr(peer) == kv.value) {
+                        peer.recordBlockReceived();
+                    } else {
+                        for (self.peers.items) |p| {
+                            if (@intFromPtr(p) == kv.value) {
+                                p.recordBlockReceived();
+                                break;
+                            }
+                        }
+                    }
+                }
 
                 // Bound the buffer to prevent OOM — if too many blocks are
                 // buffered waiting for connection, drop this one. It will
@@ -7143,6 +7190,22 @@ pub const PeerManager = struct {
             if (self.download_cursor > self.connect_cursor) {
                 self.download_cursor = self.connect_cursor;
             }
+            // Drop this peer's entries from the per-block in-flight map (Core
+            // clears a disconnected peer from mapBlocksInFlight). Until removed,
+            // pipelineBlockRequests' SKIP would treat these blocks as still
+            // in-flight and never re-request them after the W19 rewind above.
+            const gone_ptr = @intFromPtr(peer);
+            var stale_keys = std.ArrayList(types.Hash256).init(self.allocator);
+            defer stale_keys.deinit();
+            var inflight_it = self.inflight_block_peer.iterator();
+            while (inflight_it.next()) |kv| {
+                if (kv.value_ptr.* == gone_ptr) {
+                    stale_keys.append(kv.key_ptr.*) catch break;
+                }
+            }
+            for (stale_keys.items) |k| {
+                _ = self.inflight_block_peer.remove(k);
+            }
         }
         // Drop any orphan-pool entries this peer announced so the peer's
         // pointer is not dangling-referenced after `destroy`.  Mirrors
@@ -7214,7 +7277,12 @@ pub const PeerManager = struct {
                 self.download_cursor < self.connect_cursor + max_ahead)
             {
                 const h = self.expected_blocks.items[self.download_cursor];
-                if (!self.block_buffer.contains(h)) {
+                // SKIP if already buffered OR already in-flight to some peer
+                // (Core mapBlocksInFlight: never request the same block twice).
+                // This is what makes a download_cursor rewind drift-free — the
+                // wedge recovery / W19 rewind only re-issues blocks that are NOT
+                // already tracked in-flight.
+                if (!self.block_buffer.contains(h) and !self.inflight_block_peer.contains(h)) {
                     invs.append(.{
                         .inv_type = .msg_witness_block,
                         .hash = h,
@@ -7233,8 +7301,12 @@ pub const PeerManager = struct {
                 // Maintain the global `blocks_in_flight` counter for RPC /
                 // progress logging only — it no longer gates the pipeline.
                 self.blocks_in_flight += batch_count;
-                var bi: u32 = 0;
-                while (bi < batch_count) : (bi += 1) {
+                for (invs.items) |inv| {
+                    // Track which peer we requested each block from (Core
+                    // mapBlocksInFlight). Pairs 1:1 with recordBlockRequest so
+                    // the map count, global blocks_in_flight, and the peer's
+                    // blocks_in_flight_count stay in lock-step.
+                    self.inflight_block_peer.put(inv.hash, @intFromPtr(tp)) catch {};
                     tp.recordBlockRequest();
                 }
             }
@@ -7693,6 +7765,40 @@ pub const PeerManager = struct {
                             },
                         );
                     }
+
+                    // Fast staller recovery: cancel the stuck FRONT block's
+                    // in-flight request after DRAIN_WEDGE_STALL_TIMEOUT so it
+                    // re-requests from another peer, instead of waiting the 20-min
+                    // BLOCK_DOWNLOAD_TIMEOUT. The per-block map makes this
+                    // drift-free: decrement the EXACT holder + drop the entry, then
+                    // rewind download_cursor; pipelineBlockRequests re-issues ONLY
+                    // this now-untracked block (others still in-flight stay
+                    // skipped). Mirrors Core BLOCK_STALLING_TIMEOUT. Fires only in
+                    // this genuine-wedge branch (front missing + buffer non-empty),
+                    // so it does not reintroduce the W15 throughput regression.
+                    if (self.wedge_since == 0) {
+                        self.wedge_since = now;
+                    } else if (now - self.wedge_since >= DRAIN_WEDGE_STALL_TIMEOUT) {
+                        if (self.inflight_block_peer.fetchRemove(expected_hash)) |kv| {
+                            if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
+                            for (self.peers.items) |p| {
+                                if (@intFromPtr(p) == kv.value) {
+                                    p.recordBlockReceived();
+                                    break;
+                                }
+                            }
+                            std.debug.print(
+                                "P2P: drain-wedge recovery: cancelled stuck front block at connect_cursor={d} (stalled {d}s); re-requesting from another peer\n",
+                                .{ self.connect_cursor, now - self.wedge_since },
+                            );
+                        }
+                        // Rewind so the now-untracked front block re-requests
+                        // (skips others still tracked in-flight or buffered).
+                        if (self.download_cursor > self.connect_cursor) {
+                            self.download_cursor = self.connect_cursor;
+                        }
+                        self.wedge_since = now; // rate-limit subsequent recoveries
+                    }
                 }
                 break; // Not yet received, stop
             }
@@ -7944,6 +8050,8 @@ pub const PeerManager = struct {
             connected += 1;
             self.blocks_since_log += 1;
             self.connect_cursor += 1;
+            // Cursor advanced → not wedged; clear the drain-wedge staller timer.
+            self.wedge_since = 0;
 
             // Cache the connected block for relay to other peers.
             // Only cache recent blocks to bound memory (keep last 512).
