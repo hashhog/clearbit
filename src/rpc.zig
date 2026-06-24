@@ -3167,6 +3167,8 @@ pub const RpcServer = struct {
             return self.handleDecodeScript(params, id);
         } else if (std.mem.eql(u8, method, "createrawtransaction")) {
             return self.handleCreateRawTransaction(params, id);
+        } else if (std.mem.eql(u8, method, "combinerawtransaction")) {
+            return self.handleCombineRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "getconnectioncount")) {
             return self.handleGetConnectionCount(id);
         } else if (std.mem.eql(u8, method, "ping")) {
@@ -13468,6 +13470,239 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// Handle combinerawtransaction RPC - merge multiple partially-signed
+    /// versions of the SAME transaction into one carrying the union of their
+    /// signature data, returned as witness-serialized hex.
+    ///
+    /// Reference: Bitcoin Core rpc/rawtransaction.cpp combinerawtransaction
+    /// (impl body 605-668). Cross-impl reference: ouroboros f4c98ee
+    /// rpc_combinerawtransaction (the canonical SCOPE + error strings).
+    ///
+    /// Param: a single ARRAY of hex-encoded raw txs (>= 1), all the SAME
+    /// transaction structure (version/locktime/vin/vout) with DIFFERENT
+    /// partial signatures. The first variant is the structural template; for
+    /// EACH input, across all variants, we PICK the variant that actually
+    /// carries signature data (non-empty scriptSig or witness), tie-broken by
+    /// total signature-data length (longer = more sigs). The result is
+    /// re-serialized WITNESS-AWARE: the BIP-144 marker/flag are emitted iff ANY
+    /// input has a non-empty witness (Core CTransaction::HasWitness, driven
+    /// here by serialize.writeTransaction -> Transaction.hasWitness).
+    ///
+    /// SCOPE = single-sig parity (the dominant case, same as the ouroboros
+    /// reference). For P2PKH / P2WPKH / P2SH-P2WPKH this is BYTE-IDENTICAL to
+    /// Core: Core's DataFromTransaction returns the variant's scriptSig +
+    /// scriptWitness verbatim once VerifyScript marks the input complete, and
+    /// MergeSignatureData adopts that complete sigdata wholesale.
+    ///
+    /// KNOWN LIMITATION (flagged, NOT faked): merging PARTIAL multisig sigs
+    /// WITHIN a single input (two variants each holding one of M sigs for a
+    /// bare/P2SH/P2WSH M-of-N) is OUT of scope — that needs Solver /
+    /// VerifyScript-with-a-signature-extracting-checker / sighash validation.
+    /// For an input partially signed in BOTH variants (neither alone complete)
+    /// we keep the longer (more-signatures) scriptSig/witness rather than
+    /// splicing the two sig sets; the output for that input is therefore NOT
+    /// guaranteed byte-identical to Core. The per-input single-sig pick — the
+    /// dominant case — IS byte-identical and is what is verified.
+    ///
+    /// DEVIATION (flagged): Core resolves every input's prevout from its own
+    /// UTXO + mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input
+    /// not found or already spent" when a coin is missing/spent. combine is a
+    /// pure function of the provided variants here — no chainstate lookup — so
+    /// this handler does NOT raise -25 for unresolvable prevouts. The -22 empty
+    /// / -22 decode-failure error paths DO match Core byte-for-byte.
+    ///
+    /// Errors (match Core byte-for-byte):
+    ///   - non-array param  -> -3  type error (Core: get_array() on a non-array)
+    ///   - empty array      -> -22 "Missing transactions"
+    ///   - undecodable tx N -> -22 "TX decode failed for tx N. Make sure the tx
+    ///     has at least one input." (N is the 0-based index)
+    fn handleCombineRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Param shape: the dispatcher hands us the outer params array; Core
+        // reads request.params[0].get_array(). A missing/non-array first
+        // element is a type error (-3), matching Core's get_array() throw.
+        if (params != .array or params.array.items.len == 0) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Expected type array, got null", id);
+        }
+        const txs_param = params.array.items[0];
+        if (txs_param != .array) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Expected type array", id);
+        }
+        const txs = txs_param.array.items;
+
+        // 1. Decode every variant (witness-aware). Core: DecodeHexTx per idx;
+        //    on failure -> -22 "TX decode failed for tx %d. ..." (0-based idx).
+        //    We honor Core's DecodeHexTx try_no_witness/try_witness heuristic
+        //    (same path createrawtransaction/fundrawtransaction use) so a
+        //    legacy (non-witness) tx whose 0x00 input-count would be misread as
+        //    the segwit marker still decodes. A successful decode must consume
+        //    the whole buffer and have >= 1 input.
+        var variants = std.ArrayList(types.Transaction).init(self.allocator);
+        defer {
+            for (variants.items) |*tx| serialize.freeTransaction(self.allocator, tx);
+            variants.deinit();
+        }
+
+        for (txs, 0..) |item, idx| {
+            if (item != .string) {
+                // Core reads each element with .get_str() -> type error.
+                return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value is not a string as expected", id);
+            }
+            const hex_str = item.string;
+
+            const decode_failed = std.fmt.allocPrint(
+                self.allocator,
+                "TX decode failed for tx {d}. Make sure the tx has at least one input.",
+                .{idx},
+            ) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+            };
+            defer self.allocator.free(decode_failed);
+
+            if (hex_str.len % 2 != 0) {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_failed, id);
+            }
+            var tx_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+            };
+            defer self.allocator.free(tx_bytes);
+            var bad_hex = false;
+            for (0..hex_str.len / 2) |i| {
+                tx_bytes[i] = std.fmt.parseInt(u8, hex_str[i * 2 .. i * 2 + 2], 16) catch {
+                    bad_hex = true;
+                    break;
+                };
+            }
+            if (bad_hex) {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_failed, id);
+            }
+
+            // DecodeHexTx heuristic: try non-witness first, then witness; a
+            // valid decode must consume the entire buffer.
+            const decoded: types.Transaction = blk: {
+                {
+                    var r = serialize.Reader{ .data = tx_bytes };
+                    if (serialize.readTransactionNoWitness(&r, self.allocator)) |tx| {
+                        if (r.isAtEnd()) break :blk tx;
+                        serialize.freeTransaction(self.allocator, &tx);
+                    } else |_| {}
+                }
+                {
+                    var r = serialize.Reader{ .data = tx_bytes };
+                    if (serialize.readTransaction(&r, self.allocator)) |tx| {
+                        if (r.isAtEnd()) break :blk tx;
+                        serialize.freeTransaction(self.allocator, &tx);
+                    } else |_| {}
+                }
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_failed, id);
+            };
+
+            // Core's decode-failed message ("...at least one input.") is also
+            // raised for a zero-input tx (DecodeHexTx rejects it).
+            if (decoded.inputs.len == 0) {
+                serialize.freeTransaction(self.allocator, &decoded);
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_failed, id);
+            }
+
+            variants.append(decoded) catch {
+                serialize.freeTransaction(self.allocator, &decoded);
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+            };
+        }
+
+        // 2. Empty array -> -22 "Missing transactions".
+        if (variants.items.len == 0) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Missing transactions", id);
+        }
+
+        // 3. mergedTx starts as a clone of the first variant (the template:
+        //    its version / locktime / vin / vout define the result; only each
+        //    input's scriptSig + witness get rebuilt below). We build the merged
+        //    inputs into an arena-free temp list; the TxIn slices we reference
+        //    are owned by `variants` (freed by the defer above) and live until
+        //    serialization completes.
+        const template = &variants.items[0];
+
+        var merged_inputs = self.allocator.alloc(types.TxIn, template.inputs.len) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+        };
+        defer self.allocator.free(merged_inputs);
+
+        for (template.inputs, 0..) |base, i| {
+            var best_script_sig: []const u8 = &[_]u8{};
+            var best_witness: []const []const u8 = &[_][]const u8{};
+            var best_score: i128 = -1; // higher = more complete
+
+            for (variants.items) |variant| {
+                if (i >= variant.inputs.len) continue;
+                const vin = variant.inputs[i];
+                const ss = vin.script_sig;
+                const wit = vin.witness;
+
+                var wit_sig_len: usize = 0;
+                var wit_nonempty = false;
+                for (wit) |w| {
+                    wit_sig_len += w.len;
+                    if (w.len > 0) wit_nonempty = true;
+                }
+                const ss_nonempty = ss.len > 0;
+
+                // Score the candidate so we deterministically prefer the
+                // variant that carries signature data for this input. Tie-break
+                // by total signature-data length (longer = more sigs, matching
+                // the partial-multisig fallback note). Equal length -> keep the
+                // earliest variant (Core's merge is order-stable for the
+                // complete single-sig case) via strict-greater comparison.
+                const score: i128 = if (!ss_nonempty and !wit_nonempty)
+                    0
+                else
+                    @as(i128, 1_000_000) + @as(i128, @intCast(ss.len + wit_sig_len));
+
+                if (score > best_score) {
+                    best_score = score;
+                    best_script_sig = ss;
+                    best_witness = wit;
+                }
+            }
+
+            merged_inputs[i] = .{
+                .previous_output = base.previous_output,
+                .script_sig = best_script_sig,
+                .sequence = base.sequence,
+                .witness = best_witness,
+            };
+        }
+
+        // The merged tx reuses the template's version/locktime/outputs and the
+        // per-input picked scriptSig/witness. serialize.writeTransaction emits
+        // the BIP-144 marker/flag iff Transaction.hasWitness() (any input has a
+        // non-empty witness stack) — mirrors Core CTransaction::HasWitness.
+        const merged = types.Transaction{
+            .version = template.version,
+            .inputs = merged_inputs,
+            .outputs = template.outputs,
+            .lock_time = template.lock_time,
+        };
+
+        var swriter = serialize.Writer.init(self.allocator);
+        defer swriter.deinit();
+        serialize.writeTransaction(&swriter, &merged) catch {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Serialization failed", id);
+        };
+
+        // Return the witness-serialized hex as a bare JSON STRING (Core
+        // RPCResult::Type::STR / EncodeHexTx).
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeByte('"');
+        for (swriter.getWritten()) |byte| {
+            try writer.print("{x:0>2}", .{byte});
+        }
+        try writer.writeByte('"');
+
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// Handle ping RPC - request that a BIP-31 PING be sent to all peers.
     ///
     /// Reference: Bitcoin Core rpc/net.cpp:84-107 (`ping`) ->
@@ -18029,6 +18264,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("decodescript hexstring\\n\\nDecode a hex-encoded script.");
             } else if (std.mem.eql(u8, cmd, "createrawtransaction")) {
                 try writer.writeAll("createrawtransaction [{\\\"txid\\\":\\\"hex\\\",\\\"vout\\\":n},...] [{\\\"address\\\":amount},...] ( locktime )\\n\\nCreate a transaction spending inputs and creating outputs.");
+            } else if (std.mem.eql(u8, cmd, "combinerawtransaction")) {
+                try writer.writeAll("combinerawtransaction [\\\"hexstring\\\",...]\\n\\nCombine multiple partially signed transactions into one transaction.");
             } else if (std.mem.eql(u8, cmd, "sendrawtransaction")) {
                 try writer.writeAll("sendrawtransaction hexstring ( maxfeerate )\\n\\nSubmit a raw transaction to local node and network.");
             } else if (std.mem.eql(u8, cmd, "getconnectioncount")) {
@@ -18122,6 +18359,7 @@ pub const RpcServer = struct {
             try writer.writeAll("ping\\n");
             try writer.writeAll("setnetworkactive\\n");
             try writer.writeAll("\\n== Rawtransactions ==\\n");
+            try writer.writeAll("combinerawtransaction\\n");
             try writer.writeAll("createrawtransaction\\n");
             try writer.writeAll("decoderawtransaction\\n");
             try writer.writeAll("decodescript\\n");
