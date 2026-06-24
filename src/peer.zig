@@ -1216,6 +1216,87 @@ pub const Peer = struct {
         self.bytes_sent += n;
     }
 
+    /// Best-effort, NON-BLOCKING relay send (Fault B fix).
+    ///
+    /// The single P2P thread relays every accepted tx to all peers
+    /// (peer.zig `.tx` handler). The previous path used the blocking
+    /// `sendMessage` → `stream.writeAll` (30s SO_SNDTIMEO): under a public
+    /// mempool flood, ONE peer with a full TCP send window blocked the whole
+    /// relay loop for up to 30s per stalled peer — the P2P thread stopped
+    /// draining input, stopped connecting blocks, and froze the log (the
+    /// "accepted tx, relaying" line only prints after the loop returns). See
+    /// CORE-PARITY-AUDIT/_clearbit-rpc-deadlock-rootcause-2026-06-24.md (Fault B).
+    ///
+    /// Core never blocks its message-processing thread on a slow peer: it
+    /// appends to a per-peer send buffer and lets the socket thread drain it
+    /// (CConnman::PushMessage enqueues; SocketHandler flushes). clearbit has a
+    /// single P2P thread, so the cheap faithful equivalent is best-effort relay:
+    /// inv relay is advisory (the peer learns the tx via its own mempool / the
+    /// next inv round), so a send that WOULD block is SKIPPED rather than
+    /// blocked-on.
+    ///
+    /// Returns true if the inv was fully handed to the kernel, false if it was
+    /// skipped/partial (would-block, dead socket, or a v2 buffer that couldn't
+    /// fully drain). A false return is NOT a connection error — the caller
+    /// continues the relay loop.
+    ///
+    /// - v1: a single non-blocking `send(MSG_DONTWAIT)`. An inv with one entry
+    ///   is ~37 bytes, well under any socket buffer, so it is sent atomically or
+    ///   not at all; a partial/would-block write is dropped (no cipher state to
+    ///   corrupt on v1).
+    /// - v2: encrypt into the existing `send_buffer` (this DOES ratchet the
+    ///   FSChaCha20 cipher state, so the ciphertext must not be discarded), then
+    ///   attempt a single non-blocking drain. Unsent bytes stay buffered via
+    ///   `markBytesSent`, so the cipher stream never desyncs; they flush on the
+    ///   next send to this peer. We never block the relay thread.
+    pub fn trySendMessageNonBlocking(self: *Peer, msg: *const p2p.Message) bool {
+        if (self.transport_version == .v2 and self.v2_transport != null) {
+            return self.trySendMessageV2NonBlocking(msg);
+        }
+
+        const data = p2p.encodeMessage(msg, self.network_params.magic, self.allocator) catch return false;
+        defer self.allocator.free(data);
+
+        const sent = std.posix.send(self.stream.handle, data, std.posix.MSG.DONTWAIT) catch return false;
+        if (sent < data.len) return false; // partial — drop this peer's copy
+        self.bytes_sent += sent;
+        self.last_message_time = std.time.timestamp();
+        return true;
+    }
+
+    /// v2 best-effort relay: encrypt into the send buffer (ratchets cipher
+    /// state — must be retained), then non-blocking drain. Unsent ciphertext
+    /// stays buffered so the FSChaCha20 stream never desyncs.
+    fn trySendMessageV2NonBlocking(self: *Peer, msg: *const p2p.Message) bool {
+        const t = self.v2_transport.?;
+
+        const data = p2p.encodeMessage(msg, self.network_params.magic, self.allocator) catch return false;
+        defer self.allocator.free(data);
+        if (data.len < 24) return false;
+
+        var cmd_buf: [12]u8 = undefined;
+        @memcpy(&cmd_buf, data[4..16]);
+        var cmd_len: usize = 12;
+        while (cmd_len > 0 and cmd_buf[cmd_len - 1] == 0) cmd_len -= 1;
+        const cmd = cmd_buf[0..cmd_len];
+        const payload = data[24..];
+
+        t.sendMessage(cmd, payload, false) catch return false;
+
+        // Non-blocking drain of whatever is buffered (may include bytes from a
+        // prior best-effort relay that didn't fully flush). Retain the unsent
+        // remainder.
+        const send_data = t.getSendData();
+        if (send_data.len == 0) return true;
+        const sent = std.posix.send(self.stream.handle, send_data, std.posix.MSG.DONTWAIT) catch 0;
+        if (sent > 0) {
+            t.markBytesSent(sent);
+            self.bytes_sent += sent;
+            self.last_message_time = std.time.timestamp();
+        }
+        return sent == send_data.len;
+    }
+
     /// Receive the next P2P message from the connection.
     ///
     /// On a v2-negotiated peer this reads encrypted bytes from the socket,
@@ -6053,7 +6134,12 @@ pub const PeerManager = struct {
                                 p2p.InvVector{ .inv_type = .msg_tx, .hash = result.txid };
                             const relay_inv_items = [_]p2p.InvVector{relay_inv};
                             const inv_msg = p2p.Message{ .inv = .{ .inventory = &relay_inv_items } };
-                            relay_peer.sendMessage(&inv_msg) catch {};
+                            // Best-effort, non-blocking relay (Fault B): a peer
+                            // with a full send window is SKIPPED, never blocked
+                            // on, so one slow public peer can no longer stall the
+                            // single P2P thread under a mempool flood. The skipped
+                            // peer learns the tx via its own mempool / next inv.
+                            _ = relay_peer.trySendMessageNonBlocking(&inv_msg);
                         }
                         std.debug.print("MEMPOOL: accepted tx, relaying to peers\n", .{});
                     } else if (result.reject_reason) |reason| {
