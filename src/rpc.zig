@@ -3168,6 +3168,8 @@ pub const RpcServer = struct {
             return self.handleGetConnectionCount(id);
         } else if (std.mem.eql(u8, method, "addnode")) {
             return self.handleAddNode(params, id);
+        } else if (std.mem.eql(u8, method, "getaddednodeinfo")) {
+            return self.handleGetAddedNodeInfo(params, id);
         } else if (std.mem.eql(u8, method, "disconnectnode")) {
             return self.handleDisconnectNode(params, id);
         } else if (std.mem.eql(u8, method, "uptime")) {
@@ -13423,6 +13425,131 @@ pub const RpcServer = struct {
         return self.jsonRpcResult("null", id);
     }
 
+    /// getaddednodeinfo ( "node" ) — info about the persistent added-node list.
+    ///
+    /// Reference: Bitcoin Core rpc/net.cpp:486-558 (getaddednodeinfo) +
+    /// CConnman::GetAddedNodeInfo (net.cpp:2914). Faithful port of Core's shape:
+    ///
+    ///   [
+    ///     {
+    ///       "addednode": <str>,                  // node as given to `addnode`
+    ///       "connected": <bool>,                 // a current peer matches
+    ///       "addresses": [                       // ALWAYS present; [] when not connected
+    ///         { "address": <str ip:port>,        // CService::ToStringAddrPort()
+    ///           "connected": "inbound"|"outbound" } // bare direction (net.cpp:548)
+    ///       ]                                    // at most ONE entry
+    ///     }, ...
+    ///   ]
+    ///
+    /// Source of state:
+    ///   * `PeerManager.added_nodes` — the operator-managed added-node list, the
+    ///     mirror of Core's `m_added_node_params` (populated by `addnode add`,
+    ///     pruned by `addnode remove`). `onetry` adds go through `tryConnectNode`
+    ///     and are NOT recorded here, so they are correctly EXCLUDED (Core
+    ///     parity: `onetry` connections never appear in `GetAddedNodeInfo`).
+    ///   * `PeerManager.peers` — the live peer table, joined by the peer's
+    ///     `getAddressString()` (Zig's default `ip:port` for IPv4, matching
+    ///     Core's `CService::ToStringAddrPort()`), with the bare inbound/outbound
+    ///     direction taken from `peer.direction`.
+    ///
+    /// Params:
+    ///   1. node (string, OPTIONAL): if supplied, return only the single matching
+    ///      added node (exact-string match against the value passed to `addnode`,
+    ///      mirroring Core's `info.m_params.m_added_node == *node`). A `node` that
+    ///      is NOT on the added list raises RPC_CLIENT_NODE_NOT_ADDED (-24) with
+    ///      Core's exact message "Error: Node has not been added." (net.cpp:534).
+    ///      Omitted ⇒ all added nodes (`[]` when none). Pure read — no side effects.
+    fn handleGetAddedNodeInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Optional positional `node` filter (exact-string match vs the raw
+        // added-node string the operator typed — Core compares m_added_node,
+        // NOT a resolved address). A present-but-non-string arg is a type error.
+        var filter: ?[]const u8 = null;
+        if (params == .array and params.array.items.len >= 1) {
+            const node_param = params.array.items[0];
+            if (node_param != .string) {
+                return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value is not a string as expected", id);
+            }
+            filter = node_param.string;
+        }
+
+        // When a filter is supplied, it must match a node on the added list,
+        // else -24 "Error: Node has not been added." (Core net.cpp:524-535).
+        // The connectivity computation below is identical to the unfiltered
+        // case; we just emit a single matching element.
+        if (filter) |want| {
+            var found = false;
+            for (self.peer_manager.added_nodes.items) |entry| {
+                if (std.mem.eql(u8, entry, want)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return self.jsonRpcError(RPC_CLIENT_NODE_NOT_ADDED, "Error: Node has not been added.", id);
+            }
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('[');
+
+        var emitted: usize = 0;
+        for (self.peer_manager.added_nodes.items) |entry| {
+            // With a filter, only emit the single exact-string match.
+            if (filter) |want| {
+                if (!std.mem.eql(u8, entry, want)) continue;
+            }
+
+            // Join against the live peer table: a connected peer whose
+            // ip:port equals the added-node string is the match (Core looks
+            // up by resolved CService for numeric entries / by addr_name for
+            // hostnames; clearbit's added strings are the same ip:port form
+            // getAddressString produces, so exact-string equality is correct).
+            var matched_inbound: ?bool = null;
+            var matched_addr: []const u8 = "";
+            var addr_scratch: [64]u8 = undefined;
+            for (self.peer_manager.peers.items) |peer| {
+                var peer_buf: [64]u8 = undefined;
+                const peer_addr = peer.getAddressString(&peer_buf);
+                if (std.mem.eql(u8, peer_addr, entry)) {
+                    matched_inbound = (peer.direction == .inbound);
+                    // Copy out before peer_buf goes out of scope on the next iter.
+                    const n = @min(peer_addr.len, addr_scratch.len);
+                    @memcpy(addr_scratch[0..n], peer_addr[0..n]);
+                    matched_addr = addr_scratch[0..n];
+                    break;
+                }
+            }
+
+            if (emitted > 0) try writer.writeByte(',');
+            emitted += 1;
+
+            // "addednode" — JSON-escape the raw operator string (a hostname
+            // could in principle carry a quote/backslash; be safe).
+            try writer.writeAll("{\"addednode\":\"");
+            try writeJsonEscaped(writer, entry);
+            try writer.writeByte('"');
+
+            if (matched_inbound) |inbound| {
+                // connected=true → exactly one address entry with the bare
+                // direction string (Core net.cpp:545-549).
+                try writer.writeAll(",\"connected\":true,\"addresses\":[{\"address\":\"");
+                try writeJsonEscaped(writer, matched_addr);
+                try writer.writeAll("\",\"connected\":\"");
+                try writer.writeAll(if (inbound) "inbound" else "outbound");
+                try writer.writeAll("\"}]}");
+            } else {
+                // connected=false → addresses is the empty array (always present).
+                try writer.writeAll(",\"connected\":false,\"addresses\":[]}");
+            }
+        }
+
+        try writer.writeByte(']');
+        return self.jsonRpcResult(buf.items, id);
+    }
+
     /// disconnectnode — force-disconnect a connected peer by address.
     /// Reference: Bitcoin Core src/rpc/net.cpp::disconnectnode
     fn handleDisconnectNode(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
@@ -17726,6 +17853,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("getconnectioncount\\n\\nReturns the number of connections to other nodes.");
             } else if (std.mem.eql(u8, cmd, "addnode")) {
                 try writer.writeAll("addnode node command\\n\\nAttempts to add or remove a node from the addnode list.");
+            } else if (std.mem.eql(u8, cmd, "getaddednodeinfo")) {
+                try writer.writeAll("getaddednodeinfo ( \\\"node\\\" )\\n\\nReturns information about the given added node, or all added nodes.");
             } else if (std.mem.eql(u8, cmd, "disconnectnode")) {
                 try writer.writeAll("disconnectnode \\\"address\\\"\\n\\nImmediately disconnects from the specified peer node.");
             } else if (std.mem.eql(u8, cmd, "uptime")) {
@@ -17801,6 +17930,7 @@ pub const RpcServer = struct {
             try writer.writeAll("submitblock\\n");
             try writer.writeAll("\\n== Network ==\\n");
             try writer.writeAll("addnode\\n");
+            try writer.writeAll("getaddednodeinfo\\n");
             try writer.writeAll("disconnectnode\\n");
             try writer.writeAll("getconnectioncount\\n");
             try writer.writeAll("getnetworkinfo\\n");
@@ -22857,6 +22987,48 @@ test "w125 addnode remove-unknown -> RPC_CLIENT_NODE_NOT_ADDED (-24)" {
     defer allocator.free(rem2);
     try std.testing.expect(std.mem.indexOf(u8, rem2, "\"result\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, rem2, "\"code\":") == null);
+}
+
+test "getaddednodeinfo: empty list / -24 / added-not-connected shape (Core net.cpp parity)" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    // No added nodes -> exactly [] (byte-identical to Core; the port gate).
+    const empty = try server.dispatch("{\"id\":1,\"method\":\"getaddednodeinfo\",\"params\":[]}");
+    defer allocator.free(empty);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "\"result\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "\"code\":") == null);
+
+    // Filter for a node that was never added -> -24 with Core's EXACT message.
+    const miss = try server.dispatch("{\"id\":1,\"method\":\"getaddednodeinfo\",\"params\":[\"1.2.3.4:1234\"]}");
+    defer allocator.free(miss);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "\"code\":-24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "Error: Node has not been added.") != null);
+
+    // Add a node (not connected — no peer in the table). It must appear with
+    // connected=false and an EMPTY addresses array (Core net.cpp:545 false branch).
+    const add = try server.dispatch("{\"id\":1,\"method\":\"addnode\",\"params\":[\"192.0.2.50:8333\",\"add\"]}");
+    defer allocator.free(add);
+    try std.testing.expect(std.mem.indexOf(u8, add, "\"code\":") == null);
+
+    const info = try server.dispatch("{\"id\":1,\"method\":\"getaddednodeinfo\",\"params\":[]}");
+    defer allocator.free(info);
+    try std.testing.expect(std.mem.indexOf(u8, info, "\"addednode\":\"192.0.2.50:8333\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "\"connected\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "\"addresses\":[]") != null);
+
+    // Filtering by the exact added string returns the single matching element.
+    const one = try server.dispatch("{\"id\":1,\"method\":\"getaddednodeinfo\",\"params\":[\"192.0.2.50:8333\"]}");
+    defer allocator.free(one);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"addednode\":\"192.0.2.50:8333\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"code\":") == null);
 }
 
 test "w125 setban invalid IP -> RPC_CLIENT_INVALID_IP_OR_SUBNET (-30)" {
