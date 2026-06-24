@@ -3012,6 +3012,8 @@ pub const RpcServer = struct {
             return self.handleGetNodeAddresses(params, id);
         } else if (std.mem.eql(u8, method, "addpeeraddress")) {
             return self.handleAddPeerAddress(params, id);
+        } else if (std.mem.eql(u8, method, "getaddrmaninfo")) {
+            return self.handleGetAddrManInfo(id);
         } else if (std.mem.eql(u8, method, "getmempoolinfo")) {
             return self.handleGetMempoolInfo(id);
         } else if (std.mem.eql(u8, method, "getmempoolentry")) {
@@ -6029,6 +6031,111 @@ pub const RpcServer = struct {
             // Not present -> addAddress rejected it (non-routable / banned).
             try writer.writeAll("{\"success\":false,\"error\":\"failed-adding-to-new\"}");
         }
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// getaddrmaninfo — information about the node's address manager.
+    ///
+    /// Reference: Bitcoin Core rpc/net.cpp getaddrmaninfo (:1080-1117) +
+    /// AddrMan::Size (addrman.cpp Size_ :1006-1026). Pure read-only snapshot of
+    /// the addrman; takes NO params and has NO side effects (no peers, sockets,
+    /// or disk touched).
+    ///
+    /// Output: a JSON object keyed by network name. The key set is FIXED and
+    /// always present — every routable network is emitted unconditionally (even
+    /// at count 0) in Core's enum order, then a final `all_networks`:
+    ///
+    ///     ipv4, ipv6, onion, i2p, cjdns, all_networks
+    ///
+    /// Each value is an object with exactly three integer keys, in order:
+    ///
+    ///     { "new":   <count in the new table for this network>,
+    ///       "tried": <count in the tried table for this network>,
+    ///       "total": <new + tried> }
+    ///
+    /// `all_networks` carries the global sums (new = Σ new, tried = Σ tried,
+    /// total = new + tried). NET_UNROUTABLE (not_publicly_routable) and
+    /// NET_INTERNAL (internal) are never emitted, matching Core's loop that
+    /// skips those two enum values.
+    ///
+    /// New/tried split: clearbit's Core-bucketed addrman (src/addrman.zig,
+    /// wired UNDER known_addresses on the PeerManager) tracks the same NEW/TRIED
+    /// tables as Core — every entry carries an `in_tried` bool and the manager
+    /// keeps `n_new`/`n_tried` counters. We walk `map_info` (Core mapInfo),
+    /// classify each entry's address to its Core network name via its socket
+    /// family (GetNetClass parity), and bump the matching (network, table)
+    /// counter — reproducing Core's per-network Size(net, in_new) split exactly.
+    ///
+    /// clearbit's addrman only stores IPv4/IPv6 `std.net.Address` values today
+    /// (overlay addresses — onion / i2p / cjdns — are not representable as a
+    /// `std.net.Address` and never enter the manager), so onion/i2p/cjdns are
+    /// always 0/0/0 — but the keys are STILL emitted, exactly as an IPv4/IPv6
+    /// node must per Core's fixed key set.
+    ///
+    /// Invariants (oracle-free, hold by construction):
+    ///   - per network: total == new + tried
+    ///   - all_networks.new   == Σ networks.new
+    ///   - all_networks.tried == Σ networks.tried
+    ///   - all_networks.total == Σ networks.total == all_networks.new + .tried
+    fn handleGetAddrManInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        // Fixed routable-network key order (Core enum NET_IPV4..NET_CJDNS,
+        // skipping NET_UNROUTABLE / NET_INTERNAL). Every key is emitted even at
+        // zero (an IPv4/IPv6 node still reports onion/i2p/cjdns as 0/0/0).
+        const NETWORK_KEYS = [_][]const u8{ "ipv4", "ipv6", "onion", "i2p", "cjdns" };
+
+        // Per-network {new, tried} accumulators, indexed parallel to
+        // NETWORK_KEYS. Pre-seeded at zero so the key set is always complete.
+        var new_counts = [_]u64{0} ** NETWORK_KEYS.len;
+        var tried_counts = [_]u64{0} ** NETWORK_KEYS.len;
+
+        // Walk the Core-bucketed addrman's mapInfo (the authoritative NEW/TRIED
+        // split). It is lazily constructed; a null manager means no address has
+        // ever been added -> every count is correctly 0.
+        if (self.peer_manager.addrman) |*am| {
+            var it = am.entryIterator();
+            while (it.next()) |info| {
+                const ni: usize = switch (info.addr.any.family) {
+                    std.posix.AF.INET => 0, // ipv4
+                    std.posix.AF.INET6 => 1, // ipv6
+                    // Any other family maps to NET_UNROUTABLE in Core and is
+                    // NEVER emitted as a key — skip it (matches Core's loop
+                    // skipping NET_UNROUTABLE / NET_INTERNAL).
+                    else => continue,
+                };
+                if (info.in_tried) {
+                    tried_counts[ni] += 1;
+                } else {
+                    new_counts[ni] += 1;
+                }
+            }
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.writeByte('{');
+        var total_new: u64 = 0;
+        var total_tried: u64 = 0;
+        for (NETWORK_KEYS, 0..) |name, i| {
+            const n_new = new_counts[i];
+            const n_tried = tried_counts[i];
+            try writer.print("\"{s}\":{{\"new\":{d},\"tried\":{d},\"total\":{d}}},", .{
+                name,
+                n_new,
+                n_tried,
+                n_new + n_tried,
+            });
+            total_new += n_new;
+            total_tried += n_tried;
+        }
+        // Final fixed `all_networks` aggregate (no trailing comma after it).
+        try writer.print("\"all_networks\":{{\"new\":{d},\"tried\":{d},\"total\":{d}}}}}", .{
+            total_new,
+            total_tried,
+            total_new + total_tried,
+        });
+
         return self.jsonRpcResult(buf.items, id);
     }
 
