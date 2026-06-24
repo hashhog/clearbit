@@ -28,6 +28,7 @@ const psbt_mod = @import("psbt.zig");
 const address_mod = @import("address.zig");
 const script_mod = @import("script.zig");
 const indexes_mod = @import("indexes.zig");
+const debug_log = @import("debug_log.zig");
 
 // ============================================================================
 // Hex Decoding Helper
@@ -3016,6 +3017,8 @@ pub const RpcServer = struct {
             return self.handleGetAddrManInfo(id);
         } else if (std.mem.eql(u8, method, "getmemoryinfo")) {
             return self.handleGetMemoryInfo(params, id);
+        } else if (std.mem.eql(u8, method, "logging")) {
+            return self.handleLogging(params, id);
         } else if (std.mem.eql(u8, method, "getmempoolinfo")) {
             return self.handleGetMempoolInfo(id);
         } else if (std.mem.eql(u8, method, "getmempoolentry")) {
@@ -6244,6 +6247,146 @@ pub const RpcServer = struct {
         try msg_buf.writer().writeAll("unknown mode ");
         try writeJsonEscaped(msg_buf.writer(), mode);
         return self.jsonRpcError(RPC_INVALID_PARAMETER, msg_buf.items, id);
+    }
+
+    /// `logging` — get and set the debug-logging category configuration.
+    ///
+    /// Reference: bitcoin-core/src/rpc/node.cpp:218 (`logging` RPCHelpMan) +
+    /// `EnableOrDisableLogCategories` (:200); logging.cpp `LogCategoriesList`
+    /// / `EnableCategory` / `DisableCategory` / `GetLogCategory`.
+    ///
+    /// clearbit has a REAL category-based debug-logging system (src/debug_log.zig):
+    /// a single process-global atomic bitmask (`active_mask`) with one bit per
+    /// `BCLog`-style category, and `enabled(.CAT)` reads it LIVE on every probe.
+    /// This RPC mutates that live mask, so enabling a category here makes its
+    /// gated debug-log sites (`if (debug_log.enabled(.CAT)) …`) start firing
+    /// immediately with no restart and no re-attachment — exactly like Core's
+    /// in-memory `m_categories` mutation. No snapshot of the mask is taken at
+    /// any construction point (avoiding the "snapshot trap": a filter that froze
+    /// the category set at build time would ignore runtime toggles).
+    ///
+    /// Params (both OPTIONAL, positional, Core order: include THEN exclude):
+    ///   [0] include (array of category strings): categories to ENABLE.
+    ///   [1] exclude (array of category strings): categories to DISABLE.
+    /// A param slot is acted on ONLY if it is a JSON array (Core `isArray()`
+    /// guard); a missing / null / non-array slot is a silent no-op — so
+    /// `logging` with no args is a pure read-and-report. include is applied
+    /// first, then exclude, so a category named in BOTH ends up DISABLED
+    /// ("exclude wins").
+    ///
+    /// Special input-only tokens (Core GetLogCategory, logging.cpp:220):
+    /// `"all"` / `"1"` / `""` expand to the full mask. In the include slot they
+    /// enable every exposed category; in the exclude slot they clear it (the
+    /// `logging [], ["all"]` "disable everything" effect). These tokens are
+    /// accepted as INPUTS but are NEVER emitted as output keys. (`"none"`/`"0"`
+    /// are NOT Core tokens — Core's GetLogCategory does not recognise them, so
+    /// here they are treated as unknown categories -> -8, matching Core.)
+    ///
+    /// Returns: a JSON object mapping every REAL exposed category name -> bool
+    /// (whether it is currently being debug-logged), emitted in ascending
+    /// ALPHABETICAL key order (Core iterates a `std::map`, hence alphabetical;
+    /// `debug_log.CATEGORY_LIST` is kept sorted). `all`/`1`/`""` are never keys.
+    ///
+    /// Errors:
+    ///   - Unknown category in either array -> RPC_INVALID_PARAMETER (-8),
+    ///     message "unknown logging category <cat>" (Core node.cpp:213). Thrown
+    ///     as soon as the bad name is hit, after scanning include fully then
+    ///     exclude in order; categories BEFORE the bad one in the same call have
+    ///     ALREADY been applied (partial application, NO rollback — Core parity).
+    ///   - Non-string array element -> RPC_TYPE_ERROR (-3) (Core `get_str()`).
+    ///
+    /// Scope: mutates the running node's in-memory mask immediately; NOT
+    /// persisted, resets on restart to the `-debug` startup flags. Idempotent.
+    fn handleLogging(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Apply one param slot (include => enable, exclude => disable). Returns
+        // an error message slice (caller turns it into a -8 / -3 response) on
+        // failure; null on success. Partial application is intentional: bits
+        // applied before a bad name STAY applied (Core never rolls back).
+        const ApplyResult = struct {
+            // 0 = ok, -8 = unknown category, -3 = non-string element.
+            code: i32 = 0,
+            // Owned message buffer for the -8 case ("unknown logging category <c>").
+            msg: ?[]u8 = null,
+        };
+
+        const apply = struct {
+            fn run(srv: *RpcServer, slot: std.json.Value, enable: bool) ApplyResult {
+                // Core: only an ARRAY param triggers processing (isArray()).
+                // null / absent / scalar / object is a silent no-op for the slot.
+                if (slot != .array) return .{};
+                for (slot.array.items) |elem| {
+                    if (elem != .string) {
+                        // Core get_str() type error on a non-string element (-3).
+                        return .{ .code = RPC_TYPE_ERROR };
+                    }
+                    const name = elem.string;
+                    if (debug_log.isAllToken(name)) {
+                        if (enable) debug_log.enableAll() else debug_log.disableAll();
+                        continue;
+                    }
+                    if (debug_log.lookupExposed(name)) |cat| {
+                        if (enable) debug_log.enableCategory(cat) else debug_log.disableCategory(cat);
+                        continue;
+                    }
+                    // Unknown category (incl. "none"/"0", which Core's
+                    // GetLogCategory also rejects) -> -8 with Core's exact text.
+                    var mbuf = std.ArrayList(u8).init(srv.allocator);
+                    mbuf.writer().writeAll("unknown logging category ") catch {
+                        return .{ .code = RPC_INVALID_PARAMETER };
+                    };
+                    // JSON-escape the user-supplied name so a crafted value can't
+                    // break out of the error-message string. For an ordinary name
+                    // the escaped form is byte-identical to Core's literal text.
+                    writeJsonEscaped(mbuf.writer(), name) catch {
+                        mbuf.deinit();
+                        return .{ .code = RPC_INVALID_PARAMETER };
+                    };
+                    return .{ .code = RPC_INVALID_PARAMETER, .msg = mbuf.toOwnedSlice() catch null };
+                }
+                return .{};
+            }
+        }.run;
+
+        // Core order: include (params[0]) first, then exclude (params[1]).
+        const include_slot: std.json.Value = if (params == .array and params.array.items.len > 0)
+            params.array.items[0]
+        else
+            std.json.Value{ .null = {} };
+        const exclude_slot: std.json.Value = if (params == .array and params.array.items.len > 1)
+            params.array.items[1]
+        else
+            std.json.Value{ .null = {} };
+
+        const r_inc = apply(self, include_slot, true);
+        if (r_inc.code != 0) {
+            defer if (r_inc.msg) |m| self.allocator.free(m);
+            const text = r_inc.msg orelse "JSON value is not of expected type string";
+            return self.jsonRpcError(r_inc.code, text, id);
+        }
+        const r_exc = apply(self, exclude_slot, false);
+        if (r_exc.code != 0) {
+            defer if (r_exc.msg) |m| self.allocator.free(m);
+            const text = r_exc.msg orelse "JSON value is not of expected type string";
+            return self.jsonRpcError(r_exc.code, text, id);
+        }
+
+        // Emit the full {category: active} map, alphabetically sorted, for every
+        // REAL exposed category (all/1/"" are never keys). CATEGORY_LIST is
+        // pre-sorted, so a single pass preserves alphabetical key order.
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeByte('{');
+        for (debug_log.CATEGORY_LIST, 0..) |c, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            try writer.writeAll(c.name);
+            try writer.writeAll("\":");
+            try writer.writeAll(if (debug_log.enabled(c.cat)) "true" else "false");
+        }
+        try writer.writeByte('}');
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     fn handleGetMempoolInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
