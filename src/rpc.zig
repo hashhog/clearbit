@@ -3060,6 +3060,12 @@ pub const RpcServer = struct {
             return self.handleGetBlock(params, id);
         } else if (std.mem.eql(u8, method, "getbestblockhash")) {
             return self.handleGetBestBlockHash(id);
+        } else if (std.mem.eql(u8, method, "waitfornewblock")) {
+            return self.handleWaitForNewBlock(params, id);
+        } else if (std.mem.eql(u8, method, "waitforblock")) {
+            return self.handleWaitForBlock(params, id);
+        } else if (std.mem.eql(u8, method, "waitforblockheight")) {
+            return self.handleWaitForBlockHeight(params, id);
         } else if (std.mem.eql(u8, method, "getsyncstate")) {
             return self.handleGetSyncState(id);
         } else if (std.mem.eql(u8, method, "getpeerinfo")) {
@@ -3547,6 +3553,298 @@ pub const RpcServer = struct {
         try writer.writeByte('"');
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    // ========================================================================
+    // Wait-family RPCs — waitfornewblock / waitforblock / waitforblockheight
+    // ------------------------------------------------------------------------
+    // Bitcoin Core rpc/blockchain.cpp:290/349/410.  These block the calling
+    // RPC worker until the active-chain tip satisfies a predicate (new tip /
+    // hash match / height >=), then return the CURRENT tip {hash, height}.
+    // On timeout they ALSO return the current tip (Core returns the current
+    // block in both cases).
+    //
+    // clearbit's RPC server is single-threaded (one worker), so a waitfor*
+    // parks the only RPC thread for the wait — exactly as Core blocks its RPC
+    // worker.  The wait is bounded two ways so it can never wedge the server
+    // forever: (1) the caller's `timeout` deadline, and (2) independent of
+    // this code, the 30s SO_RCVTIMEO/SNDTIMEO client-socket timeout the
+    // accept side enforces (commit 28fb306) evicts a parked client at ~30s.
+    // The blocking wait is interruptible (the notifier's `wait()` returns on
+    // every tip change AND on its own timeout slice), so it never busy-spins.
+    //
+    // The notifier (storage.TipNotifier on ChainState) is fired from EVERY
+    // tip-advance chokepoint: block connect during IBD + post-IBD, the
+    // submitblock/generate accept path, and BOTH halves of a reorg.  A waiter
+    // snapshots the generation, checks its predicate against the AUTHORITATIVE
+    // best_hash/best_height, then waits for a generation bump — lost-wakeup
+    // safe.  The predicate is ALWAYS re-evaluated against the live tip on each
+    // wake, so a coalesced/missed notify can never yield a wrong answer.
+    // ========================================================================
+
+    /// Render Core's `getInt<int>` type-error (-3): "JSON value of type <T>
+    /// is not of expected type number", where <T> is the actual JSON type
+    /// name (Core univalue uvTypeName).  Used by the wait-family timeout/
+    /// height parsers when the supplied value is not an integer.
+    fn typeErrorNotNumber(self: *RpcServer, v: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const tname: []const u8 = switch (v) {
+            .null => "null",
+            .bool => "bool",
+            .object => "object",
+            .array => "array",
+            .string => "string",
+            // Zig parses any JSON number as integer/float/number_string; Core
+            // calls every numeric token "number" (the non-integral float path
+            // is rejected here as a non-integer per the spec, with the faithful
+            // type name).
+            .integer, .float, .number_string => "number",
+        };
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "JSON value of type {s} is not of expected type number",
+            .{tname},
+        );
+        defer self.allocator.free(msg);
+        return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
+    }
+
+    /// Parse a wait-family `timeout` param (Core `getInt<int>()` parity).
+    /// Returns the timeout in milliseconds, or an error response on a type /
+    /// range violation.  `null`/missing → 0 (no timeout, Core default).
+    ///
+    /// Returns a non-null `[]const u8` (the rendered error JSON) on failure,
+    /// which the caller must return directly; on success writes `*out` and
+    /// returns null.  Error codes (byte-matched to Core, verified in the
+    /// ouroboros pilot):
+    ///   * non-integer (float/string/bool/object/array) → -3 type error
+    ///   * negative → -1 RPC_MISC_ERROR "Negative timeout"
+    fn parseWaitTimeout(
+        self: *RpcServer,
+        params: std.json.Value,
+        index: usize,
+        out: *i64,
+        id: ?std.json.Value,
+    ) !?[]const u8 {
+        out.* = 0;
+        if (params != .array or params.array.items.len <= index) return null;
+        const v = params.array.items[index];
+        switch (v) {
+            .null => {
+                out.* = 0;
+            },
+            .integer => |n| {
+                out.* = n;
+            },
+            else => {
+                // Core: UniValue::getInt<int>() → checkType(VNUM) throws
+                // type_error (-3) for a non-number, and ParseInt rejects a
+                // non-integral number — both surface as the type-error string.
+                // Core's message names the ACTUAL JSON type (uvTypeName).
+                return try self.typeErrorNotNumber(v, id);
+            },
+        }
+        // Core: `if (timeout < 0) throw JSONRPCError(RPC_MISC_ERROR,
+        // "Negative timeout");` (rpc/blockchain.cpp:316/378/440).
+        if (out.* < 0) {
+            return try self.jsonRpcError(RPC_MISC_ERROR, "Negative timeout", id);
+        }
+        return null;
+    }
+
+    /// Render the wait-family success/timeout result: the current tip as
+    /// {"hash": <64-hex>, "height": <int>}.  Reads the authoritative
+    /// ChainState tip at call time (after the wait loop settles).
+    fn writeWaitTipResult(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeAll("{\"hash\":\"");
+        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writer.print("\",\"height\":{d}}}", .{self.chain_state.best_height});
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Shared wait loop for all three wait-family RPCs.  `Predicate` is a
+    /// struct value exposing `fn match(self, hash: *const types.Hash256,
+    /// height: u32) bool`.  Blocks until the predicate holds against the
+    /// authoritative tip OR `timeout_ms` elapses (0 = no timeout), then
+    /// returns the current tip via `writeWaitTipResult`.
+    fn waitForTip(
+        self: *RpcServer,
+        predicate: anytype,
+        timeout_ms: i64,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        const notifier = &self.chain_state.tip_notifier;
+
+        // Absolute deadline for the bounded case.  Core uses a steady_clock
+        // deadline and re-derives the remaining slice after each wake.
+        const have_deadline = timeout_ms > 0;
+        const deadline_ns: i128 = if (have_deadline)
+            std.time.nanoTimestamp() + @as(i128, timeout_ms) * std.time.ns_per_ms
+        else
+            0;
+
+        while (true) {
+            // Snapshot the generation BEFORE reading the tip so a notify that
+            // races in between the predicate check and the wait is observed.
+            const gen = notifier.currentGeneration();
+            if (predicate.match(&self.chain_state.best_hash, self.chain_state.best_height)) {
+                return self.writeWaitTipResult(id);
+            }
+
+            if (have_deadline) {
+                const now = std.time.nanoTimestamp();
+                const remaining = deadline_ns - now;
+                if (remaining <= 0) {
+                    // Timed out — return the current tip (Core's behaviour).
+                    return self.writeWaitTipResult(id);
+                }
+                _ = notifier.wait(gen, @intCast(remaining));
+            } else {
+                _ = notifier.wait(gen, null);
+            }
+        }
+    }
+
+    /// `waitfornewblock [timeout] [current_tip]` — Core rpc/blockchain.cpp:290.
+    /// Waits until the tip hash differs from the reference (`current_tip` if
+    /// supplied as a 64-hex hash, else the tip observed at call entry), then
+    /// returns {hash, height}.  `timeout` is in milliseconds, 0 = no timeout.
+    fn handleWaitForNewBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Core reads timeout (params[0]) first, then current_tip (params[1]).
+        var timeout_ms: i64 = 0;
+        if (try self.parseWaitTimeout(params, 0, &timeout_ms, id)) |err_resp| return err_resp;
+
+        // Reference hash the new tip must differ from.  `current_tip` (if
+        // given) is parsed as a 64-hex uint256 (ParseHashV → -8 on malformed,
+        // same display→internal byte reversal getblock uses).  When omitted,
+        // snapshot the live tip.
+        var ref_hash: types.Hash256 = self.chain_state.best_hash;
+        if (params == .array and params.array.items.len > 1) {
+            const ct = params.array.items[1];
+            if (ct != .null) {
+                if (ct != .string) {
+                    return self.jsonRpcError(
+                        RPC_INVALID_PARAMETER,
+                        "current_tip must be hexadecimal string",
+                        id,
+                    );
+                }
+                if (try self.parseHashParamReversed(ct.string, "current_tip", &ref_hash, id)) |err_resp| {
+                    return err_resp;
+                }
+            }
+        }
+
+        const Pred = struct {
+            ref: types.Hash256,
+            fn match(p: @This(), hash: *const types.Hash256, _: u32) bool {
+                return !std.mem.eql(u8, hash, &p.ref);
+            }
+        };
+        return self.waitForTip(Pred{ .ref = ref_hash }, timeout_ms, id);
+    }
+
+    /// `waitforblock "blockhash" [timeout]` — Core rpc/blockchain.cpp:349.
+    /// Waits until the tip hash equals `blockhash`, then returns {hash,
+    /// height}.  Core parses `blockhash` FIRST (before timeout), so a
+    /// malformed hash errors -8 even when a negative timeout is also supplied.
+    fn handleWaitForBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash", id);
+        }
+        const bh = params.array.items[0];
+        if (bh != .string) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "blockhash must be hexadecimal string",
+                id,
+            );
+        }
+        // Parse blockhash BEFORE timeout (Core ordering).
+        var target: types.Hash256 = undefined;
+        if (try self.parseHashParamReversed(bh.string, "blockhash", &target, id)) |err_resp| {
+            return err_resp;
+        }
+
+        var timeout_ms: i64 = 0;
+        if (try self.parseWaitTimeout(params, 1, &timeout_ms, id)) |err_resp| return err_resp;
+
+        const Pred = struct {
+            target: types.Hash256,
+            fn match(p: @This(), hash: *const types.Hash256, _: u32) bool {
+                return std.mem.eql(u8, hash, &p.target);
+            }
+        };
+        return self.waitForTip(Pred{ .target = target }, timeout_ms, id);
+    }
+
+    /// `waitforblockheight height [timeout]` — Core rpc/blockchain.cpp:410.
+    /// Waits until the tip height >= `height`, then returns {hash, height}.
+    /// `height` is read as an int (type error -3 on non-integral).
+    fn handleWaitForBlockHeight(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type null is not of expected type number",
+                id,
+            );
+        }
+        const hv = params.array.items[0];
+        const target_height: i64 = switch (hv) {
+            .integer => |n| n,
+            else => return self.typeErrorNotNumber(hv, id),
+        };
+
+        var timeout_ms: i64 = 0;
+        if (try self.parseWaitTimeout(params, 1, &timeout_ms, id)) |err_resp| return err_resp;
+
+        const Pred = struct {
+            target: i64,
+            fn match(p: @This(), _: *const types.Hash256, height: u32) bool {
+                return @as(i64, height) >= p.target;
+            }
+        };
+        return self.waitForTip(Pred{ .target = target_height }, timeout_ms, id);
+    }
+
+    /// Parse a display-order (big-endian) 64-hex block hash into the internal
+    /// little-endian `types.Hash256` (`out`), mirroring `getblock`'s ParseHashV
+    /// convention exactly: wrong length OR non-hex → RPC_INVALID_PARAMETER
+    /// (-8) with Core's byte-exact message.  `name` is the param name woven
+    /// into the error ("blockhash" / "current_tip"), matching ParseHashV.
+    /// Returns the rendered error JSON on failure (caller returns it
+    /// directly), or null on success.
+    fn parseHashParamReversed(
+        self: *RpcServer,
+        hex: []const u8,
+        comptime name: []const u8,
+        out: *types.Hash256,
+        id: ?std.json.Value,
+    ) !?[]const u8 {
+        if (hex.len != 64) {
+            const msg = try std.fmt.allocPrint(
+                self.allocator,
+                name ++ " must be of length 64 (not {d}, for '{s}')",
+                .{ hex.len, hex },
+            );
+            defer self.allocator.free(msg);
+            return try self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+        }
+        var i: usize = 0;
+        while (i < 32) : (i += 1) {
+            out[31 - i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    name ++ " must be hexadecimal string (not '{s}')",
+                    .{hex},
+                );
+                defer self.allocator.free(msg);
+                return try self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+            };
+        }
+        return null;
     }
 
     /// `getchainstates` — information about this node's chainstates.
