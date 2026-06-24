@@ -141,6 +141,113 @@ pub fn reset() void {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime-mutable category control (for the `logging` RPC, Core node.cpp:218)
+// ---------------------------------------------------------------------------
+//
+// Bitcoin Core's `logging` RPC mutates `BCLog::Logger::m_categories` in
+// memory, taking effect immediately with no restart. clearbit's equivalent
+// is the single global `active_mask` above: every `enabled()` call reads it
+// LIVE (relaxed atomic load) on each probe, so a bit flipped here is honoured
+// by the next log-site check with no restart and no re-attachment. This is the
+// "no snapshot trap" property — nothing caches the mask at construction, so a
+// toggle here is genuinely live for any site that gates on `enabled(.CAT)`.
+
+/// Canonical ordered list of the REAL categories clearbit exposes, paired with
+/// the lowercase name used on the wire. Kept in ALPHABETICAL order so the
+/// `logging` RPC's `{category: bool}` object is emitted with byte-stable,
+/// alphabetically-sorted keys (Core iterates a `std::map`, hence alphabetical).
+///
+/// These are exactly the bits of `Category` (excluding the synthetic NONE/ALL).
+/// The special input-only tokens ("all"/"1"/""/"none"/"0") are NOT here — they
+/// are accepted as inputs but are never emitted as output keys (Core parity).
+pub const CategoryName = struct { name: []const u8, cat: Category };
+pub const CATEGORY_LIST = [_]CategoryName{
+    .{ .name = "addrman", .cat = .ADDRMAN },
+    .{ .name = "bench", .cat = .BENCH },
+    .{ .name = "blockstorage", .cat = .BLOCKSTORAGE },
+    .{ .name = "cmpctblock", .cat = .CMPCTBLOCK },
+    .{ .name = "coindb", .cat = .COINDB },
+    .{ .name = "estimatefee", .cat = .ESTIMATEFEE },
+    .{ .name = "http", .cat = .HTTP },
+    .{ .name = "i2p", .cat = .I2P },
+    .{ .name = "ipc", .cat = .IPC },
+    .{ .name = "leveldb", .cat = .LEVELDB },
+    .{ .name = "libevent", .cat = .LIBEVENT },
+    .{ .name = "lock", .cat = .LOCK },
+    .{ .name = "mempool", .cat = .MEMPOOL },
+    .{ .name = "mempoolrej", .cat = .MEMPOOLREJ },
+    .{ .name = "net", .cat = .NET },
+    .{ .name = "proxy", .cat = .PROXY },
+    .{ .name = "prune", .cat = .PRUNE },
+    .{ .name = "qt", .cat = .QT },
+    .{ .name = "rand", .cat = .RAND },
+    .{ .name = "reindex", .cat = .REINDEX },
+    .{ .name = "rpc", .cat = .RPC },
+    .{ .name = "scan", .cat = .SCAN },
+    .{ .name = "selectcoins", .cat = .SELECTCOINS },
+    .{ .name = "tor", .cat = .TOR },
+    .{ .name = "txpackages", .cat = .TXPACKAGES },
+    .{ .name = "txreconciliation", .cat = .TXRECONCILIATION },
+    .{ .name = "util", .cat = .UTIL },
+    .{ .name = "validation", .cat = .VALIDATION },
+    .{ .name = "walletdb", .cat = .WALLETDB },
+    .{ .name = "zmq", .cat = .ZMQ },
+};
+
+/// Mask of every REAL exposed category OR'd together. NB this is NOT `ALL`
+/// (which is `~0`, all 64 bits) — it is precisely the bits backed by an
+/// exposed name, so `enabled()` on an exposed category after "all" is true and
+/// the reported map can show every key true without relying on phantom bits.
+pub fn allExposedMask() u64 {
+    var m: u64 = 0;
+    for (CATEGORY_LIST) |c| m |= @intFromEnum(c.cat);
+    return m;
+}
+
+/// Special input-only tokens that map to the full mask (Core logging.cpp:
+/// "all"/"1"/""), plus the disable-side "none"/"0" that clear it. These are
+/// accepted as inputs to `logging` include/exclude but are NEVER output keys.
+pub fn isAllToken(name: []const u8) bool {
+    return name.len == 0 or
+        std.mem.eql(u8, name, "all") or
+        std.mem.eql(u8, name, "1");
+}
+pub fn isNoneToken(name: []const u8) bool {
+    return std.mem.eql(u8, name, "none") or std.mem.eql(u8, name, "0");
+}
+
+/// Resolve an exposed category name -> its bit. Returns null for names that
+/// are not exposed REAL categories (special tokens handled separately by the
+/// caller). Used by the `logging` RPC to detect an unknown category (-> -8).
+pub fn lookupExposed(name: []const u8) ?Category {
+    for (CATEGORY_LIST) |c| {
+        if (std.mem.eql(u8, name, c.name)) return c.cat;
+    }
+    return null;
+}
+
+/// Enable a single exposed category in the live mask (Core EnableCategory).
+pub fn enableCategory(cat: Category) void {
+    _ = active_mask.fetchOr(@intFromEnum(cat), .acq_rel);
+}
+
+/// Disable a single exposed category in the live mask (Core DisableCategory).
+pub fn disableCategory(cat: Category) void {
+    _ = active_mask.fetchAnd(~@intFromEnum(cat), .acq_rel);
+}
+
+/// Enable every exposed category (the "all"/"1"/"" include token).
+pub fn enableAll() void {
+    _ = active_mask.fetchOr(allExposedMask(), .acq_rel);
+}
+
+/// Disable every exposed category (the "all"/"1"/"" exclude token, i.e. the
+/// `logging [], ["all"]` "none" effect). Clears precisely the exposed bits.
+pub fn disableAll() void {
+    _ = active_mask.fetchAnd(~allExposedMask(), .acq_rel);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -200,4 +307,52 @@ test "parseAndApply 0/none clears mask" {
     try std.testing.expect(parseAndApply("none"));
     try std.testing.expect(!enabled(.NET));
     reset();
+}
+
+test "CATEGORY_LIST is alphabetical" {
+    var i: usize = 1;
+    while (i < CATEGORY_LIST.len) : (i += 1) {
+        try std.testing.expect(std.mem.lessThan(u8, CATEGORY_LIST[i - 1].name, CATEGORY_LIST[i].name));
+    }
+}
+
+test "logging-style enable/disable single category is live" {
+    reset();
+    const net = lookupExposed("net").?;
+    try std.testing.expect(!enabled(.NET));
+    enableCategory(net);
+    try std.testing.expect(enabled(.NET));
+    try std.testing.expect(!enabled(.MEMPOOL));
+    disableCategory(net);
+    try std.testing.expect(!enabled(.NET));
+    reset();
+}
+
+test "logging-style enableAll / disableAll over exposed set" {
+    reset();
+    enableAll();
+    // Every exposed category reads enabled.
+    for (CATEGORY_LIST) |c| try std.testing.expect(enabled(c.cat));
+    disableAll();
+    for (CATEGORY_LIST) |c| try std.testing.expect(!enabled(c.cat));
+    reset();
+}
+
+test "lookupExposed rejects special tokens and unknowns" {
+    try std.testing.expect(lookupExposed("all") == null);
+    try std.testing.expect(lookupExposed("1") == null);
+    try std.testing.expect(lookupExposed("") == null);
+    try std.testing.expect(lookupExposed("none") == null);
+    try std.testing.expect(lookupExposed("bogus_xyz") == null);
+    try std.testing.expect(lookupExposed("net") != null);
+}
+
+test "token classifiers" {
+    try std.testing.expect(isAllToken(""));
+    try std.testing.expect(isAllToken("all"));
+    try std.testing.expect(isAllToken("1"));
+    try std.testing.expect(!isAllToken("net"));
+    try std.testing.expect(isNoneToken("none"));
+    try std.testing.expect(isNoneToken("0"));
+    try std.testing.expect(!isNoneToken("all"));
 }
