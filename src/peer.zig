@@ -2795,6 +2795,18 @@ pub const PeerManager = struct {
     /// window in maybeAddFixedSeeds is measured from here.  0 until run() sets it.
     run_loop_start_ts: i64 = 0,
 
+    /// Node-global "P2P network active" flag (Core CConnman.fNetworkActive,
+    /// net.h:1164 / SetNetworkActive net.cpp:3361, default true).  Toggled by
+    /// the `setnetworkactive` RPC and surfaced read-only as `networkactive` in
+    /// getnetworkinfo.  When false we suppress establishing NEW connections
+    /// ONLY — existing/established peers are NOT force-dropped (Core's
+    /// contract): the run loop skips (a) inbound accept (Core net.cpp:1786),
+    /// (b) outbound auto-dial refill + feeler (net.cpp:2351/3022/3219), and
+    /// (c) DNS/fixed-seed re-seeding AND the --connect/addnode manual-reconnect
+    /// loop.  Health/disconnect sweeps keep running.  Not persisted; resets to
+    /// enabled (true) on every restart.
+    network_active: bool = true,
+
     /// Operator-managed added-node list — the mirror of Bitcoin Core's
     /// `CConnman::m_added_node_params` (net.cpp). Holds the raw, user-supplied
     /// `node` strings from `addnode "<node>" "add"` (NOT resolved addresses, so
@@ -2890,8 +2902,26 @@ pub const PeerManager = struct {
             .dns_seed_enabled = true,
             .fixed_seeds_added = false,
             .run_loop_start_ts = 0,
+            .network_active = true,
             .added_nodes = std.ArrayList([]const u8).init(allocator),
         };
+    }
+
+    /// Enable/disable establishing NEW P2P connections (Core
+    /// `CConnman::SetNetworkActive`, net.cpp:3361).  Idempotent: when the flag
+    /// already equals `active` this is a logged no-op (no notification), matching
+    /// Core's early return.  Does NOT disconnect existing peers — only the three
+    /// run-loop establishment gates consult the flag.  Returns the read-back
+    /// value (`GetNetworkActive()` equivalent), which absent a race equals
+    /// `active`.  Not persisted; resets to true on restart.
+    pub fn setNetworkActive(self: *PeerManager, active: bool) bool {
+        if (self.network_active == active) {
+            std.log.info("SetNetworkActive: {} (unchanged)", .{active});
+            return self.network_active;
+        }
+        self.network_active = active;
+        std.log.info("SetNetworkActive: {}", .{active});
+        return self.network_active;
     }
 
     pub fn deinit(self: *PeerManager) void {
@@ -4327,6 +4357,13 @@ pub const PeerManager = struct {
     /// When inbound slots are full, uses eviction protection algorithm.
     pub fn acceptInbound(self: *PeerManager) !void {
         if (self.listener == null) return;
+
+        // Network-active gate (Core net.cpp:1786): while networking is disabled
+        // (`setnetworkactive false`) refuse NEW inbound connections.  The run
+        // loop already skips calling us, but enforce here too so any other
+        // caller honours the flag.  Existing peers are untouched — only new
+        // establishment is suppressed.
+        if (!self.network_active) return;
 
         // Poll with 0 timeout to check if a connection is pending (non-blocking)
         var pollfds = [_]std.posix.pollfd{.{
@@ -8309,22 +8346,39 @@ pub const PeerManager = struct {
         }
 
         while (self.running.load(.acquire)) {
+            // Network-active gate (Core CConnman.fNetworkActive). When false
+            // (`setnetworkactive false`) we suppress establishing NEW
+            // connections only: skip the manual/--connect reconnect loop, the
+            // DNS/fixed-seed re-seeding, the outbound auto-dial refill + feeler,
+            // and inbound accepts.  Existing peers are left untouched and every
+            // health/message/disconnect sweep below still runs — Core never
+            // force-drops established peers on disable.  Read once per tick.
+            const network_active = self.network_active;
+
             // 0. Reconnect dropped manual peers first (addnode <ip> add).
             // Separate from maintainOutbound so it runs even in --connect mode
             // and isn't starved by the 1-attempt-per-tick IBD throttle.
-            self.maintainManualConnections();
+            // Gated: a disabled network must not re-dial pinned/added peers
+            // (Core's connect loop spins on fNetworkActive: net.cpp:2351).
+            if (network_active) {
+                self.maintainManualConnections();
 
-            // 0b. Fixed-seed fallback (Core net.cpp:2604-2643).  One-shot, fires
-            // ONLY when the address book is empty and either DNS seeding is off
-            // or the 60s grace window elapsed without DNS/-addnode populating it.
-            // Layered AFTER the initial dnsSeeds() bootstrap above — never
-            // replaces it.  Runs before maintainOutbound so freshly-injected
-            // seeds are dialled on this same tick.  No-op once it has fired.
-            _ = self.maybeAddFixedSeeds();
+                // 0b. Fixed-seed fallback (Core net.cpp:2604-2643).  One-shot,
+                // fires ONLY when the address book is empty and either DNS
+                // seeding is off or the 60s grace window elapsed without
+                // DNS/-addnode populating it.  Layered AFTER the initial
+                // dnsSeeds() bootstrap above — never replaces it.  Runs before
+                // maintainOutbound so freshly-injected seeds are dialled on this
+                // same tick.  No-op once it has fired.  Gated so a disabled
+                // network does not re-seed (Core holds off DNS/seed queries
+                // until reactivated: net.cpp:2351).
+                _ = self.maybeAddFixedSeeds();
+            }
 
-            // 1. Open new outbound connections if needed (skip if --connect mode)
+            // 1. Open new outbound connections if needed (skip if --connect mode
+            //    and skip entirely while networking is disabled).
             // During IBD, skip connection attempts if we already have peers (avoids blocking)
-            if (self.connect_address == null) {
+            if (network_active and self.connect_address == null) {
                 // During IBD, maintainOutbound already limits to 1 attempt
                 // per call, so it won't block the loop excessively.
                 // Always try to maintain outbound diversity — a single peer
@@ -8340,8 +8394,9 @@ pub const PeerManager = struct {
                 self.maybeOpenFeeler();
             }
 
-            // 2. Accept inbound connections
-            self.acceptInbound() catch {};
+            // 2. Accept inbound connections (skip while networking is disabled —
+            //    Core net.cpp:1786 drops new inbound when !fNetworkActive).
+            if (network_active) self.acceptInbound() catch {};
 
             // 3. Process messages from all peers
             self.processAllMessages() catch {};
