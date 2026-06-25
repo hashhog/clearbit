@@ -3240,6 +3240,8 @@ pub const RpcServer = struct {
             return self.handleCombineRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "getconnectioncount")) {
             return self.handleGetConnectionCount(id);
+        } else if (std.mem.eql(u8, method, "getnettotals")) {
+            return self.handleGetNetTotals(id);
         } else if (std.mem.eql(u8, method, "ping")) {
             return self.handlePing(params, id);
         } else if (std.mem.eql(u8, method, "addnode")) {
@@ -14267,6 +14269,56 @@ pub const RpcServer = struct {
         var buf: [32]u8 = undefined;
         const result = std.fmt.bufPrint(&buf, "{d}", .{count}) catch return error.OutOfMemory;
         return self.jsonRpcResult(result, id);
+    }
+
+    /// getnettotals — network traffic statistics (bytes in/out + epoch ms +
+    /// outbound upload-target cycle state).
+    ///
+    /// Reference: Bitcoin Core rpc/net.cpp getnettotals (:560-606). Core reports
+    /// CConnman's GLOBAL cumulative counters (GetTotalBytesRecv/Sent), which
+    /// persist across peer disconnects, plus the -maxuploadtarget cycle object.
+    ///
+    /// clearbit has no CConnman-style global running counter — bytes are tracked
+    /// only per live Peer (peer.bytes_sent / peer.bytes_received, the same fields
+    /// getpeerinfo reports). So totalbytesrecv/totalbytessent here are the sum
+    /// over the CURRENTLY-connected peers; bytes from peers that have already
+    /// disconnected are not retained, making these a lower-bound APPROXIMATION of
+    /// Core's lifetime totals. This reuses the existing per-peer accounting rather
+    /// than introducing a second, parallel byte-counting path.
+    ///
+    /// uploadtarget: clearbit has no -maxuploadtarget, so this mirrors Core's
+    /// behaviour when the limit is unset — GetMaxOutboundTarget()==0, the cycle is
+    /// never "reached" (target_reached=false), historical blocks are served
+    /// (serve_historical_blocks=true), and there is no cycle to count down
+    /// (bytes_left_in_cycle=0, time_left_in_cycle=0). timeframe mirrors Core's
+    /// default DEFAULT_MAX_UPLOAD_TIMEFRAME of 86400s (24h), which is reported
+    /// independently of whether a target is set.
+    fn handleGetNetTotals(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        var total_recv: u64 = 0;
+        var total_sent: u64 = 0;
+        for (self.peer_manager.peers.items) |peer| {
+            total_recv += peer.bytes_received;
+            total_sent += peer.bytes_sent;
+        }
+
+        // Current unix epoch in milliseconds (Core: TicksSinceEpoch<ms>).
+        const time_millis: i64 = std.time.milliTimestamp();
+
+        // Default 24h timeframe in seconds (Core DEFAULT_MAX_UPLOAD_TIMEFRAME).
+        const DEFAULT_MAX_UPLOAD_TIMEFRAME: u64 = 86400;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+
+        try writer.print(
+            "{{\"totalbytesrecv\":{d},\"totalbytessent\":{d},\"timemillis\":{d}," ++
+                "\"uploadtarget\":{{\"timeframe\":{d},\"target\":0,\"target_reached\":false," ++
+                "\"serve_historical_blocks\":true,\"bytes_left_in_cycle\":0,\"time_left_in_cycle\":0}}}}",
+            .{ total_recv, total_sent, time_millis, DEFAULT_MAX_UPLOAD_TIMEFRAME },
+        );
+
+        return self.jsonRpcResult(buf.items, id);
     }
 
     /// Handle addnode RPC - add or remove a peer.
