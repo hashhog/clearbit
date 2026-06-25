@@ -2715,6 +2715,18 @@ pub const PeerManager = struct {
     /// path can't recurse into drainBlockBuffer.  W101 (2026-04-24).
     in_drain: bool,
 
+    /// Re-entrancy guard for `processAllMessages`.  The drain-heartbeat
+    /// (W100/W101) re-enters `acceptInbound`/`processAllMessages` from inside
+    /// `drainBlockBuffer`, which itself runs inside the outer
+    /// `processAllMessages` `.block` handler.  A nested pass that calls
+    /// `removePeerByIndex` (`acceptInbound` eviction, ban-scan, recv-error)
+    /// `allocator.destroy`s a peer the OUTER pass is still iterating
+    /// (`peers.items[i]` / `peer_obj.receiveMessage()`), a use-after-free that
+    /// segfaults silently in ReleaseFast.  Core never processes messages
+    /// re-entrantly; this guard makes a nested `processAllMessages` a no-op so
+    /// the outer pass keeps sole ownership of `peers.items`.  W141 (2026-06-25).
+    in_pam: bool,
+
     /// Whether to advertise NODE_BLOOM (BIP-37/BIP-35) in outgoing
     /// VERSION messages and serve `mempool` requests.  Plumbed from
     /// the `peerbloomfilters` CLI flag.  Default false to match Bitcoin
@@ -2965,6 +2977,7 @@ pub const PeerManager = struct {
             .blocks_since_log = 0,
             .last_stall_recovery = 0,
             .in_drain = false,
+            .in_pam = false,
             .peerbloomfilters = false,
             .advertise_node_network_limited = false,
             .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
@@ -4516,6 +4529,18 @@ pub const PeerManager = struct {
     /// Uses poll() to wait for data on ALL peer sockets simultaneously,
     /// then drains ALL available messages from each ready socket.
     pub fn processAllMessages(self: *PeerManager) !void {
+        // Re-entrancy guard (W141): if an outer processAllMessages pass is
+        // already iterating self.peers.items, do NOT re-enter.  A nested pass
+        // (reached via the drain-heartbeat at the `.block` handler →
+        // drainBlockBuffer → processAllMessages) can removePeerByIndex →
+        // allocator.destroy a peer the outer loop still holds, a silent
+        // use-after-free SEGV in ReleaseFast.  Blocks the nested pass would
+        // have read are consumed by the outer pass on its next tick, so
+        // throughput is unaffected (same rationale as the in_drain guard).
+        if (self.in_pam) return;
+        self.in_pam = true;
+        defer self.in_pam = false;
+
         // First pass: check for peers that need banning
         {
             var i: usize = 0;
@@ -7353,24 +7378,20 @@ pub const PeerManager = struct {
                 // Counter already drifted; reset to 0 rather than underflow.
                 self.blocks_in_flight = 0;
             }
-            // W19 fix: rewind download_cursor so the pipeline re-requests the
-            // blocks that were in-flight to this peer and are now lost.  Without
-            // this rewind, download_cursor stays at connect_cursor + max_ahead
-            // (the window ceiling) while connect_cursor is stuck waiting for the
-            // first missing block.  pipelineBlockRequests() then sees
-            // download_cursor >= connect_cursor + max_ahead and issues no new
-            // getdata — a permanent wedge until a full restart.
-            //
-            // Rewinding to connect_cursor is safe: pipelineBlockRequests() skips
-            // hashes already in block_buffer, so blocks that were received and
-            // buffered before this peer disconnected are not re-requested.
-            if (self.download_cursor > self.connect_cursor) {
-                self.download_cursor = self.connect_cursor;
-            }
-            // Drop this peer's entries from the per-block in-flight map (Core
-            // clears a disconnected peer from mapBlocksInFlight). Until removed,
-            // pipelineBlockRequests' SKIP would treat these blocks as still
-            // in-flight and never re-request them after the W19 rewind above.
+        }
+        // W141: purge this (about-to-be-destroyed) peer from BOTH pointer-keyed
+        // maps UNCONDITIONALLY — independent of blocks_in_flight_count.  The
+        // per-peer counter and the map entries are mutated on separate per-block
+        // paths (block-receive decrement, drain-wedge cancel), so a peer can
+        // reach count==0 while still owning live map entries.  The old code
+        // gated the inflight_block_peer purge on count>0 and never purged
+        // block_source_peers at all, so stale @intFromPtr keys survived
+        // allocator.destroy below; a recycled peer address then aliases them —
+        // misbehaving(100)-banning an innocent peer (block_source_peers lookup)
+        // and drifting blocks_in_flight (inflight_block_peer lookup).  Core
+        // clears a disconnected peer from mapBlocksInFlight unconditionally.
+        var purged_inflight = false;
+        {
             const gone_ptr = @intFromPtr(peer);
             var stale_keys = std.ArrayList(types.Hash256).init(self.allocator);
             defer stale_keys.deinit();
@@ -7382,6 +7403,34 @@ pub const PeerManager = struct {
             }
             for (stale_keys.items) |k| {
                 _ = self.inflight_block_peer.remove(k);
+                purged_inflight = true;
+            }
+            stale_keys.clearRetainingCapacity();
+            var source_it = self.block_source_peers.iterator();
+            while (source_it.next()) |kv| {
+                if (kv.value_ptr.* == gone_ptr) {
+                    stale_keys.append(kv.key_ptr.*) catch break;
+                }
+            }
+            for (stale_keys.items) |k| {
+                _ = self.block_source_peers.remove(k);
+            }
+        }
+        // W19 fix: rewind download_cursor so the pipeline re-requests the blocks
+        // that were in-flight to this peer and are now lost.  Without this
+        // rewind, download_cursor stays at connect_cursor + max_ahead (the
+        // window ceiling) while connect_cursor is stuck waiting for the first
+        // missing block.  pipelineBlockRequests() then sees download_cursor >=
+        // connect_cursor + max_ahead and issues no new getdata — a permanent
+        // wedge until a full restart.  Fire whenever this peer held in-flight
+        // blocks (count>0) OR we purged any inflight map entry (count may have
+        // drifted to 0 while entries remained).  Rewinding to connect_cursor is
+        // safe: pipelineBlockRequests() skips hashes already in block_buffer, so
+        // blocks received and buffered before this peer disconnected are not
+        // re-requested.
+        if (peer.blocks_in_flight_count > 0 or purged_inflight) {
+            if (self.download_cursor > self.connect_cursor) {
+                self.download_cursor = self.connect_cursor;
             }
         }
         // Drop any orphan-pool entries this peer announced so the peer's
@@ -8243,7 +8292,14 @@ pub const PeerManager = struct {
                 // min gaps against blk-replay on localhost.  acceptInbound
                 // polls non-blocking; handshake with an inbound v1 peer is
                 // sub-millisecond on localhost.
-                self.acceptInbound() catch {};
+                //
+                // W141: only when NOT inside an outer processAllMessages pass.
+                // acceptInbound can evict (removePeerByIndex → destroy) a peer
+                // the outer pass is iterating — the same use-after-free the
+                // in_pam guard prevents for the nested processAllMessages call
+                // below.  When this drain runs at top level (run() →
+                // drainBlockBuffer, in_pam == false) inbound is still serviced.
+                if (!self.in_pam) self.acceptInbound() catch {};
 
                 // W101: service existing peers during long drains.  Without
                 // this, reactive-only peers (blk-replay sends nothing unless
