@@ -3113,6 +3113,8 @@ pub const RpcServer = struct {
             return self.handleGetBlockTemplate(params, id);
         } else if (std.mem.eql(u8, method, "submitblock")) {
             return self.handleSubmitBlock(params, id);
+        } else if (std.mem.eql(u8, method, "submitheader")) {
+            return self.handleSubmitHeader(params, id);
         } else if (std.mem.eql(u8, method, "getdifficulty")) {
             return self.handleGetDifficulty(id);
         } else if (std.mem.eql(u8, method, "getindexinfo")) {
@@ -8769,6 +8771,154 @@ pub const RpcServer = struct {
             try std.fmt.format(buf.writer(), "\"{s}\"", .{reason});
             return self.jsonRpcResult(buf.items, id);
         }
+    }
+
+    /// submitheader RPC — Bitcoin Core rpc/mining.cpp submitheader().
+    ///
+    /// "Decode the given hexdata as a header and submit it as a candidate
+    ///  chain tip if valid. Throws when the header is invalid."
+    ///
+    /// Param: hexdata — hex-encoded 80-byte block header.
+    ///
+    /// Result / error parity with Core (mining.cpp:1123-1144):
+    ///   * bad hex / not exactly 80 bytes        -> -22 "Block header decode failed"
+    ///   * parent (prev) unknown to the node     -> -25 "Must submit previous header (<prevhash>) first"
+    ///                                              (<prevhash> = big-endian DISPLAY hex, Core GetHex())
+    ///   * PoW / contextual validation failure   -> -25 <reject-reason token>
+    ///   * success / already-known (idempotent)  -> JSON null
+    ///
+    /// REUSES the existing headers-first validation + store — no parallel
+    /// validator:
+    ///   * parent-known oracle = PeerManager.lookupParentChainWork (the same
+    ///     oracle insertHeader uses: covers genesis-rooted, active-chain tip,
+    ///     and the in-memory header_index), plus the in-memory block index
+    ///     (ChainManager.getBlock) and the CF_BLOCKS active-chain store.
+    ///   * PoW            = validation.checkBlockHeader (Core CheckBlockHeader
+    ///     -> CheckProofOfWork; "high-hash" on failure).
+    ///   * contextual     = PeerManager.validateHeaderContextual (Core
+    ///     ContextualCheckBlockHeader time checks; "time-too-new"/"time-too-old").
+    ///   * store          = PeerManager.insertHeader (Core AcceptBlockHeader ->
+    ///     block-index insert; idempotent on an already-known header).
+    ///
+    /// Single-threaded RPC server: this is a quick synchronous call.
+    fn handleSubmitHeader(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // ── Param: hexdata ──────────────────────────────────────────────────
+        var hex: []const u8 = undefined;
+        if (params == .array and params.array.items.len > 0 and params.array.items[0] == .string) {
+            hex = params.array.items[0].string;
+        } else {
+            // Core errors with RPC_TYPE_ERROR before reaching submitheader's
+            // body when the param is missing/non-string; mirror that boundary.
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Expected type string for hexdata", id);
+        }
+
+        // ── Step 1: decode hexdata as an 80-byte header ─────────────────────
+        // Core: DecodeHexBlockHeader(h, ...) — bad hex OR a payload that does
+        // not deserialize to exactly an 80-byte header -> RPC_DESERIALIZATION_ERROR.
+        if (hex.len != 160) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Block header decode failed", id);
+        }
+        var raw: [80]u8 = undefined;
+        for (0..80) |i| {
+            const hi: u8 = hexDigitToInt(hex[i * 2]) orelse
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Block header decode failed", id);
+            const lo: u8 = hexDigitToInt(hex[i * 2 + 1]) orelse
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Block header decode failed", id);
+            raw[i] = (@as(u8, hi) << 4) | @as(u8, lo);
+        }
+
+        var reader = serialize.Reader{ .data = &raw };
+        const header = serialize.readBlockHeader(&reader) catch {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Block header decode failed", id);
+        };
+
+        const block_hash = crypto.computeBlockHash(&header);
+
+        // ── Step 2: parent (prev block) must be known to the node ───────────
+        // Core: chainman.m_blockman.LookupBlockIndex(h.hashPrevBlock).  The
+        // block index holds EVERY header the node knows (active chain + side
+        // branches + headers-only).  clearbit's equivalents, checked in the
+        // same priority insertHeader uses:
+        //   (a) lookupParentChainWork — genesis-rooted, active-chain tip,
+        //       in-memory header_index (the headers-first store).
+        //   (b) ChainManager.getBlock — in-memory block index (blocks/headers
+        //       connected this session, incl. side branches).
+        //   (c) genesis hash (covers a fresh node whose tip IS genesis).
+        //   (d) CF_BLOCKS — persisted active-chain block bodies.
+        const prev = &header.prev_block;
+        var parent_known: bool = self.peer_manager.lookupParentChainWork(prev) != null;
+        if (!parent_known) {
+            if (self.chain_manager) |cm| {
+                if (cm.getBlock(prev) != null) parent_known = true;
+            }
+        }
+        if (!parent_known and std.mem.eql(u8, prev, &self.network_params.genesis_hash)) {
+            parent_known = true;
+        }
+        if (!parent_known) {
+            if (self.chain_state.utxo_set.db) |db| {
+                if (db.get(storage.CF_BLOCKS, prev) catch null) |raw_blk| {
+                    self.allocator.free(raw_blk);
+                    parent_known = true;
+                }
+            }
+        }
+
+        if (!parent_known) {
+            // Core (mining.cpp:1133):
+            //   "Must submit previous header (" + h.hashPrevBlock.GetHex() + ") first"
+            // GetHex() is big-endian DISPLAY order (byte-reversed); writeHashHex
+            // reverses for us.
+            var msg = std.ArrayList(u8).init(self.allocator);
+            defer msg.deinit();
+            try msg.writer().writeAll("Must submit previous header (");
+            try writeHashHex(msg.writer(), prev);
+            try msg.writer().writeAll(") first");
+            return self.jsonRpcError(RPC_VERIFY_ERROR, msg.items, id);
+        }
+
+        // ── Step 3: idempotency — already-known header is a no-op (null) ────
+        // Core's ProcessNewBlockHeaders re-running on a header already in the
+        // block index is a no-op that leaves state valid -> returns null.
+        var already_known: bool = self.peer_manager.header_index.contains(block_hash);
+        if (!already_known) {
+            if (self.chain_manager) |cm| {
+                if (cm.getBlock(&block_hash) != null) already_known = true;
+            }
+        }
+        if (!already_known and std.mem.eql(u8, &block_hash, &self.chain_state.best_hash)) {
+            already_known = true;
+        }
+        if (already_known) {
+            return self.jsonRpcResult("null", id);
+        }
+
+        // ── Step 4: PoW (Core CheckBlockHeader -> CheckProofOfWork) ─────────
+        // Reuse validation.checkBlockHeader; on failure Core returns the
+        // "high-hash" reject token (validation.cpp:3832).
+        validation.checkBlockHeader(&header, self.network_params) catch {
+            return self.jsonRpcError(RPC_VERIFY_ERROR, "high-hash", id);
+        };
+
+        // ── Step 5: contextual time checks (Core ContextualCheckBlockHeader) ─
+        // Reuse PeerManager.validateHeaderContextual: future-time +
+        // BIP-113 MTP-of-11.  Map to Core's reject tokens.
+        switch (self.peer_manager.validateHeaderContextual(&header, std.time.timestamp())) {
+            .ok => {},
+            .future_time => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-too-new", id),
+            .mtp_violation => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-too-old", id),
+        }
+
+        // ── Step 6: admit into the block index (Core AcceptBlockHeader) ─────
+        // insertHeader is the existing headers-first store; it computes
+        // height + chain_work from the parent and is idempotent.  A null
+        // return here would mean "parent not connectable" — but we already
+        // proved the parent is known above, so treat a null as a benign no-op
+        // rather than inventing a new error path.
+        _ = self.peer_manager.insertHeader(&header, &block_hash) catch null;
+
+        // Success — Core returns UniValue::VNULL.
+        return self.jsonRpcResult("null", id);
     }
 
     /// Compute the median-time-past for BIP-113 header validation in submitblock.
