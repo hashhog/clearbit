@@ -86,6 +86,12 @@ pub const RPC_INVALID_PARAMS: i32 = -32602;
 pub const RPC_INTERNAL_ERROR: i32 = -32603;
 pub const RPC_PARSE_ERROR: i32 = -32700;
 
+/// verifychain diagnostic logger — appends a newline so callers omit it.
+/// Routes to stderr like the rest of the RPC server's diagnostics.
+fn vcLog(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt ++ "\n", args);
+}
+
 /// Bitcoin-specific errors.
 pub const RPC_MISC_ERROR: i32 = -1;
 pub const RPC_FORBIDDEN_BY_SAFE_MODE: i32 = -2;
@@ -3334,6 +3340,8 @@ pub const RpcServer = struct {
             return self.handleGetTxOutProof(params, id);
         } else if (std.mem.eql(u8, method, "verifytxoutproof")) {
             return self.handleVerifyTxOutProof(params, id);
+        } else if (std.mem.eql(u8, method, "verifychain")) {
+            return self.handleVerifyChain(params, id);
         } else if (std.mem.eql(u8, method, "getrpcinfo")) {
             return self.handleGetRPCInfo(id);
         } else {
@@ -3545,6 +3553,603 @@ pub const RpcServer = struct {
         var buf: [32]u8 = undefined;
         const result = std.fmt.bufPrint(&buf, "{d}", .{self.chain_state.best_height}) catch return error.OutOfMemory;
         return self.jsonRpcResult(result, id);
+    }
+
+    // ========================================================================
+    // verifychain ( checklevel nblocks )
+    // ------------------------------------------------------------------------
+    // Re-validates the last `nblocks` blocks of the active chain at the
+    // requested `checklevel`, returning a bare JSON bool (true = every checked
+    // block passed). Faithful port of Bitcoin Core
+    // CVerifyDB::VerifyDB (bitcoin-core/src/validation.cpp:4611), called from
+    // the verifychain RPC (bitcoin-core/src/rpc/blockchain.cpp).
+    //
+    // Arguments (positional, both optional):
+    //   1. checklevel (int, default 3, clamped to 0..4) — how thorough:
+    //        0  read block from disk (ReadBlock)
+    //        1  + CheckBlock          (PoW, merkle root, tx sanity, witness)
+    //        2  + read & decode undo  (ReadBlockUndo + tx-count consistency)
+    //        3  + disconnect-tip      (in-memory DisconnectBlock consistency)
+    //        4  + reconnect           (full ConnectBlock incl input scripts)
+    //   2. nblocks (int, default 6; 0 or > chain-height means ALL blocks)
+    //
+    // CRITICAL — this MUST NOT mutate the live chainstate. Core's VerifyDB runs
+    // on a throwaway CCoinsViewCache layered over the real coins view; clearbit
+    // mirrors that with an in-memory `overlay` (an OutPoint -> ?Coin map) whose
+    // reads fall through to the live UTXO set (`utxo_set.get`) and whose writes
+    // touch ONLY the overlay. The live UTXO set, the block CF, and the undo CF
+    // are READ-ONLY here. There is no constant-true stub: every level above 0
+    // invokes the node's REAL validator functions —
+    //   level 1 -> validation.checkBlock (the same CheckBlock the sync path runs),
+    //   level 3 -> the same reverse-order DisconnectBlock coin rewind the live
+    //              reorg path (`disconnectBlockByHashCFInner`) uses, driven
+    //              against the overlay, and
+    //   level 4 -> validation.connectBlock (the same ConnectBlock the sync path
+    //              runs, including parallel per-input script verification),
+    // and returns false on any real failure (tampered block body, missing/
+    // malformed undo, a script that no longer verifies, etc.).
+    //
+    // Undo semantics (mirrors Core):
+    //   - A block with NO persisted undo (NULL undo position) is SKIPPED, not
+    //     failed (assume-valid / snapshot: "only go back as far as we have
+    //     data"). A coinbase-only block legitimately has an empty undo.
+    //   - DisconnectBlock returning DISCONNECT_UNCLEAN is a NON-FATAL warning
+    //     (continue, still return true). ONLY DISCONNECT_FAILED is fatal/false.
+    //   - Disconnect walks txs in REVERSE so an intra-block (chained / CPFP)
+    //     spend's restored output is available before the earlier tx removes it.
+    //
+    // NOT consensus-affecting (read-only; mutates no chainstate).
+    fn handleVerifyChain(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const ok = self.verifyChainImpl(params) catch |err| {
+            // An internal error (OOM, corrupt-but-unexpected DB state) surfaces
+            // as an RPC error rather than a silent `false`.
+            vcLog("verifychain: internal error: {s}", .{@errorName(err)});
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "verifychain failed", id);
+        };
+        return self.jsonRpcResult(if (ok) "true" else "false", id);
+    }
+
+    /// Faithful CVerifyDB::VerifyDB body. Returns true/false (the RPC result);
+    /// `error` is reserved for genuine internal failures (OOM, etc.) which the
+    /// caller maps to an RPC error.
+    fn verifyChainImpl(self: *RpcServer, params: std.json.Value) !bool {
+        const allocator = self.allocator;
+        const cs = self.chain_state;
+
+        // --- Parse params: [checklevel=3, nblocks=6]. ---
+        var check_level: i64 = 3;
+        var n_blocks: i64 = 6;
+        if (params == .array) {
+            const items = params.array.items;
+            if (items.len >= 1 and items[0] != .null) {
+                if (items[0] == .integer) check_level = items[0].integer else return error.InvalidParams;
+            }
+            if (items.len >= 2 and items[1] != .null) {
+                if (items[1] == .integer) n_blocks = items[1].integer else return error.InvalidParams;
+            }
+        }
+
+        // nCheckLevel = std::max(0, std::min(4, nCheckLevel)); (validation.cpp:4627)
+        if (check_level < 0) check_level = 0;
+        if (check_level > 4) check_level = 4;
+        const level: u8 = @intCast(check_level);
+
+        const tip_height = cs.best_height;
+
+        // Core: tip null or tip->pprev null -> SUCCESS (validation.cpp:4619).
+        // Genesis-only or empty chain: nothing to verify.
+        if (tip_height == 0) return true;
+
+        // if (nCheckDepth <= 0 || nCheckDepth > Height()) nCheckDepth = Height();
+        // (validation.cpp:4624). 0 (or oversized) = all blocks above genesis.
+        var check_depth: u32 = undefined;
+        if (n_blocks <= 0 or n_blocks > @as(i64, tip_height)) {
+            check_depth = tip_height;
+        } else {
+            check_depth = @intCast(n_blocks);
+        }
+        // Lowest height we visit (inclusive). Core never visits genesis (the
+        // loop requires pindex->pprev), so the floor is >= 1.
+        const start_height: u32 = tip_height - check_depth + 1;
+
+        vcLog(
+            "verifychain: verifying last {d} blocks at level {d} (tip {d}, from {d})",
+            .{ check_depth, level, tip_height, start_height },
+        );
+
+        // In-memory sandbox UTXO overlay layered over the live coins view.
+        //   present value          -> coin shadows the live entry
+        //   present null            -> outpoint is SPENT/absent in the sandbox
+        //   key absent              -> fall through to the live UTXO set
+        // Mutated ONLY in this proc; the live UTXO set is never touched.
+        const Overlay = std.AutoHashMap(types.OutPoint, ?storage.Coin);
+        var overlay = Overlay.init(allocator);
+        defer {
+            var it = overlay.valueIterator();
+            while (it.next()) |coin_opt| {
+                if (coin_opt.*) |*c| {
+                    var cc = c.*;
+                    cc.deinit(allocator);
+                }
+            }
+            overlay.deinit();
+        }
+
+        // Per-block records collected on the way DOWN so level 4 can re-connect
+        // bottom-up (oldest first), exactly like Core's reconnect loop walking
+        // chain.Next(pindex) upward (validation.cpp:4716-4737).
+        const BlockRec = struct {
+            height: u32,
+            block: types.Block,
+            block_bytes: []const u8,
+            undo: ?storage.BlockUndoData,
+        };
+        var recs = std.ArrayList(BlockRec).init(allocator);
+        defer {
+            for (recs.items) |*r| {
+                serialize.freeBlock(allocator, &r.block);
+                allocator.free(r.block_bytes);
+                if (r.undo) |*u| u.deinit(allocator);
+            }
+            recs.deinit();
+        }
+
+        // ---- Levels 0-3: walk DOWN from the tip (disconnect direction) ------
+        var h: u32 = tip_height;
+        while (h >= start_height) : (h -= 1) {
+            const block_hash = cs.getBlockHashByHeight(h) orelse {
+                vcLog("verifychain: missing height->hash mapping at {d}", .{h});
+                return false;
+            };
+
+            // Level 0: ReadBlock from disk (read + deserialize). A read failure
+            // is Core's CORRUPTED_BLOCK_DB -> false (validation.cpp:4661-4664).
+            const block_bytes = (try cs.getBlockBytes(&block_hash)) orelse {
+                std.debug.print("verifychain: ReadBlock failed at {d}\n", .{h});
+                return false;
+            };
+            var block_freed = false;
+            errdefer allocator.free(block_bytes);
+            var reader = serialize.Reader{ .data = block_bytes };
+            var block = serialize.readBlock(&reader, allocator) catch {
+                allocator.free(block_bytes);
+                vcLog("verifychain: block deserialize failed at {d}", .{h});
+                return false;
+            };
+            errdefer if (!block_freed) serialize.freeBlock(allocator, &block);
+
+            // Level 1: CheckBlock — the real context-free validator (PoW,
+            // merkle root, tx sanity, witness commitment). validation.cpp:4666.
+            if (level >= 1) {
+                validation.checkBlock(&block, h, self.network_params, allocator) catch |err| {
+                    vcLog("verifychain: found bad block at {d}: {s}", .{ h, @errorName(err) });
+                    serialize.freeBlock(allocator, &block);
+                    allocator.free(block_bytes);
+                    block_freed = true;
+                    return false;
+                };
+            }
+
+            // Level 2: read + decode undo (ReadBlockUndo) and check the
+            // block/undo tx-count consistency. validation.cpp:4672-4680.
+            //
+            // CRITICAL undo semantics: a NULL undo position is SKIPPED, not
+            // failed (Core only checks undo when !GetUndoPos().IsNull()). A
+            // coinbase-only block legitimately has no undo. A multi-tx block on
+            // the active chain MUST have undo, so a missing record there is a
+            // real CORRUPTED_BLOCK_DB.
+            var undo_owned: ?storage.BlockUndoData = null;
+            if (level >= 2) {
+                if (try cs.getBlockUndoBytes(&block_hash)) |undo_bytes| {
+                    defer allocator.free(undo_bytes);
+                    var ud = storage.BlockUndoData.fromBytes(undo_bytes, allocator) catch {
+                        vcLog("verifychain: found bad undo data (undecodable) at {d}", .{h});
+                        serialize.freeBlock(allocator, &block);
+                        allocator.free(block_bytes);
+                        block_freed = true;
+                        return false;
+                    };
+                    // One TxUndo per non-coinbase tx (Core validation.cpp:2190).
+                    if (ud.tx_undo.len + 1 != block.transactions.len) {
+                        vcLog(
+                            "verifychain: undo/tx count mismatch at {d} (undo={d} txs={d})",
+                            .{ h, ud.tx_undo.len, block.transactions.len },
+                        );
+                        ud.deinit(allocator);
+                        serialize.freeBlock(allocator, &block);
+                        allocator.free(block_bytes);
+                        block_freed = true;
+                        return false;
+                    }
+                    undo_owned = ud;
+                } else if (block.transactions.len > 1) {
+                    // Non-coinbase-bearing block on the active chain with no
+                    // undo on disk: corrupted DB (NOT the NULL-undo skip case,
+                    // which only applies to coinbase-only blocks).
+                    vcLog("verifychain: found bad undo data (missing) at {d}", .{h});
+                    serialize.freeBlock(allocator, &block);
+                    allocator.free(block_bytes);
+                    block_freed = true;
+                    return false;
+                }
+            }
+
+            // Level 3: in-memory disconnect into the overlay, REUSING the same
+            // reverse-order DisconnectBlock coin rewind the live reorg path runs
+            // (the ApplyTxInUndo / SpendCoin loop in
+            // storage.disconnectBlockByHashCFInner), driven against the overlay.
+            // Walking txs in REVERSE is what lets a chained intra-block spend
+            // restore its consumed output (via the later tx's undo) before the
+            // earlier tx removes it, so a valid chain disconnects cleanly.
+            if (level >= 3) {
+                const dr = self.verifyChainDisconnectIntoOverlay(
+                    &block,
+                    h,
+                    if (undo_owned) |*u| u else null,
+                    Overlay,
+                    &overlay,
+                ) catch |err| {
+                    vcLog("verifychain: disconnect raised at {d}: {s}", .{ h, @errorName(err) });
+                    if (undo_owned) |*u| u.deinit(allocator);
+                    serialize.freeBlock(allocator, &block);
+                    allocator.free(block_bytes);
+                    block_freed = true;
+                    return false;
+                };
+                // Core VerifyDB level 3: DISCONNECT_FAILED -> CORRUPTED_BLOCK_DB
+                // (false). DISCONNECT_UNCLEAN is a NON-FATAL warning — continue
+                // and STILL return true (this matches the verified-live
+                // behavior; an absent intra-block-spend output / overwrite is
+                // the unclean signal, not corruption). Only .failed is fatal.
+                if (dr == .failed) {
+                    vcLog("verifychain: irrecoverable inconsistency on disconnect at {d}", .{h});
+                    if (undo_owned) |*u| u.deinit(allocator);
+                    serialize.freeBlock(allocator, &block);
+                    allocator.free(block_bytes);
+                    block_freed = true;
+                    return false;
+                }
+                if (dr == .unclean) {
+                    vcLog("verifychain: DISCONNECT_UNCLEAN at {d} (non-fatal, continuing)", .{h});
+                }
+            }
+
+            // Stash for the reconnect pass (only needed at level >= 4, but we
+            // keep ownership uniformly; the defer above frees everything).
+            _ = &block_freed;
+            recs.append(.{
+                .height = h,
+                .block = block,
+                .block_bytes = block_bytes,
+                .undo = undo_owned,
+            }) catch {
+                if (undo_owned) |*u| u.deinit(allocator);
+                serialize.freeBlock(allocator, &block);
+                allocator.free(block_bytes);
+                return error.OutOfMemory;
+            };
+            block_freed = true; // ownership transferred to recs
+
+            // h is u32; guard the underflow at the loop floor.
+            if (h == start_height) break;
+        }
+
+        // ---- Level 4: walk UP (reconnect direction), full re-validation -----
+        // The overlay now represents the UTXO set as it was at start_height-1
+        // (the fork point). Re-run connectBlock bottom-up — the SAME
+        // ConnectBlock machinery used during sync, including every input script
+        // verification — sourcing each block's prevouts from its OWN undo data
+        // (the exact spent coins ConnectBlock would read). validation.cpp:4716.
+        if (level >= 4) {
+            // recs is ordered tip..start (descending); reconnect ascending.
+            var i: usize = recs.items.len;
+            while (i > 0) {
+                i -= 1;
+                const r = &recs.items[i];
+                const ok = self.verifyChainReconnect(&r.block, r.height, if (r.undo) |*u| u else null) catch |err| {
+                    vcLog("verifychain: reconnect raised at {d}: {s}", .{ r.height, @errorName(err) });
+                    return false;
+                };
+                if (!ok) {
+                    vcLog("verifychain: found unconnectable block at {d}", .{r.height});
+                    return false;
+                }
+                // Apply this block forward into the overlay so the next (higher)
+                // block sees the coins it creates/spends — replays ConnectBlock's
+                // UTXO mutation in the overlay only (never the live DB).
+                try self.verifyChainApplyForwardIntoOverlay(&r.block, r.height, Overlay, &overlay);
+            }
+        }
+
+        vcLog("verifychain: OK — no inconsistencies (level {d}, {d} blocks)", .{ level, check_depth });
+        return true;
+    }
+
+    /// Reverse-order DisconnectBlock into the in-memory overlay (Core
+    /// validation.cpp:2179-2248 DisconnectBlock, driven against the sandbox).
+    /// Returns the DisconnectResult; never mutates the live chainstate.
+    fn verifyChainDisconnectIntoOverlay(
+        self: *RpcServer,
+        block: *const types.Block,
+        height: u32,
+        undo: ?*const storage.BlockUndoData,
+        comptime Overlay: type,
+        overlay: *Overlay,
+    ) !storage.DisconnectResult {
+        const allocator = self.allocator;
+        const cs = self.chain_state;
+        var f_clean: bool = true;
+
+        // overlaySpend: remove the unspent coin at `op` from the sandbox view,
+        // returning the spent coin (caller owns its script). Looks in the
+        // overlay shadow first, then the live UTXO set. Marks the outpoint
+        // spent (null) in the overlay either way.
+        // overlayRestore: insert/overwrite a coin at `op` in the overlay.
+
+        // Iterate transactions in REVERSE (Core's
+        // `for (int i = block.vtx.size() - 1; i >= 0; i--)`).
+        var tx_idx = block.transactions.len;
+        while (tx_idx > 0) {
+            tx_idx -= 1;
+            const tx = &block.transactions[tx_idx];
+            const tx_hash = crypto.computeTxidStreaming(tx);
+            const is_coinbase = tx_idx == 0;
+
+            // Remove outputs created by this tx (Core checks each created
+            // output is present and matches; a mismatch flips fClean=false).
+            for (tx.outputs, 0..) |output, o| {
+                if (storage.isScriptUnspendable(output.script_pubkey)) continue;
+                const op = types.OutPoint{ .hash = tx_hash, .index = @intCast(o) };
+
+                // SpendCoin from the sandbox: overlay shadow first, else live.
+                if (overlay.getPtr(op)) |coin_opt_ptr| {
+                    if (coin_opt_ptr.*) |*c| {
+                        // Present in overlay: compare + spend (set null).
+                        const value_ok = c.tx_out.value == output.value;
+                        const height_ok = c.height == height;
+                        const coinbase_ok = c.is_coinbase == is_coinbase;
+                        const script_ok = std.mem.eql(u8, c.tx_out.script_pubkey, output.script_pubkey);
+                        if (!(value_ok and height_ok and coinbase_ok and script_ok)) f_clean = false;
+                        var cc = c.*;
+                        cc.deinit(allocator);
+                        coin_opt_ptr.* = null;
+                    } else {
+                        // Already spent/absent in the sandbox: output the block
+                        // claimed to create isn't there. Non-fatal (UNCLEAN).
+                        f_clean = false;
+                    }
+                } else if (try cs.utxo_set.get(&op)) |compact| {
+                    // Live UTXO entry. Compare value/height/coinbase/script
+                    // (script via the compact-form comparator) then mark spent.
+                    var cu = compact;
+                    defer cu.deinit(allocator);
+                    const value_ok = cu.value == output.value;
+                    const height_ok = cu.height == height;
+                    const coinbase_ok = cu.is_coinbase == is_coinbase;
+                    const script_ok = storage.scriptsMatch(&cu, output.script_pubkey);
+                    if (!(value_ok and height_ok and coinbase_ok and script_ok)) f_clean = false;
+                    overlay.put(op, null) catch return error.OutOfMemory;
+                } else {
+                    // Output the block claimed to create is missing entirely
+                    // (Core: !is_spent flips fClean false — non-fatal UNCLEAN).
+                    f_clean = false;
+                    overlay.put(op, null) catch return error.OutOfMemory;
+                }
+            }
+
+            // Coinbase has no inputs to restore.
+            if (is_coinbase) continue;
+
+            // Restore inputs from undo (reverse input order, Core's
+            // `for (j = vin.size(); j > 0;)`). undo is guaranteed present for a
+            // multi-tx block by the level-2 gate; if it is null here (level 3
+            // requested without level 2 having run, i.e. unreachable since 3>2),
+            // treat as FAILED.
+            const u = undo orelse return .failed;
+            const tx_undo = u.tx_undo[tx_idx - 1];
+            if (tx_undo.prev_outputs.len != tx.inputs.len) {
+                vcLog("verifychain: tx/undo input-count mismatch at {d}", .{height});
+                return .failed;
+            }
+            var j: usize = tx.inputs.len;
+            while (j > 0) {
+                j -= 1;
+                const input = tx.inputs[j];
+                const prev = tx_undo.prev_outputs[j];
+                const op = input.previous_output;
+
+                // ApplyTxInUndo (Core validation.cpp:2149): if an unspent coin
+                // already lives at the outpoint, fClean=false (overwrite).
+                const already: bool = blk: {
+                    if (overlay.get(op)) |coin_opt| break :blk coin_opt != null;
+                    break :blk cs.utxo_set.haveCoin(&op);
+                };
+                if (already) f_clean = false;
+
+                // Restore the coin into the overlay (owned script copy).
+                const script_copy = allocator.dupe(u8, prev.script_pubkey) catch return error.OutOfMemory;
+                const restored = storage.Coin{
+                    .tx_out = .{ .value = prev.value, .script_pubkey = script_copy },
+                    .height = prev.height,
+                    .is_coinbase = prev.is_coinbase,
+                };
+                if (overlay.getPtr(op)) |slot| {
+                    if (slot.*) |*old| {
+                        var oc = old.*;
+                        oc.deinit(allocator);
+                    }
+                    slot.* = restored;
+                } else {
+                    overlay.put(op, restored) catch {
+                        var rc = restored;
+                        rc.deinit(allocator);
+                        return error.OutOfMemory;
+                    };
+                }
+            }
+        }
+
+        return if (f_clean) .ok else .unclean;
+    }
+
+    /// Level-4 reconnect of a single block: full ConnectBlock (incl input
+    /// script verification) via the REAL validator, sourcing prevouts from this
+    /// block's undo data (the exact spent coins ConnectBlock would read).
+    /// Returns true on success, false on any validation failure.
+    fn verifyChainReconnect(
+        self: *RpcServer,
+        block: *const types.Block,
+        height: u32,
+        undo: ?*const storage.BlockUndoData,
+    ) !bool {
+        const allocator = self.allocator;
+
+        // Build the prevout map (outpoint -> {script, amount}) from the undo
+        // records, mirroring blockbrew's reverifyBlockScripts and Core's
+        // ConnectBlock reading prevouts from the (disconnected) coins view.
+        const OutpointKey = [36]u8;
+        const Ctx = struct {
+            map: std.AutoHashMap(OutpointKey, validation.SigopUtxoEntry),
+
+            fn key(op: *const types.OutPoint) OutpointKey {
+                var k: OutpointKey = undefined;
+                @memcpy(k[0..32], &op.hash);
+                const le = std.mem.nativeToLittle(u32, op.index);
+                @memcpy(k[32..36], std.mem.asBytes(&le));
+                return k;
+            }
+            fn lookup(ctx_ptr: *anyopaque, op: *const types.OutPoint) ?validation.SigopUtxoEntry {
+                const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                return me.map.get(key(op));
+            }
+        };
+        var ctx = Ctx{ .map = std.AutoHashMap(OutpointKey, validation.SigopUtxoEntry).init(allocator) };
+        defer {
+            var it = ctx.map.valueIterator();
+            while (it.next()) |e| allocator.free(@constCast(e.script_pubkey));
+            ctx.map.deinit();
+        }
+
+        if (undo) |u| {
+            // One TxUndo per non-coinbase tx; transactions[1..] align to
+            // tx_undo[0..]. Each prev_output is one spent input prevout.
+            for (block.transactions[1..], 0..) |*tx, ui| {
+                if (ui >= u.tx_undo.len) return false;
+                const tx_undo = u.tx_undo[ui];
+                if (tx_undo.prev_outputs.len != tx.inputs.len) return false;
+                for (tx.inputs, 0..) |input, k| {
+                    const prev = tx_undo.prev_outputs[k];
+                    const script_copy = allocator.dupe(u8, prev.script_pubkey) catch return error.OutOfMemory;
+                    ctx.map.put(Ctx.key(&input.previous_output), .{
+                        .script_pubkey = script_copy,
+                        .amount = prev.value,
+                    }) catch {
+                        allocator.free(script_copy);
+                        return error.OutOfMemory;
+                    };
+                }
+            }
+        }
+        // Also stitch intra-block prevouts: a tx may spend an output created by
+        // an earlier tx in the SAME block (chained/CPFP). Those have no undo
+        // record (they never hit the UTXO set), so add them from the block's
+        // own outputs. ConnectBlock resolves them via the same map.
+        const crypto_mod = crypto;
+        for (block.transactions) |*tx| {
+            const txid = crypto_mod.computeTxidStreaming(tx);
+            for (tx.outputs, 0..) |out, o| {
+                if (out.script_pubkey.len > 0 and out.script_pubkey[0] == 0x6a) continue;
+                if (out.script_pubkey.len > 10000) continue;
+                const op = types.OutPoint{ .hash = txid, .index = @intCast(o) };
+                const kk = Ctx.key(&op);
+                if (ctx.map.contains(kk)) continue;
+                const script_copy = allocator.dupe(u8, out.script_pubkey) catch return error.OutOfMemory;
+                ctx.map.put(kk, .{ .script_pubkey = script_copy, .amount = out.value }) catch {
+                    allocator.free(script_copy);
+                    return error.OutOfMemory;
+                };
+            }
+        }
+
+        const sigop_view = validation.SigopUtxoView{
+            .context = @ptrCast(&ctx),
+            .lookupFn = Ctx.lookup,
+        };
+
+        // connectBlock runs ContextualCheckBlock (IsFinalTx), sigop budget,
+        // per-tx fee + coinbase-value checks, and parallel per-input script
+        // verification — the full ConnectBlock pass. sequence_view/tip are null
+        // (BIP-68 time locks are not re-checked here; the substance of level 4
+        // is the script/amount/sigop re-validation, matching the reference
+        // impls). A non-error return means the block reconnected cleanly.
+        _ = validation.connectBlock(
+            block,
+            height,
+            self.network_params,
+            &sigop_view,
+            null,
+            null,
+            allocator,
+        ) catch |err| {
+            vcLog("verifychain: connectBlock failed at {d}: {s}", .{ height, @errorName(err) });
+            return false;
+        };
+        return true;
+    }
+
+    /// Apply a block forward into the overlay (replays ConnectBlock's UTXO
+    /// mutation in the sandbox only): spend each non-coinbase input, add each
+    /// spendable output. Used between level-4 reconnect steps so the next
+    /// (higher) block's input lookups stay correct as we climb back to the tip.
+    fn verifyChainApplyForwardIntoOverlay(
+        self: *RpcServer,
+        block: *const types.Block,
+        height: u32,
+        comptime Overlay: type,
+        overlay: *Overlay,
+    ) !void {
+        const allocator = self.allocator;
+        for (block.transactions, 0..) |*tx, tx_idx| {
+            const is_coinbase = tx_idx == 0;
+            if (!is_coinbase) {
+                for (tx.inputs) |input| {
+                    const op = input.previous_output;
+                    if (overlay.getPtr(op)) |slot| {
+                        if (slot.*) |*old| {
+                            var oc = old.*;
+                            oc.deinit(allocator);
+                        }
+                        slot.* = null;
+                    } else {
+                        overlay.put(op, null) catch return error.OutOfMemory;
+                    }
+                }
+            }
+            const txid = crypto.computeTxidStreaming(tx);
+            for (tx.outputs, 0..) |out, o| {
+                if (storage.isScriptUnspendable(out.script_pubkey)) continue;
+                const op = types.OutPoint{ .hash = txid, .index = @intCast(o) };
+                const script_copy = allocator.dupe(u8, out.script_pubkey) catch return error.OutOfMemory;
+                const coin = storage.Coin{
+                    .tx_out = .{ .value = out.value, .script_pubkey = script_copy },
+                    .height = height,
+                    .is_coinbase = is_coinbase,
+                };
+                if (overlay.getPtr(op)) |slot| {
+                    if (slot.*) |*old| {
+                        var oc = old.*;
+                        oc.deinit(allocator);
+                    }
+                    slot.* = coin;
+                } else {
+                    overlay.put(op, coin) catch {
+                        var cc = coin;
+                        cc.deinit(allocator);
+                        return error.OutOfMemory;
+                    };
+                }
+            }
+        }
     }
 
     fn handleGetBestBlockHash(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
