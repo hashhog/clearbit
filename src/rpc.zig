@@ -13835,6 +13835,35 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs must be an array", id);
         }
 
+        // Parse locktime (param[2]) and replaceable (param[3]) FIRST: together
+        // they determine the default nSequence applied to inputs that omit an
+        // explicit "sequence" (Core rawtransaction_util.cpp AddInputs lines
+        // 47-65). Core defaults replaceable to TRUE (rbf.value_or(true)), so a
+        // call with no replaceable arg yields MAX_BIP125_RBF_SEQUENCE.
+        var locktime: u32 = 0;
+        if (params.array.items.len > 2) {
+            const lt = params.array.items[2];
+            if (lt == .integer) {
+                locktime = @intCast(lt.integer);
+            }
+        }
+        var replaceable: bool = true; // Core rbf.value_or(true)
+        if (params.array.items.len > 3) {
+            const rep = params.array.items[3];
+            if (rep == .bool) {
+                replaceable = rep.bool;
+            }
+        }
+        // Core: rbf -> MAX_BIP125_RBF_SEQUENCE (0xfffffffd);
+        //       else locktime != 0 -> MAX_SEQUENCE_NONFINAL (0xfffffffe);
+        //       else -> SEQUENCE_FINAL (0xffffffff).
+        const default_sequence: u32 = if (replaceable)
+            0xfffffffd
+        else if (locktime != 0)
+            0xfffffffe
+        else
+            0xffffffff;
+
         // Build transaction
         var inputs = std.ArrayList(types.TxIn).init(self.allocator);
         defer inputs.deinit();
@@ -13865,8 +13894,9 @@ pub const RpcServer = struct {
                 };
             }
 
-            // Get optional sequence
-            var seq: u32 = 0xFFFFFFFF;
+            // Explicit "sequence" wins; otherwise fall back to the
+            // replaceable/locktime-derived default (Core AddInputs).
+            var seq: u32 = default_sequence;
             if (input_item.object.get("sequence")) |seq_val| {
                 if (seq_val == .integer) {
                     seq = @intCast(seq_val.integer);
@@ -13895,72 +13925,81 @@ pub const RpcServer = struct {
             outputs.deinit();
         }
 
-        if (outputs_param == .object) {
-            var it = outputs_param.object.iterator();
-            while (it.next()) |entry| {
-                const addr_str = entry.key_ptr.*;
-                const amount_val = entry.value_ptr.*;
-
+        // Append one output (address or "data" key) to the outputs list,
+        // building its scriptPubKey via the real decoder. Mirrors Core
+        // ParseOutputs + GetScriptForDestination. Returns an error reply on
+        // failure; null on success.
+        // Returns null on success, or an owned error-reply slice (to be
+        // returned to the client) on a parse/validation failure. Allocation
+        // failures propagate as Zig errors.
+        const appendOutput = struct {
+            fn call(srv: *RpcServer, out_list: *std.ArrayList(types.TxOut), key: []const u8, amount_val: std.json.Value, rid: ?std.json.Value) !?[]const u8 {
                 var amount_sats: i64 = 0;
-                if (amount_val == .float) {
-                    amount_sats = @intFromFloat(amount_val.float * 100_000_000.0);
-                } else if (amount_val == .integer) {
-                    amount_sats = @intCast(amount_val.integer * 100_000_000);
+                var script_pubkey: []u8 = undefined;
+
+                if (std.mem.eql(u8, key, "data")) {
+                    // OP_RETURN data output: value is 0, scriptPubKey = 6a <push> <bytes>.
+                    if (amount_val != .string) {
+                        return try srv.jsonRpcError(RPC_TYPE_ERROR, "Data must be a hex string", rid);
+                    }
+                    script_pubkey = scriptPubKeyForOpReturn(srv.allocator, amount_val.string) catch |e| {
+                        return switch (e) {
+                            error.InvalidData => try srv.jsonRpcError(RPC_TYPE_ERROR, "Invalid parameter, Data is not hex", rid),
+                            else => err: {
+                                break :err try srv.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", rid);
+                            },
+                        };
+                    };
+                    amount_sats = 0;
                 } else {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
-                }
-
-                // Create scriptPubKey from address (simplified - just store address length for now)
-                const script_pubkey = self.allocator.alloc(u8, addr_str.len) catch {
-                    return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
-                };
-                @memcpy(script_pubkey, addr_str);
-
-                outputs.append(.{
-                    .value = amount_sats,
-                    .script_pubkey = script_pubkey,
-                }) catch {
-                    self.allocator.free(script_pubkey);
-                    return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
-                };
-            }
-        } else if (outputs_param == .array) {
-            for (outputs_param.array.items) |out_item| {
-                if (out_item != .object) continue;
-                var out_it = out_item.object.iterator();
-                while (out_it.next()) |entry| {
-                    const addr_str = entry.key_ptr.*;
-                    const amount_val = entry.value_ptr.*;
-
-                    var amount_sats: i64 = 0;
+                    // Address output.
                     if (amount_val == .float) {
                         amount_sats = @intFromFloat(amount_val.float * 100_000_000.0);
                     } else if (amount_val == .integer) {
                         amount_sats = @intCast(amount_val.integer * 100_000_000);
+                    } else if (amount_val == .number_string) {
+                        const f = std.fmt.parseFloat(f64, amount_val.number_string) catch {
+                            return try srv.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", rid);
+                        };
+                        amount_sats = @intFromFloat(@round(f * 100_000_000.0));
+                    } else {
+                        return try srv.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", rid);
                     }
-
-                    const script_pubkey = self.allocator.alloc(u8, addr_str.len) catch {
-                        return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
-                    };
-                    @memcpy(script_pubkey, addr_str);
-
-                    outputs.append(.{
-                        .value = amount_sats,
-                        .script_pubkey = script_pubkey,
-                    }) catch {
-                        self.allocator.free(script_pubkey);
-                        return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+                    script_pubkey = scriptPubKeyForAddress(srv.allocator, key) catch {
+                        return try srv.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address", rid);
                     };
                 }
-            }
-        }
 
-        // Parse optional locktime
-        var locktime: u32 = 0;
-        if (params.array.items.len > 2) {
-            const lt = params.array.items[2];
-            if (lt == .integer) {
-                locktime = @intCast(lt.integer);
+                out_list.append(.{
+                    .value = amount_sats,
+                    .script_pubkey = script_pubkey,
+                }) catch {
+                    srv.allocator.free(script_pubkey);
+                    return try srv.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", rid);
+                };
+                return null;
+            }
+        }.call;
+
+        if (outputs_param == .object) {
+            var it = outputs_param.object.iterator();
+            while (it.next()) |entry| {
+                if (try appendOutput(self, &outputs, entry.key_ptr.*, entry.value_ptr.*, id)) |err_reply| {
+                    return err_reply;
+                }
+            }
+        } else if (outputs_param == .array) {
+            // Array form: each element is a single-key object {addr:amt} or
+            // {"data":hex} (Core NormalizeOutputs flattens these in order,
+            // permitting duplicate addresses).
+            for (outputs_param.array.items) |out_item| {
+                if (out_item != .object) continue;
+                var out_it = out_item.object.iterator();
+                while (out_it.next()) |entry| {
+                    if (try appendOutput(self, &outputs, entry.key_ptr.*, entry.value_ptr.*, id)) |err_reply| {
+                        return err_reply;
+                    }
+                }
             }
         }
 
@@ -21281,6 +21320,50 @@ fn scriptPubKeyForAddress(allocator: std.mem.Allocator, addr_str: []const u8) ![
             @memcpy(s[2..34], addr.hash[0..32]);
             return s;
         },
+    }
+}
+
+/// Build an OP_RETURN scriptPubKey for a createrawtransaction `"data"` output.
+/// Mirrors Core's `CScript() << OP_RETURN << data` (rawtransaction_util.cpp
+/// ParseOutputs): `data_hex` is decoded to bytes, then emitted with the
+/// canonical minimal push opcode — direct push (len < 0x4c), OP_PUSHDATA1
+/// (<= 0xff), or OP_PUSHDATA2 (<= 0xffff). Caller owns the returned slice.
+/// Returns error.InvalidData if `data_hex` is not valid hex.
+fn scriptPubKeyForOpReturn(allocator: std.mem.Allocator, data_hex: []const u8) ![]u8 {
+    if (data_hex.len % 2 != 0) return error.InvalidData;
+    const n = data_hex.len / 2;
+    if (n > 0xffff) return error.InvalidData;
+
+    var data = try allocator.alloc(u8, n);
+    defer allocator.free(data);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        data[i] = std.fmt.parseInt(u8, data_hex[i * 2 .. i * 2 + 2], 16) catch {
+            return error.InvalidData;
+        };
+    }
+
+    if (n < 0x4c) {
+        const s = try allocator.alloc(u8, 2 + n);
+        s[0] = 0x6a; // OP_RETURN
+        s[1] = @intCast(n); // direct push
+        @memcpy(s[2..], data);
+        return s;
+    } else if (n <= 0xff) {
+        const s = try allocator.alloc(u8, 3 + n);
+        s[0] = 0x6a; // OP_RETURN
+        s[1] = 0x4c; // OP_PUSHDATA1
+        s[2] = @intCast(n);
+        @memcpy(s[3..], data);
+        return s;
+    } else {
+        const s = try allocator.alloc(u8, 4 + n);
+        s[0] = 0x6a; // OP_RETURN
+        s[1] = 0x4d; // OP_PUSHDATA2
+        s[2] = @intCast(n & 0xff);
+        s[3] = @intCast((n >> 8) & 0xff);
+        @memcpy(s[4..], data);
+        return s;
     }
 }
 
