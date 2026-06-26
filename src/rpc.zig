@@ -3480,6 +3480,46 @@ pub const RpcServer = struct {
         try writer.writeAll("\"testdummy\":{\"type\":\"bip9\",\"active\":false,\"bip9\":{\"bit\":28,\"start_time\":-1,\"timeout\":9223372036854775807,\"min_activation_height\":0,\"status\":\"defined\",\"since\":0}}");
     }
 
+    /// Resolve the ACTIVE chain tip's real block header (bits / timestamp).
+    ///
+    /// The chainstate-summary RPCs (getblockchaininfo, getchainstates,
+    /// getmininginfo, getdifficulty) must report the live tip's nBits/target/
+    /// difficulty, NOT genesis. The in-memory chain_manager only holds blocks
+    /// connected during the current session, so on a node that finished IBD in
+    /// an earlier run `cm.getBlock(best_hash)` misses and the old code silently
+    /// fell back to genesis bits — emitting bits=1d00ffff / difficulty=1.
+    ///
+    /// This mirrors handleGetBlockHeader's proven resolution order: read the
+    /// raw tip block bytes from CF_BLOCKS first (authoritative for every block
+    /// clearbit has on disk, including historical ones the chain_manager has
+    /// dropped), then the in-memory chain_manager, then genesis as a last
+    /// resort. Core reads tip->nBits straight off the active CChain tip
+    /// (rpc/blockchain.cpp getchainstates / getblockchaininfo).
+    fn resolveTipHeader(self: *RpcServer) types.BlockHeader {
+        // Path A: CF_BLOCKS direct read of the tip's raw block bytes — same
+        // source handleGetBlockHeader uses; correct for historical tips.
+        if (self.chain_state.utxo_set.db) |db| {
+            if (db.get(storage.CF_BLOCKS, &self.chain_state.best_hash) catch null) |raw| {
+                defer self.allocator.free(raw);
+                if (raw.len >= 80) {
+                    var reader = serialize.Reader{ .data = raw };
+                    if (serialize.readBlockHeader(&reader)) |hdr| {
+                        return hdr;
+                    } else |_| {}
+                }
+            }
+        }
+        // Path B: in-memory chain_manager (blocks connected this session).
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
+                return entry.header;
+            }
+        }
+        // Path C: genesis fallback (only when CF_BLOCKS and chain_manager both
+        // miss — e.g. a node still at genesis).
+        return self.network_params.genesis_header;
+    }
+
     fn handleGetBlockchainInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         const chain_name = switch (self.network_params.magic) {
             consensus.MAINNET.magic => "main",
@@ -3505,15 +3545,17 @@ pub const RpcServer = struct {
         // Once cleared, it latches to false (cannot flip back to true)
         const ibd = self.isInitialBlockDownload();
 
-        // Get tip bits, time, chainwork from chain_manager when available.
-        var tip_bits: u32 = self.network_params.genesis_header.bits;
-        var tip_time: u32 = self.network_params.genesis_header.timestamp;
+        // Get tip bits/time from the REAL active tip header (CF_BLOCKS →
+        // chain_manager → genesis), not genesis. chainwork still prefers the
+        // chain_manager's Core-seeded value when the tip was connected this
+        // session, else the chain_state running total.
+        const tip_hdr = self.resolveTipHeader();
+        const tip_bits: u32 = tip_hdr.bits;
+        const tip_time: u32 = tip_hdr.timestamp;
         var tip_chain_work: [32]u8 = self.chain_state.total_work;
 
         if (self.chain_manager) |cm| {
             if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
-                tip_bits = entry.header.bits;
-                tip_time = entry.header.timestamp;
                 tip_chain_work = entry.chain_work;
             }
         }
@@ -4508,15 +4550,14 @@ pub const RpcServer = struct {
         const headers_height: i64 = @as(i64, self.chain_state.best_height) +
             @as(i64, @intCast(queued_count));
 
-        // Active chainstate tip header (bits/difficulty/target). When the
-        // ChainManager is wired we read the live tip entry's nBits; otherwise
-        // fall back to the genesis bits, exactly as getblockchaininfo does.
-        var tip_bits: u32 = self.network_params.genesis_header.bits;
-        if (self.chain_manager) |cm| {
-            if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
-                tip_bits = entry.header.bits;
-            }
-        }
+        // Active chainstate tip header (bits/difficulty/target): read the REAL
+        // tip header via resolveTipHeader (CF_BLOCKS → chain_manager → genesis),
+        // exactly as getblockchaininfo does. The old code only consulted the
+        // in-memory chain_manager, which misses the tip on a node that finished
+        // IBD in a prior run, so it silently reported genesis bits=1d00ffff /
+        // difficulty=1 instead of the live tip's nBits. Core reads tip->nBits
+        // off the active CChain tip (rpc/blockchain.cpp getchainstates).
+        const tip_bits: u32 = self.resolveTipHeader().bits;
 
         // verificationprogress: clearbit has no Core GuessVerificationProgress
         // (which integrates tx-rate); the genuine progress signal it tracks is
@@ -5684,10 +5725,13 @@ pub const RpcServer = struct {
     }
 
     fn handleGetDifficulty(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
-        // Core %.16g formatting via the shared helper (was {d}, serde-shortest).
+        // Core returns GetDifficulty(ActiveChain().Tip()) (rpc/blockchain.cpp:509)
+        // — the REAL tip difficulty, not genesis. Resolve the live tip header
+        // (CF_BLOCKS → chain_manager → genesis) so a post-IBD node reports the
+        // tip's difficulty instead of the genesis 1.0. %.16g via the shared helper.
         var buf: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
-        try writeDifficultyCore(fbs.writer(), getDifficultyCore(self.network_params.genesis_header.bits));
+        try writeDifficultyCore(fbs.writer(), getDifficultyCore(self.resolveTipHeader().bits));
         return self.jsonRpcResult(fbs.getWritten(), id);
     }
 
@@ -15247,13 +15291,11 @@ pub const RpcServer = struct {
         const mempool_size = self.mempool.entries.count();
         self.mempool.mutex.unlock();
 
-        // Get tip bits from chain_manager or fall back to genesis.
-        var tip_bits: u32 = self.network_params.genesis_header.bits;
-        if (self.chain_manager) |cm| {
-            if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
-                tip_bits = entry.header.bits;
-            }
-        }
+        // Get tip bits from the REAL active tip header (CF_BLOCKS →
+        // chain_manager → genesis), not genesis. The chain_manager-only lookup
+        // missed the tip on a post-IBD node and reported genesis bits/diff.
+        // Core reads pindexPrev->nBits / GetDifficulty(tip) (rpc/mining.cpp).
+        const tip_bits: u32 = self.resolveTipHeader().bits;
         try writer.print("{{\"blocks\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":", .{
             self.chain_state.best_height,
             tip_bits,
