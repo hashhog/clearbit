@@ -1191,6 +1191,20 @@ pub const IBDValidationContext = struct {
     getMtpAtHeightFn: ?*const fn (ctx: *anyopaque, height: u32) u32 = null,
     /// Context pointer passed as the first argument to getMtpAtHeightFn.
     getMtpAtHeightCtx: ?*anyopaque = null,
+    /// Optional callback resolving the ACTIVE-chain block hash at a given height
+    /// (Core's CBlockIndex::GetAncestor analogue).  Used as the fallback for the
+    /// BIP-34-active determination (which gates whether BIP-30 enforcement can be
+    /// skipped) when the in-memory `active_chain` is null/short — e.g. after a
+    /// restart, where the node resumes from a persisted post-BIP34 tip but the
+    /// in-memory height->hash view has not been rebuilt.  The live caller
+    /// (peer.zig) implements it by walking prev-pointers from the persisted tip
+    /// via CF_BLOCKS, caching the BIP-34 anchor so the walk runs at most once.
+    /// Without it, bip34_truly_active falls back to false and BIP-30 is wrongly
+    /// enforced for recent blocks, false-rejecting a block whose coinbase output
+    /// collides with an existing UTXO entry (the 2026-06-26 post-OOM-restart
+    /// wedge).  When null, behaviour is unchanged (active_chain-only).
+    getBlockHashByHeightFn: ?*const fn (ctx: *anyopaque, height: u32) ?types.Hash256 = null,
+    getBlockHashByHeightCtx: ?*anyopaque = null,
     /// Height of the current active-chain tip at the moment this block is
     /// being accepted.  Used to enforce the fTooFarAhead gate: if the block
     /// height is more than MIN_BLOCKS_TO_KEEP (288) above the active tip AND
@@ -1452,9 +1466,26 @@ pub fn validateBlockForIBD(
         const bip34_truly_active: bool = blk: {
             const bip34_h = params.bip34_height;
             const bip34_hash = params.bip34_hash orelse break :blk false;
-            const chain = ctx.active_chain orelse break :blk false;
-            if (bip34_h >= chain.len) break :blk false; // chain too short
-            break :blk std.mem.eql(u8, &chain[bip34_h], &bip34_hash);
+            // Strongest source: the in-memory active_chain when it covers the
+            // anchor height (live full-validation / sync paths supply it).
+            if (ctx.active_chain) |chain| {
+                if (bip34_h < chain.len)
+                    break :blk std.mem.eql(u8, &chain[bip34_h], &bip34_hash);
+            }
+            // Fallback (post-restart, active_chain is null/short): resolve the
+            // anchor block hash via the caller's GetAncestor-equivalent (peer.zig
+            // walks CF_BLOCKS prev-pointers from the persisted tip, cached).  This
+            // is the Core-faithful "on the known chain at height > BIP34" check
+            // (validation.cpp ConnectBlock: pindexBIP34height->GetBlockHash() ==
+            // BIP34Hash) — without it bip34_truly_active is wrongly false and
+            // BIP-30 is wrongly enforced for recent blocks.
+            if (ctx.getBlockHashByHeightFn) |f| {
+                if (ctx.getBlockHashByHeightCtx) |c| {
+                    if (f(c, bip34_h)) |h|
+                        break :blk std.mem.eql(u8, &h, &bip34_hash);
+                }
+            }
+            break :blk false;
         };
 
         const enforce_bip30 = if (bip30_exempt)
@@ -1863,6 +1894,11 @@ pub const AcceptBlockOptions = struct {
     /// Optional: see IBDValidationContext.getMtpAtHeightFn.
     getMtpAtHeightFn: ?*const fn (ctx: *anyopaque, height: u32) u32 = null,
     getMtpAtHeightCtx: ?*anyopaque = null,
+    /// Optional: see IBDValidationContext.getBlockHashByHeightFn — persisted
+    /// active-chain hash-by-height resolver (CF_BLOCKS prev-walk) used as the
+    /// BIP-34-active fallback when active_chain is null/short (post-restart).
+    getBlockHashByHeightFn: ?*const fn (ctx: *anyopaque, height: u32) ?types.Hash256 = null,
+    getBlockHashByHeightCtx: ?*anyopaque = null,
     /// See IBDValidationContext.prev_block_timestamp.  0 = skip timewarp check.
     prev_block_timestamp: u32 = 0,
     /// See IBDValidationContext.current_time.  0 = skip future-time check.
@@ -1927,6 +1963,8 @@ pub fn acceptBlock(
         .force_skip_pow = options.force_skip_pow,
         .getMtpAtHeightFn = options.getMtpAtHeightFn,
         .getMtpAtHeightCtx = options.getMtpAtHeightCtx,
+        .getBlockHashByHeightFn = options.getBlockHashByHeightFn,
+        .getBlockHashByHeightCtx = options.getBlockHashByHeightCtx,
         .active_tip_height = options.active_tip_height,
         .is_requested = options.is_requested,
     };
@@ -8575,6 +8613,112 @@ test "validateBlockForIBD: bad BIP-34 coinbase height" {
     };
     const result = validateBlockForIBD(&block, &ctx, allocator);
     try std.testing.expectError(ValidationError.BadCoinbaseHeight, result);
+}
+
+// Repro for the 2026-06-26 post-OOM-restart wedge: with the in-memory
+// active_chain unavailable (null) AND the block's coinbase output already
+// present in the UTXO (the OOM left the UTXO ahead of the connect tip), BIP-30
+// was WRONGLY enforced because bip34_truly_active fell back to false — and the
+// colliding coinbase output then tripped Bip30DuplicateOutput.  The fix lets
+// bip34_truly_active resolve the BIP-34 anchor via ctx.getBlockHashByHeightFn
+// (the live CF_BLOCKS prev-walk), so BIP-30 is correctly skipped post-BIP34.
+test "validateBlockForIBD: BIP-30 anchor fallback skips BIP-30 post-restart (active_chain=null)" {
+    const allocator = std.testing.allocator;
+
+    // REGTEST-easy difficulty, but bip34_hash SET so the gate is reachable
+    // (regtest's real bip34_hash is null → gate short-circuits).
+    var params = consensus.REGTEST;
+    const anchor_hash: types.Hash256 = [_]u8{0xA1} ** 32;
+    params.bip34_height = 1;
+    params.bip34_hash = anchor_hash;
+
+    const height: u32 = 600;
+    // Valid BIP-34 coinbase (scriptSig prefixes the encoded height) so we pass
+    // the coinbase-height gate and REACH the BIP-30 check.
+    var hbuf: [6]u8 = undefined;
+    const h_script = encodeBip34Height(height, &hbuf);
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = h_script,
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.getBlockSubsidy(height, &params),
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }},
+        .lock_time = 0,
+    };
+    const cb_txid = try crypto.computeTxid(&coinbase, allocator);
+    const merkle = try crypto.computeMerkleRoot(&[_]types.Hash256{cb_txid}, allocator);
+    var header = params.genesis_header;
+    header.version = 4;
+    header.merkle_root = merkle;
+    header.bits = 0x207fffff;
+    ibdTestMineNonce(&header, &params);
+    const block = types.Block{ .header = header, .transactions = &[_]types.Transaction{coinbase} };
+    const block_hash = crypto.computeBlockHash(&block.header);
+
+    // Lookup that returns NON-NULL for any output outpoint (index 0) — this
+    // block's only checked outpoint is the coinbase output, simulating the
+    // OOM-inconsistent UTXO where that coin is already present.
+    const Collide = struct {
+        fn lookup(_: *anyopaque, outpoint: *const types.OutPoint) ?PrevOutInfo {
+            if (outpoint.index == 0) {
+                return .{ .script_pubkey = &[_]u8{}, .amount = 1, .height = 1, .is_coinbase = true, .owner_allocator = null };
+            }
+            return null;
+        }
+    };
+    // Anchor resolver stub: returns the canonical anchor hash at bip34_height,
+    // standing in for peer.zig's CF_BLOCKS prev-walk.
+    const Anchor = struct {
+        anchor: types.Hash256,
+        fn resolve(ctx_ptr: *anyopaque, h: u32) ?types.Hash256 {
+            const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return if (h == 1) me.anchor else null;
+        }
+    };
+    var anchor_ctx = Anchor{ .anchor = anchor_hash };
+    var dummy: u8 = 0;
+
+    const base = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = height,
+        .params = &params,
+        .prevout_lookup_ctx = @ptrCast(&dummy),
+        .prevout_lookupFn = Collide.lookup,
+        .active_chain = null, // post-restart: no in-memory chain
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+        .active_tip_height = height - 1,
+    };
+
+    // CASE A — no anchor callback: bip34_truly_active=false → BIP-30 enforced →
+    // the colliding coinbase output trips Bip30DuplicateOutput (the bug).
+    {
+        var ctx = base;
+        try std.testing.expectError(
+            ValidationError.Bip30DuplicateOutput,
+            validateBlockForIBD(&block, &ctx, allocator),
+        );
+    }
+    // CASE B — anchor callback resolves bip34_hash: bip34_truly_active=true →
+    // BIP-30 SKIPPED → must NOT be Bip30DuplicateOutput (the fix).
+    {
+        var ctx = base;
+        ctx.getBlockHashByHeightFn = Anchor.resolve;
+        ctx.getBlockHashByHeightCtx = @ptrCast(&anchor_ctx);
+        if (validateBlockForIBD(&block, &ctx, allocator)) |_| {
+            // accepted past BIP-30 — fine
+        } else |err| {
+            try std.testing.expect(err != ValidationError.Bip30DuplicateOutput);
+        }
+    }
 }
 
 /// Find a nonce for `header` (regtest-loose bits) so the resulting hash
