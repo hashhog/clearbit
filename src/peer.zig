@@ -2770,6 +2770,16 @@ pub const PeerManager = struct {
     /// no extra memory or CPU).
     header_index: std.AutoHashMap(types.Hash256, BlockHeaderEntry),
 
+    /// Memoized BIP-34 anchor hash resolved by getBlockHashByHeightTrampoline
+    /// (persisted index → CF_BLOCKS prev-walk).  Guarded by bip34_anchor_attempted
+    /// so the (potentially O(tip - bip34_height)) walk runs at most once per
+    /// process — the cache covers BOTH the resolved hash and the unresolved (null)
+    /// case, so a sparse-index/pruned node never re-walks every block.  Used by the
+    /// BIP-34-active / BIP-30 gate after a restart when the in-memory active_chain
+    /// is empty.
+    cached_bip34_anchor: ?types.Hash256 = null,
+    bip34_anchor_attempted: bool = false,
+
     /// SNAPSHOT FORWARD-SYNC: median-time-past of the snapshot base block
     /// (the height at which a `--load-snapshot` boot starts), and that base
     /// height.  Both 0 when the node did not boot from a snapshot.
@@ -7737,6 +7747,64 @@ pub const PeerManager = struct {
         return self.computeMtpAtHeight(h);
     }
 
+    /// Trampoline for IBDValidationContext.getBlockHashByHeightFn: resolve the
+    /// active-chain block hash at `target_h` (Core's CBlockIndex::GetAncestor
+    /// analogue) by walking prev-pointers from the persisted tip via CF_BLOCKS.
+    /// Used by the BIP-34-active / BIP-30 gate after a restart when the in-memory
+    /// active_chain is empty.  O(tip_h - target_h) CF_BLOCKS reads; the BIP-34
+    /// anchor result is cached (cached_bip34_anchor) so the walk runs at most once
+    /// per process.  Returns null if any block on the path is missing/corrupt or
+    /// target_h is above the tip — the caller then keeps BIP-30 enforced
+    /// (fail-safe, never falsely skips).
+    fn getBlockHashByHeightTrampoline(ctx_ptr: *anyopaque, target_h: u32) ?types.Hash256 {
+        const self: *PeerManager = @ptrCast(@alignCast(ctx_ptr));
+        const cs = self.chain_state orelse return null;
+        if (target_h > cs.best_height) return null;
+        const is_anchor = (target_h == self.network_params.bip34_height);
+        // Memoize the anchor resolution INCLUDING the failure case, so the
+        // (potentially O(tip-target)) fallback walk runs at most once per process
+        // even when it returns null (sparse index + a CF_BLOCKS gap) — never
+        // re-walk on every block.
+        if (is_anchor and self.bip34_anchor_attempted) return self.cached_bip34_anchor;
+
+        const resolved: ?types.Hash256 = blk: {
+            // 1. Fast path: the persisted H:<height>->hash index (storage.zig
+            //    getBlockHashByHeight).  O(1), restart- and prune-safe.  clearbit's
+            //    fast-IBD index is currently SPARSE (only heights flushed since the
+            //    W36 index-write landed), so historical heights (e.g. the BIP-34
+            //    anchor 227931) miss here and fall through to the walk; this stays
+            //    correct and becomes the sole path once the index is backfilled.
+            if (cs.getBlockHashByHeight(target_h)) |h| break :blk h;
+
+            // 2. Fallback: walk prev-pointers from the persisted tip via CF_BLOCKS
+            //    (Core's GetAncestor analogue).  Works on un-pruned nodes whose
+            //    sparse index lacks target_h.  NOTE: CF_BLOCKS holds block BODIES,
+            //    which --prune deletes; on a pruned node this returns null and the
+            //    caller keeps BIP-30 enforced (fail-safe, never falsely skips) —
+            //    making target's BIP-30 skip unsupported under --prune until the
+            //    persisted index is backfilled.  See design doc.
+            const db = cs.utxo_set.db orelse break :blk null;
+            var cur: types.Hash256 = cs.best_hash;
+            var h: u32 = cs.best_height;
+            while (h > target_h) {
+                const raw = (db.get(storage.CF_BLOCKS, &cur) catch break :blk null) orelse break :blk null;
+                defer self.allocator.free(raw);
+                if (raw.len < 80) break :blk null;
+                var reader = serialize.Reader{ .data = raw };
+                const hdr = serialize.readBlockHeader(&reader) catch break :blk null;
+                cur = hdr.prev_block;
+                h -= 1;
+            }
+            break :blk cur;
+        };
+
+        if (is_anchor) {
+            self.cached_bip34_anchor = resolved;
+            self.bip34_anchor_attempted = true;
+        }
+        return resolved;
+    }
+
     /// Header-time validation result.
     pub const HeaderTimeReject = enum {
         ok,
@@ -7885,6 +7953,12 @@ pub const PeerManager = struct {
                 // spent UTXO.  PeerManager is long-lived; safe to pass self here.
                 .getMtpAtHeightFn = PeerManager.getMtpAtHeightTrampoline,
                 .getMtpAtHeightCtx = @ptrCast(self),
+                // BIP-34-active / BIP-30 gate: resolve the BIP-34 anchor hash via a
+                // CF_BLOCKS prev-walk when the in-memory active_chain is empty
+                // (post-restart), so BIP-30 is not wrongly enforced and a block
+                // whose coinbase output collides with the UTXO is not false-rejected.
+                .getBlockHashByHeightFn = PeerManager.getBlockHashByHeightTrampoline,
+                .getBlockHashByHeightCtx = @ptrCast(self),
                 // fTooFarAhead gate (W97 G19c): supply the active-tip height so
                 // validateBlockForIBD can reject unrequested blocks that are more
                 // than MIN_BLOCKS_TO_KEEP (288) above our tip.  IBD drain blocks
