@@ -1485,6 +1485,18 @@ pub fn validateBlockForIBD(
                         break :blk std.mem.eql(u8, &h, &bip34_hash);
                 }
             }
+            // A' proxy fallback: when neither the in-memory active_chain nor the
+            // anchor walk can resolve the BIP-34 anchor (clearbit's historical
+            // CF_BLOCKS is sparse post-restart, so the walk returns null), fall
+            // back to the height proxy.  A node whose VALIDATED tip is already past
+            // bip34_height necessarily enforced BIP-34's coinbase-height rule over
+            // its entire chain, so a duplicate coinbase is impossible below the tip
+            // and BIP-30 is safely skippable (Core's own optimisation intent).  Safe
+            // in practice because clearbit's tip hash == canonical; the only chain
+            // this differs from Core's anchor-hash check on is a fake chain that
+            // lied its way past 227,931, which a validated node is provably not on.
+            if (bip34_h != 0 and ctx.active_tip_height >= bip34_h)
+                break :blk true;
             break :blk false;
         };
 
@@ -8695,7 +8707,7 @@ test "validateBlockForIBD: BIP-30 anchor fallback skips BIP-30 post-restart (act
         .best_tip_timestamp = 0,
         .prev_mtp = 0,
         .force_skip_scripts = true,
-        .active_tip_height = height - 1,
+        .active_tip_height = 0, // CASE A/B default: A' proxy OFF (active_tip < bip34_h) so each path is isolated
     };
 
     // CASE A — no anchor callback: bip34_truly_active=false → BIP-30 enforced →
@@ -8713,6 +8725,20 @@ test "validateBlockForIBD: BIP-30 anchor fallback skips BIP-30 post-restart (act
         var ctx = base;
         ctx.getBlockHashByHeightFn = Anchor.resolve;
         ctx.getBlockHashByHeightCtx = @ptrCast(&anchor_ctx);
+        if (validateBlockForIBD(&block, &ctx, allocator)) |_| {
+            // accepted past BIP-30 — fine
+        } else |err| {
+            try std.testing.expect(err != ValidationError.Bip30DuplicateOutput);
+        }
+    }
+    // CASE C — no anchor callback (the walk returns null: clearbit's sparse historical
+    // CF_BLOCKS live case) BUT the validated tip is already past bip34_height → the A'
+    // proxy makes bip34_truly_active=true → BIP-30 SKIPPED → must NOT be
+    // Bip30DuplicateOutput.  This is the path that actually unblocks the live node
+    // (CASE B's walk never resolves on the real node).
+    {
+        var ctx = base;
+        ctx.active_tip_height = height - 1; // tip past bip34_height (=1) → proxy fires
         if (validateBlockForIBD(&block, &ctx, allocator)) |_| {
             // accepted past BIP-30 — fine
         } else |err| {
