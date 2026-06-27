@@ -10348,17 +10348,12 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash parameter", id);
         };
 
-        // Validate and parse blockhash
-        if (blockhash_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length (expected 64 hex chars)", id);
-        }
-
+        // Validate + parse blockhash exactly as Core ParseHashV: a malformed
+        // (wrong-length OR non-hex) hash -> -8 RPC_INVALID_PARAMETER with Core's
+        // message, at the parse boundary (was -32602). Mirrors handleGetBlock.
         var blockhash: types.Hash256 = undefined;
-        for (0..32) |i| {
-            // Parse in reverse (display order to internal byte order)
-            blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
-            };
+        if (try self.parseHashParamReversed(blockhash_hex, "blockhash", &blockhash, id)) |err_resp| {
+            return err_resp;
         }
 
         // Call the chain manager
@@ -10392,17 +10387,12 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash parameter", id);
         };
 
-        // Validate and parse blockhash
-        if (blockhash_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length (expected 64 hex chars)", id);
-        }
-
+        // Validate + parse blockhash exactly as Core ParseHashV: a malformed
+        // (wrong-length OR non-hex) hash -> -8 RPC_INVALID_PARAMETER with Core's
+        // message, at the parse boundary (was -32602). Mirrors handleGetBlock.
         var blockhash: types.Hash256 = undefined;
-        for (0..32) |i| {
-            // Parse in reverse (display order to internal byte order)
-            blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
-            };
+        if (try self.parseHashParamReversed(blockhash_hex, "blockhash", &blockhash, id)) |err_resp| {
+            return err_resp;
         }
 
         // Call the chain manager
@@ -10437,17 +10427,12 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash parameter", id);
         };
 
-        // Validate and parse blockhash
-        if (blockhash_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length (expected 64 hex chars)", id);
-        }
-
+        // Validate + parse blockhash exactly as Core ParseHashV: a malformed
+        // (wrong-length OR non-hex) hash -> -8 RPC_INVALID_PARAMETER with Core's
+        // message, at the parse boundary (was -32602). Mirrors handleGetBlock.
         var blockhash: types.Hash256 = undefined;
-        for (0..32) |i| {
-            // Parse in reverse (display order to internal byte order)
-            blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
-            };
+        if (try self.parseHashParamReversed(blockhash_hex, "blockhash", &blockhash, id)) |err_resp| {
+            return err_resp;
         }
 
         // Call the chain manager
