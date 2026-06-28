@@ -6591,16 +6591,12 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash", id);
         }
         const blockhash_hex = h0.string;
-        if (blockhash_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash length", id);
-        }
-        // Display-order hex → internal little-endian bytes (reversed), matching
-        // every other hash-taking handler in this file (e.g. handleGetBlock).
+        // Core ParseHashV (rpc/util.cpp:117): a malformed blockhash (wrong-length
+        // / non-hex) -> -8 RPC_INVALID_PARAMETER with Core's message (was -32602).
+        // Mirrors handleGetBlock; returns internal (reversed) bytes.
         var blockhash: types.Hash256 = undefined;
-        for (0..32) |i| {
-            blockhash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 ..][0..2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
-            };
+        if (try self.parseHashParamReversed(blockhash_hex, "blockhash", &blockhash, id)) |err_resp| {
+            return err_resp;
         }
 
         // param[1]: peer_id (NUM).  Core uses int64; we take it as a signed
@@ -20057,12 +20053,12 @@ pub const RpcServer = struct {
         if (params.array.items.len >= 2) {
             // Caller specified blockhash
             const bh_val = params.array.items[1];
-            if (bh_val != .string or bh_val.string.len != 64)
+            if (bh_val != .string)
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be 64-char hex string", id);
+            // Core ParseHashV: a malformed blockhash -> -8 RPC_INVALID_PARAMETER.
             var bh: types.Hash256 = undefined;
-            for (0..32) |i| {
-                bh[31 - i] = std.fmt.parseInt(u8, bh_val.string[i * 2 ..][0..2], 16) catch
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash hex", id);
+            if (try self.parseHashParamReversed(bh_val.string, "blockhash", &bh, id)) |err_resp| {
+                return err_resp;
             }
             const entry_opt = if (self.chain_manager) |cm| cm.getBlock(&bh) else null;
             if (entry_opt == null) {
