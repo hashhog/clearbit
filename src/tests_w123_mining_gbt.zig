@@ -556,20 +556,21 @@ test "w123 G7 BUG-7 no UpdateTime call site in handleGetBlockTemplate" {
 }
 
 // ---------------------------------------------------------------------------
-// G8 — BUG-8 P1: getmininginfo networkhashps hardcoded 0
+// G8 — BUG-8 P1: getmininginfo networkhashps hardcoded 0 — FIXED 2026-06-28
 // ---------------------------------------------------------------------------
 
-test "w123 G8 BUG-8 getmininginfo emits networkhashps hardcoded to 0" {
+test "w123 G8 FIXED getmininginfo networkhashps delegates to computeNetworkHashPS" {
     const src = @embedFile("rpc.zig");
     const handler_start = std.mem.indexOf(u8, src, "fn handleGetMiningInfo(") orelse
         return error.TestUnexpectedResult;
     const handler_end = @min(handler_start + 4_000, src.len);
     const body = src[handler_start..handler_end];
-    // Source uses escaped quotes inside a Zig print-format literal.
-    try testing.expect(std.mem.indexOf(u8, body, "\\\"networkhashps\\\":0") != null);
-    // Does not call its own getnetworkhashps helper.
-    try testing.expect(std.mem.indexOf(u8, body, "handleGetNetworkHashPS") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "getNetworkHashPS") == null);
+    // No longer hardcodes networkhashps:0 (source uses escaped quotes in the
+    // Zig print-format literal).
+    try testing.expect(std.mem.indexOf(u8, body, "\\\"networkhashps\\\":0,") == null);
+    // Instead it computes the value via the shared estimator helper, matching
+    // Core's getnetworkhashps().HandleRequest(request).
+    try testing.expect(std.mem.indexOf(u8, body, "computeNetworkHashPS") != null);
 }
 
 // ---------------------------------------------------------------------------

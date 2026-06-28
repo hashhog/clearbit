@@ -15278,6 +15278,10 @@ pub const RpcServer = struct {
         // missed the tip on a post-IBD node and reported genesis bits/diff.
         // Core reads pindexPrev->nBits / GetDifficulty(tip) (rpc/mining.cpp).
         const tip_bits: u32 = self.resolveTipHeader().bits;
+        // networkhashps: Core (rpc/mining.cpp) emits
+        // getnetworkhashps().HandleRequest(request) — the estimate over the
+        // default 120-block window (height=-1) — not a hardcoded 0.
+        const net_hashps = self.computeNetworkHashPS(120, -1);
         try writer.print("{{\"blocks\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":", .{
             self.chain_state.best_height,
             tip_bits,
@@ -15289,7 +15293,8 @@ pub const RpcServer = struct {
         try writeTargetHex(writer, tip_bits);
         // blockmintxfee: Core BLOCK_MIN_TX_FEE default = 0.00000001 BTC/kvB
         // (1e-8), not the hardcoded 0.00001 used here previously.
-        try writer.print("\",\"networkhashps\":0,\"pooledtx\":{d},\"blockmintxfee\":0.00000001,\"chain\":\"{s}\",\"next\":{{\"height\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":", .{
+        try writer.print("\",\"networkhashps\":{d},\"pooledtx\":{d},\"blockmintxfee\":0.00000001,\"chain\":\"{s}\",\"next\":{{\"height\":{d},\"bits\":\"{x:0>8}\",\"difficulty\":", .{
+            net_hashps,
             mempool_size,
             chain_name,
             self.chain_state.best_height + 1,
@@ -19955,6 +19960,54 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// Core GetNetworkHashPS (rpc/mining.cpp): estimated network hashes/sec over
+    /// the `nblocks` window ending at `target_height` (-1 = tip). Returns f64
+    /// (0.0 on the edge cases Core also returns 0 for). Extracted so that both
+    /// getnetworkhashps and getmininginfo (which Core builds via
+    /// getnetworkhashps().HandleRequest(request)) share one implementation.
+    fn computeNetworkHashPS(self: *RpcServer, nblocks_in: i64, target_height: i64) f64 {
+        var nblocks = nblocks_in;
+        const best_height = self.chain_state.best_height;
+        var tip_h: u32 = best_height;
+        if (target_height >= 0 and @as(u32, @intCast(target_height)) <= best_height) {
+            tip_h = @intCast(target_height);
+        }
+
+        if (nblocks <= 0) {
+            nblocks = @intCast(tip_h % 2016);
+            if (nblocks == 0) nblocks = 1;
+        }
+        if (@as(u64, @intCast(nblocks)) > tip_h) {
+            nblocks = @intCast(tip_h);
+        }
+        if (nblocks == 0 or tip_h == 0) return 0.0;
+
+        const start_h = tip_h - @as(u32, @intCast(nblocks));
+
+        const cm = self.chain_manager orelse return 0.0;
+
+        // Get tip and start block index entries
+        const tip_hash_opt = self.chain_state.getBlockHashByHeight(tip_h);
+        const start_hash_opt = self.chain_state.getBlockHashByHeight(start_h);
+        if (tip_hash_opt == null or start_hash_opt == null) return 0.0;
+
+        const tip_entry = cm.getBlock(&tip_hash_opt.?) orelse return 0.0;
+        const start_entry = cm.getBlock(&start_hash_opt.?) orelse return 0.0;
+
+        const time_diff: i64 = @as(i64, @intCast(tip_entry.header.timestamp)) -
+            @as(i64, @intCast(start_entry.header.timestamp));
+        if (time_diff <= 0) return 0.0;
+
+        // Compute chainwork diff from big-endian [32]u8 arrays.
+        // Extract lower 128 bits (bytes [16..32]) which is sufficient for Bitcoin.
+        const tip_work = std.mem.readInt(u128, tip_entry.chain_work[16..][0..16], .big);
+        const start_work = std.mem.readInt(u128, start_entry.chain_work[16..][0..16], .big);
+        if (tip_work <= start_work) return 0.0;
+
+        const work_diff = tip_work - start_work;
+        return @as(f64, @floatFromInt(work_diff)) / @as(f64, @floatFromInt(time_diff));
+    }
+
     fn handleGetNetworkHashPS(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Parse optional [nblocks, height]
         var nblocks: i64 = 120;
@@ -19973,47 +20026,7 @@ pub const RpcServer = struct {
             }
         }
 
-        const best_height = self.chain_state.best_height;
-        var tip_h: u32 = best_height;
-        if (target_height >= 0 and @as(u32, @intCast(target_height)) <= best_height) {
-            tip_h = @intCast(target_height);
-        }
-
-        if (nblocks <= 0) {
-            nblocks = @intCast(tip_h % 2016);
-            if (nblocks == 0) nblocks = 1;
-        }
-        if (@as(u64, @intCast(nblocks)) > tip_h) {
-            nblocks = @intCast(tip_h);
-        }
-        if (nblocks == 0 or tip_h == 0) {
-            return self.jsonRpcResult("0", id);
-        }
-
-        const start_h = tip_h - @as(u32, @intCast(nblocks));
-
-        const cm = self.chain_manager orelse return self.jsonRpcResult("0", id);
-
-        // Get tip and start block index entries
-        const tip_hash_opt = self.chain_state.getBlockHashByHeight(tip_h);
-        const start_hash_opt = self.chain_state.getBlockHashByHeight(start_h);
-        if (tip_hash_opt == null or start_hash_opt == null) return self.jsonRpcResult("0", id);
-
-        const tip_entry = cm.getBlock(&tip_hash_opt.?) orelse return self.jsonRpcResult("0", id);
-        const start_entry = cm.getBlock(&start_hash_opt.?) orelse return self.jsonRpcResult("0", id);
-
-        const time_diff: i64 = @as(i64, @intCast(tip_entry.header.timestamp)) -
-            @as(i64, @intCast(start_entry.header.timestamp));
-        if (time_diff <= 0) return self.jsonRpcResult("0", id);
-
-        // Compute chainwork diff from big-endian [32]u8 arrays.
-        // Extract lower 128 bits (bytes [16..32]) which is sufficient for Bitcoin.
-        const tip_work = std.mem.readInt(u128, tip_entry.chain_work[16..][0..16], .big);
-        const start_work = std.mem.readInt(u128, start_entry.chain_work[16..][0..16], .big);
-        if (tip_work <= start_work) return self.jsonRpcResult("0", id);
-
-        const work_diff = tip_work - start_work;
-        const hashps: f64 = @as(f64, @floatFromInt(work_diff)) / @as(f64, @floatFromInt(time_diff));
+        const hashps = self.computeNetworkHashPS(nblocks, target_height);
 
         var result_buf: [64]u8 = undefined;
         const result_str = std.fmt.bufPrint(&result_buf, "{d}", .{hashps}) catch return error.OutOfMemory;

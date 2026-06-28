@@ -882,21 +882,23 @@ test "w108 G21 BUG-21 curtime not clamped to MTP+1 (UpdateTime semantics absent)
 }
 
 // ---------------------------------------------------------------------------
-// G22 — getmininginfo networkhashps=0 (BUG-22: hardcoded)
+// G22 — getmininginfo networkhashps=0 (BUG-22) — FIXED 2026-06-28
 // ---------------------------------------------------------------------------
 //
 // Core mining.cpp:472: obj.pushKV("networkhashps", getnetworkhashps().HandleRequest(request))
 //   which calls GetNetworkHashPS() — work diff / time diff over last 120 blocks.
 //
-// BUG-22: clearbit getmininginfo emits hardcoded `"networkhashps":0`.
+// FIXED: getmininginfo now delegates to the shared computeNetworkHashPS(120, -1)
+// helper (same estimator as getnetworkhashps) instead of emitting hardcoded 0.
 
-test "w108 G22 BUG-22 getmininginfo networkhashps is hardcoded 0 (not computed)" {
-    // This is an RPC-layer bug. Document that GetNetworkHashPS logic EXISTS
-    // in clearbit (handleGetNetworkHashPS) but is disconnected from getmininginfo.
-    // getmininginfo just emits 0 without calling the hash-rate helper.
-    // FIX: getmininginfo should call GetNetworkHashPS(120, -1) and embed result.
-    const hardcoded: u64 = 0;
-    try testing.expectEqual(@as(u64, 0), hardcoded);
+test "w108 G22 FIXED getmininginfo networkhashps delegates to computeNetworkHashPS" {
+    // Source-level assertion: getmininginfo now calls the shared estimator.
+    const src = @embedFile("rpc.zig");
+    const start = std.mem.indexOf(u8, src, "fn handleGetMiningInfo(") orelse
+        return error.TestUnexpectedResult;
+    const body = src[start..@min(start + 4_000, src.len)];
+    try testing.expect(std.mem.indexOf(u8, body, "computeNetworkHashPS") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\\\"networkhashps\\\":0,") == null);
 }
 
 // ---------------------------------------------------------------------------
