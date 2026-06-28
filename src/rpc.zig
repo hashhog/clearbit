@@ -3524,6 +3524,8 @@ pub const RpcServer = struct {
         const chain_name = switch (self.network_params.magic) {
             consensus.MAINNET.magic => "main",
             consensus.TESTNET.magic => "test",
+            consensus.TESTNET4.magic => "testnet4",
+            consensus.SIGNET.magic => "signet",
             consensus.REGTEST.magic => "regtest",
             else => "unknown",
         };
@@ -15261,6 +15263,8 @@ pub const RpcServer = struct {
         const chain_name = switch (self.network_params.magic) {
             consensus.MAINNET.magic => "main",
             consensus.TESTNET.magic => "test",
+            consensus.TESTNET4.magic => "testnet4",
+            consensus.SIGNET.magic => "signet",
             consensus.REGTEST.magic => "regtest",
             else => "unknown",
         };
