@@ -1709,8 +1709,9 @@ pub const RpcServer = struct {
                 return;
             }
             const provided = auth_header[6..];
-            const user_pass_match = if (self.config.auth_token) |t| std.mem.eql(u8, provided, t) else false;
-            const cookie_match = if (self.config.cookie_token) |t| std.mem.eql(u8, provided, t) else false;
+            // Constant-time compare to avoid a timing oracle on the RPC token.
+            const user_pass_match = if (self.config.auth_token) |t| constantTimeEql(provided, t) else false;
+            const cookie_match = if (self.config.cookie_token) |t| constantTimeEql(provided, t) else false;
             if (!user_pass_match and !cookie_match) {
                 try self.sendHttpError(conn.stream, 401, "Unauthorized");
                 return;
@@ -21294,6 +21295,22 @@ fn w47bParsePartialMerkleTree(allocator: std.mem.Allocator, data: []const u8) !W
 // ============================================================================
 
 /// Find an HTTP header value by name.
+/// Constant-time byte-slice equality for credential comparison. Runs in time
+/// independent of the secret's content (no early-out on first mismatching byte),
+/// closing the timing oracle that `std.mem.eql` opens on RPC auth tokens. The
+/// length comparison itself is low-sensitivity (token format/length is fixed).
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    var diff: u8 = if (a.len == b.len) 0 else 1;
+    const n = @max(a.len, b.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const ca: u8 = if (i < a.len) a[i] else 0;
+        const cb: u8 = if (i < b.len) b[i] else 0;
+        diff |= ca ^ cb;
+    }
+    return diff == 0;
+}
+
 fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
     while (lines.next()) |line| {
