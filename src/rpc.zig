@@ -13095,13 +13095,10 @@ pub const RpcServer = struct {
                     .string => arg0.string,
                     else => return self.jsonRpcError(RPC_INVALID_PARAMS, "hash_or_height must be a height or block hash", id),
                 };
-                if (hex.len != 64) {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be of length 64 (not lesser)", id);
-                }
-                for (0..32) |i| {
-                    blockhash[31 - i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
-                        return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be hexadecimal string", id);
-                    };
+                // Core ParseHashV (via ParseHashOrHeight): a malformed hash ->
+                // -8 RPC_INVALID_PARAMETER with Core's message (was -32602).
+                if (try self.parseHashParamReversed(hex, "hash_or_height", &blockhash, id)) |err_resp| {
+                    return err_resp;
                 }
                 // Resolve hash → height: tip, then in-memory chain index, then
                 // the persisted CF_BLOCK_INDEX record (height-prefixed header).
@@ -20272,7 +20269,12 @@ pub const RpcServer = struct {
             return self.jsonRpcResult(out.items, id);
         }
 
-        return self.jsonRpcError(RPC_INTERNAL_ERROR, "gettxoutproof: block not available locally and Core proxy failed", id);
+        // Core gettxoutproof: a block that cannot be resolved (unknown to the
+        // chain, or unavailable) surfaces as -5 RPC_INVALID_ADDRESS_OR_KEY
+        // "Block not found" (blockchain.cpp) — was -32603 RPC_INTERNAL_ERROR. On
+        // the pinned node the Core proxy resolves every known block, so this
+        // fallback fires for genuinely-unknown hashes.
+        return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
     }
 
     /// Proxy verifytxoutproof to a local Bitcoin Core instance (W68).
