@@ -654,10 +654,9 @@ pub const MAINNET = NetworkParams{
     .enforce_bip94 = false,
     .pow_target_spacing = TARGET_SPACING,
     .pow_target_timespan = TARGET_TIMESPAN,
-    // Mainnet min_chain_work: ~7.9 * 10^73 (as of late 2024)
-    // This is approximately the work at block ~870,000
-    // Stored as little-endian 256-bit integer
-    .min_chain_work = hexToHash("00000000000000000000000000000000000000009c68c8e19c0c2e0b00000000"),
+    // Mainnet min_chain_work: Bitcoin Core v28.0 value (display/BE hex; hexToHash flips to LE).
+    // Approximately the work at block ~938,343.
+    .min_chain_work = hexToHash("0000000000000000000000000000000000000001128750f82f4c366153a3a030"),
     // Mainnet assumeUTXO snapshots — verbatim from Bitcoin Core
     // kernel/chainparams.cpp (CMainParams::CMainParams::m_assumeutxo_data).
     // Bytes are in Core's display (big-endian) hex; hexToHash flips them
@@ -810,13 +809,14 @@ pub const TESTNET3 = NetworkParams{
     .enforce_bip94 = false,
     .pow_target_spacing = TARGET_SPACING,
     .pow_target_timespan = TARGET_TIMESPAN,
-    // Testnet3 min_chain_work: lower threshold for testing
-    .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
+    // Testnet3 min_chain_work: Bitcoin Core v28.0 value (display/BE hex; hexToHash flips to LE).
+    .min_chain_work = hexToHash("0000000000000000000000000000000000000000000017dde1c649f3708d14b6"),
     // No assumeUTXO snapshots for testnet3
     .assume_utxo = &[_]AssumeUtxoData{},
-    // Testnet3 has no active assumevalid; scripts always run.
-    .assumed_valid_hash = null,
-    .assume_valid_height = 0,
+    // Testnet3 defaultAssumeValid: Bitcoin Core v28.0 (height 4842348).
+    // Display: 000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4
+    .assumed_valid_hash = hexToHash("000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"),
+    .assume_valid_height = 4842348,
     .bip30_exceptions = &[_]Bip30Exception{}, // No BIP-30 exceptions on testnet3
     // Testnet3 BIP34 was active from height 21111; the bypass path is never
     // triggered by a canonical chain, but we store the hash for correctness.
@@ -867,14 +867,14 @@ pub const TESTNET4 = NetworkParams{
     .enforce_bip94 = true,
     .pow_target_spacing = TARGET_SPACING,
     .pow_target_timespan = TARGET_TIMESPAN,
-    // Testnet4 min_chain_work: lower threshold for testing
-    .min_chain_work = hexToHash("0000000000000000000000000000000000000000000000000000000100000000"),
+    // Testnet4 min_chain_work: Bitcoin Core v28.0 value (display/BE hex; hexToHash flips to LE).
+    .min_chain_work = hexToHash("0000000000000000000000000000000000000000000009a0fe15d0177d086304"),
     // No assumeUTXO snapshots for testnet4
     .assume_utxo = &[_]AssumeUtxoData{},
-    // Bitcoin Core v28.0 defaultAssumeValid for testnet4 (height 4842348).
-    // Display: 000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4
-    .assumed_valid_hash = hexToHash("000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"),
-    .assume_valid_height = 4842348,
+    // Testnet4 defaultAssumeValid: Bitcoin Core v28.0 (height 123613).
+    // Display: 0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a
+    .assumed_valid_hash = hexToHash("0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"),
+    .assume_valid_height = 123613,
     .bip30_exceptions = &[_]Bip30Exception{}, // No BIP-30 exceptions on testnet4
     // Testnet4: BIP34 active from genesis; null hash disables the bypass check.
     .bip34_hash = null,
