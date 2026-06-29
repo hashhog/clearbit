@@ -917,7 +917,7 @@ fn processReorg(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !vo
     //   (a) depth-cap probe (disconnect.len > MAX_REORG_DEPTH): build a REAL
     //       linked coinbase-only old chain of that depth via the production
     //       connectBlockFastWithUndo, so the disconnect WALK hits the
-    //       MAX_REORG_DEPTH=100 cap and returns error.ReorgTooDeep. The corpus
+    //       MAX_REORG_DEPTH=288 cap and returns error.ReorgTooDeep. The corpus
     //       block bytes for this case are placeholders signalling "N deep".
     //   (b) normal disconnect: stage each given old block body + explicit undo
     //       into CF_BLOCKS/CF_BLOCK_UNDO and set the tip; reorgToChain walks

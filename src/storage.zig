@@ -4434,7 +4434,7 @@ pub const ChainState = struct {
         //     coins that do not belong (snapshot corruption).  Skip the
         //     reconcile and let the forward-sync overwrite the stale H: entries
         //     per block (the safe, pre-fix behavior).  Loud so an operator who
-        //     hit a real >100-deep inconsistency knows to reindex.
+        //     hit a real >288-deep inconsistency knows to reindex.
         if (surplus.items.len > MAX_REORG_DEPTH) {
             std.debug.print(
                 "boot-reconcile: SKIP — surplus of {d} block(s) above tip {d} " ++
@@ -5039,19 +5039,15 @@ pub const ChainState = struct {
         height: u32,
     };
 
-    /// Pattern D — multi-block reorg atomicity.  CORE-PARITY-AUDIT/
-    /// _post-reorg-consistency-fleet-result-2026-05-05.md flagged clearbit
-    /// (and 8 other impls) as D-AT-RISK: per-block disconnect+connect was
-    /// already atomic, but a multi-block reorg = N+M *separate* batches.
-    /// A crash between batches left the on-disk chainstate at an
-    /// intermediate mid-reorg height.  This bound matches the worst-case
-    /// reorg the wiretap accepts today and gives an upper bound on the
-    /// in-memory queue allocations the single-batch path holds onto
-    /// before commit.  Above this depth the reorg is rejected as
-    /// "ReorgTooDeep" — the operator is expected to investigate (a 100-
-    /// block reorg in the wild would be a major chain-split incident,
-    /// not something to silently apply).
-    pub const MAX_REORG_DEPTH: u32 = 100;
+    /// Implementation-specific memory-safety bound: the whole reorg is staged
+    /// in ONE in-memory WriteBatch, so this caps unbounded allocations before
+    /// the atomic commit.  Bitcoin Core has NO reorg-depth cap — it follows
+    /// most-work, bounded only by undo-data retention.  288 = Core's
+    /// MIN_BLOCKS_TO_KEEP — aligns clearbit's cap with the minimum undo
+    /// retention of a pruned Core node so a reorg that Core could execute
+    /// is also within clearbit's batch budget.  CORE-PARITY-AUDIT/
+    /// _post-reorg-consistency-fleet-result-2026-05-05.md (Pattern D).
+    pub const MAX_REORG_DEPTH: u32 = 288;
 
     /// Switch the active chain to the new branch ending at `new_tip_hash`.
     ///
@@ -5077,7 +5073,7 @@ pub const ChainState = struct {
     ///      `disconnectBlockByHashCFNoFlush`.  Each disconnect's UTXO
     ///      restores, tip rewind, CF_BLOCK_UNDO delete, and CF_TX_INDEX
     ///      deletes are appended to the shared pending queues without
-    ///      hitting the disk.  Capped at `MAX_REORG_DEPTH = 100` to bound
+    ///      hitting the disk.  Capped at `MAX_REORG_DEPTH = 288` to bound
     ///      in-memory queue allocations for an attacker-supplied bad
     ///      fork_point.  The undo data for each disconnect MUST be
     ///      present in CF_BLOCK_UNDO (i.e. the original connect went
@@ -5176,7 +5172,7 @@ pub const ChainState = struct {
         }
 
         // Walk back to the fork point, disconnecting each block along the
-        // way.  Bound the work to MAX_REORG_DEPTH = 100.
+        // way.  Bound the work to MAX_REORG_DEPTH = 288.
         var disconnect_count: u32 = 0;
 
         // Pattern D: errdefer drops pending queues on any failure path
