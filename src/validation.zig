@@ -2938,7 +2938,15 @@ pub fn verifyBlockScriptsParallel(
     config: ParallelVerifyConfig,
     allocator: std.mem.Allocator,
 ) ValidationError!bool {
-    const flags = getBlockScriptFlags(height, params);
+    // Thread the block hash so Core's script_flag_exceptions override
+    // (getBlockScriptFlagsForHash) reaches the actual signature checks for the
+    // two historical BIP16/Taproot violator blocks. With the height-only
+    // getBlockScriptFlags the override never reached here, so those blocks would
+    // false-reject whenever their scripts ARE verified (--noassumevalid / the
+    // import tool / a reorg revalidation). Keyed by exact block hash → no effect
+    // on any other block.
+    const av_exc_block_hash = crypto.computeBlockHash(&block.header);
+    const flags = getBlockScriptFlagsForHash(height, params, &av_exc_block_hash);
 
     // Count total inputs (excluding coinbase)
     var total_inputs: usize = 0;

@@ -9710,10 +9710,11 @@ pub const RpcServer = struct {
         var adapter = Adapter{ .cs_ptr = self.chain_state, .alloc = self.allocator };
 
         // Assumevalid script-skip: same logic as the IBD path in peer.zig.
-        // Non-script checks are never skipped regardless.
-        const av_height = self.network_params.assume_valid_height;
-        const skip_via_height = (height <= av_height) and (av_height != 0) and
-            (self.network_params.assumed_valid_hash != null);
+        // submitblock NEVER skips script verification: a miner-submitted block
+        // lands at the current tip (far above assume_valid_height), so Core's
+        // assumevalid gate (block_height <= av_height) could never fire here.
+        // The old bare-height `skip_via_height` was also a hole — a submitblock
+        // claiming a height <= av_height would skip script checks. Always verify.
 
         // Note: prev_mtp = 0 for submitblock because the block_template path
         // already enforces BIP-113 (timestamp > MTP) unconditionally before
@@ -9726,7 +9727,7 @@ pub const RpcServer = struct {
             @ptrCast(&adapter),
             Adapter.lookup,
             self.allocator,
-            .{ .prev_mtp = 0, .force_skip_scripts = skip_via_height },
+            .{ .prev_mtp = 0, .force_skip_scripts = false },
         ) catch |err| {
             const bip22 = validationErrToBip22(err);
             std.debug.print(
