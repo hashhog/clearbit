@@ -2802,6 +2802,14 @@ pub const PeerManager = struct {
     /// announcements while one is pending are deferred to the next round.
     pending_reorg: ?PendingReorg,
 
+    /// Best-known-header chainwork and timestamp for the faithful assumevalid
+    /// script-skip gate (Core ConnectBlock:2346-2366 conditions 4 + 5).
+    /// Mirrors Bitcoin Core's m_best_header field (validation.cpp).
+    /// Updated in insertHeader whenever a header with strictly greater
+    /// cumulative chain_work arrives.  Zero until the first headers batch.
+    best_header_chain_work: [32]u8 = [_]u8{0} ** 32,
+    best_header_timestamp: u32 = 0,
+
     /// Maps block hash → source peer pointer (as usize) so drainBlockBuffer
     /// can penalise the supplying peer when validateBlockForIBDOrReject rejects
     /// a block.  Mirrors Bitcoin Core's mapBlockSource (net_processing.cpp:834).
@@ -4832,6 +4840,14 @@ pub const PeerManager = struct {
         };
 
         try self.header_index.put(block_hash.*, entry);
+
+        // Track the highest-chainwork header seen (Core m_best_header,
+        // AcceptBlockHeader in validation.cpp:4233-4237).  Used by the
+        // faithful assumevalid gate (faithfulSkipScriptsGate conditions 4+5).
+        if (cmpChainWorkBE(&entry.chain_work, &self.best_header_chain_work) > 0) {
+            self.best_header_chain_work = entry.chain_work;
+            self.best_header_timestamp = entry.timestamp;
+        }
 
         // Cap at MAX_HEADER_INDEX entries.  Eviction is amortized: only
         // sweep when we cross the cap, drop the oldest 10% by
@@ -7853,6 +7869,85 @@ pub const PeerManager = struct {
         return .ok;
     }
 
+    /// Faithful 5-condition assumevalid script-skip gate mirroring Bitcoin
+    /// Core's ConnectBlock (validation.cpp:2346-2366).
+    ///
+    /// Returns true (skip script verification) iff ALL of:
+    ///
+    ///   (1) params.assumed_valid_hash is configured (non-null).
+    ///   (2) The assumevalid block IS in our expected-block queue at av_height
+    ///       (verifies the chain we're syncing passes through av_hash).
+    ///   (3) The block being connected is an ancestor of av_hash: it is in
+    ///       expected_blocks at its height AND height <= av_height.
+    ///   (4) best_header_chain_work >= params.min_chain_work (eclipse defence).
+    ///   (5) best_header_timestamp > block_timestamp + 1_209_600 (DoS defence;
+    ///       timestamp approximation of Core's GetBlockProofEquivalentTime).
+    ///
+    /// KEY FIX vs the old height-only skip: a FORK block at height <= av_height
+    /// is NOT in expected_blocks at the correct position (conditions 2 and/or 3
+    /// fail), so its scripts are verified.  An on-chain block at the same height
+    /// passes all five conditions and has scripts skipped.
+    ///
+    /// The gate is STRICTLY STRONGER than height-only: it can only INCREASE the
+    /// set of blocks whose scripts are verified → fail-safe direction.
+    pub fn faithfulSkipScriptsGate(
+        self: *PeerManager,
+        block_hash: *const types.Hash256,
+        height: u32,
+        block_timestamp: u32,
+    ) bool {
+        const TWO_WEEKS: u64 = 1_209_600; // 60 * 60 * 24 * 7 * 2
+
+        // Condition 1: assumed_valid_hash must be configured.
+        const av_hash = self.network_params.assumed_valid_hash orelse return false;
+        const av_height = self.network_params.assume_valid_height;
+        if (av_height == 0) return false; // Regtest / no assumevalid
+
+        // Condition 3a: block must be at or below av_height.
+        if (height > av_height) return false;
+
+        // Conditions 2 + 3b: verify both the AV block and the current block are
+        // in expected_blocks at their respective heights.
+        //
+        // expected_blocks[i] = hash at height (H0 + 1 + i) where
+        //   H0 = cs.best_height - connect_cursor  (IBD start height).
+        // Inside validateBlockForIBDOrReject:
+        //   height = cs.best_height + 1  →  block_idx == connect_cursor.
+        const cs = self.chain_state orelse return false;
+        const h0: u32 = if (cs.best_height >= self.connect_cursor)
+            cs.best_height - self.connect_cursor
+        else
+            0;
+
+        // Condition 3b: block must be in expected_blocks at its height.
+        if (height == 0 or height < h0 + 1) return false;
+        const block_idx = height - h0 - 1;
+        if (block_idx >= self.expected_blocks.items.len) return false;
+        if (!std.mem.eql(u8, &self.expected_blocks.items[block_idx], block_hash))
+            return false;
+
+        // Condition 2: AV block must be in expected_blocks at av_height.
+        if (av_height < h0 + 1) return false;
+        const av_idx = av_height - h0 - 1;
+        if (av_idx >= self.expected_blocks.items.len) return false;
+        if (!std.mem.eql(u8, &self.expected_blocks.items[av_idx], &av_hash))
+            return false;
+
+        // Condition 4: best_header_chain_work >= min_chain_work.
+        if (cmpChainWorkBE(
+            &self.best_header_chain_work,
+            &self.network_params.min_chain_work,
+        ) < 0) return false;
+
+        // Condition 5: best header timestamp at least TWO_WEEKS past this block.
+        if (self.best_header_timestamp <= block_timestamp) return false;
+        const elapsed: u64 = @as(u64, self.best_header_timestamp) -
+            @as(u64, block_timestamp);
+        if (elapsed <= TWO_WEEKS) return false;
+
+        return true;
+    }
+
     /// IBD-time consensus validation gate.  Returns true when the block is
     /// safe to apply via `connectBlockFast`, false on any consensus rule
     /// violation or unrecoverable lookup error.
@@ -7913,14 +8008,14 @@ pub const PeerManager = struct {
         };
         var adapter = Adapter{ .cs_ptr = cs, .alloc = self.allocator };
 
-        // Assumevalid script-skip: if the block height is at or below the
-        // assumed-valid height AND we have a valid assumed-valid hash, skip
-        // script verification (but not any other consensus check).  This
-        // matches Core's intent — scripts are skipped for ancestors of the
-        // assumed-valid block once the headers-first sync invariant holds.
-        const av_height = self.network_params.assume_valid_height;
-        const skip_via_height = (height <= av_height) and (av_height != 0) and
-            (self.network_params.assumed_valid_hash != null);
+        // Faithful assumevalid script-skip gate (Core ConnectBlock:2346-2366).
+        // Replaces the old height-only skip which wrongly allowed a fork block
+        // at height <= av_height to have its scripts skipped.
+        // faithfulSkipScriptsGate checks all 5 conditions: (1) av_hash set,
+        // (2) AV block in our expected chain, (3) this block is an ancestor of
+        // AV (in expected chain at correct height), (4) best-header chainwork
+        // >= min_chain_work, (5) best header at least 2 weeks past this block.
+        const skip_scripts = self.faithfulSkipScriptsGate(block_hash, height, block.header.timestamp);
 
         // BIP-113: compute MTP-of-11 for the block's parent.
         const prev_mtp = self.computePrevMtp(&block.header.prev_block);
@@ -7947,7 +8042,7 @@ pub const PeerManager = struct {
                 .prev_mtp = prev_mtp,
                 .prev_block_timestamp = prev_block_timestamp,
                 .current_time = current_time,
-                .force_skip_scripts = skip_via_height,
+                .force_skip_scripts = skip_scripts,
                 // BIP-68 time-based enforcement: wire the MTP-at-height callback
                 // so validateBlockForIBD can look up the prior-block MTP for each
                 // spent UTXO.  PeerManager is long-lived; safe to pass self here.
