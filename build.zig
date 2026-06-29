@@ -1406,6 +1406,42 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w142_tests.step);
     }
 
+    // W143 — Faithful assumevalid script-skip gate (Core ConnectBlock:2346-2366).
+    // Replaces the height-only skip (skip_via_height) in peer.zig with the
+    // full 5-condition gate.  Proves that a FORK block below av_height is now
+    // script-verified (was previously wrongly skipped) while an on-chain block
+    // at the same height with all 5 conditions met is still skipped.
+    // Run with `zig build test-w143`.
+    {
+        const w143_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w143_assumevalid_gate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"w143"},
+        });
+        w143_tests.linkSystemLibrary("rocksdb");
+        w143_tests.linkSystemLibrary("secp256k1");
+        w143_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w143_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w143_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w143_tests.linkSystemLibrary("minisketch");
+            w143_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w143_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w143_tests = b.addRunArtifact(w143_tests);
+        const w143_test_step = b.step("test-w143", "Run W143 faithful assumevalid 5-condition gate proof suite");
+        w143_test_step.dependOn(&run_w143_tests.step);
+        // Fold into the main `test` step so CI exercises W143.
+        test_step.dependOn(&run_w143_tests.step);
+    }
+
     // FIX-3G — ADDR/ADDRV2 peer-timestamp clamp (3G policy, fleet-wide).
     // Reference: bitcoin-core/src/net_processing.cpp:5678-5679.
     // Clamps peer-advertised nTime that is pre-2001 (≤100_000_000s) or more than
