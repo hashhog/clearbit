@@ -6960,7 +6960,7 @@ pub const ChainManager = struct {
         //
         // Only runs when a mempool is wired in — non-RPC paths (test
         // shims, P2P bootstrap with mempool=null) pass null and skip
-        // the work.  Bound by MAX_REORG_DEPTH (100), same cap as the
+        // the work.  Bound by MAX_REORG_DEPTH (288), same cap as the
         // new-chain segment above; in practice mempool snapshotting is
         // rare-event.  Bitcoin Core reference:
         // `MaybeUpdateMempoolForReorg` called from

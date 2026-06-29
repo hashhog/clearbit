@@ -1508,7 +1508,7 @@ fn fireReorgFromSideBranch(
         var walk_depth: u32 = 0;
         // Bound the snapshot walk to MAX_DEPTH so a malformed index
         // never runs us off into infinity.  reorgToChain itself caps
-        // at storage.ChainState.MAX_REORG_DEPTH (100, per Pattern D
+        // at storage.ChainState.MAX_REORG_DEPTH (288, per Pattern D
         // multi-block atomicity batch-size cap) — but the fork-point
         // walk above uses MAX_DEPTH for symmetry with the peer-layer
         // header walk (peer.MAX_REORG_DEPTH = 288).  A reorg accepted
