@@ -1737,10 +1737,12 @@ pub const BlockDownloader = struct {
 
         const block_hash = crypto.computeBlockHash(&block.header);
 
-        // Assumevalid script-skip: mirrors peer.zig logic.
-        const av_height = params.assume_valid_height;
-        const skip_via_height = (height <= av_height) and (av_height != 0) and
-            (params.assumed_valid_hash != null);
+        // This legacy BlockDownloader path is superseded by peer.zig and not in
+        // the live fleet, and it has no height->hash resolver wired for the
+        // faithful 6-condition gate. The conservative, fail-safe choice is to
+        // ALWAYS verify scripts here (never skip via a bare height compare). If
+        // reactivated, wire a ChainStore getBlockHashByHeightFn + best-tip
+        // inputs and route through the faithful gate as peer.zig will.
 
         // Per-call lookup adapter for the ChainStore-backed UTXO set.
         // Uses ChainStore.getUtxo (different from ChainState.utxo_set.get
@@ -1786,7 +1788,7 @@ pub const BlockDownloader = struct {
                 self.allocator,
                 .{
                     .prev_mtp = prev_mtp,
-                    .force_skip_scripts = skip_via_height,
+                    .force_skip_scripts = false,
                     // fTooFarAhead gate (W97 G19c): active tip is one below the
                     // block being validated.  BlockDownloader requests blocks
                     // sequentially (is_requested=true), so the ceiling is not
