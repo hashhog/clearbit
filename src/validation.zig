@@ -1930,6 +1930,15 @@ pub const AcceptBlockOptions = struct {
     /// live node uses at post-BIP34 heights (Core validation.cpp:2460-2462:
     /// pindexBIP34height->GetBlockHash() == BIP34Hash).
     active_chain: ?[]const types.Hash256 = null,
+    /// Best-known-header chainwork for the assumevalid script-skip gate
+    /// (shouldSkipScripts condition 4, IBDValidationContext.best_tip_chain_work).
+    /// Only relevant when active_chain != null.  Zero = not provided (the
+    /// peer.zig path uses force_skip_scripts instead of active_chain, so this
+    /// field has no effect on that path).
+    best_tip_chain_work: [32]u8 = [_]u8{0} ** 32,
+    /// Best-known-header Unix timestamp for the 2-week gap check (condition 5).
+    /// Only relevant when active_chain != null.  Zero = not provided.
+    best_tip_timestamp: u32 = 0,
 };
 
 /// Unified block consensus-validation entry point.
@@ -1966,8 +1975,8 @@ pub fn acceptBlock(
         .prevout_lookup_ctx = prevout_lookup_ctx,
         .prevout_lookupFn = prevout_lookupFn,
         .active_chain = options.active_chain,
-        .best_tip_chain_work = [_]u8{0} ** 32,
-        .best_tip_timestamp = 0,
+        .best_tip_chain_work = options.best_tip_chain_work,
+        .best_tip_timestamp = options.best_tip_timestamp,
         .prev_mtp = options.prev_mtp,
         .prev_block_timestamp = options.prev_block_timestamp,
         .current_time = options.current_time,
