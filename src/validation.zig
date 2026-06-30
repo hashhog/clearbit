@@ -1939,6 +1939,13 @@ pub const AcceptBlockOptions = struct {
     /// Best-known-header Unix timestamp for the 2-week gap check (condition 5).
     /// Only relevant when active_chain != null.  Zero = not provided.
     best_tip_timestamp: u32 = 0,
+    /// Expected nBits = GetNextWorkRequired(pindexPrev) for the block being
+    /// accepted.  When non-zero, enforces Core's "bad-diffbits" gate:
+    /// block.header.bits must equal this value.  0 = not available / skip.
+    /// Callers compute this via PeerManager.computeExpectedBits (peer.zig) or
+    /// equivalent before calling acceptBlock.
+    /// Reference: bitcoin-core/src/validation.cpp:4088.
+    expected_bits: u32 = 0,
 };
 
 /// Unified block consensus-validation entry point.
@@ -1988,6 +1995,7 @@ pub fn acceptBlock(
         .getBlockHashByHeightCtx = options.getBlockHashByHeightCtx,
         .active_tip_height = options.active_tip_height,
         .is_requested = options.is_requested,
+        .expected_bits = options.expected_bits,
     };
     return validateBlockForIBD(block, &ctx, allocator);
 }

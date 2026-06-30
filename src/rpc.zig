@@ -9583,6 +9583,7 @@ pub const RpcServer = struct {
             .ok => {},
             .future_time => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-too-new", id),
             .mtp_violation => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-too-old", id),
+            .bad_diffbits => return self.jsonRpcError(RPC_VERIFY_ERROR, "bad-diffbits", id),
         }
 
         // ── Step 6: admit into the block index (Core AcceptBlockHeader) ─────
@@ -9745,6 +9746,16 @@ pub const RpcServer = struct {
         // Note: prev_mtp = 0 for submitblock because the block_template path
         // already enforces BIP-113 (timestamp > MTP) unconditionally before
         // calling this function (handleSubmitBlock lines ~2737-2739).
+        //
+        // bad-diffbits: compute the expected nBits via the peer_manager's walk
+        // adapter (same method used by the IBD body path).  Returns 0 if the
+        // parent chain is not resolvable (skip the check, preserve prior
+        // behaviour); otherwise enforces Core's ContextualCheckBlockHeader:4088.
+        const expected_bits_val = self.peer_manager.computeExpectedBits(
+            block.header.prev_block,
+            height,
+            block.header.timestamp,
+        );
         validation.acceptBlock(
             block,
             block_hash,
@@ -9753,7 +9764,11 @@ pub const RpcServer = struct {
             @ptrCast(&adapter),
             Adapter.lookup,
             self.allocator,
-            .{ .prev_mtp = 0, .force_skip_scripts = false },
+            .{
+                .prev_mtp = 0,
+                .force_skip_scripts = false,
+                .expected_bits = expected_bits_val,
+            },
         ) catch |err| {
             const bip22 = validationErrToBip22(err);
             std.debug.print(
