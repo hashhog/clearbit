@@ -2914,13 +2914,19 @@ fn getLastPushData(script_sig: []const u8) ?[]const u8 {
             if (pc + 5 + push_len > script_sig.len) return null;
             last_data = script_sig[pc + 5 .. pc + 5 + push_len];
             pc += 5 + push_len;
-        } else if (opcode >= 0x51 and opcode <= 0x60) {
-            // OP_1 through OP_16: push a single byte value
-            // For sigop counting, we don't need the actual value
-            last_data = null; // These push small numbers, not script data
+        } else if (opcode >= 0x4f and opcode <= 0x60) {
+            // OP_1NEGATE (0x4f), OP_RESERVED (0x50), OP_1 (0x51) through OP_16 (0x60):
+            // Core's GetScriptOp (script.cpp:315-316) clears pvchRet at the top of every
+            // call and does NOT refill it for opcodes > OP_PUSHDATA4 (0x4e).  These opcodes
+            // are all <= OP_16 (0x60) so they do NOT trigger the early-return guard at
+            // script.cpp:197-198 (`if (opcode > OP_16) return 0`); the loop continues and
+            // vData ends up EMPTY after each such opcode.  Mirror that: clear last_data and
+            // advance one byte, letting a subsequent real push opcode overwrite last_data.
+            // Matches isPushOnly's identical range at script.zig:436.
+            last_data = null;
             pc += 1;
         } else {
-            // Non-push opcode - script is not push-only
+            // opcode > OP_16 (> 0x60): Core returns 0 immediately (script.cpp:197-198).
             return null;
         }
     }
@@ -5321,6 +5327,62 @@ test "getP2SHSigOpCount: scriptSig with non-push opcode returns 0" {
     // OP_DUP (0x76) is a non-push opcode
     const script_sig = [_]u8{0x76};
     const count = getP2SHSigOpCount(&script_pubkey, &script_sig);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+// EFFECTIVE tests for wave-3 fix: OP_1NEGATE / OP_RESERVED as non-final opcodes
+// in P2SH scriptSig.  Pre-fix: getLastPushData returned null immediately on hitting
+// 0x4f/0x50, so getP2SHSigOpCount returned 0 (false-accept — under-counted sigops).
+// Post-fix: these opcodes clear last_data and continue scanning, so the subsequent
+// real push sets last_data = redeemScript and sigops are counted correctly.
+// Reference: bitcoin-core/src/script/script.cpp:182-204, GetScriptOp:312-361.
+
+test "getP2SHSigOpCount: OP_1NEGATE before redeemScript push counts sigops (wave-3 fix)" {
+    // P2SH scriptPubKey
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xAB);
+    script_pubkey[22] = 0x87;
+
+    // scriptSig: OP_1NEGATE (0x4f) then push 1-byte redeemScript = OP_CHECKSIG (0xac).
+    // Core: OP_1NEGATE clears vData (not > OP_16 so loop continues), next GetOp fills
+    //       vData with redeemScript bytes -> subscript = {0xac} -> 1 sigop.
+    // Pre-fix clearbit: 0x4f fell into else-branch -> return null -> 0 sigops (BUG).
+    // Post-fix clearbit: last_data = null for 0x4f, continue, push sets last_data ->
+    //                    getSigOpCount({0xac}, true) = 1 (CORRECT).
+    const script_sig = [_]u8{ 0x4f, 0x01, 0xac };
+    const count = getP2SHSigOpCount(&script_pubkey, &script_sig);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getP2SHSigOpCount: OP_RESERVED before redeemScript push counts sigops (wave-3 fix)" {
+    // Same as above but with OP_RESERVED (0x50): also <= OP_16 in Core.
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xAB);
+    script_pubkey[22] = 0x87;
+
+    // scriptSig: OP_RESERVED (0x50) then push redeemScript = OP_CHECKSIG (0xac).
+    const script_sig = [_]u8{ 0x50, 0x01, 0xac };
+    const count = getP2SHSigOpCount(&script_pubkey, &script_sig);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "getP2SHSigOpCount: trailing OP_1NEGATE after redeemScript push yields 0 sigops" {
+    // Trailing OP_1NEGATE: Core clears vData for it -> empty subscript -> 0 sigops.
+    // Post-fix: last_data = null for OP_1NEGATE (trailing), orelse -> 0.  Matches Core.
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memset(script_pubkey[2..22], 0xAB);
+    script_pubkey[22] = 0x87;
+
+    // scriptSig: push redeemScript (OP_CHECKSIG) then OP_1NEGATE as the LAST opcode.
+    const script_sig = [_]u8{ 0x01, 0xac, 0x4f };
+    const count = getP2SHSigOpCount(&script_pubkey, &script_sig);
+    // Last opcode is OP_1NEGATE -> last_data = null -> 0 sigops (matches Core).
     try std.testing.expectEqual(@as(u32, 0), count);
 }
 
