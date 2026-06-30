@@ -2143,6 +2143,15 @@ pub const ScriptEngine = struct {
 
             // Taproot
             .op_checksigadd => {
+                // OP_CHECKSIGADD is only available in tapscript (BIP-342).
+                // Core interpreter.cpp:1086-1087:
+                //   if (sigversion == BASE || sigversion == WITNESS_V0)
+                //       return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+                // Must be checked BEFORE any stack pops to match Core's ordering.
+                if (self.sig_version == .base or self.sig_version == .witness_v0) {
+                    return ScriptError.InvalidOpcode;
+                }
+
                 // BIP-342 (interpreter.cpp:1084-1102 + EvalChecksigTapscript).
                 // Stack: <sig> <num> <pubkey>  -> <num + success>.
                 const pubkey = try self.pop();
@@ -7535,4 +7544,114 @@ test "WITNESS_MALLEATED_P2SH: minimal direct-push scriptSig passes malleation ch
     } else |err| {
         try std.testing.expect(err != ScriptError.WitnessMalleatedP2sh);
     }
+}
+
+// ============================================================================
+// W144-F9: OP_CHECKSIGADD tapscript gate (Bitcoin Core interpreter.cpp:1087)
+// ============================================================================
+//
+// Bitcoin Core:
+//   case OP_CHECKSIGADD:
+//     if (sigversion == BASE || sigversion == WITNESS_V0)
+//         return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+//
+// Before this fix, clearbit's op_checksigadd handler ran unconditionally in
+// BASE and WITNESS_V0 sigversions — a script with OP_CHECKSIGADD was silently
+// accepted instead of returning SCRIPT_ERR_BAD_OPCODE (InvalidOpcode).
+
+test "W144-F9: OP_CHECKSIGADD in BASE script returns InvalidOpcode (not tapscript-gated)" {
+    // OP_CHECKSIGADD (0xba) in a legacy BASE script must error with InvalidOpcode.
+    // Core interpreter.cpp:1087: SCRIPT_ERR_BAD_OPCODE for sigversion != TAPSCRIPT.
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    // sig_version defaults to .base; do NOT set .tapscript.
+
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    // Push three items (normally sig / num / pubkey), then OP_CHECKSIGADD.
+    try s.append(0x51); // OP_1 (sig substitute)
+    try s.append(0x51); // OP_1 (num)
+    try s.append(0x51); // OP_1 (pubkey substitute)
+    try s.append(0xba); // OP_CHECKSIGADD
+
+    try std.testing.expectError(ScriptError.InvalidOpcode, engine.execute(s.items));
+}
+
+test "W144-F9: OP_CHECKSIGADD in WITNESS_V0 script returns InvalidOpcode" {
+    // WITNESS_V0 scripts must also reject OP_CHECKSIGADD (Core:1087).
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    engine.sig_version = .witness_v0; // explicitly set witness_v0
+
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(0x51); // OP_1
+    try s.append(0x51); // OP_1
+    try s.append(0x51); // OP_1
+    try s.append(0xba); // OP_CHECKSIGADD
+
+    try std.testing.expectError(ScriptError.InvalidOpcode, engine.execute(s.items));
+}
+
+test "W144-F9: OP_CHECKSIGADD fails BEFORE stack pops in BASE (stack unchanged)" {
+    // Verify the check happens before ANY stack pop.  An empty stack would
+    // cause StackUnderflow if the pops ran first.  We confirm it is
+    // InvalidOpcode (bad-opcode), not StackUnderflow.
+    const allocator = std.testing.allocator;
+    const tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = 0,
+    };
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    // sig_version == .base; stack is EMPTY — no items to pop.
+
+    const script = [_]u8{0xba}; // bare OP_CHECKSIGADD with empty stack
+    // Must be InvalidOpcode, not StackUnderflow (gate fires before pops).
+    try std.testing.expectError(ScriptError.InvalidOpcode, engine.execute(&script));
+}
+
+test "W144-F9: OP_CHECKSIGADD still works in tapscript sig_version" {
+    // The gate must NOT fire in .tapscript — that is the valid path.
+    // With an empty sig and a 32-byte pubkey, tapscript CHECKSIGADD should
+    // push (num + 0) on the stack (empty-sig-is-false path).
+    const allocator = std.testing.allocator;
+    const tx = w94EmptyTx();
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    engine.sig_version = .tapscript;
+    engine.validation_weight_left = 1_000;
+    engine.validation_weight_init = true;
+    engine.tapleaf_hash = [_]u8{0xAB} ** 32;
+
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(0x00); // OP_0 — empty sig (success = false)
+    try s.append(0x51); // OP_1 — num = 1
+    // 32-byte pubkey push
+    try s.append(32);
+    try s.appendNTimes(0xDD, 32);
+    try s.append(0xba); // OP_CHECKSIGADD
+
+    // With empty sig and 32-byte pubkey, should NOT error (success=false → num stays 1).
+    // No InvalidOpcode (the .tapscript gate must not fire).
+    try engine.execute(s.items);
+    // Stack should have one element: the encoded result of (1 + 0) = 1.
+    try std.testing.expectEqual(@as(usize, 1), engine.stack.items.len);
 }

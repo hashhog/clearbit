@@ -5513,6 +5513,10 @@ pub const PeerManager = struct {
                                     peer.misbehaving(50, "header timestamp violates MTP (BIP-113)");
                                     return;
                                 },
+                                .bad_diffbits => {
+                                    peer.misbehaving(100, "header nBits does not match required difficulty (bad-diffbits)");
+                                    return;
+                                },
                             }
                             const bh = crypto.computeBlockHash(&hdr);
                             const ent_or = self.insertHeader(&hdr, &bh) catch null;
@@ -5535,16 +5539,18 @@ pub const PeerManager = struct {
                     self.expected_blocks.items.len + h.headers.len,
                 });
 
-                // BIP-113 / future-time gate at header acceptance.  Each
-                // header is checked against:
+                // Contextual header gates (Core ContextualCheckBlockHeader).
+                // Each header is checked against:
+                //   - bad-diffbits: header.bits != GetNextWorkRequired [skipped
+                //     mid-batch when prev not yet in header_index]
                 //   - now + MAX_FUTURE_BLOCK_TIME (7200s) [always-on]
                 //   - median-time-past of last 11 ancestors [skipped when
                 //     fewer than 1 ancestor is in header_index]
                 // Reference: bitcoin-core/src/validation.cpp
                 // (CheckBlockHeader + ContextualCheckBlockHeader).
                 // Reject the entire batch on the first violation and
-                // misbehave the peer; mirrors Core's "bad-time" /
-                // "time-too-new" handling.
+                // misbehave the peer; mirrors Core's "bad-diffbits" /
+                // "bad-time" / "time-too-new" handling.
                 const now_hdr: i64 = std.time.timestamp();
                 for (h.headers) |hdr| {
                     switch (self.validateHeaderContextual(&hdr, now_hdr)) {
@@ -5555,6 +5561,10 @@ pub const PeerManager = struct {
                         },
                         .mtp_violation => {
                             peer.misbehaving(50, "header timestamp violates MTP (BIP-113)");
+                            return;
+                        },
+                        .bad_diffbits => {
+                            peer.misbehaving(100, "header nBits does not match required difficulty (bad-diffbits)");
                             return;
                         },
                     }
@@ -7831,24 +7841,133 @@ pub const PeerManager = struct {
         /// Header timestamp > now + MAX_FUTURE_BLOCK_TIME (7200s).  Reference:
         /// `bitcoin-core/src/validation.cpp::CheckBlockHeader`.
         future_time,
+        /// header.bits != GetNextWorkRequired(pindexPrev) (bad-diffbits).
+        /// Mirroring Bitcoin Core's ContextualCheckBlockHeader (validation.cpp:4088).
+        /// Skipped when the prev block is not in header_index / persisted index.
+        bad_diffbits,
     };
+
+    /// Compute the expected nBits for a block at `height` whose parent is
+    /// at `prev_hash` (height-1).  Mirrors Bitcoin Core's
+    /// GetNextWorkRequired(pindexPrev, pblock, params) (pow.cpp:14).
+    ///
+    /// Returns 0 when the parent chain cannot be resolved from header_index
+    /// or the persisted block index, meaning the caller should skip the
+    /// bad-diffbits check (0 is the "not available" sentinel).
+    ///
+    /// The lookup walks back from `prev_hash` through header_index (in-memory)
+    /// with a fallback to chain_state.getPersistedHeader (RocksDB) — the same
+    /// two-layer lookup used by computePrevMtp.  For mainnet non-retarget blocks
+    /// only 1 step is needed; for retarget blocks up to interval (2016) steps.
+    ///
+    /// Reference: bitcoin-core/src/pow.cpp GetNextWorkRequired().
+    pub fn computeExpectedBits(
+        self: *PeerManager,
+        prev_hash: types.Hash256,
+        height: u32,
+        block_timestamp: u32,
+    ) u32 {
+        if (height == 0) return 0;
+
+        // Walk-back closure over header_index + chain_state.
+        // The `not_found` flag is set when a lookup fails; caller checks it.
+        const WalkCtx = struct {
+            pm: *PeerManager,
+            tip_hash: types.Hash256, // hash of block at tip_height (= height-1)
+            tip_height: u32,
+            not_found: bool,
+
+            fn getAtHeight(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
+                const self2: *@This() = @ptrCast(@alignCast(ctx));
+                if (h > self2.tip_height) return null;
+
+                // Walk backwards from tip to reach `h`.
+                var cursor = self2.tip_hash;
+                var c_h = self2.tip_height;
+                while (c_h > h) {
+                    if (self2.pm.header_index.get(cursor)) |e| {
+                        cursor = e.prev_hash;
+                    } else if (self2.pm.chain_state) |cs| {
+                        const hdr = cs.getPersistedHeader(&cursor) orelse {
+                            self2.not_found = true;
+                            return null;
+                        };
+                        cursor = hdr.prev_block;
+                    } else {
+                        self2.not_found = true;
+                        return null;
+                    }
+                    c_h -= 1;
+                }
+
+                // `cursor` is now at height `h`; return its entry.
+                if (self2.pm.header_index.get(cursor)) |e| {
+                    return consensus.BlockIndexEntry{
+                        .height = h,
+                        .timestamp = e.timestamp,
+                        .bits = e.header.bits,
+                    };
+                }
+                if (self2.pm.chain_state) |cs| {
+                    const hdr = cs.getPersistedHeader(&cursor) orelse {
+                        self2.not_found = true;
+                        return null;
+                    };
+                    return consensus.BlockIndexEntry{
+                        .height = h,
+                        .timestamp = hdr.timestamp,
+                        .bits = hdr.bits,
+                    };
+                }
+                self2.not_found = true;
+                return null;
+            }
+        };
+
+        var walk_ctx = WalkCtx{
+            .pm = self,
+            .tip_hash = prev_hash,
+            .tip_height = height - 1,
+            .not_found = false,
+        };
+
+        const pow_limit_bits = consensus.getPowLimitBits(self.network_params);
+        const view = consensus.BlockIndexView{
+            .context = @ptrCast(&walk_ctx),
+            .getAtHeightFn = WalkCtx.getAtHeight,
+            .pow_limit_bits = pow_limit_bits,
+        };
+
+        const result = consensus.getNextWorkRequired(
+            height,
+            block_timestamp,
+            &view,
+            self.network_params,
+        );
+
+        // Return 0 (skip sentinel) when any ancestor lookup failed.
+        return if (walk_ctx.not_found) 0 else result;
+    }
 
     /// Contextual header-time validation, run at header *acceptance* (not just
     /// when the block body arrives).  Implements:
+    ///   - bad-diffbits: header.bits != GetNextWorkRequired(pindexPrev) (skipped
+    ///     when prev not in header_index / persisted index, e.g. mid-batch).
     ///   - BIP-113 median-time-past: header.timestamp must strictly exceed
     ///     the MTP of its 11 most-recent ancestors (when known).
     ///   - Future-time bound: header.timestamp must not exceed `now + 7200s`.
     ///
     /// References:
     ///   - bitcoin-core/src/validation.cpp::CheckBlockHeader (future-time)
-    ///   - bitcoin-core/src/validation.cpp::ContextualCheckBlockHeader (MTP)
+    ///   - bitcoin-core/src/validation.cpp::ContextualCheckBlockHeader (all)
     ///
-    /// MTP is skipped when fewer than 1 ancestor is in `header_index`
-    /// (e.g. headers received before any prior batch landed in the index).
-    /// This matches the behaviour of `validateBlockForIBDOrReject`'s MTP
-    /// path: the body-validation pipeline still re-checks MTP once the
-    /// block lands.  The future-time bound has no ancestor dependency and
-    /// is always enforced.
+    /// MTP and bad-diffbits are skipped when fewer than 1 ancestor is in
+    /// `header_index` (e.g. headers received before any prior batch landed in
+    /// the index, or mid-batch headers whose prev is in the SAME batch).
+    /// This matches the behaviour of `validateBlockForIBDOrReject`'s body path:
+    /// the pipeline still re-checks MTP and bad-diffbits once the block body
+    /// lands.  The future-time bound has no ancestor dependency and is always
+    /// enforced.
     pub fn validateHeaderContextual(
         self: *PeerManager,
         header: *const types.BlockHeader,
@@ -7858,6 +7977,30 @@ pub const PeerManager = struct {
         const max_future: i64 = now + @as(i64, consensus.MAX_FUTURE_BLOCK_TIME);
         if (@as(i64, header.timestamp) > max_future) {
             return .future_time;
+        }
+
+        // bad-diffbits (Core ContextualCheckBlockHeader, validation.cpp:4088).
+        // Compute the expected nBits from the prev block's position in the chain.
+        // If the prev block is not resolvable (mid-batch / pre-sync), skip —
+        // the body-validation path enforces it unconditionally.
+        const prev_height_opt: ?u32 = blk: {
+            if (self.header_index.get(header.prev_block)) |e| break :blk e.height;
+            if (self.chain_state) |cs| {
+                if (cs.getBlockHeightByHash(&header.prev_block)) |h| break :blk h;
+            }
+            break :blk null;
+        };
+        if (prev_height_opt) |prev_h| {
+            const expected = self.computeExpectedBits(
+                header.prev_block,
+                prev_h + 1,
+                header.timestamp,
+            );
+            // expected == 0 means the walk failed internally (chain gap);
+            // skip rather than false-reject.
+            if (expected != 0 and header.bits != expected) {
+                return .bad_diffbits;
+            }
         }
 
         // BIP-113 MTP (skipped when fewer than 1 ancestor is known).
@@ -8030,6 +8173,18 @@ pub const PeerManager = struct {
         // Future-time gate: capture wall clock at block-body validation time.
         const current_time: i64 = std.time.timestamp();
 
+        // bad-diffbits: compute GetNextWorkRequired(pindexPrev) for this block.
+        // Passed as expected_bits so contextualCheckBlockHeader (validation.zig:1299)
+        // enforces Core's first contextual gate — wrong nBits → reject.
+        // Returns 0 (skip) when the parent chain is not resolvable, which preserves
+        // prior behaviour and covers the genesis edge case.
+        // Reference: bitcoin-core/src/validation.cpp:4088.
+        const expected_bits_val = self.computeExpectedBits(
+            block.header.prev_block,
+            height,
+            block.header.timestamp,
+        );
+
         validation.acceptBlock(
             block,
             block_hash,
@@ -8043,6 +8198,7 @@ pub const PeerManager = struct {
                 .prev_block_timestamp = prev_block_timestamp,
                 .current_time = current_time,
                 .force_skip_scripts = skip_scripts,
+                .expected_bits = expected_bits_val,
                 // BIP-68 time-based enforcement: wire the MTP-at-height callback
                 // so validateBlockForIBD can look up the prior-block MTP for each
                 // spent UTXO.  PeerManager is long-lived; safe to pass self here.
