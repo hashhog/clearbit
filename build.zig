@@ -1442,6 +1442,45 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w143_tests.step);
     }
 
+    // W144 — bad-diffbits enforcement: computeExpectedBits + live gate thread.
+    // BEFORE: IBDValidationContext.expected_bits was always 0 (skip sentinel) because
+    //   no caller computed it. The bad-diffbits gate (validation.zig:1299) was dead code.
+    // AFTER: PeerManager.computeExpectedBits walks header_index + persisted headers
+    //   to compute GetNextWorkRequired; validateBlockForIBDOrReject and
+    //   validateHeaderContextual pass it so the gate fires on the live path.
+    // Tests: computeExpectedBits correctness, validateHeaderContextual bad_diffbits,
+    //   contextualCheckBlockHeader EFFECTIVE reject.
+    // Run with `zig build test-w144`.
+    {
+        const w144_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w144_bad_diffbits.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"W144"},
+        });
+        w144_tests.linkSystemLibrary("rocksdb");
+        w144_tests.linkSystemLibrary("secp256k1");
+        w144_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w144_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w144_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w144_tests.linkSystemLibrary("minisketch");
+            w144_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w144_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w144_tests = b.addRunArtifact(w144_tests);
+        const w144_test_step = b.step("test-w144", "Run W144 bad-diffbits enforcement (computeExpectedBits + live gate thread) tests");
+        w144_test_step.dependOn(&run_w144_tests.step);
+        // Fold into the main `test` step so CI exercises W144.
+        test_step.dependOn(&run_w144_tests.step);
+    }
+
     // FIX-3G — ADDR/ADDRV2 peer-timestamp clamp (3G policy, fleet-wide).
     // Reference: bitcoin-core/src/net_processing.cpp:5678-5679.
     // Clamps peer-advertised nTime that is pre-2001 (≤100_000_000s) or more than
