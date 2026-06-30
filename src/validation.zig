@@ -1590,14 +1590,33 @@ pub fn validateBlockForIBD(
 
                 // Check intra-block first.
                 if (prevouts.get(key)) |entry| {
+                    // Coinbase-maturity check: a prevout produced by the coinbase tx
+                    // (tx_idx == 0) within THIS block has depth 0 < COINBASE_MATURITY=100
+                    // and must be rejected as a premature spend.  prevout_meta carries
+                    // {is_coinbase=true, height=connecting_height} for every coinbase
+                    // output stitched below; null means non-coinbase intra-block output,
+                    // which is spendable immediately within the same block per Core.
+                    // Mirrors the chainstate-lookup maturity guard below (~line 1617) and
+                    // matches Core's CheckTxInputs (consensus/tx_verify.cpp:179-182)
+                    // which applies the same guard regardless of whether the coin was
+                    // resolved from the chainstate view or from an intra-block stitch.
+                    // Reference: Bitcoin Core consensus/tx_verify.cpp:179-182 +
+                    //   validation.cpp:2600 (coinbase coin added to view at pindex->nHeight,
+                    //   so nSpendHeight - coin.nHeight = 0 for a same-block spend → depth 0
+                    //   < COINBASE_MATURITY=100 → "bad-txns-premature-spend-of-coinbase").
+                    if (prevout_meta.get(key)) |meta| {
+                        if (meta.is_coinbase and
+                            (height < meta.height or
+                            height - meta.height < consensus.COINBASE_MATURITY))
+                        {
+                            return ValidationError.ImmatureCoinbase;
+                        }
+                    }
                     // Per-coin value range check (same as chainstate path).
                     // Reference: Bitcoin Core consensus/tx_verify.cpp:186
                     if (!consensus.isValidMoney(entry.amount)) return ValidationError.InputValuesOutOfRange;
                     input_sum += entry.amount;
                     if (!consensus.isValidMoney(input_sum)) return ValidationError.InputValuesOutOfRange;
-                    // Intra-block prevouts are never coinbase (coinbase is
-                    // tx_idx == 0; non-coinbase outputs are spendable
-                    // immediately within the same block per Core).
                     spent.put(key, {}) catch return ValidationError.OutOfMemory;
                     continue;
                 }
@@ -1689,6 +1708,24 @@ pub fn validateBlockForIBD(
                 .script_pubkey = script_copy,
                 .amount = out.value,
             }) catch return ValidationError.OutOfMemory;
+            // Coinbase-maturity metadata: tag coinbase tx (tx_idx == 0) outputs
+            // so the intra-block spend branch above can enforce the 100-block
+            // COINBASE_MATURITY rule for same-block coinbase spends (depth 0).
+            // Non-coinbase tx outputs (tx_idx > 0) are NOT entered here; their
+            // prevout_meta.get(key) returns null in the spend branch, which
+            // means "not coinbase → no maturity check → immediately spendable
+            // within this block."  This matches Core's behaviour: ConnectBlock
+            // adds the coinbase to the view at pindex->nHeight with
+            // IsCoinBase()=true; CheckTxInputs checks nSpendHeight - coin.nHeight
+            // < COINBASE_MATURITY.  Regular intra-block outputs have is_coinbase=false
+            // in Core's view and are freely spendable within the same block.
+            // Reference: Bitcoin Core validation.cpp:2600 + consensus/tx_verify.cpp:179.
+            if (tx_idx == 0) {
+                prevout_meta.put(key, .{
+                    .height = height,
+                    .is_coinbase = true,
+                }) catch return ValidationError.OutOfMemory;
+            }
             // BIP-68: intra-block outputs have height = current block height
             // (0 effective confirmations relative to this block).
             // Reference: Core's view.AccessCoin().nHeight returns the containing
@@ -13530,4 +13567,241 @@ test "W101 PR10: executeReorg fires mempool.blockDisconnected on each disconnect
     // (camlcoin parity: a disconnected coinbase-only block re-admits
     // zero txs.)
     try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+}
+
+// ============================================================================
+// wave-4 audit: same-block coinbase spend — HIGH consensus false-accept fix
+// ============================================================================
+//
+// Bitcoin Core rejects any block where a non-coinbase tx spends that same
+// block's coinbase output (Core: "bad-txns-premature-spend-of-coinbase",
+// consensus/tx_verify.cpp:179-182).  The coinbase coin is added to the view
+// at the connecting block's height (validation.cpp:2600), so its depth is
+// 0 < COINBASE_MATURITY=100 — always immature.
+//
+// Pre-fix clearbit false-accepted such a block because the intra-block output-
+// stitching loop inserted coinbase outputs into `prevouts` WITHOUT any maturity
+// metadata in `prevout_meta`, and the intra-block spend branch only checked
+// value range + double-spend, skipping maturity entirely.
+//
+// The fix: (1) the stitching loop now populates `prevout_meta` for tx_idx==0
+// outputs with {is_coinbase=true, height=connecting_height}; (2) the intra-
+// block spend branch now checks prevout_meta.get(key) and returns
+// ImmatureCoinbase when the depth is < COINBASE_MATURITY.
+
+test "validateBlockForIBD: same-block coinbase spend rejected (ImmatureCoinbase)" {
+    // EFFECTIVE test: pre-fix this block was ACCEPTED; post-fix it MUST be
+    // rejected with ImmatureCoinbase.
+    //
+    // Block layout:
+    //   tx[0] coinbase  — outputs 50 BTC at index 0
+    //   tx[1] spender   — input spends tx[0]:0 (same-block coinbase spend, depth 0)
+    //
+    // The lookup fn returns null for every outpoint (the spender's input is
+    // resolved via the intra-block `prevouts` map, not the chainstate).
+    const allocator = std.testing.allocator;
+
+    const height: u32 = 1;
+    const subsidy = consensus.getBlockSubsidy(height, &consensus.REGTEST);
+    // P2PKH-ish script used for outputs (content irrelevant; scripts skipped).
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+
+    // Coinbase: BIP-34 height prefix (OP_1 + filler = 0x51 0x00, 2 bytes), one output.
+    // The filler byte is required because Core mandates coinbase scriptSig >= 2 bytes
+    // (CTransaction::CheckTransaction).  The BIP-34 check is a prefix match so the
+    // extra byte is harmless.  This matches the pattern in other IBD tests at height=1.
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = subsidy,
+            .script_pubkey = &p2pkh,
+        }},
+        .lock_time = 0,
+    };
+
+    // Compute coinbase txid so the spender can reference coinbase:0.
+    const cb_txid = try crypto.computeTxid(&coinbase, allocator);
+
+    // Spender: references the coinbase output in the SAME block (depth = 0).
+    const spender = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint{ .hash = cb_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = subsidy - 1000, // leave 1000 sat fee so coinbase value check passes
+            .script_pubkey = &p2pkh,
+        }},
+        .lock_time = 0,
+    };
+
+    const txid_sp = try crypto.computeTxid(&spender, allocator);
+    const merkle = try crypto.computeMerkleRoot(
+        &[_]types.Hash256{ cb_txid, txid_sp },
+        allocator,
+    );
+
+    var header = consensus.REGTEST.genesis_header;
+    header.version = 4; // REGTEST bip34/66/65 all active at height=1
+    header.merkle_root = merkle;
+    header.bits = 0x207fffff; // regtest loose target
+    ibdTestMineNonce(&header, &consensus.REGTEST);
+
+    const block = types.Block{
+        .header = header,
+        .transactions = &[_]types.Transaction{ coinbase, spender },
+    };
+    const block_hash = crypto.computeBlockHash(&block.header);
+    var dummy: u8 = 0;
+    const ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = height,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&dummy),
+        .prevout_lookupFn = ibdTestEmptyLookup, // spender's input resolved intra-block
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true, // skip script eval; test targets maturity only
+    };
+    // Post-fix: same-block coinbase spend must be rejected as ImmatureCoinbase.
+    // Pre-fix: this returned void (false-accept).
+    try std.testing.expectError(
+        ValidationError.ImmatureCoinbase,
+        validateBlockForIBD(&block, &ctx, allocator),
+    );
+}
+
+test "validateBlockForIBD: intra-block non-coinbase spend accepted (no false-reject from fix)" {
+    // Guard test: the fix must NOT introduce a false-reject for a normal
+    // intra-block spend where tx[1] spends an external UTXO and tx[2] spends
+    // tx[1]'s output within the same block.  Non-coinbase intra-block outputs
+    // have no prevout_meta entry (prevout_meta.get returns null), so the
+    // maturity check is not triggered → the block remains valid.
+    //
+    // Block layout:
+    //   tx[0]  coinbase   — normal coinbase, untouched
+    //   tx[1]  non-cb-A   — spends external UTXO (ext_hash:0), outputs 0.09 BTC
+    //   tx[2]  non-cb-B   — spends tx[1]:0 (intra-block, NOT coinbase) → must pass
+    const allocator = std.testing.allocator;
+
+    const height: u32 = 1;
+    const subsidy = consensus.getBlockSubsidy(height, &consensus.REGTEST);
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+
+    // External UTXO that tx[1] spends: non-coinbase, confirmed long ago.
+    const ext_hash: types.Hash256 = [_]u8{0xEE} ** 32;
+    const ext_amount: i64 = 9_000_000; // 0.09 BTC
+
+    // tx[0] coinbase: OP_1 + filler for BIP-34 at height=1 (2-byte minimum).
+    const coinbase = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = subsidy + 2000, // claim subsidy + fees from tx[1] and tx[2]
+            .script_pubkey = &p2pkh,
+        }},
+        .lock_time = 0,
+    };
+
+    // tx[1]: spends external UTXO, outputs ext_amount - 1000 (fee = 1000).
+    const tx1 = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint{ .hash = ext_hash, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = ext_amount - 1000,
+            .script_pubkey = &p2pkh,
+        }},
+        .lock_time = 0,
+    };
+    const txid1 = try crypto.computeTxid(&tx1, allocator);
+
+    // tx[2]: spends tx[1]:0 (non-coinbase intra-block spend), fee = 1000.
+    const tx2 = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint{ .hash = txid1, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = ext_amount - 2000,
+            .script_pubkey = &p2pkh,
+        }},
+        .lock_time = 0,
+    };
+
+    const txid_cb = try crypto.computeTxid(&coinbase, allocator);
+    const txid_tx2 = try crypto.computeTxid(&tx2, allocator);
+    const merkle = try crypto.computeMerkleRoot(
+        &[_]types.Hash256{ txid_cb, txid1, txid_tx2 },
+        allocator,
+    );
+
+    var header = consensus.REGTEST.genesis_header;
+    header.version = 4;
+    header.merkle_root = merkle;
+    header.bits = 0x207fffff;
+    ibdTestMineNonce(&header, &consensus.REGTEST);
+
+    const block = types.Block{
+        .header = header,
+        .transactions = &[_]types.Transaction{ coinbase, tx1, tx2 },
+    };
+    const block_hash = crypto.computeBlockHash(&block.header);
+
+    // Lookup: returns the external UTXO for ext_hash:0 (non-coinbase, old height).
+    // Returns null for everything else (BIP-30 checks on tx[0..2] outputs get null
+    // → no false Bip30DuplicateOutput; tx[2]'s input is resolved intra-block).
+    const ExtLookup = struct {
+        fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?PrevOutInfo {
+            const hash = @as(*const types.Hash256, @ptrCast(@alignCast(ctx_ptr))).*;
+            if (std.mem.eql(u8, &outpoint.hash, &hash) and outpoint.index == 0) {
+                return .{
+                    .script_pubkey = &[_]u8{}, // empty; scripts skipped
+                    .amount = 9_000_000,
+                    .height = 0, // confirmed long ago — no maturity issue
+                    .is_coinbase = false,
+                    .owner_allocator = null,
+                };
+            }
+            return null;
+        }
+    };
+    var ext_hash_copy: types.Hash256 = ext_hash;
+    const ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = height,
+        .params = &consensus.REGTEST,
+        .prevout_lookup_ctx = @ptrCast(&ext_hash_copy),
+        .prevout_lookupFn = ExtLookup.lookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    };
+    // Non-coinbase intra-block spend must remain accepted after the fix.
+    try validateBlockForIBD(&block, &ctx, allocator);
 }
