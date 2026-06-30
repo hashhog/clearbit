@@ -3017,54 +3017,93 @@ pub const SighashError = error{
     InvalidScript,
 };
 
-/// Remove all occurrences of `pattern` from `script` and return a new script.
-/// This implements the FindAndDelete operation used in legacy sighash computation.
-/// Per Bitcoin Core: FindAndDelete operates on raw bytes, scanning for the exact byte pattern.
-/// Reference: Bitcoin Core script/interpreter.cpp FindAndDelete()
+/// Return the byte offset of the first byte past the opcode that begins at `pc`.
+/// Mirrors Bitcoin Core's CScript::GetOp: if push data would extend past `scr.len`
+/// (malformed script) the function clamps to scr.len so the walk exits gracefully.
+/// Used exclusively by findAndDelete / findAndDeleteCount.
+fn opcodeEnd(scr: []const u8, pc: usize) usize {
+    if (pc >= scr.len) return scr.len;
+    const op = scr[pc];
+    const after: usize = pc + 1;
+    if (op >= 0x01 and op <= 0x4b) {
+        // OP_PUSHBYTES_N: push `op` bytes of data
+        return @min(scr.len, after + @as(usize, op));
+    } else if (op == 0x4c) { // OP_PUSHDATA1: 1-byte length prefix
+        if (after >= scr.len) return scr.len;
+        return @min(scr.len, after + 1 + @as(usize, scr[after]));
+    } else if (op == 0x4d) { // OP_PUSHDATA2: 2-byte LE length prefix
+        if (after + 2 > scr.len) return scr.len;
+        const n: usize = std.mem.readInt(u16, scr[after..][0..2], .little);
+        return @min(scr.len, after + 2 + n);
+    } else if (op == 0x4e) { // OP_PUSHDATA4: 4-byte LE length prefix
+        if (after + 4 > scr.len) return scr.len;
+        const n: usize = std.mem.readInt(u32, scr[after..][0..4], .little);
+        return @min(scr.len, after + 4 + n);
+    } else {
+        return after; // non-push opcode: just the one opcode byte
+    }
+}
+
+/// Remove all occurrences of `pattern` from `script`, matching ONLY at opcode
+/// boundaries.  Mirrors Bitcoin Core FindAndDelete (interpreter.cpp:229-255):
+/// the Core loop advances `pc` via GetOp so a pattern occurrence that begins
+/// INSIDE a push-data payload is never matched or removed.
+///
+/// Called from EvalChecksigPreTapscript (BASE sigversion only, line 330) to
+/// strip the push-encoded signature from scriptCode before computing the legacy
+/// sighash.
 pub fn findAndDelete(allocator: std.mem.Allocator, script: []const u8, pattern: []const u8) SighashError![]u8 {
     if (pattern.len == 0) {
-        // No pattern to delete, return copy of original
         return allocator.dupe(u8, script) catch return SighashError.OutOfMemory;
     }
 
-    // Build result by skipping all occurrences of pattern
     var result = std.ArrayList(u8).init(allocator);
     errdefer result.deinit();
 
-    var i: usize = 0;
-    while (i < script.len) {
-        // Check if pattern matches at current position
-        if (i + pattern.len <= script.len and std.mem.eql(u8, script[i .. i + pattern.len], pattern)) {
-            // Skip the pattern
-            i += pattern.len;
-        } else {
-            // Copy the byte
-            result.append(script[i]) catch return SighashError.OutOfMemory;
-            i += 1;
+    // pc  = current opcode boundary under examination
+    // pc2 = start of the pending unflushed segment (mirrors Core's pc2)
+    var pc: usize = 0;
+    var pc2: usize = 0;
+
+    while (pc < script.len) {
+        // Flush bytes accumulated since the previous match.
+        // Mirrors Core: `result.insert(result.end(), pc2, pc)` at top of do-loop.
+        result.appendSlice(script[pc2..pc]) catch return SighashError.OutOfMemory;
+
+        // Match at the current opcode boundary; consume consecutive hits.
+        // Mirrors Core's inner `while (end - pc >= b.size() && equal(...))`.
+        while (pc + pattern.len <= script.len and
+            std.mem.eql(u8, script[pc .. pc + pattern.len], pattern))
+        {
+            pc += pattern.len;
         }
+        pc2 = pc;
+
+        // Advance pc to the next opcode boundary (mirrors Core's GetOp(pc, opcode)).
+        pc = opcodeEnd(script, pc);
     }
+
+    // Flush any remaining bytes after the last opcode.
+    result.appendSlice(script[pc2..script.len]) catch return SighashError.OutOfMemory;
 
     return result.toOwnedSlice() catch return SighashError.OutOfMemory;
 }
 
-/// Count occurrences of `pattern` that FindAndDelete would remove from `script`.
-/// Mirrors Bitcoin Core's FindAndDelete return value (nFound) — used only to
-/// implement the SCRIPT_VERIFY_CONST_SCRIPTCODE reject rule (interpreter.cpp:330-332):
-/// in a pre-segwit (BASE) CHECKSIG/CHECKMULTISIG, if the push-encoded signature
-/// is found in the scriptCode and the CONST_SCRIPTCODE flag is set, the script
-/// must fail with SCRIPT_ERR_SIG_FINDANDDELETE. Operates on raw bytes, exact
-/// non-overlapping match, identical scan to findAndDelete().
+/// Count how many times findAndDelete would remove `pattern` from `script`.
+/// Uses the same opcode-aligned walk so the count matches Core's nFound return
+/// value, which gates SCRIPT_VERIFY_CONST_SCRIPTCODE (interpreter.cpp:330-332).
 pub fn findAndDeleteCount(script: []const u8, pattern: []const u8) usize {
     if (pattern.len == 0) return 0;
     var count: usize = 0;
-    var i: usize = 0;
-    while (i < script.len) {
-        if (i + pattern.len <= script.len and std.mem.eql(u8, script[i .. i + pattern.len], pattern)) {
+    var pc: usize = 0;
+    while (pc < script.len) {
+        while (pc + pattern.len <= script.len and
+            std.mem.eql(u8, script[pc .. pc + pattern.len], pattern))
+        {
+            pc += pattern.len;
             count += 1;
-            i += pattern.len;
-        } else {
-            i += 1;
         }
+        pc = opcodeEnd(script, pc);
     }
     return count;
 }
@@ -4627,26 +4666,32 @@ test "findAndDelete: empty pattern returns copy of original" {
     try std.testing.expectEqualSlices(u8, &script, result);
 }
 
-test "findAndDelete: removes single occurrence" {
+test "findAndDelete: removes single occurrence at opcode boundary" {
     const allocator = std.testing.allocator;
-    const script = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const pattern = [_]u8{ 0x02, 0x03 };
+    // Script: OP_DUP (0x76), push2 (0x02) [0xDE, 0xAD], OP_CHECKSIG (0x87).
+    // Pattern push2[0xDE,0xAD] starts exactly at an opcode boundary (pc=1) and
+    // is deleted; the surrounding opcodes are preserved.
+    const scr = [_]u8{ 0x76, 0x02, 0xDE, 0xAD, 0x87 };
+    const pattern = [_]u8{ 0x02, 0xDE, 0xAD };
 
-    const result = try findAndDelete(allocator, &script, &pattern);
+    const result = try findAndDelete(allocator, &scr, &pattern);
     defer allocator.free(result);
 
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x04 }, result);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x76, 0x87 }, result);
 }
 
-test "findAndDelete: removes multiple occurrences" {
+test "findAndDelete: removes multiple consecutive occurrences at opcode boundaries" {
     const allocator = std.testing.allocator;
-    const script = [_]u8{ 0xAB, 0x01, 0x02, 0xAB, 0x03, 0xAB };
-    const pattern = [_]u8{0xAB};
+    // Script: OP_DUP (0x76), push2[0xDE,0xAD] twice, OP_CHECKSIG (0x87).
+    // Both push2[0xDE,0xAD] start at opcode boundaries and are consumed by the
+    // inner consecutive-match loop, matching Core's inner while (interpreter.cpp:240-244).
+    const scr = [_]u8{ 0x76, 0x02, 0xDE, 0xAD, 0x02, 0xDE, 0xAD, 0x87 };
+    const pattern = [_]u8{ 0x02, 0xDE, 0xAD };
 
-    const result = try findAndDelete(allocator, &script, &pattern);
+    const result = try findAndDelete(allocator, &scr, &pattern);
     defer allocator.free(result);
 
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, result);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x76, 0x87 }, result);
 }
 
 test "findAndDelete: no match returns copy" {
@@ -4658,6 +4703,42 @@ test "findAndDelete: no match returns copy" {
     defer allocator.free(result);
 
     try std.testing.expectEqualSlices(u8, &script, result);
+}
+
+// EFFECTIVE: pattern embedded inside push payload must NOT be deleted.
+// Pre-fix (raw byte scan): the 3 payload bytes would be removed, leaving
+// [0x03, 0x87].  Post-fix (opcode-aligned): the script is returned unchanged.
+// Mirrors Bitcoin Core FindAndDelete (interpreter.cpp:229-255): GetOp skips the
+// entire push instruction, so a match INSIDE push data is never seen.
+test "findAndDelete: opcode-aligned — pattern inside push payload is preserved" {
+    const allocator = std.testing.allocator;
+    // Script: push3 (0x03) [0x02, 0xDE, 0xAD] OP_CHECKSIG (0x87).
+    // The 3-byte payload equals the pattern but lies INSIDE the push3 body —
+    // not at an opcode boundary.
+    const scr = [_]u8{ 0x03, 0x02, 0xDE, 0xAD, 0x87 };
+    const pattern = [_]u8{ 0x02, 0xDE, 0xAD };
+
+    const result = try findAndDelete(allocator, &scr, &pattern);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualSlices(u8, &scr, result);
+}
+
+test "findAndDeleteCount: opcode-aligned — pattern inside push payload counts zero" {
+    // Same layout: pattern bytes are inside push3 payload, not at a boundary.
+    // Pre-fix count = 1 (raw scan); post-fix count = 0 (opcode-aligned).
+    const scr = [_]u8{ 0x03, 0x02, 0xDE, 0xAD, 0x87 };
+    const pattern = [_]u8{ 0x02, 0xDE, 0xAD };
+    try std.testing.expectEqual(@as(usize, 0), findAndDeleteCount(&scr, &pattern));
+}
+
+test "findAndDeleteCount: counts only boundary-aligned occurrences" {
+    // Script: push3[0x02,0xDE,0xAD] (payload) then push2[0xDE,0xAD] at boundary.
+    // Raw scan would count 2 (position 1 inside payload + position 4 boundary).
+    // Opcode-aligned must count 1 (boundary at position 4 only).
+    const scr = [_]u8{ 0x03, 0x02, 0xDE, 0xAD, 0x02, 0xDE, 0xAD, 0x87 };
+    const pattern = [_]u8{ 0x02, 0xDE, 0xAD };
+    try std.testing.expectEqual(@as(usize, 1), findAndDeleteCount(&scr, &pattern));
 }
 
 test "removeCodeSeparators: removes all OP_CODESEPARATOR" {
