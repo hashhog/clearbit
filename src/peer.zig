@@ -5232,6 +5232,15 @@ pub const PeerManager = struct {
         if (self.header_index.get(hash.*)) |e| return e.height;
         if (self.chain_state) |cs| {
             if (std.mem.eql(u8, &cs.best_hash, hash)) return cs.best_height;
+            // Post-restart the in-memory header_index is empty until headers
+            // re-sync, so a fork-point that is a previously-connected block
+            // would wrongly resolve to height 0 here — making the reorg path
+            // assign heights 1,2,3,… and false-reject canonical forward blocks
+            // with BIP-34 BadCoinbaseHeight (the 2026-06-26 post-OOM wedge).
+            // Fall back to the persisted block index (CF_BLOCK_INDEX survives
+            // restart, covers every connected block). Mirrors commit 4aeb681
+            // (the analogous BIP-113 MTP in-memory-vs-persisted reconciliation).
+            if (cs.getBlockHeightByHash(hash)) |h| return h;
         }
         return 0;
     }
@@ -9767,6 +9776,69 @@ test "computeMtpAtHeight: persisted fallback yields true MTP with empty header_i
     // the true median read via the persisted-header fallback.
     try std.testing.expect(got != 0);
     try std.testing.expectEqual(expected, got);
+}
+
+test "lookupHeightOrZero: persisted fallback yields true height with empty header_index (restart reorg-wedge guard)" {
+    // Companion to the computeMtpAtHeight restart test above, for the reorg
+    // fork-point HEIGHT path. PRE-FIX an empty in-memory header_index (the
+    // post-restart / post-OOM state) made lookupHeightOrZero return 0 for a
+    // previously-connected fork-point, so tryFireReorg assigned reorg heights
+    // 1,2,3,… and validation false-rejected canonical blocks with BIP-34
+    // BadCoinbaseHeight (the 2026-06-26 wedge). POST-FIX the persisted
+    // CF_BLOCK_INDEX fallback returns the true height.
+    const allocator = std.testing.allocator;
+    const params = &consensus.MAINNET;
+
+    var path_buf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(
+        &path_buf,
+        "/tmp/clearbit_lookupheight_restart_test_{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+
+    var db = try storage.Database.open(db_path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    var manager = PeerManager.init(allocator, params);
+    defer manager.deinit();
+    manager.chain_state = &cs;
+    // header_index intentionally left EMPTY — the post-restart condition.
+
+    // Persist one fork-point block at a deep height in CF_BLOCK_INDEX
+    // (u32 height prefix + 80-byte header — getBlockHeightByHash reads the
+    // leading u32).
+    const fork_height: u32 = 944183;
+    var fork_hash: types.Hash256 = [_]u8{0} ** 32;
+    fork_hash[0] = 0xab;
+    fork_hash[1] = 0xcd;
+    const hdr = types.BlockHeader{
+        .version = 1,
+        .prev_block = [_]u8{0} ** 32,
+        .merkle_root = [_]u8{0} ** 32,
+        .timestamp = 1_700_000_000,
+        .bits = 0x1d00ffff,
+        .nonce = 0,
+    };
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try w.writeInt(u32, fork_height);
+    try serialize.writeBlockHeader(&w, &hdr);
+    try db.put(storage.CF_BLOCK_INDEX, &fork_hash, w.getWritten());
+
+    // PRE-FIX: header_index miss + not best_hash → returns 0 (test FAILS).
+    // POST-FIX: persisted CF_BLOCK_INDEX fallback → true height.
+    const got = manager.lookupHeightOrZero(&fork_hash);
+    try std.testing.expectEqual(fork_height, got);
+
+    // Semantics preserved: a genuinely-unknown hash still falls through to 0
+    // (the "fork-from-genesis" sentinel) — the fix only corrects the
+    // previously-wrong 0 for known-but-not-in-memory blocks.
+    var unknown: types.Hash256 = [_]u8{0} ** 32;
+    unknown[0] = 0xff;
+    try std.testing.expectEqual(@as(u32, 0), manager.lookupHeightOrZero(&unknown));
 }
 
 test "peer direction enum" {
