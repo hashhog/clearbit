@@ -241,6 +241,94 @@ test "tests_reorg_restore: reorg restores pre-fork coin spent by disconnected ch
     try std.testing.expectEqual(@as(u32, 3), cs.best_height);
 }
 
+// Reorg-back un-pin blocker: a reorg that ABORTS after the disconnect walk
+// began (here: an unreachable fork_point, so the walk tears down the whole
+// active chain and hits the genesis guard -> error.ForkPointNotOnChain) must
+// NOT leave the in-memory tip collapsed to genesis.  This is the exact live
+// symptom: reorg A->B succeeds, then reorg-back B->A' fails with
+//   "reorgToChain: walked back to genesis without finding fork point"
+// and best_hash/best_height corrupt to genesis (h0) while disk keeps the
+// pre-reorg tip.  Bitcoin Core's ActivateBestChainStep leaves m_chain.Tip()
+// unchanged when a DisconnectTip/ConnectTip step fails.
+//
+// Pre-fix: abortReorgInProgress deliberately did NOT restore best_hash/
+// best_height, so the disconnect walk's in-memory rewind to genesis stuck ->
+// best_height == 0, best_hash == all-zeros (FAILS the assertions below).
+// Post-fix: the pre-reorg snapshot is restored on abort -> best_height == 3,
+// best_hash == the durable tip (PASSES), matching what is still on disk.
+test "tests_reorg_restore: aborted reorg (unreachable fork point) preserves the in-memory tip (no genesis collapse)" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    // Build a 3-block active chain (heights 1..3), distinct coinbase txids.
+    // Unrolled because coinbaseOnlyBlock's script marker is a comptime param.
+    var hashes: [3][32]u8 = undefined;
+    inline for (.{ 0xC1, 0xC2, 0xC3 }, 1..) |marker, height| {
+        const prev: [32]u8 = if (height == 1) [_]u8{0} ** 32 else hashes[height - 2];
+        const block = coinbaseOnlyBlock(prev, marker);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(height);
+        bh[1] = 0xC0;
+        hashes[height - 1] = bh;
+        try queueAndConnect(&cs, &block, &bh, @intCast(height));
+    }
+    try std.testing.expectEqual(@as(u32, 3), cs.best_height);
+    try std.testing.expectEqualSlices(u8, &hashes[2], &cs.best_hash);
+
+    // The height-3 coinbase output is durable on disk — we re-check it AFTER
+    // the aborted reorg to prove the on-disk tip is untouched.
+    const cb3 = coinbaseOnlyBlock(hashes[1], 0xC3);
+    const cb3_txid = crypto.computeTxidStreaming(&cb3.transactions[0]);
+    const cb3_outpoint = types.OutPoint{ .hash = cb3_txid, .index = 0 };
+    const cb3_key = storage.makeUtxoKey(&cb3_outpoint);
+    {
+        const on_disk = try db.get(CF_UTXO, &cb3_key);
+        defer if (on_disk) |b| allocator.free(b);
+        try std.testing.expect(on_disk != null);
+    }
+
+    // Attempt a reorg whose fork_point is NOT on the active chain (and is not
+    // genesis).  The disconnect walk rewinds h3->h2->h1->genesis in memory,
+    // never matches the fork_point, and trips the genesis guard.
+    const bogus_fork_point: types.Hash256 = [_]u8{0xAB} ** 32;
+    const dummy = coinbaseOnlyBlock(bogus_fork_point, 0xDD);
+    var new_chain = [_]ChainState.ReorgBlock{
+        .{ .hash = [_]u8{0xDD} ** 32, .block = dummy, .height = 1 },
+    };
+    const res = cs.reorgToChain(&bogus_fork_point, &new_chain);
+    try std.testing.expectError(error.ForkPointNotOnChain, res);
+
+    // *** THE EFFECTIVE ASSERTIONS ***
+    // In-memory tip must be RESTORED to the pre-reorg tip, not collapsed to
+    // genesis.  Pre-fix: best_height == 0, best_hash == all-zeros.
+    if (cs.best_height != 3 or !std.mem.eql(u8, &cs.best_hash, &hashes[2])) {
+        std.debug.print(
+            "REGRESSION: aborted reorg collapsed the in-memory tip — best_height={d} best_hash[0]={x} (expected height=3)\n",
+            .{ cs.best_height, cs.best_hash[0] },
+        );
+    }
+    try std.testing.expectEqual(@as(u32, 3), cs.best_height);
+    try std.testing.expectEqualSlices(u8, &hashes[2], &cs.best_hash);
+
+    // And the durable on-disk tip is unchanged: h3's coinbase still present.
+    {
+        const on_disk = try db.get(CF_UTXO, &cb3_key);
+        defer if (on_disk) |b| allocator.free(b);
+        try std.testing.expect(on_disk != null);
+    }
+}
+
 // Deep-reorg atomicity: a reorg whose connect phase crosses a cache-eviction
 // boundary must STILL commit in exactly ONE RocksDB WriteBatch (Pattern D).
 //

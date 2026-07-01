@@ -2106,6 +2106,24 @@ pub const ChainState = struct {
     /// false: every non-reorg connect keeps its normal per-block eviction.
     in_no_flush_batch: bool = false,
 
+    /// Pre-reorg tip snapshot, captured at `reorgToChain` entry BEFORE the
+    /// disconnect walk mutates `best_hash`/`best_height` in memory.  On any
+    /// abort path (`abortReorgInProgress`) these are restored so the
+    /// in-memory tip once again matches the durable on-disk tip (nothing was
+    /// flushed on a pre-commit abort).  Bitcoin Core keeps its active-chain
+    /// tip (`m_chain.Tip()`) unchanged when a reorg step (DisconnectTip /
+    /// ConnectTip) fails inside ActivateBestChainStep — the CCoinsViewCache is
+    /// only ever committed atomically, so a failed reorg leaves the chain
+    /// exactly where it started.  Pre-fix clearbit left the disconnect walk's
+    /// partial rewind in place, so a reorg that walked back to genesis before
+    /// discovering a bad/unreachable fork point collapsed the reported tip to
+    /// height 0 while disk still held the real tip (the reorg-back un-pin
+    /// blocker).  `reorg_snapshot_valid` guards against a stray abort call
+    /// outside a reorg restoring a stale snapshot.
+    reorg_prev_best_hash: types.Hash256 = [_]u8{0} ** 32,
+    reorg_prev_best_height: u32 = 0,
+    reorg_snapshot_valid: bool = false,
+
     /// Tip-change notifier for the wait-family RPCs (waitfornewblock /
     /// waitforblock / waitforblockheight).  `notify()` is called from every
     /// tip-advance chokepoint (block connect during IBD + post-IBD, the
@@ -5196,6 +5214,16 @@ pub const ChainState = struct {
         self.in_no_flush_batch = true;
         defer self.in_no_flush_batch = false;
 
+        // Snapshot the pre-reorg tip BEFORE the disconnect walk mutates it.
+        // Any abort path restores it (abortReorgInProgress), so a reorg that
+        // fails partway — including one that walks all the way back to genesis
+        // before discovering a bad/unreachable fork_point — never leaves the
+        // in-memory tip collapsed below the durable on-disk tip.  Cleared on
+        // the SUCCESS path after the terminal flush commits the new tip.
+        self.reorg_prev_best_hash = self.best_hash;
+        self.reorg_prev_best_height = self.best_height;
+        self.reorg_snapshot_valid = true;
+
         // Walk back to the fork point, disconnecting each block along the
         // way.  Bound the work to MAX_REORG_DEPTH = 288.
         var disconnect_count: u32 = 0;
@@ -5451,6 +5479,10 @@ pub const ChainState = struct {
             self.utxo_set.suppress_eviction = false;
         }
 
+        // SUCCESS: the new tip is committed (or memory-only). Drop the
+        // pre-reorg snapshot so a later stray abort can't restore a stale tip.
+        self.reorg_snapshot_valid = false;
+
         std.debug.print(
             "reorgToChain: SUCCESS disconnected={d} connected={d} new_tip_height={d}\n",
             .{ disconnect_count, connect_count, self.best_height },
@@ -5464,12 +5496,37 @@ pub const ChainState = struct {
     /// owned bytes (block bodies + undo bytes) so the eventual deinit()
     /// path is clean.
     ///
-    /// Does NOT roll back the in-memory tip — the disconnect/connect
-    /// loop has already mutated `best_hash`/`best_height` and the
-    /// `utxo_set` cache state.  flush_error sticky-blocks any further
-    /// mutation; restart loads the on-disk pre-reorg tip and resumes
-    /// from there.
+    /// Rolls the in-memory tip (`best_hash`/`best_height`) BACK to the
+    /// pre-reorg snapshot captured at `reorgToChain` entry.  The disconnect
+    /// walk mutated these in memory as it tore down the active chain toward
+    /// the fork point; on a pre-commit abort NOTHING was flushed, so the
+    /// durable on-disk tip is still the pre-reorg tip and the in-memory tip
+    /// must agree with it.  Pre-fix this rollback was deliberately skipped,
+    /// which let a reorg that walked all the way to genesis (bad/unreachable
+    /// fork_point → error.ForkPointNotOnChain) leave `best_hash` collapsed to
+    /// height 0 while disk still held the real tip — the reorg-back un-pin
+    /// blocker (in-memory tip lies as genesis; getbestblockhash/getblockcount
+    /// report h0). Bitcoin Core's ActivateBestChainStep leaves `m_chain.Tip()`
+    /// unchanged when a DisconnectTip/ConnectTip step fails.
+    ///
+    /// The `utxo_set` cache remains sticky-divergent (the per-block spend/
+    /// restore mutations happened in-place and are not individually reverted
+    /// here); `flush_error` stays set so no further read-after-write can
+    /// observe it, and a restart reloads the pristine on-disk UTXO set.  Only
+    /// the tip pointers — which RPC and consensus read directly and which the
+    /// collapse corrupted — are restored.
     fn abortReorgInProgress(self: *ChainState) void {
+        // Restore the pre-reorg tip so the in-memory view matches the durable
+        // (un-flushed) on-disk tip.  Guarded so an abort outside a reorg
+        // (snapshot not captured) is a no-op rather than a stale restore.
+        if (self.reorg_snapshot_valid) {
+            self.best_hash = self.reorg_prev_best_hash;
+            self.best_height = self.reorg_prev_best_height;
+            self.reorg_snapshot_valid = false;
+            // A waiter that re-reads the tip now sees the restored (pre-reorg)
+            // tip rather than the collapsed genesis value.
+            self.tip_notifier.notify();
+        }
         // Free heap-owned bytes so deinit() doesn't double-free or leak.
         for (self.pending_block_writes.items) |entry| {
             self.allocator.free(entry.bytes);
