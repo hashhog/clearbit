@@ -317,6 +317,43 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_reorg_restore_tests.step);
     }
 
+    // Reorg-BACK (B -> A') via the live submitblock side-branch path.
+    // Dedicated root so it can import block_template.zig + validation.zig and
+    // EXECUTE processSideBranchSubmission -> fireReorgFromSideBranch ->
+    // reorgToChain, with a name-substring filter so heavier modules' drifted
+    // inline tests are not pulled into the run.
+    {
+        const reorg_backwalk_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_reorg_backwalk.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_reorg_backwalk"},
+        });
+        reorg_backwalk_tests.linkSystemLibrary("rocksdb");
+        reorg_backwalk_tests.linkSystemLibrary("secp256k1");
+        reorg_backwalk_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        reorg_backwalk_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            reorg_backwalk_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            reorg_backwalk_tests.linkSystemLibrary("minisketch");
+            reorg_backwalk_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        reorg_backwalk_tests.root_module.addOptions("build_options", build_options);
+
+        const run_reorg_backwalk_tests = b.addRunArtifact(reorg_backwalk_tests);
+        const reorg_backwalk_step = b.step(
+            "test-reorg-backwalk",
+            "Run reorg-back (B->A') live submitblock side-branch tests",
+        );
+        reorg_backwalk_step.dependOn(&run_reorg_backwalk_tests.step);
+        test_step.dependOn(&run_reorg_backwalk_tests.step);
+    }
+
     // Advertised P2P service-flag tests (Peer.localServices()).
     // Dedicated test root so it can import peer.zig and EXECUTE the real
     // localServices() without dragging in the pre-existing (drifted)
