@@ -282,6 +282,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_reorg_p2p_tests.step);
     }
 
+    // Reorg disconnect -> spent-coin RESTORE persistence tests.  Dedicated
+    // root (imports storage.zig only) with a name-substring filter so it does
+    // not drag in drifted inline tests from heavier modules.
+    {
+        const reorg_restore_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_reorg_restore.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_reorg_restore"},
+        });
+        reorg_restore_tests.linkSystemLibrary("rocksdb");
+        reorg_restore_tests.linkSystemLibrary("secp256k1");
+        reorg_restore_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        reorg_restore_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            reorg_restore_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            reorg_restore_tests.linkSystemLibrary("minisketch");
+            reorg_restore_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        reorg_restore_tests.root_module.addOptions("build_options", build_options);
+
+        const run_reorg_restore_tests = b.addRunArtifact(reorg_restore_tests);
+        const reorg_restore_step = b.step(
+            "test-reorg-restore",
+            "Run reorg disconnect spent-coin restore persistence tests",
+        );
+        reorg_restore_step.dependOn(&run_reorg_restore_tests.step);
+        test_step.dependOn(&run_reorg_restore_tests.step);
+    }
+
     // Advertised P2P service-flag tests (Peer.localServices()).
     // Dedicated test root so it can import peer.zig and EXECUTE the real
     // localServices() without dragging in the pre-existing (drifted)
