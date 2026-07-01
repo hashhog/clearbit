@@ -2092,6 +2092,20 @@ pub const ChainState = struct {
     /// stuck-at-370001 corruption mode (Option A, wave2-2026-04-14).
     flush_error: bool = false,
 
+    /// Set while a multi-block sequence is being accumulated into ONE deferred
+    /// flush() WriteBatch — i.e. inside `reorgToChain`'s disconnect+connect
+    /// loop (Pattern D).  While true, `connectBlockInner` MUST NOT run its
+    /// tail-eviction `evictCache()` (which itself calls `flush()`): a mid-
+    /// sequence flush would split the reorg across multiple WriteBatches,
+    /// committing a PARTIAL reorg to disk and breaking the all-or-nothing
+    /// atomicity that `reorgToChain` documents and relies on.  Bitcoin Core's
+    /// DisconnectTip→ConnectTip reorg runs under a single cs_main hold with a
+    /// coins-cache flush deferred to the end; clearbit mirrors that by keeping
+    /// the whole disconnect+connect sequence in one batch and evicting (if the
+    /// cache is over budget) only AFTER the single terminal flush().  Default
+    /// false: every non-reorg connect keeps its normal per-block eviction.
+    in_no_flush_batch: bool = false,
+
     /// Tip-change notifier for the wait-family RPCs (waitfornewblock /
     /// waitforblock / waitforblockheight).  `notify()` is called from every
     /// tip-advance chokepoint (block connect during IBD + post-IBD, the
@@ -5171,6 +5185,17 @@ pub const ChainState = struct {
             return error.ReorgTooDeep;
         }
 
+        // Pattern D: the entire disconnect+connect sequence is accumulated
+        // into ONE deferred flush().  Mark the batch active so a per-block
+        // connect's tail-eviction (connectBlockInner) cannot fire flush()
+        // mid-sequence and split the reorg across multiple WriteBatches
+        // (which would commit a partial reorg to disk and can leave the UTXO
+        // set inconsistent → MissingInput on the next forward block).  Reset
+        // unconditionally on exit; a post-flush eviction is done explicitly
+        // after the terminal flush below.
+        self.in_no_flush_batch = true;
+        defer self.in_no_flush_batch = false;
+
         // Walk back to the fork point, disconnecting each block along the
         // way.  Bound the work to MAX_REORG_DEPTH = 288.
         var disconnect_count: u32 = 0;
@@ -5409,6 +5434,21 @@ pub const ChainState = struct {
                 self.abortReorgInProgress();
                 return error.FlushError;
             };
+
+            // Pattern D committed atomically.  NOW (and only now — after the
+            // single terminal flush) reclaim cache if the reorg grew it past
+            // budget.  All entries were just marked clean + persisted by the
+            // flush above, so we run the eviction with suppress_eviction still
+            // set (as connectBlockInner left it throughout the batch): that
+            // routes evictCache() to the clean-only DROP path, reclaiming
+            // memory WITHOUT issuing a second (tip-only) WriteBatch — the
+            // reorg stays exactly one batch.  Then clear both flags so the
+            // next (non-reorg) connect resumes normal per-block eviction.
+            self.in_no_flush_batch = false;
+            if (self.utxo_set.cacheMemoryUsage() > self.utxo_set.max_cache_size -| LARGE_THRESHOLD_HEADROOM) {
+                self.utxo_set.evictCache();
+            }
+            self.utxo_set.suppress_eviction = false;
         }
 
         std.debug.print(
@@ -5469,6 +5509,12 @@ pub const ChainState = struct {
         // divergence is unobservable to callers.
         self.utxo_set.pending_deletes.clearRetainingCapacity();
         self.utxo_set.dirty_keys.clearRetainingCapacity();
+
+        // The deferred-flush batch is being abandoned; clear the guard so any
+        // later connect resumes normal per-block eviction.  (reorgToChain's
+        // own `defer` also resets this, but abortReorgInProgress may be called
+        // from other error paths.)
+        self.in_no_flush_batch = false;
 
         self.flush_error = true;
     }
@@ -5776,23 +5822,37 @@ pub const ChainState = struct {
             if (self.recent_ts_count < 11) self.recent_ts_count += 1;
         }
 
-        // Re-enable eviction now that tip is consistent with UTXO state.
-        self.utxo_set.suppress_eviction = false;
-        // Batch eviction: only check every 10 blocks to amortize the expensive
-        // flush+iterate cost.  The cache can temporarily exceed the limit by
-        // ~10 blocks of UTXOs, which is negligible compared to the cache size.
-        // This dramatically reduces eviction stalls during rapid block import
-        // (IBD or sequential feeding via submitblock RPC).
+        // Re-enable eviction now that tip is consistent with UTXO state — BUT
+        // NOT while accumulating a deferred-flush reorg batch (Pattern D).
+        // evictCache() calls flush(); firing it here mid-`reorgToChain` would
+        // split the disconnect+connect sequence across multiple WriteBatches
+        // and commit a PARTIAL reorg to disk, breaking the single-batch
+        // atomicity reorgToChain relies on (a crash/abort after a mid-batch
+        // flush would leave the durable chainstate at an inconsistent
+        // intermediate tip whose UTXO set can then false-reject the next
+        // forward block with MissingInput).  During the reorg the cache stays
+        // suppressed (as it already is during each block connect) and
+        // reorgToChain evicts, if needed, only AFTER its single terminal
+        // flush().  Bitcoin Core parity: DisconnectTip→ConnectTip runs under
+        // one cs_main hold with the coins-cache flush deferred to the end.
         var evict_ns_block: u64 = 0;
         var evict_fired: bool = false;
-        if (height % 10 == 0 and
-            self.utxo_set.cacheMemoryUsage() > self.utxo_set.max_cache_size -| LARGE_THRESHOLD_HEADROOM)
-        {
-            const t_evict_start = std.time.nanoTimestamp();
-            self.utxo_set.evictCache();
-            const t_evict_end = std.time.nanoTimestamp();
-            evict_ns_block = @as(u64, @intCast(t_evict_end - t_evict_start));
-            evict_fired = true;
+        if (!self.in_no_flush_batch) {
+            self.utxo_set.suppress_eviction = false;
+            // Batch eviction: only check every 10 blocks to amortize the
+            // expensive flush+iterate cost.  The cache can temporarily exceed
+            // the limit by ~10 blocks of UTXOs, negligible vs the cache size.
+            // Dramatically reduces eviction stalls during rapid block import
+            // (IBD or sequential feeding via submitblock RPC).
+            if (height % 10 == 0 and
+                self.utxo_set.cacheMemoryUsage() > self.utxo_set.max_cache_size -| LARGE_THRESHOLD_HEADROOM)
+            {
+                const t_evict_start = std.time.nanoTimestamp();
+                self.utxo_set.evictCache();
+                const t_evict_end = std.time.nanoTimestamp();
+                evict_ns_block = @as(u64, @intCast(t_evict_end - t_evict_start));
+                evict_fired = true;
+            }
         }
 
         // W73: stash per-block phase totals for connectBlockFast to roll up.
