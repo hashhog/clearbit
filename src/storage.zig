@@ -1263,6 +1263,37 @@ pub const UtxoSet = struct {
             return;
         }
 
+        // Pattern D (reorg atomicity): while reorgToChain is accumulating its
+        // single-WriteBatch reorg (in_no_flush_batch), a full flush here would
+        // SPLIT the batch and durably commit a PARTIAL reorg: tip rewound to
+        // the fork point, the old branch's CF_BLOCK_UNDO entries deleted, and
+        // the H:<height> index still pointing at the disconnected branch.  A
+        // crash before the terminal reorg flush then leaves a state
+        // boot-reconcile cannot repair (surplus walk resolves the old branch
+        // via the stale H: index, its undo is gone -> UndoDataNotFound ->
+        // FATAL, reindex required).  This window is reachable because
+        // disconnectBlockByHashCFInner's `defer` resets suppress_eviction
+        // when the LAST disconnect returns, so the read-through eviction
+        // check in get() is live again during the connect-side script
+        // validation of the FIRST new-branch block (reorgToChain's prevout
+        // Adapter lookups run BEFORE connectBlockInner re-sets
+        // suppress_eviction).  Demonstrated: deep reorg (276 disconnects)
+        // with >=1000 restored prevouts + a cold-coin prevout in the first
+        // connect block + tiny cache budget + SIGKILL mid-connect ->
+        // permanent boot wedge (2026-07-01 crash-injection harness).
+        // Route to the clean-only drop instead — the same policy every other
+        // mid-batch point uses — and let reorgToChain's terminal flush()
+        // commit the whole reorg as ONE WriteBatch.  Core parity: Core never
+        // deletes undo data on disconnect, so no mid-reorg flush can strand
+        // it; clearbit's undo-delete-in-batch design is safe ONLY if the
+        // batch never splits.
+        if (self.parent) |cs| {
+            if (cs.in_no_flush_batch) {
+                self.evictCleanOnly();
+                return;
+            }
+        }
+
         // Flush all dirty entries to DB (atomically with tip via ChainState
         // when wired up) before wiping the cache.
         if (self.parent) |cs| {
@@ -5507,6 +5538,12 @@ pub const ChainState = struct {
         // on disk.  Crash after this returns = post-reorg state on
         // disk.  Never an intermediate.
         if (self.utxo_set.db != null) {
+            // The terminal flush is the ONLY legal commit point for the
+            // Pattern-D batch; clear the flag here (not after the flush) so
+            // the flush() chokepoint guard admits exactly this call.  Error
+            // paths are unaffected: `defer` (entry) and abortReorgInProgress
+            // both reset the flag too.
+            self.in_no_flush_batch = false;
             self.flush() catch |err| {
                 std.debug.print("reorgToChain: final flush failed: {}\n", .{err});
                 // flush() already set flush_error and freed batch keys;
@@ -5524,9 +5561,11 @@ pub const ChainState = struct {
             // set (as connectBlockInner left it throughout the batch): that
             // routes evictCache() to the clean-only DROP path, reclaiming
             // memory WITHOUT issuing a second (tip-only) WriteBatch — the
-            // reorg stays exactly one batch.  Then clear both flags so the
-            // next (non-reorg) connect resumes normal per-block eviction.
-            self.in_no_flush_batch = false;
+            // reorg stays exactly one batch.  (in_no_flush_batch was already
+            // cleared immediately before the terminal flush above — the
+            // flush() chokepoint guard's one legal commit point.)  Then clear
+            // suppress_eviction so the next (non-reorg) connect resumes
+            // normal per-block eviction.
             if (self.utxo_set.cacheMemoryUsage() > self.utxo_set.max_cache_size -| LARGE_THRESHOLD_HEADROOM) {
                 self.utxo_set.evictCache();
             }
@@ -6078,6 +6117,23 @@ pub const ChainState = struct {
         if (self.utxo_set.db == null) {
             // Memory-only mode, nothing to persist
             return;
+        }
+
+        // Pattern D chokepoint: refuse ANY flush while reorgToChain is
+        // accumulating its single-WriteBatch reorg.  A mid-batch flush —
+        // whether from the cache-eviction path (see evictCache) or from an
+        // operator's `flushchainstate` RPC racing the reorg between two
+        // per-block connect_mutex holds — durably commits a PARTIAL reorg
+        // (fork-point tip + deleted old-branch undo + stale H: index) that a
+        // crash turns into a boot-reconcile FATAL (UndoDataNotFound).
+        // reorgToChain clears the flag immediately before its terminal
+        // flush(), which is the ONLY legal commit point for the batch.
+        // Callers with a safe fallback (evictCache) treat this as
+        // "skip and retry later"; there is nothing a mid-reorg flush caller
+        // can correctly persist anyway.
+        if (self.in_no_flush_batch) {
+            std.debug.print("flush: refused — reorg batch in progress (Pattern D single-WriteBatch)\n", .{});
+            return error.ReorgBatchInProgress;
         }
         const db = self.utxo_set.db.?;
 
