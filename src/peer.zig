@@ -29,15 +29,29 @@ pub const MAX_INBOUND_CONNECTIONS: usize = 117;
 /// "undo capture enabled" line emits exactly once per process.
 var reorg_announce_emitted: bool = false;
 
-/// Returns true if `CLEARBIT_REORG` env var is set to "1" or "strict".
-/// This gates the reorg-safe IBD path: with the flag on, drainBlockBuffer
-/// uses connectBlockFastWithUndo (captures + persists per-block undo
-/// data); reorg detection in the headers handler is also active.  Off
-/// = legacy single-fork fast path (current live-node behaviour).
+/// Gates the reorg-safe IBD path: when enabled, drainBlockBuffer uses
+/// connectBlockFastWithUndo (captures + persists per-block undo data) and
+/// reorg detection in the headers handler is active (competing-fork
+/// classification → maybeArmReorg → tryFireReorg → reorgToChain).
+///
+/// DEFAULT ON.  A node that cannot capture undo data cannot disconnect
+/// blocks, so with the reorg path off clearbit could NOT reorg to a heavier
+/// competing chain delivered over live P2P — the headers of the heavier fork
+/// were classified as unknown_parent, triggering a getheaders re-request loop
+/// and eventually a misbehaving() disconnect instead of a reorg (the
+/// live-P2P differential harness's INCONCLUSIVE/DRAIN-BREAK-WEDGE).  This is a
+/// consensus-liveness gap versus Bitcoin Core (ActivateBestChain always
+/// reorgs to the most-work chain), so the reorg-safe path is the default.
+///
+/// Escape hatch: set `CLEARBIT_REORG=0` (or "false"/"off") to fall back to
+/// the legacy single-fork fast path (no undo capture).  `CLEARBIT_REORG=warn`
+/// keeps detection on but only logs the reorg it WOULD perform (tryFireReorg
+/// dry-run) rather than committing it.
 fn isReorgEnabled() bool {
-    const v = std.posix.getenv("CLEARBIT_REORG") orelse return false;
-    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "warn") or
-        std.mem.eql(u8, v, "strict");
+    const v = std.posix.getenv("CLEARBIT_REORG") orelse return true;
+    if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or
+        std.mem.eql(u8, v, "off")) return false;
+    return true;
 }
 
 /// Mirror of storage.MAX_REORG_DEPTH (= MIN_BLOCKS_TO_KEEP, 288).  Headers
@@ -4565,7 +4579,22 @@ pub const PeerManager = struct {
             while (i < self.peers.items.len) {
                 const peer_obj = self.peers.items[i];
                 if (peer_obj.should_ban) {
-                    self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                    // Core MaybeDiscourageAndDisconnect (net_processing.cpp:5083):
+                    // a local/loopback peer is DISCONNECT-ONLY — no discourage
+                    // (ban-list) entry is ever written.  misbehaving() documents
+                    // this exemption but still sets should_ban to force the
+                    // disconnect, so the ban-list write MUST be suppressed here
+                    // or the exemption is defeated.  Without this guard a single
+                    // misbehaving() on a 127.0.0.1 peer persisted a loopback ban
+                    // to banlist.json (written relative to cwd, shared across
+                    // datadirs incl. mainnet) which then RST'd every subsequent
+                    // inbound loopback connection before the handshake — the
+                    // "retry: handshake never completes" half of the P2P-reorg
+                    // wedge, and a footgun that could brick the mainnet node's
+                    // local RPC/consensus-diff tooling.
+                    if (!peer_obj.isLocalAddress()) {
+                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                    }
                     self.removePeerByIndex(i);
                     continue;
                 }
@@ -4768,28 +4797,34 @@ pub const PeerManager = struct {
             return .{ .work = chainWorkFromHeight(0), .height = 0 };
         }
 
-        // Active-chain tip is checked first because the index doesn't
-        // include flushed-and-evicted ancestors.
+        // Prefer the REAL cumulative chain_work from the in-memory header
+        // index.  Every header carries (chainWorkFromHeight(root) + Σ real
+        // workFromBits), and reorg comparisons are only meaningful when all
+        // headers sit on that one scale.  A header whose parent happens to be
+        // the current active tip must therefore still use the tip's REAL
+        // index chain_work when it is present (the normal headers-first case).
+        // The prior code returned the synthetic `chainWorkFromHeight(height)`
+        // placeholder for the active-tip parent unconditionally, which gave a
+        // fork tip built on the tip a tiny placeholder-scale chain_work — it
+        // then compared LOWER than the real-work active chain, so a genuine
+        // one-block extension of a just-reorged tip (e.g. the follow-up spend
+        // block after a P2P reorg) was wrongly classified as a lower-work fork
+        // and dropped, wedging the tip one block short.
+        if (self.header_index.get(prev_hash.*)) |entry| {
+            return .{ .work = entry.chain_work, .height = entry.height };
+        }
+        // Active tip NOT in the index (e.g. post-restart the header_index is
+        // empty until headers re-sync, yet blocks are connected): synthesize a
+        // monotonic height-based placeholder so a fork off the tip still has a
+        // strictly-greater chain_work than the tip.  Only used for the
+        // strict-greater-than check, never persisted.
         if (self.chain_state) |cs| {
             if (std.mem.eql(u8, &cs.best_hash, prev_hash)) {
-                // Active-chain entries don't carry chain_work in our
-                // ChainState (it's flat-key UTXOs only); we synthesize a
-                // monotonic placeholder so a fork that forks off the tip
-                // still has a strictly-greater chain_work than the tip.
-                // The placeholder is `tip_height << 8` packed big-endian
-                // — gives 256B of headroom for the next ~256 forks
-                // before the comparison loses meaning. Acceptable
-                // approximation: the absolute chain_work value is only
-                // used for the strict-greater-than check, never persisted.
                 return .{
                     .work = chainWorkFromHeight(cs.best_height),
                     .height = cs.best_height,
                 };
             }
-        }
-        // Otherwise look in the in-memory index.
-        if (self.header_index.get(prev_hash.*)) |entry| {
-            return .{ .work = entry.chain_work, .height = entry.height };
         }
         return null;
     }
@@ -5059,17 +5094,47 @@ pub const PeerManager = struct {
         // Reverse fork_chain to get fork_point + 1 .. new_tip order.
         std.mem.reverse(types.Hash256, fork_chain.items);
 
-        // Compare new tip chain_work strictly greater than active tip's.
-        // For the active tip we use the chainWorkFromHeight placeholder
-        // (the same one used by lookupParentChainWork). The fork
-        // chain_work was computed cumulatively from the same placeholder
-        // root for the fork point, so the comparison is apples-to-apples.
-        const active_work = chainWorkFromHeight(cs.best_height);
+        // Only switch to a fork with strictly MORE chain_work than the chain we
+        // are already committed to.  Bitcoin Core compares nChainWork against
+        // the current best chain (ActivateBestChain), with equal work broken by
+        // first-seen.  The subtlety here: header_index chain_work is the
+        // placeholder base (chainWorkFromHeight) PLUS real workFromBits, so it is
+        // only comparable to ANOTHER header_index chain_work — NOT to the bare
+        // chainWorkFromHeight(best_height) placeholder, which omits the real work
+        // and is therefore always "lighter" than any fork tip.  Comparing a fork
+        // tip's real-work value against that bare placeholder is effectively
+        // "always heavier", so it cannot gate anything: during IBD a peer
+        // re-announcing the SAME chain we are already syncing (a normal duplicate
+        // inv/headers round in phase A) was misclassified as a heavier competing
+        // fork.  That bogus reorg then tried to reconnect a block whose coinbase
+        // is already in the UTXO set (Bip30DuplicateOutput), aborted, and latched
+        // the sticky flush_error on the chainstate — which then permanently
+        // refused the NEXT (legitimate) competing-fork reorg's disconnect, so the
+        // node could never reorg over live P2P.
+        //
+        // Fix: use the chain_work of our own best COMMITTED header (the tip of
+        // the header chain we have already accepted into expected_blocks, or the
+        // active tip) as the comparison basis, read from header_index so it is on
+        // the SAME (base+real-work) scale as the fork tip.  A re-announcement of
+        // our sync chain then compares EQUAL (same tip hash → same chain_work) and
+        // is correctly ignored (first-seen).  Only when the active header tip is
+        // not in the index (fresh/evicted) do we fall back to the placeholder —
+        // preserving the existing lower/equal-chainwork unit-test semantics.
+        const active_work: [32]u8 = blk: {
+            if (self.expected_blocks.items.len > 0) {
+                const hdr_tip = self.expected_blocks.items[self.expected_blocks.items.len - 1];
+                if (self.header_index.get(hdr_tip)) |e| break :blk e.chain_work;
+            }
+            if (self.header_index.get(cs.best_hash)) |e| break :blk e.chain_work;
+            break :blk chainWorkFromHeight(cs.best_height);
+        };
         if (cmpChainWorkBE(&tip_entry.chain_work, &active_work) <= 0) {
-            // Equal- or lower-chainwork fork: ignore (first-seen wins).
+            // Equal- or lower-chainwork than the chain we already hold/are
+            // syncing: ignore (first-seen wins; a re-announcement of our own
+            // sync chain lands here and must NOT trigger a reorg).
             std.log.info(
-                "REORG: ignoring equal/lower-chainwork fork (active_h={d})",
-                .{cs.best_height},
+                "REORG: ignoring equal/lower-chainwork fork (active_h={d} fork_tip_h={d})",
+                .{ cs.best_height, tip_entry.height },
             );
             return;
         }
@@ -7665,6 +7730,23 @@ pub const PeerManager = struct {
                     continue;
                 }
             }
+            // Genesis terminus (Core CBlockIndex::GetMedianTimePast walks
+            // pprev until null; genesis IS a real index entry with a real
+            // nTime).  During IBD the genesis block's header is in NEITHER
+            // header_index (headers start at height 1) NOR getPersistedHeader,
+            // so the walk stopped one ancestor short.  For a low block whose
+            // 11-window reaches genesis that dropped the window from an odd to
+            // an even count and flipped medianTimePast to the upper element —
+            // e.g. block-3's MTP became block-2's time instead of block-1's,
+            // and since the miner sets nTime = MTP+1 that made block-3.time ==
+            // computed-MTP and false-rejected it as bad-timestamp (BIP-113),
+            // wedging the P2P block drain at connect_cursor=2.  Supply the
+            // genesis timestamp from the network params (it has no parent) so
+            // the window matches Core exactly.
+            if (std.mem.eql(u8, &cursor, &self.network_params.genesis_hash)) {
+                timestamps[n] = self.network_params.genesis_header.timestamp;
+                n += 1;
+            }
             break;
         }
         if (n > 0) return validation.medianTimePast(timestamps[0..n]);
@@ -7752,6 +7834,16 @@ pub const PeerManager = struct {
                 cursor = hdr.prev_block;
                 n += 1;
                 continue;
+            }
+            // Genesis terminus (see computePrevMtp): genesis is a real block
+            // with a real nTime and no parent, but is absent from header_index
+            // and getPersistedHeader during IBD.  Include its timestamp from
+            // the network params so a low-height coin's GetMedianTimePast
+            // window matches Core (and the incomplete-window guard below does
+            // not needlessly zero out a genesis-rooted window).
+            if (std.mem.eql(u8, &cursor, &self.network_params.genesis_hash)) {
+                timestamps[n] = self.network_params.genesis_header.timestamp;
+                n += 1;
             }
             break;
         }
