@@ -2496,6 +2496,27 @@ pub const ChainState = struct {
     /// as the tip's H: put so a crash mid-flush leaves a consistent state.
     pending_height_index_deletes: std.ArrayList(u32) = undefined,
 
+    /// Reorg only: per-height H:<height>→hash index WRITES pending durable
+    /// commit.  A reorg replaces the blocks at every height from
+    /// fork_point+1 up to the new tip in ONE deferred flush, but the flush's
+    /// step-4 tip put only refreshes H:<best_height>.  Without re-writing the
+    /// intermediate heights, getBlockHashByHeight keeps resolving the OLD
+    /// (now-disconnected) branch's block for every height below the new tip —
+    /// which makes fireReorgFromSideBranch's fork-point walk mis-classify a
+    /// disconnected block as active-chain on the NEXT reorg-back and abort
+    /// with ForkPointNotOnChain (the reorg-back un-pin blocker).  Populated by
+    /// reorgToChain's connect loop; drained in flush() into the SAME
+    /// WriteBatch as the tip put so the whole reorg's height index commits
+    /// atomically.  Empty for every non-reorg flush.  Bitcoin Core keeps
+    /// CChain::vChain consistent with the active chain at all heights; this
+    /// mirrors that invariant for the persisted H: index.
+    pending_height_index_writes: std.ArrayList(PendingHeightHashWrite) = undefined,
+
+    pub const PendingHeightHashWrite = struct {
+        height: u32,
+        hash: types.Hash256,
+    };
+
     pub const PendingBlockWrite = struct {
         hash: types.Hash256,
         bytes: []u8,
@@ -2684,6 +2705,7 @@ pub const ChainState = struct {
             .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_height_index_deletes = std.ArrayList(u32).init(allocator),
+            .pending_height_index_writes = std.ArrayList(PendingHeightHashWrite).init(allocator),
             .pending_filter_writes = std.ArrayList(PendingFilterWrite).init(allocator),
             .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_coinstats_writes = std.ArrayList(PendingCoinStatsWrite).init(allocator),
@@ -2708,6 +2730,7 @@ pub const ChainState = struct {
             .pending_tx_index_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_undo_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_height_index_deletes = std.ArrayList(u32).init(allocator),
+            .pending_height_index_writes = std.ArrayList(PendingHeightHashWrite).init(allocator),
             .pending_filter_writes = std.ArrayList(PendingFilterWrite).init(allocator),
             .pending_filter_deletes = std.ArrayList(types.Hash256).init(allocator),
             .pending_coinstats_writes = std.ArrayList(PendingCoinStatsWrite).init(allocator),
@@ -2792,6 +2815,9 @@ pub const ChainState = struct {
         // Boot-reconcile (2026-06-23): inline u32 heights, no heap — plain
         // deinit() mirrors pending_undo_deletes.
         self.pending_height_index_deletes.deinit();
+        // Reorg multi-height H: writes: inline {u32,Hash256}, no heap — plain
+        // deinit() mirrors pending_height_index_deletes.
+        self.pending_height_index_writes.deinit();
         // BlockFilterIndex (2026-05-05): drain any unflushed filter bytes
         // (heap-owned by ChainState until flush() succeeds, mirrors
         // pending_block_writes / pending_undo_writes).  Deletes are
@@ -5444,6 +5470,34 @@ pub const ChainState = struct {
 
             try self.connectBlockFastWithUndoNoFlush(&entry.block, &entry.hash, entry.height);
             connect_count += 1;
+
+            // Refresh the H:<height>→hash index for this connected height.
+            // The terminal flush()'s single tip-height put is not enough: a
+            // reorg re-chains EVERY height from fork_point+1 up to the new
+            // tip, and any intermediate height left pointing at the OLD
+            // (disconnected) branch's block would make a later reorg-back's
+            // fork-point walk (fireReorgFromSideBranch) mis-classify a
+            // disconnected block as active-chain and abort with
+            // ForkPointNotOnChain.  Queued here so it commits atomically in
+            // the same WriteBatch as the tip advance (Pattern D).
+            try self.pending_height_index_writes.append(.{
+                .height = entry.height,
+                .hash = entry.hash,
+            });
+        }
+
+        // A reorg that net-SHORTENS the chain (disconnected more than it
+        // connected) leaves orphaned H:<height>→hash entries for the old
+        // branch's heights above the new tip.  Queue deletes so
+        // getBlockHashByHeight cannot resolve a disconnected block as
+        // active-chain — the same staleness class the per-height writes above
+        // fix for the overlapping heights.  Core keeps CChain::vChain
+        // truncated to the active tip height, so no above-tip height resolves.
+        if (self.reorg_snapshot_valid and self.reorg_prev_best_height > self.best_height) {
+            var stale_h: u32 = self.best_height + 1;
+            while (stale_h <= self.reorg_prev_best_height) : (stale_h += 1) {
+                try self.pending_height_index_deletes.append(stale_h);
+            }
         }
 
         // Pattern D single-batch commit: every disconnect-side and
@@ -5481,6 +5535,10 @@ pub const ChainState = struct {
 
         // SUCCESS: the new tip is committed (or memory-only). Drop the
         // pre-reorg snapshot so a later stray abort can't restore a stale tip.
+        // A successful flush above already drained + cleared the per-height H:
+        // write queue; this clear is a no-op there and only matters on the
+        // memory-only (db == null) path, where flush is skipped entirely.
+        self.pending_height_index_writes.clearRetainingCapacity();
         self.reorg_snapshot_valid = false;
 
         std.debug.print(
@@ -5542,6 +5600,7 @@ pub const ChainState = struct {
         self.pending_tx_index_deletes.clearRetainingCapacity();
         self.pending_undo_deletes.clearRetainingCapacity();
         self.pending_height_index_deletes.clearRetainingCapacity();
+        self.pending_height_index_writes.clearRetainingCapacity();
 
         // BlockFilterIndex (2026-05-05): heap-owned filter bytes need to be
         // freed alongside block bodies + undo bytes.  Header is inline.
@@ -6125,6 +6184,33 @@ pub const ChainState = struct {
             .value = hh_val,
         } });
 
+        // 4a. Reorg multi-height H:<height>→hash writes.  A reorg re-chains
+        //     EVERY height from fork_point+1 up to the new tip in ONE flush;
+        //     the single tip put above only refreshes H:<best_height>, leaving
+        //     the intermediate heights pointing at the OLD (disconnected)
+        //     branch's blocks.  That stale mapping makes getBlockHashByHeight
+        //     lie about active-chain membership, which in turn makes the next
+        //     reorg-back's fork-point walk (fireReorgFromSideBranch) resolve a
+        //     disconnected block as the fork point → reorgToChain walks past it
+        //     to genesis → ForkPointNotOnChain (the reorg-back un-pin blocker).
+        //     Draining the queue into THIS batch keeps the whole reorg's height
+        //     index atomic with the tip advance.  The tip height may also be in
+        //     this queue (last connected block); the duplicate put is benign
+        //     (identical value).  Empty for every non-reorg flush.  Cleared on
+        //     the successful-write path only, so a flush_error keeps the queue.
+        for (self.pending_height_index_writes.items) |hw| {
+            const w_key_bytes = ChainStore.buildHeightHashKey(hw.height);
+            const wk = try self.allocator.alloc(u8, ChainStore.HEIGHT_HASH_KEY_LEN);
+            @memcpy(wk, &w_key_bytes);
+            const wv = try self.allocator.alloc(u8, 32);
+            @memcpy(wv, &hw.hash);
+            try batch.append(.{ .put = .{
+                .cf = CF_DEFAULT,
+                .key = wk,
+                .value = wv,
+            } });
+        }
+
         // 4b. Boot-reconcile (2026-06-23): drain pending_height_index_deletes —
         //     the orphaned H:<height>→hash entries for surplus persisted blocks
         //     disconnected on boot.  Append CF_DEFAULT DELETEs into the SAME
@@ -6611,6 +6697,11 @@ pub const ChainState = struct {
             // per-op key copies.  Cleared ONLY on the successful-write path so
             // a flush_error keeps the queue for the next retry.
             self.pending_height_index_deletes.clearRetainingCapacity();
+            // Reorg multi-height H: writes committed: inline {u32,Hash256}, no
+            // heap inside the queue entries (the per-op key/value copies are
+            // freed by the generic BatchOp cleanup below).  Cleared on the
+            // successful-write path only, mirroring the deletes above.
+            self.pending_height_index_writes.clearRetainingCapacity();
 
             // BlockFilterIndex (2026-05-05): CF_BLOCK_FILTER bytes
             // committed — free filter_bytes here exactly once (the BatchOp
