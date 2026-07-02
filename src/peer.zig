@@ -303,6 +303,67 @@ pub fn chainWorkFromHeight(height: u32) [32]u8 {
     return out;
 }
 
+/// Verdict of the min-chain-work anti-DoS gate for a received header batch.
+pub const MinChainWorkVerdict = enum {
+    /// Cumulative work (parent + batch) has reached min_chain_work: commit the
+    /// batch to the download queue normally.
+    commit,
+    /// Cumulative work is still below min_chain_work but our best header chain
+    /// has ALSO not yet reached min_chain_work — i.e. we are still in initial
+    /// header sync ("presync").  Tolerate the low-work headers and accumulate;
+    /// DO NOT ban the peer.  This mirrors Bitcoin Core, which never Misbehaves
+    /// on low-work headers during sync (net_processing.cpp:1913-1916
+    /// BLOCK_HEADER_LOW_WORK -> break; TryLowWorkHeadersSync:2765-2809 stages
+    /// low-work chains without banning or committing until min work is met).
+    presync_accept,
+    /// Cumulative work is below min_chain_work even though our best header chain
+    /// has ALREADY crossed min_chain_work — a peer feeding a low-work chain that
+    /// cannot help us (steady-state DoS).  Drop the peer.
+    reject_dos,
+};
+
+/// Evaluate the min-chain-work (min_pow_checked) anti-DoS gate for a batch of
+/// headers, returning whether to commit, tolerate (presync), or drop.
+///
+/// Reference: Bitcoin Core net_processing.cpp — `MaybePunishNodeForBlock`
+/// treats BLOCK_HEADER_LOW_WORK with a bare `break` (NO Misbehaving, lines
+/// 1913-1916), and `TryLowWorkHeadersSync` (2765-2809) routes a below-threshold
+/// chain through presync (`HeadersSyncState`) WITHOUT storing or banning; it
+/// only refuses to commit the headers until `GetAntiDoSWorkThreshold()` /
+/// `nMinimumChainWork` is crossed.  Clearbit's earlier gate instead called
+/// `misbehaving(100)` on the first genesis-rooted batch (whose cumulative work
+/// is necessarily far below min_chain_work), banning the only honest peer and
+/// making genesis IBD impossible.
+///
+/// `best_header_work` is the node's current best-header cumulative chain work
+/// (the presync progress signal); `parent_work` is the cumulative work at the
+/// batch's parent; `batch_work` is the summed proof-of-work of the batch.
+pub fn evalMinChainWorkGate(
+    best_header_work: *const [32]u8,
+    parent_work: *const [32]u8,
+    batch_work: *const [32]u8,
+    min_cw: *const [32]u8,
+) MinChainWorkVerdict {
+    // All-zero min_chain_work (regtest): the gate is a no-op — commit. This
+    // matches Core, where a zero nMinimumChainWork makes min_pow_checked always
+    // satisfied.
+    const zero: [32]u8 = [_]u8{0} ** 32;
+    if (std.mem.eql(u8, min_cw, &zero)) return .commit;
+
+    // cum_work = parent_work + batch_work.
+    var cum: [32]u8 = parent_work.*;
+    addChainWorkBE(&cum, batch_work);
+    if (cmpChainWorkBE(&cum, min_cw) >= 0) return .commit;
+
+    // Below threshold.  Are we still in presync?  Yes iff our best header chain
+    // has not itself reached min_chain_work.  While in presync we tolerate the
+    // low-work headers without banning (Core presync); once our best header
+    // chain is past min_chain_work, a further below-threshold batch is a
+    // low-work chain that cannot advance us -> DoS drop.
+    if (cmpChainWorkBE(best_header_work, min_cw) < 0) return .presync_accept;
+    return .reject_dos;
+}
+
 /// Maximum total connections (125 as per Bitcoin Core).
 pub const MAX_TOTAL_CONNECTIONS: usize = MAX_OUTBOUND_CONNECTIONS + MAX_INBOUND_CONNECTIONS;
 
@@ -5699,19 +5760,43 @@ pub const PeerManager = struct {
                         break :blk false;
                     };
                     if (!std.mem.eql(u8, &min_cw, &zero) and !past_snapshot_base) {
-                        // Compute cumulative chain work for this batch.
-                        // Start from the parent's work (genesis = all-zeros).
-                        var cum_work: [32]u8 = if (self.lookupParentChainWork(&h.headers[0].prev_block)) |p| p.work else [_]u8{0} ** 32;
+                        // Compute the parent's cumulative work (genesis =
+                        // all-zeros) and the batch's summed proof-of-work.
+                        var parent_work: [32]u8 = if (self.lookupParentChainWork(&h.headers[0].prev_block)) |p| p.work else [_]u8{0} ** 32;
+                        var batch_work: [32]u8 = [_]u8{0} ** 32;
                         for (h.headers) |hdr| {
                             const w = workFromBits(hdr.bits);
-                            addChainWorkBE(&cum_work, &w);
+                            addChainWorkBE(&batch_work, &w);
                         }
-                        // Reject batch when cumulative work < min_chain_work.
-                        if (cmpChainWorkBE(&cum_work, &min_cw) < 0) {
-                            std.debug.print("P2P: peer={any} rejected: too-little-chainwork (batch work below min_chain_work)\n",
-                                .{peer.address});
-                            peer.misbehaving(100, "too-little-chainwork");
-                            return;
+                        // Core-faithful presync gate.  Do NOT ban on
+                        // too-little-chainwork during initial header sync:
+                        // Core never Misbehaves on BLOCK_HEADER_LOW_WORK
+                        // (net_processing.cpp:1913-1916) and stages low-work
+                        // chains via TryLowWorkHeadersSync (2765-2809) without
+                        // banning.  Banning here bricked genesis IBD by
+                        // discouraging the first honest peer on its very first
+                        // genesis-rooted batch (cumulative work << min_chain_work).
+                        switch (evalMinChainWorkGate(
+                            &self.best_header_chain_work,
+                            &parent_work,
+                            &batch_work,
+                            &min_cw,
+                        )) {
+                            // .commit: batch crossed min_chain_work.
+                            // .presync_accept: still in presync — tolerate the
+                            //   low-work headers and fall through to append so
+                            //   cumulative work grows toward min_chain_work.
+                            .commit, .presync_accept => {},
+                            .reject_dos => {
+                                // Best header chain is already past
+                                // min_chain_work; a further below-threshold
+                                // batch is a low-work chain that cannot advance
+                                // us — steady-state DoS drop.
+                                std.debug.print("P2P: peer={any} rejected: too-little-chainwork (low-work chain after min-work reached)\n",
+                                    .{peer.address});
+                                peer.misbehaving(100, "too-little-chainwork");
+                                return;
+                            },
                         }
                     }
                 }

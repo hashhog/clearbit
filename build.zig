@@ -392,6 +392,44 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_service_flags_tests.step);
     }
 
+    // Min-chain-work presync gate (evalMinChainWorkGate).  Dedicated test root
+    // that imports peer.zig, with a `.filters` substring matching our test
+    // names (`tests_minwork_presync.test.<name>`) so peer.zig's own inline
+    // tests are not dragged in.  Pins the genesis-IBD divergence: low-work
+    // headers must be presync-accepted (Core parity), not banned.
+    {
+        const minwork_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_minwork_presync.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_minwork_presync"},
+        });
+        minwork_tests.linkSystemLibrary("rocksdb");
+        minwork_tests.linkSystemLibrary("secp256k1");
+        minwork_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        minwork_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            minwork_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            minwork_tests.linkSystemLibrary("minisketch");
+            minwork_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        minwork_tests.root_module.addOptions("build_options", build_options);
+
+        const run_minwork_tests = b.addRunArtifact(minwork_tests);
+        const minwork_test_step = b.step(
+            "test-minwork-presync",
+            "Run min-chain-work presync gate (genesis-IBD low-work tolerance) tests",
+        );
+        minwork_test_step.dependOn(&run_minwork_tests.step);
+        // Fold into the main `test` step so CI exercises the presync gate.
+        test_step.dependOn(&run_minwork_tests.step);
+    }
+
     // W103 — tx relay flow 30-gate fleet audit.
     // Uses a dedicated test root (tests_w103_tx_relay.zig) so it can import
     // peer.zig + mempool.zig without pulling in unrelated peer.zig tests.
