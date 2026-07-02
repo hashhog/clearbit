@@ -909,6 +909,19 @@ pub const ScriptEngine = struct {
 
             // Execute the opcode
             try self.executeOpcode(opcode, script, &pc, &exec_stack, &op_count, current_opcode_pos);
+
+            // Stack-size limit — mirror Core interpreter.cpp:1222, which runs
+            // `stack.size() + altstack.size() > MAX_STACK_SIZE` (=1000) at the
+            // END of every opcode iteration -> SCRIPT_ERR_STACK_SIZE. Most
+            // stack-growing ops route through push()/pushOwned() (which gate at
+            // >= 1000 before appending), but OP_TUCK grows the stack via a
+            // direct insert() that bypasses that gate. Without this end-of-loop
+            // check a script that peaks at 1001 elements via OP_TUCK is wrongly
+            // ACCEPTED where Core REJECTS. This gate is the authoritative,
+            // op-agnostic mirror of Core's per-iteration cap.
+            if (self.stack.items.len + self.alt_stack.items.len > MAX_STACK_SIZE) {
+                return ScriptError.StackOverflow;
+            }
         }
 
         if (exec_stack.items.len != 0) return ScriptError.UnbalancedConditional;
@@ -7363,6 +7376,49 @@ test "W94: MAX_STACK_SIZE constant matches Core (1000)" {
 // Bug #7: MAX_SCRIPT_ELEMENT_SIZE constant.
 test "W94: MAX_SCRIPT_ELEMENT_SIZE constant matches Core (520)" {
     try std.testing.expectEqual(@as(comptime_int, 520), MAX_SCRIPT_ELEMENT_SIZE);
+}
+
+// GLASSBOX-W2: OP_TUCK MAX_STACK_SIZE bypass.
+// Core (interpreter.cpp:1222) checks stack+altstack > MAX_STACK_SIZE (1000) at
+// the END of every opcode iteration. OP_TUCK grows the stack via a direct
+// insert() that bypasses push()/pushOwned(), so a script that peaks at 1001
+// elements via OP_TUCK must be REJECTED (SCRIPT_ERR_STACK_SIZE). Exactly 1000
+// must still pass. Pre-fix: 1001-via-TUCK is ACCEPTED (divergence). Post-fix:
+// rejected with StackOverflow.
+test "GLASSBOX-W2: OP_TUCK peaking at 1001 elements rejected (MAX_STACK_SIZE)" {
+    const allocator = std.testing.allocator;
+    const tx = w94EmptyTx();
+
+    // Script: 1000 x OP_1 (0x51) reaches exactly 1000, then OP_TUCK (0x7d)
+    // inserts a copy -> 1001 -> must be rejected.
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.appendNTimes(0x51, 1000); // OP_1 x1000 -> stack = 1000
+    try s.append(0x7d); // OP_TUCK -> stack = 1001
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    try std.testing.expectError(ScriptError.StackOverflow, engine.execute(s.items));
+}
+
+test "GLASSBOX-W2: OP_TUCK peaking at exactly 1000 elements accepted" {
+    const allocator = std.testing.allocator;
+    const tx = w94EmptyTx();
+
+    // Script: 998 x OP_1 -> 998, then OP_TUCK duplicates the top -> 999, then
+    // one more OP_1 would be 1000 but keep the peak at exactly 1000 via TUCK:
+    // 999 x OP_1 -> 999, OP_TUCK -> 1000 (peak, allowed). Must NOT error on the
+    // size check (execute() returns without StackOverflow).
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.appendNTimes(0x51, 999); // OP_1 x999 -> stack = 999
+    try s.append(0x7d); // OP_TUCK -> stack = 1000 (exactly at the cap)
+
+    var engine = ScriptEngine.init(allocator, &tx, 0, 0, ScriptFlags{});
+    defer engine.deinit();
+    // Exactly 1000 is allowed: execute() must complete without a size error.
+    try engine.execute(s.items);
+    try std.testing.expectEqual(@as(usize, 1000), engine.stack.items.len);
 }
 
 // Bug #2 sanity: discourage flag NOT set with unknown pubkey + non-empty sig
