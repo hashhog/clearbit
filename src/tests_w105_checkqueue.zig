@@ -269,6 +269,8 @@ test "w105 G11: deinit correctly sets stop_flag before joining workers (PASS)" {
 // This wastes a full CPU core for the master thread during verification.
 // Reference: checkqueue.h:90-91 `m_master_cv.notify_one()`
 // Severity: MEDIUM — wastes one CPU during every parallel block validation
+// RESOLVED: waitAll() now blocks on Futex.wait(&workers_done, ...) instead of
+// a spin loop — the master sleeps until the last worker wakes it. No busy-wait.
 // ============================================================================
 test "w105 G12: master thread spin-waits instead of condvar sleep" {
     // The spin loop is at validation.zig:2415-2418.
@@ -295,6 +297,10 @@ test "w105 G12: master thread spin-waits instead of condvar sleep" {
 // will exceed job_count immediately, so it's safe but wasteful).
 // Reference: checkqueue.h:107-109  (mutex-protected wait prevents this race)
 // Severity: LOW — safe but can cause spurious wakeups
+// RESOLVED: workers now park on a monotonic generation counter (Futex.wait on
+// generation != last_gen) instead of a shared ResetEvent. A worker looping back
+// after a batch either sees the counter unchanged (parks) or already advanced
+// (processes the new batch) — no stale set-state re-entry.
 // ============================================================================
 test "w105 G13: ResetEvent.wait() has spurious-wakeup race between batches" {
     const allocator = testing.allocator;
@@ -321,6 +327,11 @@ test "w105 G13: ResetEvent.wait() has spurious-wakeup race between batches" {
 // if reset() fires AFTER the next submit()+set(), the worker may miss a batch.
 // Reference: checkqueue.h:108-109 (mutex serialises this)
 // Severity: MEDIUM — race condition between batches, potential missed wakeup
+// RESOLVED: the ResetEvent (and its reset()/wait() race) is gone. The master
+// signals a batch by incrementing a monotonic generation counter that is NEVER
+// reset, so a straggler entering Futex.wait after the increment observes the
+// new value and returns immediately — no lost wakeup, no missed batch. This is
+// the crash the AV=0 replay hit at height ~76871 (waitUntilSet assert panic).
 // ============================================================================
 test "w105 G14: start_event reset-before-result-check ordering race" {
     const allocator = testing.allocator;

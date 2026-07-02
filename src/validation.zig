@@ -2674,10 +2674,22 @@ pub const ScriptCheckQueue = struct {
     job_count: usize,
     /// Number of completed jobs (for synchronization)
     completed_count: std.atomic.Value(usize),
-    /// Signal for workers to start
-    start_event: std.Thread.ResetEvent,
-    /// Signal that all work is done
-    done_event: std.Thread.ResetEvent,
+    /// Batch generation counter (monotonic, u32 for Futex). The master
+    /// increments this to signal a new batch; workers futex-wait on it
+    /// changing. It is NEVER reset, so a straggler entering Futex.wait after
+    /// the master already advanced it simply observes the new value and
+    /// returns immediately — no lost wakeup and, crucially, no reset()/wait()
+    /// race. (The old design shared a single std.Thread.ResetEvent that the
+    /// master set() to wake all workers then reset() the instant the batch
+    /// finished; a worker woken by set() but not yet observing is_set would
+    /// trip ResetEvent's internal assert(state==is_set) and panic under load.)
+    generation: std.atomic.Value(u32),
+    /// Number of workers that have finished draining the current batch. The
+    /// master waits on this reaching worker_count, which is strictly stronger
+    /// than counting completed jobs: it guarantees no worker is still inside
+    /// processJobs when waitAll returns, so the next submit() cannot race a
+    /// lingering worker over the shared job array.
+    workers_done: std.atomic.Value(u32),
     /// Flag to stop worker threads
     stop_flag: std.atomic.Value(bool),
     /// Allocator for memory management
@@ -2708,8 +2720,8 @@ pub const ScriptCheckQueue = struct {
             .next_job = std.atomic.Value(usize).init(0),
             .job_count = 0,
             .completed_count = std.atomic.Value(usize).init(0),
-            .start_event = .{},
-            .done_event = .{},
+            .generation = std.atomic.Value(u32).init(0),
+            .workers_done = std.atomic.Value(u32).init(0),
             .stop_flag = std.atomic.Value(bool).init(false),
             .allocator = allocator,
             .worker_count = worker_count,
@@ -2726,9 +2738,11 @@ pub const ScriptCheckQueue = struct {
 
     /// Deinitialize the queue and stop all workers.
     pub fn deinit(self: *ScriptCheckQueue) void {
-        // Signal workers to stop
+        // Signal workers to stop, then advance the generation and wake every
+        // worker so they observe stop_flag and exit.
         self.stop_flag.store(true, .release);
-        self.start_event.set();
+        _ = self.generation.fetchAdd(1, .release);
+        std.Thread.Futex.wake(&self.generation, std.math.maxInt(u32));
 
         // Wait for all workers to finish
         for (self.workers) |worker| {
@@ -2747,7 +2761,9 @@ pub const ScriptCheckQueue = struct {
         self.job_count = jobs.len;
         self.next_job.store(0, .release);
         self.completed_count.store(0, .release);
-        self.done_event.reset();
+        // Reset the per-worker completion count for the new batch. Safe because
+        // the previous waitAll only returned once every worker had parked.
+        self.workers_done.store(0, .release);
     }
 
     /// Wait for all jobs to complete.
@@ -2756,20 +2772,25 @@ pub const ScriptCheckQueue = struct {
     pub fn waitAll(self: *ScriptCheckQueue) bool {
         if (self.job_count == 0) return true;
 
-        // Wake up workers
-        self.start_event.set();
+        // Signal a new batch by advancing the monotonic generation counter and
+        // waking every parked worker. Because the counter is never reset, a
+        // straggler still entering Futex.wait() observes the new value and
+        // returns immediately — no lost wakeup, no reset()/wait() race.
+        _ = self.generation.fetchAdd(1, .release);
+        std.Thread.Futex.wake(&self.generation, std.math.maxInt(u32));
 
-        // Master thread participates in verification
+        // Master thread participates in verification.
         self.processJobs();
 
-        // Wait for all jobs to complete
-        while (self.completed_count.load(.acquire) < self.job_count) {
-            // Spin with backoff
-            std.atomic.spinLoopHint();
+        // Block (no busy-wait) until every worker has drained the queue and is
+        // heading back to park. This is stronger than counting completed jobs:
+        // it guarantees no worker is still inside processJobs when we return,
+        // so the next submit() cannot race a lingering worker over self.jobs.
+        while (true) {
+            const done = self.workers_done.load(.acquire);
+            if (@as(usize, done) >= self.worker_count) break;
+            std.Thread.Futex.wait(&self.workers_done, done);
         }
-
-        // Reset for next batch
-        self.start_event.reset();
 
         // Check all results
         for (self.jobs[0..self.job_count]) |*job| {
@@ -2783,14 +2804,34 @@ pub const ScriptCheckQueue = struct {
 
     /// Worker thread loop
     fn workerLoop(self: *ScriptCheckQueue, _: usize) void {
-        while (!self.stop_flag.load(.acquire)) {
-            // Wait for work
-            self.start_event.wait();
+        // Last batch generation this worker has already handled. Starts at the
+        // initial counter value (0) so the worker parks until the first batch.
+        var last_gen: u32 = 0;
+        while (true) {
+            // Park until the master advances the generation counter. The value
+            // is re-checked under Futex.wait (which returns immediately if the
+            // counter no longer equals last_gen), so a wake arriving between the
+            // load and the wait is never lost.
+            while (true) {
+                const gen = self.generation.load(.acquire);
+                if (gen != last_gen) {
+                    last_gen = gen;
+                    break;
+                }
+                std.Thread.Futex.wait(&self.generation, last_gen);
+            }
 
             if (self.stop_flag.load(.acquire)) break;
 
-            // Process jobs
+            // Drain the shared job queue.
             self.processJobs();
+
+            // Announce this worker has finished the batch. The last worker to
+            // finish wakes the master, which is blocked in waitAll().
+            const prev = self.workers_done.fetchAdd(1, .acq_rel);
+            if (@as(usize, prev) + 1 == self.worker_count) {
+                std.Thread.Futex.wake(&self.workers_done, 1);
+            }
         }
     }
 
@@ -8291,6 +8332,50 @@ test "ScriptCheckQueue processes multiple jobs" {
 
     // Result should be false since the jobs have invalid data
     try std.testing.expect(!result);
+}
+
+test "ScriptCheckQueue survives many batches under high worker fan-out (reset/wait race)" {
+    // Regression test for the ResetEvent reset()/wait() race: the master used
+    // to set() a shared ResetEvent to wake all workers then reset() it the
+    // instant the batch finished, panicking a straggler still inside wait().
+    // Hammering submit()/waitAll() across thousands of tiny batches maximizes
+    // the number of park/wake cycles across all ~N-1 workers, so a straggler
+    // caught mid-wake is very likely over the run. Pre-fix: flaky panic
+    // (reached unreachable code). Post-fix: stable across every iteration.
+    const allocator = std.testing.allocator;
+
+    var queue = try ScriptCheckQueue.init(allocator);
+    defer queue.deinit();
+
+    const tx_bytes = [_]u8{0x01} ** 10;
+    const prev_script = [_]u8{0x00};
+
+    // A handful of jobs per batch keeps each batch short, so workers frequently
+    // race between "just woke" and "master already finished the batch".
+    var jobs: [8]ScriptCheckJob = undefined;
+
+    var i: usize = 0;
+    const iterations: usize = 20000;
+    while (i < iterations) : (i += 1) {
+        for (&jobs) |*job| {
+            job.* = ScriptCheckJob.init(
+                &tx_bytes,
+                0,
+                &prev_script,
+                0,
+                script.ScriptFlags{},
+                &.{},
+            );
+        }
+        queue.submit(&jobs);
+        _ = queue.waitAll();
+
+        // Every job must have been claimed and resolved (never left pending),
+        // proving all workers reliably woke and drained the queue each batch.
+        for (&jobs) |*job| {
+            try std.testing.expect(job.result.load(.acquire) != .pending);
+        }
+    }
 }
 
 test "verifyBlockScriptsSingleThreaded with empty utxo lookup returns missing input" {
