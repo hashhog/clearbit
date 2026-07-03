@@ -6952,10 +6952,11 @@ pub const ChainManager = struct {
         // Collect new-chain segment (fork_point + 1 ... to) into a
         // height-ordered array.  Walk parents from `to` back to (but
         // not including) `fork_point`, then reverse to get ascending
-        // height.  Bound the depth at MAX_REORG_DEPTH so a pathological
-        // very-deep candidate can't allocate unbounded memory before
-        // `reorgToChain` would reject it anyway.
-        const max_depth: usize = @intCast(storage.ChainState.MAX_REORG_DEPTH);
+        // height.  Bound the depth at the node's effective reorg cap:
+        // unbounded on an archive node (Core-parity — follow the most-work
+        // valid chain to any depth), 288 only when pruning is enabled.
+        // See `ChainState.reorgDepthCap`.
+        const max_depth: usize = @intCast(chain_state.reorgDepthCap());
         var stack = std.ArrayList(*BlockIndexEntry).init(self.allocator);
         defer stack.deinit();
 
