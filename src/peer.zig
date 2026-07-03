@@ -5082,16 +5082,20 @@ pub const PeerManager = struct {
         const tip_entry = self.header_index.get(fork_tip_hash.*) orelse return;
 
         // Walk back from fork_tip until we hit the active chain (most
-        // recent common ancestor).  Bound by MAX_REORG_DEPTH to avoid
-        // a malicious peer offering a fake-deep fork that OOMs the
-        // walk.
+        // recent common ancestor).  Bound by the node's effective reorg
+        // cap: unbounded on an archive node (Core-parity — follow the
+        // most-work valid chain to any depth), 288 only when pruning is
+        // enabled.  See `ChainState.reorgDepthCap`.  The walk terminates at
+        // the fork point / genesis / a header-index miss regardless, so an
+        // unbounded cap never spins.
+        const depth_cap = cs.reorgDepthCap();
         var fork_chain = std.ArrayList(types.Hash256).init(self.allocator);
         defer fork_chain.deinit();
 
         var cursor: types.Hash256 = fork_tip_hash.*;
         var depth: u32 = 0;
         var fork_point: ?types.Hash256 = null;
-        while (depth <= MAX_REORG_DEPTH) {
+        while (depth <= depth_cap) {
             // Is this hash on the active chain?  If yes → fork_point found.
             // We use the in-memory active-tip first (no DB hit), then fall
             // back to chain_state.hasBlock for older entries.
@@ -5145,8 +5149,8 @@ pub const PeerManager = struct {
 
         const fp = fork_point orelse {
             std.log.warn(
-                "REORG: refused — fork point > MAX_REORG_DEPTH ({d}) below active tip",
-                .{MAX_REORG_DEPTH},
+                "REORG: refused — fork point > reorg depth cap ({d}) below active tip",
+                .{depth_cap},
             );
             peer.misbehaving(20, "fork too deep");
             return;

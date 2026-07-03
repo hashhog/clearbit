@@ -5138,6 +5138,28 @@ pub const ChainState = struct {
     /// _post-reorg-consistency-fleet-result-2026-05-05.md (Pattern D).
     pub const MAX_REORG_DEPTH: u32 = 288;
 
+    /// Effective reorg-depth cap for the CURRENT node configuration.
+    ///
+    /// Bitcoin Core has NO consensus reorg-depth cap: `ActivateBestChainStep`
+    /// (validation.cpp) disconnects to the fork point and connects the
+    /// most-work valid chain at ANY depth, bounded only by undo-data
+    /// availability.  `MIN_BLOCKS_TO_KEEP`/288 is a PRUNING retention floor,
+    /// not a reorg limit.  A non-pruned (archive) node keeps every block's
+    /// undo forever, so it MUST follow a higher-work fork however deep the
+    /// fork point is — refusing (and staying on the lower-work chain) is a
+    /// Class-A consensus split.
+    ///
+    /// clearbit's pruner (`pruneToTarget`) only evicts CF_BLOCKS bodies and
+    /// NEVER CF_BLOCK_UNDO, so the disconnect walk's undo is present at any
+    /// depth even under pruning.  We still retain the 288 bound when pruning
+    /// is enabled as a conservative in-memory-batch / retention guard, but
+    /// with pruning OFF (`prune_target_mib == 0`, the default archive config)
+    /// the cap is lifted entirely so deep most-work reorgs match Core.
+    pub fn reorgDepthCap(self: *const ChainState) u32 {
+        if (self.prune_target_mib == 0) return std.math.maxInt(u32);
+        return MAX_REORG_DEPTH;
+    }
+
     /// Switch the active chain to the new branch ending at `new_tip_hash`.
     ///
     /// `fork_point_hash` must be a block already on the active chain
@@ -5248,14 +5270,20 @@ pub const ChainState = struct {
         drive_opts: ReorgDriveOptions,
         drive_result: ?*ReorgDriveResult,
     ) !u32 {
+        // Reorg-depth cap for this node's config: unbounded on an archive
+        // node (Core-parity — follow most-work to any depth), 288 only when
+        // pruning is enabled.  See `reorgDepthCap`.
+        const depth_cap = self.reorgDepthCap();
+
         // Pattern D bound: reject any reorg whose new-chain segment alone
         // would exceed the in-memory queue cap, before even starting the
         // disconnect walk.  Saves the operator from a wasted disconnect
-        // pass in the "fat new chain, bad fork_point" misuse.
-        if (new_chain.len > MAX_REORG_DEPTH) {
+        // pass in the "fat new chain, bad fork_point" misuse.  Unbounded on
+        // an archive node (depth_cap == maxInt), so this never fires there.
+        if (new_chain.len > depth_cap) {
             std.debug.print(
-                "reorgToChain: new_chain.len={d} exceeds MAX_REORG_DEPTH={d} — aborting\n",
-                .{ new_chain.len, MAX_REORG_DEPTH },
+                "reorgToChain: new_chain.len={d} exceeds reorg depth cap={d} — aborting\n",
+                .{ new_chain.len, depth_cap },
             );
             return error.ReorgTooDeep;
         }
@@ -5294,10 +5322,10 @@ pub const ChainState = struct {
         errdefer self.abortReorgInProgress();
 
         while (!std.mem.eql(u8, &self.best_hash, fork_point_hash)) {
-            if (disconnect_count >= MAX_REORG_DEPTH) {
+            if (disconnect_count >= depth_cap) {
                 std.debug.print(
-                    "reorgToChain: hit MAX_REORG_DEPTH ({d}) without reaching fork point — aborting\n",
-                    .{MAX_REORG_DEPTH},
+                    "reorgToChain: hit reorg depth cap ({d}) without reaching fork point — aborting\n",
+                    .{depth_cap},
                 );
                 return error.ReorgTooDeep;
             }
@@ -10358,10 +10386,13 @@ test "Pattern D: failure before final flush leaves pre-reorg state on disk" {
     }
 }
 
-test "Pattern D: new_chain longer than MAX_REORG_DEPTH=100 is rejected up front" {
-    // Memory cap: synthesize a 101-block new_chain and assert
-    // reorgToChain returns error.ReorgTooDeep before any disconnect
-    // walk runs (i.e. the fork-side state is untouched).
+test "Pattern D: on a PRUNED node a new_chain longer than MAX_REORG_DEPTH is rejected up front" {
+    // Pruned-node protection: when pruning is enabled the reorg-depth cap
+    // (MAX_REORG_DEPTH = 288) still applies.  Synthesize a 289-block
+    // new_chain and assert reorgToChain returns error.ReorgTooDeep before
+    // any disconnect walk runs (i.e. the fork-side state is untouched).
+    // NOTE: on an ARCHIVE node (pruning off, the default) this same reorg
+    // is followed to any depth — see the companion archive-parity test.
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -10375,6 +10406,8 @@ test "Pattern D: new_chain longer than MAX_REORG_DEPTH=100 is rejected up front"
     var chain_state = ChainState.init(&db, 64, allocator);
     defer chain_state.deinit();
     chain_state.wireUtxoParent();
+    // Enable pruning so the 288 cap is in force (reorgDepthCap == 288).
+    chain_state.prune_target_mib = 550;
 
     // Connect a single block so best_height = 1 (avoids the
     // walk-past-genesis short-circuit firing first).
@@ -10389,9 +10422,9 @@ test "Pattern D: new_chain longer than MAX_REORG_DEPTH=100 is rejected up front"
         try chain_state.connectBlockFastWithUndo(&block1, &bh1, 1);
     }
 
-    // Synthesize a 101-entry new_chain.  The blocks themselves are
+    // Synthesize a 289-entry new_chain.  The blocks themselves are
     // throwaway — the cap fires before any of them is inspected.
-    const N: usize = 101;
+    const N: usize = 289;
     try std.testing.expect(N > ChainState.MAX_REORG_DEPTH);
     var blocks = try allocator.alloc(types.Block, N);
     defer allocator.free(blocks);
@@ -10432,6 +10465,88 @@ test "Pattern D: new_chain longer than MAX_REORG_DEPTH=100 is rejected up front"
 
     // No flush_error: this is a pre-flight rejection, not a mid-reorg
     // abort.
+    try std.testing.expect(!chain_state.flush_error);
+}
+
+test "Pattern D archive-parity: a >MAX_REORG_DEPTH most-work reorg is FOLLOWED on an archive node (Core-parity)" {
+    // Class-A consensus parity.  Bitcoin Core's ActivateBestChainStep
+    // (validation.cpp) disconnects to the fork point and connects the
+    // most-work valid chain at ANY depth; MIN_BLOCKS_TO_KEEP=288 is a PRUNING
+    // retention floor, not a reorg cap.  On an ARCHIVE node (pruning off = the
+    // default, all undo retained) a higher-work fork deeper than 288 MUST be
+    // adopted — refusing (staying on the lower-work minority chain) is a
+    // consensus split.  This builds chain A of 289 blocks, then reorgs to a
+    // heavier chain B of 290 blocks forking at genesis (disconnect depth
+    // 289 > 288) and asserts the reorg SUCCEEDS.  PRE-fix (288 cap ungated)
+    // reorgToChain returned error.ReorgTooDeep here; POST-fix it commits.
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    // Archive node: pruning OFF (the default) → reorgDepthCap() == maxInt(u32).
+    try std.testing.expectEqual(@as(u64, 0), chain_state.prune_target_mib);
+    try std.testing.expectEqual(std.math.maxInt(u32), chain_state.reorgDepthCap());
+
+    const A_LEN: u32 = 289; // strictly > MAX_REORG_DEPTH (288)
+    const B_LEN: u32 = 290; // heavier fork (more blocks, more work)
+    try std.testing.expect(A_LEN > ChainState.MAX_REORG_DEPTH);
+
+    // Build chain A: genesis → A1 .. A289 (connected on disk with undo).
+    var prev: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= A_LEN) : (h += 1) {
+        const block = makeReorgTestBlock(prev, 0, 0xA1);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, bh[0..4], h, .little);
+        bh[31] = 0xA0; // chain-A marker
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned_const = try w.toOwnedSlice();
+        const owned: []u8 = @constCast(owned_const);
+        try chain_state.queueBlockWrite(&bh, owned, h);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev = bh;
+    }
+    try std.testing.expectEqual(A_LEN, chain_state.best_height);
+
+    // Build chain B: genesis → B1 .. B290 (held in memory; reorgToChain
+    // validates + queues them into the single Pattern-D WriteBatch).
+    const blocks_b = try allocator.alloc(types.Block, B_LEN);
+    defer allocator.free(blocks_b);
+    const rb = try allocator.alloc(ChainState.ReorgBlock, B_LEN);
+    defer allocator.free(rb);
+    var prev_b: [32]u8 = [_]u8{0} ** 32;
+    var i: u32 = 0;
+    while (i < B_LEN) : (i += 1) {
+        blocks_b[i] = makeReorgTestBlock(prev_b, 0, 0xB1);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, bh[0..4], i + 1, .little);
+        bh[31] = 0xB0; // chain-B marker
+        rb[i] = .{ .hash = bh, .block = blocks_b[i], .height = i + 1 };
+        prev_b = bh;
+    }
+
+    // Fork point = genesis (zero hash); the disconnect walk rewinds all 289
+    // chain-A blocks (> 288) before connecting the 290 chain-B blocks.
+    const fork_point: types.Hash256 = [_]u8{0} ** 32;
+    const connected = try chain_state.reorgToChain(&fork_point, rb);
+
+    // The deep reorg committed: tip is now chain B's tip at height 290.
+    try std.testing.expectEqual(B_LEN, connected);
+    try std.testing.expectEqual(B_LEN, chain_state.best_height);
+    var expected_tip: [32]u8 = [_]u8{0} ** 32;
+    std.mem.writeInt(u32, expected_tip[0..4], B_LEN, .little);
+    expected_tip[31] = 0xB0;
+    try std.testing.expectEqualSlices(u8, &expected_tip, &chain_state.best_hash);
     try std.testing.expect(!chain_state.flush_error);
 }
 

@@ -1405,7 +1405,12 @@ fn fireReorgFromSideBranch(
 
     var cursor: *validation.BlockIndexEntry = new_tip_entry;
     var fork_point_hash: ?types.Hash256 = null;
-    const MAX_DEPTH: u32 = 288;
+    // Effective reorg-depth cap: unbounded on an archive node (Core-parity —
+    // follow the most-work valid chain to any depth), 288 only when pruning
+    // is enabled.  See `ChainState.reorgDepthCap`.  The walk terminates at the
+    // fork point / a parent-index miss regardless, so an unbounded cap never
+    // spins.
+    const MAX_DEPTH: u32 = chain_state.reorgDepthCap();
     var depth: u32 = 0;
 
     while (depth < MAX_DEPTH) : (depth += 1) {
