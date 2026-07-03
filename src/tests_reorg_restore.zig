@@ -411,3 +411,197 @@ test "tests_reorg_restore: deep reorg under cache pressure commits in a single W
     }
     try std.testing.expectEqual(@as(u64, 1), reorg_writes);
 }
+
+// ---------------------------------------------------------------------------
+// REORG-DISCRIMINATING regression for 968b2c4 (the sole live un-pin blocker).
+//
+// WHY THE EXISTING TESTS ABOVE DO NOT COVER THIS
+// ----------------------------------------------
+// The "Pattern D" test above drives coinbase-only blocks through the
+// network_params==null reorg path, so reorgToChain's connect side goes
+// STRAIGHT to connectBlockInner, which sets suppress_eviction=true before any
+// prevout read.  It exercises the connectBlockInner *tail*-eviction (already
+// fixed by 1590efa) and passes on BOTH HEAD and 968b2c4's parent 1ae8c61 —
+// i.e. it does NOT discriminate the 968b2c4 fix.
+//
+// The live 956162->955886 boot-wedge came from a DIFFERENT eviction site:
+// the read-through eviction check in UtxoSet.get() (storage.zig ~1065).  During
+// a deep reorg that window is only reachable via the connect-side script-
+// validation Adapter (storage.zig ~5429, guarded by `self.network_params`),
+// which runs the prevout `get()` lookups AFTER the last disconnect's `defer`
+// reset suppress_eviction=false but BEFORE connectBlockInner re-sets it.  With
+// >=1000 accumulated restore-adds (a 276-deep disconnect) + a cold-coin prevout
+// (cache miss -> DB read-through) + cache over budget, get() fired evictCache()
+// while in_no_flush_batch=true.  Pre-fix evictCache() did a FULL ChainState
+// flush() MID-REORG, splitting the single Pattern-D WriteBatch and durably
+// committing a PARTIAL reorg (fork-point tip + deleted old-branch undo + stale
+// H: index); a crash then boot-wedged with UndoDataNotFound FATAL.
+//
+// Faithfully driving that end-to-end needs network_params set, which forces
+// real PoW + full script/merkle/BIP34/witness validation over a 276-block,
+// 1000-coin synthetic fixture — the uncommitted crash-injection harness the
+// 968b2c4 footer referenced.  The two tests below instead drive the REAL
+// buggy code paths (UtxoSet.get() read-through -> evictCache routing, and the
+// ChainState.flush() chokepoint) in the EXACT flag-state reorgToChain
+// establishes at the vulnerable window (in_no_flush_batch=true,
+// suppress_eviction=false, adds_since_eviction_check>=1000, cache over budget).
+// They discriminate cleanly:
+//   * post-fix (968b2c4): no mid-batch WriteBatch (single atomic reorg commit);
+//   * pre-fix  (1ae8c61): a mid-batch flush() fires -> the split that wedges.
+
+// (1) get() read-through eviction inside the no-flush reorg batch must route to
+//     the clean-only drop, NOT a full flush that splits the WriteBatch.
+test "tests_reorg_restore: read-through eviction inside the reorg no-flush batch does not split the WriteBatch (968b2c4)" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    // --- Cold coin C: a spendable non-coinbase prevout that lives ON DISK ONLY.
+    // This is the "cold-coin prevout" the connect-side Adapter get()s during the
+    // reorg; the cache miss forces the read-through path that carries the
+    // eviction check.  Written straight to RocksDB (never added to the cache) so
+    // the later get() is guaranteed to take the DB read-through branch.
+    const c_outpoint = types.OutPoint{ .hash = [_]u8{0xC0} ** 32, .index = 0 };
+    const c_hash: [20]u8 = [_]u8{0xCD} ** 20; // P2WPKH witness-program hash
+    const c_compact = storage.CompactUtxo{
+        .height = 5,
+        .is_coinbase = false,
+        .value = 42_000_000,
+        .script_type = storage.CompactUtxo.SCRIPT_P2WPKH,
+        .hash_or_script = &c_hash,
+    };
+    const c_key = storage.makeUtxoKey(&c_outpoint);
+    {
+        const encoded = try c_compact.encode(allocator);
+        defer allocator.free(@constCast(encoded));
+        try db.put(CF_UTXO, &c_key, encoded);
+    }
+    // Sanity: C is durable on disk and NOT in the cache.
+    {
+        const on_disk = try db.get(CF_UTXO, &c_key);
+        defer if (on_disk) |b| allocator.free(b);
+        try std.testing.expect(on_disk != null);
+        try std.testing.expect(cs.utxo_set.cache.get(c_key) == null);
+    }
+
+    // --- Dirty coin D: stands in for the accumulated in-flight reorg mutations
+    // (disconnect restores + earlier connect adds) that are dirty-in-cache and
+    // NOT yet persisted.  A mid-batch flush would durably commit D as part of a
+    // PARTIAL reorg — exactly the split we must prevent.  Left dirty (unflushed).
+    const d_outpoint = types.OutPoint{ .hash = [_]u8{0xD0} ** 32, .index = 0 };
+    const d_script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xDE} ** 20; // P2WPKH
+    const d_out = types.TxOut{ .value = 7_000_000, .script_pubkey = &d_script };
+    try cs.utxo_set.add(&d_outpoint, &d_out, 6, false);
+    const d_key = storage.makeUtxoKey(&d_outpoint);
+    try std.testing.expect(cs.utxo_set.cache.get(d_key) != null);
+
+    // --- Reproduce reorgToChain's vulnerable window state exactly:
+    //   * in_no_flush_batch=true  (reorgToChain accumulating its one WriteBatch)
+    //   * suppress_eviction=false  (last disconnect's `defer` reset it; the
+    //                               first connect block's Adapter runs here)
+    //   * adds_since_eviction_check at 999 (a 276-deep disconnect left it >=1000;
+    //                               the next read-through add tips the check)
+    //   * cache over budget (max_cache_size=0 -> any resident entry is "large")
+    cs.utxo_set.max_cache_size = 0;
+    cs.utxo_set.suppress_eviction = false;
+    cs.utxo_set.adds_since_eviction_check = 999;
+    cs.in_no_flush_batch = true;
+
+    const writes_before = db.write_batch_calls;
+
+    // The connect-side Adapter prevout lookup: cache miss -> DB read-through ->
+    // adds_since_eviction_check hits 1000 -> cache over budget -> evictCache().
+    var c_got = (try cs.utxo_set.get(&c_outpoint)) orelse {
+        cs.in_no_flush_batch = false;
+        return error.ColdCoinMissing;
+    };
+    defer c_got.deinit(allocator);
+
+    const reorg_writes = db.write_batch_calls - writes_before;
+
+    // *** THE EFFECTIVE ASSERTIONS ***
+    // Post-fix (968b2c4): evictCache saw in_no_flush_batch -> evictCleanOnly ->
+    // ZERO WriteBatch calls; the reorg batch stays whole.
+    // Pre-fix (1ae8c61): evictCache did a full ChainState.flush() MID-REORG ->
+    // >=1 WriteBatch -> the split that durably committed a partial reorg and
+    // boot-wedged (UndoDataNotFound) on the live node.
+    if (reorg_writes != 0) {
+        std.debug.print(
+            "REGRESSION (968b2c4): read-through eviction inside the reorg no-flush batch " ++
+                "issued {d} WriteBatch call(s) — a mid-reorg flush SPLIT the Pattern-D batch " ++
+                "(the 956162->955886 boot-wedge shape)\n",
+            .{reorg_writes},
+        );
+    }
+    try std.testing.expectEqual(@as(u64, 0), reorg_writes);
+
+    // The dirty in-flight coin D must NOT have been flushed+wiped: a clean-only
+    // drop keeps it resident (dirty), whereas the pre-fix full flush persisted
+    // it and cleared the cache.
+    const d_after = cs.utxo_set.cache.get(d_key);
+    if (d_after == null) {
+        std.debug.print(
+            "REGRESSION (968b2c4): dirty in-flight reorg coin D was flushed+evicted mid-batch " ++
+                "(full-flush split), not preserved by the clean-only drop\n",
+            .{},
+        );
+    }
+    try std.testing.expect(d_after != null);
+    try std.testing.expect(d_after.?.dirty);
+
+    // The cold coin still reads back correctly through the read-through.
+    try std.testing.expectEqual(@as(i64, 42_000_000), c_got.value);
+    try std.testing.expectEqual(false, c_got.is_coinbase);
+
+    // Restore the flag before teardown so deinit's paths are unaffected.
+    cs.in_no_flush_batch = false;
+}
+
+// (2) The flush() chokepoint must REFUSE any flush while the reorg batch is
+//     accumulating (covers evictCache AND a flushchainstate RPC racing the
+//     reorg between two per-block connect_mutex holds).
+test "tests_reorg_restore: flush() refuses a mid-reorg-batch commit (Pattern-D chokepoint, 968b2c4)" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    // A dirty coin so a flush would have real work to commit (a non-empty
+    // WriteBatch) — otherwise "no write" could be a false negative.
+    const e_outpoint = types.OutPoint{ .hash = [_]u8{0xEE} ** 32, .index = 0 };
+    const e_script = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xEF} ** 20;
+    const e_out = types.TxOut{ .value = 3_000_000, .script_pubkey = &e_script };
+    try cs.utxo_set.add(&e_outpoint, &e_out, 7, false);
+
+    cs.in_no_flush_batch = true;
+    const writes_before = db.write_batch_calls;
+
+    // Post-fix (968b2c4): flush() hits the chokepoint guard and returns
+    // error.ReorgBatchInProgress WITHOUT issuing a WriteBatch.
+    // Pre-fix (1ae8c61): no guard -> flush() commits -> returns void and bumps
+    // write_batch_calls, so expectError FAILS (the discriminator).
+    const res = cs.flush();
+    cs.in_no_flush_batch = false;
+
+    try std.testing.expectError(error.ReorgBatchInProgress, res);
+    try std.testing.expectEqual(writes_before, db.write_batch_calls);
+}
