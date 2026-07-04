@@ -9468,6 +9468,110 @@ test "submitblock-gate: accepts a structurally valid coinbase-only block" {
 }
 
 // ============================================================================
+// submitblock contextual-check parity (round-2 fuzz: time-too-new + class).
+// The submitblock RPC path (rpc.zig:validateSubmitBlockOrReject) calls
+// acceptBlock, NOT validateBlockForIBD directly.  These tests pin that
+// acceptBlock forwards the AcceptBlockOptions contextual inputs
+// (current_time / prev_block_timestamp) into the IBDValidationContext, so the
+// gates the P2P path enforces cannot be silently disabled by a caller that
+// forgets to pass them (the exact fuzz bug: current_time=0 → future-time gate
+// off → a block with nTime=now+1day accepted via submitblock while Core rejects
+// it "time-too-new", validation.cpp:4108).
+// ============================================================================
+
+fn submitParitySkipCoinbase(params: *const consensus.NetworkParams) types.Transaction {
+    _ = params;
+    return types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x51, 0x00 }, // OP_1 + filler: canonical BIP-34 for height=1
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{
+            .value = consensus.getBlockSubsidy(1, &consensus.REGTEST),
+            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+        }},
+        .lock_time = 0,
+    };
+}
+
+test "submitblock-parity: acceptBlock forwards current_time — future-time block REJECTED" {
+    // The confirmed round-2 fuzz bug lived in the rpc.zig call-site (it passed
+    // no current_time → 0 → gate off).  Here we prove acceptBlock DOES thread
+    // options.current_time into the gate: a block at now+1day must reject.
+    const alloc = std.testing.allocator;
+    const cb = submitParitySkipCoinbase(&consensus.REGTEST);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    const fake_now: i64 = 1_700_000_000;
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    hdr.timestamp = @intCast(fake_now + 86_400); // now + 1 day (the fuzz vector)
+    ibdTestMineNonce(&hdr, &consensus.REGTEST);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const res = acceptBlock(
+        &blk,
+        &bhash,
+        1,
+        &consensus.REGTEST,
+        @ptrCast(&d),
+        ibdTestEmptyLookup,
+        alloc,
+        .{
+            // Exactly the option shape the submitblock path now builds.
+            .current_time = fake_now,
+            .force_skip_scripts = false,
+        },
+    );
+    try std.testing.expectError(ValidationError.FutureTimestamp, res);
+}
+
+test "submitblock-parity: acceptBlock forwards current_time — valid timestamp ACCEPTED" {
+    // Same path, a sane timestamp (now) must NOT trip the future-time gate.
+    const alloc = std.testing.allocator;
+    const cb = submitParitySkipCoinbase(&consensus.REGTEST);
+    const txid = try crypto.computeTxid(&cb, alloc);
+    const mr = try crypto.computeMerkleRoot(&[_]types.Hash256{txid}, alloc);
+
+    const fake_now: i64 = 1_700_000_000;
+    var hdr = consensus.REGTEST.genesis_header;
+    hdr.version = 4;
+    hdr.merkle_root = mr;
+    hdr.bits = 0x207fffff;
+    hdr.timestamp = @intCast(fake_now); // valid: == now, well within +7200
+    ibdTestMineNonce(&hdr, &consensus.REGTEST);
+
+    const blk = types.Block{ .header = hdr, .transactions = &[_]types.Transaction{cb} };
+    const bhash = crypto.computeBlockHash(&blk.header);
+    var d: u8 = 0;
+    const res = acceptBlock(
+        &blk,
+        &bhash,
+        1,
+        &consensus.REGTEST,
+        @ptrCast(&d),
+        ibdTestEmptyLookup,
+        alloc,
+        .{
+            .current_time = fake_now,
+            .force_skip_scripts = false,
+        },
+    );
+    // Must not fail on the future-time gate (may fail nowhere — it is valid).
+    if (res) |_| {} else |err| {
+        try std.testing.expect(err != ValidationError.FutureTimestamp);
+    }
+}
+
+// ============================================================================
 // BIP-113 MTP-of-11 regression tests (Cat J fix -- 2026-05-03)
 // Reference: bitcoin-core/src/validation.cpp:4092-4093
 // ============================================================================

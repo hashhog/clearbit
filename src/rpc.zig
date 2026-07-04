@@ -9647,6 +9647,23 @@ pub const RpcServer = struct {
         return validation.medianTimePast(timestamps[0..n]);
     }
 
+    /// Look up the nTime of the parent block identified by `hash` (the parent
+    /// of the block being submitted).  Wired into the submitblock validation
+    /// path as `prev_block_timestamp` so the BIP-94 timewarp gate
+    /// (contextualCheckBlockHeader, validation.zig:1318) fires exactly as it
+    /// does on the P2P/IBD path (peer.zig:8358).  Uses the same dual lookup as
+    /// computeSubmitBlockMtp: in-memory chain_manager block_index first, then
+    /// the persisted CF_BLOCK_INDEX (restart-safe).  Returns 0 when the parent
+    /// header is not resolvable (genesis-adjacent / not-yet-indexed), which
+    /// safely skips the timewarp gate — matching the P2P path's 0 sentinel.
+    fn lookupParentTimestamp(self: *RpcServer, hash: *const types.Hash256) u32 {
+        if (self.chain_manager) |cm| {
+            if (cm.block_index.get(hash.*)) |entry| return entry.header.timestamp;
+        }
+        if (self.chain_state.getPersistedHeader(hash)) |hdr| return hdr.timestamp;
+        return 0;
+    }
+
     /// submitblock-time consensus validation gate.  Mirrors
     /// `peer.zig:validateBlockForIBDOrReject` so the RPC path runs the same
     /// `validateBlockForIBD` chain (CheckBlock + per-input UTXO + sigops +
@@ -9671,6 +9688,13 @@ pub const RpcServer = struct {
             error.BadWitnessCommitment => "bad-witness-merkle-match",
             error.TooManySigops => "bad-blk-sigops",
             error.BadProofOfWork, error.BadDifficulty => "high-hash",
+            // ContextualCheckBlockHeader reject tokens (validation.cpp:4092-4118).
+            // Now reachable via the submitblock path (contextual-check parity fix):
+            // return Core's exact BIP-22 strings instead of the generic "rejected".
+            error.BadTimestamp => "time-too-old", // block.time <= MTP (BIP-113)
+            error.TimewarpAttack => "time-timewarp-attack", // BIP-94 boundary
+            error.FutureTimestamp => "time-too-new", // block.time > now + 7200s
+            error.BadVersion => "bad-version", // v<2/3/4 after BIP34/66/65
             error.NonFinalTx, error.SequenceLockNotSatisfied => "bad-txns-nonfinal",
             error.DuplicateTx, error.Bip30DuplicateOutput => "bad-txns-duplicate",
             error.MissingInput, error.InputAlreadySpent => "bad-txns-inputs-missingorspent",
@@ -9743,9 +9767,32 @@ pub const RpcServer = struct {
         // The old bare-height `skip_via_height` was also a hole — a submitblock
         // claiming a height <= av_height would skip script checks. Always verify.
 
-        // Note: prev_mtp = 0 for submitblock because the block_template path
-        // already enforces BIP-113 (timestamp > MTP) unconditionally before
-        // calling this function (handleSubmitBlock lines ~2737-2739).
+        // CONTEXTUAL-CHECK PARITY WITH THE P2P PATH (peer.zig:8378 opts).
+        // The submitblock path used to pass ONLY {prev_mtp=0, force_skip_scripts,
+        // expected_bits}, leaving every OTHER ContextualCheckBlock input at its 0
+        // sentinel — which SILENTLY DISABLED the gates that key off those inputs.
+        // A miner-submitted block bypasses P2P, so submitblock is the ONLY gate on
+        // its consensus validity; any check the P2P path enforces but this one
+        // skips is a consensus fork (submitblock accepts what Core rejects).
+        // Round-2 fuzz confirmed the time-too-new hole (current_time=0). The full
+        // audit below closes the whole class by mirroring the P2P options set:
+        //
+        //   prev_mtp             → time-too-old header gate AND (crucially) the
+        //                          BIP-113 lock_time_cutoff for IsFinalTx: with 0
+        //                          the cutoff fell back to block.nTime (looser than
+        //                          Core's MTP → false-accept of non-final txs).
+        //   prev_block_timestamp → BIP-94 timewarp gate (testnet4/regtest).
+        //   current_time         → time-too-new gate (THE confirmed fuzz bug:
+        //                          nTime > now + 7200s must reject; 0 disabled it).
+        //   getMtpAtHeightFn     → BIP-68 time-based sequence locks (full check).
+        //   getBlockHashByHeightFn → BIP-34-active fallback that gates BIP-30
+        //                          enforcement (avoids a post-restart false-reject).
+        //   is_requested=true    → submitblock is force-processed (Core fRequested):
+        //                          the fTooFarAhead DoS ceiling never applies to a
+        //                          locally-submitted block.
+        //
+        // force_skip_scripts stays false: submitblock ALWAYS verifies scripts
+        // (a miner block lands at tip, far above assume_valid_height).
         //
         // bad-diffbits: compute the expected nBits via the peer_manager's walk
         // adapter (same method used by the IBD body path).  Returns 0 if the
@@ -9756,6 +9803,14 @@ pub const RpcServer = struct {
             height,
             block.header.timestamp,
         );
+
+        // MTP-of-11 of the parent (BIP-113 time-too-old + IsFinalTx cutoff).
+        const prev_mtp_val = self.computeSubmitBlockMtp(&block.header.prev_block);
+        // Parent block nTime (BIP-94 timewarp lower bound).
+        const prev_block_ts = self.lookupParentTimestamp(&block.header.prev_block);
+        // Wall-clock at validation time (time-too-new gate) — matches peer.zig:8364.
+        const current_time_val: i64 = std.time.timestamp();
+
         validation.acceptBlock(
             block,
             block_hash,
@@ -9765,9 +9820,16 @@ pub const RpcServer = struct {
             Adapter.lookup,
             self.allocator,
             .{
-                .prev_mtp = 0,
+                .prev_mtp = prev_mtp_val,
+                .prev_block_timestamp = prev_block_ts,
+                .current_time = current_time_val,
                 .force_skip_scripts = false,
                 .expected_bits = expected_bits_val,
+                .getMtpAtHeightFn = peer_mod.PeerManager.getMtpAtHeightTrampoline,
+                .getMtpAtHeightCtx = @ptrCast(self.peer_manager),
+                .getBlockHashByHeightFn = peer_mod.PeerManager.getBlockHashByHeightTrampoline,
+                .getBlockHashByHeightCtx = @ptrCast(self.peer_manager),
+                .is_requested = true,
             },
         ) catch |err| {
             const bip22 = validationErrToBip22(err);
