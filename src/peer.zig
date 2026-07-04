@@ -7958,7 +7958,7 @@ pub const PeerManager = struct {
 
     /// Trampoline so PeerManager.computeMtpAtHeight can be passed as a
     /// *const fn(*anyopaque, u32) u32 to IBDValidationContext.getMtpAtHeightFn.
-    fn getMtpAtHeightTrampoline(ctx_ptr: *anyopaque, h: u32) u32 {
+    pub fn getMtpAtHeightTrampoline(ctx_ptr: *anyopaque, h: u32) u32 {
         const self: *PeerManager = @ptrCast(@alignCast(ctx_ptr));
         return self.computeMtpAtHeight(h);
     }
@@ -7972,7 +7972,7 @@ pub const PeerManager = struct {
     /// per process.  Returns null if any block on the path is missing/corrupt or
     /// target_h is above the tip — the caller then keeps BIP-30 enforced
     /// (fail-safe, never falsely skips).
-    fn getBlockHashByHeightTrampoline(ctx_ptr: *anyopaque, target_h: u32) ?types.Hash256 {
+    pub fn getBlockHashByHeightTrampoline(ctx_ptr: *anyopaque, target_h: u32) ?types.Hash256 {
         const self: *PeerManager = @ptrCast(@alignCast(ctx_ptr));
         const cs = self.chain_state orelse return null;
         if (target_h > cs.best_height) return null;
