@@ -8066,6 +8066,15 @@ pub const PeerManager = struct {
             tip_hash: types.Hash256, // hash of block at tip_height (= height-1)
             tip_height: u32,
             not_found: bool,
+            // Set true once the DIRECT previous block (height-1) is resolved.
+            // getNextWorkRequired only returns the 0-skip sentinel when the prev
+            // block itself is unknown; it is otherwise tolerant of missing DEEP
+            // ancestors (falls back to prev.bits / pow_limit, never 0).  Keying
+            // the skip sentinel on `prev_resolved` (not `not_found`) stops a
+            // failed genesis / deep-ancestor lookup from silently disabling the
+            // bad-diffbits gate on the submitblock path, where header_index is
+            // empty and the walk hits getPersistedHeader (genesis absent).
+            prev_resolved: bool,
 
             fn getAtHeight(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
                 const self2: *@This() = @ptrCast(@alignCast(ctx));
@@ -8092,6 +8101,7 @@ pub const PeerManager = struct {
 
                 // `cursor` is now at height `h`; return its entry.
                 if (self2.pm.header_index.get(cursor)) |e| {
+                    if (h == self2.tip_height) self2.prev_resolved = true;
                     return consensus.BlockIndexEntry{
                         .height = h,
                         .timestamp = e.timestamp,
@@ -8103,6 +8113,7 @@ pub const PeerManager = struct {
                         self2.not_found = true;
                         return null;
                     };
+                    if (h == self2.tip_height) self2.prev_resolved = true;
                     return consensus.BlockIndexEntry{
                         .height = h,
                         .timestamp = hdr.timestamp,
@@ -8119,6 +8130,7 @@ pub const PeerManager = struct {
             .tip_hash = prev_hash,
             .tip_height = height - 1,
             .not_found = false,
+            .prev_resolved = false,
         };
 
         const pow_limit_bits = consensus.getPowLimitBits(self.network_params);
@@ -8135,8 +8147,14 @@ pub const PeerManager = struct {
             self.network_params,
         );
 
-        // Return 0 (skip sentinel) when any ancestor lookup failed.
-        return if (walk_ctx.not_found) 0 else result;
+        // Return 0 (skip sentinel) ONLY when the direct previous block
+        // (height-1) could not be resolved.  When prev IS resolved,
+        // getNextWorkRequired's `result` is always well-defined (never 0) even
+        // if a deep ancestor / genesis lookup failed along the way, so we must
+        // return it and let validation.zig's bad-diffbits equality fire.  Gating
+        // on `not_found` instead let the min-difficulty walk-back to genesis
+        // (regtest / testnet4) trip the sentinel and silently disable the gate.
+        return if (walk_ctx.prev_resolved) result else 0;
     }
 
     /// Contextual header-time validation, run at header *acceptance* (not just

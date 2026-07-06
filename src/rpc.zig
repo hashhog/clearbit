@@ -9687,7 +9687,15 @@ pub const RpcServer = struct {
             error.BadMerkleRoot => "bad-txnmrklroot",
             error.BadWitnessCommitment => "bad-witness-merkle-match",
             error.TooManySigops => "bad-blk-sigops",
-            error.BadProofOfWork, error.BadDifficulty => "high-hash",
+            // Core folds CheckBlockHeader's "hash > target" (BadProofOfWork)
+            // into "high-hash".  By the time acceptBlock's error reaches this
+            // mapping the strict PoW stage has already been run and surfaced as
+            // "high-hash" up front (see validateSubmitBlockOrReject), so the ONLY
+            // remaining source of BadDifficulty is the CONTEXTUAL
+            // nBits != GetNextWorkRequired gate (ContextualCheckBlockHeader,
+            // validation.cpp:4088) -> Core's "bad-diffbits" token.
+            error.BadProofOfWork => "high-hash",
+            error.BadDifficulty => "bad-diffbits",
             // ContextualCheckBlockHeader reject tokens (validation.cpp:4092-4118).
             // Now reachable via the submitblock path (contextual-check parity fix):
             // return Core's exact BIP-22 strings instead of the generic "rejected".
@@ -9759,6 +9767,21 @@ pub const RpcServer = struct {
             }
         };
         var adapter = Adapter{ .cs_ptr = self.chain_state, .alloc = self.allocator };
+
+        // ── Stage split: CheckBlockHeader (high-hash) BEFORE the contextual gate ─
+        // Core runs CheckBlockHeader (folds target>powLimit AND hash>target into
+        // the single "high-hash" token, validation.cpp) strictly before
+        // ContextualCheckBlockHeader (whose FIRST gate is nBits!=GetNextWorkRequired
+        // -> "bad-diffbits", validation.cpp:4088).  clearbit raises BadDifficulty for
+        // BOTH "target>powLimit" (checkBlockHeader) and the contextual diffbits
+        // mismatch, so the single-error BIP-22 mapping cannot tell them apart.
+        // Surface the strict PoW stage as "high-hash" up front here, leaving the
+        // contextual BadDifficulty out of acceptBlock unambiguously meaning
+        // "bad-diffbits".  Without this, a block with correct PoW but wrong nBits
+        // was mislabeled "high-hash".
+        validation.checkBlockHeader(&block.header, self.network_params) catch {
+            return "high-hash";
+        };
 
         // Assumevalid script-skip: same logic as the IBD path in peer.zig.
         // submitblock NEVER skips script verification: a miner-submitted block
