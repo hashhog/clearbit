@@ -1539,6 +1539,12 @@ pub const Mempool = struct {
                     MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
                     MempoolError.TooManyEvictions => "too many potential replacements",
                     MempoolError.DiagramNotImproved => "insufficient fee",
+                    // Input-existence + finality gates (added to checkTestAcceptPolicy
+                    // to match Core PreChecks). testmempoolaccept reports these with
+                    // Core's exact tokens: "missing-inputs" (rpc/mempool.cpp:400) and
+                    // "non-final" (validation.cpp:820).
+                    MempoolError.MissingInputs => "missing-inputs",
+                    MempoolError.NonFinal => "non-final",
                     else => "non-standard",
                 };
                 return AcceptResult{
@@ -2989,6 +2995,29 @@ pub const Mempool = struct {
             if (isDust(&output)) return MempoolError.DustOutput;
         }
 
+        // 2b. BIP-113 IsFinalTx (CheckFinalTxAtTip): nLockTime must be satisfied
+        //     at the next block. Core runs this in PreChecks (validation.cpp:819)
+        //     BETWEEN IsStandardTx and the input-existence loop, returning the
+        //     "non-final" reject-reason. The dry-run path previously SKIPPED this,
+        //     so a non-final tx (future nLockTime + non-final sequence) returned
+        //     allowed=true here while sendrawtransaction and Core's
+        //     testmempoolaccept both reject it — a dry-run-only soundness hole.
+        //     Mirrors addTransaction §2b exactly (same next_height / MTP cutoff).
+        //     Only enforced when chain_state is present (production); the
+        //     no-chain-state unit-test context skips it, matching addTransaction.
+        if (self.chain_state) |cs| {
+            const p = self.params orelse &consensus.MAINNET;
+            const next_height: u32 = cs.best_height + 1;
+            const mtp: u32 = cs.computeMTP();
+            const lock_time_cutoff: u32 = if (cs.best_height >= p.csv_height)
+                mtp
+            else
+                next_height;
+            if (!validation.isFinalTx(tx, next_height, lock_time_cutoff)) {
+                return MempoolError.NonFinal;
+            }
+        }
+
         // 3. Min-relay-fee gate. Compute the fee read-only by summing input
         //    values from the UTXO set (and any unconfirmed mempool parents),
         //    exactly as addTransaction does, then compare the modified fee rate
@@ -3024,14 +3053,16 @@ pub const Mempool = struct {
                     }
                     have_inputs = true;
                 } else {
-                    // Input not found: the full path would reject as MissingInputs,
-                    // but testmempoolaccept reports missing-inputs separately and
-                    // a dry run must not over-reject standardness-clean txs whose
-                    // inputs we simply cannot resolve. Treat as "fee unknown" and
-                    // skip the fee gate (matches the full path's total_in==0 case).
-                    have_inputs = false;
-                    total_in = 0;
-                    break;
+                    // Input exists in neither the mempool nor the UTXO set: the
+                    // coin the tx spends does not exist (or is already spent).
+                    // Core's PreChecks input-existence loop (validation.cpp:857)
+                    // returns TX_MISSING_INPUTS here, which testmempoolaccept maps
+                    // to the literal "missing-inputs" (rpc/mempool.cpp:399). The
+                    // dry-run path previously SWALLOWED this and only skipped the
+                    // fee gate, so a tx spending a nonexistent input returned
+                    // allowed=true — a dry-run-only soundness hole. Reject exactly
+                    // as the full addTransaction path does (mempool.zig §3).
+                    return MempoolError.MissingInputs;
                 }
             } else {
                 // No chain state (unit-test context): fee unknown, skip fee gate.
