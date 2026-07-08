@@ -281,6 +281,34 @@ pub const MempoolError = error{
     /// Reference: Bitcoin Core consensus/tx_check.cpp, called from
     /// MemPoolAccept::PreChecks line 798.
     TxSanityFailed,
+    // ------------------------------------------------------------------------
+    // Specific CheckTransaction (tx_check.cpp) sub-case variants. These carry
+    // the exact BARE Core reject token through the full sendrawtransaction /
+    // addTransaction path, so it agrees with the testmempoolaccept dry-run
+    // (which maps the ValidationError directly). Previously the full path
+    // collapsed ALL of these into TxSanityFailed => generic "bad-txns-sanity".
+    // Decision-preserving: still a reject, only the surfaced token is refined.
+    // Reference: Bitcoin Core consensus/tx_check.cpp CheckTransaction().
+    /// No inputs. Core: "bad-txns-vin-empty" (tx_check.cpp:15).
+    VinEmpty,
+    /// No outputs. Core: "bad-txns-vout-empty" (tx_check.cpp:17).
+    VoutEmpty,
+    /// Negative output value. Core: "bad-txns-vout-negative" (tx_check.cpp:28).
+    VoutNegative,
+    /// Output value > MAX_MONEY. Core: "bad-txns-vout-toolarge" (tx_check.cpp:30).
+    VoutTooLarge,
+    /// Sum of outputs > MAX_MONEY. Core: "bad-txns-txouttotal-toolarge"
+    /// (tx_check.cpp:33).
+    TxOutTotalTooLarge,
+    /// Two inputs spend the same outpoint. Core: "bad-txns-inputs-duplicate"
+    /// (tx_check.cpp:44).
+    InputsDuplicate,
+    /// Non-coinbase tx with a null (coinbase) prevout. Core:
+    /// "bad-txns-prevout-null" (tx_check.cpp:56).
+    PrevoutNull,
+    /// Coinbase scriptSig length outside [2, 100]. Core: "bad-cb-length"
+    /// (tx_check.cpp:50).
+    CbLength,
     /// Per-input or accumulated input value out of MoneyRange (W96 ATMP gate).
     /// Maps to Core "bad-txns-inputvalues-outofrange" from CheckTxInputs.
     /// Reference: Bitcoin Core consensus/tx_verify.cpp:186-189.
@@ -322,6 +350,81 @@ pub const MempoolError = error{
     /// (policy/rbf.cpp::ImprovesFeerateDiagram).
     DiagramNotImproved,
 };
+
+/// Map a `validation.checkTransactionSanity` ValidationError to the specific
+/// MempoolError variant that carries its exact Core reject token.
+///
+/// Single source of truth for the ValidationError→MempoolError step, shared by
+/// the full `addTransaction` §1a gate AND the `testmempoolaccept` dry-run §1a
+/// gate — so sendrawtransaction and testmempoolaccept surface the SAME token.
+/// Tokens are Core's own (consensus/tx_check.cpp CheckTransaction); none are
+/// invented. Unknown errors fall back to the generic TxSanityFailed.
+fn sanityErrorToMempoolError(err: anyerror) MempoolError {
+    return switch (err) {
+        error.NoInputs => MempoolError.VinEmpty,
+        error.NoOutputs => MempoolError.VoutEmpty,
+        error.TxTooLarge => MempoolError.TxOversize,
+        error.NegativeOutput => MempoolError.VoutNegative,
+        error.OutputTooLarge => MempoolError.VoutTooLarge,
+        error.TotalOutputTooLarge => MempoolError.TxOutTotalTooLarge,
+        error.DuplicateInput => MempoolError.InputsDuplicate,
+        error.NullInput => MempoolError.PrevoutNull,
+        error.CoinbaseScriptSize => MempoolError.CbLength,
+        error.InputValuesOutOfRange => MempoolError.InputValuesOutOfRange,
+        else => MempoolError.TxSanityFailed,
+    };
+}
+
+/// Map a MempoolError to Bitcoin Core's BARE reject-reason token.
+///
+/// Single source of truth for reject-reason strings, so the full
+/// sendrawtransaction / addTransaction path and the testmempoolaccept dry-run
+/// cannot drift. Decision-preserving: strings only.
+fn rejectReasonForError(err: MempoolError) []const u8 {
+    return switch (err) {
+        MempoolError.AlreadyInMempool => "txn-already-in-mempool",
+        MempoolError.SameNonWitnessDataInMempool => "txn-same-nonwitness-data-in-mempool",
+        MempoolError.InsufficientFee => "min relay fee not met",
+        MempoolError.MissingInputs => "missing-inputs",
+        MempoolError.NonBIP125Replaceable => "txn-mempool-conflict",
+        MempoolError.ReplacementFeeTooLow => "insufficient fee",
+        MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
+        MempoolError.TooManyEvictions => "too many potential replacements",
+        MempoolError.MempoolFull => "mempool full",
+        MempoolError.NonStandard => "non-standard",
+        MempoolError.NonStandardVersion => "version",
+        MempoolError.TxWeightTooLarge => "tx-size",
+        MempoolError.TxTooSmall => "tx-size-small",
+        MempoolError.TxOversize => "bad-txns-oversize",
+        MempoolError.TxSanityFailed => "bad-txns-sanity",
+        // CheckTransaction (tx_check.cpp) consensus sanity family — bare tokens
+        // now surfaced on the FULL path, matching the dry-run.
+        MempoolError.VinEmpty => "bad-txns-vin-empty",
+        MempoolError.VoutEmpty => "bad-txns-vout-empty",
+        MempoolError.VoutNegative => "bad-txns-vout-negative",
+        MempoolError.VoutTooLarge => "bad-txns-vout-toolarge",
+        MempoolError.TxOutTotalTooLarge => "bad-txns-txouttotal-toolarge",
+        MempoolError.InputsDuplicate => "bad-txns-inputs-duplicate",
+        MempoolError.PrevoutNull => "bad-txns-prevout-null",
+        MempoolError.CbLength => "bad-cb-length",
+        MempoolError.Coinbase => "coinbase",
+        MempoolError.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
+        MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
+        MempoolError.WitnessStripped => "witness-stripped",
+        MempoolError.ScriptSigTooLarge => "scriptsig-size",
+        MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
+        MempoolError.DatacarrierTooLarge => "datacarrier",
+        MempoolError.DustOutput => "dust",
+        MempoolError.TooManyAncestors => "too-long-mempool-chain",
+        MempoolError.TooManyDescendants => "too-long-mempool-chain",
+        MempoolError.ClusterSizeLimitExceeded => "cluster-size-exceeded",
+        MempoolError.ScriptVerifyFailed => "mandatory-script-verify-flag-failed",
+        MempoolError.NonFinal => "bad-txns-nonfinal",
+        MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
+        MempoolError.SequenceLockNotSatisfied => "non-BIP68-final",
+        else => "rejected",
+    };
+}
 
 // ============================================================================
 // Cluster Mempool Constants
@@ -1005,15 +1108,14 @@ pub const Mempool = struct {
         //
         //     Reference: consensus/tx_check.cpp CheckTransaction(),
         //     called from validation.cpp:798.
-        validation.checkTransactionSanity(&tx) catch |err| switch (err) {
-            error.TxTooLarge => return MempoolError.TxOversize,
-            error.InputValuesOutOfRange => return MempoolError.InputValuesOutOfRange,
-            error.OutputTooLarge,
-            error.TotalOutputTooLarge,
-            error.NegativeOutput,
-            => return MempoolError.TxSanityFailed,
-            else => return MempoolError.TxSanityFailed,
-        };
+        //     Map each CheckTransaction ValidationError to its SPECIFIC
+        //     MempoolError variant (bad-txns-vin-empty, ...-vout-negative,
+        //     ...-inputs-duplicate, bad-cb-length, ...) via the shared
+        //     sanityErrorToMempoolError() so the full sendrawtransaction reject
+        //     token below matches the testmempoolaccept dry-run exactly. Was
+        //     previously collapsed into the generic TxSanityFailed
+        //     => "bad-txns-sanity".
+        validation.checkTransactionSanity(&tx) catch |err| return sanityErrorToMempoolError(err);
 
         // 1b. Coinbase reject (W96).
         //
@@ -1496,19 +1598,10 @@ pub const Mempool = struct {
             //      — none are invented.)
             //      Reference: consensus/tx_check.cpp CheckTransaction().
             validation.checkTransactionSanity(&tx) catch |err| {
-                const reason: []const u8 = switch (err) {
-                    error.NoInputs => "bad-txns-vin-empty",
-                    error.NoOutputs => "bad-txns-vout-empty",
-                    error.TxTooLarge => "bad-txns-oversize",
-                    error.NegativeOutput => "bad-txns-vout-negative",
-                    error.OutputTooLarge => "bad-txns-vout-toolarge",
-                    error.TotalOutputTooLarge => "bad-txns-txouttotal-toolarge",
-                    error.DuplicateInput => "bad-txns-inputs-duplicate",
-                    error.NullInput => "bad-txns-prevout-null",
-                    error.CoinbaseScriptSize => "bad-cb-length",
-                    error.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
-                    else => "bad-txns-sanity",
-                };
+                // Reuse the SAME ValidationError→MempoolError→token pipeline the
+                // full addTransaction path uses (sanityErrorToMempoolError +
+                // rejectReasonForError), so the two paths cannot drift.
+                const reason: []const u8 = rejectReasonForError(sanityErrorToMempoolError(err));
                 return AcceptResult{
                     .accepted = false,
                     .txid = tx_hash,
@@ -1625,39 +1718,12 @@ pub const Mempool = struct {
 
         // Full acceptance: validate and add to mempool.
         self.addTransaction(tx) catch |err| {
-            const reason: []const u8 = switch (err) {
-                MempoolError.AlreadyInMempool => "txn-already-in-mempool",
-                MempoolError.SameNonWitnessDataInMempool => "txn-same-nonwitness-data-in-mempool",
-                MempoolError.InsufficientFee => "min relay fee not met",
-                MempoolError.MissingInputs => "missing-inputs",
-                MempoolError.NonBIP125Replaceable => "txn-mempool-conflict",
-                MempoolError.ReplacementFeeTooLow => "insufficient fee",
-                MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
-                MempoolError.TooManyEvictions => "too many potential replacements",
-                MempoolError.MempoolFull => "mempool full",
-                MempoolError.NonStandard => "non-standard",
-                MempoolError.NonStandardVersion => "version",
-                MempoolError.TxWeightTooLarge => "tx-size",
-                MempoolError.TxTooSmall => "tx-size-small",
-                MempoolError.TxOversize => "bad-txns-oversize",
-                MempoolError.TxSanityFailed => "bad-txns-sanity",
-                MempoolError.Coinbase => "coinbase",
-                MempoolError.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
-                MempoolError.TooManySigopsCost => "bad-txns-too-many-sigops",
-                MempoolError.WitnessStripped => "witness-stripped",
-                MempoolError.ScriptSigTooLarge => "scriptsig-size",
-                MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
-                MempoolError.DatacarrierTooLarge => "datacarrier",
-                MempoolError.DustOutput => "dust",
-                MempoolError.TooManyAncestors => "too-long-mempool-chain",
-                MempoolError.TooManyDescendants => "too-long-mempool-chain",
-                MempoolError.ClusterSizeLimitExceeded => "cluster-size-exceeded",
-                MempoolError.ScriptVerifyFailed => "mandatory-script-verify-flag-failed",
-                MempoolError.NonFinal => "bad-txns-nonfinal",
-                MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
-                MempoolError.SequenceLockNotSatisfied => "non-BIP68-final",
-                else => "rejected",
-            };
+            // Shared token mapping (single source of truth) — the CheckTransaction
+            // sanity family (§1a) now flows through here as its SPECIFIC variant
+            // (VinEmpty, InputsDuplicate, VoutTooLarge, ...), so the token here
+            // matches the testmempoolaccept dry-run instead of the old generic
+            // "bad-txns-sanity".
+            const reason: []const u8 = rejectReasonForError(err);
             return AcceptResult{
                 .accepted = false,
                 .txid = tx_hash,
@@ -12873,7 +12939,7 @@ fn w96BuildPlausibleTx(version: i32) types.Transaction {
     };
 }
 
-test "W96 G1: CheckTransaction — empty inputs → TxSanityFailed" {
+test "W96 G1: CheckTransaction — empty inputs → VinEmpty (bad-txns-vin-empty)" {
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -12887,10 +12953,10 @@ test "W96 G1: CheckTransaction — empty inputs → TxSanityFailed" {
     };
 
     const result = mempool.addTransaction(tx);
-    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+    try std.testing.expectError(MempoolError.VinEmpty, result);
 }
 
-test "W96 G2: CheckTransaction — empty outputs → TxSanityFailed" {
+test "W96 G2: CheckTransaction — empty outputs → VoutEmpty (bad-txns-vout-empty)" {
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -12908,10 +12974,10 @@ test "W96 G2: CheckTransaction — empty outputs → TxSanityFailed" {
     };
 
     const result = mempool.addTransaction(tx);
-    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+    try std.testing.expectError(MempoolError.VoutEmpty, result);
 }
 
-test "W96 G3: CheckTransaction — negative output value → TxSanityFailed" {
+test "W96 G3: CheckTransaction — negative output value → VoutNegative (bad-txns-vout-negative)" {
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -12930,10 +12996,10 @@ test "W96 G3: CheckTransaction — negative output value → TxSanityFailed" {
     };
 
     const result = mempool.addTransaction(tx);
-    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+    try std.testing.expectError(MempoolError.VoutNegative, result);
 }
 
-test "W96 G4: CheckTransaction — output > MAX_MONEY → TxSanityFailed" {
+test "W96 G4: CheckTransaction — output > MAX_MONEY → VoutTooLarge (bad-txns-vout-toolarge)" {
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -12955,10 +13021,10 @@ test "W96 G4: CheckTransaction — output > MAX_MONEY → TxSanityFailed" {
     };
 
     const result = mempool.addTransaction(tx);
-    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+    try std.testing.expectError(MempoolError.VoutTooLarge, result);
 }
 
-test "W96 G5: CheckTransaction — sum(outputs) > MAX_MONEY → TxSanityFailed" {
+test "W96 G5: CheckTransaction — sum(outputs) > MAX_MONEY → TxOutTotalTooLarge (bad-txns-txouttotal-toolarge)" {
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -12981,10 +13047,10 @@ test "W96 G5: CheckTransaction — sum(outputs) > MAX_MONEY → TxSanityFailed" 
     };
 
     const result = mempool.addTransaction(tx);
-    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+    try std.testing.expectError(MempoolError.TxOutTotalTooLarge, result);
 }
 
-test "W96 G6: CheckTransaction — duplicate inputs → TxSanityFailed" {
+test "W96 G6: CheckTransaction — duplicate inputs → InputsDuplicate (bad-txns-inputs-duplicate)" {
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -13002,10 +13068,10 @@ test "W96 G6: CheckTransaction — duplicate inputs → TxSanityFailed" {
     };
 
     const result = mempool.addTransaction(tx);
-    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+    try std.testing.expectError(MempoolError.InputsDuplicate, result);
 }
 
-test "W96 G7: CheckTransaction — non-coinbase with null-prevout input → TxSanityFailed (bad-txns-prevout-null)" {
+test "W96 G7: CheckTransaction — non-coinbase with null-prevout input → PrevoutNull (bad-txns-prevout-null)" {
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -13036,7 +13102,7 @@ test "W96 G7: CheckTransaction — non-coinbase with null-prevout input → TxSa
     };
 
     const result = mempool.addTransaction(tx);
-    try std.testing.expectError(MempoolError.TxSanityFailed, result);
+    try std.testing.expectError(MempoolError.PrevoutNull, result);
 }
 
 test "W96 G8: Coinbase rejected up-front from mempool" {
@@ -13221,7 +13287,11 @@ test "W96 G14: MempoolError variants — new W96 variants exist in enum" {
     try std.testing.expectEqual(@as(usize, 7), variants.len);
 }
 
-test "W96 G15: acceptToMemoryPool — empty-inputs tx surfaces a non-null reject reason" {
+test "W96 G15: acceptToMemoryPool full path — empty-inputs tx surfaces `bad-txns-vin-empty`" {
+    // Full sendrawtransaction path (test_accept=false). Previously this
+    // collapsed every CheckTransaction failure into the generic
+    // "bad-txns-sanity"; now it surfaces the SPECIFIC Core token, matching the
+    // testmempoolaccept dry-run.
     const allocator = std.testing.allocator;
     var mempool = Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -13237,7 +13307,7 @@ test "W96 G15: acceptToMemoryPool — empty-inputs tx surfaces a non-null reject
     const r = mempool.acceptToMemoryPool(tx, false);
     try std.testing.expect(!r.accepted);
     try std.testing.expect(r.reject_reason != null);
-    try std.testing.expectEqualStrings("bad-txns-sanity", r.reject_reason.?);
+    try std.testing.expectEqualStrings("bad-txns-vin-empty", r.reject_reason.?);
 }
 
 test "W96 G16: helper txHasAnyWitness — no-witness tx returns false" {
@@ -13476,6 +13546,62 @@ test "W96 G27: test_accept negative output → `bad-txns-vout-negative`" {
     try std.testing.expect(!r.accepted);
     try std.testing.expect(r.reject_reason != null);
     try std.testing.expectEqualStrings("bad-txns-vout-negative", r.reject_reason.?);
+}
+
+test "W96 G28: full path (sendrawtransaction) duplicate-input tx → `bad-txns-inputs-duplicate`" {
+    // FULL acceptance path (test_accept=false). Two inputs spending the SAME
+    // outpoint is consensus-invalid (tx_check.cpp CheckTransaction). Before the
+    // Tier-B follow-up the full path collapsed this into the generic
+    // "bad-txns-sanity"; it must now surface the SPECIFIC token, matching the
+    // testmempoolaccept dry-run (G25) and Core.
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const dup_outpoint = types.OutPoint{ .hash = [_]u8{0x77} ** 32, .index = 0 };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{
+            .{ .previous_output = dup_outpoint, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} },
+            .{ .previous_output = dup_outpoint, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} },
+        },
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const r = mempool.acceptToMemoryPool(tx, false);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("bad-txns-inputs-duplicate", r.reject_reason.?);
+}
+
+test "W96 G29: full path (sendrawtransaction) out-of-range output → `bad-txns-vout-toolarge`" {
+    // FULL acceptance path (test_accept=false). An output value > MAX_MONEY is
+    // consensus-invalid (tx_check.cpp nValueOut range check). Must surface the
+    // SPECIFIC token on the full path, matching the dry-run (G26) and Core —
+    // not the old generic "bad-txns-sanity".
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x66} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = consensus.MAX_MONEY + 1, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const r = mempool.acceptToMemoryPool(tx, false);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("bad-txns-vout-toolarge", r.reject_reason.?);
 }
 
 // ============================================================================
