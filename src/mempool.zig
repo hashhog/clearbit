@@ -1479,6 +1479,60 @@ pub const Mempool = struct {
             // Dry-run: check if it would be accepted without modifying state.
             // We check the same conditions as addTransaction but don't persist.
             //
+            // §1a. CheckTransaction() consensus sanity gate — mirror
+            //      addTransaction §1a (line ~1008). The dry-run previously
+            //      SKIPPED this, so consensus-invalid txs (duplicate inputs,
+            //      negative/overflow output values, zero in/out, ...) that both
+            //      Core AND clearbit's own addTransaction reject were
+            //      FALSE-ACCEPTED here (or reported a wrong token).
+            //
+            //      testmempoolaccept surfaces Core's BARE reject token
+            //      (rpc/mempool.cpp:399-404), so map each CheckTransaction
+            //      ValidationError straight to its exact tx_check.cpp token.
+            //      (The full sendrawtransaction path collapses these into the
+            //      generic MempoolError.TxSanityFailed => "bad-txns-sanity";
+            //      that lossy collapse cannot carry the sub-case token, so we
+            //      map the ValidationError directly here. Tokens are Core's own
+            //      — none are invented.)
+            //      Reference: consensus/tx_check.cpp CheckTransaction().
+            validation.checkTransactionSanity(&tx) catch |err| {
+                const reason: []const u8 = switch (err) {
+                    error.NoInputs => "bad-txns-vin-empty",
+                    error.NoOutputs => "bad-txns-vout-empty",
+                    error.TxTooLarge => "bad-txns-oversize",
+                    error.NegativeOutput => "bad-txns-vout-negative",
+                    error.OutputTooLarge => "bad-txns-vout-toolarge",
+                    error.TotalOutputTooLarge => "bad-txns-txouttotal-toolarge",
+                    error.DuplicateInput => "bad-txns-inputs-duplicate",
+                    error.NullInput => "bad-txns-prevout-null",
+                    error.CoinbaseScriptSize => "bad-cb-length",
+                    error.InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
+                    else => "bad-txns-sanity",
+                };
+                return AcceptResult{
+                    .accepted = false,
+                    .txid = tx_hash,
+                    .wtxid = wtxid,
+                    .fee = 0,
+                    .vsize = 0,
+                    .reject_reason = reason,
+                };
+            };
+
+            // §1b. Coinbase reject — mirror addTransaction §1b (line ~1026).
+            //      A loose coinbase is only valid inside a block. Core reject
+            //      token: "coinbase" (validation.cpp:803-804).
+            if (tx.isCoinbase()) {
+                return AcceptResult{
+                    .accepted = false,
+                    .txid = tx_hash,
+                    .wtxid = wtxid,
+                    .fee = 0,
+                    .vsize = 0,
+                    .reject_reason = "coinbase",
+                };
+            }
+
             // BIP-339 / W96 two-step duplicate check (mirrors addTransaction §1c):
             //   1. exists(wtxid) → "txn-already-in-mempool"   (exact duplicate)
             //   2. exists(txid)  → "txn-same-nonwitness-data-in-mempool" (malleated witness)
@@ -13340,6 +13394,88 @@ test "W96 G24: test_accept txid-only duplicate → `txn-same-nonwitness-data-in-
     try std.testing.expect(!r.accepted);
     try std.testing.expect(r.reject_reason != null);
     try std.testing.expectEqualStrings("txn-same-nonwitness-data-in-mempool", r.reject_reason.?);
+}
+
+test "W96 G25: test_accept duplicate-input tx → `bad-txns-inputs-duplicate`" {
+    // Dry-run CheckTransaction gate: a tx with two inputs spending the SAME
+    // outpoint is consensus-invalid (tx_check.cpp CheckTransaction). Before the
+    // fix the dry-run skipped CheckTransaction, so both inputs resolved in the
+    // UTXO view, the fee double-counted, and testmempoolaccept FALSE-ACCEPTED.
+    // Core rejects with "bad-txns-inputs-duplicate".
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const dup_outpoint = types.OutPoint{ .hash = [_]u8{0x77} ** 32, .index = 0 };
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{
+            .{ .previous_output = dup_outpoint, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} },
+            .{ .previous_output = dup_outpoint, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} },
+        },
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const r = mempool.acceptToMemoryPool(tx, true);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("bad-txns-inputs-duplicate", r.reject_reason.?);
+}
+
+test "W96 G26: test_accept out-of-range output → `bad-txns-vout-toolarge`" {
+    // Dry-run CheckTransaction gate: an output value > MAX_MONEY is
+    // consensus-invalid (tx_check.cpp: nValueOut range check). Before the fix
+    // the dry-run skipped CheckTransaction and this could FALSE-ACCEPT.
+    // Core rejects with "bad-txns-vout-toolarge".
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x66} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = consensus.MAX_MONEY + 1, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const r = mempool.acceptToMemoryPool(tx, true);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("bad-txns-vout-toolarge", r.reject_reason.?);
+}
+
+test "W96 G27: test_accept negative output → `bad-txns-vout-negative`" {
+    // Dry-run CheckTransaction gate: a negative output value is
+    // consensus-invalid (tx_check.cpp). Core rejects "bad-txns-vout-negative".
+    const allocator = std.testing.allocator;
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const sp = w96TestP2wpkhScript();
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x55} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = -1, .script_pubkey = &sp }},
+        .lock_time = 0,
+    };
+
+    const r = mempool.acceptToMemoryPool(tx, true);
+    try std.testing.expect(!r.accepted);
+    try std.testing.expect(r.reject_reason != null);
+    try std.testing.expectEqualStrings("bad-txns-vout-negative", r.reject_reason.?);
 }
 
 // ============================================================================
