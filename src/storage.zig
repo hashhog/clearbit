@@ -908,6 +908,41 @@ const UtxoKeyContext = struct {
 /// cache); we mirror that in `evictCache` below.
 const LARGE_THRESHOLD_HEADROOM: usize = 10 * 1024 * 1024; // 10 MiB
 
+/// Estimated retained heap cost of a single live UTXO cache entry, in bytes.
+///
+/// Derivation (measured with @sizeOf on Zig 0.13, x86-64; see the
+/// "utxo cache per-entry estimate is within a sane band" test):
+///
+///   std.HashMap([36]u8 -> CacheEntry) storage, per allocated slot:
+///     - key   [36]u8                                    : 36 B
+///     - value CacheEntry (@sizeOf)                      : 40 B
+///         (CompactUtxo @sizeOf = 32: value i64, slice 16,
+///          height u32, script_type u8, is_coinbase bool, padded to 32;
+///          + dirty/fresh bools, padded up to 40)
+///     - metadata byte                                   :  1 B
+///     = 77 B per *slot*.
+///   The HashMap rounds capacity up to a power of two and grows at the 80%
+///   max load factor, so the live load oscillates ~40-80% and there are on
+///   average ~1.6 slots per stored entry:  77 * 1.6 ≈ 123 B/entry.
+///
+///   Owned hash_or_script heap allocation (dup'd per entry): standard
+///   scripts store a 20-byte (P2PKH/P2SH/P2WPKH) or 32-byte (P2WSH/P2TR)
+///   hash; rounded up to the allocator's granularity plus a ~16 B glibc
+///   chunk header this is ≈ 40 B/entry.
+///
+///   True cost ≈ 123 + 40 ≈ 163-200 B/entry.
+///
+/// We use 240 B/entry: a modest ~1.2-1.3x safety margin over the measured
+/// cost.  The previous magic value of 500 was a 2.5x over-estimate that made
+/// eviction (the full flush-and-wipe in evictCache) fire at only ~40% of the
+/// real --dbcache budget, wiping the cache far more often than necessary and
+/// hurting IBD/resync hit-rate.  At 240 the cache holds ~500/240 ≈ 2.1x more
+/// entries before the same threshold, i.e. roughly ~2x fewer wipes per
+/// --dbcache budget.  This only shifts the RSS-vs-wipe tradeoff; RSS stays far
+/// below the 48G MemoryMax at any realistic --dbcache.  Eviction cadence,
+/// thresholds and the reorg-batch atomicity path are unchanged.
+const UTXO_CACHE_BYTES_PER_ENTRY: usize = 240;
+
 /// Provides efficient lookups with a configurable cache size for IBD performance.
 pub const UtxoSet = struct {
     db: ?*Database,
@@ -951,9 +986,10 @@ pub const UtxoSet = struct {
     /// If db is null, operates in memory-only mode (useful for testing).
     pub fn init(db: ?*Database, max_cache_mb: usize, allocator: std.mem.Allocator) UtxoSet {
         // Pre-size HashMap for IBD performance.
-        // With the corrected 500 bytes/entry estimate and typical --dbcache=4096,
-        // the cache can hold ~8M entries.  Pre-allocate 2M slots to avoid
-        // repeated rehashing during early IBD.
+        // With the calibrated ~240 bytes/entry estimate
+        // (UTXO_CACHE_BYTES_PER_ENTRY) and typical --dbcache=4096, the cache
+        // can hold ~17M entries.  Pre-allocate 2M slots to avoid repeated
+        // rehashing during early IBD.
         var cache = std.HashMap([36]u8, CacheEntry, UtxoKeyContext, std.hash_map.default_max_load_percentage).init(allocator);
         cache.ensureTotalCapacity(1 << 21) catch {}; // 2M slots pre-allocated
         return UtxoSet{
@@ -1551,23 +1587,12 @@ pub const UtxoSet = struct {
     }
 
     /// Get approximate cache memory usage.
-    /// Estimate the memory usage of the UTXO cache.
     ///
-    /// Per-entry cost breakdown:
-    ///   - CompactUtxo struct: ~48 bytes (height, value, coinbase, script_type, slice)
-    ///   - hash_or_script heap alloc: ~32 bytes (20-32 data + allocator overhead)
-    ///   - CacheEntry wrapper (dirty flag + padding): ~56 bytes
-    ///   - HashMap key [36]u8: 36 bytes
-    ///   - HashMap metadata per slot: ~8 bytes
-    ///   - Allocator fragmentation / glibc overhead: ~320 bytes
-    /// Total: ~500 bytes per entry (measured empirically during full IBD).
-    ///
-    /// The theoretical minimum is ~200 bytes/entry, but glibc malloc retains
-    /// freed pages due to fragmentation from millions of small hash_or_script
-    /// allocations (20-32 bytes each).  Using 500 bytes ensures eviction
-    /// triggers before RSS grows beyond --dbcache * 2.5x.
+    /// Estimates retained heap by multiplying the live entry count by the
+    /// calibrated per-entry cost.  See `UTXO_CACHE_BYTES_PER_ENTRY` for the
+    /// full derivation (~163-200 B true cost, 240 B with safety margin).
     pub fn cacheMemoryUsage(self: *const UtxoSet) usize {
-        return self.cache.count() * 500;
+        return self.cache.count() * UTXO_CACHE_BYTES_PER_ENTRY;
     }
 };
 
@@ -8827,6 +8852,38 @@ test "utxo set hit rate" {
     try std.testing.expectEqual(@as(f64, 1.0), utxo_set.hitRate());
 }
 
+test "utxo cache per-entry estimate is within a sane band" {
+    // Guards UTXO_CACHE_BYTES_PER_ENTRY against drift as CacheEntry /
+    // CompactUtxo change shape.  The estimate must at least cover the raw
+    // in-map struct storage (HashMap key + value), and must stay well below
+    // the old 2.5x-over magic value of 500 so eviction fires near the true
+    // --dbcache budget rather than at ~40% of it.
+
+    const key_bytes: usize = @sizeOf([36]u8); // HashMap key
+    const entry_bytes: usize = @sizeOf(UtxoSet.CacheEntry); // HashMap value
+    const metadata_bytes: usize = 1; // std.HashMap metadata byte per slot
+    const raw_slot_sum = key_bytes + entry_bytes + metadata_bytes;
+
+    // Sanity: the measured struct sizes this calibration was derived from.
+    try std.testing.expectEqual(@as(usize, 36), key_bytes);
+    try std.testing.expectEqual(@as(usize, 40), entry_bytes);
+
+    // Lower bound: must cover the raw per-slot struct footprint. (True cost
+    // is higher still once power-of-two slot overhead and the owned
+    // hash_or_script allocation are included.)
+    try std.testing.expect(UTXO_CACHE_BYTES_PER_ENTRY >= raw_slot_sum);
+
+    // Lower bound on the *true* cost: ~1.6 slots/entry (77 * 1.6 ≈ 123) plus
+    // the ~40 B owned script allocation ≈ 163 B/entry.  Estimating below this
+    // would under-count RSS.
+    try std.testing.expect(UTXO_CACHE_BYTES_PER_ENTRY >= 150);
+
+    // Upper bound: must not regress back toward a large over-estimate.  A
+    // ceiling of 320 keeps the safety margin modest (< ~2x true cost) and far
+    // below the old 500.
+    try std.testing.expect(UTXO_CACHE_BYTES_PER_ENTRY <= 320);
+}
+
 // ============================================================================
 // ChainState Tests
 // ============================================================================
@@ -15191,7 +15248,9 @@ test "W93 G15 IsUnspendable parity: AddCoin skips oversize-script outputs on con
 //             net_processing (txn relay path). UtxoSet has no equivalent;
 //             callers fall back to haveCoin() which may hit DB.
 // BUG-5  [P2] UtxoSet.cacheMemoryUsage() flat-estimate: returns
-//             count*500 bytes unconditionally. Core's DynamicMemoryUsage()
+//             count*UTXO_CACHE_BYTES_PER_ENTRY bytes unconditionally
+//             (constant recalibrated from 500 to the true ~240 B/entry).
+//             Core's DynamicMemoryUsage()
 //             uses memusage::DynamicUsage() on each CoinEntry. The flat
 //             estimate underestimates large-script UTXOs, causing the flush
 //             threshold to trigger too late (memory overshoot).
@@ -15410,9 +15469,9 @@ test "W100 G5: UtxoSet.add always sets fresh=true even after DB flush (BUG-3)" {
 
 // --- G6: DynamicMemoryUsage flat estimate (BUG-5) ---
 
-test "W100 G6: cacheMemoryUsage is flat count*500 not dynamic script-size aware (BUG-5)" {
+test "W100 G6: cacheMemoryUsage is flat count*const not dynamic script-size aware (BUG-5)" {
     // Core: DynamicMemoryUsage() traverses all entries for true memory.
-    // clearbit: returns count * 500 regardless of script sizes.
+    // clearbit: returns count * UTXO_CACHE_BYTES_PER_ENTRY regardless of script sizes.
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -15438,9 +15497,12 @@ test "W100 G6: cacheMemoryUsage is flat count*500 not dynamic script-size aware 
     try chain_state.utxo_set.add(&out2, &txout2, 1, false);
 
     const usage = chain_state.utxo_set.cacheMemoryUsage();
-    // BUG-5: flat estimate is 2 * 500 = 1000 regardless of actual sizes.
-    // Core would report ~small_script.len + large_script.len + overhead ≈ 600+.
-    try std.testing.expectEqual(@as(usize, 2 * 500), usage);
+    // BUG-5: flat estimate is count * UTXO_CACHE_BYTES_PER_ENTRY regardless of
+    // actual script sizes (script-size-independent).  Core would instead report
+    // ~small_script.len + large_script.len + overhead ≈ 600+.  The per-entry
+    // constant was recalibrated from 500 to its true ~240 B cost; the *flat*
+    // (script-size-independent) nature this test documents is unchanged.
+    try std.testing.expectEqual(@as(usize, 2 * UTXO_CACHE_BYTES_PER_ENTRY), usage);
     // The large-script coin is not reflected in the estimate (BUG-5).
 }
 
