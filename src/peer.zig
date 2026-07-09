@@ -60,6 +60,17 @@ fn isReorgEnabled() bool {
 /// risking running out of undo data.  Per BIP-37 / Core's MIN_BLOCKS_TO_KEEP.
 pub const MAX_REORG_DEPTH: u32 = 288;
 
+/// PERF (throughput-collapse fix): during bulk IBD the reorg-safe connect
+/// path (`connectBlockFastWithUndo`) flushed a RocksDB WriteBatch + WAL on
+/// EVERY block.  At segwit-era UTXO scale (50M+ coins) that per-block flush
+/// dominated wall-time and collapsed sustained throughput to ~1 blk/s (see
+/// the trackB replay stall at h=482,832: each block 0.5-2.7 s, a 17 k-deep
+/// header queue draining ~1 block per second).  `drainBlockBuffer` instead
+/// connects with the no-flush variant and flushes once per this many blocks.
+/// Bounded well under `MAX_REORG_DEPTH` (288) so the reorg-reachable zone
+/// near the tip is always flushed per-block (near-tip guard in the drain).
+pub const IBD_BATCH_FLUSH_INTERVAL: u32 = 128;
+
 /// BIP-159 NODE_NETWORK_LIMITED window: a limited (pruned) peer keeps only the
 /// last ~288 blocks below its tip and cannot serve anything deeper. Mirrors
 /// Bitcoin Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS` (net_processing.cpp). Used by
@@ -2781,6 +2792,12 @@ pub const PeerManager = struct {
 
     /// Total blocks connected since last progress log.
     blocks_since_log: u32,
+
+    /// PERF: blocks connected via the no-flush IBD path since the last batched
+    /// chainstate flush.  Drives the throughput-collapse fix in
+    /// `drainBlockBuffer` (see `IBD_BATCH_FLUSH_INTERVAL`).  Reset to 0 on
+    /// every flush (batched, near-tip, or pre-reorg).
+    blocks_since_flush: u32 = 0,
 
     /// Last time we attempted stall recovery.
     last_stall_recovery: i64,
@@ -8483,6 +8500,22 @@ pub const PeerManager = struct {
         // the steady-state cost is one HashMap.contains() per fork
         // hash — bounded by the fork length, typically 1-3 blocks.
         if (reorg_enabled and self.pending_reorg != null) {
+            // PERF batching invariant: a reorg reads undo data from the DB
+            // (disconnectBlockByHashCF -> getBlockUndoBytes -> CF_BLOCK_UNDO).
+            // The batched IBD path below may still hold the most-recent blocks'
+            // undo bytes in ChainState.pending_undo_writes (not yet on disk).
+            // Flush any accumulated batch first so every disconnectable block's
+            // undo is durable before the reorg walks it back.
+            if (self.blocks_since_flush > 0) {
+                cs.connect_mutex.lock();
+                const pre_reorg_flush = cs.flush();
+                cs.connect_mutex.unlock();
+                pre_reorg_flush catch |err| {
+                    std.debug.print("P2P: pre-reorg batched flush failed: {}\n", .{err});
+                    cs.flush_error = true;
+                };
+                self.blocks_since_flush = 0;
+            }
             self.tryFireReorg();
         }
 
@@ -8687,10 +8720,46 @@ pub const PeerManager = struct {
             // additional consensus checks beyond what validateBlockForIBD
             // already runs; the choice is purely about reorg readiness.
             if (reorg_enabled) {
-                cs.connectBlockFastWithUndo(&block, &block_hash, height) catch |err| {
+                // PERF (throughput-collapse fix, trackB replay stall @ h=482,832):
+                // the flushing variant issued one RocksDB WriteBatch + WAL PER
+                // block, which at segwit-era UTXO scale collapsed throughput to
+                // ~1 blk/s.  Connect with the no-flush variant and flush once
+                // per IBD_BATCH_FLUSH_INTERVAL blocks (or every block once we
+                // are within that many blocks of the tip — the near-tip guard
+                // below).  Batching also restores the FRESH-coin fast path:
+                // coins created AND spent inside one flush window skip the DB
+                // entirely (spend() takes the fresh branch — no pending delete,
+                // no read).  Crash-safety is preserved by a DIFFERENT mechanism
+                // than per-block flush: no-flush connects write NOTHING durable
+                // until the batched flush, so a crash mid-window resumes cleanly
+                // from the last flushed tip (getBlockHashByHeight above the
+                // durable tip is null -> reconcileSurplusBlocksOnBoot is a
+                // no-op).  This is Bitcoin Core's dbcache-flush model.
+                cs.connectBlockFastWithUndoNoFlush(&block, &block_hash, height) catch |err| {
                     std.debug.print("P2P: Failed to connect block (with undo) at height {d}: {}\n", .{ height, err });
                     break;
                 };
+                self.blocks_since_flush += 1;
+                // remaining_q: header slots still ahead of the connect cursor.
+                // connect_cursor is bumped a few lines below, so this is off by
+                // one at most — irrelevant for the interval comparison.
+                const remaining_q = self.expected_blocks.items.len - self.connect_cursor;
+                if (remaining_q < IBD_BATCH_FLUSH_INTERVAL or
+                    self.blocks_since_flush >= IBD_BATCH_FLUSH_INTERVAL)
+                {
+                    // Hold connect_mutex across the flush to keep the same
+                    // invariant the flushing connect path relies on (flush runs
+                    // under the connect lock; storage.zig connectBlockFast).
+                    cs.connect_mutex.lock();
+                    const batch_flush = cs.flush();
+                    cs.connect_mutex.unlock();
+                    batch_flush catch |err| {
+                        std.debug.print("P2P: batched IBD flush failed at height {d}: {} — halting drain\n", .{ height, err });
+                        cs.flush_error = true;
+                        break;
+                    };
+                    self.blocks_since_flush = 0;
+                }
             } else {
                 // During IBD, skip undo data collection for speed
                 cs.connectBlockFast(&block, &block_hash, height) catch |err| {
