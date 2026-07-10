@@ -8549,8 +8549,12 @@ pub const PeerManager = struct {
                 // for hours producing no log explanation. This line fires
                 // exactly in that condition. Rate-limit to once per second
                 // per stuck height so steady-state lookahead doesn't flood.
+                const now = std.time.timestamp();
+                // The stuck FRONT block (at connect_cursor) is missing. It needs
+                // fast recovery whenever it is in-flight to a peer — regardless
+                // of whether LATER blocks are also buffered.
+                const front_in_flight = self.inflight_block_peer.contains(expected_hash);
                 if (self.block_buffer.count() > 0) {
-                    const now = std.time.timestamp();
                     if (now != self.last_drain_break_log_ts or
                         self.connect_cursor != self.last_drain_break_cursor)
                     {
@@ -8593,17 +8597,34 @@ pub const PeerManager = struct {
                             },
                         );
                     }
+                }
 
-                    // Fast staller recovery: cancel the stuck FRONT block's
-                    // in-flight request after DRAIN_WEDGE_STALL_TIMEOUT so it
-                    // re-requests from another peer, instead of waiting the 20-min
-                    // BLOCK_DOWNLOAD_TIMEOUT. The per-block map makes this
-                    // drift-free: decrement the EXACT holder + drop the entry, then
-                    // rewind download_cursor; pipelineBlockRequests re-issues ONLY
-                    // this now-untracked block (others still in-flight stay
-                    // skipped). Mirrors Core BLOCK_STALLING_TIMEOUT. Fires only in
-                    // this genuine-wedge branch (front missing + buffer non-empty),
-                    // so it does not reintroduce the W15 throughput regression.
+                // Fast staller recovery: cancel the stuck FRONT block's
+                // in-flight request after DRAIN_WEDGE_STALL_TIMEOUT so it
+                // re-requests from another peer, instead of waiting the 20-min
+                // BLOCK_DOWNLOAD_TIMEOUT. The per-block map makes this
+                // drift-free: decrement the EXACT holder + drop the entry, then
+                // rewind download_cursor; pipelineBlockRequests re-issues ONLY
+                // this now-untracked block (others still in-flight stay
+                // skipped). Mirrors Core BLOCK_STALLING_TIMEOUT.
+                //
+                // Fires in TWO wedge shapes:
+                //   (1) head-of-line wedge — front block missing while LATER
+                //       blocks sit buffered (buffer>0);
+                //   (2) BLACK-HOLE wedge — a peer accepted the getdata but never
+                //       delivers, so NOTHING is ever buffered (buffer==0). This
+                //       is the assumeutxo windowed-replay stall: a serve-capped
+                //       replay feed silently drops block requests above its cap
+                //       (and a real peer can likewise advertise headers it won't
+                //       serve as bodies), so the ~15 blocks requested one past the
+                //       snapshot boundary never arrive. The old `buffer>0` gate
+                //       left the ONLY recovery as the 20-min BLOCK_DOWNLOAD_TIMEOUT
+                //       disconnect. Gating on `front_in_flight` (the stuck front
+                //       block IS tracked to a peer) recovers in <=64s without
+                //       waiting for the connection to drop.
+                // Still scoped to the genuine-wedge branch (front block missing),
+                // so it does not reintroduce the W15 throughput regression.
+                if (self.block_buffer.count() > 0 or front_in_flight) {
                     if (self.wedge_since == 0) {
                         self.wedge_since = now;
                         self.wedge_timeout = DRAIN_WEDGE_STALL_TIMEOUT; // fresh wedge → base
