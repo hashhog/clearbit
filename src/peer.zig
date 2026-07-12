@@ -8128,10 +8128,86 @@ pub const PeerManager = struct {
             // bad-diffbits gate on the submitblock path, where header_index is
             // empty and the walk hits getPersistedHeader (genesis absent).
             prev_resolved: bool,
+            // True when `tip_hash` is the active-chain tip (`chain_state.best_hash`),
+            // i.e. the block we are validating extends the active chain.  In that
+            // case every ancestor at height `h <= tip_height` IS the active-chain
+            // block at height `h`, so it can be resolved directly by height instead
+            // of walking prev_hash pointers.  This is essential during IBD: the
+            // difficulty-period's first block is `interval-1` blocks back, deep
+            // enough that its header has usually been evicted from the bounded
+            // (MAX_HEADER_INDEX) in-memory header_index, while intermediate blocks
+            // between the last chainstate flush and the tip are connected-but-not-
+            // yet-flushed — invisible to BOTH header_index and getPersistedHeader.
+            // The prev_hash walk then breaks in that gap and getNextWorkRequired
+            // silently falls back to prev.bits, skipping the retarget entirely
+            // (bad-diffbits at every 2016-boundary; first observed as a genesis-IBD
+            // wedge at height 32256).  Resolving deep ancestors by height reaches
+            // the flushed on-disk block and computes the correct retarget.
+            extending: bool,
 
             fn getAtHeight(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
                 const self2: *@This() = @ptrCast(@alignCast(ctx));
                 if (h > self2.tip_height) return null;
+
+                // Active-chain fast path (extend case only, so it stays reorg-safe:
+                // a block on a not-yet-activated fork still uses the prev_hash walk
+                // below).  Resolve height -> hash -> header directly.  Prefer the
+                // in-memory header_index (covers recent, not-yet-flushed blocks);
+                // fall back to the persisted CF_BLOCK_INDEX record (covers deep,
+                // flushed ancestors the walk cannot reach).
+                if (self2.extending) {
+                    if (self2.pm.chain_state) |cs| {
+                        // Primary in-memory source: the difficulty-retarget ring,
+                        // populated by connectBlockInner independently of header
+                        // download / eviction / DB flush.  Covers the whole
+                        // retarget window (the deep first-block the walk cannot
+                        // reach during IBD).
+                        if (cs.getRetargetEntry(h)) |re| {
+                            if (h == self2.tip_height) self2.prev_resolved = true;
+                            return consensus.BlockIndexEntry{
+                                .height = h,
+                                .timestamp = re.timestamp,
+                                .bits = re.bits,
+                            };
+                        }
+                        // Secondary: the persisted block index (post-restart /
+                        // post-snapshot, where the ring has not been repopulated
+                        // but the on-disk index has the flushed header).
+                        if (cs.getBlockHashByHeight(h)) |hh| {
+                            if (self2.pm.header_index.get(hh)) |e| {
+                                if (h == self2.tip_height) self2.prev_resolved = true;
+                                return consensus.BlockIndexEntry{
+                                    .height = h,
+                                    .timestamp = e.timestamp,
+                                    .bits = e.header.bits,
+                                };
+                            }
+                            if (cs.getPersistedHeader(&hh)) |hdr| {
+                                if (h == self2.tip_height) self2.prev_resolved = true;
+                                return consensus.BlockIndexEntry{
+                                    .height = h,
+                                    .timestamp = hdr.timestamp,
+                                    .bits = hdr.bits,
+                                };
+                            }
+                            // Tertiary: the block BODY in CF_BLOCKS.  The fast IBD
+                            // connect path populates CF_BLOCKS but NOT the
+                            // CF_BLOCK_INDEX header record, so after a restart
+                            // mid-IBD this is the only persisted header source for
+                            // a deep ancestor connected in a prior session.
+                            if (cs.getBlockHeaderFromBody(&hh)) |hdr| {
+                                if (h == self2.tip_height) self2.prev_resolved = true;
+                                return consensus.BlockIndexEntry{
+                                    .height = h,
+                                    .timestamp = hdr.timestamp,
+                                    .bits = hdr.bits,
+                                };
+                            }
+                        }
+                    }
+                    // Fall through to the prev_hash walk for recent heights not yet
+                    // in the ring/index: those remain resolvable via header_index.
+                }
 
                 // Walk backwards from tip to reach `h`.
                 var cursor = self2.tip_hash;
@@ -8140,10 +8216,11 @@ pub const PeerManager = struct {
                     if (self2.pm.header_index.get(cursor)) |e| {
                         cursor = e.prev_hash;
                     } else if (self2.pm.chain_state) |cs| {
-                        const hdr = cs.getPersistedHeader(&cursor) orelse {
-                            self2.not_found = true;
-                            return null;
-                        };
+                        const hdr = cs.getPersistedHeader(&cursor) orelse
+                            cs.getBlockHeaderFromBody(&cursor) orelse {
+                                self2.not_found = true;
+                                return null;
+                            };
                         cursor = hdr.prev_block;
                     } else {
                         self2.not_found = true;
@@ -8162,10 +8239,11 @@ pub const PeerManager = struct {
                     };
                 }
                 if (self2.pm.chain_state) |cs| {
-                    const hdr = cs.getPersistedHeader(&cursor) orelse {
-                        self2.not_found = true;
-                        return null;
-                    };
+                    const hdr = cs.getPersistedHeader(&cursor) orelse
+                        cs.getBlockHeaderFromBody(&cursor) orelse {
+                            self2.not_found = true;
+                            return null;
+                        };
                     if (h == self2.tip_height) self2.prev_resolved = true;
                     return consensus.BlockIndexEntry{
                         .height = h,
@@ -8178,12 +8256,21 @@ pub const PeerManager = struct {
             }
         };
 
+        // We are extending the active chain when the block's parent IS the active
+        // tip.  Only then is an ancestor at height h guaranteed to equal the
+        // active-chain block at h (see WalkCtx.extending).
+        const extending = if (self.chain_state) |cs|
+            std.mem.eql(u8, &prev_hash, &cs.best_hash)
+        else
+            false;
+
         var walk_ctx = WalkCtx{
             .pm = self,
             .tip_hash = prev_hash,
             .tip_height = height - 1,
             .not_found = false,
             .prev_resolved = false,
+            .extending = extending,
         };
 
         const pow_limit_bits = consensus.getPowLimitBits(self.network_params);

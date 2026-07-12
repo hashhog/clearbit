@@ -1993,6 +1993,12 @@ pub fn main() !void {
     // the buffer as blocks are connected.
     chain_state.initGenesisTimestamp(params.genesis_header.timestamp);
 
+    // Seed the difficulty-retarget ring with genesis (height 0).  The first
+    // retarget (height 2016) measures its timespan back to genesis, so genesis's
+    // (timestamp, bits) must be resolvable by GetNextWorkRequired.  Genesis is
+    // NOT connected via connectBlockInner, so seed it explicitly here.
+    chain_state.initGenesisRetarget(params.genesis_header.timestamp, params.genesis_header.bits);
+
     // Seed the cumulative-tx-count (Core CBlockIndex::m_chain_tx_count) for the
     // genesis block.  Genesis is NOT connected via connectBlockInner (it is the
     // chain root), so without this the running counter would start at 0 and

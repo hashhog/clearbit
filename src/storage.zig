@@ -2096,6 +2096,14 @@ pub const TipNotifier = struct {
     }
 };
 
+/// Size of the difficulty-retarget ring buffer (see ChainState.retarget_ring_*).
+/// Must exceed the difficulty adjustment interval (2016) so the whole current
+/// period — first block at tip-(interval-1) through the tip — is always covered.
+/// Power of two so `height % SIZE` is a cheap mask.
+pub const RETARGET_RING_SIZE: u32 = 4096;
+/// Sentinel marking an empty retarget-ring slot (no real block height matches).
+pub const RETARGET_RING_EMPTY: u32 = 0xFFFF_FFFF;
+
 /// Chain state tracks the current best chain and supports reorgs.
 pub const ChainState = struct {
     /// Block-keep horizon: blocks within this many heights of the tip are
@@ -2297,6 +2305,25 @@ pub const ChainState = struct {
     // Reset to all-zeros on init; the count tracks how many are valid.
     recent_timestamps: [11]u32 = [_]u32{0} ** 11,
     recent_ts_count: u32 = 0,
+
+    // Difficulty-retarget ring buffer — populated by connectBlockInner (and
+    // seeded with genesis) so GetNextWorkRequired can read the (timestamp, bits)
+    // of the difficulty period's FIRST block, which is `interval-1` blocks back
+    // from the tip.  During genesis IBD that ancestor is too deep to survive in
+    // peer.zig's bounded (MAX_HEADER_INDEX) header_index, and the block index in
+    // the DB (CF_BLOCK_INDEX / H:height→hash) is not yet flushed (batched IBD
+    // flushes), so it is invisible to BOTH header_index and getPersistedHeader.
+    // The prev_hash walk then breaks in that gap and getNextWorkRequired silently
+    // falls back to prev.bits, skipping the retarget → bad-diffbits at every
+    // 2016-boundary (first observed as a genesis-IBD wedge at height 32256).
+    // This ring is always in-memory and independent of header download / eviction
+    // / flush state, so it reliably serves the retarget window.  RETARGET_RING_SIZE
+    // must exceed the difficulty interval (2016) so the whole period is covered.
+    // Slot = height % RETARGET_RING_SIZE; retarget_ring_height records which height
+    // currently occupies the slot so wrap-around reads are unambiguous.
+    retarget_ring_ts: [RETARGET_RING_SIZE]u32 = [_]u32{0} ** RETARGET_RING_SIZE,
+    retarget_ring_bits: [RETARGET_RING_SIZE]u32 = [_]u32{0} ** RETARGET_RING_SIZE,
+    retarget_ring_height: [RETARGET_RING_SIZE]u32 = [_]u32{RETARGET_RING_EMPTY} ** RETARGET_RING_SIZE,
 
     /// Prune target size for CF_BLOCKS in MiB. 0 = disabled (pruning off).
     /// Must be ≥ 550 when non-zero (validated in main.zig before assignment).
@@ -2812,6 +2839,37 @@ pub const ChainState = struct {
             self.recent_timestamps[0] = genesis_ts;
             self.recent_ts_count = 1;
         }
+    }
+
+    /// Record a connected block's (timestamp, bits) into the difficulty-retarget
+    /// ring so GetNextWorkRequired can read the difficulty period's first block
+    /// during IBD (see the retarget_ring_* field comment).  Called by
+    /// connectBlockInner for every connected block, and seeded for genesis via
+    /// initGenesisRetarget.
+    pub fn recordRetargetEntry(self: *ChainState, height: u32, timestamp: u32, bits: u32) void {
+        const slot = height % RETARGET_RING_SIZE;
+        self.retarget_ring_height[slot] = height;
+        self.retarget_ring_ts[slot] = timestamp;
+        self.retarget_ring_bits[slot] = bits;
+    }
+
+    /// Look up a connected block's (timestamp, bits) by height from the
+    /// difficulty-retarget ring.  Returns null when the requested height is
+    /// outside the retained window (older than RETARGET_RING_SIZE below the tip)
+    /// or has never been recorded — callers then fall back to the header_index /
+    /// persisted-header walk.
+    pub fn getRetargetEntry(self: *const ChainState, height: u32) ?struct { timestamp: u32, bits: u32 } {
+        const slot = height % RETARGET_RING_SIZE;
+        if (self.retarget_ring_height[slot] != height) return null;
+        return .{ .timestamp = self.retarget_ring_ts[slot], .bits = self.retarget_ring_bits[slot] };
+    }
+
+    /// Seed the retarget ring with the genesis block (height 0).  Genesis is not
+    /// connected through connectBlockInner, but the first retarget (height 2016)
+    /// measures its timespan back to genesis, so its (timestamp, bits) must be in
+    /// the ring.  Idempotent.
+    pub fn initGenesisRetarget(self: *ChainState, genesis_ts: u32, genesis_bits: u32) void {
+        self.recordRetargetEntry(0, genesis_ts, genesis_bits);
     }
 
     /// SNAPSHOT FORWARD-SYNC (Layer 3): seed the BIP-113 MTP ring buffer with
@@ -3968,6 +4026,22 @@ pub const ChainState = struct {
         defer self.allocator.free(bytes);
         var reader = serialize.Reader{ .data = bytes };
         _ = reader.readInt(u32) catch return null; // height prefix (see getBlockIndex)
+        return serialize.readBlockHeader(&reader) catch return null;
+    }
+
+    /// Read a block header from the persisted block BODY in CF_BLOCKS (keyed by
+    /// hash; the raw block bytes begin with the 80-byte header).  Unlike
+    /// getPersistedHeader (CF_BLOCK_INDEX), CF_BLOCKS IS populated by the fast
+    /// IBD connect path (see the CF_BLOCKS populator note), so this survives a
+    /// restart mid-IBD.  Used as the deep-ancestor fallback for the difficulty
+    /// retarget when the in-memory ring is cold (post-restart) and CF_BLOCK_INDEX
+    /// is absent.  Returns null when the body is missing (pruned / DB-less).
+    pub fn getBlockHeaderFromBody(self: *ChainState, hash: *const types.Hash256) ?types.BlockHeader {
+        const db = self.utxo_set.db orelse return null;
+        const data = db.get(CF_BLOCKS, hash) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        var reader = serialize.Reader{ .data = bytes };
         return serialize.readBlockHeader(&reader) catch return null;
     }
 
@@ -6029,6 +6103,12 @@ pub const ChainState = struct {
             self.recent_timestamps[0] = block.header.timestamp;
             if (self.recent_ts_count < 11) self.recent_ts_count += 1;
         }
+
+        // Difficulty-retarget ring: record this connected block's (timestamp,
+        // bits) by height so GetNextWorkRequired can read the period's first
+        // block during IBD without depending on the (evictable) header_index or
+        // the (not-yet-flushed) block index.  See the retarget_ring_* fields.
+        self.recordRetargetEntry(height, block.header.timestamp, block.header.bits);
 
         // Re-enable eviction now that tip is consistent with UTXO state — BUT
         // NOT while accumulating a deferred-flush reorg batch (Pattern D).
