@@ -896,7 +896,27 @@ pub fn checkBlockPow(
         return ValidationError.BadMerkleRoot;
     }
 
-    // 7. Check block weight
+    // 7a. Context-free size gate — Core CheckBlock (validation.cpp:3947):
+    //   GetSerializeSize(block, NO_WITNESS) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    //   => "bad-blk-length" ("size limits failed").  Core runs this BEFORE the
+    // full GetBlockWeight gate (7b below, => "bad-blk-weight").  base_size*4 > MAX
+    // is a STRICT SUBSET of the weight gate: weight = base*3 + total >= base*4
+    // (total >= base always), so any block caught here is also caught by 7b —
+    // this refines the reject REASON only and cannot change any accept/reject
+    // decision.  Reason-string parity with Core's two-gate structure.
+    {
+        var base_size: u64 = 80 + compactSizeLen(block.transactions.len);
+        for (block.transactions) |*tx| {
+            base_size += serializeTransactionSize(tx, false, allocator) catch {
+                return ValidationError.OutOfMemory;
+            };
+        }
+        if (base_size * consensus.WITNESS_SCALE_FACTOR > consensus.MAX_BLOCK_WEIGHT) {
+            return ValidationError.BadBlockSize;
+        }
+    }
+
+    // 7b. Check block weight
     // Weight = base_size * 3 + total_size
     // where base_size is serialization without witness,
     // total_size is serialization with witness.
