@@ -3521,6 +3521,29 @@ pub const RpcServer = struct {
         return self.network_params.genesis_header;
     }
 
+    /// Compute the on-disk byte size of the data directory for
+    /// getblockchaininfo's `size_on_disk`.  Bitcoin Core reports the total size
+    /// of the block-file store (`node::CalculateCurrentUsage`); clearbit keeps
+    /// blocks + the UTXO/chainstate in RocksDB under the datadir, so the datadir
+    /// byte total is the faithful analog.  Metadata-only (`stat`, no reads) so it
+    /// stays cheap even on a multi-GB mainnet datadir; returns 0 on any FS error
+    /// so the RPC never fails on a transient condition.  Cosmetic field only —
+    /// does not touch consensus/validation state.
+    fn computeSizeOnDisk(self: *RpcServer) u64 {
+        if (self.config.datadir.len == 0) return 0;
+        var dir = std.fs.cwd().openDir(self.config.datadir, .{ .iterate = true }) catch return 0;
+        defer dir.close();
+        var walker = dir.walk(self.allocator) catch return 0;
+        defer walker.deinit();
+        var total: u64 = 0;
+        while (walker.next() catch return total) |entry| {
+            if (entry.kind != .file) continue;
+            const st = entry.dir.statFile(entry.basename) catch continue;
+            total += st.size;
+        }
+        return total;
+    }
+
     fn handleGetBlockchainInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         const chain_name = switch (self.network_params.magic) {
             consensus.MAINNET.magic => "main",
@@ -3589,7 +3612,8 @@ pub const RpcServer = struct {
         // v31.99 removed `softforks` from getblockchaininfo (moved to
         // getdeploymentinfo). warnings is an ARRAY by default in v31.99
         // (node::GetWarningsForRpc returns VARR).
-        try writer.writeAll("\",\"size_on_disk\":0,\"pruned\":false,\"warnings\":[]}");
+        // size_on_disk: real datadir byte total (was hardcoded 0 stub).
+        try writer.print("\",\"size_on_disk\":{d},\"pruned\":false,\"warnings\":[]}}", .{self.computeSizeOnDisk()});
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -9704,9 +9728,22 @@ pub const RpcServer = struct {
             error.FutureTimestamp => "time-too-new", // block.time > now + 7200s
             error.BadVersion => "bad-version", // v<2/3/4 after BIP34/66/65
             error.NonFinalTx, error.SequenceLockNotSatisfied => "bad-txns-nonfinal",
-            error.DuplicateTx, error.Bip30DuplicateOutput => "bad-txns-duplicate",
+            // CVE-2012-2459 within-block duplicate tx (mutated merkle).
+            error.DuplicateTx => "bad-txns-duplicate",
+            // BIP-30: a tx overwrites an existing unspent output. Core surfaces
+            // this as its OWN token, NOT the CVE-2012-2459 "bad-txns-duplicate"
+            // (validation.cpp:2471 ConnectBlock -> "bad-txns-BIP30").
+            error.Bip30DuplicateOutput => "bad-txns-BIP30",
             error.MissingInput, error.InputAlreadySpent => "bad-txns-inputs-missingorspent",
-            error.BadBlockWeight, error.BadBlockSize => "bad-blk-weight",
+            // Core distinguishes the two size gates: the context-free
+            // CheckBlock size-limits gate (base*4 > MAX) is "bad-blk-length"
+            // (validation.cpp:3948), the full-weight gate is "bad-blk-weight"
+            // (validation.cpp:4180).  Map each error to its Core token.
+            error.BadBlockSize => "bad-blk-length",
+            error.BadBlockWeight => "bad-blk-weight",
+            // Witness data present with no witness-commitment output
+            // (CheckWitnessMalleation, validation.cpp:3910 -> "unexpected-witness").
+            error.UnexpectedWitness => "unexpected-witness",
             // Connect-block stage: Core validation.cpp:2122 "block-script-verify-flag-failed (%s)"
             error.ScriptVerificationFailed => "block-script-verify-flag-failed",
             // Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
