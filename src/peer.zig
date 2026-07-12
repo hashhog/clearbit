@@ -8624,7 +8624,20 @@ pub const PeerManager = struct {
                 //       waiting for the connection to drop.
                 // Still scoped to the genuine-wedge branch (front block missing),
                 // so it does not reintroduce the W15 throughput regression.
-                if (self.block_buffer.count() > 0 or front_in_flight) {
+                // THIRD wedge shape (single-peer silent freeze): the front block
+                // is neither buffered NOR in-flight, yet download_cursor ran ahead
+                // of connect_cursor. That means a prior getdata for this slot was
+                // lost WITHOUT a download_cursor rewind (a receive-path drop or a
+                // disconnect purge that missed the rewind). pipelineBlockRequests
+                // then believes the slot is already downloaded and never re-issues
+                // it, so with a SINGLE peer (no "other peer" to rotate to) the node
+                // spins forever making no progress and — because buffer==0 and the
+                // block isn't in-flight — the two arms above never fire, leaving the
+                // log dark. This is the trackB replay freeze at h=483879. Arm the
+                // recovery here too and rewind (below) to re-drive the same slot.
+                const front_missing_untracked =
+                    !front_in_flight and self.download_cursor > self.connect_cursor;
+                if (self.block_buffer.count() > 0 or front_in_flight or front_missing_untracked) {
                     if (self.wedge_since == 0) {
                         self.wedge_since = now;
                         self.wedge_timeout = DRAIN_WEDGE_STALL_TIMEOUT; // fresh wedge → base
@@ -8640,6 +8653,14 @@ pub const PeerManager = struct {
                             std.debug.print(
                                 "P2P: drain-wedge recovery: cancelled stuck front block at connect_cursor={d} (stalled {d}s); re-requesting from another peer\n",
                                 .{ self.connect_cursor, now - self.wedge_since },
+                            );
+                        } else {
+                            // No in-flight entry to cancel: the slot is simply lost.
+                            // The rewind below is the whole recovery — re-drive the
+                            // SAME block against the (possibly only) peer.
+                            std.debug.print(
+                                "P2P: drain-wedge recovery: front block at connect_cursor={d} missing (buffer={d}, not in-flight, stalled {d}s); re-requesting (single-peer re-drive)\n",
+                                .{ self.connect_cursor, self.block_buffer.count(), now - self.wedge_since },
                             );
                         }
                         // Rewind so the now-untracked front block re-requests
@@ -9099,6 +9120,29 @@ pub const PeerManager = struct {
 
         // Connect to --connect peer if specified (priority)
         if (self.connect_address) |addr| {
+            // Register the pinned --connect target as a MANUAL address so
+            // maintainManualConnections re-dials it after any mid-sync drop.
+            // Core treats -connect peers as manual connections that
+            // ThreadOpenConnections reconnects; without this the single pinned
+            // peer, once it disconnects, is NEVER re-dialed (the reconnect loop
+            // only walks known_addresses entries tagged .manual and this address
+            // was never inserted). A node MUST be able to sync against one peer:
+            // the trackB replay froze at h=483879 for ~2 days at 0 peers,
+            // busy-spinning at 100% CPU, because the pinned peer dropped after a
+            // block and could not be re-established. Insert DIRECTLY (not via
+            // addAddress) because --connect targets are typically loopback /
+            // private (replay harness, regtest) and addAddress()'s routability
+            // filter would silently reject them.
+            self.known_addresses.put(addressKey(addr), AddressInfo{
+                .address = addr,
+                .services = p2p.NODE_NETWORK,
+                .last_seen = std.time.timestamp(),
+                .last_tried = 0,
+                .attempts = 0,
+                .success = false,
+                .source = .manual,
+            }) catch {};
+
             std.debug.print("P2P: Attempting TCP connection to --connect peer...\n", .{});
             // BIP-324 negotiation lives inside connectOutboundNegotiated;
             // when v2 is disabled (default) this is identical to the old
@@ -9243,9 +9287,15 @@ pub const PeerManager = struct {
             }
 
             // 8. Brief sleep to avoid busy-loop.
-            // During IBD, poll() in processAllMessages handles the wait (10ms timeout),
-            // so no additional sleep is needed. Outside IBD, sleep 50ms.
-            if (!self.isIBD()) {
+            // During IBD, poll() in processAllMessages handles the wait (10ms
+            // timeout), so no additional sleep is needed. Outside IBD, sleep 50ms.
+            // BUT with ZERO connected peers there are no sockets for poll() to
+            // wait on, so processAllMessages returns instantly and the IBD path
+            // would busy-spin at 100% CPU while waiting for a reconnect (the
+            // trackB freeze pegged a core for ~2 days at 0 peers). Always yield in
+            // that state — reconnect is driven by the 30s manual-reconnect
+            // interval, not by loop frequency.
+            if (!self.isIBD() or self.peers.items.len == 0) {
                 std.time.sleep(50 * std.time.ns_per_ms);
             }
         }
