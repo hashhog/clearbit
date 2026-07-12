@@ -7809,6 +7809,19 @@ pub const PeerManager = struct {
     }
 
     fn computePrevMtp(self: *PeerManager, prev_hash: *const types.Hash256) u32 {
+        // Resolve the parent's height so we know how many ancestors Core's
+        // GetMedianTimePast would span — min(11, height+1).  A header-walk that
+        // breaks before covering that full window must NOT be trusted (see the
+        // incomplete-window guard below); it is resolvable from header_index or
+        // the persisted height→hash index for any connected/known parent.
+        const prev_height_opt: ?u32 = blk: {
+            if (self.header_index.get(prev_hash.*)) |e| break :blk e.height;
+            if (self.chain_state) |cs_h| {
+                if (cs_h.getBlockHeightByHash(prev_hash)) |h| break :blk h;
+            }
+            break :blk null;
+        };
+
         var timestamps: [11]u32 = undefined;
         var n: usize = 0;
         var cursor = prev_hash.*;
@@ -7855,10 +7868,33 @@ pub const PeerManager = struct {
             }
             break;
         }
-        if (n > 0) return validation.medianTimePast(timestamps[0..n]);
+        // Incomplete-window guard (mirrors computeMtpAtHeight, 2026-06-20).
+        // Core's GetMedianTimePast(pindexPrev) ALWAYS spans min(11, height+1)
+        // ancestors ending at the parent.  During a genesis IBD the in-memory
+        // header_index (and, for the fast connect path, the persisted header
+        // index) can hold ONLY the immediate parent — the walk then breaks with
+        // n==1 and medianTimePast collapses to the parent's OWN timestamp,
+        // silently degrading BIP-113 into a spurious "time must exceed the
+        // parent's time" (monotonic-vs-parent) rule.  That is NOT a consensus
+        // rule: Bitcoin permits a block whose nTime is below its parent's as
+        // long as it is > MTP (mainnet block 6316: nTime 1236183771 < parent
+        // 1236183799 but > true MTP 1236180038 — Core accepts, clearbit wedged
+        // rejecting it BadTimestamp).  A truncated n<want window injects a
+        // wrong (usually too-HIGH) cutoff, so do NOT trust it: fall through to
+        // the ring-buffer / snapshot fallback below, which for the forward-sync
+        // connect case (parent == active tip) yields the EXACT Core MTP.  A
+        // genuinely genesis-adjacent parent (height < 10) legitimately has
+        // fewer ancestors and the genesis-terminus branch fills the window to
+        // want, so it still returns the correct partial median.
+        const want: usize = if (prev_height_opt) |ph|
+            @min(@as(usize, 11), @as(usize, ph) + 1)
+        else
+            11;
+        if (n >= want) return validation.medianTimePast(timestamps[0..n]);
 
         // SNAPSHOT FORWARD-SYNC (Layer 3): the in-memory header_index walk
-        // found no ancestors.  After a `--load-snapshot` boot this is the
+        // found no ancestors (or — per the incomplete-window guard above — an
+        // incomplete one).  After a `--load-snapshot` boot this is the
         // common case for the first ~11 post-snapshot blocks (base+1..base+11):
         // the snapshot carries the UTXO set, not the 11-ancestor header window,
         // and (with reorg capture off) headers are not mirrored into
