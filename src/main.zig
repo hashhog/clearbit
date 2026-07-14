@@ -30,6 +30,7 @@ pub const indexes = @import("indexes.zig");
 pub const ops = @import("ops.zig");
 pub const debug_log = @import("debug_log.zig");
 pub const zmq = @import("zmq.zig");
+pub const campaign_assumeutxo = @import("campaign_assumeutxo.zig");
 
 // ============================================================================
 // Version Info
@@ -179,8 +180,20 @@ pub const Config = struct {
         regtest,
     };
 
+    /// Upper bound on a network's own comptime `assume_utxo` table size, used
+    /// only to size the fixed merge buffer below (Core's own tables top out
+    /// at 4 entries; clearbit's regtest table adds 3 more — 32 is generous
+    /// headroom, checked with an assert rather than silently truncating).
+    const MAX_BUILTIN_ASSUME_UTXO: usize = 32;
+
     /// Get consensus network params for the configured network.
     /// When --noassumevalid is set, returns a copy with assumed_valid_hash = null.
+    /// When HASHHOG_CAMPAIGN_ASSUMEUTXO is set (campaign_assumeutxo.zig; see
+    /// receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md), the campaign file's entries
+    /// are appended to the returned `.assume_utxo` table for THIS process's
+    /// selected network. Unset (the default/production case) costs exactly
+    /// one getenv on the first call and otherwise behaves identically to
+    /// before this feature existed.
     pub fn getNetworkParams(self: *const Config) *const consensus.NetworkParams {
         const base = switch (self.network) {
             .mainnet => &consensus.MAINNET,
@@ -188,21 +201,42 @@ pub const Config = struct {
             .testnet4 => &consensus.TESTNET4,
             .regtest => &consensus.REGTEST,
         };
+
+        campaign_assumeutxo.ensureLoaded(std.heap.page_allocator, base.assume_utxo);
+        const campaign_entries = campaign_assumeutxo.entries();
+
+        if (!self.noassumevalid and campaign_entries.len == 0) {
+            return base;
+        }
+
+        // Patched copy: stashed in a static so the returned pointer stays
+        // valid past this call frame (same pattern the pre-existing
+        // --noassumevalid path already used; callers use the pointer
+        // immediately for SyncManager / block_template / RPC construction).
+        const S = struct {
+            var patched: consensus.NetworkParams = undefined;
+            var merged_assume_utxo: [MAX_BUILTIN_ASSUME_UTXO + campaign_assumeutxo.MAX_ENTRIES]consensus.AssumeUtxoData = undefined;
+        };
+        var p = base.*;
         if (self.noassumevalid) {
-            // Return a stack copy with hash cleared.  Callers must not store
-            // the pointer beyond the current call frame — all callers use it
-            // immediately for SyncManager / block_template construction.
-            var p = base.*;
             p.assumed_valid_hash = null;
             p.assume_valid_height = 0;
-            // Allocate on heap via comptime trick: we stash in a thread-local.
-            const S = struct {
-                var patched: consensus.NetworkParams = undefined;
-            };
-            S.patched = p;
-            return &S.patched;
         }
-        return base;
+        if (campaign_entries.len > 0) {
+            std.debug.assert(base.assume_utxo.len <= MAX_BUILTIN_ASSUME_UTXO);
+            var n: usize = 0;
+            for (base.assume_utxo) |e| {
+                S.merged_assume_utxo[n] = e;
+                n += 1;
+            }
+            for (campaign_entries) |e| {
+                S.merged_assume_utxo[n] = e;
+                n += 1;
+            }
+            p.assume_utxo = S.merged_assume_utxo[0..n];
+        }
+        S.patched = p;
+        return &S.patched;
     }
 
     /// The explicit `-wallet=` list (possibly empty).  Empty → enumerate the

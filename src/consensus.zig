@@ -980,8 +980,40 @@ pub const REGTEST = NetworkParams{
     .pow_target_timespan = 24 * 60 * 60, // 1 day for regtest
     // Regtest: zero min_chain_work (no anti-DoS check needed for local testing)
     .min_chain_work = [_]u8{0} ** 32,
-    // No assumeUTXO snapshots for regtest (create your own)
-    .assume_utxo = &[_]AssumeUtxoData{},
+    // Core-parity regtest assumeUTXO entries — byte-for-byte
+    // CRegTestParams::m_assumeutxo_data (kernel/chainparams.cpp:607-628).
+    // These are FIXED test-vector heights (110/200/299) that Core's own
+    // functional tests (feature_assumeutxo.py, tool_bitcoin_chainstate.py,
+    // fuzz/utxo_snapshot.cpp, unit tests) build deterministically from
+    // genesis, so — unlike a locally-mined regtest chain — these hashes are
+    // reproducible across implementations and can be hardcoded exactly like
+    // Core does. Ad-hoc/locally-mined regtest snapshots still go through the
+    // runtime-registered whitelist (au_bg_chainstate.registerRegtestSnapshot /
+    // findRegtestSnapshot), which is unaffected by this table.
+    .assume_utxo = &[_]AssumeUtxoData{
+        .{
+            // For use by unit tests.
+            .height = 110,
+            .block_hash = hexToHash("6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"),
+            .hash_serialized = hexToHash("b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"),
+            .chain_tx_count = 111,
+        },
+        .{
+            // For use by fuzz target src/test/fuzz/utxo_snapshot.cpp.
+            .height = 200,
+            .block_hash = hexToHash("385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"),
+            .hash_serialized = hexToHash("17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"),
+            .chain_tx_count = 201,
+        },
+        .{
+            // For use by test/functional/feature_assumeutxo.py and
+            // test/functional/tool_bitcoin_chainstate.py.
+            .height = 299,
+            .block_hash = hexToHash("7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"),
+            .hash_serialized = hexToHash("d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"),
+            .chain_tx_count = 334,
+        },
+    },
     // Regtest has no assumevalid — every script check runs for test determinism.
     .assumed_valid_hash = null,
     .assume_valid_height = 0,
