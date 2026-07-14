@@ -207,9 +207,21 @@ pub const BgChainState = struct {
     ) BgError!void {
         try self.assertNotAliased();
 
-        // Contiguity: first connect must be genesis (0); thereafter strictly +1.
+        // Contiguity: first connect must be height 0 or 1; thereafter
+        // strictly +1.
+        //
+        // Genesis (height 0) is IMPLICIT: its coinbase output is consensus-
+        // unspendable and never enters the UTXO set (Core never indexes it —
+        // see the genesis_coinbase skip below; the genesis output is absent
+        // from gettxoutsetinfo), so an EMPTY store is byte-exactly the
+        // post-genesis state. Requiring a height-0 BODY made the real RPC
+        // loadtxoutset path fail NonContiguousReplay (clearbit#7): the
+        // genesis body is never stored in CF_BLOCKS (compiled-in;
+        // consensus.zig:379), so ChainStateBlockProvider cannot serve it —
+        // and connecting it contributes nothing anyway. Height 0 is still
+        // ACCEPTED when a provider can serve it (test chains do).
         if (!self.started) {
-            if (height != 0) return BgError.NonContiguousReplay;
+            if (height > 1) return BgError.NonContiguousReplay;
             self.started = true;
         } else {
             if (@as(i64, height) != self.tip_height + 1) return BgError.NonContiguousReplay;
@@ -404,7 +416,12 @@ pub fn runBackgroundValidation(
     try bg.assertNotAliased();
 
     // STAGE 2: genuine genesis→base replay over the SEPARATE store.
-    var height: u32 = 0;
+    // Starts at height 1: genesis contributes nothing to the UTXO set (its
+    // coinbase is consensus-unspendable — connectBlock's genesis_coinbase
+    // skip), and its body is compiled-in rather than stored, so a provider
+    // fetch at height 0 can never succeed on the real CF_BLOCKS path
+    // (clearbit#7).
+    var height: u32 = 1;
     var block: types.Block = undefined;
     while (height <= base_height) : (height += 1) {
         provider.getBlock(height, &block) catch return BgError.NonContiguousReplay;
