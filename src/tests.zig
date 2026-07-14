@@ -20,6 +20,7 @@ comptime {
     _ = @import("zmq.zig");
     _ = @import("muhash.zig");
     _ = @import("asmap.zig");
+    _ = @import("campaign_assumeutxo.zig");
 }
 
 // ============================================================
