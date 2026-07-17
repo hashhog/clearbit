@@ -230,10 +230,20 @@ pub const Database = struct {
 };
 
 /// Iterator for scanning a column family.
-/// Stub implementation when RocksDB is not available.
+///
+/// When constructed via `Database.iterator()` the `handle` points at a live
+/// RocksDB cursor (see `storage_rocksdb.dbIterator`) and every method delegates
+/// to the matching `storage_rocksdb.iter*` backend.  A default-initialized
+/// Iterator (`handle == null`) is an inert stub whose methods no-op / report
+/// "not valid", preserving the previous behaviour for the RocksDB-absent and
+/// unsupported-op cases.
 pub const Iterator = struct {
+    /// Opaque pointer to the backend cursor state (`storage_rocksdb.IterState`),
+    /// or null for the inert stub.
+    handle: ?*anyopaque = null,
+
     pub fn seekToFirst(self: *Iterator) void {
-        _ = self;
+        if (self.handle != null) storage_rocksdb.iterSeekToFirst(self);
     }
 
     pub fn seekToLast(self: *Iterator) void {
@@ -246,30 +256,36 @@ pub const Iterator = struct {
     }
 
     pub fn valid(self: *Iterator) bool {
-        _ = self;
-        return false;
+        if (self.handle == null) return false;
+        return storage_rocksdb.iterValid(self);
     }
 
     pub fn next(self: *Iterator) void {
-        _ = self;
+        if (self.handle != null) storage_rocksdb.iterNext(self);
     }
 
     pub fn prev(self: *Iterator) void {
         _ = self;
     }
 
+    /// Current key. Slice points into RocksDB-owned memory valid only until the
+    /// next `next()`/`deinit()`; decode/copy immediately.
     pub fn getKey(self: *Iterator) []const u8 {
-        _ = self;
-        return &[_]u8{};
+        if (self.handle == null) return &[_]u8{};
+        return storage_rocksdb.iterGetKey(self);
     }
 
+    /// Current value. Same lifetime caveat as `getKey`.
     pub fn getValue(self: *Iterator) []const u8 {
-        _ = self;
-        return &[_]u8{};
+        if (self.handle == null) return &[_]u8{};
+        return storage_rocksdb.iterGetValue(self);
     }
 
     pub fn deinit(self: *Iterator) void {
-        _ = self;
+        if (self.handle != null) {
+            storage_rocksdb.iterDeinit(self);
+            self.handle = null;
+        }
     }
 };
 
@@ -7507,6 +7523,240 @@ pub const ChainStateManager = struct {
     }
 };
 
+// ===========================================================================
+// FULL-SET UTXO walk (GEN-CLEARBIT-UTXOHASH)
+//
+// Bitcoin Core computes every UTXO-set hash / dump by FLUSHING the write-back
+// coins cache down to the on-disk coinsdb (ForceFlushStateToDisk(wipe=false) ==
+// CCoinsViewCache::Sync — dirty->DB, cache retained), then cursor-walking the
+// DB ALONE (rpc/blockchain.cpp:1075/1081, kernel/coinstats.cpp cursor loop).
+//
+// clearbit's `utxo_set.cache` is exactly the long-lived write-back cache Core
+// flushes: once the set exceeds --dbcache, `evictCache` flushes dirty entries
+// to CF_UTXO and then WIPES the map, so the cache is only a small recently
+// touched slice while the bulk lives on disk.  Walking the cache therefore
+// hashes a PARTIAL set.  The two helpers below mirror Core exactly:
+//   * `syncUtxoToDb`       — flush dirty cache -> CF_UTXO, NO wipe (Sync).
+//   * `forEachCoinInDbOrder` — cursor-walk the full CF_UTXO in Core order.
+// After the sync the DB is the complete authoritative set, so the walk needs no
+// cache overlay (that would double-count).
+//
+// Memory-only UtxoSets (db == null: loaded snapshots via `loadTxOutSet`, unit
+// tests) have no CF to walk and never evict — their cache IS the full set — so
+// each producer keeps the original cache walk for that case and only takes the
+// flush-then-DB path when `utxo_set.db != null`.
+// ===========================================================================
+
+/// Emit one coin's Bitcoin Core `TxOutSer(outpoint, coin)` bytes to `w` (any
+/// writer exposing writeBytes/writeInt/writeCompactSize — `Sha256Writer` or
+/// `serialize.Writer`):
+///   32B txid (internal order) || LE32 vout || LE32 (height<<1|coinbase)
+///   || LE i64 value || CompactSize(spk.len) || spk.
+/// Byte-for-byte identical to the per-coin blocks previously inlined in each
+/// producer (already verified Core-exact against the 4 assumeutxo constants).
+/// Reference: `bitcoin-core/src/kernel/coinstats.cpp:45-51`.
+fn writeTxOutSer(
+    w: anytype,
+    txid: []const u8,
+    vout: u32,
+    coin: *const CompactUtxo,
+    allocator: std.mem.Allocator,
+) !void {
+    try w.writeBytes(txid);
+    try w.writeInt(u32, vout);
+    const code: u32 = (@as(u32, coin.height) << 1) | (if (coin.is_coinbase) @as(u32, 1) else 0);
+    try w.writeInt(u32, code);
+    try w.writeInt(i64, coin.value);
+    const script = try coin.reconstructScript(allocator);
+    defer allocator.free(script);
+    try w.writeCompactSize(script.len);
+    try w.writeBytes(script);
+}
+
+/// Flush all dirty in-memory cache entries down to CF_UTXO WITHOUT wiping the
+/// cache — clearbit's mirror of Core's `ForceFlushStateToDisk(wipe_cache=false)`
+/// / `CCoinsViewCache::Sync()`.  This is exactly `evictCache`'s flush half
+/// (ChainState.flush / UtxoSet.flush) minus the `clearRetainingCapacity` wipe.
+/// After it returns, CF_UTXO holds the complete UTXO set and `dirty_keys` /
+/// `pending_deletes` are empty, so a plain DB cursor walk is complete.
+///
+/// Prefers `ChainState.flush()` (via the wired `parent` back-reference) so the
+/// chain tip is persisted atomically with the UTXOs and the reorg-batch guard
+/// (`in_no_flush_batch` -> error.ReorgBatchInProgress) is honoured — identical
+/// to evictCache.  Falls back to the tip-less `UtxoSet.flush()` when no parent
+/// is wired.  No-op for memory-only sets (db == null).
+fn syncUtxoToDb(utxo_set: *UtxoSet) !void {
+    if (utxo_set.db == null) return;
+    if (utxo_set.parent) |cs| {
+        try cs.flush();
+    } else {
+        try utxo_set.flush();
+    }
+}
+
+/// Cursor-walk the FULL on-disk CF_UTXO, calling `sink.emit(txid_ptr, vout,
+/// coin_ptr)` once per coin in Bitcoin Core's canonical order: txids ascending
+/// by their raw 32-byte key, and WITHIN each txid outputs ascending by NUMERIC
+/// vout.  Caller must have already flushed via `syncUtxoToDb` (this fn does not
+/// mutate the cache/DB) and, for consistency, hold the chainstate's
+/// `connect_mutex` so no block connects mid-walk.
+///
+/// clearbit stores the outpoint key as `txid(32) || LE32(vout)`, so a raw
+/// RocksDB byte-order walk yields txids in the correct global order but would
+/// mis-order outputs *within* a txid once vout >= 256 (LE32 byte order !=
+/// numeric).  Because all outputs of a txid are contiguous (the 32-byte txid is
+/// the key prefix), we accumulate each txid group and sort it by numeric vout
+/// before emitting — reproducing Core's `std::map<uint32_t,Coin>` (VARINT(n),
+/// numeric) intra-txid order.  Memory is O(one txid's outputs); the full set is
+/// never materialised.
+///
+/// `sink` is any pointer whose pointee has
+/// `pub fn emit(self, txid: *const [32]u8, vout: u32, coin: *const CompactUtxo) !void`.
+/// The `coin` (and its owned script bytes) is valid only for that call — copy /
+/// reconstruct anything needed before returning.
+fn forEachCoinInDbOrder(
+    utxo_set: *UtxoSet,
+    allocator: std.mem.Allocator,
+    sink: anytype,
+) !void {
+    const db = utxo_set.db orelse return;
+
+    const GroupCoin = struct {
+        vout: u32,
+        coin: CompactUtxo,
+        fn lessVout(_: void, a: @This(), b: @This()) bool {
+            return a.vout < b.vout;
+        }
+    };
+
+    var group = std.ArrayList(GroupCoin).init(allocator);
+    // On any error (decode / emit) the outer defer frees whatever coins are
+    // still owned by `group`.  The flush-group step below emits ALL coins
+    // before freeing ANY, so a mid-emit error leaves every group coin unfreed
+    // and owned here — freed exactly once by this defer.
+    defer {
+        for (group.items) |*gc| gc.coin.deinit(allocator);
+        group.deinit();
+    }
+
+    var have_txid = false;
+    var cur_txid: [32]u8 = undefined;
+
+    var it = db.iterator(CF_UTXO);
+    defer it.deinit();
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        const key = it.getKey();
+        if (key.len < 36) continue; // defensive: not a 36-byte outpoint key
+        const val = it.getValue();
+
+        const txid_slice = key[0..32];
+        const vout = std.mem.readInt(u32, key[32..36], .little);
+
+        if (have_txid and !std.mem.eql(u8, &cur_txid, txid_slice)) {
+            // txid boundary — flush the completed group (sort numeric vout,
+            // emit, then free).  Emit-all-before-free keeps the error path
+            // double-free-safe (see the defer above).
+            std.mem.sort(GroupCoin, group.items, {}, GroupCoin.lessVout);
+            for (group.items) |*gc| try sink.emit(&cur_txid, gc.vout, &gc.coin);
+            for (group.items) |*gc| gc.coin.deinit(allocator);
+            group.clearRetainingCapacity();
+        }
+        if (!have_txid or !std.mem.eql(u8, &cur_txid, txid_slice)) {
+            @memcpy(&cur_txid, txid_slice);
+            have_txid = true;
+        }
+
+        // Decode into an owned CompactUtxo immediately — `val` points into
+        // RocksDB memory invalidated by the next it.next().
+        const coin = try CompactUtxo.decode(val, allocator);
+        try group.append(.{ .vout = vout, .coin = coin });
+    }
+
+    // Final group.
+    if (have_txid and group.items.len > 0) {
+        std.mem.sort(GroupCoin, group.items, {}, GroupCoin.lessVout);
+        for (group.items) |*gc| try sink.emit(&cur_txid, gc.vout, &gc.coin);
+        for (group.items) |*gc| gc.coin.deinit(allocator);
+        group.clearRetainingCapacity();
+    }
+}
+
+/// Count the coins persisted in CF_UTXO (36-byte outpoint keys).  Used by
+/// `dumpTxOutSet` to write the snapshot header's `coins_count` up front from the
+/// flushed on-disk set.  Caller must have flushed (`syncUtxoToDb`) and hold
+/// `connect_mutex` so this count matches the subsequent `forEachCoinInDbOrder`
+/// walk.  No-op-safe (returns 0) for memory-only sets.
+fn countCoinsInDb(utxo_set: *UtxoSet) u64 {
+    const db = utxo_set.db orelse return 0;
+    var n: u64 = 0;
+    var it = db.iterator(CF_UTXO);
+    defer it.deinit();
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        if (it.getKey().len >= 36) n += 1;
+    }
+    return n;
+}
+
+/// Streaming snapshot emitter for `dumpTxOutSet`, shared by the on-disk DB walk
+/// and the in-memory cache walk.  Implements the `emit(txid, vout, coin)` sink
+/// contract; buffers the coins of the current txid and, at each txid boundary
+/// (and via `finish()` at the end), writes the Core `WriteUTXOSnapshot` chunk
+/// `{txid, compactsize(N), payloads...}`.  Requires coins to arrive grouped by
+/// txid (all callers guarantee this: same-txid keys are contiguous under both
+/// the DB cursor and the lexical/numeric cache sort).
+fn DumpSink(comptime BufW: type) type {
+    return struct {
+        buffered: *BufW,
+        group_writer: *serialize.Writer,
+        allocator: std.mem.Allocator,
+        coins_in_group: u64 = 0,
+        written_coins: u64 = 0,
+        current_txid: [32]u8 = undefined,
+        have_group: bool = false,
+
+        fn flushGroup(self: *@This()) !void {
+            const out = self.buffered.writer();
+            try out.writeAll(&self.current_txid);
+            var hdr_buf = serialize.Writer.init(self.allocator);
+            defer hdr_buf.deinit();
+            try hdr_buf.writeCompactSize(self.coins_in_group);
+            try out.writeAll(hdr_buf.getWritten());
+            try out.writeAll(self.group_writer.getWritten());
+            self.group_writer.list.clearRetainingCapacity();
+            self.coins_in_group = 0;
+        }
+
+        fn emit(self: *@This(), txid: *const [32]u8, vout: u32, coin: *const CompactUtxo) !void {
+            if (self.have_group and !std.mem.eql(u8, &self.current_txid, txid)) {
+                try self.flushGroup();
+            }
+            if (!self.have_group or !std.mem.eql(u8, &self.current_txid, txid)) {
+                @memcpy(&self.current_txid, txid);
+                self.have_group = true;
+            }
+
+            const script = try coin.reconstructScript(self.allocator);
+            defer self.allocator.free(script);
+            const sc = SnapshotCoin{
+                .outpoint = types.OutPoint{ .hash = self.current_txid, .index = vout },
+                .height = coin.height,
+                .is_coinbase = coin.is_coinbase,
+                .value = coin.value,
+                .script_pubkey = script,
+            };
+            try writeSnapshotCoinPayload(self.group_writer, vout, &sc);
+            self.coins_in_group += 1;
+            self.written_coins += 1;
+        }
+
+        fn finish(self: *@This()) !void {
+            if (self.have_group and self.coins_in_group > 0) try self.flushGroup();
+        }
+    };
+}
+
 /// Compute the MuHash3072 of a UTXO set.
 ///
 /// **NOT** the Core-strict `hash_serialized` value: `hash_serialized` is
@@ -7539,41 +7789,34 @@ pub fn computeMuHashTxOutSet(utxo_set: *UtxoSet, allocator: std.mem.Allocator) !
 
     var acc = muhash.MuHash3072.init();
 
-    var keys = std.ArrayList([36]u8).init(allocator);
-    defer keys.deinit();
-    var iter = utxo_set.cache.iterator();
-    while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
-
-    // MuHash is order-independent, so iteration order is irrelevant for
-    // correctness; we don't sort here.
-
     var per_coin = serialize.Writer.init(allocator);
     defer per_coin.deinit();
 
-    for (keys.items) |key| {
-        const entry = utxo_set.cache.get(key) orelse continue;
-
-        per_coin.list.clearRetainingCapacity();
-        const txid = key[0..32];
-        const vout = std.mem.readInt(u32, key[32..36], .little);
-
-        // COutPoint: txid || LE32 vout
-        try per_coin.writeBytes(txid);
-        try per_coin.writeInt(u32, vout);
-
-        // (height << 1) | coinbase, written as LE32 (Core does
-        // `static_cast<uint32_t>(...)` then default LE serialization).
-        const code: u32 = (@as(u32, entry.utxo.height) << 1) | (if (entry.utxo.is_coinbase) @as(u32, 1) else 0);
-        try per_coin.writeInt(u32, code);
-
-        // CTxOut: i64 value LE + CompactSize(script.len) + script bytes.
-        try per_coin.writeInt(i64, entry.utxo.value);
-        const script = try entry.utxo.reconstructScript(allocator);
-        defer allocator.free(script);
-        try per_coin.writeCompactSize(script.len);
-        try per_coin.writeBytes(script);
-
-        acc.insert(per_coin.getWritten());
+    // MuHash is order-independent, so iteration order is irrelevant here; the
+    // only thing that matters is that we hash the FULL set.
+    if (utxo_set.db != null) {
+        // Full on-disk set: flush dirty cache -> CF_UTXO, then walk CF_UTXO.
+        try syncUtxoToDb(utxo_set);
+        const Sink = struct {
+            acc: *muhash.MuHash3072,
+            per_coin: *serialize.Writer,
+            allocator: std.mem.Allocator,
+            fn emit(self: *@This(), txid: *const [32]u8, vout: u32, coin: *const CompactUtxo) !void {
+                self.per_coin.list.clearRetainingCapacity();
+                try writeTxOutSer(self.per_coin, txid, vout, coin, self.allocator);
+                self.acc.insert(self.per_coin.getWritten());
+            }
+        };
+        var sink = Sink{ .acc = &acc, .per_coin = &per_coin, .allocator = allocator };
+        try forEachCoinInDbOrder(utxo_set, allocator, &sink);
+    } else {
+        // Memory-only set (loaded snapshot / tests): the cache IS the full set.
+        var iter = utxo_set.cache.iterator();
+        while (iter.next()) |entry| {
+            per_coin.list.clearRetainingCapacity();
+            try writeTxOutSer(&per_coin, entry.key_ptr[0..32], std.mem.readInt(u32, entry.key_ptr[32..36], .little), &entry.value_ptr.utxo, allocator);
+            acc.insert(per_coin.getWritten());
+        }
     }
 
     return acc.finalize();
@@ -7612,41 +7855,41 @@ pub fn computeMuHashTxOutSet(utxo_set: *UtxoSet, allocator: std.mem.Allocator) !
 pub fn computeHashSerializedTxOutSet(utxo_set: *UtxoSet, allocator: std.mem.Allocator) !types.Hash256 {
     const crypto = @import("crypto.zig");
 
+    var hw = crypto.Sha256Writer.init();
+
+    if (utxo_set.db != null) {
+        // Full on-disk set: flush dirty cache -> CF_UTXO, then cursor-walk
+        // CF_UTXO in canonical (txid, numeric-vout) order.  `forEachCoinInDbOrder`
+        // guarantees that order (group-by-txid + numeric intra-group sort), so
+        // the SHA256d over the concatenated per-coin TxOutSer streams matches
+        // Core's `hash_serialized_3`.
+        try syncUtxoToDb(utxo_set);
+        const Sink = struct {
+            hw: *crypto.Sha256Writer,
+            allocator: std.mem.Allocator,
+            fn emit(self: *@This(), txid: *const [32]u8, vout: u32, coin: *const CompactUtxo) !void {
+                try writeTxOutSer(self.hw, txid, vout, coin, self.allocator);
+            }
+        };
+        var sink = Sink{ .hw = &hw, .allocator = allocator };
+        try forEachCoinInDbOrder(utxo_set, allocator, &sink);
+        return hw.finalHash256();
+    }
+
+    // Memory-only set (loaded snapshot / tests): the cache IS the full set.
+    // Collect the keys and sort them into canonical (txid, numeric-vout) order
+    // — the 36-byte key is `txid || LE32(vout)`; sorting it lexically would
+    // mis-order vouts >= 256 (LE32 byte order != numeric order), so we compare
+    // txid bytes first then numeric vout (see utxoKeyLessThan).
     var keys = std.ArrayList([36]u8).init(allocator);
     defer keys.deinit();
     var iter = utxo_set.cache.iterator();
     while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
-
-    // Canonical (txid, numeric-vout) order — matches Core's CCoinsViewCursor
-    // walk. The 36-byte key is `txid || LE32(vout)`; sorting it lexically would
-    // mis-order vouts >= 256 (LE32 byte order != numeric order), so we compare
-    // txid bytes first then numeric vout (see utxoKeyLessThan).
     std.mem.sort([36]u8, keys.items, {}, utxoKeyLessThan);
 
-    var hw = crypto.Sha256Writer.init();
-
     for (keys.items) |key| {
-        const entry = utxo_set.cache.get(key) orelse continue;
-
-        const txid = key[0..32];
-        const vout = std.mem.readInt(u32, key[32..36], .little);
-
-        // COutPoint: txid || LE32 vout.
-        try hw.writeBytes(txid);
-        try hw.writeInt(u32, vout);
-
-        // (height << 1) | coinbase, written as LE32. Core does
-        // `static_cast<uint32_t>(...)` then default LE serialization
-        // (kernel/coinstats.cpp:49).
-        const code: u32 = (@as(u32, entry.utxo.height) << 1) | (if (entry.utxo.is_coinbase) @as(u32, 1) else 0);
-        try hw.writeInt(u32, code);
-
-        // CTxOut: i64 value LE + CompactSize(script.len) + script bytes.
-        try hw.writeInt(i64, entry.utxo.value);
-        const script = try entry.utxo.reconstructScript(allocator);
-        defer allocator.free(script);
-        try hw.writeCompactSize(script.len);
-        try hw.writeBytes(script);
+        const entry = utxo_set.cache.getPtr(key) orelse continue;
+        try writeTxOutSer(&hw, key[0..32], std.mem.readInt(u32, key[32..36], .little), &entry.utxo, allocator);
     }
 
     return hw.finalHash256();
@@ -7712,15 +7955,6 @@ pub fn computeTxOutSetStats(
     const crypto = @import("crypto.zig");
     const muhash = @import("muhash.zig");
 
-    var keys = std.ArrayList([36]u8).init(allocator);
-    defer keys.deinit();
-    var iter = utxo_set.cache.iterator();
-    while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
-
-    // Core (txid, numeric-vout) cursor order. MuHash is order-independent so
-    // the sort is harmless there; for hash_serialized_3 it is load-bearing.
-    std.mem.sort([36]u8, keys.items, {}, utxoKeyLessThan);
-
     var stats = TxOutSetStats{
         .txouts = 0,
         .transactions = 0,
@@ -7733,49 +7967,79 @@ pub fn computeTxOutSetStats(
     var per_coin = serialize.Writer.init(allocator);
     defer per_coin.deinit();
 
-    var have_prev_txid = false;
-    var prev_txid: [32]u8 = undefined;
+    // Shared per-coin accumulator: identical whether the coin is streamed from
+    // the on-disk CF_UTXO walk or from the in-memory cache.  Coins arrive in
+    // canonical (txid asc, vout asc) order, so `transactions` counts distinct
+    // txids by incrementing on each txid change (Core stats.nTransactions), and
+    // the hash_serialized_3 byte stream is fed in the load-bearing order.
+    const Sink = struct {
+        stats: *TxOutSetStats,
+        hash_kind: u8,
+        hw: *crypto.Sha256Writer,
+        acc: *muhash.MuHash3072,
+        per_coin: *serialize.Writer,
+        allocator: std.mem.Allocator,
+        have_prev: bool = false,
+        prev_txid: [32]u8 = undefined,
 
-    for (keys.items) |key| {
-        const entry = utxo_set.cache.get(key) orelse continue;
+        fn emit(self: *@This(), txid: *const [32]u8, vout: u32, coin: *const CompactUtxo) !void {
+            if (!self.have_prev or !std.mem.eql(u8, &self.prev_txid, txid)) {
+                self.stats.transactions += 1;
+                @memcpy(&self.prev_txid, txid);
+                self.have_prev = true;
+            }
+            self.stats.txouts += 1;
+            self.stats.total_amount +%= coin.value;
 
-        // ── aggregate stats ──────────────────────────────────────────────
-        const txid = key[0..32];
-        if (!have_prev_txid or !std.mem.eql(u8, &prev_txid, txid)) {
-            stats.transactions += 1;
-            @memcpy(&prev_txid, txid);
-            have_prev_txid = true;
+            const script = try coin.reconstructScript(self.allocator);
+            defer self.allocator.free(script);
+            self.stats.bogosize += coinBogoSize(script.len);
+
+            if (self.hash_kind == 0) return;
+
+            const code: u32 = (@as(u32, coin.height) << 1) | (if (coin.is_coinbase) @as(u32, 1) else 0);
+            if (self.hash_kind == 1) {
+                try self.hw.writeBytes(txid);
+                try self.hw.writeInt(u32, vout);
+                try self.hw.writeInt(u32, code);
+                try self.hw.writeInt(i64, coin.value);
+                try self.hw.writeCompactSize(script.len);
+                try self.hw.writeBytes(script);
+            } else { // hash_kind == 2 (muhash)
+                self.per_coin.list.clearRetainingCapacity();
+                try self.per_coin.writeBytes(txid);
+                try self.per_coin.writeInt(u32, vout);
+                try self.per_coin.writeInt(u32, code);
+                try self.per_coin.writeInt(i64, coin.value);
+                try self.per_coin.writeCompactSize(script.len);
+                try self.per_coin.writeBytes(script);
+                self.acc.insert(self.per_coin.getWritten());
+            }
         }
-        stats.txouts += 1;
-        stats.total_amount +%= entry.utxo.value;
+    };
+    var sink = Sink{
+        .stats = &stats,
+        .hash_kind = hash_kind,
+        .hw = &hw,
+        .acc = &acc,
+        .per_coin = &per_coin,
+        .allocator = allocator,
+    };
 
-        const script = try entry.utxo.reconstructScript(allocator);
-        defer allocator.free(script);
-        stats.bogosize += coinBogoSize(script.len);
-
-        if (hash_kind == 0) continue;
-
-        // ── per-coin serialization (TxOutSer) shared by both hash kinds ───
-        const vout = std.mem.readInt(u32, key[32..36], .little);
-        const code: u32 = (@as(u32, entry.utxo.height) << 1) |
-            (if (entry.utxo.is_coinbase) @as(u32, 1) else 0);
-
-        if (hash_kind == 1) {
-            try hw.writeBytes(txid);
-            try hw.writeInt(u32, vout);
-            try hw.writeInt(u32, code);
-            try hw.writeInt(i64, entry.utxo.value);
-            try hw.writeCompactSize(script.len);
-            try hw.writeBytes(script);
-        } else { // hash_kind == 2 (muhash)
-            per_coin.list.clearRetainingCapacity();
-            try per_coin.writeBytes(txid);
-            try per_coin.writeInt(u32, vout);
-            try per_coin.writeInt(u32, code);
-            try per_coin.writeInt(i64, entry.utxo.value);
-            try per_coin.writeCompactSize(script.len);
-            try per_coin.writeBytes(script);
-            acc.insert(per_coin.getWritten());
+    if (utxo_set.db != null) {
+        // Full on-disk set: flush dirty cache -> CF_UTXO, then cursor-walk it.
+        try syncUtxoToDb(utxo_set);
+        try forEachCoinInDbOrder(utxo_set, allocator, &sink);
+    } else {
+        // Memory-only set (loaded snapshot / tests): the cache IS the full set.
+        var keys = std.ArrayList([36]u8).init(allocator);
+        defer keys.deinit();
+        var iter = utxo_set.cache.iterator();
+        while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
+        std.mem.sort([36]u8, keys.items, {}, utxoKeyLessThan);
+        for (keys.items) |key| {
+            const entry = utxo_set.cache.getPtr(key) orelse continue;
+            try sink.emit(key[0..32], std.mem.readInt(u32, key[32..36], .little), &entry.utxo);
         }
     }
 
@@ -7876,9 +8140,21 @@ pub fn dumpTxOutSet(
     var buffered = std.io.bufferedWriter(file.writer());
     const out = buffered.writer();
 
-    const coins_count = chainstate.utxo_set.cache.count();
+    // GEN-CLEARBIT-UTXOHASH: dump the FULL set.  For a live chainstate
+    // (db != null) the on-disk CF_UTXO — not the partial write-back cache — is
+    // the authoritative full set, so flush dirty entries down first and count /
+    // walk the DB.  Memory-only chainstates (loaded snapshots, tests) keep
+    // using the cache, which for them holds the entire set (no eviction).
+    const use_db = chainstate.utxo_set.db != null;
+    if (use_db) try syncUtxoToDb(&chainstate.utxo_set);
 
-    // 1. Metadata header.
+    const coins_count: u64 = if (use_db)
+        countCoinsInDb(&chainstate.utxo_set)
+    else
+        chainstate.utxo_set.cache.count();
+
+    // 1. Metadata header (coins_count must precede the coins — Core asserts the
+    //    written count equals it below).
     const metadata = SnapshotMetadata{
         .network_magic = network_magic,
         .base_blockhash = chainstate.best_hash,
@@ -7888,77 +8164,45 @@ pub fn dumpTxOutSet(
     defer allocator.free(header);
     try out.writeAll(header);
 
-    // 2. Collect and sort UTXO keys lexicographically. This is what Core's
-    //    LevelDB cursor iteration produces, and it has the property that
-    //    coins for the same txid appear contiguously (since the key is
-    //    `txid || vout_le` and the txid prefix dominates the comparison).
-    var keys = std.ArrayList([36]u8).init(allocator);
-    defer keys.deinit();
-    var iter = chainstate.utxo_set.cache.iterator();
-    while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
-    std.mem.sort([36]u8, keys.items, {}, struct {
-        fn lessThan(_: void, a: [36]u8, b: [36]u8) bool {
-            return std.mem.order(u8, &a, &b) == .lt;
-        }
-    }.lessThan);
-
-    // 3. Walk the sorted key list, grouping by leading 32-byte txid.
-    //    For each group, buffer the per-coin payloads, then emit
-    //    {txid, compactsize(N), payloads...} as a single contiguous chunk.
+    // 2. Group-by-txid snapshot emitter.  For each txid, buffer the per-coin
+    //    payloads, then emit {txid, compactsize(N), payloads...} as a single
+    //    contiguous chunk.  Coins are fed in canonical (txid asc, vout asc)
+    //    order — from the DB cursor walk (`forEachCoinInDbOrder`, which sorts
+    //    each txid group by NUMERIC vout, fixing the latent lexical-vs-numeric
+    //    vout>=256 mis-ordering) or from the lexical cache walk below.
     var group_writer = serialize.Writer.init(allocator);
     defer group_writer.deinit();
-    var coins_in_group: u64 = 0;
-    var current_txid: types.Hash256 = undefined;
-    var have_group: bool = false;
 
-    var written_coins: u64 = 0;
+    const BufW = @TypeOf(buffered);
+    var dsink = DumpSink(BufW){
+        .buffered = &buffered,
+        .group_writer = &group_writer,
+        .allocator = allocator,
+    };
 
-    for (keys.items) |key| {
-        const txid_slice = key[0..32];
-        const vout = std.mem.readInt(u32, key[32..36], .little);
-
-        if (!have_group or !std.mem.eql(u8, &current_txid, txid_slice)) {
-            if (have_group) {
-                // Flush previous group.
-                try out.writeAll(&current_txid);
-                var hdr_buf = serialize.Writer.init(allocator);
-                defer hdr_buf.deinit();
-                try hdr_buf.writeCompactSize(coins_in_group);
-                try out.writeAll(hdr_buf.getWritten());
-                try out.writeAll(group_writer.getWritten());
-                group_writer.list.clearRetainingCapacity();
-                coins_in_group = 0;
+    if (use_db) {
+        try forEachCoinInDbOrder(&chainstate.utxo_set, allocator, &dsink);
+    } else {
+        // Memory-only path: collect + lexical-sort the cache keys (same-txid
+        // stays contiguous since the 32-byte txid prefix dominates) and feed
+        // the sink.  Behaviour is byte-identical to the pre-fix cache dump.
+        var keys = std.ArrayList([36]u8).init(allocator);
+        defer keys.deinit();
+        var iter = chainstate.utxo_set.cache.iterator();
+        while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
+        std.mem.sort([36]u8, keys.items, {}, struct {
+            fn lessThan(_: void, a: [36]u8, b: [36]u8) bool {
+                return std.mem.order(u8, &a, &b) == .lt;
             }
-            current_txid = txid_slice.*;
-            have_group = true;
+        }.lessThan);
+        for (keys.items) |key| {
+            const entry = chainstate.utxo_set.cache.getPtr(key) orelse continue;
+            try dsink.emit(key[0..32], std.mem.readInt(u32, key[32..36], .little), &entry.utxo);
         }
-
-        const entry = chainstate.utxo_set.cache.get(key) orelse continue;
-        const script = try entry.utxo.reconstructScript(allocator);
-        defer allocator.free(script);
-
-        const coin = SnapshotCoin{
-            .outpoint = types.OutPoint{ .hash = current_txid, .index = vout },
-            .height = entry.utxo.height,
-            .is_coinbase = entry.utxo.is_coinbase,
-            .value = entry.utxo.value,
-            .script_pubkey = script,
-        };
-        try writeSnapshotCoinPayload(&group_writer, vout, &coin);
-        coins_in_group += 1;
-        written_coins += 1;
     }
+    try dsink.finish();
 
-    if (have_group and coins_in_group > 0) {
-        try out.writeAll(&current_txid);
-        var hdr_buf = serialize.Writer.init(allocator);
-        defer hdr_buf.deinit();
-        try hdr_buf.writeCompactSize(coins_in_group);
-        try out.writeAll(hdr_buf.getWritten());
-        try out.writeAll(group_writer.getWritten());
-    }
-
-    std.debug.assert(written_coins == coins_count);
+    std.debug.assert(dsink.written_coins == coins_count);
     try buffered.flush();
 
     // Durability barrier: fsync the bytes before the atomic rename. A

@@ -12537,20 +12537,32 @@ pub const RpcServer = struct {
         // takes when `target_index == tip` (rpc/blockchain.cpp:3161,
         // "we don't have to roll back at all"). Cover both
         // `latest`/no-arg and the rollback-resolved-to-tip case.
+        //
+        // dumpTxOutSetWithResult now flushes the dirty UTXO cache down to
+        // CF_UTXO and walks the full on-disk set (count pass + write pass +
+        // hash pass). Hold connect_mutex across it so those passes see a
+        // quiescent CF_UTXO (no concurrent block connect) — mirrors Core
+        // holding cs_main across PrepareUTXOSnapshot's flush+stats+cursor
+        // (rpc/blockchain.cpp:3255-3266), and matches the rollback branch
+        // above which already holds connect_mutex.
+        self.chain_state.connect_mutex.lock();
         const dump_result = storage.dumpTxOutSetWithResult(
             self.chain_state,
             self.network_params.magic,
             path,
             self.allocator,
         ) catch |err| {
+            self.chain_state.connect_mutex.unlock();
             const msg = switch (err) {
                 error.FileNotFound, error.AccessDenied => "Cannot create snapshot file",
                 storage.StorageError.SerializationFailed => "Serialization failed",
                 storage.StorageError.OutOfMemory => "Out of memory",
+                error.ReorgBatchInProgress => "UTXO set busy (reorg in progress), retry",
                 else => "Failed to dump UTXO set",
             };
             return self.jsonRpcError(RPC_MISC_ERROR, msg, id);
         };
+        self.chain_state.connect_mutex.unlock();
 
         // Build response
         var buf = std.ArrayList(u8).init(self.allocator);
@@ -19997,22 +20009,34 @@ pub const RpcServer = struct {
             }
         }
 
-        // Single cache walk producing the Core aggregate stats (txouts,
+        // Full-set walk producing the Core aggregate stats (txouts,
         // transactions, bogosize, total_amount) AND the requested set hash.
+        // computeTxOutSetStats now FLUSHES the dirty UTXO cache down to
+        // CF_UTXO and cursor-walks the full on-disk set (mirrors Core's
+        // ForceFlushStateToDisk(wipe_cache=false) + CoinsDB() cursor at
+        // rpc/blockchain.cpp:1075/1081). Hold connect_mutex across the
+        // flush+walk so no block connects mid-iteration and the flush is
+        // atomic w.r.t. block connects (Core holds cs_main equivalently).
         const hash_kind: u8 = switch (hash_type) {
             .none => 0,
             .hash_serialized => 1,
             .muhash => 2,
         };
         var set_hash: types.Hash256 = undefined;
+        self.chain_state.connect_mutex.lock();
         const stats = storage.computeTxOutSetStats(
             &self.chain_state.utxo_set,
             self.allocator,
             hash_kind,
             &set_hash,
-        ) catch {
+        ) catch |e| {
+            self.chain_state.connect_mutex.unlock();
+            if (e == error.ReorgBatchInProgress) {
+                return self.jsonRpcError(RPC_MISC_ERROR, "UTXO set busy (reorg in progress), retry", id);
+            }
             return self.jsonRpcError(RPC_MISC_ERROR, "Failed to compute UTXO set stats", id);
         };
+        self.chain_state.connect_mutex.unlock();
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
