@@ -545,6 +545,11 @@ const IterState = struct {
 };
 
 /// Create an iterator for scanning a column family.
+///
+/// The returned `storage.Iterator` carries an opaque `handle` pointing at the
+/// heap-allocated `IterState` (RocksDB iterator + allocator).  The Iterator's
+/// methods delegate back into the `iter*` wrappers below.  `deinit()` destroys
+/// both the RocksDB iterator and the `IterState`.
 pub fn dbIterator(db: *storage.Database, cf_index: usize) storage.Iterator {
     const state: *DbState = @ptrCast(@alignCast(db.handle));
 
@@ -552,7 +557,7 @@ pub fn dbIterator(db: *storage.Database, cf_index: usize) storage.Iterator {
         state.db,
         state.read_options,
         state.cf_handles[cf_index],
-    );
+    ) orelse @panic("rocksdb_create_iterator_cf returned null");
 
     const iter_state = state.allocator.create(IterState) catch @panic("OOM");
     iter_state.* = .{
@@ -560,8 +565,61 @@ pub fn dbIterator(db: *storage.Database, cf_index: usize) storage.Iterator {
         .allocator = state.allocator,
     };
 
-    // Return a stub Iterator, the real state is tracked separately
-    return storage.Iterator{};
+    // Hand the live IterState to the Iterator via its opaque handle so the
+    // delegating methods below can drive the real RocksDB cursor (previously
+    // this state was discarded and a no-op stub returned).
+    return storage.Iterator{ .handle = iter_state };
+}
+
+// ---------------------------------------------------------------------------
+// storage.Iterator method backends.  Each casts the Iterator's opaque handle
+// back to *IterState and drives the RocksDB C iterator.  Callers must not
+// invoke these on a stub Iterator (handle == null); storage.Iterator guards
+// that.
+// ---------------------------------------------------------------------------
+
+/// Position the cursor at the first key in the column family.
+pub fn iterSeekToFirst(it: *storage.Iterator) void {
+    const st: *IterState = @ptrCast(@alignCast(it.handle.?));
+    c.rocksdb_iter_seek_to_first(st.inner);
+}
+
+/// True while the cursor points at a valid entry.
+pub fn iterValid(it: *storage.Iterator) bool {
+    const st: *IterState = @ptrCast(@alignCast(it.handle.?));
+    return c.rocksdb_iter_valid(st.inner) != 0;
+}
+
+/// Advance the cursor to the next key.
+pub fn iterNext(it: *storage.Iterator) void {
+    const st: *IterState = @ptrCast(@alignCast(it.handle.?));
+    c.rocksdb_iter_next(st.inner);
+}
+
+/// Return the current key.  The slice points into RocksDB-owned memory and is
+/// only valid until the next `iterNext`/`iterDeinit` — copy/decode immediately.
+pub fn iterGetKey(it: *storage.Iterator) []const u8 {
+    const st: *IterState = @ptrCast(@alignCast(it.handle.?));
+    var klen: usize = 0;
+    const kptr = c.rocksdb_iter_key(st.inner, &klen);
+    if (kptr == null or klen == 0) return &[_]u8{};
+    return @as([*]const u8, @ptrCast(kptr))[0..klen];
+}
+
+/// Return the current value.  Same lifetime caveat as `iterGetKey`.
+pub fn iterGetValue(it: *storage.Iterator) []const u8 {
+    const st: *IterState = @ptrCast(@alignCast(it.handle.?));
+    var vlen: usize = 0;
+    const vptr = c.rocksdb_iter_value(st.inner, &vlen);
+    if (vptr == null or vlen == 0) return &[_]u8{};
+    return @as([*]const u8, @ptrCast(vptr))[0..vlen];
+}
+
+/// Destroy the RocksDB iterator and free the IterState.
+pub fn iterDeinit(it: *storage.Iterator) void {
+    const st: *IterState = @ptrCast(@alignCast(it.handle.?));
+    c.rocksdb_iter_destroy(st.inner);
+    st.allocator.destroy(st);
 }
 
 // ============================================================================
