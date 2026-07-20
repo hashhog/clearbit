@@ -925,6 +925,16 @@ fn processReorg(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !vo
     const depth_cap_probe = disc_arr.len > storage.ChainState.MAX_REORG_DEPTH;
 
     if (depth_cap_probe) {
+        // The production cap is PRUNED-mode semantics: reorgDepthCap()
+        // returns MAX_REORG_DEPTH(288) only when prune_target_mib != 0 and
+        // maxInt on an archive node (Core-parity — Core has no fixed cap and
+        // an archive node's undo data is unbounded).  The fleet runs pruned
+        // (prune=10000), and the R10 corpus vector encodes the pruned bound,
+        // so the probe must present a PRUNED chainstate — without this the
+        // scratch cs is archive, the cap is maxInt, and the 289-deep reorg
+        // APPLIES (the standing reorg_prove_clearbit divergence, ≥1wk red,
+        // root-caused 2026-07-20).
+        cs.prune_target_mib = 10000;
         // Build a linked coinbase-only old chain of disc_arr.len blocks.
         var prev: [32]u8 = [_]u8{0} ** 32;
         var hh: u32 = 1;
