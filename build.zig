@@ -2708,4 +2708,41 @@ pub fn build(b: *std.Build) void {
         const minisketch_test_step = b.step("test-minisketch", "Run Erlay/minisketch tests with FFI");
         minisketch_test_step.dependOn(&run_minisketch_tests.step);
     }
+
+    // ── fuzz-decode ─────────────────────────────────────────────────────────
+    // Structured mutation smoke-fuzzer for p2p.decodePayload (src/fuzz_decode.zig).
+    // ALWAYS ReleaseSafe: runtime safety must be ON so an @intCast truncation /
+    // integer overflow / OOB slice in the decoder traps as a crash the fuzzer
+    // can catch, regardless of the -Doptimize passed for the rest of the build.
+    // Mirrors the main exe's link setup (p2p.zig -> crypto.zig -> secp256k1 +
+    // SHA-NI shim + rocksdb via the types graph). See the P1.2 follow-up in
+    // receipts/decoder-security-audit-flagships.md.
+    {
+        const fuzz_decode = b.addExecutable(.{
+            .name = "fuzz-decode",
+            .root_source_file = b.path("src/fuzz_decode.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        });
+        fuzz_decode.linkSystemLibrary("rocksdb");
+        fuzz_decode.linkSystemLibrary("secp256k1");
+        fuzz_decode.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        fuzz_decode.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            fuzz_decode.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+        }
+        if (minisketch_enabled) {
+            fuzz_decode.linkSystemLibrary("minisketch");
+            fuzz_decode.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        fuzz_decode.root_module.addOptions("build_options", build_options);
+        // Deliberately NOT installArtifact'd: the default `zig build` (what
+        // build-all.sh runs for the whole fleet) must stay lean. The fuzzer is
+        // built on demand only via `zig build fuzz-decode`.
+
+        const run_fuzz_decode = b.addRunArtifact(fuzz_decode);
+        if (b.args) |a| run_fuzz_decode.addArgs(a);
+        const fuzz_decode_step = b.step("fuzz-decode", "Run the P2P decodePayload smoke-fuzzer (args: [iterations] [seed])");
+        fuzz_decode_step.dependOn(&run_fuzz_decode.step);
+    }
 }
