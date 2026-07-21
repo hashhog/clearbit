@@ -9381,6 +9381,21 @@ pub const RpcServer = struct {
         const block_data = serialize.readBlock(&reader, self.allocator) catch {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Block decode failed", id);
         };
+        // P1.6 fix (2026-07-21): free the parsed block when the handler
+        // returns. Every submitblock leaked the whole deserialized block
+        // (txs, scripts, witnesses — ~8 GPA allocations per block): the
+        // connect path serializes its OWN owned copy for CF_BLOCKS
+        // (queueBlockWrite), copies the header by value into the block
+        // index, and flushes UTXOs before returning, so nothing retains
+        // block_data — same reason the P2P path frees right after
+        // connectBlockFast* (peer.zig drainBlockBuffer) and getblock
+        // frees after use (rpc.zig handleGetBlock). Besides the unbounded
+        // per-submission leak, the GPA leak-report storm at exit (877
+        // symbolicated traces after a 110-block regtest feed) stalled
+        // process teardown for minutes AFTER "closing DB", so SIGTERM
+        // exceeded any reasonable stop grace (observed: >120s; the P1.6
+        // harness FAILed disk_full/dbcache on stop_mode=kill).
+        defer serialize.freeBlock(self.allocator, &block_data);
 
         // P0-#3 (2026-05-02): full consensus validation BEFORE block_template.submitBlock.
         // P0-#3 (2026-05-02) + wave-32 acceptBlock unification: full consensus
