@@ -4620,6 +4620,17 @@ pub const PeerManager = struct {
 
         const peer = try self.allocator.create(Peer);
         peer.* = Peer.accept(conn.stream, conn.address, self.network_params, self.allocator);
+        // P1.4 Finding 4: the inbound accept path drives performHandshake
+        // SYNCHRONOUSLY on the single P2P run-loop thread, but Peer.accept never
+        // set a receive timeout — so a peer that completes the TCP handshake and
+        // then sends nothing (or a partial header) blocks readExact in the kernel
+        // forever and wedges the whole node (no drain/heartbeat/eviction runs).
+        // The outbound path already sets this 30s SO_RCVTIMEO (peer.zig connect);
+        // mirror it here BEFORE the blocking handshake read. Without this, opening
+        // clearbit's inbound port is a trivial remote DoS. Set before
+        // performHandshake so the version/verack reads are bounded; the
+        // post-handshake processAllMessages path re-sets its own timeout as before.
+        peer.setRecvTimeout(30, 0);
         peer.advertise_node_bloom = self.peerbloomfilters;
         peer.advertise_node_network_limited = self.advertise_node_network_limited;
         peer.advertise_compact_filters = self.blockfilterindex_enabled;
