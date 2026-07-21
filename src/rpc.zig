@@ -17432,21 +17432,40 @@ pub const RpcServer = struct {
             locktime = @intCast(params.array.items[2].integer);
         }
 
-        // Options: only `feeRate` (BTC/kvB) and `changeAddress` are honored.
-        // Anything else is ignored, matching the conservative-port pattern of
-        // the rest of clearbit's wallet surface.
-        var fee_rate: u64 = 1; // sat/vB
+        // Options: `fee_rate` (sat/vB, the modern option) takes precedence over
+        // the deprecated `feeRate` (BTC/kvB); `changeAddress` is also honored.
+        // Reference: bitcoin-core/src/wallet/rpc/spend.cpp::SetFeeEstimateMode
+        // (fee_rate → cc.m_feerate in sat/vB) and the feeRate deprecation branch
+        // (spend.cpp:559 — the two are mutually exclusive, fee_rate wins).
+        var fee_rate: u64 = 1; // sat/vB (min-relay floor is the default)
         var change_address_opt: ?[]const u8 = null;
         if (params.array.items.len > 3 and params.array.items[3] == .object) {
-            if (params.array.items[3].object.get("feeRate")) |fr| {
+            const opts = params.array.items[3].object;
+            var fee_rate_set = false;
+            // Modern: fee_rate is already sat/vB (Core parses it with
+            // decimals=3, i.e. milli-sat/vB precision; we take the whole-sat/vB
+            // value, which is what the harness and mainnet relay care about).
+            if (opts.get("fee_rate")) |fr| {
                 if (fr == .float) {
-                    // BTC/kvB → sat/vB: btc * 1e8 / 1000.
-                    fee_rate = @max(1, @as(u64, @intFromFloat(fr.float * 100_000.0)));
-                } else if (fr == .integer) {
-                    fee_rate = @max(1, @as(u64, @intCast(fr.integer * 100_000)));
+                    fee_rate = @max(1, @as(u64, @intFromFloat(fr.float)));
+                    fee_rate_set = true;
+                } else if (fr == .integer and fr.integer > 0) {
+                    fee_rate = @max(1, @as(u64, @intCast(fr.integer)));
+                    fee_rate_set = true;
                 }
             }
-            if (params.array.items[3].object.get("changeAddress")) |ca| {
+            // Deprecated: feeRate is BTC/kvB → sat/vB (btc * 1e8 / 1000). Only
+            // honored when fee_rate was not supplied.
+            if (!fee_rate_set) {
+                if (opts.get("feeRate")) |fr| {
+                    if (fr == .float) {
+                        fee_rate = @max(1, @as(u64, @intFromFloat(fr.float * 100_000.0)));
+                    } else if (fr == .integer) {
+                        fee_rate = @max(1, @as(u64, @intCast(fr.integer * 100_000)));
+                    }
+                }
+            }
+            if (opts.get("changeAddress")) |ca| {
                 if (ca == .string) change_address_opt = ca.string;
             }
         }
@@ -17561,7 +17580,6 @@ pub const RpcServer = struct {
         // Run coin selection on the remaining target (may be ≤0 if user
         // fully funded by hand).
         var selected: []wallet_mod.OwnedUtxo = &[_]wallet_mod.OwnedUtxo{};
-        var change_value: i64 = 0;
         var did_select = false;
         if (target_value > 0) {
             const sel = wallet.selectCoinsWithOptions(target_value, .{ .fee_rate = fee_rate }) catch |e| switch (e) {
@@ -17573,7 +17591,6 @@ pub const RpcServer = struct {
                 else => return self.jsonRpcError(RPC_INTERNAL_ERROR, "Coin selection failed", id),
             };
             selected = sel.selected;
-            change_value = sel.change;
             did_select = true;
         }
         defer if (did_select) self.allocator.free(selected);
@@ -17589,26 +17606,72 @@ pub const RpcServer = struct {
             try locked_inputs.append(u);
         }
 
-        // Add a change output if the selector left dust-or-better residue.
-        if (change_value >= 546) {
-            const change_spk = if (change_address_opt) |ca|
-                scriptPubKeyForAddress(self.allocator, ca) catch {
-                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid changeAddress", id);
-                }
-            else blk: {
-                const new_addr = wallet.getnewaddress(.p2wpkh, true) catch {
-                    return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to derive change address", id);
-                };
-                defer self.allocator.free(new_addr.address);
-                break :blk scriptPubKeyForAddress(self.allocator, new_addr.address) catch {
-                    return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to build change scriptPubKey", id);
-                };
+        // -----------------------------------------------------------------
+        // Fee (Core parity): fee = feerate * the ESTIMATED VSIZE of the funded
+        // tx — every input (segwit witness amortized into the per-input vbyte
+        // constants), every output, the change output, and tx overhead — NOT a
+        // fixed per-input residue. The change output absorbs the remainder so
+        // the reported fee (input total − output total) equals the on-chain fee
+        // to the satoshi. Floor the rate at 1 sat/vB (DEFAULT_MIN_RELAY_TX_FEE)
+        // so a spend always clears the mainnet min-relay gate.
+        // Reference: bitcoin-core/src/wallet/spend.cpp::CreateTransactionInternal
+        // (fee = coin_selection_params.m_effective_feerate.GetFee(nBytes), with
+        // GetRequiredFee/min-relay as the lower bound).
+        const eff_fee_rate: u64 = @max(1, fee_rate); // sat/vB, min-relay floor
+
+        var funded_input_total: i64 = 0;
+        for (locked_inputs.items) |u| funded_input_total += u.output.value;
+        var spend_total: i64 = 0; // dest outputs only (change not yet appended)
+        for (tx_outputs.items) |o| spend_total += o.value;
+
+        // Estimated vsize without change: 10 (version+locktime+counts+segwit
+        // marker/flag overhead) + Σ per-input vbytes (estimateInputSize already
+        // folds the witness/4 discount) + 34 vbytes per output (Core's
+        // conservative output estimate, matching wallet.zig::estimateTxVsize —
+        // guarantees the fee lands at/above feerate*actual-vsize rather than a
+        // sub-vbyte underpay).
+        const TX_OVERHEAD_VBYTES: u64 = 10;
+        const OUTPUT_VBYTES: u64 = 34;
+        var est_vsize_no_change: u64 = TX_OVERHEAD_VBYTES;
+        for (locked_inputs.items) |u| est_vsize_no_change += wallet_mod.estimateInputSize(u.address_type);
+        est_vsize_no_change += OUTPUT_VBYTES * @as(u64, @intCast(tx_outputs.items.len));
+
+        // Resolve the change scriptPubKey up front so its vbytes count toward
+        // the estimate; only keep the output if the residual clears dust.
+        const change_spk: []const u8 = if (change_address_opt) |ca|
+            scriptPubKeyForAddress(self.allocator, ca) catch {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid changeAddress", id);
+            }
+        else blk: {
+            const new_addr = wallet.getnewaddress(.p2wpkh, true) catch {
+                return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to derive change address", id);
             };
+            defer self.allocator.free(new_addr.address);
+            break :blk scriptPubKeyForAddress(self.allocator, new_addr.address) catch {
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to build change scriptPubKey", id);
+            };
+        };
+        var change_spk_used = false;
+        defer if (!change_spk_used) self.allocator.free(change_spk);
+
+        // Fee assuming a change output is present; change = whatever is left
+        // after the spend and that fee.
+        const est_vsize_with_change: u64 = est_vsize_no_change + OUTPUT_VBYTES;
+        const fee_with_change: i64 = @intCast(eff_fee_rate * est_vsize_with_change);
+        const change_value: i64 = funded_input_total - spend_total - fee_with_change;
+
+        var has_change = false;
+        if (change_value >= 546) {
             try tx_outputs.append(types.TxOut{
                 .value = change_value,
                 .script_pubkey = change_spk,
             });
+            change_spk_used = true;
+            has_change = true;
         }
+        // If change < dust the output is dropped and the whole residual
+        // (input − spend) becomes the fee, matching Core folding sub-dust
+        // change into the fee — still ≥ feerate*vsize, so never below relay.
 
         // Materialize transaction + PSBT.
         const tx = types.Transaction{
@@ -17640,12 +17703,13 @@ pub const RpcServer = struct {
         };
         defer self.allocator.free(b64);
 
-        // Compute fee estimate and total selected value for the result body.
-        var input_total: i64 = 0;
-        for (locked_inputs.items) |u| input_total += u.output.value;
+        // Fee for the result body = input total − output total. Because the
+        // change output was sized so that equals eff_fee_rate * estimated
+        // vsize (or the sub-dust residual was folded in), this is the exact
+        // on-chain fee of the funded tx.
         var output_total: i64 = 0;
         for (tx_outputs.items) |o| output_total += o.value;
-        const fee = if (input_total > output_total) input_total - output_total else 0;
+        const fee = if (funded_input_total > output_total) funded_input_total - output_total else 0;
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
@@ -17657,7 +17721,7 @@ pub const RpcServer = struct {
             // Change output, if present, is appended at the end. We don't
             // randomize position (Core does, behind a flag) — this keeps
             // tests deterministic.
-            if (change_value >= 546)
+            if (has_change)
                 @as(i64, @intCast(tx_outputs.items.len - 1))
             else
                 @as(i64, -1),
