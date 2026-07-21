@@ -9948,17 +9948,24 @@ pub const RpcServer = struct {
         };
         defer desc.deinit(self.allocator);
 
-        // Get canonical form with checksum
+        // Get canonical (normalized-public) form with checksum for the
+        // `descriptor` field.
         const canonical = descriptor.toStringWithChecksum(self.allocator, &desc) catch {
             return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to serialize descriptor", id);
         };
         defer self.allocator.free(canonical);
 
-        // Extract checksum
-        const hash_pos = std.mem.lastIndexOf(u8, canonical, "#") orelse {
-            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Checksum error", id);
+        // `checksum` is Core's GetDescriptorChecksum(input): the checksum of the
+        // descriptor AS GIVEN (input minus any provided #checksum), kept SEPARATE
+        // from the normalized `descriptor` field. Computing it over the canonical
+        // re-serialization is wrong — e.g. the h vs ' hardened marker differs and
+        // yields a divergent checksum. Cross-ref: bitcoin-core/src/rpc/
+        // output_script.cpp:215 + GetDescriptorChecksum (descriptor.cpp).
+        const cs_body = if (std.mem.indexOfScalar(u8, desc_str, '#')) |hp| desc_str[0..hp] else desc_str;
+        const checksum_arr = descriptor.computeChecksum(cs_body) orelse {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid descriptor", id);
         };
-        const checksum = canonical[hash_pos + 1 ..];
+        const checksum = checksum_arr[0..];
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();

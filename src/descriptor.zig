@@ -917,13 +917,22 @@ pub fn deriveScript(allocator: std.mem.Allocator, desc: *const Descriptor, index
             try script.appendSlice(&hash);
         },
         .tr => |t| {
-            // P2TR: OP_1 <x-only-pubkey>
-            // For key-path only, output the tweaked key
-            const pubkey = try resolveKeyToXOnlyPubkey(allocator, t.internal_key, index);
-            defer allocator.free(pubkey);
+            // P2TR: OP_1 <32-byte TWEAKED output key>.
+            // BIP-341/BIP-86: the on-chain key is NOT the raw internal key P —
+            // it is Q = P + int(H_TapTweak(P))·G, with an EMPTY merkle root for a
+            // key-path-only tr(KEY) descriptor. Emitting the untweaked internal
+            // key yields the wrong (Core-unspendable) address. Cross-ref:
+            // bitcoin-core/src/key.cpp ComputeTapTweakHash + script/descriptor.cpp.
+            const internal_xonly = try resolveKeyToXOnlyPubkey(allocator, t.internal_key, index);
+            defer allocator.free(internal_xonly);
+            if (internal_xonly.len != 32) return error.InvalidKeyExpression;
+            var ik: [32]u8 = undefined;
+            @memcpy(&ik, internal_xonly);
+            const ctx = try getSecpContext();
+            const output_key = try wallet.bip86TweakXOnly(ctx, &ik);
             try script.append(0x51); // OP_1
             try script.append(0x20); // Push 32 bytes
-            try script.appendSlice(pubkey);
+            try script.appendSlice(&output_key);
         },
         .multi, .sorted_multi => |m| {
             // multisig: <threshold> <pubkey1> ... <pubkeyn> <n> OP_CHECKMULTISIG
@@ -1075,27 +1084,45 @@ fn decodeWifToPubkey(allocator: std.mem.Allocator, wif: []const u8) ![]const u8 
 
 /// Decode extended key (xpub/xprv) and derive the public key at the specified index
 fn decodeExtendedKeyToPubkey(allocator: std.mem.Allocator, key_str: []const u8, path: []const u32, derive_type: DeriveType, index: u32, is_xprv: bool) ![]const u8 {
-    // Decode base58check
-    const decoded = address.base58CheckDecode(key_str, allocator) catch return error.InvalidKeyExpression;
-    defer allocator.free(decoded.data);
+    // BIP-32 extended keys carry a 4-BYTE version prefix — unlike the 1-byte
+    // address version that base58CheckDecode strips — so decode RAW and verify
+    // both the 4-byte double-SHA256 checksum and the 4-byte version ourselves.
+    // Serialization (BIP-32): 4 version + 1 depth + 4 fingerprint + 4 child +
+    // 32 chaincode + 33 key = 78-byte payload, + 4-byte checksum = 82 bytes.
+    // Cross-ref: bitcoin-core/src/key_io.cpp DecodeExtKey/DecodeExtPubKey
+    // (DecodeBase58Check -> BIP32_EXTKEY_SIZE(74) body after the 4-byte prefix).
+    const raw = address.base58Decode(key_str, allocator) catch return error.InvalidKeyExpression;
+    defer allocator.free(raw);
 
-    // Extended key format: 4 bytes version + 1 byte depth + 4 bytes fingerprint +
-    //                      4 bytes child number + 32 bytes chain code + 33 bytes key
-    // Total: 78 bytes payload (version already stripped by base58CheckDecode)
-    if (decoded.data.len != 77) {
+    if (raw.len != 82) {
+        return error.InvalidKeyExpression;
+    }
+    const payload = raw[0..78];
+    const cksum = raw[78..82];
+    const computed = crypto.hash256(payload);
+    if (!std.mem.eql(u8, cksum, computed[0..4])) {
         return error.InvalidKeyExpression;
     }
 
-    // Parse extended key components
-    // Bytes 0: depth
-    // Bytes 1-4: parent fingerprint
-    // Bytes 5-8: child number
-    // Bytes 9-40: chain code (32 bytes)
-    // Bytes 41-72: key (33 bytes) - for xprv: 0x00 + 32-byte key, for xpub: 33-byte pubkey
-    const depth = decoded.data[0];
+    // 4-byte version prefix (BIP-32): xpub 0x0488B21E / xprv 0x0488ADE4 on
+    // mainnet, tpub 0x043587CF / tprv 0x04358394 on testnet+regtest. It must
+    // match the key TYPE the descriptor asked for (xprv vs xpub).
+    const version = (@as(u32, payload[0]) << 24) | (@as(u32, payload[1]) << 16) |
+        (@as(u32, payload[2]) << 8) | @as(u32, payload[3]);
+    if (is_xprv) {
+        if (version != 0x0488ADE4 and version != 0x04358394) return error.InvalidKeyExpression;
+    } else {
+        if (version != 0x0488B21E and version != 0x043587CF) return error.InvalidKeyExpression;
+    }
+
+    // Body = the 74 bytes after the 4-byte version. The field offsets
+    // (depth=[0], fingerprint=[1..5], child=[5..9], chaincode=[9..41],
+    // key=[41..74]) are correct once all 4 version bytes are removed.
+    const body = payload[4..78];
+    const depth = body[0];
     _ = depth;
-    const chain_code = decoded.data[9..41];
-    const key_data = decoded.data[41..74];
+    const chain_code = body[9..41];
+    const key_data = body[41..74];
 
     const ctx = try getSecpContext();
 
@@ -1506,10 +1533,12 @@ pub fn getDescriptorInfo(allocator: std.mem.Allocator, input: []const u8) !Descr
     const canonical = try toStringWithChecksum(allocator, &desc);
     defer allocator.free(canonical);
 
-    // Extract checksum
-    const hash_pos = std.mem.lastIndexOf(u8, canonical, "#") orelse return error.InvalidDescriptorCharacter;
-    var checksum: [8]u8 = undefined;
-    @memcpy(&checksum, canonical[hash_pos + 1 ..][0..8]);
+    // `checksum` is Core's GetDescriptorChecksum(input): the checksum of the
+    // descriptor AS GIVEN (input minus any provided #checksum), NOT the checksum
+    // of the canonical re-serialization (the h vs ' hardened marker differs).
+    // Cross-ref: bitcoin-core/src/rpc/output_script.cpp:215.
+    const cs_body = if (std.mem.indexOfScalar(u8, input, '#')) |hp| input[0..hp] else input;
+    const checksum = computeChecksum(cs_body) orelse return error.InvalidDescriptorCharacter;
 
     return .{
         .descriptor = try allocator.dupe(u8, canonical),
@@ -1563,7 +1592,12 @@ pub fn deriveAddresses(
         addresses.deinit();
     }
 
-    const count = if (desc.isRange()) range_end - range_start else 1;
+    // Core's deriveaddresses range is [begin,end] INCLUSIVE — it loops
+    // `for (i = range_begin; i <= range_end; ++i)` (bitcoin-core/src/rpc/
+    // output_script.cpp:228), so an [0,19] range yields 20 addresses. Using an
+    // exclusive count drops the final address (fund-loss class on the change
+    // chain). Mirrors rustoshi's start..=end fix (finding #1).
+    const count = if (desc.isRange()) range_end - range_start + 1 else 1;
 
     for (0..count) |i| {
         const index = range_start + @as(u32, @intCast(i));
