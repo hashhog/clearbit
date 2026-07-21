@@ -4434,7 +4434,7 @@ pub fn psbtBumpFee(
 // ============================================================================
 
 /// Estimate input size in virtual bytes for fee calculation.
-fn estimateInputSize(addr_type: AddressType) u64 {
+pub fn estimateInputSize(addr_type: AddressType) u64 {
     return switch (addr_type) {
         .p2pkh => 148, // 32+4+1+~107+4
         .p2sh_p2wpkh => 91, // 32+4+1+23+4 + witness/4 (91 vbytes)
