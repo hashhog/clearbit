@@ -2011,10 +2011,22 @@ pub const Peer = struct {
         const sc = p2p.Message{ .sendcmpct = .{ .announce = false, .version = 2 } };
         try self.sendMessage(&sc);
 
-        // BIP-133: Send initial feefilter after handshake
-        // 100 sat/vbyte = 100,000 sat/kvB to discourage tx relay during sync
+        // BIP-133: send our initial feefilter after the handshake.
+        //
+        // This MUST be the fee rate our mempool actually enforces. Core seeds
+        // its FeeFilterRounder from the very same symbol the mempool reads:
+        // max(rounded mempool min fee, min_relay_feerate) —
+        // net_processing.cpp:5550/5565-5567, floored at
+        // DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB (policy/policy.h:70).
+        //
+        // This used to be a hard-coded 100_000 sat/kvB (= 100 sat/vB), 1000x
+        // Core, "to discourage tx relay during sync" — but it was sent on every
+        // handshake and never lowered afterwards, because the one function that
+        // could lower it (maybeSendFeefilter below) has no caller. Under BIP-133
+        // peers withhold everything below the advertised rate, so we asked the
+        // network for near-zero transaction relay permanently.
         if (self.relay_txs) {
-            const ff = p2p.Message{ .feefilter = .{ .feerate = 100_000 } };
+            const ff = p2p.Message{ .feefilter = .{ .feerate = mempool_mod.MIN_RELAY_FEE } };
             try self.sendMessage(&ff);
         }
     }
