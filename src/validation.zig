@@ -134,6 +134,17 @@ pub const TAPROOT_EXCEPTION_HASH: types.Hash256 = consensus.hexToHash(
 ///
 /// Block-hash arg is required so we can apply the exception overrides;
 /// callers that don't have the hash (e.g. legacy unit tests) pass null.
+///
+/// DANGER — DO NOT USE THIS FOR BLOCK VALIDATION.
+/// Passing null skips the script_flag_exceptions lookup entirely. Because the
+/// base trio (P2SH|WITNESS|TAPROOT) is unconditional, a block-validation caller
+/// that uses this overload will FALSE-REJECT the two historical violator blocks
+/// (170060 BIP-16, 692261 Taproot) and fork the node off mainnet. connectBlock
+/// did exactly that until it was switched to getBlockScriptFlagsForHash.
+/// Legitimate null callers are ones with no block at all — the mempool
+/// (mempool.zig, standard-flag context) — and unit tests that only probe the
+/// height ladder. If you have a block, call getBlockScriptFlagsForHash with
+/// crypto.computeBlockHash(&block.header).
 pub fn getBlockScriptFlags(height: u32, params: *const consensus.NetworkParams) script.ScriptFlags {
     return getBlockScriptFlagsForHash(height, params, null);
 }
@@ -997,8 +1008,18 @@ pub fn connectBlock(
     tip: ?*const BlockIndex,
     allocator: std.mem.Allocator,
 ) ValidationError!i64 {
-    // Get script verification flags for this block height
-    const flags = getBlockScriptFlags(height, params);
+    // Get script verification flags for this block.
+    //
+    // MUST use the hash-keyed variant: the base trio (P2SH|WITNESS|TAPROOT) is
+    // unconditional here, so without the exception lookup the two historical
+    // violator blocks — 170060 (BIP-16) and 692261 (Taproot) — would be
+    // FALSE-REJECTED and the node would fork itself off mainnet at the first
+    // full revalidation of either (--noassumevalid, a reorg, or the import
+    // tool). Core keys script_flag_exceptions on the block hash for exactly
+    // this reason (kernel/chainparams.cpp:85-88). Mirrors the same threading
+    // already done on the assume-valid script path below.
+    const block_hash_for_flags = crypto.computeBlockHash(&block.header);
+    const flags = getBlockScriptFlagsForHash(height, params, &block_hash_for_flags);
 
     // ContextualCheckBlock: enforce IsFinalTx for every transaction
     // (Bitcoin Core validation.cpp:4146). Consensus rule that runs even
