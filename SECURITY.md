@@ -27,7 +27,8 @@ release. Run from a pinned commit.
 
 | Version | Supported |
 |---------|-----------|
-| `v0.1.0-rc1` (pinned `e173d5b`) | Validator RC — best-effort; no security SLA until the final `v0.1.0` |
+| `v0.1.0-rc2` (pinned `bc7cb98`) | Validator RC — best-effort; no security SLA until the final `v0.1.0` |
+| `v0.1.0-rc1` (pinned `e173d5b`) | **SUPERSEDED — do not run.** Carries a latent consensus defect: `connectBlock` skipped Core's `script_flag_exceptions` lookup, so blocks **170060** and **692261** would be false-rejected on any full revalidation (`--noassumevalid`, a reorg, the import tool). Fixed in rc2 (`bc7cb98`). Latent rather than exploitable — zero reachability on the canonical chain — but a genuine rule divergence. |
 | pre-release (`master`) | Best-effort |
 
 ## Reporting a vulnerability
