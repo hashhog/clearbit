@@ -8721,6 +8721,12 @@ pub const RpcServer = struct {
                 mempool_mod.MempoolError.TooManyDescendants => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many unconfirmed descendants", id),
                 mempool_mod.MempoolError.AncestorSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "ancestor size limit exceeded", id),
                 mempool_mod.MempoolError.DescendantSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "descendant size limit exceeded", id),
+                // Core v31 cluster mempool: both the cluster count (64) and the
+                // cluster weight (404,000 wu) gates reject with the bare token
+                // "too-large-cluster" and an EMPTY debug string
+                // (validation.cpp:1024). Keep the token bare so it normalizes
+                // identically to the testmempoolaccept reject-reason.
+                mempool_mod.MempoolError.ClusterSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "too-large-cluster", id),
                 mempool_mod.MempoolError.NonBIP125Replaceable => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),
                 // BIP-125 Rule 3/4 (PaysForRBF): Core's category is "insufficient
                 // fee". Keep the bare token so it normalizes identically to the
