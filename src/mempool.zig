@@ -28,16 +28,32 @@ const validation = @import("validation.zig");
 /// 1024*1024.  Using binary MiB inflates the limit by ~4.9% and diverges from Core.
 pub const MAX_MEMPOOL_SIZE: usize = 300 * 1_000_000;
 
-/// Maximum number of unconfirmed ancestors.
+// NOT ENFORCED in mempool admission (Core v31 cluster mempool).
+//
+// The four constants below are reporting/compatibility values only. Core's
+// cluster mempool replaced general ancestor/descendant enforcement with the
+// cluster count + cluster weight gates (see MAX_CLUSTER_SIZE /
+// MAX_CLUSTER_WEIGHT); "too-long-mempool-chain" occurs zero times in
+// bitcoin-core/src. Core still keeps MemPoolLimits::ancestor_count and
+// ::descendant_count at 25 (kernel/mempool_limits.h:24-25) purely so the
+// wallet can read them for coin selection (node/interfaces.cpp:715-716), and
+// exposes them as -limitancestorcount / -limitdescendantcount. The only
+// surviving ancestor/descendant *enforcement* is TRUC's 2/2 pair, in
+// checkTrucPolicy.
+
+/// Maximum number of unconfirmed ancestors (reporting only — see note above).
+/// Bitcoin Core: DEFAULT_ANCESTOR_LIMIT = 25 (policy/policy.h:76).
 pub const MAX_ANCESTOR_COUNT: usize = 25;
 
-/// Maximum number of unconfirmed descendants.
+/// Maximum number of unconfirmed descendants (reporting only — see note above).
+/// Bitcoin Core: DEFAULT_DESCENDANT_LIMIT = 25 (policy/policy.h:78).
 pub const MAX_DESCENDANT_COUNT: usize = 25;
 
-/// Maximum total size of ancestors in bytes.
+/// Historical ancestor size limit in vbytes (no longer enforced; Core's
+/// MemPoolLimits has no ancestor_size field at all any more).
 pub const MAX_ANCESTOR_SIZE: usize = 101_000;
 
-/// Maximum total size of descendants in bytes.
+/// Historical descendant size limit in vbytes (no longer enforced).
 pub const MAX_DESCENDANT_SIZE: usize = 101_000;
 
 /// Transaction expiry time: 2 weeks in seconds.
@@ -415,9 +431,17 @@ fn rejectReasonForError(err: MempoolError) []const u8 {
         MempoolError.ScriptSigNotPushOnly => "scriptsig-not-pushonly",
         MempoolError.DatacarrierTooLarge => "datacarrier",
         MempoolError.DustOutput => "dust",
-        MempoolError.TooManyAncestors => "too-long-mempool-chain",
-        MempoolError.TooManyDescendants => "too-long-mempool-chain",
-        MempoolError.ClusterSizeLimitExceeded => "cluster-size-exceeded",
+        // Core v31 cluster mempool: the cluster count/weight gates are the only
+        // topology rejects, and both carry the SAME token with an EMPTY debug
+        // string — `state.Invalid(TX_MEMPOOL_POLICY, "too-large-cluster", "")`
+        // at validation.cpp:1024, :1116, :1343 and :1521.
+        //
+        // "too-long-mempool-chain" is deliberately absent: it occurs zero times
+        // in bitcoin-core/src now that the general ancestor/descendant limits
+        // are gone. TooManyAncestors / TooManyDescendants /
+        // {Ancestor,Descendant}SizeLimitExceeded are no longer reachable from
+        // either admission path and therefore map to nothing here.
+        MempoolError.ClusterSizeLimitExceeded => "too-large-cluster",
         MempoolError.ScriptVerifyFailed => "mandatory-script-verify-flag-failed",
         MempoolError.NonFinal => "bad-txns-nonfinal",
         MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
@@ -438,7 +462,42 @@ pub const MAX_CLUSTER_SIZE: usize = 64;
 /// Maximum total virtual size of a cluster in vbytes.
 /// Bitcoin Core: DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 → 101,000 vbytes
 /// (policy/policy.h:74, kernel/mempool_limits.h cluster_size_vbytes).
+///
+/// NOTE: this is the *reporting* form only — it is what `getmempoolinfo`
+/// emits as `limitclustersize` (Core rpc/mempool.cpp:1062 pushes
+/// `limits.cluster_size_vbytes`).  Enforcement happens in WEIGHT units
+/// against `MAX_CLUSTER_WEIGHT` below; see the comment there for why.
 pub const MAX_CLUSTER_VBYTES: usize = 101_000;
+
+/// Maximum total sigop-adjusted WEIGHT of a cluster — the enforced bound.
+///
+/// Bitcoin Core builds its TxGraph with
+///   `max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR`
+/// (txmempool.cpp:181), and the per-transaction quantity TxGraph sums is the
+/// UNROUNDED sigop-adjusted weight
+///   `GetSigOpsAdjustedWeight(GetTransactionWeight(tx), sigops_cost, nBytesPerSigOp)`
+/// (txmempool.cpp:1017 → policy.cpp:390).  TxGraph then rejects on
+/// `total_size > max_size` (txgraph.cpp:2059, STRICT `>`).
+///
+/// Summing per-transaction *vbytes* instead would compute Σ⌈wᵢ/4⌉, which is
+/// ≥ (Σwᵢ)/4 and therefore systematically STRICTER than Core — by up to
+/// ⌈3/4⌉ vB per transaction, i.e. up to 48 vB over a 64-tx cluster.  Small,
+/// but a structural one-directional divergence.  Summing weight and
+/// comparing against 404,000 has no per-transaction rounding at all.
+pub const MAX_CLUSTER_WEIGHT: u64 = @as(u64, MAX_CLUSTER_VBYTES) * @as(u64, consensus.WITNESS_SCALE_FACTOR);
+
+/// Per-transaction contribution to a cluster's summed weight.
+///
+/// Bitcoin Core `GetSigOpsAdjustedWeight` (policy/policy.cpp:390):
+///     max(weight, sigop_cost * bytes_per_sigop)
+/// with `bytes_per_sigop` = DEFAULT_BYTES_PER_SIGOP = 20 (policy/policy.h:50).
+///
+/// This is deliberately the ONLY place the cluster per-tx quantity is formed,
+/// so both admission paths (`addTransaction`, `addTransactionWithPackageRate`)
+/// and the union-find accumulator cannot drift apart.
+pub fn clusterWeightContribution(weight: u64, sigop_cost: u64) u64 {
+    return consensus.getSigOpsAdjustedWeight(weight, sigop_cost, consensus.DEFAULT_BYTES_PER_SIGOP);
+}
 
 /// CPFP carve-out: one extra descendant is permitted if it is the sole
 /// descendant of a mempool entry and its vsize does not exceed this limit.
@@ -451,7 +510,8 @@ pub const EXTRA_DESCENDANT_TX_SIZE_LIMIT: usize = 10_000;
 
 /// Union-Find (Disjoint Set Union) data structure for efficient cluster detection.
 /// Used to track connected components in the transaction dependency graph.
-/// Tracks both tx-count and total vbytes per cluster (for both Core limits).
+/// Tracks both tx-count and total sigop-adjusted WEIGHT per cluster (Core's two
+/// cluster limits: cluster_count and cluster_size_vbytes*WITNESS_SCALE_FACTOR).
 pub const UnionFind = struct {
     /// Parent pointer for each transaction (by index).
     parent: []u32,
@@ -459,8 +519,11 @@ pub const UnionFind = struct {
     rank: []u32,
     /// Number of elements in each set (stored at root).
     size: []u32,
-    /// Total vbytes for each set (stored at root). Mirrors Core's cluster_size_vbytes limit.
-    vbytes: []u64,
+    /// Total sigop-adjusted weight for each set (stored at root).  WEIGHT units,
+    /// not vbytes: Core's TxGraph sums the unrounded per-tx
+    /// `GetSigOpsAdjustedWeight` (txmempool.cpp:1017) against
+    /// `cluster_size_vbytes * WITNESS_SCALE_FACTOR` (txmempool.cpp:181).
+    weight: []u64,
     /// Allocator for memory management.
     allocator: std.mem.Allocator,
     /// Number of elements.
@@ -471,21 +534,21 @@ pub const UnionFind = struct {
         const parent = try allocator.alloc(u32, capacity);
         const rank = try allocator.alloc(u32, capacity);
         const size = try allocator.alloc(u32, capacity);
-        const vbytes = try allocator.alloc(u64, capacity);
+        const weight = try allocator.alloc(u64, capacity);
 
-        // Initialize each element as its own set (vbytes set separately via setVbytes)
+        // Initialize each element as its own set (weight set separately via setWeight)
         for (0..capacity) |i| {
             parent[i] = @intCast(i);
             rank[i] = 0;
             size[i] = 1;
-            vbytes[i] = 0;
+            weight[i] = 0;
         }
 
         return UnionFind{
             .parent = parent,
             .rank = rank,
             .size = size,
-            .vbytes = vbytes,
+            .weight = weight,
             .allocator = allocator,
             .count = capacity,
         };
@@ -496,7 +559,7 @@ pub const UnionFind = struct {
         self.allocator.free(self.parent);
         self.allocator.free(self.rank);
         self.allocator.free(self.size);
-        self.allocator.free(self.vbytes);
+        self.allocator.free(self.weight);
     }
 
     /// Find the root of the set containing element x, with path compression.
@@ -508,10 +571,11 @@ pub const UnionFind = struct {
         return self.parent[x];
     }
 
-    /// Set the vbytes for a singleton element (call once after init, before any unite).
-    pub fn setVbytes(self: *UnionFind, x: u32, vb: u64) void {
+    /// Set the sigop-adjusted weight for a singleton element (call once after
+    /// init, before any unite).
+    pub fn setWeight(self: *UnionFind, x: u32, w: u64) void {
         const root = self.find(x);
-        self.vbytes[root] = vb;
+        self.weight[root] = w;
     }
 
     /// Union the sets containing elements x and y. Returns true if they were in different sets.
@@ -527,15 +591,15 @@ pub const UnionFind = struct {
         if (self.rank[root_x] < self.rank[root_y]) {
             self.parent[root_x] = root_y;
             self.size[root_y] += self.size[root_x];
-            self.vbytes[root_y] += self.vbytes[root_x];
+            self.weight[root_y] += self.weight[root_x];
         } else if (self.rank[root_x] > self.rank[root_y]) {
             self.parent[root_y] = root_x;
             self.size[root_x] += self.size[root_y];
-            self.vbytes[root_x] += self.vbytes[root_y];
+            self.weight[root_x] += self.weight[root_y];
         } else {
             self.parent[root_y] = root_x;
             self.size[root_x] += self.size[root_y];
-            self.vbytes[root_x] += self.vbytes[root_y];
+            self.weight[root_x] += self.weight[root_y];
             self.rank[root_x] += 1;
         }
 
@@ -548,10 +612,10 @@ pub const UnionFind = struct {
         return self.size[root];
     }
 
-    /// Get the total vbytes of the set containing element x.
-    pub fn setVbyteTotal(self: *UnionFind, x: u32) u64 {
+    /// Get the total sigop-adjusted weight of the set containing element x.
+    pub fn setWeightTotal(self: *UnionFind, x: u32) u64 {
         const root = self.find(x);
-        return self.vbytes[root];
+        return self.weight[root];
     }
 
     /// Check if two elements are in the same set.
@@ -1343,7 +1407,16 @@ pub const Mempool = struct {
         // verify — silent acceptance until a miner tries to mine them. We
         // run this BEFORE any mutation (RBF removal / TRUC checks) so a
         // failing tx leaves mempool state untouched.
-        try self.verifyInputScripts(&tx);
+        //
+        // Returns the tx's BIP-141 weighted sigop cost, which feeds the cluster
+        // size gate below (Core txmempool.cpp:1017 → policy.cpp:390).
+        const sigop_cost = try self.verifyInputScripts(&tx);
+
+        // Per-tx cluster contribution, in WEIGHT units:
+        //     max(tx_weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP)
+        // This is exactly what Core hands TxGraph — unrounded, never divided
+        // by WITNESS_SCALE_FACTOR per transaction.
+        const cluster_weight = clusterWeightContribution(@intCast(weight), sigop_cost);
 
         // 7. Handle RBF conflicts
         // FIX-73 / W120 BUG-3+5+8: collect the full evicted set (direct
@@ -1396,35 +1469,36 @@ pub const Mempool = struct {
             self.removeTransaction(sibling_txid);
         }
 
-        // 8. Check cluster limits (count + vbytes) and ancestor/descendant limits.
-        // Bitcoin Core: CheckMemPoolPolicyLimits checks both cluster_count AND
-        // cluster_size_vbytes for ALL transactions (validation.cpp:1342-1344).
-        // These limits apply to TRUC transactions too — TRUC only tightens the
-        // ancestor/descendant limits further; it does not bypass cluster gates.
+        // 8. Cluster limits — the ONLY topology bound in Core v31's cluster mempool.
+        //
+        // Bitcoin Core: CheckMemPoolPolicyLimits checks cluster_count AND the
+        // cluster weight bound for ALL transactions (validation.cpp:1343 →
+        // txgraph.cpp:2059). These apply to TRUC transactions too — TRUC only
+        // tightens things further via its own 2-ancestor/2-descendant rules
+        // (checkTrucPolicy, above); it does not bypass the cluster gates.
+        //
+        // The general ancestor/descendant count and size limits that used to sit
+        // here are GONE, matching Core: "too-long-mempool-chain" appears zero
+        // times in bitcoin-core/src. The cluster gates below subsume them, and
+        // the TRUC 2/2 pair is the only surviving ancestor/descendant
+        // enforcement. `MAX_ANCESTOR_COUNT` / `MAX_DESCENDANT_COUNT` survive as
+        // constants only, exactly as Core keeps MemPoolLimits::ancestor_count /
+        // ::descendant_count for the wallet's coin-selection hint
+        // (node/interfaces.cpp:715-716) while enforcing neither in ATMP.
         const ancestors = try self.getAncestors(tx_hash, &tx);
 
-        // Gate A: cluster count limit (DEFAULT_CLUSTER_LIMIT = 64, policy/policy.h:72)
-        // Gate B: cluster vbytes limit (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB, policy/policy.h:74)
-        const projected = try self.projectClusterLimits(&tx, vsize);
+        // Gate A: cluster count (DEFAULT_CLUSTER_LIMIT = 64, policy/policy.h:72).
+        // Gate B: cluster weight (DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101 * 1000 * 4
+        //         = 404,000 weight units, policy/policy.h:74 + txmempool.cpp:181).
+        // Both comparisons are STRICT `>` — Core txgraph.cpp:2059
+        //   `total_count > m_max_cluster_count || total_size > m_max_cluster_size`
+        // so 64 / 404,000 accept and 65 / 404,001 reject.
+        const projected = try self.projectClusterLimits(&tx, cluster_weight);
         if (projected.count > MAX_CLUSTER_SIZE) {
             return MempoolError.ClusterSizeLimitExceeded;
         }
-        if (projected.vbytes > MAX_CLUSTER_VBYTES) {
+        if (projected.weight > MAX_CLUSTER_WEIGHT) {
             return MempoolError.ClusterSizeLimitExceeded;
-        }
-
-        // Gate C/D: ancestor count + size (non-TRUC; TRUC checked in checkTrucPolicy).
-        // Gate E/F: descendant count + size across all ancestors (non-TRUC).
-        // CPFP carve-out (EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10_000 vbytes) was active
-        // in pre-cluster Bitcoin Core; removed in Core 28+ when cluster mempool replaced
-        // ancestor/descendant enforcement. Constant kept in policy.h as documentation.
-        if (tx.version != TRUC_VERSION) {
-            // Gate C: ancestor count (DEFAULT_ANCESTOR_LIMIT = 25)
-            if (ancestors.count > MAX_ANCESTOR_COUNT) return MempoolError.TooManyAncestors;
-            // Gate D: ancestor total vbytes (101 kvB)
-            if (ancestors.size + vsize > MAX_ANCESTOR_SIZE) return MempoolError.AncestorSizeLimitExceeded;
-            // Gate E/F: descendant count + size
-            try self.checkDescendantLimits(&tx, vsize);
         }
 
         // 9. Check dust outputs
@@ -1445,9 +1519,11 @@ pub const Mempool = struct {
         // Initialize or expand UnionFind if needed
         try self.ensureClusterCapacity(self.next_cluster_index);
 
-        // Record this tx's vbytes in the UnionFind for cluster_size_vbytes gate.
+        // Record this tx's sigop-adjusted weight in the UnionFind so the cluster
+        // weight gate sees it. Set BEFORE any unite() below, which sums the
+        // per-root accumulators into the surviving root.
         if (self.cluster_union) |*uf| {
-            uf.setVbytes(cluster_idx, @intCast(vsize));
+            uf.setWeight(cluster_idx, cluster_weight);
         }
 
         // 12. Create entry and add to mempool
@@ -2705,10 +2781,21 @@ pub const Mempool = struct {
         }
     }
 
-    fn verifyInputScripts(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
+    /// Verify input scripts and return the transaction's BIP-141 weighted sigop
+    /// cost (4× legacy + 4× P2SH + 1× witness).
+    ///
+    /// The sigop cost is returned rather than discarded because the cluster size
+    /// gate needs it: Core feeds `GetSigOpsAdjustedWeight(weight, sigops_cost,
+    /// nBytesPerSigOp)` into TxGraph (txmempool.cpp:1017), so a tx whose sigop
+    /// cost × 20 exceeds its raw weight occupies the larger figure in its
+    /// cluster.  Prevouts are only resolvable here, so this is the natural place
+    /// to compute it once.
+    fn verifyInputScripts(self: *Mempool, tx: *const types.Transaction) MempoolError!u64 {
         // No chain_state → unit-test path, skip script verify (parity with
         // the "assume inputs exist" branch a few lines up the call stack).
-        const cs = self.chain_state orelse return;
+        // No prevouts means no resolvable sigop cost either; report 0, which
+        // makes GetSigOpsAdjustedWeight degenerate to the raw weight.
+        const cs = self.chain_state orelse return 0;
 
         // Coinbase transactions are not relayed; reject up-front.
         if (tx.isCoinbase()) return MempoolError.NonStandard;
@@ -2786,6 +2873,10 @@ pub const Mempool = struct {
         //
         //   Reference: Bitcoin Core validation.cpp:941-943,
         //   getTransactionSigOpCost in consensus/tx_verify.cpp.
+        //
+        //   The computed cost is also returned to the caller so the cluster
+        //   size gate can apply Core's sigop-adjusted weight (policy.cpp:390).
+        var tx_sigop_cost: u64 = 0;
         {
             const W96SigopView = struct {
                 inputs: []const types.TxIn,
@@ -2820,6 +2911,7 @@ pub const Mempool = struct {
             if (sigop_cost > consensus.MAX_STANDARD_TX_SIGOPS_COST) {
                 return MempoolError.TooManySigopsCost;
             }
+            tx_sigop_cost = sigop_cost;
         }
 
         // Now actually run the script engine against each input.
@@ -2898,6 +2990,8 @@ pub const Mempool = struct {
                 return MempoolError.ScriptVerifyFailed;
             }
         }
+
+        return tx_sigop_cost;
     }
 
     /// Helper: does any input of `tx` carry a non-empty witness?
@@ -4191,7 +4285,12 @@ pub const Mempool = struct {
 
         // 6b. Script verification (STANDARD_SCRIPT_VERIFY_FLAGS) — same gate
         // as `addTransaction`. See that function's comment for the why.
-        try self.verifyInputScripts(&tx);
+        // Also yields the weighted sigop cost for the cluster weight gate.
+        const sigop_cost = try self.verifyInputScripts(&tx);
+
+        // Per-tx cluster contribution in WEIGHT units — identical form to
+        // `addTransaction`, via the single shared helper.
+        const cluster_weight = clusterWeightContribution(@intCast(weight), sigop_cost);
 
         // 7. Handle RBF conflicts
         // FIX-73 / W120 BUG-3+5+8: capture evicted-txids set before removal
@@ -4235,25 +4334,20 @@ pub const Mempool = struct {
             self.removeTransaction(sibling_txid);
         }
 
-        // 8. Check cluster limits (count + vbytes) and ancestor/descendant limits.
-        // Applies to all transactions including TRUC (v3).
+        // 8. Cluster limits — the only topology bound (see `addTransaction` §8
+        // for the full rationale). Applies to all transactions including TRUC.
+        // The general ancestor/descendant gates that used to follow are gone,
+        // matching Core; TRUC 2/2 (checkTrucPolicy) is what survives.
         const ancestors = try self.getAncestors(tx_hash, &tx);
 
-        // Gate A: cluster count limit; Gate B: cluster vbytes limit.
-        const projected = try self.projectClusterLimits(&tx, vsize);
+        // Gate A: cluster count (64). Gate B: cluster weight (404,000).
+        // Both strict `>` per txgraph.cpp:2059.
+        const projected = try self.projectClusterLimits(&tx, cluster_weight);
         if (projected.count > MAX_CLUSTER_SIZE) {
             return MempoolError.ClusterSizeLimitExceeded;
         }
-        if (projected.vbytes > MAX_CLUSTER_VBYTES) {
+        if (projected.weight > MAX_CLUSTER_WEIGHT) {
             return MempoolError.ClusterSizeLimitExceeded;
-        }
-
-        // Gate C/D/E/F (non-TRUC only; TRUC already checked in checkTrucPolicy).
-        // CPFP carve-out removed in Bitcoin Core 28+ cluster mempool.
-        if (tx.version != TRUC_VERSION) {
-            if (ancestors.count > MAX_ANCESTOR_COUNT) return MempoolError.TooManyAncestors;
-            if (ancestors.size + vsize > MAX_ANCESTOR_SIZE) return MempoolError.AncestorSizeLimitExceeded;
-            try self.checkDescendantLimits(&tx, vsize);
         }
 
         // 9. Check dust outputs
@@ -4274,9 +4368,10 @@ pub const Mempool = struct {
         // Initialize or expand UnionFind if needed
         try self.ensureClusterCapacity(self.next_cluster_index);
 
-        // Record this tx's vbytes in the UnionFind for cluster_size_vbytes gate.
+        // Record this tx's sigop-adjusted weight in the UnionFind for the
+        // cluster weight gate. Set BEFORE any unite() below.
         if (self.cluster_union) |*uf| {
-            uf.setVbytes(cluster_idx, @intCast(vsize));
+            uf.setWeight(cluster_idx, cluster_weight);
         }
 
         // 12. Create entry and add to mempool
@@ -4381,7 +4476,7 @@ pub const Mempool = struct {
                     new_uf.parent[i] = uf.parent[i];
                     new_uf.rank[i] = uf.rank[i];
                     new_uf.size[i] = uf.size[i];
-                    new_uf.vbytes[i] = uf.vbytes[i];
+                    new_uf.weight[i] = uf.weight[i];
                 }
 
                 uf.deinit();
@@ -4391,12 +4486,21 @@ pub const Mempool = struct {
     }
 
     /// Project the cluster limits if a new transaction were added.
-    /// Returns both the projected tx-count and total vbytes for the merged cluster.
+    /// Returns both the projected tx-count and the total sigop-adjusted WEIGHT
+    /// for the merged cluster.
+    ///
+    /// `tx_weight` must already be the new transaction's per-tx cluster
+    /// contribution, i.e. `clusterWeightContribution(weight, sigop_cost)` =
+    /// max(weight, sigop_cost*20).  No per-transaction division or rounding
+    /// happens anywhere on this path — Core sums unrounded weights and compares
+    /// against `cluster_size_vbytes * WITNESS_SCALE_FACTOR`.
+    ///
     /// Bitcoin Core: CheckMemPoolPolicyLimits checks both cluster_count and
-    /// cluster_size_vbytes (kernel/mempool_limits.h MemPoolLimits, txmempool.cpp:169-173).
-    fn projectClusterLimits(self: *Mempool, tx: *const types.Transaction, tx_vsize: usize) MempoolError!struct {
+    /// cluster_size_vbytes (kernel/mempool_limits.h MemPoolLimits,
+    /// txmempool.cpp:181, txgraph.cpp:2059).
+    fn projectClusterLimits(self: *Mempool, tx: *const types.Transaction, tx_weight: u64) MempoolError!struct {
         count: usize,
-        vbytes: usize,
+        weight: u64,
     } {
         // Find all unique clusters that would be joined
         var cluster_roots = std.AutoHashMap(u32, void).init(self.allocator);
@@ -4414,22 +4518,22 @@ pub const Mempool = struct {
 
         if (cluster_roots.count() == 0) {
             // New independent transaction — forms its own cluster
-            return .{ .count = 1, .vbytes = tx_vsize };
+            return .{ .count = 1, .weight = tx_weight };
         }
 
-        // Sum up count + vbytes of all clusters that would be joined
+        // Sum up count + sigop-adjusted weight of all clusters that would be joined
         var total_count: usize = 1; // +1 for the new tx
-        var total_vbytes: usize = tx_vsize; // +new tx vbytes
+        var total_weight: u64 = tx_weight; // + new tx's adjusted weight
         var roots_iter = cluster_roots.iterator();
         while (roots_iter.next()) |entry| {
             const root = entry.key_ptr.*;
             if (self.cluster_union) |*uf| {
                 total_count += uf.setSize(root);
-                total_vbytes += @intCast(uf.setVbyteTotal(root));
+                total_weight += uf.setWeightTotal(root);
             }
         }
 
-        return .{ .count = total_count, .vbytes = total_vbytes };
+        return .{ .count = total_count, .weight = total_weight };
     }
 
     /// Project the cluster size (tx count only) if a new transaction were added.
@@ -6100,7 +6204,13 @@ test "ancestor limit of 25 allows chain" {
     try std.testing.expectEqual(@as(usize, 25), mempool.entries.count());
 }
 
-test "ancestor limit of 26 fails" {
+test "ancestor chain of 26 is ACCEPTED (Core v31: no ancestor-count limit)" {
+    // WAVE A / Core v31 cluster mempool: the general 25-ancestor limit is gone.
+    // "too-long-mempool-chain" occurs zero times in bitcoin-core/src. A 26-deep
+    // chain forms a cluster of 26 ≤ MAX_CLUSTER_SIZE (64) and a tiny total
+    // weight, so BOTH cluster gates pass and the tx is admitted.
+    // The chain-length bound is now purely the cluster count gate (see the
+    // 64-accepts / 65-rejects boundary tests below).
     const allocator = std.testing.allocator;
 
     var mempool = Mempool.init(null, null, allocator);
@@ -6145,7 +6255,7 @@ test "ancestor limit of 26 fails" {
         prev_txid = txids[i];
     }
 
-    // Now try to add the 26th transaction - should fail with TooManyAncestors
+    // Now add the 26th transaction — under Core v31 this is ACCEPTED.
     const input26 = types.TxIn{
         .previous_output = .{ .hash = prev_txid, .index = 0 },
         .script_sig = &[_]u8{},
@@ -6164,8 +6274,12 @@ test "ancestor limit of 26 fails" {
         .lock_time = 26,
     };
 
-    const result = mempool.addTransaction(tx26);
-    try std.testing.expectError(MempoolError.TooManyAncestors, result);
+    try mempool.addTransaction(tx26);
+    try std.testing.expectEqual(@as(usize, 26), mempool.entries.count());
+
+    // And the whole chain is one cluster of 26 — well inside both gates.
+    const idx26 = mempool.txid_to_index.get(try crypto.computeTxid(&tx26, allocator)).?;
+    try std.testing.expectEqual(@as(u32, 26), mempool.cluster_union.?.setSize(idx26));
 }
 
 test "descendant limit of 25 allows chain" {
@@ -6224,7 +6338,11 @@ test "descendant limit of 25 allows chain" {
     try std.testing.expectEqual(@as(usize, 25), max_descendant_count);
 }
 
-test "descendant limit of 26 fails" {
+test "descendant fan-out of 26 is ACCEPTED (Core v31: no descendant-count limit)" {
+    // WAVE A / Core v31 cluster mempool: the general 25-descendant limit is
+    // gone alongside the ancestor limit. A parent + 25 children is a cluster of
+    // 26 ≤ 64 with negligible weight, so it is admitted. Only the cluster count
+    // gate (>64) and cluster weight gate (>404,000) can reject a fan-out now.
     const allocator = std.testing.allocator;
 
     var mempool = Mempool.init(null, null, allocator);
@@ -6297,7 +6415,7 @@ test "descendant limit of 26 fails" {
     try std.testing.expect(parent_entry != null);
     try std.testing.expectEqual(@as(usize, 25), parent_entry.?.descendant_count);
 
-    // Now try to add the 25th child (26th descendant including parent) - should fail
+    // Now add the 25th child (26th descendant including parent) — ACCEPTED under Core v31.
     const child25_input = types.TxIn{
         .previous_output = .{ .hash = parent_txid, .index = 24 },
         .script_sig = &[_]u8{},
@@ -6316,8 +6434,11 @@ test "descendant limit of 26 fails" {
         .lock_time = 25,
     };
 
-    const result = mempool.addTransaction(child25_tx);
-    try std.testing.expectError(MempoolError.TooManyDescendants, result);
+    try mempool.addTransaction(child25_tx);
+    // Parent now has 26 descendants (itself + 25 children) and the cluster is 26.
+    try std.testing.expectEqual(@as(usize, 26), mempool.entries.count());
+    const parent_idx = mempool.txid_to_index.get(parent_txid).?;
+    try std.testing.expectEqual(@as(u32, 26), mempool.cluster_union.?.setSize(parent_idx));
 }
 
 test "ancestor size limit enforced" {
@@ -9778,6 +9899,9 @@ pub fn acceptPackage(
                 MempoolError.InsufficientFee => "insufficient fee",
                 MempoolError.TooManyAncestors => "too many ancestors",
                 MempoolError.TooManyDescendants => "too many descendants",
+                // Core PCKG_POLICY reject for the cluster gates
+                // (validation.cpp:1116 / :1521), empty debug string.
+                MempoolError.ClusterSizeLimitExceeded => "too-large-cluster",
                 MempoolError.DustOutput => "dust output",
                 MempoolError.NonStandard => "non-standard",
                 else => "validation failed",
@@ -10824,8 +10948,12 @@ test "W75: cluster count gate — projectClusterLimits rejects at 65" {
     const limits = try mempool.projectClusterLimits(&probe_tx, 200);
     // Merges cluster(A)=1 + cluster(B)=1 + new_tx=1 → count=3
     try std.testing.expectEqual(@as(usize, 3), limits.count);
-    // Vbytes = vsize(A) + vsize(B) + 200 probe vbytes
-    try std.testing.expect(limits.vbytes > 0);
+    // Weight = weight(A) + weight(B) + 200 probe weight units.
+    // Exact: the accumulator sums the per-tx sigop-adjusted weight, and with no
+    // chain_state the sigop cost is 0, so each stored value is the raw weight.
+    const wa = try computeTxWeight(&tx_a, allocator);
+    const wb = try computeTxWeight(&tx_b, allocator);
+    try std.testing.expectEqual(@as(u64, @intCast(wa + wb)) + 200, limits.weight);
 
     // Confirm the limit check would trigger for a cluster that exceeds 64
     try std.testing.expect(limits.count <= MAX_CLUSTER_SIZE);
@@ -10903,8 +11031,11 @@ test "W75: accept-25 ancestor chain (boundary)" {
     try std.testing.expectEqual(@as(usize, MAX_ANCESTOR_COUNT), mempool.entries.count());
 }
 
-test "W75: reject-26 ancestor chain (one over)" {
-    // Gate C: adding a 26th tx in a chain (ancestor_count would be 26) must fail.
+test "W75/WAVE-A: 26-deep ancestor chain accepted (Gate C removed in Core v31)" {
+    // Was: "reject-26 ancestor chain (one over)" pinning the old Gate C.
+    // Core v31 deleted the general ancestor limit; the 26th tx is admitted
+    // because the resulting cluster is 26 txs / a few thousand weight units,
+    // inside both surviving gates.
     const allocator = std.testing.allocator;
 
     var mempool = Mempool.init(null, null, allocator);
@@ -10938,7 +11069,7 @@ test "W75: reject-26 ancestor chain (one over)" {
         prev_txid = txids[i];
     }
 
-    // Now try to add the 26th — ancestor_count would be 26 > MAX_ANCESTOR_COUNT (25)
+    // Now add the 26th — no ancestor gate remains, so this is accepted.
     const input26 = types.TxIn{
         .previous_output = .{ .hash = prev_txid, .index = 0 },
         .script_sig = &[_]u8{},
@@ -10952,8 +11083,8 @@ test "W75: reject-26 ancestor chain (one over)" {
         .outputs = &[_]types.TxOut{output26},
         .lock_time = 300,
     };
-    const result = mempool.addTransaction(tx26);
-    try std.testing.expectError(MempoolError.TooManyAncestors, result);
+    try mempool.addTransaction(tx26);
+    try std.testing.expectEqual(@as(usize, MAX_ANCESTOR_COUNT + 1), mempool.entries.count());
 }
 
 test "W75: accept-25 descendant fan-out (boundary)" {
@@ -11011,9 +11142,10 @@ test "W75: accept-25 descendant fan-out (boundary)" {
     try std.testing.expectEqual(@as(usize, 25), root_entry.?.descendant_count);
 }
 
-test "W75: reject-26 descendant fan-out (one over)" {
-    // Gate E: adding a 25th child to a root that already has 24 children
-    // would give the root descendant_count = 26 > MAX_DESCENDANT_COUNT (25). Must fail.
+test "W75/WAVE-A: 26-wide descendant fan-out accepted (Gate E removed in Core v31)" {
+    // Was: "reject-26 descendant fan-out (one over)" pinning the old Gate E.
+    // Core v31 deleted the general descendant limit. Root + 25 children = a
+    // cluster of 26, inside both surviving gates, so it is admitted.
     const allocator = std.testing.allocator;
 
     var mempool = Mempool.init(null, null, allocator);
@@ -11060,7 +11192,7 @@ test "W75: reject-26 descendant fan-out (one over)" {
         try mempool.addTransaction(ct);
     }
 
-    // Adding the 25th child must fail: root's descendant_count would become 26
+    // Adding the 25th child is now accepted: no descendant gate remains.
     const extra_in = types.TxIn{
         .previous_output = .{ .hash = root_txid2, .index = MAX_DESCENDANT_COUNT - 1 },
         .script_sig = &[_]u8{},
@@ -11074,8 +11206,10 @@ test "W75: reject-26 descendant fan-out (one over)" {
         .outputs = &[_]types.TxOut{extra_out},
         .lock_time = 600,
     };
-    const result = mempool.addTransaction(extra);
-    try std.testing.expectError(MempoolError.TooManyDescendants, result);
+    try mempool.addTransaction(extra);
+    try std.testing.expectEqual(@as(usize, MAX_DESCENDANT_COUNT + 1), mempool.entries.count());
+    const root_idx = mempool.txid_to_index.get(root_txid2).?;
+    try std.testing.expectEqual(@as(u32, MAX_DESCENDANT_COUNT + 1), mempool.cluster_union.?.setSize(root_idx));
 }
 
 test "W75: TRUC v3 cluster gate applies — not bypassed" {
@@ -11131,11 +11265,315 @@ test "W75: TRUC v3 cluster gate applies — not bypassed" {
     try std.testing.expectEqual(@as(usize, 2), cluster_size);
 }
 
+// ===========================================================================
+// WAVE A — Core v31 cluster mempool limits, in WEIGHT units.
+//
+// The gate Core implements is, per transaction:
+//     contribution := max(tx_weight, tx_sigops_cost * DEFAULT_BYTES_PER_SIGOP)
+//                     [policy.cpp:390 GetSigOpsAdjustedWeight, fed at txmempool.cpp:1017]
+// summed over the cluster with NO per-transaction division or rounding, then
+//     reject if Σ > cluster_size_vbytes * WITNESS_SCALE_FACTOR = 404,000
+//                     [txmempool.cpp:181 + txgraph.cpp:2059, strict `>`]
+// and separately
+//     reject if count > 64          [policy.h:72, same strict `>`]
+// with reject token "too-large-cluster" and an EMPTY debug string
+//                     [validation.cpp:1024/:1116/:1343/:1521]
+// ===========================================================================
+
+test "WAVE-A units: cluster accumulator stores WEIGHT, not vbytes" {
+    // THE regression test for "swapped the constant to 404000 but kept
+    // rounding each tx to vbytes". If the accumulator held vbytes, the stored
+    // value would be ⌈w/4⌉ — roughly a quarter of what we assert here.
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x77} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(tx);
+
+    const txid = try crypto.computeTxid(&tx, allocator);
+    const idx = mempool.txid_to_index.get(txid).?;
+    const stored = mempool.cluster_union.?.setWeightTotal(idx);
+
+    const weight: u64 = @intCast(try computeTxWeight(&tx, allocator));
+    try std.testing.expectEqual(weight, stored);
+
+    // Explicitly NOT the vbyte form (these differ ~4x for any real tx).
+    const vbytes: u64 = (weight + 3) / 4;
+    try std.testing.expect(stored != vbytes);
+}
+
+test "WAVE-A units: MAX_CLUSTER_WEIGHT is exactly 4 x MAX_CLUSTER_VBYTES" {
+    // Core txmempool.cpp:181 — max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR.
+    try std.testing.expectEqual(@as(u64, 404_000), MAX_CLUSTER_WEIGHT);
+    try std.testing.expectEqual(
+        @as(u64, MAX_CLUSTER_VBYTES) * @as(u64, consensus.WITNESS_SCALE_FACTOR),
+        MAX_CLUSTER_WEIGHT,
+    );
+}
+
+test "WAVE-A units: sum-of-weights accepts where sum-of-ceiled-vbytes would reject" {
+    // The discriminating case the brief calls out. 64 transactions whose raw
+    // weights sum to EXACTLY 404,000 — legal, since the gate is strict `>`.
+    //
+    // Every one of those weights is ≢ 0 (mod 4), so the incorrect
+    // "⌈wᵢ/4⌉ summed against 101,000" form overshoots by 48 vB and REJECTS
+    // the very same cluster. Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4 always, so the divergence is
+    // one-directional: the vbyte form is systematically stricter than Core.
+    const n_big = 63;
+    const w_big: u64 = 6_313; // 6313 mod 4 == 1
+    const w_last: u64 = 6_281; // 6281 mod 4 == 1
+    comptime {
+        std.debug.assert(w_big % 4 != 0);
+        std.debug.assert(w_last % 4 != 0);
+    }
+
+    var sum_weight: u64 = 0;
+    var sum_ceiled_vbytes: u64 = 0;
+    for (0..n_big) |_| {
+        sum_weight += w_big;
+        sum_ceiled_vbytes += (w_big + 3) / 4;
+    }
+    sum_weight += w_last;
+    sum_ceiled_vbytes += (w_last + 3) / 4;
+
+    // Core's form: exactly at the bound, so NOT rejected (strict `>`).
+    try std.testing.expectEqual(@as(u64, 404_000), sum_weight);
+    try std.testing.expect(!(sum_weight > MAX_CLUSTER_WEIGHT));
+
+    // The rounding-per-tx form on the same cluster: 48 vB over, so rejected.
+    try std.testing.expectEqual(@as(u64, 101_048), sum_ceiled_vbytes);
+    try std.testing.expect(sum_ceiled_vbytes > MAX_CLUSTER_VBYTES);
+
+    // And the union-find really does accumulate the unrounded weights.
+    var uf = try UnionFind.init(std.testing.allocator, 64);
+    defer uf.deinit();
+    for (0..n_big) |i| uf.setWeight(@intCast(i), w_big);
+    uf.setWeight(63, w_last);
+    for (1..64) |i| _ = uf.unite(0, @intCast(i));
+    try std.testing.expectEqual(@as(u64, 404_000), uf.setWeightTotal(0));
+    try std.testing.expectEqual(@as(u32, 64), uf.setSize(0));
+}
+
+test "WAVE-A boundary: cluster weight 404000 accepts, 404001 rejects" {
+    // Pins the strict `>` at the exact bound on the LIVE addTransaction path.
+    // The parent's accumulator is seeded so the child lands precisely on the
+    // boundary; the child contributes its own (unrounded) weight.
+    const allocator = std.testing.allocator;
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+
+    const parent = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x51} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 0,
+    };
+    const parent_txid = try crypto.computeTxid(&parent, allocator);
+    const child = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 99_000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 1,
+    };
+    const child_weight: u64 = @intCast(try computeTxWeight(&child, allocator));
+    try std.testing.expect(child_weight < MAX_CLUSTER_WEIGHT);
+
+    // (a) total lands on exactly 404,000 → accepted.
+    {
+        var mempool = Mempool.init(null, null, allocator);
+        defer mempool.deinit();
+        try mempool.addTransaction(parent);
+        const pidx = mempool.txid_to_index.get(parent_txid).?;
+        mempool.cluster_union.?.setWeight(pidx, MAX_CLUSTER_WEIGHT - child_weight);
+
+        try mempool.addTransaction(child);
+        try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+        try std.testing.expectEqual(MAX_CLUSTER_WEIGHT, mempool.cluster_union.?.setWeightTotal(pidx));
+    }
+
+    // (b) one weight unit more → 404,001 → rejected as too-large-cluster.
+    {
+        var mempool = Mempool.init(null, null, allocator);
+        defer mempool.deinit();
+        try mempool.addTransaction(parent);
+        const pidx = mempool.txid_to_index.get(parent_txid).?;
+        mempool.cluster_union.?.setWeight(pidx, MAX_CLUSTER_WEIGHT - child_weight + 1);
+
+        try std.testing.expectError(
+            MempoolError.ClusterSizeLimitExceeded,
+            mempool.addTransaction(child),
+        );
+        try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+    }
+}
+
+test "WAVE-A boundary: cluster count 64 accepts, 65 rejects" {
+    // policy.h:72 DEFAULT_CLUSTER_LIMIT = 64, compared with strict `>`
+    // (txgraph.cpp:2059). A 64-tx chain is admitted; the 65th is not.
+    const allocator = std.testing.allocator;
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    var inputs: [MAX_CLUSTER_SIZE][1]types.TxIn = undefined;
+    var outputs: [MAX_CLUSTER_SIZE][1]types.TxOut = undefined;
+
+    var prev_txid: types.Hash256 = [_]u8{0x64} ** 32;
+    var value: i64 = 10_000_000;
+
+    for (0..MAX_CLUSTER_SIZE) |i| {
+        inputs[i][0] = types.TxIn{
+            .previous_output = .{ .hash = prev_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        };
+        value -= 500;
+        outputs[i][0] = types.TxOut{ .value = value, .script_pubkey = &p2wpkh_script };
+        const tx = types.Transaction{
+            .version = 2,
+            .inputs = &inputs[i],
+            .outputs = &outputs[i],
+            .lock_time = @intCast(9000 + i),
+        };
+        try mempool.addTransaction(tx);
+        prev_txid = crypto.computeTxid(&tx, allocator) catch unreachable;
+    }
+
+    // 64 accepted, and they form ONE cluster of exactly 64.
+    try std.testing.expectEqual(@as(usize, MAX_CLUSTER_SIZE), mempool.entries.count());
+    const last_idx = mempool.txid_to_index.get(prev_txid).?;
+    try std.testing.expectEqual(@as(u32, MAX_CLUSTER_SIZE), mempool.cluster_union.?.setSize(last_idx));
+
+    // The 65th extends the same cluster to 65 > 64 → rejected.
+    const tx65 = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = prev_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = value - 500, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 9999,
+    };
+    try std.testing.expectError(
+        MempoolError.ClusterSizeLimitExceeded,
+        mempool.addTransaction(tx65),
+    );
+    try std.testing.expectEqual(@as(usize, MAX_CLUSTER_SIZE), mempool.entries.count());
+}
+
+test "WAVE-A sigops: max(weight, sigops*20) is what trips the cluster gate" {
+    // policy.cpp:390 GetSigOpsAdjustedWeight. A transaction whose sigop cost x 20
+    // exceeds its raw weight occupies the LARGER figure in its cluster, so a
+    // cluster that fits by raw weight can still be rejected once sigops are
+    // accounted for. Verified here on `projectClusterLimits`, the function the
+    // live gate compares against MAX_CLUSTER_WEIGHT.
+    const allocator = std.testing.allocator;
+
+    // The helper itself: sigop-dominated, weight-dominated, and the tie.
+    try std.testing.expectEqual(@as(u64, 2_000), clusterWeightContribution(1_000, 100)); // 100*20 wins
+    try std.testing.expectEqual(@as(u64, 5_000), clusterWeightContribution(5_000, 100)); // weight wins
+    try std.testing.expectEqual(@as(u64, 2_000), clusterWeightContribution(2_000, 100)); // tie
+    try std.testing.expectEqual(@as(u64, 1_000), clusterWeightContribution(1_000, 0)); // no sigops
+    try std.testing.expectEqual(@as(u32, 20), consensus.DEFAULT_BYTES_PER_SIGOP);
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    const p2wpkh_script = [_]u8{0x00} ++ [_]u8{0x14} ++ [_]u8{0xAA} ** 20;
+    const parent = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = [_]u8{0x5A} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 100_000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent);
+    const parent_txid = try crypto.computeTxid(&parent, allocator);
+    const pidx = mempool.txid_to_index.get(parent_txid).?;
+
+    // Leave exactly 1,500 weight units of headroom in the parent's cluster.
+    const headroom: u64 = 1_500;
+    mempool.cluster_union.?.setWeight(pidx, MAX_CLUSTER_WEIGHT - headroom);
+
+    const child = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = parent_txid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 99_000, .script_pubkey = &p2wpkh_script }},
+        .lock_time = 1,
+    };
+
+    // Raw weight 1,000 fits in the 1,500 of headroom → within the limit.
+    const by_raw_weight = try mempool.projectClusterLimits(&child, clusterWeightContribution(1_000, 0));
+    try std.testing.expect(!(by_raw_weight.weight > MAX_CLUSTER_WEIGHT));
+
+    // Same transaction, 100 sigops: 100*20 = 2,000 > 1,000 raw, and 2,000
+    // exceeds the 1,500 of headroom → the sigop term is what trips the gate.
+    const by_sigops = try mempool.projectClusterLimits(&child, clusterWeightContribution(1_000, 100));
+    try std.testing.expect(by_sigops.weight > MAX_CLUSTER_WEIGHT);
+    try std.testing.expectEqual(MAX_CLUSTER_WEIGHT - headroom + 2_000, by_sigops.weight);
+}
+
+test "WAVE-A token: cluster rejects map to \"too-large-cluster\", chain token gone" {
+    // validation.cpp:1024/:1116/:1343/:1521 all use "too-large-cluster" with an
+    // EMPTY debug string; "too-long-mempool-chain" occurs zero times in
+    // bitcoin-core/src now that the general anc/desc limits are gone.
+    try std.testing.expectEqualStrings(
+        "too-large-cluster",
+        rejectReasonForError(MempoolError.ClusterSizeLimitExceeded),
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        "too-long-mempool-chain",
+        rejectReasonForError(MempoolError.TooManyAncestors),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        "too-long-mempool-chain",
+        rejectReasonForError(MempoolError.TooManyDescendants),
+    ));
+}
+
 test "W75: all limit constants match Core policy.h" {
     // Comprehensive constant audit.
     // Bitcoin Core policy/policy.h:72-90, kernel/mempool_limits.h.
     try std.testing.expectEqual(@as(usize, 64), MAX_CLUSTER_SIZE); // DEFAULT_CLUSTER_LIMIT
     try std.testing.expectEqual(@as(usize, 101_000), MAX_CLUSTER_VBYTES); // DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000
+    try std.testing.expectEqual(@as(u64, 404_000), MAX_CLUSTER_WEIGHT); // * WITNESS_SCALE_FACTOR (txmempool.cpp:181)
     try std.testing.expectEqual(@as(usize, 25), MAX_ANCESTOR_COUNT); // DEFAULT_ANCESTOR_LIMIT
     try std.testing.expectEqual(@as(usize, 25), MAX_DESCENDANT_COUNT); // DEFAULT_DESCENDANT_LIMIT
     try std.testing.expectEqual(@as(usize, 101_000), MAX_ANCESTOR_SIZE); // historical 101 kvB
