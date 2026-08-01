@@ -36,7 +36,7 @@ pub const campaign_assumeutxo = @import("campaign_assumeutxo.zig");
 // Version Info
 // ============================================================================
 
-pub const VERSION = "0.1.0";
+pub const VERSION = "1.0.0";
 pub const VERSION_STRING = "clearbit v" ++ VERSION;
 
 // ============================================================================
@@ -177,6 +177,7 @@ pub const Config = struct {
         mainnet,
         testnet,
         testnet4,
+        signet,
         regtest,
     };
 
@@ -199,6 +200,7 @@ pub const Config = struct {
             .mainnet => &consensus.MAINNET,
             .testnet => &consensus.TESTNET,
             .testnet4 => &consensus.TESTNET4,
+            .signet => &consensus.SIGNET,
             .regtest => &consensus.REGTEST,
         };
 
@@ -272,6 +274,10 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             config.network = .testnet4;
             config.listen_port = 48333;
             config.rpc_port = 48332;
+        } else if (std.mem.eql(u8, arg, "--signet") or std.mem.eql(u8, arg, "-signet")) {
+            config.network = .signet;
+            config.listen_port = 38333;
+            config.rpc_port = 38332;
         } else if (std.mem.eql(u8, arg, "--regtest") or std.mem.eql(u8, arg, "-regtest")) {
             config.network = .regtest;
             config.listen_port = 18444;
@@ -545,7 +551,9 @@ pub fn printUsage() void {
         \\Usage: clearbit [options]
         \\
         \\Network selection:
-        \\  --testnet              Use testnet network
+        \\  --testnet              Use testnet network (testnet3)
+        \\  --testnet4             Use testnet4 network
+        \\  --signet               Use signet network
         \\  --regtest              Use regtest network
         \\
         \\Connection options:
@@ -664,6 +672,7 @@ pub fn getNetworkSubdir(network: Config.Network) []const u8 {
         .mainnet => "",
         .testnet => "testnet3",
         .testnet4 => "testnet4",
+        .signet => "signet",
         .regtest => "regtest",
     };
 }
@@ -738,6 +747,10 @@ pub fn loadConfigFile(
                 config.network = .testnet4;
                 config.listen_port = 48333;
                 config.rpc_port = 48332;
+            } else if (std.mem.eql(u8, key, "signet") and std.mem.eql(u8, value, "1")) {
+                config.network = .signet;
+                config.listen_port = 38333;
+                config.rpc_port = 38332;
             } else if (std.mem.eql(u8, key, "regtest") and std.mem.eql(u8, value, "1")) {
                 config.network = .regtest;
                 config.listen_port = 18444;
@@ -2184,7 +2197,7 @@ pub fn main() !void {
     defer allocator.free(wallets_dir);
     const wallet_net: wallet.Network = switch (config.network) {
         .mainnet => .mainnet,
-        .testnet, .testnet4 => .testnet,
+        .testnet, .testnet4, .signet => .testnet,
         .regtest => .regtest,
     };
     var wallet_manager = wallet.WalletManager.init(allocator, wallets_dir, wallet_net) catch |err| {

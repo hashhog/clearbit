@@ -706,16 +706,17 @@ test "w137 G24: utxoupdatepsbt RPC not dispatched (BUG-25)" {
 
 // ===========================================================================
 // G25 — `walletprocesspsbt` RPC
-// Status: MISSING (BUG-26).
+// Status: FIXED (was MISSING, BUG-26). Dispatched at rpc.zig ("walletprocesspsbt"
+// arm) with handler handleWalletProcessPsbt — Core spend.cpp::walletprocesspsbt.
 // ===========================================================================
-test "w137 G25: walletprocesspsbt RPC not dispatched (BUG-26)" {
+test "w137 G25: walletprocesspsbt RPC is dispatched (BUG-26 fixed)" {
     const allocator = testing.allocator;
     const src = try loadSrc(allocator, "rpc");
     defer allocator.free(src);
 
-    try testing.expect(!contains(src, "\"walletprocesspsbt\""));
-    try testing.expect(!contains(src, "handleWalletProcessPsbt"));
-    // walletcreatefundedpsbt + psbtbumpfee DO exist — confirm.
+    try testing.expect(contains(src, "\"walletprocesspsbt\""));
+    try testing.expect(contains(src, "handleWalletProcessPsbt"));
+    // walletcreatefundedpsbt + psbtbumpfee also exist — confirm.
     try testing.expect(contains(src, "\"walletcreatefundedpsbt\""));
     try testing.expect(contains(src, "\"psbtbumpfee\""));
 }

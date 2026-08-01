@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu's libsecp256k1-dev is too old: it ships no
+      # secp256k1_ellswift.h, which src/secp.zig's @cImport requires
+      # (BIP-324). Build upstream v0.7.1 from source into /usr/local.
+      # NOTE: do NOT also install libsecp256k1-dev — its stale headers in
+      # /usr/include would shadow the fresh ones in /usr/local/include.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y librocksdb-dev libsnappy-dev autoconf automake libtool
+      - name: Build libsecp256k1 v0.7.1 from source
+        run: |
+          git clone --depth 1 --branch v0.7.1 https://github.com/bitcoin-core/secp256k1 /tmp/secp256k1
+          cd /tmp/secp256k1
+          ./autogen.sh
+          ./configure --enable-module-ecdh --enable-module-recovery --enable-module-extrakeys --enable-module-schnorrsig --enable-module-ellswift
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.13.0"
+      - run: zig build -Doptimize=ReleaseFast --search-prefix /usr/local
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # See the Build job: secp256k1 must come from source (ellswift).
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y librocksdb-dev libsnappy-dev autoconf automake libtool
+      - name: Build libsecp256k1 v0.7.1 from source
+        run: |
+          git clone --depth 1 --branch v0.7.1 https://github.com/bitcoin-core/secp256k1 /tmp/secp256k1
+          cd /tmp/secp256k1
+          ./autogen.sh
+          ./configure --enable-module-ecdh --enable-module-recovery --enable-module-extrakeys --enable-module-schnorrsig --enable-module-ellswift
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.13.0"
+      - run: zig build test --search-prefix /usr/local
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: clearbit:${{ github.sha }}

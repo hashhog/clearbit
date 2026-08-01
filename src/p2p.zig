@@ -23,7 +23,7 @@ pub const NODE_NETWORK_LIMITED: u64 = 1024;
 /// Value = 1 << 11 = 2048.  Core protocol.h:329.  Advertised only when the
 /// node genuinely runs the v2 transport (clearbit: `bip324V2Enabled()`).
 pub const NODE_P2P_V2: u64 = 1 << 11;
-pub const USER_AGENT: []const u8 = "/clearbit:0.1.0/";
+pub const USER_AGENT: []const u8 = "/clearbit:1.0.0/";
 /// Maximum protocol message payload length accepted from a peer.
 /// Matches Bitcoin Core net.h: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000.
 /// W99 G23 fix: was 32 * 1024 * 1024 (32 MiB, 8× too large).

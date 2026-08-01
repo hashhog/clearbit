@@ -6753,7 +6753,7 @@ pub const RpcServer = struct {
         // relayfee/incrementalfee source the v31.99 100-sat relay constants.
         const local_services = self.peer_manager.localServices();
 
-        try writer.print("{{\"version\":250000,\"subversion\":\"/clearbit:0.1.0/\",\"protocolversion\":70016,\"localservices\":\"{x:0>16}\",\"localservicesnames\":[", .{local_services});
+        try writer.print("{{\"version\":250000,\"subversion\":\"/clearbit:1.0.0/\",\"protocolversion\":70016,\"localservices\":\"{x:0>16}\",\"localservicesnames\":[", .{local_services});
         // Names array derived from the SAME local_services word (Core
         // GetServicesNames order: NETWORK, ... WITNESS ... NETWORK_LIMITED,
         // P2P_V2). Emit in Core's bit order to match.
