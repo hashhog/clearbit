@@ -9770,7 +9770,7 @@ test "version message construction with correct protocol version" {
     try std.testing.expectEqual(@as(i64, 1234567890), version_msg.timestamp);
     try std.testing.expectEqual(@as(i32, 700000), version_msg.start_height);
     try std.testing.expect(version_msg.relay);
-    try std.testing.expectEqualStrings("/clearbit:0.1.0/", version_msg.user_agent);
+    try std.testing.expectEqualStrings("/clearbit:1.0.0/", version_msg.user_agent);
 
     // Verify services bitmap
     try std.testing.expect((version_msg.services & p2p.NODE_NETWORK) != 0);
@@ -10398,8 +10398,10 @@ test "peer manager address tracking - add and dedup" {
     var manager = PeerManager.init(allocator, params);
     defer manager.deinit();
 
-    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
-    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 2 }, 8333);
+    // NOTE: 250.1.2.x — publicly routable per isRoutable(); RFC1918 addresses
+    // are rejected by addAddress's IsRoutable gate (Core addrman AddSingle).
+    const addr1 = std.net.Address.initIp4([4]u8{ 250, 1, 2, 1 }, 8333);
+    const addr2 = std.net.Address.initIp4([4]u8{ 250, 1, 2, 2 }, 8333);
 
     // Add first address
     try manager.addAddress(addr1, p2p.NODE_NETWORK, .dns_seed);
@@ -10424,8 +10426,8 @@ test "peer manager address selection" {
     // No addresses - should return null
     try std.testing.expect(manager.selectPeerToConnect() == null);
 
-    // Add an address
-    const addr = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+    // Add an address (publicly routable — addAddress rejects RFC1918)
+    const addr = std.net.Address.initIp4([4]u8{ 250, 1, 3, 1 }, 8333);
     try manager.addAddress(addr, p2p.NODE_NETWORK, .dns_seed);
 
     // Should select the address
@@ -10443,7 +10445,8 @@ test "peer manager ban ip" {
     var manager = PeerManager.init(allocator, params);
     defer manager.deinit();
 
-    const addr = std.net.Address.initIp4([4]u8{ 192, 168, 1, 100 }, 8333);
+    // Publicly routable — addAddress rejects RFC1918 (Core addrman AddSingle).
+    const addr = std.net.Address.initIp4([4]u8{ 250, 1, 4, 100 }, 8333);
 
     // Add address first
     try manager.addAddress(addr, p2p.NODE_NETWORK, .dns_seed);
@@ -10453,7 +10456,7 @@ test "peer manager ban ip" {
     try manager.banIP(addr, DEFAULT_BAN_DURATION, "test ban");
 
     // Adding a new address with same IP should be rejected
-    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 100 }, 18333); // Same IP, different port
+    const addr2 = std.net.Address.initIp4([4]u8{ 250, 1, 4, 100 }, 18333); // Same IP, different port
     try manager.addAddress(addr2, p2p.NODE_NETWORK, .dns_seed);
     // Still only 1 address since same IP is banned
     try std.testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
@@ -10524,7 +10527,7 @@ test "peer manager running state" {
 // Misbehavior Scoring Tests
 // ============================================================================
 
-test "misbehaving function increments score and sets should_ban" {
+test "misbehaving function sets should_ban on first call (single-event model)" {
     const allocator = std.testing.allocator;
     const params = &consensus.MAINNET;
 
@@ -10565,14 +10568,15 @@ test "misbehaving function increments score and sets should_ban" {
     try std.testing.expect(!peer.should_ban);
     try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
 
-    // Add misbehavior with 50 points
+    // Core 2022 single-event model (PR #25974, W99 G1): ANY Misbehaving call
+    // discourages immediately — no score accumulation. ban_score stays 0.
     peer.misbehaving(50, "test misbehavior");
-    try std.testing.expectEqual(@as(u32, 50), peer.ban_score);
-    try std.testing.expect(!peer.should_ban);
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
+    try std.testing.expect(peer.should_ban);
 
-    // Add another 50 points - now at 100, should be banned
+    // A second call is idempotent: still discouraged, still no score.
     peer.misbehaving(50, "second misbehavior");
-    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
     try std.testing.expect(peer.should_ban);
 }
 
@@ -10613,9 +10617,11 @@ test "misbehaving with 100 points immediately bans" {
         .connect_time = std.time.timestamp(),
     };
 
-    // Invalid block header = 100 points = immediate ban
+    // Invalid block header: any single Misbehaving call discourages
+    // immediately (Core 2022 single-event model, PR #25974 — see W99 G1).
+    // No score accumulation: ban_score stays 0, should_ban is set.
     peer.misbehaving(100, "invalid block header");
-    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
     try std.testing.expect(peer.should_ban);
 }
 
@@ -10675,8 +10681,11 @@ test "peer manager ban integration" {
     var manager = PeerManager.init(allocator, params);
     defer manager.deinit();
 
-    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 50, 1 }, 8333);
-    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 50, 2 }, 8333);
+    // NOTE: 250.1.2.x — publicly routable per isRoutable() (RFC1918/RFC5737
+    // and friends are rejected by addAddress's IsRoutable gate, matching
+    // Core's addrman AddSingle), so these actually enter the address book.
+    const addr1 = std.net.Address.initIp4([4]u8{ 250, 1, 2, 1 }, 8333);
+    const addr2 = std.net.Address.initIp4([4]u8{ 250, 1, 2, 2 }, 8333);
 
     // Add addresses
     try manager.addAddress(addr1, p2p.NODE_NETWORK, .dns_seed);
@@ -10691,7 +10700,7 @@ test "peer manager ban integration" {
     try std.testing.expect(!manager.isIPBanned(addr2));
 
     // Can't add same IP again
-    const addr1_different_port = std.net.Address.initIp4([4]u8{ 192, 168, 50, 1 }, 9999);
+    const addr1_different_port = std.net.Address.initIp4([4]u8{ 250, 1, 2, 1 }, 9999);
     try manager.addAddress(addr1_different_port, p2p.NODE_NETWORK, .manual);
     // Count should still be 2
     try std.testing.expectEqual(@as(usize, 2), manager.knownAddressCount());
@@ -10841,31 +10850,39 @@ test "eclipse protection: eviction candidate building" {
 test "eclipse protection: eviction algorithm protects by categories" {
     const allocator = std.testing.allocator;
 
-    // Create a set of candidates with different characteristics
+    // 12 candidates. With Core's protection constants (4 netgroup + 8 ping +
+    // 4 tx + 8 block-relay-only + 4 block + half the remainder by uptime —
+    // see 3d67e3b) a 7-candidate fixture ends up fully protected, so this
+    // fixture is sized to leave exactly the two dullest peers evictable.
+    // Indices 0-3: distinct low netgroups (netgroup-protected), also the
+    // fastest pings; index 0 has the most recent tx, index 1 the most
+    // recent block (tx/block protection overlaps already-protected peers).
+    // Indices 4-11: one shared netgroup 50 with ascending pings; 8 and 9
+    // are the longest-connected of the unprotected remainder (uptime-protected),
+    // leaving 10 and 11 as the only eviction candidates.
     var candidates = [_]EvictionCandidate{
-        // Fast ping (should be protected)
-        .{ .peer_index = 0, .net_group = 1, .min_ping_time = 10, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1000, .relay_txs = true, .is_protected = false },
-        // Recent tx (should be protected)
-        .{ .peer_index = 1, .net_group = 2, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 900, .connect_time = 500, .relay_txs = true, .is_protected = false },
-        // Recent block (should be protected)
-        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 100, .last_block_time = 800, .last_tx_time = 0, .connect_time = 600, .relay_txs = true, .is_protected = false },
-        // Long connection (should be protected)
-        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 0, .connect_time = 100, .relay_txs = true, .is_protected = false },
-        // Distinct netgroup (should be protected)
-        .{ .peer_index = 4, .net_group = 5, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 0, .connect_time = 700, .relay_txs = true, .is_protected = false },
-        // Unprotected - same netgroup as another, no special characteristics
-        .{ .peer_index = 5, .net_group = 1, .min_ping_time = 200, .last_block_time = 0, .last_tx_time = 0, .connect_time = 800, .relay_txs = true, .is_protected = false },
-        // Another unprotected - same netgroup
-        .{ .peer_index = 6, .net_group = 1, .min_ping_time = 300, .last_block_time = 0, .last_tx_time = 0, .connect_time = 900, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 0, .net_group = 1, .min_ping_time = 10, .last_block_time = 0, .last_tx_time = 900, .connect_time = 1000, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 1, .net_group = 2, .min_ping_time = 20, .last_block_time = 800, .last_tx_time = 0, .connect_time = 1000, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 30, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1000, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 40, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1000, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 4, .net_group = 50, .min_ping_time = 50, .last_block_time = 0, .last_tx_time = 0, .connect_time = 100, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 5, .net_group = 50, .min_ping_time = 60, .last_block_time = 0, .last_tx_time = 0, .connect_time = 200, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 6, .net_group = 50, .min_ping_time = 70, .last_block_time = 0, .last_tx_time = 0, .connect_time = 300, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 7, .net_group = 50, .min_ping_time = 80, .last_block_time = 0, .last_tx_time = 0, .connect_time = 400, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 8, .net_group = 50, .min_ping_time = 90, .last_block_time = 0, .last_tx_time = 0, .connect_time = 500, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 9, .net_group = 50, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 0, .connect_time = 600, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 10, .net_group = 50, .min_ping_time = 110, .last_block_time = 0, .last_tx_time = 0, .connect_time = 700, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 11, .net_group = 50, .min_ping_time = 120, .last_block_time = 0, .last_tx_time = 0, .connect_time = 800, .relay_txs = true, .is_protected = false },
     };
 
     const victim = selectEvictionCandidate(&candidates, allocator);
 
-    // Should select a victim (the algorithm will pick from netgroup 1 which has most connections)
+    // Should select a victim (indices 10/11 are the only unprotected peers)
     try std.testing.expect(victim != null);
-    // The victim should be from netgroup 1 (most connections)
+    // The victim should be from netgroup 50 (most connections among the
+    // unprotected) — the youngest of the two unprotected peers there.
     if (victim) |v| {
-        try std.testing.expect(v == 5 or v == 6); // One of the unprotected peers in netgroup 1
+        try std.testing.expect(v == 10 or v == 11);
     }
 }
 
@@ -10925,21 +10942,36 @@ test "eclipse protection: eclipse constants match Bitcoin Core" {
 test "eclipse protection: block-relay-only peers get protected" {
     const allocator = std.testing.allocator;
 
-    // Create candidates: some relay_txs=true, some relay_txs=false (block-relay-only)
+    // 12 candidates: 2 block-relay-only peers (relay_txs=false) + 10
+    // full-relay peers. The block-relay-only peers deliberately lose every
+    // other protection race (high netgroups, worst pings, youngest
+    // connections) so that ONLY the EVICTION_PROTECT_BLOCK_RELAY_ONLY=8
+    // slot (Core protects up to 8 non-tx-relay peers by recent block)
+    // keeps them alive — if that step regressed, one of them would be the
+    // victim here. Sized so two full-relay peers (10, 11) survive
+    // unprotected after all six protection steps.
     var candidates = [_]EvictionCandidate{
         // Block-relay-only peers (relay_txs=false) - should be protected
-        .{ .peer_index = 0, .net_group = 1, .min_ping_time = 500, .last_block_time = 100, .last_tx_time = 0, .connect_time = 900, .relay_txs = false, .is_protected = false },
-        .{ .peer_index = 1, .net_group = 2, .min_ping_time = 500, .last_block_time = 200, .last_tx_time = 0, .connect_time = 800, .relay_txs = false, .is_protected = false },
-        // Full relay peers
-        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 500, .last_block_time = 50, .last_tx_time = 50, .connect_time = 700, .relay_txs = true, .is_protected = false },
-        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 500, .last_block_time = 60, .last_tx_time = 60, .connect_time = 600, .relay_txs = true, .is_protected = false },
-        .{ .peer_index = 4, .net_group = 5, .min_ping_time = 500, .last_block_time = 70, .last_tx_time = 70, .connect_time = 500, .relay_txs = true, .is_protected = false },
-        .{ .peer_index = 5, .net_group = 6, .min_ping_time = 500, .last_block_time = 80, .last_tx_time = 80, .connect_time = 400, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 0, .net_group = 90, .min_ping_time = 500, .last_block_time = 100, .last_tx_time = 0, .connect_time = 2000, .relay_txs = false, .is_protected = false },
+        .{ .peer_index = 1, .net_group = 91, .min_ping_time = 500, .last_block_time = 200, .last_tx_time = 0, .connect_time = 2100, .relay_txs = false, .is_protected = false },
+        // Full relay peers: four win the netgroup race, eight win the ping
+        // race (overlap), none relay recent txs/blocks.
+        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 10, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1000, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 20, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1001, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 4, .net_group = 5, .min_ping_time = 30, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1002, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 5, .net_group = 6, .min_ping_time = 40, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1003, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 6, .net_group = 7, .min_ping_time = 50, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1004, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 7, .net_group = 8, .min_ping_time = 60, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1005, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 8, .net_group = 9, .min_ping_time = 70, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1006, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 9, .net_group = 10, .min_ping_time = 80, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1007, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 10, .net_group = 11, .min_ping_time = 90, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1008, .relay_txs = true, .is_protected = false },
+        .{ .peer_index = 11, .net_group = 12, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1009, .relay_txs = true, .is_protected = false },
     };
 
     const victim = selectEvictionCandidate(&candidates, allocator);
 
-    // Should select a victim
+    // Should select a victim (index 11: full-relay, unprotected after all
+    // six steps — 10 takes the single uptime-protection slot)
     try std.testing.expect(victim != null);
 
     // The victim should NOT be a block-relay-only peer (0 or 1) since those get protected
@@ -11817,11 +11849,13 @@ test "W99/G16: block_source_peers tracks supplying peer; misbehaving(100) fires 
 
     const peer = try allocator.create(Peer);
     peer.* = makeTestPeer(allocator, .outbound_full_relay);
-    defer peer.recv_buffer.deinit();
     // Do NOT destroy peer here — pm.deinit() does not own it in this test;
     // we destroy it manually after asserting, before pm.deinit runs (pm has no
     // chain_state so it never reaches the ban-list save that touches peers).
+    // Defer order matters (LIFO): recv_buffer must be deinit'ed BEFORE the
+    // Peer allocation itself is destroyed.
     defer allocator.destroy(peer);
+    defer peer.recv_buffer.deinit();
 
     // Add the peer to the manager's live list so the drain-path lookup finds it.
     try pm.peers.append(peer);
@@ -11842,8 +11876,9 @@ test "W99/G16: block_source_peers tracks supplying peer; misbehaving(100) fires 
     }
     _ = pm.block_source_peers.remove(fake_hash);
 
-    // Peer must now carry a 100-point score and should_ban=true.
-    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    // Peer must now be flagged for discourage: single-event model (Core 2022
+    // PR #25974, W99 G1) — should_ban=true and no score accumulation.
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
     try std.testing.expect(peer.should_ban);
     // Source map entry was removed.
     try std.testing.expect(pm.block_source_peers.get(fake_hash) == null);

@@ -6487,6 +6487,15 @@ test "anti-fee-sniping sets locktime to current height" {
         },
     );
     defer {
+        // Deep-free the witness stacks signInput allocated (serialize.freeTransaction
+        // is not usable here: the outputs point at this test's stack memory).
+        for (tx.inputs) |input| {
+            if (input.script_sig.len > 0) allocator.free(input.script_sig);
+            for (input.witness) |item| {
+                if (item.len > 0) allocator.free(item);
+            }
+            if (input.witness.len > 0) allocator.free(input.witness);
+        }
         allocator.free(tx.inputs);
         allocator.free(tx.outputs);
     }
@@ -6536,6 +6545,15 @@ test "anti-fee-sniping disabled sets locktime to 0" {
         },
     );
     defer {
+        // Deep-free the witness stacks signInput allocated (serialize.freeTransaction
+        // is not usable here: the outputs point at this test's stack memory).
+        for (tx.inputs) |input| {
+            if (input.script_sig.len > 0) allocator.free(input.script_sig);
+            for (input.witness) |item| {
+                if (item.len > 0) allocator.free(item);
+            }
+            if (input.witness.len > 0) allocator.free(input.witness);
+        }
         allocator.free(tx.inputs);
         allocator.free(tx.outputs);
     }

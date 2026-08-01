@@ -252,16 +252,17 @@ test "w125 G15 BUG-9 (HIGH-COMPAT): RPC_CLIENT_INVALID_IP_OR_SUBNET = -30 (PRESE
 }
 
 // ---------------------------------------------------------------------------
-// G16: RPC_CLIENT_P2P_DISABLED = -31 + RPC_CLIENT_MEMPOOL_DISABLED = -33 +
-// RPC_CLIENT_NODE_CAPACITY_REACHED = -34 (all MISSING)
+// G16: RPC_CLIENT_P2P_DISABLED = -31 PRESENT; RPC_CLIENT_MEMPOOL_DISABLED = -33 +
+// RPC_CLIENT_NODE_CAPACITY_REACHED = -34 still MISSING.
 // Core uses these for `getpeerinfo` when -listen=0 (server_util.cpp:103,
 // 119, 127), `importmempool` when mempool=0 (server_util.cpp:37), and
 // `addnode` when at capacity (net.cpp:428).  clearbit can't disable these
 // subsystems independently so they're inert today, but if a runtime
-// disable-toggle lands the constants will be needed.
+// disable-toggle lands the constants will be needed.  (P2P_DISABLED landed
+// with the EnsureConnman/EnsurePeerman parity work — see rpc.zig:129.)
 // ---------------------------------------------------------------------------
-test "w125 G16 BUG-10 (LOW-COMPAT): RPC_CLIENT_{P2P,MEMPOOL}_DISABLED + _NODE_CAPACITY MISSING (xfail)" {
-    try testing.expect(!@hasDecl(rpc, "RPC_CLIENT_P2P_DISABLED"));
+test "w125 G16 BUG-10 (LOW-COMPAT): RPC_CLIENT_P2P_DISABLED present; _MEMPOOL_DISABLED + _NODE_CAPACITY MISSING (xfail)" {
+    try testing.expectEqual(@as(i32, -31), rpc.RPC_CLIENT_P2P_DISABLED);
     try testing.expect(!@hasDecl(rpc, "RPC_CLIENT_MEMPOOL_DISABLED"));
     try testing.expect(!@hasDecl(rpc, "RPC_CLIENT_NODE_CAPACITY_REACHED"));
 }

@@ -94,18 +94,28 @@ test "w136/G2: maybeSendFeefilter has no caller in the source tree" {
     const peer_src = try readPeerSrc(allocator);
     defer allocator.free(peer_src);
 
-    // Count occurrences of "maybeSendFeefilter" in peer.zig.
-    // Expected: 1 — the `pub fn maybeSendFeefilter` definition line at 1658.
-    // (Doc-comment mentions like "// Maybe send a feefilter ..." use lowercase.)
-    var count: usize = 0;
+    // Count call-site occurrences of "maybeSendFeefilter" in peer.zig.
+    // A real call is method-shaped (`.maybeSendFeefilter(`); the definition
+    // line is `pub fn maybeSendFeefilter(` and doc comments mention the bare
+    // name (e.g. the feefilter comment at peer.zig:2025 explains why the
+    // handshake rate is static — precisely because this function is dead).
+    var call_count: usize = 0;
     var idx: usize = 0;
-    const needle = "maybeSendFeefilter";
-    while (std.mem.indexOfPos(u8, peer_src, idx, needle)) |pos| {
-        count += 1;
-        idx = pos + needle.len;
+    const call_needle = ".maybeSendFeefilter(";
+    while (std.mem.indexOfPos(u8, peer_src, idx, call_needle)) |pos| {
+        call_count += 1;
+        idx = pos + call_needle.len;
     }
-    // Exactly one hit = the definition; >=2 would mean a caller exists.
-    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(usize, 0), call_count);
+    // Exactly one definition = the dispatcher target is still present.
+    var def_count: usize = 0;
+    idx = 0;
+    const def_needle = "pub fn maybeSendFeefilter(";
+    while (std.mem.indexOfPos(u8, peer_src, idx, def_needle)) |pos| {
+        def_count += 1;
+        idx = pos + def_needle.len;
+    }
+    try testing.expectEqual(@as(usize, 1), def_count);
 }
 
 // G3 BUG: maybeSendFeefilter is dead code.  Same root as G2 but listed
@@ -192,18 +202,23 @@ test "w136/G6: inv handler msg_tx arm does not gate on wtxid_relay_negotiated" {
 // G7 — Hardcoded handshake feefilter
 // ============================================================================
 
-// G7 BUG: handshake feefilter is hardcoded to 100_000 sat/kvB.
-// Core (line 5550) derives it from mempool.GetMinFee().GetFeePerK().
-// clearbit (peer.zig:1629) sends 100_000 regardless of mempool state.
-test "w136/G7: handshake feefilter is hardcoded constant 100_000" {
+// G7 FIXED (b0332ce): handshake feefilter is sourced from the mempool's
+// MIN_RELAY_FEE, not a hardcoded constant.  Core (line 5550) derives it from
+// mempool.GetMinFee().GetFeePerK().  clearbit used to send a hard-coded
+// 100_000 sat/kvB regardless of mempool state; now the wire advertisement and
+// the mempool read the same symbol so they cannot drift apart.
+test "w136/G7: handshake feefilter is sourced from mempool MIN_RELAY_FEE (FIXED)" {
     const allocator = testing.allocator;
     const peer_src = try readPeerSrc(allocator);
     defer allocator.free(peer_src);
 
-    // The literal "feerate = 100_000" appears at the post-handshake feefilter
-    // send site.  Confirm at least one such literal exists.
+    // The fix: the post-handshake feefilter send site reads the mempool's
+    // min-relay-fee symbol...
+    const has_dynamic = std.mem.indexOf(u8, peer_src, ".feerate = mempool_mod.MIN_RELAY_FEE") != null;
+    try testing.expect(has_dynamic);
+    // ...and the old hard-coded 100_000 sat/kvB literal is gone.
     const has_hardcoded = std.mem.indexOf(u8, peer_src, ".feerate = 100_000") != null;
-    try testing.expect(has_hardcoded);
+    try testing.expect(!has_hardcoded);
 }
 
 // ============================================================================
@@ -506,7 +521,7 @@ test "w136/G29: clearbit handshake order is sendheaders -> sendcmpct -> feefilte
     const sc_pos = std.mem.indexOf(u8, peer_src, "p2p.Message{ .sendcmpct = .{ .announce = false") orelse {
         return error.SendCmpctNotFound;
     };
-    const ff_pos = std.mem.indexOf(u8, peer_src, ".feerate = 100_000") orelse {
+    const ff_pos = std.mem.indexOf(u8, peer_src, ".feerate = mempool_mod.MIN_RELAY_FEE") orelse {
         return error.FeeFilterNotFound;
     };
     // Document the order: sendheaders < sendcmpct < feefilter in source.
@@ -514,28 +529,28 @@ test "w136/G29: clearbit handshake order is sendheaders -> sendcmpct -> feefilte
     try testing.expect(sc_pos < ff_pos);
 }
 
-// G30 BUG: handshake feefilter ignores empty-mempool case.
-// peer.zig:1628 gates only on self.relay_txs; never reads mempool state.
-test "w136/G30: handshake feefilter gates only on relay_txs, not on mempool state" {
+// G30 FIXED (b0332ce): handshake feefilter now reflects mempool state.
+// peer.zig used to gate only on self.relay_txs and send a hard-coded
+// 100_000 sat/kvB; it now sends mempool_mod.MIN_RELAY_FEE — the same symbol
+// the mempool enforces — so the advertisement tracks mempool policy.
+test "w136/G30: handshake feefilter advertises the mempool min-relay fee (FIXED)" {
     const allocator = testing.allocator;
     const peer_src = try readPeerSrc(allocator);
     defer allocator.free(peer_src);
 
     // Locate the post-handshake feefilter send block.
-    const ff_block_start = std.mem.indexOf(u8, peer_src, "BIP-133: Send initial feefilter after handshake") orelse {
+    const ff_block_start = std.mem.indexOf(u8, peer_src, "BIP-133: send our initial feefilter after the handshake.") orelse {
         return error.HandshakeFeefilterBlockNotFound;
     };
-    const ff_block_end = @min(ff_block_start + 600, peer_src.len);
+    const ff_block_end = @min(ff_block_start + 1100, peer_src.len);
     const window = peer_src[ff_block_start..ff_block_end];
 
-    // The block must check self.relay_txs (correct) but must NOT read mempool
-    // (incorrect — the bug).
+    // The block still gates on self.relay_txs (correct — no feefilter to
+    // block-relay-only connections) ...
     try testing.expect(std.mem.indexOf(u8, window, "if (self.relay_txs)") != null);
-    // mempool / GetMinFee / dynamic_min_fee reference inside this window:
-    const has_mempool = std.mem.indexOf(u8, window, "mempool") != null or
-        std.mem.indexOf(u8, window, "GetMinFee") != null or
-        std.mem.indexOf(u8, window, "dynamic_min_fee") != null;
-    try testing.expect(!has_mempool);
+    // ... and now sources the rate from the mempool's own min-relay-fee
+    // symbol (the fix) instead of a hard-coded literal.
+    try testing.expect(std.mem.indexOf(u8, window, "mempool_mod.MIN_RELAY_FEE") != null);
 }
 
 // ============================================================================

@@ -11448,13 +11448,16 @@ test "W97 G4: CheckBlockHeader rejects high-hash header (PoW)" {
 }
 
 test "W97 G4: CheckBlockHeader gate ordering — pow_limit check exists" {
-    // bitsToTarget(0x1d010000) encodes target with byte 0x01 at position 29.
-    // Mainnet pow_limit has 0xFFFF at bytes 28-29 (LE), so target 0x010000.. is
-    // BELOW limit — passes the pow_limit gate but the hash fails PoW.
-    // checkBlockHeader returns BadProofOfWork (not BadDifficulty), confirming
-    // the pow_limit gate ordering: limit check FIRST, then hash check.
+    // bitsToTarget(0x1d00fffe) encodes mantissa 0x00FFFE at exponent 0x1d:
+    // target = 0xFFFE * 2^208, strictly BELOW mainnet pow_limit
+    // (0xFFFF * 2^208), so it passes the pow_limit gate while the header
+    // hash still fails to meet the target.  checkBlockHeader returns
+    // BadProofOfWork (not BadDifficulty), confirming the gate order:
+    // limit check FIRST, then hash check (Core pow.cpp CheckProofOfWork).
+    // (The previous fixture used 0x1d010000 — mantissa 0x010000 = 65536 >
+    // 0xFFFF = 65535, i.e. ABOVE pow_limit, so BadDifficulty was correct.)
     var hdr = consensus.MAINNET.genesis_header;
-    hdr.bits = 0x1d010000; // below limit but hash doesn't meet
+    hdr.bits = 0x1d00fffe; // below limit but hash doesn't meet
     hdr.nonce = 0;
     try std.testing.expectError(
         ValidationError.BadProofOfWork,

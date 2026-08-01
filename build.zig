@@ -99,9 +99,13 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run clearbit");
     run_step.dependOn(&run_cmd.step);
 
-    // Main test step uses tests.zig as root for comprehensive test coverage
+    // Main test step uses tests_all.zig as root for comprehensive test
+    // coverage. The wrapper lives at the project root (same trick as
+    // tests_rpc.zig / tests_bip39.zig) so that `src/wallet.zig`'s
+    // `@embedFile("../resources/bip39-english.txt")` — now pulled in
+    // transitively via src/descriptor.zig — resolves inside the package.
     const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/tests.zig"),
+        .root_source_file = b.path("tests_all.zig"),
         .target = target,
         .optimize = optimize,
     });

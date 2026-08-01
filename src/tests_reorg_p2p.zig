@@ -456,6 +456,12 @@ test "maybeArmReorg: fork too deep → refused with peer +20" {
     var cs = storage.ChainState.init(&db, 64, allocator);
     defer cs.deinit();
     cs.wireUtxoParent();
+    // Enable pruning so the reorg depth cap is MAX_REORG_DEPTH (288):
+    // ChainState.reorgDepthCap() is unbounded on an archive node
+    // (prune_target_mib == 0, Core-parity — follow the most-work valid
+    // chain to any depth) and 288 only when pruning is on.  This gate
+    // exercises the pruning-mode refusal path.
+    cs.prune_target_mib = 550;
     pm.chain_state = &cs;
 
     // Active tip at height 1000.  Build a fake fork chain that's
