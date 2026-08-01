@@ -16,10 +16,18 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: clearbit-linux-amd64
-          - os: macos-latest
+          # macos-13 = Intel runners, matching the amd64 artifact name
+          # (macos-latest is arm64 now).
+          - os: macos-13
             artifact: clearbit-macos-amd64
     steps:
       - uses: actions/checkout@v4
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y librocksdb-dev libsecp256k1-dev libsnappy-dev
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install rocksdb secp256k1 snappy
       - uses: goto-bus-stop/setup-zig@v2
         with:
           version: "0.13.0"

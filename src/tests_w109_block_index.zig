@@ -381,23 +381,26 @@ test "w109 G15: block_index is AutoHashMap — iteration order non-deterministic
 }
 
 // ============================================================================
-// G16 — Genesis block: chain_work initialised to 0 instead of GetBlockProof
+// G16 — Genesis block: chain_work initialised to GetBlockProof (FIXED)
 // ============================================================================
 //
 // Spec: Core's LoadGenesisBlock sets genesis->nChainWork = GetBlockProof(*genesis)
 // (a small but non-zero value).
 //
-// BUG-16 (MEDIUM): loadGenesis (validation.zig:6359) sets chain_work = [0]*32.
+// BUG-16 (MEDIUM) was: loadGenesis (validation.zig) set chain_work = [0]*32.
+// Fixed: it now sets chain_work = genesisBlockProof(genesis_header.bits),
+// matching Core (validation.cpp LoadGenesisBlock).
 
-test "w109 G16: loadGenesis sets chain_work = 0 (BUG-16)" {
+test "w109 G16: loadGenesis sets chain_work = GetBlockProof(genesis) (BUG-16 fixed)" {
     const allocator = std.testing.allocator;
     var mgr = validation.ChainManager.init(null, null, allocator);
     defer mgr.deinit();
     try mgr.loadGenesis(&consensus.MAINNET);
     const genesis = mgr.getBlock(&consensus.MAINNET.genesis_hash).?;
-    // BUG-16: should be non-zero (GetBlockProof(genesis.nBits))
-    const zero = [_]u8{0} ** 32;
-    try std.testing.expectEqualSlices(u8, &zero, &genesis.chain_work);
+    // Core's canonical mainnet genesis nChainWork:
+    // GetBlockProof(0x1d00ffff) = 0x0100010001 (big-endian, non-zero).
+    const expected = [_]u8{0} ** 27 ++ [_]u8{ 0x01, 0x00, 0x01, 0x00, 0x01 };
+    try std.testing.expectEqualSlices(u8, &expected, &genesis.chain_work);
 }
 
 // ============================================================================

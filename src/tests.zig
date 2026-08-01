@@ -1045,8 +1045,11 @@ comptime {
     _ = @import("tests_w116_package_relay.zig"); // W116 package relay 30-gate audit
     _ = @import("tests_w117_bip155_networks.zig"); // W117 BIP-155 anonymous networks 30-gate audit
     // rpc.zig is exercised in its own dedicated test step (`zig build
-    // test-rpc` and folded into `zig build test` via build.zig). Importing
-    // it here would transitively pull wallet.zig, which uses an
-    // `@embedFile("../resources/bip39-english.txt")` whose relative path
-    // does not survive the test harness's working-directory choice.
+    // test-rpc` and folded into `zig build test` via build.zig). It is not
+    // imported here: the wallet.zig `@embedFile("../resources/bip39-english.txt")`
+    // that rpc.zig pulls in transitively only resolves when the test harness's
+    // package path is the project root. The aggregate root now IS a
+    // project-root wrapper (tests_all.zig — descriptor.zig's wallet.zig
+    // import made that necessary), but rpc.zig's tests stay in their own
+    // step to keep this aggregate's build time down.
 }

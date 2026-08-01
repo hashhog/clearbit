@@ -157,6 +157,9 @@ test "w139 G6: BUG-6 no FeeFilterRounder helper / MakeFeeSet" {
     // `class FeeFilterRounder` + `MakeFeeSet` namespace helper.  clearbit
     // has neither.  Cross-validated by W136 G8 (`tests_w136_relay_flags.zig:218`);
     // W139 reasserts from the fee-engine side.
+    // NOTE: peer.zig's feefilter comment (post-b0332ce) *mentions* Core's
+    // FeeFilterRounder in prose; the gap is the absence of a declaration,
+    // so this gate matches declaration shapes only, not bare mentions.
     const a = testing.allocator;
     const mp_src = try loadSrc(a, "mempool");
     defer a.free(mp_src);
@@ -165,10 +168,11 @@ test "w139 G6: BUG-6 no FeeFilterRounder helper / MakeFeeSet" {
     const peer_src = loadSrc(a, "peer") catch null;
     defer if (peer_src) |s| a.free(s);
 
-    try testing.expect(!contains(mp_src, "FeeFilterRounder"));
+    try testing.expect(!contains(mp_src, "FeeFilterRounder ="));
+    try testing.expect(!contains(mp_src, "FeeFilterRounder{"));
     try testing.expect(!contains(mp_src, "MakeFeeSet"));
-    if (p2p_src) |s| try testing.expect(!contains(s, "FeeFilterRounder"));
-    if (peer_src) |s| try testing.expect(!contains(s, "FeeFilterRounder"));
+    if (p2p_src) |s| try testing.expect(!contains(s, "FeeFilterRounder ="));
+    if (peer_src) |s| try testing.expect(!contains(s, "FeeFilterRounder ="));
 }
 
 // ===========================================================================

@@ -13,7 +13,7 @@ sudo apt-get install -y librocksdb-dev libsecp256k1-dev
 # Build
 zig build -Doptimize=ReleaseFast
 
-# Run on testnet4
+# Run on testnet (testnet3; use --testnet4 for testnet4)
 ./zig-out/bin/clearbit --testnet
 
 # Show help
@@ -82,7 +82,9 @@ zig build -Dminisketch=true
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--testnet` | Use testnet network | |
+| `--testnet` | Use testnet3 network | |
+| `--testnet4` | Use testnet4 network | |
+| `--signet` | Use signet network | |
 | `--regtest` | Use regtest network | |
 | `--port=<port>` | P2P listen port | `8333` |
 | `--maxconnections=<n>` | Maximum total connections | `125` |
