@@ -960,6 +960,29 @@ pub fn submitBlockWithIndexAndMempool(
             .accepted = false,
             .reject_reason = switch (err) {
                 error.CoinbaseScriptSize => "bad-cb-length",
+                // First transaction is not a coinbase (or the block has no
+                // transactions at all). Core CheckBlock validation.cpp:3952
+                // emits "bad-cb-missing" / "first tx is not coinbase".
+                // validation.zig:867,870 raise FirstTxNotCoinbase for both
+                // cases, and this switch had no arm, so it fell through to
+                // else => "rejected".
+                //
+                // NOTE: verifyscript_shim.zig:408 ALREADY maps this error
+                // correctly — but the submitblock RPC path comes through
+                // checkBlock here, not the shim, so that mapping never
+                // applied. Same failure mode as rustoshi, where fixing one
+                // mapper changed nothing because the live path used another
+                // (rustoshi db23aec).
+                //
+                // Found by the 2026-08-02 corpus sweep, entry
+                // F-coinbase-prevout-nonnull: a coinbase with a non-null
+                // prevout fails isCoinbase(). SEVEN of ten impls answered the
+                // generic form; only beamchain and rustoshi were correct.
+                // Equivalents: blockbrew 72a5519, ouroboros a8f40ab,
+                // hotbuns 7c8a950, nimrod 5736da6, lunarblock 91a7ed4.
+                //
+                // Decision unchanged (rejected either way): R2 parity.
+                error.FirstTxNotCoinbase => "bad-cb-missing",
                 error.BadWitnessCommitment => "bad-witness-merkle-match",
                 error.BadMerkleRoot => "bad-txnmrklroot",
                 error.BadCoinbaseHeight => "bad-cb-height",
