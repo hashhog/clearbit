@@ -9728,6 +9728,28 @@ pub const RpcServer = struct {
         return switch (err) {
             error.BadCoinbaseValue => "bad-cb-amount",
             error.CoinbaseScriptSize => "bad-cb-length",
+            // First transaction is not a coinbase (or the block is empty).
+            // Core CheckBlock validation.cpp:3952 emits "bad-cb-missing".
+            // validation.zig:867,870 raise FirstTxNotCoinbase for both cases.
+            //
+            // clearbit has THREE error->BIP-22 mappers and this is the one the
+            // submitblock RPC actually uses:
+            //   1. verifyscript_shim.zig:408   — already had the correct arm
+            //   2. block_template.zig checkBlock switch — arm added alongside
+            //   3. rpc.zig validationErrToBip22 (here) — was missing it
+            // Adding it to (2) alone left the RPC output UNCHANGED, verified
+            // against a live bitcoind. The same shape cost a wasted fix in
+            // rustoshi (db23aec), so: in this fleet the existence of a correct
+            // mapping is not evidence the RPC path uses it.
+            //
+            // Found by the 2026-08-02 corpus sweep, entry
+            // F-coinbase-prevout-nonnull. SEVEN of ten impls answered the
+            // generic "rejected"; only beamchain and rustoshi were correct.
+            // Equivalents: blockbrew 72a5519, ouroboros a8f40ab,
+            // hotbuns 7c8a950, nimrod 5736da6, lunarblock 91a7ed4.
+            //
+            // Decision unchanged (rejected either way): R2 parity.
+            error.FirstTxNotCoinbase => "bad-cb-missing",
             error.BadCoinbaseHeight => "bad-cb-height",
             error.BadMerkleRoot => "bad-txnmrklroot",
             error.BadWitnessCommitment => "bad-witness-merkle-match",
