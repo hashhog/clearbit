@@ -108,6 +108,57 @@ pub const BlockHeaderEntry = struct {
     last_seen: i64,
 };
 
+/// Batch-local, POINTER-LINKED view of the headers already accepted from the
+/// SAME inbound `headers` message but not yet inserted into `header_index`.
+///
+/// Why this exists (the bug it closes):
+/// Bitcoin Core's ProcessNewBlockHeaders (validation.cpp:4247-4252) validates
+/// and ADDS each header one at a time, so header[i]'s parent is in
+/// m_block_index by the time header[i+1] is contextually checked.  clearbit's
+/// `.headers` handler instead validated the WHOLE batch first and inserted
+/// afterwards, so for every header except the first the parent was
+/// unresolvable and `validateHeaderContextual` skipped bad-diffbits entirely.
+/// A peer could therefore append 1999 headers per message with ARBITRARY nBits
+/// (and, since clearbit runs no header-time PoW check, zero work).
+///
+/// This overlay restores Core's semantics without changing the batch's
+/// commit/rollback structure: each header that passes is appended here, and the
+/// difficulty walk resolves ancestors through it by PREV-POINTER before falling
+/// back to `header_index` / persisted headers.  It is explicitly NOT a
+/// height→hash index: entries are keyed by block hash and linked by
+/// `prev_hash`, so a batch on a competing branch can never be answered with an
+/// active-chain block (the camlcoin inversion).
+pub const HeaderBatchOverlay = struct {
+    pub const Entry = struct {
+        prev_hash: types.Hash256,
+        height: u32,
+        timestamp: u32,
+        bits: u32,
+    };
+
+    map: std.AutoHashMap(types.Hash256, Entry),
+
+    pub fn init(allocator: std.mem.Allocator) HeaderBatchOverlay {
+        return .{ .map = std.AutoHashMap(types.Hash256, Entry).init(allocator) };
+    }
+
+    pub fn deinit(self: *HeaderBatchOverlay) void {
+        self.map.deinit();
+    }
+
+    pub fn get(self: *const HeaderBatchOverlay, hash: *const types.Hash256) ?Entry {
+        return self.map.get(hash.*);
+    }
+
+    pub fn put(self: *HeaderBatchOverlay, hash: *const types.Hash256, entry: Entry) !void {
+        try self.map.put(hash.*, entry);
+    }
+
+    pub fn count(self: *const HeaderBatchOverlay) usize {
+        return self.map.count();
+    }
+};
+
 /// State of an in-progress reorg attempt.  Set when the headers handler
 /// detects a competing-fork branch with strictly higher chainwork than
 /// our active tip.  Cleared after the reorg completes (success or
@@ -2873,6 +2924,22 @@ pub const PeerManager = struct {
     /// Never accessed when CLEARBIT_REORG is unset (so the live node pays
     /// no extra memory or CPU).
     header_index: std.AutoHashMap(types.Hash256, BlockHeaderEntry),
+
+    /// ---- bad-diffbits observability (W150) -------------------------------
+    /// Number of inbound headers for which the declared nBits was actually
+    /// COMPARED against the required nBits (i.e. the gate ran).  Used by the
+    /// dead-code proof: it must grow by exactly `headers.len` for a fully
+    /// resolvable batch, not by 1.
+    header_diffbits_checks: u64 = 0,
+    /// Number of inbound headers we could NOT evaluate (missing ancestors).
+    /// These are dropped WITHOUT any peer penalty — our gap is not evidence of
+    /// peer misbehaviour (Core has no such state: pow.cpp:45 asserts).
+    header_undecidable_count: u64 = 0,
+    /// Number of times the required-bits ancestor walk had to fall back to the
+    /// height→hash index (retarget ring / persisted "H:" index) because the
+    /// prev-pointer walk could not reach the ancestor.  MUST stay 0 for any
+    /// header validated against a batch overlay; see `heightFastPathAllowed`.
+    height_index_fallbacks: u64 = 0,
 
     /// Memoized BIP-34 anchor hash resolved by getBlockHashByHeightTrampoline
     /// (persisted index → CF_BLOCKS prev-walk).  Guarded by bip34_anchor_attempted
@@ -5674,30 +5741,42 @@ pub const PeerManager = struct {
                                 h.headers[0].prev_block[31],
                             },
                         );
-                        // BIP-113 / future-time gate: reject any fork header
-                        // whose timestamp falls outside the contextual bounds
-                        // BEFORE inserting into header_index.  Misbehave the
-                        // peer on rejection — same severity as Core's
-                        // bad-header DoS handling.
+                        // Contextual gates in Core order (bad-diffbits FIRST,
+                        // validation.cpp:4088) applied to EVERY fork header
+                        // BEFORE inserting into header_index.  This arm already
+                        // validated and inserted in one loop; the overlay makes
+                        // it independent of whether insertHeader succeeded, and
+                        // gives us the `.undecidable` distinction.
                         const now_fork: i64 = std.time.timestamp();
+                        var fork_overlay = HeaderBatchOverlay.init(self.allocator);
+                        defer fork_overlay.deinit();
                         var last_inserted: ?BlockHeaderEntry = null;
                         for (h.headers) |hdr| {
-                            switch (self.validateHeaderContextual(&hdr, now_fork)) {
+                            switch (self.validateHeaderContextualStrict(&hdr, now_fork, &fork_overlay)) {
                                 .ok => {},
-                                .future_time => {
-                                    peer.misbehaving(50, "header timestamp too far in the future");
-                                    return;
+                                .undecidable => {
+                                    // OUR gap, not the peer's.  Stop ingesting
+                                    // this batch; apply NO penalty.
+                                    std.debug.print(
+                                        "P2P: fork header undecidable (missing ancestors) from peer={any} — dropping remainder, no penalty\n",
+                                        .{peer.address},
+                                    );
+                                    break;
                                 },
-                                .mtp_violation => {
-                                    peer.misbehaving(50, "header timestamp violates MTP (BIP-113)");
-                                    return;
-                                },
-                                .bad_diffbits => {
-                                    peer.misbehaving(100, "header nBits does not match required difficulty (bad-diffbits)");
+                                else => |verdict| {
+                                    misbehaveForHeaderVerdict(peer, verdict);
                                     return;
                                 },
                             }
                             const bh = crypto.computeBlockHash(&hdr);
+                            if (self.resolvePrevForHeader(&hdr.prev_block, &fork_overlay)) |pr| {
+                                fork_overlay.put(&bh, .{
+                                    .prev_hash = hdr.prev_block,
+                                    .height = pr.height + 1,
+                                    .timestamp = hdr.timestamp,
+                                    .bits = hdr.bits,
+                                }) catch {};
+                            }
                             const ent_or = self.insertHeader(&hdr, &bh) catch null;
                             if (ent_or) |ent| last_inserted = ent;
                         }
@@ -5718,36 +5797,55 @@ pub const PeerManager = struct {
                     self.expected_blocks.items.len + h.headers.len,
                 });
 
-                // Contextual header gates (Core ContextualCheckBlockHeader).
-                // Each header is checked against:
-                //   - bad-diffbits: header.bits != GetNextWorkRequired [skipped
-                //     mid-batch when prev not yet in header_index]
-                //   - now + MAX_FUTURE_BLOCK_TIME (7200s) [always-on]
-                //   - median-time-past of last 11 ancestors [skipped when
-                //     fewer than 1 ancestor is in header_index]
-                // Reference: bitcoin-core/src/validation.cpp
-                // (CheckBlockHeader + ContextualCheckBlockHeader).
-                // Reject the entire batch on the first violation and
-                // misbehave the peer; mirrors Core's "bad-diffbits" /
-                // "bad-time" / "time-too-new" handling.
+                // Contextual header gates, in Core's order
+                // (ContextualCheckBlockHeader, validation.cpp:4086-4118):
+                //   (1) bad-diffbits   — declared nBits vs REQUIRED nBits
+                //   (2) time-too-old   — BIP-113 median-time-past
+                //   (3) time-timewarp  — BIP-94 (enforce_bip94 chains)
+                //   (4) time-too-new   — now + MAX_FUTURE_BLOCK_TIME (7200s)
+                //
+                // EVERY header in the batch is gated, not just headers[0].
+                // `validateHeaderBatch` threads a batch-local, prev-pointer
+                // linked overlay so headers[i]'s parent — which is headers[i-1]
+                // and therefore not yet in header_index — resolves exactly as
+                // it does in Core's ProcessNewBlockHeaders, which adds each
+                // header to the block index before validating the next
+                // (validation.cpp:4247-4252).
+                //
+                // Before this, the batch was validated in one loop and inserted
+                // in a LATER loop, so only headers[0] had a resolvable parent:
+                // headers[1..1999] were admitted with ARBITRARY nBits, and
+                // clearbit runs no header-time proof-of-work check at all.
+                //
+                // On an INVALID header: drop the batch and misbehave the peer.
+                // On an UNDECIDABLE header (our own missing ancestors): admit
+                // the validated prefix, drop the rest, and apply NO penalty —
+                // our gap is not evidence of peer misbehaviour.
                 const now_hdr: i64 = std.time.timestamp();
-                for (h.headers) |hdr| {
-                    switch (self.validateHeaderContextual(&hdr, now_hdr)) {
-                        .ok => {},
-                        .future_time => {
-                            peer.misbehaving(50, "header timestamp too far in the future");
-                            return;
-                        },
-                        .mtp_violation => {
-                            peer.misbehaving(50, "header timestamp violates MTP (BIP-113)");
-                            return;
-                        },
-                        .bad_diffbits => {
-                            peer.misbehaving(100, "header nBits does not match required difficulty (bad-diffbits)");
-                            return;
-                        },
-                    }
+                var batch_overlay = HeaderBatchOverlay.init(self.allocator);
+                defer batch_overlay.deinit();
+                const outcome = self.validateHeaderBatch(h.headers, now_hdr, &batch_overlay);
+                if (outcome.reject) |verdict| {
+                    misbehaveForHeaderVerdict(peer, verdict);
+                    return;
                 }
+                if (outcome.accepted == 0) {
+                    // Nothing admissible and nobody at fault.  Do NOT re-request
+                    // here — that would spin; the getheaders timeout path retries.
+                    std.debug.print(
+                        "P2P: headers batch undecidable at header 0 from peer={any} (missing ancestors) — dropped, no penalty\n",
+                        .{peer.address},
+                    );
+                    return;
+                }
+                if (outcome.undecidable) {
+                    std.debug.print(
+                        "P2P: headers batch truncated at {d}/{d} from peer={any} (cannot evaluate difficulty — missing ancestors), no penalty\n",
+                        .{ outcome.accepted, h.headers.len, peer.address },
+                    );
+                }
+                // Only the validated prefix may be admitted anywhere below.
+                const admitted: []const types.BlockHeader = h.headers[0..outcome.accepted];
 
                 // G8 — min_pow_checked / MinimumChainWork (W97 FIX-4)
                 // Reference: bitcoin-core/src/validation.cpp:4226-4232
@@ -5806,9 +5904,9 @@ pub const PeerManager = struct {
                     if (!std.mem.eql(u8, &min_cw, &zero) and !past_snapshot_base) {
                         // Compute the parent's cumulative work (genesis =
                         // all-zeros) and the batch's summed proof-of-work.
-                        var parent_work: [32]u8 = if (self.lookupParentChainWork(&h.headers[0].prev_block)) |p| p.work else [_]u8{0} ** 32;
+                        var parent_work: [32]u8 = if (self.lookupParentChainWork(&admitted[0].prev_block)) |p| p.work else [_]u8{0} ** 32;
                         var batch_work: [32]u8 = [_]u8{0} ** 32;
-                        for (h.headers) |hdr| {
+                        for (admitted) |hdr| {
                             const w = workFromBits(hdr.bits);
                             addChainWorkBE(&batch_work, &w);
                         }
@@ -5845,22 +5943,28 @@ pub const PeerManager = struct {
                     }
                 }
 
-                // Add header hashes to the expected_blocks queue.  Also
-                // insert into the header_index when reorg detection is
-                // enabled — this populates the structure so future
-                // competing-fork announcements can find a recent ancestor.
-                for (h.headers) |header| {
+                // Add the VALIDATED PREFIX to the expected_blocks queue and to
+                // the header_index.
+                //
+                // The header_index insert is now UNCONDITIONAL (it used to be
+                // gated on CLEARBIT_REORG).  It is no longer just a reorg
+                // convenience: it is how the NEXT batch's headers[0] resolves
+                // its parent.  With the insert gated off, headers[0].prev is
+                // the queue tail — a header we accepted but never recorded —
+                // so bad-diffbits would be `.undecidable` for every batch after
+                // the first and header sync would stall.  CLEARBIT_REORG
+                // defaults to ON (isReorgEnabled), so this only changes the
+                // explicitly-disabled configuration.
+                for (admitted) |header| {
                     const block_hash = crypto.computeBlockHash(&header);
                     self.expected_blocks.append(block_hash) catch continue;
-                    if (reorg_enabled) {
-                        _ = self.insertHeader(&header, &block_hash) catch null;
-                    }
+                    _ = self.insertHeader(&header, &block_hash) catch null;
                 }
 
                 // Request more headers from this specific peer if we got a full batch
                 // But limit the queue to avoid too many outstanding blocks
                 const remaining_queue = self.expected_blocks.items.len - self.connect_cursor;
-                if (h.headers.len >= 2000 and remaining_queue < 16000) {
+                if (h.headers.len >= 2000 and !outcome.undecidable and remaining_queue < 16000) {
                     self.sendGetHeaders(peer) catch {};
                 }
 
@@ -7832,12 +7936,27 @@ pub const PeerManager = struct {
     }
 
     fn computePrevMtp(self: *PeerManager, prev_hash: *const types.Hash256) u32 {
+        return self.computePrevMtpEx(prev_hash, null);
+    }
+
+    /// As `computePrevMtp`, but the ancestor walk also threads the batch-local
+    /// overlay (headers accepted earlier in the same inbound `headers`
+    /// message).  Without it a mid-batch header's 11-ancestor window is
+    /// unreachable and BIP-113 silently self-skips for the whole batch.
+    fn computePrevMtpEx(
+        self: *PeerManager,
+        prev_hash: *const types.Hash256,
+        overlay: ?*const HeaderBatchOverlay,
+    ) u32 {
         // Resolve the parent's height so we know how many ancestors Core's
         // GetMedianTimePast would span — min(11, height+1).  A header-walk that
         // breaks before covering that full window must NOT be trusted (see the
         // incomplete-window guard below); it is resolvable from header_index or
         // the persisted height→hash index for any connected/known parent.
         const prev_height_opt: ?u32 = blk: {
+            if (overlay) |ov| {
+                if (ov.get(prev_hash)) |e| break :blk e.height;
+            }
             if (self.header_index.get(prev_hash.*)) |e| break :blk e.height;
             if (self.chain_state) |cs_h| {
                 if (cs_h.getBlockHeightByHash(prev_hash)) |h| break :blk h;
@@ -7849,6 +7968,14 @@ pub const PeerManager = struct {
         var n: usize = 0;
         var cursor = prev_hash.*;
         while (n < 11) {
+            if (overlay) |ov| {
+                if (ov.get(&cursor)) |e| {
+                    timestamps[n] = e.timestamp;
+                    cursor = e.prev_hash;
+                    n += 1;
+                    continue;
+                }
+            }
             if (self.header_index.get(cursor)) |entry| {
                 timestamps[n] = entry.timestamp;
                 cursor = entry.prev_hash;
@@ -8109,191 +8236,326 @@ pub const PeerManager = struct {
         future_time,
         /// header.bits != GetNextWorkRequired(pindexPrev) (bad-diffbits).
         /// Mirroring Bitcoin Core's ContextualCheckBlockHeader (validation.cpp:4088).
-        /// Skipped when the prev block is not in header_index / persisted index.
         bad_diffbits,
+        /// BIP-94 time-timewarp-attack: on an enforce_bip94 chain, the first
+        /// block of a difficulty period is more than MAX_TIMEWARP seconds
+        /// earlier than its parent (validation.cpp:4097-4105).
+        timewarp,
+        /// WE could not evaluate the prev-relative rules — the header's parent
+        /// (or an ancestor the retarget needs) is not in our view.
+        ///
+        /// This is NOT a statement about the header or the peer.  Core never
+        /// reaches this state: a header whose parent is absent is rejected as
+        /// "prev-blk-not-found" BEFORE ContextualCheckBlockHeader
+        /// (validation.cpp:4215-4217) and never misbehaves the peer for it,
+        /// and GetNextWorkRequired's ancestor lookups are `assert`s
+        /// (pow.cpp:16/43/45) precisely because they cannot fail there.
+        ///
+        /// Callers MUST: drop the header, apply NO peer penalty, and (if it
+        /// helps) ask for bridging headers.  Treating this as "ok" is the
+        /// fail-open bug this wave removes; treating it as "invalid" bans
+        /// honest peers for our own gap.
+        undecidable,
     };
 
-    /// Compute the expected nBits for a block at `height` whose parent is
-    /// at `prev_hash` (height-1).  Mirrors Bitcoin Core's
+    /// Result of resolving the required nBits for a candidate block.
+    pub const RequiredBits = union(enum) {
+        /// GetNextWorkRequired(pindexPrev) evaluated successfully.
+        bits: u32,
+        /// We cannot evaluate the rule — see HeaderTimeReject.undecidable.
+        undecidable,
+    };
+
+    /// Parent reference resolved for header-time contextual checks.
+    /// Mirrors Core's `pindexPrev` (validation.cpp:4212-4218).
+    pub const PrevRef = struct {
+        height: u32,
+        /// 0 when the parent's timestamp is not available (BIP-94 timewarp
+        /// gate then self-skips on its own 0 sentinel).
+        timestamp: u32,
+    };
+
+    /// Resolve the parent of `prev_hash` the way Core resolves `pindexPrev`:
+    /// by HASH, out of the set of headers we know.  Returns null when the
+    /// parent is unknown → the caller must report `.undecidable`, exactly as
+    /// Core returns "prev-blk-not-found" (validation.cpp:4215-4217) rather
+    /// than running the contextual gates against a guessed parent.
+    ///
+    /// Resolution order (all hash-keyed; NO height→hash index is consulted):
+    ///   1. the batch overlay (headers accepted earlier in this same message),
+    ///   2. the in-memory header_index,
+    ///   3. the chain state's hash→height index + persisted header/body,
+    ///   4. the genesis block, which every node has by construction.
+    pub fn resolvePrevForHeader(
+        self: *PeerManager,
+        prev_hash: *const types.Hash256,
+        overlay: ?*const HeaderBatchOverlay,
+    ) ?PrevRef {
+        if (overlay) |ov| {
+            if (ov.get(prev_hash)) |e| {
+                return .{ .height = e.height, .timestamp = e.timestamp };
+            }
+        }
+        if (self.header_index.get(prev_hash.*)) |e| {
+            return .{ .height = e.height, .timestamp = e.timestamp };
+        }
+        if (self.chain_state) |cs| {
+            if (cs.getBlockHeightByHash(prev_hash)) |h| {
+                const ts: u32 = blk: {
+                    if (cs.getPersistedHeader(prev_hash)) |hdr| break :blk hdr.timestamp;
+                    if (cs.getBlockHeaderFromBody(prev_hash)) |hdr| break :blk hdr.timestamp;
+                    break :blk 0;
+                };
+                return .{ .height = h, .timestamp = ts };
+            }
+        }
+        // Genesis is in Core's block index by construction (LoadGenesisBlock),
+        // but clearbit stores neither its body nor a header record for it.
+        if (std.mem.eql(u8, prev_hash, &self.network_params.genesis_hash)) {
+            return .{ .height = 0, .timestamp = self.network_params.genesis_header.timestamp };
+        }
+        return null;
+    }
+
+    /// Whether the height→hash fast path may be consulted for a candidate
+    /// whose parent is `prev_hash`.
+    ///
+    /// TWO conditions, both required:
+    ///   (a) NO batch overlay is in play.  A header being validated against a
+    ///       batch overlay is by definition not an extension of our active tip
+    ///       (its parent is a header from the same message), so a height→hash
+    ///       lookup would answer with an unrelated active-chain block.  That is
+    ///       exactly the inversion that gets the honest header rejected and the
+    ///       attacker (who matched the poisoned answer) admitted.
+    ///   (b) The candidate's parent IS the active tip.  Only then is "the block
+    ///       at height h" unambiguously an ancestor of the candidate.
+    ///
+    /// Even when allowed, the fast path is a FALLBACK: `getAtHeight` tries the
+    /// prev-pointer walk first (Core CBlockIndex::GetAncestor, pow.cpp:44,72)
+    /// and only reaches for the height index when the walk cannot reach the
+    /// ancestor at all.  Every such use is counted in `height_index_fallbacks`.
+    pub fn heightFastPathAllowed(overlay_present: bool, prev_is_active_tip: bool) bool {
+        if (overlay_present) return false;
+        return prev_is_active_tip;
+    }
+
+    /// Compute the REQUIRED nBits for a block at `height` whose parent is at
+    /// `prev_hash` (height-1).  Mirrors Bitcoin Core's
     /// GetNextWorkRequired(pindexPrev, pblock, params) (pow.cpp:14).
     ///
-    /// Returns 0 when the parent chain cannot be resolved from header_index
-    /// or the persisted block index, meaning the caller should skip the
-    /// bad-diffbits check (0 is the "not available" sentinel).
+    /// Returns `.undecidable` — never a guess — when an ancestor Core is
+    /// guaranteed to have is missing from our view.  See
+    /// `consensus.getNextWorkRequiredChecked` and `HeaderTimeReject.undecidable`.
     ///
-    /// The lookup walks back from `prev_hash` through header_index (in-memory)
-    /// with a fallback to chain_state.getPersistedHeader (RocksDB) — the same
-    /// two-layer lookup used by computePrevMtp.  For mainnet non-retarget blocks
-    /// only 1 step is needed; for retarget blocks up to interval (2016) steps.
+    /// Ancestor resolution is a PREV-POINTER WALK (Core
+    /// CBlockIndex::GetAncestor, pow.cpp:44 and pow.cpp:72), threading
+    ///   batch overlay → header_index → persisted header → block body → genesis
+    /// all keyed by HASH.  The height→hash structures (the retarget ring and
+    /// the persisted "H:" index) are consulted only as a last resort and only
+    /// under `heightFastPathAllowed`.
     ///
-    /// Reference: bitcoin-core/src/pow.cpp GetNextWorkRequired().
-    pub fn computeExpectedBits(
+    /// `overlay` supplies the headers accepted earlier in the same inbound
+    /// `headers` message; pass null outside the batch path.
+    pub fn computeRequiredBits(
         self: *PeerManager,
         prev_hash: types.Hash256,
         height: u32,
         block_timestamp: u32,
-    ) u32 {
-        if (height == 0) return 0;
+        overlay: ?*const HeaderBatchOverlay,
+    ) RequiredBits {
+        if (height == 0) return .undecidable;
 
-        // Walk-back closure over header_index + chain_state.
-        // The `not_found` flag is set when a lookup fails; caller checks it.
+        // Walk-back closure over overlay + header_index + chain_state.
         const WalkCtx = struct {
             pm: *PeerManager,
+            overlay: ?*const HeaderBatchOverlay,
             tip_hash: types.Hash256, // hash of block at tip_height (= height-1)
             tip_height: u32,
             not_found: bool,
             // Set true once the DIRECT previous block (height-1) is resolved.
-            // getNextWorkRequired only returns the 0-skip sentinel when the prev
-            // block itself is unknown; it is otherwise tolerant of missing DEEP
-            // ancestors (falls back to prev.bits / pow_limit, never 0).  Keying
-            // the skip sentinel on `prev_resolved` (not `not_found`) stops a
-            // failed genesis / deep-ancestor lookup from silently disabling the
-            // bad-diffbits gate on the submitblock path, where header_index is
-            // empty and the walk hits getPersistedHeader (genesis absent).
             prev_resolved: bool,
-            // True when `tip_hash` is the active-chain tip (`chain_state.best_hash`),
-            // i.e. the block we are validating extends the active chain.  In that
-            // case every ancestor at height `h <= tip_height` IS the active-chain
-            // block at height `h`, so it can be resolved directly by height instead
-            // of walking prev_hash pointers.  This is essential during IBD: the
-            // difficulty-period's first block is `interval-1` blocks back, deep
-            // enough that its header has usually been evicted from the bounded
-            // (MAX_HEADER_INDEX) in-memory header_index, while intermediate blocks
-            // between the last chainstate flush and the tip are connected-but-not-
-            // yet-flushed — invisible to BOTH header_index and getPersistedHeader.
-            // The prev_hash walk then breaks in that gap and getNextWorkRequired
-            // silently falls back to prev.bits, skipping the retarget entirely
-            // (bad-diffbits at every 2016-boundary; first observed as a genesis-IBD
-            // wedge at height 32256).  Resolving deep ancestors by height reaches
-            // the flushed on-disk block and computes the correct retarget.
-            extending: bool,
+            // True when the height→hash fast path is permitted at all; see
+            // PeerManager.heightFastPathAllowed.
+            fast_path_allowed: bool,
+            // Monotonic walk memo.  Successive getAtHeight calls made by
+            // getNextWorkRequired descend (prev_height, then the min-difficulty
+            // walk, then the retarget window's first block), so continuing the
+            // walk from the last resolved cursor turns an O(k^2) re-walk into
+            // O(k).  The memo only ever holds hashes reached by following
+            // prev_hash from tip_hash, so it cannot cross onto another branch.
+            memo_valid: bool,
+            memo_hash: types.Hash256,
+            memo_height: u32,
+
+            const Resolved = struct {
+                prev_hash: types.Hash256,
+                timestamp: u32,
+                bits: u32,
+            };
+
+            /// Hash-keyed header lookup.  This is the only place ancestors are
+            /// read during the pointer walk.
+            fn lookupByHash(self2: *@This(), hash: *const types.Hash256) ?Resolved {
+                if (self2.overlay) |ov| {
+                    if (ov.get(hash)) |e| {
+                        return .{ .prev_hash = e.prev_hash, .timestamp = e.timestamp, .bits = e.bits };
+                    }
+                }
+                if (self2.pm.header_index.get(hash.*)) |e| {
+                    return .{ .prev_hash = e.prev_hash, .timestamp = e.timestamp, .bits = e.header.bits };
+                }
+                if (self2.pm.chain_state) |cs| {
+                    if (cs.getPersistedHeader(hash)) |hdr| {
+                        return .{ .prev_hash = hdr.prev_block, .timestamp = hdr.timestamp, .bits = hdr.bits };
+                    }
+                    if (cs.getBlockHeaderFromBody(hash)) |hdr| {
+                        return .{ .prev_hash = hdr.prev_block, .timestamp = hdr.timestamp, .bits = hdr.bits };
+                    }
+                }
+                // Genesis terminus.  Core's index always contains genesis
+                // (LoadGenesisBlock); clearbit stores neither a header record
+                // nor a body for it, so supply it from chain params.  This is
+                // the REAL genesis header, not a fabricated default — it is
+                // keyed by the genesis HASH, so it can only ever answer for the
+                // genesis block itself.
+                if (std.mem.eql(u8, hash, &self2.pm.network_params.genesis_hash)) {
+                    const g = self2.pm.network_params.genesis_header;
+                    return .{ .prev_hash = [_]u8{0} ** 32, .timestamp = g.timestamp, .bits = g.bits };
+                }
+                return null;
+            }
+
+            /// Last-resort height→hash resolution, permitted only when the
+            /// candidate extends the active tip and no batch overlay is in
+            /// play (see heightFastPathAllowed).  Counted so a test can prove
+            /// the batch path never reaches it.
+            fn heightIndexFallback(self2: *@This(), h: u32) ?consensus.BlockIndexEntry {
+                if (!self2.fast_path_allowed) return null;
+                const cs = self2.pm.chain_state orelse return null;
+
+                // Primary in-memory source: the difficulty-retarget ring,
+                // populated by connectBlockInner independently of header
+                // download / eviction / DB flush.
+                if (cs.getRetargetEntry(h)) |re| {
+                    self2.pm.height_index_fallbacks += 1;
+                    if (h == self2.tip_height) self2.prev_resolved = true;
+                    return consensus.BlockIndexEntry{
+                        .height = h,
+                        .timestamp = re.timestamp,
+                        .bits = re.bits,
+                    };
+                }
+                // Secondary: the persisted height→hash index (post-restart /
+                // post-snapshot, where the ring has not been repopulated but
+                // the on-disk index has the flushed header).
+                if (cs.getBlockHashByHeight(h)) |hh| {
+                    if (self2.pm.header_index.get(hh)) |e| {
+                        self2.pm.height_index_fallbacks += 1;
+                        if (h == self2.tip_height) self2.prev_resolved = true;
+                        return consensus.BlockIndexEntry{
+                            .height = h,
+                            .timestamp = e.timestamp,
+                            .bits = e.header.bits,
+                        };
+                    }
+                    if (cs.getPersistedHeader(&hh)) |hdr| {
+                        self2.pm.height_index_fallbacks += 1;
+                        if (h == self2.tip_height) self2.prev_resolved = true;
+                        return consensus.BlockIndexEntry{
+                            .height = h,
+                            .timestamp = hdr.timestamp,
+                            .bits = hdr.bits,
+                        };
+                    }
+                    // Tertiary: the block BODY in CF_BLOCKS.  The fast IBD
+                    // connect path populates CF_BLOCKS but NOT the
+                    // CF_BLOCK_INDEX header record.
+                    if (cs.getBlockHeaderFromBody(&hh)) |hdr| {
+                        self2.pm.height_index_fallbacks += 1;
+                        if (h == self2.tip_height) self2.prev_resolved = true;
+                        return consensus.BlockIndexEntry{
+                            .height = h,
+                            .timestamp = hdr.timestamp,
+                            .bits = hdr.bits,
+                        };
+                    }
+                }
+                return null;
+            }
 
             fn getAtHeight(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
                 const self2: *@This() = @ptrCast(@alignCast(ctx));
                 if (h > self2.tip_height) return null;
 
-                // Active-chain fast path (extend case only, so it stays reorg-safe:
-                // a block on a not-yet-activated fork still uses the prev_hash walk
-                // below).  Resolve height -> hash -> header directly.  Prefer the
-                // in-memory header_index (covers recent, not-yet-flushed blocks);
-                // fall back to the persisted CF_BLOCK_INDEX record (covers deep,
-                // flushed ancestors the walk cannot reach).
-                if (self2.extending) {
-                    if (self2.pm.chain_state) |cs| {
-                        // Primary in-memory source: the difficulty-retarget ring,
-                        // populated by connectBlockInner independently of header
-                        // download / eviction / DB flush.  Covers the whole
-                        // retarget window (the deep first-block the walk cannot
-                        // reach during IBD).
-                        if (cs.getRetargetEntry(h)) |re| {
-                            if (h == self2.tip_height) self2.prev_resolved = true;
-                            return consensus.BlockIndexEntry{
-                                .height = h,
-                                .timestamp = re.timestamp,
-                                .bits = re.bits,
-                            };
-                        }
-                        // Secondary: the persisted block index (post-restart /
-                        // post-snapshot, where the ring has not been repopulated
-                        // but the on-disk index has the flushed header).
-                        if (cs.getBlockHashByHeight(h)) |hh| {
-                            if (self2.pm.header_index.get(hh)) |e| {
-                                if (h == self2.tip_height) self2.prev_resolved = true;
-                                return consensus.BlockIndexEntry{
-                                    .height = h,
-                                    .timestamp = e.timestamp,
-                                    .bits = e.header.bits,
-                                };
-                            }
-                            if (cs.getPersistedHeader(&hh)) |hdr| {
-                                if (h == self2.tip_height) self2.prev_resolved = true;
-                                return consensus.BlockIndexEntry{
-                                    .height = h,
-                                    .timestamp = hdr.timestamp,
-                                    .bits = hdr.bits,
-                                };
-                            }
-                            // Tertiary: the block BODY in CF_BLOCKS.  The fast IBD
-                            // connect path populates CF_BLOCKS but NOT the
-                            // CF_BLOCK_INDEX header record, so after a restart
-                            // mid-IBD this is the only persisted header source for
-                            // a deep ancestor connected in a prior session.
-                            if (cs.getBlockHeaderFromBody(&hh)) |hdr| {
-                                if (h == self2.tip_height) self2.prev_resolved = true;
-                                return consensus.BlockIndexEntry{
-                                    .height = h,
-                                    .timestamp = hdr.timestamp,
-                                    .bits = hdr.bits,
-                                };
-                            }
-                        }
-                    }
-                    // Fall through to the prev_hash walk for recent heights not yet
-                    // in the ring/index: those remain resolvable via header_index.
+                // ---- PREV-POINTER WALK (Core CBlockIndex::GetAncestor) ----
+                // Start from the memo when it is at or below the tip and at or
+                // above the height we want; otherwise from the candidate's
+                // parent.  Both are on the CANDIDATE's ancestry by construction.
+                var cursor: types.Hash256 = self2.tip_hash;
+                var c_h: u32 = self2.tip_height;
+                if (self2.memo_valid and self2.memo_height >= h and self2.memo_height <= self2.tip_height) {
+                    cursor = self2.memo_hash;
+                    c_h = self2.memo_height;
                 }
 
-                // Walk backwards from tip to reach `h`.
-                var cursor = self2.tip_hash;
-                var c_h = self2.tip_height;
+                var walk_ok = true;
                 while (c_h > h) {
-                    if (self2.pm.header_index.get(cursor)) |e| {
-                        cursor = e.prev_hash;
-                    } else if (self2.pm.chain_state) |cs| {
-                        const hdr = cs.getPersistedHeader(&cursor) orelse
-                            cs.getBlockHeaderFromBody(&cursor) orelse {
-                                self2.not_found = true;
-                                return null;
-                            };
-                        cursor = hdr.prev_block;
-                    } else {
-                        self2.not_found = true;
-                        return null;
-                    }
+                    const info = self2.lookupByHash(&cursor) orelse {
+                        walk_ok = false;
+                        break;
+                    };
+                    cursor = info.prev_hash;
                     c_h -= 1;
                 }
 
-                // `cursor` is now at height `h`; return its entry.
-                if (self2.pm.header_index.get(cursor)) |e| {
-                    if (h == self2.tip_height) self2.prev_resolved = true;
-                    return consensus.BlockIndexEntry{
-                        .height = h,
-                        .timestamp = e.timestamp,
-                        .bits = e.header.bits,
-                    };
-                }
-                if (self2.pm.chain_state) |cs| {
-                    const hdr = cs.getPersistedHeader(&cursor) orelse
-                        cs.getBlockHeaderFromBody(&cursor) orelse {
-                            self2.not_found = true;
-                            return null;
+                if (walk_ok) {
+                    if (self2.lookupByHash(&cursor)) |info| {
+                        self2.memo_valid = true;
+                        self2.memo_hash = cursor;
+                        self2.memo_height = h;
+                        if (h == self2.tip_height) self2.prev_resolved = true;
+                        return consensus.BlockIndexEntry{
+                            .height = h,
+                            .timestamp = info.timestamp,
+                            .bits = info.bits,
                         };
-                    if (h == self2.tip_height) self2.prev_resolved = true;
-                    return consensus.BlockIndexEntry{
-                        .height = h,
-                        .timestamp = hdr.timestamp,
-                        .bits = hdr.bits,
-                    };
+                    }
                 }
+
+                // ---- LAST RESORT: height→hash, only when allowed ----
+                // During a genesis IBD the retarget window's first block is
+                // ~2016 blocks back — deep enough to have been evicted from the
+                // bounded header_index while the intermediate blocks between
+                // the last chainstate flush and the tip are connected-but-not-
+                // yet-flushed, invisible to BOTH header_index and
+                // getPersistedHeader.  Without this the walk breaks in that gap
+                // (first observed as a genesis-IBD wedge at height 32256).
+                if (self2.heightIndexFallback(h)) |e| return e;
+
                 self2.not_found = true;
                 return null;
             }
         };
 
-        // We are extending the active chain when the block's parent IS the active
-        // tip.  Only then is an ancestor at height h guaranteed to equal the
-        // active-chain block at h (see WalkCtx.extending).
-        const extending = if (self.chain_state) |cs|
+        // The candidate extends the active chain when its parent IS the active
+        // tip.  Only then can a height→hash answer be an ancestor of it.
+        const prev_is_active_tip = if (self.chain_state) |cs|
             std.mem.eql(u8, &prev_hash, &cs.best_hash)
         else
             false;
+        const fast_path_allowed = heightFastPathAllowed(overlay != null, prev_is_active_tip);
 
         var walk_ctx = WalkCtx{
             .pm = self,
+            .overlay = overlay,
             .tip_hash = prev_hash,
             .tip_height = height - 1,
             .not_found = false,
             .prev_resolved = false,
-            .extending = extending,
+            .fast_path_allowed = fast_path_allowed,
+            .memo_valid = false,
+            .memo_hash = [_]u8{0} ** 32,
+            .memo_height = 0,
         };
 
         const pow_limit_bits = consensus.getPowLimitBits(self.network_params);
@@ -8303,84 +8565,226 @@ pub const PeerManager = struct {
             .pow_limit_bits = pow_limit_bits,
         };
 
-        const result = consensus.getNextWorkRequired(
+        // STRICT: null means "we cannot evaluate", never a fabricated answer.
+        const result = consensus.getNextWorkRequiredChecked(
             height,
             block_timestamp,
             &view,
             self.network_params,
-        );
+        ) orelse return .undecidable;
 
-        // Return 0 (skip sentinel) ONLY when the direct previous block
-        // (height-1) could not be resolved.  When prev IS resolved,
-        // getNextWorkRequired's `result` is always well-defined (never 0) even
-        // if a deep ancestor / genesis lookup failed along the way, so we must
-        // return it and let validation.zig's bad-diffbits equality fire.  Gating
-        // on `not_found` instead let the min-difficulty walk-back to genesis
-        // (regtest / testnet4) trip the sentinel and silently disable the gate.
-        return if (walk_ctx.prev_resolved) result else 0;
+        if (!walk_ctx.prev_resolved) return .undecidable;
+        // A zero expectation is nonsense (it is also the historical "skip"
+        // sentinel).  It can only come from a placeholder header record — e.g.
+        // the all-zero header a canonical-assumeutxo boot writes for the
+        // snapshot base.  Refuse to compare against it rather than skipping
+        // silently.
+        if (result == 0) return .undecidable;
+        return .{ .bits = result };
     }
 
-    /// Contextual header-time validation, run at header *acceptance* (not just
-    /// when the block body arrives).  Implements:
-    ///   - bad-diffbits: header.bits != GetNextWorkRequired(pindexPrev) (skipped
-    ///     when prev not in header_index / persisted index, e.g. mid-batch).
-    ///   - BIP-113 median-time-past: header.timestamp must strictly exceed
-    ///     the MTP of its 11 most-recent ancestors (when known).
-    ///   - Future-time bound: header.timestamp must not exceed `now + 7200s`.
+    /// Legacy 0-sentinel wrapper around `computeRequiredBits`, kept for the
+    /// block-BODY path (`validateBlockForIBDOrReject`) and `submitblock`, whose
+    /// `IBDValidationContext.expected_bits` / `ContextualHeaderCtx.expected_bits`
+    /// contract is "0 = not available → skip the gate".
     ///
-    /// References:
-    ///   - bitcoin-core/src/validation.cpp::CheckBlockHeader (future-time)
-    ///   - bitcoin-core/src/validation.cpp::ContextualCheckBlockHeader (all)
+    /// Reference: bitcoin-core/src/pow.cpp GetNextWorkRequired().
+    pub fn computeExpectedBits(
+        self: *PeerManager,
+        prev_hash: types.Hash256,
+        height: u32,
+        block_timestamp: u32,
+    ) u32 {
+        return switch (self.computeRequiredBits(prev_hash, height, block_timestamp, null)) {
+            .bits => |b| b,
+            .undecidable => 0,
+        };
+    }
+
+    /// STRICT contextual header validation, run at header *acceptance* (not
+    /// just when the block body arrives).
     ///
-    /// MTP and bad-diffbits are skipped when fewer than 1 ancestor is in
-    /// `header_index` (e.g. headers received before any prior batch landed in
-    /// the index, or mid-batch headers whose prev is in the SAME batch).
-    /// This matches the behaviour of `validateBlockForIBDOrReject`'s body path:
-    /// the pipeline still re-checks MTP and bad-diffbits once the block body
-    /// lands.  The future-time bound has no ancestor dependency and is always
-    /// enforced.
+    /// This is a thin, faithful adapter over
+    /// `validation.contextualCheckBlockHeader`, which already implements Core's
+    /// ContextualCheckBlockHeader (validation.cpp:4080-4118) IN CORE'S ORDER:
+    ///
+    ///   (0) prev-blk-not-found  — validation.cpp:4215-4217, BEFORE the gates.
+    ///   (1) bad-diffbits        — validation.cpp:4088   ← FIRST contextual gate
+    ///   (2) time-too-old (MTP)  — validation.cpp:4092
+    ///   (3) time-timewarp       — validation.cpp:4097-4105 (enforce_BIP94)
+    ///   (4) time-too-new        — validation.cpp:4108
+    ///   (5) bad-version         — validation.cpp:4112 (see note below)
+    ///
+    /// The height fed to the gates is the parent's height + 1, taken off the
+    /// RESOLVED parent (Core validation.cpp:4084) — never a batch position, a
+    /// queue length, or a counter.
+    ///
+    /// `overlay` carries the headers already accepted from the SAME inbound
+    /// `headers` message, so a mid-batch header's parent resolves exactly as it
+    /// does in Core's ProcessNewBlockHeaders (validation.cpp:4247-4252, which
+    /// adds each header to the index before validating the next).  Pass null
+    /// outside the batch path.
+    ///
+    /// bad-version note: gate (5) is Core's LAST check, so a bad-version-only
+    /// header can never mask an earlier verdict.  clearbit has never enforced
+    /// it at header-receipt time (it IS enforced on the block-body path via the
+    /// same function), and this wave deliberately does not change that: the
+    /// verdict is mapped to `.ok` so this fix stays scoped to bad-diffbits.
+    pub fn validateHeaderContextualStrict(
+        self: *PeerManager,
+        header: *const types.BlockHeader,
+        now: i64,
+        overlay: ?*const HeaderBatchOverlay,
+    ) HeaderTimeReject {
+        // (0) Resolve pindexPrev.  Core rejects "prev-blk-not-found"
+        // (validation.cpp:4215-4217) before ContextualCheckBlockHeader and
+        // never punishes the peer for it; we report `.undecidable`.
+        const prev = self.resolvePrevForHeader(&header.prev_block, overlay) orelse {
+            self.header_undecidable_count += 1;
+            return .undecidable;
+        };
+        if (prev.height == std.math.maxInt(u32)) {
+            self.header_undecidable_count += 1;
+            return .undecidable;
+        }
+        // Core validation.cpp:4084 — `const int nHeight = pindexPrev->nHeight + 1;`
+        const height: u32 = prev.height + 1;
+
+        // (1) required nBits, resolved by prev-pointer walk.
+        const expected_bits: u32 = switch (self.computeRequiredBits(
+            header.prev_block,
+            height,
+            header.timestamp,
+            overlay,
+        )) {
+            .bits => |b| b,
+            .undecidable => {
+                self.header_undecidable_count += 1;
+                return .undecidable;
+            },
+        };
+
+        const ctx = validation.ContextualHeaderCtx{
+            .expected_bits = expected_bits,
+            .prev_mtp = self.computePrevMtpEx(&header.prev_block, overlay),
+            .prev_block_timestamp = prev.timestamp,
+            .current_time = now,
+        };
+
+        // The gate actually ran for this header (expected_bits is non-zero by
+        // construction — computeRequiredBits returns .undecidable for 0).
+        self.header_diffbits_checks += 1;
+
+        validation.contextualCheckBlockHeader(header, height, self.network_params, ctx) catch |err| {
+            return switch (err) {
+                error.BadDifficulty => .bad_diffbits,
+                error.BadTimestamp => .mtp_violation,
+                error.TimewarpAttack => .timewarp,
+                error.FutureTimestamp => .future_time,
+                // See the bad-version note above: not enforced at header time.
+                error.BadVersion => .ok,
+                else => .undecidable,
+            };
+        };
+        return .ok;
+    }
+
+    /// LENIENT wrapper, kept for the non-P2P callers (`checkheader` RPC and the
+    /// existing header-time unit tests) whose contract predates the strict
+    /// "cannot evaluate" verdict.  When the prev-relative rules cannot be
+    /// evaluated it applies only the context-free future-time bound.
+    ///
+    /// New peer-facing code must use `validateHeaderContextualStrict` (or
+    /// `validateHeaderBatch`) so that "we cannot evaluate" is not silently
+    /// laundered into "the header is fine".
     pub fn validateHeaderContextual(
         self: *PeerManager,
         header: *const types.BlockHeader,
         now: i64,
     ) HeaderTimeReject {
-        // Future-time bound (always-on).
-        const max_future: i64 = now + @as(i64, consensus.MAX_FUTURE_BLOCK_TIME);
-        if (@as(i64, header.timestamp) > max_future) {
-            return .future_time;
-        }
-
-        // bad-diffbits (Core ContextualCheckBlockHeader, validation.cpp:4088).
-        // Compute the expected nBits from the prev block's position in the chain.
-        // If the prev block is not resolvable (mid-batch / pre-sync), skip —
-        // the body-validation path enforces it unconditionally.
-        const prev_height_opt: ?u32 = blk: {
-            if (self.header_index.get(header.prev_block)) |e| break :blk e.height;
-            if (self.chain_state) |cs| {
-                if (cs.getBlockHeightByHash(&header.prev_block)) |h| break :blk h;
-            }
-            break :blk null;
+        return switch (self.validateHeaderContextualStrict(header, now, null)) {
+            .undecidable => blk: {
+                const max_future: i64 = now + @as(i64, consensus.MAX_FUTURE_BLOCK_TIME);
+                break :blk if (@as(i64, header.timestamp) > max_future)
+                    HeaderTimeReject.future_time
+                else
+                    HeaderTimeReject.ok;
+            },
+            else => |v| v,
         };
-        if (prev_height_opt) |prev_h| {
-            const expected = self.computeExpectedBits(
-                header.prev_block,
-                prev_h + 1,
-                header.timestamp,
-            );
-            // expected == 0 means the walk failed internally (chain gap);
-            // skip rather than false-reject.
-            if (expected != 0 and header.bits != expected) {
-                return .bad_diffbits;
+    }
+
+    /// Outcome of validating one inbound `headers` batch.
+    pub const BatchOutcome = struct {
+        /// Number of leading headers that passed every contextual gate.  Only
+        /// these may be admitted; the rest of the batch is discarded.
+        accepted: usize,
+        /// Set when a header was found INVALID.  The peer is at fault.
+        reject: ?HeaderTimeReject = null,
+        /// Set when the batch was truncated because WE could not evaluate the
+        /// rules.  NOT the peer's fault — apply no penalty.
+        undecidable: bool = false,
+    };
+
+    /// Validate an inbound `headers` batch the way Core's
+    /// ProcessNewBlockHeaders does (validation.cpp:4247-4252): header by
+    /// header, each one checked against a parent set that INCLUDES the headers
+    /// accepted earlier in the same message.
+    ///
+    /// This is the fix for the batch hole.  Before it, the handler ran a
+    /// validate-everything loop and then a separate insert-everything loop, so
+    /// only headers[0] had a resolvable parent and headers[1..] were admitted
+    /// with arbitrary nBits.
+    ///
+    /// Returns the number of leading headers the caller may admit plus the
+    /// reason the batch stopped.  Stops at the FIRST failure (Core
+    /// ProcessNewBlockHeaders returns false immediately, validation.cpp:4252-4254).
+    pub fn validateHeaderBatch(
+        self: *PeerManager,
+        headers: []const types.BlockHeader,
+        now: i64,
+        overlay: *HeaderBatchOverlay,
+    ) BatchOutcome {
+        var accepted: usize = 0;
+        for (headers) |*hdr| {
+            switch (self.validateHeaderContextualStrict(hdr, now, overlay)) {
+                .ok => {},
+                .undecidable => return .{ .accepted = accepted, .undecidable = true },
+                else => |v| return .{ .accepted = accepted, .reject = v },
             }
+            // Admit into the batch-local overlay so the NEXT header's parent
+            // resolves (Core: AcceptBlockHeader added it to m_block_index).
+            // The parent must be resolvable — validateHeaderContextualStrict
+            // just proved it — so height comes from the parent, never a counter.
+            const prev = self.resolvePrevForHeader(&hdr.prev_block, overlay) orelse
+                return .{ .accepted = accepted, .undecidable = true };
+            const bh = crypto.computeBlockHash(hdr);
+            overlay.put(&bh, .{
+                .prev_hash = hdr.prev_block,
+                .height = prev.height + 1,
+                .timestamp = hdr.timestamp,
+                .bits = hdr.bits,
+            }) catch {
+                // Out of memory is OUR gap, not the peer's.
+                self.header_undecidable_count += 1;
+                return .{ .accepted = accepted, .undecidable = true };
+            };
+            accepted += 1;
         }
+        return .{ .accepted = accepted };
+    }
 
-        // BIP-113 MTP (skipped when fewer than 1 ancestor is known).
-        const prev_mtp = self.computePrevMtp(&header.prev_block);
-        if (prev_mtp != 0 and header.timestamp <= prev_mtp) {
-            return .mtp_violation;
+    /// Map a contextual header verdict onto the peer-facing action.
+    /// `.undecidable` is deliberately absent — it is never a peer's fault and
+    /// must be handled by the caller as "drop, no penalty".
+    fn misbehaveForHeaderVerdict(peer: *Peer, verdict: HeaderTimeReject) void {
+        switch (verdict) {
+            .ok, .undecidable => {},
+            .future_time => peer.misbehaving(50, "header timestamp too far in the future"),
+            .mtp_violation => peer.misbehaving(50, "header timestamp violates MTP (BIP-113)"),
+            .timewarp => peer.misbehaving(100, "header violates BIP-94 timewarp rule (time-timewarp-attack)"),
+            .bad_diffbits => peer.misbehaving(100, "header nBits does not match required difficulty (bad-diffbits)"),
         }
-
-        return .ok;
     }
 
     /// Faithful 5-condition assumevalid script-skip gate mirroring Bitcoin
@@ -11940,4 +12344,179 @@ test "W99/G6: min_pow_checked gate wired — min_chain_work non-zero for mainnet
     try std.testing.expect(cmpChainWorkBE(&low, &high) < 0); // low < high → would be rejected
     try std.testing.expect(cmpChainWorkBE(&high, &low) > 0); // high >= low → passes
     try std.testing.expect(cmpChainWorkBE(&low, &low) == 0); // equal → passes
+}
+
+// ---------------------------------------------------------------------------
+// W150 — DEAD-CODE PROOF for the per-header bad-diffbits gate.
+//
+// These tests drive the REAL inbound-message entry point
+// (`PeerManager.handleMessage` -> the `.headers` arm), not a helper, so they
+// prove the new check actually executes on the P2P header path.  They live in
+// peer.zig because `handleMessage` is private to this file.
+//
+// Path under test:
+//   Peer.receiveMessage -> PeerManager.processAllMessages -> handleMessage
+//     -> `.headers` arm -> classifyHeaderBatch -> validateHeaderBatch
+//     -> validateHeaderContextualStrict -> computeRequiredBits
+//     -> consensus.getNextWorkRequiredChecked
+//     -> validation.contextualCheckBlockHeader (bad-diffbits FIRST)
+//
+// Reference: bitcoin-core/src/validation.cpp:4088 (bad-diffbits) and
+//            validation.cpp:4247-4252 (ProcessNewBlockHeaders, per-header).
+// ---------------------------------------------------------------------------
+
+fn w150StubPeer(params: *const consensus.NetworkParams, allocator: std.mem.Allocator) Peer {
+    return .{
+        .stream = .{ .handle = -1 },
+        // 127.0.0.1 is treated as local by `misbehaving`, so a ban verdict sets
+        // should_ban WITHOUT writing a banlist entry to the working directory.
+        .address = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 0),
+        .state = .handshake_complete,
+        .direction = .outbound,
+        .version_info = null,
+        .services = 0,
+        .last_ping_time = 0,
+        .last_pong_time = 0,
+        .last_ping_nonce = 0,
+        .last_message_time = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .start_height = 100,
+        .network_params = params,
+        .allocator = allocator,
+        .recv_buffer = std.ArrayList(u8).init(allocator),
+        .is_witness_capable = true,
+        .is_headers_first = true,
+        .ban_score = 0,
+        .should_ban = false,
+        .conn_type = .outbound_full_relay,
+        .last_block_time = 0,
+        .last_tx_time = 0,
+        .min_ping_time = std.math.maxInt(i64),
+        .relay_txs = false,
+        .is_protected = false,
+        .connect_time = 0,
+        .fee_filter_received = 0,
+        .fee_filter_sent = 0,
+        .next_send_feefilter = 0,
+        .best_known_height = 0,
+        .last_getheaders_time = 0,
+        .oldest_block_in_flight_time = 0,
+        .blocks_in_flight_count = 0,
+        .chain_sync_protected = false,
+        .time_offset = 0,
+        .advertise_node_bloom = false,
+        .transport_version = .v1,
+    };
+}
+
+/// Build a mainnet-rooted header chain of `n` headers starting at height 1
+/// (parent = the real mainnet genesis block).  `cheat_index`, when non-null,
+/// gets deliberately wrong nBits.
+fn w150MainnetChain(
+    allocator: std.mem.Allocator,
+    n: usize,
+    cheat_index: ?usize,
+) ![]types.BlockHeader {
+    const g = consensus.MAINNET.genesis_header;
+    const hdrs = try allocator.alloc(types.BlockHeader, n);
+    var prev = consensus.MAINNET.genesis_hash;
+    var ts: u32 = g.timestamp + 600;
+    for (hdrs, 0..) |*hp, i| {
+        const cheat = if (cheat_index) |ci| ci == i else false;
+        hp.* = types.BlockHeader{
+            .version = 4,
+            .prev_block = prev,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = ts,
+            // Mainnet is non-retarget at these heights, so the required nBits
+            // is the parent's == the genesis bits.  A "cheat" header claims an
+            // arbitrary, much easier target.
+            .bits = if (cheat) 0x1e0fffff else g.bits,
+            .nonce = 0,
+        };
+        prev = crypto.computeBlockHash(hp);
+        ts += 600;
+    }
+    return hdrs;
+}
+
+test "W150 LIVE: .headers handler gates EVERY header, not just headers[0]" {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    defer pm.deinit();
+    var peer = w150StubPeer(&consensus.MAINNET, allocator);
+    defer peer.recv_buffer.deinit();
+
+    // 5 honest headers rooted at the real mainnet genesis block.
+    const hdrs = try w150MainnetChain(allocator, 5, null);
+    // handleMessage's `.headers` arm frees the slice via `defer`.
+    const msg = p2p.Message{ .headers = .{ .headers = hdrs } };
+
+    const before = pm.header_diffbits_checks;
+    try pm.handleMessage(&peer, msg);
+
+    // The gate ran once per header on the LIVE inbound path.
+    try std.testing.expectEqual(@as(u64, 5), pm.header_diffbits_checks - before);
+    try std.testing.expect(!peer.should_ban);
+    // All five were admitted to the download queue.
+    try std.testing.expectEqual(@as(usize, 5), pm.expected_blocks.items.len);
+    // Ancestors resolved by prev-pointer walk only.
+    try std.testing.expectEqual(@as(u64, 0), pm.height_index_fallbacks);
+}
+
+test "W150 LIVE: mid-batch bad nBits is rejected by the .headers handler" {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    defer pm.deinit();
+    var peer = w150StubPeer(&consensus.MAINNET, allocator);
+    defer peer.recv_buffer.deinit();
+
+    // headers[3] claims an arbitrary easy target.  Its parent is headers[2],
+    // i.e. inside the SAME message — the exact case that used to skip the gate.
+    const hdrs = try w150MainnetChain(allocator, 5, 3);
+    const msg = p2p.Message{ .headers = .{ .headers = hdrs } };
+
+    const before = pm.header_diffbits_checks;
+    try pm.handleMessage(&peer, msg);
+
+    // Headers 0..3 were each evaluated; header 3 failed.
+    try std.testing.expectEqual(@as(u64, 4), pm.header_diffbits_checks - before);
+    try std.testing.expect(peer.should_ban);
+    // NOTHING from a rejected batch is admitted (Core ProcessNewBlockHeaders
+    // returns false on the first failure, validation.cpp:4252-4254).
+    try std.testing.expectEqual(@as(usize, 0), pm.expected_blocks.items.len);
+    try std.testing.expectEqual(@as(u64, 0), pm.height_index_fallbacks);
+}
+
+test "W150 LIVE: unresolvable parent drops the batch WITHOUT punishing the peer" {
+    const allocator = std.testing.allocator;
+    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    defer pm.deinit();
+    var peer = w150StubPeer(&consensus.MAINNET, allocator);
+    defer peer.recv_buffer.deinit();
+
+    // A batch rooted at a hash we have never seen.  classifyHeaderBatch sends
+    // this down the unknown_parent path, which must not ban either — but the
+    // point of this test is the contrast with the bad-diffbits case above:
+    // our own gap never produces should_ban.
+    const hdrs = try allocator.alloc(types.BlockHeader, 2);
+    var prev: types.Hash256 = [_]u8{0x7C} ** 32;
+    for (hdrs) |*hp| {
+        hp.* = types.BlockHeader{
+            .version = 4,
+            .prev_block = prev,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = 1_600_000_000,
+            .bits = 0x1e0fffff, // arbitrary/wrong, but unevaluable
+            .nonce = 0,
+        };
+        prev = crypto.computeBlockHash(hp);
+    }
+    const msg = p2p.Message{ .headers = .{ .headers = hdrs } };
+
+    try pm.handleMessage(&peer, msg);
+
+    try std.testing.expect(!peer.should_ban);
+    try std.testing.expectEqual(@as(usize, 0), pm.expected_blocks.items.len);
 }

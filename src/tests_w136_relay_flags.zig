@@ -439,8 +439,12 @@ test "w136/G24: handleMessage switch lacks .wtxidrelay arm" {
     const dispatcher_idx = std.mem.indexOf(u8, peer_src, "Handle a received message") orelse {
         return error.DispatcherNotFound;
     };
-    // Window must cover the full switch (~70KB from dispatcher comment).
-    const window_end = @min(dispatcher_idx + 80_000, peer_src.len);
+    // Window must cover the full switch.  It was ~70KB from the dispatcher
+    // comment when this gate was written and >81KB after W150 widened the
+    // `.headers` arm (per-header bad-diffbits + batch overlay).  The byte
+    // budget is a heuristic for "inside handleMessage's switch", not a
+    // property under test, so keep headroom.
+    const window_end = @min(dispatcher_idx + 160_000, peer_src.len);
     const window = peer_src[dispatcher_idx..window_end];
     try testing.expect(std.mem.indexOf(u8, window, ".wtxidrelay =>") == null);
 }
@@ -464,8 +468,12 @@ test "w136/G26: handleMessage .sendheaders arm is present" {
     const dispatcher_idx = std.mem.indexOf(u8, peer_src, "Handle a received message") orelse {
         return error.DispatcherNotFound;
     };
-    // Window must cover the full switch (~70KB from dispatcher comment).
-    const window_end = @min(dispatcher_idx + 80_000, peer_src.len);
+    // Window must cover the full switch.  It was ~70KB from the dispatcher
+    // comment when this gate was written and >81KB after W150 widened the
+    // `.headers` arm (per-header bad-diffbits + batch overlay).  The byte
+    // budget is a heuristic for "inside handleMessage's switch", not a
+    // property under test, so keep headroom.
+    const window_end = @min(dispatcher_idx + 160_000, peer_src.len);
     const window = peer_src[dispatcher_idx..window_end];
     try testing.expect(std.mem.indexOf(u8, window, ".sendheaders =>") != null);
 }

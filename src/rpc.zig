@@ -9516,8 +9516,13 @@ pub const RpcServer = struct {
     ///     (ChainManager.getBlock) and the CF_BLOCKS active-chain store.
     ///   * PoW            = validation.checkBlockHeader (Core CheckBlockHeader
     ///     -> CheckProofOfWork; "high-hash" on failure).
-    ///   * contextual     = PeerManager.validateHeaderContextual (Core
-    ///     ContextualCheckBlockHeader time checks; "time-too-new"/"time-too-old").
+    ///   * contextual     = PeerManager.validateHeaderContextualStrict (Core
+    ///     ContextualCheckBlockHeader: bad-diffbits + BIP-113 MTP + BIP-94
+    ///     timewarp + future-time, ancestors resolved by prev-pointer walk;
+    ///     "bad-diffbits"/"time-too-old"/"time-timewarp-attack"/"time-too-new".
+    ///     An unresolvable required difficulty REFUSES the header — an operator
+    ///     path has no honest peer to protect, and Core cannot admit a header
+    ///     whose required work it cannot compute).
     ///   * store          = PeerManager.insertHeader (Core AcceptBlockHeader ->
     ///     block-index insert; idempotent on an already-known header).
     ///
@@ -9621,13 +9626,24 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_VERIFY_ERROR, "high-hash", id);
         };
 
-        // ── Step 5: contextual time checks (Core ContextualCheckBlockHeader) ─
-        // Reuse PeerManager.validateHeaderContextual: future-time +
-        // BIP-113 MTP-of-11.  Map to Core's reject tokens.
-        switch (self.peer_manager.validateHeaderContextual(&header, std.time.timestamp())) {
+        // ── Step 5: contextual checks (Core ContextualCheckBlockHeader) ─────
+        // STRICT variant: bad-diffbits + BIP-113 MTP + BIP-94 timewarp +
+        // future-time, with ancestors resolved by prev-pointer walk.  Map to
+        // Core's reject tokens.
+        //
+        // `.undecidable` (we cannot resolve the required difficulty) REFUSES
+        // the header.  This is a local/operator path — there is no honest peer
+        // to protect from a false penalty, and Core structurally cannot admit
+        // a header whose required work it cannot compute (pow.cpp:16/43/45
+        // asserts).  Admitting on "cannot evaluate" would let an operator (or
+        // anything driving the RPC) seed the header index with unchecked-nBits
+        // headers — the exact fail-open this wave removes from the P2P path.
+        switch (self.peer_manager.validateHeaderContextualStrict(&header, std.time.timestamp(), null)) {
             .ok => {},
+            .undecidable => return self.jsonRpcError(RPC_VERIFY_ERROR, "required difficulty unresolvable (missing ancestors); refusing header", id),
             .future_time => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-too-new", id),
             .mtp_violation => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-too-old", id),
+            .timewarp => return self.jsonRpcError(RPC_VERIFY_ERROR, "time-timewarp-attack", id),
             .bad_diffbits => return self.jsonRpcError(RPC_VERIFY_ERROR, "bad-diffbits", id),
         }
 

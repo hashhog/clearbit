@@ -1591,6 +1591,86 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w144_tests.step);
     }
 
+    // W150 — bad-diffbits at header admission for EVERY header in a batch.
+    // BEFORE: the `.headers` handler validated the whole batch, THEN inserted into
+    //   header_index, so only headers[0] had a resolvable parent; headers[1..1999]
+    //   were admitted with arbitrary nBits (and clearbit runs no header-time PoW
+    //   check at all).  A failed retarget-window walk also fabricated `prev.bits`
+    //   as the expectation, inverting the gate at a 2016-boundary.
+    // AFTER: validateHeaderBatch threads a prev-pointer-linked batch overlay so
+    //   every header is gated at parent.height+1 (Core validation.cpp:4084/4088),
+    //   and consensus.getNextWorkRequiredChecked reports "cannot evaluate" instead
+    //   of guessing — dropped without any peer penalty.
+    // Tests: mid-batch difficulty-1 rejection, 2016-boundary retarget (MAINNET),
+    //   truncated-window undecidability, TESTNET4 min-difficulty + BIP-94,
+    //   and a negative test proving the height->hash index is never consulted.
+    // Run with `zig build test-w150`.
+    {
+        const w150_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_w150_diffbits_batch.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"W150"},
+        });
+        w150_tests.linkSystemLibrary("rocksdb");
+        w150_tests.linkSystemLibrary("secp256k1");
+        w150_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w150_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w150_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w150_tests.linkSystemLibrary("minisketch");
+            w150_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w150_tests.root_module.addOptions("build_options", build_options);
+
+        const run_w150_tests = b.addRunArtifact(w150_tests);
+        const w150_test_step = b.step("test-w150", "Run W150 per-header bad-diffbits batch-gate tests");
+        w150_test_step.dependOn(&run_w150_tests.step);
+        // Fold into the main `test` step so CI exercises W150.
+        test_step.dependOn(&run_w150_tests.step);
+    }
+
+    // W150 LIVE — dead-code proof: drive PeerManager.handleMessage's `.headers`
+    // arm directly and assert the bad-diffbits gate ran once per header.
+    // `handleMessage` is private to peer.zig, so these tests live IN peer.zig
+    // and need a peer.zig-rooted test binary.  The aggregate `src/tests.zig`
+    // root does not build today (pre-existing: wallet.zig's @embedFile escapes
+    // the package path), so peer.zig's in-file tests would otherwise never run.
+    // Run with `zig build test-w150-live`.
+    {
+        const w150_live = b.addTest(.{
+            .root_source_file = b.path("src/peer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"W150 LIVE"},
+        });
+        w150_live.linkSystemLibrary("rocksdb");
+        w150_live.linkSystemLibrary("secp256k1");
+        w150_live.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        w150_live.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            w150_live.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            w150_live.linkSystemLibrary("minisketch");
+            w150_live.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        w150_live.root_module.addOptions("build_options", build_options);
+
+        const run_w150_live = b.addRunArtifact(w150_live);
+        const w150_live_step = b.step("test-w150-live", "Run W150 LIVE .headers-handler dead-code proof (peer.zig-rooted)");
+        w150_live_step.dependOn(&run_w150_live.step);
+        test_step.dependOn(&run_w150_live.step);
+    }
+
     // FIX-3G — ADDR/ADDRV2 peer-timestamp clamp (3G policy, fleet-wide).
     // Reference: bitcoin-core/src/net_processing.cpp:5678-5679.
     // Clamps peer-advertised nTime that is pre-2001 (≤100_000_000s) or more than
