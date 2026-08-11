@@ -1197,10 +1197,97 @@ pub fn difficultyAdjustmentInterval(params: *const NetworkParams) u32 {
     return params.pow_target_timespan / params.pow_target_spacing;
 }
 
+/// STRICT variant of `getNextWorkRequired`.
+///
+/// Returns `null` — meaning "WE cannot evaluate this rule" — whenever an
+/// ancestor that Bitcoin Core is structurally guaranteed to have is missing
+/// from our view.  It NEVER fabricates a plausible-looking answer.
+///
+/// Why this exists (the camlcoin inversion, arriving via a walk fallback):
+/// the lenient `getNextWorkRequired` below returns `pow_limit_bits` when the
+/// parent is unresolvable (line marked PREV-FALLBACK) and `prev_entry.bits`
+/// when the retarget period's FIRST block is unresolvable (RETARGET-FALLBACK).
+/// Both are *wrong non-zero expectations*, and a wrong expectation inverts the
+/// gate: the honest header (which carries the correctly retargeted nBits) is
+/// rejected as bad-diffbits and its peer is discouraged, while an attacker who
+/// simply keeps nBits constant across the boundary matches our fabricated
+/// answer and is ADMITTED.  Core cannot reach either state:
+///   - pow.cpp:16  `assert(pindexLast != nullptr)`
+///   - pow.cpp:43  `assert(nHeightFirst >= 0)`
+///   - pow.cpp:45  `assert(pindexFirst)`  (GetAncestor always succeeds because
+///                 every header in m_block_index has a full pprev chain)
+/// so the honest translation of Core's asserts into an implementation that CAN
+/// have gaps is "cannot evaluate", not "guess".  Callers must treat `null` as
+/// "do not reject this header, and do not punish the peer — the gap is ours".
+///
+/// Reference: bitcoin-core/src/pow.cpp:14 GetNextWorkRequired
+pub fn getNextWorkRequiredChecked(
+    height: u32,
+    block_timestamp: u32,
+    index_view: *const BlockIndexView,
+    params: *const NetworkParams,
+) ?u32 {
+    // Genesis block (height 0) has no previous block.
+    if (height == 0) {
+        return index_view.pow_limit_bits;
+    }
+
+    const prev_height = height - 1;
+    // Core pow.cpp:16 `assert(pindexLast != nullptr)`.
+    const prev_entry = index_view.getAtHeight(prev_height) orelse return null;
+
+    const interval = difficultyAdjustmentInterval(params);
+
+    // Only change once per difficulty adjustment interval.
+    if (height % interval != 0) {
+        // Special rule for testnet: allow minimum difficulty blocks
+        // (Core pow.cpp:21-37, fPowAllowMinDifficultyBlocks).
+        if (params.pow_allow_min_difficulty_blocks) {
+            if (block_timestamp > prev_entry.timestamp + params.pow_target_spacing * 2) {
+                return index_view.pow_limit_bits;
+            }
+
+            // Core walks `pindex = pindex->pprev` — it can never fail.  We can,
+            // and a failure here means we cannot reproduce Core's answer.
+            var walk_height = prev_height;
+            while (walk_height > 0 and walk_height % interval != 0) {
+                const entry = index_view.getAtHeight(walk_height) orelse return null;
+                if (entry.bits != index_view.pow_limit_bits) {
+                    return entry.bits;
+                }
+                walk_height -= 1;
+            }
+            const boundary = index_view.getAtHeight(walk_height) orelse return null;
+            return boundary.bits;
+        }
+
+        // Non-testnet: difficulty stays the same (Core pow.cpp:38).
+        return prev_entry.bits;
+    }
+
+    // Retarget block: go back by difficulty interval to find the first block
+    // (Core pow.cpp:41-45).
+    const first_height = if (prev_height >= interval - 1) prev_height - (interval - 1) else 0;
+    // Core pow.cpp:45 `assert(pindexFirst)`.
+    const first_entry = index_view.getAtHeight(first_height) orelse return null;
+
+    return calculateNextWorkRequiredBip94(
+        prev_entry,
+        first_entry,
+        index_view,
+        params,
+    );
+}
+
 /// Compute the next required work (difficulty target) for a new block.
 ///
 /// This is the main entry point for difficulty calculation, matching Bitcoin Core's
 /// GetNextWorkRequired() function.
+///
+/// NOTE: this is the LENIENT variant.  It substitutes a fallback value whenever
+/// an ancestor lookup fails (see `getNextWorkRequiredChecked` for why that is
+/// dangerous on any peer-facing admission path).  New consensus-facing callers
+/// should use `getNextWorkRequiredChecked` and handle `null` explicitly.
 ///
 /// Parameters:
 /// - height: Height of the block being validated (1-indexed, so height 1 comes after genesis)
@@ -1221,6 +1308,7 @@ pub fn getNextWorkRequired(
     }
 
     const prev_height = height - 1;
+    // PREV-FALLBACK — see getNextWorkRequiredChecked.
     const prev_entry = index_view.getAtHeight(prev_height) orelse return index_view.pow_limit_bits;
 
     const interval = difficultyAdjustmentInterval(params);
@@ -1258,6 +1346,7 @@ pub fn getNextWorkRequired(
 
     // Retarget block: go back by difficulty interval to find the first block
     const first_height = if (prev_height >= interval - 1) prev_height - (interval - 1) else 0;
+    // RETARGET-FALLBACK — see getNextWorkRequiredChecked.
     const first_entry = index_view.getAtHeight(first_height) orelse return prev_entry.bits;
 
     return calculateNextWorkRequiredBip94(
