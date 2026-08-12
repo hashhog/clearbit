@@ -9451,7 +9451,18 @@ pub const RpcServer = struct {
             // parameter / deserialization problems.
             var buf = std.ArrayList(u8).init(self.allocator);
             defer buf.deinit();
-            try std.fmt.format(buf.writer(), "\"{s}\"", .{bip22_str});
+            // bad-version carries the offending nVersion in Core's token:
+            // strprintf("bad-version(0x%08x)", block.nVersion) (validation.cpp:4116).
+            // The mapper returns the bare "bad-version" (it has no block handle);
+            // append the block's nVersion here, formatted UNSIGNED (@bitCast i32→u32)
+            // and zero-padded to 8 lowercase hex digits — matching %08x exactly for
+            // the high-bit (0x80000000) and -1 (0xffffffff) discriminating cases.
+            if (std.mem.eql(u8, bip22_str, "bad-version")) {
+                const nversion_u32: u32 = @bitCast(block_data.header.version);
+                try std.fmt.format(buf.writer(), "\"bad-version(0x{x:0>8})\"", .{nversion_u32});
+            } else {
+                try std.fmt.format(buf.writer(), "\"{s}\"", .{bip22_str});
+            }
             return self.jsonRpcResult(buf.items, id);
         }
 
@@ -9812,6 +9823,16 @@ pub const RpcServer = struct {
             error.NegativeOutput => "bad-txns-vout-negative",
             // Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
             error.OutputTooLarge => "bad-txns-vout-toolarge",
+            // CheckTransaction context-free gates (consensus/tx_check.cpp:13-17,44).
+            // These fire in checkTransactionSanity (validation.zig:329-354), inside
+            // checkBlock before script/UTXO stages, but were falling through to the
+            // generic "rejected" — Core emits the specific token for each:
+            //   vin empty            → tx_check.cpp:15  "bad-txns-vin-empty"
+            //   vout empty (incl cb) → tx_check.cpp:17  "bad-txns-vout-empty"
+            //   duplicate vin        → tx_check.cpp:44  "bad-txns-inputs-duplicate"
+            error.NoInputs => "bad-txns-vin-empty",
+            error.NoOutputs => "bad-txns-vout-empty",
+            error.DuplicateInput => "bad-txns-inputs-duplicate",
             // Non-coinbase tx where sum(inputs) < sum(outputs).
             // Core consensus/tx_verify.cpp::CheckTxInputs:
             //   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
