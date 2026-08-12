@@ -9777,9 +9777,18 @@ pub const RpcServer = struct {
             //
             // Decision unchanged (rejected either way): R2 parity.
             error.FirstTxNotCoinbase => "bad-cb-missing",
+            // More than one coinbase in the block (validation.cpp:3953-3955).
+            // Was missing from THIS mapper (the one submitblock actually uses,
+            // see the note above) and fell through to the generic "rejected" —
+            // corpus bwmc A5-two-coinbases / A6-coinbase-at-index2.
+            error.MultipleCoinbase => "bad-cb-multiple",
             error.BadCoinbaseHeight => "bad-cb-height",
             error.BadMerkleRoot => "bad-txnmrklroot",
             error.BadWitnessCommitment => "bad-witness-merkle-match",
+            // Coinbase witness reserved value not exactly 1x32 bytes
+            // (validation.cpp:3880-3885) — Core's OWN token, distinct from the
+            // commitment-hash mismatch above.  Corpus bwmc C7.
+            error.BadWitnessNonceSize => "bad-witness-nonce-size",
             error.TooManySigops => "bad-blk-sigops",
             // Core folds CheckBlockHeader's "hash > target" (BadProofOfWork)
             // into "high-hash".  By the time acceptBlock's error reaches this

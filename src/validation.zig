@@ -59,6 +59,12 @@ pub const ValidationError = error{
     FirstTxNotCoinbase,
     MultipleCoinbase,
     BadWitnessCommitment,
+    /// Coinbase witness reserved value (nonce) is not exactly 1 stack element
+    /// of 32 bytes.  Core checks this BEFORE the commitment-hash compare and
+    /// emits its own token (CheckWitnessMalleation, validation.cpp:3880-3885
+    /// -> "bad-witness-nonce-size"), distinct from the hash-mismatch case
+    /// (:3893-3897 -> "bad-witness-merkle-match").
+    BadWitnessNonceSize,
     UnexpectedWitness,
     BadProofOfWork,
     BadCoinbaseValue,
@@ -863,23 +869,19 @@ pub fn checkBlockPow(
         try checkBlockHeader(&block.header, params);
     }
 
-    // 2. Must have at least one transaction (the coinbase)
-    if (block.transactions.len == 0) return ValidationError.FirstTxNotCoinbase;
+    // Steps 2-6 mirror Core CheckBlock's EXACT gate order (validation.cpp
+    // :3936-:3968): merkle root -> size limits -> cb-missing -> cb-multiple ->
+    // per-tx CheckTransaction.  The order is observable through the reject
+    // reason on multi-defect blocks (corpus bwmc A2: an EMPTY block is
+    // "bad-blk-length" via the size gate, NOT "bad-cb-missing" — the old
+    // order here checked coinbase presence first) and cannot change any
+    // accept/reject decision (all gates are still enforced).
 
-    // 3. First transaction must be coinbase
-    if (!block.transactions[0].isCoinbase()) return ValidationError.FirstTxNotCoinbase;
-
-    // 4. No other transaction may be coinbase
-    for (block.transactions[1..]) |*tx| {
-        if (tx.isCoinbase()) return ValidationError.MultipleCoinbase;
-    }
-
-    // 5. Check each transaction's sanity
-    for (block.transactions) |*tx| {
-        try checkTransactionSanity(tx);
-    }
-
-    // 6. Verify merkle root
+    // 2. Verify merkle root — Core runs CheckMerkleRoot (validation.cpp:3936,
+    // body :3837-3862) BEFORE the size and coinbase gates.  An empty tx list
+    // is safe here: computeMerkleRootMutated([]) returns the zero hash,
+    // matching Core's ComputeMerkleRoot on an empty leaf vector, and the
+    // empty block is then rejected by the size gate below.
     var tx_hashes = allocator.alloc(types.Hash256, block.transactions.len) catch {
         return ValidationError.OutOfMemory;
     };
@@ -896,25 +898,35 @@ pub fn checkBlockPow(
     // `mutated` flag (consensus/merkle.cpp:46-63) and CheckBlock rejects with
     // "bad-txns-duplicate" (validation.cpp:3850-3858). We mirror both: compute
     // the root with the mutation out-param and reject a mutated block.
+    // Core checks the root MISMATCH first (:3843 "bad-txnmrklroot"), then the
+    // mutation flag (:3853 "bad-txns-duplicate") — same order here.
     var merkle_mutated: bool = false;
     const computed_root = crypto.computeMerkleRootMutated(tx_hashes, allocator, &merkle_mutated) catch {
         return ValidationError.OutOfMemory;
     };
-    if (merkle_mutated) {
-        return ValidationError.DuplicateTx;
-    }
     if (!std.mem.eql(u8, &computed_root, &block.header.merkle_root)) {
         return ValidationError.BadMerkleRoot;
     }
+    if (merkle_mutated) {
+        return ValidationError.DuplicateTx;
+    }
 
-    // 7a. Context-free size gate — Core CheckBlock (validation.cpp:3947):
-    //   GetSerializeSize(block, NO_WITNESS) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
-    //   => "bad-blk-length" ("size limits failed").  Core runs this BEFORE the
-    // full GetBlockWeight gate (7b below, => "bad-blk-weight").  base_size*4 > MAX
-    // is a STRICT SUBSET of the weight gate: weight = base*3 + total >= base*4
-    // (total >= base always), so any block caught here is also caught by 7b —
-    // this refines the reject REASON only and cannot change any accept/reject
-    // decision.  Reason-string parity with Core's two-gate structure.
+    // 3. Context-free size gate — Core CheckBlock (validation.cpp:3947):
+    //   block.vtx.empty()
+    //   || block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    //   || GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    //   => "bad-blk-length" ("size limits failed").  All THREE disjuncts,
+    // including the empty-block case (corpus bwmc A2) and the tx-count bound.
+    // Core runs this BEFORE the full GetBlockWeight gate (7b below,
+    // => "bad-blk-weight").  base_size*4 > MAX is a STRICT SUBSET of the
+    // weight gate: weight = base*3 + total >= base*4 (total >= base always),
+    // so any block caught here is also caught by 7b — this refines the reject
+    // REASON only.  Reason-string parity with Core's two-gate structure.
+    if (block.transactions.len == 0 or
+        block.transactions.len * consensus.WITNESS_SCALE_FACTOR > consensus.MAX_BLOCK_WEIGHT)
+    {
+        return ValidationError.BadBlockSize;
+    }
     {
         var base_size: u64 = 80 + compactSizeLen(block.transactions.len);
         for (block.transactions) |*tx| {
@@ -925,6 +937,23 @@ pub fn checkBlockPow(
         if (base_size * consensus.WITNESS_SCALE_FACTOR > consensus.MAX_BLOCK_WEIGHT) {
             return ValidationError.BadBlockSize;
         }
+    }
+
+    // 4. First transaction must be coinbase (validation.cpp:3951-3952
+    // -> "bad-cb-missing").  Reached only with len >= 1 (size gate above).
+    if (!block.transactions[0].isCoinbase()) return ValidationError.FirstTxNotCoinbase;
+
+    // 5. No other transaction may be coinbase (validation.cpp:3953-3955
+    // -> "bad-cb-multiple").
+    for (block.transactions[1..]) |*tx| {
+        if (tx.isCoinbase()) return ValidationError.MultipleCoinbase;
+    }
+
+    // 6. Per-tx sanity — Core's CheckTransaction loop (validation.cpp:3959-3968)
+    // runs AFTER the coinbase-structure gates; surfaces bad-cb-length,
+    // bad-txns-vin-empty, bad-txns-inputs-duplicate, etc.
+    for (block.transactions) |*tx| {
+        try checkTransactionSanity(tx);
     }
 
     // 7b. Check block weight
@@ -2260,7 +2289,11 @@ fn checkWitnessMalleation(
             const coinbase = &block.transactions[0];
             const witness_stack = coinbase.inputs[0].witness;
             if (witness_stack.len != 1 or witness_stack[0].len != 32) {
-                return ValidationError.BadWitnessCommitment; // bad-witness-nonce-size
+                // Core: validation.cpp:3880-3885 — its OWN token, checked
+                // BEFORE the commitment-hash compare (corpus bwmc C7: a
+                // 31-byte nonce is "bad-witness-nonce-size", NOT
+                // "bad-witness-merkle-match").
+                return ValidationError.BadWitnessNonceSize;
             }
             const witness_nonce = witness_stack[0];
 
@@ -8620,27 +8653,26 @@ test "validateBlockForIBD: rejects bad PoW header" {
     try std.testing.expectError(ValidationError.BadProofOfWork, result);
 }
 
-test "validateBlockForIBD: rejects empty block (no coinbase)" {
+test "validateBlockForIBD: rejects empty block (bad-blk-length, Core size gate)" {
+    // Core CheckBlock order (validation.cpp:3936-3952): merkle root, then the
+    // size-limits gate (whose FIRST disjunct is block.vtx.empty() ->
+    // "bad-blk-length"), and only then coinbase presence.  An empty block is
+    // therefore BadBlockSize, NOT FirstTxNotCoinbase (corpus bwmc A2).  The
+    // header's merkle root is the zero hash — the merkle root of an empty tx
+    // list — so the merkle gate passes and the size gate fires.
+    // Exercised through checkBlockPow (Core's CheckBlock analogue) with
+    // check_pow=false so the isolated structural-gate ORDER is tested without
+    // mining a header nonce.  merkle_root is the zero hash — the merkle root
+    // of an empty tx list — so the merkle gate passes and the size gate fires.
     const allocator = std.testing.allocator;
+    var empty_header = consensus.MAINNET.genesis_header;
+    empty_header.merkle_root = [_]u8{0} ** 32;
     const block = types.Block{
-        .header = consensus.MAINNET.genesis_header,
+        .header = empty_header,
         .transactions = &[_]types.Transaction{},
     };
-    const block_hash = crypto.computeBlockHash(&block.header);
-    var dummy_ctx_state: u8 = 0;
-    var ctx = IBDValidationContext{
-        .block_hash = block_hash,
-        .height = 1,
-        .params = &consensus.MAINNET,
-        .prevout_lookup_ctx = @ptrCast(&dummy_ctx_state),
-        .prevout_lookupFn = ibdTestEmptyLookup,
-        .active_chain = null,
-        .best_tip_chain_work = [_]u8{0} ** 32,
-        .best_tip_timestamp = 0,
-        .prev_mtp = 0,
-    };
-    const result = validateBlockForIBD(&block, &ctx, allocator);
-    try std.testing.expectError(ValidationError.FirstTxNotCoinbase, result);
+    const result = checkBlockPow(&block, 1, &consensus.MAINNET, allocator, false);
+    try std.testing.expectError(ValidationError.BadBlockSize, result);
 }
 
 test "validateBlockForIBD: rejects bad merkle root" {
@@ -11078,7 +11110,7 @@ test "W77 G4: commitment present but coinbase witness stack empty → BadWitness
     };
     const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
     const result = checkWitnessMalleation(&block, true, allocator);
-    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+    try std.testing.expectError(ValidationError.BadWitnessNonceSize, result);
 }
 
 test "W77 G5: commitment present; coinbase witness stack has 2 elements → BadWitnessCommitment" {
@@ -11102,7 +11134,7 @@ test "W77 G5: commitment present; coinbase witness stack has 2 elements → BadW
     };
     const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
     const result = checkWitnessMalleation(&block, true, allocator);
-    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+    try std.testing.expectError(ValidationError.BadWitnessNonceSize, result);
 }
 
 test "W77 G6: commitment present; nonce is 31 bytes → BadWitnessCommitment" {
@@ -11124,7 +11156,7 @@ test "W77 G6: commitment present; nonce is 31 bytes → BadWitnessCommitment" {
     };
     const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
     const result = checkWitnessMalleation(&block, true, allocator);
-    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+    try std.testing.expectError(ValidationError.BadWitnessNonceSize, result);
 }
 
 test "W77 G7: commitment present; nonce is 33 bytes → BadWitnessCommitment" {
@@ -11146,7 +11178,7 @@ test "W77 G7: commitment present; nonce is 33 bytes → BadWitnessCommitment" {
     };
     const block = types.Block{ .header = consensus.MAINNET.genesis_header, .transactions = &[_]types.Transaction{cb} };
     const result = checkWitnessMalleation(&block, true, allocator);
-    try std.testing.expectError(ValidationError.BadWitnessCommitment, result);
+    try std.testing.expectError(ValidationError.BadWitnessNonceSize, result);
 }
 
 test "W77 G8: commitment present; hash mismatch → BadWitnessCommitment" {

@@ -402,6 +402,7 @@ fn connectErrToReason(err: validation.ValidationError) []const u8 {
         error.BadBlockWeight => "bad-blk-length",
         error.BadCoinbaseHeight => "bad-cb-height",
         error.BadWitnessCommitment => "bad-witness-merkle-match",
+        error.BadWitnessNonceSize => "bad-witness-nonce-size",
         error.UnexpectedWitness => "unexpected-witness",
         error.BadMerkleRoot => "bad-txnmrklroot",
         error.DuplicateTx => "bad-txns-duplicate",

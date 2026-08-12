@@ -983,7 +983,9 @@ pub fn submitBlockWithIndexAndMempool(
                 //
                 // Decision unchanged (rejected either way): R2 parity.
                 error.FirstTxNotCoinbase => "bad-cb-missing",
+                error.MultipleCoinbase => "bad-cb-multiple",
                 error.BadWitnessCommitment => "bad-witness-merkle-match",
+                error.BadWitnessNonceSize => "bad-witness-nonce-size",
                 error.BadMerkleRoot => "bad-txnmrklroot",
                 error.BadCoinbaseHeight => "bad-cb-height",
                 error.TooManySigops => "bad-blk-sigops",
