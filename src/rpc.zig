@@ -4881,30 +4881,23 @@ pub const RpcServer = struct {
                 return self.jsonRpcResult(buf.items, id);
             }
 
-            // No local bytes: proxy to Core (v=0 raw hex).
-            if (try self.proxyGetBlock0FromCore(blockhash_hex, id)) |result| {
-                return result;
-            }
+            // No local bytes: honest not-found (R3(a) 2026-08-12 — the Core
+            // proxy that answered for pre-base blocks here is removed; a
+            // snapshot-bootstrapped node genuinely lacks those bodies).
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
         }
 
         // ── Verbosity 1 or 2: JSON ────────────────────────────────────────────
         //
-        // Strategy (W59):
+        // Strategy (W59, rewritten 2026-08-12 R3(a)):
         //  1. If raw block bytes are available locally (CF_BLOCKS): parse and
         //     emit locally for both v=1 and v=2.  Uses the same header-field
         //     helpers as handleGetBlockHeader (W57), plus full TxToUniv shape.
-        //  2. If bytes are absent: fall back to Core proxy for v=2 (proxyGetBlock2FromCore).
-        //     For v=1, fall back via Core's v=1 response re-emitted with local
-        //     difficulty/target/confirmations.
-        //  3. If Core is also unavailable, return Block not found.
-        //
-        // clearbit's fast IBD path (peer.zig → drainBlockBuffer →
-        // connectBlockFast) does NOT populate CF_BLOCKS for historical blocks
-        // unless they were synced after commit cdd9e20 (2026-04-29).  For
-        // all blocks synced before that fix, CF_BLOCKS is empty and we must
-        // rely on Core.  The corpus (recent-tip-minus-50/500/1000) falls in
-        // this category.
+        //  2. If bytes are absent: honest "Block not found" (-5).  The former
+        //     Core proxy fallbacks (proxyGetBlock{0,1,2}FromCore) are REMOVED —
+        //     they made clearbit a front-end for blocks it does not hold
+        //     (every pre-snapshot-base block, and pre-cdd9e20 fast-IBD blocks
+        //     with empty CF_BLOCKS).  A node that lacks the data says so.
 
         // Resolve height + header for use in all verbosity paths.
         var height: u32 = 0;
@@ -4927,18 +4920,16 @@ pub const RpcServer = struct {
                     header = hdr;
                 } else |_| {}
             }
-            // Height from Core meta.
-            if (queryCoreBlockHeaderMeta(self.allocator, blockhash_hex)) |meta| {
-                height = meta.height;
-                height_known = true;
-            }
-        } else {
-            // No local data: need Core for everything.
-            if (queryCoreBlockHeaderMeta(self.allocator, blockhash_hex)) |meta| {
-                height = meta.height;
+            // Height from the persisted CF_BLOCK_INDEX record (R3(a)
+            // 2026-08-12 — replaces the removed Core-meta query).
+            if (self.chain_state.getBlockHeightByHash(&blockhash)) |ih| {
+                height = ih;
                 height_known = true;
             }
         }
+        // (No local data at all: the verbosity arms below return an honest
+        // "Block not found" — the Core fallback that served those blocks is
+        // removed, R3(a) 2026-08-12.)
 
         // Compute confirmations.
         const confirmations: i64 = if (height_known)
@@ -4959,11 +4950,10 @@ pub const RpcServer = struct {
         // If raw_block_opt is non-null AND Core is unavailable, fall through to
         // local parsing below.
         if (verbosity >= 2) {
-            // Always try the Core proxy first — it provides fee + full body.
-            if (try self.proxyGetBlock2FromCore(blockhash_hex, id)) |result| {
-                return result;
-            }
-            // Core unavailable: fall through to local parsing if bytes present.
+            // R3(a) 2026-08-12: LOCAL emission only (proxyGetBlock2FromCore
+            // removed).  Blocks without local bytes are honestly not-found.
+            // Per-tx fee fields follow local undo availability — the same
+            // shape Core emits when it lacks the undo data.
             if (raw_block_opt == null and !is_genesis) {
                 return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
             }
@@ -4980,10 +4970,10 @@ pub const RpcServer = struct {
         // If Core is unavailable, fall through to local partial emission (better
         // than returning an error when some header metadata is available).
         if (verbosity == 1 and raw_block_opt == null and !is_genesis) {
-            if (try self.proxyGetBlock1FromCore(blockhash_hex, id)) |result| {
-                return result;
-            }
-            // Core unavailable: fall through to local partial emission.
+            // R3(a) 2026-08-12: honest not-found.  Was: Core proxy, then a
+            // PARTIAL local emission (ntx=1, truncated tx array) — replaced
+            // outright; confidently-wrong output is worse than an honest -5.
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
         }
 
         // ── Local block bytes path (verbosity 1 or local-only verbosity 2) ───
@@ -5006,9 +4996,10 @@ pub const RpcServer = struct {
             // For verbosity 2, the Core proxy should have handled it above.
         }
 
-        // Fetch header meta from Core for header fields we don't have locally.
-        const core_meta = if (!is_genesis)
-            queryCoreBlockHeaderMeta(self.allocator, blockhash_hex)
+        // Persisted-index meta (R3(a) 2026-08-12 — replaces the Core-meta
+        // query for header fields we don't have in memory).
+        const idx_height_gb: ?u32 = if (!is_genesis)
+            self.chain_state.getBlockHeightByHash(&blockhash)
         else
             null;
 
@@ -5028,12 +5019,13 @@ pub const RpcServer = struct {
                 }
                 nextblockhash_opt = nbh_hex;
             }
-        } else if (core_meta) |m| {
-            if (!height_known) height = m.height;
-            mediantime = m.mediantime;
-            if (ntx == 0) ntx = m.ntx;
-            @memcpy(&chainwork_str, &m.chainwork);
-            nextblockhash_opt = m.nextblockhash;
+        } else if (idx_height_gb) |ih| {
+            if (!height_known) {
+                height = ih;
+                height_known = true;
+            }
+            // mediantime / chainwork resolved by the local computation block
+            // below; nextblockhash from the H: index below.
         }
 
         // ── REAL computed mediantime + chainwork (local in-memory state) ─────
@@ -5062,6 +5054,25 @@ pub const RpcServer = struct {
             if (cm_chainwork_opt) |cw| {
                 for (cw, 0..) |byte, i| {
                     _ = std.fmt.bufPrint(chainwork_str[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch {};
+                }
+            } else if (height_known) {
+                // R3(a) 2026-08-12: synthetic monotone scale (see
+                // handleGetBlockHeader) — true cumulative work is not
+                // derivable on a snapshot-bootstrapped node, and the Core
+                // proxy that used to fill it is removed.
+                const cw = peer_mod.chainWorkFromHeight(height);
+                for (cw, 0..) |byte, i| {
+                    _ = std.fmt.bufPrint(chainwork_str[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch {};
+                }
+            }
+            // nextblockhash from the H: index (was: Core meta).
+            if (nextblockhash_opt == null and height_known) {
+                if (self.chain_state.getBlockHashByHeight(height + 1)) |nbh| {
+                    var nbh_hex: [64]u8 = undefined;
+                    for (0..32) |i| {
+                        _ = std.fmt.bufPrint(nbh_hex[i * 2 ..][0..2], "{x:0>2}", .{nbh[31 - i]}) catch {};
+                    }
+                    nextblockhash_opt = nbh_hex;
                 }
             }
         }
@@ -5388,368 +5399,8 @@ pub const RpcServer = struct {
         try writer.writeAll("\"}");
     }
 
-    /// Proxy a getblock verbose=2 call through Bitcoin Core and return a
-    /// Core-byte-compatible response.  Used when clearbit has no local block
-    /// body in CF_BLOCKS (blocks synced before the queueBlockWrite fix).
-    ///
-    /// The response is passed through from Core almost verbatim.  Only
-    /// `confirmations` is replaced with clearbit's local chain-height
-    /// calculation (the harness strips `confirmations` anyway, so this is
-    /// cosmetic).  `difficulty` and `target` are recomputed from `bits` using
-    /// clearbit's own algorithm (getDifficultyCore + writeTargetHex) to ensure
-    /// byte-identity even if Core's serialisation changes.
-    ///
-    /// Returns null if Core is unavailable or doesn't know the block (caller
-    /// should try a local fallback or return Block not found).
-    fn proxyGetBlock2FromCore(
-        self: *RpcServer,
-        hash_hex: []const u8,
-        id: ?std.json.Value,
-    ) !?[]const u8 {
-        const Endpoint = struct { port: u16, cookie_path: []const u8 };
-        const endpoints = [_]Endpoint{
-            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
-            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
-        };
 
-        for (endpoints) |ep| {
-            const cookie_raw = std.fs.cwd().readFileAlloc(
-                self.allocator, ep.cookie_path, 1024,
-            ) catch continue;
-            defer self.allocator.free(cookie_raw);
-            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
 
-            const b64_enc = std.base64.standard.Encoder;
-            const b64_len = b64_enc.calcSize(cookie.len);
-            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
-            defer self.allocator.free(b64_buf);
-            _ = b64_enc.encode(b64_buf, cookie);
-
-            const body = std.fmt.allocPrint(
-                self.allocator,
-                "{{\"id\":1,\"method\":\"getblock\",\"params\":[\"{s}\",2]}}",
-                .{hash_hex},
-            ) catch continue;
-            defer self.allocator.free(body);
-
-            const request = std.fmt.allocPrint(
-                self.allocator,
-                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
-                "Authorization: Basic {s}\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n\r\n{s}",
-                .{ ep.port, b64_buf, body.len, body },
-            ) catch continue;
-            defer self.allocator.free(request);
-
-            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
-            defer stream.close();
-            stream.writeAll(request) catch continue;
-
-            // Core's getblock v=2 for a ~2 MB block can produce ~50-80 MB JSON.
-            const response = stream.reader().readAllAlloc(self.allocator, 256 * 1024 * 1024) catch continue;
-            defer self.allocator.free(response);
-
-            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
-            const json_str = response[body_start + 4 ..];
-
-            // ── Quick sanity check: confirm this is a non-error response ─────
-            // We parse only the top-level envelope (tiny) to check the error
-            // field and extract a few scalar fields we need to substitute.
-            // We do NOT re-serialize Core's result — that round-trip corrupts
-            // float representations (e.g. 0E-8 → 0, breaking vout value parity).
-            // Instead we locate the "result":{...} raw substring and use it
-            // verbatim, then do targeted string substitutions on the scalar
-            // fields at the top level of the result object.
-
-            const parsed = std.json.parseFromSlice(
-                std.json.Value, self.allocator, json_str, .{ .max_value_len = 256 * 1024 * 1024 },
-            ) catch continue;
-            defer parsed.deinit();
-
-            const root = parsed.value;
-            if (root != .object) continue;
-            if (root.object.get("error")) |err_val| {
-                if (err_val != .null) continue;
-            }
-            const result_val = root.object.get("result") orelse continue;
-            if (result_val == .null) continue;
-            if (result_val != .object) continue;
-            const result = result_val.object;
-
-            // Extract the scalar fields we need for substitution.
-            const bits_str: []const u8 = switch (result.get("bits") orelse .null) {
-                .string => |s| s,
-                else => continue,
-            };
-            const bits: u32 = std.fmt.parseInt(u32, bits_str, 16) catch continue;
-
-            const height: u32 = switch (result.get("height") orelse .null) {
-                .integer => |n| @intCast(n),
-                else => continue,
-            };
-            const local_confirmations: i64 =
-                @as(i64, @intCast(self.chain_state.best_height)) -
-                @as(i64, @intCast(height)) + 1;
-
-            // ── Extract the raw "result" JSON substring ──────────────────────
-            // Find {"result": in the raw response.  Core always sends:
-            //   {"result":{...},"error":null,"id":1}
-            // We need the {...} part verbatim.  Use raw string search — safe
-            // because we already confirmed the parsed response is valid.
-            const result_raw = extractRawJsonField(json_str, "result") orelse continue;
-
-            // ── Build the output: Core's raw result with field substitutions ─
-            // Fields to override (all are top-level scalar in the result object):
-            //   "confirmations": N       → clearbit's own count
-            //   "difficulty": F          → recomputed from bits (same algorithm)
-            //   "target": "hex"          → recomputed from bits (same algorithm)
-            //
-            // We do field-level raw-string substitution so that nested values
-            // (tx array, coinbase_tx, vout values like 0E-8) pass through
-            // byte-for-byte from Core.
-            const result_patched = try patchBlockResultFields(
-                self.allocator,
-                result_raw,
-                local_confirmations,
-                getDifficultyCore(bits),
-                bits,
-            );
-            defer self.allocator.free(result_patched);
-
-            return @as(?[]const u8, try self.jsonRpcResult(result_patched, id));
-        }
-        return null;
-    }
-
-    /// Proxy getblock verbosity=0 (raw hex) through Bitcoin Core.
-    ///
-    /// Used when CF_BLOCKS is absent for pre-cdd9e20 fast-IBD blocks.
-    /// Core returns a JSON string containing the raw block hex; we pass it
-    /// through verbatim as clearbit's result value (no field substitution
-    /// needed for v=0 — there are no derived fields like difficulty/target).
-    ///
-    /// Returns null if Core is unavailable or does not know the block.
-    fn proxyGetBlock0FromCore(
-        self: *RpcServer,
-        hash_hex: []const u8,
-        id: ?std.json.Value,
-    ) !?[]const u8 {
-        const Endpoint = struct { port: u16, cookie_path: []const u8 };
-        const endpoints = [_]Endpoint{
-            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
-            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
-        };
-
-        for (endpoints) |ep| {
-            const cookie_raw = std.fs.cwd().readFileAlloc(
-                self.allocator, ep.cookie_path, 1024,
-            ) catch continue;
-            defer self.allocator.free(cookie_raw);
-            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
-
-            const b64_enc = std.base64.standard.Encoder;
-            const b64_len = b64_enc.calcSize(cookie.len);
-            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
-            defer self.allocator.free(b64_buf);
-            _ = b64_enc.encode(b64_buf, cookie);
-
-            const body = std.fmt.allocPrint(
-                self.allocator,
-                "{{\"id\":1,\"method\":\"getblock\",\"params\":[\"{s}\",0]}}",
-                .{hash_hex},
-            ) catch continue;
-            defer self.allocator.free(body);
-
-            const request = std.fmt.allocPrint(
-                self.allocator,
-                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
-                "Authorization: Basic {s}\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n\r\n{s}",
-                .{ ep.port, b64_buf, body.len, body },
-            ) catch continue;
-            defer self.allocator.free(request);
-
-            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
-            defer stream.close();
-            stream.writeAll(request) catch continue;
-
-            // A raw block serialised is at most ~4 MB; hex-encoded is ~8 MB.
-            // Allow 16 MB to be safe.
-            const response = stream.reader().readAllAlloc(self.allocator, 16 * 1024 * 1024) catch continue;
-            defer self.allocator.free(response);
-
-            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
-            const json_str = response[body_start + 4 ..];
-
-            // Parse the envelope to verify success and extract the hex string.
-            const parsed = std.json.parseFromSlice(
-                std.json.Value, self.allocator, json_str, .{ .max_value_len = 16 * 1024 * 1024 },
-            ) catch continue;
-            defer parsed.deinit();
-
-            const root = parsed.value;
-            if (root != .object) continue;
-            if (root.object.get("error")) |err_val| {
-                if (err_val != .null) continue;
-            }
-            const result_val = root.object.get("result") orelse continue;
-            // v=0 result is a plain hex string.
-            if (result_val != .string) continue;
-            const hex_str = result_val.string;
-
-            // Wrap in JSON string quotes for the RPC result.
-            var buf = std.ArrayList(u8).init(self.allocator);
-            defer buf.deinit();
-            try buf.append('"');
-            try buf.appendSlice(hex_str);
-            try buf.append('"');
-
-            return @as(?[]const u8, try self.jsonRpcResult(buf.items, id));
-        }
-        return null;
-    }
-
-    /// Proxy getblock verbosity=1 through Bitcoin Core and return a
-    /// Core-byte-compatible response with clearbit's own confirmations,
-    /// difficulty, and target substituted.
-    ///
-    /// Used when CF_BLOCKS is absent for pre-cdd9e20 fast-IBD blocks.
-    /// Without local block bytes, clearbit cannot provide the full tx array;
-    /// this proxy fetches the complete verbosity-1 JSON from Core and patches
-    /// only the derived scalar fields.
-    ///
-    /// Returns null if Core is unavailable or does not know the block.
-    fn proxyGetBlock1FromCore(
-        self: *RpcServer,
-        hash_hex: []const u8,
-        id: ?std.json.Value,
-    ) !?[]const u8 {
-        const Endpoint = struct { port: u16, cookie_path: []const u8 };
-        const endpoints = [_]Endpoint{
-            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
-            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
-        };
-
-        for (endpoints) |ep| {
-            const cookie_raw = std.fs.cwd().readFileAlloc(
-                self.allocator, ep.cookie_path, 1024,
-            ) catch continue;
-            defer self.allocator.free(cookie_raw);
-            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
-
-            const b64_enc = std.base64.standard.Encoder;
-            const b64_len = b64_enc.calcSize(cookie.len);
-            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
-            defer self.allocator.free(b64_buf);
-            _ = b64_enc.encode(b64_buf, cookie);
-
-            const body = std.fmt.allocPrint(
-                self.allocator,
-                "{{\"id\":1,\"method\":\"getblock\",\"params\":[\"{s}\",1]}}",
-                .{hash_hex},
-            ) catch continue;
-            defer self.allocator.free(body);
-
-            const request = std.fmt.allocPrint(
-                self.allocator,
-                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
-                "Authorization: Basic {s}\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n\r\n{s}",
-                .{ ep.port, b64_buf, body.len, body },
-            ) catch continue;
-            defer self.allocator.free(request);
-
-            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
-            defer stream.close();
-            stream.writeAll(request) catch continue;
-
-            // Verbosity-1 for large blocks can be a few MB of JSON.
-            const response = stream.reader().readAllAlloc(self.allocator, 32 * 1024 * 1024) catch continue;
-            defer self.allocator.free(response);
-
-            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
-            const json_str = response[body_start + 4 ..];
-
-            const parsed = std.json.parseFromSlice(
-                std.json.Value, self.allocator, json_str, .{ .max_value_len = 32 * 1024 * 1024 },
-            ) catch continue;
-            defer parsed.deinit();
-
-            const root = parsed.value;
-            if (root != .object) continue;
-            if (root.object.get("error")) |err_val| {
-                if (err_val != .null) continue;
-            }
-            const result_val = root.object.get("result") orelse continue;
-            if (result_val == .null) continue;
-            if (result_val != .object) continue;
-            const result = result_val.object;
-
-            // Extract bits so we can recompute difficulty and target.
-            const bits_str: []const u8 = switch (result.get("bits") orelse .null) {
-                .string => |s| s,
-                else => continue,
-            };
-            const bits_val = std.fmt.parseInt(u32, bits_str, 16) catch continue;
-
-            // Compute clearbit's local confirmations.
-            const height_val = result.get("height") orelse continue;
-            const height: u32 = switch (height_val) {
-                .integer => |n| @intCast(n),
-                else => continue,
-            };
-            const local_confirmations: i64 =
-                @as(i64, @intCast(self.chain_state.best_height)) - @as(i64, @intCast(height)) + 1;
-
-            // Locate the raw result JSON substring to pass through verbatim.
-            // Find `"result":` in json_str, then grab the object span.
-            const result_key = "\"result\":";
-            const result_key_pos = std.mem.indexOf(u8, json_str, result_key) orelse continue;
-            const result_raw_start = result_key_pos + result_key.len;
-            // Skip leading whitespace.
-            var rp = result_raw_start;
-            while (rp < json_str.len and (json_str[rp] == ' ' or json_str[rp] == '\n' or
-                   json_str[rp] == '\r' or json_str[rp] == '\t')) rp += 1;
-            if (rp >= json_str.len or json_str[rp] != '{') continue;
-            // Walk to find the matching closing brace.
-            var depth: usize = 0;
-            var in_string = false;
-            var escape_next = false;
-            var result_raw_end = rp;
-            while (result_raw_end < json_str.len) : (result_raw_end += 1) {
-                const ch = json_str[result_raw_end];
-                if (escape_next) { escape_next = false; continue; }
-                if (ch == '\\' and in_string) { escape_next = true; continue; }
-                if (ch == '"') { in_string = !in_string; continue; }
-                if (in_string) continue;
-                if (ch == '{') depth += 1;
-                if (ch == '}') {
-                    depth -= 1;
-                    if (depth == 0) { result_raw_end += 1; break; }
-                }
-            }
-            const result_raw = json_str[rp..result_raw_end];
-
-            // Patch confirmations, difficulty, and target.
-            const result_patched = try patchBlockResultFields(
-                self.allocator,
-                result_raw,
-                local_confirmations,
-                getDifficultyCore(bits_val),
-                bits_val,
-            );
-            defer self.allocator.free(result_patched);
-
-            return @as(?[]const u8, try self.jsonRpcResult(result_patched, id));
-        }
-        return null;
-    }
 
     fn handleGetDifficulty(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         // Core returns GetDifficulty(ActiveChain().Tip()) (rpc/blockchain.cpp:509)
@@ -9074,14 +8725,9 @@ pub const RpcServer = struct {
 
         // ── Not found ────────────────────────────────────────────────────────
         if (found_tx == null) {
-            // verbosity=2 Core-proxy fallback (W60): CF_TX_INDEX/CF_BLOCKS can
-            // be empty for blocks synced before the queueBlockWrite fix.
-            if (verbosity == 2) {
-                const bh_hex = blockhash_hex_param orelse "";
-                if (try self.proxyGetRawTx2FromCore(txid_hex, bh_hex, id)) |result| {
-                    return result;
-                }
-            }
+            // R3(a) 2026-08-12: the verbosity=2 Core-proxy fallback (W60) is
+            // removed — a tx clearbit cannot find locally is honestly
+            // not-found, exactly like verbosity 0/1.
             // Core's error-message family (rpc/rawtransaction.cpp:314-329), all
             // RPC code -5.  We pick the wording by whether txindex is on, since
             // the exact suffix is not consensus-relevant.
@@ -9162,110 +8808,6 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
-    /// Core proxy for getrawtransaction verbosity=2 (W60).
-    ///
-    /// Sends `getrawtransaction [txid, 2, blockhash]` to the local Bitcoin Core
-    /// node (mainnet port 8332 first, then testnet4 port 48343) and passes the
-    /// result JSON string through almost verbatim — only `confirmations` is
-    /// substituted with clearbit's own count so that float fields like `fee` and
-    /// `value` are not corrupted by a Zig std.json round-trip.
-    ///
-    /// Pattern: same as proxyGetBlock2FromCore (W59).
-    fn proxyGetRawTx2FromCore(
-        self: *RpcServer,
-        txid_hex: []const u8,
-        blockhash_hex: []const u8,
-        id: ?std.json.Value,
-    ) !?[]const u8 {
-        const Endpoint = struct { port: u16, cookie_path: []const u8 };
-        const endpoints = [_]Endpoint{
-            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
-            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
-        };
-
-        for (endpoints) |ep| {
-            const cookie_raw = std.fs.cwd().readFileAlloc(
-                self.allocator, ep.cookie_path, 1024,
-            ) catch continue;
-            defer self.allocator.free(cookie_raw);
-            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
-
-            const b64_enc = std.base64.standard.Encoder;
-            const b64_len = b64_enc.calcSize(cookie.len);
-            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
-            defer self.allocator.free(b64_buf);
-            _ = b64_enc.encode(b64_buf, cookie);
-
-            // Build request body.  Include blockhash param if provided.
-            const body = if (blockhash_hex.len == 64)
-                std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"id\":1,\"method\":\"getrawtransaction\",\"params\":[\"{s}\",2,\"{s}\"]}}",
-                    .{ txid_hex, blockhash_hex },
-                ) catch continue
-            else
-                std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"id\":1,\"method\":\"getrawtransaction\",\"params\":[\"{s}\",2]}}",
-                    .{txid_hex},
-                ) catch continue;
-            defer self.allocator.free(body);
-
-            const request = std.fmt.allocPrint(
-                self.allocator,
-                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
-                "Authorization: Basic {s}\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n\r\n{s}",
-                .{ ep.port, b64_buf, body.len, body },
-            ) catch continue;
-            defer self.allocator.free(request);
-
-            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
-            defer stream.close();
-            stream.writeAll(request) catch continue;
-
-            // getrawtransaction v=2 for a large tx can produce several MB of JSON.
-            const response = stream.reader().readAllAlloc(self.allocator, 64 * 1024 * 1024) catch continue;
-            defer self.allocator.free(response);
-
-            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
-            const json_str = response[body_start + 4 ..];
-
-            // Quick sanity check: parse top-level envelope to verify no error.
-            // We do NOT re-serialize the result — that round-trip corrupts float
-            // representations (e.g. fee=0.0001578 might emit differently).
-            // Instead we extract the raw "result" substring and pass it verbatim.
-            {
-                const parsed = std.json.parseFromSlice(
-                    std.json.Value, self.allocator, json_str, .{ .max_value_len = 64 * 1024 * 1024 },
-                ) catch continue;
-                defer parsed.deinit();
-
-                const root = parsed.value;
-                if (root != .object) continue;
-                if (root.object.get("error")) |err_val| {
-                    if (err_val != .null) continue;
-                }
-                const result_val = root.object.get("result") orelse continue;
-                if (result_val == .null) continue;
-                if (result_val != .object) continue;
-                // Confirmed: result is a non-null object.  Fall through to raw extraction.
-            }
-
-            // Extract the raw "result" JSON substring — verbatim pass-through.
-            // Core sends: {"result":{...},"error":null,"id":1}
-            // We use the {...} verbatim to preserve float precision for fee/value.
-            // The harness strips `confirmations` via jq del(.confirmations) so we
-            // can pass Core's confirmations through unchanged.
-            const result_raw = extractRawJsonField(json_str, "result") orelse continue;
-
-            // Wrap in a jsonRpcResult envelope and return.
-            return @as(?[]const u8, try self.jsonRpcResult(result_raw, id));
-        }
-        return null;
-    }
 
     // ========================================================================
     // Mining Methods
@@ -12807,13 +12349,11 @@ pub const RpcServer = struct {
                 try w.writeAll(",\"nextblockhash\":\"");
                 try writeHashHex(w, &nbh);
                 try w.writeByte('"');
-            } else if (queryCoreBlockHeaderMeta(self.allocator, blockhash_hex)) |meta| {
-                if (meta.nextblockhash) |nbh| {
-                    try w.writeAll(",\"nextblockhash\":\"");
-                    try w.writeAll(&nbh);
-                    try w.writeByte('"');
-                }
             }
+            // R3(a) 2026-08-12: no Core fallback for nextblockhash.  A
+            // snapshot-bootstrapped clearbit genuinely lacks the height-1
+            // block; omitting the optional field is the honest answer
+            // (proxying it to Core made clearbit a front-end).
             try w.writeByte('}');
 
             return self.jsonRpcResult(buf.items, id);
@@ -12873,21 +12413,51 @@ pub const RpcServer = struct {
             // If not, fall through to Core.
         }
 
-        // Path D: Bitcoin Core RPC — used both to supplement local data and as
-        // the sole source for blocks where CF_BLOCKS is absent (historical IBD
-        // blocks synced before the queueBlockWrite fix, commit cdd9e20).
-        const core_meta = queryCoreBlockHeaderMeta(self.allocator, blockhash_hex);
+        // Path D (rewritten 2026-08-12, R3(a)): persistent CF_BLOCK_INDEX
+        // record — hash → height + 80-byte header (+ status/chain_work in the
+        // 140-byte full form) written by the header-sync persist paths and the
+        // snapshot bootstrap's base-tail loop.  Replaces the removed Bitcoin
+        // Core proxy (queryCoreBlockHeaderMeta / proxyGetBlockHeaderFromCore):
+        // clearbit serves ONLY blocks it locally knows.
+        var idx_height: ?u32 = null;
+        var idx_chainwork: ?[32]u8 = null;
+        if (self.chain_state.utxo_set.db) |db| {
+            if (db.get(storage.CF_BLOCK_INDEX, &hash) catch null) |rec| {
+                defer self.allocator.free(rec);
+                if (rec.len >= 84) {
+                    idx_height = std.mem.readInt(u32, rec[0..4], .little);
+                    if (header_opt == null) {
+                        var reader = serialize.Reader{ .data = rec[4..84] };
+                        if (serialize.readBlockHeader(&reader)) |hdr| {
+                            // Guard against the legacy all-zero placeholder
+                            // row (pre base-tail-headers bootstrap): a zeroed
+                            // header hashes to a nonsense value, never `hash`.
+                            const hh = crypto.computeBlockHash(&hdr);
+                            if (std.mem.eql(u8, &hh, &hash)) header_opt = hdr;
+                        } else |_| {}
+                    }
+                    if (rec.len >= 120) {
+                        // All-zero chain_work in a persisted record means the
+                        // writer didn't track work (flush-path rows) — treat
+                        // as absent so the synthetic-scale fallback fires
+                        // instead of emitting a zero.
+                        const cw: [32]u8 = rec[88..120].*;
+                        if (!std.mem.allEqual(u8, &cw, 0)) idx_chainwork = cw;
+                    }
+                }
+            }
+        }
 
         if (header_opt == null) {
-            // No local header — Core is our only source.
-            // If Core also doesn't know the block, return not-found.
-            if (core_meta == null) {
-                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-            }
-            // We have no local header.  Delegate entirely to the Core proxy
-            // which parses the full Core response and rebuilds all 16 fields
-            // with clearbit's own difficulty/target computation.
-            return self.proxyGetBlockHeaderFromCore(blockhash_hex, id);
+            // Honest not-found: no CF_BLOCKS bytes, no in-memory entry, no
+            // persisted index record.  This is every pre-snapshot-base block
+            // (the assumeUTXO bootstrap carries no headers below base-11) —
+            // the same "genuinely lacks that history" branch lunarblock and
+            // ouroboros take, and the branch that satisfies R3(b): both
+            // getblockhash(H) and getblockheader(hash) now fail consistently
+            // below the base.  The removed Core proxy here made clearbit a
+            // front-end (R3(a)) and created the both-succeed asymmetry.
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
         }
 
         const header = header_opt.?;
@@ -12905,12 +12475,17 @@ pub const RpcServer = struct {
         // ── Resolve height, chainwork, mediantime, nTx, nextblockhash ───────
 
         var height: ?u32 = cm_height;
+        if (height == null) height = idx_height;
         if (height == null and std.mem.eql(u8, &hash, &self.chain_state.best_hash)) {
             height = self.chain_state.best_height;
         }
 
         var chainwork_str: [64]u8 = [_]u8{'0'} ** 64;
-        var ntx: u64 = raw_ntx;
+        // ntx: from local block bytes only (R3(a) — the Core-meta fill is
+        // gone).  For the ~12 base-tail headers (bodies genuinely absent on a
+        // snapshot bootstrap) this emits 0 — an evident sentinel, preferred
+        // over a proxied value pretending the data is held locally.
+        const ntx: u64 = raw_ntx;
         var nextblockhash_opt: ?[64]u8 = null;
 
         // mediantime = Core's CBlockIndex::GetMedianTimePast (11-block MTP),
@@ -12939,25 +12514,31 @@ pub const RpcServer = struct {
             }
         }
 
-        // Apply Core meta where available — but never override a locally
-        // computed MTP / chainwork (same chain, but local is authoritative
-        // and works offline).
-        if (core_meta) |m| {
-            if (height == null) height = m.height;
-            if (ntx == 0) ntx = m.ntx;
-            if (!mtp_resolved) mediantime = m.mediantime;
-            @memcpy(&chainwork_str, &m.chainwork);
-            if (cm_chainwork) |cw| {
-                // Prefer in-memory chainwork (Core-seeded genesis included).
-                var tmp_buf: [64]u8 = undefined;
-                for (cw, 0..) |byte, i| {
-                    _ = try std.fmt.bufPrint(tmp_buf[i * 2 ..][0..2], "{x:0>2}", .{byte});
-                }
-                @memcpy(&chainwork_str, &tmp_buf);
+        // Chainwork resolution — LOCAL ONLY (R3(a) 2026-08-12; the Core-meta
+        // fill that used to sit here made the field correct only because a
+        // Bitcoin Core node answered for us).  Order:
+        //   1. In-memory index entry (this session's scale).
+        //   2. Persisted full CF_BLOCK_INDEX record's chain_work.
+        //   3. chainWorkFromHeight(h) — the same synthetic monotone scale the
+        //      in-memory header index roots on.  A snapshot-bootstrapped
+        //      clearbit CANNOT compute true cumulative work (no pre-base
+        //      headers); the ~height-magnitude sentinel is obviously not a
+        //      real 2^90-scale work value, so it cannot be mistaken for one.
+        //      True chainwork requires a genesis header backfill (R4-class).
+        if (cm_chainwork) |cw| {
+            var tmp_buf: [64]u8 = undefined;
+            for (cw, 0..) |byte, i| {
+                _ = try std.fmt.bufPrint(tmp_buf[i * 2 ..][0..2], "{x:0>2}", .{byte});
             }
-            if (nextblockhash_opt == null) nextblockhash_opt = m.nextblockhash;
-        } else if (cm_chainwork) |cw| {
-            // Use in-memory chainwork if Core was unavailable.
+            @memcpy(&chainwork_str, &tmp_buf);
+        } else if (idx_chainwork) |cw| {
+            var tmp_buf: [64]u8 = undefined;
+            for (cw, 0..) |byte, i| {
+                _ = try std.fmt.bufPrint(tmp_buf[i * 2 ..][0..2], "{x:0>2}", .{byte});
+            }
+            @memcpy(&chainwork_str, &tmp_buf);
+        } else if (height) |h| {
+            const cw = peer_mod.chainWorkFromHeight(h);
             var tmp_buf: [64]u8 = undefined;
             for (cw, 0..) |byte, i| {
                 _ = try std.fmt.bufPrint(tmp_buf[i * 2 ..][0..2], "{x:0>2}", .{byte});
@@ -13526,185 +13107,6 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
-    /// Proxy a getblockheader verbose=true call through Bitcoin Core and return
-    /// a Core-byte-compatible response.  Used when clearbit has no local header
-    /// for a historical block (CF_BLOCKS empty for pre-cdd9e20 IBD blocks).
-    ///
-    /// The response is constructed field-by-field so that clearbit recomputes
-    /// difficulty (Core's exact iterative algorithm) and target from the bits
-    /// value, guaranteeing byte-identity even if Core's serialisation changes.
-    /// confirmations is replaced with clearbit's local calculation.
-    ///
-    /// Returns "Block not found" if Core is unavailable or doesn't know the block.
-    fn proxyGetBlockHeaderFromCore(
-        self: *RpcServer,
-        hash_hex: []const u8,
-        id: ?std.json.Value,
-    ) ![]const u8 {
-        // Cookie paths for mainnet and testnet4 Bitcoin Core instances.
-        const Endpoint = struct { port: u16, cookie_path: []const u8 };
-        const endpoints = [_]Endpoint{
-            .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
-            .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
-        };
-
-        for (endpoints) |ep| {
-            const cookie_raw = std.fs.cwd().readFileAlloc(
-                self.allocator, ep.cookie_path, 1024,
-            ) catch continue;
-            defer self.allocator.free(cookie_raw);
-            const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
-
-            const b64_enc = std.base64.standard.Encoder;
-            const b64_len = b64_enc.calcSize(cookie.len);
-            const b64_buf = self.allocator.alloc(u8, b64_len) catch continue;
-            defer self.allocator.free(b64_buf);
-            _ = b64_enc.encode(b64_buf, cookie);
-
-            const body = std.fmt.allocPrint(
-                self.allocator,
-                "{{\"id\":1,\"method\":\"getblockheader\",\"params\":[\"{s}\",true]}}",
-                .{hash_hex},
-            ) catch continue;
-            defer self.allocator.free(body);
-
-            const request = std.fmt.allocPrint(
-                self.allocator,
-                "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
-                "Authorization: Basic {s}\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n\r\n{s}",
-                .{ ep.port, b64_buf, body.len, body },
-            ) catch continue;
-            defer self.allocator.free(request);
-
-            const stream = std.net.tcpConnectToHost(self.allocator, "127.0.0.1", ep.port) catch continue;
-            defer stream.close();
-            stream.writeAll(request) catch continue;
-
-            const response = stream.reader().readAllAlloc(self.allocator, 128 * 1024) catch continue;
-            defer self.allocator.free(response);
-
-            const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
-            const json_str = response[body_start + 4 ..];
-
-            const parsed = std.json.parseFromSlice(
-                std.json.Value, self.allocator, json_str, .{},
-            ) catch continue;
-            defer parsed.deinit();
-
-            const root = parsed.value;
-            if (root != .object) continue;
-            // Check for error from Core.
-            if (root.object.get("error")) |err_val| {
-                if (err_val != .null) continue;
-            }
-            const result_val = root.object.get("result") orelse continue;
-            if (result_val == .null) continue;
-            if (result_val != .object) continue;
-            const result = result_val.object;
-
-            // Extract scalar fields from Core's response.
-            const bits_str: []const u8 = switch (result.get("bits") orelse .null) {
-                .string => |s| s,
-                else => continue,
-            };
-            const height_val = result.get("height") orelse continue;
-            const height: u32 = switch (height_val) {
-                .integer => |n| @intCast(n),
-                else => continue,
-            };
-            const version_val = result.get("version") orelse continue;
-            const version: i32 = switch (version_val) {
-                .integer => |n| @intCast(n),
-                else => continue,
-            };
-            const nonce_val = result.get("nonce") orelse continue;
-            const nonce: u32 = switch (nonce_val) {
-                .integer => |n| @intCast(n),
-                else => continue,
-            };
-            const time_val = result.get("time") orelse continue;
-            const block_time: u32 = switch (time_val) {
-                .integer => |n| @intCast(n),
-                else => continue,
-            };
-            const mt_val = result.get("mediantime") orelse continue;
-            const mediantime: u32 = switch (mt_val) {
-                .integer => |n| @intCast(n),
-                else => continue,
-            };
-            const ntx_val = result.get("nTx") orelse continue;
-            const ntx: u64 = switch (ntx_val) {
-                .integer => |n| @intCast(n),
-                else => continue,
-            };
-            const merkle_str: []const u8 = switch (result.get("merkleroot") orelse .null) {
-                .string => |s| s,
-                else => continue,
-            };
-            const chainwork_str: []const u8 = switch (result.get("chainwork") orelse .null) {
-                .string => |s| s,
-                else => continue,
-            };
-
-            // Parse nBits from hex string to compute difficulty and target locally.
-            const bits: u32 = std.fmt.parseInt(u32, bits_str, 16) catch continue;
-
-            // Compute confirmations using clearbit's own best_height (not Core's).
-            const confirmations: i64 =
-                @as(i64, @intCast(self.chain_state.best_height)) -
-                @as(i64, @intCast(height)) + 1;
-
-            // Build JSON output (fields alphabetical per jq -S).
-            var buf = std.ArrayList(u8).init(self.allocator);
-            defer buf.deinit();
-            const w = buf.writer();
-
-            try w.writeAll("{\"bits\":\"");
-            try w.writeAll(bits_str);
-            try w.writeAll("\",\"chainwork\":\"");
-            try w.writeAll(chainwork_str);
-            try w.print("\",\"confirmations\":{d},\"difficulty\":", .{confirmations});
-            try writeDifficultyCore(w, getDifficultyCore(bits));
-            try w.writeAll(",\"hash\":\"");
-            try w.writeAll(hash_hex);
-            try w.print("\",\"height\":{d},\"mediantime\":{d},\"merkleroot\":\"", .{
-                height, mediantime,
-            });
-            try w.writeAll(merkle_str);
-            try w.print("\",\"nTx\":{d},", .{ntx});
-            // nextblockhash (optional — absent at tip).
-            if (result.get("nextblockhash")) |nbh_val| {
-                if (nbh_val == .string) {
-                    try w.writeAll("\"nextblockhash\":\"");
-                    try w.writeAll(nbh_val.string);
-                    try w.writeAll("\",");
-                }
-            }
-            try w.print("\"nonce\":{d},", .{nonce});
-            // previousblockhash (absent for genesis, but genesis is handled above).
-            if (result.get("previousblockhash")) |pbh_val| {
-                if (pbh_val == .string) {
-                    try w.writeAll("\"previousblockhash\":\"");
-                    try w.writeAll(pbh_val.string);
-                    try w.writeAll("\",");
-                }
-            }
-            try w.writeAll("\"target\":\"");
-            try writeTargetHex(w, bits);
-            try w.print("\",\"time\":{d},\"version\":{d},\"versionHex\":\"", .{
-                block_time, version,
-            });
-            try w.print("{x:0>8}", .{@as(u32, @bitCast(version))});
-            try w.writeAll("\"}");
-
-            return self.jsonRpcResult(buf.items, id);
-        }
-
-        return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-    }
 
     /// Handle getdeploymentinfo RPC - return deployment/softfork status.
     /// Reference: Bitcoin Core rpc/blockchain.cpp getdeploymentinfo
@@ -22696,349 +22098,6 @@ fn readNTxFromRawBlock(raw: []const u8) u64 {
     return std.mem.readInt(u64, raw[81..89], .little);
 }
 
-/// Struct holding the fields we can retrieve from Bitcoin Core via RPC fallback.
-/// Used when clearbit's own index cannot supply height / chainwork / mediantime.
-const CoreBlockHeaderMeta = struct {
-    height: u32,
-    chainwork: [64]u8, // hex, zero-padded, lowercase
-    mediantime: u32,
-    ntx: u64,
-    nextblockhash: ?[64]u8,
-};
-
-/// Extract the raw JSON value substring for a top-level string key in a JSON
-/// object.  The input `json` must be a JSON object (starting with '{').  The
-/// returned slice is a sub-slice of `json` pointing at the raw JSON value for
-/// the key (e.g. the '{...}' substring for an object value).
-///
-/// This operates on the raw JSON bytes without a round-trip through the parser
-/// so that float representations like "0E-8" are preserved verbatim.
-///
-/// Returns null if the key is not found or parsing fails.
-fn extractRawJsonField(json: []const u8, key: []const u8) ?[]const u8 {
-    // Build the search pattern '"key":'.
-    var needle_buf: [128]u8 = undefined;
-    if (key.len + 3 > needle_buf.len) return null;
-    needle_buf[0] = '"';
-    @memcpy(needle_buf[1..1 + key.len], key);
-    needle_buf[1 + key.len] = '"';
-    needle_buf[2 + key.len] = ':';
-    const needle = needle_buf[0..3 + key.len];
-
-    const start_idx = std.mem.indexOf(u8, json, needle) orelse return null;
-    var pos = start_idx + needle.len;
-
-    // Skip whitespace.
-    while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '\n' or json[pos] == '\r')) {
-        pos += 1;
-    }
-    if (pos >= json.len) return null;
-
-    const val_start = pos;
-
-    // Walk through the JSON value to find its end.
-    switch (json[pos]) {
-        '{' => {
-            var depth: usize = 0;
-            var in_str = false;
-            while (pos < json.len) {
-                switch (json[pos]) {
-                    '\\' => { pos += 2; continue; },
-                    '"' => { in_str = !in_str; },
-                    '{' => { if (!in_str) depth += 1; },
-                    '}' => { if (!in_str) {
-                        depth -= 1;
-                        if (depth == 0) { pos += 1; break; }
-                    }},
-                    else => {},
-                }
-                pos += 1;
-            }
-        },
-        '[' => {
-            var depth: usize = 0;
-            var in_str = false;
-            while (pos < json.len) {
-                switch (json[pos]) {
-                    '\\' => { pos += 2; continue; },
-                    '"' => { in_str = !in_str; },
-                    '[' => { if (!in_str) depth += 1; },
-                    ']' => { if (!in_str) {
-                        depth -= 1;
-                        if (depth == 0) { pos += 1; break; }
-                    }},
-                    else => {},
-                }
-                pos += 1;
-            }
-        },
-        '"' => {
-            pos += 1; // skip opening quote
-            while (pos < json.len) {
-                if (json[pos] == '\\') { pos += 2; continue; }
-                if (json[pos] == '"') { pos += 1; break; }
-                pos += 1;
-            }
-        },
-        else => {
-            // Number, bool, null — advance until delimiter.
-            while (pos < json.len and json[pos] != ',' and json[pos] != '}' and json[pos] != ']') {
-                pos += 1;
-            }
-        },
-    }
-
-    return json[val_start..pos];
-}
-
-/// Patch specific top-level scalar fields in a raw JSON object string (Core's
-/// getblock v=2 result) without re-parsing it.  Returns a new allocated string.
-///
-/// Fields patched:
-///   "confirmations": N   — replaced with `confirmations`
-///   "difficulty": F      — replaced with writeDifficultyCore(getDifficultyCore(bits))
-///   "target": "hex"      — replaced with writeTargetHex(bits)
-///
-/// All other content (tx array, coinbase_tx, vout values, fee, etc.) is copied
-/// verbatim so that float representations like "0E-8" survive unchanged.
-fn patchBlockResultFields(
-    allocator: std.mem.Allocator,
-    result_json: []const u8,
-    confirmations: i64,
-    difficulty: f64,
-    bits: u32,
-) ![]const u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-
-    // We replace occurrences of the three top-level scalar fields.
-    // Since Core's JSON has these as simple scalars (not nested), we can use
-    // a direct search-and-replace.  We scan through the raw bytes, and when
-    // we find '"confirmations":', '"difficulty":', or '"target":', we emit
-    // our replacement value and skip Core's original value.
-
-    var pos: usize = 0;
-    while (pos < result_json.len) {
-        // Try each pattern in turn.
-        const remaining = result_json[pos..];
-
-        const conf_needle = "\"confirmations\":";
-        const diff_needle = "\"difficulty\":";
-        const tgt_needle = "\"target\":";
-
-        if (std.mem.startsWith(u8, remaining, conf_needle)) {
-            try out.appendSlice(conf_needle);
-            pos += conf_needle.len;
-            // Skip Core's value.
-            while (pos < result_json.len and result_json[pos] != ',' and result_json[pos] != '}') {
-                pos += 1;
-            }
-            // Emit clearbit's value.
-            const s = try std.fmt.allocPrint(allocator, "{d}", .{confirmations});
-            defer allocator.free(s);
-            try out.appendSlice(s);
-        } else if (std.mem.startsWith(u8, remaining, diff_needle)) {
-            try out.appendSlice(diff_needle);
-            pos += diff_needle.len;
-            // Skip Core's float value.
-            while (pos < result_json.len and result_json[pos] != ',' and result_json[pos] != '}') {
-                pos += 1;
-            }
-            // Emit clearbit's difficulty.
-            var dbuf = std.ArrayList(u8).init(allocator);
-            defer dbuf.deinit();
-            try writeDifficultyCore(dbuf.writer(), difficulty);
-            try out.appendSlice(dbuf.items);
-        } else if (std.mem.startsWith(u8, remaining, tgt_needle)) {
-            try out.appendSlice(tgt_needle);
-            pos += tgt_needle.len;
-            // Skip Core's quoted hex string including quotes.
-            if (pos < result_json.len and result_json[pos] == '"') {
-                pos += 1; // opening quote
-                while (pos < result_json.len and result_json[pos] != '"') pos += 1;
-                if (pos < result_json.len) pos += 1; // closing quote
-            }
-            // Emit clearbit's target.
-            try out.append('"');
-            try writeTargetHex(out.writer(), bits);
-            try out.append('"');
-        } else {
-            try out.append(result_json[pos]);
-            pos += 1;
-        }
-    }
-
-    return out.toOwnedSlice();
-}
-
-/// Patch the "confirmations" field in a raw JSON object string (Core's
-/// getrawtransaction v=2 result) without re-parsing it.  Returns a new
-/// allocated string.
-///
-/// All other content (fee, value, vin, vout, prevout, etc.) is copied verbatim
-/// so that float representations survive unchanged.
-///
-/// W60 analog of patchBlockResultFields for getblock v=2.
-fn patchRawTxResultFields(
-    allocator: std.mem.Allocator,
-    result_json: []const u8,
-    confirmations: i64,
-) ![]const u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-
-    const conf_needle = "\"confirmations\":";
-
-    var pos: usize = 0;
-    while (pos < result_json.len) {
-        const remaining = result_json[pos..];
-
-        if (std.mem.startsWith(u8, remaining, conf_needle)) {
-            try out.appendSlice(conf_needle);
-            pos += conf_needle.len;
-            // Skip Core's original confirmations value.
-            while (pos < result_json.len and result_json[pos] != ',' and result_json[pos] != '}') {
-                pos += 1;
-            }
-            // Emit clearbit's count.
-            const s = try std.fmt.allocPrint(allocator, "{d}", .{confirmations});
-            defer allocator.free(s);
-            try out.appendSlice(s);
-        } else {
-            try out.append(result_json[pos]);
-            pos += 1;
-        }
-    }
-
-    return out.toOwnedSlice();
-}
-
-/// Query the local Bitcoin Core node for block header metadata not available in
-/// clearbit's own storage.  Tries mainnet (port 8332) first, then testnet4
-/// (port 48343).  Returns null on any failure (network error, Core not running,
-/// block unknown to Core).  On success, populates a CoreBlockHeaderMeta struct.
-///
-/// Reference implementation: blockbrew's nTxFromFallback / queryBitcoinCoreNTx.
-fn queryCoreBlockHeaderMeta(
-    allocator: std.mem.Allocator,
-    hash_hex: []const u8,
-) ?CoreBlockHeaderMeta {
-    // Cookie paths for mainnet and testnet4 Bitcoin Core instances.
-    const Endpoint = struct { port: u16, cookie_path: []const u8 };
-    const endpoints = [_]Endpoint{
-        .{ .port = 8332,  .cookie_path = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" },
-        .{ .port = 48343, .cookie_path = "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" },
-    };
-
-    for (endpoints) |ep| {
-        // Read cookie file.
-        const cookie_raw = std.fs.cwd().readFileAlloc(
-            allocator, ep.cookie_path, 1024,
-        ) catch continue;
-        defer allocator.free(cookie_raw);
-        const cookie = std.mem.trim(u8, cookie_raw, "\n\r \t");
-
-        // Base64-encode the cookie for HTTP Basic auth.
-        const b64_enc = std.base64.standard.Encoder;
-        const b64_len = b64_enc.calcSize(cookie.len);
-        const b64_buf = allocator.alloc(u8, b64_len) catch continue;
-        defer allocator.free(b64_buf);
-        _ = b64_enc.encode(b64_buf, cookie);
-
-        // Build the JSON-RPC request body.
-        const body = std.fmt.allocPrint(
-            allocator,
-            "{{\"id\":1,\"method\":\"getblockheader\",\"params\":[\"{s}\",true]}}",
-            .{hash_hex},
-        ) catch continue;
-        defer allocator.free(body);
-
-        // Build the HTTP/1.1 request.
-        const request = std.fmt.allocPrint(
-            allocator,
-            "POST / HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\n" ++
-            "Authorization: Basic {s}\r\n" ++
-            "Content-Type: application/json\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Connection: close\r\n\r\n{s}",
-            .{ ep.port, b64_buf, body.len, body },
-        ) catch continue;
-        defer allocator.free(request);
-
-        // Open TCP connection (5 s timeout via O_NONBLOCK + select would be
-        // ideal, but for a local loopback call connect() completes instantly;
-        // we accept blocking here).
-        const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", ep.port) catch continue;
-        defer stream.close();
-
-        stream.writeAll(request) catch continue;
-
-        const response = stream.reader().readAllAlloc(allocator, 128 * 1024) catch continue;
-        defer allocator.free(response);
-
-        // Find the JSON body after the HTTP headers (past the blank line).
-        const body_start = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
-        const json_str = response[body_start + 4 ..];
-
-        // Parse with std.json.
-        const parsed = std.json.parseFromSlice(
-            std.json.Value, allocator, json_str, .{},
-        ) catch continue;
-        defer parsed.deinit();
-
-        const root = parsed.value;
-        if (root != .object) continue;
-        const result_val = root.object.get("result") orelse continue;
-        if (result_val != .object) continue;
-        const result = result_val.object;
-
-        // Extract fields.
-        const height_val = result.get("height") orelse continue;
-        const height: u32 = switch (height_val) {
-            .integer => |n| @intCast(n),
-            else => continue,
-        };
-
-        const mt_val = result.get("mediantime") orelse continue;
-        const mediantime: u32 = switch (mt_val) {
-            .integer => |n| @intCast(n),
-            else => continue,
-        };
-
-        const ntx_val = result.get("nTx") orelse continue;
-        const ntx: u64 = switch (ntx_val) {
-            .integer => |n| @intCast(n),
-            else => continue,
-        };
-
-        const cw_val = result.get("chainwork") orelse continue;
-        const cw_str: []const u8 = switch (cw_val) {
-            .string => |s| s,
-            else => continue,
-        };
-        if (cw_str.len != 64) continue;
-        var chainwork: [64]u8 = undefined;
-        @memcpy(&chainwork, cw_str[0..64]);
-
-        var nextblockhash: ?[64]u8 = null;
-        if (result.get("nextblockhash")) |nbh_val| {
-            if (nbh_val == .string and nbh_val.string.len == 64) {
-                var nbh: [64]u8 = undefined;
-                @memcpy(&nbh, nbh_val.string[0..64]);
-                nextblockhash = nbh;
-            }
-        }
-
-        return CoreBlockHeaderMeta{
-            .height = height,
-            .chainwork = chainwork,
-            .mediantime = mediantime,
-            .ntx = ntx,
-            .nextblockhash = nextblockhash,
-        };
-    }
-    return null;
-}
 
 /// Write the full-precision 64-char hex target derived from compact bits.
 /// Matches Bitcoin Core GetTarget() / DeriveTarget() logic.
