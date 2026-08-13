@@ -1660,6 +1660,79 @@ fn processSubsidy(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !
     try out.print("{{\"subsidy_sats\":{d}}}\n", .{subsidy});
 }
 
+/// `sighash` op: byte-exact legacy SignatureHash conformance (Core
+/// sighash.json, 500 vectors). Drives clearbit's REAL legacy sighash —
+/// `script.legacySignatureHash` (src/script.zig:3278), the SAME function the
+/// interpreter's CHECKSIG path computes with (verifySignature,
+/// src/script.zig:2509-2525: CHECKMULTISIG calls it directly; single-sig
+/// wraps it in legacySignatureHashWithFindAndDelete, which only prepends the
+/// per-sig FindAndDelete before delegating to it). It carries every
+/// consensus quirk: the opcode-aware OP_CODESEPARATOR strip
+/// (removeCodeSeparators), ANYONECANPAY/NONE/SINGLE serialization, the
+/// SIGHASH_SINGLE nIn>=nOuts "hash of one" bug (0x01 + 31 zero bytes
+/// internal), and the raw uint32 hashtype as the 4-byte LE footer. The shim
+/// reimplements NOTHING: tx_hex is deserialized with clearbit's OWN reader
+/// (the exact verifytx path), the SIGNED request hashtype is reinterpreted
+/// two's-complement to the u32 the impl takes (== hashtype & 0xFFFFFFFF —
+/// the mode bits &0x1f/&0x80 are derived INSIDE legacySignatureHash, exactly
+/// as the interpreter does), and the returned INTERNAL-order digest is
+/// reversed ONCE at the boundary to Core's GetHex/display order.
+///
+///   request:  {"op":"sighash","tx_hex":"...","script_hex":"...",
+///              "input_index":N,"hashtype":<signed int>}
+///   response: {"sighash":"<64-hex display order>"} | {"error":"..."}
+fn processSighash(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype) !void {
+    const tx_hex = switch (obj.get("tx_hex") orelse return error.MissingTxHex) {
+        .string => |s| s,
+        else => return error.TxHexNotString,
+    };
+    const tx_bytes = try hexDecode(a, tx_hex);
+
+    var reader = serialize.Reader{ .data = tx_bytes };
+    const tx = serialize.readTransaction(&reader, a) catch |err| {
+        // Undeserializable tx => {"error"} (the driver scores it as FAIL:
+        // Core computes a hash for every sighash.json vector).
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"tx deserialize: {s}\"}}\n", .{reason});
+        return;
+    };
+
+    const script_code = try hexDecode(a, switch (obj.get("script_hex") orelse return error.MissingScriptHex) {
+        .string => |s| s,
+        else => return error.ScriptHexNotString,
+    });
+
+    const input_index: usize = switch (obj.get("input_index") orelse return error.MissingInputIndex) {
+        .integer => |iv| @intCast(iv),
+        else => return error.InputIndexNotInt,
+    };
+
+    // hashtype arrives SIGNED (sighash.json passes raw, possibly negative
+    // ints). Two's-complement reinterpret to the u32 the impl takes — the
+    // same value the interpreter's u8-widened hashtype occupies in the LE
+    // footer; NO shim-side re-derivation of mode bits.
+    const ht_raw: i64 = switch (obj.get("hashtype") orelse return error.MissingHashtype) {
+        .integer => |iv| iv,
+        else => return error.HashtypeNotInt,
+    };
+    const hash_type: u32 = @truncate(@as(u64, @bitCast(ht_raw)));
+
+    // REAL legacy sighash entrypoint (src/script.zig:3278) — returns the
+    // INTERNAL-order 32-byte double-SHA256 digest.
+    const internal = script.legacySignatureHash(a, &tx, input_index, script_code, hash_type) catch |err| {
+        const reason = try jsonEscape(a, @errorName(err));
+        try out.print("{{\"error\":\"legacySignatureHash: {s}\"}}\n", .{reason});
+        return;
+    };
+
+    // Reverse ONCE at the boundary: internal order -> Core GetHex/display
+    // order (the digest is the ONLY thing reversed; prevout txids inside the
+    // tx stay internal).
+    var disp: [32]u8 = undefined;
+    for (0..32) |j| disp[j] = internal[31 - j];
+    try out.print("{{\"sighash\":\"{s}\"}}\n", .{std.fmt.bytesToHex(disp, .lower)});
+}
+
 /// Process one request line; dispatches on the JSON "op" field (default
 /// "verifyscript" for back-compat). On success writes the response, on
 /// failure returns an error which main() turns into {"error":...}.
@@ -1694,6 +1767,8 @@ fn process(allocator: std.mem.Allocator, line: []const u8, out: anytype) !void {
         return processMerkleroot(a, obj, out);
     } else if (std.mem.eql(u8, op, "subsidy")) {
         return processSubsidy(a, obj, out);
+    } else if (std.mem.eql(u8, op, "sighash")) {
+        return processSighash(a, obj, out);
     } else if (!std.mem.eql(u8, op, "verifyscript")) {
         return error.UnknownOp;
     }
