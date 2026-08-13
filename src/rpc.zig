@@ -19343,7 +19343,15 @@ pub const RpcServer = struct {
             try writer.writeAll("getchaintips\\n");
             try writer.writeAll("getchaintxstats\\n");
             try writer.writeAll("getblockstats\\n");
+            try writer.writeAll("getblockfrompeer\\n");
+            try writer.writeAll("getchainstates\\n");
             try writer.writeAll("getdifficulty\\n");
+            try writer.writeAll("gettxoutproof\\n");
+            try writer.writeAll("preciousblock\\n");
+            try writer.writeAll("verifychain\\n");
+            try writer.writeAll("waitforblock\\n");
+            try writer.writeAll("waitforblockheight\\n");
+            try writer.writeAll("waitfornewblock\\n");
             try writer.writeAll("\\n== Mempool ==\\n");
             try writer.writeAll("getmempoolancestors\\n");
             try writer.writeAll("getmempooldescendants\\n");
@@ -19360,6 +19368,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getprioritisedtransactions\\n");
             try writer.writeAll("prioritisetransaction\\n");
             try writer.writeAll("submitblock\\n");
+            try writer.writeAll("submitheader\\n");
             try writer.writeAll("\\n== Network ==\\n");
             try writer.writeAll("addnode\\n");
             try writer.writeAll("getaddednodeinfo\\n");
@@ -19369,6 +19378,11 @@ pub const RpcServer = struct {
             try writer.writeAll("getpeerinfo\\n");
             try writer.writeAll("ping\\n");
             try writer.writeAll("setnetworkactive\\n");
+            try writer.writeAll("getaddrmaninfo\\n");
+            try writer.writeAll("getnettotals\\n");
+            try writer.writeAll("getnodeaddresses\\n");
+            try writer.writeAll("listbanned\\n");
+            try writer.writeAll("setban\\n");
             try writer.writeAll("\\n== Rawtransactions ==\\n");
             try writer.writeAll("combinerawtransaction\\n");
             try writer.writeAll("createrawtransaction\\n");
@@ -19376,6 +19390,9 @@ pub const RpcServer = struct {
             try writer.writeAll("decodescript\\n");
             try writer.writeAll("getrawtransaction\\n");
             try writer.writeAll("sendrawtransaction\\n");
+            try writer.writeAll("converttopsbt\\n");
+            try writer.writeAll("decodepsbt\\n");
+            try writer.writeAll("finalizepsbt\\n");
             try writer.writeAll("\\n== Wallet ==\\n");
             try writer.writeAll("createwallet\\n");
             try writer.writeAll("getbalance\\n");
@@ -19400,6 +19417,10 @@ pub const RpcServer = struct {
             try writer.writeAll("estimatesmartfee\\n");
             try writer.writeAll("signmessagewithprivkey\\n");
             try writer.writeAll("verifymessage\\n");
+            try writer.writeAll("getdescriptorinfo\\n");
+            try writer.writeAll("getmemoryinfo\\n");
+            try writer.writeAll("getrpcinfo\\n");
+            try writer.writeAll("logging\\n");
             try writer.writeAll("help\\n");
             try writer.writeAll("stop\\n");
             try writer.writeAll("uptime\\n");
