@@ -182,8 +182,13 @@ pub fn base58CheckDecode(encoded: []const u8, allocator: std.mem.Allocator) !str
     const decoded = try base58Decode(encoded, allocator);
     errdefer allocator.free(decoded);
 
+    // DO NOT free `decoded` explicitly on these error paths: `errdefer` (above)
+    // already frees it when we return an error. The prior explicit frees here
+    // caused a DOUBLE FREE on every malformed base58 address (e.g. a bad
+    // checksum), corrupting the heap — SIGABRT under the ReleaseFast C
+    // allocator (validateaddress "notanaddress" crash-looped the mainnet node;
+    // R5 probe 2026-08-13).
     if (decoded.len < 5) {
-        allocator.free(decoded);
         return error.InvalidBase58CheckLength;
     }
 
@@ -193,7 +198,6 @@ pub fn base58CheckDecode(encoded: []const u8, allocator: std.mem.Allocator) !str
 
     const computed_checksum = crypto.hash256(payload);
     if (!std.mem.eql(u8, checksum, computed_checksum[0..4])) {
-        allocator.free(decoded);
         return error.InvalidBase58CheckChecksum;
     }
 
@@ -535,14 +539,15 @@ pub fn segwitDecode(addr: []const u8, allocator: std.mem.Allocator) !struct {
     const program = try convertBits5to8(program_5bit, allocator);
     errdefer allocator.free(program);
 
-    // Validate program length
+    // Validate program length. `errdefer allocator.free(program)` (above) owns
+    // the free on these error returns — the prior explicit frees were a DOUBLE
+    // FREE on any malformed bc1/tb1/bcrt1 address with an out-of-range program
+    // (same class as the base58CheckDecode / Address.decode fixes; R5 2026-08-13).
     if (program.len < 2 or program.len > 40) {
-        allocator.free(program);
         return error.InvalidWitnessProgramLength;
     }
 
     if (witness_version == 0 and program.len != 20 and program.len != 32) {
-        allocator.free(program);
         return error.InvalidWitnessProgramLength;
     }
 
@@ -656,9 +661,10 @@ pub const Address = struct {
             else => return error.UnknownVersionByte,
         };
 
-        // Validate hash length
+        // Validate hash length. `errdefer allocator.free(result.data)` (above)
+        // owns the free on this error return — an explicit free here would be a
+        // double free (same class as the base58CheckDecode fix).
         if (result.data.len != 20) {
-            allocator.free(result.data);
             return error.InvalidHashLength;
         }
 
@@ -703,6 +709,34 @@ pub fn createP2WPKH(pubkey: []const u8, network: Network, allocator: std.mem.All
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "Address.decode rejects malformed input without double-free (R5 2026-08-13)" {
+    // std.testing.allocator asserts on double-free AND leaks, so decoding each
+    // malformed address here would trip the old base58CheckDecode /
+    // segwitDecode / Address.decode double-frees (which SIGABRT'd the mainnet
+    // node's validateaddress under the ReleaseFast C allocator). Every case
+    // must return an error and free its scratch exactly once.
+    const allocator = std.testing.allocator;
+    const bad = [_][]const u8{
+        "notanaddress",       // valid base58 alphabet, bad checksum
+        "",                   // empty
+        "1BvBMSEYstZ",        // base58 prefix, too short / bad checksum
+        "3aaaaaaaaaaaaaaaa",  // p2sh-ish, bad checksum
+        "bc1qbad",            // bech32 prefix, malformed
+        "bcrt1qzzzzzzzz",     // regtest bech32, bad
+        "tb1qqqqqqqqqqqqqqq", // testnet bech32, bad program
+    };
+    for (bad) |s| {
+        if (Address.decode(s, allocator)) |r| {
+            // Should not have decoded; free so no leak is reported, then fail.
+            allocator.free(r.hash);
+            try std.testing.expect(false);
+        } else |_| {
+            // Expected: errored, and every scratch buffer freed exactly once.
+            // A double-free/leak trips std.testing.allocator here.
+        }
+    }
+}
 
 test "base58 encode/decode round-trip" {
     const allocator = std.testing.allocator;
