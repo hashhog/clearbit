@@ -216,19 +216,23 @@ fn readObfuscatedTransaction(
     scratch: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
 ) Error!types.Transaction {
-    // Strategy: deobfuscate the tail of the stream (from current pos onward)
-    // into the scratch buffer, hand it to serialize.readTransaction, then
-    // advance our reader by the consumed byte count. This is O(N) extra
-    // memory in the size of the largest single tx, which is bounded by
-    // MAX_BLOCK_WEIGHT/4 in practice. Since the obfuscation is just a XOR
-    // mask, deobfuscating ahead is cheap and correctness-preserving.
-    const tail_len = reader.data.len - reader.pos;
-    scratch.clearRetainingCapacity();
-    try scratch.resize(tail_len);
-    @memcpy(scratch.items, reader.data[reader.pos..]);
-    applyObfuscation(scratch.items, @intCast(reader.pos), reader.key);
+    // The whole buffer was deobfuscated in ONE pass by loadMempool before the
+    // first transaction is read, so we can parse straight out of it. No copy,
+    // no per-transaction XOR.
+    //
+    // The previous strategy copied and deobfuscated the entire remaining tail
+    // per transaction. Its comment claimed "O(N) extra memory in the size of
+    // the largest single tx" — but the slice taken was `data[pos..]`, the whole
+    // rest of the file, so both the memory and the time were O(remaining), once
+    // per transaction: O(T*N) overall. Measured on the live mainnet node
+    // (101 MiB, 137,091 txs) that was ~6.6 TiB of memcpy+XOR and 29+ minutes of
+    // startup before the RPC port was bound.
+    //
+    // `scratch` is retained in the signature (unused here) so the caller's
+    // buffer management is unchanged; it costs nothing.
+    _ = scratch;
 
-    var inner = serialize.Reader{ .data = scratch.items };
+    var inner = serialize.Reader{ .data = reader.data[reader.pos..] };
     const tx = serialize.readTransaction(&inner, allocator) catch |e| switch (e) {
         error.EndOfStream => return Error.UnexpectedEof,
         error.InvalidCompactSize, error.InvalidSegwitMarker, error.OversizedVector, error.SuperfluousWitnessRecord => return Error.InvalidFormat,
@@ -468,6 +472,28 @@ pub fn loadMempool(
         if (reader.pos + OBFUSCATION_KEY_SIZE > reader.data.len) return Error.UnexpectedEof;
         @memcpy(&reader.key, reader.data[reader.pos .. reader.pos + OBFUSCATION_KEY_SIZE]);
         reader.pos += OBFUSCATION_KEY_SIZE;
+
+        // Deobfuscate the REMAINDER OF THE FILE EXACTLY ONCE, in place, then
+        // clear the key so every subsequent read is a plain read.
+        //
+        // The obfuscation is a position-keyed XOR, so a single pass over
+        // buf[pos..] with file_offset=pos is identical to XOR-ing each field as
+        // it is read — but it is O(N) for the whole file instead of O(N) per
+        // item. `applyObfuscation` early-returns on an all-zero key, so zeroing
+        // `reader.key` afterwards makes ObfReader's per-field XOR a no-op while
+        // leaving all of its bounds checking intact.
+        //
+        // Before this, `readObfuscatedTransaction` copied and deobfuscated the
+        // ENTIRE REMAINING TAIL for every transaction — O(T*N). On the live
+        // mainnet node that was a 101 MiB file with 137,091 transactions:
+        // ~6.6 TiB of memcpy+XOR, 68,546x more work than necessary. clearbit
+        // spent 29+ MINUTES in this function on startup, before binding its RPC
+        // port, and was simply absent from the fleet the whole time (the
+        // stop_mainnet.sh helper reported "RELAUNCH SILENTLY MISSED" at its
+        // 300s deadline). With mempool.dat removed the same node came up in
+        // TWO SECONDS.
+        applyObfuscation(buf[reader.pos..], @intCast(reader.pos), reader.key);
+        reader.key = [_]u8{0} ** OBFUSCATION_KEY_SIZE;
     } else {
         return Error.UnsupportedVersion;
     }
