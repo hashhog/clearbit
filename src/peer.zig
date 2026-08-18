@@ -2189,7 +2189,46 @@ pub const Peer = struct {
         if (self.clean_subver) |old| self.allocator.free(old);
         self.clean_subver = cleaned;
 
-        self.version_info = v;
+        // Store the version fields WITHOUT the raw user_agent slice.
+        //
+        // `v.user_agent` points into the per-message receive buffer that
+        // `receiveMessage` frees on return — exactly as this function's own
+        // doc comment above states ("we never retain it — only the sanitized
+        // copy survives"). Assigning the whole struct retained it anyway, so
+        // `self.version_info.user_agent` became a DANGLING slice the moment
+        // the buffer was freed, and every later reader of it touched freed
+        // memory.
+        //
+        // That is remote-triggerable: the field is attacker-controlled, and it
+        // crash-looped the live mainnet node — SIGSEGV in sanitizeSubVer
+        // (peer.zig:849) via recordVersion, 61 crashes in 3 hours on
+        // 2026-08-18, ~1 every 3 minutes, with the node stuck at height
+        // 962953 making zero progress. It had already been down 9h overnight
+        // for the same reason.
+        //
+        // NOTE — THIS IS HARDENING, NOT THE FIX FOR THE CRASH ABOVE.
+        // The SIGSEGV happens EARLIER, in sanitizeSubVer at line 2188, because
+        // `v.user_agent` is ALREADY dangling on arrival. Root cause is in
+        // receiveMessage (peer.zig:1444): it allocates `payload`, sets
+        // `defer allocator.free(payload)`, and returns
+        // `p2p.decodePayload(command, payload, ...)` — while decodePayload
+        // builds user_agent via serialize.Reader.readBytes, which returns
+        // `self.data[pos..pos+n]`, a ZERO-COPY SLICE INTO payload
+        // (serialize.zig:24). So the defer frees the backing buffer as the
+        // function returns and every caller gets a dangling slice.
+        // Fixing that properly needs an ownership decision — p2p.Message has
+        // no deinit, so the likely answer is an inline fixed-size buffer, the
+        // field being bounded by MAX_SUBVERSION_LENGTH. Tracked separately.
+        //
+        // What this change DOES do: stop retaining a second dangling copy in
+        // self.version_info, making the documented invariant true rather than
+        // aspirational, so a future reader fails loudly (empty subver) instead
+        // of corrupting memory. The sanitized, owned copy in
+        // `self.clean_subver` remains the ONLY subver any consumer should read
+        // (getpeerinfo already does).
+        var stored = v;
+        stored.user_agent = &[_]u8{};
+        self.version_info = stored;
         self.services = v.services;
         self.start_height = v.start_height;
         self.is_witness_capable = (v.services & p2p.NODE_WITNESS) != 0;
