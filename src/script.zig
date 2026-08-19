@@ -601,7 +601,12 @@ fn preScanTapscript(script: []const u8) ?u8 {
             i += 1 + op;
         } else if (op == 76) { // OP_PUSHDATA1
             if (i + 1 >= script.len) break;
-            i += 2 + script[i + 1];
+            // Widen BEFORE adding: `2 + script[i+1]` in u8 overflows for any
+            // length byte >= 254. The PUSHDATA2/PUSHDATA4 arms below already
+            // widen; this one did not, and crashed the mainnet node on
+            // 2026-08-19. Core reads every push length into an `unsigned int`
+            // (script.cpp GetScriptOp), so it has no equivalent case.
+            i += 2 + @as(usize, script[i + 1]);
         } else if (op == 77) { // OP_PUSHDATA2
             if (i + 2 >= script.len) break;
             i += 3 + @as(usize, script[i + 1]) + (@as(usize, script[i + 2]) << 8);
@@ -7853,4 +7858,71 @@ test "W144-F9: OP_CHECKSIGADD still works in tapscript sig_version" {
     try engine.execute(s.items);
     // Stack should have one element: the encoded result of (1 + 0) = 1.
     try std.testing.expectEqual(@as(usize, 1), engine.stack.items.len);
+}
+
+// ============================================================================
+// BIP-342 tapscript pre-scan: OP_PUSHDATA1 length arithmetic
+//
+// Regression tests for the crash that took the mainnet clearbit node down on
+// 2026-08-19 (restart.log: "thread 2664258 panic: integer overflow" at
+// script.zig preScanTapscript, reached from verifyScriptJob -> real block
+// validation).
+//
+// `i += 2 + script[i + 1]` evaluated in u8: a PUSHDATA1 length byte >= 254
+// overflows. The PUSHDATA2 and PUSHDATA4 branches immediately below it both
+// widen with @as(usize, ...) already; only PUSHDATA1 did not.
+//
+// Consequences differ by build mode, and BOTH are severe:
+//   safety ON  -> panic, i.e. a remote crash from a tapscript in any block
+//   safety OFF -> wraps. len=254 gives i += 0 (INFINITE LOOP); len=255 gives
+//                 i += 1, so the scan walks INTO the push payload and reads
+//                 DATA bytes as opcodes. isOpSuccess() covers 0xbb-0xfe, so a
+//                 payload byte in that range is misread as OP_SUCCESSx and the
+//                 script is declared unconditionally valid per BIP-342 --
+//                 accepting a script Bitcoin Core rejects. That is a consensus
+//                 split, not just a liveness bug.
+//
+// Core has no such case: GetScriptOp (script.cpp) reads every push length into
+// an `unsigned int nSize`, so PUSHDATA1/2/4 all widen before any arithmetic.
+// ============================================================================
+
+test "tapscript pre-scan: PUSHDATA1 len=255 payload is skipped as data, not scanned" {
+    const allocator = std.testing.allocator;
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(76); // OP_PUSHDATA1
+    try s.append(255); // overflows u8 in `2 + len`
+    // Payload is entirely 0xbb, which isOpSuccess() accepts. If the scanner
+    // walks into it, it wrongly reports OP_SUCCESS.
+    try s.appendNTimes(0xbb, 255);
+    try std.testing.expectEqual(@as(?u8, null), preScanTapscript(s.items));
+}
+
+test "tapscript pre-scan: PUSHDATA1 len=254 terminates (wrapped i += 0 would hang)" {
+    const allocator = std.testing.allocator;
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(76);
+    try s.append(254); // 2 + 254 == 256 -> wraps to 0 with safety off
+    try s.appendNTimes(0xbb, 254);
+    try std.testing.expectEqual(@as(?u8, null), preScanTapscript(s.items));
+}
+
+test "tapscript pre-scan: OP_SUCCESS *after* a 255-byte PUSHDATA1 is still found" {
+    // Pins the exact resume offset, not merely "returns null". A scanner that
+    // skipped too far would miss this real OP_SUCCESS and wrongly REJECT a
+    // script Core accepts -- the opposite-direction consensus split.
+    const allocator = std.testing.allocator;
+    var s = std.ArrayList(u8).init(allocator);
+    defer s.deinit();
+    try s.append(76);
+    try s.append(255);
+    try s.appendNTimes(0x00, 255); // benign payload
+    try s.append(0xbb); // genuine OP_SUCCESSx at top level
+    try std.testing.expectEqual(@as(?u8, 0xbb), preScanTapscript(s.items));
+}
+
+test "tapscript pre-scan: top-level OP_SUCCESS still detected (positive control)" {
+    const s = [_]u8{0xbb};
+    try std.testing.expectEqual(@as(?u8, 0xbb), preScanTapscript(&s));
 }
