@@ -863,7 +863,14 @@ pub fn decodePayload(
             .nonce = try reader.readInt(u64),
             .user_agent = blk: {
                 const len = try reader.readCompactSize();
-                break :blk try reader.readBytes(@intCast(len));
+                // OWNED COPY. readBytes returns a slice into `payload`, which
+                // receiveMessage frees on return — every borrower was dangling
+                // the moment the caller saw it (the long-standing #31 UAF; the
+                // hardening in recordVersion could only blank the stored copy,
+                // not fix the read). The receiver owns this and must free it:
+                // handshake arms do so via defer, including on early returns.
+                const raw = try reader.readBytes(@intCast(len));
+                break :blk allocator.dupe(u8, raw) catch return ParseError.OutOfMemory;
             },
             .start_height = try reader.readInt(i32),
             .relay = if (reader.pos < payload.len) (try reader.readBytes(1))[0] != 0 else true,
@@ -922,7 +929,8 @@ pub fn decodePayload(
         const set_size = try reader.readInt(u16);
         const q = try reader.readInt(u16);
         const sketch_len = try reader.readCompactSize();
-        const sketch_data = try reader.readBytes(@intCast(sketch_len));
+        // Owned copy — same #31 borrowing hazard as user_agent above.
+        const sketch_data = allocator.dupe(u8, try reader.readBytes(@intCast(sketch_len))) catch return ParseError.OutOfMemory;
         return Message{ .reqrecon = .{
             .set_size = set_size,
             .q = q,
@@ -930,7 +938,8 @@ pub fn decodePayload(
         } };
     } else if (std.mem.eql(u8, command, "sketch")) {
         const sketch_len = try reader.readCompactSize();
-        const sketch_data = try reader.readBytes(@intCast(sketch_len));
+        // Owned copy — same #31 borrowing hazard as user_agent above.
+        const sketch_data = allocator.dupe(u8, try reader.readBytes(@intCast(sketch_len))) catch return ParseError.OutOfMemory;
         return Message{ .sketch = .{
             .sketch_data = sketch_data,
         } };

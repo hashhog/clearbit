@@ -1939,6 +1939,11 @@ pub const Peer = struct {
             const their_version = try self.receiveMessage();
             switch (their_version) {
                 .version => |v| {
+                    // user_agent is an OWNED heap copy as of the #31 fix
+                    // (decodePayload dupes it out of the transient payload
+                    // buffer). This arm is the owner: defer covers the
+                    // MIN_PROTOCOL_VERSION early return too.
+                    defer self.allocator.free(v.user_agent);
                     if (v.version < p2p.MIN_PROTOCOL_VERSION)
                         return PeerError.HandshakeFailed;
                     self.recordVersion(v);
@@ -1964,6 +1969,10 @@ pub const Peer = struct {
                 const msg = try self.receiveMessage();
                 switch (msg) {
                     .verack => break,
+                    // A duplicate version mid-handshake is a protocol
+                    // violation; we ignore it, but its user_agent is an owned
+                    // heap copy (#31) and must not leak.
+                    .version => |sv| self.allocator.free(sv.user_agent),
                     .wtxidrelay => {
                         // BIP-339: peer negotiated wtxid relay.
                         self.wtxid_relay_negotiated = true;
@@ -2002,6 +2011,11 @@ pub const Peer = struct {
             const their_version = try self.receiveMessage();
             switch (their_version) {
                 .version => |v| {
+                    // user_agent is an OWNED heap copy as of the #31 fix
+                    // (decodePayload dupes it out of the transient payload
+                    // buffer). This arm is the owner: defer covers the
+                    // MIN_PROTOCOL_VERSION early return too.
+                    defer self.allocator.free(v.user_agent);
                     if (v.version < p2p.MIN_PROTOCOL_VERSION)
                         return PeerError.HandshakeFailed;
                     self.recordVersion(v);
@@ -2046,6 +2060,10 @@ pub const Peer = struct {
                 const msg = try self.receiveMessage();
                 switch (msg) {
                     .verack => break,
+                    // A duplicate version mid-handshake is a protocol
+                    // violation; we ignore it, but its user_agent is an owned
+                    // heap copy (#31) and must not leak.
+                    .version => |sv| self.allocator.free(sv.user_agent),
                     else => {},
                 }
             }
@@ -2206,13 +2224,18 @@ pub const Peer = struct {
         // 962953 making zero progress. It had already been down 9h overnight
         // for the same reason.
         //
-        // NOTE — THIS IS HARDENING, NOT THE FIX FOR THE CRASH ABOVE.
-        // The SIGSEGV happens EARLIER, in sanitizeSubVer at line 2188, because
-        // `v.user_agent` is ALREADY dangling on arrival. Root cause is in
-        // receiveMessage (peer.zig:1444): it allocates `payload`, sets
+        // RESOLVED 2026-08-21 (#31): `v.user_agent` is no longer dangling on
+        // arrival — decodePayload now DUPES it out of the transient payload
+        // buffer (p2p.zig version arm), and the handshake .version arms own
+        // and free the copy (defer, covering early returns). This blanking
+        // remains as defence-in-depth so the stored struct never carries a
+        // pointer whose lifetime this function does not control.
+        //
+        // Historical root cause, kept for the record: receiveMessage
+        // (peer.zig:1444) allocates `payload`, sets
         // `defer allocator.free(payload)`, and returns
-        // `p2p.decodePayload(command, payload, ...)` — while decodePayload
-        // builds user_agent via serialize.Reader.readBytes, which returns
+        // `p2p.decodePayload(command, payload, ...)` — and decodePayload
+        // built user_agent via serialize.Reader.readBytes, which returns
         // `self.data[pos..pos+n]`, a ZERO-COPY SLICE INTO payload
         // (serialize.zig:24). So the defer frees the backing buffer as the
         // function returns and every caller gets a dangling slice.
