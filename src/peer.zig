@@ -10864,8 +10864,11 @@ test "peer manager address tracking - add and dedup" {
     var manager = PeerManager.init(allocator, params);
     defer manager.deinit();
 
-    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
-    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 2 }, 8333);
+    // ROUTABLE addresses required — addAddressWithTime drops non-routable ones
+    // (RFC1918 etc) exactly as Core's addrman AddSingle does, so the 192.168.x.x
+    // these used were correctly rejected and knownAddressCount() stayed 0.
+    const addr1 = std.net.Address.initIp4([4]u8{ 51, 15, 1, 1 }, 8333);
+    const addr2 = std.net.Address.initIp4([4]u8{ 51, 15, 1, 2 }, 8333);
 
     // Add first address
     try manager.addAddress(addr1, p2p.NODE_NETWORK, .dns_seed);
@@ -10890,8 +10893,10 @@ test "peer manager address selection" {
     // No addresses - should return null
     try std.testing.expect(manager.selectPeerToConnect() == null);
 
-    // Add an address
-    const addr = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 8333);
+    // Add an address. Must be ROUTABLE: a non-routable one is silently dropped
+    // by addAddressWithTime (Core addrman AddSingle parity), leaving nothing to
+    // select and making the assertion below unreachable.
+    const addr = std.net.Address.initIp4([4]u8{ 51, 15, 1, 1 }, 8333);
     try manager.addAddress(addr, p2p.NODE_NETWORK, .dns_seed);
 
     // Should select the address
