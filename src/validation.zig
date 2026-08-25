@@ -9791,7 +9791,30 @@ test "validateBlockForIBD: prev_mtp=0 skips MTP check (genesis-adjacent)" {
 /// Build a minimal valid coinbase transaction for W85 gate tests.
 /// Uses script_sig = OP_1 + 0x00, which satisfies BIP-34 at height=1.
 /// All W85 tests use height=1 (or a height where BIP-34 is not yet active).
+// Storage for the coinbase's outputs. It CANNOT be an inline `&[_]types.TxOut{...}`
+// in the return expression below: `.value` is computed at RUNTIME from
+// `subsidy_params`, so the array is not comptime-known and therefore is NOT
+// const-promoted — `&` would yield a pointer into this function's own stack
+// frame, dangling the moment it returns.
+//
+// That is not theoretical. It segfaulted: the caller's immediate
+// `crypto.computeTxid(&cb, ...)` succeeded because the dead frame had not been
+// reused yet, and then `validateBlockForIBD` — one call deeper — clobbered it, so
+// hashing `output.script_pubkey` read a wild stack address and aborted the whole
+// test binary, hiding every test ordered after it.
+//
+// `inputs` above needs no such treatment: every field there is comptime-known, so
+// that array IS const-promoted and safe to take the address of.
+//
+// Single-threaded test use only; each caller consumes its coinbase before the next
+// call overwrites this.
+var w85_cb_outputs: [1]types.TxOut = undefined;
+
 fn w85MakeCoinbase(subsidy_params: *const consensus.NetworkParams) types.Transaction {
+    w85_cb_outputs[0] = .{
+        .value = consensus.getBlockSubsidy(1, subsidy_params),
+        .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
+    };
     return types.Transaction{
         .version = 1,
         .inputs = &[_]types.TxIn{.{
@@ -9800,10 +9823,7 @@ fn w85MakeCoinbase(subsidy_params: *const consensus.NetworkParams) types.Transac
             .sequence = 0xFFFFFFFF,
             .witness = &[_][]const u8{},
         }},
-        .outputs = &[_]types.TxOut{.{
-            .value = consensus.getBlockSubsidy(1, subsidy_params),
-            .script_pubkey = &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac }),
-        }},
+        .outputs = &w85_cb_outputs,
         .lock_time = 0,
     };
 }
