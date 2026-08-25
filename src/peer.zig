@@ -10909,7 +10909,12 @@ test "peer manager ban ip" {
     var manager = PeerManager.init(allocator, params);
     defer manager.deinit();
 
-    const addr = std.net.Address.initIp4([4]u8{ 192, 168, 1, 100 }, 8333);
+    // ROUTABLE address required: addAddressWithTime rejects non-routable ones
+    // (RFC1918 etc) exactly as Core's addrman AddSingle does. This test used
+    // 192.168.1.100, which is RFC1918, so the address was correctly dropped and
+    // knownAddressCount() stayed 0 — the test asserted 1 and had never run to
+    // notice. 51.15.x.x is public; the /16 netgroup relationship is unchanged.
+    const addr = std.net.Address.initIp4([4]u8{ 51, 15, 1, 100 }, 8333);
 
     // Add address first
     try manager.addAddress(addr, p2p.NODE_NETWORK, .dns_seed);
@@ -10919,7 +10924,7 @@ test "peer manager ban ip" {
     try manager.banIP(addr, DEFAULT_BAN_DURATION, "test ban");
 
     // Adding a new address with same IP should be rejected
-    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 100 }, 18333); // Same IP, different port
+    const addr2 = std.net.Address.initIp4([4]u8{ 51, 15, 1, 100 }, 18333); // Same IP, different port
     try manager.addAddress(addr2, p2p.NODE_NETWORK, .dns_seed);
     // Still only 1 address since same IP is banned
     try std.testing.expectEqual(@as(usize, 1), manager.knownAddressCount());
@@ -11154,8 +11159,10 @@ test "peer manager ban integration" {
     var manager = PeerManager.init(allocator, params);
     defer manager.deinit();
 
-    const addr1 = std.net.Address.initIp4([4]u8{ 192, 168, 50, 1 }, 8333);
-    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 50, 2 }, 8333);
+    // ROUTABLE addresses required — see the note in "peer manager ban ip".
+    // 192.168.50.x is RFC1918 and was silently dropped by addAddress.
+    const addr1 = std.net.Address.initIp4([4]u8{ 51, 15, 50, 1 }, 8333);
+    const addr2 = std.net.Address.initIp4([4]u8{ 51, 15, 50, 2 }, 8333);
 
     // Add addresses
     try manager.addAddress(addr1, p2p.NODE_NETWORK, .dns_seed);
