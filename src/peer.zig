@@ -10990,7 +10990,7 @@ test "peer manager running state" {
 // Misbehavior Scoring Tests
 // ============================================================================
 
-test "misbehaving function increments score and sets should_ban" {
+test "misbehaving discourages on the FIRST infraction (Core single-event model)" {
     const allocator = std.testing.allocator;
     const params = &consensus.MAINNET;
 
@@ -11027,19 +11027,30 @@ test "misbehaving function increments score and sets should_ban" {
         .connect_time = std.time.timestamp(),
     };
 
-    // Initially not marked for ban
+    // Core PR #25974 (2022) replaced score accumulation with a SINGLE-EVENT
+    // discourage: any Misbehaving call sets m_should_discourage immediately, and
+    // no running total is kept. misbehaving() implements exactly that and says so.
+    //
+    // This test used to assert 0 -> 50 -> 100 accumulation AND, crucially, that
+    // should_ban was still FALSE after the first 50-point call. That is the
+    // substantive difference: under the current model one infraction is enough.
+    // It asserted the model Core abandoned, and never ran to say so.
+    //
+    // Score accumulation still exists as a separate API, addBanScore(), which has
+    // its own test immediately below. Keeping the two straight is the point here.
     try std.testing.expect(!peer.should_ban);
     try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
 
-    // Add misbehavior with 50 points
+    // ONE infraction, of any weight, discourages immediately.
     peer.misbehaving(50, "test misbehavior");
-    try std.testing.expectEqual(@as(u32, 50), peer.ban_score);
-    try std.testing.expect(!peer.should_ban);
-
-    // Add another 50 points - now at 100, should be banned
-    peer.misbehaving(50, "second misbehavior");
-    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
     try std.testing.expect(peer.should_ban);
+    // ...and leaves no score behind: that is addBanScore()'s job, not this one's.
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
+
+    // A second infraction is idempotent — still discouraged, still no score.
+    peer.misbehaving(50, "second misbehavior");
+    try std.testing.expect(peer.should_ban);
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
 }
 
 test "misbehaving with 100 points immediately bans" {
@@ -11079,10 +11090,12 @@ test "misbehaving with 100 points immediately bans" {
         .connect_time = std.time.timestamp(),
     };
 
-    // Invalid block header = 100 points = immediate ban
+    // Invalid block header discourages immediately. Under the single-event model
+    // the weight argument is informational only — it is logged, not accumulated —
+    // so ban_score stays 0. This previously asserted 100, i.e. the pre-2022 model.
     peer.misbehaving(100, "invalid block header");
-    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
     try std.testing.expect(peer.should_ban);
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
 }
 
 test "addBanScore sets should_ban at threshold" {
