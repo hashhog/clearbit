@@ -12283,11 +12283,15 @@ test "W99/G16: block_source_peers tracks supplying peer; misbehaving(100) fires 
 
     const peer = try allocator.create(Peer);
     peer.* = makeTestPeer(allocator, .outbound_full_relay);
-    defer peer.recv_buffer.deinit();
-    // Do NOT destroy peer here — pm.deinit() does not own it in this test;
-    // we destroy it manually after asserting, before pm.deinit runs (pm has no
-    // chain_state so it never reaches the ban-list save that touches peers).
+    // ORDER MATTERS: defers run in REVERSE, so destroy() must be registered
+    // FIRST and recv_buffer.deinit() SECOND. The other way round frees the
+    // peer and then dereferences it — a use-after-free that segfaulted during
+    // teardown and took the whole test binary down with it, hiding every test
+    // ordered after this one.
+    // pm.deinit() does not own this peer (pm has no chain_state, so it never
+    // reaches the ban-list save that touches peers); we free it here.
     defer allocator.destroy(peer);
+    defer peer.recv_buffer.deinit();
 
     // Add the peer to the manager's live list so the drain-path lookup finds it.
     try pm.peers.append(peer);
@@ -12308,8 +12312,14 @@ test "W99/G16: block_source_peers tracks supplying peer; misbehaving(100) fires 
     }
     _ = pm.block_source_peers.remove(fake_hash);
 
-    // Peer must now carry a 100-point score and should_ban=true.
-    try std.testing.expectEqual(@as(u32, 100), peer.ban_score);
+    // SINGLE-EVENT MODEL (Core PR #25974, 2022): misbehaving() sets should_ban
+    // immediately and deliberately does NOT accumulate a score — see its
+    // implementation, which says so. ban_score belongs to the OTHER API,
+    // addBanScore(), and correctly stays 0 here.
+    // This previously asserted ban_score == 100, i.e. the pre-2022 model Core
+    // itself abandoned. It was never corrected because this whole test step
+    // has never run. Pin the real contract instead of the abandoned one.
+    try std.testing.expectEqual(@as(u32, 0), peer.ban_score);
     try std.testing.expect(peer.should_ban);
     // Source map entry was removed.
     try std.testing.expect(pm.block_source_peers.get(fake_hash) == null);
