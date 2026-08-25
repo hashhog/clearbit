@@ -27561,9 +27561,17 @@ test "computeSubmitBlockMtp: uses prev_hash ancestors, not stale tip ring (reorg
     defer cm.deinit();
 
     const N_ANCESTORS: usize = 11;
-    var entries: [N_ANCESTORS]validation.BlockIndexEntry = undefined;
+    // HEAP-allocate: ChainManager.deinit() OWNS every entry in block_index and
+    // calls allocator.destroy() on each (validation.zig:6431-6434, and the
+    // comment below it says so outright). Stack-allocated entries made that an
+    // "Invalid free" panic -> SIGABRT in teardown, which aborted the whole
+    // test-rpc binary. Production always inserts heap entries
+    // (validation.zig:6451,6520; sync.zig:954,1067), so the contract is fine —
+    // the test was violating it. Nothing is freed here: cm.deinit() does it.
+    var entries: [N_ANCESTORS]*validation.BlockIndexEntry = undefined;
     for (0..N_ANCESTORS) |i| {
-        entries[i] = .{
+        entries[i] = try allocator.create(validation.BlockIndexEntry);
+        entries[i].* = .{
             .hash = [_]u8{@intCast(i + 1)} ** 32, // distinct hashes: 0x01..0x0B
             .header = blk: {
                 var h = std.mem.zeroes(types.BlockHeader);
@@ -27585,11 +27593,12 @@ test "computeSubmitBlockMtp: uses prev_hash ancestors, not stale tip ring (reorg
     // Link parent pointers so computeMTPViaChainManager could also work, though
     // computeSubmitBlockMtp uses block_index.get(), not entry.parent.
     for (0..N_ANCESTORS - 1) |i| {
-        entries[i].parent = &entries[i + 1];
+        entries[i].parent = entries[i + 1];
     }
-    // Add all entries to the block_index, keyed by hash.
+    // Add all entries to the block_index, keyed by hash. Ownership transfers
+    // to the ChainManager here; cm.deinit() destroys them.
     for (0..N_ANCESTORS) |i| {
-        try cm.block_index.put(entries[i].hash, &entries[i]);
+        try cm.block_index.put(entries[i].hash, entries[i]);
     }
 
     // chain-B prev_hash: the youngest entry (entry[0] = timestamp 1000; its
