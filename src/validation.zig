@@ -11500,13 +11500,24 @@ test "W97 G4: CheckBlockHeader rejects high-hash header (PoW)" {
 }
 
 test "W97 G4: CheckBlockHeader gate ordering — pow_limit check exists" {
-    // bitsToTarget(0x1d010000) encodes target with byte 0x01 at position 29.
-    // Mainnet pow_limit has 0xFFFF at bytes 28-29 (LE), so target 0x010000.. is
-    // BELOW limit — passes the pow_limit gate but the hash fails PoW.
-    // checkBlockHeader returns BadProofOfWork (not BadDifficulty), confirming
-    // the pow_limit gate ordering: limit check FIRST, then hash check.
+    // Intent: prove the limit gate runs BEFORE the hash gate. To show that, the
+    // header must PASS the limit gate and FAIL the hash gate, yielding
+    // BadProofOfWork rather than BadDifficulty.
+    //
+    // This previously used bits = 0x1d010000 and asserted BadProofOfWork, with a
+    // comment claiming that target was "BELOW limit". It is not. Compact bits
+    // share the exponent 0x1d with the mainnet limit 0x1d00ffff, so the mantissas
+    // decide it: 0x010000 = 65536 is one GREATER than 0x00ffff = 65535. That
+    // target is ABOVE the limit, so BadDifficulty was the correct answer and the
+    // header never reached the hash gate at all — the test was asserting the
+    // wrong outcome, and never ran to say so.
+    //
+    // 0x1b00ffff keeps the limit's mantissa and drops the exponent by one: the
+    // mainnet limit made 256x harder. Target 0x0000...0000ffff000... is below the
+    // limit (passes gate 2) and below the genesis hash 0x00000000_0019d668...
+    // (so gate 3 rejects). That is the ordering this test exists to pin.
     var hdr = consensus.MAINNET.genesis_header;
-    hdr.bits = 0x1d010000; // below limit but hash doesn't meet
+    hdr.bits = 0x1b00ffff; // below pow_limit, but the genesis hash cannot meet it
     hdr.nonce = 0;
     try std.testing.expectError(
         ValidationError.BadProofOfWork,
