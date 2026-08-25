@@ -521,16 +521,40 @@ test "tryFireReorg: arms pending_reorg when fork has higher chainwork" {
     // (No actual blocks committed — we exercise the trigger logic only;
     // tryFireReorg's downstream call to reorgToChain is exercised in
     // its own storage.zig tests at storage.zig:5718.)
-    cs.best_hash = [_]u8{0xAA} ** 32;
-    cs.best_height = 2;
-
-    // Build fork chain B from genesis: B1, B2, B3 (3 blocks > 2).
     // We collect the blocks for cleanup later.
     var to_free = std.ArrayList(types.Block).init(allocator);
     defer {
         for (to_free.items) |b| freeTestBlock(allocator, b);
         to_free.deinit();
     }
+
+    // Build the ACTIVE chain A (2 blocks) and point ChainState at its tip,
+    // so the tip is present in header_index and the reorg comparison has a
+    // REAL, same-scale basis.
+    //
+    // This test used to set `cs.best_hash = 0xAA..` — a hash deliberately NOT
+    // in header_index — and its comment said it forced the fork's work "to
+    // strictly exceed the active tip's chainWorkFromHeight(2) placeholder".
+    // That made the test depend on the synthetic fallback, which is exactly
+    // the #46 defect: a value engineered to lose standing in for the active
+    // chain. The fallback now refuses instead, so the test states its real
+    // intent — a STRICTLY HEAVIER fork arms a reorg — against a basis that
+    // actually means something.
+    var prev_a: [32]u8 = [_]u8{0} ** 32;
+    var a_tip: types.Hash256 = undefined;
+    var ai: u32 = 0;
+    while (ai < 2) : (ai += 1) {
+        const a = try makeForkTestBlock(allocator, prev_a, @as(u8, @intCast(0xA0 + ai)), 0x207fffff, 200 + ai);
+        try to_free.append(a.block);
+        const aent = try pm.insertHeader(&a.block.header, &a.hash);
+        try testing.expect(aent != null);
+        prev_a = a.hash;
+        a_tip = a.hash;
+    }
+    cs.best_hash = a_tip;
+    cs.best_height = 2;
+
+    // Build fork chain B from genesis: B1, B2, B3 (3 blocks > 2).
 
     var prev_b: [32]u8 = [_]u8{0} ** 32;
     var hashes_b: [3]types.Hash256 = undefined;
@@ -545,8 +569,9 @@ test "tryFireReorg: arms pending_reorg when fork has higher chainwork" {
         prev_b = b.hash;
     }
 
-    // Force fork_tip's chain_work to strictly exceed the active tip's
-    // chainWorkFromHeight(2) placeholder so maybeArmReorg arms.
+    // Force fork_tip's chain_work to strictly exceed the ACTIVE TIP's real
+    // header_index chain_work so maybeArmReorg arms. Both operands are now on
+    // the same scale (chainWorkFromHeight(root) + SUM(workFromBits)).
     var ent = pm.header_index.get(hashes_b[2]).?;
     var bigwork: [32]u8 = [_]u8{0} ** 32;
     bigwork[0] = 0xFF; // top byte set → maximal big-endian value
@@ -1446,4 +1471,81 @@ test "getheaders responder: fork point at tip → nothing to serve (null)" {
     const zero_stop = [_]u8{0} ** 32;
     try testing.expectEqual(@as(u32, 3), pm.getHeadersForkPoint(&locator));
     try testing.expect(pm.collectHeadersFromForkPoint(&locator, &zero_stop) == null);
+}
+
+// ====================================================================
+// #46: a fork must NOT win when there is no same-scale basis for the
+// active chain.
+//
+// maybeArmReorg used to fall back to `chainWorkFromHeight(cs.best_height)`
+// when the active tip was absent from header_index — a synthetic value that
+// encodes height+1 into the low 5 bytes and, by construction, LOSES to any
+// real chain. That state is reached after every restart or eviction until
+// headers re-sync, so the chain the node was actually on was represented by a
+// number engineered to lose and the first fork to arrive took the node.
+//
+// Reading the PERSISTED chain_work instead would be wrong for a different
+// reason: header_index accumulates from the sync ROOT
+// (chainWorkFromHeight(root) + SUM(work)) while the block index accumulates
+// from GENESIS (genesisBlockProof + SUM(work)). Mixing the scales makes the
+// active tip win every contest. So the only honest answer is to refuse.
+// ====================================================================
+test "maybeArmReorg: refuses when the active tip has no comparable chainwork" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    // Active tip is NOT in header_index — the post-restart / post-eviction
+    // state. Height 5 keeps the implied reorg well inside the depth cap, so
+    // this test isolates the missing-basis path and nothing else.
+    cs.best_hash = [_]u8{0xAA} ** 32;
+    cs.best_height = 5;
+
+    var to_free = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (to_free.items) |b| freeTestBlock(allocator, b);
+        to_free.deinit();
+    }
+
+    // A fork carrying genuinely large work.
+    var prev: [32]u8 = [_]u8{0} ** 32;
+    var fork_tip: types.Hash256 = undefined;
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        const b = try makeForkTestBlock(allocator, prev, @as(u8, @intCast(0xC0 + i)), 0x207fffff, 700 + i);
+        try to_free.append(b.block);
+        const e = try pm.insertHeader(&b.block.header, &b.hash);
+        try testing.expect(e != null);
+        prev = b.hash;
+        fork_tip = b.hash;
+    }
+    var ent = pm.header_index.get(fork_tip).?;
+    var bigwork: [32]u8 = [_]u8{0} ** 32;
+    bigwork[0] = 0xFF; // maximal big-endian value — beats any placeholder
+    ent.chain_work = bigwork;
+    try pm.header_index.put(fork_tip, ent);
+
+    var stub = makeStubPeer(&params, allocator);
+    defer stub.recv_buffer.deinit();
+
+    pm.maybeArmReorg(&stub, &fork_tip);
+
+    // Pre-fix this armed: bigwork beat chainWorkFromHeight(5). The node must
+    // now keep the chain it has until header sync gives it a real basis.
+    try testing.expect(pm.pending_reorg == null);
+    // And the peer is NOT penalised — offering a fork we cannot yet evaluate
+    // is our limitation, not its misbehaviour.
+    try testing.expect(!stub.should_ban);
 }

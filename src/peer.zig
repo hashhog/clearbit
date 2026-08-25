@@ -348,6 +348,11 @@ pub fn cmpChainWorkBE(a: *const [32]u8, b: *const [32]u8) i32 {
 /// comparison in `maybeArmReorg` correctly reflects "fork extends
 /// past tip".  Used only during the in-memory header-index walk;
 /// never persisted.
+/// Maximum reorg depth this node will consider, mirroring
+/// storage.ChainState.MAX_REORG_DEPTH (288 = Core's MIN_BLOCKS_TO_KEEP). Declared
+/// here so the header-sync path can bound a reorg before any chainstate call.
+pub const MAX_REORG_DEPTH_PEER: u32 = 288;
+
 pub fn chainWorkFromHeight(height: u32) [32]u8 {
     var out: [32]u8 = [_]u8{0} ** 32;
     // Encode (height + 1) big-endian into the trailing 5 bytes,
@@ -5325,6 +5330,43 @@ pub const PeerManager = struct {
             return;
         };
 
+        // Reorg DEPTH is checked here, on the RESOLVED fork point, and
+        // independently of chain work.
+        //
+        // The walk above can terminate on the all-zeros sentinel (a header whose
+        // prev_hash is zero, i.e. a chain rooted at genesis) and report it as the
+        // fork point, which sidesteps the depth cap enforced inside the walk. A
+        // 300-deep alt chain rooted there against a tip at height 1000 therefore
+        // arrived here with a "valid" fork point and a reorg depth of 1000.
+        //
+        // That case USED to be caught by accident: the fork outweighed the
+        // synthetic chainWorkFromHeight placeholder, a reorg was ARMED,
+        // tryFireReorg attempted it, the attempt failed, and
+        // `misbehaving(100, "reorg failure")` banned the peer. The penalty was a
+        // SIDE EFFECT of attempting something already known to be impossible.
+        // Once the placeholder stops handing every fork a win (below), that path
+        // is no longer reached and the penalty would silently vanish — trading a
+        // consensus hole for a DoS hole. So the check moves here, where it can be
+        // stated directly.
+        //
+        // A fork point we do not have an entry for is treated as height 0, which
+        // is the honest reading of the zero sentinel: the chain is rooted at
+        // genesis, so the implied reorg is the full height of our tip.
+        const fp_height: u32 = if (self.header_index.get(fp)) |e| e.height else 0;
+        const reorg_depth: u32 = if (cs.best_height > fp_height)
+            cs.best_height - fp_height
+        else
+            0;
+        if (reorg_depth > MAX_REORG_DEPTH_PEER) {
+            std.log.warn(
+                "REORG: refused — reorg depth {d} exceeds the cap ({d}) " ++
+                    "(fork_point_h={d}, active_h={d})",
+                .{ reorg_depth, MAX_REORG_DEPTH_PEER, fp_height, cs.best_height },
+            );
+            peer.misbehaving(20, "fork too deep");
+            return;
+        }
+
         // Reverse fork_chain to get fork_point + 1 .. new_tip order.
         std.mem.reverse(types.Hash256, fork_chain.items);
 
@@ -5360,7 +5402,47 @@ pub const PeerManager = struct {
                 if (self.header_index.get(hdr_tip)) |e| break :blk e.chain_work;
             }
             if (self.header_index.get(cs.best_hash)) |e| break :blk e.chain_work;
-            break :blk chainWorkFromHeight(cs.best_height);
+
+            // No same-scale basis for the active chain: REFUSE to reorg.
+            //
+            // This used to fall back to `chainWorkFromHeight(cs.best_height)`,
+            // a synthetic value that encodes height+1 into the low 5 bytes and
+            // — by its own definition — LOSES to any real chain. Reached
+            // whenever the active tip is absent from header_index, i.e. after
+            // every restart or eviction until headers re-sync, it meant the
+            // chain we are actually on was represented by a number engineered
+            // to lose, so the first fork to arrive took the node.
+            //
+            // Reading the PERSISTED chain_work (BlockIndexRecord via
+            // getBlockIndexFull) looks like the obvious fix and is also wrong:
+            // the two values are on DIFFERENT SCALES. header_index entries are
+            // chainWorkFromHeight(root) + SUM(workFromBits) — real work
+            // accumulated only since header sync began (peer.zig:5094). The
+            // block index is seeded from genesisBlockProof and accumulates from
+            // GENESIS (validation.zig:7410, block_template.zig:1251). Comparing
+            // a full-genesis total against a since-root total would make the
+            // active tip win every contest, which is the same class of bug
+            // pointing the other way.
+            //
+            // `ChainState.total_work` is not a third option: it is a dead field,
+            // written only as zeros (storage.zig:2797, 2822) and never
+            // accumulated or persisted.
+            //
+            // So the honest answer is that we cannot compare, and an
+            // incomparable basis is not evidence. Keep the chain we have; the
+            // fork must PROVE more work on the same scale, which it can once
+            // header sync repopulates header_index — normal operation, and
+            // self-healing within one sync round. Same principle as beamchain
+            // #45: waiting for evidence costs a round trip, guessing costs the
+            // chain.
+            std.log.warn(
+                "REORG: refusing fork — active tip {x} (h={d}) is not in " ++
+                    "header_index, so there is no same-scale chainwork basis " ++
+                    "to compare against. Keeping the current chain until " ++
+                    "header sync repopulates the index.",
+                .{ std.fmt.fmtSliceHexLower(cs.best_hash[0..8]), cs.best_height },
+            );
+            return;
         };
         if (cmpChainWorkBE(&tip_entry.chain_work, &active_work) <= 0) {
             // Equal- or lower-chainwork than the chain we already hold/are
