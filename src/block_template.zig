@@ -1007,7 +1007,36 @@ pub fn submitBlockWithIndexAndMempool(
     // Reference: consensus/tx_verify.cpp:IsFinalTx, BIP-113.
     {
         const csv_active = height >= params.csv_height;
-        const prev_mtp: u32 = if (csv_active) chain_state.computeMTP() else 0;
+        // Core: nLockTimeCutoff = pindexPrev->GetMedianTimePast()
+        // (validation.cpp:4140-4142) — the MTP of the PARENT, walked over
+        // real headers.  `chain_state.computeMTP()` is NOT that: it reads an
+        // in-memory ring that `initGenesisTimestamp` seeds with a single
+        // entry — the GENESIS nTime — on every boot and refills one slot per
+        // connected block.  A node restarted at height H therefore answered
+        // `genesis nTime` here, a cutoff decades below the true median, and
+        // false-REJECTED every block holding a time-based nLockTime with a
+        // non-final sequence.
+        //
+        // #55, measured 2026-08-24 on regtest at height 110 (true MTP of
+        // block 110 = 1777840541, regtest genesis nTime = 1296688602):
+        //   corpus timelocks/locktime-time-below-mtp  nLockTime 1777840540
+        //   corpus _advsweep-2026-07-07/bip113-mtp-locktime/
+        //          final-below-mtp-accept             nLockTime 1777840540
+        // Core: 1777840540 < 1777840541 -> final -> accept 110->111.
+        // clearbit: 1777840540 < 1296688602 is FALSE, nSequence != 0xffffffff
+        //           -> non-final -> reject:bad-txns-nonfinal, stuck at 110.
+        // Over-rejection: a live node would refuse a valid block and fork
+        // itself off the network.  Only visible after a restart, which is why
+        // it surfaced when the corpus sweep moved to --context-cache (the
+        // node BOOTS on a cloned, already-primed datadir).
+        //
+        // computeMtpForParent walks the parent's real 11-ancestor window out
+        // of CF_BLOCK_INDEX / CF_BLOCKS, which survive the restart, and
+        // returns 0 rather than a truncated-window median when it cannot.
+        const prev_mtp: u32 = if (csv_active)
+            chain_state.computeMtpForParent(&block.header.prev_block, params)
+        else
+            0;
         const lock_time_cutoff: u32 = if (csv_active and prev_mtp != 0)
             prev_mtp
         else

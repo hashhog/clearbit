@@ -4105,6 +4105,133 @@ pub const ChainState = struct {
         return tmp[n / 2];
     }
 
+    /// True when the in-memory `recent_timestamps` ring actually spans the
+    /// window Core's `GetMedianTimePast()` uses for the active tip —
+    /// min(11, best_height + 1) entries.
+    ///
+    /// The ring is IN-MEMORY ONLY.  It is seeded with a single entry — the
+    /// GENESIS timestamp, via `initGenesisTimestamp` — on every boot,
+    /// regardless of the tip height, and refills one slot per connected
+    /// block.  A node restarted at height 110 therefore holds exactly one
+    /// entry (the genesis nTime) and `computeMTP()` returns THAT, a cutoff
+    /// decades below the true median.  Any consensus caller that feeds the
+    /// result to `IsFinalTx` then false-REJECTS every block carrying a
+    /// time-based nLockTime with a non-final sequence (#55).
+    ///
+    /// Consensus callers MUST gate `computeMTP()` on this predicate (or,
+    /// better, use `computeMtpForParent`, which reads real headers).
+    pub fn mtpRingCoversTip(self: *const ChainState) bool {
+        const want: u32 = @min(@as(u32, 11), self.best_height +| 1);
+        return self.recent_ts_count >= want;
+    }
+
+    /// Collect up to 11 ancestor timestamps starting AT `start_hash` and
+    /// walking `prev_block` backwards, into `out`.  Returns the count.
+    ///
+    /// Sources, in order: the persisted block index (CF_BLOCK_INDEX, written
+    /// for every connected block by `flush`), then the persisted block BODY
+    /// (CF_BLOCKS, which the fast IBD connect path also populates).  Both
+    /// survive a process restart, unlike `recent_timestamps`.
+    ///
+    /// Genesis is a terminus: Core's walk stops at `pprev == nullptr` with
+    /// the genesis block COUNTED, but genesis is in neither store here, so
+    /// its nTime comes from the network params.
+    fn collectAncestorTimestamps(
+        self: *ChainState,
+        start_hash: *const types.Hash256,
+        params: *const @import("consensus.zig").NetworkParams,
+        out: *[11]u32,
+    ) usize {
+        var n: usize = 0;
+        var cursor: types.Hash256 = start_hash.*;
+        while (n < 11) {
+            if (std.mem.eql(u8, &cursor, &params.genesis_hash)) {
+                out[n] = params.genesis_header.timestamp;
+                n += 1;
+                break;
+            }
+            const hdr = self.getPersistedHeader(&cursor) orelse
+                self.getBlockHeaderFromBody(&cursor) orelse break;
+            out[n] = hdr.timestamp;
+            cursor = hdr.prev_block;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Median-time-past OF the block `prev_hash` — Bitcoin Core's
+    /// `pindexPrev->GetMedianTimePast()` (validation.cpp:4140-4142), i.e. the
+    /// BIP-113 `nLockTimeCutoff` for a block whose PARENT is `prev_hash`.
+    ///
+    /// This is the restart-safe answer the submitblock path needs.  The tip
+    /// ring (`computeMTP()`) is not: see `mtpRingCoversTip`.
+    ///
+    /// Returns 0 ("MTP unavailable") when the header walk cannot cover Core's
+    /// full min(11, prev_height + 1) window and the ring cannot stand in for
+    /// it.  A truncated window has a DIFFERENT median, so returning it would
+    /// only swap one wrong cutoff for another; 0 tells the caller to fall
+    /// back to the documented pre-BIP-113 behaviour instead.
+    pub fn computeMtpForParent(
+        self: *ChainState,
+        prev_hash: *const types.Hash256,
+        params: *const @import("consensus.zig").NetworkParams,
+    ) u32 {
+        const prev_height: ?u32 = blk: {
+            if (std.mem.eql(u8, prev_hash, &self.best_hash)) break :blk self.best_height;
+            if (self.getBlockHeightByHash(prev_hash)) |h| break :blk h;
+            break :blk null;
+        };
+
+        var timestamps: [11]u32 = undefined;
+        const n = self.collectAncestorTimestamps(prev_hash, params, &timestamps);
+
+        // Incomplete-window guard — the twin of peer.zig's
+        // computePrevMtpEx guard.  Core always spans min(11, height+1).
+        const want: usize = if (prev_height) |ph|
+            @min(@as(usize, 11), @as(usize, ph) +| 1)
+        else
+            11;
+        if (n >= want) {
+            return @import("validation.zig").medianTimePast(timestamps[0..n]);
+        }
+
+        // Walk incomplete (DB-less mode, pruned bodies, pre-index datadir).
+        // The ring is a valid stand-in only when the parent IS the tip AND
+        // the ring covers the tip's own window.
+        if (std.mem.eql(u8, prev_hash, &self.best_hash) and self.mtpRingCoversTip()) {
+            return self.computeMTP();
+        }
+        return 0;
+    }
+
+    /// Rebuild the BIP-113 MTP ring from persisted headers at boot.
+    ///
+    /// Before this ran, EVERY restart left the ring holding one entry — the
+    /// genesis nTime — no matter the tip height, so `computeMTP()` answered
+    /// the genesis timestamp until 11 fresh blocks had connected.  Every
+    /// consumer was wrong for that window: submitblock's BIP-113 cutoff
+    /// (false-REJECT, #55), mempool finality, getblocktemplate's mintime and
+    /// getblockchaininfo's `mediantime` (which reported 1296688602 on a
+    /// regtest node restarted at height 110 whose true MTP was 1777840541).
+    ///
+    /// Commits ONLY when the full min(11, best_height + 1) window is
+    /// recovered — a partial window has a different median, i.e. a different
+    /// wrong answer.  Returns true when the ring was warmed.
+    pub fn warmMtpRingFromDisk(
+        self: *ChainState,
+        params: *const @import("consensus.zig").NetworkParams,
+    ) bool {
+        const want: usize = @min(@as(usize, 11), @as(usize, self.best_height) +| 1);
+        var timestamps: [11]u32 = undefined;
+        const n = self.collectAncestorTimestamps(&self.best_hash, params, &timestamps);
+        if (n < want) return false;
+        // Ring invariant: slot i = timestamp of block (best_height - i), which
+        // is exactly the order collectAncestorTimestamps produced.
+        @memcpy(self.recent_timestamps[0..n], timestamps[0..n]);
+        self.recent_ts_count = @intCast(n);
+        return true;
+    }
+
     /// Returns true if the chain has ever connected a block with the given
     /// hash.  Used by the headers handler's competing-fork detector to
     /// decide whether a "non-tip" prev_block names a real ancestor on the
@@ -16230,4 +16357,216 @@ test "W93 G15 IsUnspendable parity: normal P2WPKH coinbase IS emplaced (regressi
     const after = chain_state.utxo_set.total_utxos;
 
     try std.testing.expectEqual(@as(u64, before + 1), after);
+}
+
+// ============================================================================
+// #55 — BIP-113 locktime cutoff must come from the PARENT's real MTP
+// ============================================================================
+//
+// Regression guards for the consensus split found by the 2026-08-24
+// full-coverage cold-cache corpus sweep: clearbit REJECTED two blocks Bitcoin
+// Core ACCEPTS (`timelocks/locktime-time-below-mtp`,
+// `_advsweep-2026-07-07/bip113-mtp-locktime/final-below-mtp-accept`), both
+// with `bad-txns-nonfinal`, both only after a RESTART.
+//
+// The numbers, on the corpus's 110-block regtest chain:
+//   block 100..110 nTime = 540,540,540,540,541,541,541,541,541,541,542
+//                          (all prefixed 17778405xx)
+//   MTP(parent=110)      = 1777840541   <- Core's nLockTimeCutoff
+//   regtest genesis nTime= 1296688602   <- what the cold ring answered
+//   entry tx nLockTime   = 1777840540, nSequence = 0 (non-final)
+//   Core:     1777840540 < 1777840541 -> final  -> accept
+//   clearbit: 1777840540 < 1296688602 -> FALSE  -> reject:bad-txns-nonfinal
+
+/// Corpus timestamps for heights 100..110 (index 0 = height 100).
+const T55_TIMESTAMPS = [_]u32{
+    1777840540, 1777840540, 1777840540, 1777840540, // 100..103
+    1777840541, 1777840541, 1777840541, 1777840541, // 104..107
+    1777840541, 1777840541, // 108..109
+    1777840542, // 110 (the tip / parent)
+};
+const T55_TRUE_MTP: u32 = 1777840541;
+const T55_REGTEST_GENESIS_TS: u32 = 1296688602;
+const T55_ENTRY_LOCKTIME: u32 = 1777840540;
+
+/// Plant heights 100..110 as a linked header chain in CF_BLOCKS (the store
+/// `getBlockHeaderFromBody` reads) and point the chain state at the tip.
+fn plant55Chain(chain_state: *ChainState, db: *Database, allocator: std.mem.Allocator) !void {
+    const crypto = @import("crypto.zig");
+    var prev: types.Hash256 = [_]u8{0xAA} ** 32; // height-99 stand-in
+    for (T55_TIMESTAMPS, 0..) |ts, i| {
+        const hdr = types.BlockHeader{
+            .version = 0x20000000,
+            .prev_block = prev,
+            .merkle_root = [_]u8{@intCast(i)} ** 32,
+            .timestamp = ts,
+            .bits = 0x207fffff,
+            .nonce = @intCast(i),
+        };
+        var w = serialize.Writer.init(allocator);
+        defer w.deinit();
+        try serialize.writeBlockHeader(&w, &hdr);
+        const hash = crypto.computeBlockHash(&hdr);
+        try db.put(CF_BLOCKS, &hash, w.getWritten());
+        prev = hash;
+    }
+    chain_state.best_hash = prev; // hash of height 110
+    chain_state.best_height = 110;
+}
+
+test "#55 A: a freshly-booted ring holds ONLY the genesis nTime and must not be trusted" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    // Exactly what main.zig does on every boot, at a tip of height 110.
+    chain_state.best_height = 110;
+    chain_state.initGenesisTimestamp(T55_REGTEST_GENESIS_TS);
+
+    // The pre-fix cutoff source: a genesis-only ring answers the genesis nTime.
+    try std.testing.expectEqual(@as(u32, T55_REGTEST_GENESIS_TS), chain_state.computeMTP());
+    // ...and the guard says so, which is what stops a consensus path using it.
+    try std.testing.expect(!chain_state.mtpRingCoversTip());
+
+    // A full window at the tip IS trustworthy.
+    for (T55_TIMESTAMPS, 0..) |ts, i| chain_state.recent_timestamps[10 - i] = ts;
+    chain_state.recent_ts_count = 11;
+    try std.testing.expect(chain_state.mtpRingCoversTip());
+    try std.testing.expectEqual(@as(u32, T55_TRUE_MTP), chain_state.computeMTP());
+}
+
+test "#55 B: genesis-adjacent tips legitimately have a short window" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    // Fresh chain at genesis: min(11, 0+1) == 1 entry is the whole window.
+    chain_state.best_height = 0;
+    chain_state.initGenesisTimestamp(T55_REGTEST_GENESIS_TS);
+    try std.testing.expect(chain_state.mtpRingCoversTip());
+
+    // Height 3 with 4 entries (blocks 3,2,1 + genesis) is complete; 1 is not.
+    chain_state.best_height = 3;
+    chain_state.recent_ts_count = 1;
+    try std.testing.expect(!chain_state.mtpRingCoversTip());
+    chain_state.recent_ts_count = 4;
+    try std.testing.expect(chain_state.mtpRingCoversTip());
+}
+
+test "#55 C: computeMtpForParent walks persisted headers, not the cold ring" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path_buf = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_buf);
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/mtp55_db", .{path_buf});
+    defer allocator.free(db_path);
+
+    var db = try Database.open(db_path, 64, allocator);
+    defer db.close();
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    try plant55Chain(&chain_state, &db, allocator);
+
+    // Boot state: the ring holds only the genesis nTime.
+    chain_state.initGenesisTimestamp(T55_REGTEST_GENESIS_TS);
+    try std.testing.expectEqual(@as(u32, T55_REGTEST_GENESIS_TS), chain_state.computeMTP());
+
+    // The consensus path must still get Core's answer.
+    const params = &@import("consensus.zig").REGTEST;
+    const cutoff = chain_state.computeMtpForParent(&chain_state.best_hash, params);
+    try std.testing.expectEqual(@as(u32, T55_TRUE_MTP), cutoff);
+}
+
+test "#55 D: warmMtpRingFromDisk restores the true window at boot" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path_buf = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path_buf);
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/warm55_db", .{path_buf});
+    defer allocator.free(db_path);
+
+    var db = try Database.open(db_path, 64, allocator);
+    defer db.close();
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+
+    try plant55Chain(&chain_state, &db, allocator);
+    chain_state.initGenesisTimestamp(T55_REGTEST_GENESIS_TS);
+    try std.testing.expectEqual(@as(u32, T55_REGTEST_GENESIS_TS), chain_state.computeMTP());
+
+    const params = &@import("consensus.zig").REGTEST;
+    try std.testing.expect(chain_state.warmMtpRingFromDisk(params));
+    try std.testing.expectEqual(@as(u32, 11), chain_state.recent_ts_count);
+    // Ring invariant: slot 0 = tip (height 110).
+    try std.testing.expectEqual(@as(u32, 1777840542), chain_state.recent_timestamps[0]);
+    try std.testing.expectEqual(@as(u32, T55_TRUE_MTP), chain_state.computeMTP());
+    try std.testing.expect(chain_state.mtpRingCoversTip());
+}
+
+test "#55 E: an unrecoverable window returns 0 (fall back), never the genesis nTime" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    // No DB at all, tip at height 110, cold genesis-seeded ring: the walk
+    // cannot cover min(11, 111) == 11 entries and the ring does not cover the
+    // tip, so the answer must be "unavailable" — NOT 1296688602, which is what
+    // false-rejected the corpus blocks.
+    chain_state.best_hash = [_]u8{0xBB} ** 32;
+    chain_state.best_height = 110;
+    chain_state.initGenesisTimestamp(T55_REGTEST_GENESIS_TS);
+
+    const params = &@import("consensus.zig").REGTEST;
+    const cutoff = chain_state.computeMtpForParent(&chain_state.best_hash, params);
+    try std.testing.expectEqual(@as(u32, 0), cutoff);
+    try std.testing.expect(cutoff != T55_REGTEST_GENESIS_TS);
+
+    // warmMtpRingFromDisk must refuse to commit a partial window.
+    try std.testing.expect(!chain_state.warmMtpRingFromDisk(params));
+    try std.testing.expectEqual(@as(u32, 1), chain_state.recent_ts_count);
+}
+
+test "#55 F: the corpus arithmetic — cutoff decides accept vs bad-txns-nonfinal" {
+    const isFinalTx = @import("validation.zig").isFinalTx;
+    // The entry tx: time-based nLockTime one second BELOW MTP, non-final seq.
+    const tx = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint{ .hash = [_]u8{0xCC} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0, // non-final: the SEQUENCE_FINAL escape does not apply
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{},
+        .lock_time = T55_ENTRY_LOCKTIME,
+    };
+    // Core's cutoff (MTP of the parent) -> FINAL -> block accepted.
+    try std.testing.expect(isFinalTx(&tx, 111, T55_TRUE_MTP));
+    // The cold-ring cutoff (genesis nTime) -> NON-FINAL -> bad-txns-nonfinal.
+    try std.testing.expect(!isFinalTx(&tx, 111, T55_REGTEST_GENESIS_TS));
+    // Neighbours that passed on both sides must keep their verdicts:
+    //   locktime == MTP  -> non-final (strict '<' in tx_verify.cpp:21)
+    const tx_at_mtp = types.Transaction{
+        .version = tx.version,
+        .inputs = tx.inputs,
+        .outputs = tx.outputs,
+        .lock_time = T55_TRUE_MTP,
+    };
+    try std.testing.expect(!isFinalTx(&tx_at_mtp, 111, T55_TRUE_MTP));
+    //   all inputs SEQUENCE_FINAL -> final regardless of the cutoff
+    const tx_seqfinal = types.Transaction{
+        .version = tx.version,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = types.OutPoint{ .hash = [_]u8{0xCC} ** 32, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = tx.outputs,
+        .lock_time = T55_TRUE_MTP,
+    };
+    try std.testing.expect(isFinalTx(&tx_seqfinal, 111, T55_TRUE_MTP));
 }

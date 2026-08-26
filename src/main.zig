@@ -2485,6 +2485,35 @@ pub fn main() !void {
         }
     }
 
+    // BIP-113 MTP ring warm-up (#55).  `recent_timestamps` is in-memory only
+    // and `initGenesisTimestamp` (above) seeds it with ONE entry — the genesis
+    // nTime — on every boot regardless of the tip height, so until 11 fresh
+    // blocks connected `chain_state.computeMTP()` returned the genesis
+    // timestamp.  Measured on regtest at height 110: mediantime 1296688602
+    // instead of 1777840541.  That fed submitblock's BIP-113 nLockTimeCutoff
+    // (false-REJECT of valid blocks — the #55 consensus split), mempool
+    // finality, getblocktemplate's mintime and getblockchaininfo's mediantime.
+    //
+    // Rebuild the window from the persisted headers of the loaded tip's 11
+    // ancestors.  Runs AFTER the snapshot forward-sync seed so a real,
+    // exact window supersedes the coarse base_mtp lower bound when the
+    // headers are on disk; a snapshot node still keeps base_mtp when they
+    // are not (warm returns false and changes nothing).
+    if (chain_state.best_height > 0) {
+        if (chain_state.warmMtpRingFromDisk(params)) {
+            std.debug.print(
+                "BIP-113 MTP window warmed from disk: mediantime {d} (tip height {d})\n",
+                .{ chain_state.computeMTP(), chain_state.best_height },
+            );
+        } else {
+            std.debug.print(
+                "BIP-113 MTP window NOT warmed at height {d} (persisted ancestor headers " ++
+                    "incomplete); the block-submit path falls back to its own header walk\n",
+                .{chain_state.best_height},
+            );
+        }
+    }
+
     // 9. Parse --connect address before starting threads
     if (config.connect) |addr_str| {
         // Parse "host:port" format
