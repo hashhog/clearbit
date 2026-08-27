@@ -1549,3 +1549,106 @@ test "maybeArmReorg: refuses when the active tip has no comparable chainwork" {
     // is our limitation, not its misbehaviour.
     try testing.expect(!stub.should_ban);
 }
+
+// ====================================================================
+// 2026-08-26 LIVE INCIDENT REGRESSION: a routine 1-block race must be
+// recoverable AFTER A RESTART.
+//
+// clearbit lost the race at 964181 and sat 48 blocks behind on its stale
+// branch. Post-restart the in-memory header_index is empty, so the depth
+// check resolved the fork point — OUR OWN active-chain block, found by the
+// walk's hasBlock() probe — as height 0. Every reorg then looked ~964k deep:
+//
+//   REORG: refused — reorg depth 964181 exceeds the cap (288)
+//          (fork_point_h=0, active_h=964181)
+//   Misbehaving: +20 ... fork too deep      <- banning the honest peers
+//
+// The fix resolves the fork point's ABSOLUTE height from the persisted block
+// index first, and prices both chains above the shared fork point on the
+// same scale (persisted headers for our side), so the heavier real chain
+// arms a reorg.
+// ====================================================================
+test "maybeArmReorg: post-restart 1-block race arms a reorg, not a ban" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    // Persisted active chain: fork point at 999, our stale tip at 1000.
+    // best_height=1000 makes the OLD height-0 reading exceed the 288 cap.
+    // Our STALE TIP is absent from header_index — the post-restart state.
+    //
+    // The fork point itself is inserted into header_index as a zero-parent
+    // root, which gives it the DEGENERATE in-memory height 0 (insertHeader's
+    // genesis convention) — exactly what a post-restart served batch
+    // produces. The persisted record below carries the TRUE height 999, so
+    // this also pins the fix's storage-over-index preference: trusting the
+    // in-memory height here would re-create the 1000-deep misread.
+    var to_free = std.ArrayList(types.Block).init(allocator);
+    defer {
+        for (to_free.items) |b| freeTestBlock(allocator, b);
+        to_free.deinit();
+    }
+    const fpb = try makeForkTestBlock(allocator, [_]u8{0} ** 32, 0xF0, 0x207fffff, 299);
+    try to_free.append(fpb.block);
+    try testing.expect((try pm.insertHeader(&fpb.block.header, &fpb.hash)) != null);
+    const fp_hash: types.Hash256 = fpb.hash;
+    const stale_tip: types.Hash256 = [_]u8{0xF1} ** 32;
+
+    // CF_BLOCKS body presence is what the fork-point walk probes (hasBlock).
+    try db.put(storage.CF_BLOCKS, &fp_hash, &[_]u8{0xEE});
+
+    // CF_BLOCK_INDEX records: height(4 LE) + 80-byte header + padding, the
+    // layout getBlockHeightByHash / getPersistedHeader parse. Our stale tip's
+    // header carries real regtest bits so the same-scale pricing can read it.
+    var rec: [140]u8 = [_]u8{0} ** 140;
+    std.mem.writeInt(u32, rec[0..4], 999, .little);
+    try db.put(storage.CF_BLOCK_INDEX, &fp_hash, &rec);
+
+    var rec2: [140]u8 = [_]u8{0} ** 140;
+    std.mem.writeInt(u32, rec2[0..4], 1000, .little);
+    std.mem.writeInt(u32, rec2[4 + 72 ..][0..4], 0x207fffff, .little); // bits
+    try db.put(storage.CF_BLOCK_INDEX, &stale_tip, &rec2);
+
+    // Height->hash rows for the same-scale walk (fp+1..best).
+    const k1000 = storage.ChainStore.buildHeightHashKey(1000);
+    try db.put(storage.CF_DEFAULT, &k1000, &stale_tip);
+
+    cs.best_hash = stale_tip;
+    cs.best_height = 1000;
+
+    // The competing branch: 3 headers rooted at the fork point — one block
+    // more work than our single stale block.
+    var prev: [32]u8 = fp_hash;
+    var fork_tip: types.Hash256 = undefined;
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        const b = try makeForkTestBlock(allocator, prev, @as(u8, @intCast(0xD0 + i)), 0x207fffff, 300 + i);
+        try to_free.append(b.block);
+        const ent = try pm.insertHeader(&b.block.header, &b.hash);
+        try testing.expect(ent != null);
+        prev = b.hash;
+        fork_tip = b.hash;
+    }
+
+    var stub = makeStubPeer(&params, allocator);
+    defer stub.recv_buffer.deinit();
+
+    pm.maybeArmReorg(&stub, &fork_tip);
+
+    // Pre-fix: fp read as height 0 -> depth 1000 > 288 -> refused + banned.
+    try testing.expect(!stub.should_ban);
+    try testing.expect(pm.pending_reorg != null);
+    try testing.expectEqual(@as(usize, 3), pm.pending_reorg.?.fork_hashes.items.len);
+}

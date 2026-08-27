@@ -5349,10 +5349,29 @@ pub const PeerManager = struct {
         // consensus hole for a DoS hole. So the check moves here, where it can be
         // stated directly.
         //
-        // A fork point we do not have an entry for is treated as height 0, which
-        // is the honest reading of the zero sentinel: the chain is rooted at
-        // genesis, so the implied reorg is the full height of our tip.
-        const fp_height: u32 = if (self.header_index.get(fp)) |e| e.height else 0;
+        // Resolve the fork point's height from the PERSISTED block index
+        // first, then the in-memory header_index, and only then assume 0.
+        //
+        // The first version of this check consulted header_index alone and
+        // treated a miss as height 0. That reading is only honest for the
+        // zero sentinel / genesis hash; for the COMMON case it is wrong: after
+        // a restart the in-memory index is empty, so the fork point of a
+        // routine 1-block race — our own active-chain block, found by the
+        // walk's hasBlock() probe — read as height 0, every reorg looked
+        // ~964k deep, and the node refused Core's chain while handing +20 to
+        // every honest peer that served it. Live incident, 2026-08-26:
+        // clearbit sat 48 blocks behind on a stale branch repeating
+        //   REORG: refused — reorg depth 964181 exceeds the cap (288)
+        //          (fork_point_h=0, active_h=964181)
+        // The persisted index survives restarts and carries the ABSOLUTE
+        // height; header_index heights can be root-relative fakes after a
+        // restart (a served batch roots at height 0 wherever it attaches), so
+        // storage is consulted first.
+        const fp_height: u32 = blk: {
+            if (cs.getBlockHeightByHash(&fp)) |h| break :blk h;
+            if (self.header_index.get(fp)) |e| break :blk e.height;
+            break :blk 0; // genesis hash or the zero sentinel — genuinely 0
+        };
         const reorg_depth: u32 = if (cs.best_height > fp_height)
             cs.best_height - fp_height
         else
@@ -5402,6 +5421,52 @@ pub const PeerManager = struct {
                 if (self.header_index.get(hdr_tip)) |e| break :blk e.chain_work;
             }
             if (self.header_index.get(cs.best_hash)) |e| break :blk e.chain_work;
+
+            // 2.5: the active tip is not in header_index (the post-restart
+            // state), but the fork point IS on our persisted active chain.
+            // Core's comparison is total work, and the shared prefix below
+            // the fork point cancels — so compare only the work ABOVE it,
+            // built on the fork side's own scale:
+            //
+            //   fork side = tip_entry.chain_work, which accumulates from the
+            //     fork root's base (the root of a batch whose parent was
+            //     unknown got "chain_work = work-of-this-header", i.e. no
+            //     base — see insertHeader; a root that attached to a known
+            //     entry inherited that entry's base).
+            //   our side  = (fork point's header_index base, if any, else 0)
+            //     + SUM of workFromBits over our PERSISTED headers from
+            //     fp_height+1 to the tip. getPersistedHeader survives
+            //     restarts, and the span is depth-capped above.
+            //
+            // Adding the fork point's base to our sum puts both operands on
+            // the identical accumulation, so the existing strict comparison
+            // below is exact. If any persisted header is missing we fall
+            // through to the refusal — fail closed, never guess.
+            if (cs.getBlockHeightByHash(&fp)) |fph| {
+                if (cs.best_height > fph and
+                    cs.best_height - fph <= MAX_REORG_DEPTH_PEER)
+                {
+                    var our: [32]u8 = if (self.header_index.get(fp)) |e|
+                        e.chain_work
+                    else
+                        [_]u8{0} ** 32;
+                    var h: u32 = fph + 1;
+                    var complete = true;
+                    while (h <= cs.best_height) : (h += 1) {
+                        const bh = cs.getBlockHashByHeight(h) orelse {
+                            complete = false;
+                            break;
+                        };
+                        const hdr = cs.getPersistedHeader(&bh) orelse {
+                            complete = false;
+                            break;
+                        };
+                        const w = workFromBits(hdr.bits);
+                        addChainWorkBE(&our, &w);
+                    }
+                    if (complete) break :blk our;
+                }
+            }
 
             // No same-scale basis for the active chain: REFUSE to reorg.
             //
