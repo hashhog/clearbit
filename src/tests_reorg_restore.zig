@@ -605,3 +605,272 @@ test "tests_reorg_restore: flush() refuses a mid-reorg-batch commit (Pattern-D c
     try std.testing.expectError(error.ReorgBatchInProgress, res);
     try std.testing.expectEqual(writes_before, db.write_batch_calls);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #53c — the reorg CONNECT path enforces MTP-derived consensus gates
+// (BIP-113 time-too-old / strict-MTP nLockTime cutoff / time-based BIP-68
+// sequence locks).  Before the fix, reorgToChain's connect side passed
+// prev_mtp=0 + no getMtpAtHeightFn — the documented sentinel-skip mode — so
+// all three gates were silently disabled on the one connect path an attacker
+// can steer (a reorg is attacker-triggerable).  Core's ConnectTip enforces
+// them identically on reorg connects (validation.cpp:4092 / 4140-4142 /
+// tx_verify.cpp:74).
+//
+// Fixture: regtest params + connect_force_skip_pow (Core fCheckPOW=false
+// parity), fake block hashes (as in the tests above), REAL merkle roots +
+// BIP-34 coinbase heights + version 4 so full validation passes.  Pre-fork
+// chain h1..h13 with timestamps T+600*i; old tip h14_A at T+1_000_000
+// (deliberately huge: an implementation that wrongly derived the cutoff from
+// the un-rewound tip ring would compute median(ts4..ts13, T+1e6) = ts9 =
+// T+5400 and false-reject the T+4801 positive case below).  MTP of h13 (the
+// fork point) = median(ts3..ts13) = ts8 = T+4800.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const consensus_mod = @import("consensus.zig");
+
+const MTP_T: u32 = 1_600_000_000;
+
+/// BIP-34 height prefix (OP_N for 1..16, minimal CScriptNum push above)
+/// + one pad byte to satisfy the 2-byte coinbase scriptSig minimum.
+fn mtpCbHeightScript(allocator: std.mem.Allocator, height: u32) ![]u8 {
+    var buf: [7]u8 = undefined;
+    var n: usize = 0;
+    if (height >= 1 and height <= 16) {
+        buf[0] = @intCast(0x50 + height);
+        n = 1;
+    } else {
+        // fixture heights stay < 128: single unsigned CScriptNum byte
+        buf[0] = 0x01;
+        buf[1] = @intCast(height);
+        n = 2;
+    }
+    buf[n] = 0x00;
+    n += 1;
+    return allocator.dupe(u8, buf[0..n]);
+}
+
+const MtpTestBlock = struct { block: types.Block, hash: types.Hash256 };
+
+/// Coinbase-only block that passes FULL acceptBlock validation under regtest
+/// params (modulo PoW, which the drive skips): version 4, real merkle root,
+/// BIP-34 coinbase height, 50 BTC subsidy, no witness data.
+fn makeMtpCoinbaseBlock(
+    allocator: std.mem.Allocator,
+    prev_hash: [32]u8,
+    height: u32,
+    timestamp: u32,
+    fake_hash_byte: u8,
+) !MtpTestBlock {
+    // BIP-34 prefix + the branch marker byte so competing same-height
+    // branches carry DISTINCT coinbase txids (a byte-identical coinbase
+    // would legitimately trip the BIP-30 duplicate-output probe instead
+    // of the gate under test).
+    const height_prefix = try mtpCbHeightScript(allocator, height);
+    defer allocator.free(height_prefix);
+    const script_sig = try allocator.alloc(u8, height_prefix.len + 1);
+    @memcpy(script_sig[0..height_prefix.len], height_prefix);
+    script_sig[height_prefix.len] = fake_hash_byte;
+    const inputs = try allocator.alloc(types.TxIn, 1);
+    inputs[0] = .{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = script_sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const spk = try allocator.dupe(u8, &[_]u8{0x51}); // OP_TRUE
+    const outputs = try allocator.alloc(types.TxOut, 1);
+    outputs[0] = .{ .value = 5_000_000_000, .script_pubkey = spk };
+    const txs = try allocator.alloc(types.Transaction, 1);
+    txs[0] = .{ .version = 1, .inputs = inputs, .outputs = outputs, .lock_time = 0 };
+    var block = types.Block{
+        .header = .{
+            .version = 4,
+            .prev_block = prev_hash,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = timestamp,
+            .bits = 0x207fffff,
+            .nonce = 0,
+        },
+        .transactions = txs,
+    };
+    block.header.merkle_root = crypto.computeTxidStreaming(&txs[0]);
+    return .{ .block = block, .hash = [_]u8{fake_hash_byte} ** 32 };
+}
+
+/// Pre-fork OP_TRUE coin spent by the BIP-68 case.  Recorded at height 12 so
+/// its BIP-68 nCoinTime = MTP(11) = median(ts1..ts11) = ts6 = T+3600.
+const MTP_COIN_OUTPOINT = types.OutPoint{ .hash = [_]u8{0xFE} ** 32, .index = 0 };
+
+const MtpFixture = struct {
+    fork_hash: types.Hash256, // h13
+    mtp13: u32, // MTP of the fork point = T+4800
+};
+
+/// Build h1..h13 (ts = T+600*i) + old tip h14_A (ts = T+1_000_000), all
+/// connected + flushed so the H:height index and persisted headers exist.
+fn buildMtpFixtureChain(
+    cs: *ChainState,
+    arena: std.mem.Allocator,
+) !MtpFixture {
+    const coin_script = try arena.dupe(u8, &[_]u8{0x51});
+    const coin_out = types.TxOut{ .value = 100_000_000, .script_pubkey = coin_script };
+    try cs.utxo_set.add(&MTP_COIN_OUTPOINT, &coin_out, 12, false);
+
+    var prev: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= 13) : (h += 1) {
+        const tb = try makeMtpCoinbaseBlock(arena, prev, h, MTP_T + h * 600, @intCast(h));
+        try queueAndConnect(cs, &tb.block, &tb.hash, h);
+        prev = tb.hash;
+    }
+    const fork_hash = prev;
+
+    const tip = try makeMtpCoinbaseBlock(arena, prev, 14, MTP_T + 1_000_000, 0xA4);
+    try queueAndConnect(cs, &tip.block, &tip.hash, 14);
+    try std.testing.expectEqual(@as(u32, 14), cs.best_height);
+
+    return .{ .fork_hash = fork_hash, .mtp13 = MTP_T + 4800 };
+}
+
+// NEGATIVE: side-branch block whose timestamp equals the fork point's MTP
+// (Core: strictly greater required).  Pre-fix the gate was sentinel-skipped
+// and the reorg SUCCEEDED (this test then fails); post-fix -> BadTimestamp
+// -> ReorgBlockInvalid.
+test "tests_reorg_restore: #53c reorg connect rejects time-too-old side branch (BIP-113)" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(consensus_mod.getNetworkParams(.regtest));
+
+    const fx = try buildMtpFixtureChain(&cs, arena);
+
+    const b14 = try makeMtpCoinbaseBlock(arena, fx.fork_hash, 14, fx.mtp13, 0xB4);
+    var new_chain = [_]ChainState.ReorgBlock{
+        .{ .hash = b14.hash, .block = b14.block, .height = 14 },
+    };
+    const res = cs.reorgToChainWithOptions(
+        &fx.fork_hash,
+        &new_chain,
+        .{ .connect_force_skip_pow = true },
+        null,
+    );
+    try std.testing.expectError(error.ReorgBlockInvalid, res);
+}
+
+// POSITIVE (window-anchor pin): timestamp = fork-point MTP + 1 must be
+// ACCEPTED.  This discriminates the MTP *source*: a cutoff derived from the
+// stale un-rewound tip ring (window ending at the disconnected h14_A) is
+// T+5400 and would false-reject this block; the correct fork-point window
+// gives T+4800.
+test "tests_reorg_restore: #53c reorg connect accepts side branch just above fork-point MTP" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(consensus_mod.getNetworkParams(.regtest));
+
+    const fx = try buildMtpFixtureChain(&cs, arena);
+
+    const b14 = try makeMtpCoinbaseBlock(arena, fx.fork_hash, 14, fx.mtp13 + 1, 0xB5);
+    var new_chain = [_]ChainState.ReorgBlock{
+        .{ .hash = b14.hash, .block = b14.block, .height = 14 },
+    };
+    const connected = try cs.reorgToChainWithOptions(
+        &fx.fork_hash,
+        &new_chain,
+        .{ .connect_force_skip_pow = true },
+        null,
+    );
+    try std.testing.expectEqual(@as(u32, 1), connected);
+    try std.testing.expectEqual(@as(u32, 14), cs.best_height);
+    try std.testing.expectEqualSlices(u8, &b14.hash, &cs.best_hash);
+}
+
+// NEGATIVE: time-based BIP-68 sequence lock violated by a side-branch spend.
+// Coin (height 12) nCoinTime = MTP(11) = T+3600; sequence value 4 (time
+// type) -> min_time = T+3600 + 4*512 - 1 = T+5647 >= prev_mtp T+4800 ->
+// nonfinal.  Pre-fix the height-only fallback waved it through (min_height
+// = -1) and the reorg SUCCEEDED; post-fix -> SequenceLockNotSatisfied ->
+// ReorgBlockInvalid.
+test "tests_reorg_restore: #53c reorg connect enforces time-based BIP-68 sequence locks" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(consensus_mod.getNetworkParams(.regtest));
+
+    const fx = try buildMtpFixtureChain(&cs, arena);
+
+    // Side branch h14_C: valid coinbase + a v2 spend of the pre-fork OP_TRUE
+    // coin with a 4*512s relative time lock (sequence type flag bit 22).
+    var b14 = try makeMtpCoinbaseBlock(arena, fx.fork_hash, 14, MTP_T + 6000, 0xC4);
+
+    const spend_inputs = try arena.alloc(types.TxIn, 1);
+    spend_inputs[0] = .{
+        .previous_output = MTP_COIN_OUTPOINT,
+        .script_sig = try arena.dupe(u8, &[_]u8{}),
+        .sequence = (1 << 22) | 4,
+        .witness = &[_][]const u8{},
+    };
+    const spend_outputs = try arena.alloc(types.TxOut, 1);
+    spend_outputs[0] = .{
+        .value = 100_000_000,
+        .script_pubkey = try arena.dupe(u8, &[_]u8{0x51}),
+    };
+    const txs = try arena.alloc(types.Transaction, 2);
+    txs[0] = b14.block.transactions[0];
+    txs[1] = .{
+        .version = 2,
+        .inputs = spend_inputs,
+        .outputs = spend_outputs,
+        .lock_time = 0,
+    };
+    b14.block.transactions = txs;
+    const leaves = [_]types.Hash256{
+        crypto.computeTxidStreaming(&txs[0]),
+        crypto.computeTxidStreaming(&txs[1]),
+    };
+    b14.block.header.merkle_root = try crypto.computeMerkleRoot(&leaves, arena);
+
+    var new_chain = [_]ChainState.ReorgBlock{
+        .{ .hash = b14.hash, .block = b14.block, .height = 14 },
+    };
+    const res = cs.reorgToChainWithOptions(
+        &fx.fork_hash,
+        &new_chain,
+        .{ .connect_force_skip_pow = true },
+        null,
+    );
+    try std.testing.expectError(error.ReorgBlockInvalid, res);
+}

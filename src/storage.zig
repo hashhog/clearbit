@@ -5370,6 +5370,66 @@ pub const ChainState = struct {
         height: u32,
     };
 
+    /// MTP source for the reorg CONNECT loop (#53c).
+    ///
+    /// The tip ring (`recent_timestamps`) is anchored at the PRE-reorg tip and
+    /// is not rewound by the disconnect walk, so `computeMTP()` would answer a
+    /// stale old-branch median at the fork point.  This source never reads the
+    /// ring.  Heights ABOVE the fork resolve from the in-hand `new_chain`
+    /// headers — their durable H:/CF_BLOCK_INDEX records still point at the
+    /// OLD branch until the terminal flush, so the persisted stores are the
+    /// wrong answer there.  Heights AT/BELOW the fork are shared history whose
+    /// persisted records the reorg never touches, so they resolve exactly like
+    /// peer.zig's computeMtpAtHeight: H:height→hash, then the persisted header
+    /// (CF_BLOCK_INDEX) or the block body (CF_BLOCKS), genesis from params.
+    ///
+    /// `mtpAt` mirrors the fleet-standard incomplete-window guard
+    /// (computeMtpForParent / peer.zig computePrevMtpEx): Core's window is
+    /// min(11, h+1) entries ending AT h; a truncated median is a DIFFERENT
+    /// median, so any miss returns 0 — the validation sentinel that skips the
+    /// time gates instead of enforcing a wrong cutoff.
+    const ReorgMtpSource = struct {
+        cs: *ChainState,
+        params: *const @import("consensus.zig").NetworkParams,
+        new_chain: []const ReorgBlock,
+        fork_height: u32,
+
+        fn timestampAt(self: *const ReorgMtpSource, h: u32) ?u32 {
+            if (h > self.fork_height) {
+                const idx: usize = h - self.fork_height - 1;
+                if (idx >= self.new_chain.len) return null;
+                return self.new_chain[idx].block.header.timestamp;
+            }
+            const hash = self.cs.getBlockHashByHeight(h) orelse {
+                if (h == 0) return self.params.genesis_header.timestamp;
+                return null;
+            };
+            if (std.mem.eql(u8, &hash, &self.params.genesis_hash)) {
+                return self.params.genesis_header.timestamp;
+            }
+            if (self.cs.getPersistedHeader(&hash)) |hdr| return hdr.timestamp;
+            if (self.cs.getBlockHeaderFromBody(&hash)) |hdr| return hdr.timestamp;
+            return null;
+        }
+
+        /// Median-time-past OF the block at height `h`
+        /// (Core CBlockIndex::GetMedianTimePast).  0 = window not coverable.
+        fn mtpAt(self: *const ReorgMtpSource, h: u32) u32 {
+            var ts: [11]u32 = undefined;
+            const want: usize = @min(@as(usize, 11), @as(usize, h) + 1);
+            var i: usize = 0;
+            while (i < want) : (i += 1) {
+                ts[i] = self.timestampAt(h - @as(u32, @intCast(i))) orelse return 0;
+            }
+            return @import("validation.zig").medianTimePast(ts[0..want]);
+        }
+
+        pub fn getMtpTrampoline(ctx_ptr: *anyopaque, h: u32) u32 {
+            const self: *const ReorgMtpSource = @ptrCast(@alignCast(ctx_ptr));
+            return self.mtpAt(h);
+        }
+    };
+
     /// Implementation-specific memory-safety bound: the whole reorg is staged
     /// in ONE in-memory WriteBatch, so this caps unbounded allocations before
     /// the atomic commit.  Bitcoin Core has NO reorg-depth cap — it follows
@@ -5611,6 +5671,10 @@ pub const ChainState = struct {
         // so CF_BLOCKS gets the bytes too.  All connect-side mutations
         // accumulate in the same pending queues as the disconnect-side
         // state from above, so the final flush() commits one giant batch.
+        //
+        // The fork point is the tip left standing by the disconnect walk;
+        // ReorgMtpSource keys its shared-vs-new-branch split off it (#53c).
+        const fork_height = self.best_height;
         var connect_count: u32 = 0;
         for (new_chain) |entry| {
             // Linkage check: caller is supposed to guarantee this, but
@@ -5699,24 +5763,37 @@ pub const ChainState = struct {
                 };
                 var adapter = Adapter{ .cs = self };
 
-                // Conservative MTP handling: the disconnect walk does NOT
-                // rewind the recent_timestamps ring buffer, so computeMTP()
-                // would return a stale (old-chain) MTP at the fork point.
-                // Rather than risk a FALSE-REJECT on a valid block (BIP-113
-                // timestamp / time-based BIP-68 locks), we pass prev_mtp=0 and
-                // no getMtpAtHeightFn — exactly the "MTP not available" mode
-                // validateBlockForIBD already handles for the IBD fast path.
-                // In that mode the BIP-113 strict-MTP check is skipped and
-                // sequence locks fall back to height-only enforcement, which
-                // the validation code documents as the safe direction (it can
-                // only false-ACCEPT a time-locked spend, never false-reject).
+                // Full MTP wiring (#53c).  The P2P and RPC connect paths wire
+                // getMtpAtHeightFn + a real prev_mtp; before this fix the
+                // reorg connect passed the 0 sentinels because the
+                // recent_timestamps ring is anchored at the PRE-reorg tip and
+                // computeMTP() would have answered a stale old-branch median.
+                // That sentinel mode silently disabled three Core-mandatory
+                // gates on every reorged-in block: BIP-113 time-too-old
+                // (header.timestamp <= prev MTP), the BIP-113 strict-MTP
+                // nLockTime cutoff (degraded to the pre-BIP113 block-time
+                // rule), and time-based BIP-68 sequence locks (degraded to
+                // height-only) — a false-ACCEPT class on the exact path an
+                // attacker steers (a reorg is attacker-triggerable; Core
+                // validation.cpp ConnectTip enforces all three identically on
+                // reorg connects).  ReorgMtpSource never reads the stale ring:
+                // it resolves shared-history heights from the persisted
+                // stores and new-branch heights from the in-hand new_chain
+                // headers, and returns the 0 sentinel (= skip, the old
+                // behaviour) only when a window cannot be fully covered.
                 // Height-gated softfork flags (DERSIG/CLTV/CSV/NULLDUMMY +
-                // unconditional P2SH/WITNESS/TAPROOT) are unaffected — they key
-                // off `height`, not MTP — so script verification of those
-                // rules runs at full strength.  force_skip_scripts stays false
+                // unconditional P2SH/WITNESS/TAPROOT) key off `height`, not
+                // MTP, and were always enforced.  force_skip_scripts stays false
                 // and active_chain is left null, so scripts ALWAYS run here
                 // (reorg fork blocks are at/above the active tip, never an
                 // assumevalid ancestor we'd legitimately skip).
+                var mtp_src = ReorgMtpSource{
+                    .cs = self,
+                    .params = params,
+                    .new_chain = new_chain,
+                    .fork_height = fork_height,
+                };
+
                 validation.acceptBlock(
                     &entry.block,
                     &entry.hash,
@@ -5726,7 +5803,13 @@ pub const ChainState = struct {
                     Adapter.lookup,
                     self.allocator,
                     .{
-                        .prev_mtp = 0,
+                        // MTP of the parent block (entry.height - 1 is the
+                        // fork point for the first entry, the previous
+                        // new-chain block after that).  0 = window not
+                        // coverable -> the documented sentinel-skip mode.
+                        .prev_mtp = mtp_src.mtpAt(entry.height - 1),
+                        .getMtpAtHeightFn = ReorgMtpSource.getMtpTrampoline,
+                        .getMtpAtHeightCtx = @ptrCast(&mtp_src),
                         .prev_block_timestamp = 0,
                         .current_time = 0,
                         .force_skip_scripts = false,

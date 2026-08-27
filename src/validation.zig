@@ -1585,7 +1585,12 @@ pub fn validateBlockForIBD(
                         .hash = txid,
                         .index = @intCast(vout),
                     };
-                    if (ctx.prevout_lookupFn(ctx.prevout_lookup_ctx, &outpoint) != null) {
+                    if (ctx.prevout_lookupFn(ctx.prevout_lookup_ctx, &outpoint)) |hit| {
+                        // Honor the lookup contract: a heap-owned script must
+                        // be freed by the consumer (every other caller routes
+                        // it through the arena; this reject path discarded it
+                        // and leaked one script per BIP-30 hit).
+                        if (hit.owner_allocator) |a| a.free(hit.script_pubkey);
                         return ValidationError.Bip30DuplicateOutput;
                     }
                 }
