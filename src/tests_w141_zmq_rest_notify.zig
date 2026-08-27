@@ -79,11 +79,14 @@ fn readMainSrc(alloc: std.mem.Allocator) ![]const u8 {
     return try dir.readFileAlloc(alloc, "main.zig", 4 * 1024 * 1024);
 }
 
-/// Read sync.zig for IBD-gate guard.
-fn readSyncSrc(alloc: std.mem.Allocator) ![]const u8 {
+/// Read peer.zig — the LIVE block-connect + zmq-publish path since #71e
+/// (2026-08-27) wired publishBlock at the drain site and deleted the dead
+/// sync.zig (which these scans used to read: tests defending a module the
+/// compiler never built).
+fn readPeerSrc(alloc: std.mem.Allocator) ![]const u8 {
     var dir = try std.fs.cwd().openDir("src", .{});
     defer dir.close();
-    return try dir.readFileAlloc(alloc, "sync.zig", 2 * 1024 * 1024);
+    return try dir.readFileAlloc(alloc, "peer.zig", 4 * 1024 * 1024);
 }
 
 // ============================================================================
@@ -127,44 +130,40 @@ test "w141/G2: no 'R' mempool-removal publisher exists (xfail)" {
     try testing.expect(!@hasDecl(zmq.Notifier, "notifyTransactionRemoval"));
 }
 
-// G3 BUG-3: IBD not gated for block-connect publish.
+// G3 (FIXED 2026-08-27, #71e): the block-connect publish IS gated.
 // Core's UpdatedBlockTip returns immediately when fInitialDownload is true
-// (zmqnotificationinterface.cpp:153-154).  clearbit fires zmq.global.publishBlock
-// inside sync.zig:1861-1868 unconditionally — no isInitialBlockDownload check.
-test "w141/G3: ZMQ block-connect publish has no IBD guard (xfail)" {
+// (zmqnotificationinterface.cpp:153-154); the dominant condition of
+// IsInitialBlockDownload is max tip age (~24h). The live peer.zig publish
+// site gates on block freshness (timestamp within 86_400s) — the dead
+// sync.zig site this test used to scan was UNGATED, and this test used to
+// ASSERT that gap (a test defending the defect). Now it requires the gate.
+test "w141/G3: ZMQ block-connect publish is freshness-gated (Core !IBD parity)" {
     const alloc = testing.allocator;
-    const src = try readSyncSrc(alloc);
+    const src = try readPeerSrc(alloc);
     defer alloc.free(src);
 
-    // Locate the ZMQ-publish region — between `if (zmq.global.initialized)` and
-    // the matching closing brace.  Check that NO IBD-related identifier
-    // appears in or directly before that region.
     const zmq_region_start = std.mem.indexOf(u8, src, "if (zmq.global.initialized)").?;
-    // Inspect the 1KB-window before the region: this is the block-connect
-    // path that should have gated on IBD.
     const window_start: usize = if (zmq_region_start > 1024) zmq_region_start - 1024 else 0;
     const window = src[window_start..zmq_region_start];
 
-    const has_ibd = std.mem.indexOf(u8, window, "initial_block_download") != null or
-        std.mem.indexOf(u8, window, "isInitialBlockDownload") != null or
-        std.mem.indexOf(u8, window, "is_initial_download") != null or
-        std.mem.indexOf(u8, window, "InitialBlockDownload") != null;
-    try testing.expect(!has_ibd);
+    // The freshness gate must wrap the publish region.
+    const has_gate = std.mem.indexOf(u8, window, "timestamp + 86_400") != null;
+    try testing.expect(has_gate);
 }
 
 // G4 BUG-4: per-block-tx fan-out on BlockConnected missing.
 // Core's BlockConnected iterates pblock->vtx and fires NotifyTransaction
 // per tx BEFORE calling NotifyBlockConnect (zmqnotificationinterface.cpp:185-195).
-// clearbit's sync.zig zmq-publish path calls only zmq.global.publishBlock —
+// clearbit's live peer.zig zmq-publish path calls only zmq.global.publishBlock —
 // no per-tx loop.  This means coinbase + every tx that arrived in the block
 // without first appearing in the mempool will not generate hashtx/rawtx events.
 test "w141/G4: no per-block-tx hashtx/rawtx fan-out on connect (xfail)" {
     const alloc = testing.allocator;
-    const src = try readSyncSrc(alloc);
+    const src = try readPeerSrc(alloc);
     defer alloc.free(src);
 
     // The ZMQ region must NOT contain a publishTx loop over block.transactions.
-    const zmq_region_idx = std.mem.indexOf(u8, src, "Phase 4: ZMQ publish").?;
+    const zmq_region_idx = std.mem.indexOf(u8, src, "if (zmq.global.initialized)").?;
     // Look ahead 600 bytes (the entire ZMQ block) for a publishTx invocation.
     const end_idx = @min(zmq_region_idx + 600, src.len);
     const window = src[zmq_region_idx..end_idx];
@@ -175,12 +174,16 @@ test "w141/G4: no per-block-tx hashtx/rawtx fan-out on connect (xfail)" {
 
 // G5 BUG-5: no disconnect hook exists at all.
 // Even setting aside the missing 'D' sequence label (G1), the reorg /
-// disconnect code path in sync.zig (or wherever a block is disconnected)
+// disconnect code path in storage.zig (where reorg disconnects live)
 // does not call into zmq.global at all.  Symmetric to G4 for the
 // disconnect direction.
 test "w141/G5: no zmq.global call from disconnect path (xfail)" {
     const alloc = testing.allocator;
-    const src = try readSyncSrc(alloc);
+    // Block disconnect (reorg) lives in storage.zig — scan it instead of
+    // peer.zig, where "disconnect" overwhelmingly means PEER disconnects.
+    var dir = try std.fs.cwd().openDir("src", .{});
+    defer dir.close();
+    const src = try dir.readFileAlloc(alloc, "storage.zig", 4 * 1024 * 1024);
     defer alloc.free(src);
 
     // Look for any disconnect-related function that contains a zmq.global.

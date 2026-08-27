@@ -18,7 +18,6 @@ pub const consensus = @import("consensus.zig");
 pub const validation = @import("validation.zig");
 pub const p2p = @import("p2p.zig");
 pub const peer = @import("peer.zig");
-pub const sync = @import("sync.zig");
 pub const mempool = @import("mempool.zig");
 pub const mempool_persist = @import("mempool_persist.zig");
 pub const block_template = @import("block_template.zig");
@@ -2974,7 +2973,6 @@ test {
     _ = validation;
     _ = p2p;
     _ = peer;
-    _ = sync;
     _ = mempool;
     _ = block_template;
     _ = rpc;

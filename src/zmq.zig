@@ -13,7 +13,7 @@
 //!     unconditional throughout the codebase.
 //!
 //! Hook points (driven by main.zig wiring):
-//!   - block-connect (sync.zig validateAndConnectBlock) → publishBlock()
+//!   - block-connect (peer.zig drain, freshness-gated) → publishBlock()
 //!   - mempool-add  (mempool.zig addTransaction)        → publishTx()
 
 const std = @import("std");

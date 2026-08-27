@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const p2p = @import("p2p.zig");
+const zmq = @import("zmq.zig");
 const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
 const banlist = @import("banlist.zig");
@@ -4441,7 +4442,7 @@ pub const PeerManager = struct {
             std.log.info("Connected to anchor peer: {}", .{addr});
 
             // Initiate header sync with anchor peer
-            self.sendGetHeaders(peer) catch {};
+            self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
         }
     }
 
@@ -4533,7 +4534,7 @@ pub const PeerManager = struct {
             std.log.info("Connected to outbound peer {} (height={d}, {d}/{d} outbound)", .{ addr, peer.start_height, outbound_count, MAX_OUTBOUND_CONNECTIONS });
 
             // Initiate header sync with newly connected peer
-            self.sendGetHeaders(peer) catch {};
+            self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
         }
     }
 
@@ -4862,7 +4863,7 @@ pub const PeerManager = struct {
                 if (now_ts - peer_obj.last_getheaders_time > 5) {
                     if (self.chain_state) |cs| {
                         if (peer_obj.start_height > 0 and cs.best_height < @as(u32, @intCast(peer_obj.start_height))) {
-                            self.sendGetHeaders(peer_obj) catch {};
+                            self.sendGetHeaders(peer_obj) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                             break; // Only send to one peer at a time
                         }
                     }
@@ -5893,7 +5894,7 @@ pub const PeerManager = struct {
                     }
                 }
                 if (has_block_inv) {
-                    self.sendGetHeaders(peer) catch {};
+                    self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                 }
                 // Request unknown transactions via getdata, batched at MAX_GETDATA_SZ=1000.
                 // Core net_processing.cpp:6205-6210 batches outgoing getdata at MAX_GETDATA_SZ.
@@ -5924,7 +5925,7 @@ pub const PeerManager = struct {
                             .{ our_height, self.expected_blocks.items.len, best_peer_h });
                         // Try sending getheaders to a different peer
                         if (self.pickSyncPeer(peer)) |alt_peer| {
-                            self.sendGetHeaders(alt_peer) catch {};
+                            self.sendGetHeaders(alt_peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                         }
                     } else {
                         // Headers are caught up to the network tip.  Only emit
@@ -6101,7 +6102,7 @@ pub const PeerManager = struct {
                         // Continue to ask for more headers — the peer may
                         // have additional fork headers beyond this batch.
                         if (h.headers.len >= 2000) {
-                            self.sendGetHeaders(peer) catch {};
+                            self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                         }
                         return;
                     },
@@ -6280,7 +6281,7 @@ pub const PeerManager = struct {
                 // But limit the queue to avoid too many outstanding blocks
                 const remaining_queue = self.expected_blocks.items.len - self.connect_cursor;
                 if (h.headers.len >= 2000 and !outcome.undecidable and remaining_queue < 16000) {
-                    self.sendGetHeaders(peer) catch {};
+                    self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                 }
 
                 // Pipeline: request blocks up to the download window
@@ -9720,6 +9721,25 @@ pub const PeerManager = struct {
             // advances each wallet's persisted last_synced_height watermark.
             self.scanConnectedBlockIntoWallets(&block, height);
 
+            // ZMQ block notifications (#71e, 2026-08-27). This is the LIVE
+            // publish site: the previous one lived in dead sync.zig (lazily
+            // compiled out), so rawblock/hashblock never fired on mainnet.
+            // Gated on block freshness — Core's CZMQNotificationInterface::
+            // UpdatedBlockTip publishes only when !fInitialDownload, whose
+            // dominant condition is max tip age (~24h); a from-genesis IBD
+            // must not firehose a million notifications.
+            if (block.header.timestamp + 86_400 > std.time.timestamp()) {
+                if (zmq.global.initialized) {
+                    var raw_alloc: ?[]const u8 = null;
+                    defer if (raw_alloc) |b| self.allocator.free(b);
+                    if (zmq.global.findSocket(zmq.TOPIC_RAWBLOCK) != null) {
+                        raw_alloc = zmq.encodeBlockAlloc(self.allocator, &block) catch null;
+                    }
+                    zmq.global.publishBlock(&block_hash, raw_alloc);
+                    std.log.info("ZMQ: published block h={d}", .{height});
+                }
+            }
+
             const block_elapsed_ns = std.time.nanoTimestamp() - block_start;
             const block_elapsed_ms = @divTrunc(block_elapsed_ns, 1_000_000);
             if (block_elapsed_ms > 50) {
@@ -9943,7 +9963,7 @@ pub const PeerManager = struct {
             if (remaining < 500) {
                 for (self.peers.items) |p| {
                     if (p.state == .handshake_complete and p.last_getheaders_time == 0) {
-                        self.sendGetHeaders(p) catch {};
+                        self.sendGetHeaders(p) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                         break;
                     }
                 }
