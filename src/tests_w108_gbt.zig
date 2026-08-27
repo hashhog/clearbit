@@ -253,7 +253,7 @@ test "w108 G2 BUG-2 createBlockTemplate succeeds with no peers (IBD gate absent)
         &chain_state,
         &mempool,
         &consensus.REGTEST,
-        .{ .payout_script = &payout },
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();
@@ -271,7 +271,7 @@ test "w108 G2 BUG-2 createBlockTemplate succeeds with no peers (IBD gate absent)
 // BUG-3: CONSENSUS-DIVERGENT — after the first 2016-block retarget, the
 // template will carry genesis bits while the network has a different target.
 
-test "w108 G3 BUG-3 template nBits is genesis_header.bits (placeholder, not GetNextWorkRequired)" {
+test "w108 G3 FIXED: template nBits comes from GetNextWorkRequired; no ancestors -> refuses (not genesis placeholder)" {
     const allocator = testing.allocator;
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
@@ -279,23 +279,25 @@ test "w108 G3 BUG-3 template nBits is genesis_header.bits (placeholder, not GetN
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();
 
+    // FLIPPED (was BUG-3's lock-in): pre-fix the template served
+    // params.genesis_header.bits verbatim forever — past the first retarget
+    // every template carried a wrong target and a block mined from it was
+    // consensus-invalid (bad-diffbits).  Post-fix the template computes
+    // GetNextWorkRequired over the chain state's persisted headers and,
+    // exactly like the strict header path, REFUSES when the ancestors are
+    // unavailable (this DB-less fixture) instead of fabricating a target.
+    // Test fixtures that legitimately cannot serve headers opt in via
+    // TemplateOptions.override_bits.  FAILS AT PARENT: the parent returns a
+    // genesis-bits template here.
     const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xBB} ** 20;
-    var tmpl = try block_template.createBlockTemplate(
+    const result = block_template.createBlockTemplate(
         &chain_state,
         &mempool,
         &consensus.REGTEST,
         .{ .payout_script = &payout },
         allocator,
     );
-    defer tmpl.deinit();
-
-    // BUG-3: clearbit returns genesis bits verbatim.
-    // After a retarget, bits should differ from genesis.
-    // Document current (broken) behaviour: bits == genesis bits.
-    const genesis_bits = consensus.REGTEST.genesis_header.bits;
-    try testing.expectEqual(genesis_bits, tmpl.header.bits);
-    // FIX: should call getNextWorkRequired(chain_state, params) and use the
-    // result rather than params.genesis_header.bits.
+    try testing.expectError(error.DifficultyUnavailable, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +328,7 @@ test "w108 G4 BUG-4 mintime should be MTP+1 not wall clock" {
         &chain_state,
         &mempool,
         &consensus.REGTEST,
-        .{ .payout_script = &payout },
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();
@@ -374,7 +376,7 @@ test "w108 G5 BUG-5 GetMinimumTime lacks BIP-94 timewarp adjustment" {
         &chain_state,
         &mempool,
         &consensus.REGTEST,
-        .{ .payout_script = &payout },
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();
@@ -409,7 +411,7 @@ test "w108 G6 BUG-6 GBT response missing rules field (documented)" {
     const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xEE} ** 20;
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout }, allocator,
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits }, allocator,
     );
     defer tmpl.deinit();
     // The block_template struct has no `rules` field — it belongs in the RPC response.
@@ -440,7 +442,7 @@ test "w108 G7 BUG-7 GBT response missing vbavailable field (BIP-9 GBT extension)
     const payout = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x01} ** 20 ++ [_]u8{ 0x88, 0xac }; // P2PKH
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout }, allocator,
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits }, allocator,
     );
     defer tmpl.deinit();
     // block_template populates template.header.version via computeBlockVersion()
@@ -547,7 +549,7 @@ test "w108 G10 BUG-10 GBT transaction entries missing sigops field (BIP-22)" {
     const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0x11} ** 20;
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout }, allocator,
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits }, allocator,
     );
     defer tmpl.deinit();
     // With no transactions in mempool, selected is empty — but struct has .sigops
@@ -689,7 +691,7 @@ test "w108 G18 BUG-18 proposal mode not implemented (params ignored in rpc.zig)"
     const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0x42} ** 20;
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout, .include_witness_commitment = false },
+        .{ .payout_script = &payout, .include_witness_commitment = false , .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();
@@ -718,7 +720,7 @@ test "w108 G19 BUG-19 coinbasevalue emitted unconditionally (no capabilities che
     const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0x55} ** 20;
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout }, allocator,
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits }, allocator,
     );
     defer tmpl.deinit();
     // coinbasevalue = subsidy + fees.  At height 145 (regtest): 50 BTC + 0 fees.
@@ -786,7 +788,7 @@ test "w108 G20b BUG-20 createBlockTemplate at height 145 produces 2-byte scriptS
 
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout, .include_witness_commitment = false },
+        .{ .payout_script = &payout, .include_witness_commitment = false , .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();
@@ -869,7 +871,7 @@ test "w108 G21 BUG-21 curtime not clamped to MTP+1 (UpdateTime semantics absent)
     const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0x77} ** 20;
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout }, allocator,
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits }, allocator,
     );
     defer tmpl.deinit();
     // curtime is set to std.time.timestamp() — no UpdateTime clamp.
@@ -942,7 +944,7 @@ test "w108 G24 BUG-24 GBT response missing signet_challenge for signet networks"
     // Build template for signet — no error expected from the core logic
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.SIGNET,
-        .{ .payout_script = &payout }, allocator,
+        .{ .payout_script = &payout, .override_bits = consensus.SIGNET.genesis_header.bits }, allocator,
     );
     defer tmpl.deinit();
     try testing.expect(tmpl.height > 0);
@@ -974,7 +976,7 @@ test "w108 G25 BUG-25 GBT response missing default_witness_commitment field" {
 
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout, .include_witness_commitment = true },
+        .{ .payout_script = &payout, .include_witness_commitment = true , .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();
@@ -1040,13 +1042,13 @@ test "w108 G27 BUG-27 no template caching (rebuilt on every GBT call)" {
 
     var tmpl1 = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout }, allocator,
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits }, allocator,
     );
     defer tmpl1.deinit();
 
     var tmpl2 = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout }, allocator,
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits }, allocator,
     );
     defer tmpl2.deinit();
 
@@ -1191,7 +1193,7 @@ test "w108 G30j PASS coinbase nLockTime = height - 1 (anti-fee-sniping)" {
 
     var tmpl = try block_template.createBlockTemplate(
         &chain_state, &mempool, &consensus.REGTEST,
-        .{ .payout_script = &payout, .include_witness_commitment = false },
+        .{ .payout_script = &payout, .include_witness_commitment = false , .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();

@@ -175,6 +175,11 @@ pub const TemplateOptions = struct {
     /// transactions are excluded from the template.  0 = accept all.
     /// Matches Bitcoin Core blockMinFeeRate (policy/policy.h:36).
     block_min_fee_rate: u64 = 0,
+    /// TEST-ONLY escape hatch: use these bits verbatim instead of computing
+    /// GetNextWorkRequired over the chain state (which DB-less test fixtures
+    /// cannot serve).  Production callers MUST leave this null — a template
+    /// with fabricated bits mines a consensus-invalid block (bad-diffbits).
+    override_bits: ?u32 = null,
 };
 
 /// Clamp TemplateOptions to valid ranges, mirroring Bitcoin Core ClampOptions()
@@ -227,10 +232,36 @@ pub fn createBlockTemplate(
 
     const height = chain_state.best_height + 1;
 
-    // 1. Compute difficulty target
-    // In production, this would use the full difficulty adjustment algorithm.
-    // For now, use a placeholder or the previous block's bits.
-    const bits: u32 = params.genesis_header.bits; // Use genesis bits as placeholder
+    // 1. Compute difficulty target — the REAL GetNextWorkRequired over the
+    // chain state's persisted headers (Core miner.cpp CreateNewBlock →
+    // pow.cpp GetNextWorkRequired).  The old placeholder served genesis bits
+    // forever; past the first retarget every template carried a wrong target,
+    // so any block mined from it was consensus-invalid (bad-diffbits).  The
+    // strict variant refuses (null) rather than fabricate when an ancestor is
+    // unavailable — surface that as an error, never a wrong target.
+    const IndexAdapter = struct {
+        cs: *storage.ChainState,
+        fn getAtHeight(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
+            const me: *@This() = @ptrCast(@alignCast(ctx));
+            const hash = me.cs.getBlockHashByHeight(h) orelse return null;
+            const hdr = me.cs.getPersistedHeader(&hash) orelse
+                me.cs.getBlockHeaderFromBody(&hash) orelse return null;
+            return .{ .height = h, .timestamp = hdr.timestamp, .bits = hdr.bits };
+        }
+    };
+    var index_adapter = IndexAdapter{ .cs = chain_state };
+    const index_view = consensus.BlockIndexView{
+        .context = @ptrCast(&index_adapter),
+        .getAtHeightFn = IndexAdapter.getAtHeight,
+        .pow_limit_bits = consensus.getPowLimitBits(params),
+    };
+    const bits: u32 = opts.override_bits orelse
+        (consensus.getNextWorkRequiredChecked(
+            height,
+            @intCast(std.time.timestamp()),
+            &index_view,
+            params,
+        ) orelse return error.DifficultyUnavailable);
     const target = consensus.bitsToTarget(bits);
 
     // 2. Reserve weight for the block header, tx-count varint, and coinbase tx.

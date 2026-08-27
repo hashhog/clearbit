@@ -809,7 +809,7 @@ test "w123 G25 BUG-25 GBT bits field reflects placeholder (root cause: BUG-2)" {
         &chain_state,
         &mempool,
         &consensus.REGTEST,
-        .{ .payout_script = &payout },
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();
@@ -963,7 +963,7 @@ test "w123 G30d PASS coinbase input sequence = MAX_SEQUENCE_NONFINAL (0xFFFFFFFE
         &chain_state,
         &mempool,
         &consensus.REGTEST,
-        .{ .payout_script = &payout },
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();
@@ -1018,7 +1018,7 @@ test "w123 G30i PASS template ~ getBlockReward = subsidy + fees (raw)" {
         &chain_state,
         &mempool,
         &consensus.REGTEST,
-        .{ .payout_script = &payout },
+        .{ .payout_script = &payout, .override_bits = consensus.REGTEST.genesis_header.bits },
         allocator,
     );
     defer tmpl.deinit();

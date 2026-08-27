@@ -1932,8 +1932,22 @@ pub fn validateBlockForIBD(
                     return ValidationError.SequenceLockNotSatisfied;
                 }
             } else {
-                // Height-only: safe because mtp=0 would cause false-accepts
-                // on time-based locks if we applied the full check.
+                // Height-only mode: no per-block MTP source is wired.  A
+                // TIME-based lock cannot be evaluated here — the old
+                // behaviour skipped it, false-ACCEPTING any unexpired time
+                // lock (w132 G15 BUG-1).  Core always evaluates time locks
+                // (tx_verify.cpp:74-88 / EvaluateSequenceLocks), so a caller
+                // that cannot supply MTP must not accept a time-locked
+                // spend: fail closed.  Every production path (P2P, RPC,
+                // reorg connect) wires getMtpAtHeightFn + a real prev_mtp,
+                // so this arm is reachable only by validate-only shims and
+                // future callers — refusal here is loud, not disruptive.
+                // (Per-COIN mtp=0 under a WIRED callback — the assumeutxo
+                // below-base trust — takes the full_time_check branch above
+                // and is unaffected.)
+                if (txHasTimeBasedLock(tx)) {
+                    return ValidationError.SequenceLockNotSatisfied;
+                }
                 if (lock_result.min_height >= @as(i32, @intCast(tip_index.height))) {
                     return ValidationError.SequenceLockNotSatisfied;
                 }
@@ -2561,6 +2575,21 @@ test "bip68VersionActive compares version unsigned (Core uint32_t)" {
 ///   - Compare against height of block containing the UTXO
 ///
 /// Returns: SequenceLockResult with the maximum required height/time across all inputs.
+/// True when any input carries an ENABLED time-type relative lock
+/// (BIP-68: tx version >= 2, sequence DISABLE bit clear, TYPE bit set).
+/// Used by the height-only sequence-lock arm to fail closed: a time lock
+/// cannot be evaluated without an MTP source, and skipping it false-accepts
+/// (w132 G15).  Reference: Core tx_verify.cpp:41-55 (lock applicability).
+pub fn txHasTimeBasedLock(tx: *const types.Transaction) bool {
+    if (tx.version < 2) return false;
+    for (tx.inputs) |input| {
+        const seq = input.sequence;
+        if ((seq & consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0) continue;
+        if ((seq & consensus.SEQUENCE_LOCKTIME_TYPE_FLAG) != 0) return true;
+    }
+    return false;
+}
+
 pub fn calculateSequenceLocks(
     tx: *const types.Transaction,
     utxo_view: *const UtxoView,
@@ -2610,8 +2639,12 @@ pub fn calculateSequenceLocks(
             //   nMinTime = max(nMinTime, nCoinTime + (value << GRANULARITY) - 1)
             // utxo_info.mtp MUST hold GetAncestor(coinHeight-1)->GetMedianTimePast(),
             // i.e. the MTP of the block PRIOR to the coin's confirming block.
-            // Callers set this correctly when ctx.getMtpAtHeightFn is wired;
-            // otherwise mtp=0 produces a permissive (always-satisfied) result.
+            // Callers set this correctly when ctx.getMtpAtHeightFn is wired.
+            // A per-coin mtp=0 under a WIRED callback is the assumeutxo
+            // below-base trust (trivially-satisfied min_time, deliberate);
+            // the null-callback case never reaches this formula any more —
+            // validateBlockForIBD's height-only arm fails closed on
+            // time-based locks via txHasTimeBasedLock (w132 G15 fix).
             const lock_time = @as(i64, lock_value) << consensus.SEQUENCE_LOCKTIME_GRANULARITY;
             // Subtract 1 to convert from "first valid" to "last invalid" semantics
             // (matches Core's nLockTime semantics for EvaluateSequenceLocks).

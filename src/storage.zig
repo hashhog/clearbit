@@ -1283,10 +1283,34 @@ pub const UtxoSet = struct {
             }
         }
 
-        // Store in cache (marked dirty + fresh — FRESH means it was created in
-        // cache and never written to DB, so if it's spent before the next flush
-        // we can skip the DB write entirely).
-        try self.cache.put(key, CacheEntry{ .utxo = compact, .dirty = true, .fresh = true });
+        // FRESH means "this coin provably does not exist in the durable set,
+        // so a spend before the next flush may skip the DB delete" (see
+        // spend()).  It is safe ONLY when this add did not shadow an existing
+        // durable coin — the old unconditional fresh=true left a PHANTOM UTXO
+        // on disk whenever a DB-resident coin was re-added and then spent
+        // within one flush window (W100 BUG-3; Core coins.cpp:96-99 guards
+        // the same invariant):
+        //  - cache hit: inherit the entry's freshness.  An entry with
+        //    fresh=false predating this add (flushed earlier, or read
+        //    through) may be DB-resident; re-marking it fresh makes the next
+        //    spend skip the delete.
+        //  - cache miss with a DB attached: probe the durable set.  Core's
+        //    replay path does the same probe (ReplayBlocks ->
+        //    AddCoins(check_for_overwrite=true)) — and crash-replay is
+        //    exactly the live path that re-adds already-flushed coins into a
+        //    cold cache.  Bloom filters keep the negative probe (the common
+        //    IBD case) cheap.
+        const fresh: bool = blk: {
+            if (self.cache.get(key)) |existing| break :blk existing.fresh;
+            if (self.db) |db| {
+                if (db.get(CF_UTXO, &key) catch null) |bytes| {
+                    self.allocator.free(bytes);
+                    break :blk false;
+                }
+            }
+            break :blk true;
+        };
+        try self.cache.put(key, CacheEntry{ .utxo = compact, .dirty = true, .fresh = fresh });
         // Track dirty key for efficient flush
         self.dirty_keys.append(key) catch {};
 
@@ -15956,7 +15980,7 @@ test "W100 G4: UtxoSet.spend returns CompactUtxo (Core SpendCoin moveout)" {
 
 // --- G5: FRESH flag invariant on overwrite (BUG-3) ---
 
-test "W100 G5: UtxoSet.add always sets fresh=true even after DB flush (BUG-3)" {
+test "W100 G5 FIXED: UtxoSet.add preserves fresh=false across re-add of a DB-resident coin (was BUG-3)" {
     // Core BatchWrite invariant: fresh flag may only be set if the entry was
     // never written to the parent DB layer.  Overwriting a DB-resident entry
     // must keep fresh=false so the tombstone path fires on spend.
@@ -15990,14 +16014,42 @@ test "W100 G5: UtxoSet.add always sets fresh=true even after DB flush (BUG-3)" {
         try std.testing.expect(!entry.fresh); // post-flush: fresh=false (correct).
     }
 
-    // Second add (overwrite of DB-resident entry): should set fresh=false.
+    // Second add (overwrite of DB-resident entry): FLIPPED (was BUG-3's
+    // lock-in asserting fresh=true).  The re-add must inherit fresh=false —
+    // marking it fresh makes the next spend skip the DB delete and leaves a
+    // phantom UTXO on disk.  FAILS AT PARENT (parent sets fresh=true).
     const txout2 = types.TxOut{ .value = 3001, .script_pubkey = &script };
     try chain_state.utxo_set.add(&outpoint, &txout2, 11, false);
-
-    // BUG-3: clearbit unconditionally sets fresh=true here.
     if (chain_state.utxo_set.cache.get(key)) |entry| {
-        // Confirmed BUG-3: fresh=true after overwriting a DB-resident entry.
-        try std.testing.expect(entry.fresh); // documents wrong value (should be false).
+        try std.testing.expect(!entry.fresh);
+    } else return error.TestUnexpectedResult;
+
+    // Cold-cache re-add (the crash-replay shape: flushed coin, cache empty):
+    // the disk probe must classify it NOT-fresh.
+    if (chain_state.utxo_set.cache.fetchRemove(key)) |old| {
+        var evicted = old.value.utxo;
+        evicted.deinit(allocator);
+    }
+    const txout3 = types.TxOut{ .value = 3002, .script_pubkey = &script };
+    try chain_state.utxo_set.add(&outpoint, &txout3, 12, false);
+    if (chain_state.utxo_set.cache.get(key)) |entry| {
+        try std.testing.expect(!entry.fresh);
+    } else return error.TestUnexpectedResult;
+
+    // THE PHANTOM PIN (behavioral, disk-level): spend the re-added coin and
+    // flush.  Pre-fix the fresh mislabel made spend() skip the DB delete, so
+    // the FIRST flush's copy survived on disk forever — a phantom UTXO the
+    // durable set would resurrect on the next cache miss.  Post-fix the
+    // delete is queued and the coin is gone from CF_UTXO.
+    if (try chain_state.utxo_set.spend(&outpoint)) |spent| {
+        var owned = spent;
+        owned.deinit(allocator);
+    }
+    try chain_state.utxo_set.flush();
+    {
+        const on_disk = try db.get(CF_UTXO, &key);
+        defer if (on_disk) |b| allocator.free(b);
+        try std.testing.expect(on_disk == null);
     }
 }
 

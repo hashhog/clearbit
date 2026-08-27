@@ -280,36 +280,110 @@ test "w132 G14: checkSequenceLocks fails on min_time >= tip.prev_mtp (PRESENT)" 
     try testing.expect(validation.checkSequenceLocks(r, &.{ .height = 100, .prev_mtp = 1_600_000_001 }));
 }
 
-// G15 BUG-1 — mtp=0 silently bypasses the time-based BIP-68 check.
-// The IBD path at validation.zig:1574-1583 falls back to "height-only" when
-// ctx.getMtpAtHeightFn == null.  This permits time-locked txs to admit
-// before their delay has expired.
-test "w132 G15 BUG-1: time-based BIP-68 bypassed when callback not wired (PARTIAL, P0-CDIV)" {
-    // Construct a scenario where the time-lock has NOT been met but the
-    // height-only fallback returns "satisfied".
-    //
-    // - lock_value = 0xFFFF (max) → required_time = 0 + (0xFFFF << 9) - 1
-    //   ≈ 33,553,919 seconds ≈ 388 days.
-    // - prev_mtp = 1_700_000_000 (some current-era MTP).
-    // - 1_700_000_000 > 33_553_919 → the bypass check would say "satisfied"
-    //   even though the coin was just created (mtp=0).
-    const seq: u32 = consensus.SEQUENCE_LOCKTIME_TYPE_FLAG | 0xFFFF;
-    const tx = makeTx(2, seq, 0);
-    var sv = FlatSeqView{ .info = .{ .height = 50, .mtp = 0 } }; // mtp=0 (BUG)
-    const view = sv.view();
-    const r = validation.calculateSequenceLocks(&tx, &view, 500_000, &consensus.MAINNET);
+// G15 FIXED (was BUG-1) — a time-based lock with no MTP source now fails
+// CLOSED instead of being silently bypassed.  Pre-fix, validateBlockForIBD's
+// height-only arm (ctx.getMtpAtHeightFn == null) skipped time-based locks
+// entirely, admitting any unexpired time-locked spend (false-accept).  Core
+// always evaluates time locks (tx_verify.cpp:74-88).  All production paths
+// wire the callback; the null-callback mode is shim/test-only, so refusal
+// is loud, never disruptive.  BEHAVIORAL, FAILS AT PARENT: the parent
+// accepts this block; the fix rejects it with SequenceLockNotSatisfied.
+test "w132 G15 FIXED: time-locked spend REFUSED when MTP callback not wired (fail-closed)" {
+    const allocator = testing.allocator;
+    const crypto = @import("crypto.zig");
 
-    // The bug: min_time is small because mtp=0 collapses the formula.
-    try testing.expect(r.min_time >= 0);
-    try testing.expect(r.min_time < 100_000_000); // way less than current chain time
+    // Pre-existing OP_TRUE coin the block spends (height 12, external).
+    const coin_outpoint = OutPoint{ .hash = [_]u8{0xFE} ** 32, .index = 0 };
 
-    // Worse: a real-chain prev_mtp > min_time so the gate passes.
-    const tip = BlockIndex{ .height = 500_001, .prev_mtp = 1_700_000_000 };
-    try testing.expect(validation.checkSequenceLocks(r, &tip)); // BUG: would have rejected with correct mtp
+    // Coinbase for height 14: BIP-34 OP_14 prefix + pad, OP_TRUE payout.
+    const cb = Transaction{
+        .version = 1,
+        .inputs = &[_]TxIn{.{
+            .previous_output = OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x5e, 0x00 },
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]TxOut{.{ .value = 5_000_000_000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    // v2 spend with an ENABLED time-type lock (4 * 512s), empty scriptSig
+    // against the OP_TRUE prevout.
+    const spend = Transaction{
+        .version = 2,
+        .inputs = &[_]TxIn{.{
+            .previous_output = coin_outpoint,
+            .script_sig = &[_]u8{},
+            .sequence = consensus.SEQUENCE_LOCKTIME_TYPE_FLAG | 4,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]TxOut{.{ .value = 100_000_000, .script_pubkey = &[_]u8{0x51} }},
+        .lock_time = 0,
+    };
+    var txs = [_]Transaction{ cb, spend };
+    const leaves = [_]types.Hash256{
+        crypto.computeTxidStreaming(&txs[0]),
+        crypto.computeTxidStreaming(&txs[1]),
+    };
+    const merkle = try crypto.computeMerkleRoot(&leaves, allocator);
+    const block = types.Block{
+        .header = .{
+            .version = 4,
+            .prev_block = [_]u8{0xAA} ** 32,
+            .merkle_root = merkle,
+            .timestamp = 1_700_000_000,
+            .bits = 0x207fffff,
+            .nonce = 0,
+        },
+        .transactions = &txs,
+    };
+    const block_hash = [_]u8{0xAB} ** 32;
 
-    // Source-level guard: the comment acknowledging the bypass.
+    const Lookup = struct {
+        fn lookup(ctx: *anyopaque, outpoint: *const OutPoint) ?validation.PrevOutInfo {
+            _ = ctx;
+            const want = OutPoint{ .hash = [_]u8{0xFE} ** 32, .index = 0 };
+            if (!std.mem.eql(u8, &outpoint.hash, &want.hash) or
+                outpoint.index != want.index) return null;
+            return .{
+                .script_pubkey = &[_]u8{0x51},
+                .amount = 100_000_000,
+                .height = 12,
+                .is_coinbase = false,
+                .owner_allocator = null,
+            };
+        }
+    };
+    var dummy: u8 = 0;
+
+    const result = validation.acceptBlock(
+        &block,
+        &block_hash,
+        14,
+        &consensus.REGTEST,
+        @ptrCast(&dummy),
+        Lookup.lookup,
+        allocator,
+        .{
+            // The mode under test: NO MTP source at all.
+            .prev_mtp = 0,
+            .force_skip_pow = true,
+            .is_requested = true,
+        },
+    );
+    try testing.expectError(validation.ValidationError.SequenceLockNotSatisfied, result);
+
+    // Predicate unit: the gate keys on an ENABLED time-type lock only.
+    try testing.expect(validation.txHasTimeBasedLock(&txs[1]));
+    const height_locked = makeTx(2, 10, 0); // height-type lock: unaffected
+    try testing.expect(!validation.txHasTimeBasedLock(&height_locked));
+    const disabled = makeTx(2, consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG |
+        consensus.SEQUENCE_LOCKTIME_TYPE_FLAG | 4, 0); // DISABLE set: unaffected
+    try testing.expect(!validation.txHasTimeBasedLock(&disabled));
+
+    // Source-level guard: the old bypass comment is GONE.
     const src = @embedFile("validation.zig");
-    try testing.expect(std.mem.indexOf(u8, src, "permissive (always-satisfied)") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "permissive (always-satisfied)") == null);
     try testing.expect(std.mem.indexOf(u8, src, "full_time_check") != null);
 }
 
