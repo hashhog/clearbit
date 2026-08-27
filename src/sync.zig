@@ -1,3 +1,23 @@
+//! ############################################################################
+//! # DEAD MODULE ON THE LIVE PATH — DO NOT PATCH LIVE BEHAVIOR HERE.
+//! #
+//! # The mainnet node's sync/IBD/locator/reorg behavior lives in peer.zig
+//! # (PeerManager). Nothing instantiates sync.zig's SyncManager at runtime:
+//! # main.zig re-exports this module but never constructs it, and Zig's lazy
+//! # analysis compiles none of it into the binary. PROVEN 2026-08-26: a
+//! # locator fix landed here (338e2d1) and produced a BYTE-IDENTICAL release
+//! # binary ("built in 0s") — the live stall continued until the same fix
+//! # was applied to peer.zig sendGetHeaders (7b97bce). If you are fixing a
+//! # live defect and your patch lands in this file, you are in the wrong
+//! # file.
+//! #
+//! # Kept (for now) because tests_w141_zmq_rest_notify.zig source-scans this
+//! # file and validation.zig documents shapes against it. Scheduled for
+//! # deletion/retargeting under task #71. Any edit here MUST leave the
+//! # release binary sha unchanged — if the sha moves, this banner is wrong
+//! # and must be rewritten, because the module would then be live.
+//! ############################################################################
+
 const std = @import("std");
 const types = @import("types.zig");
 const p2p = @import("p2p.zig");
