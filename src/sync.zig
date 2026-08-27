@@ -978,11 +978,45 @@ pub const SyncManager = struct {
     fn sendGetHeaders(self: *SyncManager) SyncError!void {
         const peer = self.headers_sync_peer orelse return SyncError.NoPeers;
 
-        // Build block locator: exponentially spaced hashes from our tip
+        // Build block locator: exponentially spaced hashes from our tip.
+        //
+        // PREFER THE PERSISTED CHAIN. The in-memory active_chain list starts
+        // as [genesis] on every boot, so a post-restart locator told peers
+        // "I have only genesis" and they correctly served 2000-header batches
+        // from block 1. At the tip that is masked — new blocks arrive by
+        // announcement and connect directly — but after a LOST 1-BLOCK RACE
+        // it is fatal: recovering needs the competitor's recent headers, the
+        // genesis-rooted batches those locators elicit are (correctly)
+        // refused as ~964k-deep forks, and nothing ever repopulates the list.
+        // Live incident 2026-08-26: clearbit stalled 51 blocks behind in
+        // exactly this loop. The height->hash index survives restarts and is
+        // what the getheaders RESPONDER already serves from, so the sender
+        // now speaks from the same store.
         var locator = std.ArrayList(types.Hash256).init(self.allocator);
         defer locator.deinit();
 
-        if (self.active_chain.items.len > 0) {
+        var used_persisted = false;
+        if (self.peer_manager.chain_state) |cs| {
+            if (cs.best_height > 0) {
+                var step: u32 = 1;
+                var h: u32 = cs.best_height;
+                var count: usize = 0;
+                while (true) {
+                    const hh = cs.getBlockHashByHeight(h) orelse break;
+                    locator.append(hh) catch return SyncError.OutOfMemory;
+                    count += 1;
+                    if (h == 0) break;
+                    if (count >= 10) step *= 2;
+                    h = if (step > h) 0 else h - step;
+                }
+                // A usable locator needs the tip AND deeper shared entries;
+                // require a handful before trusting this path.
+                used_persisted = count >= 2;
+                if (!used_persisted) locator.clearRetainingCapacity();
+            }
+        }
+
+        if (!used_persisted and self.active_chain.items.len > 0) {
             var step: usize = 1;
             var idx: usize = self.active_chain.items.len - 1;
             var count: usize = 0;
