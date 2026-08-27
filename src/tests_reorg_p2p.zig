@@ -1652,3 +1652,131 @@ test "maybeArmReorg: post-restart 1-block race arms a reorg, not a ban" {
     try testing.expect(pm.pending_reorg != null);
     try testing.expectEqual(@as(usize, 3), pm.pending_reorg.?.fork_hashes.items.len);
 }
+
+// ── 2026-08-26 stall layers L3 + L4 ─────────────────────────────────────
+// L1 (fork-point height misread) is pinned by the post-restart-race test
+// above. These pin the other two silent layers: the single-hash locator
+// (L3) and the silently-nulled competing branch root (L4). Both functions
+// were extracted from live paths specifically so these tests exist; at the
+// parent commit they fail to compile (method undef) — that is the A/B.
+
+test "buildGetHeadersLocator: post-restart stale tip yields a real locator, not a single hash" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    // Persisted active chain, tip at 1000; height->hash rows for 990..999.
+    const tip: types.Hash256 = [_]u8{0xAB} ** 32;
+    cs.best_hash = tip;
+    cs.best_height = 1000;
+    var h: u32 = 990;
+    while (h <= 999) : (h += 1) {
+        var hh: types.Hash256 = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, hh[0..4], h, .little);
+        const k = storage.ChainStore.buildHeightHashKey(h);
+        try db.put(storage.CF_DEFAULT, &k, &hh);
+    }
+
+    var locator = std.ArrayList(types.Hash256).init(allocator);
+    defer locator.deinit();
+    try pm.buildGetHeadersLocator(&locator);
+
+    // The L3 regression sent exactly ONE hash — a stale tip no peer
+    // recognizes, so peers served from genesis and the competing branch
+    // could never arrive.
+    try testing.expect(locator.items.len > 3);
+    try testing.expect(std.mem.eql(u8, &locator.items[0], &tip));
+    try testing.expect(std.mem.eql(
+        u8,
+        &locator.items[locator.items.len - 1],
+        &params.genesis_hash,
+    ));
+    // ...and it must actually walk the persisted chain below the tip.
+    var h999: types.Hash256 = [_]u8{0} ** 32;
+    std.mem.writeInt(u32, h999[0..4], 999, .little);
+    var found = false;
+    for (locator.items) |it| {
+        if (std.mem.eql(u8, &it, &h999)) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "seedForkRootParent: root parent on the persisted active chain is seeded" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    // Our own block at height 1000 exists ONLY in persisted storage —
+    // header_index is empty, the post-restart state that silently nulled
+    // the whole 53-header branch on 2026-08-26.
+    const want: types.Hash256 = [_]u8{0xC7} ** 32;
+    cs.best_hash = want;
+    cs.best_height = 1000;
+    const k1000 = storage.ChainStore.buildHeightHashKey(1000);
+    try db.put(storage.CF_DEFAULT, &k1000, &want);
+    var rec: [140]u8 = [_]u8{0} ** 140;
+    std.mem.writeInt(u32, rec[0..4], 1000, .little);
+    std.mem.writeInt(u32, rec[4 + 72 ..][0..4], 0x207fffff, .little); // bits
+    try db.put(storage.CF_BLOCK_INDEX, &want, &rec);
+
+    try testing.expect(pm.header_index.get(want) == null);
+    try testing.expect(pm.seedForkRootParent(want));
+    const ent = pm.header_index.get(want) orelse return error.TestExpectedSeededEntry;
+    try testing.expectEqual(@as(u32, 1000), ent.height);
+    // Idempotent: a second call must not re-insert.
+    try testing.expect(!pm.seedForkRootParent(want));
+}
+
+test "seedForkRootParent: hash not on the active chain is refused" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    pm.chain_state = &cs;
+
+    const ours: types.Hash256 = [_]u8{0xC7} ** 32;
+    cs.best_hash = ours;
+    cs.best_height = 1000;
+    const k1000 = storage.ChainStore.buildHeightHashKey(1000);
+    try db.put(storage.CF_DEFAULT, &k1000, &ours);
+
+    // An attacker-supplied parent that is NOT one of our blocks must never
+    // be seeded — that would let a fork root itself anywhere.
+    const stranger: types.Hash256 = [_]u8{0x5A} ** 32;
+    try testing.expect(!pm.seedForkRootParent(stranger));
+    try testing.expect(pm.header_index.get(stranger) == null);
+}

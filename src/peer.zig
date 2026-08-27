@@ -4977,10 +4977,16 @@ pub const PeerManager = struct {
     /// reorg fixes because those fixes never received the headers they
     /// needed. A locator with deep SHARED entries lets peers answer from the
     /// true fork point instead.
-    fn sendGetHeaders(self: *PeerManager, target_peer: *Peer) !void {
-        var locator = std.ArrayList(types.Hash256).init(self.allocator);
-        defer locator.deinit();
-
+    /// Build the getheaders block locator: in-flight queue tip, then the
+    /// persisted active chain walked tip-down with an exponential step,
+    /// then genesis.  Extracted from sendGetHeaders so the 2026-08-26 L3
+    /// stall (a single-hash locator no peer recognizes, so peers serve
+    /// from genesis and a competing branch can never arrive) stays pinned
+    /// by tests_reorg_p2p.
+    pub fn buildGetHeadersLocator(
+        self: *PeerManager,
+        locator: *std.ArrayList(types.Hash256),
+    ) !void {
         if (self.expected_blocks.items.len > 0) {
             try locator.append(self.expected_blocks.items[self.expected_blocks.items.len - 1]);
         }
@@ -5002,6 +5008,12 @@ pub const PeerManager = struct {
             }
         }
         try locator.append(self.network_params.genesis_hash);
+    }
+
+    fn sendGetHeaders(self: *PeerManager, target_peer: *Peer) !void {
+        var locator = std.ArrayList(types.Hash256).init(self.allocator);
+        defer locator.deinit();
+        try self.buildGetHeadersLocator(&locator);
 
         const msg = p2p.Message{ .getheaders = .{
             .version = @intCast(p2p.PROTOCOL_VERSION),
@@ -5015,6 +5027,46 @@ pub const PeerManager = struct {
     // ====================================================================
     // Header index + competing-fork detection (CLEARBIT_REORG=1)
     // ====================================================================
+
+    /// L4 of the 2026-08-26 stall: insertHeader consults only the in-memory
+    /// header_index for a header's parent, and after a restart that index is
+    /// empty — so every insert of a competing branch rooted at one of OUR OWN
+    /// recent blocks returned null, last_inserted stayed null, and
+    /// maybeArmReorg was never called.  No log, no penalty, no reorg.
+    /// If `want` is absent from the index but verifiably on our persisted
+    /// active chain (bounded tip-down height->hash walk), insert a synthetic
+    /// header_index entry for it from persisted data.  Its chain_work uses
+    /// the documented chainWorkFromHeight placeholder-base convention, which
+    /// cancels in maybeArmReorg's above-fork-point comparison because our
+    /// side is priced from the same entry's base (98b0765).
+    /// Returns true iff an entry was inserted.  Idempotent.
+    pub fn seedForkRootParent(self: *PeerManager, want: types.Hash256) bool {
+        if (self.header_index.get(want) != null) return false;
+        const cs2 = self.chain_state orelse return false;
+        var d2: u32 = 0;
+        while (d2 <= MAX_REORG_DEPTH_PEER and d2 <= cs2.best_height) : (d2 += 1) {
+            const hh2 = cs2.getBlockHashByHeight(cs2.best_height - d2) orelse break;
+            if (!std.mem.eql(u8, &hh2, &want)) continue;
+            const ph = cs2.getPersistedHeader(&want) orelse
+                cs2.getBlockHeaderFromBody(&want) orelse break;
+            const hp = cs2.best_height - d2;
+            self.header_index.put(want, .{
+                .hash = want,
+                .prev_hash = ph.prev_block,
+                .height = hp,
+                .timestamp = ph.timestamp,
+                .chain_work = chainWorkFromHeight(hp),
+                .header = ph,
+                .last_seen = std.time.timestamp(),
+            }) catch return false;
+            std.debug.print(
+                "P2P: REORG-CANDIDATE root parent seeded from active chain at h={d}\n",
+                .{hp},
+            );
+            return true;
+        }
+        return false;
+    }
 
     /// Look up the chain_work + height of an entry's parent header.  Used
     /// when ingesting a new header so we can compute its cumulative
@@ -6002,50 +6054,13 @@ pub const PeerManager = struct {
                         // validated and inserted in one loop; the overlay makes
                         // it independent of whether insertHeader succeeded, and
                         // gives us the `.undecidable` distinction.
-                        // SEED THE PARENT. insertHeader consults only the
-                        // in-memory header_index for a header's parent, and
-                        // after a restart that index is empty — so every
-                        // insert of a competing branch rooted at one of OUR
-                        // OWN recent blocks failed, last_inserted stayed null,
-                        // and maybeArmReorg was never called. No log, no
-                        // penalty, no reorg: the silent final layer of the
-                        // 2026-08-26 stall, still present after the locator
-                        // fix finally delivered the right 53-header batch.
-                        // If the batch's root parent is absent from the index
-                        // but verifiably on our persisted active chain, insert
-                        // a synthetic entry for it from persisted data. Its
-                        // chain_work uses the documented placeholder-base
-                        // convention (chainWorkFromHeight), which cancels in
-                        // maybeArmReorg's above-fork-point comparison because
-                        // our side is priced from the same entry's base.
-                        if (h.headers.len > 0 and
-                            self.header_index.get(h.headers[0].prev_block) == null)
-                        {
-                            if (self.chain_state) |cs2| {
-                                const want = h.headers[0].prev_block;
-                                var d2: u32 = 0;
-                                while (d2 <= MAX_REORG_DEPTH_PEER and d2 <= cs2.best_height) : (d2 += 1) {
-                                    const hh2 = cs2.getBlockHashByHeight(cs2.best_height - d2) orelse break;
-                                    if (!std.mem.eql(u8, &hh2, &want)) continue;
-                                    const ph = cs2.getPersistedHeader(&want) orelse
-                                        cs2.getBlockHeaderFromBody(&want) orelse break;
-                                    const hp = cs2.best_height - d2;
-                                    self.header_index.put(want, .{
-                                        .hash = want,
-                                        .prev_hash = ph.prev_block,
-                                        .height = hp,
-                                        .timestamp = ph.timestamp,
-                                        .chain_work = chainWorkFromHeight(hp),
-                                        .header = ph,
-                                        .last_seen = std.time.timestamp(),
-                                    }) catch {};
-                                    std.debug.print(
-                                        "P2P: REORG-CANDIDATE root parent seeded from active chain at h={d}\n",
-                                        .{hp},
-                                    );
-                                    break;
-                                }
-                            }
+                        // Seed the batch's root parent from the persisted
+                        // chain when the post-restart index doesn't know it —
+                        // otherwise insertHeader silently nulls the whole
+                        // branch (L4 of the 2026-08-26 stall; rationale on
+                        // seedForkRootParent).
+                        if (h.headers.len > 0) {
+                            _ = self.seedForkRootParent(h.headers[0].prev_block);
                         }
                         const now_fork: i64 = std.time.timestamp();
                         var fork_overlay = HeaderBatchOverlay.init(self.allocator);
