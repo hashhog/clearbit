@@ -1343,9 +1343,12 @@ test "version message encode/decode round-trip" {
     const payload = encoded[24..];
     try std.testing.expect(header.verifyChecksum(payload));
 
-    // Decode payload
+    // Decode payload.  Post-#31, decoded messages OWN their bytes (the
+    // user_agent is duped in decodePayload); the receiver must free — the
+    // handshake arms do so via defer, and so must this test.
     const decoded_msg = try decodePayload(header.commandName(), payload, allocator);
     const decoded = decoded_msg.version;
+    defer allocator.free(decoded.user_agent);
 
     try std.testing.expectEqual(version_msg.version, decoded.version);
     try std.testing.expectEqual(version_msg.services, decoded.services);
