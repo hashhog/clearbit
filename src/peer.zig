@@ -4962,28 +4962,50 @@ pub const PeerManager = struct {
         return null;
     }
 
-    /// Send getheaders to a peer using our current best block as locator.
+    /// Send getheaders to a peer with a REAL block locator: header-queue
+    /// tip, then the active tip, then a persisted height->hash walk down the
+    /// chain (ten single steps, then doubling), ending at genesis.
+    ///
+    /// This used to send a SINGLE hash — our tip alone. The protocol answers
+    /// an unrecognised locator from GENESIS, so the moment our tip was a
+    /// block the network did not have — i.e. immediately after LOSING a
+    /// 1-block race — every peer replied with 2000-header batches rooted at
+    /// block 1, which the reorg machinery (correctly) refused as ~964k-deep
+    /// forks. Nothing could ever deliver the competitor's recent headers, so
+    /// the node sat on its stale branch indefinitely: the 2026-08-26 clearbit
+    /// stall, 51 blocks behind through two restarts, survived two upstream
+    /// reorg fixes because those fixes never received the headers they
+    /// needed. A locator with deep SHARED entries lets peers answer from the
+    /// true fork point instead.
     fn sendGetHeaders(self: *PeerManager, target_peer: *Peer) !void {
-        // Build locator: use the tip of the header queue if available,
-        // otherwise our best connected hash, or genesis.
-        var locator_hash: types.Hash256 = undefined;
-        if (self.expected_blocks.items.len > 0) {
-            // Use the last known header hash (end of queue) to avoid duplicate headers
-            locator_hash = self.expected_blocks.items[self.expected_blocks.items.len - 1];
-        } else if (self.chain_state) |cs| {
-            if (cs.best_height > 0) {
-                locator_hash = cs.best_hash;
-            } else {
-                locator_hash = self.network_params.genesis_hash;
-            }
-        } else {
-            locator_hash = self.network_params.genesis_hash;
-        }
+        var locator = std.ArrayList(types.Hash256).init(self.allocator);
+        defer locator.deinit();
 
-        const locators = [_]types.Hash256{locator_hash};
+        if (self.expected_blocks.items.len > 0) {
+            try locator.append(self.expected_blocks.items[self.expected_blocks.items.len - 1]);
+        }
+        if (self.chain_state) |cs| {
+            if (cs.best_height > 0) {
+                try locator.append(cs.best_hash);
+                var step: u32 = 1;
+                var h: u32 = cs.best_height -| 1;
+                var count: usize = 0;
+                while (h > 0 and locator.items.len < 96) {
+                    if (cs.getBlockHashByHeight(h)) |hh| {
+                        try locator.append(hh);
+                    }
+                    count += 1;
+                    if (count >= 10) step *= 2;
+                    if (step > h) break;
+                    h -= step;
+                }
+            }
+        }
+        try locator.append(self.network_params.genesis_hash);
+
         const msg = p2p.Message{ .getheaders = .{
             .version = @intCast(p2p.PROTOCOL_VERSION),
-            .block_locator_hashes = &locators,
+            .block_locator_hashes = locator.items,
             .hash_stop = [_]u8{0} ** 32,
         } };
         try target_peer.sendMessage(&msg);
