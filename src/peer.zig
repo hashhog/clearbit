@@ -5369,8 +5369,30 @@ pub const PeerManager = struct {
         // storage is consulted first.
         const fp_height: u32 = blk: {
             if (cs.getBlockHeightByHash(&fp)) |h| break :blk h;
+            // The fast IBD connect path populates CF_BLOCKS but NOT the
+            // per-hash CF_BLOCK_INDEX records (see getPersistedHeader's
+            // docstring), so on a live datadir the lookup above can miss for
+            // exactly the recent blocks a 1-block race forks from. The
+            // height->hash index IS maintained, so walk down from the tip —
+            // bounded by the reorg cap — comparing hashes. Live proof this
+            // path is required: the 2026-08-26 redeploy still logged
+            // fork_point_h=0 because the direct lookup missed.
+            var d: u32 = 0;
+            while (d <= MAX_REORG_DEPTH_PEER and d <= cs.best_height) : (d += 1) {
+                const hh = cs.getBlockHashByHeight(cs.best_height - d) orelse break;
+                if (std.mem.eql(u8, &hh, &fp)) break :blk cs.best_height - d;
+            }
             if (self.header_index.get(fp)) |e| break :blk e.height;
             break :blk 0; // genesis hash or the zero sentinel — genuinely 0
+        };
+        // True iff fp_height came from the PERSISTED active chain (either
+        // lookup), i.e. the fork point verifiably sits on our own chain at an
+        // absolute height — the precondition for pricing both sides above it.
+        const fp_on_active: bool = blk: {
+            if (cs.getBlockHeightByHash(&fp) != null) break :blk true;
+            if (cs.getBlockHashByHeight(fp_height)) |hh|
+                break :blk std.mem.eql(u8, &hh, &fp);
+            break :blk false;
         };
         const reorg_depth: u32 = if (cs.best_height > fp_height)
             cs.best_height - fp_height
@@ -5442,7 +5464,8 @@ pub const PeerManager = struct {
             // the identical accumulation, so the existing strict comparison
             // below is exact. If any persisted header is missing we fall
             // through to the refusal — fail closed, never guess.
-            if (cs.getBlockHeightByHash(&fp)) |fph| {
+            if (fp_on_active) {
+                const fph = fp_height;
                 if (cs.best_height > fph and
                     cs.best_height - fph <= MAX_REORG_DEPTH_PEER)
                 {
@@ -5457,7 +5480,8 @@ pub const PeerManager = struct {
                             complete = false;
                             break;
                         };
-                        const hdr = cs.getPersistedHeader(&bh) orelse {
+                        const hdr = cs.getPersistedHeader(&bh) orelse
+                            cs.getBlockHeaderFromBody(&bh) orelse {
                             complete = false;
                             break;
                         };
