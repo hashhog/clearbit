@@ -561,8 +561,24 @@ fn processConnecttx(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype)
 ///   request:  {"op":"checkblock","block_hex":"<FINAL block bytes>",
 ///              "prevouts":[{"txid":"<display-hex>","vout":N,
 ///                           "scriptPubKey_hex":"...","value_sats":<u64>,
-///                           "height":N,"is_coinbase":bool},...],
-///              "spend_height":709742,"skip_pow":true,"skip_scripts":false}
+///                           "height":N,"is_coinbase":bool,
+///                           "mtp":<u32 OPTIONAL lock-start MTP>},...],
+///              "spend_height":709742,"skip_pow":true,"skip_scripts":false,
+///              "prev_mtp":<u32 OPTIONAL parent MTP>,
+///              "timestamps":[11 raw ancestor times, OPTIONAL]}
+///
+/// OPTIONAL chain-time context (corpus P1 packs): top-level "prev_mtp" is the
+/// parent's median-time-past (Core pindexPrev->GetMedianTimePast()) and drives
+/// the BIP-113 lock_time_cutoff, the time-too-old gate, and the BIP-68 tip
+/// side; "timestamps" (raw times of the 11 ancestors, median == prev_mtp) is a
+/// fallback source fed through clearbit's OWN validation.medianTimePast when
+/// "prev_mtp" is absent. Per-prevout "mtp" is that coin's lock-start MTP
+/// (Core CalculateSequenceLocks: GetAncestor(coinHeight-1)->GetMedianTimePast())
+/// and feeds AcceptBlockOptions.getMtpAtHeightFn so time-based BIP-68 locks
+/// take the FULL check instead of the #53c fail-closed refusal. When these
+/// fields are absent, behaviour is byte-identical to before they existed:
+/// prev_mtp=0 + null callback => MTP gates skipped, time-based BIP-68 locks
+/// refused fail-closed (validation.zig txHasTimeBasedLock arm).
 ///   response: {"valid":true}                    (block accepted)
 ///             {"valid":false,"reason":"<token>"} (rejected; advisory token)
 ///             {"error":"..."}                    (could not evaluate => SKIP)
@@ -602,6 +618,39 @@ fn processCheckblock(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype
         };
         break :blk false;
     };
+
+    // OPTIONAL parent MTP (drives BIP-113 cutoff + time-too-old + BIP-68 tip
+    // side). Same parsing idiom as checkheader's top-level "mtp". Absent => 0
+    // sentinel ("not available"), all MTP gates skipped as before.
+    var prev_mtp: u32 = blk: {
+        if (obj.get("prev_mtp")) |v| switch (v) {
+            .integer => |iv| break :blk @intCast(iv),
+            else => break :blk 0,
+        };
+        break :blk 0;
+    };
+    // Fallback: derive prev_mtp from the OPTIONAL "timestamps" array (raw
+    // times of the 11 ancestors) via clearbit's OWN medianTimePast — the same
+    // fn the live node uses over its header index. Explicit "prev_mtp" wins.
+    if (prev_mtp == 0) {
+        if (obj.get("timestamps")) |v| {
+            if (v == .array) {
+                var times: [11]u32 = undefined;
+                var n: usize = 0;
+                for (v.array.items) |tv| {
+                    if (n >= times.len) break;
+                    switch (tv) {
+                        .integer => |iv| {
+                            times[n] = @intCast(iv);
+                            n += 1;
+                        },
+                        else => {},
+                    }
+                }
+                prev_mtp = validation.medianTimePast(times[0..n]);
+            }
+        }
+    }
 
     // Seed the in-memory UTXO view: one coin per prevout entry, keyed by
     // (wire-order txid, vout). VERBATIM the connecttx seeding plumbing.
@@ -651,6 +700,25 @@ fn processCheckblock(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype
         });
     }
 
+    // OPTIONAL per-prevout "mtp": that coin's lock-start MTP (Core
+    // CalculateSequenceLocks: GetAncestor(coinHeight-1)->GetMedianTimePast()).
+    // Keyed by the height validateBlockForIBD's callback will ask for
+    // (coinHeight-1), so the map IS the MTP source. No "mtp" fields => empty
+    // map => callback NOT wired => the #53c fail-closed arm still refuses
+    // time-based BIP-68 locks, byte-identical to before.
+    var coin_mtps = std.AutoHashMap(u32, u32).init(a);
+    for (prevouts) |p| {
+        const po = p.object;
+        const mv = po.get("mtp") orelse continue;
+        const hv = po.get("height") orelse continue;
+        if (mv != .integer or hv != .integer) continue;
+        const coin_height: u32 = @intCast(hv.integer);
+        try coin_mtps.put(
+            if (coin_height > 0) coin_height - 1 else 0,
+            @intCast(mv.integer),
+        );
+    }
+
     // SAME View.lookup closure as connecttx (PrevOutInfo over the seeded view).
     const View = struct {
         map: *std.AutoHashMap(OutPointKey, ConnectCoin),
@@ -668,6 +736,24 @@ fn processCheckblock(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype
         }
     };
     var view_ctx = View{ .map = &view };
+
+    // MTP-at-height source over the per-coin map (storage.zig ReorgMtpSource
+    // pattern, request-fed). A map miss returns 0 — under a WIRED callback
+    // that is the deliberate "assumeutxo below-base trust" semantics
+    // (validation.zig calculateSequenceLocks), and it can only be reached for
+    // coins the driver did not annotate. Wired ONLY when the map is non-empty.
+    const MtpSource = struct {
+        map: *std.AutoHashMap(u32, u32),
+        fn get(ctx_ptr: *anyopaque, h: u32) u32 {
+            const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return me.map.get(h) orelse 0;
+        }
+    };
+    var mtp_src = MtpSource{ .map = &coin_mtps };
+    const mtp_fn: ?*const fn (*anyopaque, u32) u32 =
+        if (coin_mtps.count() > 0) MtpSource.get else null;
+    const mtp_ctx: ?*anyopaque =
+        if (coin_mtps.count() > 0) @as(*anyopaque, @ptrCast(&mtp_src)) else null;
 
     // Compute the block hash from the (final) header — used by acceptBlock for
     // the BIP-30 exemption check + script-flag-for-hash selection. We do NOT
@@ -711,7 +797,14 @@ fn processCheckblock(a: std.mem.Allocator, obj: std.json.ObjectMap, out: anytype
         &view_ctx,
         View.lookup,
         a,
-        .{ .force_skip_scripts = skip_scripts, .force_skip_pow = skip_pow, .active_chain = active_chain },
+        .{
+            .force_skip_scripts = skip_scripts,
+            .force_skip_pow = skip_pow,
+            .active_chain = active_chain,
+            .prev_mtp = prev_mtp,
+            .getMtpAtHeightFn = mtp_fn,
+            .getMtpAtHeightCtx = mtp_ctx,
+        },
     ) catch |err| {
         const reason = try jsonEscape(a, connectErrToReason(err));
         try out.print("{{\"valid\":false,\"reason\":\"{s}\"}}\n", .{reason});
