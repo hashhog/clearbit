@@ -14225,11 +14225,29 @@ pub const RpcServer = struct {
                 locktime = @intCast(lt.integer);
             }
         }
+        // Core carries rbf as std::optional<bool> (rawtransaction.cpp:398-401),
+        // nullopt while params[3].isNull(), and its OPTIONAL-NESS is
+        // load-bearing because the two consumers read it DIFFERENTLY:
+        //
+        //   choosing the default sequence -> rbf.value_or(true)          absent == true
+        //   the contradiction check below -> rbf.has_value() && value()  absent == no check
+        //
+        // So an ABSENT argument still defaults to TRUE for picking the
+        // sequence, yet suppresses the contradiction check entirely: only a
+        // caller who literally typed `replaceable=true` has stated an intent
+        // that a sequence can contradict. Collapsing the option into one bool
+        // loses the second reading and makes an ordinary call with no
+        // replaceable argument and a final sequence wrongly REJECT.
+        //
+        // A JSON null lands in the `else` here, i.e. counts as ABSENT, which is
+        // Core's isNull() for both an omitted and an explicitly-null argument.
         var replaceable: bool = true; // Core rbf.value_or(true)
+        var replaceable_explicit: bool = false; // Core rbf.has_value()
         if (params.array.items.len > 3) {
             const rep = params.array.items[3];
             if (rep == .bool) {
                 replaceable = rep.bool;
+                replaceable_explicit = true;
             }
         }
         // Core: rbf -> MAX_BIP125_RBF_SEQUENCE (0xfffffffd);
@@ -14477,6 +14495,51 @@ pub const RpcServer = struct {
                         return err_reply;
                     }
                 }
+            }
+        }
+
+        // An explicit replaceable=true whose input set does NOT signal opt-in
+        // RBF is a CONTRADICTION, and Core refuses to guess which half the
+        // caller meant. This is the LAST statement of ConstructTransaction,
+        // after both AddInputs AND AddOutputs (rawtransaction_util.cpp:166-168):
+        //
+        //   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+        //       !SignalsOptInRBF(CTransaction(rawTx)))
+        //       throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+        //           combination: Sequence number(s) contradict replaceable option");
+        //
+        // SignalsOptInRBF (util/rbf.cpp) is true as soon as ANY input carries
+        // nSequence <= MAX_BIP125_RBF_SEQUENCE (util/rbf.h, 0xfffffffd). ANY,
+        // not ALL: that is BIP-125's multi-party rule, so no single co-signer
+        // can opt the whole transaction out of replacement through their own
+        // input.
+        //
+        // clearbit silently ACCEPTED the contradiction. A caller asking for
+        // replaceable=true while pinning a final sequence got back a
+        // well-formed transaction that CANNOT be fee-bumped, with no error and
+        // no log line: the explicit sequence quietly won and the flag was
+        // discarded. The caller finds out when the bump is refused under
+        // BIP-125 Rule 1, with the fee already committed.
+        //
+        // Placed HERE, after the outputs are parsed, on purpose: Core evaluates
+        // it after AddOutputs, so a bad address or amount must still win over
+        // this error. Hoisting it up next to the input loop — where it reads
+        // more naturally — would silently change which error this request
+        // reports.
+        if (replaceable_explicit and replaceable and inputs.items.len > 0) {
+            var signals_rbf = false;
+            for (inputs.items) |txin| {
+                if (txin.sequence <= 0xfffffffd) { // MAX_BIP125_RBF_SEQUENCE
+                    signals_rbf = true;
+                    break;
+                }
+            }
+            if (!signals_rbf) {
+                return self.jsonRpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter combination: Sequence number(s) contradict replaceable option",
+                    id,
+                );
             }
         }
 

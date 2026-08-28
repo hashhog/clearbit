@@ -406,3 +406,326 @@ test "tests_createrawtx_vout_range: CONTROL an ordinary vout 7 is ACCEPTED and l
     defer allocator.free(params);
     try testing.expectEqual(@as(u32, 7), try firstInputVout(&rig, params));
 }
+
+// ==========================================================================
+// SECOND REGRESSION: an EXPLICIT `replaceable=true` that the supplied sequence
+// numbers CONTRADICT must be REJECTED, not silently resolved.
+// ==========================================================================
+//
+// THE DEFECT
+// ----------
+// `createrawtransaction(ins, outs, 0, true)` asks for a REPLACEABLE
+// transaction.  BIP-125 opt-in signalling means at least one input carrying
+// nSequence <= MAX_BIP125_RBF_SEQUENCE (0xfffffffd); a sequence ABOVE that is
+// precisely the opt-OUT.  A caller who passes replaceable=true and also pins
+// every input to 0xfffffffe or 0xffffffff has asked for two things that cannot
+// both hold.
+//
+// clearbit resolved that silently, in favour of the sequence: it returned a
+// well-formed transaction hex that CANNOT be fee-bumped, with no error, no
+// warning and no log line.  The caller learns the truth only when the bump is
+// needed and the replacement is refused under BIP-125 Rule 1 — at which point
+// the transaction is broadcast and the fee is stuck.
+//
+// WHAT BITCOIN CORE DOES
+// ----------------------
+// The LAST statement of ConstructTransaction, after AddInputs AND AddOutputs
+// (bitcoin-core/src/rpc/rawtransaction_util.cpp:166-168):
+//
+//     if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+//         !SignalsOptInRBF(CTransaction(rawTx)))
+//         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+//             combination: Sequence number(s) contradict replaceable option");
+//
+// SignalsOptInRBF (bitcoin-core/src/util/rbf.cpp) is true if ANY input has
+// nSequence <= MAX_BIP125_RBF_SEQUENCE.  "Any" rather than "all" is deliberate
+// upstream: in a multi-party protocol a single participant must not be able to
+// disable replacement by opting out in their own input.
+//
+// THE ABSENT-vs-EXPLICIT ASYMMETRY (the subtle part)
+// --------------------------------------------------
+// `rbf` is a std::optional<bool>, left nullopt when the JSON argument is
+// absent or null, and TWO DIFFERENT QUESTIONS are asked of it:
+//   * AddInputs asks rbf.value_or(true)          — absent counts as TRUE,
+//     which is what makes 0xfffffffd the DEFAULT sequence;
+//   * this check asks rbf.has_value() && value() — absent counts as NOT SET,
+//     so no check fires at all.
+// Consequence, verified against the live Core node (2026-08-28): an omitted
+// `replaceable` with an explicit final sequence is ACCEPTED, while the same
+// call with `replaceable=true` spelled out is REJECTED.  A check keyed off the
+// effective boolean instead of has_value() breaks the first, which is
+// ordinary, legal usage.
+//
+// TEETH
+// -----
+// Only two of the nine rows below are rejections.  The seven ACCEPT rows are
+// the controls, and they are the ones an over-eager check breaks: each drives
+// the real dispatcher to success and DECODES the returned hex, asserting the
+// nSequence values that actually reached the wire bytes rather than merely
+// that the call did not error.
+//
+// Oracle table, every row captured from the LIVE Core node on 2026-08-28:
+//   rbf ABSENT + sequence 0xFFFFFFFF          ACCEPT, emits 0xffffffff
+//   rbf null   + sequence 0xFFFFFFFF          ACCEPT, emits 0xffffffff
+//   rbf true   + sequence 0xFFFFFFFD          ACCEPT, emits 0xfffffffd
+//   rbf true   + sequence 0xFFFFFFFE          REJECT -8
+//   rbf true   + sequence 0xFFFFFFFF          REJECT -8
+//   rbf true   + no inputs                    ACCEPT
+//   rbf true   + two inputs, one signals      ACCEPT, emits {0xffffffff, 0}
+//   rbf false  + sequence 0xFFFFFFFF          ACCEPT, emits 0xffffffff
+//   rbf true   + no explicit sequence         ACCEPT, emits 0xfffffffd
+
+const CONTRADICT_MSG =
+    "Invalid parameter combination: Sequence number(s) contradict replaceable option";
+
+/// Build the params array for one input with an optional explicit sequence and
+/// optional trailing `locktime, replaceable` arguments.  `rbf_json` is spliced
+/// in as LITERAL JSON text so that ABSENT (null slice) and the JSON literals
+/// `true` / `false` / `null` reach the dispatcher exactly as they would off the
+/// wire — the absent/present distinction is the whole point of these rows and
+/// must not be laundered through an encoder.
+fn rbfParams(
+    allocator: std.mem.Allocator,
+    sequence_json: ?[]const u8,
+    rbf_json: ?[]const u8,
+) ![]const u8 {
+    const seq_part = if (sequence_json) |s|
+        try std.fmt.allocPrint(allocator, ",\"sequence\":{s}", .{s})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(seq_part);
+
+    const tail = if (rbf_json) |r|
+        try std.fmt.allocPrint(allocator, ",0,{s}", .{r})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(tail);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "[[{{\"txid\":\"{s}\",\"vout\":0{s}}}],{s}{s}]",
+        .{ TXID, seq_part, OUTPUTS, tail },
+    );
+}
+
+/// Drive the real dispatcher, require SUCCESS, and return every input's
+/// nSequence as it actually landed in the serialized bytes.  Caller owns the
+/// returned slice.
+fn inputSequences(rig: *Rig, params_json: []const u8) ![]u32 {
+    const resp = try rig.dispatchCreateRaw(params_json);
+    defer rig.allocator.free(resp);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, rig.allocator, resp, .{});
+    defer parsed.deinit();
+
+    const err_v = parsed.value.object.get("error") orelse std.json.Value{ .null = {} };
+    if (err_v == .object) {
+        std.debug.print("\nexpected success, got error reply: {s}\n", .{resp});
+        return error.UnexpectedRpcError;
+    }
+    const hex = parsed.value.object.get("result").?.string;
+
+    const bytes = try rig.allocator.alloc(u8, hex.len / 2);
+    defer rig.allocator.free(bytes);
+    _ = try std.fmt.hexToBytes(bytes, hex);
+
+    var reader = serialize.Reader{ .data = bytes };
+    const tx = try serialize.readTransaction(&reader, rig.allocator);
+    defer serialize.freeTransaction(rig.allocator, &tx);
+
+    const seqs = try rig.allocator.alloc(u32, tx.inputs.len);
+    for (tx.inputs, 0..) |txin, i| seqs[i] = txin.sequence;
+    return seqs;
+}
+
+fn expectSequences(
+    rig: *Rig,
+    params_json: []const u8,
+    expected: []const u32,
+) !void {
+    const got = try inputSequences(rig, params_json);
+    defer rig.allocator.free(got);
+    try testing.expectEqualSlices(u32, expected, got);
+}
+
+test "tests_createrawtx_vout_range: row 1 rbf ABSENT + final sequence is ACCEPTED" {
+    // The asymmetry row. Absent still DEFAULTS to replaceable for CHOOSING the
+    // sequence, but has_value() is false so the contradiction check never
+    // arms. A check keyed off the effective boolean breaks this ordinary call.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try rbfParams(allocator, "4294967295", null);
+    defer allocator.free(params);
+    try expectSequences(&rig, params, &[_]u32{0xffffffff});
+}
+
+test "tests_createrawtx_vout_range: rbf JSON null + final sequence is ACCEPTED" {
+    // Core's test is params[3].isNull(), so a literal null is identical to
+    // omitting the argument: nullopt, has_value() false, no check.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try rbfParams(allocator, "4294967295", "null");
+    defer allocator.free(params);
+    try expectSequences(&rig, params, &[_]u32{0xffffffff});
+}
+
+test "tests_createrawtx_vout_range: row 2 rbf true + 0xfffffffd is ACCEPTED" {
+    // Exactly MAX_BIP125_RBF_SEQUENCE: SignalsOptInRBF compares `<=`, so this
+    // signals. Fails loudly if the comparison is written `<`.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try rbfParams(allocator, "4294967293", "true");
+    defer allocator.free(params);
+    try expectSequences(&rig, params, &[_]u32{0xfffffffd});
+}
+
+test "tests_createrawtx_vout_range: row 3 rbf true + 0xfffffffe -> -8 contradiction" {
+    // One above MAX_BIP125_RBF_SEQUENCE — the tight boundary on the other
+    // side. MAX_SEQUENCE_NONFINAL is still non-final for locktime purposes but
+    // is NOT RBF-signalling.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try rbfParams(allocator, "4294967294", "true");
+    defer allocator.free(params);
+    try expectRpcError(&rig, params, -8, CONTRADICT_MSG);
+}
+
+test "tests_createrawtx_vout_range: row 4 rbf true + 0xffffffff -> -8 contradiction" {
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try rbfParams(allocator, "4294967295", "true");
+    defer allocator.free(params);
+    try expectRpcError(&rig, params, -8, CONTRADICT_MSG);
+}
+
+test "tests_createrawtx_vout_range: row 5 rbf true + NO inputs is ACCEPTED" {
+    // A transaction with no inputs cannot signal, and Core does not punish it:
+    // rawTx.vin.size() > 0 short-circuits first. Dropping that guard turns
+    // this legal call into an error.
+    //
+    // Asserted on the RAW BYTES rather than through the deserializer: a
+    // zero-input tx serializes as `02000000 00 01 ...`, whose 0x00 0x01 is
+    // byte-identical to the BIP-144 segwit marker+flag, so any witness-aware
+    // reader (ours and Core's alike) mis-reads it. Byte 5 — right after the
+    // 4-byte version — is the CompactSize input count and must be 0.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try std.fmt.allocPrint(allocator, "[[],{s},0,true]", .{OUTPUTS});
+    defer allocator.free(params);
+
+    const resp = try rig.dispatchCreateRaw(params);
+    defer allocator.free(resp);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+    defer parsed.deinit();
+    const err_v = parsed.value.object.get("error") orelse std.json.Value{ .null = {} };
+    if (err_v == .object) {
+        std.debug.print("\nexpected success, got error reply: {s}\n", .{resp});
+        return error.UnexpectedRpcError;
+    }
+    const hex = parsed.value.object.get("result").?.string;
+    try testing.expect(hex.len >= 10);
+    try testing.expectEqualStrings("00", hex[8..10]);
+}
+
+test "tests_createrawtx_vout_range: row 6 rbf true + ONE of two inputs signals is ACCEPTED" {
+    // SignalsOptInRBF is ANY, not ALL — deliberately, so that in a multi-party
+    // protocol one participant cannot disable replacement by opting out in
+    // their own input. A check written as "every input must signal" passes
+    // rows 3 and 4 and fails here.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try std.fmt.allocPrint(
+        allocator,
+        "[[{{\"txid\":\"{s}\",\"vout\":0,\"sequence\":4294967295}}," ++
+            "{{\"txid\":\"{s}\",\"vout\":1,\"sequence\":0}}],{s},0,true]",
+        .{ TXID, TXID, OUTPUTS },
+    );
+    defer allocator.free(params);
+    try expectSequences(&rig, params, &[_]u32{ 0xffffffff, 0 });
+}
+
+test "tests_createrawtx_vout_range: row 7 rbf FALSE + final sequence is ACCEPTED" {
+    // The caller asserted NON-replaceable and supplied a matching sequence.
+    // Nothing contradicts anything; rbf.value() is false.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try rbfParams(allocator, "4294967295", "false");
+    defer allocator.free(params);
+    try expectSequences(&rig, params, &[_]u32{0xffffffff});
+}
+
+test "tests_createrawtx_vout_range: row 8 rbf true + NO explicit sequence is ACCEPTED" {
+    // The single most common RBF call there is. With no "sequence" key
+    // AddInputs picks MAX_BIP125_RBF_SEQUENCE because rbf.value_or(true) is
+    // true, so the default is itself signalling and the check is satisfied.
+    // Breaking this row would break the RPC for its main use — and the
+    // assertion is on the EMITTED sequence, so a handler that accepted while
+    // writing SEQUENCE_FINAL still fails.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try rbfParams(allocator, null, "true");
+    defer allocator.free(params);
+    try expectSequences(&rig, params, &[_]u32{0xfffffffd});
+}
+
+test "tests_createrawtx_vout_range: an OUTPUT error still outranks the contradiction" {
+    // Core runs the check as the LAST statement of ConstructTransaction, after
+    // AddOutputs, so a bad output is reported first even though the
+    // rbf/sequence pair also contradicts. Hoisting the check up next to the
+    // input loop — where it reads more naturally — silently changes which
+    // error this request reports. Pins the placement.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+
+    const params = try std.fmt.allocPrint(
+        allocator,
+        "[[{{\"txid\":\"{s}\",\"vout\":0,\"sequence\":4294967295}}]," ++
+            "{{\"notanaddress\":0.1}},0,true]",
+        .{TXID},
+    );
+    defer allocator.free(params);
+
+    const resp = try rig.dispatchCreateRaw(params);
+    defer allocator.free(resp);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+    defer parsed.deinit();
+    const err_v = parsed.value.object.get("error") orelse std.json.Value{ .null = {} };
+    if (err_v != .object) {
+        std.debug.print("\nexpected an output error, got: {s}\n", .{resp});
+        return error.ExpectedRpcErrorGotSuccess;
+    }
+    const got_msg = err_v.object.get("message").?.string;
+    if (std.mem.eql(u8, got_msg, CONTRADICT_MSG)) {
+        std.debug.print(
+            "\nthe contradiction check outranked the OUTPUT error; Core reports the output error first: {s}\n",
+            .{resp},
+        );
+        return error.ContradictionCheckRanTooEarly;
+    }
+    // The address error itself: -5 RPC_INVALID_ADDRESS_OR_KEY.  Asserted on
+    // the PREFIX, not the whole string: clearbit still says "Invalid Bitcoin
+    // address" where Core says "Invalid Bitcoin address: <addr>". That gap is
+    // a separate, known divergence and is deliberately NOT what this row is
+    // about — this row is only about WHICH error wins.
+    try testing.expectEqual(@as(i64, -5), err_v.object.get("code").?.integer);
+    try testing.expect(std.mem.startsWith(u8, got_msg, "Invalid Bitcoin address"));
+}
