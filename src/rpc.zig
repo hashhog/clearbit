@@ -4286,6 +4286,29 @@ pub const RpcServer = struct {
         return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
     }
 
+    /// Render Core's `get_str()` type-error (-3): "JSON value of type <T> is
+    /// not of expected type string".  Same univalue `checkType` path as
+    /// `typeErrorNotNumber` above, just the other destination type — a
+    /// `UniValue::type_error` becomes RPC_TYPE_ERROR at rpc/server.cpp:512.
+    /// Used by `createrawtransaction`'s ParseHashO(txid) parity.
+    fn typeErrorNotString(self: *RpcServer, v: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const tname: []const u8 = switch (v) {
+            .null => "null",
+            .bool => "bool",
+            .object => "object",
+            .array => "array",
+            .string => "string",
+            .integer, .float, .number_string => "number",
+        };
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "JSON value of type {s} is not of expected type string",
+            .{tname},
+        );
+        defer self.allocator.free(msg);
+        return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
+    }
+
     /// Parse a wait-family `timeout` param (Core `getInt<int>()` parity).
     /// Returns the timeout in milliseconds, or an error response on a type /
     /// range violation.  `null`/missing → 0 (no timeout, Core default).
@@ -14174,12 +14197,30 @@ pub const RpcServer = struct {
         var locktime: u32 = 0;
         if (params.array.items.len > 2) {
             const lt = params.array.items[2];
-            if (lt == .integer) {
+            if (lt != .null) {
+                // Core's ConstructTransaction reads locktime with
+                // getInt<int64_t>() BEFORE it touches the inputs
+                // (rawtransaction_util.cpp:151-156), then range-checks against
+                // [0, LOCKTIME_MAX] (script.h:53).  A numeric token univalue
+                // cannot convert is its own -1 "JSON integer out of range";
+                // a non-number is checkType's -3.  Both fire before the -8.
+                switch (lt) {
+                    .integer => {},
+                    .float, .number_string => return self.jsonRpcError(
+                        RPC_MISC_ERROR,
+                        "JSON integer out of range",
+                        id,
+                    ),
+                    else => return self.typeErrorNotNumber(lt, id),
+                }
                 // Same unchecked-cast hazard as vout below.  Core:
                 // "Invalid parameter, locktime out of range" (-8).
                 if (lt.integer < 0 or lt.integer > std.math.maxInt(u32)) {
-                    return self.jsonRpcError(RPC_INVALID_PARAMETER,
-                        "Invalid parameter, locktime out of range", id);
+                    return self.jsonRpcError(
+                        RPC_INVALID_PARAMETER,
+                        "Invalid parameter, locktime out of range",
+                        id,
+                    );
                 }
                 locktime = @intCast(lt.integer);
             }
@@ -14210,54 +14251,132 @@ pub const RpcServer = struct {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "input must be an object", id);
             }
 
-            const txid_val = input_item.object.get("txid") orelse {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing txid", id);
-            };
-            const vout_val = input_item.object.get("vout") orelse {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing vout", id);
-            };
+            // Core's AddInputs runs ParseHashO FIRST
+            // (rawtransaction_util.cpp:38), so a malformed txid is reported as
+            // a txid problem — with ParseHashV's exact wording (rpc/util.cpp:
+            // 117-125) — BEFORE anything is said about vout.  The old
+            // "Invalid txid"/-32602 pair was clearbit's own invention.
+            const txid_val = input_item.object.get("txid") orelse
+                std.json.Value{ .null = {} };
+            if (txid_val != .string) {
+                return self.typeErrorNotString(txid_val, id);
+            }
+            if (txid_val.string.len != 64) {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "txid must be of length 64 (not {d}, for '{s}')",
+                    .{ txid_val.string.len, txid_val.string },
+                );
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+            }
 
-            if (txid_val != .string or txid_val.string.len != 64) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid", id);
+            var prev_hash: types.Hash256 = undefined;
+            for (0..32) |i| {
+                // charToDigit, not parseInt: parseInt accepts a leading '+',
+                // which Core's IsHex does not.  Same strict loop as the
+                // ParseHashV site in getmempoolentry.
+                const high = std.fmt.charToDigit(txid_val.string[i * 2], 16) catch {
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "txid must be hexadecimal string (not '{s}')",
+                        .{txid_val.string},
+                    );
+                    defer self.allocator.free(msg);
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                };
+                const low = std.fmt.charToDigit(txid_val.string[i * 2 + 1], 16) catch {
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "txid must be hexadecimal string (not '{s}')",
+                        .{txid_val.string},
+                    );
+                    defer self.allocator.free(msg);
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                };
+                // Bitcoin txids are displayed in reverse byte order.
+                prev_hash[31 - i] = (high << 4) | low;
             }
-            if (vout_val != .integer) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
-            }
+
+            // vout.  Core: `if (!vout_v.isNum()) throw -8 "missing vout key"`,
+            // then `vout_v.getInt<int>()` — a THIRTY-TWO-BIT int — and only
+            // then the sign test (rawtransaction_util.cpp:40-45).
+            //
             // RANGE-CHECK BEFORE THE CAST.  `.index` is u32 and the JSON value
             // is i64: `@intCast` on a negative or oversized vout panics with
             // "integer cast truncated bits" and takes the whole node down.  A
             // single RPC call — createrawtransaction with vout:-1 — killed
             // clearbit on mainnet (2026-08-28; the datadir log carries 16
-            // restart banners).  Core rejects this as RPC_INVALID_PARAMETER
-            // (-8) "Invalid parameter, vout cannot be negative"
-            // (rpc/rawtransaction.cpp), which is also what the R5 probe expects.
+            // restart banners).
+            //
+            // The width check lives INSIDE univalue's conversion, so RANGE
+            // BEATS SIGN: 2147483648 and -2147483649 are both -1 "JSON integer
+            // out of range" (rpc/server.cpp:514 turns univalue's
+            // std::runtime_error into RPC_MISC_ERROR), while -1 — which does
+            // fit in an int32 — gets the vout-specific -8.  The previous bound
+            // was maxInt(u32), so vout 2147483648 was ACCEPTED and written as
+            // outpoint index 0x80000000, a spend Core refuses to build.
+            const vout_val = input_item.object.get("vout") orelse
+                std.json.Value{ .null = {} };
+            switch (vout_val) {
+                .integer => {},
+                // isNum() is true for any numeric token, but getInt<int> then
+                // fails on a non-integral or out-of-i64 one.
+                .float, .number_string => return self.jsonRpcError(
+                    RPC_MISC_ERROR,
+                    "JSON integer out of range",
+                    id,
+                ),
+                else => return self.jsonRpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, missing vout key",
+                    id,
+                ),
+            }
+            if (vout_val.integer < std.math.minInt(i32) or
+                vout_val.integer > std.math.maxInt(i32))
+            {
+                return self.jsonRpcError(
+                    RPC_MISC_ERROR,
+                    "JSON integer out of range",
+                    id,
+                );
+            }
             if (vout_val.integer < 0) {
-                return self.jsonRpcError(RPC_INVALID_PARAMETER,
-                    "Invalid parameter, vout cannot be negative", id);
-            }
-            if (vout_val.integer > std.math.maxInt(u32)) {
-                return self.jsonRpcError(RPC_INVALID_PARAMETER,
-                    "Invalid parameter, vout is too large", id);
-            }
-
-            var prev_hash: types.Hash256 = undefined;
-            for (0..32) |i| {
-                prev_hash[31 - i] = std.fmt.parseInt(u8, txid_val.string[i * 2 .. i * 2 + 2], 16) catch {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
-                };
+                return self.jsonRpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, vout cannot be negative",
+                    id,
+                );
             }
 
             // Explicit "sequence" wins; otherwise fall back to the
             // replaceable/locktime-derived default (Core AddInputs).
             var seq: u32 = default_sequence;
             if (input_item.object.get("sequence")) |seq_val| {
-                if (seq_val == .integer) {
-                    // Same unchecked-cast hazard as vout above.
-                    if (seq_val.integer < 0 or seq_val.integer > std.math.maxInt(u32)) {
-                        return self.jsonRpcError(RPC_INVALID_PARAMETER,
-                            "Invalid parameter, sequence number is out of range", id);
-                    }
-                    seq = @intCast(seq_val.integer);
+                // Core guards the read with `if (sequenceObj.isNum())`
+                // (rawtransaction_util.cpp:58): a present but NON-numeric
+                // sequence is IGNORED and the default still applies — it is
+                // not an error.
+                switch (seq_val) {
+                    .integer => {
+                        // Same unchecked-cast hazard as vout above.
+                        if (seq_val.integer < 0 or seq_val.integer > std.math.maxInt(u32)) {
+                            return self.jsonRpcError(
+                                RPC_INVALID_PARAMETER,
+                                "Invalid parameter, sequence number is out of range",
+                                id,
+                            );
+                        }
+                        seq = @intCast(seq_val.integer);
+                    },
+                    // isNum(), but getInt<int64_t> cannot represent it.
+                    .float, .number_string => return self.jsonRpcError(
+                        RPC_MISC_ERROR,
+                        "JSON integer out of range",
+                        id,
+                    ),
+                    else => {},
                 }
             }
 

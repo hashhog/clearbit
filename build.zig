@@ -760,6 +760,44 @@ pub fn build(b: *std.Build) void {
         // live in `src/crypto.zig` and run via `zig build test`.
     }
 
+    // createrawtransaction vout/sequence/locktime range-check regression.
+    // Same project-root wrapper as tests_rpc.zig (src/rpc.zig transitively
+    // imports src/wallet.zig, whose @embedFile only resolves from the project
+    // root), filtered to this suite's own test names so the run is not
+    // contaminated by the pre-existing src/peer.zig and src/wallet.zig test
+    // failures that surface when rpc.zig is pulled in as a test root — the
+    // same reason `test-rpc` and `test-getnodeaddresses` are not folded into
+    // the default `test` step. Run with `zig build test-createrawtx`.
+    {
+        const crt_tests = b.addTest(.{
+            .root_source_file = b.path("tests_createrawtx_vout_range.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_createrawtx_vout_range"},
+        });
+        crt_tests.linkSystemLibrary("rocksdb");
+        crt_tests.linkSystemLibrary("secp256k1");
+        crt_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        crt_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            crt_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            crt_tests.linkSystemLibrary("minisketch");
+            crt_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        crt_tests.root_module.addOptions("build_options", build_options);
+
+        const run_crt_tests = b.addRunArtifact(crt_tests);
+        const crt_step = b.step("test-createrawtx", "Run createrawtransaction vout/sequence/locktime Core-parity regression tests");
+        crt_step.dependOn(&run_crt_tests.step);
+        // NOT folded into the default `test` step — same wallet.zig selectCoins
+        // gotcha as test-rpc above.
+    }
+
     // getnodeaddresses Core-parity regression. Same wrapper as test-rpc
     // (tests_rpc.zig re-exposes src/rpc.zig's tests), filtered to just the
     // getnodeaddresses test names so the run isn't contaminated by the
