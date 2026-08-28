@@ -14175,6 +14175,12 @@ pub const RpcServer = struct {
         if (params.array.items.len > 2) {
             const lt = params.array.items[2];
             if (lt == .integer) {
+                // Same unchecked-cast hazard as vout below.  Core:
+                // "Invalid parameter, locktime out of range" (-8).
+                if (lt.integer < 0 or lt.integer > std.math.maxInt(u32)) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER,
+                        "Invalid parameter, locktime out of range", id);
+                }
                 locktime = @intCast(lt.integer);
             }
         }
@@ -14217,6 +14223,22 @@ pub const RpcServer = struct {
             if (vout_val != .integer) {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
             }
+            // RANGE-CHECK BEFORE THE CAST.  `.index` is u32 and the JSON value
+            // is i64: `@intCast` on a negative or oversized vout panics with
+            // "integer cast truncated bits" and takes the whole node down.  A
+            // single RPC call — createrawtransaction with vout:-1 — killed
+            // clearbit on mainnet (2026-08-28; the datadir log carries 16
+            // restart banners).  Core rejects this as RPC_INVALID_PARAMETER
+            // (-8) "Invalid parameter, vout cannot be negative"
+            // (rpc/rawtransaction.cpp), which is also what the R5 probe expects.
+            if (vout_val.integer < 0) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER,
+                    "Invalid parameter, vout cannot be negative", id);
+            }
+            if (vout_val.integer > std.math.maxInt(u32)) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER,
+                    "Invalid parameter, vout is too large", id);
+            }
 
             var prev_hash: types.Hash256 = undefined;
             for (0..32) |i| {
@@ -14230,6 +14252,11 @@ pub const RpcServer = struct {
             var seq: u32 = default_sequence;
             if (input_item.object.get("sequence")) |seq_val| {
                 if (seq_val == .integer) {
+                    // Same unchecked-cast hazard as vout above.
+                    if (seq_val.integer < 0 or seq_val.integer > std.math.maxInt(u32)) {
+                        return self.jsonRpcError(RPC_INVALID_PARAMETER,
+                            "Invalid parameter, sequence number is out of range", id);
+                    }
                     seq = @intCast(seq_val.integer);
                 }
             }
