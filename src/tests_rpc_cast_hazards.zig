@@ -158,6 +158,19 @@ test "tests_rpc_cast_hazards: gettxout vout 2^32 -> -1, not a dead process" {
 test "tests_rpc_cast_hazards: gettxout vout int32 MIN-1 -> -1, range beats sign" {
     try expectError("gettxout", "[\"" ++ TXID ++ "\",-2147483649]", -1, OUT_OF_RANGE);
 }
+test "tests_rpc_cast_hazards: gettxout vout -1 -> -1 (uint32 takes no sign)" {
+    // Core reads n as getInt<uint32_t>, so std::from_chars rejects the sign
+    // itself -- a negative vout is a CONVERSION failure, not a domain error.
+    try expectError("gettxout", "[\"" ++ TXID ++ "\",-1]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: CONTROL gettxout vout 2^31 is VALID (uint32, not int32)" {
+    // The first int32 bound rejected half the legal vout range; the regtest
+    // differential caught it as a SPURIOUS-REJECT.
+    try expectAccepted("gettxout", "[\"" ++ TXID ++ "\",2147483648]");
+}
+test "tests_rpc_cast_hazards: CONTROL gettxout vout uint32 MAX is VALID" {
+    try expectAccepted("gettxout", "[\"" ++ TXID ++ "\",4294967295]");
+}
 test "tests_rpc_cast_hazards: deriveaddresses range 2^32 -> -1" {
     try expectError("deriveaddresses", "[\"" ++ DESC ++ "\",4294967296]", -1, OUT_OF_RANGE);
 }
@@ -449,4 +462,103 @@ test "tests_rpc_cast_hazards: CONTROL absent version defaults to 2" {
     const resp = try createrawWithVersion(&rig, null);
     defer allocator.free(resp);
     try testing.expectEqual(@as(i64, 2), try versionOfReply(allocator, resp));
+}
+
+// ==========================================================================
+// ROUND 2 (2026-08-29): the arguments that were not node-kills, just WRONG.
+//
+// The kill vectors above were found by asking "did the process survive".
+// These were found by asking a different question — "does the ANSWER match
+// Core's" — against a regtest Bitcoin Core oracle
+// (tools/rpc-arg-differential.py). clearbit ACCEPTED 10 arguments Core
+// refuses. Nothing crashed; the node answered, and the answer was for a
+// question the caller had not asked.
+//
+//   estimatesmartfee 2147483648  ->  CLAMPED into [1,1008] and answered.
+//                                    Core's ParseConfirmTarget
+//                                    (rpc/util.cpp) REJECTS; it does not
+//                                    clamp. The clamp was also the only
+//                                    thing keeping the @intCast one line
+//                                    below it from aborting the process.
+//   estimatesmartfee <mode>      ->  estimate_mode ignored entirely, so ""
+//                                    and any other garbage got an estimate.
+//                                    Core validates with FeeModeFromString
+//                                    (common/messages.cpp), case-insensitively.
+//   getblock <hash> -2147483649  ->  verbosity read unbounded.
+//   getnodeaddresses 2147483648  ->  count read unbounded (and the .float
+//                                    branch fed @intFromFloat, which is
+//                                    illegal behaviour outside i64 range).
+//   waitforblockheight -2147483649 -> height read unbounded; the timeout was
+//                                    already bounded by the earlier fix, the
+//                                    HEIGHT was not.
+// ==========================================================================
+
+test "tests_rpc_cast_hazards: waitforblockheight height int32 MIN-1 -> -1" {
+    try expectError("waitforblockheight", "[-2147483649]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: waitforblockheight height 2^32 -> -1" {
+    try expectError("waitforblockheight", "[4294967296]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: getnodeaddresses count 2^31 -> -1" {
+    try expectError("getnodeaddresses", "[2147483648]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: getnodeaddresses count 2^32 -> -1" {
+    try expectError("getnodeaddresses", "[4294967296]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: getblock verbosity int32 MIN-1 -> -1" {
+    try expectError("getblock", "[\"" ++ TXID ++ "\",-2147483649]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: estimatesmartfee conf_target 2^31 -> -1" {
+    try expectError("estimatesmartfee", "[2147483648]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: estimatesmartfee conf_target int32 MIN-1 -> -1" {
+    try expectError("estimatesmartfee", "[-2147483649]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: estimatesmartfee conf_target 99999 -> -8, not clamped" {
+    try expectError("estimatesmartfee", "[99999]", -8,
+        "Invalid conf_target, must be between 1 and 1008");
+}
+test "tests_rpc_cast_hazards: estimatesmartfee conf_target 0 -> -8, not clamped up" {
+    try expectError("estimatesmartfee", "[0]", -8,
+        "Invalid conf_target, must be between 1 and 1008");
+}
+test "tests_rpc_cast_hazards: estimatesmartfee estimate_mode garbage -> -8" {
+    try expectError("estimatesmartfee", "[6,\"garbage\"]", -8,
+        "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"");
+}
+test "tests_rpc_cast_hazards: estimatesmartfee estimate_mode empty -> -8" {
+    try expectError("estimatesmartfee", "[6,\"\"]", -8,
+        "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"");
+}
+
+// CONTROLS for round 2. Without these a handler that rejected every
+// conf_target and every mode would satisfy all six rejections above.
+fn expectAccepted(method: []const u8, params_json: []const u8) !void {
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+    const resp = try rig.dispatch(method, params_json);
+    defer allocator.free(resp);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+    defer parsed.deinit();
+    const err_v = parsed.value.object.get("error") orelse std.json.Value{ .null = {} };
+    if (err_v == .object) {
+        std.debug.print("\n{s} {s} was REJECTED: {s}\n", .{ method, params_json, resp });
+        return error.InRangeArgumentRejected;
+    }
+}
+
+test "tests_rpc_cast_hazards: CONTROL estimatesmartfee boundary targets accepted" {
+    try expectAccepted("estimatesmartfee", "[1]");
+    try expectAccepted("estimatesmartfee", "[6]");
+    try expectAccepted("estimatesmartfee", "[1008]");
+}
+test "tests_rpc_cast_hazards: CONTROL estimatesmartfee accepts the three fee modes" {
+    try expectAccepted("estimatesmartfee", "[6,\"unset\"]");
+    try expectAccepted("estimatesmartfee", "[6,\"economical\"]");
+    try expectAccepted("estimatesmartfee", "[6,\"CONSERVATIVE\"]");
+    try expectAccepted("estimatesmartfee", "[6,\"Economical\"]");
+}
+test "tests_rpc_cast_hazards: CONTROL getnodeaddresses in-range count accepted" {
+    try expectAccepted("getnodeaddresses", "[1]");
 }

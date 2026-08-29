@@ -4597,7 +4597,16 @@ pub const RpcServer = struct {
         }
         const hv = params.array.items[0];
         const target_height: i64 = switch (hv) {
-            .integer => |n| n,
+            .integer => |n| blk: {
+                // Core reads height with getInt<int> — a THIRTY-TWO bit parse —
+                // and the width check lives INSIDE that conversion, so it fires
+                // before anything else the handler does with the value.
+                if (n < -2147483648 or n > 2147483647) {
+                    return self.jsonRpcError(
+                        RPC_MISC_ERROR, "JSON integer out of range", id);
+                }
+                break :blk n;
+            },
             else => return self.typeErrorNotNumber(hv, id),
         };
 
@@ -4960,6 +4969,12 @@ pub const RpcServer = struct {
             if (params.array.items.len > 1) {
                 const v = params.array.items[1];
                 if (v == .integer) {
+                    // getInt<int> width check, before the verbosity value is
+                    // used for anything.
+                    if (v.integer < -2147483648 or v.integer > 2147483647) {
+                        return self.jsonRpcError(
+                            RPC_MISC_ERROR, "JSON integer out of range", id);
+                    }
                     verbosity = v.integer;
                 } else if (v == .bool) {
                     verbosity = if (v.bool) 1 else 0;
@@ -6758,8 +6773,26 @@ pub const RpcServer = struct {
         if (params == .array and params.array.items.len > 0) {
             const p0 = params.array.items[0];
             if (p0 == .integer) {
+                // Core: getInt<int> BEFORE the handler's own -8 range test, so
+                // an out-of-int32 count fails the CONVERSION (-1) while an
+                // in-range negative one reaches the domain error (-8).
+                if (p0.integer < -2147483648 or p0.integer > 2147483647) {
+                    return self.jsonRpcError(
+                        RPC_MISC_ERROR, "JSON integer out of range", id);
+                }
                 count = p0.integer;
             } else if (p0 == .float) {
+                // A JSON number with a fractional part fails from_chars in Core
+                // ("JSON integer out of range"), and @intFromFloat on a value
+                // outside i64 is illegal behaviour in Zig — checked here rather
+                // than trusted.
+                if (!std.math.isFinite(p0.float) or
+                    p0.float != @trunc(p0.float) or
+                    p0.float < -2147483648.0 or p0.float > 2147483647.0)
+                {
+                    return self.jsonRpcError(
+                        RPC_MISC_ERROR, "JSON integer out of range", id);
+                }
                 count = @intFromFloat(p0.float);
             } else if (p0 != .null) {
                 return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value of type string is not of expected type number", id);
@@ -16349,7 +16382,58 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "conf_target must be numeric", id);
         }
 
-        const conf_target: u32 = @intCast(@max(1, @min(1008, target_param.integer)));
+        // Core: ParseConfirmTarget (rpc/util.cpp) reads conf_target with
+        // getInt<int> and then REJECTS anything outside
+        // [1, HighestTargetTracked] — it does not clamp.  The clamp here
+        // answered a 99999-block request with a 1008-block estimate and called
+        // it success; it also happened to be the only thing keeping the
+        // @intCast below from aborting the process under ReleaseFast.
+        if (target_param.integer < -2147483648 or target_param.integer > 2147483647) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
+        }
+        if (target_param.integer < 1 or target_param.integer > 1008) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "Invalid conf_target, must be between 1 and 1008",
+                id,
+            );
+        }
+
+        // estimate_mode (positional 1): Core validates it with
+        // FeeModeFromString (common/messages.cpp), case-insensitively, and
+        // rejects anything else.  Ignoring it returned an estimate for
+        // whatever the caller passed.
+        if (params.array.items.len > 1) {
+            const mode_param = params.array.items[1];
+            if (mode_param != .null) {
+                if (mode_param != .string) {
+                    return self.jsonRpcError(
+                        RPC_TYPE_ERROR,
+                        "JSON value of type number is not of expected type string",
+                        id,
+                    );
+                }
+                const mode = mode_param.string;
+                var upper_buf: [16]u8 = undefined;
+                const ok_mode = blk: {
+                    if (mode.len == 0 or mode.len > upper_buf.len) break :blk false;
+                    for (mode, 0..) |c, i| upper_buf[i] = std.ascii.toUpper(c);
+                    const up = upper_buf[0..mode.len];
+                    break :blk std.mem.eql(u8, up, "UNSET") or
+                        std.mem.eql(u8, up, "ECONOMICAL") or
+                        std.mem.eql(u8, up, "CONSERVATIVE");
+                };
+                if (!ok_mode) {
+                    return self.jsonRpcError(
+                        RPC_INVALID_PARAMETER,
+                        "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"",
+                        id,
+                    );
+                }
+            }
+        }
+
+        const conf_target: u32 = @intCast(target_param.integer);
 
         // Get fee estimate from mempool's fee estimator
         self.mempool.mutex.lock();
@@ -19330,19 +19414,26 @@ pub const RpcServer = struct {
         // The negative guard here was NOT enough: `@intCast(v.integer)` still
         // panicked on anything above u32, so `gettxout <txid> 4294967296`
         // aborted the process ("integer cast truncated bits").  A range check
-        // must bound BOTH ends before the narrowing conversion.  Core reads
-        // this with getInt<int>(), so out-of-int32 is RPC_MISC_ERROR (-1)
-        // "JSON integer out of range" (bitcoin-core/src/rpc/blockchain.cpp
-        // gettxout), before any vout-specific complaint.
+        // must bound BOTH ends before the narrowing conversion.
+        //
+        // THE WIDTH IS uint32, NOT int32.  Core reads n as
+        // `request.params[1].getInt<uint32_t>()`
+        // (bitcoin-core/src/rpc/blockchain.cpp gettxout), so:
+        //   * a NEGATIVE vout fails the CONVERSION -- std::from_chars accepts
+        //     no sign for an unsigned destination -- giving -1, not a
+        //     vout-specific complaint, and
+        //   * 2147483648 is a PERFECTLY VALID vout that Core accepts.
+        // The first version of this bound used int32 and therefore REJECTED
+        // half the legal range; the regtest differential caught it as a
+        // SPURIOUS-REJECT (Core accepted, clearbit did not).
         const vout: u32 = blk: {
             const v = params.array.items[1];
             switch (v) {
                 .integer => |iv| {
-                    if (iv < -2147483648 or iv > 2147483647) {
+                    if (iv < 0 or iv > 4294967295) {
                         return self.jsonRpcError(
                             RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
-                    if (iv < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
                     break :blk @intCast(iv);
                 },
                 .float, .number_string => return self.jsonRpcError(
@@ -20552,7 +20643,10 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.print("{{\"result\":null,\"error\":{{\"code\":{d},\"message\":\"{s}\"}},\"id\":", .{ code, message });
+        try writer.print("{{\"result\":null,\"error\":{{\"code\":{d},\"message\":\"", .{code});
+        try writeJsonEscapedBody(writer, message);
+        // NOTE: writeAll takes a literal, not a format string -- no `}}` doubling.
+        try writer.writeAll("\"},\"id\":");
         try writeJsonValue(writer, id);
         try writer.writeByte('}');
 
@@ -22237,6 +22331,35 @@ fn writeBlockHeaderHex(writer: anytype, header: *const types.BlockHeader) !void 
 }
 
 /// Write a JSON value.
+/// Write `s` as the BODY of a JSON string (no surrounding quotes), escaping
+/// what RFC 8259 requires.
+///
+/// `jsonRpcError` interpolated the message RAW, so any error text containing a
+/// double quote produced a response that was not valid JSON at all -- the
+/// client got a parse error instead of the node's answer.  Core has such
+/// messages: `Invalid estimate_mode parameter, must be one of: "unset",
+/// "economical", "conservative"` is one, and it is why this was found.
+fn writeJsonEscapedBody(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0C => try writer.writeAll("\\f"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+}
+
 fn writeJsonValue(writer: anytype, value: ?std.json.Value) !void {
     if (value == null) {
         try writer.writeAll("null");
@@ -22250,7 +22373,7 @@ fn writeJsonValue(writer: anytype, value: ?std.json.Value) !void {
         .float => |f| try writer.print("{d}", .{f}),
         .string => |s| {
             try writer.writeByte('"');
-            try writer.writeAll(s);
+            try writeJsonEscapedBody(writer, s);
             try writer.writeByte('"');
         },
         .number_string => |s| try writer.writeAll(s),
