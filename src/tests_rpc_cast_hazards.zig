@@ -269,3 +269,56 @@ test "tests_rpc_cast_hazards: CONTROL createpsbt builds a psbt from in-range arg
     const r = parsed.value.object.get("result").?;
     try testing.expect(r == .string and r.string.len > 0);
 }
+
+// ==========================================================================
+// waitfor* timeout — the same unchecked range, with a worse consequence.
+//
+// Core reads the timeout with getInt<int>() (rpc/blockchain.cpp), so a value
+// outside int32 fails inside the conversion, before the "Negative timeout"
+// check.  clearbit accepted 4294967296 and started a ~49-day wait; because its
+// RPC server handles requests serially, the node then answered NOTHING —
+// getblockcount timed out, the process stayed alive, and only a restart
+// recovered it.  One unprivileged request disabled the entire RPC interface.
+//
+// The wedge itself is broader than this bound: any large-but-valid timeout
+// still occupies the server.  That is a separate, architectural defect and is
+// tracked separately; these tests pin the argument bound only, and say so
+// rather than implying the wedge is closed.
+// ==========================================================================
+
+test "tests_rpc_cast_hazards: waitforblock timeout 2^32 -> -1" {
+    try expectError("waitforblock", "[\"" ++ TXID ++ "\",4294967296]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: waitfornewblock timeout 2^32 -> -1" {
+    try expectError("waitfornewblock", "[4294967296]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: waitforblockheight timeout 2^32 -> -1" {
+    try expectError("waitforblockheight", "[0,4294967296]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: waitforblock timeout int32 MIN-1 -> -1, range beats sign" {
+    // Both out of range AND negative.  Core answers -1 "JSON integer out of
+    // range", not "Negative timeout": the width check lives inside the
+    // conversion and therefore runs first.
+    try expectError("waitforblock", "[\"" ++ TXID ++ "\",-4294967297]", -1, OUT_OF_RANGE);
+}
+test "tests_rpc_cast_hazards: CONTROL waitforblock timeout -1 still says Negative timeout" {
+    // The new bound must not swallow the in-range negative case: that ordering
+    // is Core's and the earlier commit's ordering bug was exactly this shape.
+    try expectError("waitforblock", "[\"" ++ TXID ++ "\",-1]", -1, "Negative timeout");
+}
+test "tests_rpc_cast_hazards: CONTROL waitfornewblock with a 1ms timeout still returns" {
+    // Without this, "reject every timeout" would satisfy all of the above.
+    // A 1ms wait must come back promptly with a result, not an error.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+    const resp = try rig.dispatch("waitfornewblock", "[1]");
+    defer allocator.free(resp);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+    defer parsed.deinit();
+    const err_v = parsed.value.object.get("error") orelse std.json.Value{ .null = {} };
+    if (err_v == .object) {
+        std.debug.print("\nCONTROL failed, waitfornewblock[1] errored: {s}\n", .{resp});
+        return error.ControlRejected;
+    }
+}

@@ -4334,6 +4334,22 @@ pub const RpcServer = struct {
                 out.* = 0;
             },
             .integer => |n| {
+                // Core reads the timeout with getInt<int>() — a THIRTY-TWO bit
+                // parse (rpc/blockchain.cpp waitforblock / waitfornewblock /
+                // waitforblockheight) — so a value outside int32 fails inside
+                // the conversion, BEFORE the negative check below.
+                //
+                // This was not merely an error-code difference.  clearbit
+                // accepted `waitforblock <hash> 4294967296` and began a wait of
+                // ~49 days, and because the RPC server handles requests
+                // serially the node then answered NOTHING at all: getblockcount
+                // timed out, the process stayed alive, and only a restart
+                // recovered it.  One unprivileged request disabled the whole
+                // RPC interface.
+                if (n < -2147483648 or n > 2147483647) {
+                    return try self.jsonRpcError(
+                        RPC_MISC_ERROR, "JSON integer out of range", id);
+                }
                 out.* = n;
             },
             else => {
