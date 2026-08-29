@@ -4718,11 +4718,45 @@ pub const RpcServer = struct {
     }
 
     fn handleGetBlockHash(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // Extract height parameter
+        // Extract height parameter.
+        //
+        // The bare `@intCast(h.integer)` here was a REMOTE NODE-KILL: on a
+        // ReleaseFast build `getblockhash 4294967296` panicked with "integer
+        // cast truncated bits" and the process died with SIGABRT.  It took
+        // down the live mainnet node on 2026-08-29 at 01:41:25 (systemd
+        // restart counter 1, 19.5G peak) the moment a parity probe sent an
+        // out-of-range height.
+        //
+        // Same class as the createrawtransaction cast kill fixed in 8e18116 --
+        // that sweep was scoped to ONE RPC, and this is the same defect on a
+        // different method.  Range-check BEFORE the narrowing conversion, and
+        // in Core's order: univalue's getInt<int>() fails first with
+        // RPC_MISC_ERROR (-1) "JSON integer out of range" for anything outside
+        // int32, and only then does getblockhash's own bounds check produce
+        // RPC_INVALID_PARAMETER (-8) "Block height out of range"
+        // (bitcoin-core/src/rpc/blockchain.cpp getblockhash).
         const height = blk: {
             if (params == .array and params.array.items.len > 0) {
                 const h = params.array.items[0];
-                if (h == .integer) break :blk @as(u32, @intCast(h.integer));
+                switch (h) {
+                    .integer => |v| {
+                        if (v < -2147483648 or v > 2147483647) {
+                            return self.jsonRpcError(
+                                RPC_MISC_ERROR, "JSON integer out of range", id);
+                        }
+                        if (v < 0) {
+                            return self.jsonRpcError(
+                                RPC_INVALID_PARAMETER, "Block height out of range", id);
+                        }
+                        break :blk @as(u32, @intCast(v));
+                    },
+                    // A float, or an integer literal too large for i64 (which
+                    // std.json surfaces as .number_string), is what univalue's
+                    // from_chars rejects.
+                    .float, .number_string => return self.jsonRpcError(
+                        RPC_MISC_ERROR, "JSON integer out of range", id),
+                    else => {},
+                }
             }
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid height parameter", id);
         };
