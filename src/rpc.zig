@@ -10505,8 +10505,13 @@ pub const RpcServer = struct {
         const inputs_param = params.array.items[0];
         const outputs_param = params.array.items[1];
 
-        if (inputs_param != .array or outputs_param != .array) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs and outputs must be arrays", id);
+        // Core: inputs is an array; outputs is an array OR an object —
+        // `outputs_is_obj ? outputs_in.get_obj() : outputs_in.get_array()`
+        // (rawtransaction_util.cpp:80-81).  Rejecting the object form here
+        // turned away calls Core accepts, and did so BEFORE any of the
+        // argument parsing below could run.
+        if (inputs_param != .array or (outputs_param != .array and outputs_param != .object)) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs must be an array and outputs an array or object", id);
         }
 
         // Parse locktime (optional, defaults to 0)
@@ -10622,70 +10627,34 @@ pub const RpcServer = struct {
             tx_outputs.deinit();
         }
 
-        for (outputs_param.array.items) |output_obj| {
-            if (output_obj != .object) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Each output must be an object", id);
+        // Core builds outputs for createrawtransaction, createpsbt and
+        // walletcreatefundedpsbt with ONE routine (ConstructTransaction ->
+        // ParseOutputs), and accepts BOTH the object form {addr: amt} and the
+        // array form [{addr: amt}, {"data": hex}] —
+        // `outputs_is_obj ? get_obj() : get_array()`
+        // (rawtransaction_util.cpp:80-81).  This handler used to accept only
+        // the array form AND never decode the address, writing a placeholder
+        // P2WPKH-of-zeros for every non-data output; two different addresses
+        // produced a byte-identical PSBT that pays no one.  It now shares
+        // createrawtransaction's builder, so both forms and the real decoder
+        // come along with it.
+        if (outputs_param == .object) {
+            var it = outputs_param.object.iterator();
+            while (it.next()) |entry| {
+                if (try appendTxOutput(self, &tx_outputs, entry.key_ptr.*, entry.value_ptr.*, id)) |err_reply| {
+                    return err_reply;
+                }
             }
-
-            var iter = output_obj.object.iterator();
-            while (iter.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "data")) {
-                    // OP_RETURN output
-                    if (entry.value_ptr.* != .string) {
-                        return self.jsonRpcError(RPC_INVALID_PARAMS, "data must be hex string", id);
+        } else {
+            for (outputs_param.array.items) |output_obj| {
+                if (output_obj != .object) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Each output must be an object", id);
+                }
+                var iter = output_obj.object.iterator();
+                while (iter.next()) |entry| {
+                    if (try appendTxOutput(self, &tx_outputs, entry.key_ptr.*, entry.value_ptr.*, id)) |err_reply| {
+                        return err_reply;
                     }
-                    const hex = entry.value_ptr.string;
-                    if (hex.len % 2 != 0 or hex.len > 160) { // 80 bytes max
-                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid data length", id);
-                    }
-
-                    var data_script = std.ArrayList(u8).init(self.allocator);
-                    errdefer data_script.deinit();
-                    try data_script.append(0x6a); // OP_RETURN
-                    try data_script.append(@intCast(hex.len / 2));
-                    for (0..hex.len / 2) |i| {
-                        try data_script.append(std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
-                            data_script.deinit();
-                            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid data hex", id);
-                        });
-                    }
-
-                    // Ownership note: every script placed in tx_outputs from
-                    // here on is HEAP-OWNED, so the cleanup below can free them
-                    // uniformly.  The old code mixed an owned slice (this one)
-                    // with a static array in the sibling branch, so neither
-                    // could be freed and the OP_RETURN script leaked on every
-                    // call — an unbounded, remotely-driven leak on a long-lived
-                    // node.
-                    try tx_outputs.append(types.TxOut{
-                        .value = 0,
-                        .script_pubkey = try data_script.toOwnedSlice(),
-                    });
-                } else {
-                    // Regular output: address -> amount
-                    const amount_val = entry.value_ptr.*;
-                    var amount_sats: i64 = 0;
-                    if (amount_val == .float) {
-                        amount_sats = @intFromFloat(amount_val.float * 100_000_000.0);
-                    } else if (amount_val == .integer) {
-                        amount_sats = @intCast(amount_val.integer * 100_000_000);
-                    } else {
-                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
-                    }
-
-                    // NOTE: this placeholder script does NOT encode the
-                    // destination address — see the separate fix for that.  It
-                    // is heap-allocated here only so that every script in
-                    // tx_outputs has uniform ownership and the cleanup below
-                    // can free them all without a per-entry ownership flag.
-                    const placeholder = try self.allocator.dupe(
-                        u8,
-                        &([_]u8{ 0x00, 0x14 } ++ [_]u8{0x00} ** 20),
-                    );
-                    try tx_outputs.append(types.TxOut{
-                        .value = amount_sats,
-                        .script_pubkey = placeholder,
-                    });
                 }
             }
         }
@@ -14551,59 +14520,11 @@ pub const RpcServer = struct {
         // Returns null on success, or an owned error-reply slice (to be
         // returned to the client) on a parse/validation failure. Allocation
         // failures propagate as Zig errors.
-        const appendOutput = struct {
-            fn call(srv: *RpcServer, out_list: *std.ArrayList(types.TxOut), key: []const u8, amount_val: std.json.Value, rid: ?std.json.Value) !?[]const u8 {
-                var amount_sats: i64 = 0;
-                var script_pubkey: []u8 = undefined;
-
-                if (std.mem.eql(u8, key, "data")) {
-                    // OP_RETURN data output: value is 0, scriptPubKey = 6a <push> <bytes>.
-                    if (amount_val != .string) {
-                        return try srv.jsonRpcError(RPC_TYPE_ERROR, "Data must be a hex string", rid);
-                    }
-                    script_pubkey = scriptPubKeyForOpReturn(srv.allocator, amount_val.string) catch |e| {
-                        return switch (e) {
-                            error.InvalidData => try srv.jsonRpcError(RPC_TYPE_ERROR, "Invalid parameter, Data is not hex", rid),
-                            else => err: {
-                                break :err try srv.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", rid);
-                            },
-                        };
-                    };
-                    amount_sats = 0;
-                } else {
-                    // Address output.
-                    if (amount_val == .float) {
-                        amount_sats = @intFromFloat(amount_val.float * 100_000_000.0);
-                    } else if (amount_val == .integer) {
-                        amount_sats = @intCast(amount_val.integer * 100_000_000);
-                    } else if (amount_val == .number_string) {
-                        const f = std.fmt.parseFloat(f64, amount_val.number_string) catch {
-                            return try srv.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", rid);
-                        };
-                        amount_sats = @intFromFloat(@round(f * 100_000_000.0));
-                    } else {
-                        return try srv.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", rid);
-                    }
-                    script_pubkey = scriptPubKeyForAddress(srv.allocator, key) catch {
-                        return try srv.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address", rid);
-                    };
-                }
-
-                out_list.append(.{
-                    .value = amount_sats,
-                    .script_pubkey = script_pubkey,
-                }) catch {
-                    srv.allocator.free(script_pubkey);
-                    return try srv.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", rid);
-                };
-                return null;
-            }
-        }.call;
 
         if (outputs_param == .object) {
             var it = outputs_param.object.iterator();
             while (it.next()) |entry| {
-                if (try appendOutput(self, &outputs, entry.key_ptr.*, entry.value_ptr.*, id)) |err_reply| {
+                if (try appendTxOutput(self, &outputs, entry.key_ptr.*, entry.value_ptr.*, id)) |err_reply| {
                     return err_reply;
                 }
             }
@@ -14615,7 +14536,7 @@ pub const RpcServer = struct {
                 if (out_item != .object) continue;
                 var out_it = out_item.object.iterator();
                 while (out_it.next()) |entry| {
-                    if (try appendOutput(self, &outputs, entry.key_ptr.*, entry.value_ptr.*, id)) |err_reply| {
+                    if (try appendTxOutput(self, &outputs, entry.key_ptr.*, entry.value_ptr.*, id)) |err_reply| {
                         return err_reply;
                     }
                 }
@@ -17232,8 +17153,13 @@ pub const RpcServer = struct {
         }
         const inputs_param = params.array.items[0];
         const outputs_param = params.array.items[1];
-        if (inputs_param != .array or outputs_param != .array) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs and outputs must be arrays", id);
+        // Core: inputs is an array; outputs is an array OR an object —
+        // `outputs_is_obj ? outputs_in.get_obj() : outputs_in.get_array()`
+        // (rawtransaction_util.cpp:80-81).  Rejecting the object form here
+        // turned away calls Core accepts, and did so BEFORE any of the
+        // argument parsing below could run.
+        if (inputs_param != .array or (outputs_param != .array and outputs_param != .object)) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs must be an array and outputs an array or object", id);
         }
 
         // Core builds createpsbt, walletcreatefundedpsbt and
@@ -21931,6 +21857,85 @@ fn walletNetworkFromParams(params: *const consensus.NetworkParams) wallet_mod.Ne
 /// Build a scriptPubKey from a Bitcoin address string. Returns an
 /// allocator-owned slice; caller frees. Used by walletcreatefundedpsbt to
 /// translate `{"address": amount}` rows into outputs.
+/// Append one output (address key or the "data" key) to `out_list`, building
+/// its scriptPubKey with the REAL decoder.  Mirrors Core ParseOutputs +
+/// GetScriptForDestination + AmountFromValue.
+///
+/// File-scope on purpose.  Core builds createrawtransaction, createpsbt and
+/// walletcreatefundedpsbt from ONE argument builder (ConstructTransaction,
+/// rawtransaction_util.cpp).  This used to be a local helper inside
+/// handleCreateRawTransaction, and the two PSBT methods grew their own copies —
+/// createpsbt's copy never decoded the address at all, emitting a placeholder
+/// P2WPKH-of-zeros for every output, so two DIFFERENT addresses produced a
+/// byte-identical PSBT.  One shared builder is both the fix and the reason the
+/// divergence cannot recur.
+///
+/// Returns null on success, or an owned error-reply slice to hand back to the
+/// client.  Allocation failures propagate as Zig errors.
+fn appendTxOutput(srv: *RpcServer, out_list: *std.ArrayList(types.TxOut), key: []const u8, amount_val: std.json.Value, rid: ?std.json.Value) !?[]const u8 {
+    var amount_sats: i64 = 0;
+    var script_pubkey: []u8 = undefined;
+
+    if (std.mem.eql(u8, key, "data")) {
+        // OP_RETURN data output: value is 0, scriptPubKey = 6a <push> <bytes>.
+        if (amount_val != .string) {
+            return try srv.jsonRpcError(RPC_TYPE_ERROR, "Data must be a hex string", rid);
+        }
+        script_pubkey = scriptPubKeyForOpReturn(srv.allocator, amount_val.string) catch |e| {
+            return switch (e) {
+                error.InvalidData => try srv.jsonRpcError(RPC_TYPE_ERROR, "Invalid parameter, Data is not hex", rid),
+                else => err: {
+                    break :err try srv.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", rid);
+                },
+            };
+        };
+        amount_sats = 0;
+    } else {
+        // Address output.
+        // Core AmountFromValue (rpc/util.cpp): parse, then MoneyRange.
+        // The old `@intCast(v * 100_000_000)` OVERFLOWED i64 before the cast —
+        // 92233720368 was accepted and serialised as a wrapped value near
+        // i64::MAX — and the float path had no bound at all, so 1e300 landed
+        // as i64::MIN.  Bound the input FIRST, in the wide type, then convert.
+        const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
+        if (amount_val == .float) {
+            const scaled = amount_val.float * 100_000_000.0;
+            if (!(scaled >= 0.0) or scaled > @as(f64, @floatFromInt(MAX_MONEY))) {
+                return try srv.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", rid);
+            }
+            amount_sats = @intFromFloat(@round(scaled));
+        } else if (amount_val == .integer) {
+            if (amount_val.integer < 0 or amount_val.integer > @divTrunc(MAX_MONEY, 100_000_000)) {
+                return try srv.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", rid);
+            }
+            amount_sats = amount_val.integer * 100_000_000;
+        } else if (amount_val == .number_string) {
+            const f = std.fmt.parseFloat(f64, amount_val.number_string) catch {
+                return try srv.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", rid);
+            };
+            const scaled = f * 100_000_000.0;
+            if (!(scaled >= 0.0) or scaled > @as(f64, @floatFromInt(MAX_MONEY))) {
+                return try srv.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", rid);
+            }
+            amount_sats = @intFromFloat(@round(scaled));
+        } else {
+            return try srv.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", rid);
+        }
+        script_pubkey = scriptPubKeyForAddress(srv.allocator, key) catch {
+            return try srv.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address", rid);
+        };
+    }
+
+    out_list.append(.{
+        .value = amount_sats,
+        .script_pubkey = script_pubkey,
+    }) catch {
+        srv.allocator.free(script_pubkey);
+        return try srv.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", rid);
+    };
+    return null;
+}
+
 fn scriptPubKeyForAddress(allocator: std.mem.Allocator, addr_str: []const u8) ![]u8 {
     const addr = try address_mod.Address.decode(addr_str, allocator);
     defer addr.deinit(allocator);
