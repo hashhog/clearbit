@@ -1317,6 +1317,9 @@ pub const RpcServer = struct {
     /// Atomic so the read-only-shaped `*const RpcServer` callers from
     /// future code paths don't have to re-thread mutability.
     ibd_latched_off: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Number of wait-family requests currently parked on their own thread.
+    /// See MAX_WAIT_WORKERS and handleConnection's hand-off below.
+    wait_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Initialize the RPC server.
     pub fn init(
@@ -1556,9 +1559,37 @@ pub const RpcServer = struct {
         }
     }
 
+    /// Upper bound on wait-family requests parked on their own threads.
+    /// Core bounds the same thing with -rpcworkqueue (DEFAULT_HTTP_WORKQUEUE =
+    /// 16) and answers HTTP 500 "Work queue depth exceeded" once it is full;
+    /// this mirrors both the bound and the reply.  Without a bound, a client
+    /// could park unlimited threads.
+    const MAX_WAIT_WORKERS: u32 = 16;
+
+    /// Serve one already-authenticated wait-family request on its own thread,
+    /// then close the connection.  Owns `body` and frees it.
+    fn waitWorker(self: *RpcServer, conn: std.net.Server.Connection, body: []u8) void {
+        defer {
+            self.allocator.free(body);
+            conn.stream.close();
+            _ = self.wait_workers.fetchSub(1, .release);
+        }
+        const response = self.dispatch(body) catch |err| {
+            const er = self.jsonRpcError(RPC_INTERNAL_ERROR, @errorName(err), null) catch return;
+            defer self.allocator.free(er);
+            self.sendHttpResponse(conn.stream, 200, er) catch {};
+            return;
+        };
+        defer self.allocator.free(response);
+        self.sendHttpResponse(conn.stream, 200, response) catch {};
+    }
+
     /// Handle a single HTTP connection.
     fn handleConnection(self: *RpcServer, conn: std.net.Server.Connection) !void {
-        defer conn.stream.close();
+        // Cleared when the connection is handed to a wait worker, which then
+        // owns closing it.  Everything else still closes here as before.
+        var handed_off = false;
+        defer if (!handed_off) conn.stream.close();
 
         // Per-connection read/write timeouts (the un-pin gate, Fault A).
         //
@@ -1772,6 +1803,62 @@ pub const RpcServer = struct {
         defer if (body_allocated) self.allocator.free(body);
 
         // Process JSON-RPC request
+        // Wait-family hand-off.
+        //
+        // waitforblock / waitfornewblock / waitforblockheight block until the
+        // tip satisfies a predicate, and with Core's default timeout of 0 ("no
+        // timeout") that wait is unbounded BY DESIGN.  On a single
+        // accept-one/serve-one thread that means one ordinary request stops the
+        // node answering anything at all — process alive, every other RPC timing
+        // out, recoverable only by restart.  This is not a hostile-input case:
+        // `waitforblockheight <height ahead of the tip>` is the method's entire
+        // purpose, and our own tooling calls it.
+        //
+        // Measured 2026-08-29 with tools/rpc-wedge-probe.py across all ten
+        // implementations: the other nine stayed responsive during the wait,
+        // clearbit alone wedged.  The 30s SO_RCVTIMEO/SO_SNDTIMEO above bound a
+        // stalled CLIENT; they cannot bound a handler that is legitimately
+        // asleep on a condition variable.
+        //
+        // So the wait family — and only the wait family — is served on its own
+        // thread.  The blast radius is deliberately small: these handlers read
+        // the tip through ChainState.tip_notifier, a mutex+condvar already
+        // designed for cross-thread use (the validation thread is what calls
+        // notify()), and they touch none of the mutable RpcServer state
+        // (current_wallet, payjoin_*) that other handlers write.  The allocator
+        // is thread-safe in both build modes: c_allocator in release, and the
+        // default (thread-safe) GeneralPurposeAllocator in Debug.
+        //
+        // The substring test is deliberately loose. Every method in the family
+        // begins "waitfor" and no other method does; a body that merely
+        // CONTAINS the text is routed to a thread and still answered correctly,
+        // so a false positive costs a thread, never a wrong reply.
+        if (std.mem.indexOf(u8, body, "\"waitfor") != null) {
+            if (self.wait_workers.load(.acquire) >= MAX_WAIT_WORKERS) {
+                // Core's reply when -rpcworkqueue is full (httpserver.cpp).
+                try self.sendHttpError(conn.stream, 500, "Work queue depth exceeded");
+                return;
+            }
+            // The body may point into the stack read buffer, so the worker gets
+            // its own copy regardless of how it was obtained above.
+            const owned = self.allocator.dupe(u8, body) catch {
+                try self.sendHttpError(conn.stream, 500, "Internal Server Error");
+                return;
+            };
+            _ = self.wait_workers.fetchAdd(1, .acquire);
+            if (std.Thread.spawn(.{}, waitWorker, .{ self, conn, owned })) |th| {
+                th.detach();
+                handed_off = true;
+                return;
+            } else |_| {
+                // Could not spawn: undo the accounting and fall through to
+                // synchronous handling.  Degrading to today's behaviour is
+                // better than refusing the request.
+                _ = self.wait_workers.fetchSub(1, .release);
+                self.allocator.free(owned);
+            }
+        }
+
         const response = self.dispatch(body) catch |err| {
             const error_response = self.jsonRpcError(
                 RPC_INTERNAL_ERROR,
