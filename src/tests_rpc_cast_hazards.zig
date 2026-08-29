@@ -322,3 +322,131 @@ test "tests_rpc_cast_hazards: CONTROL waitfornewblock with a 1ms timeout still r
         return error.ControlRejected;
     }
 }
+
+// ==========================================================================
+// createrawtransaction / createpsbt must HONOUR the `version` argument (#84).
+//
+// Core's createrawtransaction takes a 5th argument, `version`
+// (rpc/rawtransaction.cpp:122), reads it as `self.Arg<uint32_t>("version")`,
+// bounds it to [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+// (policy/policy.h:152-153) and ASSIGNS it (rawtransaction_util.cpp:158-161).
+//
+// clearbit hardcoded `.version = 2` in BOTH handlers and ignored the argument.
+// Asked for version 1, 2 or 3 it returned 02000000 every time, and version 4 —
+// which Core rejects — was accepted. Version 3 is TRUC (BIP 431), so a caller
+// who asked for v3 and got v2 holds a transaction with different relay
+// behaviour than the one requested.
+//
+// THE WIDTH IS UNSIGNED here, unlike every other argument in this suite: 2^31
+// fits a uint32, survives the conversion and reaches the DOMAIN error (-8),
+// while -1 and 2^32 fail the CONVERSION first (-1). Both pinned.
+//
+// These assertions DECODE THE VERSION BYTES off the returned transaction.
+// Asserting the call was accepted is exactly the pre-fix behaviour.
+// ==========================================================================
+
+/// First 4 bytes of the returned tx hex, little-endian.
+fn versionOfReply(allocator: std.mem.Allocator, resp: []const u8) !i64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+    defer parsed.deinit();
+    const err_v = parsed.value.object.get("error") orelse std.json.Value{ .null = {} };
+    if (err_v == .object) {
+        std.debug.print("\nexpected a transaction, got error reply: {s}\n", .{resp});
+        return error.UnexpectedRpcError;
+    }
+    const hex = parsed.value.object.get("result").?.string;
+    if (hex.len < 8) return error.ReplyTooShort;
+    var b: [4]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&b, hex[0..8]);
+    return @as(i64, b[0]) | (@as(i64, b[1]) << 8) | (@as(i64, b[2]) << 16) | (@as(i64, b[3]) << 24);
+}
+
+fn createrawWithVersion(rig: *Rig, version_literal: ?[]const u8) ![]const u8 {
+    const params = if (version_literal) |v|
+        try std.fmt.allocPrint(rig.allocator,
+            "[[{{\"txid\":\"{s}\",\"vout\":0}}],{{\"data\":\"deadbeef\"}},0,false,{s}]",
+            .{ TXID, v })
+    else
+        try std.fmt.allocPrint(rig.allocator,
+            "[[{{\"txid\":\"{s}\",\"vout\":0}}],{{\"data\":\"deadbeef\"}},0,false]",
+            .{TXID});
+    defer rig.allocator.free(params);
+    return rig.dispatch("createrawtransaction", params);
+}
+
+test "tests_rpc_cast_hazards: createrawtransaction emits versions 1, 2 and 3" {
+    const allocator = testing.allocator;
+    inline for (.{ .{ "1", 1 }, .{ "2", 2 }, .{ "3", 3 } }) |c| {
+        var rig = try Rig.init(allocator);
+        defer rig.deinit();
+        const resp = try createrawWithVersion(&rig, c[0]);
+        defer allocator.free(resp);
+        const got = try versionOfReply(allocator, resp);
+        if (got != c[1]) {
+            std.debug.print("\nasked for version {s}, transaction carries {d}\n", .{ c[0], got });
+            return error.VersionNotHonoured;
+        }
+    }
+}
+
+test "tests_rpc_cast_hazards: createrawtransaction version outside [1,3] -> -8" {
+    inline for (.{ "0", "4", "2147483648" }) |bad| {
+        const allocator = testing.allocator;
+        var rig = try Rig.init(allocator);
+        defer rig.deinit();
+        const params = try std.fmt.allocPrint(allocator,
+            "[[{{\"txid\":\"{s}\",\"vout\":0}}],{{\"data\":\"deadbeef\"}},0,false,{s}]",
+            .{ TXID, bad });
+        defer allocator.free(params);
+        const resp = try rig.dispatch("createrawtransaction", params);
+        defer allocator.free(resp);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+        defer parsed.deinit();
+        const err_v = parsed.value.object.get("error") orelse std.json.Value{ .null = {} };
+        if (err_v != .object) {
+            std.debug.print("\nversion {s} was ACCEPTED: {s}\n", .{ bad, resp });
+            return error.OutOfDomainVersionAccepted;
+        }
+        try testing.expectEqual(@as(i64, -8), err_v.object.get("code").?.integer);
+        try testing.expectEqualStrings("Invalid parameter, version out of range(1~3)",
+            err_v.object.get("message").?.string);
+    }
+}
+
+test "tests_rpc_cast_hazards: createrawtransaction version outside uint32 -> -1" {
+    // Paired with the test above: -8 inside uint32, -1 outside it. The split is
+    // at the UNSIGNED edge, which is what makes this argument different from
+    // vout.
+    inline for (.{ "-1", "-2147483649", "4294967296" }) |bad| {
+        const allocator = testing.allocator;
+        var rig = try Rig.init(allocator);
+        defer rig.deinit();
+        const params = try std.fmt.allocPrint(allocator,
+            "[[{{\"txid\":\"{s}\",\"vout\":0}}],{{\"data\":\"deadbeef\"}},0,false,{s}]",
+            .{ TXID, bad });
+        defer allocator.free(params);
+        const resp = try rig.dispatch("createrawtransaction", params);
+        defer allocator.free(resp);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+        defer parsed.deinit();
+        const err_v = parsed.value.object.get("error") orelse std.json.Value{ .null = {} };
+        if (err_v != .object) {
+            std.debug.print("\nversion {s} was ACCEPTED: {s}\n", .{ bad, resp });
+            return error.OutOfRangeVersionAccepted;
+        }
+        try testing.expectEqual(@as(i64, -1), err_v.object.get("code").?.integer);
+        try testing.expectEqualStrings("JSON integer out of range",
+            err_v.object.get("message").?.string);
+    }
+}
+
+test "tests_rpc_cast_hazards: CONTROL absent version defaults to 2" {
+    // Without this, a handler that rejected every version would pass every
+    // rejection test above.
+    const allocator = testing.allocator;
+    var rig = try Rig.init(allocator);
+    defer rig.deinit();
+    const resp = try createrawWithVersion(&rig, null);
+    defer allocator.free(resp);
+    try testing.expectEqual(@as(i64, 2), try versionOfReply(allocator, resp));
+}

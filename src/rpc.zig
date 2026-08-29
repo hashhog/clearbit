@@ -10642,6 +10642,11 @@ pub const RpcServer = struct {
                 locktime = @intCast(lt.integer);
             }
         }
+        // Core builds createpsbt from the SAME ConstructTransaction as
+        // createrawtransaction, so it takes the same 5th `version` argument
+        // (rpc/rawtransaction.cpp:1642).
+        const psbt_ver = (try self.parseCreaterawVersion(params, 4, id)).?;
+        if (psbt_ver.err) |e| return e;
 
         // Parse replaceable (optional, defaults to true)
         var replaceable = true;
@@ -10764,7 +10769,8 @@ pub const RpcServer = struct {
 
         // Create the transaction
         const tx = types.Transaction{
-            .version = 2,
+            // Was hardcoded 2, discarding the caller's `version`.
+            .version = psbt_ver.version,
             .inputs = tx_inputs.items,
             .outputs = tx_outputs.items,
             .lock_time = locktime,
@@ -14373,6 +14379,53 @@ pub const RpcServer = struct {
     /// Arguments:
     ///   1. inputs (array, required) - [{txid, vout}, ...]
     ///   2. outputs (array/object, required) - [{address: amount}, ...] or {address: amount, ...}
+    /// Core's `version` argument for the createrawtransaction family
+    /// (rpc/rawtransaction.cpp:122).
+    ///
+    /// Core reads it as `self.Arg<uint32_t>("version")` — a THIRTY-TWO BIT
+    /// UNSIGNED parse, unlike the int32 used for `vout` — then bounds it to
+    /// [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+    /// (policy/policy.h:152-153) inside ConstructTransaction
+    /// (rawtransaction_util.cpp:158-161) and ASSIGNS it to the transaction.
+    ///
+    /// These handlers hardcoded `.version = 2` and ignored the argument, so a
+    /// caller asking for version 3 received a version 2 transaction and a
+    /// SUCCESS reply, and version 4 — which Core rejects — was accepted.
+    /// Version 3 is TRUC (BIP 431) and carries different policy rules, so the
+    /// transaction returned had different relay behaviour from the one asked
+    /// for, with nothing in the reply saying so.
+    ///
+    /// THE UNSIGNED WIDTH DECIDES WHICH ERROR YOU GET: 2147483648 fits a
+    /// uint32, survives the conversion and reaches the DOMAIN error (-8),
+    /// while -1 and 4294967296 fail the CONVERSION first (-1).
+    ///
+    /// Absent or null means Core's DEFAULT_RAWTX_VERSION
+    /// (CTransaction::CURRENT_VERSION = 2).
+    fn parseCreaterawVersion(self: *RpcServer, params: std.json.Value, index: usize, id: ?std.json.Value) !?struct { version: i32, err: ?[]const u8 } {
+        if (params != .array or params.array.items.len <= index) {
+            return .{ .version = 2, .err = null };
+        }
+        const v = params.array.items[index];
+        switch (v) {
+            .null => return .{ .version = 2, .err = null },
+            .integer => |n| {
+                if (n < 0 or n > 4294967295) {
+                    return .{ .version = 2, .err = try self.jsonRpcError(
+                        RPC_MISC_ERROR, "JSON integer out of range", id) };
+                }
+                if (n < 1 or n > 3) {
+                    return .{ .version = 2, .err = try self.jsonRpcError(
+                        RPC_INVALID_PARAMETER,
+                        "Invalid parameter, version out of range(1~3)", id) };
+                }
+                return .{ .version = @intCast(n), .err = null };
+            },
+            .float, .number_string => return .{ .version = 2, .err = try self.jsonRpcError(
+                RPC_MISC_ERROR, "JSON integer out of range", id) },
+            else => return .{ .version = 2, .err = try self.typeErrorNotNumber(v, id) },
+        }
+    }
+
     fn handleCreateRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (params != .array or params.array.items.len < 2) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires inputs and outputs", id);
@@ -14421,6 +14474,8 @@ pub const RpcServer = struct {
                 locktime = @intCast(lt.integer);
             }
         }
+        const crt_ver = (try self.parseCreaterawVersion(params, 4, id)).?;
+        if (crt_ver.err) |e| return e;
         // Core carries rbf as std::optional<bool> (rawtransaction.cpp:398-401),
         // nullopt while params[3].isNull(), and its OPTIONAL-NESS is
         // load-bearing because the two consumers read it DIFFERENTLY:
@@ -14693,7 +14748,8 @@ pub const RpcServer = struct {
 
         // Serialize transaction
         const tx = types.Transaction{
-            .version = 2,
+            // Was hardcoded 2, discarding the caller's `version`.
+            .version = crt_ver.version,
             .inputs = inputs.items,
             .outputs = outputs.items,
             .lock_time = locktime,
