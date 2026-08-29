@@ -8581,8 +8581,19 @@ pub const RpcServer = struct {
                 if (v == .bool) {
                     verbosity = if (v.bool) 1 else 0;
                 } else if (v == .integer) {
-                    verbosity = @intCast(@min(v.integer, 2));
-                    if (v.integer < 0) verbosity = 0;
+                    // The negative guard used to sit one line BELOW the cast,
+                    // so `getrawtransaction <txid> -4294967297` aborted the
+                    // process before it ever ran.  @min bounds the top only;
+                    // a cast needs both ends bounded FIRST.  Core reads this
+                    // with getInt<int>() (rpc/rawtransaction.cpp), so outside
+                    // int32 is -1 "JSON integer out of range"; negatives inside
+                    // int32 behave as verbosity 0, which Core also does via
+                    // `if (verbosity <= 0)`.
+                    if (v.integer < -2147483648 or v.integer > 2147483647) {
+                        return self.jsonRpcError(RPC_MISC_ERROR,
+                            "JSON integer out of range", id);
+                    }
+                    verbosity = if (v.integer < 0) 0 else @intCast(@min(v.integer, 2));
                 }
             }
 
@@ -10499,9 +10510,29 @@ pub const RpcServer = struct {
         }
 
         // Parse locktime (optional, defaults to 0)
+        // Core builds createpsbt, walletcreatefundedpsbt and
+        // createrawtransaction from ONE argument builder — ConstructTransaction
+        // (rawtransaction_util.cpp).  clearbit has three separate parsers, so
+        // the range checks added to createrawtransaction never reached the two
+        // PSBT entry points and `createpsbt [..] {} 4294967296` aborted the
+        // process.  Mirror the sibling exactly: -1 for a value univalue's
+        // getInt<int64_t> cannot hold, then Core's own -8 for the domain.
         var locktime: u32 = 0;
-        if (params.array.items.len > 2 and params.array.items[2] == .integer) {
-            locktime = @intCast(params.array.items[2].integer);
+        if (params.array.items.len > 2) {
+            const lt = params.array.items[2];
+            if (lt != .null) {
+                switch (lt) {
+                    .integer => {},
+                    .float, .number_string => return self.jsonRpcError(
+                        RPC_MISC_ERROR, "JSON integer out of range", id),
+                    else => return self.typeErrorNotNumber(lt, id),
+                }
+                if (lt.integer < 0 or lt.integer > std.math.maxInt(u32)) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER,
+                        "Invalid parameter, locktime out of range", id);
+                }
+                locktime = @intCast(lt.integer);
+            }
         }
 
         // Parse replaceable (optional, defaults to true)
@@ -10545,10 +10576,29 @@ pub const RpcServer = struct {
             var sequence: u32 = if (replaceable) 0xFFFFFFFD else 0xFFFFFFFF;
             if (input_obj.object.get("sequence")) |seq_val| {
                 if (seq_val == .integer) {
+                    // Core AddInputs: getInt<int64_t>() then
+                    // [0, CTxIn::SEQUENCE_FINAL] -> -8.
+                    if (seq_val.integer < 0 or seq_val.integer > std.math.maxInt(u32)) {
+                        return self.jsonRpcError(RPC_INVALID_PARAMETER,
+                            "Invalid parameter, sequence number is out of range", id);
+                    }
                     sequence = @intCast(seq_val.integer);
+                } else if (seq_val == .float or seq_val == .number_string) {
+                    return self.jsonRpcError(RPC_MISC_ERROR,
+                        "JSON integer out of range", id);
                 }
             }
 
+            // Core reads vout with getInt<int>() — a 32-bit parse, so anything
+            // outside int32 is univalue's own -1 before the -8 domain check.
+            if (vout_val.integer < -2147483648 or vout_val.integer > 2147483647) {
+                return self.jsonRpcError(RPC_MISC_ERROR,
+                    "JSON integer out of range", id);
+            }
+            if (vout_val.integer < 0) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER,
+                    "Invalid parameter, vout cannot be negative", id);
+            }
             try tx_inputs.append(types.TxIn{
                 .previous_output = .{
                     .hash = txid,
@@ -10562,7 +10612,15 @@ pub const RpcServer = struct {
 
         // Build outputs
         var tx_outputs = std.ArrayList(types.TxOut).init(self.allocator);
-        defer tx_outputs.deinit();
+        defer {
+            // Free every output script, not just the list spine.  `deinit()`
+            // alone released the ArrayList's own buffer and leaked each
+            // heap-owned script_pubkey — one leak per output, on every call,
+            // driven remotely and never reclaimed.  Every script appended below
+            // is heap-owned precisely so this loop is unconditional.
+            for (tx_outputs.items) |o| self.allocator.free(o.script_pubkey);
+            tx_outputs.deinit();
+        }
 
         for (outputs_param.array.items) |output_obj| {
             if (output_obj != .object) {
@@ -10582,14 +10640,23 @@ pub const RpcServer = struct {
                     }
 
                     var data_script = std.ArrayList(u8).init(self.allocator);
+                    errdefer data_script.deinit();
                     try data_script.append(0x6a); // OP_RETURN
                     try data_script.append(@intCast(hex.len / 2));
                     for (0..hex.len / 2) |i| {
                         try data_script.append(std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
+                            data_script.deinit();
                             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid data hex", id);
                         });
                     }
 
+                    // Ownership note: every script placed in tx_outputs from
+                    // here on is HEAP-OWNED, so the cleanup below can free them
+                    // uniformly.  The old code mixed an owned slice (this one)
+                    // with a static array in the sibling branch, so neither
+                    // could be freed and the OP_RETURN script leaked on every
+                    // call — an unbounded, remotely-driven leak on a long-lived
+                    // node.
                     try tx_outputs.append(types.TxOut{
                         .value = 0,
                         .script_pubkey = try data_script.toOwnedSlice(),
@@ -10606,11 +10673,18 @@ pub const RpcServer = struct {
                         return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
                     }
 
-                    // For now, just create a placeholder script - in production, decode the address
-                    // This is a simplified implementation
+                    // NOTE: this placeholder script does NOT encode the
+                    // destination address — see the separate fix for that.  It
+                    // is heap-allocated here only so that every script in
+                    // tx_outputs has uniform ownership and the cleanup below
+                    // can free them all without a per-entry ownership flag.
+                    const placeholder = try self.allocator.dupe(
+                        u8,
+                        &([_]u8{ 0x00, 0x14 } ++ [_]u8{0x00} ** 20),
+                    );
                     try tx_outputs.append(types.TxOut{
                         .value = amount_sats,
-                        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0x00} ** 20, // P2WPKH placeholder
+                        .script_pubkey = placeholder,
                     });
                 }
             }
@@ -17162,9 +17236,29 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs and outputs must be arrays", id);
         }
 
+        // Core builds createpsbt, walletcreatefundedpsbt and
+        // createrawtransaction from ONE argument builder — ConstructTransaction
+        // (rawtransaction_util.cpp).  clearbit has three separate parsers, so
+        // the range checks added to createrawtransaction never reached the two
+        // PSBT entry points and `createpsbt [..] {} 4294967296` aborted the
+        // process.  Mirror the sibling exactly: -1 for a value univalue's
+        // getInt<int64_t> cannot hold, then Core's own -8 for the domain.
         var locktime: u32 = 0;
-        if (params.array.items.len > 2 and params.array.items[2] == .integer) {
-            locktime = @intCast(params.array.items[2].integer);
+        if (params.array.items.len > 2) {
+            const lt = params.array.items[2];
+            if (lt != .null) {
+                switch (lt) {
+                    .integer => {},
+                    .float, .number_string => return self.jsonRpcError(
+                        RPC_MISC_ERROR, "JSON integer out of range", id),
+                    else => return self.typeErrorNotNumber(lt, id),
+                }
+                if (lt.integer < 0 or lt.integer > std.math.maxInt(u32)) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER,
+                        "Invalid parameter, locktime out of range", id);
+                }
+                locktime = @intCast(lt.integer);
+            }
         }
 
         // Options: `fee_rate` (sat/vB, the modern option) takes precedence over
@@ -20044,7 +20138,12 @@ pub const RpcServer = struct {
         var nblocks = nblocks_in;
         const best_height = self.chain_state.best_height;
         var tip_h: u32 = best_height;
-        if (target_height >= 0 and @as(u32, @intCast(target_height)) <= best_height) {
+        // Compare in i64 FIRST.  The old form cast to u32 inside the `and`,
+        // so the cast ran before the <= test and panicked on any target_height
+        // above u32 — the guard was structurally unreachable for the values it
+        // was meant to reject.  Reached from getmininginfo too, not just
+        // getnetworkhashps, so it is bounded here as well as at both callers.
+        if (target_height >= 0 and target_height <= @as(i64, best_height)) {
             tip_h = @intCast(target_height);
         }
 
@@ -20091,13 +20190,29 @@ pub const RpcServer = struct {
         if (params == .array) {
             if (params.array.items.len >= 1) {
                 const p0 = params.array.items[0];
-                if (p0 == .integer) nblocks = p0.integer
-                else if (p0 == .float) nblocks = @intFromFloat(p0.float);
+                // Core declares both args as Arg<int> (rpc/mining.cpp
+                // getnetworkhashps), a 32-bit parse: out of int32 is univalue's
+                // -1 before the handler sees anything.  Unbounded values used to
+                // reach computeNetworkHashPS and abort the process there.
+                if (p0 == .integer) {
+                    if (p0.integer < -2147483648 or p0.integer > 2147483647) {
+                        return self.jsonRpcError(RPC_MISC_ERROR,
+                            "JSON integer out of range", id);
+                    }
+                    nblocks = p0.integer;
+                } else if (p0 == .float) return self.jsonRpcError(
+                    RPC_MISC_ERROR, "JSON integer out of range", id);
             }
             if (params.array.items.len >= 2) {
                 const p1 = params.array.items[1];
-                if (p1 == .integer) target_height = p1.integer
-                else if (p1 == .float) target_height = @intFromFloat(p1.float);
+                if (p1 == .integer) {
+                    if (p1.integer < -2147483648 or p1.integer > 2147483647) {
+                        return self.jsonRpcError(RPC_MISC_ERROR,
+                            "JSON integer out of range", id);
+                    }
+                    target_height = p1.integer;
+                } else if (p1 == .float) return self.jsonRpcError(
+                    RPC_MISC_ERROR, "JSON integer out of range", id);
             }
         }
 
