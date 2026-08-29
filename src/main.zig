@@ -2443,6 +2443,73 @@ pub fn main() !void {
         chain_state.best_height = 0;
     }
 
+    // Genesis index records (#80, 2026-08-29).
+    //
+    // Genesis was invisible to every height-keyed and hash-keyed index lookup,
+    // because the records that back them have exactly two writers and genesis
+    // qualifies for neither:
+    //
+    //   "H:" ++ u32_LE(height) in CF_DEFAULT  <- the assumeutxo base at load
+    //                                            (earlier in this file), and
+    //                                            best_height on connect
+    //                                            (ChainState's flush batch).
+    //   CF_BLOCK_INDEX row (height+header)    <- written on connect.
+    //
+    // Genesis is neither loaded as a snapshot base nor ever "connected" -- it is
+    // the chain anchor, established directly from chain params -- so it fell
+    // through both writers and BOTH records were missing.  (types.NetworkParams
+    // already says as much beside genesis_output_script: "the genesis block body
+    // is never stored in CF_BLOCKS -- it is synthesized".)
+    //
+    // Consequence, measured: ChainState.getBlockHashByHeight(0) returned null on
+    // every datadir, so the block template's strict getNextWorkRequiredChecked
+    // refused with DifficultyUnavailable and regtest could not mine AT ALL --
+    // generatetoaddress and getblocktemplate both -32603.  That is what broke
+    // the wallet-recovery regression arm on 2026-08-28.  Writing only the H:
+    // record was NOT enough: the failure simply moved one step along the
+    // adapter chain to getPersistedHeader, which is why both records are
+    // written here.
+    //
+    // Core has no such gap -- genesis gets a CBlockIndex at init like any other
+    // block, which is exactly why GetNextWorkRequired's
+    // `assert(pindexLast != nullptr)` always holds (bitcoin-core/src/pow.cpp:16)
+    // and Core never refuses a difficulty query.
+    //
+    // Written UNCONDITIONALLY and idempotently rather than only on a fresh
+    // chain: every existing datadir is missing them too, and an ancestor walk
+    // that reaches height 0 needs them whatever the current tip is.
+    //
+    // Deliberately the ANCHOR-side fix.  clearbit already patched this same
+    // class once at the TIP -- the W36 note in storage.zig, where
+    // handleGetBlockHash fell back to walking an in-memory active_tip that is
+    // null after restart -- and the anchor-shaped hole survived it.  Patching
+    // the template instead would have repeated that mistake one layer further
+    // out.  fb4051b's no-fabrication intent is untouched: the template still
+    // refuses when an ancestor genuinely is unavailable.  Genesis IS available;
+    // it was merely unrecorded.
+    if (db_ptr) |dbp| {
+        const genesis_hh_key = storage.ChainStore.buildHeightHashKey(0);
+        dbp.put(storage.CF_DEFAULT, &genesis_hh_key, &params.genesis_hash) catch |err| {
+            std.debug.print("Warning: failed to write genesis height->hash entry: {}\n", .{err});
+        };
+
+        // CF_BLOCK_INDEX row, same layout as ChainStore.putBlockIndex:
+        // height (4 bytes LE) followed by the 80-byte header.
+        var gw = serialize.Writer.init(allocator);
+        defer gw.deinit();
+        if (gw.writeInt(u32, 0)) |_| {
+            if (serialize.writeBlockHeader(&gw, &params.genesis_header)) |_| {
+                dbp.put(storage.CF_BLOCK_INDEX, &params.genesis_hash, gw.getWritten()) catch |err| {
+                    std.debug.print("Warning: failed to write genesis block-index entry: {}\n", .{err});
+                };
+            } else |err| {
+                std.debug.print("Warning: genesis header serialize failed: {}\n", .{err});
+            }
+        } else |err| {
+            std.debug.print("Warning: genesis height prefix serialize failed: {}\n", .{err});
+        }
+    }
+
     // Boot-reconcile (2026-06-23): after an unclean restart the durable tip can
     // be BEHIND surplus persisted blocks whose created UTXOs are still on disk;
     // re-connecting the next block then false-rejects with a spurious BIP-30
