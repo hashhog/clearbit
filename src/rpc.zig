@@ -9688,12 +9688,28 @@ pub const RpcServer = struct {
                     // Range is [start, end]
                     const range_s = range_param.array.items[0];
                     const range_e = range_param.array.items[1];
+                    // Bound BOTH ends before narrowing: an unchecked
+                    // @intCast here aborted the process on
+                    // `deriveaddresses <desc> 4294967296` ("integer cast
+                    // truncated bits").  Core reads a descriptor range with
+                    // getInt<int>(), so out-of-int32 is RPC_MISC_ERROR (-1)
+                    // "JSON integer out of range".
                     if (range_s == .integer and range_e == .integer) {
+                        if (range_s.integer < 0 or range_s.integer > 2147483647 or
+                            range_e.integer < 0 or range_e.integer > 2147483647)
+                        {
+                            return self.jsonRpcError(
+                                RPC_MISC_ERROR, "JSON integer out of range", id);
+                        }
                         range_start = @intCast(range_s.integer);
                         range_end = @intCast(range_e.integer);
                     }
                 } else if (range_param == .integer) {
                     // Single number means [0, n]
+                    if (range_param.integer < 0 or range_param.integer > 2147483647) {
+                        return self.jsonRpcError(
+                            RPC_MISC_ERROR, "JSON integer out of range", id);
+                    }
                     range_end = @intCast(range_param.integer);
                 }
             }
@@ -19130,12 +19146,29 @@ pub const RpcServer = struct {
             txid[31 - i] = (high << 4) | low;
         }
 
-        // Parse vout index
+        // Parse vout index.
+        //
+        // The negative guard here was NOT enough: `@intCast(v.integer)` still
+        // panicked on anything above u32, so `gettxout <txid> 4294967296`
+        // aborted the process ("integer cast truncated bits").  A range check
+        // must bound BOTH ends before the narrowing conversion.  Core reads
+        // this with getInt<int>(), so out-of-int32 is RPC_MISC_ERROR (-1)
+        // "JSON integer out of range" (bitcoin-core/src/rpc/blockchain.cpp
+        // gettxout), before any vout-specific complaint.
         const vout: u32 = blk: {
             const v = params.array.items[1];
-            if (v == .integer) {
-                if (v.integer < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
-                break :blk @intCast(v.integer);
+            switch (v) {
+                .integer => |iv| {
+                    if (iv < -2147483648 or iv > 2147483647) {
+                        return self.jsonRpcError(
+                            RPC_MISC_ERROR, "JSON integer out of range", id);
+                    }
+                    if (iv < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
+                    break :blk @intCast(iv);
+                },
+                .float, .number_string => return self.jsonRpcError(
+                    RPC_MISC_ERROR, "JSON integer out of range", id),
+                else => {},
             }
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
         };
