@@ -7799,13 +7799,41 @@ pub const RpcServer = struct {
         const address = std.net.Address.initIp4(ip_parts, 0);
 
         if (std.mem.eql(u8, command, "add")) {
+            // Core checks IsBanned FIRST, before bantime is read at all
+            // (rpc/net.cpp).  clearbit had no already-banned check, so a re-ban
+            // silently succeeded where Core answers -23.
+            if (self.peer_manager.isIPBanned(address)) {
+                return self.jsonRpcError(RPC_CLIENT_NODE_ALREADY_ADDED, "Error: IP/Subnet already banned", id);
+            }
+
             // Get optional ban time (default 24 hours)
             var ban_time: i64 = banlist.DEFAULT_BAN_DURATION;
             if (params.array.items.len >= 3) {
                 const bt = params.array.items[2];
-                if (bt == .integer) {
-                    ban_time = bt.integer;
+                switch (bt) {
+                    .integer => ban_time = bt.integer,
+                    // A float bantime was silently DISCARDED and the default
+                    // used -- an argument read and then not honoured.
+                    .float => ban_time = @intFromFloat(bt.float),
+                    .null => {},
+                    else => return self.jsonRpcError(RPC_INVALID_PARAMS, "bantime must be a number", id),
                 }
+            }
+            // Core: bantime 0 means "use the default".
+            if (ban_time == 0) ban_time = banlist.DEFAULT_BAN_DURATION;
+
+            // The `absolute` argument was NEVER READ.  banIP takes a DURATION,
+            // so `setban ip add <now+3600> true` -- a one-hour ban -- was
+            // recorded as a ~56-YEAR one, and an absolute timestamp already in
+            // the past was accepted instead of Core's -8.
+            const absolute = params.array.items.len >= 4 and
+                params.array.items[3] == .bool and params.array.items[3].bool;
+            if (absolute) {
+                const now = std.time.timestamp();
+                if (ban_time < now) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Error: Absolute timestamp is in the past", id);
+                }
+                ban_time -= now;
             }
 
             self.peer_manager.banIP(address, ban_time, "manual ban via RPC") catch {
@@ -7815,7 +7843,8 @@ pub const RpcServer = struct {
             return self.jsonRpcResult("null", id);
         } else if (std.mem.eql(u8, command, "remove")) {
             if (!self.peer_manager.unbanIP(address)) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "IP not found in ban list", id);
+                // Core: RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with this wording.
+                return self.jsonRpcError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Unban failed. Requested address/subnet was not previously manually banned.", id);
             }
             return self.jsonRpcResult("null", id);
         } else {
@@ -13064,6 +13093,13 @@ pub const RpcServer = struct {
                 .float => @intFromFloat(nb.float),
                 else => return self.jsonRpcError(RPC_INVALID_PARAMS, "JSON value of type for nblocks is not an integer as expected", id),
             };
+            // Core reads nblocks as getInt<int>, and getInt runs std::from_chars
+            // INTO the destination width -- so an out-of-int32 value fails in the
+            // CONVERSION and never reaches the domain test below.  clearbit ran
+            // the domain test first and answered -8 where Core answers -1.
+            if (blockcount < -2147483648 or blockcount > 2147483647) {
+                return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
+            }
             if (blockcount < 0 or (blockcount > 0 and blockcount >= @as(i64, @intCast(pindex_height)))) {
                 return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid block count: should be between 0 and the block's height - 1", id);
             }
@@ -15363,8 +15399,37 @@ pub const RpcServer = struct {
         }
 
         const addr_param = params.array.items[0];
+        const nodeid_param: std.json.Value =
+            if (params.array.items.len >= 2) params.array.items[1] else .null;
+
+        // Core (rpc/net.cpp::disconnectnode) takes EITHER address or nodeid and
+        // requires strictly one; "to disconnect by nodeid, either set address to
+        // the empty string, or call using the named nodeid argument only".
+        // clearbit read only params[0] and demanded a string, so every by-id
+        // call -- the form getpeerinfo's "id" field exists to feed -- came back
+        // -32602 "address must be a string" where Core answers -29.
+        const have_address = addr_param == .string and addr_param.string.len > 0;
+        const have_nodeid = nodeid_param != .null;
+
+        if (have_nodeid and !have_address) {
+            const raw: i64 = switch (nodeid_param) {
+                .integer => nodeid_param.integer,
+                .float => @intFromFloat(nodeid_param.float),
+                else => return self.jsonRpcError(RPC_INVALID_PARAMS, "nodeid must be a number", id),
+            };
+            // getpeerinfo reports id as the index into peer_manager.peers, so
+            // by-id disconnect must use the SAME mapping or the two disagree.
+            if (raw >= 0 and raw < @as(i64, @intCast(self.peer_manager.peers.items.len))) {
+                self.peer_manager.peers.items[@intCast(raw)].disconnect();
+                return self.jsonRpcResult("null", id);
+            }
+            return self.jsonRpcError(RPC_CLIENT_NODE_NOT_CONNECTED, "Node not found in connected nodes", id);
+        }
+        if (have_address and have_nodeid) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Only one of address and nodeid should be provided.", id);
+        }
         if (addr_param != .string) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "address must be a string", id);
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Only one of address and nodeid should be provided.", id);
         }
         const addr_str = addr_param.string;
 
@@ -28317,4 +28382,206 @@ test "computeSubmitBlockMtp: uses prev_hash ancestors, not stale tip ring (reorg
 
     // The fix must NOT return the stale ring value.
     try std.testing.expect(got_mtp != ring_mtp);
+}
+
+// ============================================================================
+// #41 — the integer conversion runs before the lookup, and setban/disconnectnode
+//       honour the arguments they were given.  REGRESSION PINS.
+//
+// Measured against a regtest Core oracle (tools/rpc-arg-differential.py):
+// 8 findings + 1 control failure.
+//
+//   getchaintxstats <out-of-int32>  -> -8 "Invalid block count..."   (Core -1)
+//   disconnectnode ["", <nodeid>]   -> -32602 "address must be a string" (Core -29)
+//   setban ip add <past-ts> true    -> ACCEPTED                       (Core -8)
+//
+// Core's UniValue::getInt<T> runs std::from_chars INTO THE DESTINATION WIDTH,
+// so an out-of-int32 nblocks fails in the CONVERSION and never reaches the
+// domain test.  clearbit ran the domain test first.
+//
+// setban was worse than a code difference: the `absolute` argument was NEVER
+// READ, and banIP takes a DURATION.  `setban ip add <now+3600> true` -- a
+// one-hour ban -- was recorded as a ~56-YEAR one, and an absolute timestamp
+// already in the past was accepted instead of refused.  A float bantime was
+// silently discarded and the default used.  There was also no already-banned
+// check at all (Core: -23, and it runs BEFORE bantime is read), and a failed
+// unban answered -32602 instead of Core's -30 and wording.
+//
+// TEETH: rejecting everything would satisfy every rejection assertion, so each
+// block carries a CONTROL that must SUCCEED.
+// ============================================================================
+
+test "#41 getchaintxstats: the conversion beats the block-count domain test" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    const hostile = [_][]const u8{ "2147483648", "-2147483649", "4294967296", "-4294967297" };
+    for (hostile) |v| {
+        const req = try std.fmt.allocPrint(allocator,
+            "{{\"id\":1,\"method\":\"getchaintxstats\",\"params\":[{s}]}}", .{v});
+        defer allocator.free(req);
+        const resp = try server.dispatch(req);
+        defer allocator.free(resp);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "JSON integer out of range") != null);
+        // The domain error must NOT be what came back.
+        try std.testing.expect(std.mem.indexOf(u8, resp, "Invalid block count") == null);
+    }
+
+    // CONTROL: an in-range but illegal count still reaches the domain test.
+    const ctl = try server.dispatch("{\"id\":1,\"method\":\"getchaintxstats\",\"params\":[-1]}");
+    defer allocator.free(ctl);
+    try std.testing.expect(std.mem.indexOf(u8, ctl, "Invalid block count") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctl, "JSON integer out of range") == null);
+}
+
+test "#41 disconnectnode: nodeid selects THE PEER AT THAT ID" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    // Three connected peers at distinct addresses.  Without them the by-id
+    // assertions have NO TEETH: with the nodeid branch removed, params ["",1]
+    // falls through to the address walk, matches nothing, and answers -29
+    // anyway -- the mutation survives.  Selecting the RIGHT peer is the thing
+    // no amount of extra validation can fake.
+    var far: [3]i32 = undefined;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var fds: [2]i32 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+        far[i] = fds[1];
+        const p = try allocator.create(peer_mod.Peer);
+        p.* = makeTestPeerForGbfp(.{ .handle = fds[0] }, &consensus.MAINNET, allocator);
+        p.address = std.net.Address.initIp4([4]u8{ 192, 0, 2, @intCast(10 + i) }, 8333);
+        try peer_manager.peers.append(p);
+    }
+    defer for (far) |fd| std.posix.close(fd);
+
+    // Both provided -> Core's -32602 with Core's wording.
+    const both = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"192.0.2.10:8333\",0]}");
+    defer allocator.free(both);
+    try std.testing.expect(std.mem.indexOf(u8, both, "Only one of address and nodeid should be provided.") != null);
+    try std.testing.expect(peer_manager.peers.items[0].state != .disconnected);
+
+    // An id past the end is Core's -29, not a type error about the address.
+    const miss = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"\",99]}");
+    defer allocator.free(miss);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "\"code\":-29") != null);
+    try std.testing.expect(std.mem.indexOf(u8, miss, "address must be a string") == null);
+    const neg = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"\",-1]}");
+    defer allocator.free(neg);
+    try std.testing.expect(std.mem.indexOf(u8, neg, "\"code\":-29") != null);
+    const wide = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"\",4294967296]}");
+    defer allocator.free(wide);
+    try std.testing.expect(std.mem.indexOf(u8, wide, "\"code\":-29") != null);
+    for (peer_manager.peers.items) |p| try std.testing.expect(p.state != .disconnected);
+
+    // THE TEETH: id 1 must succeed and must disconnect peer 1 -- the same
+    // index getpeerinfo reports as "id" -- leaving 0 and 2 connected.
+    const byid = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"\",1]}");
+    defer allocator.free(byid);
+    try std.testing.expect(std.mem.indexOf(u8, byid, "\"result\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, byid, "\"code\":") == null);
+    try std.testing.expect(peer_manager.peers.items[1].state == .disconnected);
+    try std.testing.expect(peer_manager.peers.items[0].state != .disconnected);
+    try std.testing.expect(peer_manager.peers.items[2].state != .disconnected);
+
+    // CONTROL: by-address still selects by address -- peer 2, not peer 0.
+    const byaddr = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"192.0.2.12:8333\"]}");
+    defer allocator.free(byaddr);
+    try std.testing.expect(std.mem.indexOf(u8, byaddr, "\"result\":null") != null);
+    try std.testing.expect(peer_manager.peers.items[2].state == .disconnected);
+    try std.testing.expect(peer_manager.peers.items[0].state != .disconnected);
+
+    // OWNERSHIP: PeerManager.deinit() calls peer.disconnect() unconditionally,
+    // which would deinit an already-freed recv_buffer.  Drop the two we
+    // disconnected and destroy them ourselves.
+    var j: usize = peer_manager.peers.items.len;
+    while (j > 0) {
+        j -= 1;
+        if (peer_manager.peers.items[j].state == .disconnected) {
+            const dead = peer_manager.peers.orderedRemove(j);
+            allocator.destroy(dead);
+        }
+    }
+}
+
+test "#41 setban: absolute is read, already-banned is -23, unban failure is -30" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = makeNetParityServer(allocator, &chain_state, &mempool, &peer_manager);
+    defer server.deinit();
+
+    // An ABSOLUTE timestamp in the past is refused, not accepted and clamped.
+    const past = try server.dispatch("{\"id\":1,\"method\":\"setban\",\"params\":[\"1.2.3.4\",\"add\",1,true]}");
+    defer allocator.free(past);
+    try std.testing.expect(std.mem.indexOf(u8, past, "\"code\":-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past, "Error: Absolute timestamp is in the past") != null);
+
+    // Unbanning something never banned is -30 with Core's wording, not -32602.
+    const unban = try server.dispatch("{\"id\":1,\"method\":\"setban\",\"params\":[\"1.2.3.4\",\"remove\"]}");
+    defer allocator.free(unban);
+    try std.testing.expect(std.mem.indexOf(u8, unban, "\"code\":-30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unban, "Error: Unban failed.") != null);
+
+    // CONTROL: an ABSOLUTE timestamp in the FUTURE is accepted...
+    const now = std.time.timestamp();
+    const req = try std.fmt.allocPrint(allocator,
+        "{{\"id\":1,\"method\":\"setban\",\"params\":[\"5.6.7.8\",\"add\",{d},true]}}", .{now + 3600});
+    defer allocator.free(req);
+    const ok = try server.dispatch(req);
+    defer allocator.free(ok);
+    try std.testing.expect(std.mem.indexOf(u8, ok, "\"result\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ok, "\"code\":") == null);
+
+    // ...as a ~1h DURATION, not a 56-year one.  banIP takes seconds-from-now,
+    // and the absolute epoch was being passed straight through.
+    const bl = peer_manager.getBanList();
+    const entry = bl.banned.get(banlist.BanList.ipToKey([4]u8{ 5, 6, 7, 8 })) orelse
+        return error.BanNotRecorded;
+    try std.testing.expect(entry.ban_until <= now + 3600);
+    try std.testing.expect(entry.ban_until > now + 3500);
+
+    // A FLOAT bantime is honoured, not silently discarded in favour of the
+    // default -- the `.integer`-only switch was an argument read and dropped.
+    const flo = try server.dispatch("{\"id\":1,\"method\":\"setban\",\"params\":[\"9.10.11.12\",\"add\",7200.0]}");
+    defer allocator.free(flo);
+    try std.testing.expect(std.mem.indexOf(u8, flo, "\"result\":null") != null);
+    const fent = bl.banned.get(banlist.BanList.ipToKey([4]u8{ 9, 10, 11, 12 })) orelse
+        return error.BanNotRecorded;
+    try std.testing.expect(fent.ban_until <= now + 7200);
+    try std.testing.expect(fent.ban_until > now + 7100);
+
+    // Core: bantime 0 means "use the default", not a zero-length ban.
+    const zero = try server.dispatch("{\"id\":1,\"method\":\"setban\",\"params\":[\"11.12.13.14\",\"add\",0]}");
+    defer allocator.free(zero);
+    try std.testing.expect(std.mem.indexOf(u8, zero, "\"result\":null") != null);
+    const zent = bl.banned.get(banlist.BanList.ipToKey([4]u8{ 11, 12, 13, 14 })) orelse
+        return error.BanNotRecorded;
+    try std.testing.expect(zent.ban_until > now + banlist.DEFAULT_BAN_DURATION - 100);
+
+    // ...and re-banning it is now Core's -23, checked BEFORE bantime is read.
+    const again = try server.dispatch("{\"id\":1,\"method\":\"setban\",\"params\":[\"5.6.7.8\",\"add\",1,true]}");
+    defer allocator.free(again);
+    try std.testing.expect(std.mem.indexOf(u8, again, "\"code\":-23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "Error: IP/Subnet already banned") != null);
 }
