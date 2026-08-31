@@ -666,6 +666,36 @@ fn runTestVector(
     }
 }
 
+// Locate a Bitcoin Core test-vector file.
+//
+// The path used to be hard-coded to a developer laptop
+// ("/home/max/hashhog/bitcoin/...", and for sighash a relative path into a
+// SIBLING implementation's vendored tree, "../ouroboros/bitcoin/..."). Neither
+// exists on the build host, so `zig build test-script` / `test-sighash` died in
+// readFileAlloc before executing a single vector. They are excluded from the
+// aggregate `test` step, so nothing ever noticed: the consensus vector suites
+// were dead code from whenever the path was written until 2026-08-30, when the
+// slow-test lane ran them for the first time.
+//
+// Try the canonical in-repo location first, then a couple of historical
+// layouts, and FAIL LOUDLY naming every path tried — a vector harness that
+// cannot find its vectors must never look like a pass.
+fn openVectorFile(allocator: std.mem.Allocator, comptime name: []const u8) ![]u8 {
+    const candidates = [_][]const u8{
+        "../bitcoin-core/src/test/data/" ++ name, // canonical: repo checkout of Core
+        "bitcoin-core/src/test/data/" ++ name,    // when cwd is the repo root
+        "../bitcoin/src/test/data/" ++ name,      // older vendored layout
+    };
+    for (candidates) |p| {
+        const data = std.fs.cwd().readFileAlloc(allocator, p, 50 * 1024 * 1024) catch continue;
+        return data;
+    }
+    const stderr = std.io.getStdErr().writer();
+    try stderr.print("FATAL: could not find test vectors '{s}'. Tried:\n", .{name});
+    for (candidates) |p| try stderr.print("  {s}\n", .{p});
+    return error.VectorFileNotFound;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -680,8 +710,7 @@ pub fn main() !void {
     defer crypto.deinitSecp256k1();
 
     // Load JSON test vectors
-    const json_path = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
-    const json_data = try std.fs.cwd().readFileAlloc(allocator, json_path, 50 * 1024 * 1024);
+    const json_data = try openVectorFile(allocator, "script_tests.json");
     defer allocator.free(json_data);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_data, .{});
