@@ -1,0 +1,437 @@
+{
+ "addnode": {
+  "declared": 3,
+  "required": 2,
+  "sig": "addnode \"node\" \"command\" ( v2transport )"
+ },
+ "analyzepsbt": {
+  "declared": 1,
+  "required": 1,
+  "sig": "analyzepsbt \"psbt\""
+ },
+ "clearbanned": {
+  "declared": 0,
+  "required": 0,
+  "sig": "clearbanned"
+ },
+ "combinepsbt": {
+  "declared": 1,
+  "required": 1,
+  "sig": "combinepsbt [\"psbt\",...]"
+ },
+ "combinerawtransaction": {
+  "declared": 1,
+  "required": 1,
+  "sig": "combinerawtransaction [\"hexstring\",...]"
+ },
+ "converttopsbt": {
+  "declared": 3,
+  "required": 1,
+  "sig": "converttopsbt \"hexstring\" ( permitsigdata iswitness )"
+ },
+ "createmultisig": {
+  "declared": 3,
+  "required": 2,
+  "sig": "createmultisig nrequired [\"key\",...] ( \"address_type\" )"
+ },
+ "createpsbt": {
+  "declared": 5,
+  "required": 2,
+  "sig": "createpsbt [{\"txid\":\"hex\",\"vout\":n,\"sequence\":n},...] [{\"address\":amount,...},{\"data\":\"hex\"},...] ( locktime replaceable version )"
+ },
+ "createrawtransaction": {
+  "declared": 5,
+  "required": 2,
+  "sig": "createrawtransaction [{\"txid\":\"hex\",\"vout\":n,\"sequence\":n},...] [{\"address\":amount,...},{\"data\":\"hex\"},...] ( locktime replaceable version )"
+ },
+ "decodepsbt": {
+  "declared": 1,
+  "required": 1,
+  "sig": "decodepsbt \"psbt\""
+ },
+ "decoderawtransaction": {
+  "declared": 2,
+  "required": 1,
+  "sig": "decoderawtransaction \"hexstring\" ( iswitness )"
+ },
+ "decodescript": {
+  "declared": 1,
+  "required": 1,
+  "sig": "decodescript \"hexstring\""
+ },
+ "deriveaddresses": {
+  "declared": 2,
+  "required": 1,
+  "sig": "deriveaddresses \"descriptor\" ( range )"
+ },
+ "descriptorprocesspsbt": {
+  "declared": 7,
+  "required": 4,
+  "sig": "descriptorprocesspsbt \"psbt\" [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] ( \"sighashtype\" bip32derivs finalize )"
+ },
+ "disconnectnode": {
+  "declared": 2,
+  "required": 0,
+  "sig": "disconnectnode ( \"address\" nodeid )"
+ },
+ "estimatesmartfee": {
+  "declared": 2,
+  "required": 1,
+  "sig": "estimatesmartfee conf_target ( \"estimate_mode\" )"
+ },
+ "finalizepsbt": {
+  "declared": 2,
+  "required": 1,
+  "sig": "finalizepsbt \"psbt\" ( extract )"
+ },
+ "getaddednodeinfo": {
+  "declared": 1,
+  "required": 0,
+  "sig": "getaddednodeinfo ( \"node\" )"
+ },
+ "getaddrmaninfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getaddrmaninfo"
+ },
+ "getbestblockhash": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getbestblockhash"
+ },
+ "getblock": {
+  "declared": 2,
+  "required": 1,
+  "sig": "getblock \"blockhash\" ( verbosity )"
+ },
+ "getblockchaininfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getblockchaininfo"
+ },
+ "getblockcount": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getblockcount"
+ },
+ "getblockfilter": {
+  "declared": 2,
+  "required": 1,
+  "sig": "getblockfilter \"blockhash\" ( \"filtertype\" )"
+ },
+ "getblockfrompeer": {
+  "declared": 2,
+  "required": 2,
+  "sig": "getblockfrompeer \"blockhash\" peer_id"
+ },
+ "getblockhash": {
+  "declared": 1,
+  "required": 1,
+  "sig": "getblockhash height"
+ },
+ "getblockheader": {
+  "declared": 2,
+  "required": 1,
+  "sig": "getblockheader \"blockhash\" ( verbose )"
+ },
+ "getblockstats": {
+  "declared": 2,
+  "required": 1,
+  "sig": "getblockstats hash_or_height ( stats )"
+ },
+ "getblocktemplate": {
+  "declared": 1,
+  "required": 1,
+  "sig": "getblocktemplate {\"mode\":\"str\",\"capabilities\":[\"str\",...],\"rules\":[\"segwit\",\"str\",...],\"longpollid\":\"str\",\"data\":\"hex\"}"
+ },
+ "getchainstates": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getchainstates"
+ },
+ "getchaintips": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getchaintips"
+ },
+ "getchaintxstats": {
+  "declared": 2,
+  "required": 0,
+  "sig": "getchaintxstats ( nblocks \"blockhash\" )"
+ },
+ "getconnectioncount": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getconnectioncount"
+ },
+ "getdeploymentinfo": {
+  "declared": 1,
+  "required": 0,
+  "sig": "getdeploymentinfo ( \"blockhash\" )"
+ },
+ "getdescriptorinfo": {
+  "declared": 1,
+  "required": 1,
+  "sig": "getdescriptorinfo \"descriptor\""
+ },
+ "getdifficulty": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getdifficulty"
+ },
+ "getindexinfo": {
+  "declared": 1,
+  "required": 0,
+  "sig": "getindexinfo ( \"index_name\" )"
+ },
+ "getmemoryinfo": {
+  "declared": 1,
+  "required": 0,
+  "sig": "getmemoryinfo ( \"mode\" )"
+ },
+ "getmempoolancestors": {
+  "declared": 2,
+  "required": 1,
+  "sig": "getmempoolancestors \"txid\" ( verbose )"
+ },
+ "getmempooldescendants": {
+  "declared": 2,
+  "required": 1,
+  "sig": "getmempooldescendants \"txid\" ( verbose )"
+ },
+ "getmempoolentry": {
+  "declared": 1,
+  "required": 1,
+  "sig": "getmempoolentry \"txid\""
+ },
+ "getmempoolinfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getmempoolinfo"
+ },
+ "getmininginfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getmininginfo"
+ },
+ "getnettotals": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getnettotals"
+ },
+ "getnetworkhashps": {
+  "declared": 2,
+  "required": 0,
+  "sig": "getnetworkhashps ( nblocks height )"
+ },
+ "getnetworkinfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getnetworkinfo"
+ },
+ "getnodeaddresses": {
+  "declared": 2,
+  "required": 0,
+  "sig": "getnodeaddresses ( count \"network\" )"
+ },
+ "getpeerinfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getpeerinfo"
+ },
+ "getprioritisedtransactions": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getprioritisedtransactions"
+ },
+ "getrawmempool": {
+  "declared": 2,
+  "required": 0,
+  "sig": "getrawmempool ( verbose mempool_sequence )"
+ },
+ "getrawtransaction": {
+  "declared": 3,
+  "required": 1,
+  "sig": "getrawtransaction \"txid\" ( verbosity \"blockhash\" )"
+ },
+ "getrpcinfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getrpcinfo"
+ },
+ "gettxout": {
+  "declared": 3,
+  "required": 2,
+  "sig": "gettxout \"txid\" n ( include_mempool )"
+ },
+ "gettxoutproof": {
+  "declared": 2,
+  "required": 1,
+  "sig": "gettxoutproof [\"txid\",...] ( \"blockhash\" )"
+ },
+ "gettxoutsetinfo": {
+  "declared": 3,
+  "required": 0,
+  "sig": "gettxoutsetinfo ( \"hash_type\" hash_or_height use_index )"
+ },
+ "gettxspendingprevout": {
+  "declared": 2,
+  "required": 1,
+  "sig": "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...] ( {\"mempool_only\":bool,\"return_spending_tx\":bool,...} )"
+ },
+ "help": {
+  "declared": 1,
+  "required": 0,
+  "sig": "help ( \"command\" )"
+ },
+ "importmempool": {
+  "declared": 2,
+  "required": 1,
+  "sig": "importmempool \"filepath\" ( options )"
+ },
+ "joinpsbts": {
+  "declared": 1,
+  "required": 1,
+  "sig": "joinpsbts [\"psbt\",...]"
+ },
+ "listbanned": {
+  "declared": 0,
+  "required": 0,
+  "sig": "listbanned"
+ },
+ "logging": {
+  "declared": 2,
+  "required": 0,
+  "sig": "logging ( [\"include_category\",...] [\"exclude_category\",...] )"
+ },
+ "ping": {
+  "declared": 0,
+  "required": 0,
+  "sig": "ping"
+ },
+ "preciousblock": {
+  "declared": 1,
+  "required": 1,
+  "sig": "preciousblock \"blockhash\""
+ },
+ "prioritisetransaction": {
+  "declared": 3,
+  "required": 1,
+  "sig": "prioritisetransaction \"txid\" ( dummy ) fee_delta"
+ },
+ "pruneblockchain": {
+  "declared": 1,
+  "required": 1,
+  "sig": "pruneblockchain height"
+ },
+ "savemempool": {
+  "declared": 0,
+  "required": 0,
+  "sig": "savemempool"
+ },
+ "scanblocks": {
+  "declared": 6,
+  "required": 1,
+  "sig": "scanblocks \"action\" ( [scanobjects,...] start_height stop_height \"filtertype\" options )"
+ },
+ "scantxoutset": {
+  "declared": 2,
+  "required": 1,
+  "sig": "scantxoutset \"action\" ( [scanobjects,...] )"
+ },
+ "sendrawtransaction": {
+  "declared": 3,
+  "required": 1,
+  "sig": "sendrawtransaction \"hexstring\" ( maxfeerate maxburnamount )"
+ },
+ "setban": {
+  "declared": 4,
+  "required": 2,
+  "sig": "setban \"subnet\" \"command\" ( bantime absolute )"
+ },
+ "setnetworkactive": {
+  "declared": 1,
+  "required": 1,
+  "sig": "setnetworkactive state"
+ },
+ "signmessagewithprivkey": {
+  "declared": 2,
+  "required": 2,
+  "sig": "signmessagewithprivkey \"privkey\" \"message\""
+ },
+ "signrawtransactionwithkey": {
+  "declared": 4,
+  "required": 2,
+  "sig": "signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":amount},...] \"sighashtype\" )"
+ },
+ "stop": {
+  "declared": 0,
+  "required": 0,
+  "sig": "stop"
+ },
+ "submitblock": {
+  "declared": 2,
+  "required": 1,
+  "sig": "submitblock \"hexdata\" ( \"dummy\" )"
+ },
+ "submitheader": {
+  "declared": 1,
+  "required": 1,
+  "sig": "submitheader \"hexdata\""
+ },
+ "submitpackage": {
+  "declared": 3,
+  "required": 1,
+  "sig": "submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )"
+ },
+ "testmempoolaccept": {
+  "declared": 2,
+  "required": 1,
+  "sig": "testmempoolaccept [\"rawtx\",...] ( maxfeerate )"
+ },
+ "uptime": {
+  "declared": 0,
+  "required": 0,
+  "sig": "uptime"
+ },
+ "utxoupdatepsbt": {
+  "declared": 4,
+  "required": 1,
+  "sig": "utxoupdatepsbt \"psbt\" ( [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] )"
+ },
+ "validateaddress": {
+  "declared": 1,
+  "required": 1,
+  "sig": "validateaddress \"address\""
+ },
+ "verifychain": {
+  "declared": 2,
+  "required": 0,
+  "sig": "verifychain ( checklevel nblocks )"
+ },
+ "verifymessage": {
+  "declared": 3,
+  "required": 3,
+  "sig": "verifymessage \"address\" \"signature\" \"message\""
+ },
+ "verifytxoutproof": {
+  "declared": 1,
+  "required": 1,
+  "sig": "verifytxoutproof \"proof\""
+ },
+ "waitforblock": {
+  "declared": 2,
+  "required": 1,
+  "sig": "waitforblock \"blockhash\" ( timeout )"
+ },
+ "waitforblockheight": {
+  "declared": 2,
+  "required": 1,
+  "sig": "waitforblockheight height ( timeout )"
+ },
+ "waitfornewblock": {
+  "declared": 2,
+  "required": 0,
+  "sig": "waitfornewblock ( timeout \"current_tip\" )"
+ }
+}

@@ -94,6 +94,94 @@ fn vcLog(comptime fmt: []const u8, args: anytype) void {
 
 /// Bitcoin-specific errors.
 pub const RPC_MISC_ERROR: i32 = -1;
+
+// ===========================================================================
+// Dispatcher arity check (Core rpc/util.cpp:644 -> IsValidNumArgs at :733)
+// ===========================================================================
+//
+// Core validates argument COUNT centrally, before any handler runs:
+//     if (GET_HELP || !IsValidNumArgs(request.params.size())) throw HelpResult{..}
+//     IsValidNumArgs = num_required <= n && n <= num_declared
+// and the violation surfaces as error -1 carrying the method's help text.
+//
+// No implementation in this fleet had that check: handlers decline to police
+// argument count because the dispatcher is supposed to, and no dispatcher did.
+// The operator probe found savemempool accepting a surplus argument in 10 of 10
+// implementations and clearbanned in 9 of 10 (2026-08-31).
+//
+// The table is DERIVED FROM CORE by tools/core-arity.py, which reads
+// `help <method>` (optional arguments are parenthesised in the signature line),
+// rather than hand-written once per language. Validated by calling Core with
+// declared+1 arguments on nine read-only methods: all nine returned -1.
+//
+// COVERAGE: 87 of the 103 operator-subset methods. A method ABSENT from the
+// table is NOT checked, deliberately -- treating an unknown method as zero-arg
+// would reject calls Core accepts, a worse failure than the one being fixed.
+//
+// Embedded at comptime: no runtime path resolution, so it cannot go missing
+// the way a relative resources/ path did in camlcoin and clearbit's own
+// script-vector harness.
+const core_arity_json = @embedFile("core-arity.json");
+
+pub const CoreArity = struct { required: u32, declared: u32 };
+
+/// Core validates argument COUNT centrally, before any handler runs
+/// (rpc/util.cpp:644, IsValidNumArgs): required <= n <= declared, else it
+/// throws the help text as error -1. clearbit dispatched on the method name
+/// alone, so surplus positional arguments were silently dropped.
+///
+/// The table is parsed ONCE for the life of the process, out of
+/// page_allocator: it is a few kB, it is read on every RPC request, and
+/// re-parsing per request would put an allocation cycle in the request hot
+/// path. Because it is never freed it also cannot show up as a test leak.
+var core_arity_table: ?std.json.Parsed(std.json.Value) = null;
+var core_arity_once = std.once(coreArityInit);
+
+fn coreArityInit() void {
+    core_arity_table = std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.page_allocator,
+        core_arity_json,
+        .{},
+    ) catch null;
+}
+
+/// Look up a method's declared argument counts. Returns null when the method is
+/// absent from the table -- coverage is 87 of 103, and a method we have no
+/// entry for must FAIL OPEN rather than be treated as zero-arg.
+pub fn coreArityFor(method: []const u8) ?CoreArity {
+    core_arity_once.call();
+    const parsed = core_arity_table orelse return null;
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const entry = root.get(method) orelse return null;
+    const fields = switch (entry) {
+        .object => |o| o,
+        else => return null,
+    };
+    const req = fields.get("required") orelse return null;
+    const dec = fields.get("declared") orelse return null;
+    const req_i = switch (req) { .integer => |i| i, else => return null };
+    const dec_i = switch (dec) { .integer => |i| i, else => return null };
+    if (req_i < 0 or dec_i < 0) return null;
+    return CoreArity{ .required = @intCast(req_i), .declared = @intCast(dec_i) };
+}
+
+pub fn coreArityViolated(method: []const u8, params: std.json.Value) bool {
+    const a = coreArityFor(method) orelse return false;
+    // Only positional (array) params are subject to this check; Core resolves a
+    // named-params object against the parameter names instead.
+    const n: usize = switch (params) {
+        .array => |arr| arr.items.len,
+        .null => 0,
+        else => return false,
+    };
+    return n < a.required or n > a.declared;
+}
+
+
 pub const RPC_FORBIDDEN_BY_SAFE_MODE: i32 = -2;
 pub const RPC_TYPE_ERROR: i32 = -3;
 pub const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
@@ -3142,6 +3230,12 @@ pub const RpcServer = struct {
 
         // Get params (optional, defaults to empty array)
         const params = obj.get("params") orelse std.json.Value{ .array = std.json.Array.init(self.allocator) };
+
+        // Core checks argument count centrally before dispatching
+        // (rpc/util.cpp:644). See coreArityViolated above.
+        if (coreArityViolated(method, params)) {
+            return try self.jsonRpcError(RPC_MISC_ERROR, "Wrong number of arguments", id);
+        }
 
         // Dispatch by method name
         if (std.mem.eql(u8, method, "getblockchaininfo")) {
@@ -25240,14 +25334,21 @@ test "sendrawtransaction rejects missing params" {
     );
     defer server.deinit();
 
-    // Missing params
+    // sendrawtransaction requires 1 argument ("hexstring"). Core rejects the
+    // zero-arg call in IsValidNumArgs, BEFORE the handler runs, with -1 and the
+    // help text -- not -32602. Verified against the live oracle 2026-08-31:
+    //   getblockhash [] -> code=-1 "getblockhash height".
     const request = "{\"id\":1,\"method\":\"sendrawtransaction\",\"params\":[]}";
     const result = try server.dispatch(request);
     defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":-1") != null);
 
-    // Should return invalid params error
-    try std.testing.expect(std.mem.indexOf(u8, result, "-32602") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Missing hex string") != null);
+    // CONTROL: with a legal argument count the call reaches the handler, so a
+    // malformed hex string still produces the handler's own -22.
+    const bad_hex = "{\"id\":1,\"method\":\"sendrawtransaction\",\"params\":[\"zz\"]}";
+    const bad_res = try server.dispatch(bad_hex);
+    defer allocator.free(bad_res);
+    try std.testing.expect(std.mem.indexOf(u8, bad_res, "\"code\":-1,") == null);
 }
 
 test "sendrawtransaction default maxfeerate constant" {
@@ -25737,24 +25838,45 @@ test "savemempool aliases dumpmempool" {
         &mempool,
         &peer_manager,
         &consensus.MAINNET,
-        .{},
+        .{ .datadir = path },
     );
     defer server.deinit();
 
-    const req = try std.fmt.allocPrint(
+    // Core's savemempool takes NO arguments: it always writes
+    // <datadir>/mempool.dat (`help savemempool` prints the bare name). The
+    // zero-arg call is the only shape Core accepts, and it must still work --
+    // the arity check must not have made the method unreachable.
+    const ok = try server.dispatch(
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"savemempool\",\"params\":[]}",
+    );
+    defer allocator.free(ok);
+    try std.testing.expect(std.mem.indexOf(u8, ok, "\"filename\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ok, "\"error\":null") != null);
+
+    // #103: a path argument is NOT part of Core's signature. Core answers -1
+    // (rpc/util.cpp:644). Verified against the live oracle 2026-08-31:
+    //   savemempool ["/tmp/x"] -> code=-1.
+    const surplus = try std.fmt.allocPrint(
         allocator,
         "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"savemempool\",\"params\":[\"{s}\"]}}",
         .{dump_path},
     );
-    defer allocator.free(req);
+    defer allocator.free(surplus);
+    const rejected = try server.dispatch(surplus);
+    defer allocator.free(rejected);
+    try std.testing.expect(std.mem.indexOf(u8, rejected, "\"code\":-1") != null);
 
-    const result = try server.dispatch(req);
-    defer allocator.free(result);
-
-    // Both savemempool and dumpmempool must accept the same params and
-    // return the same {"filename":...} response shape. Empty mempool is OK.
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"filename\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\":null") != null);
+    // dumpmempool is a clearbit alias, not a Core RPC, so it is absent from the
+    // arity table and keeps accepting the path override (fail-open).
+    const alias = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumpmempool\",\"params\":[\"{s}\"]}}",
+        .{dump_path},
+    );
+    defer allocator.free(alias);
+    const alias_res = try server.dispatch(alias);
+    defer allocator.free(alias_res);
+    try std.testing.expect(std.mem.indexOf(u8, alias_res, "\"filename\":") != null);
 }
 
 test "verifymessage rejects malformed base64 signature" {
@@ -27195,12 +27317,13 @@ test "signrawtransactionwithkey rejects malformed input" {
     );
     defer server.deinit();
 
-    // Missing args.
+    // Missing args. signrawtransactionwithkey requires 2, so Core rejects this
+    // in IsValidNumArgs with -1 before the handler runs (#103).
     const r1 = try server.dispatch(
         "{\"id\":1,\"method\":\"signrawtransactionwithkey\",\"params\":[]}",
     );
     defer allocator.free(r1);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "\"code\":-1") != null);
 
     // Wrong type for first param.
     const r2 = try server.dispatch(
@@ -28584,4 +28707,89 @@ test "#41 setban: absolute is read, already-banned is -23, unban failure is -30"
     defer allocator.free(again);
     try std.testing.expect(std.mem.indexOf(u8, again, "\"code\":-23") != null);
     try std.testing.expect(std.mem.indexOf(u8, again, "Error: IP/Subnet already banned") != null);
+}
+
+// ===========================================================================
+// #103 PIN — dispatcher arity check (Core rpc/util.cpp:644 / IsValidNumArgs)
+// ===========================================================================
+//
+// Core validates argument COUNT centrally before any handler runs; a violation
+// is error -1. clearbit's handleSingleRequest went straight from the method
+// name into the dispatch chain with no argument-count gate, so surplus
+// positional arguments were silently ignored. savemempool failed this in 10 of
+// 10 fleet implementations, clearbanned in 9 of 10.
+//
+// These fail at the parent commit: without coreArityViolated the surplus cases
+// return false and the call is dispatched.
+
+test "#103 arity table is embedded and non-empty" {
+    // Guards every assertion below: they are all vacuous if the embedded table
+    // failed to parse. @embedFile cannot go missing at runtime, but a malformed
+    // table would silently disable the check.
+    const a = coreArityFor("savemempool");
+    try std.testing.expect(a != null);
+    try std.testing.expectEqual(@as(u32, 0), a.?.required);
+    try std.testing.expectEqual(@as(u32, 0), a.?.declared);
+
+    const b = coreArityFor("clearbanned");
+    try std.testing.expect(b != null);
+    try std.testing.expectEqual(@as(u32, 0), b.?.declared);
+}
+
+test "#103 a surplus argument is refused" {
+    var arr = std.json.Array.init(std.testing.allocator);
+    defer arr.deinit();
+    try arr.append(std.json.Value{ .string = "r5-probe-extra-arg" });
+    const params = std.json.Value{ .array = arr };
+
+    try std.testing.expect(coreArityViolated("savemempool", params));
+    try std.testing.expect(coreArityViolated("clearbanned", params));
+}
+
+test "#103 CONTROL: correct calls are still accepted" {
+    // Without this, a dispatcher that refused everything would pass the test
+    // above.
+    var empty = std.json.Array.init(std.testing.allocator);
+    defer empty.deinit();
+    const none = std.json.Value{ .array = empty };
+    try std.testing.expect(!coreArityViolated("savemempool", none));
+    try std.testing.expect(!coreArityViolated("clearbanned", none));
+
+    // gettxout takes 2 required, 3 declared -- every legal count must pass.
+    var two = std.json.Array.init(std.testing.allocator);
+    defer two.deinit();
+    try two.append(std.json.Value{ .string = "ab" });
+    try two.append(std.json.Value{ .integer = 0 });
+    try std.testing.expect(!coreArityViolated("gettxout", std.json.Value{ .array = two }));
+
+    var three = std.json.Array.init(std.testing.allocator);
+    defer three.deinit();
+    try three.append(std.json.Value{ .string = "ab" });
+    try three.append(std.json.Value{ .integer = 0 });
+    try three.append(std.json.Value{ .bool = true });
+    try std.testing.expect(!coreArityViolated("gettxout", std.json.Value{ .array = three }));
+
+    // ...and one too many, or one too few, must fail.
+    var four = std.json.Array.init(std.testing.allocator);
+    defer four.deinit();
+    try four.append(std.json.Value{ .string = "ab" });
+    try four.append(std.json.Value{ .integer = 0 });
+    try four.append(std.json.Value{ .bool = true });
+    try four.append(std.json.Value{ .string = "x" });
+    try std.testing.expect(coreArityViolated("gettxout", std.json.Value{ .array = four }));
+
+    var one = std.json.Array.init(std.testing.allocator);
+    defer one.deinit();
+    try one.append(std.json.Value{ .string = "ab" });
+    try std.testing.expect(coreArityViolated("gettxout", std.json.Value{ .array = one }));
+}
+
+test "#103 CONTROL: a method absent from the table fails OPEN" {
+    // Coverage is 87 of 103. Treating an unknown method as zero-arg would
+    // reject calls Core accepts -- worse than the gap being closed.
+    var arr = std.json.Array.init(std.testing.allocator);
+    defer arr.deinit();
+    try arr.append(std.json.Value{ .string = "a" });
+    try arr.append(std.json.Value{ .string = "b" });
+    try std.testing.expect(!coreArityViolated("definitely-not-an-rpc", std.json.Value{ .array = arr }));
 }
