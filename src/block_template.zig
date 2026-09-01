@@ -243,6 +243,23 @@ pub fn createBlockTemplate(
         cs: *storage.ChainState,
         fn getAtHeight(ctx: *anyopaque, h: u32) ?consensus.BlockIndexEntry {
             const me: *@This() = @ptrCast(@alignCast(ctx));
+            // Primary: the in-memory difficulty-retarget ring, written by
+            // connectBlockInner for every connected block (and seeded with
+            // genesis by main.zig via initGenesisRetarget).  It is the same
+            // source, in the same order, that the P2P validation path uses
+            // when it has to resolve an ancestor by height
+            // (peer.zig heightIndexFallback), so the template and the
+            // validator agree even while the H:height->hash index sits in a
+            // not-yet-flushed IBD batch (or, in DB-less fixtures, never
+            // exists at all).  Nothing is fabricated: a ring miss falls
+            // through to the persisted index, and a miss there still
+            // refuses (null -> DifficultyUnavailable).
+            if (me.cs.getRetargetEntry(h)) |re| {
+                return .{ .height = h, .timestamp = re.timestamp, .bits = re.bits };
+            }
+            // Secondary: the persisted height->hash index + stored header
+            // (post-restart / post-snapshot, where the ring has not been
+            // repopulated but the on-disk index has the flushed header).
             const hash = me.cs.getBlockHashByHeight(h) orelse return null;
             const hdr = me.cs.getPersistedHeader(&hash) orelse
                 me.cs.getBlockHeaderFromBody(&hash) orelse return null;
