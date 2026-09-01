@@ -11605,32 +11605,47 @@ test "eclipse protection: eviction candidate building" {
 test "eclipse protection: eviction algorithm protects by categories" {
     const allocator = std.testing.allocator;
 
-    // Create a set of candidates with different characteristics
-    var candidates = [_]EvictionCandidate{
-        // Fast ping (should be protected)
-        .{ .peer_index = 0, .net_group = 1, .min_ping_time = 10, .last_block_time = 0, .last_tx_time = 0, .connect_time = 1000, .relay_txs = true, .is_protected = false },
-        // Recent tx (should be protected)
-        .{ .peer_index = 1, .net_group = 2, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 900, .connect_time = 500, .relay_txs = true, .is_protected = false },
-        // Recent block (should be protected)
-        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 100, .last_block_time = 800, .last_tx_time = 0, .connect_time = 600, .relay_txs = true, .is_protected = false },
-        // Long connection (should be protected)
-        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 0, .connect_time = 100, .relay_txs = true, .is_protected = false },
-        // Distinct netgroup (should be protected)
-        .{ .peer_index = 4, .net_group = 5, .min_ping_time = 100, .last_block_time = 0, .last_tx_time = 0, .connect_time = 700, .relay_txs = true, .is_protected = false },
-        // Unprotected - same netgroup as another, no special characteristics
-        .{ .peer_index = 5, .net_group = 1, .min_ping_time = 200, .last_block_time = 0, .last_tx_time = 0, .connect_time = 800, .relay_txs = true, .is_protected = false },
-        // Another unprotected - same netgroup
-        .{ .peer_index = 6, .net_group = 1, .min_ping_time = 300, .last_block_time = 0, .last_tx_time = 0, .connect_time = 900, .relay_txs = true, .is_protected = false },
-    };
+    // Core protects 4 by netgroup, 8 by ping, 4 by tx time, up to 8
+    // block-relay-only, 4 by block time, then half the rest by connection
+    // age (node/eviction.cpp:188-207).  Core's own suite therefore expects
+    // an eviction only with >= 29 candidates and NONE with <= 20
+    // (test/net_peer_eviction_tests.cpp:665-672); the previous 7-candidate
+    // fixture asserted a victim that those constants make impossible.
+    //
+    // 30 candidates:
+    //   0..7   fast ping, distinct netgroups 1..8   -> ping-protected
+    //   8..11  recent tx, netgroups 9..12           -> tx-protected
+    //   12..15 recent block, netgroups 13..16       -> block-protected
+    //   16..29 crowded netgroup 100, nothing special; connect_time rises
+    //          with the index so 29 is the youngest.
+    var candidates: [30]EvictionCandidate = undefined;
+    for (&candidates, 0..) |*c, i| {
+        const idx: i64 = @intCast(i);
+        c.* = .{
+            .peer_index = i,
+            .net_group = if (i < 16) @as(u32, @intCast(i + 1)) else 100,
+            .min_ping_time = if (i < 8) idx + 1 else 500,
+            .last_block_time = if (i >= 12 and i < 16) 800 + idx else 0,
+            .last_tx_time = if (i >= 8 and i < 12) 900 + idx else 0,
+            .connect_time = if (i < 16) 5000 + idx else 1000 + (idx - 16) * 10,
+            .relay_txs = true,
+            .is_protected = false,
+        };
+    }
 
     const victim = selectEvictionCandidate(&candidates, allocator);
 
-    // Should select a victim (the algorithm will pick from netgroup 1 which has most connections)
+    // >= 29 candidates: an eviction is expected (Core
+    // net_peer_eviction_tests.cpp:665-668).
     try std.testing.expect(victim != null);
-    // The victim should be from netgroup 1 (most connections)
-    if (victim) |v| {
-        try std.testing.expect(v == 5 or v == 6); // One of the unprotected peers in netgroup 1
-    }
+    const v = victim.?;
+    // Never one of the category-protected peers.
+    try std.testing.expect(v >= 16);
+    // Of the crowded netgroup, the older half (16..22) is protected by
+    // connection time; the youngest remaining peer is evicted
+    // (Core eviction.cpp: most-connected netgroup, then most recently
+    // connected).
+    try std.testing.expectEqual(@as(usize, 29), v);
 }
 
 test "eclipse protection: eviction returns null when all protected" {
@@ -11689,27 +11704,43 @@ test "eclipse protection: eclipse constants match Bitcoin Core" {
 test "eclipse protection: block-relay-only peers get protected" {
     const allocator = std.testing.allocator;
 
-    // Create candidates: some relay_txs=true, some relay_txs=false (block-relay-only)
-    var candidates = [_]EvictionCandidate{
-        // Block-relay-only peers (relay_txs=false) - should be protected
-        .{ .peer_index = 0, .net_group = 1, .min_ping_time = 500, .last_block_time = 100, .last_tx_time = 0, .connect_time = 900, .relay_txs = false, .is_protected = false },
-        .{ .peer_index = 1, .net_group = 2, .min_ping_time = 500, .last_block_time = 200, .last_tx_time = 0, .connect_time = 800, .relay_txs = false, .is_protected = false },
-        // Full relay peers
-        .{ .peer_index = 2, .net_group = 3, .min_ping_time = 500, .last_block_time = 50, .last_tx_time = 50, .connect_time = 700, .relay_txs = true, .is_protected = false },
-        .{ .peer_index = 3, .net_group = 4, .min_ping_time = 500, .last_block_time = 60, .last_tx_time = 60, .connect_time = 600, .relay_txs = true, .is_protected = false },
-        .{ .peer_index = 4, .net_group = 5, .min_ping_time = 500, .last_block_time = 70, .last_tx_time = 70, .connect_time = 500, .relay_txs = true, .is_protected = false },
-        .{ .peer_index = 5, .net_group = 6, .min_ping_time = 500, .last_block_time = 80, .last_tx_time = 80, .connect_time = 400, .relay_txs = true, .is_protected = false },
-    };
+    // Same sizing rule as above: Core only expects an eviction with >= 29
+    // candidates (test/net_peer_eviction_tests.cpp:665-668), so the fixture
+    // must be at least that large for `victim != null` to be a valid
+    // expectation.
+    //
+    // 30 candidates:
+    //   0..7  block-relay-only (relay_txs=false), distinct netgroups 1..8,
+    //         each with a novel block -> protected by the
+    //         CompareNodeBlockRelayOnlyTime step (eviction.cpp:198-199).
+    //   8..29 full-relay peers in crowded netgroup 100 with no novel tx or
+    //         block; slower ping than the block-relay-only set so the ping
+    //         step cannot shield them; connect_time rises with the index.
+    var candidates: [30]EvictionCandidate = undefined;
+    for (&candidates, 0..) |*c, i| {
+        const idx: i64 = @intCast(i);
+        c.* = .{
+            .peer_index = i,
+            .net_group = if (i < 8) @as(u32, @intCast(i + 1)) else 100,
+            .min_ping_time = if (i < 8) 500 else 600,
+            .last_block_time = if (i < 8) 100 + idx else 0,
+            .last_tx_time = 0,
+            .connect_time = if (i < 8) 5000 + idx else 1000 + (idx - 8) * 10,
+            .relay_txs = i >= 8,
+            .is_protected = false,
+        };
+    }
 
     const victim = selectEvictionCandidate(&candidates, allocator);
 
-    // Should select a victim
+    // Should select a victim (>= 29 candidates).
     try std.testing.expect(victim != null);
-
-    // The victim should NOT be a block-relay-only peer (0 or 1) since those get protected
-    if (victim) |v| {
-        try std.testing.expect(v != 0 and v != 1);
-    }
+    const v = victim.?;
+    // The victim must NOT be a block-relay-only peer (0..7): those are
+    // protected as a class.
+    try std.testing.expect(v >= 8);
+    // Youngest unprotected member of the crowded netgroup.
+    try std.testing.expectEqual(@as(usize, 29), v);
 }
 
 // ============================================================================

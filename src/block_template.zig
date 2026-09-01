@@ -2324,6 +2324,10 @@ test "empty mempool produces valid template with only coinbase" {
     // Create a memory-only chain state
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.REGTEST.genesis_header.timestamp, consensus.REGTEST.genesis_header.bits);
 
     // Create empty mempool
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -2360,6 +2364,10 @@ test "block template total weight does not exceed MAX_BLOCK_WEIGHT" {
     // Create chain state
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.MAINNET.genesis_header.timestamp, consensus.MAINNET.genesis_header.bits);
 
     // Create mempool
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -2546,6 +2554,10 @@ test "transactions are ordered by fee rate" {
     // Create chain state
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.MAINNET.genesis_header.timestamp, consensus.MAINNET.genesis_header.bits);
 
     // Create mempool
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
@@ -2578,6 +2590,10 @@ test "block merkle root is correctly computed" {
 
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.REGTEST.genesis_header.timestamp, consensus.REGTEST.genesis_header.bits);
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -2828,6 +2844,10 @@ test "regtest: mine single block" {
     // Create chain state and mempool
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.REGTEST.genesis_header.timestamp, consensus.REGTEST.genesis_header.bits);
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -2861,6 +2881,10 @@ test "regtest: mine multiple blocks" {
     // Create chain state and mempool
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.REGTEST.genesis_header.timestamp, consensus.REGTEST.genesis_header.bits);
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -2892,6 +2916,10 @@ test "regtest: blocks chain correctly" {
 
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.REGTEST.genesis_header.timestamp, consensus.REGTEST.genesis_header.bits);
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -2940,6 +2968,10 @@ test "regtest: mineBlock finds valid nonce quickly" {
 
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.REGTEST.genesis_header.timestamp, consensus.REGTEST.genesis_header.bits);
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();
@@ -3136,6 +3168,10 @@ test "W87: createBlockTemplate seeds total_weight from DEFAULT_BLOCK_RESERVED_WE
 
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
+    // DB-less fixture: seed the retarget ring with genesis exactly as
+    // main.zig does at boot (initGenesisRetarget), so createBlockTemplate's
+    // real GetNextWorkRequired can resolve height 0 without a DB.
+    chain_state.initGenesisRetarget(consensus.REGTEST.genesis_header.timestamp, consensus.REGTEST.genesis_header.bits);
 
     var mempool = mempool_mod.Mempool.init(null, null, allocator);
     defer mempool.deinit();

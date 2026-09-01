@@ -6487,6 +6487,14 @@ test "anti-fee-sniping sets locktime to current height" {
         },
     );
     defer {
+        // createTransaction signs the input: signInput allocates the P2WPKH
+        // witness (and any scriptSig) and the caller owns them, per the
+        // freeTx convention in tests_w118_wallet.zig.
+        for (tx.inputs) |inp| {
+            for (inp.witness) |w| allocator.free(w);
+            allocator.free(inp.witness);
+            if (inp.script_sig.len > 0) allocator.free(inp.script_sig);
+        }
         allocator.free(tx.inputs);
         allocator.free(tx.outputs);
     }
@@ -6536,6 +6544,14 @@ test "anti-fee-sniping disabled sets locktime to 0" {
         },
     );
     defer {
+        // createTransaction signs the input: signInput allocates the P2WPKH
+        // witness (and any scriptSig) and the caller owns them, per the
+        // freeTx convention in tests_w118_wallet.zig.
+        for (tx.inputs) |inp| {
+            for (inp.witness) |w| allocator.free(w);
+            allocator.free(inp.witness);
+            if (inp.script_sig.len > 0) allocator.free(inp.script_sig);
+        }
         allocator.free(tx.inputs);
         allocator.free(tx.outputs);
     }

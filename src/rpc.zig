@@ -25712,7 +25712,7 @@ test "ParseHashV parity: malformed txid/blockhash -> -8, well-formed-absent -> -
     }
 }
 
-test "regtest: getblockchaininfo.softforks and getdeploymentinfo.deployments are consistent" {
+test "regtest: getblockchaininfo omits softforks (v31.99); getdeploymentinfo.deployments reports them" {
     // Regtest round-trip test: both RPCs must read from the same shared helper
     // (writeDeploymentsJson) so that every deployment's active/height values are
     // identical in both responses.  Any field-level divergence would be a consensus
@@ -25765,50 +25765,33 @@ test "regtest: getblockchaininfo.softforks and getdeploymentinfo.deployments are
     try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"error\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"error\":null") != null);
 
-    // getblockchaininfo must now include "softforks"
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"softforks\":{") != null);
+    // getblockchaininfo must NOT carry "softforks": Core removed it in
+    // v31.99 (rpc/blockchain.cpp getblockchaininfo RPCResult has no
+    // "softforks" key; the object is only built in getdeploymentinfo,
+    // blockchain.cpp:1499-1506).  The pre-v31.99 expectation was stale.
+    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"softforks\"") == null);
 
     // getdeploymentinfo must include "deployments"
     try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"deployments\":{") != null);
 
-    // --- Per-deployment consistency checks ---
-    // On regtest at height 0:
-    //   csv, segwit, taproot activate at height 0 → active:true
-    //   bip34(500), bip65(1351), bip66(1251) → active:false
-    //   testdummy (bip9) → active:false
-
-    // csv: active on regtest (csv_height=0)
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"csv\":{\"type\":\"buried\",\"active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"csv\":{\"type\":\"buried\",\"active\":true") != null);
-
-    // segwit: active on regtest (segwit_height=0)
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"segwit\":{\"type\":\"buried\",\"active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"segwit\":{\"type\":\"buried\",\"active\":true") != null);
-
-    // taproot: active on regtest (taproot_height=0)
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true") != null);
-
-    // bip34: inactive at height 0 on regtest (bip34_height=500)
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"bip34\":{\"type\":\"buried\",\"active\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip34\":{\"type\":\"buried\",\"active\":false") != null);
-
-    // bip65: inactive at height 0 on regtest (bip65_height=1351)
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"bip65\":{\"type\":\"buried\",\"active\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip65\":{\"type\":\"buried\",\"active\":false") != null);
-
-    // bip66: inactive at height 0 on regtest (bip66_height=1251)
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"bip66\":{\"type\":\"buried\",\"active\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip66\":{\"type\":\"buried\",\"active\":false") != null);
-
-    // testdummy: always inactive (bip9, never activated)
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"testdummy\":{\"type\":\"bip9\",\"active\":false") != null);
+    // --- Per-deployment checks, Core regtest params at height 0 ---
+    // kernel/chainparams.cpp:536-541 (regtest): BIP34/65/66/CSV = 1,
+    // SegWit = 0; clearbit REGTEST taproot_height = 0.  getdeploymentinfo
+    // reports a buried deployment active from ONE BELOW its activation
+    // height (blockchain.cpp:1301-1303, DeploymentActiveAfter), so at
+    // height 0 every buried deployment is already active:true.
+    // testdummy (bip9) is never active.
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"csv\":{\"type\":\"buried\",\"active\":true,\"height\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"segwit\":{\"type\":\"buried\",\"active\":true,\"height\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true,\"height\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip34\":{\"type\":\"buried\",\"active\":true,\"height\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip65\":{\"type\":\"buried\",\"active\":true,\"height\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"bip66\":{\"type\":\"buried\",\"active\":true,\"height\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"testdummy\":{\"type\":\"bip9\",\"active\":false") != null);
 
-    // Both RPCs must contain the same activation-height sentinel for taproot on regtest
-    // (height=0, min_activation_height=0) — confirms both read from NetworkParams, not a
+    // getdeploymentinfo must carry the activation-height sentinel for taproot on regtest
+    // (height=0, min_activation_height=0) — confirms it reads from NetworkParams, not a
     // hard-coded table.
-    try std.testing.expect(std.mem.indexOf(u8, gbi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true,\"height\":0,\"min_activation_height\":0}") != null);
     try std.testing.expect(std.mem.indexOf(u8, gdi_result, "\"taproot\":{\"type\":\"buried\",\"active\":true,\"height\":0,\"min_activation_height\":0}") != null);
 }
 
@@ -26757,15 +26740,15 @@ test "submitblock missing params returns error" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "error") != null);
 }
 
-// loadtxoutset RPC is gated to refuse-and-direct-at-CLI in this build, per
-// the cross-impl audit at
-// CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md and the
-// rustoshi 1d0a325 / hotbuns e355cd7 reference fixes. The gate must:
-//
-//   1. Refuse with RPC_INTERNAL_ERROR (-32603).
-//   2. Direct the operator at the --load-snapshot CLI flag.
-//   3. NOT touch the filesystem (no validateAndLoadSnapshot call).
-test "loadtxoutset RPC is refused with internal-error gate" {
+// loadtxoutset error-path parity.  The 2026-05-05 refuse-gate (07c0eda:
+// -32603 + "use --load-snapshot") was replaced by the real two-stage
+// AssumeUTXO handler in 9de6087; the tests that encoded the removed stub
+// are retargeted to Core's behaviour for a path that cannot be opened:
+// rpc/blockchain.cpp:3410-3416 fopen()s the path first and throws
+// RPC_INVALID_PARAMETER (-8) "Couldn't open file <path> for reading."
+// before any parsing, so no snapshot-content field (coins_loaded) and no
+// later-stage error text may appear.
+test "loadtxoutset: unopenable path is RPC_INVALID_PARAMETER with Core's message" {
     const allocator = std.testing.allocator;
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
@@ -26782,16 +26765,15 @@ test "loadtxoutset RPC is refused with internal-error gate" {
 
     // Must be a JSON-RPC error response (has "error" object, no "result" key).
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"error\"") != null);
-    // -32603 is RPC_INTERNAL_ERROR.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "-32603") != null);
-    // Must direct the operator at the CLI flag.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "--load-snapshot") != null);
-    // Must NOT contain coins_loaded (pre-fix would have returned that field
-    // even on the no-op path because it serialized load_result.result).
+    // Core rpc/blockchain.cpp:3413 RPC_INVALID_PARAMETER = -8.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-8") != null);
+    // Core rpc/blockchain.cpp:3415 message, with the path echoed back.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Couldn't open file /some/snapshot.dat for reading.") != null);
+    // Must NOT contain coins_loaded (only a successful activation returns it).
     try std.testing.expect(std.mem.indexOf(u8, resp, "coins_loaded") == null);
 }
 
-test "loadtxoutset RPC gate fires before any file I/O" {
+test "loadtxoutset: unopenable path fails before any snapshot parsing (Core fopen-first order)" {
     const allocator = std.testing.allocator;
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
@@ -26802,18 +26784,20 @@ test "loadtxoutset RPC gate fires before any file I/O" {
     var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
     defer server.deinit();
 
-    // Path does NOT exist. Pre-fix code would have called
-    // storage.validateAndLoadSnapshot which opens the file and would have
-    // returned SnapshotError.IoError → "Failed to read snapshot file".
-    // Post-fix gate must short-circuit to the gate message instead.
+    // Path does NOT exist.  Core's loadtxoutset (rpc/blockchain.cpp:3410-3427)
+    // orders its failures fopen (-8) -> metadata parse (-22) -> activation
+    // (-32603); an unopenable path must therefore surface ONLY the -8 arm.
     const req = "{\"id\":1,\"method\":\"loadtxoutset\",\"params\":[\"/nonexistent/path/snapshot.dat\"]}";
     const resp = try server.dispatch(req);
     defer allocator.free(resp);
 
-    try std.testing.expect(std.mem.indexOf(u8, resp, "-32603") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "--load-snapshot") != null);
-    // Must NOT have surfaced any file-I/O error from the (pre-fix) opener.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "Failed to read snapshot file") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"code\":-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Couldn't open file /nonexistent/path/snapshot.dat for reading.") != null);
+    // None of the later-stage arms may have fired.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "-22") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "-32603") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Couldn't open or read the snapshot file") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Unable to load UTXO snapshot") == null);
 }
 
 test "loadtxoutset RPC still rejects malformed params before the gate" {
@@ -27519,6 +27503,10 @@ test "walletcreatefundedpsbt builds + funds a PSBT" {
     sk[31] = 0x01;
     const ki = try wallet.importKey(sk);
     const spk = try wallet.getScriptPubKey(ki, .p2wpkh);
+    // Wallet.deinit() frees the utxos list but NOT each utxo's script_pubkey
+    // (see the note in the walletcreatefundedpsbt round-trip test above), so
+    // the test owns spk.
+    defer allocator.free(spk);
     try wallet.addUtxo(.{
         .outpoint = .{ .hash = [_]u8{0xab} ** 32, .index = 0 },
         .output = .{ .value = 100_000_000, .script_pubkey = spk },
