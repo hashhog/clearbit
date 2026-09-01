@@ -3597,7 +3597,11 @@ pub const RpcServer = struct {
         // ---- bip34 (buried) ----
         {
             const act_height = np.bip34_height;
-            const active = query_height >= act_height;
+            // Core rpc/blockchain.cpp:1301-1303 DeploymentActiveAfter: "getdeploymentinfo
+            // reports the softfork as active from when the chain height is one
+            // below the activation height" (deploymentstatus.h:14-18,
+            // (nHeight + 1) >= DeploymentHeight).
+            const active = query_height + 1 >= act_height;
             try writer.print("\"bip34\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
                 active, act_height, act_height,
             });
@@ -3607,7 +3611,11 @@ pub const RpcServer = struct {
         // ---- bip65 (buried) ----
         {
             const act_height = np.bip65_height;
-            const active = query_height >= act_height;
+            // Core rpc/blockchain.cpp:1301-1303 DeploymentActiveAfter: "getdeploymentinfo
+            // reports the softfork as active from when the chain height is one
+            // below the activation height" (deploymentstatus.h:14-18,
+            // (nHeight + 1) >= DeploymentHeight).
+            const active = query_height + 1 >= act_height;
             try writer.print("\"bip65\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
                 active, act_height, act_height,
             });
@@ -3617,7 +3625,11 @@ pub const RpcServer = struct {
         // ---- bip66 (buried) ----
         {
             const act_height = np.bip66_height;
-            const active = query_height >= act_height;
+            // Core rpc/blockchain.cpp:1301-1303 DeploymentActiveAfter: "getdeploymentinfo
+            // reports the softfork as active from when the chain height is one
+            // below the activation height" (deploymentstatus.h:14-18,
+            // (nHeight + 1) >= DeploymentHeight).
+            const active = query_height + 1 >= act_height;
             try writer.print("\"bip66\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
                 active, act_height, act_height,
             });
@@ -3627,7 +3639,11 @@ pub const RpcServer = struct {
         // ---- csv (buried — activation height stored in NetworkParams) ----
         {
             const act_height = np.csv_height;
-            const active = query_height >= act_height;
+            // Core rpc/blockchain.cpp:1301-1303 DeploymentActiveAfter: "getdeploymentinfo
+            // reports the softfork as active from when the chain height is one
+            // below the activation height" (deploymentstatus.h:14-18,
+            // (nHeight + 1) >= DeploymentHeight).
+            const active = query_height + 1 >= act_height;
             try writer.print("\"csv\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
                 active, act_height, act_height,
             });
@@ -3637,7 +3653,11 @@ pub const RpcServer = struct {
         // ---- segwit (buried) ----
         {
             const act_height = np.segwit_height;
-            const active = query_height >= act_height;
+            // Core rpc/blockchain.cpp:1301-1303 DeploymentActiveAfter: "getdeploymentinfo
+            // reports the softfork as active from when the chain height is one
+            // below the activation height" (deploymentstatus.h:14-18,
+            // (nHeight + 1) >= DeploymentHeight).
+            const active = query_height + 1 >= act_height;
             try writer.print("\"segwit\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
                 active, act_height, act_height,
             });
@@ -3647,7 +3667,11 @@ pub const RpcServer = struct {
         // ---- taproot (buried) ----
         {
             const act_height = np.taproot_height;
-            const active = query_height >= act_height;
+            // Core rpc/blockchain.cpp:1301-1303 DeploymentActiveAfter: "getdeploymentinfo
+            // reports the softfork as active from when the chain height is one
+            // below the activation height" (deploymentstatus.h:14-18,
+            // (nHeight + 1) >= DeploymentHeight).
+            const active = query_height + 1 >= act_height;
             try writer.print("\"taproot\":{{\"type\":\"buried\",\"active\":{},\"height\":{d},\"min_activation_height\":{d}}}", .{
                 active, act_height, act_height,
             });
