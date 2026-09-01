@@ -17127,6 +17127,12 @@ pub const RpcServer = struct {
         var tx = serialize.readTransaction(&reader, self.allocator) catch {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
         };
+        // The decoded tx owns its input scriptSigs / witnesses and output
+        // scriptPubKeys (serialize.readTransaction dupes each one).  Release
+        // them when the handler returns.  Pre-fix every call leaked the whole
+        // decoded transaction — invisible under ReleaseFast's C allocator,
+        // caught by the testing allocator.
+        defer serialize.freeTransaction(self.allocator, &tx);
 
         // Build an ephemeral wallet whose `keys[i].secret_key` is the i-th
         // decoded WIF. We then synthesize OwnedUtxo entries pointing at the
@@ -17305,9 +17311,25 @@ pub const RpcServer = struct {
                 .is_coinbase = false,
                 .height = 0,
             };
+            // signInput installs a freshly allocated scriptSig/witness in
+            // place of the decoded ones (wallet.zig `mutable_inputs[i] =
+            // types.TxIn{...}`); free the originals it displaced so the
+            // deferred freeTransaction sees only live allocations.
+            const old_script_sig = tx.inputs[input_idx].script_sig;
+            const old_witness = tx.inputs[input_idx].witness;
             ephem.signInput(&tx, input_idx, synth_utxo, sighash_type, flat_prevouts) catch {
                 complete = false;
+                continue;
             };
+            if (tx.inputs[input_idx].script_sig.ptr != old_script_sig.ptr and old_script_sig.len > 0) {
+                self.allocator.free(old_script_sig);
+            }
+            if (tx.inputs[input_idx].witness.ptr != old_witness.ptr and old_witness.len > 0) {
+                for (old_witness) |item| {
+                    if (item.len > 0) self.allocator.free(item);
+                }
+                self.allocator.free(old_witness);
+            }
         }
 
         // Re-serialize the signed tx.
