@@ -11904,6 +11904,22 @@ pub const RpcServer = struct {
         }
         const path = path_param.string;
 
+        // Core rpc/blockchain.cpp:3410-3416 opens the file FIRST and reports
+        // an unopenable path as RPC_INVALID_PARAMETER ("Couldn't open file
+        // <path> for reading.") before parsing a single byte.  Mirror that
+        // ordering and code: a bad path is a parameter error (-8), not the
+        // RPC_MISC_ERROR the generic IoError arm below reports for a file
+        // that opened but could not be read.
+        if (std.fs.cwd().openFile(path, .{})) |probe| {
+            probe.close();
+        } else |_| {
+            const msg = std.fmt.allocPrint(self.allocator, "Couldn't open file {s} for reading.", .{path}) catch {
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+            };
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+        }
+
         // ── STAGE 1: authenticate the snapshot FILE (load-time hash gate) ──────
         var rejected_hash: types.Hash256 = undefined;
         var actual_hash: types.Hash256 = undefined;
