@@ -6,6 +6,8 @@ A Bitcoin full node written from scratch in Zig. Part of the [Hashhog](https://g
 
 ### Build from Source
 
+Requires **Zig 0.13.0** exactly (the version `Dockerfile` pins; other Zig releases do not build this tree). System libraries `librocksdb` and `libsecp256k1` are always linked by `build.zig` (secp256k1 is not optional despite the `-Dsecp256k1` flag below).
+
 ```bash
 # Install dependencies (Debian/Ubuntu)
 sudo apt-get install -y librocksdb-dev libsecp256k1-dev
