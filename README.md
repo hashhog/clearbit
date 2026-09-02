@@ -1,6 +1,6 @@
 # clearbit
 
-A Bitcoin full node written from scratch in Zig. Part of the [Hashhog](https://github.com/hashhog/hashhog) project.
+A Bitcoin full node written from scratch in Zig. Part of the Hashhog project.
 
 ## Status — v1.0.0
 
@@ -44,17 +44,23 @@ in `signrawtransactionwithkey`, `3c37e49` `loadtxoutset` on an unopenable path,
 template retarget ancestors read from the in-memory ring before the persisted
 height index).
 
-**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
-[hashhog meta-repo](https://github.com/hashhog/hashhog).
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the hashhog
+meta-repo, which is **not public** — see the note below.
 
+> **The cited paths are NOT publicly readable — do not treat them as evidence.**
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
-> the hashhog meta-repo, not to this repository.
-> **Two notes on the citations above.** The R5 probe JSON is **gitignored** in the
-> meta-repo (`.gitignore:60  tools/diff-test-artifacts/`), so a stranger cloning
-> either repository cannot read it; regenerate it with `python3 tools/r5_probe.py`
-> against a running fleet. The nightly `diffguard-*.log` files are likewise
-> gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
-> `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
+> the hashhog meta-repo, which is a **private** repository, not to this one. They
+> are provenance for the maintainers. From outside, any claim resting only on such
+> a path is **unverified**, and you should read it as such.
+>
+> Two of those paths are unreadable even with the meta-repo in hand: the R5 probe
+> JSON is gitignored (`.gitignore:60  tools/diff-test-artifacts/`) and so are the
+> nightly `diffguard-*.log` files (`.gitignore:43  *.log`). Regenerate the probe
+> JSON with `python3 tools/r5_probe.py` against a running fleet.
+>
+> **What you can check from this repository alone:** build it, run its own test
+> suite, and reproduce its behaviour against Bitcoin Core yourself. That is the
+> evidence this repo actually ships.
 
 ## Quick Start
 
