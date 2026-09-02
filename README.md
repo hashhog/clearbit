@@ -2,6 +2,54 @@
 
 A Bitcoin full node written from scratch in Zig. Part of the [Hashhog](https://github.com/hashhog/hashhog) project.
 
+## Status — v1.0.0
+
+**Label: "Validated — reproduced Core's UTXO set from genesis with all scripts
+verified"** (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That
+label means one specific thing: clearbit connected every mainnet block from block 0
+to height 958,794 with its assumevalid gate off, serialized its entire UTXO set,
+and produced the byte string
+`29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over
+166,180,925 coins — the same value Bitcoin Core's `dumptxoutset` produced at that
+height. A single wrong coin anywhere in fifteen years changes that hash. The git
+tag `v0.1.0-rc2` (`receipts/RELEASE-v1.0-FREEZE.md`) marks the same bar: `rc` in this
+project certifies that reproduction and nothing else
+(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
+or fund-custody readiness — see `SECURITY.md`.
+
+Two things that reproduction does not cover, stated plainly. The committed
+genesis → 250000 replay ledger
+(`CORE-PARITY-AUDIT/replay-ledgers/clearbit-av0-danger-ledger.txt`) is a
+**pre-fix** run that never reached 250000: it ends
+`overall=FAIL@~76871 (validation-worker crash)`, before the script-check
+worker-pool fix `a6300ff`. And on 2026-08-19, a month *after* the reproduction,
+a one-token `OP_PUSHDATA1` overflow in the BIP-342 tapscript pre-scan
+(`2 + script[i+1]` in `u8`) took the mainnet node down and would have been a
+silent consensus split in the documented `ReleaseFast` build mode — fixed in
+`fa71198` (`receipts/clearbit-tapscript-pushdata1-overflow-2026-08-19.md`). A
+from-genesis reproduction is evidence about the code as it stood, not a
+guarantee about later code.
+
+**Operator RPC parity: 56 of Bitcoin Core's 85.** From the 103-method R5
+operator probe run 2026-09-01
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): clearbit 56 PASS /
+29 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core.
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
+unit suite went 18 failing → 0 with no skips and no documented gaps carried;
+four of those were real bugs, each mutation-verified (`7bd3a4f` a per-call leak
+in `signrawtransactionwithkey`, `3c37e49` `loadtxoutset` on an unopenable path,
+`3758e26` `getdeploymentinfo` off-by-one at activation height, `6a745d7`
+template retarget ancestors read from the in-memory ring before the persisted
+height index).
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Build from Source
@@ -109,6 +157,11 @@ zig build -Dminisketch=true
 | `--load-snapshot=<path>` | Load a Bitcoin Core-format UTXO snapshot (as produced by Core's `dumptxoutset` RPC) | |
 
 ## RPC API
+
+> **Parity note.** These methods are modelled on Bitcoin Core's, but shape parity is not
+> behaviour parity. On the 2026-09-01 operator probe clearbit answers 56 of the 103
+> probed methods correctly against Core's 85, and 29 probes fail — mostly on error
+> codes (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
 
 ### Blockchain
 
@@ -228,7 +281,7 @@ The script interpreter implements all standard Bitcoin script types (P2PKH, P2SH
 
 Storage uses RocksDB with separate column families, and block data lives in flat blk*.dat files (128 MiB max) with pre-allocation and a RocksDB index. The UTXO cache implements a CoinsViewCache layer with FRESH/DIRTY optimization for efficient batch flushing. Undo data for reorgs is persisted in rev*.dat files. The assumeUTXO feature supports snapshot creation and loading with hash verification and dual chainstate management.
 
-P2P networking supports both v1 plaintext and BIP-324 v2 encrypted transport (ElligatorSwift key exchange, FSChaCha20-Poly1305 encryption, short message IDs). BIP-330 Erlay provides bandwidth-efficient transaction relay via set reconciliation using libminisketch. The peer manager handles DNS discovery, misbehavior scoring (100-point threshold with JSON-persisted ban lists), and eclipse attack protections (netgroup diversity for /16 IPv4 and /32 IPv6, anchor connections, Bitcoin Core-compatible inbound eviction). Tor and I2P connectivity is supported via SOCKS5 proxying and control protocols.
+P2P networking supports both v1 plaintext and BIP-324 v2 encrypted transport (ElligatorSwift key exchange, FSChaCha20-Poly1305 encryption, short message IDs). BIP-330 Erlay provides bandwidth-efficient transaction relay via set reconciliation using libminisketch. The peer manager handles DNS discovery, misbehavior scoring (100-point threshold with JSON-persisted ban lists), and eclipse attack protections (netgroup diversity for /16 IPv4 and /32 IPv6, anchor connections, and an inbound eviction path modelled on Bitcoin Core's). No committed artifact in this project measures that eviction path against Core, so read the parity claim as intent, not as a measured result. Tor and I2P connectivity is supported via SOCKS5 proxying and control protocols.
 
 The mempool implements full RBF with TRUC v3 transaction relay policy and cluster-based linearization for accurate mining score computation. Package relay follows BIP-331 with child-with-parents support. Fee estimation tracks confirmations across exponential buckets with decay. Block template construction selects transactions by ancestor feerate with BIP-34 coinbase height encoding, BIP-141 witness commitment, sigops limits, locktime finality checks, and anti-fee-sniping nLockTime. Arena allocators are used throughout for predictable memory management, and SIMD intrinsics accelerate hot paths like merkle root computation and block deserialization.
 
