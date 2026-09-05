@@ -1224,15 +1224,30 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     // 2. Cross-reference the snapshot tip against the assumeutxo entries
     //    hardcoded in chainparams. This is what gates which snapshots a
     //    node will accept (see consensus.zig MAINNET.assume_utxo).
+    //
+    //    DEV ESCAPE: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT (see
+    //    storage.unsafeSnapshotHeightOverride) accepts an unlisted base hash
+    //    and takes the base height from the env var, because the whitelist
+    //    entry is normally what supplies that height.  loadtxoutset is a trust
+    //    shortcut for end users — that is why Core hardcodes these anchors —
+    //    but this project also validates arbitrary block ranges in parallel
+    //    from a locally generated snapshot ladder whose rungs can never be
+    //    listed; there, correctness comes from checking each range's OUTPUT
+    //    utxo hash against an independent commitment, not from trusting the
+    //    input snapshot.  Unset (the shipped default) leaves this gate exactly
+    //    as it was, and nothing else is relaxed either way: the header
+    //    magic/version check above and every per-coin check below still run.
+    const unsafe_height = storage.unsafeSnapshotHeightOverride();
     const assume_entry = storage.findAssumeUtxoEntry(network_params, &metadata.base_blockhash);
-    if (assume_entry == null) {
+    if (assume_entry == null and unsafe_height == null) {
         // Print display-order hash for the operator.
         var disp: [64]u8 = undefined;
         for (0..32) |i| _ = std.fmt.bufPrint(disp[i * 2 ..][0..2], "{x:0>2}", .{metadata.base_blockhash[31 - i]}) catch unreachable;
         std.debug.print("FATAL: Snapshot tip {s} is not a recognized assumeutxo block for this network.\n", .{disp[0..]});
         std.process.exit(1);
     }
-    const block_height: u32 = assume_entry.?.height;
+    if (assume_entry == null) storage.warnUnverifiedSnapshot(&metadata.base_blockhash, unsafe_height.?);
+    const block_height: u32 = if (assume_entry) |e| e.height else unsafe_height.?;
 
     // Display header.
     std.debug.print("clearbit UTXO snapshot import (Bitcoin Core wire format)\n", .{});
@@ -1242,7 +1257,11 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     std.debug.print("\n", .{});
     std.debug.print("  Height:     {d}\n", .{block_height});
     std.debug.print("  Coins:      {d}\n", .{metadata.coins_count});
-    std.debug.print("  Chain txs:  {d} (from chainparams)\n", .{assume_entry.?.chain_tx_count});
+    if (assume_entry) |e| {
+        std.debug.print("  Chain txs:  {d} (from chainparams)\n", .{e.chain_tx_count});
+    } else {
+        std.debug.print("  Chain txs:  unknown (no chainparams entry - UNVERIFIED snapshot)\n", .{});
+    }
 
     const start_time = std.time.milliTimestamp();
     const BATCH_SIZE: u64 = 100_000;
@@ -1428,7 +1447,11 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     // keeps the full header chain from genesis even under AssumeUTXO). The base
     // entry (last in the table) replaces the placeholder; its .hash equals
     // metadata.base_blockhash by construction (both hexToHash of the base block).
-    const base_tail = assume_entry.?.base_tail_headers;
+    // No chainparams entry (DEV ESCAPE) means no baked base-tail headers, so
+    // the all-zero placeholder fallback below applies, exactly as it does for
+    // the canonical Core entries that bake none.
+    const base_tail: []const consensus.BaseTailHeader =
+        if (assume_entry) |e| e.base_tail_headers else &.{};
     if (base_tail.len > 0) {
         for (base_tail) |bh| {
             var bidx: [84]u8 = undefined;

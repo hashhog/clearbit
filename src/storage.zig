@@ -8561,6 +8561,64 @@ pub fn findAssumeUtxoEntry(
     return null;
 }
 
+/// Development-only escape from the chainparams assumeutxo whitelist.
+///
+/// `loadtxoutset` is a trust shortcut for end users, which is exactly why Core
+/// hardcodes the anchors in `m_assumeutxo_data`: an operator importing a
+/// snapshot is trusting whoever produced it, so the only safe answer there is a
+/// short list of hashes shipped inside the binary.  This project also needs to
+/// validate arbitrary block ranges in parallel from a locally generated
+/// snapshot ladder, and no rung of that ladder can ever appear in such a list.
+/// For that use the anchor buys nothing: correctness is established by checking
+/// each range's OUTPUT utxo hash against an independent commitment, not by
+/// trusting the input snapshot.
+///
+/// UNSET — the shipped default, and the only thing production ever sees — this
+/// returns null and every caller behaves byte-for-byte as it did before this
+/// existed.  SET, it supplies the base height the whitelist entry would
+/// normally have carried, and ONLY the whitelist membership test plus its
+/// associated hardcoded `hash_serialized` comparison are skipped; format,
+/// magic, coin count and per-coin parsing all still run.
+///
+/// Uses `std.posix.getenv` (a borrowed slice into the process environment) on
+/// purpose: no allocation, hence no allocator lifetime to get wrong.
+pub fn unsafeSnapshotHeightOverride() ?u32 {
+    const raw = std.posix.getenv("HASHHOG_UNSAFE_SNAPSHOT_HEIGHT") orelse return null;
+    if (raw.len == 0) return null;
+    return std.fmt.parseInt(u32, raw, 10) catch {
+        std.debug.print(
+            "WARNING: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=\"{s}\" is not a block height; " ++
+                "ignoring it (the assumeutxo whitelist stays enforced).\n",
+            .{raw},
+        );
+        return null;
+    };
+}
+
+/// Loud banner every `unsafeSnapshotHeightOverride` bypass site prints to the
+/// node's normal log before accepting an unlisted snapshot.
+pub fn warnUnverifiedSnapshot(base_blockhash: *const types.Hash256, height: u32) void {
+    var disp: [64]u8 = undefined;
+    for (0..32) |i| _ = std.fmt.bufPrint(disp[i * 2 ..][0..2], "{x:0>2}", .{base_blockhash[31 - i]}) catch unreachable;
+    std.debug.print(
+        "\n" ++
+            "!!! ============================================================ !!!\n" ++
+            "!!! WARNING: LOADING AN UNVERIFIED UTXO SNAPSHOT                 !!!\n" ++
+            "!!! ============================================================ !!!\n" ++
+            "!!! HASHHOG_UNSAFE_SNAPSHOT_HEIGHT is set, so the assumeutxo\n" ++
+            "!!! whitelist check was BYPASSED for this snapshot.\n" ++
+            "!!!   base blockhash: {s}\n" ++
+            "!!!   base height:    {d}  (from the env var, NOT from chainparams)\n" ++
+            "!!! This blockhash is NOT a chainparams trust anchor. Nothing has\n" ++
+            "!!! attested that this is the real UTXO set at that height, and the\n" ++
+            "!!! hardcoded hash_serialized comparison was skipped along with the\n" ++
+            "!!! whitelist lookup.\n" ++
+            "!!! DEVELOPMENT ONLY -- NEVER RUN THIS IN PRODUCTION.\n" ++
+            "!!! ============================================================ !!!\n\n",
+        .{ disp[0..], height },
+    );
+}
+
 /// Find an AssumeUtxo entry by height.
 /// Returns the entry if there's a snapshot at the given height, null otherwise.
 pub fn findAssumeUtxoEntryByHeight(
@@ -8714,11 +8772,31 @@ pub fn validateAndLoadSnapshot(
     // resolves base_height via the block index then calls
     // `AssumeutxoForHeight(base_height)`; clearbit's `AssumeUtxoData`
     // pairs hash and height 1:1, so a hash miss is exactly a height miss.
-    const assume_entry = findAssumeUtxoEntry(network_params, &metadata.base_blockhash) orelse {
+    //
+    // DEV ESCAPE (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT — see
+    // `unsafeSnapshotHeightOverride` above): when set, an unlisted base hash is
+    // accepted and its base height comes from the env var, because the
+    // whitelist entry is normally what supplies that height.  Declined when the
+    // runtime-registered regtest whitelist already knows the hash, so the
+    // existing regtest fallback path (rpc.zig loadTxOutSetRegtestPath, reached
+    // via UnknownSnapshot) keeps its real entry instead of an env-supplied one.
+    const assume_entry_opt = findAssumeUtxoEntry(network_params, &metadata.base_blockhash);
+    const unsafe_height: ?u32 = if (assume_entry_opt != null) null else blk: {
+        const h = unsafeSnapshotHeightOverride() orelse break :blk null;
+        // A runtime-registered regtest snapshot IS an anchor for this hash, so
+        // let the existing regtest path use its real entry rather than an
+        // env-supplied height.
+        if (@import("au_bg_chainstate.zig").findRegtestSnapshot(&metadata.base_blockhash) != null)
+            break :blk null;
+        break :blk h;
+    };
+    if (assume_entry_opt == null and unsafe_height == null) {
         if (out_rejected_hash) |dst| dst.* = metadata.base_blockhash;
         chainstate.deinit();
         return SnapshotError.UnknownSnapshot;
-    };
+    }
+    if (assume_entry_opt == null) warnUnverifiedSnapshot(&metadata.base_blockhash, unsafe_height.?);
+    const base_height: u32 = if (assume_entry_opt) |e| e.height else unsafe_height.?;
 
     // B11: BLOCK_FAILED_VALID check — Core validation.cpp:5617-5619.
     // If the base block header is known and marked invalid, refuse the snapshot.
@@ -8749,27 +8827,33 @@ pub fn validateAndLoadSnapshot(
     // (`a2a5521b...` etc. for mainnet 840k) are SHA256d outputs.
     // MuHash3072 is the separate hash type exposed by `gettxoutsetinfo
     // hash_type=muhash`; wiring it into this gate is a category error.
-    const actual_hash = computeHashSerializedTxOutSet(&chainstate.utxo_set, allocator) catch {
-        chainstate.deinit();
-        return SnapshotError.OutOfMemory;
-    };
-    if (!std.mem.eql(u8, &actual_hash, &assume_entry.hash_serialized)) {
-        if (out_actual_hash) |dst| dst.* = actual_hash;
-        if (out_expected_hash) |dst| dst.* = assume_entry.hash_serialized;
-        chainstate.deinit();
-        return SnapshotError.HashMismatch;
+    // Skipped only under the DEV ESCAPE above: with no whitelist entry there is
+    // no hardcoded `hash_serialized` to compare against.  This is the one other
+    // check the env var relaxes, and only because it is the whitelist entry's
+    // own field.
+    if (assume_entry_opt) |assume_entry| {
+        const actual_hash = computeHashSerializedTxOutSet(&chainstate.utxo_set, allocator) catch {
+            chainstate.deinit();
+            return SnapshotError.OutOfMemory;
+        };
+        if (!std.mem.eql(u8, &actual_hash, &assume_entry.hash_serialized)) {
+            if (out_actual_hash) |dst| dst.* = actual_hash;
+            if (out_expected_hash) |dst| dst.* = assume_entry.hash_serialized;
+            chainstate.deinit();
+            return SnapshotError.HashMismatch;
+        }
     }
 
     // Set the height on the chainstate
-    chainstate.best_height = assume_entry.height;
+    chainstate.best_height = base_height;
 
     return .{
         .chainstate = chainstate,
         .result = SnapshotLoadResult{
             .coins_loaded = metadata.coins_count,
             .tip_hash = metadata.base_blockhash,
-            .tip_height = assume_entry.height,
-            .base_height = assume_entry.height,
+            .tip_height = base_height,
+            .base_height = base_height,
         },
     };
 }

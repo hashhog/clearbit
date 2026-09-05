@@ -11988,8 +11988,28 @@ pub const RpcServer = struct {
         const base_height = loaded.result.base_height;
         const base_hash = loaded.result.tip_hash;
 
-        const au_data = storage.findAssumeUtxoEntry(self.network_params, &base_hash) orelse
-            return self.jsonRpcError(RPC_MISC_ERROR, "assumeutxo data not found for base block", id);
+        // DEV ESCAPE (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT): STAGE 1 already let this
+        // snapshot through without a whitelist entry, so there is no
+        // chainparams row to look up here.  Stand in for it with the snapshot
+        // file's OWN hash_serialized: STAGE 2 below still runs the full
+        // independent genesis->base re-derivation and still has to agree with
+        // it, so a tampered file is still caught.  What the env var gives up is
+        // only the trust anchor — which is exactly what it opts out of, and is
+        // sound here because correctness for the parallel range-validation
+        // ladder comes from checking each range's OUTPUT utxo hash against an
+        // independent commitment, not from trusting the input snapshot.
+        const au_data = storage.findAssumeUtxoEntry(self.network_params, &base_hash) orelse blk: {
+            if (storage.unsafeSnapshotHeightOverride() == null)
+                return self.jsonRpcError(RPC_MISC_ERROR, "assumeutxo data not found for base block", id);
+            const file_hash = storage.computeHashSerializedTxOutSet(&cs.utxo_set, self.allocator) catch
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to hash snapshot coins", id);
+            break :blk consensus.AssumeUtxoData{
+                .height = base_height,
+                .block_hash = base_hash,
+                .hash_serialized = file_hash,
+                .chain_tx_count = 0,
+            };
+        };
 
         // ── STAGE 2: REAL background genesis→base re-derivation ────────────────
         // Refuse if we can't replay genesis→base from on-disk bodies (a fresh
