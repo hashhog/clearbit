@@ -6152,6 +6152,7 @@ pub const PeerManager = struct {
                         "P2P: headers batch undecidable at header 0 from peer={any} (missing ancestors) — dropped, no penalty\n",
                         .{peer.address},
                     );
+                    self.reportUndecidableAtHeaderZero(h.headers);
                     return;
                 }
                 if (outcome.undecidable) {
@@ -9088,6 +9089,59 @@ pub const PeerManager = struct {
             accepted += 1;
         }
         return .{ .accepted = accepted };
+    }
+
+    /// Explain WHY an inbound batch was undecidable at header 0.
+    ///
+    /// A batch that stops at header 0 admits nothing and requests nothing, so
+    /// header sync — and with it block download — stops permanently.  The
+    /// one-line "missing ancestors" message cannot tell apart the two very
+    /// different causes:
+    ///
+    ///   * we have never heard of the parent (index_height=null), versus
+    ///   * we DO have a block-index row for the parent but its header is a
+    ///     PLACEHOLDER (bits=0, time=0) — the all-zero row `--load-snapshot`
+    ///     writes for a snapshot base when the accepted snapshot entry bakes no
+    ///     `base_tail_headers`.  `computeRequiredBits` then resolves a required
+    ///     nBits of 0 and correctly refuses to compare against it, so EVERY
+    ///     header above the base is undecidable forever.
+    ///
+    /// The second case is a silent post-snapshot wedge: correct base, correct
+    /// UTXO surface, peer connected, headers arriving, tip never moving.  It
+    /// cost the whole 2026-09-05 clearbit ladder run before the log said which
+    /// of the two it was.
+    fn reportUndecidableAtHeaderZero(self: *PeerManager, headers: []const types.BlockHeader) void {
+        if (headers.len == 0) return;
+        const prev = &headers[0].prev_block;
+        var disp: [64]u8 = undefined;
+        for (0..32) |i| {
+            _ = std.fmt.bufPrint(disp[i * 2 ..][0..2], "{x:0>2}", .{prev[31 - i]}) catch return;
+        }
+        const index_height: ?u32 = if (self.resolvePrevForHeader(prev, null)) |p| p.height else null;
+        var have_header = false;
+        var bits: u32 = 0;
+        var time: u32 = 0;
+        if (self.chain_state) |cs| {
+            if (cs.getPersistedHeader(prev) orelse cs.getBlockHeaderFromBody(prev)) |hdr| {
+                have_header = true;
+                bits = hdr.bits;
+                time = hdr.timestamp;
+            }
+        }
+        const why: []const u8 = if (index_height == null)
+            "parent is not in our view at all — genuinely missing ancestors"
+        else if (bits == 0)
+            "parent is a PLACEHOLDER block-index row (a snapshot base imported with no real" ++
+                " header): required-nBits resolves to 0, which is refused, so EVERY header above" ++
+                " the base is undecidable — a permanent post-snapshot wedge"
+        else
+            "parent is known with real bits — the unresolvable ancestor is deeper" ++
+                " (e.g. the first block of the retarget window)";
+        std.debug.print(
+            "P2P:   parent {s} index_height={?d} header_on_disk={} bits=0x{x:0>8} time={d}\n" ++
+                "P2P:   -> {s}\n",
+            .{ disp[0..], index_height, have_header, bits, time, why },
+        );
     }
 
     /// Map a contextual header verdict onto the peer-facing action.
