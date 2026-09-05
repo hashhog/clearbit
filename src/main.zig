@@ -1997,6 +1997,32 @@ pub fn main() !void {
     //      false-accept).  Bitcoin Core always connects reorg side branches
     //      through ConnectBlock → CheckInputScripts.
     chain_state.setNetworkParams(params);
+
+    // ---- scripts-on evidence banner (--noassumevalid) ----
+    // Read off the EFFECTIVE params just wired into ChainState above, NOT off
+    // the CLI bool: getNetworkParams() (Config.getNetworkParams, this file)
+    // returns a patched copy with assumed_valid_hash = null and
+    // assume_valid_height = 0, and BOTH consumers of the skip decision
+    // short-circuit on that copy -- validation.shouldSkipScripts
+    // ("if (av_height == 0) return false", validation.zig) and
+    // peer.PeerManager's faithful 5-condition gate (same early return,
+    // peer.zig), the latter reading the same `params` pointer handed to
+    // PeerManager.init below. So when this line prints, every connected
+    // block's input scripts are verified.
+    // The config.noassumevalid conjunct keeps the line DISCRIMINATING: regtest
+    // has assume_valid_height = 0 by construction, so the params test alone
+    // would print without the flag and prove nothing.
+    // Consumed by the boundary campaign's ack check:
+    // tools/lib/campaign-impl-lib.sh `_campaign_scripts_on_ack_re` (meta-repo).
+    if (config.noassumevalid and
+        params.assumed_valid_hash == null and
+        params.assume_valid_height == 0)
+    {
+        std.debug.print(
+            "assumevalid DISABLED (--noassumevalid): verifying ALL scripts from genesis\n",
+            .{},
+        );
+    }
     // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
     // 2026-05-05.md): plumb --txindex from CLI/config into ChainState so
     // connectBlockInner queues CF_TX_INDEX writes and disconnectBlockByHashCF
