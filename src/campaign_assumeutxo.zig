@@ -26,6 +26,14 @@
 //! `tools/start_mainnet.sh` refuses to launch any node with this env var set
 //! (launcher guard, mandatory + uniform). See the spec's "Security note".
 //!
+//! What "validate" does and does not mean here: a `base_tail_headers` band's
+//! CONTENTS are pinned to reality by hash-linkage down from the entry's own
+//! blockhash (plus a per-header PoW gate), but the entry's `height` is TRUSTED
+//! FIXTURE INPUT and no header-local check can attest it. A genuine band
+//! declared at a wrong height installs a difficulty history that never existed
+//! there. Full argument on `stageBaseTailHeaders`; this is the reason the
+//! launcher guard is load-bearing rather than merely tidy.
+//!
 //! All hex fields are DISPLAY order (as Core's `kernel/chainparams.cpp`
 //! prints / `uint256{"..."}` parses), matching every other AssumeUtxoData
 //! literal in consensus.zig — converted here with the same reversal
@@ -55,6 +63,13 @@ var g_entries_buf: [MAX_ENTRIES]consensus.AssumeUtxoData = undefined;
 var g_entries_len: usize = 0;
 /// Backing store for every entry's `base_tail_headers` slice. Entries in
 /// `g_entries_buf` point into this; both live for the life of the process.
+///
+/// COST NOTE for anyone copying this pattern: at 8192 x 116 bytes this is a
+/// ~950 KB ALWAYS-RESIDENT static, present whether or not the env var is set,
+/// and it is roughly 95% of the whole binary's `.bss` (measured 2026-09-05:
+/// `nm -S` reports 950,272 bytes for this symbol against a 1,003,392-byte
+/// `.bss`). The no-heap-growth rule that motivates it is worth the page cost
+/// here, but it is not free and it is not small.
 var g_tail_buf: [MAX_BASE_TAIL_HEADERS]consensus.BaseTailHeader = undefined;
 var g_tail_len: usize = 0;
 
@@ -118,6 +133,51 @@ fn headerHash(raw: *const [80]u8) types.Hash256 {
 /// blockheader"), so `GetNextWorkRequired(pindexPrev)` always has real bits.
 /// This function is how a campaign base gets the same guarantee.
 ///
+/// WHAT IS AND IS NOT PROVEN HERE. Read this before describing the band as
+/// "validated" anywhere else; the distinction is the whole security story.
+///
+///   PROVEN -- the band's CONTENTS. Every element is hashed; every element's
+///   prev_block must equal the hash of the element before it; the LAST element
+///   must hash to the entry's declared `blockhash`. Those three are a DOWNWARD
+///   INDUCTION, not three independent spot checks: the terminal element is
+///   pinned by hash, which pins its prev_block, which pins the element below
+///   it, and so on to the bottom of the band. So if the terminal anchor is a
+///   GENUINE block hash then -- absent a SHA-256d preimage break -- every
+///   header in the band is the genuine header of a real block, carrying that
+///   block's real nBits and real timestamp. Tampering with any byte of any
+///   element is refused: a middle or leading edit breaks linkage, a trailing
+///   edit breaks the anchor.
+///
+///   PROVEN -- proof of work, per header, below. Given the induction above
+///   this is REDUNDANT whenever the anchor is genuine, and it is here anyway
+///   for two reasons: so this module's guarantee does not silently depend on a
+///   check that lives in a different file (main.zig only reaches this data via
+///   `findAssumeUtxoEntry`, matching the entry against the snapshot file's own
+///   base hash), and so a wholly fabricated band is refused AT PARSE TIME
+///   instead of sitting in `entries()` until something downstream happens to
+///   reject it. It does NOT address the height problem below -- a genuine
+///   header has valid PoW no matter what height it is claimed to sit at.
+///
+///   NOT PROVEN -- the band's absolute HEIGHT. `height` is trusted fixture
+///   input. Nothing local to a header band can attest an absolute height:
+///   headers carry no height field, and a genuine band has valid PoW and valid
+///   linkage at any claimed height. The derivation below fixes only the band's
+///   heights RELATIVE to that claimed anchor. A fixture pairing a genuine band
+///   with a wrong `height` installs a genuine difficulty history at heights it
+///   never occupied, and `computeRequiredBits` then demands that difficulty of
+///   the blocks above the base. Measured 2026-09-05: the real height-6299 band
+///   declared as `"height": 700000` made `getblocktemplate` ask for difficulty
+///   1 at height 700001, and the retarget window opening at 699552 landed
+///   inside the mislabelled band too, so it does not self-correct at the next
+///   boundary. THIS is why the env var is development-only and why
+///   `tools/start_mainnet.sh` refuses to launch any node with it set.
+///
+///   Core does not validate its way out of this class -- it avoids the class.
+///   `ActivateSnapshot` (validation.cpp, "Did not find snapshot start
+///   blockheader") requires the base block's real header to ALREADY be in a
+///   genesis-connected block index, so the height is attested by the header
+///   chain itself and is never taken from the snapshot's provenance.
+///
 /// Accepts the fixture's ascending `base_tail_headers` chain (last element IS
 /// the base block), falling back to a lone `base_header`. A one-element chain
 /// unblocks base+1 but cannot answer a retarget window that reaches below the
@@ -126,6 +186,7 @@ fn stageBaseTailHeaders(
     obj: std.json.ObjectMap,
     height: u32,
     block_hash: types.Hash256,
+    params: *const consensus.NetworkParams,
 ) ![]const consensus.BaseTailHeader {
     const start = g_tail_len;
 
@@ -158,7 +219,24 @@ fn stageBaseTailHeaders(
     if (n == 0) return &[_]consensus.BaseTailHeader{}; // optional; placeholder path still applies
 
     const chain = g_tail_buf[start..g_tail_len];
-    for (chain) |*e| e.hash = headerHash(&e.raw);
+    // Hash every element and gate each on its OWN declared target, the two
+    // checks Core folds into CheckProofOfWork (pow.cpp): the target must not
+    // be above the network's pow_limit, and the header hash must meet it.
+    // Mirrors `consensus.validateProofOfWork`, done on raw bytes here because
+    // the band is stored serialized. A garbage nBits decodes to a zero target
+    // via `bitsToTarget`, which no real hash can meet, so this is fail-closed.
+    // Reminder: this says nothing about the band's absolute height.
+    for (chain) |*e| {
+        e.hash = headerHash(&e.raw);
+        const bits = std.mem.readInt(u32, e.raw[72..76], .little);
+        const target = consensus.bitsToTarget(bits);
+        if (!consensus.hashMeetsTarget(&target, &params.pow_limit)) {
+            return error.BaseTailHeaderTargetAbovePowLimit;
+        }
+        if (!consensus.hashMeetsTarget(&e.hash, &target)) {
+            return error.BaseTailHeaderInsufficientPow;
+        }
+    }
 
     // The chain must END at the snapshot base: the import path persists its
     // last element IN PLACE OF the all-zero placeholder, keyed by that hash.
@@ -174,14 +252,23 @@ fn stageBaseTailHeaders(
         }
     }
     if (n - 1 > height) return error.BaseTailHeadersBelowGenesis;
-    for (chain, 0..) |*e, k| e.height = height - @as(u32, @intCast(n - 1 - k));
+    const start_height: u32 = height - @as(u32, @intCast(n - 1));
+    // A band that reaches down to height 0 must reach GENESIS. Heights are
+    // derived, not carried, so without this a fixture could file an ordinary
+    // header under height 0, where the import path's "H:" height index write
+    // would shadow the real genesis for every height-keyed lookup.
+    if (start_height == 0 and !std.mem.eql(u8, &chain[0].hash, &params.genesis_hash)) {
+        return error.BaseTailHeadersDoNotStartAtGenesis;
+    }
+    for (chain, 0..) |*e, k| e.height = start_height + @as(u32, @intCast(k));
     return chain;
 }
 
 /// Ensure the campaign table has been loaded (idempotent, thread-safe,
-/// exactly-once). `builtin_entries` is the SELECTED network's own comptime
-/// `assume_utxo` table (e.g. MAINNET.assume_utxo) — used only to detect
-/// collisions; never mutated.
+/// exactly-once). `params` is the SELECTED network's comptime params, used
+/// read-only for three things: its `assume_utxo` table (collision detection),
+/// its `pow_limit` (the base-tail band's PoW gate) and its `genesis_hash` (the
+/// band's bottom-of-chain rule). Never mutated.
 ///
 /// Unset/empty env var: returns immediately after the getenv call, having
 /// touched nothing else (the "bit-identical" contract).
@@ -190,7 +277,7 @@ fn stageBaseTailHeaders(
 /// collision with a built-in entry) this prints a FATAL message and exits
 /// the process — campaign data must never silently coexist with a bad or
 /// colliding entry.
-pub fn ensureLoaded(allocator: std.mem.Allocator, builtin_entries: []const consensus.AssumeUtxoData) void {
+pub fn ensureLoaded(allocator: std.mem.Allocator, params: *const consensus.NetworkParams) void {
     g_mu.lock();
     defer g_mu.unlock();
     if (g_loaded) return;
@@ -206,7 +293,7 @@ pub fn ensureLoaded(allocator: std.mem.Allocator, builtin_entries: []const conse
     defer allocator.free(path);
     if (path.len == 0) return; // empty: treat like unset
 
-    loadFromPath(allocator, path, builtin_entries) catch |err| {
+    loadFromPath(allocator, path, params, params.assume_utxo) catch |err| {
         std.debug.print(
             "[CAMPAIGN-ASSUMEUTXO] FATAL: failed to load {s}={s}: {}\n",
             .{ ENV_VAR, path, err },
@@ -215,9 +302,15 @@ pub fn ensureLoaded(allocator: std.mem.Allocator, builtin_entries: []const conse
     };
 }
 
+/// `builtin_entries` stays a separate parameter from `params` (rather than
+/// being read off `params.assume_utxo`) so the tests below can drive collision
+/// detection with an explicit table — including the empty one — independently
+/// of which network's consensus constants are in play. `ensureLoaded` passes
+/// `params.assume_utxo`, which is the production wiring.
 fn loadFromPath(
     allocator: std.mem.Allocator,
     path: []const u8,
+    params: *const consensus.NetworkParams,
     builtin_entries: []const consensus.AssumeUtxoData,
 ) !void {
     var file = try std.fs.cwd().openFile(path, .{});
@@ -297,7 +390,7 @@ fn loadFromPath(
             }
         }
 
-        const base_tail = try stageBaseTailHeaders(obj, height, block_hash);
+        const base_tail = try stageBaseTailHeaders(obj, height, block_hash, params);
 
         staged[staged_len] = .{
             .height = height,
@@ -376,7 +469,7 @@ test "campaign_assumeutxo: loadFromPath accepts a valid entry and populates entr
     );
     defer testing.allocator.free(path);
 
-    try loadFromPath(testing.allocator, path, &.{});
+    try loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{});
 
     const got = entries();
     try testing.expectEqual(@as(usize, 1), got.len);
@@ -405,7 +498,7 @@ test "campaign_assumeutxo: loadFromPath refuses collision with builtin (same hei
         .hash_serialized = consensus.hexToHash("a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"),
         .chain_tx_count = 1,
     }};
-    try testing.expectError(error.CollidesWithBuiltinEntry, loadFromPath(testing.allocator, path, &builtin));
+    try testing.expectError(error.CollidesWithBuiltinEntry, loadFromPath(testing.allocator, path, &consensus.MAINNET, &builtin));
     resetForTest();
 }
 
@@ -422,7 +515,7 @@ test "campaign_assumeutxo: loadFromPath refuses collision with builtin (same blo
     defer testing.allocator.free(path);
 
     const builtin = consensus.MAINNET.assume_utxo;
-    try testing.expectError(error.CollidesWithBuiltinEntry, loadFromPath(testing.allocator, path, builtin));
+    try testing.expectError(error.CollidesWithBuiltinEntry, loadFromPath(testing.allocator, path, &consensus.MAINNET, builtin));
     resetForTest();
 }
 
@@ -442,7 +535,7 @@ test "campaign_assumeutxo: loadFromPath refuses a duplicate height within the fi
     );
     defer testing.allocator.free(path);
 
-    try testing.expectError(error.DuplicateCampaignEntry, loadFromPath(testing.allocator, path, &.{}));
+    try testing.expectError(error.DuplicateCampaignEntry, loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{}));
     resetForTest();
 }
 
@@ -458,7 +551,7 @@ test "campaign_assumeutxo: loadFromPath rejects a non-positive height" {
     );
     defer testing.allocator.free(path);
 
-    try testing.expectError(error.InvalidHeight, loadFromPath(testing.allocator, path, &.{}));
+    try testing.expectError(error.InvalidHeight, loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{}));
     resetForTest();
 }
 
@@ -474,7 +567,7 @@ test "campaign_assumeutxo: loadFromPath rejects an invalid-length blockhash" {
     );
     defer testing.allocator.free(path);
 
-    try testing.expectError(error.InvalidHexLength, loadFromPath(testing.allocator, path, &.{}));
+    try testing.expectError(error.InvalidHexLength, loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{}));
     resetForTest();
 }
 
@@ -503,7 +596,7 @@ test "campaign_assumeutxo: base_tail_headers are consumed, hashed, and height-st
     const path = try writeTempJson(tmp_dir.dir, "campaign.json", json);
     defer testing.allocator.free(path);
 
-    try loadFromPath(testing.allocator, path, &.{});
+    try loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{});
     const got = entries();
     try testing.expectEqual(@as(usize, 1), got.len);
     const tail = got[0].base_tail_headers;
@@ -535,7 +628,7 @@ test "campaign_assumeutxo: base_tail_headers must end at the snapshot base" {
     const path = try writeTempJson(tmp_dir.dir, "campaign.json", json);
     defer testing.allocator.free(path);
 
-    try testing.expectError(error.BaseTailHeadersDoNotEndAtBase, loadFromPath(testing.allocator, path, &.{}));
+    try testing.expectError(error.BaseTailHeadersDoNotEndAtBase, loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{}));
     resetForTest();
 }
 
@@ -554,7 +647,7 @@ test "campaign_assumeutxo: a lone base_header is accepted as a one-block chain" 
     const path = try writeTempJson(tmp_dir.dir, "campaign.json", json);
     defer testing.allocator.free(path);
 
-    try loadFromPath(testing.allocator, path, &.{});
+    try loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{});
     const tail = entries()[0].base_tail_headers;
     try testing.expectEqual(@as(usize, 1), tail.len);
     try testing.expectEqual(@as(u32, 91_795), tail[0].height);
@@ -573,7 +666,125 @@ test "campaign_assumeutxo: an entry with no header fields still loads (schema-op
     );
     defer testing.allocator.free(path);
 
-    try loadFromPath(testing.allocator, path, &.{});
+    try loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{});
     try testing.expectEqual(@as(usize, 0), entries()[0].base_tail_headers.len);
+    resetForTest();
+}
+
+// ── 2026-09-05 adversarial probe: the three gaps it found ───────────────────
+// A hostile fixture was walked through the parser and, where it got that far,
+// through `--load-snapshot` against a real UTXO snapshot. Contents held (every
+// tamper bounced off linkage or the anchor); these are the cases that did not.
+
+/// Fabricated header: plausible mainnet nBits (0x1d00ffff) but no work behind
+/// it. Its own hash 052054de… is far above the 00000000ffff… target.
+const TEST_HDR_FABRICATED_NO_POW = "010000000000000000000000000000000000000000000000000000000000000000000000111111111111111111111111111111111111111111111111111111111111111100f15365ffff001d00000000";
+const TEST_HASH_FABRICATED_NO_POW = "052054defd7a24f7ab532d207979c9cc31987a81a53bbba049805e423f7119df";
+/// Same body with regtest nBits (0x207fffff): it DOES meet its own absurd
+/// target, so only the pow_limit gate can catch it on mainnet params.
+const TEST_HDR_TARGET_ABOVE_LIMIT = "010000000000000000000000000000000000000000000000000000000000000000000000111111111111111111111111111111111111111111111111111111111111111100f15365ffff7f2000000000";
+const TEST_HASH_TARGET_ABOVE_LIMIT = "7191afd24462547aa825ff538cfcc8842f04fe7f0467c872ca1f1f5a6596868f";
+
+test "campaign_assumeutxo: a self-consistent but fabricated band is refused (no PoW)" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    // The band is INTERNALLY consistent — the entry declares as its blockhash
+    // exactly the hash of the header it ships — so hash-linkage alone cannot
+    // reject it. Before the PoW gate this loaded, and was caught (if at all)
+    // only downstream, when `findAssumeUtxoEntry` failed to match a real
+    // snapshot's base hash. Now it dies at parse time.
+    const json = try std.fmt.allocPrint(testing.allocator,
+        \\[ {{ "height": 600001,
+        \\    "blockhash": "{s}",
+        \\    "hash_serialized": "cf05f1d9aaf934cd6dae809e2c318e226f36b6c49a4a47a7553deae8406cf53e",
+        \\    "m_chain_tx_count": 1000,
+        \\    "base_tail_headers": ["{s}"] }} ]
+    , .{ TEST_HASH_FABRICATED_NO_POW, TEST_HDR_FABRICATED_NO_POW });
+    defer testing.allocator.free(json);
+    const path = try writeTempJson(tmp_dir.dir, "campaign.json", json);
+    defer testing.allocator.free(path);
+
+    try testing.expectError(
+        error.BaseTailHeaderInsufficientPow,
+        loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{}),
+    );
+    resetForTest();
+}
+
+test "campaign_assumeutxo: a band header whose target exceeds pow_limit is refused" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const json = try std.fmt.allocPrint(testing.allocator,
+        \\[ {{ "height": 600001,
+        \\    "blockhash": "{s}",
+        \\    "hash_serialized": "cf05f1d9aaf934cd6dae809e2c318e226f36b6c49a4a47a7553deae8406cf53e",
+        \\    "m_chain_tx_count": 1000,
+        \\    "base_header": "{s}" }} ]
+    , .{ TEST_HASH_TARGET_ABOVE_LIMIT, TEST_HDR_TARGET_ABOVE_LIMIT });
+    defer testing.allocator.free(json);
+    const path = try writeTempJson(tmp_dir.dir, "campaign.json", json);
+    defer testing.allocator.free(path);
+
+    try testing.expectError(
+        error.BaseTailHeaderTargetAbovePowLimit,
+        loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{}),
+    );
+    resetForTest();
+}
+
+test "campaign_assumeutxo: a band reaching height 0 must reach genesis" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    // Two REAL mainnet headers (valid PoW, valid linkage, terminating at the
+    // declared blockhash) declared at `height: 1`, so the derivation puts
+    // header 91794 at height 0. Everything except the bottom-of-chain rule
+    // passes; without that rule this loaded and the import path would have
+    // written a non-genesis header into the "H:" index at height 0.
+    const json = try std.fmt.allocPrint(testing.allocator,
+        \\[ {{ "height": 1,
+        \\    "blockhash": "000000000008efd439511811080d3a7d832f862395ca0c1fc8cb060a72a8f7a8",
+        \\    "hash_serialized": "cf05f1d9aaf934cd6dae809e2c318e226f36b6c49a4a47a7553deae8406cf53e",
+        \\    "m_chain_tx_count": 142698,
+        \\    "base_tail_headers": ["{s}", "{s}"] }} ]
+    , .{ TEST_HDR_91794, TEST_HDR_91795 });
+    defer testing.allocator.free(json);
+    const path = try writeTempJson(tmp_dir.dir, "campaign.json", json);
+    defer testing.allocator.free(path);
+
+    try testing.expectError(
+        error.BaseTailHeadersDoNotStartAtGenesis,
+        loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{}),
+    );
+    resetForTest();
+}
+
+test "campaign_assumeutxo: the height label is NOT validated (documented gap)" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    // A GENUINE band (real headers, real PoW, real linkage, real terminal
+    // anchor) declared at a height it never occupied. This is ACCEPTED, and
+    // that is not an oversight: no header-local check can attest an absolute
+    // height. The guard against it is external — the env var is development-
+    // only and `tools/start_mainnet.sh` refuses to launch with it set. This
+    // test exists so the gap stays visible and cannot be quietly assumed shut.
+    const json = try std.fmt.allocPrint(testing.allocator,
+        \\[ {{ "height": 700000,
+        \\    "blockhash": "000000000008efd439511811080d3a7d832f862395ca0c1fc8cb060a72a8f7a8",
+        \\    "hash_serialized": "cf05f1d9aaf934cd6dae809e2c318e226f36b6c49a4a47a7553deae8406cf53e",
+        \\    "m_chain_tx_count": 142698,
+        \\    "base_tail_headers": ["{s}", "{s}"] }} ]
+    , .{ TEST_HDR_91794, TEST_HDR_91795 });
+    defer testing.allocator.free(json);
+    const path = try writeTempJson(tmp_dir.dir, "campaign.json", json);
+    defer testing.allocator.free(path);
+
+    try loadFromPath(testing.allocator, path, &consensus.MAINNET, &.{});
+    const tail = entries()[0].base_tail_headers;
+    try testing.expectEqual(@as(u32, 699_999), tail[0].height);
+    try testing.expectEqual(@as(u32, 700_000), tail[1].height);
     resetForTest();
 }

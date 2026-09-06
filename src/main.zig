@@ -201,7 +201,7 @@ pub const Config = struct {
             .regtest => &consensus.REGTEST,
         };
 
-        campaign_assumeutxo.ensureLoaded(std.heap.page_allocator, base.assume_utxo);
+        campaign_assumeutxo.ensureLoaded(std.heap.page_allocator, base);
         const campaign_entries = campaign_assumeutxo.entries();
 
         if (!self.noassumevalid and campaign_entries.len == 0) {
