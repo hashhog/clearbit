@@ -101,7 +101,12 @@ pub fn build(b: *std.Build) void {
 
     // Main test step uses tests.zig as root for comprehensive test coverage
     const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/tests.zig"),
+        // Rooted at the PROJECT ROOT via tests_all.zig, not at src/tests.zig:
+        // rooting inside src/ puts the package path there, so wallet.zig's
+        // @embedFile("../resources/bip39-english.txt") escapes it and the whole
+        // module fails to compile. Same wrapper pattern as the wallet test
+        // steps below.
+        .root_source_file = b.path("tests_all.zig"),
         .target = target,
         .optimize = optimize,
     });
