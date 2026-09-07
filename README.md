@@ -4,6 +4,11 @@ A Bitcoin full node written from scratch in Zig. Part of the Hashhog project.
 
 ## Status — v1.0.0
 
+> **Every `receipts/…`, `tools/…`, `docs/…` and `CORE-PARITY-AUDIT/…` path cited in
+> this section is in the hashhog meta-repo, which is permanently private.** Those
+> citations are maintainer provenance, not evidence you can check. The full note on
+> what that does and does not leave verifiable is further down this section.
+
 **Label: "Validated — reproduced Core's UTXO set from genesis with all scripts
 verified"** (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That
 label means one specific thing: clearbit connected every mainnet block from block 0
@@ -49,9 +54,9 @@ meta-repo, which is **not public** — see the note below.
 
 > **The cited paths are NOT publicly readable — do not treat them as evidence.**
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
-> the hashhog meta-repo, which is a **private** repository, not to this one. They
-> are provenance for the maintainers. From outside, any claim resting only on such
-> a path is **unverified**, and you should read it as such.
+> the hashhog meta-repo, which is a **permanently private** repository, not to
+> this one. They are provenance for the maintainers. From outside, any claim
+> resting only on such a path is **unverified**, and you should read it as such.
 >
 > Two of those paths are unreadable even with the meta-repo in hand: the R5 probe
 > JSON is gitignored (`.gitignore:60  tools/diff-test-artifacts/`) and so are the
