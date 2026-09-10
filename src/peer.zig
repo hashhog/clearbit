@@ -14,6 +14,11 @@ const asmap_mod = @import("asmap.zig");
 const proxy_mod = @import("proxy.zig");
 const wallet_mod = @import("wallet.zig");
 const addrman_mod = @import("addrman.zig");
+const chainwork_mod = @import("chainwork.zig");
+
+pub const addChainWorkBE = chainwork_mod.addChainWorkBE;
+pub const workFromBits = chainwork_mod.workFromBits;
+pub const cmpChainWorkBE = chainwork_mod.cmpChainWorkBE;
 
 // ============================================================================
 // Peer Manager Constants
@@ -190,155 +195,12 @@ pub const PendingReorg = struct {
 };
 
 // =====================================================================
-// Chain-work helpers (256-bit big-endian).
-//
-// Bitcoin Core's GetBlockProof returns work = (~target / (target + 1)) + 1
-// where target is the 256-bit difficulty target derived from header.bits.
-// We mirror that math here using 64-bit limbs (4 limbs = 256 bits).
-//
-// Chain work for an entry = parent.chain_work + GetBlockProof(this header).
-// Stored big-endian to keep byte-comparison semantics (matches
-// validation.BlockIndexEntry.chain_work and ChainManager.compareChainWork).
+// Chain-work helpers (256-bit big-endian) live in chainwork.zig
+// (GetBlockProof) and are re-exported above so existing call sites keep
+// compiling.  Header-index work is still since-root (chainWorkFromHeight
+// + SUM(workFromBits)); that scale is NOT genesis nChainWork and must
+// not be copied into ChainState.total_work.
 // =====================================================================
-
-/// In-place big-endian 256-bit add: a += b.  No-op on overflow (chainwork
-/// values used here are sums of GetBlockProof results — overflow would
-/// require >2^256 cumulative work, which is impossible at any realistic
-/// difficulty).  Suppressing wrap silently is acceptable.
-pub fn addChainWorkBE(a: *[32]u8, b: *const [32]u8) void {
-    var carry: u16 = 0;
-    var i: usize = 32;
-    while (i > 0) {
-        i -= 1;
-        const sum = @as(u16, a[i]) + @as(u16, b[i]) + carry;
-        a[i] = @intCast(sum & 0xFF);
-        carry = sum >> 8;
-    }
-    // Drop final carry (overflow); see comment above.
-}
-
-/// Compute GetBlockProof for one header, given the compact-target bits.
-/// Returns the work as a 32-byte big-endian array.
-///
-/// Bitcoin Core (validation.cpp::GetBlockProof):
-///   bnTarget = ArithToUint256(...) from nBits
-///   return (~bnTarget / (bnTarget + 1)) + 1
-///
-/// All math is done on 32-byte big-endian arrays via byte-level
-/// helpers; this keeps the call cost bounded (no allocator) and
-/// matches the storage representation exactly.  When bnTarget is zero
-/// (which the SetCompact contract treats as "negative or overflow")
-/// we return zero work.
-pub fn workFromBits(bits: u32) [32]u8 {
-    const zero: [32]u8 = [_]u8{0} ** 32;
-    // bitsToTarget returns little-endian; convert to big-endian for math.
-    const target_le = consensus.bitsToTarget(bits);
-    var target_be: [32]u8 = undefined;
-    {
-        var i: usize = 0;
-        while (i < 32) : (i += 1) target_be[i] = target_le[31 - i];
-    }
-    // Quick zero check.
-    var nonzero = false;
-    for (target_be) |b| {
-        if (b != 0) {
-            nonzero = true;
-            break;
-        }
-    }
-    if (!nonzero) return zero;
-
-    // Compute ~target.
-    var nt: [32]u8 = undefined;
-    {
-        var i: usize = 0;
-        while (i < 32) : (i += 1) nt[i] = ~target_be[i];
-    }
-
-    // Compute target + 1 (carry-propagate from low byte = index 31 → 0).
-    var t_plus_1: [32]u8 = target_be;
-    {
-        var carry: u16 = 1;
-        var j: usize = 32;
-        while (j > 0 and carry != 0) {
-            j -= 1;
-            const sum = @as(u16, t_plus_1[j]) + carry;
-            t_plus_1[j] = @intCast(sum & 0xFF);
-            carry = sum >> 8;
-        }
-    }
-
-    // Long-divide nt by t_plus_1 using 256-bit shift-and-subtract.
-    // This bounds runtime at 256 iterations per header — slower than a
-    // bigint divide but allocator-free and correct for arbitrary bits.
-    var quotient: [32]u8 = [_]u8{0} ** 32;
-    var remainder: [32]u8 = [_]u8{0} ** 32;
-
-    // Process bits MSB→LSB.
-    var bit_i: usize = 0;
-    while (bit_i < 256) : (bit_i += 1) {
-        // Shift remainder left by 1.
-        var carry_bit: u8 = 0;
-        var j: usize = 32;
-        while (j > 0) {
-            j -= 1;
-            const new_carry: u8 = (remainder[j] >> 7) & 1;
-            remainder[j] = (remainder[j] << 1) | carry_bit;
-            carry_bit = new_carry;
-        }
-        // Pull next bit of nt into remainder LSB.
-        const byte_i: usize = bit_i / 8;
-        const bit_off: u3 = @intCast(7 - (bit_i % 8));
-        const next_bit: u8 = (nt[byte_i] >> bit_off) & 1;
-        remainder[31] |= next_bit;
-
-        // If remainder >= t_plus_1 then quotient bit = 1, remainder -= divisor.
-        if (cmpChainWorkBE(&remainder, &t_plus_1) >= 0) {
-            // remainder -= t_plus_1.
-            var borrow: i16 = 0;
-            var k: usize = 32;
-            while (k > 0) {
-                k -= 1;
-                const diff: i16 = @as(i16, remainder[k]) - @as(i16, t_plus_1[k]) - borrow;
-                if (diff < 0) {
-                    remainder[k] = @intCast(diff + 256);
-                    borrow = 1;
-                } else {
-                    remainder[k] = @intCast(diff);
-                    borrow = 0;
-                }
-            }
-            // Set quotient bit at position bit_i.
-            quotient[byte_i] |= (@as(u8, 1) << bit_off);
-        }
-    }
-
-    // quotient += 1 (Core's GetBlockProof).
-    {
-        var carry: u16 = 1;
-        var j: usize = 32;
-        while (j > 0 and carry != 0) {
-            j -= 1;
-            const sum = @as(u16, quotient[j]) + carry;
-            quotient[j] = @intCast(sum & 0xFF);
-            carry = sum >> 8;
-        }
-    }
-
-    return quotient;
-}
-
-/// Compare two 256-bit big-endian chain-work values.  Returns >0 if
-/// a > b, <0 if a < b, 0 if equal.  Mirrors
-/// validation.ChainManager.compareChainWork.
-pub fn cmpChainWorkBE(a: *const [32]u8, b: *const [32]u8) i32 {
-    var i: usize = 0;
-    while (i < 32) : (i += 1) {
-        if (a[i] > b[i]) return 1;
-        if (a[i] < b[i]) return -1;
-    }
-    return 0;
-}
 
 /// Synthesize a placeholder big-endian chain_work value for an
 /// active-chain entry whose true cumulative work isn't tracked.
@@ -1916,28 +1778,30 @@ pub const Peer = struct {
 
         if (self.direction == .outbound) {
             // Send our version
-            const version_msg = p2p.Message{ .version = p2p.VersionMessage{
-                .version = p2p.PROTOCOL_VERSION,
-                .services = our_services,
-                .timestamp = now,
-                .addr_recv = types.NetworkAddress{
-                    .services = 0,
-                    .ip = [_]u8{0} ** 16,
-                    .port = 0,
-                },
-                .addr_from = types.NetworkAddress{
+            const version_msg = p2p.Message{
+                .version = p2p.VersionMessage{
+                    .version = p2p.PROTOCOL_VERSION,
                     .services = our_services,
-                    .ip = [_]u8{0} ** 16,
-                    .port = 0,
+                    .timestamp = now,
+                    .addr_recv = types.NetworkAddress{
+                        .services = 0,
+                        .ip = [_]u8{0} ** 16,
+                        .port = 0,
+                    },
+                    .addr_from = types.NetworkAddress{
+                        .services = our_services,
+                        .ip = [_]u8{0} ** 16,
+                        .port = 0,
+                    },
+                    .nonce = std.crypto.random.int(u64),
+                    .user_agent = p2p.USER_AGENT,
+                    .start_height = our_height,
+                    // fRelay: false for feeler / block-relay-only connections so the
+                    // peer does not start an inv-based tx relay (Core net.cpp builds
+                    // the version with tx_relay = !block_relay_only).
+                    .relay = self.relay_self,
                 },
-                .nonce = std.crypto.random.int(u64),
-                .user_agent = p2p.USER_AGENT,
-                .start_height = our_height,
-                // fRelay: false for feeler / block-relay-only connections so the
-                // peer does not start an inv-based tx relay (Core net.cpp builds
-                // the version with tx_relay = !block_relay_only).
-                .relay = self.relay_self,
-            } };
+            };
             try self.sendMessage(&version_msg);
             self.state = .version_sent;
 
@@ -3904,7 +3768,10 @@ pub const PeerManager = struct {
                 if (!is_loopback) {
                     is_loopback = true;
                     for (b[0..15]) |v| {
-                        if (v != 0) { is_loopback = false; break; }
+                        if (v != 0) {
+                            is_loopback = false;
+                            break;
+                        }
                     }
                     if (is_loopback) is_loopback = (b[15] == 1);
                 }
@@ -4496,9 +4363,7 @@ pub const PeerManager = struct {
         // allow up to MAX_OUTBOUND_CONNECTIONS attempts so we recover quickly
         // instead of waiting for the loop to cycle once per peer slot.
         var attempts: u32 = 0;
-        const max_attempts: u32 = if (!self.isIBD()) 8
-                                  else if (outbound_count == 0) MAX_OUTBOUND_CONNECTIONS
-                                  else 1;
+        const max_attempts: u32 = if (!self.isIBD()) 8 else if (outbound_count == 0) MAX_OUTBOUND_CONNECTIONS else 1;
 
         while (outbound_count < MAX_OUTBOUND_CONNECTIONS and attempts < max_attempts) {
             attempts += 1;
@@ -5921,8 +5786,7 @@ pub const PeerManager = struct {
                     const our_height = if (self.chain_state) |cs| cs.best_height else 0;
                     const best_peer_h = self.getBestPeerHeight();
                     if (our_height + self.expected_blocks.items.len < best_peer_h) {
-                        std.debug.print("P2P: 0 headers but behind peers (ours={d}+{d}, best_peer={d}), retrying\n",
-                            .{ our_height, self.expected_blocks.items.len, best_peer_h });
+                        std.debug.print("P2P: 0 headers but behind peers (ours={d}+{d}, best_peer={d}), retrying\n", .{ our_height, self.expected_blocks.items.len, best_peer_h });
                         // Try sending getheaders to a different peer
                         if (self.pickSyncPeer(peer)) |alt_peer| {
                             self.sendGetHeaders(alt_peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
@@ -5942,8 +5806,7 @@ pub const PeerManager = struct {
                         }
                         // Headers synced but blocks still behind: keep the block
                         // download pipeline running.
-                        std.debug.print("P2P: headers synced at height {d}, blocks at {d} (queue={d}), continuing block download\n",
-                            .{ our_height + (self.expected_blocks.items.len - self.connect_cursor), our_height, self.expected_blocks.items.len - self.connect_cursor });
+                        std.debug.print("P2P: headers synced at height {d}, blocks at {d} (queue={d}), continuing block download\n", .{ our_height + (self.expected_blocks.items.len - self.connect_cursor), our_height, self.expected_blocks.items.len - self.connect_cursor });
                         self.pipelineBlockRequests() catch {};
                     }
                     return;
@@ -5960,8 +5823,7 @@ pub const PeerManager = struct {
                     // so the first batch of headers (whose prev_block is the
                     // genesis hash) chains correctly.
                     break :blk if (cs.best_height == 0) self.network_params.genesis_hash else cs.best_hash;
-                } else
-                    self.network_params.genesis_hash;
+                } else self.network_params.genesis_hash;
 
                 // ============================================================
                 // CLEARBIT_REORG=1: classify the header batch into one of
@@ -6251,8 +6113,7 @@ pub const PeerManager = struct {
                                 // min_chain_work; a further below-threshold
                                 // batch is a low-work chain that cannot advance
                                 // us — steady-state DoS drop.
-                                std.debug.print("P2P: peer={any} rejected: too-little-chainwork (low-work chain after min-work reached)\n",
-                                    .{peer.address});
+                                std.debug.print("P2P: peer={any} rejected: too-little-chainwork (low-work chain after min-work reached)\n", .{peer.address});
                                 peer.misbehaving(100, "too-little-chainwork");
                                 return;
                             },
@@ -8195,7 +8056,7 @@ pub const PeerManager = struct {
                 // correctly contributes nothing this round.
                 if (tp_limited and tp.best_known_height != 0 and
                     (@as(i64, @intCast(tp.best_known_height)) - h_height) >=
-                        NODE_NETWORK_LIMITED_MIN_BLOCKS - 2)
+                    NODE_NETWORK_LIMITED_MIN_BLOCKS - 2)
                 {
                     break;
                 }
@@ -9491,8 +9352,7 @@ pub const PeerManager = struct {
                             // Find which expected_blocks index the buffered
                             // hash corresponds to — bounded scan to keep
                             // this cheap during the wedge spin loop.
-                            const scan_max = @min(self.expected_blocks.items.len,
-                                self.connect_cursor + 4096);
+                            const scan_max = @min(self.expected_blocks.items.len, self.connect_cursor + 4096);
                             var i = self.connect_cursor;
                             while (i < scan_max) : (i += 1) {
                                 if (std.mem.eql(u8, &self.expected_blocks.items[i], &kv.key_ptr.*)) {
@@ -9977,8 +9837,7 @@ pub const PeerManager = struct {
             if (!self.block_buffer.contains(gap_hash)) {
                 // The block at the connection front is missing and was already
                 // "requested" (download_cursor passed it) — rewind to re-request.
-                std.debug.print("P2P: gap-stall recovery: block at connect_cursor={d} missing, rewinding download_cursor\n",
-                    .{self.connect_cursor});
+                std.debug.print("P2P: gap-stall recovery: block at connect_cursor={d} missing, rewinding download_cursor\n", .{self.connect_cursor});
                 self.download_cursor = self.connect_cursor;
             }
         }

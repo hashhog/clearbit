@@ -10,6 +10,7 @@ const validation = @import("validation.zig");
 const types = @import("types.zig");
 const consensus = @import("consensus.zig");
 const serialize = @import("serialize.zig");
+const chainwork = @import("chainwork.zig");
 
 // ============================================================================
 // G1 — BlockStatus: BLOCK_VALID_* graduated-validity levels missing
@@ -259,20 +260,56 @@ test "w109 G9: getBlockIndexFull silently zero-fills truncated records (BUG-9 do
 }
 
 // ============================================================================
-// G10 — ChainState.total_work: declared but never updated
+// G10 — ChainState.total_work: genesis-scale GetBlockProof accumulation
 // ============================================================================
 //
-// Spec: ConnectBlock accumulates chainwork per block.
-//
-// BUG-10 (HIGH): total_work init to [0]*32 and never updated anywhere.
-// rpc.zig reads it for "chainwork" field — always "0000...0000".
-// Min-chainwork comparison at rpc.zig:11726 always fails (0 < any real value).
+// Spec: ConnectBlock accumulates nChainWork = parent + GetBlockProof(block)
+// (Core chain.cpp GetBitsProof).  Genesis is seeded with GetBlockProof(genesis).
 
-test "w109 G10: ChainState.total_work is never updated — stays zero (BUG-10)" {
+test "w109 G10: connect accumulates genesis-scale GetBlockProof into total_work" {
     const allocator = std.testing.allocator;
     var cs = storage.ChainState.init(null, 64, allocator);
     defer cs.deinit();
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &cs.total_work);
+    cs.wireUtxoParent();
+    cs.seedGenesisTotalWork(0x1d00ffff);
+
+    const genesis_proof = chainwork.workFromBits(0x1d00ffff);
+    try std.testing.expectEqualSlices(u8, &genesis_proof, &cs.total_work);
+
+    const coinbase_input = types.TxIn{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const coinbase_output = types.TxOut{
+        .value = 5000000000,
+        .script_pubkey = &[_]u8{0x51},
+    };
+    const coinbase_tx = types.Transaction{
+        .version = 1,
+        .inputs = &[_]types.TxIn{coinbase_input},
+        .outputs = &[_]types.TxOut{coinbase_output},
+        .lock_time = 0,
+    };
+    const block1 = types.Block{
+        .header = types.BlockHeader{
+            .version = 1,
+            .prev_block = [_]u8{0} ** 32,
+            .merkle_root = [_]u8{0xAA} ** 32,
+            .timestamp = 1231006506,
+            .bits = 0x1d00ffff,
+            .nonce = 0,
+        },
+        .transactions = &[_]types.Transaction{coinbase_tx},
+    };
+    const bh1 = [_]u8{0x01} ** 32;
+    try cs.connectBlockFast(&block1, &bh1, 1);
+
+    var want = genesis_proof;
+    chainwork.addChainWorkBE(&want, &genesis_proof);
+    try std.testing.expectEqualSlices(u8, &want, &cs.total_work);
+    try std.testing.expect(!chainwork.isZero(&cs.total_work));
 }
 
 // ============================================================================
@@ -389,15 +426,19 @@ test "w109 G15: block_index is AutoHashMap — iteration order non-deterministic
 //
 // BUG-16 (MEDIUM): loadGenesis (validation.zig:6359) sets chain_work = [0]*32.
 
-test "w109 G16: loadGenesis sets chain_work = 0 (BUG-16)" {
+test "w109 G16: loadGenesis seeds chain_work = GetBlockProof(genesis)" {
     const allocator = std.testing.allocator;
     var mgr = validation.ChainManager.init(null, null, allocator);
     defer mgr.deinit();
     try mgr.loadGenesis(&consensus.MAINNET);
     const genesis = mgr.getBlock(&consensus.MAINNET.genesis_hash).?;
-    // BUG-16: should be non-zero (GetBlockProof(genesis.nBits))
-    const zero = [_]u8{0} ** 32;
-    try std.testing.expectEqualSlices(u8, &zero, &genesis.chain_work);
+    const want = chainwork.workFromBits(consensus.MAINNET.genesis_header.bits);
+    try std.testing.expectEqualSlices(u8, &want, &genesis.chain_work);
+    const hex = chainwork.toHex(&genesis.chain_work);
+    try std.testing.expectEqualStrings(
+        "0000000000000000000000000000000000000000000000000000000100010001",
+        &hex,
+    );
 }
 
 // ============================================================================
@@ -667,19 +708,122 @@ test "w109 G25: HEIGHT_HASH_KEY format = 'H:' (2 bytes) + u32 LE (4 bytes)" {
 }
 
 // ============================================================================
-// G26 — GetBlockProof accumulation absent from connect path
+// G26 — persisted genesis-scale nChainWork survives restart
 // ============================================================================
 //
-// BUG-26 (HIGH): connectBlockInner never calls GetBlockProof or accumulates
-// work into total_work or any BlockIndexEntry.chain_work.
+// Control: if connect stops writing total_work / restore stops reading it,
+// this fails.  Header-index since-root work is not a substitute.
 
-test "w109 G26: total_work stays zero — GetBlockProof never called in connect path (BUG-26)" {
+test "w109 G26: total_work persists across reopen (genesis-scale, not since-root)" {
     const allocator = std.testing.allocator;
-    var cs = storage.ChainState.init(null, 64, allocator);
+    const Database = storage.Database;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    const genesis_proof = chainwork.workFromBits(0x1d00ffff);
+    var want = genesis_proof;
+    chainwork.addChainWorkBE(&want, &genesis_proof);
+
+    {
+        var db = try Database.open(path, 64, allocator);
+        defer db.close();
+        var cs = storage.ChainState.init(&db, 64, allocator);
+        defer cs.deinit();
+        cs.wireUtxoParent();
+        cs.seedGenesisTotalWork(0x1d00ffff);
+
+        const coinbase_input = types.TxIn{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = &[_]u8{ 0x03, 0x01, 0x00, 0x00 },
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        };
+        const coinbase_output = types.TxOut{
+            .value = 5000000000,
+            .script_pubkey = &[_]u8{0x51},
+        };
+        const coinbase_tx = types.Transaction{
+            .version = 1,
+            .inputs = &[_]types.TxIn{coinbase_input},
+            .outputs = &[_]types.TxOut{coinbase_output},
+            .lock_time = 0,
+        };
+        const block1 = types.Block{
+            .header = types.BlockHeader{
+                .version = 1,
+                .prev_block = [_]u8{0} ** 32,
+                .merkle_root = [_]u8{0xAA} ** 32,
+                .timestamp = 1231006506,
+                .bits = 0x1d00ffff,
+                .nonce = 0,
+            },
+            .transactions = &[_]types.Transaction{coinbase_tx},
+        };
+        const bh1 = [_]u8{0x01} ** 32;
+        try cs.connectBlockFast(&block1, &bh1, 1);
+        try std.testing.expectEqualSlices(u8, &want, &cs.total_work);
+    }
+
+    {
+        var db = try Database.open(path, 64, allocator);
+        defer db.close();
+        var cs = storage.ChainState.init(&db, 64, allocator);
+        defer cs.deinit();
+        cs.best_height = 1;
+        cs.restoreTotalWork(&consensus.MAINNET);
+        try std.testing.expectEqualSlices(u8, &want, &cs.total_work);
+        const hex = chainwork.toHex(&cs.total_work);
+        try std.testing.expectEqualStrings(
+            "0000000000000000000000000000000000000000000000000000000200020002",
+            &hex,
+        );
+    }
+}
+
+test "w109 G26b: restore reconstructs from snapshot checkpoint + header walk" {
+    const allocator = std.testing.allocator;
+    const Database = storage.Database;
+    const snap = consensus.MAINNET.snapshot_bootstrap[0];
+    try std.testing.expect(!chainwork.isZero(&snap.chain_work));
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
     defer cs.deinit();
-    cs.best_height = 900_000; // simulate deep IBD
-    // BUG-26: total_work is still all-zero despite 900k blocks "connected"
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &cs.total_work);
+
+    const hh_base = storage.ChainStore.buildHeightHashKey(snap.height);
+    try db.put(storage.CF_DEFAULT, &hh_base, &snap.block_hash);
+
+    const next_hash = [_]u8{0x22} ** 32;
+    const next_h = snap.height + 1;
+    const hh_next = storage.ChainStore.buildHeightHashKey(next_h);
+    try db.put(storage.CF_DEFAULT, &hh_next, &next_hash);
+
+    var hdr = std.mem.zeroes(types.BlockHeader);
+    hdr.bits = 0x1d00ffff;
+    hdr.timestamp = 1_775_650_300;
+    var rec_w = serialize.Writer.init(allocator);
+    defer rec_w.deinit();
+    rec_w.writeInt(u32, next_h) catch unreachable;
+    serialize.writeBlockHeader(&rec_w, &hdr) catch unreachable;
+    try db.put(storage.CF_BLOCK_INDEX, &next_hash, rec_w.getWritten());
+
+    cs.best_height = next_h;
+    cs.best_hash = next_hash;
+    cs.restoreTotalWork(&consensus.MAINNET);
+
+    var want = snap.chain_work;
+    const proof = chainwork.workFromBits(0x1d00ffff);
+    chainwork.addChainWorkBE(&want, &proof);
+    try std.testing.expectEqualSlices(u8, &want, &cs.total_work);
 }
 
 // ============================================================================

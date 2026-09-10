@@ -544,6 +544,12 @@ pub const AssumeUtxoData = struct {
     /// placeholder poisons the partial median → BIP-68 time-lock false-reject.
     /// Empty = none baked (canonical Core assumeutxo entries leave it empty).
     base_tail_headers: []const BaseTailHeader = &.{},
+    /// Cumulative nChainWork at this height (Core GetHex / 32-byte big-endian).
+    /// Not in Core's m_assumeutxo_data — Core header-syncs from genesis and
+    /// computes it.  Baked here because a snapshot-bootstrapped clearbit has
+    /// no pre-base headers, so genesis-scale chainwork cannot be reconstructed
+    /// from the datadir alone.  All-zero = unknown.
+    chain_work: [32]u8 = [_]u8{0} ** 32,
 };
 
 /// Standard Satoshi genesis coinbase output scriptPubKey (P2PK):
@@ -667,24 +673,28 @@ pub const MAINNET = NetworkParams{
             .block_hash = hexToHash("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
             .hash_serialized = hexToHash("a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"),
             .chain_tx_count = 991_032_194,
+            .chain_work = hexToBytes32BE("0000000000000000000000000000000000000000753bdab0e0d745453677442b"),
         },
         .{
             .height = 880_000,
             .block_hash = hexToHash("000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"),
             .hash_serialized = hexToHash("dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"),
             .chain_tx_count = 1_145_604_538,
+            .chain_work = hexToBytes32BE("0000000000000000000000000000000000000000a879619cfddf806d3bdf607b"),
         },
         .{
             .height = 910_000,
             .block_hash = hexToHash("0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"),
             .hash_serialized = hexToHash("4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"),
             .chain_tx_count = 1_226_586_151,
+            .chain_work = hexToBytes32BE("0000000000000000000000000000000000000000da15bcbf68ad7fed795c504f"),
         },
         .{
             .height = 935_000,
             .block_hash = hexToHash("0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"),
             .hash_serialized = hexToHash("e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"),
             .chain_tx_count = 1_305_397_408,
+            .chain_work = hexToBytes32BE("00000000000000000000000000000000000000010c5d28e9a19a225fb7c9e2fd"),
         },
     },
     // hashhog-only snapshot-bootstrap allowlist (NOT in Bitcoin Core's
@@ -699,6 +709,7 @@ pub const MAINNET = NetworkParams{
             .block_hash = hexToHash("0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"),
             .hash_serialized = hexToHash("2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"),
             .chain_tx_count = 1_334_000_000,
+            .chain_work = hexToBytes32BE("00000000000000000000000000000000000000011de68a167d5dad115a96be80"),
             // GetMedianTimePast of block 944183 (Core getblockheader.mediantime).
             // Seeds the post-snapshot MTP window so blocks 944184..~944194 enforce
             // BIP-113 against the real base MTP instead of falling back to 0.
@@ -1588,6 +1599,19 @@ pub fn multiplyTargetByRatio(target: *const [32]u8, numerator: u32, denominator:
 // Helper Functions
 // ============================================================================
 
+/// Comptime hex → 32 bytes, decoded STRAIGHT (no reversal).  Use for
+/// chainwork / GetHex values.  Display block hashes go through hexToHash.
+pub fn hexToBytes32BE(comptime hex: *const [64:0]u8) [32]u8 {
+    @setEvalBranchQuota(100000);
+    comptime {
+        var out: [32]u8 = undefined;
+        for (0..32) |i| {
+            out[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch unreachable;
+        }
+        return out;
+    }
+}
+
 /// Helper: convert hex string to Hash256 at comptime.
 /// The hash is reversed because Bitcoin displays hashes in big-endian
 /// but stores them internally in little-endian.
@@ -1804,7 +1828,7 @@ test "W76: weight constants correct values" {
     try std.testing.expectEqual(@as(u32, 4_000_000), MAX_BLOCK_WEIGHT);
     try std.testing.expectEqual(@as(u32, 400_000), MAX_STANDARD_TX_WEIGHT);
     try std.testing.expectEqual(@as(u32, 4), WITNESS_SCALE_FACTOR);
-    try std.testing.expectEqual(@as(u32, 240), MIN_TRANSACTION_WEIGHT);       // 4 × 60
+    try std.testing.expectEqual(@as(u32, 240), MIN_TRANSACTION_WEIGHT); // 4 × 60
     try std.testing.expectEqual(@as(u32, 40), MIN_SERIALIZABLE_TRANSACTION_WEIGHT); // 4 × 10
     try std.testing.expectEqual(@as(u32, 20), DEFAULT_BYTES_PER_SIGOP);
     // Cross-check derived constants
@@ -1818,7 +1842,7 @@ test "W76: legacy tx weight = 4 × size" {
     // Pick an arbitrary size; verify formula holds.
     const legacy_size: u64 = 200; // arbitrary non-witness serialized size
     const weight = legacy_size * (WITNESS_SCALE_FACTOR - 1) + legacy_size;
-    try std.testing.expectEqual(@as(u64, 800), weight);    // 4 × 200
+    try std.testing.expectEqual(@as(u64, 800), weight); // 4 × 200
     try std.testing.expectEqual(legacy_size * 4, weight);
 }
 
@@ -2223,7 +2247,10 @@ test "W83: multiplyTargetByRatio 4x scale-up (easy case)" {
     var i: usize = 32;
     while (i > 0) {
         i -= 1;
-        if (result[i] > target[i]) { result_larger = true; break; }
+        if (result[i] > target[i]) {
+            result_larger = true;
+            break;
+        }
         if (result[i] < target[i]) break;
     }
     try std.testing.expect(result_larger);
@@ -2243,7 +2270,10 @@ test "W83: multiplyTargetByRatio regtest 0x207fffff no carry overflow" {
     while (j > 0) {
         j -= 1;
         if (result[j] > target[j]) break;
-        if (result[j] < target[j]) { result_ge_target = false; break; }
+        if (result[j] < target[j]) {
+            result_ge_target = false;
+            break;
+        }
     }
     try std.testing.expect(result_ge_target);
 }

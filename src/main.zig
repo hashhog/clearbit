@@ -119,16 +119,16 @@ pub const Config = struct {
     logfile: ?[]const u8 = null,
 
     // Operational parity (mirrors Bitcoin Core's init.cpp argspec).
-    daemon: bool = false,                       // --daemon: fork+setsid, detach from tty
-    pidfile: ?[]const u8 = null,                // --pid=<path>; default <datadir>/clearbit.pid
-    conf_path: ?[]const u8 = null,              // --conf=<file>: explicit config file location
-    reindex: bool = false,                      // --reindex: rebuild block index/UTXO from CF_BLOCKS
-    ready_fd: i32 = -1,                         // --ready-fd=<N>: write READY=1\n to fd N once up
-    zmq_rawblock: ?[]const u8 = null,           // --zmqpubrawblock=tcp://...
-    zmq_hashblock: ?[]const u8 = null,          // --zmqpubhashblock=...
-    zmq_rawtx: ?[]const u8 = null,              // --zmqpubrawtx=...
-    zmq_hashtx: ?[]const u8 = null,             // --zmqpubhashtx=...
-    zmq_sequence: ?[]const u8 = null,           // --zmqpubsequence=...
+    daemon: bool = false, // --daemon: fork+setsid, detach from tty
+    pidfile: ?[]const u8 = null, // --pid=<path>; default <datadir>/clearbit.pid
+    conf_path: ?[]const u8 = null, // --conf=<file>: explicit config file location
+    reindex: bool = false, // --reindex: rebuild block index/UTXO from CF_BLOCKS
+    ready_fd: i32 = -1, // --ready-fd=<N>: write READY=1\n to fd N once up
+    zmq_rawblock: ?[]const u8 = null, // --zmqpubrawblock=tcp://...
+    zmq_hashblock: ?[]const u8 = null, // --zmqpubhashblock=...
+    zmq_rawtx: ?[]const u8 = null, // --zmqpubrawtx=...
+    zmq_hashtx: ?[]const u8 = null, // --zmqpubhashtx=...
+    zmq_sequence: ?[]const u8 = null, // --zmqpubsequence=...
 
     // Benchmarking
     run_benchmark: bool = false,
@@ -1491,6 +1491,29 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
         std.debug.print("Warning: Failed to write base height→hash index entry: {}\n", .{err});
     };
 
+    // Genesis-scale nChainWork at the snapshot base (Core GetHex).  The
+    // snapshot file has no headers below the base, so this baked value is
+    // the only way to seed getblockchaininfo.chainwork / IBD / nethash
+    // without a from-genesis header walk.
+    if (assume_entry) |e| {
+        var all_zero = true;
+        for (e.chain_work) |b| {
+            if (b != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (!all_zero) {
+            db.put(storage.CF_DEFAULT, storage.ChainState.CHAIN_WORK_KEY, &e.chain_work) catch |err| {
+                std.debug.print("Warning: Failed to persist snapshot chainwork: {}\n", .{err});
+            };
+            const wk = storage.ChainStore.buildChainWorkKey(block_height);
+            db.put(storage.CF_DEFAULT, &wk, &e.chain_work) catch |err| {
+                std.debug.print("Warning: Failed to persist snapshot W: chainwork: {}\n", .{err});
+            };
+        }
+    }
+
     db.flush() catch |err| {
         std.debug.print("Warning: RocksDB flush error: {}\n", .{err});
     };
@@ -1818,8 +1841,7 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
             const elapsed_ms = std.time.milliTimestamp() - start_time;
             const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
             const rate = if (elapsed_s > 0) @as(f64, @floatFromInt(count)) / elapsed_s else 0.0;
-            std.debug.print("\rImported {d} blocks (height {d}, {d:.1} blk/s, scripts: {d} run / {d} skipped)",
-                .{ count, last_height, rate, scripts_run, scripts_skipped });
+            std.debug.print("\rImported {d} blocks (height {d}, {d:.1} blk/s, scripts: {d} run / {d} skipped)", .{ count, last_height, rate, scripts_run, scripts_skipped });
         }
     }
 
@@ -2092,6 +2114,11 @@ pub fn main() !void {
     // from the persisted tip entry instead (see ChainState.restoreChainTxCount).
     chain_state.seedGenesisTxCount();
 
+    // Seed nChainWork(genesis) = GetBlockProof(genesis).  Same restart
+    // pattern as seedGenesisTxCount: only meaningful at height 0; a resumed
+    // node overwrites total_work from the persisted tip key in restoreTotalWork.
+    chain_state.seedGenesisTotalWork(params.genesis_header.bits);
+
     // Plumb pruning policy from CLI/config-file into the chain state. The
     // pruner runs lazily from the IBD loop / RPC tip-update path; this just
     // configures the watermark + target. 0 = disabled (default).
@@ -2358,9 +2385,9 @@ pub fn main() !void {
     if (config.reindex) {
         std.debug.print(
             "--reindex requested: clearbit's CF_BLOCKS-based reindex is partial.\n" ++
-            "  For a full rebuild, stop the node, delete <datadir>/<network>/chainstate,\n" ++
-            "  and restart. CF_BLOCKS bodies are preserved; UTXO + headers will\n" ++
-            "  rebuild from peers (or from blockstorage when --import-blocks= is set).\n",
+                "  For a full rebuild, stop the node, delete <datadir>/<network>/chainstate,\n" ++
+                "  and restart. CF_BLOCKS bodies are preserved; UTXO + headers will\n" ++
+                "  rebuild from peers (or from blockstorage when --import-blocks= is set).\n",
             .{},
         );
         // Mark in debug log so the [REINDEX] category is visible if enabled.
@@ -2387,6 +2414,10 @@ pub fn main() !void {
                     // genesis seed (1) when the per-height entry is absent
                     // (pre-index datadir) — matching Core's "unknown" sentinel.
                     chain_state.restoreChainTxCount();
+                    // Genesis-scale nChainWork: persisted tip key, else
+                    // reconstruct from a matching snapshot checkpoint +
+                    // SUM(GetBlockProof) over headers above the base.
+                    chain_state.restoreTotalWork(params);
                 }
             }
         } else |_| {}
@@ -3024,16 +3055,18 @@ fn metricsServerThread(
             // without a JSON lib (curl + grep is fine).
             const tip = chain_state.best_height;
             var hbuf: [256]u8 = undefined;
-            const hbody = std.fmt.bufPrint(&hbuf,
+            const hbody = std.fmt.bufPrint(
+                &hbuf,
                 "{{\"status\":\"ok\",\"height\":{d},\"version\":\"{s}\"}}\n",
                 .{ tip, VERSION_STRING },
             ) catch continue;
             var hresp_buf: [512]u8 = undefined;
-            const hresp = std.fmt.bufPrint(&hresp_buf,
+            const hresp = std.fmt.bufPrint(
+                &hresp_buf,
                 "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n\r\n{s}",
+                    "Content-Type: application/json\r\n" ++
+                    "Content-Length: {d}\r\n" ++
+                    "Connection: close\r\n\r\n{s}",
                 .{ hbody.len, hbody },
             ) catch continue;
             _ = stream.write(hresp) catch {};
@@ -3047,26 +3080,28 @@ fn metricsServerThread(
 
         // Format response body
         var body_buf: [1024]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buf,
+        const body = std.fmt.bufPrint(
+            &body_buf,
             "# HELP bitcoin_blocks_total Current block height\n" ++
-            "# TYPE bitcoin_blocks_total gauge\n" ++
-            "bitcoin_blocks_total {d}\n" ++
-            "# HELP bitcoin_peers_connected Number of connected peers\n" ++
-            "# TYPE bitcoin_peers_connected gauge\n" ++
-            "bitcoin_peers_connected {d}\n" ++
-            "# HELP bitcoin_mempool_size Mempool transaction count\n" ++
-            "# TYPE bitcoin_mempool_size gauge\n" ++
-            "bitcoin_mempool_size {d}\n",
+                "# TYPE bitcoin_blocks_total gauge\n" ++
+                "bitcoin_blocks_total {d}\n" ++
+                "# HELP bitcoin_peers_connected Number of connected peers\n" ++
+                "# TYPE bitcoin_peers_connected gauge\n" ++
+                "bitcoin_peers_connected {d}\n" ++
+                "# HELP bitcoin_mempool_size Mempool transaction count\n" ++
+                "# TYPE bitcoin_mempool_size gauge\n" ++
+                "bitcoin_mempool_size {d}\n",
             .{ height, peers, mstats.count },
         ) catch continue;
 
         // Format HTTP response
         var resp_buf: [2048]u8 = undefined;
-        const resp = std.fmt.bufPrint(&resp_buf,
+        const resp = std.fmt.bufPrint(
+            &resp_buf,
             "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Connection: close\r\n\r\n{s}",
+                "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n\r\n{s}",
             .{ body.len, body },
         ) catch continue;
 

@@ -29,6 +29,7 @@ const address_mod = @import("address.zig");
 const script_mod = @import("script.zig");
 const indexes_mod = @import("indexes.zig");
 const debug_log = @import("debug_log.zig");
+const chainwork = @import("chainwork.zig");
 
 // ============================================================================
 // Hex Decoding Helper
@@ -163,8 +164,14 @@ pub fn coreArityFor(method: []const u8) ?CoreArity {
     };
     const req = fields.get("required") orelse return null;
     const dec = fields.get("declared") orelse return null;
-    const req_i = switch (req) { .integer => |i| i, else => return null };
-    const dec_i = switch (dec) { .integer => |i| i, else => return null };
+    const req_i = switch (req) {
+        .integer => |i| i,
+        else => return null,
+    };
+    const dec_i = switch (dec) {
+        .integer => |i| i,
+        else => return null,
+    };
     if (req_i < 0 or dec_i < 0) return null;
     return CoreArity{ .required = @intCast(req_i), .declared = @intCast(dec_i) };
 }
@@ -180,7 +187,6 @@ pub fn coreArityViolated(method: []const u8, params: std.json.Value) bool {
     };
     return n < a.required or n > a.declared;
 }
-
 
 pub const RPC_FORBIDDEN_BY_SAFE_MODE: i32 = -2;
 pub const RPC_TYPE_ERROR: i32 = -3;
@@ -3777,17 +3783,18 @@ pub const RpcServer = struct {
         const ibd = self.isInitialBlockDownload();
 
         // Get tip bits/time from the REAL active tip header (CF_BLOCKS →
-        // chain_manager → genesis), not genesis. chainwork still prefers the
-        // chain_manager's Core-seeded value when the tip was connected this
-        // session, else the chain_state running total.
+        // chain_manager → genesis), not genesis. chainwork is genesis-scale
+        // nChainWork from ChainState.total_work (persisted).  Do not copy
+        // header_index work: that is since-root, not genesis.
         const tip_hdr = self.resolveTipHeader();
         const tip_bits: u32 = tip_hdr.bits;
         const tip_time: u32 = tip_hdr.timestamp;
         var tip_chain_work: [32]u8 = self.chain_state.total_work;
-
-        if (self.chain_manager) |cm| {
-            if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
-                tip_chain_work = entry.chain_work;
+        if (chainwork.isZero(&tip_chain_work)) {
+            if (self.chain_manager) |cm| {
+                if (cm.getBlock(&self.chain_state.best_hash)) |entry| {
+                    tip_chain_work = entry.chain_work;
+                }
             }
         }
 
@@ -4552,8 +4559,7 @@ pub const RpcServer = struct {
                 // recovered it.  One unprivileged request disabled the whole
                 // RPC interface.
                 if (n < -2147483648 or n > 2147483647) {
-                    return try self.jsonRpcError(
-                        RPC_MISC_ERROR, "JSON integer out of range", id);
+                    return try self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 }
                 out.* = n;
             },
@@ -4720,8 +4726,7 @@ pub const RpcServer = struct {
                 // and the width check lives INSIDE that conversion, so it fires
                 // before anything else the handler does with the value.
                 if (n < -2147483648 or n > 2147483647) {
-                    return self.jsonRpcError(
-                        RPC_MISC_ERROR, "JSON integer out of range", id);
+                    return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 }
                 break :blk n;
             },
@@ -4971,20 +4976,17 @@ pub const RpcServer = struct {
                 switch (h) {
                     .integer => |v| {
                         if (v < -2147483648 or v > 2147483647) {
-                            return self.jsonRpcError(
-                                RPC_MISC_ERROR, "JSON integer out of range", id);
+                            return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                         }
                         if (v < 0) {
-                            return self.jsonRpcError(
-                                RPC_INVALID_PARAMETER, "Block height out of range", id);
+                            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block height out of range", id);
                         }
                         break :blk @as(u32, @intCast(v));
                     },
                     // A float, or an integer literal too large for i64 (which
                     // std.json surfaces as .number_string), is what univalue's
                     // from_chars rejects.
-                    .float, .number_string => return self.jsonRpcError(
-                        RPC_MISC_ERROR, "JSON integer out of range", id),
+                    .float, .number_string => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                     else => {},
                 }
             }
@@ -5090,8 +5092,7 @@ pub const RpcServer = struct {
                     // getInt<int> width check, before the verbosity value is
                     // used for anything.
                     if (v.integer < -2147483648 or v.integer > 2147483647) {
-                        return self.jsonRpcError(
-                            RPC_MISC_ERROR, "JSON integer out of range", id);
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
                     verbosity = v.integer;
                 } else if (v == .bool) {
@@ -5387,10 +5388,7 @@ pub const RpcServer = struct {
             size = raw.len;
             // Stripped size: 80-byte header + varint(nTx) + sum of no-witness tx sizes.
             // varint(nTx) bytes:
-            const varint_len: usize = if (ntx < 0xfd) 1
-                                      else if (ntx <= 0xffff) 3
-                                      else if (ntx <= 0xffffffff) 5
-                                      else 9;
+            const varint_len: usize = if (ntx < 0xfd) 1 else if (ntx <= 0xffff) 3 else if (ntx <= 0xffffffff) 5 else 9;
             strippedsize = 80 + varint_len;
             if (block_opt) |blk| {
                 for (blk.transactions) |*tx| {
@@ -5691,9 +5689,6 @@ pub const RpcServer = struct {
         for (tx_full_bytes) |b| try writer.print("{x:0>2}", .{b});
         try writer.writeAll("\"}");
     }
-
-
-
 
     fn handleGetDifficulty(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         // Core returns GetDifficulty(ActiveChain().Tip()) (rpc/blockchain.cpp:509)
@@ -6895,8 +6890,7 @@ pub const RpcServer = struct {
                 // an out-of-int32 count fails the CONVERSION (-1) while an
                 // in-range negative one reaches the domain error (-8).
                 if (p0.integer < -2147483648 or p0.integer > 2147483647) {
-                    return self.jsonRpcError(
-                        RPC_MISC_ERROR, "JSON integer out of range", id);
+                    return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 }
                 count = p0.integer;
             } else if (p0 == .float) {
@@ -6908,8 +6902,7 @@ pub const RpcServer = struct {
                     p0.float != @trunc(p0.float) or
                     p0.float < -2147483648.0 or p0.float > 2147483647.0)
                 {
-                    return self.jsonRpcError(
-                        RPC_MISC_ERROR, "JSON integer out of range", id);
+                    return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 }
                 count = @intFromFloat(p0.float);
             } else if (p0 != .null) {
@@ -7857,9 +7850,8 @@ pub const RpcServer = struct {
 
             const ip = entry.value_ptr.ip;
             try writer.print("{{\"address\":\"{d}.{d}.{d}.{d}\",\"ban_created\":{d},\"banned_until\":{d},\"ban_reason\":\"", .{
-                ip[0], ip[1], ip[2], ip[3],
-                entry.value_ptr.create_time,
-                entry.value_ptr.ban_until,
+                ip[0],                       ip[1],                     ip[2], ip[3],
+                entry.value_ptr.create_time, entry.value_ptr.ban_until,
             });
             // Escape the reason string
             for (entry.value_ptr.reason) |c| {
@@ -8873,8 +8865,7 @@ pub const RpcServer = struct {
                     // int32 behave as verbosity 0, which Core also does via
                     // `if (verbosity <= 0)`.
                     if (v.integer < -2147483648 or v.integer > 2147483647) {
-                        return self.jsonRpcError(RPC_MISC_ERROR,
-                            "JSON integer out of range", id);
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
                     verbosity = if (v.integer < 0) 0 else @intCast(@min(v.integer, 2));
                 }
@@ -9159,7 +9150,6 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
-
     // ========================================================================
     // Mining Methods
     // ========================================================================
@@ -9176,7 +9166,7 @@ pub const RpcServer = struct {
         // funds are recoverable rather than burned. Real pools should
         // construct their own coinbase per BIP-22; this placeholder exists
         // only to allow the template to validate locally.
-        const payout_script = [_]u8{ 0x51 };
+        const payout_script = [_]u8{0x51};
         var template = block_template.createBlockTemplate(
             self.chain_state,
             self.mempool,
@@ -9992,8 +9982,7 @@ pub const RpcServer = struct {
                         if (range_s.integer < 0 or range_s.integer > 2147483647 or
                             range_e.integer < 0 or range_e.integer > 2147483647)
                         {
-                            return self.jsonRpcError(
-                                RPC_MISC_ERROR, "JSON integer out of range", id);
+                            return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                         }
                         range_start = @intCast(range_s.integer);
                         range_end = @intCast(range_e.integer);
@@ -10001,8 +9990,7 @@ pub const RpcServer = struct {
                 } else if (range_param == .integer) {
                     // Single number means [0, n]
                     if (range_param.integer < 0 or range_param.integer > 2147483647) {
-                        return self.jsonRpcError(
-                            RPC_MISC_ERROR, "JSON integer out of range", id);
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
                     range_end = @intCast(range_param.integer);
                 }
@@ -10811,13 +10799,11 @@ pub const RpcServer = struct {
             if (lt != .null) {
                 switch (lt) {
                     .integer => {},
-                    .float, .number_string => return self.jsonRpcError(
-                        RPC_MISC_ERROR, "JSON integer out of range", id),
+                    .float, .number_string => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                     else => return self.typeErrorNotNumber(lt, id),
                 }
                 if (lt.integer < 0 or lt.integer > std.math.maxInt(u32)) {
-                    return self.jsonRpcError(RPC_INVALID_PARAMETER,
-                        "Invalid parameter, locktime out of range", id);
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, locktime out of range", id);
                 }
                 locktime = @intCast(lt.integer);
             }
@@ -10872,25 +10858,21 @@ pub const RpcServer = struct {
                     // Core AddInputs: getInt<int64_t>() then
                     // [0, CTxIn::SEQUENCE_FINAL] -> -8.
                     if (seq_val.integer < 0 or seq_val.integer > std.math.maxInt(u32)) {
-                        return self.jsonRpcError(RPC_INVALID_PARAMETER,
-                            "Invalid parameter, sequence number is out of range", id);
+                        return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, sequence number is out of range", id);
                     }
                     sequence = @intCast(seq_val.integer);
                 } else if (seq_val == .float or seq_val == .number_string) {
-                    return self.jsonRpcError(RPC_MISC_ERROR,
-                        "JSON integer out of range", id);
+                    return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 }
             }
 
             // Core reads vout with getInt<int>() — a 32-bit parse, so anything
             // outside int32 is univalue's own -1 before the -8 domain check.
             if (vout_val.integer < -2147483648 or vout_val.integer > 2147483647) {
-                return self.jsonRpcError(RPC_MISC_ERROR,
-                    "JSON integer out of range", id);
+                return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
             }
             if (vout_val.integer < 0) {
-                return self.jsonRpcError(RPC_INVALID_PARAMETER,
-                    "Invalid parameter, vout cannot be negative", id);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, vout cannot be negative", id);
             }
             try tx_inputs.append(types.TxIn{
                 .previous_output = .{
@@ -11967,8 +11949,7 @@ pub const RpcServer = struct {
             },
             storage.SnapshotError.HashMismatch => return self.jsonRpcError(
                 RPC_MISC_ERROR,
-                "Bad snapshot content hash (load-time gate): the snapshot file's "
-                    ++ "own UTXO-set hash does not match the expected assumeutxo hash.",
+                "Bad snapshot content hash (load-time gate): the snapshot file's " ++ "own UTXO-set hash does not match the expected assumeutxo hash.",
                 id,
             ),
             storage.SnapshotError.InvalidBaseBlock => return self.jsonRpcError(
@@ -12017,9 +11998,7 @@ pub const RpcServer = struct {
         if (self.chain_state.getBlockHashByHeight(base_height) == null) {
             return self.jsonRpcError(
                 RPC_INTERNAL_ERROR,
-                "loadtxoutset cannot complete background validation: the genesis→base "
-                    ++ "block bodies are not present on disk yet. Bootstrap with the CLI "
-                    ++ "flag --load-snapshot=<path> at startup instead.",
+                "loadtxoutset cannot complete background validation: the genesis→base " ++ "block bodies are not present on disk yet. Bootstrap with the CLI " ++ "flag --load-snapshot=<path> at startup instead.",
                 id,
             );
         }
@@ -12038,9 +12017,7 @@ pub const RpcServer = struct {
                 // committed hash — refuse, leave the active chainstate untouched.
                 return self.jsonRpcError(
                     RPC_MISC_ERROR,
-                    "Background validation FAILED: the genesis→base re-derived UTXO "
-                        ++ "set hash does not match the expected assumeutxo hash. The "
-                        ++ "snapshot is invalid (or tampered); refusing to activate.",
+                    "Background validation FAILED: the genesis→base re-derived UTXO " ++ "set hash does not match the expected assumeutxo hash. The " ++ "snapshot is invalid (or tampered); refusing to activate.",
                     id,
                 );
             },
@@ -12080,10 +12057,10 @@ pub const RpcServer = struct {
 
         const au_data = au_bg.findRegtestSnapshot(&base_hash) orelse
             return self.jsonRpcError(
-                RPC_MISC_ERROR,
-                "assumeutxo block hash in snapshot metadata not recognized",
-                id,
-            );
+            RPC_MISC_ERROR,
+            "assumeutxo block hash in snapshot metadata not recognized",
+            id,
+        );
         const base_height = au_data.height;
 
         // STAGE 1 (load-time hash gate) on the regtest entry.
@@ -12097,8 +12074,7 @@ pub const RpcServer = struct {
         if (self.chain_state.getBlockHashByHeight(base_height) == null) {
             return self.jsonRpcError(
                 RPC_INTERNAL_ERROR,
-                "loadtxoutset cannot complete background validation: genesis→base "
-                    ++ "block bodies not present on disk.",
+                "loadtxoutset cannot complete background validation: genesis→base " ++ "block bodies not present on disk.",
                 id,
             );
         }
@@ -13555,7 +13531,6 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
-
     /// Handle getdeploymentinfo RPC - return deployment/softfork status.
     /// Reference: Bitcoin Core rpc/blockchain.cpp getdeploymentinfo
     ///
@@ -14179,15 +14154,15 @@ pub const RpcServer = struct {
         // We reuse writeScriptPubKeyUniv's logic but suppress the `hex` field.
         const script_type = script_mod.classifyScript(script_bytes);
         const type_str: []const u8 = switch (script_type) {
-            .p2pkh    => "pubkeyhash",
-            .p2sh     => "scripthash",
-            .p2wpkh   => "witness_v0_keyhash",
-            .p2wsh    => "witness_v0_scripthash",
-            .p2tr     => "witness_v1_taproot",
-            .anchor   => "anchor",
-            .p2pk     => "pubkey",
+            .p2pkh => "pubkeyhash",
+            .p2sh => "scripthash",
+            .p2wpkh => "witness_v0_keyhash",
+            .p2wsh => "witness_v0_scripthash",
+            .p2tr => "witness_v1_taproot",
+            .anchor => "anchor",
+            .p2pk => "pubkey",
             .multisig => "multisig",
-            .null_data=> "nulldata",
+            .null_data => "nulldata",
             .witness_unknown => "witness_unknown",
             .nonstandard => "nonstandard",
         };
@@ -14221,16 +14196,15 @@ pub const RpcServer = struct {
         //                    no OP_CHECKSIGADD/OP_SUCCESSx.
         const can_wrap = blk: {
             switch (script_type) {
-                .p2pk, .p2pkh, .multisig, .nonstandard,
-                .p2wpkh, .p2wsh => {
+                .p2pk, .p2pkh, .multisig, .nonstandard, .p2wpkh, .p2wsh => {
                     // Fall through to guard checks.
                 },
                 // null_data / p2sh / p2tr / anchor — never wrapped.
                 else => break :blk false,
             }
             if (!decodeScriptHasValidOps(script_bytes)) break :blk false;
-            if (decodeScriptIsUnspendable(script_bytes))  break :blk false;
-            if (decodeScriptHasTaprootOps(script_bytes))  break :blk false;
+            if (decodeScriptIsUnspendable(script_bytes)) break :blk false;
+            if (decodeScriptHasTaprootOps(script_bytes)) break :blk false;
             break :blk true;
         };
 
@@ -14348,8 +14322,7 @@ pub const RpcServer = struct {
         }
         const n_required: i64 = nreq_val.integer;
         if (n_required < 1) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS,
-                "a multisignature address must require at least one key to redeem", id);
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "a multisignature address must require at least one key to redeem", id);
         }
 
         // --- Parse keys array ---
@@ -14361,14 +14334,11 @@ pub const RpcServer = struct {
         const n_keys: i64 = @intCast(keys.len);
 
         if (n_keys > 16) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS,
-                "Number of keys involved in the multisignature address creation > 16\nReduce the number", id);
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Number of keys involved in the multisignature address creation > 16\nReduce the number", id);
         }
         if (n_required > n_keys) {
             var msg_buf: [128]u8 = undefined;
-            const msg = try std.fmt.bufPrint(&msg_buf,
-                "not enough keys supplied (got {d} keys, but need at least {d} to redeem)",
-                .{ n_keys, n_required });
+            const msg = try std.fmt.bufPrint(&msg_buf, "not enough keys supplied (got {d} keys, but need at least {d} to redeem)", .{ n_keys, n_required });
             return self.jsonRpcError(RPC_INVALID_PARAMS, msg, id);
         }
 
@@ -14382,8 +14352,7 @@ pub const RpcServer = struct {
 
         for (keys, 0..) |key_val, i| {
             if (key_val != .string) {
-                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY,
-                    "pubkey must be a hex string", id);
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "pubkey must be a hex string", id);
             }
             const hex_str = key_val.string;
             const byte_len = hex_str.len / 2;
@@ -14391,8 +14360,7 @@ pub const RpcServer = struct {
             // Length check: must be 33 or 65 bytes
             if ((hex_str.len != 66 and hex_str.len != 130) or hex_str.len % 2 != 0) {
                 var emsg: [256]u8 = undefined;
-                const s = try std.fmt.bufPrint(&emsg,
-                    "Pubkey \"{s}\" must have a length of either 33 or 65 bytes", .{hex_str});
+                const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must have a length of either 33 or 65 bytes", .{hex_str});
                 return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
             }
 
@@ -14400,8 +14368,7 @@ pub const RpcServer = struct {
             for (0..byte_len) |bi| {
                 pk_data[i][bi] = std.fmt.parseInt(u8, hex_str[bi * 2 ..][0..2], 16) catch {
                     var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg,
-                        "Pubkey \"{s}\" must be a hex string", .{hex_str});
+                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be a hex string", .{hex_str});
                     return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
                 };
             }
@@ -14413,29 +14380,25 @@ pub const RpcServer = struct {
             if (byte_len == 33) {
                 if (pk_data[i][0] != 0x02 and pk_data[i][0] != 0x03) {
                     var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg,
-                        "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
                     return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
                 }
                 const pk33: *const [33]u8 = pk_data[i][0..33];
                 if (crypto.decompressPubkey33(pk33) == null) {
                     var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg,
-                        "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
                     return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
                 }
             } else { // 65 bytes
                 if (pk_data[i][0] != 0x04) {
                     var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg,
-                        "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
                     return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
                 }
                 const pk65: *const [65]u8 = pk_data[i][0..65];
                 if (crypto.parseUncompressedPubkey65(pk65) == null) {
                     var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg,
-                        "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
                     return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
                 }
                 has_uncompressed = true;
@@ -14633,18 +14596,14 @@ pub const RpcServer = struct {
             .null => return .{ .version = 2, .err = null },
             .integer => |n| {
                 if (n < 0 or n > 4294967295) {
-                    return .{ .version = 2, .err = try self.jsonRpcError(
-                        RPC_MISC_ERROR, "JSON integer out of range", id) };
+                    return .{ .version = 2, .err = try self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id) };
                 }
                 if (n < 1 or n > 3) {
-                    return .{ .version = 2, .err = try self.jsonRpcError(
-                        RPC_INVALID_PARAMETER,
-                        "Invalid parameter, version out of range(1~3)", id) };
+                    return .{ .version = 2, .err = try self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, version out of range(1~3)", id) };
                 }
                 return .{ .version = @intCast(n), .err = null };
             },
-            .float, .number_string => return .{ .version = 2, .err = try self.jsonRpcError(
-                RPC_MISC_ERROR, "JSON integer out of range", id) },
+            .float, .number_string => return .{ .version = 2, .err = try self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id) },
             else => return .{ .version = 2, .err = try self.typeErrorNotNumber(v, id) },
         }
     }
@@ -16732,9 +16691,9 @@ pub const RpcServer = struct {
             scale: u32,
             max_target: usize,
         }{
-            .{ .name = "short",  .decay = mempool_mod.FeeEstimator.DECAY[0], .scale = mempool_mod.FeeEstimator.SCALE[0], .max_target = mempool_mod.FeeEstimator.SHORT_MAX_TARGET },
+            .{ .name = "short", .decay = mempool_mod.FeeEstimator.DECAY[0], .scale = mempool_mod.FeeEstimator.SCALE[0], .max_target = mempool_mod.FeeEstimator.SHORT_MAX_TARGET },
             .{ .name = "medium", .decay = mempool_mod.FeeEstimator.DECAY[1], .scale = mempool_mod.FeeEstimator.SCALE[1], .max_target = mempool_mod.FeeEstimator.MED_MAX_TARGET },
-            .{ .name = "long",   .decay = mempool_mod.FeeEstimator.DECAY[2], .scale = mempool_mod.FeeEstimator.SCALE[2], .max_target = mempool_mod.FeeEstimator.MAX_CONFIRMATION_TARGET },
+            .{ .name = "long", .decay = mempool_mod.FeeEstimator.DECAY[2], .scale = mempool_mod.FeeEstimator.SCALE[2], .max_target = mempool_mod.FeeEstimator.MAX_CONFIRMATION_TARGET },
         };
         try w.writeByte('{');
         for (horizons, 0..) |h, i| {
@@ -17659,13 +17618,11 @@ pub const RpcServer = struct {
             if (lt != .null) {
                 switch (lt) {
                     .integer => {},
-                    .float, .number_string => return self.jsonRpcError(
-                        RPC_MISC_ERROR, "JSON integer out of range", id),
+                    .float, .number_string => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                     else => return self.typeErrorNotNumber(lt, id),
                 }
                 if (lt.integer < 0 or lt.integer > std.math.maxInt(u32)) {
-                    return self.jsonRpcError(RPC_INVALID_PARAMETER,
-                        "Invalid parameter, locktime out of range", id);
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, locktime out of range", id);
                 }
                 locktime = @intCast(lt.integer);
             }
@@ -19126,8 +19083,7 @@ pub const RpcServer = struct {
         const hex = seed_hex orelse {
             return self.jsonRpcError(
                 RPC_INVALID_PARAMS,
-                "sethdseed requires a hex seed argument (clearbit divergence: "
-                    ++ "16..64-byte BIP-32 seed as hex)",
+                "sethdseed requires a hex seed argument (clearbit divergence: " ++ "16..64-byte BIP-32 seed as hex)",
                 id,
             );
         };
@@ -19672,13 +19628,11 @@ pub const RpcServer = struct {
             switch (v) {
                 .integer => |iv| {
                     if (iv < 0 or iv > 4294967295) {
-                        return self.jsonRpcError(
-                            RPC_MISC_ERROR, "JSON integer out of range", id);
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
                     break :blk @intCast(iv);
                 },
-                .float, .number_string => return self.jsonRpcError(
-                    RPC_MISC_ERROR, "JSON integer out of range", id),
+                .float, .number_string => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                 else => {},
             }
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
@@ -20356,10 +20310,10 @@ pub const RpcServer = struct {
             }
             const rec = rec_opt orelse
                 return self.jsonRpcError(
-                    RPC_INTERNAL_ERROR,
-                    "Unable to get data because coinstatsindex is still syncing.",
-                    id,
-                );
+                RPC_INTERNAL_ERROR,
+                "Unable to get data because coinstatsindex is still syncing.",
+                id,
+            );
 
             return self.emitCoinStatsResult(&rec, hash_type, id);
         }
@@ -20573,11 +20527,15 @@ pub const RpcServer = struct {
         }
         if (nblocks == 0 or tip_h == 0) return 0.0;
 
-        const start_h = tip_h - @as(u32, @intCast(nblocks));
+        // Path 1: walk persisted headers (restart-safe).  workDiff is
+        // SUM(GetBlockProof) over the `nblocks` blocks after pb0 — Core
+        // rpc/mining.cpp GetNetworkHashPS.  Does not need genesis-scale
+        // totals at both ends; the per-block proofs are the same scale.
+        if (self.networkHashPsFromHeaders(tip_h, nblocks)) |v| return v;
 
+        const start_h = tip_h - @as(u32, @intCast(nblocks));
         const cm = self.chain_manager orelse return 0.0;
 
-        // Get tip and start block index entries
         const tip_hash_opt = self.chain_state.getBlockHashByHeight(tip_h);
         const start_hash_opt = self.chain_state.getBlockHashByHeight(start_h);
         if (tip_hash_opt == null or start_hash_opt == null) return 0.0;
@@ -20599,6 +20557,41 @@ pub const RpcServer = struct {
         return @as(f64, @floatFromInt(work_diff)) / @as(f64, @floatFromInt(time_diff));
     }
 
+    /// Core GetNetworkHashPS over persisted headers: walk `lookup` steps
+    /// back from `tip_h`, min/max timestamps inclusive of pb0, work = sum
+    /// of GetBlockProof on (pb0+1 .. pb).
+    fn networkHashPsFromHeaders(self: *RpcServer, tip_h: u32, nblocks: i64) ?f64 {
+        const lookup: u32 = @intCast(nblocks);
+        var work: [32]u8 = [_]u8{0} ** 32;
+        var min_t: i64 = 0;
+        var max_t: i64 = 0;
+        var h: u32 = tip_h;
+        var i: u32 = 0;
+        while (i <= lookup) : (i += 1) {
+            const hdr = self.chain_state.getHeaderAtHeight(h) orelse return null;
+            const t: i64 = @intCast(hdr.timestamp);
+            if (i == 0) {
+                min_t = t;
+                max_t = t;
+            } else {
+                if (t < min_t) min_t = t;
+                if (t > max_t) max_t = t;
+            }
+            if (i < lookup) {
+                const proof = chainwork.workFromBits(hdr.bits);
+                chainwork.addChainWorkBE(&work, &proof);
+            }
+            if (h == 0) {
+                if (i < lookup) return null;
+                break;
+            }
+            h -= 1;
+        }
+        if (max_t <= min_t) return 0.0;
+        if (chainwork.isZero(&work)) return 0.0;
+        return chainwork.workToF64(&work) / @as(f64, @floatFromInt(max_t - min_t));
+    }
+
     fn handleGetNetworkHashPS(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Parse optional [nblocks, height]
         var nblocks: i64 = 120;
@@ -20613,23 +20606,19 @@ pub const RpcServer = struct {
                 // reach computeNetworkHashPS and abort the process there.
                 if (p0 == .integer) {
                     if (p0.integer < -2147483648 or p0.integer > 2147483647) {
-                        return self.jsonRpcError(RPC_MISC_ERROR,
-                            "JSON integer out of range", id);
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
                     nblocks = p0.integer;
-                } else if (p0 == .float) return self.jsonRpcError(
-                    RPC_MISC_ERROR, "JSON integer out of range", id);
+                } else if (p0 == .float) return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
             }
             if (params.array.items.len >= 2) {
                 const p1 = params.array.items[1];
                 if (p1 == .integer) {
                     if (p1.integer < -2147483648 or p1.integer > 2147483647) {
-                        return self.jsonRpcError(RPC_MISC_ERROR,
-                            "JSON integer out of range", id);
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
                     target_height = p1.integer;
-                } else if (p1 == .float) return self.jsonRpcError(
-                    RPC_MISC_ERROR, "JSON integer out of range", id);
+                } else if (p1 == .float) return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
             }
         }
 
@@ -20711,12 +20700,21 @@ pub const RpcServer = struct {
             var h: u32 = tip_h;
             search: while (h >= search_start) : (h -= 1) {
                 const hash_opt = self.chain_state.getBlockHashByHeight(h);
-                const hash = hash_opt orelse { if (h == 0) break; continue; };
-                const raw = (db.get(storage.CF_BLOCKS, &hash) catch null) orelse { if (h == 0) break; continue; };
+                const hash = hash_opt orelse {
+                    if (h == 0) break;
+                    continue;
+                };
+                const raw = (db.get(storage.CF_BLOCKS, &hash) catch null) orelse {
+                    if (h == 0) break;
+                    continue;
+                };
                 defer self.allocator.free(raw);
                 // Parse block and check txids
                 var reader = serialize.Reader{ .data = raw };
-                const blk = serialize.readBlock(&reader, self.allocator) catch { if (h == 0) break; continue; };
+                const blk = serialize.readBlock(&reader, self.allocator) catch {
+                    if (h == 0) break;
+                    continue;
+                };
                 defer serialize.freeBlock(self.allocator, &blk);
                 for (blk.transactions) |*tx| {
                     const txid = crypto.computeTxidStreaming(tx);
@@ -20789,8 +20787,6 @@ pub const RpcServer = struct {
         try result_buf.append('"');
         return self.jsonRpcResult(result_buf.items, id);
     }
-
-
 
     fn handleVerifyTxOutProof(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (params != .array or params.array.items.len < 1 or params.array.items[0] != .string)
@@ -20908,15 +20904,13 @@ pub const RpcServer = struct {
     ///
     /// FIX-80: the daily consensus-diff (2026-05-16) flagged that
     /// `initialblockdownload` stayed `true` even at chain tip because
-    /// (a) we had no sticky latch, (b) `chain_state.total_work` is
-    /// never mutated after init (always zero, so chainwork < min always
-    /// returned true on mainnet), and (c) the tip-age check considered
-    /// the recorded `tip.header.timestamp` without any latch on the
-    /// successful exit.  We now prefer the chain manager's
-    /// `active_tip.chain_work` (which IS populated during validation),
-    /// fall back to `chain_state.total_work` only when no chain_manager
-    /// is wired, and latch sticky-OFF on the first successful exit to
-    /// mirror Core's `m_cached_is_ibd`.
+    /// (a) we had no sticky latch, (b) `chain_state.total_work` was a
+    /// dead zero field, and (c) the tip-age check had no latch.
+    /// total_work is now genesis-scale nChainWork (persisted).  Compared
+    /// against min_chain_work in Core GetHex / BE order (min is stored
+    /// via hexToHash, so it is reversed first).  Tip age uses
+    /// resolveTipHeader so a restarted node without an in-memory
+    /// active_tip can still exit IBD.
     ///
     /// Reference: bitcoin-core/src/validation.cpp UpdateIBDStatus +
     /// chain.h CChain::IsTipRecent.
@@ -20924,13 +20918,12 @@ pub const RpcServer = struct {
         // Sticky-OFF latch: once we've reported IBD as false, stay false.
         if (self.ibd_latched_off.load(.monotonic)) return false;
 
-        // Source-of-truth for chainwork:  prefer the chain manager's
-        // `active_tip.chain_work` because `chain_state.total_work` is
-        // never mutated post-init in the current build.  When the
-        // manager is not yet wired (early boot / test path) we fall
-        // back to `chain_state.total_work`, accepting the conservative
-        // "stay in IBD" answer if chainwork is unknown.
+        // Genesis-scale nChainWork: persist first, then in-memory
+        // active_tip (session-only).  Never header_index (since-root).
         const tip_chain_work_ptr: *const [32]u8 = blk: {
+            if (!chainwork.isZero(&self.chain_state.total_work)) {
+                break :blk &self.chain_state.total_work;
+            }
             if (self.chain_manager) |cm| {
                 if (cm.active_tip) |tip| {
                     break :blk &tip.chain_work;
@@ -20940,7 +20933,9 @@ pub const RpcServer = struct {
         };
 
         // Condition 1: chainwork must meet the minimum chain-work bar.
-        if (self.compareChainWork(tip_chain_work_ptr, &self.network_params.min_chain_work) < 0) {
+        // min_chain_work is hexToHash-reversed; compare in GetHex / BE order.
+        const min_be = chainwork.minChainWorkBE(&self.network_params.min_chain_work);
+        if (chainwork.cmpChainWorkBE(tip_chain_work_ptr, &min_be) < 0) {
             return true;
         }
 
@@ -20968,24 +20963,20 @@ pub const RpcServer = struct {
         }
 
         // Condition 2: tip wallclock age must be < max_tip_age (24h).
-        // Core's IsTipRecent uses the tip's own block time vs now, which
-        // is what we replicate here.  When no chain_manager is wired
-        // (test-only path), we cannot evaluate tip age and conservatively
-        // stay in IBD until the manager is attached.
+        // Core's IsTipRecent uses the tip's own block time vs now.
+        // Prefer in-memory active_tip (tests pin a fresh timestamp);
+        // otherwise the persisted tip header (CF_BLOCKS).
         const max_tip_age_seconds: i64 = 24 * 60 * 60;
         const now = std.time.timestamp();
-        if (self.chain_manager) |cm| {
-            if (cm.active_tip) |tip| {
-                const tip_time: i64 = @intCast(tip.header.timestamp);
-                if (now - tip_time > max_tip_age_seconds) {
-                    return true;
+        const tip_time: i64 = blk: {
+            if (self.chain_manager) |cm| {
+                if (cm.active_tip) |tip| {
+                    break :blk @as(i64, @intCast(tip.header.timestamp));
                 }
-            } else {
-                // chain_manager present but no active_tip: still booting.
-                return true;
             }
-        } else {
-            // No chain_manager yet: don't latch — let later calls flip.
+            break :blk @as(i64, @intCast(self.resolveTipHeader().timestamp));
+        };
+        if (now - tip_time > max_tip_age_seconds) {
             return true;
         }
 
@@ -21531,7 +21522,10 @@ fn w47bBuildPartialMerkleTree(
         var parent_match = false;
         var k: usize = start;
         while (k < end) : (k += 1) {
-            if (matches[k]) { parent_match = true; break; }
+            if (matches[k]) {
+                parent_match = true;
+                break;
+            }
         }
         try bits.append(parent_match);
 
@@ -22177,14 +22171,14 @@ fn computeBlockStats(
 /// utxo_increase, utxo_size_inc, utxo_increase_actual, utxo_size_inc_actual).
 fn blockStatAllNames() []const []const u8 {
     return &[_][]const u8{
-        "avgfee",      "avgfeerate",      "avgtxsize",        "blockhash",
-        "feerate_percentiles", "height",  "ins",              "maxfee",
-        "maxfeerate",  "maxtxsize",       "medianfee",        "mediantime",
-        "mediantxsize", "minfee",         "minfeerate",       "mintxsize",
-        "outs",        "subsidy",         "swtotal_size",     "swtotal_weight",
-        "swtxs",       "time",            "total_out",        "total_size",
-        "total_weight", "totalfee",       "txs",              "utxo_increase",
-        "utxo_size_inc", "utxo_increase_actual", "utxo_size_inc_actual",
+        "avgfee",              "avgfeerate",           "avgtxsize",            "blockhash",
+        "feerate_percentiles", "height",               "ins",                  "maxfee",
+        "maxfeerate",          "maxtxsize",            "medianfee",            "mediantime",
+        "mediantxsize",        "minfee",               "minfeerate",           "mintxsize",
+        "outs",                "subsidy",              "swtotal_size",         "swtotal_weight",
+        "swtxs",               "time",                 "total_out",            "total_size",
+        "total_weight",        "totalfee",             "txs",                  "utxo_increase",
+        "utxo_size_inc",       "utxo_increase_actual", "utxo_size_inc_actual",
     };
 }
 
@@ -22231,34 +22225,7 @@ fn writeBlockStatValue(
         return;
     }
     const v: i64 =
-        if (std.mem.eql(u8, name, "avgfee")) stats.avgfee
-        else if (std.mem.eql(u8, name, "avgfeerate")) stats.avgfeerate
-        else if (std.mem.eql(u8, name, "avgtxsize")) stats.avgtxsize
-        else if (std.mem.eql(u8, name, "ins")) stats.ins
-        else if (std.mem.eql(u8, name, "maxfee")) stats.maxfee
-        else if (std.mem.eql(u8, name, "maxfeerate")) stats.maxfeerate
-        else if (std.mem.eql(u8, name, "maxtxsize")) stats.maxtxsize
-        else if (std.mem.eql(u8, name, "medianfee")) stats.medianfee
-        else if (std.mem.eql(u8, name, "mediantxsize")) stats.mediantxsize
-        else if (std.mem.eql(u8, name, "minfee")) stats.minfee
-        else if (std.mem.eql(u8, name, "minfeerate")) stats.minfeerate
-        else if (std.mem.eql(u8, name, "mintxsize")) stats.mintxsize
-        else if (std.mem.eql(u8, name, "outs")) stats.outs
-        else if (std.mem.eql(u8, name, "subsidy")) stats.subsidy
-        else if (std.mem.eql(u8, name, "swtotal_size")) stats.swtotal_size
-        else if (std.mem.eql(u8, name, "swtotal_weight")) stats.swtotal_weight
-        else if (std.mem.eql(u8, name, "swtxs")) stats.swtxs
-        else if (std.mem.eql(u8, name, "time")) stats.time
-        else if (std.mem.eql(u8, name, "total_out")) stats.total_out
-        else if (std.mem.eql(u8, name, "total_size")) stats.total_size
-        else if (std.mem.eql(u8, name, "total_weight")) stats.total_weight
-        else if (std.mem.eql(u8, name, "totalfee")) stats.totalfee
-        else if (std.mem.eql(u8, name, "txs")) stats.txs
-        else if (std.mem.eql(u8, name, "utxo_increase")) stats.utxo_increase
-        else if (std.mem.eql(u8, name, "utxo_size_inc")) stats.utxo_size_inc
-        else if (std.mem.eql(u8, name, "utxo_increase_actual")) stats.utxo_increase_actual
-        else if (std.mem.eql(u8, name, "utxo_size_inc_actual")) stats.utxo_size_inc_actual
-        else 0;
+        if (std.mem.eql(u8, name, "avgfee")) stats.avgfee else if (std.mem.eql(u8, name, "avgfeerate")) stats.avgfeerate else if (std.mem.eql(u8, name, "avgtxsize")) stats.avgtxsize else if (std.mem.eql(u8, name, "ins")) stats.ins else if (std.mem.eql(u8, name, "maxfee")) stats.maxfee else if (std.mem.eql(u8, name, "maxfeerate")) stats.maxfeerate else if (std.mem.eql(u8, name, "maxtxsize")) stats.maxtxsize else if (std.mem.eql(u8, name, "medianfee")) stats.medianfee else if (std.mem.eql(u8, name, "mediantxsize")) stats.mediantxsize else if (std.mem.eql(u8, name, "minfee")) stats.minfee else if (std.mem.eql(u8, name, "minfeerate")) stats.minfeerate else if (std.mem.eql(u8, name, "mintxsize")) stats.mintxsize else if (std.mem.eql(u8, name, "outs")) stats.outs else if (std.mem.eql(u8, name, "subsidy")) stats.subsidy else if (std.mem.eql(u8, name, "swtotal_size")) stats.swtotal_size else if (std.mem.eql(u8, name, "swtotal_weight")) stats.swtotal_weight else if (std.mem.eql(u8, name, "swtxs")) stats.swtxs else if (std.mem.eql(u8, name, "time")) stats.time else if (std.mem.eql(u8, name, "total_out")) stats.total_out else if (std.mem.eql(u8, name, "total_size")) stats.total_size else if (std.mem.eql(u8, name, "total_weight")) stats.total_weight else if (std.mem.eql(u8, name, "totalfee")) stats.totalfee else if (std.mem.eql(u8, name, "txs")) stats.txs else if (std.mem.eql(u8, name, "utxo_increase")) stats.utxo_increase else if (std.mem.eql(u8, name, "utxo_size_inc")) stats.utxo_size_inc else if (std.mem.eql(u8, name, "utxo_increase_actual")) stats.utxo_increase_actual else if (std.mem.eql(u8, name, "utxo_size_inc_actual")) stats.utxo_size_inc_actual else 0;
     try writer.print("{d}", .{v});
 }
 
@@ -22651,7 +22618,7 @@ fn getDifficulty(bits: u32) f64 {
 fn getDifficultyCore(bits: u32) f64 {
     var nShift: i32 = @as(i32, @intCast((bits >> 24) & 0xff));
     var dDiff: f64 = @as(f64, @floatFromInt(@as(u32, 0x0000ffff))) /
-                     @as(f64, @floatFromInt(bits & 0x00ffffff));
+        @as(f64, @floatFromInt(bits & 0x00ffffff));
     while (nShift < 29) {
         dDiff *= 256.0;
         nShift += 1;
@@ -22847,7 +22814,6 @@ fn readNTxFromRawBlock(raw: []const u8) u64 {
     return std.mem.readInt(u64, raw[81..89], .little);
 }
 
-
 /// Write the full-precision 64-char hex target derived from compact bits.
 /// Matches Bitcoin Core GetTarget() / DeriveTarget() logic.
 fn writeTargetHex(writer: anytype, bits: u32) !void {
@@ -22935,18 +22901,24 @@ fn writeScriptAsmCore(writer: anytype, script_bytes: []const u8) !void {
             if (op < 0x4c) {
                 data_len = op;
             } else if (op == 0x4c) {
-                if (i >= script_bytes.len) { bad = true; } else {
+                if (i >= script_bytes.len) {
+                    bad = true;
+                } else {
                     data_len = script_bytes[i];
                     i += 1;
                 }
             } else if (op == 0x4d) {
-                if (i + 2 > script_bytes.len) { bad = true; } else {
+                if (i + 2 > script_bytes.len) {
+                    bad = true;
+                } else {
                     data_len = @as(usize, script_bytes[i]) |
                         (@as(usize, script_bytes[i + 1]) << 8);
                     i += 2;
                 }
             } else { // 0x4e
-                if (i + 4 > script_bytes.len) { bad = true; } else {
+                if (i + 4 > script_bytes.len) {
+                    bad = true;
+                } else {
                     data_len = @as(usize, script_bytes[i]) |
                         (@as(usize, script_bytes[i + 1]) << 8) |
                         (@as(usize, script_bytes[i + 2]) << 16) |
@@ -23187,7 +23159,7 @@ fn sighashTypeToStr(sighash: u32) []const u8 {
         0x81 => "ALL|ANYONECANPAY",
         0x82 => "NONE|ANYONECANPAY",
         0x83 => "SINGLE|ANYONECANPAY",
-        else  => "",
+        else => "",
     };
 }
 
@@ -23213,18 +23185,24 @@ fn writeScriptAsmCoreSigDecode(writer: anytype, script_bytes: []const u8) !void 
             if (op < 0x4c) {
                 data_len = op;
             } else if (op == 0x4c) {
-                if (i >= script_bytes.len) { bad = true; } else {
+                if (i >= script_bytes.len) {
+                    bad = true;
+                } else {
                     data_len = script_bytes[i];
                     i += 1;
                 }
             } else if (op == 0x4d) {
-                if (i + 2 > script_bytes.len) { bad = true; } else {
+                if (i + 2 > script_bytes.len) {
+                    bad = true;
+                } else {
                     data_len = @as(usize, script_bytes[i]) |
                         (@as(usize, script_bytes[i + 1]) << 8);
                     i += 2;
                 }
             } else { // 0x4e
-                if (i + 4 > script_bytes.len) { bad = true; } else {
+                if (i + 4 > script_bytes.len) {
+                    bad = true;
+                } else {
                     data_len = @as(usize, script_bytes[i]) |
                         (@as(usize, script_bytes[i + 1]) << 8) |
                         (@as(usize, script_bytes[i + 2]) << 16) |
@@ -23285,15 +23263,15 @@ fn attemptSighashDecode(vch: []const u8) ?[]const u8 {
 fn writeScriptUnivNoAddr(writer: anytype, script_bytes: []const u8) !void {
     const t = script_mod.classifyScript(script_bytes);
     const type_str: []const u8 = switch (t) {
-        .p2pkh    => "pubkeyhash",
-        .p2sh     => "scripthash",
-        .p2wpkh   => "witness_v0_keyhash",
-        .p2wsh    => "witness_v0_scripthash",
-        .p2tr     => "witness_v1_taproot",
-        .anchor   => "anchor",
-        .p2pk     => "pubkey",
+        .p2pkh => "pubkeyhash",
+        .p2sh => "scripthash",
+        .p2wpkh => "witness_v0_keyhash",
+        .p2wsh => "witness_v0_scripthash",
+        .p2tr => "witness_v1_taproot",
+        .anchor => "anchor",
+        .p2pk => "pubkey",
         .multisig => "multisig",
-        .null_data=> "nulldata",
+        .null_data => "nulldata",
         .witness_unknown => "witness_unknown",
         .nonstandard => "nonstandard",
     };
@@ -23752,9 +23730,9 @@ fn decodeScriptHasValidOps(s: []const u8) bool {
         } else if (op == 0x4e) {
             if (i + 4 > s.len) return false;
             data_len = @as(usize, s[i]) |
-                       (@as(usize, s[i + 1]) << 8) |
-                       (@as(usize, s[i + 2]) << 16) |
-                       (@as(usize, s[i + 3]) << 24);
+                (@as(usize, s[i + 1]) << 8) |
+                (@as(usize, s[i + 2]) << 16) |
+                (@as(usize, s[i + 3]) << 24);
             i += 4;
         }
         if (i + data_len > s.len) return false;
@@ -23767,7 +23745,7 @@ fn decodeScriptHasValidOps(s: []const u8) bool {
 /// Mirrors CScript::IsUnspendable (script/script.h).
 fn decodeScriptIsUnspendable(s: []const u8) bool {
     if (s.len > 10000) return true;
-    if (s.len > 0 and s[0] == 0x6a) return true;  // OP_RETURN
+    if (s.len > 0 and s[0] == 0x6a) return true; // OP_RETURN
     return false;
 }
 
@@ -23806,9 +23784,9 @@ fn decodeScriptHasTaprootOps(s: []const u8) bool {
         } else if (op == 0x4e) {
             if (i + 4 > s.len) return false;
             data_len = @as(usize, s[i]) |
-                       (@as(usize, s[i + 1]) << 8) |
-                       (@as(usize, s[i + 2]) << 16) |
-                       (@as(usize, s[i + 3]) << 24);
+                (@as(usize, s[i + 1]) << 8) |
+                (@as(usize, s[i + 2]) << 16) |
+                (@as(usize, s[i + 3]) << 24);
             i += 4;
         }
         if (i + data_len > s.len) break;
@@ -24506,6 +24484,180 @@ test "FIX-80: mainnet at tip exits IBD via active_tip.chain_work (chain_state.to
     // prefers `active_tip.chain_work` and returns false correctly.
     try std.testing.expect(!server.isInitialBlockDownload());
     try std.testing.expect(server.ibd_latched_off.load(.monotonic));
+}
+
+// Genesis-scale nChainWork: getblockchaininfo.chainwork, IBD, and the
+// refusal to copy header_index since-root work.  Reverting the persist
+// path (total_work stays zero) or comparing against hexToHash-reversed
+// min_chain_work without minChainWorkBE makes these fail.
+test "getblockchaininfo chainwork is genesis-scale GetBlockProof, not header_index since-root" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 100;
+    chain_state.best_hash = [_]u8{0xAB} ** 32;
+    chain_state.total_work = chainwork.workFromBits(0x1d00ffff);
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    // Poison header_index with since-root work (height+1 in the low bytes).
+    // RPC must not copy this into getblockchaininfo.chainwork.
+    try peer_manager.header_index.put(chain_state.best_hash, .{
+        .hash = chain_state.best_hash,
+        .prev_hash = [_]u8{0} ** 32,
+        .height = 100,
+        .chain_work = peer_mod.chainWorkFromHeight(100),
+        .timestamp = 1_700_000_000,
+        .header = std.mem.zeroes(types.BlockHeader),
+        .last_seen = 0,
+    });
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockchaininfo\",\"params\":[]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"chainwork\":\"0000000000000000000000000000000000000000000000000000000100010001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"chainwork\":\"0000000000000000000000000000000000000000000000000000000000000065\"") == null);
+}
+
+test "IBD exits on mainnet when total_work meets BE min_chain_work and tip is fresh" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 966_000;
+    chain_state.best_hash = [_]u8{0xAB} ** 32;
+    chain_state.total_work = chainwork.minChainWorkBE(&consensus.MAINNET.min_chain_work);
+
+    var cm = validation.ChainManager.init(&chain_state, null, allocator);
+    defer cm.deinit();
+    const tip_entry = try allocator.create(validation.BlockIndexEntry);
+    tip_entry.* = .{
+        .hash = chain_state.best_hash,
+        .header = blk: {
+            var h = std.mem.zeroes(types.BlockHeader);
+            h.timestamp = @intCast(std.time.timestamp());
+            break :blk h;
+        },
+        .height = chain_state.best_height,
+        .status = .{},
+        // Zeros: IBD must use total_work, not active_tip.chain_work.
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try cm.block_index.put(tip_entry.hash, tip_entry);
+    cm.active_tip = tip_entry;
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    try std.testing.expect(!server.isInitialBlockDownload());
+    try std.testing.expect(server.ibd_latched_off.load(.monotonic));
+}
+
+test "getnetworkhashps sums GetBlockProof over persisted headers" {
+    const allocator = std.testing.allocator;
+    const Database = storage.Database;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 2;
+
+    const h1 = [_]u8{0x11} ** 32;
+    const h2 = [_]u8{0x22} ** 32;
+    const k1 = storage.ChainStore.buildHeightHashKey(1);
+    const k2 = storage.ChainStore.buildHeightHashKey(2);
+    try db.put(storage.CF_DEFAULT, &k1, &h1);
+    try db.put(storage.CF_DEFAULT, &k2, &h2);
+
+    var hdr1 = std.mem.zeroes(types.BlockHeader);
+    hdr1.bits = 0x1d00ffff;
+    hdr1.timestamp = 1_000;
+    var hdr2 = std.mem.zeroes(types.BlockHeader);
+    hdr2.bits = 0x1d00ffff;
+    hdr2.timestamp = 1_600;
+
+    var w1 = serialize.Writer.init(allocator);
+    defer w1.deinit();
+    w1.writeInt(u32, 1) catch unreachable;
+    serialize.writeBlockHeader(&w1, &hdr1) catch unreachable;
+    try db.put(storage.CF_BLOCK_INDEX, &h1, w1.getWritten());
+    var w2 = serialize.Writer.init(allocator);
+    defer w2.deinit();
+    w2.writeInt(u32, 2) catch unreachable;
+    serialize.writeBlockHeader(&w2, &hdr2) catch unreachable;
+    try db.put(storage.CF_BLOCK_INDEX, &h2, w2.getWritten());
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getnetworkhashps\",\"params\":[1]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    // nblocks=1 → work = GetBlockProof(tip), timeDiff = max-min of {pb0, pb} = 600.
+    // 0x100010001 / 600 = 7158388.055...
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\":null") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const nethash = parsed.value.object.get("result").?;
+    const nh: f64 = switch (nethash) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => return error.TestUnexpectedResult,
+    };
+    const proof = chainwork.workFromBits(0x1d00ffff);
+    const expect_nh = chainwork.workToF64(&proof) / 600.0;
+    try std.testing.expectApproxEqRel(expect_nh, nh, 1e-9);
+    try std.testing.expect(nh > 0);
 }
 
 // getblockfrompeer — Core parity (rpc/blockchain.cpp:514 + net_processing.cpp
@@ -28094,7 +28246,7 @@ test "getblockstats: computeBlockStats fee + size math on a constructed block" {
         .sequence = 0xFFFFFFFF,
         .witness = empty_witness,
     };
-    const cb_out = types.TxOut{ .value = 5_000_000_000, .script_pubkey = &[_]u8{ 0x51 } }; // OP_TRUE
+    const cb_out = types.TxOut{ .value = 5_000_000_000, .script_pubkey = &[_]u8{0x51} }; // OP_TRUE
     const coinbase = types.Transaction{
         .version = 1,
         .inputs = &[_]types.TxIn{cb_in},
@@ -28617,8 +28769,7 @@ test "#41 getchaintxstats: the conversion beats the block-count domain test" {
 
     const hostile = [_][]const u8{ "2147483648", "-2147483649", "4294967296", "-4294967297" };
     for (hostile) |v| {
-        const req = try std.fmt.allocPrint(allocator,
-            "{{\"id\":1,\"method\":\"getchaintxstats\",\"params\":[{s}]}}", .{v});
+        const req = try std.fmt.allocPrint(allocator, "{{\"id\":1,\"method\":\"getchaintxstats\",\"params\":[{s}]}}", .{v});
         defer allocator.free(req);
         const resp = try server.dispatch(req);
         defer allocator.free(resp);
@@ -28738,8 +28889,7 @@ test "#41 setban: absolute is read, already-banned is -23, unban failure is -30"
 
     // CONTROL: an ABSOLUTE timestamp in the FUTURE is accepted...
     const now = std.time.timestamp();
-    const req = try std.fmt.allocPrint(allocator,
-        "{{\"id\":1,\"method\":\"setban\",\"params\":[\"5.6.7.8\",\"add\",{d},true]}}", .{now + 3600});
+    const req = try std.fmt.allocPrint(allocator, "{{\"id\":1,\"method\":\"setban\",\"params\":[\"5.6.7.8\",\"add\",{d},true]}}", .{now + 3600});
     defer allocator.free(req);
     const ok = try server.dispatch(req);
     defer allocator.free(ok);

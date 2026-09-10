@@ -19,6 +19,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const serialize = @import("serialize.zig");
 const storage_rocksdb = @import("storage_rocksdb.zig");
+const chainwork = @import("chainwork.zig");
 
 /// Column family indices for organizing data.
 /// Each stores a different type of data with potentially different
@@ -327,6 +328,21 @@ pub const ChainStore = struct {
     pub fn buildTxCountKey(height: u32) [TX_COUNT_KEY_LEN]u8 {
         var key: [TX_COUNT_KEY_LEN]u8 = undefined;
         key[0] = 'X';
+        key[1] = ':';
+        std.mem.writeInt(u32, key[2..6], height, .little);
+        return key;
+    }
+
+    /// Prefix for cumulative-chainwork-by-height index keys in CF_DEFAULT.
+    /// Key layout: "W:" ++ u32_LE(height) (6 bytes).  Value: 32-byte
+    /// big-endian nChainWork (Core GetHex order) from genesis through
+    /// `height`.  Written by connectBlockInner; restored at boot.
+    pub const CHAINWORK_PREFIX = "W:";
+    pub const CHAINWORK_KEY_LEN: usize = 6;
+
+    pub fn buildChainWorkKey(height: u32) [CHAINWORK_KEY_LEN]u8 {
+        var key: [CHAINWORK_KEY_LEN]u8 = undefined;
+        key[0] = 'W';
         key[1] = ':';
         std.mem.writeInt(u32, key[2..6], height, .little);
         return key;
@@ -2157,9 +2173,18 @@ pub const ChainState = struct {
     /// orphan rate budget. We follow Core verbatim so operators can
     /// reuse their existing tuning.
     pub const MIN_PRUNE_TARGET_MIB: u64 = 550;
+    /// CF_DEFAULT key for the tip's 32-byte BE nChainWork, written in flush
+    /// atomically with `chain_tip`.
+    pub const CHAIN_WORK_KEY: []const u8 = "chain_work";
 
     best_hash: types.Hash256,
     best_height: u32,
+    /// Cumulative nChainWork of the active tip (Core GetHex / 32-byte BE),
+    /// genesis through `best_height`.  Accumulated in connectBlockInner as
+    /// `prev + GetBlockProof(block)` (chain.cpp GetBitsProof), rewound on
+    /// disconnect, persisted under CF_DEFAULT `chain_work` and per-height
+    /// "W:" keys.  All-zero means unknown (pre-index datadir / unseeded).
+    /// Header-index work is since-root, not genesis — do not copy it here.
     total_work: [32]u8,
     /// Cumulative number of transactions in the active chain from genesis
     /// up to and including `best_height`.  Bitcoin Core analog:
@@ -4348,6 +4373,141 @@ pub const ChainState = struct {
         }
     }
 
+    /// Persist the genesis-scale nChainWork at `height` (CF_DEFAULT "W:").
+    /// Best-effort, same race-tolerance as putCumulativeTxCount.
+    pub fn putCumulativeChainWork(self: *ChainState, height: u32, work: *const [32]u8) void {
+        const db = self.utxo_set.db orelse return;
+        if (chainwork.isZero(work)) return;
+        const key_bytes = ChainStore.buildChainWorkKey(height);
+        db.put(CF_DEFAULT, &key_bytes, work) catch return;
+    }
+
+    /// Look up persisted nChainWork at `height`.  Null if absent / all-zero.
+    pub fn getCumulativeChainWork(self: *ChainState, height: u32) ?[32]u8 {
+        const db = self.utxo_set.db orelse return null;
+        const key_bytes = ChainStore.buildChainWorkKey(height);
+        const data = db.get(CF_DEFAULT, &key_bytes) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        if (bytes.len != 32) return null;
+        var w: [32]u8 = undefined;
+        @memcpy(&w, bytes[0..32]);
+        if (chainwork.isZero(&w)) return null;
+        return w;
+    }
+
+    /// Seed nChainWork(genesis) = GetBlockProof(genesis).  Genesis is not
+    /// connected via connectBlockInner.  Safe to call at startup before the
+    /// tip is loaded (best_height is still 0); restoreTotalWork overwrites
+    /// this if a later tip is then loaded.
+    pub fn seedGenesisTotalWork(self: *ChainState, genesis_bits: u32) void {
+        if (self.best_height != 0) return;
+        if (!chainwork.isZero(&self.total_work)) return;
+        self.total_work = chainwork.workFromBits(genesis_bits);
+        self.putCumulativeChainWork(0, &self.total_work);
+        self.persistTipWorkKey(&self.total_work);
+    }
+
+    fn persistTipWorkKey(self: *ChainState, work: *const [32]u8) void {
+        const db = self.utxo_set.db orelse return;
+        if (chainwork.isZero(work)) return;
+        db.put(CF_DEFAULT, CHAIN_WORK_KEY, work) catch return;
+    }
+
+    fn loadPersistedTipWork(self: *ChainState) ?[32]u8 {
+        const db = self.utxo_set.db orelse return null;
+        if (db.get(CF_DEFAULT, CHAIN_WORK_KEY) catch null) |data| {
+            defer self.allocator.free(data);
+            if (data.len == 32) {
+                var w: [32]u8 = undefined;
+                @memcpy(&w, data[0..32]);
+                if (!chainwork.isZero(&w)) return w;
+            }
+        }
+        return self.getCumulativeChainWork(self.best_height);
+    }
+
+    /// Restore in-memory total_work after the chain tip is loaded.
+    /// Order: persisted tip key / W: at height, else reconstruct from a
+    /// snapshot-base checkpoint whose hash matches H:, else zero (unknown).
+    pub fn restoreTotalWork(self: *ChainState, params: *const @import("consensus.zig").NetworkParams) void {
+        if (self.best_height == 0) {
+            if (chainwork.isZero(&self.total_work)) {
+                self.total_work = chainwork.workFromBits(params.genesis_header.bits);
+            }
+            return;
+        }
+        if (self.loadPersistedTipWork()) |w| {
+            self.total_work = w;
+            return;
+        }
+        if (self.reconstructTotalWork(params)) |w| {
+            self.total_work = w;
+            self.putCumulativeChainWork(self.best_height, &w);
+            self.persistTipWorkKey(&w);
+            return;
+        }
+        self.total_work = [_]u8{0} ** 32;
+    }
+
+    /// Reconstruct genesis-scale nChainWork: start from the highest
+    /// assumeutxo/snapshot_bootstrap checkpoint at or below the tip whose
+    /// H: hash matches, then SUM(GetBlockProof) over headers base+1..tip.
+    /// Returns null if any header in the walk is missing (fail closed).
+    fn reconstructTotalWork(self: *ChainState, params: *const @import("consensus.zig").NetworkParams) ?[32]u8 {
+        var base_h: u32 = 0;
+        var acc: [32]u8 = chainwork.workFromBits(params.genesis_header.bits);
+        var found = false;
+
+        const consider = struct {
+            fn go(
+                cs: *ChainState,
+                e: @import("consensus.zig").AssumeUtxoData,
+                tip_h: u32,
+                best_base: *u32,
+                best_acc: *[32]u8,
+                have: *bool,
+            ) void {
+                if (e.height > tip_h) return;
+                if (chainwork.isZero(&e.chain_work)) return;
+                if (have.* and e.height < best_base.*) return;
+                const hh = cs.getBlockHashByHeight(e.height) orelse return;
+                if (!std.mem.eql(u8, &hh, &e.block_hash)) return;
+                best_base.* = e.height;
+                best_acc.* = e.chain_work;
+                have.* = true;
+            }
+        };
+        for (params.assume_utxo) |e| {
+            consider.go(self, e, self.best_height, &base_h, &acc, &found);
+        }
+        for (params.snapshot_bootstrap) |e| {
+            consider.go(self, e, self.best_height, &base_h, &acc, &found);
+        }
+        if (!found) {
+            // No matching checkpoint.  Walking from genesis is only cheap
+            // on short chains (regtest).  Mainnet without a snapshot base
+            // leaves total_work unknown rather than a minutes-long boot.
+            if (self.best_height > 10_000) return null;
+            base_h = 0;
+            acc = chainwork.workFromBits(params.genesis_header.bits);
+        }
+
+        var h: u32 = base_h + 1;
+        while (h <= self.best_height) : (h += 1) {
+            const hdr = self.getHeaderAtHeight(h) orelse return null;
+            const proof = chainwork.workFromBits(hdr.bits);
+            chainwork.addChainWorkBE(&acc, &proof);
+        }
+        return acc;
+    }
+
+    /// Header at an active-chain height: CF_BLOCK_INDEX, else CF_BLOCKS.
+    pub fn getHeaderAtHeight(self: *ChainState, height: u32) ?types.BlockHeader {
+        const hash = self.getBlockHashByHeight(height) orelse return null;
+        return self.getPersistedHeader(&hash) orelse self.getBlockHeaderFromBody(&hash);
+    }
+
     /// Estimate live-data size of CF_BLOCKS in bytes via RocksDB property.
     /// Used by the pruner to decide whether to prune more. Returns 0 when
     /// the DB is absent or the property call fails (treat as "unknown
@@ -4793,9 +4953,9 @@ pub const ChainState = struct {
         if (surplus.items.len > MAX_REORG_DEPTH) {
             std.debug.print(
                 "boot-reconcile: SKIP — surplus of {d} block(s) above tip {d} " ++
-                "exceeds MAX_REORG_DEPTH={d}; treating as stale index (snapshot " ++
-                "base or deep corruption), NOT a clean rollback. Forward-sync " ++
-                "will overwrite stale H: entries; reindex if this recurs.\n",
+                    "exceeds MAX_REORG_DEPTH={d}; treating as stale index (snapshot " ++
+                    "base or deep corruption), NOT a clean rollback. Forward-sync " ++
+                    "will overwrite stale H: entries; reindex if this recurs.\n",
                 .{ surplus.items.len, self.best_height, MAX_REORG_DEPTH },
             );
             return;
@@ -5085,8 +5245,7 @@ pub const ChainState = struct {
 
         // G8 — block-vs-undo count consistency.
         if (undo_data.tx_undo.len + 1 != block.transactions.len) {
-            std.debug.print("disconnectBlockByHashCF: undo/tx count mismatch ({d} vs {d})\n",
-                .{ undo_data.tx_undo.len, block.transactions.len });
+            std.debug.print("disconnectBlockByHashCF: undo/tx count mismatch ({d} vs {d})\n", .{ undo_data.tx_undo.len, block.transactions.len });
             return error.CorruptData;
         }
 
@@ -5281,6 +5440,17 @@ pub const ChainState = struct {
         self.best_hash = block.header.prev_block;
         if (self.best_height > 0) self.best_height -= 1;
 
+        // Rewind nChainWork by this block's GetBlockProof.  Prefer the
+        // persisted parent "W:" entry when present so a pre-fix datadir
+        // that never accumulated work does not underflow.
+        if (!chainwork.isZero(&self.total_work)) {
+            const proof = chainwork.workFromBits(block.header.bits);
+            chainwork.subChainWorkBE(&self.total_work, &proof);
+            if (self.getCumulativeChainWork(self.best_height)) |w| {
+                self.total_work = w;
+            }
+        }
+
         // Wake the wait-family RPCs on this tip change.  This is the
         // disconnect-to-fork half of a reorg (the reorg loop calls
         // disconnectBlockByHashCFNoFlush → here per rewound block) AND the
@@ -5380,8 +5550,7 @@ pub const ChainState = struct {
         // VerifyDB-style callers that tolerate UNCLEAN can catch this
         // specific error and continue.
         if (!f_clean) {
-            std.debug.print("disconnectBlockByHashCF: completed with DISCONNECT_UNCLEAN — UTXO state self-inconsistent for {x}\n",
-                .{std.fmt.fmtSliceHexLower(hash)});
+            std.debug.print("disconnectBlockByHashCF: completed with DISCONNECT_UNCLEAN — UTXO state self-inconsistent for {x}\n", .{std.fmt.fmtSliceHexLower(hash)});
             return error.DisconnectUnclean;
         }
     }
@@ -6200,8 +6369,7 @@ pub const ChainState = struct {
                         }
                         s.deinit(self.allocator);
                     } else {
-                        const spent = try self.utxo_set.spend(&input.previous_output)
-                            orelse return error.MissingInput;
+                        const spent = try self.utxo_set.spend(&input.previous_output) orelse return error.MissingInput;
                         if (want_filters) {
                             const script = try spent.reconstructScript(self.allocator);
                             try spent_scripts_owned.append(script);
@@ -6298,6 +6466,19 @@ pub const ChainState = struct {
             self.chain_tx_count += block_ntx;
         }
         self.putCumulativeTxCount(height, self.chain_tx_count);
+
+        // nChainWork (Core GetBitsProof / GetBlockProof): genesis is seeded
+        // with GetBlockProof(genesis); every later block adds its own proof.
+        // Persisted per-height ("W:") so getblockchaininfo / IBD /
+        // getnetworkhashps survive a restart.  Header-index since-root work
+        // is a different scale and is not copied here.
+        const proof = chainwork.workFromBits(block.header.bits);
+        if (height == 0) {
+            self.total_work = proof;
+        } else {
+            chainwork.addChainWorkBE(&self.total_work, &proof);
+        }
+        self.putCumulativeChainWork(height, &self.total_work);
 
         // Pattern C0 (CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-
         // 2026-05-05.md): queue per-tx CF_TX_INDEX writes for this block so
@@ -6604,6 +6785,20 @@ pub const ChainState = struct {
             .key = tip_key,
             .value = tip_val,
         } });
+
+        // 3b. Tip nChainWork — same batch as chain_tip so a crash cannot
+        //     leave height and genesis-scale work pointing at different tips.
+        if (!chainwork.isZero(&self.total_work)) {
+            const cw_key = try self.allocator.alloc(u8, CHAIN_WORK_KEY.len);
+            @memcpy(cw_key, CHAIN_WORK_KEY);
+            const cw_val = try self.allocator.alloc(u8, 32);
+            @memcpy(cw_val, &self.total_work);
+            try batch.append(.{ .put = .{
+                .cf = CF_DEFAULT,
+                .key = cw_key,
+                .value = cw_val,
+            } });
+        }
 
         // 4. Height→hash index for getblockhash RPC.  Writes one entry per
         //    flush for the current tip height, atomic with the tip update.
@@ -7299,8 +7494,7 @@ pub const ChainState = struct {
         // the per-tx loop, which truncated the restore halfway through
         // when undo data was short.
         if (undo_data.tx_undo.len + 1 != block.transactions.len) {
-            std.debug.print("disconnectBlockFromFile: undo/tx count mismatch ({d} vs {d})\n",
-                .{ undo_data.tx_undo.len, block.transactions.len });
+            std.debug.print("disconnectBlockFromFile: undo/tx count mismatch ({d} vs {d})\n", .{ undo_data.tx_undo.len, block.transactions.len });
             return error.CorruptData;
         }
 
@@ -13964,8 +14158,12 @@ test "W102 G3 dumpTxOutSet coins_count matches cache not persisted total" {
     cs.best_height = 1;
 
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0x44); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x44);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0x10} ** 32, .index = 0 };
     try cs.utxo_set.add(&op, &types.TxOut{ .value = 1_000_000, .script_pubkey = &p2pkh }, 1, false);
 
@@ -14041,8 +14239,12 @@ test "W102 G7 loadTxOutSet accepts zero-value coin (MoneyRange boundary)" {
     cs.best_height = 0;
     const op = types.OutPoint{ .hash = [_]u8{0x55} ** 32, .index = 0 };
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0x77); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x77);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     try cs.utxo_set.add(&op, &types.TxOut{ .value = 0, .script_pubkey = &p2pkh }, 0, false);
 
     const tmp = "/tmp/clearbit-w102-g7-zero-val.dat";
@@ -14072,8 +14274,12 @@ test "W102 G15 completeValidation uses legacy hash not hash_serialized" {
     defer bg_cs.deinit();
 
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0xCC); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xCC);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0x11} ** 32, .index = 0 };
     try active_cs.utxo_set.add(&op, &types.TxOut{ .value = 5_000_000_000, .script_pubkey = &p2pkh }, 100, true);
     try bg_cs.utxo_set.add(&op, &types.TxOut{ .value = 5_000_000_000, .script_pubkey = &p2pkh }, 100, true);
@@ -14116,8 +14322,12 @@ test "W102 G15 completeValidation accepts mismatched-chainparams UTXO set" {
 
     // Single dummy coin — clearly not the 840k mainnet UTXO set.
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0xDD); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xDD);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0x22} ** 32, .index = 0 };
     try active_cs.utxo_set.add(&op, &types.TxOut{ .value = 100_000, .script_pubkey = &p2pkh }, 50, false);
     try bg_cs.utxo_set.add(&op, &types.TxOut{ .value = 100_000, .script_pubkey = &p2pkh }, 50, false);
@@ -14152,8 +14362,12 @@ test "W102 G20 loadTxOutSet rejects trailing bytes (EOF gate)" {
     cs.best_hash = [_]u8{0xCC} ** 32;
     cs.best_height = 0;
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0x88); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x88);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0x33} ** 32, .index = 0 };
     try cs.utxo_set.add(&op, &types.TxOut{ .value = 1_000, .script_pubkey = &p2pkh }, 0, false);
 
@@ -14235,8 +14449,12 @@ test "W102 G4 validateAndLoadSnapshot enforces hash_serialized content check" {
 
     // Garbage UTXO set.
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0xEE); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xEE);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0x99} ** 32, .index = 0 };
     try cs.utxo_set.add(&op, &types.TxOut{ .value = 1_234, .script_pubkey = &p2pkh }, 100, false);
 
@@ -14267,8 +14485,12 @@ test "W102 G4 validateAndLoadSnapshot out_actual_hash is populated on HashMismat
     cs.best_height = entry840k.height;
 
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0xFF); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xFF);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0x77} ** 32, .index = 0 };
     try cs.utxo_set.add(&op, &types.TxOut{ .value = 9_999, .script_pubkey = &p2pkh }, 50, false);
 
@@ -14304,8 +14526,12 @@ test "W102 G9 loadTxOutSet has no MoneyRange gate (MAX_MONEY boundary passes)" {
     cs.best_hash = [_]u8{0xEE} ** 32;
     cs.best_height = 0;
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0x11); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x11);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0x44} ** 32, .index = 0 };
     // MAX_MONEY itself is valid per MoneyRange — this round-trips fine.
     try cs.utxo_set.add(&op, &types.TxOut{ .value = MAX_MONEY, .script_pubkey = &p2pkh }, 0, false);
@@ -14345,8 +14571,12 @@ test "W102 G14 validateAndLoadSnapshot does not persist snapshot_base key" {
     cs.best_height = entry840k.height;
 
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0x55); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0x55);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0xAB} ** 32, .index = 0 };
     try cs.utxo_set.add(&op, &types.TxOut{ .value = 500_000, .script_pubkey = &p2pkh }, 10, false);
 
@@ -14390,8 +14620,12 @@ test "W102 B11 validateAndLoadSnapshot rejects base block with BLOCK_FAILED_VALI
     cs.best_height = entry840k.height;
 
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0xAB); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xAB);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0xB1} ** 32, .index = 0 };
     try cs.utxo_set.add(&op, &types.TxOut{ .value = 10_000, .script_pubkey = &p2pkh }, 100, false);
 
@@ -14444,8 +14678,12 @@ test "W102 B11 validateAndLoadSnapshot passes when base block not BLOCK_FAILED_V
     cs.best_height = entry840k.height;
 
     var p2pkh: [25]u8 = undefined;
-    p2pkh[0] = 0x76; p2pkh[1] = 0xa9; p2pkh[2] = 20;
-    @memset(p2pkh[3..23], 0xCD); p2pkh[23] = 0x88; p2pkh[24] = 0xac;
+    p2pkh[0] = 0x76;
+    p2pkh[1] = 0xa9;
+    p2pkh[2] = 20;
+    @memset(p2pkh[3..23], 0xCD);
+    p2pkh[23] = 0x88;
+    p2pkh[24] = 0xac;
     const op = types.OutPoint{ .hash = [_]u8{0xC2} ** 32, .index = 0 };
     try cs.utxo_set.add(&op, &types.TxOut{ .value = 5_000, .script_pubkey = &p2pkh }, 10, false);
 
@@ -15942,7 +16180,7 @@ test "W100 G1: UtxoSet.haveCoin returns false after spend (FRESH path removes fr
 
     const txid = [_]u8{0x10} ** 32;
     const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
-    const script = [_]u8{ 0x51 }; // OP_1
+    const script = [_]u8{0x51}; // OP_1
     const txout = types.TxOut{ .value = 5000, .script_pubkey = &script };
 
     // Add then spend the coin (FRESH path: never flushed to DB).
@@ -15977,7 +16215,7 @@ test "W100 G2: UtxoSet lacks HaveCoinInCache predicate (BUG-4)" {
 
     const txid = [_]u8{0x20} ** 32;
     const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout = types.TxOut{ .value = 1000, .script_pubkey = &script };
     try chain_state.utxo_set.add(&outpoint, &txout, 1, false);
 
@@ -16006,7 +16244,7 @@ test "W100 G3: UtxoSet.add silently overwrites unspent coin without assertion (B
 
     const txid = [_]u8{0x30} ** 32;
     const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout1 = types.TxOut{ .value = 1000, .script_pubkey = &script };
     const txout2 = types.TxOut{ .value = 9999, .script_pubkey = &script };
 
@@ -16046,7 +16284,7 @@ test "W100 G4: UtxoSet.spend returns CompactUtxo (Core SpendCoin moveout)" {
 
     const txid = [_]u8{0x40} ** 32;
     const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout = types.TxOut{ .value = 2000, .script_pubkey = &script };
 
     try chain_state.utxo_set.add(&outpoint, &txout, 5, false);
@@ -16084,7 +16322,7 @@ test "W100 G5 FIXED: UtxoSet.add preserves fresh=false across re-add of a DB-res
     const txid = [_]u8{0x50} ** 32;
     const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
     const key = makeUtxoKey(&outpoint);
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout = types.TxOut{ .value = 3000, .script_pubkey = &script };
 
     // First add: entry enters cache as fresh+dirty.
@@ -16155,7 +16393,7 @@ test "W100 G6: cacheMemoryUsage is flat count*const not dynamic script-size awar
     defer chain_state.deinit();
 
     // Insert two coins: one small script, one large script.
-    const small_script = [_]u8{ 0x51 };
+    const small_script = [_]u8{0x51};
     const large_script = [_]u8{0x01} ** 520; // 520-byte script
 
     const out1 = types.OutPoint{ .hash = [_]u8{0x61} ** 32, .index = 0 };
@@ -16199,7 +16437,7 @@ test "W100 G7: UtxoSet flush writes dirty entries without FRESH+DIRTY merge (BUG
     const txid = [_]u8{0x70} ** 32;
     const outpoint = types.OutPoint{ .hash = txid, .index = 0 };
     const key = makeUtxoKey(&outpoint);
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout = types.TxOut{ .value = 777, .script_pubkey = &script };
 
     try chain_state.utxo_set.add(&outpoint, &txout, 7, false);
@@ -16300,7 +16538,7 @@ test "W100 G11: CoinsViewCache.flush evicts all entries including clean ones (BU
     var cvc = CoinsViewCache.init(null, 1024 * 1024, allocator);
     defer cvc.deinit();
 
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const out1 = types.OutPoint{ .hash = [_]u8{0xA1} ** 32, .index = 0 };
     const out2 = types.OutPoint{ .hash = [_]u8{0xA2} ** 32, .index = 0 };
 
@@ -16325,7 +16563,7 @@ test "W100 G12: CoinsViewCache.addCoin rejects double-add with possible_overwrit
     var cvc = CoinsViewCache.init(null, 1024 * 1024, allocator);
     defer cvc.deinit();
 
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const out = types.OutPoint{ .hash = [_]u8{0xB1} ** 32, .index = 0 };
 
     try cvc.addCoin(&out, Coin{ .tx_out = .{ .value = 500, .script_pubkey = &script }, .height = 1, .is_coinbase = false }, false);
@@ -16372,7 +16610,7 @@ test "W100 G14: total_utxos counter increments on add and decrements on spend" {
 
     const txid = [_]u8{0xD0} ** 32;
     const out = types.OutPoint{ .hash = txid, .index = 0 };
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout = types.TxOut{ .value = 100, .script_pubkey = &script };
 
     const before = chain_state.utxo_set.total_utxos;
@@ -16446,7 +16684,7 @@ test "W100 G17: UtxoSet.flush uses RocksDB WriteBatch for atomic UTXO+tip write"
     const txid = [_]u8{0xE0} ** 32;
     const out = types.OutPoint{ .hash = txid, .index = 0 };
     const key = makeUtxoKey(&out);
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout = types.TxOut{ .value = 400, .script_pubkey = &script };
     try chain_state.utxo_set.add(&out, &txout, 20, false);
 
@@ -16480,7 +16718,7 @@ test "W100 G18: accessByTxidSibling is opt-in only; applyTxInUndo uses direct ke
     const txid = [_]u8{0xF0} ** 32;
     const out0 = types.OutPoint{ .hash = txid, .index = 0 };
     const out1 = types.OutPoint{ .hash = txid, .index = 1 };
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout0 = types.TxOut{ .value = 1000, .script_pubkey = &script };
     const txout1 = types.TxOut{ .value = 2000, .script_pubkey = &script };
     try chain_state.utxo_set.add(&out0, &txout0, 1, false);
@@ -16507,7 +16745,7 @@ test "W100 G19: CoinsViewCache.haveCoinInCache present in secondary layer (BUG-4
     defer cvc.deinit();
 
     const out = types.OutPoint{ .hash = [_]u8{0x19} ** 32, .index = 0 };
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     try cvc.addCoin(&out, Coin{ .tx_out = .{ .value = 50, .script_pubkey = &script }, .height = 1, .is_coinbase = false }, false);
 
     // haveCoinInCache: returns true without DB lookup.
@@ -16538,7 +16776,7 @@ test "W100 G20: UtxoSet.get returns null for unknown outpoint; after add+flush D
     const miss = try chain_state.utxo_set.get(&out);
     try std.testing.expectEqual(@as(?CompactUtxo, null), miss);
 
-    const script = [_]u8{ 0x51 };
+    const script = [_]u8{0x51};
     const txout = types.TxOut{ .value = 600, .script_pubkey = &script };
     try chain_state.utxo_set.add(&out, &txout, 3, false);
     try chain_state.utxo_set.flush();
