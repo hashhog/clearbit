@@ -9155,7 +9155,46 @@ pub const RpcServer = struct {
     // ========================================================================
 
     fn handleGetBlockTemplate(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        _ = params; // Template request params (capabilities, rules) - not fully implemented
+        // Core rpc/mining.cpp:854-857: GBT must be called with 'segwit' in
+        // rules. The T1 probe `missing-segwit-rule` is `params: [{}]`.
+        var has_segwit = false;
+        if (params == .array and params.array.items.len >= 1) {
+            const p0 = params.array.items[0];
+            if (p0 == .object) {
+                if (p0.object.get("rules")) |rules_v| {
+                    if (rules_v == .array) {
+                        for (rules_v.array.items) |r| {
+                            if (r == .string and std.mem.eql(u8, r.string, "segwit")) {
+                                has_segwit = true;
+                            }
+                        }
+                    }
+                }
+            } else if (p0 != .null) {
+                const tname: []const u8 = switch (p0) {
+                    .null => "null",
+                    .bool => "bool",
+                    .object => "object",
+                    .array => "array",
+                    .string => "string",
+                    .integer, .float, .number_string => "number",
+                };
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "JSON value of type {s} is not of expected type object",
+                    .{tname},
+                );
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
+            }
+        }
+        if (!has_segwit) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})",
+                id,
+            );
+        }
 
         // Create block template
         // OP_TRUE (anyone-can-spend) — Core's convention for unconfigured mining
@@ -13834,21 +13873,29 @@ pub const RpcServer = struct {
         defer decode_errors.deinit();
 
         for (rawtxs) |tx_item| {
+            // Core rpc/mempool.cpp:332-335: DecodeHexTx failure is an RPC
+            // error RPC_DESERIALIZATION_ERROR (-22) for the whole call, not a
+            // per-row {allowed:false}. The T1 probe `decode-error` is
+            // params: [["deadbeef"]].
             if (tx_item != .string) {
-                try txns.append(undefined);
-                try decode_errors.append("invalid-hex");
-                continue;
+                return self.jsonRpcError(
+                    RPC_DESERIALIZATION_ERROR,
+                    "TX decode failed. Make sure the tx has at least one input.",
+                    id,
+                );
             }
             const hex_str = tx_item.string;
+            const decode_fail_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "TX decode failed: {s} Make sure the tx has at least one input.",
+                .{hex_str},
+            );
+            defer self.allocator.free(decode_fail_msg);
             if (hex_str.len % 2 != 0) {
-                try txns.append(undefined);
-                try decode_errors.append("invalid-hex");
-                continue;
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_fail_msg, id);
             }
             var tx_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
-                try txns.append(undefined);
-                try decode_errors.append("decode-error");
-                continue;
+                return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
             };
             defer self.allocator.free(tx_bytes);
             var valid_hex = true;
@@ -13859,15 +13906,11 @@ pub const RpcServer = struct {
                 };
             }
             if (!valid_hex) {
-                try txns.append(undefined);
-                try decode_errors.append("invalid-hex");
-                continue;
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_fail_msg, id);
             }
             var reader = serialize.Reader{ .data = tx_bytes };
             const tx = serialize.readTransaction(&reader, self.allocator) catch {
-                try txns.append(undefined);
-                try decode_errors.append("TX decode failed");
-                continue;
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_fail_msg, id);
             };
             try txns.append(tx);
             try decode_errors.append(null);
@@ -15373,7 +15416,13 @@ pub const RpcServer = struct {
                 },
             };
         } else {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid command", id);
+            // Core rpc/net.cpp:336-339: unknown command throws runtime_error
+            // of the method help, which becomes RPC_MISC_ERROR (-1).
+            return self.jsonRpcError(
+                RPC_MISC_ERROR,
+                "addnode \"node\" \"command\" ( v2transport )\n\nAttempts to add or remove a node from the addnode list.",
+                id,
+            );
         }
 
         return self.jsonRpcResult("null", id);
@@ -20026,6 +20075,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("ping\\n\\nRequests that a ping be sent to all other nodes, to measure ping time.\\nResults are provided in getpeerinfo.");
             } else if (std.mem.eql(u8, cmd, "addnode")) {
                 try writer.writeAll("addnode node command\\n\\nAttempts to add or remove a node from the addnode list.");
+            } else if (std.mem.eql(u8, cmd, "clearbanned")) {
+                try writer.writeAll("clearbanned\\n\\nClear all banned IPs.");
             } else if (std.mem.eql(u8, cmd, "getaddednodeinfo")) {
                 try writer.writeAll("getaddednodeinfo ( \\\"node\\\" )\\n\\nReturns information about the given added node, or all added nodes.");
             } else if (std.mem.eql(u8, cmd, "disconnectnode")) {
@@ -20123,6 +20174,7 @@ pub const RpcServer = struct {
             try writer.writeAll("getnettotals\\n");
             try writer.writeAll("getnodeaddresses\\n");
             try writer.writeAll("listbanned\\n");
+            try writer.writeAll("clearbanned\\n");
             try writer.writeAll("setban\\n");
             try writer.writeAll("\\n== Rawtransactions ==\\n");
             try writer.writeAll("combinerawtransaction\\n");
@@ -20222,7 +20274,15 @@ pub const RpcServer = struct {
                 } else if (std.mem.eql(u8, s, "none")) {
                     hash_type = .none;
                 } else {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid hash_type", id);
+                    // Core ParseHashType (rpc/blockchain.cpp:967-977):
+                    // RPC_INVALID_PARAMETER (-8) "'%s' is not a valid hash_type".
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "'{s}' is not a valid hash_type",
+                        .{s},
+                    );
+                    defer self.allocator.free(msg);
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
                 }
             } else if (p0 != .null) {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "hash_type must be a string", id);
@@ -20518,7 +20578,10 @@ pub const RpcServer = struct {
             tip_h = @intCast(target_height);
         }
 
-        if (nblocks <= 0) {
+        if (nblocks == -1) {
+            // Core GetNetworkHashPS: lookup = height % DifficultyAdjustmentInterval() + 1.
+            nblocks = @as(i64, @intCast(tip_h % 2016)) + 1;
+        } else if (nblocks <= 0) {
             nblocks = @intCast(tip_h % 2016);
             if (nblocks == 0) nblocks = 1;
         }
@@ -20601,15 +20664,18 @@ pub const RpcServer = struct {
             if (params.array.items.len >= 1) {
                 const p0 = params.array.items[0];
                 // Core declares both args as Arg<int> (rpc/mining.cpp
-                // getnetworkhashps), a 32-bit parse: out of int32 is univalue's
-                // -1 before the handler sees anything.  Unbounded values used to
-                // reach computeNetworkHashPS and abort the process there.
+                // getnetworkhashps). A non-number is RPC_TYPE_ERROR (-3);
+                // T1 probe `type-error` is params: ["foo"].
                 if (p0 == .integer) {
                     if (p0.integer < -2147483648 or p0.integer > 2147483647) {
                         return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
                     nblocks = p0.integer;
-                } else if (p0 == .float) return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
+                } else if (p0 == .float) {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
+                } else if (p0 != .null) {
+                    return try self.typeErrorNotNumber(p0, id);
+                }
             }
             if (params.array.items.len >= 2) {
                 const p1 = params.array.items[1];
@@ -20618,8 +20684,29 @@ pub const RpcServer = struct {
                         return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     }
                     target_height = p1.integer;
-                } else if (p1 == .float) return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
+                } else if (p1 == .float) {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
+                } else if (p1 != .null) {
+                    return try self.typeErrorNotNumber(p1, id);
+                }
             }
+        }
+
+        // Core GetNetworkHashPS (rpc/mining.cpp:66-72).
+        if (nblocks < -1 or nblocks == 0) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "Invalid nblocks. Must be a positive number or -1.",
+                id,
+            );
+        }
+        const best_h: i64 = @intCast(self.chain_state.best_height);
+        if (target_height < -1 or target_height > best_h) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "Block does not exist at specified height",
+                id,
+            );
         }
 
         const hashps = self.computeNetworkHashPS(nblocks, target_height);

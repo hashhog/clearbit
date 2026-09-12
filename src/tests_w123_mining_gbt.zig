@@ -498,13 +498,15 @@ test "w123 G3 BUG-3 GBT response missing core BIP-22 fields" {
 // G4 — BUG-4 P0-CDIV: handleGetBlockTemplate ignores params
 // ---------------------------------------------------------------------------
 
-test "w123 G4 BUG-4 params ignored: handleGetBlockTemplate has `_ = params` discard" {
+test "w123 G4 handleGetBlockTemplate reads rules and requires segwit" {
     const src = @embedFile("rpc.zig");
     const handler_start = std.mem.indexOf(u8, src, "fn handleGetBlockTemplate(") orelse
         return error.TestUnexpectedResult;
-    const handler_end = @min(handler_start + 400, src.len);
+    const handler_end = @min(handler_start + 1_200, src.len);
     const body = src[handler_start..handler_end];
-    try testing.expect(std.mem.indexOf(u8, body, "_ = params;") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "_ = params;") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "segwit") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "RPC_INVALID_PARAMETER") != null);
 }
 
 // ---------------------------------------------------------------------------

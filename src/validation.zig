@@ -92,6 +92,9 @@ pub const ValidationError = error{
     /// full validation to prevent an attacker from buffering blocks at tip+1M.
     /// Reference: validation.cpp:4325-4339 — fTooFarAhead gate.
     TooFarAhead,
+    /// Unrequested block whose nChainWork is below nMinimumChainWork.
+    /// Core AcceptBlock (validation.cpp:4345) returns true without writing.
+    TooLittleChainwork,
 
     // General errors
     OutOfMemory,
@@ -1308,6 +1311,10 @@ pub const IBDValidationContext = struct {
     ///   `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))
     ///        return state.Invalid(..., "bad-diffbits", "incorrect proof of work");`
     expected_bits: u32 = 0,
+    /// Cumulative nChainWork of this block (big-endian). All-zero = not
+    /// provided; the AcceptBlock nMinimumChainWork skip is not applied.
+    /// Reference: validation.cpp:4345.
+    block_chain_work: [32]u8 = [_]u8{0} ** 32,
 };
 
 /// Information about a previous output, returned by IBDValidationContext.
@@ -1459,6 +1466,29 @@ pub fn validateBlockForIBD(
         if (height > ctx.active_tip_height + min_blocks_to_keep) {
             return ValidationError.TooFarAhead;
         }
+    }
+
+    // 0b. AcceptBlock nChainWork < nMinimumChainWork (validation.cpp:4345).
+    // Unrequested low-work blocks are not stored. All-zero block_chain_work
+    // means the caller did not supply it (skip). Regtest min is zero so the
+    // comparison never fires there.
+    if (!ctx.is_requested and !chainwork.isZero(&ctx.block_chain_work)) {
+        const min_be = chainwork.minChainWorkBE(&params.min_chain_work);
+        if (!chainwork.isZero(&min_be) and
+            chainwork.cmpChainWorkBE(&ctx.block_chain_work, &min_be) < 0)
+        {
+            return ValidationError.TooLittleChainwork;
+        }
+    }
+
+    // 0c. Checkpoint match at known heights. Cheap hash compare; runs before
+    // PoW so a mismatch is CheckpointMismatch rather than BadProofOfWork.
+    if (!consensus.verifyCheckpoint(
+        consensus.checkpointsForParams(params),
+        height,
+        &ctx.block_hash,
+    )) {
+        return ValidationError.CheckpointMismatch;
     }
 
     // 1. Header PoW.  Flag-gated to mirror Core's CheckBlock(..., fCheckPOW):
@@ -2073,6 +2103,8 @@ pub const AcceptBlockOptions = struct {
     /// equivalent before calling acceptBlock.
     /// Reference: bitcoin-core/src/validation.cpp:4088.
     expected_bits: u32 = 0,
+    /// See IBDValidationContext.block_chain_work.
+    block_chain_work: [32]u8 = [_]u8{0} ** 32,
 };
 
 /// Unified block consensus-validation entry point.
@@ -2123,6 +2155,7 @@ pub fn acceptBlock(
         .active_tip_height = options.active_tip_height,
         .is_requested = options.is_requested,
         .expected_bits = options.expected_bits,
+        .block_chain_work = options.block_chain_work,
     };
     return validateBlockForIBD(block, &ctx, allocator);
 }
@@ -10559,9 +10592,11 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range when BIP34Hash verifie
     // Case B: active_chain has the correct BIP34Hash at index 227931 → bypass applies.
     const alloc = std.testing.allocator;
     var cb_bufs: Bip30CoinbaseBufs = .{};
-    var cb = bip30MakeCoinbase(250000, &cb_bufs);
+    var cb = bip30MakeCoinbase(250001, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
-    // Height 250000 > MAINNET bip34_height=227931 → bad-version gate fires for v<2.
+    // Height 250001 > MAINNET bip34_height=227931 → bad-version gate fires for v<2.
+    // 250000 is a mainnet checkpoint; use 250001 so this BIP-30 case is not
+    // short-circuited by CheckpointMismatch.
     // Set version=4 BEFORE mining so the hash is correct for the new version.
     blk.header.version = 4;
     bip30Mine(&blk, alloc);
@@ -10579,7 +10614,7 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range when BIP34Hash verifie
     {
         const result = validateBlockForIBD(&blk, &IBDValidationContext{
             .block_hash = block_hash,
-            .height = 250000,
+            .height = 250001,
             .params = &mainnet_regtest_pow,
             .prevout_lookup_ctx = @ptrCast(&hit_ctx),
             .prevout_lookupFn = bip30HitLookup,
@@ -10604,7 +10639,7 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range when BIP34Hash verifie
 
         const result = validateBlockForIBD(&blk, &IBDValidationContext{
             .block_hash = block_hash,
-            .height = 250000,
+            .height = 250001,
             .params = &mainnet_regtest_pow,
             .prevout_lookup_ctx = @ptrCast(&hit_ctx),
             .prevout_lookupFn = bip30HitLookup,
@@ -10630,7 +10665,7 @@ test "validateBlockForIBD: BIP-30 skipped in BIP-34 range when BIP34Hash verifie
 
         const result = validateBlockForIBD(&blk, &IBDValidationContext{
             .block_hash = block_hash,
-            .height = 250000,
+            .height = 250001,
             .params = &mainnet_regtest_pow,
             .prevout_lookup_ctx = @ptrCast(&hit_ctx),
             .prevout_lookupFn = bip30HitLookup,
@@ -10752,9 +10787,11 @@ test "W79 G6: BIP-34 bypass — active_chain too short to include bip34_height �
     // BIP34Hash anchor → conservative: keep BIP-30 enforced.
     const alloc = std.testing.allocator;
     var cb_bufs: Bip30CoinbaseBufs = .{};
-    var cb = bip30MakeCoinbase(250000, &cb_bufs);
+    var cb = bip30MakeCoinbase(250001, &cb_bufs);
     var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
-    // Height 250000 > MAINNET bip34_height=227931 → bad-version gate fires for v<2.
+    // Height 250001 > MAINNET bip34_height=227931 → bad-version gate fires for v<2.
+    // 250000 is a mainnet checkpoint; use 250001 so this BIP-30 case is not
+    // short-circuited by CheckpointMismatch.
     // Set version=4 BEFORE mining so the hash is correct for the new version.
     blk.header.version = 4;
     bip30Mine(&blk, alloc);
@@ -10773,7 +10810,7 @@ test "W79 G6: BIP-34 bypass — active_chain too short to include bip34_height �
 
     const result = validateBlockForIBD(&blk, &IBDValidationContext{
         .block_hash = block_hash,
-        .height = 250000,
+        .height = 250001,
         .params = &params,
         .prevout_lookup_ctx = @ptrCast(&hit_ctx),
         .prevout_lookupFn = bip30HitLookup,
@@ -11907,11 +11944,33 @@ test "W97 G19c: requested block >288 above tip is NOT TooFarAhead (is_requested=
 // pre-sync clone in sync.zig DOES have min_chain_work, but that runs on
 // the headers-presync path, not the body-acceptance path.
 
-test "W97 G19d: NetworkParams.min_chain_work present on params" {
-    // Shape: field is present and big-endian 32 bytes.  The body-acceptance
-    // check would be: validateBlockForIBD short-circuits when
-    // pindex.chain_work < params.min_chain_work.  No such gate exists.
-    try std.testing.expectEqual(@as(usize, 32), consensus.MAINNET.min_chain_work.len);
+test "W97 G19d: unrequested block below min_chain_work is TooLittleChainwork" {
+    const allocator = std.testing.allocator;
+    var txs: [1]types.Transaction = undefined;
+    var ins: [1]types.TxIn = undefined;
+    var outs: [1]types.TxOut = undefined;
+    const ssig = [_]u8{ 0x51, 0x00 };
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xAB} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const built = w97FillRegtestHeightOneBlock(&txs, &ins, &outs, &ssig, &spk, allocator) catch unreachable;
+    var blk = built.block;
+    const block_hash = crypto.computeBlockHash(&blk.header);
+    var dummy: u8 = 0;
+    var low_work = [_]u8{0} ** 32;
+    low_work[31] = 1;
+    const ctx = IBDValidationContext{
+        .block_hash = block_hash,
+        .height = 1,
+        .params = &consensus.MAINNET,
+        .prevout_lookup_ctx = @ptrCast(&dummy),
+        .prevout_lookupFn = ibdTestEmptyLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .is_requested = false,
+        .block_chain_work = low_work,
+    };
+    try std.testing.expectError(ValidationError.TooLittleChainwork, validateBlockForIBD(&blk, &ctx, allocator));
 }
 
 // ---- G20 — CheckBlock call ------------------------------------------------

@@ -19,6 +19,7 @@ const chainwork_mod = @import("chainwork.zig");
 pub const addChainWorkBE = chainwork_mod.addChainWorkBE;
 pub const workFromBits = chainwork_mod.workFromBits;
 pub const cmpChainWorkBE = chainwork_mod.cmpChainWorkBE;
+pub const minChainWorkBE = chainwork_mod.minChainWorkBE;
 
 // ============================================================================
 // Peer Manager Constants
@@ -292,6 +293,18 @@ pub fn evalMinChainWorkGate(
     // low-work chain that cannot advance us -> DoS drop.
     if (cmpChainWorkBE(best_header_work, min_cw) < 0) return .presync_accept;
     return .reject_dos;
+}
+
+/// Whether the headers-path min-chain-work anti-DoS gate should be skipped
+/// because parent chainwork is the synthetic `chainWorkFromHeight` fallback
+/// (active tip not in `header_index` after snapshot-boot / restart).
+///
+/// A node at tip is past every assumeUTXO height; skipping on that predicate
+/// disabled the gate for every live mainnet node. Skip only when the parent
+/// is the active tip AND is not in the header index — the one case where
+/// lookupParentChainWork returns a tiny placeholder instead of real work.
+pub fn shouldSkipMinChainWorkGate(parent_in_header_index: bool, parent_is_active_tip: bool) bool {
+    return parent_is_active_tip and !parent_in_header_index;
 }
 
 /// Maximum total connections (125 as per Bitcoin Core).
@@ -5035,6 +5048,14 @@ pub const PeerManager = struct {
             return null;
         }
         const p = parent_info.?;
+        const height = p.height + 1;
+        if (!consensus.verifyCheckpoint(
+            consensus.checkpointsForParams(self.network_params),
+            height,
+            block_hash,
+        )) {
+            return error.CheckpointMismatch;
+        }
         var new_work: [32]u8 = p.work;
         const this_work = workFromBits(header.bits);
         addChainWorkBE(&new_work, &this_work);
@@ -5042,7 +5063,7 @@ pub const PeerManager = struct {
         const entry: BlockHeaderEntry = .{
             .hash = block_hash.*,
             .prev_hash = header.prev_block,
-            .height = p.height + 1,
+            .height = height,
             .chain_work = new_work,
             .timestamp = header.timestamp,
             .header = header.*,
@@ -6042,53 +6063,31 @@ pub const PeerManager = struct {
                     const min_cw = self.network_params.min_chain_work;
                     // Fast path: skip gate when min_chain_work is all-zeros (regtest).
                     const zero: [32]u8 = [_]u8{0} ** 32;
-                    // assumeUTXO / snapshot-bootstrap anchor.
-                    //
-                    // When the node booted from a UTXO snapshot (--load-snapshot)
-                    // its active tip is the snapshot base block (e.g. height
-                    // 944183) but its header chain_work is NOT reconstructed: the
-                    // snapshot carries the UTXO set, not the header index, and the
-                    // placeholder block-index entry written at import time has
-                    // chain_work=0 (main.zig:1262).  lookupParentChainWork then
-                    // returns chainWorkFromHeight(best_height) — a tiny synthetic
-                    // value (~2^20), NOT the real ~2^245 mainnet chain_work — so a
-                    // genuine post-snapshot header batch (944184..) would compute
-                    // cum_work << min_chain_work and be rejected as
-                    // too-little-chainwork, banning every honest peer and wedging
-                    // forward sync at the snapshot base forever.
-                    //
-                    // Core does not hit this: a node that has adopted an
-                    // assumeUTXO snapshot is by construction already past
-                    // nMinimumChainWork (the snapshot base height has far more
-                    // cumulative work than min_chain_work), so min_pow_checked is
-                    // satisfied and AcceptBlockHeader never rejects on low work.
-                    // Reference: bitcoin-core/src/validation.cpp AcceptBlockHeader
-                    // min_pow_checked + node/chainstate snapshot activation.
-                    //
-                    // We mirror that: if our active tip height is at or above any
-                    // known snapshot base (canonical assume_utxo OR the hashhog
-                    // snapshot_bootstrap allowlist), the min-chain-work anti-DoS
-                    // gate has already been satisfied for this chain — skip it.
-                    const past_snapshot_base = blk: {
-                        const cs = self.chain_state orelse break :blk false;
-                        const params = self.network_params;
-                        for (params.assume_utxo) |e| {
-                            if (cs.best_height >= e.height) break :blk true;
-                        }
-                        for (params.snapshot_bootstrap) |e| {
-                            if (cs.best_height >= e.height) break :blk true;
-                        }
-                        break :blk false;
-                    };
-                    if (!std.mem.eql(u8, &min_cw, &zero) and !past_snapshot_base) {
+                    // Skip only when parent chainwork is the synthetic
+                    // chainWorkFromHeight fallback (active tip not in
+                    // header_index after snapshot-boot / restart). Do NOT skip
+                    // merely because best_height is past an assumeUTXO entry —
+                    // that disabled the gate for every live mainnet node.
+                    const prev_hash = admitted[0].prev_block;
+                    const parent_in_index = self.header_index.get(prev_hash) != null;
+                    const parent_is_active_tip = if (self.chain_state) |cs|
+                        std.mem.eql(u8, &cs.best_hash, &prev_hash)
+                    else
+                        false;
+                    if (!std.mem.eql(u8, &min_cw, &zero) and
+                        !shouldSkipMinChainWorkGate(parent_in_index, parent_is_active_tip))
+                    {
                         // Compute the parent's cumulative work (genesis =
                         // all-zeros) and the batch's summed proof-of-work.
-                        var parent_work: [32]u8 = if (self.lookupParentChainWork(&admitted[0].prev_block)) |p| p.work else [_]u8{0} ** 32;
+                        var parent_work: [32]u8 = if (self.lookupParentChainWork(&prev_hash)) |p| p.work else [_]u8{0} ** 32;
                         var batch_work: [32]u8 = [_]u8{0} ** 32;
                         for (admitted) |hdr| {
                             const w = workFromBits(hdr.bits);
                             addChainWorkBE(&batch_work, &w);
                         }
+                        // Compare against Core GetHex / BE min_chain_work.
+                        // NetworkParams.min_chain_work is hexToHash-reversed.
+                        const min_be = minChainWorkBE(&min_cw);
                         // Core-faithful presync gate.  Do NOT ban on
                         // too-little-chainwork during initial header sync:
                         // Core never Misbehaves on BLOCK_HEADER_LOW_WORK
@@ -6101,7 +6100,7 @@ pub const PeerManager = struct {
                             &self.best_header_chain_work,
                             &parent_work,
                             &batch_work,
-                            &min_cw,
+                            &min_be,
                         )) {
                             // .commit: batch crossed min_chain_work.
                             // .presync_accept: still in presync — tolerate the
@@ -9226,6 +9225,7 @@ pub const PeerManager = struct {
                 // the check for free.
                 .active_tip_height = cs.best_height,
                 .is_requested = true,
+                .block_chain_work = if (self.header_index.get(block_hash.*)) |e| e.chain_work else [_]u8{0} ** 32,
             },
         ) catch |err| {
             std.debug.print(

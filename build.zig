@@ -445,7 +445,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             // Filter to only our W103 tests; exclude drifted peer.zig tests
             // that this root transitively pulls in via the peer import.
-            .filters = &[_][]const u8{"W103", "tests_w103_tx_relay"},
+            .filters = &[_][]const u8{ "W103", "tests_w103_tx_relay" },
         });
         w103_tests.linkSystemLibrary("rocksdb");
         w103_tests.linkSystemLibrary("secp256k1");
@@ -480,7 +480,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             // Filter to only our W104 tests; exclude drifted peer.zig tests
             // that this root transitively pulls in via the peer import.
-            .filters = &[_][]const u8{"w104", "tests_w104_addrman"},
+            .filters = &[_][]const u8{ "w104", "tests_w104_addrman" },
         });
         w104_tests.linkSystemLibrary("rocksdb");
         w104_tests.linkSystemLibrary("secp256k1");
@@ -765,6 +765,40 @@ pub fn build(b: *std.Build) void {
         // live in `src/crypto.zig` and run via `zig build test`.
     }
 
+    // T1 R5 probe parity + deferred 1.0.1 min-chainwork / checkpoint controls.
+    // Same project-root package layout as tests_rpc.zig. Filter t1_r5 so
+    // imported rpc/peer/wallet tests do not run. CONTROL for QUEUES.md item 3.
+    {
+        const t1_tests = b.addTest(.{
+            .root_source_file = b.path("tests_t1_r5.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"t1_r5"},
+        });
+        t1_tests.linkSystemLibrary("rocksdb");
+        t1_tests.linkSystemLibrary("secp256k1");
+        t1_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        t1_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            t1_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            t1_tests.linkSystemLibrary("minisketch");
+            t1_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        t1_tests.root_module.addOptions("build_options", build_options);
+
+        const run_t1_tests = b.addRunArtifact(t1_tests);
+        const t1_test_step = b.step(
+            "test-t1-r5",
+            "Run T1 R5 probe parity + min-chainwork/checkpoint production-caller tests",
+        );
+        t1_test_step.dependOn(&run_t1_tests.step);
+    }
+
     // createrawtransaction vout/sequence/locktime range-check regression.
     // Same project-root wrapper as tests_rpc.zig (src/rpc.zig transitively
     // imports src/wallet.zig, whose @embedFile only resolves from the project
@@ -916,7 +950,7 @@ pub fn build(b: *std.Build) void {
             // Filter to only the W20 test names so we don't drag in the
             // unrelated pre-existing wallet.zig tests (some of which leak
             // in a way that's outside the scope of this wave).
-            .filters = &[_][]const u8{"BIP-86", "BIP-341", "BIP-39", "wallet computeTaprootSigHash", "signInput .p2tr", "Wallet.initFromMnemonic"},
+            .filters = &[_][]const u8{ "BIP-86", "BIP-341", "BIP-39", "wallet computeTaprootSigHash", "signInput .p2tr", "Wallet.initFromMnemonic" },
         });
         wallet_taproot_tests.linkSystemLibrary("rocksdb");
         wallet_taproot_tests.linkSystemLibrary("secp256k1");
@@ -1561,7 +1595,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             // Filter to only our W128 tests; exclude drifted peer.zig tests
             // that this root transitively pulls in via the peer import.
-            .filters = &[_][]const u8{"w128", "tests_w128_addrman"},
+            .filters = &[_][]const u8{ "w128", "tests_w128_addrman" },
         });
         w128_tests.linkSystemLibrary("rocksdb");
         w128_tests.linkSystemLibrary("secp256k1");
@@ -1599,7 +1633,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             // Filter to only our W142 tests; exclude drifted peer.zig tests
             // that this root transitively pulls in via the peer import.
-            .filters = &[_][]const u8{"w142", "tests_w142_anti_eclipse"},
+            .filters = &[_][]const u8{ "w142", "tests_w142_anti_eclipse" },
         });
         w142_tests.linkSystemLibrary("rocksdb");
         w142_tests.linkSystemLibrary("secp256k1");

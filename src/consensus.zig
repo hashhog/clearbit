@@ -1652,6 +1652,15 @@ pub fn getNetworkParams(network: Network) *const NetworkParams {
     };
 }
 
+/// Checkpoints for a live `NetworkParams` (identified by genesis hash).
+pub fn checkpointsForParams(params: *const NetworkParams) []const Checkpoint {
+    if (std.mem.eql(u8, &params.genesis_hash, &MAINNET.genesis_hash)) return MAINNET_CHECKPOINTS;
+    if (std.mem.eql(u8, &params.genesis_hash, &TESTNET3.genesis_hash)) return TESTNET3_CHECKPOINTS;
+    if (std.mem.eql(u8, &params.genesis_hash, &TESTNET4.genesis_hash)) return TESTNET4_CHECKPOINTS;
+    if (std.mem.eql(u8, &params.genesis_hash, &SIGNET.genesis_hash)) return SIGNET_CHECKPOINTS;
+    return REGTEST_CHECKPOINTS;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
