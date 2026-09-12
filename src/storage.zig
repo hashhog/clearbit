@@ -4400,12 +4400,30 @@ pub const ChainState = struct {
     /// connected via connectBlockInner.  Safe to call at startup before the
     /// tip is loaded (best_height is still 0); restoreTotalWork overwrites
     /// this if a later tip is then loaded.
+    ///
+    /// Must not persist the tip `chain_work` key when the datadir already
+    /// holds a non-genesis chain_tip: main.zig calls this while
+    /// best_height is still 0, and writing GetBlockProof(genesis) there
+    /// made restoreTotalWork treat 0x100010001 as the tip's nChainWork
+    /// (live mainnet, 2026-09-11).
     pub fn seedGenesisTotalWork(self: *ChainState, genesis_bits: u32) void {
         if (self.best_height != 0) return;
         if (!chainwork.isZero(&self.total_work)) return;
+        if (self.peekPersistedTipHeight()) |h| {
+            if (h > 0) return;
+        }
         self.total_work = chainwork.workFromBits(genesis_bits);
         self.putCumulativeChainWork(0, &self.total_work);
         self.persistTipWorkKey(&self.total_work);
+    }
+
+    fn peekPersistedTipHeight(self: *ChainState) ?u32 {
+        const db = self.utxo_set.db orelse return null;
+        const data = db.get(CF_DEFAULT, ChainStore.CHAIN_TIP_KEY) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        if (bytes.len != 36) return null;
+        return std.mem.readInt(u32, bytes[32..36], .little);
     }
 
     fn persistTipWorkKey(self: *ChainState, work: *const [32]u8) void {
@@ -4427,9 +4445,43 @@ pub const ChainState = struct {
         return self.getCumulativeChainWork(self.best_height);
     }
 
+    /// True when `w` is a plausible genesis-scale nChainWork for the loaded
+    /// tip.  A seed-poisoned key (GetBlockProof(genesis) at height>0) and a
+    /// key grown from that poison (still below a matching assumeutxo /
+    /// snapshot checkpoint) both fail.
+    fn persistedWorkPlausible(
+        self: *ChainState,
+        w: *const [32]u8,
+        params: *const @import("consensus.zig").NetworkParams,
+    ) bool {
+        if (self.best_height == 0) return true;
+        const genesis = chainwork.workFromBits(params.genesis_header.bits);
+        if (chainwork.cmpChainWorkBE(w, &genesis) <= 0) return false;
+
+        var ok = true;
+        const check = struct {
+            fn go(
+                cs: *ChainState,
+                e: @import("consensus.zig").AssumeUtxoData,
+                work: *const [32]u8,
+                all_ok: *bool,
+            ) void {
+                if (!all_ok.*) return;
+                if (e.height > cs.best_height) return;
+                if (chainwork.isZero(&e.chain_work)) return;
+                const hh = cs.getBlockHashByHeight(e.height) orelse return;
+                if (!std.mem.eql(u8, &hh, &e.block_hash)) return;
+                if (chainwork.cmpChainWorkBE(work, &e.chain_work) < 0) all_ok.* = false;
+            }
+        };
+        for (params.assume_utxo) |e| check.go(self, e, w, &ok);
+        for (params.snapshot_bootstrap) |e| check.go(self, e, w, &ok);
+        return ok;
+    }
+
     /// Restore in-memory total_work after the chain tip is loaded.
-    /// Order: persisted tip key / W: at height, else reconstruct from a
-    /// snapshot-base checkpoint whose hash matches H:, else zero (unknown).
+    /// Order: plausible persisted tip key / W: at height, else reconstruct
+    /// from a snapshot-base checkpoint whose hash matches H:, else zero.
     pub fn restoreTotalWork(self: *ChainState, params: *const @import("consensus.zig").NetworkParams) void {
         if (self.best_height == 0) {
             if (chainwork.isZero(&self.total_work)) {
@@ -4438,13 +4490,18 @@ pub const ChainState = struct {
             return;
         }
         if (self.loadPersistedTipWork()) |w| {
-            self.total_work = w;
-            return;
+            if (self.persistedWorkPlausible(&w, params)) {
+                self.total_work = w;
+                return;
+            }
+            std.debug.print("Ignoring implausible persisted nChainWork at height {d}; reconstructing\n", .{self.best_height});
         }
         if (self.reconstructTotalWork(params)) |w| {
             self.total_work = w;
             self.putCumulativeChainWork(self.best_height, &w);
             self.persistTipWorkKey(&w);
+            const hex = chainwork.toHex(&w);
+            std.debug.print("Reconstructed nChainWork at height {d}: {s}\n", .{ self.best_height, hex });
             return;
         }
         self.total_work = [_]u8{0} ** 32;
@@ -4454,6 +4511,10 @@ pub const ChainState = struct {
     /// assumeutxo/snapshot_bootstrap checkpoint at or below the tip whose
     /// H: hash matches, then SUM(GetBlockProof) over headers base+1..tip.
     /// Returns null if any header in the walk is missing (fail closed).
+    ///
+    /// On networks that do not allow min-difficulty blocks, nBits is
+    /// constant inside a 2016-block retarget window, so the walk reads the
+    /// first and last header of each window instead of every body.
     fn reconstructTotalWork(self: *ChainState, params: *const @import("consensus.zig").NetworkParams) ?[32]u8 {
         var base_h: u32 = 0;
         var acc: [32]u8 = chainwork.workFromBits(params.genesis_header.bits);
@@ -4493,11 +4554,35 @@ pub const ChainState = struct {
             acc = chainwork.workFromBits(params.genesis_header.bits);
         }
 
+        const interval: u32 = if (params.pow_target_spacing == 0)
+            1
+        else
+            params.pow_target_timespan / params.pow_target_spacing;
+        const stride: u32 = if (params.pow_allow_min_difficulty_blocks or interval == 0)
+            1
+        else
+            interval;
+
         var h: u32 = base_h + 1;
-        while (h <= self.best_height) : (h += 1) {
+        while (h <= self.best_height) {
             const hdr = self.getHeaderAtHeight(h) orelse return null;
             const proof = chainwork.workFromBits(hdr.bits);
-            chainwork.addChainWorkBE(&acc, &proof);
+            var run_last: u32 = h;
+            if (stride > 1) {
+                const rem = h % stride;
+                const next_retarget = if (rem == 0) h + stride else h + (stride - rem);
+                run_last = @min(self.best_height, next_retarget - 1);
+                if (run_last > h) {
+                    const last_hdr = self.getHeaderAtHeight(run_last) orelse return null;
+                    if (last_hdr.bits != hdr.bits) run_last = h;
+                }
+            }
+            const count: u32 = run_last - h + 1;
+            var n: u32 = 0;
+            while (n < count) : (n += 1) {
+                chainwork.addChainWorkBE(&acc, &proof);
+            }
+            h = run_last + 1;
         }
         return acc;
     }
@@ -5442,12 +5527,17 @@ pub const ChainState = struct {
 
         // Rewind nChainWork by this block's GetBlockProof.  Prefer the
         // persisted parent "W:" entry when present so a pre-fix datadir
-        // that never accumulated work does not underflow.
+        // that never accumulated work does not underflow — but only if
+        // that entry is plausible (a seed-poisoned W: would re-poison).
         if (!chainwork.isZero(&self.total_work)) {
             const proof = chainwork.workFromBits(block.header.bits);
             chainwork.subChainWorkBE(&self.total_work, &proof);
             if (self.getCumulativeChainWork(self.best_height)) |w| {
-                self.total_work = w;
+                const plausible = if (self.network_params) |p|
+                    self.persistedWorkPlausible(&w, p)
+                else
+                    true;
+                if (plausible) self.total_work = w;
             }
         }
 

@@ -24585,6 +24585,87 @@ test "IBD exits on mainnet when total_work meets BE min_chain_work and tip is fr
     try std.testing.expect(server.ibd_latched_off.load(.monotonic));
 }
 
+test "getblockchaininfo after boot on pre-fix snapshot index: Core chainwork, IBD false" {
+    const allocator = std.testing.allocator;
+    const Database = storage.Database;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    const snap = consensus.MAINNET.snapshot_bootstrap[0];
+    const h184 = comptime consensus.hexToHash("000000000000000000014d061fd22141ef4bb10b9ad25cb0477f1b219e23c331");
+    const r184 = comptime consensus.hexToBytes80("0000002017d8ce98333245aba5170dc0c69a0e9d8303160a18460100000000000000000037a4fb60f1cbe5a9b4e254bda42caf9e8b062b492dc8e6d4a61e0bf3f65d4ed40651d6698406021761302a45");
+    const h185 = comptime consensus.hexToHash("000000000000000000000a9236068479131c495cc72b506e7fb6d21bc421ff27");
+    const r185 = comptime consensus.hexToBytes80("0060f92431c3239e211b7f47b05cd29a0bb14bef4121d21f064d01000000000000000000e83acc52fb60620fac04a026fb953c1ca9970be5c5539197db419e219a525f66b451d66984060217568ac796");
+
+    const hh_base = storage.ChainStore.buildHeightHashKey(snap.height);
+    const hh_184 = storage.ChainStore.buildHeightHashKey(snap.height + 1);
+    const hh_185 = storage.ChainStore.buildHeightHashKey(snap.height + 2);
+    try db.put(storage.CF_DEFAULT, &hh_base, &snap.block_hash);
+    try db.put(storage.CF_DEFAULT, &hh_184, &h184);
+    try db.put(storage.CF_DEFAULT, &hh_185, &h185);
+
+    var rec184 = serialize.Writer.init(allocator);
+    defer rec184.deinit();
+    rec184.writeInt(u32, snap.height + 1) catch unreachable;
+    rec184.writeBytes(r184[0..]) catch unreachable;
+    try db.put(storage.CF_BLOCK_INDEX, &h184, rec184.getWritten());
+    var rec185 = serialize.Writer.init(allocator);
+    defer rec185.deinit();
+    rec185.writeInt(u32, snap.height + 2) catch unreachable;
+    rec185.writeBytes(r185[0..]) catch unreachable;
+    try db.put(storage.CF_BLOCK_INDEX, &h185, rec185.getWritten());
+
+    var tip_buf: [36]u8 = undefined;
+    @memcpy(tip_buf[0..32], &h185);
+    std.mem.writeInt(u32, tip_buf[32..36], snap.height + 2, .little);
+    try db.put(storage.CF_DEFAULT, "chain_tip", &tip_buf);
+    const genesis = chainwork.workFromBits(0x1d00ffff);
+    try db.put(storage.CF_DEFAULT, storage.ChainState.CHAIN_WORK_KEY, &genesis);
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.seedGenesisTotalWork(consensus.MAINNET.genesis_header.bits);
+    chain_state.best_height = snap.height + 2;
+    chain_state.best_hash = h185;
+    chain_state.restoreTotalWork(&consensus.MAINNET);
+
+    var hdr_reader = serialize.Reader{ .data = &r185 };
+    var tip_hdr = serialize.readBlockHeader(&hdr_reader) catch unreachable;
+    tip_hdr.timestamp = @intCast(std.time.timestamp());
+    var hdr_w = serialize.Writer.init(allocator);
+    defer hdr_w.deinit();
+    serialize.writeBlockHeader(&hdr_w, &tip_hdr) catch unreachable;
+    try db.put(storage.CF_BLOCKS, &h185, hdr_w.getWritten());
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(
+        allocator,
+        &chain_state,
+        &mempool,
+        &peer_manager,
+        &consensus.MAINNET,
+        .{},
+    );
+    defer server.deinit();
+
+    const request = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockchaininfo\",\"params\":[]}";
+    const result = try server.dispatch(request);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"chainwork\":\"00000000000000000000000000000000000000011de786def83d604b77454dd0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"initialblockdownload\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"chainwork\":\"0000000000000000000000000000000000000000000000000000000100010001\"") == null);
+}
+
 test "getnetworkhashps sums GetBlockProof over persisted headers" {
     const allocator = std.testing.allocator;
     const Database = storage.Database;

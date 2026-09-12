@@ -827,6 +827,155 @@ test "w109 G26b: restore reconstructs from snapshot checkpoint + header walk" {
 }
 
 // ============================================================================
+// G26c — production boot order on a pre-fix / seed-poisoned snapshot index
+// ============================================================================
+//
+// Live mainnet datadir (receipt 2026-09-11): snapshot-bootstrapped at 944183,
+// H: populated from the base through the tip, no genesis-scale nChainWork.
+// main.zig calls seedGenesisTotalWork WHILE best_height is still 0 (before
+// chain_tip is loaded).  That wrote GetBlockProof(genesis)=0x100010001 into
+// the tip `chain_work` key; restoreTotalWork then trusted it and never
+// reconstructed.  G26/G26b never sequenced seed-then-restore against an
+// index the pre-fix binary wrote, so they stayed green while the live
+// probe read chainwork 0x100010001 / IBD true.
+//
+// Headers 944184 and 944185 are Core getblockheader hex; expected chainwork
+// is Core's nChainWork at 944185.
+
+fn plantHeightHash(db: *storage.Database, height: u32, hash: *const types.Hash256) !void {
+    const key = storage.ChainStore.buildHeightHashKey(height);
+    try db.put(storage.CF_DEFAULT, &key, hash);
+}
+
+fn plantBlockIndexHeader(
+    db: *storage.Database,
+    allocator: std.mem.Allocator,
+    height: u32,
+    hash: *const types.Hash256,
+    raw: *const [80]u8,
+) !void {
+    var rec_w = serialize.Writer.init(allocator);
+    defer rec_w.deinit();
+    rec_w.writeInt(u32, height) catch unreachable;
+    rec_w.writeBytes(raw[0..]) catch unreachable;
+    try db.put(storage.CF_BLOCK_INDEX, hash, rec_w.getWritten());
+}
+
+fn plantChainTip(db: *storage.Database, hash: *const types.Hash256, height: u32) !void {
+    var buf: [36]u8 = undefined;
+    @memcpy(buf[0..32], hash);
+    std.mem.writeInt(u32, buf[32..36], height, .little);
+    try db.put(storage.CF_DEFAULT, "chain_tip", &buf);
+}
+
+const live944184_hash = consensus.hexToHash("000000000000000000014d061fd22141ef4bb10b9ad25cb0477f1b219e23c331");
+const live944184_raw = consensus.hexToBytes80("0000002017d8ce98333245aba5170dc0c69a0e9d8303160a18460100000000000000000037a4fb60f1cbe5a9b4e254bda42caf9e8b062b492dc8e6d4a61e0bf3f65d4ed40651d6698406021761302a45");
+const live944185_hash = consensus.hexToHash("000000000000000000000a9236068479131c495cc72b506e7fb6d21bc421ff27");
+const live944185_raw = consensus.hexToBytes80("0060f92431c3239e211b7f47b05cd29a0bb14bef4121d21f064d01000000000000000000e83acc52fb60620fac04a026fb953c1ca9970be5c5539197db419e219a525f66b451d66984060217568ac796");
+const live944185_chainwork = consensus.hexToBytes32BE("00000000000000000000000000000000000000011de786def83d604b77454dd0");
+
+fn plantLiveSnapshotIndexShape(db: *storage.Database, allocator: std.mem.Allocator) !void {
+    const snap = consensus.MAINNET.snapshot_bootstrap[0];
+    try plantHeightHash(db, snap.height, &snap.block_hash);
+    try plantHeightHash(db, snap.height + 1, &live944184_hash);
+    try plantHeightHash(db, snap.height + 2, &live944185_hash);
+    try plantBlockIndexHeader(db, allocator, snap.height + 1, &live944184_hash, &live944184_raw);
+    try plantBlockIndexHeader(db, allocator, snap.height + 2, &live944185_hash, &live944185_raw);
+    try plantChainTip(db, &live944185_hash, snap.height + 2);
+}
+
+fn bootLikeMain(cs: *storage.ChainState) void {
+    // main.zig: seed while best_height is still 0, then load chain_tip, then restore.
+    cs.best_height = 0;
+    cs.best_hash = [_]u8{0} ** 32;
+    cs.total_work = [_]u8{0} ** 32;
+    cs.seedGenesisTotalWork(consensus.MAINNET.genesis_header.bits);
+    cs.best_height = consensus.MAINNET.snapshot_bootstrap[0].height + 2;
+    cs.best_hash = live944185_hash;
+    cs.restoreTotalWork(&consensus.MAINNET);
+}
+
+test "w109 G26c: production boot on pre-fix snapshot index reconstructs Core nChainWork" {
+    const allocator = std.testing.allocator;
+    const Database = storage.Database;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    try plantLiveSnapshotIndexShape(&db, allocator);
+
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bootLikeMain(&cs);
+
+    const hex = chainwork.toHex(&cs.total_work);
+    try std.testing.expectEqualStrings(
+        "00000000000000000000000000000000000000011de786def83d604b77454dd0",
+        &hex,
+    );
+    try std.testing.expectEqualSlices(u8, &live944185_chainwork, &cs.total_work);
+
+    const min_be = chainwork.minChainWorkBE(&consensus.MAINNET.min_chain_work);
+    try std.testing.expect(chainwork.cmpChainWorkBE(&cs.total_work, &min_be) >= 0);
+    const genesis = chainwork.workFromBits(0x1d00ffff);
+    try std.testing.expect(chainwork.cmpChainWorkBE(&cs.total_work, &genesis) > 0);
+}
+
+test "w109 G26d: production boot ignores seed-poisoned tip chain_work key" {
+    const allocator = std.testing.allocator;
+    const Database = storage.Database;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    try plantLiveSnapshotIndexShape(&db, allocator);
+    // Live shape 90s after the 33337be0 restart: tip key = GetBlockProof(genesis).
+    const genesis = chainwork.workFromBits(0x1d00ffff);
+    try db.put(storage.CF_DEFAULT, storage.ChainState.CHAIN_WORK_KEY, &genesis);
+
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bootLikeMain(&cs);
+
+    try std.testing.expectEqualSlices(u8, &live944185_chainwork, &cs.total_work);
+}
+
+test "w109 G26e: production boot ignores grown-from-genesis tip chain_work" {
+    const allocator = std.testing.allocator;
+    const Database = storage.Database;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    try plantLiveSnapshotIndexShape(&db, allocator);
+    // Live shape hours after the poisoned restart: connects added modern
+    // proofs onto genesis, still far below the 944183 checkpoint.
+    var grown = chainwork.workFromBits(0x1d00ffff);
+    const modern = chainwork.workFromBits(0x17020684);
+    var i: usize = 0;
+    while (i < 50) : (i += 1) chainwork.addChainWorkBE(&grown, &modern);
+    try db.put(storage.CF_DEFAULT, storage.ChainState.CHAIN_WORK_KEY, &grown);
+
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bootLikeMain(&cs);
+
+    try std.testing.expectEqualSlices(u8, &live944185_chainwork, &cs.total_work);
+}
+
+// ============================================================================
 // G27 — best_invalid not persisted to database
 // ============================================================================
 //
