@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- docs: stall-class diagnosis — 132 CRITICALs are VERSION-height getheaders retry + 2000-header REORG-CANDIDATE ingest (`docs/STALL-CLASS-132-CRITICALS.md`); no fix until a failing control exists
 - reconstruct genesis-scale nChainWork on boot from a pre-fix / seed-poisoned snapshot index (do not persist GetBlockProof(genesis) as the tip key before chain_tip is loaded)
 - persist genesis-scale nChainWork (Core GetBlockProof) so getblockchaininfo.chainwork, IBD and getnetworkhashps match Core
 - 99b8263 docs: say the cited paths are private before the claims that rest on them
