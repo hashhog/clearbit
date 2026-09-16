@@ -1,6 +1,16 @@
 # Changelog
 
-## v1.0.1 (unreleased)
+## v1.0.2 — 2026-09-16
+
+- 0436b30 test: align stale audit-flip gates to Core-correct behavior
+- 5866132 fix: handle repeated unresolvable REORG-CANDIDATE headers once
+- 61caa89 fix: T1 R5 probe parity, min-chainwork gate, verifyCheckpoint caller
+- 7d35fe4 docs: stall-class diagnosis — 132 CRITICALs are VERSION-height getheaders retry
+- de18c5c fix: reconstruct nChainWork on boot from a pre-fix snapshot index
+- 33337be fix: persist genesis-scale nChainWork so chainwork, IBD and nethash match Core
+
+
+## v1.0.2 — 2026-09-16
 
 Changes since `v1.0.0`:
 
