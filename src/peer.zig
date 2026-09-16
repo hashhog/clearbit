@@ -217,6 +217,61 @@ pub const PendingReorg = struct {
 /// here so the header-sync path can bound a reorg before any chainstate call.
 pub const MAX_REORG_DEPTH_PEER: u32 = 288;
 
+/// Bitcoin Core `MAX_HEADERS_RESULTS` (net_processing.h). A headers message
+/// of this size means "there may be more"; continuing a competing fork with
+/// our *active-chain* locator re-requests the same batch forever.
+pub const MAX_HEADERS_RESULTS: usize = 2000;
+
+/// Minimum seconds between identical REORG-CANDIDATE log lines (same prev).
+/// The 2026-09-13 mainnet incident wrote 4,085,480 copies of one line and
+/// filled `/data/nvme1`. One print per distinct fork-prev per minute is enough
+/// for operators; the announcement is still handled (or ignored) every time.
+pub const REORG_CANDIDATE_LOG_INTERVAL_SECS: i64 = 60;
+
+/// Bound on remembered fork-batch fingerprints so a peer cannot grow the
+/// dedupe map without bound. When full we drop the table; at worst a unique
+/// batch is ingested once more.
+pub const MAX_SEEN_FORK_BATCHES: usize = 2048;
+
+/// Outcome of `maybeArmReorg` (and of a competing-fork batch that never
+/// reached it). Used to decide whether to ask the peer for more of the fork.
+pub const ReorgArmResult = enum {
+    armed,
+    already_pending,
+    refused_too_deep,
+    refused_lower_work,
+    no_fork_point,
+    skipped,
+    unresolved,
+};
+
+/// Fingerprint of one competing-fork headers batch: the first header's
+/// prev plus the last header's hash. An identical re-announcement is a
+/// no-op after the first ingest.
+pub const ForkBatchKey = struct {
+    prev: types.Hash256,
+    tip: types.Hash256,
+};
+
+/// Whether a competing-fork headers batch should trigger another getheaders.
+///
+/// `sendGetHeaders` builds a locator from OUR active chain, not the fork
+/// tip, so a 2000-header genesis-rooted (or otherwise unresolvable / too-deep)
+/// announcement is re-sent forever if we continue. Only continue when the
+/// fork is still a live reorg candidate AND we actually learned new headers.
+pub fn shouldContinueCompetingFork(
+    batch_len: usize,
+    arm: ReorgArmResult,
+    newly_inserted: usize,
+) bool {
+    if (batch_len < MAX_HEADERS_RESULTS) return false;
+    if (newly_inserted == 0) return false;
+    return switch (arm) {
+        .armed, .already_pending, .refused_lower_work => true,
+        .refused_too_deep, .no_fork_point, .skipped, .unresolved => false,
+    };
+}
+
 pub fn chainWorkFromHeight(height: u32) [32]u8 {
     var out: [32]u8 = [_]u8{0} ** 32;
     // Encode (height + 1) big-endian into the trailing 5 bytes,
@@ -2870,6 +2925,23 @@ pub const PeerManager = struct {
     /// no extra memory or CPU).
     header_index: std.AutoHashMap(types.Hash256, BlockHeaderEntry),
 
+    /// Fork-root prev hashes we have already refused (too deep, no fork
+    /// point, or unresolvable). A peer re-announcing the same genesis-rooted
+    /// 2000-header batch must not re-enter the competing_fork ingest path.
+    ignored_fork_roots: std.AutoHashMap(types.Hash256, void),
+    /// Exact (prev, batch-tip) fingerprints already ingested. Identical
+    /// re-announcements of a near-tip fork are dropped without re-validation.
+    seen_fork_batches: std.AutoHashMap(ForkBatchKey, void),
+    /// How many competing_fork announcements arrived (including suppressed).
+    reorg_candidate_announcements: u64 = 0,
+    /// How many REORG-CANDIDATE lines were actually printed.
+    reorg_candidate_logs_emitted: u64 = 0,
+    /// How many times the competing_fork arm called sendGetHeaders for more.
+    fork_getheaders_continues: u64 = 0,
+    last_reorg_candidate_prev: types.Hash256 = [_]u8{0} ** 32,
+    last_reorg_candidate_log_ts: i64 = 0,
+    last_arm_result: ReorgArmResult = .skipped,
+
     /// ---- bad-diffbits observability (W150) -------------------------------
     /// Number of inbound headers for which the declared nBits was actually
     /// COMPARED against the required nBits (i.e. the gate ran).  Used by the
@@ -3116,6 +3188,8 @@ pub const PeerManager = struct {
             .advertise_node_network_limited = false,
             .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
             .header_index = std.AutoHashMap(types.Hash256, BlockHeaderEntry).init(allocator),
+            .ignored_fork_roots = std.AutoHashMap(types.Hash256, void).init(allocator),
+            .seen_fork_batches = std.AutoHashMap(ForkBatchKey, void).init(allocator),
             .pending_reorg = null,
             .block_source_peers = std.AutoHashMap(types.Hash256, usize).init(allocator),
             .inflight_block_peer = std.AutoHashMap(types.Hash256, usize).init(allocator),
@@ -3190,6 +3264,8 @@ pub const PeerManager = struct {
         if (self.listener) |*l| l.deinit();
         self.v2_fallback_set.deinit();
         self.header_index.deinit();
+        self.ignored_fork_roots.deinit();
+        self.seen_fork_batches.deinit();
         if (self.pending_reorg) |*pr| pr.deinit();
         self.block_source_peers.deinit();
         self.inflight_block_peer.deinit();
@@ -4815,6 +4891,18 @@ pub const PeerManager = struct {
 
                 self.handleMessage(peer_obj, msg) catch {};
                 msgs_read += 1;
+                // A competing-fork / misbehavior verdict inside handleMessage
+                // used to leave the peer in the drain loop (ban is only
+                // checked at processAllMessages entry and on recv errors).
+                // Up to 256 more 2000-header batches then re-logged
+                // REORG-CANDIDATE and re-validated on the only P2P thread.
+                if (peer_obj.should_ban) {
+                    if (!peer_obj.isLocalAddress()) {
+                        self.banIP(peer_obj.address, DEFAULT_BAN_DURATION, "misbehavior threshold reached") catch {};
+                    }
+                    self.removePeerByIndex(i);
+                    break;
+                }
             }
 
             // Restore long timeout for handshake use
@@ -5188,6 +5276,37 @@ pub const PeerManager = struct {
         return .unknown_parent;
     }
 
+    /// Rate-limit the REORG-CANDIDATE line. Returns true iff the caller
+    /// should print. Identical `prev` within REORG_CANDIDATE_LOG_INTERVAL_SECS
+    /// is suppressed; a new prev or a later refresh is emitted.
+    pub fn shouldLogReorgCandidate(self: *PeerManager, prev: types.Hash256, now: i64) bool {
+        const same = std.mem.eql(u8, &prev, &self.last_reorg_candidate_prev);
+        if (same and (now - self.last_reorg_candidate_log_ts) < REORG_CANDIDATE_LOG_INTERVAL_SECS) {
+            return false;
+        }
+        self.last_reorg_candidate_prev = prev;
+        self.last_reorg_candidate_log_ts = now;
+        self.reorg_candidate_logs_emitted += 1;
+        return true;
+    }
+
+    pub fn rememberIgnoredForkRoot(self: *PeerManager, prev: types.Hash256) void {
+        self.ignored_fork_roots.put(prev, {}) catch {};
+    }
+
+    pub fn rememberForkBatch(self: *PeerManager, key: ForkBatchKey) void {
+        if (self.seen_fork_batches.count() >= MAX_SEEN_FORK_BATCHES) {
+            self.seen_fork_batches.clearRetainingCapacity();
+        }
+        self.seen_fork_batches.put(key, {}) catch {};
+    }
+
+    /// Test/production wrapper around the private `.headers` handler.
+    /// Takes ownership of `headers` (freed by handleMessage).
+    pub fn ingestHeadersMessage(self: *PeerManager, peer: *Peer, headers: []types.BlockHeader) !void {
+        try self.handleMessage(peer, .{ .headers = .{ .headers = headers } });
+    }
+
     /// Once a header batch has been ingested AND the first header was
     /// classified as competing_fork, walk through the new headers and
     /// figure out:
@@ -5210,11 +5329,18 @@ pub const PeerManager = struct {
     ) void {
         if (self.pending_reorg != null) {
             // Already arming a reorg — defer this fork until the next round.
+            self.last_arm_result = .already_pending;
             return;
         }
-        const cs = self.chain_state orelse return;
+        const cs = self.chain_state orelse {
+            self.last_arm_result = .skipped;
+            return;
+        };
 
-        const tip_entry = self.header_index.get(fork_tip_hash.*) orelse return;
+        const tip_entry = self.header_index.get(fork_tip_hash.*) orelse {
+            self.last_arm_result = .skipped;
+            return;
+        };
 
         // Walk back from fork_tip until we hit the active chain (most
         // recent common ancestor).  Bound by the node's effective reorg
@@ -5259,9 +5385,13 @@ pub const PeerManager = struct {
                 // Walk fell off the index (a header we evicted).
                 // We can't proceed safely; abort.
                 std.log.warn("REORG: walk fell off header_index at depth {d}", .{depth});
+                self.last_arm_result = .no_fork_point;
                 return;
             };
-            fork_chain.append(cursor) catch return;
+            fork_chain.append(cursor) catch {
+                self.last_arm_result = .skipped;
+                return;
+            };
             cursor = e.prev_hash;
             depth += 1;
             // Pre-genesis sentinel: prev_block of the genesis block is
@@ -5288,6 +5418,7 @@ pub const PeerManager = struct {
                 .{depth_cap},
             );
             peer.misbehaving(20, "fork too deep");
+            self.last_arm_result = .refused_too_deep;
             return;
         };
 
@@ -5366,6 +5497,7 @@ pub const PeerManager = struct {
                 .{ reorg_depth, MAX_REORG_DEPTH_PEER, fp_height, cs.best_height },
             );
             peer.misbehaving(20, "fork too deep");
+            self.last_arm_result = .refused_too_deep;
             return;
         }
 
@@ -5492,6 +5624,7 @@ pub const PeerManager = struct {
                     "header sync repopulates the index.",
                 .{ std.fmt.fmtSliceHexLower(cs.best_hash[0..8]), cs.best_height },
             );
+            self.last_arm_result = .skipped;
             return;
         };
         if (cmpChainWorkBE(&tip_entry.chain_work, &active_work) <= 0) {
@@ -5502,6 +5635,7 @@ pub const PeerManager = struct {
                 "REORG: ignoring equal/lower-chainwork fork (active_h={d} fork_tip_h={d})",
                 .{ cs.best_height, tip_entry.height },
             );
+            self.last_arm_result = .refused_lower_work;
             return;
         }
 
@@ -5510,6 +5644,7 @@ pub const PeerManager = struct {
         var owned = std.ArrayList(types.Hash256).init(self.allocator);
         owned.appendSlice(fork_chain.items) catch {
             owned.deinit();
+            self.last_arm_result = .skipped;
             return;
         };
         self.pending_reorg = .{
@@ -5544,6 +5679,7 @@ pub const PeerManager = struct {
                 fp[30], fp[31], owned.items.len, cs.best_height, tip_entry.height,
             },
         );
+        self.last_arm_result = .armed;
     }
 
     /// Try to fire the pending reorg if all fork bodies are present in
@@ -5924,14 +6060,37 @@ pub const PeerManager = struct {
                         // append fork headers to expected_blocks — the active
                         // chain stays in expected_blocks; the fork lives in
                         // header_index + pending_reorg.fork_hashes.
-                        std.debug.print(
-                            "P2P: REORG-CANDIDATE peer announces fork ({d} headers, prev=...{x:0>2}{x:0>2})\n",
-                            .{
-                                h.headers.len,
-                                h.headers[0].prev_block[30],
-                                h.headers[0].prev_block[31],
-                            },
-                        );
+                        //
+                        // A repeated or unresolvable announcement (live
+                        // 2026-09-13: 2000 genesis-rooted headers, prev
+                        // printing as ...0000) must be handled once: the
+                        // REORG-CANDIDATE line is rate-limited, a too-deep /
+                        // unresolved fork root is ignored on re-announce, and
+                        // we never sendGetHeaders with our active-chain
+                        // locator for a fork we will not follow (that locator
+                        // re-requests the same batch forever and starves RPC
+                        // via log/CPU).
+                        self.reorg_candidate_announcements += 1;
+                        const fork_prev = h.headers[0].prev_block;
+                        const batch_key = ForkBatchKey{
+                            .prev = fork_prev,
+                            .tip = crypto.computeBlockHash(&h.headers[h.headers.len - 1]),
+                        };
+                        if (self.ignored_fork_roots.contains(fork_prev) or
+                            self.seen_fork_batches.contains(batch_key))
+                        {
+                            return;
+                        }
+                        if (self.shouldLogReorgCandidate(fork_prev, std.time.timestamp())) {
+                            std.debug.print(
+                                "P2P: REORG-CANDIDATE peer announces fork ({d} headers, prev=...{x:0>2}{x:0>2})\n",
+                                .{
+                                    h.headers.len,
+                                    fork_prev[30],
+                                    fork_prev[31],
+                                },
+                            );
+                        }
                         // Contextual gates in Core order (bad-diffbits FIRST,
                         // validation.cpp:4088) applied to EVERY fork header
                         // BEFORE inserting into header_index.  This arm already
@@ -5943,13 +6102,12 @@ pub const PeerManager = struct {
                         // otherwise insertHeader silently nulls the whole
                         // branch (L4 of the 2026-08-26 stall; rationale on
                         // seedForkRootParent).
-                        if (h.headers.len > 0) {
-                            _ = self.seedForkRootParent(h.headers[0].prev_block);
-                        }
+                        _ = self.seedForkRootParent(fork_prev);
                         const now_fork: i64 = std.time.timestamp();
                         var fork_overlay = HeaderBatchOverlay.init(self.allocator);
                         defer fork_overlay.deinit();
                         var last_inserted: ?BlockHeaderEntry = null;
+                        var newly_inserted: usize = 0;
                         for (h.headers) |hdr| {
                             switch (self.validateHeaderContextualStrict(&hdr, now_fork, &fork_overlay)) {
                                 .ok => {},
@@ -5963,6 +6121,7 @@ pub const PeerManager = struct {
                                     break;
                                 },
                                 else => |verdict| {
+                                    self.rememberForkBatch(batch_key);
                                     misbehaveForHeaderVerdict(peer, verdict);
                                     return;
                                 },
@@ -5976,15 +6135,31 @@ pub const PeerManager = struct {
                                     .bits = hdr.bits,
                                 }) catch {};
                             }
+                            const already = self.header_index.contains(bh);
                             const ent_or = self.insertHeader(&hdr, &bh) catch null;
-                            if (ent_or) |ent| last_inserted = ent;
+                            if (ent_or) |ent| {
+                                last_inserted = ent;
+                                if (!already) newly_inserted += 1;
+                            }
                         }
                         if (last_inserted) |fork_tip| {
                             self.maybeArmReorg(peer, &fork_tip.hash);
+                        } else {
+                            self.last_arm_result = .unresolved;
                         }
-                        // Continue to ask for more headers — the peer may
-                        // have additional fork headers beyond this batch.
-                        if (h.headers.len >= 2000) {
+                        self.rememberForkBatch(batch_key);
+                        switch (self.last_arm_result) {
+                            .refused_too_deep, .no_fork_point, .unresolved => {
+                                self.rememberIgnoredForkRoot(fork_prev);
+                            },
+                            else => {},
+                        }
+                        if (shouldContinueCompetingFork(
+                            h.headers.len,
+                            self.last_arm_result,
+                            newly_inserted,
+                        )) {
+                            self.fork_getheaders_continues += 1;
                             self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                         }
                         return;
@@ -7249,7 +7424,6 @@ pub const PeerManager = struct {
             }
         }
 
-        const MAX_HEADERS_RESULTS: u32 = 2000;
         var collected = std.ArrayList(types.BlockHeader).init(self.allocator);
         errdefer collected.deinit();
 

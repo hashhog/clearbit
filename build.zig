@@ -799,6 +799,41 @@ pub fn build(b: *std.Build) void {
         t1_test_step.dependOn(&run_t1_tests.step);
     }
 
+    // CONTROL for QUEUES.md item 0: REORG-CANDIDATE spam loop.
+    // Same project-root package layout as tests_t1_r5.zig. Filter so imported
+    // rpc/peer/wallet tests do not run.
+    {
+        const spam_tests = b.addTest(.{
+            .root_source_file = b.path("tests_reorg_candidate_spam.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"reorg_candidate_spam"},
+        });
+        spam_tests.linkSystemLibrary("rocksdb");
+        spam_tests.linkSystemLibrary("secp256k1");
+        spam_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        spam_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            spam_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            spam_tests.linkSystemLibrary("minisketch");
+            spam_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        spam_tests.root_module.addOptions("build_options", build_options);
+
+        const run_spam_tests = b.addRunArtifact(spam_tests);
+        const spam_test_step = b.step(
+            "test-reorg-candidate-spam",
+            "Run REORG-CANDIDATE spam-loop control (repeated unknown-prev fork)",
+        );
+        spam_test_step.dependOn(&run_spam_tests.step);
+        test_step.dependOn(&run_spam_tests.step);
+    }
+
     // createrawtransaction vout/sequence/locktime range-check regression.
     // Same project-root wrapper as tests_rpc.zig (src/rpc.zig transitively
     // imports src/wallet.zig, whose @embedFile only resolves from the project
