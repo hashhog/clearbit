@@ -747,9 +747,10 @@ test "P2P version message round-trip" {
     const payload = serialized[24..];
     try testing.expect(header.verifyChecksum(payload));
 
-    // Decode payload
+    // Decode payload. Post-#31, version.user_agent is an owned dupe.
     const decoded_msg = try p2p.decodePayload(header.commandName(), payload, allocator);
     const deserialized = decoded_msg.version;
+    defer allocator.free(deserialized.user_agent);
 
     try testing.expectEqual(version_msg.version, deserialized.version);
     try testing.expectEqual(version_msg.services, deserialized.services);

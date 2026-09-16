@@ -16611,10 +16611,10 @@ pub const RpcServer = struct {
 
         // Core: ParseConfirmTarget (rpc/util.cpp) reads conf_target with
         // getInt<int> and then REJECTS anything outside
-        // [1, HighestTargetTracked] — it does not clamp.  The clamp here
-        // answered a 99999-block request with a 1008-block estimate and called
-        // it success; it also happened to be the only thing keeping the
-        // @intCast below from aborting the process under ReleaseFast.
+        // [1, HighestTargetTracked] — it does not clamp. We reject the same
+        // way with a hard-coded 1008 bound (estimator LONG horizon max). A
+        // prior silent clamp answered a 99999-block request with a 1008-block
+        // estimate and called it success.
         if (target_param.integer < -2147483648 or target_param.integer > 2147483647) {
             return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
         }

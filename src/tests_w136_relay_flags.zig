@@ -94,17 +94,18 @@ test "w136/G2: maybeSendFeefilter has no caller in the source tree" {
     const peer_src = try readPeerSrc(allocator);
     defer allocator.free(peer_src);
 
-    // Count occurrences of "maybeSendFeefilter" in peer.zig.
-    // Expected: 1 — the `pub fn maybeSendFeefilter` definition line at 1658.
-    // (Doc-comment mentions like "// Maybe send a feefilter ..." use lowercase.)
+    // Count call-shaped occurrences: "maybeSendFeefilter(". Comments that
+    // mention the identifier without a paren (the handshake doc-comment)
+    // are not callers. Expected: 1 — the `pub fn maybeSendFeefilter(`
+    // definition. A real SendMessages-tick call site would make this 2+.
+    // Open gap vs Core net_processing.cpp:5540 (MaybeSendFeefilter every tick).
     var count: usize = 0;
     var idx: usize = 0;
-    const needle = "maybeSendFeefilter";
+    const needle = "maybeSendFeefilter(";
     while (std.mem.indexOfPos(u8, peer_src, idx, needle)) |pos| {
         count += 1;
         idx = pos + needle.len;
     }
-    // Exactly one hit = the definition; >=2 would mean a caller exists.
     try testing.expectEqual(@as(usize, 1), count);
 }
 
@@ -192,18 +193,18 @@ test "w136/G6: inv handler msg_tx arm does not gate on wtxid_relay_negotiated" {
 // G7 — Hardcoded handshake feefilter
 // ============================================================================
 
-// G7 BUG: handshake feefilter is hardcoded to 100_000 sat/kvB.
-// Core (line 5550) derives it from mempool.GetMinFee().GetFeePerK().
-// clearbit (peer.zig:1629) sends 100_000 regardless of mempool state.
-test "w136/G7: handshake feefilter is hardcoded constant 100_000" {
+// G7: handshake feefilter uses mempool MIN_RELAY_FEE (Core-correct floor).
+// Core (net_processing.cpp:5550) derives it from mempool.GetMinFee().GetFeePerK()
+// floored at DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB (policy.h:70).
+// clearbit used to send a hard-coded 100_000 sat/kvB (100 sat/vB, 1000x Core);
+// the handshake now seeds from mempool_mod.MIN_RELAY_FEE.
+test "w136/G7: handshake feefilter uses mempool MIN_RELAY_FEE not 100_000" {
     const allocator = testing.allocator;
     const peer_src = try readPeerSrc(allocator);
     defer allocator.free(peer_src);
 
-    // The literal "feerate = 100_000" appears at the post-handshake feefilter
-    // send site.  Confirm at least one such literal exists.
-    const has_hardcoded = std.mem.indexOf(u8, peer_src, ".feerate = 100_000") != null;
-    try testing.expect(has_hardcoded);
+    try testing.expect(std.mem.indexOf(u8, peer_src, ".feerate = 100_000") == null);
+    try testing.expect(std.mem.indexOf(u8, peer_src, ".feerate = mempool_mod.MIN_RELAY_FEE") != null);
 }
 
 // ============================================================================
@@ -514,7 +515,7 @@ test "w136/G29: clearbit handshake order is sendheaders -> sendcmpct -> feefilte
     const sc_pos = std.mem.indexOf(u8, peer_src, "p2p.Message{ .sendcmpct = .{ .announce = false") orelse {
         return error.SendCmpctNotFound;
     };
-    const ff_pos = std.mem.indexOf(u8, peer_src, ".feerate = 100_000") orelse {
+    const ff_pos = std.mem.indexOf(u8, peer_src, ".feerate = mempool_mod.MIN_RELAY_FEE") orelse {
         return error.FeeFilterNotFound;
     };
     // Document the order: sendheaders < sendcmpct < feefilter in source.
@@ -522,28 +523,23 @@ test "w136/G29: clearbit handshake order is sendheaders -> sendcmpct -> feefilte
     try testing.expect(sc_pos < ff_pos);
 }
 
-// G30 BUG: handshake feefilter ignores empty-mempool case.
-// peer.zig:1628 gates only on self.relay_txs; never reads mempool state.
-test "w136/G30: handshake feefilter gates only on relay_txs, not on mempool state" {
+// G30: handshake feefilter is gated on relay_txs and sends the mempool
+// MIN_RELAY_FEE floor. Empty-mempool GetMinFee() == DEFAULT_MIN_RELAY_TX_FEE
+// in Core, so the constant is the right empty-mempool value. Periodic
+// updates from the live rolling min still need a maybeSendFeefilter caller (G2).
+test "w136/G30: handshake feefilter sends mempool MIN_RELAY_FEE gated on relay_txs" {
     const allocator = testing.allocator;
     const peer_src = try readPeerSrc(allocator);
     defer allocator.free(peer_src);
 
-    // Locate the post-handshake feefilter send block.
-    const ff_block_start = std.mem.indexOf(u8, peer_src, "BIP-133: Send initial feefilter after handshake") orelse {
+    const ff_block_start = std.mem.indexOf(u8, peer_src, "BIP-133: send our initial feefilter after the handshake") orelse {
         return error.HandshakeFeefilterBlockNotFound;
     };
-    const ff_block_end = @min(ff_block_start + 600, peer_src.len);
+    const ff_block_end = @min(ff_block_start + 2000, peer_src.len);
     const window = peer_src[ff_block_start..ff_block_end];
 
-    // The block must check self.relay_txs (correct) but must NOT read mempool
-    // (incorrect — the bug).
     try testing.expect(std.mem.indexOf(u8, window, "if (self.relay_txs)") != null);
-    // mempool / GetMinFee / dynamic_min_fee reference inside this window:
-    const has_mempool = std.mem.indexOf(u8, window, "mempool") != null or
-        std.mem.indexOf(u8, window, "GetMinFee") != null or
-        std.mem.indexOf(u8, window, "dynamic_min_fee") != null;
-    try testing.expect(!has_mempool);
+    try testing.expect(std.mem.indexOf(u8, window, "mempool_mod.MIN_RELAY_FEE") != null);
 }
 
 // ============================================================================
@@ -640,7 +636,8 @@ test "w136/constants: feefilter timing constants match Core (10min / 5min)" {
     try testing.expectEqual(@as(i64, 5 * 60), peer_mod.MAX_FEEFILTER_CHANGE_DELAY);
 }
 
-// Verify MIN_RELAY_FEE matches Core's 1000 sat/kvB.
-test "w136/constants: MIN_RELAY_FEE = 1000 sat/kvB" {
-    try testing.expectEqual(@as(u64, 1000), peer_mod.MIN_RELAY_FEE);
+// Verify MIN_RELAY_FEE matches Core's DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB
+// (policy.h:70). The historical 1000 sat/kvB figure is pre-v28.
+test "w136/constants: MIN_RELAY_FEE = 100 sat/kvB" {
+    try testing.expectEqual(@as(u64, 100), peer_mod.MIN_RELAY_FEE);
 }

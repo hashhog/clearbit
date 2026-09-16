@@ -357,17 +357,19 @@ test "w127 G28 BUG-1 (P1 perf): SigCache exists with full LRU+nonce shape (PARTI
     try testing.expect(srcContains(SIGCACHE_SRC, "32 bytes x-only for Schnorr"));
 }
 
-test "w127 G28 BUG-1 (P2 perf): SigCache wired at WHOLE-INPUT granularity, not per-CHECKSIG (xfail)" {
+test "w127 G28 BUG-1 (P2 perf): SigCache wired at per-input granularity, not per-CHECKSIG (xfail)" {
     // SigCache IS wired — in validation.zig's `verifyScriptJob` (the
-    // parallel checkqueue worker). That cache keys on
-    // (txid, prev_script_pubkey, script_sig||witness, flags) — the
-    // whole-input replay key. Mempool→block replay hits this; cross-tx
-    // / cross-input signature reuse misses.
+    // parallel checkqueue worker). W160 bound the key to a per-input
+    // sighash-proxy (not the txid), so two inputs of the same tx no
+    // longer share a cache entry. Still not Core's per-CHECKSIG
+    // CSignatureCache (sigcache.cpp:39-50: actual sighash + pubkey +
+    // sig + flags). Mempool→block replay hits this; intra-input
+    // signature reuse still misses.
     try testing.expect(srcContains(VALIDATION_SRC, "sig_cache_mod"));
-    try testing.expect(srcContains(VALIDATION_SRC, "cache.lookup(txid, job.prev_script_pubkey, sig_material, flags_u32)"));
-    try testing.expect(srcContains(VALIDATION_SRC, "cache.insert(txid, job.prev_script_pubkey, sig_material, flags_u32)"));
+    try testing.expect(srcContains(VALIDATION_SRC, "cache.lookup(per_input_sighash, job.prev_script_pubkey, sig_material, flags_u32)"));
+    try testing.expect(srcContains(VALIDATION_SRC, "cache.insert(per_input_sighash, job.prev_script_pubkey, sig_material, flags_u32)"));
 
-    // But crypto.zig's verifySchnorr / verifyEcdsa do NOT consult any
+    // crypto.zig's verifySchnorr / verifyEcdsa do NOT consult any
     // cache — every CHECKSIG goes straight to libsecp256k1.
     try testing.expect(!srcContains(CRYPTO_SRC, "sig_cache"));
     try testing.expect(!srcContains(CRYPTO_SRC, "SigCache"));
@@ -470,13 +472,13 @@ test "w127 BUG-6 (P3 cosmetic): tapleaf_hash field never reset across verify() c
     try testing.expect(!srcContains(SCRIPT_SRC, "self.tapleaf_hash = null;"));
 }
 
-test "w127 BUG-7 (P3 cosmetic): codesep_pos default set at construction, not per-EvalScript-entry" {
+test "w127 BUG-7 (P3): codesep_pos reset at every EvalScript-entry (execute)" {
     // Core resets execdata.m_codeseparator_pos = 0xFFFFFFFFUL inside
-    // EvalScript at entry (interpreter.cpp:434). clearbit sets it once at
-    // engine construction (script.zig:697) and never re-asserts.
+    // EvalScript at entry (interpreter.cpp:434). clearbit now resets both
+    // codesep trackers at the top of execute() so a codesep in one script
+    // phase does not leak into the next phase's sighash scriptCode.
     try testing.expect(srcContains(SCRIPT_SRC, ".codesep_pos = 0xFFFFFFFF,"));
-    // No per-entry reset inside the script execution loop:
-    try testing.expect(!srcContains(SCRIPT_SRC, "self.codesep_pos = 0xFFFFFFFF;"));
+    try testing.expect(srcContains(SCRIPT_SRC, "self.codesep_pos = 0xFFFFFFFF;"));
 }
 
 test "w127 BUG-8 (P3 cosmetic): consumeValidationWeight returns error instead of asserting on uninit (defensive guard)" {

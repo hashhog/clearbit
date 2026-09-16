@@ -560,7 +560,8 @@ pub const AVG_FEEFILTER_BROADCAST_INTERVAL: i64 = 10 * 60;
 pub const MAX_FEEFILTER_CHANGE_DELAY: i64 = 5 * 60;
 
 /// Default minimum relay fee in sat/kvB.
-pub const MIN_RELAY_FEE: u64 = 1000;
+/// Core policy.h:70 DEFAULT_MIN_RELAY_TX_FEE = 100 (0.1 sat/vB).
+pub const MIN_RELAY_FEE: u64 = 100;
 
 /// Incremental relay fee in sat/kvB (for RBF replacement).
 pub const INCREMENTAL_RELAY_FEE: u64 = 1000;
@@ -11838,7 +11839,7 @@ test "feefilter: constants match Bitcoin Core defaults" {
     // Verify feefilter constants match Bitcoin Core
     try std.testing.expectEqual(@as(i64, 600), AVG_FEEFILTER_BROADCAST_INTERVAL); // 10 min
     try std.testing.expectEqual(@as(i64, 300), MAX_FEEFILTER_CHANGE_DELAY); // 5 min
-    try std.testing.expectEqual(@as(u64, 1000), MIN_RELAY_FEE); // 1000 sat/kvB
+    try std.testing.expectEqual(@as(u64, 100), MIN_RELAY_FEE); // 100 sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE)
     try std.testing.expectEqual(@as(u64, 1000), INCREMENTAL_RELAY_FEE); // 1000 sat/kvB
 }
 

@@ -155,20 +155,17 @@ test "w139 G5: BUG-5 feeToBucket accepts any f64; no virtual_bytes>0 guard" {
 test "w139 G6: BUG-6 no FeeFilterRounder helper / MakeFeeSet" {
     // Core block_policy_estimator.{h:323-344, cpp:1085-1118} declares
     // `class FeeFilterRounder` + `MakeFeeSet` namespace helper.  clearbit
-    // has neither.  Cross-validated by W136 G8 (`tests_w136_relay_flags.zig:218`);
-    // W139 reasserts from the fee-engine side.
+    // has neither as a type/fn.  peer.zig mentions the Core name in a
+    // handshake comment; that is documentation, not a helper.
+    // Cross-validated by W136 G8 (`@hasDecl(peer_mod, "FeeFilterRounder")`).
     const a = testing.allocator;
     const mp_src = try loadSrc(a, "mempool");
     defer a.free(mp_src);
-    const p2p_src = loadSrc(a, "p2p") catch null;
-    defer if (p2p_src) |s| a.free(s);
-    const peer_src = loadSrc(a, "peer") catch null;
-    defer if (peer_src) |s| a.free(s);
 
-    try testing.expect(!contains(mp_src, "FeeFilterRounder"));
+    try testing.expect(!@hasDecl(mempool_mod, "FeeFilterRounder"));
+    try testing.expect(!contains(mp_src, "pub const FeeFilterRounder"));
     try testing.expect(!contains(mp_src, "MakeFeeSet"));
-    if (p2p_src) |s| try testing.expect(!contains(s, "FeeFilterRounder"));
-    if (peer_src) |s| try testing.expect(!contains(s, "FeeFilterRounder"));
+    try testing.expect(!contains(mp_src, "fn makeFeeSet"));
 }
 
 // ===========================================================================
@@ -566,29 +563,21 @@ test "w139 G24: BUG-24 no GetFeeEstimatorFileAge / file mtime helper" {
 // ===========================================================================
 // G25 — BUG-25: No ParseConfirmTarget helper
 // ===========================================================================
-test "w139 G25: BUG-25 no central ParseConfirmTarget helper; each RPC clamps differently" {
-    // Core common/messages.h declares ParseConfirmTarget; used by both
-    // estimatesmartfee (rpc/fees.cpp:71) and estimaterawfee (cpp:159).
-    //
-    // clearbit's handleEstimateSmartFee (rpc.zig:11142) uses
-    //   const conf_target: u32 = @intCast(@max(1, @min(1008, target_param.integer)));
-    // — clamps silently (returns target=1008 for any over-large input).
-    //
-    // clearbit's handleEstimateRawFee (rpc.zig:11187) uses
-    //   if (conf_target_i < 1 or conf_target_i > 1008) return InvalidParameter;
-    // — REJECTS out-of-range input.
-    //
-    // Different RPCs, different validation strategies — both wrong vs Core
-    // which uses the same helper for consistency.
+test "w139 G25: estimatesmartfee/estimaterawfee reject out-of-range conf_target" {
+    // Core ParseConfirmTarget (rpc/util.cpp) rejects conf_target outside
+    // [1, HighestTargetTracked]. clearbit now rejects (does not clamp) in
+    // both handlers with a hard-coded 1008 bound. No shared helper yet —
+    // both inline the same check (G30 still tracks the missing
+    // HighestTargetTracked). rpc.zig comments cite ParseConfirmTarget;
+    // pin absence of an actual fn, not the comment.
     const a = testing.allocator;
     const rpc_src = try loadSrc(a, "rpc");
     defer a.free(rpc_src);
-    try testing.expect(!contains(rpc_src, "ParseConfirmTarget"));
-    try testing.expect(!contains(rpc_src, "parseConfirmTarget"));
-    try testing.expect(!contains(rpc_src, "parse_confirm_target"));
-    // Confirm divergent inline clamp/reject style by verifying both literal patterns.
-    try testing.expect(contains(rpc_src, "@max(1, @min(1008,"));
-    try testing.expect(contains(rpc_src, "< 1 or conf_target_i > 1008"));
+    try testing.expect(!contains(rpc_src, "fn parseConfirmTarget"));
+    try testing.expect(!contains(rpc_src, "fn ParseConfirmTarget"));
+    try testing.expect(!contains(rpc_src, "@max(1, @min(1008,"));
+    try testing.expect(contains(rpc_src, "target_param.integer < 1 or target_param.integer > 1008"));
+    try testing.expect(contains(rpc_src, "conf_target_i < 1 or conf_target_i > 1008"));
 }
 
 // ===========================================================================
@@ -701,8 +690,8 @@ test "w139 G30: BUG-29 max_target hard-coded 1008; not HighestTargetTracked(LONG
     const a = testing.allocator;
     const rpc_src = try loadSrc(a, "rpc");
     defer a.free(rpc_src);
-    // Hard-coded literal present in BOTH smartfee + rawfee handlers.
-    try testing.expect(contains(rpc_src, "@min(1008, target_param.integer))"));
+    // Hard-coded 1008 bound present in BOTH smartfee + rawfee reject paths.
+    try testing.expect(contains(rpc_src, "target_param.integer > 1008"));
     try testing.expect(contains(rpc_src, "conf_target_i > 1008"));
     // And no use of MAX_CONFIRMATION_TARGET via the constant (which IS
     // what HighestTargetTracked would resolve to in clearbit).
@@ -710,6 +699,7 @@ test "w139 G30: BUG-29 max_target hard-coded 1008; not HighestTargetTracked(LONG
     const end_idx = std.mem.indexOfPos(u8, rpc_src, start, "\n    fn ") orelse rpc_src.len;
     const handler = rpc_src[start..end_idx];
     try testing.expect(!contains(handler, "MAX_CONFIRMATION_TARGET"));
-    try testing.expect(!contains(handler, "HighestTargetTracked"));
-    try testing.expect(!contains(handler, "highestTargetTracked"));
+    // Comments cite Core's HighestTargetTracked; pin absence of a call.
+    try testing.expect(!contains(handler, "HighestTargetTracked("));
+    try testing.expect(!contains(handler, "highestTargetTracked("));
 }
