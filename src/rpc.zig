@@ -8011,47 +8011,68 @@ pub const RpcServer = struct {
         return null;
     }
 
-    /// createwallet "wallet_name" ( disable_private_keys blank passphrase )
-    /// Creates and loads a new wallet.
+    /// createwallet "wallet_name" ( disable_private_keys blank passphrase
+    /// avoid_reuse descriptors load_on_startup external_signer )
+    ///
+    /// Core: bitcoin-core/src/wallet/rpc/wallet.cpp:346-430.
+    /// Legacy (descriptors=false) wallets can no longer be created:
+    /// wallet.cpp:402-405 throws RPC_WALLET_ERROR (-4). Missing required
+    /// wallet_name is arity HelpResult → RPC_MISC_ERROR (-1)
+    /// (rpc/util.cpp:644), not JSON-RPC -32602.
     fn handleCreateWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         const wm = self.wallet_manager orelse {
             return self.jsonRpcError(RPC_WALLET_ERROR, "Multi-wallet not enabled", id);
         };
 
-        // Extract wallet name
         const wallet_name = blk: {
             if (params == .array and params.array.items.len > 0) {
                 const n = params.array.items[0];
                 if (n == .string) break :blk n.string;
             }
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing wallet_name", id);
+            return self.jsonRpcError(RPC_MISC_ERROR, "Wrong number of arguments", id);
         };
 
-        // Parse options
         var options = wallet_mod.WalletOptions{};
 
         if (params == .array) {
-            // disable_private_keys
-            if (params.array.items.len > 1) {
-                const dpk = params.array.items[1];
-                if (dpk == .bool) {
-                    options.disable_private_keys = dpk.bool;
-                }
-            }
-            // blank
-            if (params.array.items.len > 2) {
-                const blank = params.array.items[2];
-                if (blank == .bool) {
-                    options.blank = blank.bool;
-                }
-            }
-            // passphrase
-            if (params.array.items.len > 3) {
-                const pp = params.array.items[3];
-                if (pp == .string and pp.string.len > 0) {
-                    options.passphrase = pp.string;
-                }
-            }
+            if (params.array.items.len > 1) switch (params.array.items[1]) {
+                .bool => |b| options.disable_private_keys = b,
+                else => {},
+            };
+            if (params.array.items.len > 2) switch (params.array.items[2]) {
+                .bool => |b| options.blank = b,
+                else => {},
+            };
+            if (params.array.items.len > 3) switch (params.array.items[3]) {
+                .string => |s| {
+                    if (s.len > 0) options.passphrase = s;
+                },
+                else => {},
+            };
+            if (params.array.items.len > 4) switch (params.array.items[4]) {
+                .bool => |b| options.avoid_reuse = b,
+                else => {},
+            };
+            if (params.array.items.len > 5) switch (params.array.items[5]) {
+                .bool => |b| options.descriptors = b,
+                else => {},
+            };
+            if (params.array.items.len > 6) switch (params.array.items[6]) {
+                .bool => |b| options.load_on_startup = b,
+                else => {},
+            };
+        }
+
+        // Core wallet.cpp:402-405 — descriptors defaults to true; explicit
+        // false is no longer a supported create path. Returning here also
+        // keeps the refused name from staying loaded and perturbing later
+        // single-wallet probes (R5 T3 createwallet legacy-refused).
+        if (!options.descriptors) {
+            return self.jsonRpcError(
+                RPC_WALLET_ERROR,
+                "descriptors argument must be set to \"true\"; it is no longer possible to create a legacy wallet.",
+                id,
+            );
         }
 
         _ = wm.createWallet(wallet_name, options) catch |err| {
@@ -8061,7 +8082,6 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_WALLET_ERROR, @errorName(err), id);
         };
 
-        // Return success with wallet name and warning
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
