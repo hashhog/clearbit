@@ -22,6 +22,7 @@ comptime {
     _ = @import("asmap.zig");
     _ = @import("campaign_assumeutxo.zig");
     _ = @import("chainwork.zig");
+    _ = @import("historical_backfill.zig");
 }
 
 // ============================================================

@@ -1029,6 +1029,38 @@ pub fn build(b: *std.Build) void {
         r5_pruned_step.dependOn(&run_r5_pruned_tests.step);
     }
 
+    // CONTROL for QUEUES.md item 0: background genesis→snapshot-base backfill.
+    {
+        const backfill_tests = b.addTest(.{
+            .root_source_file = b.path("tests_r5_snapshot_backfill.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{ "historical_backfill", "snapshot_backfill" },
+        });
+        backfill_tests.linkSystemLibrary("rocksdb");
+        backfill_tests.linkSystemLibrary("secp256k1");
+        backfill_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        backfill_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            backfill_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            backfill_tests.linkSystemLibrary("minisketch");
+            backfill_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        backfill_tests.root_module.addOptions("build_options", build_options);
+
+        const run_backfill_tests = b.addRunArtifact(backfill_tests);
+        const backfill_step = b.step(
+            "test-historical-backfill",
+            "Run snapshot-boot genesis→base header+body backfill control",
+        );
+        backfill_step.dependOn(&run_backfill_tests.step);
+    }
+
     // CONTROL for QUEUES.md item 0: REORG-CANDIDATE spam loop.
     // Same project-root package layout as tests_t1_r5.zig. Filter so imported
     // rpc/peer/wallet tests do not run.

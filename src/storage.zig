@@ -2176,6 +2176,11 @@ pub const ChainState = struct {
     /// CF_DEFAULT key for the tip's 32-byte BE nChainWork, written in flush
     /// atomically with `chain_tip`.
     pub const CHAIN_WORK_KEY: []const u8 = "chain_work";
+    /// Original assumeutxo index floor persisted while a historical backfill
+    /// is in progress. 4-byte LE u32. Cleared when genesis→floor is dense
+    /// (headers AND bodies). Needed so a restart after height 1 is indexed
+    /// still resumes the remaining gap.
+    pub const HISTORICAL_BACKFILL_FLOOR_KEY: []const u8 = "historical_backfill_floor";
 
     best_hash: types.Hash256,
     best_height: u32,
@@ -4318,6 +4323,50 @@ pub const ChainState = struct {
         db.put(CF_DEFAULT, &key_bytes, hash) catch return;
     }
 
+    /// Persist a CF_BLOCK_INDEX row (4-byte LE height + 80-byte header).
+    /// Used by historical backfill; does not move the active tip.
+    pub fn putPersistedHeader(
+        self: *ChainState,
+        hash: *const types.Hash256,
+        header: *const types.BlockHeader,
+        height: u32,
+    ) void {
+        const db = self.utxo_set.db orelse return;
+        var writer = serialize.Writer.init(self.allocator);
+        defer writer.deinit();
+        writer.writeInt(u32, height) catch return;
+        serialize.writeBlockHeader(&writer, header) catch return;
+        db.put(CF_BLOCK_INDEX, hash, writer.getWritten()) catch return;
+    }
+
+    /// Persist a raw block body in CF_BLOCKS. Does not connect UTXO.
+    pub fn putBlockBody(self: *ChainState, hash: *const types.Hash256, raw: []const u8) void {
+        const db = self.utxo_set.db orelse return;
+        db.put(CF_BLOCKS, hash, raw) catch return;
+    }
+
+    /// Original assumeutxo floor persisted while HistoricalBackfill runs.
+    pub fn loadHistoricalBackfillFloor(self: *ChainState) ?u32 {
+        const db = self.utxo_set.db orelse return null;
+        const data = db.get(CF_DEFAULT, HISTORICAL_BACKFILL_FLOOR_KEY) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        if (bytes.len != 4) return null;
+        return std.mem.readInt(u32, bytes[0..4], .little);
+    }
+
+    pub fn persistHistoricalBackfillFloor(self: *ChainState, floor: u32) void {
+        const db = self.utxo_set.db orelse return;
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, floor, .little);
+        db.put(CF_DEFAULT, HISTORICAL_BACKFILL_FLOOR_KEY, &buf) catch return;
+    }
+
+    pub fn clearHistoricalBackfillFloor(self: *ChainState) void {
+        const db = self.utxo_set.db orelse return;
+        db.delete(CF_DEFAULT, HISTORICAL_BACKFILL_FLOOR_KEY) catch return;
+    }
+
     /// Persist the cumulative-tx-count (Core m_chain_tx_count) for `height`.
     /// Best-effort, idempotent on the active chain — same race-tolerance
     /// reasoning as putBlockHashByHeight.  No-op in DB-less mode.
@@ -4740,6 +4789,15 @@ pub const ChainState = struct {
             return;
         }
         if (self.getBlockHashByHeight(1) != null) {
+            // Height 1 present: either the chain is dense from genesis, or a
+            // historical backfill has started filling the hole. Keep reporting
+            // the original floor until the genesis-side run meets the tail.
+            if (self.loadHistoricalBackfillFloor()) |floor| {
+                if (floor > 1 and self.getBlockHashByHeight(floor - 1) == null) {
+                    self.history_floor = floor;
+                    return;
+                }
+            }
             self.history_floor = 0;
             return;
         }

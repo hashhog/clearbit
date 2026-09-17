@@ -15,6 +15,7 @@ const proxy_mod = @import("proxy.zig");
 const wallet_mod = @import("wallet.zig");
 const addrman_mod = @import("addrman.zig");
 const chainwork_mod = @import("chainwork.zig");
+const historical_backfill_mod = @import("historical_backfill.zig");
 
 pub const addChainWorkBE = chainwork_mod.addChainWorkBE;
 pub const workFromBits = chainwork_mod.workFromBits;
@@ -2896,6 +2897,12 @@ pub const PeerManager = struct {
     /// future prune-specific behaviour.
     advertise_node_network_limited: bool = false,
 
+    /// AssumeUTXO hole: genesis-side header+body backfill. Null when the
+    /// height index is dense from genesis (or the hole has been filled).
+    historical_backfill: ?historical_backfill_mod.HistoricalBackfill = null,
+    /// Last time we sent a historical-backfill getheaders/getdata (unix s).
+    last_historical_drive_ts: i64 = 0,
+
     /// BIP-157: when true, advertise NODE_COMPACT_FILTERS (1<<6) in outgoing
     /// VERSION messages.  Wired from `config.blockfilterindex` at peer-creation
     /// time.  Mirrors Core's `init.cpp:992-998` where `g_local_services` gains
@@ -3187,6 +3194,8 @@ pub const PeerManager = struct {
             .in_pam = false,
             .peerbloomfilters = false,
             .advertise_node_network_limited = false,
+            .historical_backfill = null,
+            .last_historical_drive_ts = 0,
             .v2_fallback_set = std.AutoHashMap(u64, void).init(allocator),
             .header_index = std.AutoHashMap(types.Hash256, BlockHeaderEntry).init(allocator),
             .ignored_fork_roots = std.AutoHashMap(types.Hash256, void).init(allocator),
@@ -3275,6 +3284,7 @@ pub const PeerManager = struct {
         // Free the owned added-node strings (Core m_added_node_params).
         for (self.added_nodes.items) |n| self.allocator.free(n);
         self.added_nodes.deinit();
+        if (self.historical_backfill) |*bf| bf.deinit();
     }
 
     /// Default SOCKS5 proxy port when none is given (matches Core's default
@@ -4400,6 +4410,8 @@ pub const PeerManager = struct {
 
             // Initiate header sync with anchor peer
             self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
+            self.driveHistoricalBackfill(peer);
+            self.finishHistoricalBackfillIfDone();
         }
     }
 
@@ -4490,6 +4502,8 @@ pub const PeerManager = struct {
 
             // Initiate header sync with newly connected peer
             self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
+            self.driveHistoricalBackfill(peer);
+            self.finishHistoricalBackfillIfDone();
         }
     }
 
@@ -4823,6 +4837,13 @@ pub const PeerManager = struct {
                         }
                     }
                 }
+                if (self.historical_backfill != null and now_ts - self.last_historical_drive_ts > 5) {
+                    if (peer_obj.state == .handshake_complete) {
+                        self.driveHistoricalBackfill(peer_obj);
+                        self.finishHistoricalBackfillIfDone();
+                        break;
+                    }
+                }
             }
             return;
         }
@@ -4990,6 +5011,69 @@ pub const PeerManager = struct {
         } };
         try target_peer.sendMessage(&msg);
         target_peer.last_getheaders_time = std.time.timestamp();
+    }
+
+    /// Arm genesis→snapshot-base header+body backfill when the height index
+    /// has an assumeUTXO prefix hole. Safe to call more than once.
+    pub fn armHistoricalBackfill(self: *PeerManager) void {
+        if (self.historical_backfill != null) return;
+        const cs = self.chain_state orelse return;
+        self.historical_backfill = historical_backfill_mod.HistoricalBackfill.detect(
+            cs,
+            self.network_params.genesis_hash,
+            cs.best_height,
+        );
+        if (self.historical_backfill) |*bf| {
+            self.advertise_node_network_limited = true;
+            std.debug.print(
+                "historical backfill armed: genesis-side tip {d} → floor {d} (P2P headers+bodies; forward header sync stays at the snapshot tip)\n",
+                .{ bf.genesisTip(), bf.targetFloor() },
+            );
+        }
+    }
+
+    fn driveHistoricalBackfill(self: *PeerManager, target_peer: *Peer) void {
+        const bf = if (self.historical_backfill) |*b| b else return;
+        const cs = self.chain_state orelse return;
+        if (!bf.headersComplete()) {
+            const loc = bf.locator();
+            const msg = p2p.Message{ .getheaders = .{
+                .version = @intCast(p2p.PROTOCOL_VERSION),
+                .block_locator_hashes = loc.slice(),
+                .hash_stop = bf.hashStop(),
+            } };
+            target_peer.sendMessage(&msg) catch {};
+        }
+        var reqs: [historical_backfill_mod.BACKFILL_BODIES_PER_REQUEST]historical_backfill_mod.BodyRequest = undefined;
+        const n = bf.nextBodyHashes(cs, &reqs);
+        if (n > 0) {
+            var inv: [historical_backfill_mod.BACKFILL_BODIES_PER_REQUEST]p2p.InvVector = undefined;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                inv[i] = .{ .inv_type = .msg_witness_block, .hash = reqs[i].hash };
+            }
+            const msg = p2p.Message{ .getdata = .{ .inventory = inv[0..n] } };
+            target_peer.sendMessage(&msg) catch {};
+        }
+        self.last_historical_drive_ts = std.time.timestamp();
+        if (bf.isComplete()) {
+            std.debug.print(
+                "historical backfill complete: genesis→{d} indexed (getblockhash(1) is live)\n",
+                .{bf.targetFloor() -| 1},
+            );
+        }
+    }
+
+    fn finishHistoricalBackfillIfDone(self: *PeerManager) void {
+        const bf = if (self.historical_backfill) |*b| b else return;
+        if (!bf.isComplete()) return;
+        bf.deinit();
+        self.historical_backfill = null;
+        if (self.chain_state) |cs| {
+            if (cs.prune_target_mib == 0) {
+                self.advertise_node_network_limited = false;
+            }
+        }
     }
 
     // ====================================================================
@@ -5936,6 +6020,32 @@ pub const PeerManager = struct {
                 defer self.allocator.free(h.headers);
                 // Don't clear getheaders timeout -- we'll request more below if needed
 
+                if (h.headers.len > 0) {
+                    var historical = false;
+                    if (self.historical_backfill) |*bf| {
+                        if (self.chain_state) |cs| {
+                            if (bf.isBackfillBatch(cs, h.headers)) {
+                                const n = bf.acceptHeaders(h.headers, cs, self.network_params) catch |err| {
+                                    std.log.warn("historical backfill: header batch rejected: {}", .{err});
+                                    return;
+                                };
+                                if (n > 0) {
+                                    std.debug.print(
+                                        "P2P: historical backfill stored {d} headers, genesis_tip={d}/{d}\n",
+                                        .{ n, bf.genesisTip(), bf.targetFloor() -| 1 },
+                                    );
+                                }
+                                historical = true;
+                            }
+                        }
+                    }
+                    if (historical) {
+                        self.driveHistoricalBackfill(peer);
+                        self.finishHistoricalBackfillIfDone();
+                        return;
+                    }
+                }
+
                 if (h.headers.len == 0) {
                     // 0 headers from this peer doesn't mean we're synced — the
                     // peer may not have recognized our locator, or it's behind.
@@ -6326,6 +6436,26 @@ pub const PeerManager = struct {
             },
             .block => |block| {
                 const block_hash = crypto.computeBlockHash(&block.header);
+
+                var historical_body = false;
+                if (self.historical_backfill) |*bf| {
+                    if (self.chain_state) |cs| {
+                        if (bf.wantsHash(cs, &block_hash)) {
+                            _ = bf.acceptBlock(&block, cs) catch |err| {
+                                std.log.warn("historical backfill: body rejected: {}", .{err});
+                                serialize.freeBlock(self.allocator, &block);
+                                return;
+                            };
+                            serialize.freeBlock(self.allocator, &block);
+                            historical_body = true;
+                        }
+                    }
+                }
+                if (historical_body) {
+                    self.driveHistoricalBackfill(peer);
+                    self.finishHistoricalBackfillIfDone();
+                    return;
+                }
 
                 // Clear this block's in-flight record (Core RemoveBlockRequest).
                 // The per-block map is the source of truth: decrement the peer we

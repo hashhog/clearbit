@@ -13424,6 +13424,7 @@ pub const RpcServer = struct {
             if (self.chain_manager) |cm| {
                 if (cm.getBlock(&hash)) |e| return e.header.timestamp;
             }
+            if (self.chain_state.getPersistedHeader(&hash)) |hdr| return hdr.timestamp;
         }
         return null;
     }
@@ -13540,6 +13541,12 @@ pub const RpcServer = struct {
                 resolved_height = self.chain_state.best_height;
             } else if (self.chain_manager != null and self.chain_manager.?.getBlock(&hash) != null) {
                 resolved_height = self.chain_manager.?.getBlock(&hash).?.height;
+            }
+
+            if (resolved_height == null) {
+                if (self.chain_state.getBlockHeightByHash(&hash)) |h| {
+                    resolved_height = h;
+                }
             }
 
             if (resolved_height == null) {
