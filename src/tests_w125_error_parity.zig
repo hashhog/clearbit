@@ -326,25 +326,21 @@ test "w125 G21: RPC_WALLET_NOT_SPECIFIED = -19 (PRESENT)" {
 }
 
 // ---------------------------------------------------------------------------
-// G22: RPC_WALLET_ALREADY_LOADED = -35 (MISSING)
+// G22: RPC_WALLET_ALREADY_LOADED = -35 (PRESENT)
 // Core uses this on loadwallet when the named wallet is already in the
-// loaded set (wallet/rpc/wallet.cpp:261).  clearbit returns -4
-// RPC_WALLET_ERROR instead (rpc.zig:5104-5105).  Wire-format diverge:
-// clients expecting -35 won't auto-detect "wallet already loaded — no
-// action needed".
+// loaded set (wallet/rpc/wallet.cpp:261).
 // ---------------------------------------------------------------------------
-test "w125 G22 BUG-12 (HIGH-COMPAT): RPC_WALLET_ALREADY_LOADED constant MISSING (xfail)" {
-    try testing.expect(!@hasDecl(rpc, "RPC_WALLET_ALREADY_LOADED"));
+test "w125 G22: RPC_WALLET_ALREADY_LOADED = -35 (PRESENT)" {
+    try testing.expectEqual(@as(i32, -35), rpc.RPC_WALLET_ALREADY_LOADED);
 }
 
 // ---------------------------------------------------------------------------
-// G23: RPC_WALLET_ALREADY_EXISTS = -36 (MISSING)
-// Core uses on createwallet when a wallet of the same name already exists
-// (wallet/rpc/util.cpp:143).  clearbit returns -4 RPC_WALLET_ERROR
-// (rpc.zig:5071-5072).  Same wire-format-diverge class as G22.
+// G23: RPC_WALLET_ALREADY_EXISTS = -36 (PRESENT)
+// Core uses on restorewallet when a wallet of the same name already exists
+// (wallet/rpc/util.cpp:143).
 // ---------------------------------------------------------------------------
-test "w125 G23 BUG-13 (HIGH-COMPAT): RPC_WALLET_ALREADY_EXISTS constant MISSING (xfail)" {
-    try testing.expect(!@hasDecl(rpc, "RPC_WALLET_ALREADY_EXISTS"));
+test "w125 G23: RPC_WALLET_ALREADY_EXISTS = -36 (PRESENT)" {
+    try testing.expectEqual(@as(i32, -36), rpc.RPC_WALLET_ALREADY_EXISTS);
 }
 
 // ---------------------------------------------------------------------------

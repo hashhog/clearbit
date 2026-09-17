@@ -104,6 +104,11 @@
   "required": 0,
   "sig": "getaddrmaninfo"
  },
+ "getbalances": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getbalances"
+ },
  "getbestblockhash": {
   "declared": 0,
   "required": 0,
@@ -313,6 +318,11 @@
   "declared": 0,
   "required": 0,
   "sig": "listbanned"
+ },
+ "listwallets": {
+  "declared": 0,
+  "required": 0,
+  "sig": "listwallets"
  },
  "logging": {
   "declared": 2,

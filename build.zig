@@ -964,6 +964,38 @@ pub fn build(b: *std.Build) void {
         r5_sbr_step.dependOn(&run_r5_sbr_tests.step);
     }
 
+    // CONTROL for QUEUES.md T3 remaining accept-invalid / shape / error-code.
+    {
+        const r5_t3_tests = b.addTest(.{
+            .root_source_file = b.path("tests_r5_t3_remaining.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"r5_t3_remaining"},
+        });
+        r5_t3_tests.linkSystemLibrary("rocksdb");
+        r5_t3_tests.linkSystemLibrary("secp256k1");
+        r5_t3_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        r5_t3_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            r5_t3_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            r5_t3_tests.linkSystemLibrary("minisketch");
+            r5_t3_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        r5_t3_tests.root_module.addOptions("build_options", build_options);
+
+        const run_r5_t3_tests = b.addRunArtifact(r5_t3_tests);
+        const r5_t3_step = b.step(
+            "test-r5-t3-remaining",
+            "Run R5 T3 remaining Core-parity probes (accept-invalid / shape / codes)",
+        );
+        r5_t3_step.dependOn(&run_r5_t3_tests.step);
+    }
+
     // CONTROL for QUEUES.md item 0: REORG-CANDIDATE spam loop.
     // Same project-root package layout as tests_t1_r5.zig. Filter so imported
     // rpc/peer/wallet tests do not run.

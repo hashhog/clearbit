@@ -233,6 +233,11 @@ pub const RPC_WALLET_ENCRYPTION_FAILED: i32 = -16;
 pub const RPC_WALLET_ALREADY_UNLOCKED: i32 = -17;
 pub const RPC_WALLET_NOT_FOUND: i32 = -18;
 pub const RPC_WALLET_NOT_SPECIFIED: i32 = -19;
+/// loadwallet on a name already in the loaded set
+/// (protocol.h:82 RPC_WALLET_ALREADY_LOADED; wallet/rpc/wallet.cpp:261).
+pub const RPC_WALLET_ALREADY_LOADED: i32 = -35;
+/// restorewallet dest already exists (protocol.h:83 RPC_WALLET_ALREADY_EXISTS).
+pub const RPC_WALLET_ALREADY_EXISTS: i32 = -36;
 
 // ============================================================================
 // RPC Server
@@ -8151,7 +8156,13 @@ pub const RpcServer = struct {
 
         _ = wm.loadWallet(wallet_name) catch |err| {
             if (err == error.WalletAlreadyLoaded) {
-                return self.jsonRpcError(RPC_WALLET_ERROR, "Wallet is already loaded", id);
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Wallet \"{s}\" is already loaded.",
+                    .{wallet_name},
+                );
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_WALLET_ALREADY_LOADED, msg, id);
             }
             if (err == error.WalletNotFound) {
                 return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "Wallet file not found", id);
@@ -8327,8 +8338,7 @@ pub const RpcServer = struct {
                         .{wallet_name},
                     );
                     defer self.allocator.free(msg);
-                    // protocol.h:83 RPC_WALLET_ALREADY_EXISTS
-                    break :blk self.jsonRpcError(-36, msg, id);
+                    break :blk self.jsonRpcError(RPC_WALLET_ALREADY_EXISTS, msg, id);
                 },
                 else => self.jsonRpcError(RPC_WALLET_ERROR, "Error: Wallet restore failed!", id),
             };
@@ -8513,7 +8523,10 @@ pub const RpcServer = struct {
     }
 
     /// getaddressinfo "address"
-    /// Returns information about the given address.
+    /// Core: bitcoin-core/src/wallet/rpc/addresses.cpp:423-510 +
+    /// rpc/util.cpp DescribeAddress. Invalid destination is -5; solvable
+    /// own addresses carry desc/parent_desc; witness addresses emit
+    /// iswitness/witness_version/witness_program.
     fn handleGetAddressInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
@@ -8521,7 +8534,6 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
         };
 
-        // Extract address
         const addr = blk: {
             if (params == .array and params.array.items.len > 0) {
                 const a = params.array.items[0];
@@ -8530,28 +8542,28 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing address", id);
         };
 
+        // addresses.cpp:430-438 DecodeDestination + IsValidDestination.
+        if (!destinationValidForNetwork(addr, wallet.network, self.allocator)) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        }
+        var decoded = address_mod.Address.decode(addr, self.allocator) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address", id);
+        };
+        defer decoded.deinit(self.allocator);
+
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
-        // Derive the scriptPubKey from the address (best-effort).
         const spk_opt = scriptPubKeyForAddress(self.allocator, addr) catch null;
         defer if (spk_opt) |s| self.allocator.free(s);
 
-        // Determine ownership across both axes:
-        //   * spendable key match: a derived key-script equals this address's
-        //     scriptPubKey (ismine via a private key clearbit holds);
-        //   * watch-only match: an imported watch-only script equals it.
-        // Either makes ismine true (descriptor-wallet semantics — imported
-        // watch descriptors ARE IsMine; addresses.cpp:452). iswatchonly is the
-        // deprecated, hardcoded-false field (addresses.cpp:478).
         var is_mine = false;
         var is_change = false;
         var solvable = false;
         var watched_desc: ?[]const u8 = null;
 
         if (spk_opt) |spk| {
-            // Spendable key-script match.
             outer: for (0..wallet.keys.items.len) |ki| {
                 const types_to_try = [_]wallet_mod.AddressType{ .p2wpkh, .p2sh_p2wpkh, .p2pkh, .p2tr, .p2wsh };
                 for (types_to_try) |at| {
@@ -8564,7 +8576,6 @@ pub const RpcServer = struct {
                     }
                 }
             }
-            // Watch-only imported-script match.
             if (!is_mine) {
                 if (wallet.watchedScriptForSpk(spk)) |ws| {
                     is_mine = true;
@@ -8574,7 +8585,6 @@ pub const RpcServer = struct {
                 }
             }
         }
-        // Fall back to address-keyed lookup (covers raw scripts with no decode).
         if (!is_mine) {
             if (wallet.watchedScriptForAddress(addr)) |ws| {
                 is_mine = true;
@@ -8584,9 +8594,21 @@ pub const RpcServer = struct {
             }
         }
 
+        const addr_net: address_mod.Network = switch (wallet.network) {
+            .mainnet => .mainnet,
+            .testnet, .regtest => .testnet,
+        };
+        const is_regtest = wallet.network == .regtest;
+        var inferred: ?[]const u8 = null;
+        defer if (inferred) |d| self.allocator.free(d);
+        if (spk_opt) |spk| {
+            if (solvable or is_mine) {
+                inferred = inferDescriptorForSpk(self.allocator, spk, addr_net, is_regtest) catch null;
+            }
+        }
+
         try writer.print("{{\"address\":\"{s}\"", .{addr});
 
-        // scriptPubKey (hex).
         if (spk_opt) |spk| {
             try writer.writeAll(",\"scriptPubKey\":\"");
             for (spk) |b| try writer.print("{x:0>2}", .{b});
@@ -8595,22 +8617,56 @@ pub const RpcServer = struct {
 
         try writer.print(",\"ismine\":{s}", .{if (is_mine) "true" else "false"});
         try writer.print(",\"solvable\":{s}", .{if (solvable) "true" else "false"});
-        if (watched_desc) |d| {
-            try writer.writeAll(",\"desc\":\"");
-            try writeJsonEscaped(writer, d);
-            try writer.writeByte('"');
+        if (solvable) {
+            if (inferred) |d| {
+                try writer.writeAll(",\"desc\":\"");
+                try writeJsonEscaped(writer, d);
+                try writer.writeByte('"');
+            } else if (watched_desc) |d| {
+                try writer.writeAll(",\"desc\":\"");
+                try writeJsonEscaped(writer, d);
+                try writer.writeByte('"');
+            }
         }
-        // iswatchonly is DEPRECATED and ALWAYS false in descriptor wallets
-        // (addresses.cpp:383,478) — emitted for shape compatibility.
+        if (is_mine) {
+            if (inferred) |d| {
+                try writer.writeAll(",\"parent_desc\":\"");
+                try writeJsonEscaped(writer, d);
+                try writer.writeByte('"');
+            } else if (watched_desc) |d| {
+                try writer.writeAll(",\"parent_desc\":\"");
+                try writeJsonEscaped(writer, d);
+                try writer.writeByte('"');
+            }
+        }
         try writer.writeAll(",\"iswatchonly\":false");
         try writer.print(",\"ischange\":{s}", .{if (is_change) "true" else "false"});
 
-        // Add label if exists
+        // DescribeAddress (rpc/util.cpp:268-344).
+        switch (decoded.addr_type) {
+            .p2pkh => try writer.writeAll(",\"isscript\":false,\"iswitness\":false"),
+            .p2sh => try writer.writeAll(",\"isscript\":true,\"iswitness\":false"),
+            .p2wpkh => {
+                try writer.writeAll(",\"isscript\":false,\"iswitness\":true,\"witness_version\":0,\"witness_program\":\"");
+                for (decoded.hash) |b| try writer.print("{x:0>2}", .{b});
+                try writer.writeByte('"');
+            },
+            .p2wsh => {
+                try writer.writeAll(",\"isscript\":true,\"iswitness\":true,\"witness_version\":0,\"witness_program\":\"");
+                for (decoded.hash) |b| try writer.print("{x:0>2}", .{b});
+                try writer.writeByte('"');
+            },
+            .p2tr => {
+                try writer.writeAll(",\"isscript\":true,\"iswitness\":true,\"witness_version\":1,\"witness_program\":\"");
+                for (decoded.hash) |b| try writer.print("{x:0>2}", .{b});
+                try writer.writeByte('"');
+            },
+        }
+
         if (wallet.getLabel(addr)) |label| {
             try writer.print(",\"label\":\"{s}\"", .{label});
         }
 
-        // labels[] array (Core always emits this; 0 or 1 label string).
         try writer.writeAll(",\"labels\":[");
         if (wallet.getLabel(addr)) |label| {
             try writer.print("\"{s}\"", .{label});
@@ -15934,10 +15990,8 @@ pub const RpcServer = struct {
     ///   1. label (string, optional) - label for the address
     ///   2. address_type (string, optional) - "legacy", "p2sh-segwit", "bech32", "bech32m"
     fn handleGetNewAddress(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        const wallet = self.current_wallet orelse {
-            if (self.wallet) |w| {
-                return self.handleGetNewAddressWithWallet(w, params, id);
-            }
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
             return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
         };
         return self.handleGetNewAddressWithWallet(wallet, params, id);
@@ -15957,16 +16011,28 @@ pub const RpcServer = struct {
 
         var addr_type: wallet_mod.AddressType = .p2wpkh; // default to native segwit
 
-        if (params == .array and params.array.items.len > 1) {
+        // Core ParseOutputType (outputtype.cpp:23-34): unknown type is -5
+        // "Unknown address type '%s'" (addresses.cpp:54-58). Pre-fix an
+        // unrecognised string fell through to the bech32 default.
+        if (params == .array and params.array.items.len > 1 and params.array.items[1] != .null) {
             const type_param = params.array.items[1];
-            if (type_param == .string) {
-                if (std.mem.eql(u8, type_param.string, "legacy")) {
-                    addr_type = .p2pkh;
-                } else if (std.mem.eql(u8, type_param.string, "p2sh-segwit")) {
-                    addr_type = .p2sh_p2wpkh;
-                } else if (std.mem.eql(u8, type_param.string, "bech32m")) {
-                    addr_type = .p2tr;
-                }
+            if (type_param != .string) return self.typeErrorNotString(type_param, id);
+            if (std.mem.eql(u8, type_param.string, "legacy")) {
+                addr_type = .p2pkh;
+            } else if (std.mem.eql(u8, type_param.string, "p2sh-segwit")) {
+                addr_type = .p2sh_p2wpkh;
+            } else if (std.mem.eql(u8, type_param.string, "bech32")) {
+                addr_type = .p2wpkh;
+            } else if (std.mem.eql(u8, type_param.string, "bech32m")) {
+                addr_type = .p2tr;
+            } else {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Unknown address type '{s}'",
+                    .{type_param.string},
+                );
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, msg, id);
             }
         }
 
@@ -16097,6 +16163,14 @@ pub const RpcServer = struct {
             try writer.print("\"trusted\":{d:.8}", .{@as(f64, @floatFromInt(watch_trusted)) / 100_000_000.0});
             try writer.writeAll(",\"untrusted_pending\":0.00000000,\"immature\":0.00000000}");
         }
+        // coins.cpp:450 AppendLastProcessedBlock — required by the T3 shape probe.
+        const lp_height = wallet.last_synced_height;
+        const lp_hash = self.chain_state.getBlockHashByHeight(lp_height) orelse
+            (if (lp_height == self.chain_state.best_height) self.chain_state.best_hash else [_]u8{0} ** 32);
+        try writer.writeAll(",\"lastprocessedblock\":{\"hash\":\"");
+        try writeHashHex(writer, &lp_hash);
+        try writer.print("\",\"height\":{d}}}", .{lp_height});
+
         try writer.writeByte('}');
 
         return self.jsonRpcResult(buf.items, id);
@@ -16112,11 +16186,8 @@ pub const RpcServer = struct {
         if (params != .array or params.array.items.len < 2) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires address and amount", id);
         }
-
-        const wallet = self.current_wallet orelse {
-            if (self.wallet) |w| {
-                return self.handleSendToAddressWithWallet(w, params, id);
-            }
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
             return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
         };
         return self.handleSendToAddressWithWallet(wallet, params, id);
@@ -16151,8 +16222,14 @@ pub const RpcServer = struct {
         } else {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
         }
-        if (amount_sats <= 0) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
+        // AmountFromValue (rpc/util.cpp:99-107): negative fails MoneyRange
+        // as RPC_TYPE_ERROR -3 "Amount out of range". Pre-fix this was
+        // generic -32602.
+        if (amount_sats < 0) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
+        }
+        if (amount_sats == 0) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "Invalid amount", id);
         }
 
         // Destination scriptPubKey from the address.
@@ -17030,12 +17107,12 @@ pub const RpcServer = struct {
         if (params == .array) {
             if (params.array.items.len >= 2 and params.array.items[1] == .integer) {
                 const c = params.array.items[1].integer;
-                if (c < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Negative count", id);
+                if (c < 0) return self.jsonRpcError(RPC_INVALID_PARAMETER, "Negative count", id);
                 count = @intCast(c);
             }
             if (params.array.items.len >= 3 and params.array.items[2] == .integer) {
                 const s = params.array.items[2].integer;
-                if (s < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Negative from", id);
+                if (s < 0) return self.jsonRpcError(RPC_INVALID_PARAMETER, "Negative from", id);
                 skip = @intCast(s);
             }
         }
@@ -18310,6 +18387,15 @@ pub const RpcServer = struct {
         // argument parsing below could run.
         if (inputs_param != .array or (outputs_param != .array and outputs_param != .object)) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "inputs must be an array and outputs an array or object", id);
+        }
+        // spend.cpp:679 FundTransaction: empty recipients → -8
+        // "TX must have at least one output". Empty array used to succeed
+        // (coin selection skipped, a change-only PSBT was returned).
+        if (outputs_param == .array and outputs_param.array.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "TX must have at least one output", id);
+        }
+        if (outputs_param == .object and outputs_param.object.count() == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "TX must have at least one output", id);
         }
 
         // Core builds createpsbt, walletcreatefundedpsbt and
@@ -20745,8 +20831,12 @@ pub const RpcServer = struct {
                 try writer.writeAll("getmininginfo\\n\\nReturns a json object containing mining-related information.");
             } else if (std.mem.eql(u8, cmd, "getnewaddress")) {
                 try writer.writeAll("getnewaddress ( label address_type )\\n\\nReturns a new Bitcoin address for receiving payments.");
+            } else if (std.mem.eql(u8, cmd, "getaddressinfo")) {
+                try writer.writeAll("getaddressinfo \"address\"\\n\\nReturn information about the given bitcoin address.");
             } else if (std.mem.eql(u8, cmd, "getbalance")) {
                 try writer.writeAll("getbalance ( dummy minconf )\\n\\nReturns the total available balance.");
+            } else if (std.mem.eql(u8, cmd, "getbalances")) {
+                try writer.writeAll("getbalances\\n\\nReturns an object with all balances in BTC.");
             } else if (std.mem.eql(u8, cmd, "sendtoaddress")) {
                 try writer.writeAll("sendtoaddress address amount\\n\\nSend an amount to a given address.");
             } else if (std.mem.eql(u8, cmd, "send")) {
@@ -20777,6 +20867,8 @@ pub const RpcServer = struct {
                 try writer.writeAll("listlockunspent\\n\\nReturns the list of currently locked UTXOs.");
             } else if (std.mem.eql(u8, cmd, "walletcreatefundedpsbt")) {
                 try writer.writeAll("walletcreatefundedpsbt [{\"txid\",\"vout\"}...] [{\"address\":amount},...] ( locktime options bip32derivs )\\n\\nCreate and fund a PSBT using wallet UTXOs.");
+            } else if (std.mem.eql(u8, cmd, "walletprocesspsbt")) {
+                try writer.writeAll("walletprocesspsbt \"psbt\" ( sign sighashtype bip32derivs finalize )\\n\\nUpdate and (optionally) sign a PSBT with wallet keys.");
             } else if (std.mem.eql(u8, cmd, "savemempool")) {
                 try writer.writeAll("savemempool ( \"path\" )\\n\\nDump the mempool to disk in Bitcoin Core mempool.dat format. Alias of dumpmempool.");
             } else if (std.mem.eql(u8, cmd, "help")) {
@@ -20854,6 +20946,8 @@ pub const RpcServer = struct {
             try writer.writeAll("backupwallet\\n");
             try writer.writeAll("createwallet\\n");
             try writer.writeAll("getbalance\\n");
+            try writer.writeAll("getbalances\\n");
+            try writer.writeAll("getaddressinfo\\n");
             try writer.writeAll("getnewaddress\\n");
             try writer.writeAll("getwalletinfo\\n");
             try writer.writeAll("listunspent\\n");
@@ -20869,6 +20963,7 @@ pub const RpcServer = struct {
             try writer.writeAll("lockunspent\\n");
             try writer.writeAll("listlockunspent\\n");
             try writer.writeAll("walletcreatefundedpsbt\\n");
+            try writer.writeAll("walletprocesspsbt\\n");
             try writer.writeAll("importdescriptors\\n");
             try writer.writeAll("unloadwallet\\n");
             try writer.writeAll("\\n== Util ==\\n");
