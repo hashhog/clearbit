@@ -4521,6 +4521,27 @@ pub const RpcServer = struct {
         return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
     }
 
+    /// Render Core's `get_array()` type-error (-3): "JSON value of type <T>
+    /// is not of expected type array". listunspent's addresses argument
+    /// (coins.cpp:537 `request.params[2].get_array()`).
+    fn typeErrorNotArray(self: *RpcServer, v: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const tname: []const u8 = switch (v) {
+            .null => "null",
+            .bool => "bool",
+            .object => "object",
+            .array => "array",
+            .string => "string",
+            .integer, .float, .number_string => "number",
+        };
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "JSON value of type {s} is not of expected type array",
+            .{tname},
+        );
+        defer self.allocator.free(msg);
+        return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
+    }
+
     /// Parse a wait-family `timeout` param (Core `getInt<int>()` parity).
     /// Returns the timeout in milliseconds, or an error response on a type /
     /// range violation.  `null`/missing → 0 (no timeout, Core default).
@@ -16179,53 +16200,156 @@ pub const RpcServer = struct {
     /// Arguments:
     ///   1. minconf (numeric, optional, default=1) - minimum confirmations
     ///   2. maxconf (numeric, optional, default=9999999) - maximum confirmations
+    ///   3. addresses (array, optional) - filter; invalid → -5, duplicate → -8
+    ///   4. include_unsafe (bool, optional, default=true)
     fn handleListUnspent(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        _ = params;
-
-        const wallet = self.current_wallet orelse {
-            if (self.wallet) |w| {
-                return self.handleListUnspentWithWallet(w, id);
-            }
-            return self.jsonRpcError(RPC_WALLET_NOT_SPECIFIED, "No wallet loaded", id);
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
         };
-        return self.handleListUnspentWithWallet(wallet, id);
+        return self.handleListUnspentWithWallet(wallet, params, id);
     }
 
-    fn handleListUnspentWithWallet(self: *RpcServer, wallet: *wallet_mod.Wallet, id: ?std.json.Value) ![]const u8 {
+    fn handleListUnspentWithWallet(
+        self: *RpcServer,
+        wallet: *wallet_mod.Wallet,
+        params: std.json.Value,
+        id: ?std.json.Value,
+    ) ![]const u8 {
+        // Core coins.cpp:525-548 — parse minconf/maxconf/addresses BEFORE
+        // walking UTXOs. Pre-fix this handler ignored params, so invalid
+        // addresses succeeded, duplicates succeeded, and minconf never
+        // filtered (R5 T3 listunspent).
+        const items: []const std.json.Value = switch (params) {
+            .array => |a| a.items,
+            else => &.{},
+        };
+
+        var minconf: i64 = 1;
+        var maxconf: i64 = 9_999_999;
+        if (items.len >= 1 and items[0] != .null) {
+            switch (items[0]) {
+                .integer => |n| minconf = n,
+                else => return self.typeErrorNotNumber(items[0], id),
+            }
+        }
+        if (items.len >= 2 and items[1] != .null) {
+            switch (items[1]) {
+                .integer => |n| maxconf = n,
+                else => return self.typeErrorNotNumber(items[1], id),
+            }
+        }
+
+        var dest_set = std.StringHashMap(void).init(self.allocator);
+        defer dest_set.deinit();
+        if (items.len >= 3 and items[2] != .null) {
+            if (items[2] != .array) return self.typeErrorNotArray(items[2], id);
+            for (items[2].array.items) |item| {
+                if (item != .string) return self.typeErrorNotString(item, id);
+                const addr = item.string;
+                if (!destinationValidForNetwork(addr, wallet.network, self.allocator)) {
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Invalid Bitcoin address: {s}",
+                        .{addr},
+                    );
+                    defer self.allocator.free(msg);
+                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, msg, id);
+                }
+                const gop = try dest_set.getOrPut(addr);
+                if (gop.found_existing) {
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Invalid parameter, duplicated address: {s}",
+                        .{addr},
+                    );
+                    defer self.allocator.free(msg);
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                }
+            }
+        }
+
+        var include_unsafe: bool = true;
+        if (items.len >= 4 and items[3] != .null) {
+            switch (items[3]) {
+                .bool => |b| include_unsafe = b,
+                else => return self.jsonRpcError(
+                    RPC_TYPE_ERROR,
+                    "JSON value is not of expected type bool",
+                    id,
+                ),
+            }
+        }
+
+        const addr_net: address_mod.Network = switch (wallet.network) {
+            .mainnet => .mainnet,
+            .testnet, .regtest => .testnet,
+        };
+        const is_regtest = wallet.network == .regtest;
+
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
         try writer.writeByte('[');
 
-        for (wallet.utxos.items, 0..) |utxo, i| {
-            if (i > 0) try writer.writeByte(',');
+        var first = true;
+        for (wallet.utxos.items) |utxo| {
+            if (wallet.isLockedCoin(utxo.outpoint)) continue;
 
-            const btc_amount = @as(f64, @floatFromInt(utxo.output.value)) / 100_000_000.0;
-            const confirmations = if (self.chain_state.best_height >= utxo.height)
+            const confirmations: u32 = if (self.chain_state.best_height >= utxo.height)
                 self.chain_state.best_height - utxo.height + 1
             else
                 0;
+            const conf_i: i64 = confirmations;
+            if (conf_i < minconf or conf_i > maxconf) continue;
+
+            // AvailableCoins drops immature coinbase unless
+            // query_options.include_immature_coinbase (default false).
+            if (utxo.is_coinbase and confirmations < consensus.COINBASE_MATURITY) continue;
+
+            const safe = confirmations > 0;
+            if (!include_unsafe and !safe) continue;
+
+            const addr_opt: ?[]const u8 = if (utxo.output.script_pubkey.len > 0)
+                wallet_mod.scriptToAddress(utxo.output.script_pubkey, wallet.network, self.allocator) catch null
+            else
+                null;
+            defer if (addr_opt) |a| self.allocator.free(a);
+
+            if (dest_set.count() > 0) {
+                const a = addr_opt orelse continue;
+                if (!dest_set.contains(a)) continue;
+            }
+
+            if (!first) try writer.writeByte(',');
+            first = false;
+
+            const btc_amount = @as(f64, @floatFromInt(utxo.output.value)) / 100_000_000.0;
 
             try writer.writeAll("{\"txid\":\"");
             try writeHashHex(writer, &utxo.outpoint.hash);
             try writer.print("\",\"vout\":{d}", .{utxo.outpoint.index});
 
-            // scriptPubKey (hex) + address, so a caller can attribute the coin
-            // to a specific watched script/address. Persisted spk may be empty
-            // on legacy/reconstructed entries.
             if (utxo.output.script_pubkey.len > 0) {
                 try writer.writeAll(",\"scriptPubKey\":\"");
                 for (utxo.output.script_pubkey) |b| try writer.print("{x:0>2}", .{b});
                 try writer.writeByte('"');
-                const addr_opt = wallet_mod.scriptToAddress(utxo.output.script_pubkey, wallet.network, self.allocator) catch null;
-                defer if (addr_opt) |a| self.allocator.free(a);
-                if (addr_opt) |a| try writer.print(",\"address\":\"{s}\"", .{a});
             }
 
-            // Watch-only coins are NOT spendable (no private key) but ARE owned
-            // (ismine via the imported descriptor). solvable reflects whether
-            // the descriptor can produce a spend script.
+            if (addr_opt) |a| {
+                try writer.writeAll(",\"address\":\"");
+                try writeJsonEscaped(writer, a);
+                try writer.writeByte('"');
+                // Core emits label when the address-book has an entry
+                // (coins.cpp:625-628). getnewaddress always books the
+                // address; unlabeled own coins still carry "".
+                const label = wallet.getLabel(a) orelse "";
+                try writer.writeAll(",\"label\":\"");
+                try writeJsonEscaped(writer, label);
+                try writer.writeByte('"');
+            }
+
             const spendable = !utxo.is_watchonly;
             const solvable = blk: {
                 if (!utxo.is_watchonly) break :blk true;
@@ -16234,12 +16358,26 @@ pub const RpcServer = struct {
                 }
                 break :blk false;
             };
-            try writer.print(",\"amount\":{d:.8},\"confirmations\":{d},\"spendable\":{s},\"solvable\":{s},\"safe\":true}}", .{
+            try writer.print(",\"amount\":{d:.8},\"confirmations\":{d},\"spendable\":{s},\"solvable\":{s}", .{
                 btc_amount,
                 confirmations,
                 if (spendable) "true" else "false",
                 if (solvable) "true" else "false",
             });
+
+            // coins.cpp:677-683 — desc when solvable (InferDescriptor).
+            if (solvable and utxo.output.script_pubkey.len > 0) {
+                if (inferDescriptorForSpk(self.allocator, utxo.output.script_pubkey, addr_net, is_regtest)) |d| {
+                    defer self.allocator.free(d);
+                    try writer.writeAll(",\"desc\":\"");
+                    try writeJsonEscaped(writer, d);
+                    try writer.writeByte('"');
+                } else |_| {}
+            }
+
+            // coins.cpp:684 PushParentDescriptors — non-optional array.
+            try writer.writeAll(",\"parent_descs\":[]");
+            try writer.print(",\"safe\":{s}}}", .{if (safe) "true" else "false"});
         }
 
         try writer.writeByte(']');
@@ -22639,6 +22777,33 @@ fn appendTxOutput(srv: *RpcServer, out_list: *std.ArrayList(types.TxOut), key: [
         return try srv.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", rid);
     };
     return null;
+}
+
+/// Core DecodeDestination + IsValidDestination for the node's chain
+/// (coins.cpp:540-542). A string that decodes but belongs to another
+/// network (bc1 on regtest, etc.) is invalid, same as Core's
+/// CChainParams-bound DecodeDestination.
+fn destinationValidForNetwork(
+    addr_str: []const u8,
+    network: wallet_mod.Network,
+    allocator: std.mem.Allocator,
+) bool {
+    var decoded = address_mod.Address.decode(addr_str, allocator) catch return false;
+    defer decoded.deinit(allocator);
+
+    var lower: [5]u8 = undefined;
+    const n = @min(addr_str.len, 5);
+    for (addr_str[0..n], 0..) |c, i| {
+        lower[i] = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+    }
+    if (n >= 5 and std.mem.eql(u8, lower[0..5], "bcrt1")) return network == .regtest;
+    if (n >= 3 and std.mem.eql(u8, lower[0..3], "bc1")) return network == .mainnet;
+    if (n >= 3 and std.mem.eql(u8, lower[0..3], "tb1")) return network == .testnet;
+
+    return switch (network) {
+        .mainnet => decoded.network == .mainnet,
+        .testnet, .regtest => decoded.network == .testnet,
+    };
 }
 
 fn scriptPubKeyForAddress(allocator: std.mem.Allocator, addr_str: []const u8) ![]u8 {

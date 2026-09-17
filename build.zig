@@ -899,6 +899,39 @@ pub fn build(b: *std.Build) void {
         r5_gwi_step.dependOn(&run_r5_gwi_tests.step);
     }
 
+    // CONTROL for QUEUES.md T3 listunspent filters / label / desc.
+    // Same project-root package layout as tests_r5_getwalletinfo.zig.
+    {
+        const r5_lu_tests = b.addTest(.{
+            .root_source_file = b.path("tests_r5_listunspent.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"r5_listunspent"},
+        });
+        r5_lu_tests.linkSystemLibrary("rocksdb");
+        r5_lu_tests.linkSystemLibrary("secp256k1");
+        r5_lu_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        r5_lu_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            r5_lu_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            r5_lu_tests.linkSystemLibrary("minisketch");
+            r5_lu_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        r5_lu_tests.root_module.addOptions("build_options", build_options);
+
+        const run_r5_lu_tests = b.addRunArtifact(r5_lu_tests);
+        const r5_lu_step = b.step(
+            "test-r5-listunspent",
+            "Run R5 T3 listunspent Core-parity probes (filters / label / desc)",
+        );
+        r5_lu_step.dependOn(&run_r5_lu_tests.step);
+    }
+
     // CONTROL for QUEUES.md item 0: REORG-CANDIDATE spam loop.
     // Same project-root package layout as tests_t1_r5.zig. Filter so imported
     // rpc/peer/wallet tests do not run.
