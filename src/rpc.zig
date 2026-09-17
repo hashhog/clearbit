@@ -8011,6 +8011,21 @@ pub const RpcServer = struct {
         return null;
     }
 
+    /// Name of `target` in the wallet manager, or "" for the legacy single
+    /// wallet. The returned slice aliases the manager's key (valid for the
+    /// rest of this request — wallets are not unloaded mid-dispatch).
+    fn walletNameOf(self: *RpcServer, target: *wallet_mod.Wallet) []const u8 {
+        if (self.wallet_manager) |wm| {
+            wm.mutex.lock();
+            defer wm.mutex.unlock();
+            var it = wm.wallets.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* == target) return entry.key_ptr.*;
+            }
+        }
+        return "";
+    }
+
     /// createwallet "wallet_name" ( disable_private_keys blank passphrase
     /// avoid_reuse descriptors load_on_startup external_signer )
     ///
@@ -8512,7 +8527,8 @@ pub const RpcServer = struct {
     }
 
     /// getwalletinfo
-    /// Returns information about the wallet.
+    /// Core: bitcoin-core/src/wallet/rpc/wallet.cpp:34-134.
+    /// `txcount` is mapWallet.size (wallet-relevant txs), not the keypool.
     fn handleGetWalletInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         if (self.requireWallet(id)) |err| return err;
 
@@ -8525,27 +8541,34 @@ pub const RpcServer = struct {
         const writer = buf.writer();
 
         const balance = wallet.getBalance();
-        const spendable = wallet.getSpendableBalance();
         const immature = wallet.getImmatureBalance();
-        const unlocked = wallet.isUnlocked();
+        const name = self.walletNameOf(wallet);
+        // Core keeps emitting the latest legacy min-version even on
+        // descriptor wallets (wallet.cpp:85-89).
+        const walletversion: u32 = 169900;
 
-        try writer.print("{{\"balance\":{d}.{d:0>8},\"unconfirmed_balance\":0.0,\"immature_balance\":{d}.{d:0>8}", .{
+        try writer.writeByte('{');
+        try writer.writeAll("\"walletname\":\"");
+        try writeJsonEscaped(writer, name);
+        try writer.writeByte('"');
+        try writer.print(",\"walletversion\":{d}", .{walletversion});
+        try writer.writeAll(",\"format\":\"sqlite\"");
+        try writer.print(",\"balance\":{d}.{d:0>8},\"unconfirmed_balance\":0.0,\"immature_balance\":{d}.{d:0>8}", .{
             @divTrunc(balance, 100_000_000),
             @abs(@rem(balance, 100_000_000)),
             @divTrunc(immature, 100_000_000),
             @abs(@rem(immature, 100_000_000)),
         });
-
-        try writer.print(",\"txcount\":{d}", .{wallet.keys.items.len});
+        try writer.print(",\"txcount\":{d}", .{wallet.tx_history.items.len});
         try writer.print(",\"keypoolsize\":{d}", .{wallet.keys.items.len});
-
-        // private_keys_enabled — false on an enforced watch-only wallet
-        // (createwallet disable_private_keys=true). Core: getwalletinfo emits
-        // `!IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)`
-        // (wallet/rpc/wallet.cpp:98). importdescriptors reads the same flag.
         try writer.print(",\"private_keys_enabled\":{s}", .{
             if (wallet.disable_private_keys) "false" else "true",
         });
+        try writer.print(",\"avoid_reuse\":{s}", .{if (wallet.avoid_reuse) "true" else "false"});
+        try writer.writeAll(",\"scanning\":false");
+        try writer.print(",\"descriptors\":{s}", .{if (wallet.descriptors) "true" else "false"});
+        try writer.print(",\"external_signer\":{s}", .{if (wallet.external_signer) "true" else "false"});
+        try writer.print(",\"blank\":{s}", .{if (wallet.blank) "true" else "false"});
 
         if (wallet.encrypted) {
             try writer.writeAll(",\"unlocked_until\":");
@@ -8556,8 +8579,30 @@ pub const RpcServer = struct {
             }
         }
 
-        _ = spendable;
-        _ = unlocked;
+        try writer.writeAll(",\"flags\":[");
+        var first_flag = true;
+        const Flag = struct { set: bool, name: []const u8 };
+        const flags = [_]Flag{
+            .{ .set = wallet.avoid_reuse, .name = "avoid_reuse" },
+            .{ .set = wallet.blank, .name = "blank" },
+            .{ .set = wallet.descriptors, .name = "descriptors" },
+            .{ .set = wallet.disable_private_keys, .name = "disable_private_keys" },
+            .{ .set = wallet.external_signer, .name = "external_signer" },
+        };
+        for (flags) |f| {
+            if (!f.set) continue;
+            if (!first_flag) try writer.writeByte(',');
+            first_flag = false;
+            try writer.print("\"{s}\"", .{f.name});
+        }
+        try writer.writeByte(']');
+
+        const lp_height = wallet.last_synced_height;
+        const lp_hash = self.chain_state.getBlockHashByHeight(lp_height) orelse
+            (if (lp_height == self.chain_state.best_height) self.chain_state.best_hash else [_]u8{0} ** 32);
+        try writer.writeAll(",\"lastprocessedblock\":{\"hash\":\"");
+        try writeHashHex(writer, &lp_hash);
+        try writer.print("\",\"height\":{d}}}", .{lp_height});
 
         try writer.writeByte('}');
 

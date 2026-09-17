@@ -284,6 +284,11 @@
   "required": 1,
   "sig": "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...] ( {\"mempool_only\":bool,\"return_spending_tx\":bool,...} )"
  },
+ "getwalletinfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getwalletinfo"
+ },
  "help": {
   "declared": 1,
   "required": 0,

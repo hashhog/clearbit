@@ -10120,23 +10120,27 @@ pub const PeerManager = struct {
             // BIP-324 negotiation lives inside connectOutboundNegotiated;
             // when v2 is disabled (default) this is identical to the old
             // Peer.connect+performHandshake pair.
-            const new_peer = self.connectOutboundNegotiated(addr) orelse {
-                std.debug.print("P2P: Connection or handshake failed with --connect peer\n", .{});
-                return;
-            };
-            new_peer.conn_type = .manual;
-            std.debug.print("P2P: Handshake complete with --connect peer (height={d})\n", .{new_peer.start_height});
+            //
+            // Do NOT abort the run loop if this first attempt fails: Core may
+            // not be listening yet (regtest harness races RPC-ready vs P2P
+            // bind). The address is already tagged .manual so
+            // maintainManualConnections re-dials it. Returning here used to
+            // kill the P2P thread, leaving the node at 0 peers forever.
+            if (self.connectOutboundNegotiated(addr)) |new_peer| {
+                new_peer.conn_type = .manual;
+                std.debug.print("P2P: Handshake complete with --connect peer (height={d})\n", .{new_peer.start_height});
 
-            self.peers.append(new_peer) catch {
-                new_peer.disconnect();
-                self.allocator.destroy(new_peer);
-                return;
-            };
-
-            // Send getheaders using our best block as locator
-            self.sendGetHeaders(new_peer) catch |err| {
-                std.debug.print("P2P: Failed to send getheaders: {}\n", .{err});
-            };
+                if (self.peers.append(new_peer)) |_| {
+                    self.sendGetHeaders(new_peer) catch |err| {
+                        std.debug.print("P2P: Failed to send getheaders: {}\n", .{err});
+                    };
+                } else |_| {
+                    new_peer.disconnect();
+                    self.allocator.destroy(new_peer);
+                }
+            } else {
+                std.debug.print("P2P: Connection or handshake failed with --connect peer (will retry)\n", .{});
+            }
         } else {
             // Load anchor connections from disk
             self.loadAnchors() catch {};

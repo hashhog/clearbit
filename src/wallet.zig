@@ -1639,6 +1639,12 @@ pub const Wallet = struct {
     /// (backup.cpp:259-262). Persisted across restart.
     disable_private_keys: bool = false,
 
+    /// createwallet flags reported by getwalletinfo (Core wallet.cpp:98-110).
+    avoid_reuse: bool = false,
+    blank: bool = false,
+    descriptors: bool = true,
+    external_signer: bool = false,
+
     // Labels: address -> label mapping
     labels: std.StringHashMap([]const u8),
 
@@ -5006,6 +5012,9 @@ pub const WalletManager = struct {
         // private_keys_enabled=false and importdescriptors enforces the
         // privkey/DPK -4 rules against it.
         wallet.disable_private_keys = options.disable_private_keys;
+        wallet.avoid_reuse = options.avoid_reuse;
+        wallet.blank = options.blank;
+        wallet.descriptors = options.descriptors;
 
         // Encrypt if passphrase provided
         if (options.passphrase) |passphrase| {
@@ -6461,7 +6470,7 @@ test "anti-fee-sniping sets locktime to current height" {
     _ = try wallet.generateKey();
 
     // Create a mock P2WPKH scriptPubKey
-    const script_pubkey = [_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20;
+    const script_pubkey = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
 
     // Add a UTXO to spend
     const utxo = OwnedUtxo{
@@ -6519,7 +6528,7 @@ test "anti-fee-sniping disabled sets locktime to 0" {
 
     _ = try wallet.generateKey();
 
-    const script_pubkey = [_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20;
+    const script_pubkey = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
 
     const utxo = OwnedUtxo{
         .outpoint = .{ .hash = [_]u8{0x01} ** 32, .index = 0 },
@@ -6677,7 +6686,8 @@ test "BIP32 CKDpub: TV1 chain m/0h xpub matches neuter(CKDpriv)" {
         0x03, 0x5a, 0x78, 0x46, 0x62, 0xa4, 0xa2, 0x0a,
         0x65, 0xbf, 0x6a, 0xab, 0x9a, 0xe9, 0x8a, 0x6c,
         0x06, 0x8a, 0x81, 0xc5, 0x2e, 0x4b, 0x03, 0x2c,
-        0x0f, 0xb5, 0x40, 0x0c, 0x70, 0x6c, 0xfc, 0xcc, 0x56,
+        0x0f, 0xb5, 0x40, 0x0c, 0x70, 0x6c, 0xfc, 0xcc,
+        0x56,
     };
     const m0h_pub = try m0h.neuter(ctx.?);
     try std.testing.expectEqualSlices(u8, &expected_pub_hex, &m0h_pub.pub_key.bytes);
@@ -6720,7 +6730,8 @@ test "BIP32 CKDpub: m/0h/1 commutes with neuter" {
         0x03, 0x50, 0x1e, 0x45, 0x4b, 0xf0, 0x07, 0x51,
         0xf2, 0x4b, 0x1b, 0x48, 0x9a, 0xa9, 0x25, 0x21,
         0x5d, 0x66, 0xaf, 0x22, 0x34, 0xe3, 0x89, 0x1c,
-        0x3b, 0x21, 0xa5, 0x2b, 0xed, 0xb3, 0xcd, 0x71, 0x1c,
+        0x3b, 0x21, 0xa5, 0x2b, 0xed, 0xb3, 0xcd, 0x71,
+        0x1c,
     };
     try std.testing.expectEqualSlices(u8, &expected_pub_hex, &actual.pub_key.bytes);
 
