@@ -1523,6 +1523,12 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
     const rate = @as(f64, @floatFromInt(imported)) / elapsed_s;
     std.debug.print("Snapshot load complete: {d} coins in {d:.1}s ({d:.0} coin/s)\n", .{ imported, elapsed_s, rate });
     std.debug.print("Chain tip set to height {d}\n", .{block_height});
+    // INTENT (QUEUES.md ASK 2): this writes the snapshot UTXO set and the
+    // baked base-tail headers only. Core then keeps a second chainstate and
+    // backfills genesis→base in the background. clearbit does not; the
+    // resulting datadir has no height→hash index below the tail. Boot
+    // discoverHistoryFloor reports that gap as pruned=true. Historical
+    // header+block backfill is the remaining work, not this load path.
 }
 
 // ============================================================================
@@ -2588,6 +2594,22 @@ pub fn main() !void {
         } else |err| {
             std.debug.print("Warning: genesis height prefix serialize failed: {}\n", .{err});
         }
+    }
+
+    // Snapshot-boot honesty: the H:{height} index on a --load-snapshot
+    // datadir starts at the baked base-tail (944172 on mainnet), not
+    // genesis. Core would keep a second chainstate and backfill
+    // genesis→base in the background; this node currently does not.
+    // Probe the gap once so getblockchaininfo reports pruned=true +
+    // pruneheight instead of claiming a full chain, and so getblockhash
+    // of an in-range unretained height is -1 not -8.
+    chain_state.discoverHistoryFloor();
+    if (chain_state.history_floor > 1) {
+        peer_manager.advertise_node_network_limited = true;
+        std.debug.print(
+            "History floor {d}: this datadir does not retain blocks below that height (snapshot boot without Core's background backfill). getblockchaininfo.pruned=true pruneheight={d}. NODE_NETWORK_LIMITED advertised. Historical header+block backfill is NOT running.\n",
+            .{ chain_state.history_floor, chain_state.history_floor },
+        );
     }
 
     // Boot-reconcile (2026-06-23): after an unclean restart the durable tip can

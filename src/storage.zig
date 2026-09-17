@@ -2396,6 +2396,16 @@ pub const ChainState = struct {
     /// Highest height whose block body has been pruned (or considered prunable).
     /// Heights ≤ prune_height are not retrievable via getblock RPC.
     prune_height: u32 = 0,
+    /// Lowest height > 0 whose H:{height}→hash index is populated.
+    /// 0 means the height index is complete from genesis (or not yet probed /
+    /// DB-less). Snapshot-bootstrapped datadirs have a prefix gap: genesis is
+    /// synthesized at height 0, then nothing until the baked base-tail
+    /// (944172 on mainnet's hashhog bootstrap) and the snapshot base. Used by
+    /// getblockchaininfo to report pruned=true + pruneheight instead of
+    /// silently claiming a full chain.
+    history_floor: u32 = 0,
+    /// Whether discoverHistoryFloor has run (or a caller set the floor).
+    history_floor_probed: bool = false,
 
     // ----------------------------------------------------------------------
     // CF_BLOCKS populator (Bitcoin Core analog:
@@ -4698,8 +4708,77 @@ pub const ChainState = struct {
     /// than a misleading "block not found" — same UX as Bitcoin Core's
     /// rpc/blockchain.cpp getblock() pruned-block branch.
     pub fn isHeightPruned(self: *const ChainState, height: u32) bool {
+        if (height == 0) return false;
+        if (self.history_floor > 1 and height < self.history_floor) return true;
         if (self.prune_target_mib == 0) return false;
-        return height != 0 and height <= self.prune_height;
+        return height <= self.prune_height;
+    }
+
+    /// Record that the height→hash index starts at `floor` (snapshot boot
+    /// or a test). 0 means complete from genesis.
+    pub fn setHistoryFloor(self: *ChainState, floor: u32) void {
+        self.history_floor = floor;
+        self.history_floor_probed = true;
+    }
+
+    /// Probe the H:{height}→hash index for a prefix gap. Idempotent.
+    ///
+    /// A from-genesis node has height 1 (and every height up to the tip).
+    /// A snapshot-bootstrapped node has genesis (synthesized) then a hole
+    /// until the baked base-tail / snapshot base. Binary search finds the
+    /// first present height in (1..best_height]; O(log n) DB reads, once.
+    /// DB-less / genesis-only chains leave the floor at 0.
+    pub fn discoverHistoryFloor(self: *ChainState) void {
+        if (self.history_floor_probed) return;
+        self.history_floor_probed = true;
+        if (self.utxo_set.db == null) {
+            self.history_floor = 0;
+            return;
+        }
+        if (self.best_height <= 1) {
+            self.history_floor = 0;
+            return;
+        }
+        if (self.getBlockHashByHeight(1) != null) {
+            self.history_floor = 0;
+            return;
+        }
+        var lo: u32 = 1;
+        var hi: u32 = self.best_height;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.getBlockHashByHeight(mid) != null) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        if (self.getBlockHashByHeight(lo) != null) {
+            self.history_floor = lo;
+        } else {
+            self.history_floor = self.best_height;
+        }
+    }
+
+    /// True when the node does not hold the full chain: prune mode is on,
+    /// or the height index has a snapshot-style prefix gap. Core reports
+    /// getblockchaininfo.pruned from IsPruneMode(); we also report it for
+    /// a missing prefix so an operator is not told the chain is complete.
+    pub fn holdsIncompleteHistory(self: *const ChainState) bool {
+        return self.prune_target_mib > 0 or self.history_floor > 1;
+    }
+
+    /// First height with complete data (Core pruneheight: the first
+    /// unpruned block). 0 when nothing is missing.
+    pub fn firstCompleteHeight(self: *const ChainState) u32 {
+        var h: u32 = 0;
+        if (self.prune_target_mib > 0 and self.prune_height > 0) {
+            h = self.prune_height + 1;
+        }
+        if (self.history_floor > 1 and self.history_floor > h) {
+            h = self.history_floor;
+        }
+        return h;
     }
 
     /// Connect a block: spend inputs, create outputs, optionally save undo data.
@@ -9861,6 +9940,57 @@ test "isHeightPruned: enabled prune respects watermark" {
     // Heights above watermark are retained.
     try std.testing.expect(!chain_state.isHeightPruned(101));
     try std.testing.expect(!chain_state.isHeightPruned(1_000_000));
+}
+
+test "history floor: snapshot prefix gap reports incomplete + pruneheight" {
+    const allocator = std.testing.allocator;
+    var chain_state = ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+
+    try std.testing.expect(!chain_state.holdsIncompleteHistory());
+    try std.testing.expectEqual(@as(u32, 0), chain_state.firstCompleteHeight());
+
+    chain_state.setHistoryFloor(944_172);
+    chain_state.best_height = 967_441;
+    try std.testing.expect(chain_state.holdsIncompleteHistory());
+    try std.testing.expectEqual(@as(u32, 944_172), chain_state.firstCompleteHeight());
+    try std.testing.expect(chain_state.isHeightPruned(1));
+    try std.testing.expect(chain_state.isHeightPruned(944_171));
+    try std.testing.expect(!chain_state.isHeightPruned(944_172));
+    try std.testing.expect(!chain_state.isHeightPruned(0));
+}
+
+test "discoverHistoryFloor finds first H: after a prefix gap" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    const floor_h: u32 = 90;
+    const tip_h: u32 = 100;
+    var h: u32 = floor_h;
+    while (h <= tip_h) : (h += 1) {
+        var hash: types.Hash256 = [_]u8{0x11} ** 32;
+        hash[0] = @intCast(h);
+        const key = ChainStore.buildHeightHashKey(h);
+        try db.put(CF_DEFAULT, &key, &hash);
+    }
+    // Genesis is synthesized on boot; include it so the probe does not
+    // treat height 0 as the floor.
+    const gkey = ChainStore.buildHeightHashKey(0);
+    try db.put(CF_DEFAULT, &gkey, &([_]u8{0x00} ** 32));
+
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = tip_h;
+    chain_state.discoverHistoryFloor();
+    try std.testing.expectEqual(floor_h, chain_state.history_floor);
+    try std.testing.expect(chain_state.holdsIncompleteHistory());
+    try std.testing.expectEqual(floor_h, chain_state.firstCompleteHeight());
 }
 
 test "pruneToTarget: no-op when prune disabled" {

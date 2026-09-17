@@ -3836,7 +3836,32 @@ pub const RpcServer = struct {
         // getdeploymentinfo). warnings is an ARRAY by default in v31.99
         // (node::GetWarningsForRpc returns VARR).
         // size_on_disk: real datadir byte total (was hardcoded 0 stub).
-        try writer.print("\",\"size_on_disk\":{d},\"pruned\":false,\"warnings\":[]}}", .{self.computeSizeOnDisk()});
+        //
+        // pruned / pruneheight: Core (rpc/blockchain.cpp) emits pruned from
+        // IsPruneMode() and pruneheight = first unpruned height. Hardcoding
+        // pruned=false lied about snapshot-bootstrapped datadirs whose
+        // height→hash index starts at the baked base-tail (944172 on the
+        // live mainnet node, 2026-09-17) — getblockhash(1) then read as a
+        // bad parameter instead of "not retained". Report the floor.
+        self.chain_state.discoverHistoryFloor();
+        const pruned = self.chain_state.holdsIncompleteHistory();
+        try writer.print("\",\"size_on_disk\":{d},\"pruned\":{}", .{
+            self.computeSizeOnDisk(),
+            pruned,
+        });
+        if (pruned) {
+            try writer.print(",\"pruneheight\":{d}", .{self.chain_state.firstCompleteHeight()});
+            if (self.chain_state.prune_target_mib > 0) {
+                const automatic = self.chain_state.prune_target_mib != 1;
+                try writer.print(",\"automatic_pruning\":{}", .{automatic});
+                if (automatic) {
+                    try writer.print(",\"prune_target_size\":{d}", .{
+                        self.chain_state.prune_target_mib *% (1024 * 1024),
+                    });
+                }
+            }
+        }
+        try writer.writeAll(",\"warnings\":[]}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -5042,6 +5067,17 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block height out of range", id);
         }
 
+        // Height is in [0, tip]. A snapshot-bootstrapped datadir has a
+        // prefix gap: the height is a valid chain index, but we do not
+        // retain it. Core getblockhash only uses -8 for height < 0 or
+        // height > tip; returning -8 here reads as "bad parameter".
+        // Same string Core's getblock uses for pruned bodies
+        // (rpc/blockchain.cpp GetBlockChecked).
+        self.chain_state.discoverHistoryFloor();
+        if (self.chain_state.isHeightPruned(height)) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Block not available (pruned data)", id);
+        }
+
         // First: consult the H:{height}→hash index written atomically with
         // the chain tip in ChainState.flush().  This is the only path that
         // works post-restart for blocks connected via peer.zig's fast IBD path.
@@ -5098,7 +5134,10 @@ pub const RpcServer = struct {
             return self.jsonRpcResult(buf.items, id);
         }
 
-        return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block height out of range", id);
+        // In-range but the height→hash index has no entry (snapshot prefix
+        // gap, or a pre-W37 height that was never backfilled). Not "out of
+        // range" — the height is on the advertised chain.
+        return self.jsonRpcError(RPC_MISC_ERROR, "Block not available (pruned data)", id);
     }
 
     fn handleGetBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {

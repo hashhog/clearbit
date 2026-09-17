@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-16
 
+- fix: getblockchaininfo reports pruned=true + pruneheight when the height index has a snapshot prefix gap (live mainnet started at 944172 while claiming pruned=false); getblockhash of an in-range unretained height is -1 "Block not available (pruned data)", not -8. Does not backfill genesis→floor.
 - fix: R5 accepts-invalid class — reject input Core rejects (combinerawtransaction -25, deriveaddresses checksum/range, getindexinfo type, signrawtransactionwithkey WIF)
 - 0436b30 test: align stale audit-flip gates to Core-correct behavior
 - 5866132 fix: handle repeated unresolvable REORG-CANDIDATE headers once

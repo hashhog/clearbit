@@ -996,6 +996,39 @@ pub fn build(b: *std.Build) void {
         r5_t3_step.dependOn(&run_r5_t3_tests.step);
     }
 
+    // CONTROL for QUEUES.md item 0: snapshot-boot missing history reported
+    // as pruned=false. Filter so imported rpc/peer/wallet tests do not run.
+    {
+        const r5_pruned_tests = b.addTest(.{
+            .root_source_file = b.path("tests_r5_pruned_history.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"r5_pruned_history"},
+        });
+        r5_pruned_tests.linkSystemLibrary("rocksdb");
+        r5_pruned_tests.linkSystemLibrary("secp256k1");
+        r5_pruned_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        r5_pruned_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            r5_pruned_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            r5_pruned_tests.linkSystemLibrary("minisketch");
+            r5_pruned_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        r5_pruned_tests.root_module.addOptions("build_options", build_options);
+
+        const run_r5_pruned_tests = b.addRunArtifact(r5_pruned_tests);
+        const r5_pruned_step = b.step(
+            "test-r5-pruned-history",
+            "Run snapshot-boot pruned=true / getblockhash not-retained control",
+        );
+        r5_pruned_step.dependOn(&run_r5_pruned_tests.step);
+    }
+
     // CONTROL for QUEUES.md item 0: REORG-CANDIDATE spam loop.
     // Same project-root package layout as tests_t1_r5.zig. Filter so imported
     // rpc/peer/wallet tests do not run.
