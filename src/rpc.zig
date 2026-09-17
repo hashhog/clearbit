@@ -5743,10 +5743,16 @@ pub const RpcServer = struct {
     /// Empty/omitted arg = all running indices.
     fn handleGetIndexInfo(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Optional positional arg 0: the index-name filter ("" when omitted).
+        // Core RPCArg::Type::STR (rpc/node.cpp getindexinfo); a non-string is
+        // UniValue type_error → RPC_TYPE_ERROR (-3). The T2 probe
+        // `wrong-type-arg` is params: [123]. Null is treated as omitted.
         const filter: []const u8 = blk: {
             if (params) |p| {
                 if (p == .array and p.array.items.len > 0) {
-                    if (p.array.items[0] == .string) break :blk p.array.items[0].string;
+                    const a0 = p.array.items[0];
+                    if (a0 == .null) break :blk "";
+                    if (a0 != .string) return try self.typeErrorNotString(a0, id);
+                    break :blk a0.string;
                 }
             }
             break :blk "";
@@ -9995,6 +10001,10 @@ pub const RpcServer = struct {
         var desc_str: []const u8 = undefined;
         var range_start: u32 = 0;
         var range_end: u32 = 1;
+        // Core rpc/output_script.cpp:320 uses request.params.size() > 1, not
+        // "range parsed successfully". A second positional arg on an
+        // un-ranged descriptor is RPC_INVALID_PARAMETER (-8).
+        var range_specified = false;
 
         if (params == .array and params.array.items.len >= 1) {
             const d = params.array.items[0];
@@ -10004,8 +10014,11 @@ pub const RpcServer = struct {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid descriptor", id);
             }
 
-            // Parse optional range parameter
+            // Parse optional range parameter. Core ParseDescriptorRange runs
+            // BEFORE Parse(..., require_checksum=true), so an out-of-int32
+            // range still beats a missing checksum (tests_rpc_cast_hazards).
             if (params.array.items.len >= 2) {
+                range_specified = true;
                 const range_param = params.array.items[1];
                 if (range_param == .array and range_param.array.items.len == 2) {
                     // Range is [start, end]
@@ -10036,6 +10049,56 @@ pub const RpcServer = struct {
             }
         } else {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing descriptor", id);
+        }
+
+        // Core Parse(desc, ..., require_checksum=true) (output_script.cpp:315).
+        // T2 probe `missing-checksum` is a wpkh() with no #checksum.
+        const hash_pos = std.mem.lastIndexOf(u8, desc_str, "#");
+        if (hash_pos == null) {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Missing checksum", id);
+        }
+        const hp = hash_pos.?;
+        const provided_cs = desc_str[hp + 1 ..];
+        if (provided_cs.len != 8) {
+            const msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Expected 8 character checksum, not {d} characters",
+                .{provided_cs.len},
+            );
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, msg, id);
+        }
+        if (!descriptor.verifyChecksum(desc_str)) {
+            const computed = descriptor.computeChecksum(desc_str[0..hp]);
+            if (computed) |ck| {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Provided checksum '{s}' does not match computed checksum '{s}'",
+                    .{ provided_cs, ck },
+                );
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, msg, id);
+            }
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid characters in payload", id);
+        }
+
+        var parsed_desc = descriptor.parseDescriptor(self.allocator, desc_str) catch {
+            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive addresses from descriptor", id);
+        };
+        defer parsed_desc.deinit(self.allocator);
+        if (!parsed_desc.isRange() and range_specified) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "Range should not be specified for an un-ranged descriptor",
+                id,
+            );
+        }
+        if (parsed_desc.isRange() and !range_specified) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMETER,
+                "Range must be specified for a ranged descriptor",
+                id,
+            );
         }
 
         // Determine network
@@ -15000,6 +15063,17 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// True iff `outpoint` is an unspent coin in the UTXO set or an unspent
+    /// mempool output. Mirrors Core CCoinsViewMemPool + IsSpent for
+    /// combinerawtransaction (rawtransaction.cpp:625-653).
+    fn combinePrevoutAvailable(self: *RpcServer, outpoint: *const types.OutPoint) bool {
+        if (self.chain_state.utxo_set.haveCoin(outpoint)) return true;
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+        if (self.mempool.spenders.get(outpoint.*) != null) return false;
+        return self.mempool.getOutputFromMempool(outpoint) != null;
+    }
+
     /// Handle combinerawtransaction RPC - merge multiple partially-signed
     /// versions of the SAME transaction into one carrying the union of their
     /// signature data, returned as witness-serialized hex.
@@ -15034,12 +15108,12 @@ pub const RpcServer = struct {
     /// guaranteed byte-identical to Core. The per-input single-sig pick — the
     /// dominant case — IS byte-identical and is what is verified.
     ///
-    /// DEVIATION (flagged): Core resolves every input's prevout from its own
-    /// UTXO + mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input
-    /// not found or already spent" when a coin is missing/spent. combine is a
-    /// pure function of the provided variants here — no chainstate lookup — so
-    /// this handler does NOT raise -25 for unresolvable prevouts. The -22 empty
-    /// / -22 decode-failure error paths DO match Core byte-for-byte.
+    /// Prevouts: Core resolves every input from its UTXO + mempool
+    /// CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found or
+    /// already spent" when a coin is missing/spent (rawtransaction.cpp:650-653).
+    /// T2 probe `unknown-input` is two copies of a tx spending an all-0xaa
+    /// prevout. We match that reject. Signature *merge* remains the
+    /// single-sig pick described above (no Solver splice).
     ///
     /// Errors (match Core byte-for-byte):
     ///   - non-array param  -> -3  type error (Core: get_array() on a non-array)
@@ -15142,6 +15216,14 @@ pub const RpcServer = struct {
         // 2. Empty array -> -22 "Missing transactions".
         if (variants.items.len == 0) {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Missing transactions", id);
+        }
+
+        // 2b. Core AccessCoin + IsSpent → RPC_VERIFY_ERROR (-25).
+        const template_for_coins = &variants.items[0];
+        for (template_for_coins.inputs) |input| {
+            if (!self.combinePrevoutAvailable(&input.previous_output)) {
+                return self.jsonRpcError(RPC_VERIFY_ERROR, "Input not found or already spent", id);
+            }
         }
 
         // 3. mergedTx starts as a clone of the first variant (the template:
@@ -17212,9 +17294,19 @@ pub const RpcServer = struct {
         defer ephem.deinit();
 
         for (keys_param.array.items) |k| {
-            if (k != .string) continue;
-            const decoded = self.decodeWifPrivkey(k.string) orelse continue;
-            _ = ephem.importKey(decoded.secret) catch continue;
+            // Core DecodeSecret(k.get_str()): a non-string is type_error (-3);
+            // an undecodable WIF is RPC_INVALID_ADDRESS_OR_KEY (-5)
+            // "Invalid private key" (rawtransaction.cpp:749-751). T2 probe
+            // `bad-privkey` is params: [hex, ["notakey"]].
+            if (k != .string) {
+                return try self.typeErrorNotString(k, id);
+            }
+            const decoded = self.decodeWifPrivkey(k.string) orelse {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key", id);
+            };
+            _ = ephem.importKey(decoded.secret) catch {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key", id);
+            };
         }
 
         // Per-input prev-output lookup. Try the optional prevtxs array first,

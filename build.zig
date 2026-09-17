@@ -799,6 +799,40 @@ pub fn build(b: *std.Build) void {
         t1_test_step.dependOn(&run_t1_tests.step);
     }
 
+    // CONTROL for QUEUES.md R5 "accepts input Core rejects" class.
+    // Same project-root package layout as tests_t1_r5.zig. Filter so imported
+    // rpc/peer/wallet tests do not run.
+    {
+        const r5_inv_tests = b.addTest(.{
+            .root_source_file = b.path("tests_r5_accepts_invalid.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"r5_accepts_invalid"},
+        });
+        r5_inv_tests.linkSystemLibrary("rocksdb");
+        r5_inv_tests.linkSystemLibrary("secp256k1");
+        r5_inv_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        r5_inv_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            r5_inv_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            r5_inv_tests.linkSystemLibrary("minisketch");
+            r5_inv_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        r5_inv_tests.root_module.addOptions("build_options", build_options);
+
+        const run_r5_inv_tests = b.addRunArtifact(r5_inv_tests);
+        const r5_inv_step = b.step(
+            "test-r5-accepts-invalid",
+            "Run R5 probes that currently accept input Core rejects",
+        );
+        r5_inv_step.dependOn(&run_r5_inv_tests.step);
+    }
+
     // CONTROL for QUEUES.md item 0: REORG-CANDIDATE spam loop.
     // Same project-root package layout as tests_t1_r5.zig. Filter so imported
     // rpc/peer/wallet tests do not run.
