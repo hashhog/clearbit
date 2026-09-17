@@ -3340,6 +3340,10 @@ pub const RpcServer = struct {
             return self.handleListWallets(id);
         } else if (std.mem.eql(u8, method, "listwalletdir")) {
             return self.handleListWalletDir(id);
+        } else if (std.mem.eql(u8, method, "backupwallet")) {
+            return self.handleBackupWallet(params, id);
+        } else if (std.mem.eql(u8, method, "restorewallet")) {
+            return self.handleRestoreWallet(params, id);
         }
         // Wallet RPC methods
         else if (std.mem.eql(u8, method, "encryptwallet")) {
@@ -3456,6 +3460,8 @@ pub const RpcServer = struct {
             return self.handleGetBalances(id);
         } else if (std.mem.eql(u8, method, "sendtoaddress")) {
             return self.handleSendToAddress(params, id);
+        } else if (std.mem.eql(u8, method, "send")) {
+            return self.handleSend(params, id);
         } else if (std.mem.eql(u8, method, "listunspent")) {
             return self.handleListUnspent(params, id);
         } else if (std.mem.eql(u8, method, "listtransactions")) {
@@ -8261,6 +8267,75 @@ pub const RpcServer = struct {
 
         try writer.writeAll("]}");
 
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// backupwallet "destination"
+    /// Safely copies the current wallet file to dest (file or directory).
+    /// Missing parent directory → RPC_WALLET_ERROR -4.
+    /// Core: bitcoin-core/src/wallet/rpc/backup.cpp backupwallet.
+    fn handleBackupWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+        const dest = blk: {
+            if (params == .array and params.array.items.len > 0 and params.array.items[0] == .string) {
+                break :blk params.array.items[0].string;
+            }
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "backupwallet \"destination\"", id);
+        };
+        const wm = self.wallet_manager orelse {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Multi-wallet not enabled", id);
+        };
+        const name = try self.allocator.dupe(u8, self.walletNameOf(wallet));
+        defer self.allocator.free(name);
+        wm.backupWallet(name, dest) catch {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Error: Wallet backup failed!", id);
+        };
+        return self.jsonRpcResult("null", id);
+    }
+
+    /// restorewallet "wallet_name" "backup_file" ( load_on_startup )
+    /// Missing backup → -8 (checked first); dest already exists → -36.
+    /// Core: bitcoin-core/src/wallet/wallet.cpp RestoreWallet +
+    /// wallet/rpc/util.cpp HandleWalletError.
+    fn handleRestoreWallet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        const wm = self.wallet_manager orelse {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Multi-wallet not enabled", id);
+        };
+        const items: []const std.json.Value = switch (params) {
+            .array => |a| a.items,
+            else => &.{},
+        };
+        if (items.len < 2 or items[0] != .string or items[1] != .string) {
+            return self.jsonRpcError(
+                RPC_INVALID_PARAMS,
+                "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )",
+                id,
+            );
+        }
+        const wallet_name = items[0].string;
+        const backup_file = items[1].string;
+        _ = wm.restoreWallet(wallet_name, backup_file) catch |err| {
+            return switch (err) {
+                error.BackupFileMissing => self.jsonRpcError(RPC_INVALID_PARAMETER, "Backup file does not exist", id),
+                error.WalletAlreadyExists => blk: {
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Failed to restore wallet. Database file exists '{s}'.",
+                        .{wallet_name},
+                    );
+                    defer self.allocator.free(msg);
+                    // protocol.h:83 RPC_WALLET_ALREADY_EXISTS
+                    break :blk self.jsonRpcError(-36, msg, id);
+                },
+                else => self.jsonRpcError(RPC_WALLET_ERROR, "Error: Wallet restore failed!", id),
+            };
+        };
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        try buf.writer().print("{{\"name\":\"{s}\"}}", .{wallet_name});
         return self.jsonRpcResult(buf.items, id);
     }
 
@@ -16189,9 +16264,297 @@ pub const RpcServer = struct {
             };
         };
 
+        // Core CommitTransaction: drop spent inputs and credit change so a
+        // subsequent send cannot double-spend the same coins.
+        self.commitWalletSend(wallet, &tx, txid);
+
         // Broadcast + return the Core-style display (reversed) txid, matching
         // sendrawtransaction / getrawmempool.
         return self.returnTxidAndBroadcast(txid, id);
+    }
+
+    /// send [{"address":amount},...] ( conf_target estimate_mode fee_rate options )
+    /// Core: bitcoin-core/src/wallet/rpc/spend.cpp send.
+    /// Empty outputs → -8 "TX must have at least one output"; invalid address → -5.
+    fn handleSend(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (self.requireWallet(id)) |err| return err;
+        const wallet = self.getTargetWallet() orelse {
+            return self.jsonRpcError(RPC_WALLET_NOT_FOUND, "No wallet loaded", id);
+        };
+        if (wallet.disable_private_keys) {
+            return self.jsonRpcError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet", id);
+        }
+
+        const items: []const std.json.Value = switch (params) {
+            .array => |a| a.items,
+            else => &.{},
+        };
+        if (items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing outputs", id);
+        }
+
+        var dests = std.ArrayList(types.TxOut).init(self.allocator);
+        defer {
+            for (dests.items) |o| self.allocator.free(o.script_pubkey);
+            dests.deinit();
+        }
+
+        const outs = items[0];
+        if (outs == .array) {
+            if (outs.array.items.len == 0) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "TX must have at least one output", id);
+            }
+            for (outs.array.items) |item| {
+                if (item != .object) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, key-value pair not an object as expected", id);
+                }
+                if (item.object.count() != 1) {
+                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, key-value pair must contain exactly one key", id);
+                }
+                if (try self.appendSendOutput(&dests, item.object, wallet, id)) |err| return err;
+            }
+        } else if (outs == .object) {
+            if (outs.object.count() == 0) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "TX must have at least one output", id);
+            }
+            if (try self.appendSendOutput(&dests, outs.object, wallet, id)) |err| return err;
+        } else {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, outputs are missing", id);
+        }
+        if (dests.items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "TX must have at least one output", id);
+        }
+
+        var fee_rate: u64 = 5;
+        if (items.len >= 4 and items[3] != .null) {
+            switch (items[3]) {
+                .integer => |n| {
+                    if (n > 0) fee_rate = @intCast(n);
+                },
+                .float => |f| {
+                    if (f > 0) fee_rate = @intFromFloat(@round(f));
+                },
+                else => {},
+            }
+        }
+
+        return self.broadcastWalletPayment(wallet, dests.items, fee_rate, id, .send_object);
+    }
+
+    fn appendSendOutput(
+        self: *RpcServer,
+        dests: *std.ArrayList(types.TxOut),
+        obj: std.json.ObjectMap,
+        wallet: *wallet_mod.Wallet,
+        id: ?std.json.Value,
+    ) !?[]const u8 {
+        var it = obj.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (std.mem.eql(u8, key, "data")) continue;
+            var amount_sats: i64 = 0;
+            switch (entry.value_ptr.*) {
+                .float => |f| {
+                    if (f < 0 or f > 21_000_000) {
+                        return try self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
+                    }
+                    amount_sats = @intFromFloat(@round(f * 100_000_000.0));
+                },
+                .integer => |n| {
+                    if (n < 0 or n > 21_000_000) {
+                        return try self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
+                    }
+                    amount_sats = n * 100_000_000;
+                },
+                else => return try self.jsonRpcError(RPC_TYPE_ERROR, "Amount is not a number or string", id),
+            }
+            if (!destinationValidForNetwork(key, wallet.network, self.allocator)) {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Invalid Bitcoin address: {s}",
+                    .{key},
+                );
+                defer self.allocator.free(msg);
+                return try self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, msg, id);
+            }
+            const spk = scriptPubKeyForAddress(self.allocator, key) catch {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Invalid Bitcoin address: {s}",
+                    .{key},
+                );
+                defer self.allocator.free(msg);
+                return try self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, msg, id);
+            };
+            dests.append(.{ .value = amount_sats, .script_pubkey = spk }) catch {
+                self.allocator.free(spk);
+                return try self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+            };
+        }
+        return null;
+    }
+
+    /// Build, sign, mempool-accept and commit a wallet payment. `dests` scripts
+    /// stay owned by the caller; this dupes them onto the tx.
+    fn broadcastWalletPayment(
+        self: *RpcServer,
+        wallet: *wallet_mod.Wallet,
+        dests: []const types.TxOut,
+        fee_rate: u64,
+        id: ?std.json.Value,
+        mode: enum { txid_string, send_object },
+    ) ![]const u8 {
+        var target_value: i64 = 0;
+        for (dests) |o| target_value += o.value;
+
+        const sel = wallet.selectCoinsWithOptions(target_value, .{ .fee_rate = fee_rate }) catch |e| switch (e) {
+            error.InsufficientFunds => return self.jsonRpcError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds", id),
+            else => return self.jsonRpcError(RPC_WALLET_ERROR, "Coin selection failed", id),
+        };
+        defer self.allocator.free(sel.selected);
+
+        var tx_inputs = std.ArrayList(types.TxIn).init(self.allocator);
+        defer tx_inputs.deinit();
+        for (sel.selected) |u| {
+            try tx_inputs.append(types.TxIn{
+                .previous_output = u.outpoint,
+                .script_sig = &[_]u8{},
+                .sequence = 0xFFFFFFFD,
+                .witness = &[_][]const u8{},
+            });
+        }
+
+        var tx_outputs = std.ArrayList(types.TxOut).init(self.allocator);
+        defer tx_outputs.deinit();
+        for (dests) |o| {
+            const spk = try self.allocator.dupe(u8, o.script_pubkey);
+            tx_outputs.append(.{ .value = o.value, .script_pubkey = spk }) catch {
+                self.allocator.free(spk);
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+            };
+        }
+
+        var change_addr_alloc: ?[]const u8 = null;
+        defer if (change_addr_alloc) |ca| self.allocator.free(ca);
+        if (sel.change >= 546) {
+            const change_addr = wallet.getnewaddress(.p2wpkh, true) catch {
+                for (tx_outputs.items) |o| self.allocator.free(o.script_pubkey);
+                return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to derive change address", id);
+            };
+            change_addr_alloc = change_addr.address;
+            const change_spk = scriptPubKeyForAddress(self.allocator, change_addr.address) catch {
+                for (tx_outputs.items) |o| self.allocator.free(o.script_pubkey);
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to build change scriptPubKey", id);
+            };
+            tx_outputs.append(.{ .value = sel.change, .script_pubkey = change_spk }) catch {
+                self.allocator.free(change_spk);
+                for (tx_outputs.items) |o| self.allocator.free(o.script_pubkey);
+                return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+            };
+        }
+
+        const inputs_slice = try self.allocator.dupe(types.TxIn, tx_inputs.items);
+        const outputs_slice = try self.allocator.dupe(types.TxOut, tx_outputs.items);
+        var tx = types.Transaction{
+            .version = 2,
+            .inputs = inputs_slice,
+            .outputs = outputs_slice,
+            .lock_time = 0,
+        };
+
+        for (sel.selected, 0..) |u, idx| {
+            wallet.signInput(&tx, idx, u, @intFromEnum(types.SigHashType.all), sel.selected) catch {
+                for (outputs_slice) |o| self.allocator.free(o.script_pubkey);
+                self.allocator.free(outputs_slice);
+                self.allocator.free(inputs_slice);
+                return self.jsonRpcError(RPC_WALLET_ERROR, "Failed to sign transaction", id);
+            };
+        }
+
+        const txid = crypto.computeTxid(&tx, self.allocator) catch {
+            for (tx.inputs) |in| {
+                if (in.script_sig.len > 0) self.allocator.free(in.script_sig);
+                for (in.witness) |w| self.allocator.free(w);
+                if (in.witness.len > 0) self.allocator.free(in.witness);
+            }
+            for (outputs_slice) |o| self.allocator.free(o.script_pubkey);
+            self.allocator.free(outputs_slice);
+            self.allocator.free(inputs_slice);
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to compute txid", id);
+        };
+
+        self.mempool.addTransaction(tx) catch |err| {
+            for (tx.inputs) |in| {
+                if (in.script_sig.len > 0) self.allocator.free(in.script_sig);
+                for (in.witness) |w| self.allocator.free(w);
+                if (in.witness.len > 0) self.allocator.free(in.witness);
+            }
+            for (outputs_slice) |o| self.allocator.free(o.script_pubkey);
+            self.allocator.free(outputs_slice);
+            self.allocator.free(inputs_slice);
+            return switch (err) {
+                mempool_mod.MempoolError.InsufficientFee => self.jsonRpcError(RPC_WALLET_ERROR, "min relay fee not met", id),
+                mempool_mod.MempoolError.ImmatureCoinbase => self.jsonRpcError(RPC_WALLET_ERROR, "bad-txns-premature-spend-of-coinbase", id),
+                mempool_mod.MempoolError.MissingInputs => self.jsonRpcError(RPC_WALLET_ERROR, "missing inputs", id),
+                else => self.jsonRpcError(RPC_WALLET_ERROR, "Transaction rejected by mempool", id),
+            };
+        };
+
+        self.commitWalletSend(wallet, &tx, txid);
+
+        if (mode == .txid_string) {
+            return self.returnTxidAndBroadcast(txid, id);
+        }
+        self.broadcastTxInv(&txid);
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
+        try writer.writeAll("{\"complete\":true,\"txid\":\"");
+        try writeHashHex(writer, &txid);
+        try writer.writeAll("\"}");
+        return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Drop spent inputs and credit own outputs (change). Mirrors Core
+    /// CWallet::CommitTransaction so a later send cannot reuse the same coins.
+    fn commitWalletSend(self: *RpcServer, wallet: *wallet_mod.Wallet, tx: *const types.Transaction, txid: types.Hash256) void {
+        _ = self;
+        for (tx.inputs) |in| {
+            _ = wallet.removeUtxo(in.previous_output);
+        }
+        const types_to_try = [_]wallet_mod.AddressType{ .p2wpkh, .p2sh_p2wpkh, .p2pkh, .p2tr, .p2wsh };
+        for (tx.outputs, 0..) |out, vout| {
+            var matched = false;
+            var match_key_index: usize = 0;
+            var match_addr_type: wallet_mod.AddressType = .p2wpkh;
+            outer: for (0..wallet.keys.items.len) |ki| {
+                for (types_to_try) |at| {
+                    const spk = wallet.getScriptPubKey(ki, at) catch continue;
+                    defer wallet.allocator.free(spk);
+                    if (std.mem.eql(u8, spk, out.script_pubkey)) {
+                        matched = true;
+                        match_key_index = ki;
+                        match_addr_type = at;
+                        break :outer;
+                    }
+                }
+            }
+            if (!matched) continue;
+            const spk_copy = wallet.allocator.dupe(u8, out.script_pubkey) catch continue;
+            wallet.addUtxo(.{
+                .outpoint = .{ .hash = txid, .index = @intCast(vout) },
+                .output = .{ .value = out.value, .script_pubkey = spk_copy },
+                .key_index = match_key_index,
+                .address_type = match_addr_type,
+                .confirmations = 0,
+                .is_coinbase = false,
+                .height = wallet.tip_height,
+            }) catch {
+                wallet.allocator.free(spk_copy);
+                continue;
+            };
+        }
+        wallet.dirty = true;
     }
 
     /// Handle listunspent RPC - list unspent transaction outputs.
@@ -20386,6 +20749,12 @@ pub const RpcServer = struct {
                 try writer.writeAll("getbalance ( dummy minconf )\\n\\nReturns the total available balance.");
             } else if (std.mem.eql(u8, cmd, "sendtoaddress")) {
                 try writer.writeAll("sendtoaddress address amount\\n\\nSend an amount to a given address.");
+            } else if (std.mem.eql(u8, cmd, "send")) {
+                try writer.writeAll("send outputs ( conf_target estimate_mode fee_rate options )\\n\\nSend a transaction.");
+            } else if (std.mem.eql(u8, cmd, "backupwallet")) {
+                try writer.writeAll("backupwallet destination\\n\\nSafely copies current wallet file to destination.");
+            } else if (std.mem.eql(u8, cmd, "restorewallet")) {
+                try writer.writeAll("restorewallet wallet_name backup_file ( load_on_startup )\\n\\nRestores and loads a wallet from backup.");
             } else if (std.mem.eql(u8, cmd, "listunspent")) {
                 try writer.writeAll("listunspent ( minconf maxconf addresses )\\n\\nReturns array of unspent transaction outputs.");
             } else if (std.mem.eql(u8, cmd, "listtransactions")) {
@@ -20482,6 +20851,7 @@ pub const RpcServer = struct {
             try writer.writeAll("decodepsbt\\n");
             try writer.writeAll("finalizepsbt\\n");
             try writer.writeAll("\\n== Wallet ==\\n");
+            try writer.writeAll("backupwallet\\n");
             try writer.writeAll("createwallet\\n");
             try writer.writeAll("getbalance\\n");
             try writer.writeAll("getnewaddress\\n");
@@ -20490,6 +20860,8 @@ pub const RpcServer = struct {
             try writer.writeAll("listtransactions\\n");
             try writer.writeAll("listwallets\\n");
             try writer.writeAll("loadwallet\\n");
+            try writer.writeAll("restorewallet\\n");
+            try writer.writeAll("send\\n");
             try writer.writeAll("sendtoaddress\\n");
             try writer.writeAll("signmessage\\n");
             try writer.writeAll("signrawtransactionwithwallet\\n");

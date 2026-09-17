@@ -9,6 +9,11 @@
   "required": 1,
   "sig": "analyzepsbt \"psbt\""
  },
+ "backupwallet": {
+  "declared": 1,
+  "required": 1,
+  "sig": "backupwallet \"destination\""
+ },
  "clearbanned": {
   "declared": 0,
   "required": 0,
@@ -334,6 +339,11 @@
   "required": 1,
   "sig": "pruneblockchain height"
  },
+ "restorewallet": {
+  "declared": 3,
+  "required": 2,
+  "sig": "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )"
+ },
  "savemempool": {
   "declared": 0,
   "required": 0,
@@ -348,6 +358,11 @@
   "declared": 2,
   "required": 1,
   "sig": "scantxoutset \"action\" ( [scanobjects,...] )"
+ },
+ "send": {
+  "declared": 6,
+  "required": 1,
+  "sig": "send outputs ( conf_target estimate_mode fee_rate options version )"
  },
  "sendrawtransaction": {
   "declared": 3,

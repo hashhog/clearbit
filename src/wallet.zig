@@ -5207,6 +5207,18 @@ pub const WalletManager = struct {
     // Internal Methods
     // ========================================================================
 
+    fn pathIsDir(path: []const u8) bool {
+        var d = std.fs.openDirAbsolute(path, .{}) catch return false;
+        d.close();
+        return true;
+    }
+
+    fn pathIsFile(path: []const u8) bool {
+        const f = std.fs.openFileAbsolute(path, .{}) catch return false;
+        f.close();
+        return true;
+    }
+
     fn getWalletDir(self: *WalletManager, name: []const u8) ![]const u8 {
         if (name.len == 0) {
             // Default wallet is in wallets_dir root
@@ -5300,6 +5312,70 @@ pub const WalletManager = struct {
         defer self.mutex.unlock();
         const wallet = self.wallets.get(name) orelse return error.WalletNotLoaded;
         try self.saveWalletInternal(name, wallet);
+    }
+
+    /// Copy the named wallet's database to `dest`. Parent directory of dest
+    /// must already exist (Core backupwallet: missing parent → -4).
+    /// Destination may be a file path or an existing directory (file lands at
+    /// dest/wallet.dat). Reference: bitcoin-core/src/wallet/rpc/backup.cpp.
+    pub fn backupWallet(self: *WalletManager, name: []const u8, dest: []const u8) !void {
+        try self.saveWallet(name);
+
+        const wallet_dir = try self.getWalletDir(name);
+        defer self.allocator.free(wallet_dir);
+        const src = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat", .{wallet_dir});
+        defer self.allocator.free(src);
+
+        var dest_owned: ?[]u8 = null;
+        defer if (dest_owned) |p| self.allocator.free(p);
+        var final_dest: []const u8 = dest;
+        if (WalletManager.pathIsDir(dest)) {
+            dest_owned = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat", .{dest});
+            final_dest = dest_owned.?;
+        }
+
+        if (std.fs.path.dirname(final_dest)) |parent| {
+            if (parent.len > 0 and !WalletManager.pathIsDir(parent)) {
+                return error.WalletBackupFailed;
+            }
+        }
+
+        std.fs.copyFileAbsolute(src, final_dest, .{}) catch return error.WalletBackupFailed;
+    }
+
+    /// Restore a wallet from a backupwallet file and load it.
+    /// Missing backup → BackupFileMissing (-8) checked FIRST; destination
+    /// already exists → WalletAlreadyExists (-36).
+    /// Reference: bitcoin-core/src/wallet/wallet.cpp RestoreWallet.
+    pub fn restoreWallet(self: *WalletManager, name: []const u8, backup_file: []const u8) !*Wallet {
+        if (!WalletManager.pathIsFile(backup_file)) {
+            return error.BackupFileMissing;
+        }
+
+        const wallet_dir = try self.getWalletDir(name);
+        defer self.allocator.free(wallet_dir);
+        const dest_db = try std.fmt.allocPrint(self.allocator, "{s}/wallet.dat", .{wallet_dir});
+        defer self.allocator.free(dest_db);
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.wallets.contains(name) or WalletManager.pathIsFile(dest_db)) {
+                return error.WalletAlreadyExists;
+            }
+        }
+
+        std.fs.makeDirAbsolute(wallet_dir) catch |err| {
+            if (err != error.PathAlreadyExists) return error.WalletRestoreFailed;
+        };
+        std.fs.copyFileAbsolute(backup_file, dest_db, .{}) catch {
+            return error.WalletRestoreFailed;
+        };
+
+        return self.loadWallet(name) catch |err| {
+            std.fs.deleteFileAbsolute(dest_db) catch {};
+            return err;
+        };
     }
 
     /// Persist every loaded wallet whose `dirty` flag is set.  Cheap when no
