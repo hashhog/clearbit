@@ -144,6 +144,11 @@ pub const Config = struct {
     // Assumevalid control
     noassumevalid: bool = false, // if true, set assumed_valid_hash = null (always verify scripts)
 
+    // Script-verification threads. Mirrors Bitcoin Core `-par` (init.cpp:513):
+    // 0 = auto (every core), n>0 = n total threads (master + extras),
+    // n<0 = leave |n| cores free. Default 0.
+    par: i32 = 0,
+
     // ASMap: optional path to a binary asmap file for ASN-based peer bucketing.
     // When set and the file passes SanityCheckAsmap, getPeerInfo will include
     // `mapped_as` and netGroup() uses ASN keys instead of /16 prefixes.
@@ -467,6 +472,12 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         else if (std.mem.eql(u8, arg, "--noassumevalid") or std.mem.eql(u8, arg, "-noassumevalid")) {
             config.noassumevalid = true;
         }
+        // Script-verification thread count (Core `-par`, init.cpp:513).
+        else if (std.mem.startsWith(u8, arg, "--par=") or std.mem.startsWith(u8, arg, "-par=")) {
+            const eq = std.mem.indexOf(u8, arg, "=").?;
+            config.par = std.fmt.parseInt(i32, arg[eq + 1 ..], 10) catch
+                return ArgParseError.InvalidArgument;
+        }
         // ASMap — optional binary asmap file for ASN-based peer bucketing.
         // Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
         else if (std.mem.startsWith(u8, arg, "--asmap=") or std.mem.startsWith(u8, arg, "-asmap=")) {
@@ -618,6 +629,9 @@ pub fn printUsage() void {
         \\Performance:
         \\  --benchmark            Run performance benchmarks and exit
         \\  --noassumevalid        Disable assumevalid (verify all scripts, for benchmarking)
+        \\  --par=<n>              Script verification threads (0 = auto, every
+        \\                         core; n>0 = n threads including the caller;
+        \\                         n<0 = leave |n| cores free; default: 0)
         \\
         \\Import:
         \\  --import-blocks=<path>   Import blocks from file (- for stdin)
@@ -821,6 +835,8 @@ pub fn loadConfigFile(
                 config.pidfile = value;
             } else if (std.mem.eql(u8, key, "reindex")) {
                 config.reindex = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "par")) {
+                config.par = std.fmt.parseInt(i32, value, 10) catch continue;
             }
             // ZMQ publishing.
             else if (std.mem.eql(u8, key, "zmqpubrawblock")) {
@@ -1548,6 +1564,15 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
     }
     defer crypto.deinitSecp256k1();
 
+    {
+        const extra = validation.resolveScriptCheckWorkers(config.par);
+        validation.initScriptCheckPool(allocator, extra) catch |err| {
+            std.debug.print("FATAL: Failed to start script-check pool: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+    defer validation.deinitScriptCheckPool();
+
     // Resolve data directory
     const datadir = resolveDataDir(config.datadir, allocator) catch |err| {
         std.debug.print("Error resolving data directory: {}\n", .{err});
@@ -1815,9 +1840,9 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
                     height,
                     params,
                     &utxo_view,
-                    // Single-threaded: the script_map (AutoHashMap) is not
-                    // thread-safe; parallel verification would race on lookups.
-                    .{ .enabled = false },
+                    // Lookups run on this thread before jobs are submitted;
+                    // workers only read the borrowed script/amount slices.
+                    .{},
                     arena_alloc,
                 ) catch false;
                 if (!script_ok) {
@@ -1975,6 +2000,17 @@ pub fn main() !void {
         std.process.exit(1);
     }
     defer crypto.deinitSecp256k1();
+
+    // Process-wide script-check pool (Core CCheckQueue). Created once,
+    // reused for every ConnectBlock. `--par` selects extra workers.
+    {
+        const extra = validation.resolveScriptCheckWorkers(config.par);
+        validation.initScriptCheckPool(allocator, extra) catch |err| {
+            std.debug.print("FATAL: Failed to start script-check pool: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+    defer validation.deinitScriptCheckPool();
 
     // Open RocksDB for disk-backed UTXO persistence.
     var db: ?storage.Database = null;

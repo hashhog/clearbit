@@ -2718,6 +2718,153 @@ pub fn checkSequenceLocks(result: SequenceLockResult, tip: *const BlockIndex) bo
 // Parallel Script Validation
 // ============================================================================
 
+/// Stable reject-reason codes for a script-check job.
+/// Serial and parallel paths MUST report the same code for the same job:
+/// the lowest-index failure is the batch's reason, never a race-winner.
+/// Reference: CScriptCheck::operator() returns ScriptError + debug string.
+pub const ScriptCheckFailCode = enum(u32) {
+    none = 0,
+    script_false = 1,
+    deserialize = 2,
+    bad_input_index = 3,
+    invalid_script = 10,
+    stack_underflow = 11,
+    stack_overflow = 12,
+    invalid_opcode = 13,
+    script_failed = 14,
+    disabled_opcode = 15,
+    push_size_exceeded = 16,
+    op_count_exceeded = 17,
+    equal_verify_failed = 18,
+    checksig_failed = 19,
+    checkmultisig_failed = 20,
+    null_dummy = 21,
+    null_fail = 22,
+    clean_stack = 23,
+    minimal_data = 24,
+    minimal_if = 25,
+    negative_locktime = 26,
+    unsatisfied_locktime = 27,
+    witness_program_mismatch = 28,
+    witness_program_wrong_length = 29,
+    witness_pubkey_type = 30,
+    witness_unexpected = 31,
+    out_of_memory = 32,
+    invalid_number = 33,
+    division_by_zero = 34,
+    invalid_stack_operation = 35,
+    verify_failed = 36,
+    op_return_encountered = 37,
+    unbalanced_conditional = 38,
+    sig_push_only = 39,
+    invalid_signature_encoding = 40,
+    sig_high_s = 41,
+    invalid_sighash_type = 42,
+    invalid_pubkey_type = 43,
+    discourage_op_success = 44,
+    discourage_upgradable_nops = 45,
+    discourage_upgradable_pubkeytype = 46,
+    discourage_upgradable_taproot_version = 47,
+    tapscript_empty_pubkey = 48,
+    tapscript_checkmultisig_disabled = 49,
+    witness_program_witness_empty = 50,
+    taproot_wrong_control_size = 51,
+    tapscript_validation_weight = 52,
+    tapscript_minimal_if = 53,
+    const_script_code = 54,
+    sig_find_and_delete = 55,
+    stack_size = 56,
+    push_size = 57,
+    schnorr_sig_size = 58,
+    schnorr_sig_hash_type = 59,
+    witness_malleated_p2sh = 60,
+};
+
+pub fn failCodeFromScriptError(err: script.ScriptError) u32 {
+    return @intFromEnum(switch (err) {
+        error.InvalidScript => ScriptCheckFailCode.invalid_script,
+        error.StackUnderflow => ScriptCheckFailCode.stack_underflow,
+        error.StackOverflow => ScriptCheckFailCode.stack_overflow,
+        error.InvalidOpcode => ScriptCheckFailCode.invalid_opcode,
+        error.ScriptFailed => ScriptCheckFailCode.script_failed,
+        error.DisabledOpcode => ScriptCheckFailCode.disabled_opcode,
+        error.PushSizeExceeded => ScriptCheckFailCode.push_size_exceeded,
+        error.OpCountExceeded => ScriptCheckFailCode.op_count_exceeded,
+        error.EqualVerifyFailed => ScriptCheckFailCode.equal_verify_failed,
+        error.CheckSigFailed => ScriptCheckFailCode.checksig_failed,
+        error.CheckMultisigFailed => ScriptCheckFailCode.checkmultisig_failed,
+        error.NullDummy => ScriptCheckFailCode.null_dummy,
+        error.NullFail => ScriptCheckFailCode.null_fail,
+        error.CleanStack => ScriptCheckFailCode.clean_stack,
+        error.MinimalData => ScriptCheckFailCode.minimal_data,
+        error.MinimalIf => ScriptCheckFailCode.minimal_if,
+        error.NegativeLocktime => ScriptCheckFailCode.negative_locktime,
+        error.UnsatisfiedLocktime => ScriptCheckFailCode.unsatisfied_locktime,
+        error.WitnessProgramMismatch => ScriptCheckFailCode.witness_program_mismatch,
+        error.WitnessProgramWrongLength => ScriptCheckFailCode.witness_program_wrong_length,
+        error.WitnessPubkeyType => ScriptCheckFailCode.witness_pubkey_type,
+        error.WitnessUnexpected => ScriptCheckFailCode.witness_unexpected,
+        error.OutOfMemory => ScriptCheckFailCode.out_of_memory,
+        error.InvalidNumber => ScriptCheckFailCode.invalid_number,
+        error.DivisionByZero => ScriptCheckFailCode.division_by_zero,
+        error.InvalidStackOperation => ScriptCheckFailCode.invalid_stack_operation,
+        error.VerifyFailed => ScriptCheckFailCode.verify_failed,
+        error.OpReturnEncountered => ScriptCheckFailCode.op_return_encountered,
+        error.UnbalancedConditional => ScriptCheckFailCode.unbalanced_conditional,
+        error.SigPushOnly => ScriptCheckFailCode.sig_push_only,
+        error.InvalidSignatureEncoding => ScriptCheckFailCode.invalid_signature_encoding,
+        error.SigHighS => ScriptCheckFailCode.sig_high_s,
+        error.InvalidSigHashType => ScriptCheckFailCode.invalid_sighash_type,
+        error.InvalidPubkeyType => ScriptCheckFailCode.invalid_pubkey_type,
+        error.DiscourageOpSuccess => ScriptCheckFailCode.discourage_op_success,
+        error.DiscourageUpgradableNops => ScriptCheckFailCode.discourage_upgradable_nops,
+        error.DiscourageUpgradablePubkeyType => ScriptCheckFailCode.discourage_upgradable_pubkeytype,
+        error.DiscourageUpgradableTaprootVersion => ScriptCheckFailCode.discourage_upgradable_taproot_version,
+        error.TapscriptEmptyPubkey => ScriptCheckFailCode.tapscript_empty_pubkey,
+        error.TapscriptCheckmultisigDisabled => ScriptCheckFailCode.tapscript_checkmultisig_disabled,
+        error.WitnessProgramWitnessEmpty => ScriptCheckFailCode.witness_program_witness_empty,
+        error.TaprootWrongControlSize => ScriptCheckFailCode.taproot_wrong_control_size,
+        error.TapscriptValidationWeight => ScriptCheckFailCode.tapscript_validation_weight,
+        error.TapscriptMinimalIf => ScriptCheckFailCode.tapscript_minimal_if,
+        error.ConstScriptCode => ScriptCheckFailCode.const_script_code,
+        error.SigFindAndDelete => ScriptCheckFailCode.sig_find_and_delete,
+        error.StackSize => ScriptCheckFailCode.stack_size,
+        error.PushSize => ScriptCheckFailCode.push_size,
+        error.SchnorrSigSize => ScriptCheckFailCode.schnorr_sig_size,
+        error.SchnorrSigHashType => ScriptCheckFailCode.schnorr_sig_hash_type,
+        error.WitnessMalleatedP2sh => ScriptCheckFailCode.witness_malleated_p2sh,
+    });
+}
+
+/// Map Core's `-par` to extra worker threads (not including the master).
+/// `-par=0` (default): auto = cpu_count-1 extra workers (every core).
+/// `-par=n` for n>0: n-1 extra workers (n total including master).
+/// `-par=-n`: leave n cores free, then minus 1 for the master.
+/// Never more extra workers than cpu_count-1. Unlike Core we do NOT clamp
+/// to 15: that cap leaves cores idle on the operation that dominates IBD.
+/// Reference: bitcoin-core/src/node/chainstatemanager_args.cpp:53-60
+pub fn resolveScriptCheckWorkers(par: i32) usize {
+    const cores_usz = std.Thread.getCpuCount() catch 1;
+    const cores: i32 = @intCast(cores_usz);
+    var script_threads: i32 = par;
+    if (script_threads <= 0) {
+        script_threads += cores;
+    }
+    var extra: i32 = script_threads - 1;
+    if (extra < 0) extra = 0;
+    const max_extra: i32 = @max(@as(i32, 0), cores - 1);
+    if (extra > max_extra) extra = max_extra;
+    return @intCast(extra);
+}
+
+/// Outcome of one submit()+waitAll() batch. `first_fail_*` is the lowest
+/// job index that failed (deterministic; not a race-winner).
+pub const BatchResult = struct {
+    ok: bool,
+    first_fail_index: usize = std.math.maxInt(usize),
+    first_fail_code: u32 = 0,
+};
+
 /// A job representing a single script verification to be performed.
 /// These jobs are distributed across worker threads for parallel execution.
 ///
@@ -2742,6 +2889,8 @@ pub const ScriptCheckJob = struct {
     spent_scripts: []const []const u8 = &.{},
     /// Result of verification (set by worker thread)
     result: std.atomic.Value(VerifyResult),
+    /// Reject reason; 0 on success. Written by the worker that ran this job.
+    fail_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub const VerifyResult = enum(u8) {
         pending = 0,
@@ -2767,6 +2916,7 @@ pub const ScriptCheckJob = struct {
             .flags = flags,
             .witness = witness,
             .result = std.atomic.Value(VerifyResult).init(.pending),
+            .fail_code = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -2794,6 +2944,7 @@ pub const ScriptCheckJob = struct {
             .spent_amounts = spent_amounts,
             .spent_scripts = spent_scripts,
             .result = std.atomic.Value(VerifyResult).init(.pending),
+            .fail_code = std.atomic.Value(u32).init(0),
         };
     }
 };
@@ -2847,21 +2998,34 @@ pub const ScriptCheckQueue = struct {
     /// Avoids re-running ECDSA/Schnorr on inputs already verified in the mempool.
     sig_cache: sig_cache_mod.SigCache,
 
-    /// Initialize the script check queue with worker threads.
+    /// One ConnectBlock at a time. Core's m_control_mutex / CCheckQueueControl.
+    control_mutex: std.Thread.Mutex = .{},
+
+    /// Initialize the script check queue with auto extra-worker count
+    /// (`-par=0` → cpu_count-1). Prefer `initWithWorkers` when the count
+    /// must be explicit (tests, `--par`).
+    pub fn init(allocator: std.mem.Allocator) !*ScriptCheckQueue {
+        return initWithWorkers(allocator, resolveScriptCheckWorkers(0));
+    }
+
+    /// Initialize with an explicit extra-worker count.
+    /// `extra_workers=0` is serial: the master thread runs every job, no
+    /// extra threads are spawned (Core `-par=1`).
     /// Returns a heap-allocated queue so worker threads always hold a stable
     /// pointer (returning by value would move the struct and invalidate the
     /// pointer passed to the worker threads).
-    /// Uses std.Thread.getCpuCount() - 1 workers (minimum 1).
-    pub fn init(allocator: std.mem.Allocator) !*ScriptCheckQueue {
-        const cpu_count = std.Thread.getCpuCount() catch 1;
-        // Use N-1 workers since master thread also participates
-        const worker_count = @max(1, cpu_count -| 1);
-
+    pub fn initWithWorkers(allocator: std.mem.Allocator, extra_workers: usize) !*ScriptCheckQueue {
         const queue = try allocator.create(ScriptCheckQueue);
         errdefer allocator.destroy(queue);
 
+        var workers: []std.Thread = &.{};
+        if (extra_workers > 0) {
+            workers = try allocator.alloc(std.Thread, extra_workers);
+            errdefer allocator.free(workers);
+        }
+
         queue.* = ScriptCheckQueue{
-            .workers = try allocator.alloc(std.Thread, worker_count),
+            .workers = workers,
             .jobs = &.{},
             .next_job = std.atomic.Value(usize).init(0),
             .job_count = 0,
@@ -2870,13 +3034,28 @@ pub const ScriptCheckQueue = struct {
             .workers_done = std.atomic.Value(u32).init(0),
             .stop_flag = std.atomic.Value(bool).init(false),
             .allocator = allocator,
-            .worker_count = worker_count,
+            .worker_count = extra_workers,
             .sig_cache = sig_cache_mod.SigCache.init(allocator, sig_cache_mod.DEFAULT_MAX_ENTRIES),
+            .control_mutex = .{},
         };
+        errdefer queue.sig_cache.deinit();
 
         // Spawn worker threads — safe because queue lives on the heap.
-        for (queue.workers, 0..) |*worker, i| {
-            worker.* = try std.Thread.spawn(.{}, workerLoop, .{ queue, i });
+        if (extra_workers > 0) {
+            var spawned: usize = 0;
+            errdefer {
+                queue.stop_flag.store(true, .release);
+                _ = queue.generation.fetchAdd(1, .release);
+                std.Thread.Futex.wake(&queue.generation, std.math.maxInt(u32));
+                var i: usize = 0;
+                while (i < spawned) : (i += 1) {
+                    queue.workers[i].join();
+                }
+            }
+            for (queue.workers, 0..) |*worker, i| {
+                worker.* = try std.Thread.spawn(.{}, workerLoop, .{ queue, i });
+                spawned += 1;
+            }
         }
 
         return queue;
@@ -2890,13 +3069,12 @@ pub const ScriptCheckQueue = struct {
         _ = self.generation.fetchAdd(1, .release);
         std.Thread.Futex.wake(&self.generation, std.math.maxInt(u32));
 
-        // Wait for all workers to finish
         for (self.workers) |worker| {
             worker.join();
         }
 
         self.sig_cache.deinit();
-        self.allocator.free(self.workers);
+        if (self.workers.len != 0) self.allocator.free(self.workers);
         self.allocator.destroy(self);
     }
 
@@ -2916,36 +3094,58 @@ pub const ScriptCheckQueue = struct {
     /// The calling thread participates in verification while waiting.
     /// Returns true if all verifications passed, false if any failed.
     pub fn waitAll(self: *ScriptCheckQueue) bool {
-        if (self.job_count == 0) return true;
+        return self.waitAllDetailed().ok;
+    }
 
-        // Signal a new batch by advancing the monotonic generation counter and
-        // waking every parked worker. Because the counter is never reset, a
-        // straggler still entering Futex.wait() observes the new value and
-        // returns immediately — no lost wakeup, no reset()/wait() race.
-        _ = self.generation.fetchAdd(1, .release);
-        std.Thread.Futex.wake(&self.generation, std.math.maxInt(u32));
+    /// Like waitAll, but returns the lowest-index failure's reason so
+    /// serial and parallel paths can be compared byte-for-byte. Scanning
+    /// in index order (not completion order) is load-bearing: a
+    /// race-winner reason would be a chain-split bug under `-par`.
+    pub fn waitAllDetailed(self: *ScriptCheckQueue) BatchResult {
+        if (self.job_count == 0) return .{ .ok = true };
 
-        // Master thread participates in verification.
-        self.processJobs();
-
-        // Block (no busy-wait) until every worker has drained the queue and is
-        // heading back to park. This is stronger than counting completed jobs:
-        // it guarantees no worker is still inside processJobs when we return,
-        // so the next submit() cannot race a lingering worker over self.jobs.
-        while (true) {
-            const done = self.workers_done.load(.acquire);
-            if (@as(usize, done) >= self.worker_count) break;
-            std.Thread.Futex.wait(&self.workers_done, done);
+        if (self.worker_count > 0) {
+            // Signal a new batch by advancing the monotonic generation
+            // counter and waking every parked worker. Because the counter
+            // is never reset, a straggler still entering Futex.wait()
+            // observes the new value and returns immediately.
+            _ = self.generation.fetchAdd(1, .release);
+            std.Thread.Futex.wake(&self.generation, std.math.maxInt(u32));
         }
 
-        // Check all results
-        for (self.jobs[0..self.job_count]) |*job| {
-            if (job.result.load(.acquire) != .success) {
-                return false;
+        // Master thread participates in verification (Core's fMaster Loop).
+        self.processJobs();
+
+        if (self.worker_count > 0) {
+            // Block until every worker has drained the queue and is heading
+            // back to park. Stronger than counting completed jobs: it
+            // guarantees no worker is still inside processJobs when we
+            // return, so the next submit() cannot race a lingering worker
+            // over self.jobs.
+            while (true) {
+                const done = self.workers_done.load(.acquire);
+                if (@as(usize, done) >= self.worker_count) break;
+                std.Thread.Futex.wait(&self.workers_done, done);
             }
         }
 
-        return true;
+        var first_fail_index: usize = std.math.maxInt(usize);
+        var first_fail_code: u32 = 0;
+        for (self.jobs[0..self.job_count], 0..) |*job, i| {
+            if (job.result.load(.acquire) != .success) {
+                first_fail_index = i;
+                first_fail_code = job.fail_code.load(.acquire);
+                if (first_fail_code == 0) {
+                    first_fail_code = @intFromEnum(ScriptCheckFailCode.script_false);
+                }
+                break;
+            }
+        }
+        return .{
+            .ok = first_fail_index == std.math.maxInt(usize),
+            .first_fail_index = first_fail_index,
+            .first_fail_code = first_fail_code,
+        };
     }
 
     /// Worker thread loop
@@ -3016,7 +3216,7 @@ pub const ScriptCheckQueue = struct {
 ///
 /// The `allocator` parameter is intentionally unused here; it is kept in the
 /// signature only because processJobs passes self.allocator for API consistency.
-fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cache: *sig_cache_mod.SigCache) bool {
+fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *sig_cache_mod.SigCache) bool {
     // Per-worker arena backed by libc malloc (thread-safe).
     // All per-job allocations (tx deserialisation, script engine internals)
     // live here and are freed atomically on return via arena.deinit().
@@ -3025,16 +3225,22 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cac
     defer per_job_arena.deinit();
     const job_alloc = per_job_arena.allocator();
 
+    job.fail_code.store(0, .release);
+
     // Deserialize the transaction into the per-job arena.
     var reader = serialize.Reader{ .data = job.tx_bytes };
     const tx = serialize.readTransaction(&reader, job_alloc) catch {
+        job.fail_code.store(@intFromEnum(ScriptCheckFailCode.deserialize), .release);
         return false;
     };
     // No manual defer-free needed: per_job_arena.deinit() above reclaims
     // the entire arena (tx.inputs, tx.outputs, script_sig, witness items, etc.)
 
     // Get the input being verified
-    if (job.input_index >= tx.inputs.len) return false;
+    if (job.input_index >= tx.inputs.len) {
+        job.fail_code.store(@intFromEnum(ScriptCheckFailCode.bad_input_index), .release);
+        return false;
+    }
     const input = tx.inputs[job.input_index];
 
     // W160 BUG-3 (P0-CDIV catastrophic) fix — SigCache key MUST bind to the
@@ -3147,9 +3353,12 @@ fn verifyScriptJob(job: *const ScriptCheckJob, allocator: std.mem.Allocator, cac
             // Pass the same per-input sighash-proxy material used in the lookup above
             // (W160 BUG-3 fix — must match the key derived for the lookup).
             cache.insert(per_input_sighash, job.prev_script_pubkey, sig_material, flags_u32);
+            return true;
         }
-        return valid;
-    } else |_| {
+        job.fail_code.store(@intFromEnum(ScriptCheckFailCode.script_false), .release);
+        return false;
+    } else |err| {
+        job.fail_code.store(failCodeFromScriptError(err), .release);
         return false;
     }
 }
@@ -3162,6 +3371,14 @@ pub const ParallelVerifyConfig = struct {
 
     /// Whether parallel verification is enabled
     enabled: bool = true,
+
+    /// Extra worker threads for a one-shot queue when `queue` and the
+    /// process-wide pool are both unset. null = auto (`-par=0`). 0 = serial.
+    extra_workers: ?usize = null,
+
+    /// Borrowed persistent queue. When null, uses the process-wide pool if
+    /// inited, else a one-shot queue that is joined before return.
+    queue: ?*ScriptCheckQueue = null,
 };
 
 /// Verify all scripts in a block using parallel verification.
@@ -3286,17 +3503,29 @@ pub fn verifyBlockScriptsParallel(
         }
     }
 
-    // Initialize thread pool
-    var queue = ScriptCheckQueue.init(allocator) catch {
-        return ValidationError.OutOfMemory;
+    // Persistent process-wide pool if the node started one (Core's
+    // CCheckQueue lives for the Chainstate lifetime). Tests pass
+    // `config.queue` or `config.extra_workers` for a one-shot.
+    var owned: ?*ScriptCheckQueue = null;
+    defer if (owned) |q| q.deinit();
+
+    const queue: *ScriptCheckQueue = if (config.queue) |q|
+        q
+    else if (globalScriptCheckQueue()) |q|
+        q
+    else blk: {
+        const extra = config.extra_workers orelse resolveScriptCheckWorkers(0);
+        const q = ScriptCheckQueue.initWithWorkers(allocator, extra) catch {
+            return ValidationError.OutOfMemory;
+        };
+        owned = q;
+        break :blk q;
     };
-    defer queue.deinit();
 
-    // Submit and wait for completion
+    queue.control_mutex.lock();
+    defer queue.control_mutex.unlock();
     queue.submit(jobs);
-    const all_passed = queue.waitAll();
-
-    return all_passed;
+    return queue.waitAll();
 }
 
 /// Single-threaded script verification fallback.
@@ -3355,7 +3584,38 @@ fn verifyBlockScriptsSingleThreaded(
 
 /// Get the number of CPU cores available for parallel verification.
 pub fn getParallelVerifyThreadCount() usize {
+    if (g_script_check_queue) |p| {
+        return if (p.worker_count == 0) 1 else p.worker_count + 1;
+    }
     return std.Thread.getCpuCount() catch 1;
+}
+
+// Process-wide script-check pool. Core constructs CCheckQueue once at
+// ChainstateManager init (validation.cpp:6136) and reuses it for every
+// ConnectBlock. Spawning N-1 threads per block was the previous shape
+// and left the extra cores idle in thread-create/join overhead.
+var g_script_check_mutex: std.Thread.Mutex = .{};
+var g_script_check_queue: ?*ScriptCheckQueue = null;
+
+pub fn initScriptCheckPool(allocator: std.mem.Allocator, extra_workers: usize) !void {
+    g_script_check_mutex.lock();
+    defer g_script_check_mutex.unlock();
+    if (g_script_check_queue != null) return;
+    g_script_check_queue = try ScriptCheckQueue.initWithWorkers(allocator, extra_workers);
+    std.debug.print("Script verification uses {d} additional threads\n", .{extra_workers});
+}
+
+pub fn deinitScriptCheckPool() void {
+    g_script_check_mutex.lock();
+    defer g_script_check_mutex.unlock();
+    if (g_script_check_queue) |q| {
+        q.deinit();
+        g_script_check_queue = null;
+    }
+}
+
+pub fn globalScriptCheckQueue() ?*ScriptCheckQueue {
+    return g_script_check_queue;
 }
 
 // ============================================================================

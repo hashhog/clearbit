@@ -1061,6 +1061,40 @@ pub fn build(b: *std.Build) void {
         backfill_step.dependOn(&run_backfill_tests.step);
     }
 
+    // CONTROL for QUEUES.md PARALLEL SCRIPT VERIFICATION (2026-09-19).
+    // Decision identity (1 vs N), failure propagation, measured scaling,
+    // bounded job buffer. Filter so imported validation tests do not run.
+    {
+        const par_tests = b.addTest(.{
+            .root_source_file = b.path("tests_parallel_script.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"parallel_script"},
+        });
+        par_tests.linkSystemLibrary("rocksdb");
+        par_tests.linkSystemLibrary("secp256k1");
+        par_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        par_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            par_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            par_tests.linkSystemLibrary("minisketch");
+            par_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        par_tests.root_module.addOptions("build_options", build_options);
+
+        const run_par_tests = b.addRunArtifact(par_tests);
+        const par_step = b.step(
+            "test-parallel-script",
+            "Run parallel script-verification identity/failure/scaling/RSS control",
+        );
+        par_step.dependOn(&run_par_tests.step);
+    }
+
     // CONTROL for QUEUES.md item 0: REORG-CANDIDATE spam loop.
     // Same project-root package layout as tests_t1_r5.zig. Filter so imported
     // rpc/peer/wallet tests do not run.
