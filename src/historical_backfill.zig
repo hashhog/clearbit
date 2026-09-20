@@ -213,7 +213,15 @@ pub const HistoricalBackfill = struct {
     ) bool {
         if (headers.len == 0) return false;
         if (std.mem.eql(u8, &headers[0].prev_block, &self.genesis_tip_hash)) return true;
-        return self.isHistoricalHash(cs, &headers[0].prev_block);
+        if (self.isHistoricalHash(cs, &headers[0].prev_block)) return true;
+        // The genesis header itself has prev=0x00..00, which is neither the
+        // genesis hash nor a stored historical hash. A one-peer replay that
+        // answers a locator containing genesis with that batch used to miss
+        // this classifier, land in competing_fork, and walk header_index
+        // 10_000 deep (live 60000→91705: `REORG-CANDIDATE prev=...0000`).
+        if (!self.headersComplete() and std.mem.allEqual(u8, &headers[0].prev_block, 0))
+            return true;
+        return false;
     }
 
     /// True when `hash` is a stored historical header whose body we still want.

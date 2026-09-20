@@ -1061,6 +1061,40 @@ pub fn build(b: *std.Build) void {
         backfill_step.dependOn(&run_backfill_tests.step);
     }
 
+    // CONTROL for QUEUES.md 60000→91705 HOL stall: historical backfill must
+    // yield the one-peer getdata budget to tip+1, and far-ahead junk must not
+    // occupy the drain buffer. Filter so imported peer tests do not run.
+    {
+        const hol_tests = b.addTest(.{
+            .root_source_file = b.path("tests_ibd_hol_cap.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"ibd_hol"},
+        });
+        hol_tests.linkSystemLibrary("rocksdb");
+        hol_tests.linkSystemLibrary("secp256k1");
+        hol_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        hol_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            hol_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            hol_tests.linkSystemLibrary("minisketch");
+            hol_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        hol_tests.root_module.addOptions("build_options", build_options);
+
+        const run_hol_tests = b.addRunArtifact(hol_tests);
+        const hol_step = b.step(
+            "test-ibd-hol-cap",
+            "Run IBD head-of-line / historical-yield / junk-buffer control",
+        );
+        hol_step.dependOn(&run_hol_tests.step);
+    }
+
     // CONTROL for QUEUES.md PARALLEL SCRIPT VERIFICATION (2026-09-19).
     // Decision identity (1 vs N), failure propagation, measured scaling,
     // bounded job buffer. Filter so imported validation tests do not run.

@@ -91,6 +91,12 @@ pub const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 /// resident — small enough to keep around even in a constrained datadir.
 pub const MAX_HEADER_INDEX: usize = 10_000;
 
+/// Do not prefetch more headers than the in-memory index can hold minus one
+/// retarget window.  A 16_000 queue with a 10_000 LRU dropped the 2016-block
+/// difficulty ancestor; the next batch then came back `.undecidable` and
+/// header sync froze (live 60000→91705 after the HOL fix, tip=82656=2016*41).
+pub const HEADER_PREFETCH_CAP: usize = MAX_HEADER_INDEX - consensus.DIFFICULTY_ADJUSTMENT_INTERVAL;
+
 /// In-memory record of a single block header that we've SEEN but may or
 /// may not have a body for.  Populated by the `.headers` handler so we
 /// can detect competing-fork announcements (Case B).  Each entry knows
@@ -5032,9 +5038,20 @@ pub const PeerManager = struct {
         }
     }
 
-    fn driveHistoricalBackfill(self: *PeerManager, target_peer: *Peer) void {
+    pub fn driveHistoricalBackfill(self: *PeerManager, target_peer: *Peer) void {
         const bf = if (self.historical_backfill) |*b| b else return;
         const cs = self.chain_state orelse return;
+        // Yield to forward IBD. Historical getheaders/getdata on the same
+        // peer starves the connect cursor: the 60000→91705 one-peer range
+        // requested 16 historical bodies on top of 16 forward, sampled_ahead
+        // stayed empty, and drain-wedge cancelled the same front 26 times.
+        // Core's snapshot chainstate follows the tip; the background
+        // chainstate is lower priority. Also yield while behind the peer's
+        // announced height — an empty expected_blocks after a truncated
+        // headers batch must not hand the only peer to genesis-side getheaders.
+        const peer_h = self.getBestPeerHeight();
+        if (historicalYieldsToForwardSync(self.ibdConnectQueuePending(), cs.best_height, peer_h))
+            return;
         if (!bf.headersComplete()) {
             const loc = bf.locator();
             const msg = p2p.Message{ .getheaders = .{
@@ -5245,6 +5262,14 @@ pub const PeerManager = struct {
 
         try self.header_index.put(block_hash.*, entry);
 
+        // Persist so GetNextWorkRequired still resolves after LRU eviction.
+        // The walk (computeRequiredBits) already falls back to CF_BLOCK_INDEX
+        // by hash; without this write, a 2016-deep retarget ancestor that
+        // header_index dropped made the next headers batch undecidable.
+        if (self.chain_state) |cs| {
+            cs.putPersistedHeader(block_hash, header, height);
+        }
+
         // Track the highest-chainwork header seen (Core m_best_header,
         // AcceptBlockHeader in validation.cpp:4233-4237).  Used by the
         // faithful assumevalid gate (faithfulSkipScriptsGate conditions 4+5).
@@ -5390,6 +5415,51 @@ pub const PeerManager = struct {
     /// Takes ownership of `headers` (freed by handleMessage).
     pub fn ingestHeadersMessage(self: *PeerManager, peer: *Peer, headers: []types.BlockHeader) !void {
         try self.handleMessage(peer, .{ .headers = .{ .headers = headers } });
+    }
+
+    /// Test wrapper around the private `.block` handler. Takes ownership of
+    /// `block` (buffered, historically stored, or freed by handleMessage).
+    pub fn ingestBlockMessage(self: *PeerManager, peer: *Peer, block: types.Block) !void {
+        try self.handleMessage(peer, .{ .block = block });
+    }
+
+    /// True when the forward connect queue still has unconnected hashes.
+    /// One-peer IBD (range-runner `--connect`) must not share that peer's
+    /// getdata budget with historical backfill while this is true.
+    pub fn ibdConnectQueuePending(self: *const PeerManager) bool {
+        return self.connect_cursor < self.expected_blocks.items.len;
+    }
+
+    /// Historical getheaders on a `--connect` peer races the forward locator.
+    /// Yield while we still have unconnected expected hashes OR we are below
+    /// the peer's announced height (an empty queue after a truncated headers
+    /// batch is how the 60000→91705 run froze at the 82656 retarget: historical
+    /// grabbed the only peer and 82656+ never arrived).
+    pub fn historicalYieldsToForwardSync(connect_pending: bool, our_height: u32, peer_height: u32) bool {
+        if (connect_pending) return true;
+        return peer_height > our_height;
+    }
+
+    /// True when `hash` is in the download window starting at connect_cursor.
+    /// Matches pipelineBlockRequests' 512-block max_ahead so a body we asked
+    /// for (or that extends the tip) is never treated as junk.
+    fn isConnectWindowHash(self: *const PeerManager, hash: *const types.Hash256) bool {
+        if (self.connect_cursor >= self.expected_blocks.items.len) return false;
+        const start = self.connect_cursor;
+        const end = @min(self.expected_blocks.items.len, start + 512);
+        var i = start;
+        while (i < end) : (i += 1) {
+            if (std.mem.eql(u8, &self.expected_blocks.items[i], hash)) return true;
+        }
+        return false;
+    }
+
+    fn isPendingReorgHash(self: *const PeerManager, hash: *const types.Hash256) bool {
+        const pr = self.pending_reorg orelse return false;
+        for (pr.fork_hashes.items) |h| {
+            if (std.mem.eql(u8, &h, hash)) return true;
+        }
+        return false;
     }
 
     /// Once a header batch has been ingested AND the first header was
@@ -6427,7 +6497,7 @@ pub const PeerManager = struct {
                 // Request more headers from this specific peer if we got a full batch
                 // But limit the queue to avoid too many outstanding blocks
                 const remaining_queue = self.expected_blocks.items.len - self.connect_cursor;
-                if (h.headers.len >= 2000 and !outcome.undecidable and remaining_queue < 16000) {
+                if (h.headers.len >= 2000 and !outcome.undecidable and remaining_queue < HEADER_PREFETCH_CAP) {
                     self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                 }
 
@@ -6436,24 +6506,42 @@ pub const PeerManager = struct {
             },
             .block => |block| {
                 const block_hash = crypto.computeBlockHash(&block.header);
+                const in_window = self.isConnectWindowHash(&block_hash);
+                const was_requested = self.inflight_block_peer.contains(block_hash);
+                const reorg_body = self.isPendingReorgHash(&block_hash);
 
                 var historical_body = false;
-                if (self.historical_backfill) |*bf| {
-                    if (self.chain_state) |cs| {
-                        if (bf.wantsHash(cs, &block_hash)) {
-                            _ = bf.acceptBlock(&block, cs) catch |err| {
-                                std.log.warn("historical backfill: body rejected: {}", .{err});
+                // Do not steal a forward-window / in-flight hash into the
+                // historical index. Live 60000→91705: a body the drain needed
+                // next was accepted as historical (wantsHash via CF_BLOCK_INDEX)
+                // and never entered block_buffer, so connect_cursor spun.
+                if (!in_window and !was_requested) {
+                    if (self.historical_backfill) |*bf| {
+                        if (self.chain_state) |cs| {
+                            if (bf.wantsHash(cs, &block_hash)) {
+                                _ = bf.acceptBlock(&block, cs) catch |err| {
+                                    std.log.warn("historical backfill: body rejected: {}", .{err});
+                                    serialize.freeBlock(self.allocator, &block);
+                                    return;
+                                };
                                 serialize.freeBlock(self.allocator, &block);
-                                return;
-                            };
-                            serialize.freeBlock(self.allocator, &block);
-                            historical_body = true;
+                                historical_body = true;
+                            }
                         }
                     }
                 }
                 if (historical_body) {
                     self.driveHistoricalBackfill(peer);
                     self.finishHistoricalBackfillIfDone();
+                    return;
+                }
+
+                // Unsolicited / historical-miss / far-ahead fork bodies must
+                // not occupy the IBD drain buffer. That is the
+                // DRAIN-BREAK-WEDGE sampled_ahead_min=INT64_MAX shape: buffer>0
+                // but none of the hashes are expected_blocks[connect_cursor].
+                if (!in_window and !was_requested and !reorg_body) {
+                    serialize.freeBlock(self.allocator, &block);
                     return;
                 }
 
