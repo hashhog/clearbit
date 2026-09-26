@@ -7284,6 +7284,33 @@ pub const PeerManager = struct {
                                 p2p.Message{ .block_no_witness = buffered_block };
                             peer.sendMessage(&block_msg) catch {};
                             std.debug.print("P2P: served buffered block to peer\n", .{});
+                        } else if (self.readStoredBlockBytes(&item.hash)) |raw| {
+                            // 3. The block store (CF_BLOCKS). The two caches above
+                            // only hold the most recent blocks, so without this
+                            // every older block was answered with notfound: a
+                            // peer syncing from us stalled at the cache horizon
+                            // (regtest relay test 2026-09-26: Core B stuck at
+                            // height 64 of 101, 32 notfound). Core serves any
+                            // block it has on disk (ProcessGetBlockData ->
+                            // ReadBlock).
+                            defer self.allocator.free(raw);
+                            var disk_reader = serialize.Reader{ .data = raw };
+                            if (serialize.readBlock(&disk_reader, self.allocator)) |disk_block| {
+                                const owned = disk_block;
+                                defer serialize.freeBlock(self.allocator, &owned);
+                                const block_msg = if (want_witness)
+                                    p2p.Message{ .block = owned }
+                                else
+                                    p2p.Message{ .block_no_witness = owned };
+                                peer.sendMessage(&block_msg) catch {};
+                            } else |_| {
+                                const not_found_inv = [_]p2p.InvVector{.{
+                                    .inv_type = item.inv_type,
+                                    .hash = item.hash,
+                                }};
+                                const nf_msg = p2p.Message{ .notfound = .{ .inventory = &not_found_inv } };
+                                peer.sendMessage(&nf_msg) catch {};
+                            }
                         } else {
                             // Block not available — send notfound
                             const not_found_inv = [_]p2p.InvVector{.{
@@ -7400,6 +7427,18 @@ pub const PeerManager = struct {
                                     const fb_msg = p2p.Message{ .block = cmpct_block };
                                     peer.sendMessage(&fb_msg) catch {};
                                 }
+                            } else if (self.readStoredBlockBytes(&item.hash)) |raw| {
+                                // Not in the relay caches: serve the full block
+                                // from CF_BLOCKS (Core's own reply for
+                                // MSG_CMPCT_BLOCK when it will not build one).
+                                defer self.allocator.free(raw);
+                                var cb_disk_reader = serialize.Reader{ .data = raw };
+                                if (serialize.readBlock(&cb_disk_reader, self.allocator)) |disk_block| {
+                                    const owned = disk_block;
+                                    defer serialize.freeBlock(self.allocator, &owned);
+                                    const fb_msg = p2p.Message{ .block = owned };
+                                    peer.sendMessage(&fb_msg) catch {};
+                                } else |_| {}
                             } else {
                                 // Block not in cache — notfound.
                                 const not_found_inv = [_]p2p.InvVector{.{
@@ -7767,7 +7806,22 @@ pub const PeerManager = struct {
         locator_hashes: []const types.Hash256,
         hash_stop: *const types.Hash256,
     ) void {
-        const headers = self.collectHeadersFromForkPoint(locator_hashes, hash_stop) orelse return;
+        const headers = self.collectHeadersFromForkPoint(locator_hashes, hash_stop) orelse {
+            // Nothing past the fork point: answer with an EMPTY `headers`.
+            // Core's GETHEADERS handler (net_processing.cpp:4306-4385)
+            // always pushes a HEADERS reply, empty when the requester is
+            // already at our tip.  Staying silent is not neutral: the
+            // requester's m_last_getheaders_timestamp is only cleared by a
+            // HEADERS reply, and MaybeSendGetHeaders (:2829) then refuses
+            // to send another getheaders for HEADERS_RESPONSE_TIME (2 min),
+            // so every inv announcement in that window is ignored (regtest
+            // relay test 2026-09-26: Core B stayed at genesis).
+            if (self.chain_state == null) return;
+            const empty = [_]types.BlockHeader{};
+            const empty_msg = p2p.Message{ .headers = .{ .headers = &empty } };
+            peer.sendMessage(&empty_msg) catch {};
+            return;
+        };
         defer self.allocator.free(headers);
         if (headers.len == 0) return;
 
@@ -10364,6 +10418,16 @@ pub const PeerManager = struct {
             // dominant condition is max tip age (~24h); a from-genesis IBD
             // must not firehose a million notifications.
             if (block.header.timestamp + 86_400 > std.time.timestamp()) {
+                // Block relay (BIP-130): announce the new tip to every peer —
+                // `headers` to sendheaders peers, `inv` otherwise. Core:
+                // PeerManagerImpl::UpdatedBlockTip (net_processing.cpp:2158,
+                // skipped while fInitialDownload — the same tip-age gate as
+                // the ZMQ publish below) feeding SendMessages' announcement
+                // loop. announceBlock used to be reachable only from the
+                // mining RPCs, so P2P-received blocks were connected but never
+                // relayed: two Core peers linked only through clearbit never
+                // converged (regtest relay test 2026-09-26).
+                self.announceBlock(&block.header, &block_hash);
                 if (zmq.global.initialized) {
                     var raw_alloc: ?[]const u8 = null;
                     defer if (raw_alloc) |b| self.allocator.free(b);
@@ -10491,9 +10555,21 @@ pub const PeerManager = struct {
             // Cursor advanced → not wedged; clear the drain-wedge staller timer.
             self.wedge_since = 0;
 
-            // Cache the connected block for relay to other peers.
-            // Only cache recent blocks to bound memory (keep last 512).
-            if (self.served_blocks.count() < 64) {
+            // Cache the connected block for relay to other peers, as a
+            // rolling window of the most recent RELAY_CACHE_DEPTH blocks.
+            // This used to be `if (count < 64) cache`, which kept the FIRST
+            // 64 blocks ever connected and then cached nothing, so a just-
+            // announced tip was missing from the cache: getdata(MSG_CMPCT_BLOCK)
+            // for it got notfound (regtest relay test 2026-09-26: Core B
+            // never got blocks 102/103). Evict the block that falls out of
+            // the window, then cache (hard cap guards mined-block entries).
+            const RELAY_CACHE_DEPTH: u32 = 64;
+            if (height >= RELAY_CACHE_DEPTH) {
+                if (cs.getBlockHashByHeight(height - RELAY_CACHE_DEPTH)) |old_hash| {
+                    if (self.served_blocks.fetchRemove(old_hash)) |kv| self.allocator.free(kv.value);
+                }
+            }
+            if (self.served_blocks.count() < 4 * RELAY_CACHE_DEPTH) {
                 self.cacheBlockForRelay(&block_hash, &block);
             }
 
@@ -10943,6 +11019,15 @@ pub const PeerManager = struct {
                 peer.sendMessage(msg) catch continue;
             }
         }
+    }
+
+    /// Raw bytes of a stored block body from CF_BLOCKS, or null (not stored,
+    /// pruned, no chainstate/db, or read error).  Caller owns the returned
+    /// memory and frees it with `self.allocator`.
+    pub fn readStoredBlockBytes(self: *PeerManager, hash: *const types.Hash256) ?[]const u8 {
+        const cs = self.chain_state orelse return null;
+        const db = cs.utxo_set.db orelse return null;
+        return db.get(storage.CF_BLOCKS, hash) catch null;
     }
 
     /// BIP-130 block announcement.  For each connected peer:

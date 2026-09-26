@@ -417,6 +417,63 @@ test "w136/G23: announceBlock uses sendMessage(...) catch continue" {
     try testing.expect(std.mem.indexOf(u8, window, "catch continue") != null);
 }
 
+// G22b FIX (2026-09-26): the live P2P connect path (drainBlockBuffer) must
+// relay each freshly connected tip via announceBlock. It used to be called only
+// from the mining RPCs, so P2P-received blocks were never announced (regtest:
+// Core B never followed Core A through clearbit). Core: UpdatedBlockTip ->
+// SendMessages, skipped during IBD (the tip-age gate shared with ZMQ).
+test "w136/G22b: drainBlockBuffer announces the connected tip" {
+    const allocator = testing.allocator;
+    const peer_src = try readPeerSrc(allocator);
+    defer allocator.free(peer_src);
+    const drain_idx = std.mem.indexOf(u8, peer_src, "fn drainBlockBuffer(") orelse
+        return error.DrainBlockBufferNotFound;
+    const gate_rel = std.mem.indexOf(u8, peer_src[drain_idx..], "if (block.header.timestamp + 86_400 > std.time.timestamp()) {") orelse
+        return error.TipAgeGateNotFound;
+    const gate = drain_idx + gate_rel;
+    const window = peer_src[gate..@min(gate + 1500, peer_src.len)];
+    try testing.expect(std.mem.indexOf(u8, window, "self.announceBlock(&block.header, &block_hash);") != null);
+}
+
+// G22c FIX (2026-09-26): getheaders at/after our tip gets an EMPTY headers
+// reply (Core GETHEADERS handler always answers).  Silence arms the
+// requester's 2-minute HEADERS_RESPONSE_TIME getheaders throttle.
+test "w136/G22c: processGetHeaders answers an empty headers message at tip" {
+    const allocator = testing.allocator;
+    const peer_src = try readPeerSrc(allocator);
+    defer allocator.free(peer_src);
+    const idx = std.mem.indexOf(u8, peer_src, "fn processGetHeaders(") orelse
+        return error.ProcessGetHeadersNotFound;
+    const window = peer_src[idx..@min(idx + 2000, peer_src.len)];
+    try testing.expect(std.mem.indexOf(u8, window, "collectHeadersFromForkPoint(locator_hashes, hash_stop) orelse return;") == null);
+    try testing.expect(std.mem.indexOf(u8, window, "const empty_msg = p2p.Message{ .headers = .{ .headers = &empty } };") != null);
+}
+
+// G22d FIX (2026-09-26): getdata(MSG_BLOCK/MSG_WITNESS_BLOCK) falls back to
+// the block store after the two recent-block caches, instead of notfound.
+test "w136/G22d: getdata serves blocks from CF_BLOCKS beyond the relay cache" {
+    const allocator = testing.allocator;
+    const peer_src = try readPeerSrc(allocator);
+    defer allocator.free(peer_src);
+    try testing.expect(@hasDecl(PeerManager, "readStoredBlockBytes"));
+    const idx = std.mem.indexOf(u8, peer_src, "P2P: served buffered block to peer") orelse
+        return error.GetDataBlockArmNotFound;
+    const window = peer_src[idx..@min(idx + 800, peer_src.len)];
+    try testing.expect(std.mem.indexOf(u8, window, "} else if (self.readStoredBlockBytes(&item.hash)) |raw| {") != null);
+}
+
+// G22e FIX (2026-09-26): the relay cache is a rolling window of recent
+// blocks (it used to stop caching after the first 64 blocks ever connected),
+// and MSG_CMPCT_BLOCK falls back to the stored full block.
+test "w136/G22e: relay cache rolls; cmpct getdata falls back to CF_BLOCKS" {
+    const allocator = testing.allocator;
+    const peer_src = try readPeerSrc(allocator);
+    defer allocator.free(peer_src);
+    try testing.expect(std.mem.indexOf(u8, peer_src, "if (self.served_blocks.count() < 64) {\n                self.cacheBlockForRelay") == null);
+    try testing.expect(std.mem.indexOf(u8, peer_src, "if (self.served_blocks.fetchRemove(old_hash)) |kv| self.allocator.free(kv.value);") != null);
+    try testing.expect(std.mem.indexOf(u8, peer_src, "var cb_disk_reader = serialize.Reader{ .data = raw };") != null);
+}
+
 // ============================================================================
 // G24..G25 — wtxidrelay structural absence
 // ============================================================================
