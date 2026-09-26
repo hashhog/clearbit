@@ -509,6 +509,16 @@ pub fn writeBlockHeader(writer: *Writer, header: *const types.BlockHeader) !void
     try writer.writeInt(u32, header.nonce);
 }
 
+/// Write a block with every transaction serialized WITHOUT witness data
+/// (Core TX_NO_WITNESS(block)) — the reply to a getdata MSG_BLOCK.
+pub fn writeBlockNoWitness(writer: *Writer, block: *const types.Block) !void {
+    try writeBlockHeader(writer, &block.header);
+    try writer.writeCompactSize(block.transactions.len);
+    for (block.transactions) |*tx| {
+        try writeTransactionNoWitness(writer, tx);
+    }
+}
+
 /// Write a full block to the binary stream
 pub fn writeBlock(writer: *Writer, block: *const types.Block) !void {
     try writeBlockHeader(writer, &block.header);

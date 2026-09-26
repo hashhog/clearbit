@@ -28,6 +28,7 @@ const consensus = @import("src/consensus.zig");
 const crypto = @import("src/crypto.zig");
 const types = @import("src/types.zig");
 const serialize = @import("src/serialize.zig");
+const p2p = @import("src/p2p.zig");
 
 fn stubPeer(params: *const consensus.NetworkParams, allocator: std.mem.Allocator) peer_mod.Peer {
     return .{
@@ -36,7 +37,9 @@ fn stubPeer(params: *const consensus.NetworkParams, allocator: std.mem.Allocator
         .state = .handshake_complete,
         .direction = .outbound,
         .version_info = null,
-        .services = 0,
+        // A witness peer: block bodies are only requested from NODE_WITNESS
+        // peers (Core CanServeWitnesses).
+        .services = p2p.NODE_NETWORK | p2p.NODE_WITNESS,
         .last_ping_time = 0,
         .last_pong_time = 0,
         .last_ping_nonce = 0,
@@ -149,6 +152,19 @@ test "ibd_hol: historical getdata resumes once the forward queue is caught up" {
     try testing.expect(!fx.pm.ibdConnectQueuePending());
     fx.pm.driveHistoricalBackfill(&fx.peer);
     try testing.expect(fx.historicalInFlight() > 0);
+}
+
+test "ibd_hol: historical bodies are never requested from a non-witness peer" {
+    // Same at-rest setup as the "resumes" test above (which requests > 0 from
+    // a NODE_WITNESS peer — the control); only the peer's services differ.
+    var fx: Fixture = undefined;
+    try fx.init(testing.allocator);
+    defer fx.deinit();
+    try fx.acceptHistoricalHeaders();
+    fx.peer.services = p2p.NODE_NETWORK;
+    try testing.expect(!fx.pm.ibdConnectQueuePending());
+    fx.pm.driveHistoricalBackfill(&fx.peer);
+    try testing.expectEqual(@as(u32, 0), fx.historicalInFlight());
 }
 
 test "ibd_hol: historical still yields when the queue is empty but the peer is ahead" {

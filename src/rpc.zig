@@ -6771,6 +6771,16 @@ pub const RpcServer = struct {
         }
         const peer = self.peer_manager.peers.items[@intCast(peer_id)];
 
+        // ── Step 3: ignore pre-segwit peers (Core net_processing.cpp:1969) ──
+        //
+        // `if (!CanServeWitnesses(*peer)) return "Pre-SegWit peer"` — a peer
+        // without NODE_WITNESS cannot serve the witness block we request
+        // below. Such peers can now complete the handshake (Core keeps
+        // inbound non-witness peers), so this gate is reachable.
+        if (!peer.canServeWitnesses()) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Pre-SegWit peer", id);
+        }
+
         // ── Step 4: send the block getdata (Core net_processing.cpp:1979-1987) ─
         //
         // One inv of type MSG_BLOCK | MSG_WITNESS_FLAG (0x40000002 ==
@@ -25791,8 +25801,20 @@ test "getblockfrompeer: header-missing, bad-peer, and genuine getdata send" {
     // closes fds_c[0]; we own only the far end fds_c[1].
     defer std.posix.close(fds_c[1]);
 
+    // ── (b2) pre-segwit peer → "Pre-SegWit peer" (Core net_processing.cpp:1969)
+    // peer 0 advertises no NODE_WITNESS.
+    {
+        const req = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockfrompeer\",\"params\":[\"" ++ known_hex ++ "\",0]}";
+        const res = try server.dispatch(req);
+        defer allocator.free(res);
+        try std.testing.expect(std.mem.indexOf(u8, res, "\"code\":-1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res, "Pre-SegWit peer") != null);
+    }
+
     const peer_c = try allocator.create(peer_mod.Peer);
     peer_c.* = makeTestPeerForGbfp(.{ .handle = fds_c[0] }, &consensus.MAINNET, allocator);
+    // A witness peer: getblockfrompeer only requests from NODE_WITNESS peers.
+    peer_c.services = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
     try peer_manager.peers.append(peer_c);
 
     {

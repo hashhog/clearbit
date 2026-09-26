@@ -397,6 +397,44 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_service_flags_tests.step);
     }
 
+    // Version-handshake Core parity (MIN_PEER_PROTO_VERSION 31800, version-
+    // gated feature messages, pre-verack record/ignore) + witness-aware block
+    // download and getdata serving. Dedicated root importing peer.zig; the
+    // filter keeps only "tests_handshake_parity..." tests so peer.zig's
+    // drifted inline tests are not pulled in.
+    {
+        const hs_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_handshake_parity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_handshake_parity"},
+        });
+        hs_tests.linkSystemLibrary("rocksdb");
+        hs_tests.linkSystemLibrary("secp256k1");
+        hs_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        hs_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            hs_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            hs_tests.linkSystemLibrary("minisketch");
+            hs_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        hs_tests.root_module.addOptions("build_options", build_options);
+
+        const run_hs_tests = b.addRunArtifact(hs_tests);
+        const hs_test_step = b.step(
+            "test-handshake",
+            "Run version-handshake Core-parity + witness-aware block download tests",
+        );
+        hs_test_step.dependOn(&run_hs_tests.step);
+        // Fold into the main `test` step.
+        test_step.dependOn(&run_hs_tests.step);
+    }
+
     // Self-address advertisement (Core MaybeSendAddr / GetLocalAddrForPeer /
     // -externalip / -discover). Dedicated root importing peer.zig; the filter
     // keeps only tests named "tests_selfadv..." (including localaddr.zig's own

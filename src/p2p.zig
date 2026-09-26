@@ -9,7 +9,27 @@ const erlay_mod = @import("erlay.zig");
 // ============================================================================
 
 pub const PROTOCOL_VERSION: i32 = 70016;
-pub const MIN_PROTOCOL_VERSION: i32 = 70001;
+/// Oldest peer protocol version we keep a connection with — Bitcoin Core
+/// `MIN_PEER_PROTO_VERSION` (node/protocol_version.h), checked for EVERY
+/// peer, inbound and outbound (net_processing.cpp VERSION handler,
+/// `if (nVersion < MIN_PEER_PROTO_VERSION) fDisconnect = true`).
+/// 31800 is the version that introduced getheaders.  This used to be 70001,
+/// which disconnected every Core-acceptable peer in [31800, 70001).
+pub const MIN_PEER_PROTO_VERSION: i32 = 31800;
+/// Historical name, kept as an alias so existing callers read the Core value.
+pub const MIN_PROTOCOL_VERSION: i32 = MIN_PEER_PROTO_VERSION;
+/// BIP-31: `pong` exists and `ping` carries a nonce only for versions
+/// strictly GREATER than this (Core BIP0031_VERSION).
+pub const BIP0031_VERSION: i32 = 60000;
+/// BIP-130 `sendheaders` (Core SENDHEADERS_VERSION).
+pub const SENDHEADERS_VERSION: i32 = 70012;
+/// BIP-133 `feefilter` (Core FEEFILTER_VERSION).
+pub const FEEFILTER_VERSION: i32 = 70013;
+/// BIP-152 compact blocks / `sendcmpct` (Core SHORT_IDS_BLOCKS_VERSION).
+pub const SHORT_IDS_BLOCKS_VERSION: i32 = 70014;
+/// BIP-339 `wtxidrelay`; also Core's courtesy floor for sending BIP-155
+/// `sendaddrv2` (Core WTXID_RELAY_VERSION).
+pub const WTXID_RELAY_VERSION: i32 = 70016;
 pub const NODE_NETWORK: u64 = 1;
 /// NODE_COMPACT_FILTERS (BIP-157): node serves getcfilters/getcfheaders/getcfcheckpt.
 /// Value = 1 << 6 = 64.  Core protocol.h:323.
@@ -169,6 +189,19 @@ pub const Message = union(enum) {
     getblocks: GetHeadersMessage, // Same format as getheaders
     block: types.Block,
     tx: types.Transaction,
+    /// Outgoing only: a `block` message serialized WITHOUT witness data
+    /// (Core TX_NO_WITNESS). The answer to a getdata MSG_BLOCK (as opposed
+    /// to MSG_WITNESS_BLOCK) — Core net_processing.cpp ProcessGetBlockData.
+    /// Wire command is "block"; decode never produces this variant.
+    block_no_witness: types.Block,
+    /// Outgoing only: a `tx` message serialized WITHOUT witness data. The
+    /// answer to a getdata MSG_TX (as opposed to MSG_WITNESS_TX / MSG_WTX) —
+    /// Core ProcessGetData `inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS`.
+    /// Wire command is "tx"; decode never produces this variant.
+    tx_no_witness: types.Transaction,
+    /// Outgoing only: a pre-BIP-31 `ping` with an EMPTY payload, sent to
+    /// peers whose version is <= BIP0031_VERSION (Core MaybeSendPing).
+    ping_no_nonce: void,
     sendheaders: void,
     sendcmpct: SendCmpctMessage,
     feefilter: FeeFilterMessage,
@@ -555,8 +588,9 @@ pub fn encodeMessage(
         .getheaders => "getheaders",
         .headers => "headers",
         .getblocks => "getblocks",
-        .block => "block",
-        .tx => "tx",
+        .block, .block_no_witness => "block",
+        .tx, .tx_no_witness => "tx",
+        .ping_no_nonce => "ping",
         .sendheaders => "sendheaders",
         .sendcmpct => "sendcmpct",
         .feefilter => "feefilter",
@@ -607,7 +641,7 @@ pub fn encodeMessage(
             try payload_writer.writeInt(i32, v.start_height);
             try payload_writer.writeBytes(&[_]u8{if (v.relay) 1 else 0});
         },
-        .verack, .getaddr, .sendheaders, .wtxidrelay, .sendaddrv2, .mempool => {
+        .verack, .getaddr, .sendheaders, .wtxidrelay, .sendaddrv2, .mempool, .ping_no_nonce => {
             // Empty payload
         },
         .ping, .pong => |pp| {
@@ -661,6 +695,12 @@ pub fn encodeMessage(
         },
         .tx => |transaction| {
             try serialize.writeTransaction(&payload_writer, &transaction);
+        },
+        .block_no_witness => |blk| {
+            try serialize.writeBlockNoWitness(&payload_writer, &blk);
+        },
+        .tx_no_witness => |transaction| {
+            try serialize.writeTransactionNoWitness(&payload_writer, &transaction);
         },
         .addr => |a| {
             try payload_writer.writeCompactSize(a.addrs.len);
@@ -846,6 +886,51 @@ pub const ParseError = error{
 };
 
 /// Deserialize a message payload given the command name.
+/// Release every heap allocation `decodePayload` made for `msg`, for a
+/// message the receiver drops WITHOUT handling it (e.g. a message that
+/// arrives between VERSION and VERACK, which Core logs and ignores:
+/// net_processing.cpp "Unsupported message prior to verack").
+///
+/// Ownership mirrors decodePayload exactly: only fields decodePayload
+/// allocated (or duped) are freed. Fields that are zero-copy slices into the
+/// transport payload buffer — addrv2 `addr_bytes`, every `reject` field —
+/// are NOT freed here (they die with the payload). Variants decodePayload
+/// never produces (package relay, the outgoing-only *_no_witness/ping
+/// variants) have nothing to free.
+pub fn freeDecodedMessage(allocator: std.mem.Allocator, msg: Message) void {
+    switch (msg) {
+        .version => |v| allocator.free(v.user_agent),
+        .inv, .getdata, .notfound => |inv| allocator.free(inv.inventory),
+        .getheaders, .getblocks => |gh| allocator.free(gh.block_locator_hashes),
+        .headers => |h| allocator.free(h.headers),
+        .block => |blk| serialize.freeBlock(allocator, &blk),
+        .tx => |t| serialize.freeTransaction(allocator, &t),
+        .addr => |a| allocator.free(a.addrs),
+        .addrv2 => |a2| allocator.free(a2.entries),
+        .reqrecon => |r| allocator.free(r.sketch_data),
+        .sketch => |sk| allocator.free(sk.sketch_data),
+        .reconcildiff => |rd| {
+            allocator.free(rd.missing_short_ids);
+            allocator.free(rd.extra_short_ids);
+        },
+        .cmpctblock => |cb| {
+            allocator.free(cb.short_ids);
+            for (cb.prefilled_txs) |pt| serialize.freeTransaction(allocator, &pt.tx);
+            allocator.free(cb.prefilled_txs);
+        },
+        .getblocktxn => |g| allocator.free(g.indexes),
+        .blocktxn => |bt| {
+            for (bt.transactions) |*t| serialize.freeTransaction(allocator, t);
+            allocator.free(bt.transactions);
+        },
+        .filterload, .filteradd, .merkleblock => |bf| allocator.free(bf.payload),
+        .cfilter => |cf| allocator.free(cf.filter),
+        .cfheaders => |cfh| allocator.free(cfh.filter_hashes),
+        .cfcheckpt => |cfc| allocator.free(cfc.filter_headers),
+        else => {},
+    }
+}
+
 pub fn decodePayload(
     command: []const u8,
     payload: []const u8,
@@ -878,6 +963,11 @@ pub fn decodePayload(
     } else if (std.mem.eql(u8, command, "verack")) {
         return Message{ .verack = {} };
     } else if (std.mem.eql(u8, command, "ping")) {
+        // A pre-BIP-31 peer (version <= BIP0031_VERSION) sends `ping` with an
+        // EMPTY payload; Core reads the nonce only when the peer's version is
+        // > BIP0031_VERSION and never pongs the older kind. Decode the empty
+        // form as nonce 0 — the handler gates the pong on the peer version.
+        if (payload.len == 0) return Message{ .ping = .{ .nonce = 0 } };
         return Message{ .ping = .{ .nonce = try reader.readInt(u64) } };
     } else if (std.mem.eql(u8, command, "pong")) {
         return Message{ .pong = .{ .nonce = try reader.readInt(u64) } };

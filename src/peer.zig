@@ -924,6 +924,14 @@ pub const Peer = struct {
     /// Mirrors Core: CNodeState::m_wtxid_relay (net_processing.cpp:283).
     wtxid_relay_negotiated: bool = false,
 
+    /// Set by `receiveMessage` when the most recent failure was a message
+    /// that was framed and checksummed correctly but whose payload did not
+    /// decode (unknown command, short/garbled payload). The bytes were fully
+    /// consumed, so the stream is still in sync; the pre-verack loop uses this
+    /// to IGNORE such a message the way Core does before verack, instead of
+    /// failing the whole handshake. Cleared on every receive.
+    last_recv_undecodable: bool = false,
+
     /// BIP-324 v2 transport protocol version.
     transport_version: TransportVersion = .v1,
 
@@ -1400,6 +1408,7 @@ pub const Peer = struct {
     /// AEAD ciphertext) has been received.  Otherwise it reads the v1
     /// 24-byte framing header + payload as before.
     pub fn receiveMessage(self: *Peer) PeerError!p2p.Message {
+        self.last_recv_undecodable = false;
         if (self.transport_version == .v2 and self.v2_transport != null) {
             return self.receiveMessageV2();
         }
@@ -1439,8 +1448,10 @@ pub const Peer = struct {
 
         // Parse payload
         const command = header.commandName();
-        return p2p.decodePayload(command, payload, self.allocator) catch
+        return p2p.decodePayload(command, payload, self.allocator) catch {
+            self.last_recv_undecodable = true;
             return PeerError.ProtocolViolation;
+        };
     }
 
     /// V2 receive path: pull encrypted bytes off the socket into V2Transport
@@ -1513,8 +1524,10 @@ pub const Peer = struct {
         if (payload.len > p2p.MAX_MESSAGE_SIZE) return PeerError.MessageTooLarge;
 
         self.last_message_time = std.time.timestamp();
-        return p2p.decodePayload(command, payload, self.allocator) catch
+        return p2p.decodePayload(command, payload, self.allocator) catch {
+            self.last_recv_undecodable = true;
             return PeerError.ProtocolViolation;
+        };
     }
 
     /// Maximum time we'll spend driving the BIP-324 cipher handshake
@@ -1866,6 +1879,14 @@ pub const Peer = struct {
         // (Core init.cpp:863), NODE_P2P_V2 when v2 transport is enabled.
         const our_services: u64 = self.localServices();
 
+        // Core disconnects a peer that has not completed the version
+        // handshake within -peertimeout (DEFAULT_PEER_CONNECT_TIMEOUT = 60s,
+        // net.cpp InactivityCheck "version handshake timeout"). Core does NOT
+        // cap how many messages arrive before verack, so this wall-clock
+        // deadline is what bounds a peer that keeps the handshake open by
+        // trickling ignorable messages.
+        const deadline = now + HANDSHAKE_TIMEOUT_SECS;
+
         if (self.direction == .outbound) {
             // Send our version
             const version_msg = p2p.Message{
@@ -1896,96 +1917,10 @@ pub const Peer = struct {
             self.state = .version_sent;
 
             // Wait for their version
-            const their_version = try self.receiveMessage();
-            switch (their_version) {
-                .version => |v| {
-                    // user_agent is an OWNED heap copy as of the #31 fix
-                    // (decodePayload dupes it out of the transient payload
-                    // buffer). This arm is the owner: defer covers the
-                    // MIN_PROTOCOL_VERSION early return too.
-                    defer self.allocator.free(v.user_agent);
-                    if (v.version < p2p.MIN_PROTOCOL_VERSION)
-                        return PeerError.HandshakeFailed;
-                    self.recordVersion(v);
-                },
-                else => return PeerError.HandshakeFailed,
-            }
-
-            // Send wtxidrelay (BIP-339) and sendaddrv2 (BIP-155) BEFORE verack.
-            // These must be sent between version and verack per their respective BIPs.
-            // Bitcoin Core disconnects peers that send them after verack.
-            const wtxid = p2p.Message{ .wtxidrelay = {} };
-            try self.sendMessage(&wtxid);
-
-            const addrv2 = p2p.Message{ .sendaddrv2 = {} };
-            try self.sendMessage(&addrv2);
-
-            // Send verack (after feature negotiation messages)
-            const verack = p2p.Message{ .verack = {} };
-            try self.sendMessage(&verack);
-
-            // Wait for their verack
-            while (true) {
-                const msg = try self.receiveMessage();
-                switch (msg) {
-                    .verack => break,
-                    // A duplicate version mid-handshake is a protocol
-                    // violation; we ignore it, but its user_agent is an owned
-                    // heap copy (#31) and must not leak.
-                    .version => |sv| self.allocator.free(sv.user_agent),
-                    .wtxidrelay => {
-                        // BIP-339: peer negotiated wtxid relay.
-                        self.wtxid_relay_negotiated = true;
-                    },
-                    .sendaddrv2 => {
-                        // BIP-155: peer wants addrv2 (Core m_wants_addrv2).
-                        self.wants_addrv2 = true;
-                    },
-                    .sendheaders => {
-                        // Accept during handshake; no action needed
-                    },
-                    .sendcmpct => |sc| {
-                        // BIP-152: validate version field.
-                        // Core rejects version != 2 immediately
-                        // (net_processing.cpp:3907 if sendcmpct_version != CMPCTBLOCKS_VERSION return).
-                        // Version 1 (non-segwit) was removed in Core 0.18+; only v2 is supported.
-                        // Silently drop non-v2: do not update peer compact-relay state.
-                        if (sc.version == 2) {
-                            self.bip152_provides_cmpctblocks = true;
-                            self.bip152_highbandwidth_from = sc.announce;
-                        }
-                    },
-                    .feefilter => |ff| {
-                        // BIP-133: Store the peer's fee filter during handshake
-                        const MAX_MONEY: u64 = 2_100_000_000_000_000;
-                        if (ff.feerate <= MAX_MONEY) {
-                            self.fee_filter_received = ff.feerate;
-                        }
-                    },
-                    .ping => |ping| {
-                        // Handle ping during handshake
-                        const pong = p2p.Message{ .pong = ping };
-                        try self.sendMessage(&pong);
-                    },
-                    else => {},
-                }
-            }
+            try self.receivePeerVersion(deadline);
         } else {
             // Inbound: wait for version first
-            const their_version = try self.receiveMessage();
-            switch (their_version) {
-                .version => |v| {
-                    // user_agent is an OWNED heap copy as of the #31 fix
-                    // (decodePayload dupes it out of the transient payload
-                    // buffer). This arm is the owner: defer covers the
-                    // MIN_PROTOCOL_VERSION early return too.
-                    defer self.allocator.free(v.user_agent);
-                    if (v.version < p2p.MIN_PROTOCOL_VERSION)
-                        return PeerError.HandshakeFailed;
-                    self.recordVersion(v);
-                },
-                else => return PeerError.HandshakeFailed,
-            }
+            try self.receivePeerVersion(deadline);
 
             // Send our version
             const version_msg = p2p.Message{ .version = p2p.VersionMessage{
@@ -2008,47 +1943,64 @@ pub const Peer = struct {
                 .relay = true,
             } };
             try self.sendMessage(&version_msg);
+        }
 
-            // Send wtxidrelay (BIP-339) and sendaddrv2 (BIP-155) before verack
-            const wtxid_in = p2p.Message{ .wtxidrelay = {} };
-            try self.sendMessage(&wtxid_in);
-            const addrv2_in = p2p.Message{ .sendaddrv2 = {} };
-            try self.sendMessage(&addrv2_in);
+        // Feature negotiation between VERSION and VERACK, gated on the
+        // negotiated version exactly as Core's VERSION handler does
+        // (net_processing.cpp, after PushNodeVersion):
+        //   greatest_common_version >= WTXID_RELAY_VERSION -> WTXIDRELAY
+        //   greatest_common_version >= 70016               -> SENDADDRV2
+        //     ("some implementations reject messages they don't know. As a
+        //      courtesy, don't send it to nodes with a version before 70016")
+        // A 70002 peer must never receive a message it cannot parse.
+        const common = self.commonVersion();
+        if (common >= p2p.WTXID_RELAY_VERSION) {
+            const wtxid = p2p.Message{ .wtxidrelay = {} };
+            try self.sendMessage(&wtxid);
+            const addrv2 = p2p.Message{ .sendaddrv2 = {} };
+            try self.sendMessage(&addrv2);
+        }
 
-            // Send verack (after feature negotiation messages)
-            const verack = p2p.Message{ .verack = {} };
-            try self.sendMessage(&verack);
+        // Send verack (after feature negotiation messages)
+        const verack = p2p.Message{ .verack = {} };
+        try self.sendMessage(&verack);
 
-            // Wait for their verack
-            while (true) {
-                const msg = try self.receiveMessage();
-                switch (msg) {
-                    .verack => break,
-                    // A duplicate version mid-handshake is a protocol
-                    // violation; we ignore it, but its user_agent is an owned
-                    // heap copy (#31) and must not leak.
-                    .version => |sv| self.allocator.free(sv.user_agent),
-                    // BIP-155: peer wants addrv2 (Core m_wants_addrv2).
-                    .sendaddrv2 => {
-                        self.wants_addrv2 = true;
-                    },
-                    else => {},
-                }
-            }
+        // Wait for their verack. Everything between VERSION and VERACK goes
+        // through the same Core-shaped dispatcher for both directions.
+        while (true) {
+            if (std.time.timestamp() > deadline) return PeerError.HandshakeFailed;
+            const msg = self.receiveMessage() catch |err| {
+                // A framed, checksummed message whose payload we could not
+                // decode (e.g. a command we do not know): its bytes are
+                // consumed and the stream is in sync. Core logs and ignores
+                // unknown/unsupported messages before verack — do the same.
+                if (err == PeerError.ProtocolViolation and self.last_recv_undecodable) continue;
+                return err;
+            };
+            if (self.processPreVerackMessage(msg)) break;
         }
 
         self.state = .handshake_complete;
 
-        // Send sendheaders (BIP-130) - request headers announcements
-        const sh = p2p.Message{ .sendheaders = {} };
-        try self.sendMessage(&sh);
+        // BIP-130: request header announcements — only from peers that
+        // understand `sendheaders` (Core MaybeSendSendHeaders:
+        // GetCommonVersion() >= SENDHEADERS_VERSION).
+        if (common >= p2p.SENDHEADERS_VERSION) {
+            const sh = p2p.Message{ .sendheaders = {} };
+            try self.sendMessage(&sh);
+        }
 
-        // Send sendcmpct (BIP-152) - signal compact block relay support
-        // Version 2 = segwit-aware, announce=false = low-bandwidth mode
-        const sc = p2p.Message{ .sendcmpct = .{ .announce = false, .version = 2 } };
-        try self.sendMessage(&sc);
+        // BIP-152: signal compact block relay support (version 2 =
+        // segwit-aware, announce=false = low-bandwidth mode) — Core VERACK
+        // handler: GetCommonVersion() >= SHORT_IDS_BLOCKS_VERSION.
+        if (common >= p2p.SHORT_IDS_BLOCKS_VERSION) {
+            const sc = p2p.Message{ .sendcmpct = .{ .announce = false, .version = 2 } };
+            try self.sendMessage(&sc);
+        }
 
-        // BIP-133: send our initial feefilter after the handshake.
+        // BIP-133: send our initial feefilter after the handshake — only to
+        // peers that understand it (Core MaybeSendFeefilter:
+        // `if (pto.GetCommonVersion() < FEEFILTER_VERSION) return;`).
         //
         // This MUST be the fee rate our mempool actually enforces. Core seeds
         // its FeeFilterRounder from the very same symbol the mempool reads:
@@ -2062,16 +2014,126 @@ pub const Peer = struct {
         // could lower it (maybeSendFeefilter below) has no caller. Under BIP-133
         // peers withhold everything below the advertised rate, so we asked the
         // network for near-zero transaction relay permanently.
-        if (self.relay_txs) {
+        if (self.relay_txs and common >= p2p.FEEFILTER_VERSION) {
             const ff = p2p.Message{ .feefilter = .{ .feerate = mempool_mod.MIN_RELAY_FEE } };
             try self.sendMessage(&ff);
         }
     }
 
+    /// Core's version-handshake timeout (DEFAULT_PEER_CONNECT_TIMEOUT, net.h).
+    pub const HANDSHAKE_TIMEOUT_SECS: i64 = 60;
+
+    /// The protocol version the peer announced (0 before its VERSION).
+    pub fn peerVersion(self: *const Peer) i32 {
+        return if (self.version_info) |v| v.version else 0;
+    }
+
+    /// Core `GetCommonVersion()`: min(peer version, our PROTOCOL_VERSION).
+    /// Every feature message we send is gated on this.
+    pub fn commonVersion(self: *const Peer) i32 {
+        return @min(self.peerVersion(), p2p.PROTOCOL_VERSION);
+    }
+
+    /// Core `CanServeWitnesses(peer)`: the peer advertised NODE_WITNESS.
+    /// Blocks are only ever requested from such peers — a non-witness peer
+    /// can complete the handshake (Core keeps inbound peers without it) but
+    /// cannot give us the witness data post-segwit validation needs.
+    pub fn canServeWitnesses(self: *const Peer) bool {
+        return (self.services & p2p.NODE_WITNESS) != 0;
+    }
+
+    /// Read until the peer's VERSION arrives, then apply Core's only
+    /// version-based gate. Core ignores any message that precedes VERSION
+    /// ("non-version message before version handshake", no disconnect).
+    fn receivePeerVersion(self: *Peer, deadline: i64) PeerError!void {
+        while (true) {
+            if (std.time.timestamp() > deadline) return PeerError.HandshakeFailed;
+            const msg = self.receiveMessage() catch |err| {
+                if (err == PeerError.ProtocolViolation and self.last_recv_undecodable) continue;
+                return err;
+            };
+            switch (msg) {
+                .version => |v| {
+                    // user_agent is an OWNED heap copy as of the #31 fix
+                    // (decodePayload dupes it out of the transient payload
+                    // buffer). This arm is the owner: defer covers the
+                    // MIN_PEER_PROTO_VERSION early return too.
+                    defer self.allocator.free(v.user_agent);
+                    // Core net_processing.cpp: `if (nVersion <
+                    // MIN_PEER_PROTO_VERSION) fDisconnect` — the ONLY version
+                    // floor, for inbound and outbound alike. Service bits are
+                    // NOT a handshake gate here: block download separately
+                    // requires canServeWitnesses().
+                    if (v.version < p2p.MIN_PEER_PROTO_VERSION)
+                        return PeerError.HandshakeFailed;
+                    self.recordVersion(v);
+                    return;
+                },
+                else => p2p.freeDecodedMessage(self.allocator, msg),
+            }
+        }
+    }
+
+    /// Apply one message received between VERSION and VERACK, the way
+    /// Core's ProcessMessage does before `fSuccessfullyConnected`.
+    /// Returns true when the message is the peer's VERACK.
+    ///
+    /// Core PROCESSES (records) these before verack: WTXIDRELAY, SENDADDRV2,
+    /// SENDTXRCNCL, SENDHEADERS (net_processing.cpp "SENDHEADERS" ->
+    /// m_prefers_headers) and SENDCMPCT. A redundant VERSION is ignored.
+    /// Everything else (ping, inv, feefilter, getheaders, ...) is logged and
+    /// IGNORED: "Unsupported message prior to verack" — no reply (a
+    /// pre-verack ping is NOT ponged), no disconnect, no misbehaviour.
+    pub fn processPreVerackMessage(self: *Peer, msg: p2p.Message) bool {
+        switch (msg) {
+            .verack => return true,
+            .wtxidrelay => {
+                // BIP-339: honoured only if the common version supports it
+                // (Core: GetCommonVersion() >= WTXID_RELAY_VERSION, else
+                // "ignoring wtxidrelay due to old common version").
+                if (self.commonVersion() >= p2p.WTXID_RELAY_VERSION)
+                    self.wtxid_relay_negotiated = true;
+            },
+            // BIP-155: peer wants addrv2 (Core m_wants_addrv2).
+            .sendaddrv2 => self.wants_addrv2 = true,
+            // BIP-130: Core records m_prefers_headers before verack too.
+            .sendheaders => self.send_headers = true,
+            .sendcmpct => |sc| {
+                // BIP-152: only version 2 (witness-aware) is supported;
+                // Core returns early on any other version
+                // (`if (sendcmpct_version != CMPCTBLOCKS_VERSION) return`).
+                if (sc.version == 2) {
+                    self.bip152_provides_cmpctblocks = true;
+                    self.bip152_highbandwidth_from = sc.announce;
+                }
+            },
+            // Redundant VERSION, SENDTXRCNCL (we do not run Erlay
+            // reconciliation, which Core also ignores when disabled), and
+            // every other message: ignore, releasing whatever the decoder
+            // allocated for it.
+            else => p2p.freeDecodedMessage(self.allocator, msg),
+        }
+        return false;
+    }
+
     /// Send a ping and record the nonce.
     pub fn sendPing(self: *Peer) PeerError!void {
+        const now = std.time.timestamp();
+        if (self.commonVersion() <= p2p.BIP0031_VERSION) {
+            // Pre-BIP-31 peer: `ping` has no nonce and is never answered
+            // (Core MaybeSendPing: m_ping_nonce_sent = 0, empty PING; with no
+            // nonce outstanding there is no ping timeout). Mark the ping as
+            // already satisfied so isTimedOut/hasPingTimeout never fire on a
+            // pong that cannot come.
+            self.last_ping_nonce = 0;
+            self.last_ping_time = now;
+            self.last_pong_time = now;
+            const legacy = p2p.Message{ .ping_no_nonce = {} };
+            try self.sendMessage(&legacy);
+            return;
+        }
         self.last_ping_nonce = std.crypto.random.int(u64);
-        self.last_ping_time = std.time.timestamp();
+        self.last_ping_time = now;
         const msg = p2p.Message{ .ping = .{ .nonce = self.last_ping_nonce } };
         try self.sendMessage(&msg);
     }
@@ -2098,6 +2160,11 @@ pub const Peer = struct {
 
         // Don't send to block-relay-only peers
         if (self.conn_type == .block_relay) return;
+
+        // Core MaybeSendFeefilter: `if (pto.GetCommonVersion() <
+        // FEEFILTER_VERSION) return;` — never send BIP-133 to a peer that
+        // cannot parse it.
+        if (self.commonVersion() < p2p.FEEFILTER_VERSION) return;
 
         // Don't send if peer doesn't relay transactions
         if (!self.relay_txs) return;
@@ -4886,7 +4953,9 @@ pub const PeerManager = struct {
                     }
                 }
                 if (self.historical_backfill != null and now_ts - self.last_historical_drive_ts > 5) {
-                    if (peer_obj.state == .handshake_complete) {
+                    // Drive from a peer that can serve witness blocks, not
+                    // merely the first handshake-complete one.
+                    if (peer_obj.state == .handshake_complete and peer_obj.canServeWitnesses()) {
                         self.driveHistoricalBackfill(peer_obj);
                         self.finishHistoricalBackfillIfDone();
                         break;
@@ -5103,6 +5172,9 @@ pub const PeerManager = struct {
             } };
             target_peer.sendMessage(&msg) catch {};
         }
+        // Bodies only from a peer that can serve witnesses (Core
+        // CanServeWitnesses) — headers above are fine from anyone.
+        if (!target_peer.canServeWitnesses()) return;
         var reqs: [historical_backfill_mod.BACKFILL_BODIES_PER_REQUEST]historical_backfill_mod.BodyRequest = undefined;
         const n = bf.nextBodyHashes(cs, &reqs);
         if (n > 0) {
@@ -5836,6 +5908,17 @@ pub const PeerManager = struct {
             return;
         }
 
+        // Fork bodies are requested from the announcing peer, so it must be
+        // able to serve witnesses (Core FindNextBlocksToDownload /
+        // headers direct-fetch: `!CanServeWitnesses(peer)` -> "We wouldn't
+        // download this block or its descendants from this peer"). Do not
+        // arm on a non-witness announcer; a witness peer announcing the same
+        // fork arms it instead.
+        if (!peer.canServeWitnesses()) {
+            self.last_arm_result = .skipped;
+            return;
+        }
+
         // Arm pending_reorg and request fork bodies from this peer.
         // Move ownership of fork_chain into PendingReorg by copying.
         var owned = std.ArrayList(types.Hash256).init(self.allocator);
@@ -6013,8 +6096,13 @@ pub const PeerManager = struct {
     fn handleMessage(self: *PeerManager, peer: *Peer, msg: p2p.Message) !void {
         switch (msg) {
             .ping => |pp| {
-                const pong = p2p.Message{ .pong = pp };
-                try peer.sendMessage(&pong);
+                // BIP-31: Core answers only when GetCommonVersion() >
+                // BIP0031_VERSION; an older peer's ping has no nonce and
+                // `pong` does not exist in its protocol.
+                if (peer.commonVersion() > p2p.BIP0031_VERSION) {
+                    const pong = p2p.Message{ .pong = pp };
+                    try peer.sendMessage(&pong);
+                }
             },
             .pong => |pp| peer.handlePong(pp.nonce),
             .addr => |a| {
@@ -6089,10 +6177,14 @@ pub const PeerManager = struct {
                         has_block_inv = true;
                     } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
                         // Legacy txid inv: request if not already in mempool by txid.
+                        // Core requests `MSG_TX | GetFetchFlags(peer)`: with the
+                        // witness flag from a NODE_WITNESS peer (a plain MSG_TX
+                        // would be answered witness-stripped, and a stripped
+                        // segwit tx fails validation), plain MSG_TX otherwise.
                         if (self.mempool) |pool| {
                             if (!pool.entries.contains(item.hash)) {
                                 tx_requests.append(.{
-                                    .inv_type = .msg_tx,
+                                    .inv_type = if (peer.canServeWitnesses()) .msg_witness_tx else .msg_tx,
                                     .hash = item.hash,
                                 }) catch {};
                             }
@@ -6774,6 +6866,12 @@ pub const PeerManager = struct {
 
                 const block_hash = header_hash;
 
+                // Every path below ends in a block request (getdata
+                // MSG_WITNESS_BLOCK or getblocktxn) to THIS peer. Never
+                // request blocks from a peer that cannot serve witnesses
+                // (Core CanServeWitnesses).
+                if (!peer.canServeWitnesses()) return;
+
                 // BIP 152: Reconstruct block from compact block + mempool.
                 // Derive SipHash key: SHA256(header_bytes || nonce_le)[0:16]
                 // Reference: Bitcoin Core blockencodings.cpp FillShortTxIDSelector
@@ -7158,18 +7256,32 @@ pub const PeerManager = struct {
                 }
                 for (gd.inventory) |item| {
                     const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
+                    // MSG_WITNESS_FLAG. Core serializes with witness ONLY for
+                    // the witness inv types: MSG_BLOCK -> TX_NO_WITNESS(block),
+                    // MSG_WITNESS_BLOCK -> TX_WITH_WITNESS (ProcessGetBlockData);
+                    // MSG_TX -> TX_NO_WITNESS, MSG_WITNESS_TX / MSG_WTX -> with
+                    // witness (ProcessGetData `inv.IsMsgTx() ? TX_NO_WITNESS :
+                    // TX_WITH_WITNESS`). A pre-segwit / non-NODE_WITNESS peer
+                    // asks with the plain types and cannot parse witness data.
+                    const want_witness = (@intFromEnum(item.inv_type) & 0x40000000) != 0;
                     if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_block))) {
                         // 1. Check served_blocks cache (mined + recently connected blocks)
                         if (self.served_blocks.get(item.hash)) |block_data| {
                             var reader = serialize.Reader{ .data = block_data };
                             const block = serialize.readBlock(&reader, self.allocator) catch continue;
                             defer serialize.freeBlock(self.allocator, &block);
-                            const block_msg = p2p.Message{ .block = block };
+                            const block_msg = if (want_witness)
+                                p2p.Message{ .block = block }
+                            else
+                                p2p.Message{ .block_no_witness = block };
                             peer.sendMessage(&block_msg) catch {};
                             std.debug.print("P2P: served block from relay cache to peer\n", .{});
                         } else if (self.block_buffer.get(item.hash)) |buffered_block| {
                             // 2. Check block_buffer (received but not yet connected)
-                            const block_msg = p2p.Message{ .block = buffered_block };
+                            const block_msg = if (want_witness)
+                                p2p.Message{ .block = buffered_block }
+                            else
+                                p2p.Message{ .block_no_witness = buffered_block };
                             peer.sendMessage(&block_msg) catch {};
                             std.debug.print("P2P: served buffered block to peer\n", .{});
                         } else {
@@ -7321,9 +7433,13 @@ pub const PeerManager = struct {
                         }
                     } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
                         // Serve transaction from mempool by txid (legacy getdata).
+                        // MSG_TX -> no witness; MSG_WITNESS_TX -> with witness.
                         if (self.mempool) |pool| {
                             if (pool.entries.get(item.hash)) |entry| {
-                                const tx_msg = p2p.Message{ .tx = entry.tx };
+                                const tx_msg = if (want_witness)
+                                    p2p.Message{ .tx = entry.tx }
+                                else
+                                    p2p.Message{ .tx_no_witness = entry.tx };
                                 peer.sendMessage(&tx_msg) catch {};
                             } else {
                                 const not_found_inv = [_]p2p.InvVector{.{
@@ -8588,7 +8704,7 @@ pub const PeerManager = struct {
     ///
     /// The `download_cursor` rewind on buffer-full drop (wave 9) is preserved
     /// in the `.block` handler — see `peer.zig:2198` and `peer.zig:2215`.
-    fn pipelineBlockRequests(self: *PeerManager) !void {
+    pub fn pipelineBlockRequests(self: *PeerManager) !void {
         if (self.chain_state == null) return;
         if (self.download_cursor >= self.expected_blocks.items.len) return;
 
@@ -8616,6 +8732,11 @@ pub const PeerManager = struct {
         while (pidx < peer_n) : (pidx += 1) {
             const tp = self.peers.items[(self.block_request_rotation + pidx) % peer_n];
             if (tp.state != .handshake_complete) continue;
+            // Core CanServeWitnesses: never download blocks from a peer that
+            // did not advertise NODE_WITNESS. Such peers may now complete the
+            // handshake (inbound, or any version >= 31800), so this is the
+            // gate that keeps them out of block download.
+            if (!tp.canServeWitnesses()) continue;
 
             // Compute this peer's remaining slot budget.  Saturating so a
             // transient over-count (shouldn't happen, but be defensive)

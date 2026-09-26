@@ -149,19 +149,15 @@ test "w136/G4: handleMessage has no .wtxidrelay arm (silent post-handshake drop)
     try testing.expect(!has_arm);
 }
 
-// G5 BUG: WTXIDRELAY accepted without GetCommonVersion >= 70016 gate.
-// Core (line 3928) gates `peer.m_wtxid_relay = true;` on
-// `pfrom.GetCommonVersion() >= WTXID_RELAY_VERSION`.  clearbit's inline
-// handshake handler at peer.zig:1524-1527 unconditionally assigns it.
-test "w136/G5: clearbit lacks WTXID_RELAY_VERSION (70016) gating constant" {
-    // Core's protocol_version.h defines WTXID_RELAY_VERSION = 70016.
-    // clearbit's p2p.zig defines PROTOCOL_VERSION = 70016 (same value) but
-    // does not name it as the wtxidrelay threshold.
-    try testing.expect(!@hasDecl(p2p, "WTXID_RELAY_VERSION"));
-    try testing.expect(!@hasDecl(p2p, "WTXID_RELAY_MIN_VERSION"));
-    try testing.expect(!@hasDecl(p2p, "WTXIDRELAY_VERSION"));
-    // The MIN_PROTOCOL_VERSION at 70001 is what the handshake checks against.
-    try testing.expectEqual(@as(i32, 70001), p2p.MIN_PROTOCOL_VERSION);
+// G5 FIXED (handshake Core parity): WTXIDRELAY is honoured only when
+// GetCommonVersion() >= WTXID_RELAY_VERSION (Core net_processing.cpp
+// WTXIDRELAY handler); the gate lives in Peer.processPreVerackMessage and is
+// exercised end-to-end by src/tests_handshake_parity.zig. The only version
+// floor is Core's MIN_PEER_PROTO_VERSION = 31800 (was 70001).
+test "w136/G5: WTXID_RELAY_VERSION (70016) gating constant + Core version floor" {
+    try testing.expectEqual(@as(i32, 70016), p2p.WTXID_RELAY_VERSION);
+    try testing.expectEqual(@as(i32, 31800), p2p.MIN_PEER_PROTO_VERSION);
+    try testing.expectEqual(p2p.MIN_PEER_PROTO_VERSION, p2p.MIN_PROTOCOL_VERSION);
 }
 
 // G6 BUG: inv handler does not filter by wtxid_relay_negotiated.
@@ -538,7 +534,8 @@ test "w136/G30: handshake feefilter sends mempool MIN_RELAY_FEE gated on relay_t
     const ff_block_end = @min(ff_block_start + 2000, peer_src.len);
     const window = peer_src[ff_block_start..ff_block_end];
 
-    try testing.expect(std.mem.indexOf(u8, window, "if (self.relay_txs)") != null);
+    // Gated on relay_txs AND (Core MaybeSendFeefilter) the common version.
+    try testing.expect(std.mem.indexOf(u8, window, "if (self.relay_txs and common >= p2p.FEEFILTER_VERSION)") != null);
     try testing.expect(std.mem.indexOf(u8, window, "mempool_mod.MIN_RELAY_FEE") != null);
 }
 

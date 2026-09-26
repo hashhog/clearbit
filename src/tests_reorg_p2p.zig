@@ -115,7 +115,9 @@ fn makeStubPeer(params: *const consensus.NetworkParams, allocator: std.mem.Alloc
         .state = .handshake_complete,
         .direction = .outbound,
         .version_info = null,
-        .services = 0,
+        // Fork bodies are requested from the announcer, which must be a
+        // NODE_WITNESS peer (Core CanServeWitnesses).
+        .services = p2p.NODE_NETWORK | p2p.NODE_WITNESS,
         .last_ping_time = 0,
         .last_pong_time = 0,
         .last_ping_nonce = 0,
@@ -580,6 +582,16 @@ test "tryFireReorg: arms pending_reorg when fork has higher chainwork" {
 
     var stub = makeStubPeer(&params, allocator);
     defer stub.recv_buffer.deinit();
+
+    // A NON-witness announcer of the very same heavier fork must NOT arm:
+    // its bodies would be requested from it, and Core never downloads
+    // blocks from a peer that cannot serve witnesses.
+    stub.services = p2p.NODE_NETWORK;
+    pm.last_arm_result = .no_fork_point; // not the default, so the next assert means something
+    pm.maybeArmReorg(&stub, &hashes_b[2]);
+    try testing.expect(pm.pending_reorg == null);
+    try testing.expectEqual(peer_mod.ReorgArmResult.skipped, pm.last_arm_result);
+    stub.services = p2p.NODE_NETWORK | p2p.NODE_WITNESS;
 
     pm.maybeArmReorg(&stub, &hashes_b[2]);
     try testing.expect(pm.pending_reorg != null);
