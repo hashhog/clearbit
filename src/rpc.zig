@@ -4537,6 +4537,83 @@ pub const RpcServer = struct {
     /// Render Core's `get_str()` type-error (-3): "JSON value of type <T> is
     /// not of expected type string".  Same univalue `checkType` path as
     /// `typeErrorNotNumber` above, just the other destination type — a
+    /// Result of `parseHashArg`: the parsed hash, or the finished error body.
+    const HashArg = union(enum) { hash: types.Hash256, response: []const u8 };
+
+    /// Core ParseHashV (rpc/util.cpp): a non-string is RPC_TYPE_ERROR (-3); a
+    /// wrong length or non-hex string is RPC_INVALID_PARAMETER (-8) at the
+    /// parse boundary, BEFORE any lookup; the display-order hex is reversed
+    /// into internal byte order.  Shared by every blockhash-taking handler so
+    /// no handler can byte-order or validate a hash differently.
+    fn parseHashArg(self: *RpcServer, v: std.json.Value, name: []const u8, id: ?std.json.Value) !HashArg {
+        if (v != .string) return .{ .response = try self.typeErrorNotString(v, id) };
+        const hex = v.string;
+        if (hex.len != 64) {
+            const msg = try std.fmt.allocPrint(self.allocator, "{s} must be of length 64 (not {d}, for '{s}')", .{ name, hex.len, hex });
+            defer self.allocator.free(msg);
+            return .{ .response = try self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id) };
+        }
+        var hash: types.Hash256 = undefined;
+        for (0..32) |i| {
+            hash[31 - i] = std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16) catch {
+                const msg = try std.fmt.allocPrint(self.allocator, "{s} must be hexadecimal string (not '{s}')", .{ name, hex });
+                defer self.allocator.free(msg);
+                return .{ .response = try self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id) };
+            };
+        }
+        return .{ .hash = hash };
+    }
+
+    /// A block the node knows, resolved from its hash.
+    const KnownBlock = struct { height: u32, on_active_chain: bool };
+
+    /// Core `LookupBlockIndex(hash)` + `ActiveChain().Contains(pindex)`,
+    /// answered from EVERY place clearbit records a block's height — not just
+    /// the in-memory ChainManager, which the fast-IBD / P2P-sync path never
+    /// populates (so blocks getblockheader serves were "not found" to
+    /// getdeploymentinfo / getblockfilter).  Order: genesis, tip, ChainManager
+    /// entry, persisted CF_BLOCK_INDEX height (the same record getblockheader
+    /// reads).  Active-chain membership: the H:{height} index (or the
+    /// ChainManager's active tip ancestor) must name this exact hash.
+    /// Returns null when no local record exists (Core: "Block not found").
+    fn lookupKnownBlock(self: *RpcServer, hash: *const types.Hash256) ?KnownBlock {
+        if (std.mem.eql(u8, hash, &self.network_params.genesis_hash))
+            return .{ .height = 0, .on_active_chain = true };
+        if (std.mem.eql(u8, hash, &self.chain_state.best_hash))
+            return .{ .height = self.chain_state.best_height, .on_active_chain = true };
+        var height: ?u32 = null;
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(hash)) |e| {
+                height = e.height;
+                if (cm.active_tip) |tip| {
+                    if (tip.getAncestor(e.height)) |anc| {
+                        if (std.mem.eql(u8, &anc.hash, hash))
+                            return .{ .height = e.height, .on_active_chain = true };
+                    }
+                }
+            }
+        }
+        if (height == null) height = self.chain_state.getBlockHeightByHash(hash);
+        const h = height orelse return null;
+        const on_active = h <= self.chain_state.best_height and
+            if (self.chain_state.getBlockHashByHeight(h)) |at| std.mem.eql(u8, &at, hash) else false;
+        return .{ .height = h, .on_active_chain = on_active };
+    }
+
+    /// Hash of the active-chain block at `height` (genesis, H: index, or the
+    /// ChainManager's active tip ancestor).  Null when the node has no record.
+    fn activeChainHashAt(self: *RpcServer, height: u32) ?types.Hash256 {
+        if (height == 0) return self.network_params.genesis_hash;
+        if (height == self.chain_state.best_height) return self.chain_state.best_hash;
+        if (self.chain_state.getBlockHashByHeight(height)) |h| return h;
+        if (self.chain_manager) |cm| {
+            if (cm.active_tip) |tip| {
+                if (tip.getAncestor(height)) |e| return e.hash;
+            }
+        }
+        return null;
+    }
+
     /// `UniValue::type_error` becomes RPC_TYPE_ERROR at rpc/server.cpp:512.
     /// Used by `createrawtransaction`'s ParseHashO(txid) parity.
     fn typeErrorNotString(self: *RpcServer, v: std.json.Value, id: ?std.json.Value) ![]const u8 {
@@ -6174,17 +6251,17 @@ pub const RpcServer = struct {
     /// so the bytes match Core regardless of index sync state.
     fn handleGetBlockFilter(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // ── Parse params ────────────────────────────────────────────────────
-        var blockhash_hex: []const u8 = undefined;
         var filtertype: []const u8 = "basic"; // Core default
+        var hash: types.Hash256 = undefined;
 
         if (params == .array) {
             if (params.array.items.len > 0) {
-                const h = params.array.items[0];
-                if (h == .string) {
-                    blockhash_hex = h.string;
-                } else {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid blockhash", id);
-                }
+                // Core: ParseHashV(params[0]) runs FIRST (-3 / -8), before
+                // the filtertype and index checks.
+                hash = switch (try self.parseHashArg(params.array.items[0], "blockhash", id)) {
+                    .hash => |h| h,
+                    .response => |r| return r,
+                };
             } else {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash", id);
             }
@@ -6211,32 +6288,13 @@ pub const RpcServer = struct {
             );
         }
 
-        if (blockhash_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-        }
-
-        // Parse display-order hex → internal little-endian bytes.
-        var hash: types.Hash256 = undefined;
-        for (0..32) |i| {
-            hash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 .. i * 2 + 2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-            };
-        }
-
         // ── locate the block + confirm it is on the active chain ────────────
-        const cm = self.chain_manager orelse {
+        // Shared resolver (lookupKnownBlock): the ChainManager is never filled
+        // by the P2P-sync path, so requiring it answered -5 for every synced
+        // block, genesis included.
+        const known = self.lookupKnownBlock(&hash) orelse
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-        };
-        const target_entry = cm.getBlock(&hash) orelse {
-            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-        };
-        const tip = cm.active_tip orelse {
-            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-        };
-        const at_target = tip.getAncestor(target_entry.height) orelse {
-            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-        };
-        if (!std.mem.eql(u8, &at_target.hash, &target_entry.hash)) {
+        if (!known.on_active_chain) {
             // Block exists but is on a side chain — Core's LookupFilter would
             // fail too (block_was_connected == false).
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
@@ -6255,11 +6313,11 @@ pub const RpcServer = struct {
         // header_{-1} (genesis parent) = all-zero (BIP-157).
         var filter_header: types.Hash256 = [_]u8{0} ** 32;
         var h: u32 = 0;
-        while (h <= target_entry.height) : (h += 1) {
-            const e = tip.getAncestor(h) orelse {
+        while (h <= known.height) : (h += 1) {
+            const ah = self.activeChainHashAt(h) orelse {
                 return self.jsonRpcError(RPC_INTERNAL_ERROR, "Filter chain walk failed", id);
             };
-            const fb = (self.computeBasicFilterBytes(&e.hash) catch null) orelse {
+            const fb = (self.computeBasicFilterBytes(&ah) catch null) orelse {
                 return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
             };
             defer self.allocator.free(fb);
@@ -13522,52 +13580,16 @@ pub const RpcServer = struct {
         var has_blockhash_arg = false;
 
         if (params == .array and params.array.items.len > 1 and params.array.items[1] != .null) {
-            const bh = params.array.items[1];
-            if (bh != .string or bh.string.len != 64) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be of length 64 (not lesser)", id);
-            }
-            var hash: types.Hash256 = undefined;
-            for (0..32) |i| {
-                hash[31 - i] = std.fmt.parseInt(u8, bh.string[i * 2 .. i * 2 + 2], 16) catch {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be hexadecimal string", id);
-                };
-            }
+            const hash = switch (try self.parseHashArg(params.array.items[1], "blockhash", id)) {
+                .hash => |h| h,
+                .response => |r| return r,
+            };
             has_blockhash_arg = true;
-
-            // Resolve hash → height.  Tip first (cheap), then the in-memory
-            // chain index, then a reverse scan of the H: index as last resort.
-            var resolved_height: ?u32 = null;
-            if (std.mem.eql(u8, &hash, &self.chain_state.best_hash)) {
-                resolved_height = self.chain_state.best_height;
-            } else if (self.chain_manager != null and self.chain_manager.?.getBlock(&hash) != null) {
-                resolved_height = self.chain_manager.?.getBlock(&hash).?.height;
-            }
-
-            if (resolved_height == null) {
-                if (self.chain_state.getBlockHeightByHash(&hash)) |h| {
-                    resolved_height = h;
-                }
-            }
-
-            if (resolved_height == null) {
+            const known = self.lookupKnownBlock(&hash) orelse
                 return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-            }
-            const h = resolved_height.?;
-
-            // "in main chain" check (Core ActiveChain().Contains): the active
-            // chain's block at this height must hash to the requested block.
-            // The tip is trivially on the active chain; for any other block we
-            // require the H:{height} index to map back to the same hash.
-            if (!std.mem.eql(u8, &hash, &self.chain_state.best_hash)) {
-                const at_h = self.chain_state.getBlockHashByHeight(h) orelse {
-                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block is not in main chain", id);
-                };
-                if (!std.mem.eql(u8, &at_h, &hash)) {
-                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block is not in main chain", id);
-                }
-            }
-
-            pindex_height = h;
+            if (!known.on_active_chain)
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Block is not in main chain", id);
+            pindex_height = known.height;
             pindex_hash = hash;
         }
 
@@ -13922,47 +13944,17 @@ pub const RpcServer = struct {
         if (params == .array and params.array.items.len > 0) {
             const h = params.array.items[0];
             if (h != .null) {
-                if (h != .string) {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "blockhash must be a string", id);
-                }
-                const blockhash_hex = h.string;
-                if (blockhash_hex.len != 64) {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash length", id);
-                }
-                // Parse hex → bytes (display order → internal LE order)
-                var parsed_hash: types.Hash256 = undefined;
-                for (0..32) |i| {
-                    parsed_hash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 .. i * 2 + 2], 16) catch {
-                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid block hash hex", id);
-                    };
-                }
-                // Resolve to a height.  We support the genesis hash and the
-                // current best hash; everything else returns "Block not found".
-                if (std.mem.eql(u8, &parsed_hash, &self.network_params.genesis_hash)) {
-                    query_height = 0;
-                    query_hash = parsed_hash;
-                } else if (std.mem.eql(u8, &parsed_hash, &self.chain_state.best_hash)) {
-                    query_height = self.chain_state.best_height;
-                    query_hash = parsed_hash;
-                } else if (self.chain_manager) |cm| {
-                    // Walk the active chain looking for the requested hash.
-                    var entry: ?*validation.BlockIndexEntry = cm.active_tip;
-                    var found = false;
-                    while (entry) |e| {
-                        if (std.mem.eql(u8, &e.hash, &parsed_hash)) {
-                            query_height = e.height;
-                            query_hash = parsed_hash;
-                            found = true;
-                            break;
-                        }
-                        entry = e.parent;
-                    }
-                    if (!found) {
-                        return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-                    }
-                } else {
+                const parsed_hash = switch (try self.parseHashArg(h, "blockhash", id)) {
+                    .hash => |ph| ph,
+                    .response => |r| return r,
+                };
+                // Core getdeploymentinfo: LookupBlockIndex(hash) or -5.  Any
+                // indexed block is answered (no active-chain requirement);
+                // the deployment state is a function of its height here.
+                const known = self.lookupKnownBlock(&parsed_hash) orelse
                     return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found", id);
-                }
+                query_height = known.height;
+                query_hash = parsed_hash;
             }
         }
 
@@ -26768,7 +26760,10 @@ test "getdeploymentinfo invalid blockhash returns error" {
     defer allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Invalid block hash length") != null);
+    // Core ParseHashV (rpc/util.cpp): RPC_INVALID_PARAMETER (-8)
+    // "blockhash must be of length 64 (not 63, for '…')".
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "blockhash must be of length 64 (not 63") != null);
 }
 
 test "ParseHashV parity: malformed txid/blockhash -> -8, well-formed-absent -> -5/null" {

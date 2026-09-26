@@ -375,21 +375,24 @@ pub const HistoricalBackfill = struct {
         while (h < self.next_body_height) : (h += 1) {
             if (cs.getCumulativeTxCount(h) != null) continue;
             const hash = cs.getBlockHashByHeight(h) orelse continue;
-            const n_tx = nTxAt(cs, &hash);
+            // An unreadable body is an UNKNOWN count (Core m_chain_tx_count = 0):
+            // stop rather than count the block as one transaction.
+            const n_tx = nTxAt(cs, &hash) orelse break;
             const prev = cs.getCumulativeTxCount(h - 1) orelse break;
             cs.putCumulativeTxCount(h, prev + n_tx);
         }
     }
 };
 
-fn nTxAt(cs: *storage.ChainState, hash: *const types.Hash256) u64 {
-    const db = cs.utxo_set.db orelse return 1;
-    const raw = db.get(storage.CF_BLOCKS, hash) catch return 1;
-    const bytes = raw orelse return 1;
+fn nTxAt(cs: *storage.ChainState, hash: *const types.Hash256) ?u64 {
+    const db = cs.utxo_set.db orelse return null;
+    const raw = db.get(storage.CF_BLOCKS, hash) catch return null;
+    const bytes = raw orelse return null;
     defer cs.allocator.free(bytes);
-    if (bytes.len < 81) return 1;
+    if (bytes.len < 81) return null;
     var reader = serialize.Reader{ .data = bytes[80..] };
-    return reader.readCompactSize() catch 1;
+    const n = reader.readCompactSize() catch return null;
+    return if (n == 0) null else n;
 }
 
 fn expectedBits(

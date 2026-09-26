@@ -1507,6 +1507,26 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
         std.debug.print("Warning: Failed to write base height→hash index entry: {}\n", .{err});
     };
 
+    // m_chain_tx_count at the snapshot base (Core node/blockstorage.cpp:440-444:
+    // `base->m_chain_tx_count = au_data.m_chain_tx_count`).  Only a chainparams
+    // entry carries a trusted count; the DEV-ESCAPE path has none, so the base
+    // and everything above it stay UNKNOWN (getchaintxstats omits txcount)
+    // instead of counting from 1.  The v2 marker is cleared so the next boot's
+    // repairTxCountIndex drops any "X:" entries a previous chain left behind.
+    {
+        const xk = storage.ChainStore.buildTxCountKey(block_height);
+        if (assume_entry != null and assume_entry.?.chain_tx_count != 0) {
+            var xv: [8]u8 = undefined;
+            std.mem.writeInt(u64, &xv, assume_entry.?.chain_tx_count, .little);
+            db.put(storage.CF_DEFAULT, &xk, &xv) catch |err| {
+                std.debug.print("Warning: Failed to persist snapshot base tx count: {}\n", .{err});
+            };
+        } else {
+            db.delete(storage.CF_DEFAULT, &xk) catch {};
+        }
+        db.delete(storage.CF_DEFAULT, storage.ChainState.TX_COUNT_INDEX_V2_KEY) catch {};
+    }
+
     // Genesis-scale nChainWork at the snapshot base (Core GetHex).  The
     // snapshot file has no headers below the base, so this baked value is
     // the only way to seed getblockchaininfo.chainwork / IBD / nethash
@@ -2453,6 +2473,11 @@ pub fn main() !void {
                     // the correct base after a restart.  Falls back to the
                     // genesis seed (1) when the per-height entry is absent
                     // (pre-index datadir) — matching Core's "unknown" sentinel.
+                    // One-time migration off the old running-counter "X:"
+                    // index (inflated by every reorg; counted from 1 after a
+                    // snapshot boot).  No-op once the v2 marker exists.
+                    const rebuilt = chain_state.repairTxCountIndex(params);
+                    if (rebuilt > 0) std.debug.print("Rebuilt cumulative tx-count index for {d} blocks\n", .{rebuilt});
                     chain_state.restoreChainTxCount();
                     // Genesis-scale nChainWork: persisted tip key, else
                     // reconstruct from a matching snapshot checkpoint +

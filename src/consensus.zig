@@ -708,7 +708,10 @@ pub const MAINNET = NetworkParams{
             .height = 944_183,
             .block_hash = hexToHash("0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"),
             .hash_serialized = hexToHash("2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"),
-            .chain_tx_count = 1_334_000_000,
+            // Core getchaintxstats txcount at this hash (0000…ced817).  Was the
+            // 1_334_000_000 progress-display placeholder: 1,914,531 short, and
+            // every post-snapshot count inherited the deficit.
+            .chain_tx_count = 1_335_914_531,
             .chain_work = hexToBytes32BE("00000000000000000000000000000000000000011de68a167d5dad115a96be80"),
             // GetMedianTimePast of block 944183 (Core getblockheader.mediantime).
             // Seeds the post-snapshot MTP window so blocks 944184..~944194 enforce

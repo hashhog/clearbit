@@ -4427,9 +4427,100 @@ pub const ChainState = struct {
             self.chain_tx_count = 1;
             return;
         }
-        if (self.getCumulativeTxCount(self.best_height)) |c| {
-            if (c != 0) self.chain_tx_count = c;
+        // Absent entry = UNKNOWN (0), never the genesis seed: keeping the seed
+        // made the next connect report "1 + nTx" as the chain total.
+        self.chain_tx_count = self.getCumulativeTxCount(self.best_height) orelse 0;
+    }
+
+    /// Remove the "X:" entry for `height` (count unknown).  Best-effort.
+    pub fn deleteCumulativeTxCount(self: *ChainState, height: u32) void {
+        if (height == 0) return; // genesis is always 1 (see getCumulativeTxCount)
+        const db = self.utxo_set.db orelse return;
+        const key_bytes = ChainStore.buildTxCountKey(height);
+        db.delete(CF_DEFAULT, &key_bytes) catch return;
+    }
+
+    /// Marker: the "X:" index was (re)built by the parent-derived connect rule
+    /// from a genesis or chainparams anchor.  Absent on every datadir written
+    /// by the old running-counter code, whose entries cannot be trusted.
+    pub const TX_COUNT_INDEX_V2_KEY = "tx_count_index_v2";
+
+    /// Rebuild at most this many blocks at boot; above it the entries between
+    /// the anchor and the tip stay unknown (omitted, as Core omits an unknown
+    /// m_chain_tx_count) rather than stalling startup.
+    pub const TX_COUNT_REBUILD_MAX: u32 = 250_000;
+
+    /// One-time repair of a datadir whose "X:" index was written by the old
+    /// running counter (see connectBlockInner).  Those entries are wrong in two
+    /// ways that cannot be detected per-entry, so ALL of them are dropped, and
+    /// the index is rebuilt forward — exactly Core's LoadBlockIndex rule
+    /// (node/blockstorage.cpp:440-487: m_chain_tx_count is recomputed from
+    /// nTx, seeded only at genesis or at an assumeutxo base carrying a
+    /// chainparams m_chain_tx_count) — from the highest anchor on the active
+    /// chain: an assumeutxo / snapshot-bootstrap entry whose H:{height} is its
+    /// block hash, else genesis.  nTx comes from the stored block body; the
+    /// rebuild stops at the first missing body or height, leaving the rest
+    /// unknown.  Idempotent: a no-op once TX_COUNT_INDEX_V2_KEY is written.
+    /// Returns the number of heights rebuilt.
+    pub fn repairTxCountIndex(self: *ChainState, params: *const @import("consensus.zig").NetworkParams) u32 {
+        const db = self.utxo_set.db orelse return 0;
+        if (db.get(CF_DEFAULT, TX_COUNT_INDEX_V2_KEY) catch null) |m| {
+            self.allocator.free(m);
+            return 0;
         }
+        const tip = self.best_height;
+        // 1. Drop every non-genesis entry up to the tip (batched deletes).
+        {
+            var keys = std.ArrayList([ChainStore.TX_COUNT_KEY_LEN]u8).init(self.allocator);
+            defer keys.deinit();
+            var ops = std.ArrayList(BatchOp).init(self.allocator);
+            defer ops.deinit();
+            var h: u32 = 1;
+            while (h <= tip) {
+                keys.clearRetainingCapacity();
+                ops.clearRetainingCapacity();
+                const end = @min(tip, h +| 49_999);
+                var k = h;
+                while (k <= end) : (k += 1) keys.append(ChainStore.buildTxCountKey(k)) catch return 0;
+                for (keys.items) |*key| ops.append(.{ .delete = .{ .cf = CF_DEFAULT, .key = key } }) catch return 0;
+                db.writeBatch(ops.items) catch return 0;
+                if (end == std.math.maxInt(u32)) break;
+                h = end + 1;
+            }
+        }
+        // 2. Highest anchor on the active chain at or below the tip.
+        var anchor_h: u32 = 0;
+        var anchor_count: u64 = 1; // genesis: one coinbase on every network
+        for ([_][]const @import("consensus.zig").AssumeUtxoData{ params.assume_utxo, params.snapshot_bootstrap }) |list| {
+            for (list) |e| {
+                if (e.height > tip or e.height <= anchor_h or e.chain_tx_count == 0) continue;
+                const at = self.getBlockHashByHeight(e.height) orelse continue;
+                if (!std.mem.eql(u8, &at, &e.block_hash)) continue;
+                anchor_h = e.height;
+                anchor_count = e.chain_tx_count;
+            }
+        }
+        if (anchor_h != 0) self.putCumulativeTxCount(anchor_h, anchor_count);
+        // 3. Forward rebuild from the anchor (bounded).
+        var rebuilt: u32 = 0;
+        if (tip - anchor_h <= TX_COUNT_REBUILD_MAX) {
+            var count = anchor_count;
+            var h: u32 = anchor_h + 1;
+            while (h <= tip) : (h += 1) {
+                const hash = self.getBlockHashByHeight(h) orelse break;
+                const raw = (db.get(CF_BLOCKS, &hash) catch null) orelse break;
+                defer self.allocator.free(raw);
+                if (raw.len < 81) break;
+                var reader = serialize.Reader{ .data = raw[80..] };
+                const n_tx = reader.readCompactSize() catch break;
+                if (n_tx == 0) break;
+                count += n_tx;
+                self.putCumulativeTxCount(h, count);
+                rebuilt += 1;
+            }
+        }
+        db.put(CF_DEFAULT, TX_COUNT_INDEX_V2_KEY, "1") catch {};
+        return rebuilt;
     }
 
     /// Persist the genesis-scale nChainWork at `height` (CF_DEFAULT "W:").
@@ -6678,21 +6769,30 @@ pub const ChainState = struct {
         self.best_height = height;
 
         // m_chain_tx_count maintenance (Bitcoin Core CBlockIndex::m_chain_tx_count,
-        // chain.h:129 / SetChainTxCount validation.cpp).  Running cumulative
-        // count of all txs genesis..height = prev_cumulative + nTx(block).
-        // At genesis (height 0) Core seeds m_chain_tx_count = nTx; every later
-        // block adds its own nTx.  We keep the in-memory running counter and
-        // persist the per-height value (CF_DEFAULT "X:" index) so
-        // getchaintxstats can read the cumulative at both ends of its window
-        // and survive a restart.  Reorg-safe: the disconnect path rewinds the
-        // counter symmetrically.
+        // chain.h:129; validation.cpp ReceivedBlockTransactions:
+        // `pindex->m_chain_tx_count = prev_tx_sum(*pindex)` =
+        // pprev->m_chain_tx_count + nTx, and 0 = UNKNOWN when the parent's
+        // count is unknown).  Derived from the PARENT's persisted "X:" entry,
+        // never from a process-wide running counter: the old `+=` counter
+        // (a) was never rewound on disconnect, so every reorg permanently
+        // inflated every later count by the disconnected block's nTx, and
+        // (b) resumed from the genesis seed (1) after a --load-snapshot boot,
+        // so every post-snapshot count was "txs since the base" presented as a
+        // chain total (live mainnet: 110,707,364 vs Core 1,446,603,828).  A
+        // height-keyed entry is overwritten when a different block connects at
+        // that height, so the parent read below is always the active chain's.
         const block_ntx: u64 = @intCast(block.transactions.len);
-        if (height == 0) {
-            self.chain_tx_count = block_ntx;
+        const parent_count: ?u64 = if (height == 0) 0 else self.getCumulativeTxCount(height - 1);
+        if (parent_count != null and (height == 0 or parent_count.? != 0)) {
+            self.chain_tx_count = parent_count.? + block_ntx;
+            self.putCumulativeTxCount(height, self.chain_tx_count);
         } else {
-            self.chain_tx_count += block_ntx;
+            // Parent count unknown (snapshot without a chainparams count, or a
+            // hole): Core leaves m_chain_tx_count = 0 and getchaintxstats omits
+            // txcount.  Drop any stale entry a previous chain left here.
+            self.chain_tx_count = 0;
+            self.deleteCumulativeTxCount(height);
         }
-        self.putCumulativeTxCount(height, self.chain_tx_count);
 
         // nChainWork (Core GetBitsProof / GetBlockProof): genesis is seeded
         // with GetBlockProof(genesis); every later block adds its own proof.
