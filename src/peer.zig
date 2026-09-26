@@ -16,6 +16,7 @@ const wallet_mod = @import("wallet.zig");
 const addrman_mod = @import("addrman.zig");
 const chainwork_mod = @import("chainwork.zig");
 const historical_backfill_mod = @import("historical_backfill.zig");
+const localaddr = @import("localaddr.zig");
 
 pub const addChainWorkBE = chainwork_mod.addChainWorkBE;
 pub const workFromBits = chainwork_mod.workFromBits;
@@ -966,6 +967,19 @@ pub const Peer = struct {
     /// for this flag). Default true (the common full-relay case); set false on
     /// the feeler connect path before the handshake runs.
     relay_self: bool = true,
+
+    /// BIP-155: the peer sent `sendaddrv2` during the handshake, so addresses
+    /// we send it go out as `addrv2` (Core `Peer::m_wants_addrv2`).
+    wants_addrv2: bool = false,
+
+    /// When our own address is next announced to this peer, unix seconds
+    /// (Core `Peer::m_next_local_addr_send`); 0 = never sent yet, so the
+    /// first announcement goes out as soon as the gates allow it.
+    next_local_addr_send: i64 = 0,
+
+    /// Whether this peer's VERSION addr_recv has been fed to local-address
+    /// discovery yet (PeerManager.noteVersionAddrRecv runs once per peer).
+    local_addr_noted: bool = false,
 
     /// INBOUND addr token bucket (Core `Peer::m_addr_token_bucket`, init 1.0).
     /// Refilled by `elapsed * MAX_ADDR_RATE_PER_SECOND` (capped at
@@ -1923,8 +1937,12 @@ pub const Peer = struct {
                         // BIP-339: peer negotiated wtxid relay.
                         self.wtxid_relay_negotiated = true;
                     },
-                    .sendaddrv2, .sendheaders => {
-                        // Accept these during handshake but no action needed
+                    .sendaddrv2 => {
+                        // BIP-155: peer wants addrv2 (Core m_wants_addrv2).
+                        self.wants_addrv2 = true;
+                    },
+                    .sendheaders => {
+                        // Accept during handshake; no action needed
                     },
                     .sendcmpct => |sc| {
                         // BIP-152: validate version field.
@@ -2010,6 +2028,10 @@ pub const Peer = struct {
                     // violation; we ignore it, but its user_agent is an owned
                     // heap copy (#31) and must not leak.
                     .version => |sv| self.allocator.free(sv.user_agent),
+                    // BIP-155: peer wants addrv2 (Core m_wants_addrv2).
+                    .sendaddrv2 => {
+                        self.wants_addrv2 = true;
+                    },
                     else => {},
                 }
             }
@@ -3135,6 +3157,25 @@ pub const PeerManager = struct {
     /// in deinit() and on removeAddedNode().
     added_nodes: std.ArrayList([]const u8),
 
+    /// Our own address table (Core mapLocalHost); see localaddr.zig. Written
+    /// by the P2P thread, read by RPC getnetworkinfo; internally locked.
+    local_addrs: localaddr.LocalAddrTable = .{},
+    /// Core `-discover`: learn our public address from what outbound peers
+    /// report in VERSION addr_recv. Default on; main.zig turns it off when
+    /// `--externalip` is given unless `--discover` is passed explicitly.
+    discover: bool = true,
+    /// The port our P2P listener is bound to (Core GetListenPort); 0 = not
+    /// listening (Core fListen false). Set by startListening on success.
+    listen_port: u16 = 0,
+    /// Core-style IBD source for the self-announcement gate (MaybeSendAddr
+    /// checks `IsInitialBlockDownload()`). main.zig points it at the RPC
+    /// server's latched `isInitialBlockDownload`; null falls back to the
+    /// PeerManager download heuristic `isIBD()`.
+    ibd_ctx: ?*anyopaque = null,
+    ibd_fn: ?*const fn (*anyopaque) bool = null,
+    /// Last run-loop second the self-address sweep ran (throttle to 1/s).
+    last_local_addr_sweep: i64 = 0,
+
     /// Build the advertised local service flags this node announces in its
     /// outgoing VERSION handshakes — the manager-level mirror of
     /// `Peer.localServices()` (the per-peer accessor reads the same config
@@ -4083,6 +4124,7 @@ pub const PeerManager = struct {
         self.listener = try addr.listen(.{
             .reuse_address = true,
         });
+        self.listen_port = port;
     }
 
     /// Ban an IP address with a reason.
@@ -7875,6 +7917,171 @@ pub const PeerManager = struct {
         return n;
     }
 
+    // ------------------------------------------------------------------
+    // Self-address advertisement (Core net.cpp GetLocalAddrForPeer +
+    // net_processing.cpp MaybeSendAddr). The table itself is localaddr.zig.
+    // ------------------------------------------------------------------
+
+    /// Point the self-announcement IBD gate at a Core-style
+    /// IsInitialBlockDownload (main.zig wires the RPC server's latch).
+    pub fn setIbdSource(self: *PeerManager, ctx: *anyopaque, f: *const fn (*anyopaque) bool) void {
+        self.ibd_ctx = ctx;
+        self.ibd_fn = f;
+    }
+
+    fn selfAdvIbd(self: *PeerManager) bool {
+        if (self.ibd_fn) |f| {
+            if (self.ibd_ctx) |ctx| return f(ctx);
+        }
+        return self.isIBD();
+    }
+
+    /// Core fListen: we accept inbound connections on a known port.
+    pub fn listening(self: *const PeerManager) bool {
+        return self.listen_port != 0;
+    }
+
+    fn isRoutableIp16(ip: *const [16]u8) bool {
+        return isRoutable(localaddr.toStdAddress(ip, 0));
+    }
+
+    /// Record an `--externalip` address at LOCAL_MANUAL (Core AddLocal).
+    /// `port == 0` means the P2P listen port. Refuses (returns false) a
+    /// non-routable address, as Core's AddLocal does, or when there is no
+    /// port to advertise.
+    pub fn addExternalIp(self: *PeerManager, ip: [16]u8, port: u16) bool {
+        const p: u16 = if (port == 0) self.listen_port else port;
+        if (p == 0) return false;
+        if (!isRoutableIp16(&ip)) return false;
+        return self.local_addrs.addManual(ip, p);
+    }
+
+    /// Feed a peer's VERSION addr_recv (the address it sees us at) to
+    /// discovery. Outbound peers can create an entry; inbound peers only
+    /// score one that exists (Core SeenLocal). Only with --discover, only
+    /// while listening, and only when BOTH the peer and the reported address
+    /// are publicly routable (Core IsPeerAddrLocalGood). The entry is stored
+    /// with OUR listen port — an outbound peer only ever sees our ephemeral
+    /// source port. Score = distinct peer netgroups that confirmed it.
+    pub fn noteVersionAddrRecv(self: *PeerManager, peer: *const Peer, now: i64) void {
+        if (!self.discover or !self.listening()) return;
+        const v = peer.version_info orelse return;
+        if (!isRoutable(peer.address)) return;
+        if (!isRoutableIp16(&v.addr_recv.ip)) return;
+        _ = self.local_addrs.confirm(
+            v.addr_recv.ip,
+            self.listen_port,
+            self.getNetGroup(peer.address),
+            peer.direction == .outbound,
+            now,
+        );
+    }
+
+    pub const LocalAddrChoice = struct { ip: [16]u8, port: u16 };
+
+    /// Pick the address to advertise to `peer` (Core GetLocalAddrForPeer,
+    /// net.cpp:240-268): the best usable table entry for the peer's address
+    /// family; but when discovery is on and the peer told us a routable
+    /// address for us, use that instead if the table has nothing, and
+    /// otherwise at 1/2 odds (1/8 when the best entry scores above
+    /// LOCAL_MANUAL). For an INBOUND peer its view includes the port (it
+    /// dialed our listening port); for an outbound peer only the IP is taken.
+    pub fn localAddrForPeer(self: *PeerManager, peer: *const Peer, now: i64) ?LocalAddrChoice {
+        const peer_is_v4 = peer.address.any.family == std.posix.AF.INET;
+        const best_local = self.local_addrs.best(peer_is_v4, now);
+        var ip: [16]u8 = if (best_local) |b| b.ip else [_]u8{0} ** 16;
+        var port: u16 = if (best_local) |b| b.port else self.listen_port;
+        if (self.discover and isRoutable(peer.address)) {
+            if (peer.version_info) |v| {
+                if (isRoutableIp16(&v.addr_recv.ip)) {
+                    const bits: u6 = if (best_local != null and best_local.?.score > localaddr.LOCAL_MANUAL) 3 else 1;
+                    const mask: u64 = (@as(u64, 1) << bits) - 1;
+                    if (best_local == null or (std.crypto.random.int(u64) & mask) == 0) {
+                        ip = v.addr_recv.ip;
+                        if (peer.direction == .inbound) port = v.addr_recv.port;
+                    }
+                }
+            }
+        }
+        if (!isRoutableIp16(&ip) or port == 0) return null;
+        return .{ .ip = ip, .port = port };
+    }
+
+    /// Core MaybeSendAddr's self-announcement: if `peer` is due, send it ONE
+    /// addr (or addrv2 when it sent sendaddrv2) holding a single entry — our
+    /// address, the services we put in VERSION, time `now`, and the LISTEN
+    /// port. Only while listening and out of IBD; never to block-relay-only
+    /// or feeler connections (Core: m_addr_relay_enabled is false there).
+    /// IBD returns early WITHOUT arming the timer, so the first announcement
+    /// goes out on the first sweep after IBD ends. Returns true when sent.
+    pub fn maybeSendLocalAddr(self: *PeerManager, peer: *Peer, now: i64) bool {
+        return self.maybeSendLocalAddrGated(peer, now, null);
+    }
+
+    /// `is_ibd` lets the sweep evaluate IBD once for all peers (null = ask).
+    fn maybeSendLocalAddrGated(self: *PeerManager, peer: *Peer, now: i64, is_ibd: ?bool) bool {
+        if (!self.listening()) return false;
+        if (peer.state != .handshake_complete) return false;
+        switch (peer.conn_type) {
+            .block_relay, .feeler => return false,
+            else => {},
+        }
+        if (peer.next_local_addr_send != 0 and now < peer.next_local_addr_send) return false;
+        if (is_ibd orelse self.selfAdvIbd()) return false;
+        peer.next_local_addr_send = now +| localaddr.nextLocalAddrDelaySecs(std.crypto.random.float(f64));
+        const choice = self.localAddrForPeer(peer, now) orelse return false;
+        const services = peer.localServices();
+        // Clamp instead of @intCast: a pre-1970 or post-2106 clock must not trap.
+        const ts: u32 = @intCast(std.math.clamp(now, 0, std.math.maxInt(u32)));
+        if (peer.wants_addrv2) {
+            const is_v4 = localaddr.isIpv4Mapped(&choice.ip);
+            const entry = p2p.AddrV2Entry{
+                .timestamp = ts,
+                .services = services,
+                .network_id = if (is_v4) 1 else 2, // BIP-155 IPV4 / IPV6
+                .addr_bytes = if (is_v4) choice.ip[12..16] else choice.ip[0..16],
+                .port = choice.port,
+            };
+            const entries = [_]p2p.AddrV2Entry{entry};
+            const msg = p2p.Message{ .addrv2 = .{ .entries = &entries } };
+            peer.sendMessage(&msg) catch return false;
+        } else {
+            const addrs = [_]p2p.TimestampedAddr{.{
+                .timestamp = ts,
+                .addr = .{ .services = services, .ip = choice.ip, .port = choice.port },
+            }};
+            const msg = p2p.Message{ .addr = .{ .addrs = &addrs } };
+            peer.sendMessage(&msg) catch return false;
+        }
+        return true;
+    }
+
+    /// Run-loop hook (once per second): feed each new peer's addr_recv to
+    /// discovery, then announce our address to every peer that is due.
+    pub fn sweepLocalAddrs(self: *PeerManager, now: i64) void {
+        if (now == self.last_local_addr_sweep) return;
+        self.last_local_addr_sweep = now;
+        for (self.peers.items) |p| {
+            if (!p.local_addr_noted and p.version_info != null) {
+                p.local_addr_noted = true;
+                self.noteVersionAddrRecv(p, now);
+            }
+        }
+        if (!self.listening()) return;
+        // Evaluate IBD at most once per sweep, and only if some peer is due.
+        var ibd: ?bool = null;
+        for (self.peers.items) |p| {
+            if (p.next_local_addr_send != 0 and now < p.next_local_addr_send) continue;
+            if (ibd == null) ibd = self.selfAdvIbd();
+            _ = self.maybeSendLocalAddrGated(p, now, ibd);
+        }
+    }
+
+    /// Snapshot of the local address table for getnetworkinfo.
+    pub fn localAddresses(self: *PeerManager, out: []localaddr.LocalAddress) usize {
+        return self.local_addrs.list(out, std.time.timestamp());
+    }
+
     /// Send known addresses to a peer, capped at `cap` entries. `cap` is the
     /// getaddr 23%-cap (min(MAX_ADDR_TO_SEND, floor(0.23*size)), integer div) when answering a
     /// getaddr; callers that want the legacy behaviour pass MAX_ADDR_TO_SEND.
@@ -10475,6 +10682,12 @@ pub const PeerManager = struct {
                     if (self.data_dir) |dir| am.save(dir);
                 }
             }
+
+            // 6f. Self-address advertisement (Core MaybeSendAddr): discovery
+            //     from new peers' addr_recv, the first announcement right
+            //     after the handshake, and the 24h-average Poisson re-sends.
+            //     Throttled to once per second inside.
+            self.sweepLocalAddrs(std.time.timestamp());
 
             // 7. Peer rotation (skip if --connect mode)
             if (self.connect_address == null) {

@@ -15,6 +15,7 @@ const storage = @import("storage.zig");
 const mempool_mod = @import("mempool.zig");
 const mempool_persist = @import("mempool_persist.zig");
 const peer_mod = @import("peer.zig");
+const localaddr = @import("localaddr.zig");
 const p2p = @import("p2p.zig");
 const banlist = @import("banlist.zig");
 const serialize = @import("serialize.zig");
@@ -6875,7 +6876,7 @@ pub const RpcServer = struct {
         // Toggled by setnetworkactive; default true.
         const network_active_str: []const u8 = if (self.peer_manager.network_active) "true" else "false";
 
-        try writer.print("],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":{s},\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"onion\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"i2p\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"cjdns\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":{d:.8},\"incrementalfee\":{d:.8},\"localaddresses\":[],\"warnings\":[]}}", .{
+        try writer.print("],\"localrelay\":true,\"timeoffset\":0,\"networkactive\":{s},\"connections\":{d},\"connections_in\":{d},\"connections_out\":{d},\"networks\":[{{\"name\":\"ipv4\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"ipv6\",\"limited\":false,\"reachable\":true,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"onion\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"i2p\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}},{{\"name\":\"cjdns\",\"limited\":true,\"reachable\":false,\"proxy\":\"\",\"proxy_randomize_credentials\":false}}],\"relayfee\":{d:.8},\"incrementalfee\":{d:.8},\"localaddresses\":[", .{
             network_active_str,
             total,
             inbound,
@@ -6883,6 +6884,20 @@ pub const RpcServer = struct {
             relay_fee_btc,
             incremental_fee_btc,
         });
+        // localaddresses: our own advertised addresses (--externalip +
+        // discovered), Core rpc/net.cpp getnetworkinfo: [{address,port,score}].
+        {
+            var la_buf: [localaddr.LocalAddrTable.MAX_LIST]localaddr.LocalAddress = undefined;
+            const n_la = self.peer_manager.localAddresses(&la_buf);
+            for (la_buf[0..n_la], 0..) |la, idx| {
+                if (idx != 0) try writer.writeByte(',');
+                var ip_buf: [64]u8 = undefined;
+                try writer.print("{{\"address\":\"{s}\",\"port\":{d},\"score\":{d}}}", .{
+                    localaddr.formatIp(&la.ip, &ip_buf), la.port, la.score,
+                });
+            }
+        }
+        try writer.writeAll("],\"warnings\":[]}");
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -21870,6 +21885,14 @@ pub const RpcServer = struct {
         // Both conditions satisfied: latch sticky-OFF and report false.
         self.ibd_latched_off.store(true, .monotonic);
         return false;
+    }
+
+    /// Type-erased entry point so PeerManager's self-address advertisement
+    /// gate (Core MaybeSendAddr: `!IsInitialBlockDownload()`) uses this same
+    /// latched IBD state. Wired in main.zig via PeerManager.setIbdSource.
+    pub fn isInitialBlockDownloadTrampoline(ctx: *anyopaque) bool {
+        const self: *RpcServer = @ptrCast(@alignCast(ctx));
+        return self.isInitialBlockDownload();
     }
 
     /// Compare two 256-bit chain work values (little-endian representation).

@@ -18,6 +18,7 @@ pub const consensus = @import("consensus.zig");
 pub const validation = @import("validation.zig");
 pub const p2p = @import("p2p.zig");
 pub const peer = @import("peer.zig");
+pub const localaddr = @import("localaddr.zig");
 pub const mempool = @import("mempool.zig");
 pub const mempool_persist = @import("mempool_persist.zig");
 pub const block_template = @import("block_template.zig");
@@ -56,6 +57,17 @@ pub const Config = struct {
     /// Disabled with `--nofixedseeds` / `-fixedseeds=0`; also force-off in
     /// `--connect` peer-pinned mode (handled in PeerManager.run).
     fixed_seed: bool = true,
+    /// Core `-externalip=<ip>[:port]` (repeatable; each value may also be
+    /// comma-separated): our own public address(es) to advertise to peers at
+    /// LOCAL_MANUAL. A bare IP uses the P2P listen port. Borrowed argv
+    /// slices in a fixed backing array, like wallet_names_buf.
+    externalip_buf: [16][]const u8 = undefined,
+    externalip_len: usize = 0,
+    /// Core `-discover` (default on): learn our public address from what
+    /// outbound peers report in VERSION addr_recv. Soft-set off when
+    /// --externalip is given (init.cpp) unless --discover was explicit.
+    discover: bool = true,
+    discover_set: bool = false,
 
     // RPC
     rpc_bind: []const u8 = "127.0.0.1",
@@ -261,6 +273,13 @@ pub const ArgParseError = error{
     MissingValue,
 };
 
+/// Core init.cpp: `-externalip` soft-sets `-discover=0` unless `-discover`
+/// was given explicitly.
+pub fn effectiveDiscover(config: *const Config) bool {
+    if (config.externalip_len > 0 and !config.discover_set) return false;
+    return config.discover;
+}
+
 /// Parse command line arguments into config.
 /// CLI arguments override config file settings.
 pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!bool {
@@ -336,6 +355,22 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
                 return ArgParseError.InvalidArgument;
         } else if (std.mem.startsWith(u8, arg, "--connect=")) {
             config.connect = arg["--connect=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--externalip=") or std.mem.startsWith(u8, arg, "-externalip=")) {
+            const v = arg[std.mem.indexOfScalar(u8, arg, '=').? + 1 ..];
+            if (v.len == 0) return ArgParseError.MissingValue;
+            if (config.externalip_len >= config.externalip_buf.len) return ArgParseError.InvalidArgument;
+            config.externalip_buf[config.externalip_len] = v;
+            config.externalip_len += 1;
+        } else if (std.mem.eql(u8, arg, "--discover") or std.mem.eql(u8, arg, "-discover") or
+            std.mem.eql(u8, arg, "--discover=1") or std.mem.eql(u8, arg, "-discover=1"))
+        {
+            config.discover = true;
+            config.discover_set = true;
+        } else if (std.mem.eql(u8, arg, "--nodiscover") or std.mem.eql(u8, arg, "-nodiscover") or
+            std.mem.eql(u8, arg, "--discover=0") or std.mem.eql(u8, arg, "-discover=0"))
+        {
+            config.discover = false;
+            config.discover_set = true;
         } else if (std.mem.eql(u8, arg, "--nodnsseed") or std.mem.eql(u8, arg, "-nodnsseed")) {
             config.dns_seed = false;
         } else if (std.mem.eql(u8, arg, "--nofixedseeds") or std.mem.eql(u8, arg, "-nofixedseeds") or
@@ -564,6 +599,11 @@ pub fn printUsage() void {
         \\  --connect=<addr>       Connect only to specified peer
         \\  --nodnsseed            Disable DNS seeding
         \\  --nofixedseeds         Disable the hardcoded fixed-seed fallback
+        \\  --externalip=<ip>[:port]  Advertise this public address to peers
+        \\                         (repeatable / comma-separated; bare IP uses
+        \\                         --port). Implies --discover=0 unless given.
+        \\  --discover[=0|1]       Learn our public address from outbound
+        \\                         peers (default: 1 unless --externalip)
         \\
         \\RPC server options:
         \\  --rpcbind=<addr>       Bind RPC to address (default: 127.0.0.1)
@@ -2825,6 +2865,26 @@ pub fn main() !void {
         std.debug.print("Warning: could not start P2P listener on port {d}: {}\n", .{ config.listen_port, err });
     };
     std.debug.print("P2P listening on port {d}\n", .{config.listen_port});
+
+    // Self-address advertisement (Core -externalip / -discover / MaybeSendAddr).
+    // Core init.cpp: -externalip soft-sets -discover=0.
+    peer_manager.discover = effectiveDiscover(&config);
+    peer_manager.setIbdSource(@ptrCast(&rpc_server), rpc.RpcServer.isInitialBlockDownloadTrampoline);
+    for (config.externalip_buf[0..config.externalip_len]) |raw| {
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |one| {
+            const parsed = localaddr.parseExternalIp(one) orelse {
+                std.debug.print("Error: invalid --externalip address '{s}'\n", .{one});
+                std.process.exit(1);
+            };
+            if (peer_manager.addExternalIp(parsed.ip, parsed.port)) {
+                std.debug.print("externalip: advertising {s} (listen port {d})\n", .{ one, peer_manager.listen_port });
+            } else {
+                std.debug.print("Warning: --externalip={s} is not publicly routable or we are not listening; ignored\n", .{one});
+            }
+        }
+    }
+    std.debug.print("P2P self-advertisement: discover={} externalip={d}\n", .{ peer_manager.discover, config.externalip_len });
     std.debug.print("RPC server on {s}:{d}\n", .{ config.rpc_bind, config.rpc_port });
 
     // Load persisted ban list from disk (W99/G3 fix). Without this, every

@@ -74,7 +74,7 @@
 //!   Reference: Core net_processing.cpp ProcessMessage("addrv2"):
 //!              NET_IPV6 handling must call addrman.Add().
 //!
-//! BUG-6  (G6,  HIGH): addrv2 negotiation flag (m_wants_addrv2) is NOT tracked
+//! BUG-6  (G6,  HIGH) [FIXED: Peer.wants_addrv2]: addrv2 negotiation flag (m_wants_addrv2) was NOT tracked
 //!   per-peer.  Core's CNode::m_wants_addrv2 records whether a peer sent
 //!   sendaddrv2, so we know whether to reply to getaddr with addrv2 or old addr.
 //!   The Peer struct in peer.zig has no such field; line 1450 says
@@ -376,22 +376,16 @@ test "W117/G5-bug: addrv2 handler only frees entries slice, not addr_bytes conte
     try testing.expectEqual(@as(u8, 5), entry.network_id);
 }
 
-test "W117/G6-bug: Peer struct missing m_wants_addrv2 flag" {
-    // BUG-6: Core tracks CNode::m_wants_addrv2 so it knows whether to send
-    // addr or addrv2 in response to getaddr.  Clearbit's Peer struct has no
-    // such field.  The sendaddrv2 message during handshake is accepted but
-    // no state is updated.
-    //
-    // We verify via compile-time inspection that Peer has relevant fields
-    // (wtxid_relay_negotiated exists, but no addrv2 equivalent).
+test "W117/G6-fixed: Peer tracks m_wants_addrv2 (sendaddrv2 during handshake)" {
+    // Was BUG-6 (pinned as "field missing"). FIXED by the self-address
+    // advertisement work: Peer.wants_addrv2 (Core Peer::m_wants_addrv2) is
+    // set when the peer sends sendaddrv2 before verack, in both the outbound
+    // and inbound handshake loops, and PeerManager.maybeSendLocalAddr sends
+    // addrv2 instead of addr when it is set (tests_selfadv.zig proves the
+    // wire bytes).
     const peer_type = peer_mod.Peer;
-    // wtxid relay is tracked (proves the pattern is used for BIP-339)
     try testing.expect(@hasField(peer_type, "wtxid_relay_negotiated"));
-    // BUG-6: addrv2 negotiation is NOT tracked — none of these fields exist
-    try testing.expect(!@hasField(peer_type, "addrv2_negotiated"));
-    try testing.expect(!@hasField(peer_type, "wants_addrv2"));
-    try testing.expect(!@hasField(peer_type, "m_wants_addrv2"));
-    try testing.expect(!@hasField(peer_type, "send_addrv2"));
+    try testing.expect(@hasField(peer_type, "wants_addrv2"));
 }
 
 test "W117/G7: sendaddrv2 message encode round-trips correctly" {
