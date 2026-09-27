@@ -1084,6 +1084,18 @@ fn decodeWifToPubkey(allocator: std.mem.Allocator, wif: []const u8) ![]const u8 
 
 /// Decode extended key (xpub/xprv) and derive the public key at the specified index
 fn decodeExtendedKeyToPubkey(allocator: std.mem.Allocator, key_str: []const u8, path: []const u32, derive_type: DeriveType, index: u32, is_xprv: bool) ![]const u8 {
+    const d = try deriveExtendedKey(allocator, key_str, path, derive_type, index, is_xprv);
+    const result = try allocator.alloc(u8, 33);
+    @memcpy(result, &d.pubkey);
+    return result;
+}
+
+/// A BIP-32 derivation result: the derived key pair plus the ROOT (serialized)
+/// key's pubkey, whose hash160 prefix is Core's origin fingerprint for an
+/// extended key written without an explicit [origin].
+pub const ExtDerived = struct { pubkey: [33]u8, privkey: ?[32]u8, root_pubkey: [33]u8 };
+
+fn deriveExtendedKey(allocator: std.mem.Allocator, key_str: []const u8, path: []const u32, derive_type: DeriveType, index: u32, is_xprv: bool) !ExtDerived {
     // BIP-32 extended keys carry a 4-BYTE version prefix — unlike the 1-byte
     // address version that base58CheckDecode strips — so decode RAW and verify
     // both the 4-byte double-SHA256 checksum and the 4-byte version ourselves.
@@ -1151,6 +1163,8 @@ fn decodeExtendedKeyToPubkey(allocator: std.mem.Allocator, key_str: []const u8, 
         // xpub: key_data is 33-byte compressed public key
         @memcpy(&current_pubkey, key_data[0..33]);
     }
+
+    const root_pubkey = current_pubkey;
 
     // Derive along the path
     for (path) |child_index| {
@@ -1252,10 +1266,92 @@ fn decodeExtendedKeyToPubkey(allocator: std.mem.Allocator, key_str: []const u8, 
         }
     }
 
-    // Return the final public key
-    const result = try allocator.alloc(u8, 33);
-    @memcpy(result, &current_pubkey);
-    return result;
+    return .{
+        .pubkey = current_pubkey,
+        .privkey = if (is_xprv) current_key else null,
+        .root_pubkey = root_pubkey,
+    };
+}
+
+/// Everything a signing provider needs from one key expression at `index`
+/// (Core descriptor.cpp PubkeyProvider::GetPubKey + GetPrivKey):
+///   pubkey       the derived public key (33 or 65 bytes, owned)
+///   privkey      the derived secret, when the expression carries one
+///   fingerprint/path  the KeyOriginInfo Core records: an explicit [origin]
+///                is prefixed to the derivation steps; without one, an
+///                extended key's own fingerprint (hash160(root pubkey)[0..4])
+///                and a bare key's hash160(pubkey)[0..4] with an empty path.
+pub const ResolvedKey = struct {
+    pubkey: []u8,
+    privkey: ?[32]u8,
+    fingerprint: [4]u8,
+    path: []u32,
+
+    pub fn deinit(self: *ResolvedKey, allocator: std.mem.Allocator) void {
+        allocator.free(self.pubkey);
+        allocator.free(self.path);
+        if (self.privkey) |*k| @memset(k, 0);
+    }
+};
+
+pub fn resolveKey(allocator: std.mem.Allocator, key: Key, index: u32) !ResolvedKey {
+    var steps = std.ArrayList(u32).init(allocator);
+    defer steps.deinit();
+    var pubkey: []u8 = undefined;
+    var privkey: ?[32]u8 = null;
+    var own_fp: [4]u8 = undefined;
+    switch (key.key) {
+        .pubkey => |p| {
+            const pk = try decodeHex(allocator, p.data);
+            pubkey = @constCast(pk);
+            const h = crypto.hash160(pubkey);
+            @memcpy(&own_fp, h[0..4]);
+        },
+        .wif => |wif| {
+            const pk = try decodeWifToPubkey(allocator, wif);
+            pubkey = @constCast(pk);
+            privkey = try decodeWifPrivkey(allocator, wif);
+            const h = crypto.hash160(pubkey);
+            @memcpy(&own_fp, h[0..4]);
+        },
+        .xpub, .xprv => {
+            const is_xprv = key.key == .xprv;
+            const kstr: []const u8 = if (is_xprv) key.key.xprv.key else key.key.xpub.key;
+            const kpath: []const u32 = if (is_xprv) key.key.xprv.path else key.key.xpub.path;
+            const kdt: DeriveType = if (is_xprv) key.key.xprv.derive_type else key.key.xpub.derive_type;
+            const d = try deriveExtendedKey(allocator, kstr, kpath, kdt, index, is_xprv);
+            pubkey = try allocator.dupe(u8, &d.pubkey);
+            privkey = d.privkey;
+            const h = crypto.hash160(&d.root_pubkey);
+            @memcpy(&own_fp, h[0..4]);
+            try steps.appendSlice(kpath);
+            switch (kdt) {
+                .non_ranged => {},
+                .unhardened => try steps.append(index),
+                .hardened => try steps.append(index | 0x80000000),
+            }
+        },
+    }
+    errdefer allocator.free(pubkey);
+    var path = std.ArrayList(u32).init(allocator);
+    errdefer path.deinit();
+    var fp = own_fp;
+    if (key.origin) |o| {
+        fp = o.fingerprint;
+        try path.appendSlice(o.path);
+    }
+    try path.appendSlice(steps.items);
+    return .{ .pubkey = pubkey, .privkey = privkey, .fingerprint = fp, .path = try path.toOwnedSlice() };
+}
+
+fn decodeWifPrivkey(allocator: std.mem.Allocator, wif: []const u8) ![32]u8 {
+    const decoded = address.base58CheckDecode(wif, allocator) catch return error.InvalidKeyExpression;
+    defer allocator.free(decoded.data);
+    if (decoded.version != 0x80 and decoded.version != 0xEF) return error.InvalidKeyExpression;
+    if (decoded.data.len != 32 and !(decoded.data.len == 33 and decoded.data[32] == 0x01)) return error.InvalidKeyExpression;
+    var out: [32]u8 = undefined;
+    @memcpy(&out, decoded.data[0..32]);
+    return out;
 }
 
 /// Resolve a key expression to a public key at the given derivation index

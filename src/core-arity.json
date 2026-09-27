@@ -75,8 +75,8 @@
   "sig": "deriveaddresses \"descriptor\" ( range )"
  },
  "descriptorprocesspsbt": {
-  "declared": 7,
-  "required": 4,
+  "declared": 5,
+  "required": 2,
   "sig": "descriptorprocesspsbt \"psbt\" [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] ( \"sighashtype\" bip32derivs finalize )"
  },
  "disconnectnode": {
@@ -341,7 +341,7 @@
  },
  "prioritisetransaction": {
   "declared": 3,
-  "required": 1,
+  "required": 3,
   "sig": "prioritisetransaction \"txid\" ( dummy ) fee_delta"
  },
  "pruneblockchain": {
@@ -400,7 +400,7 @@
   "sig": "signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":amount},...] \"sighashtype\" )"
  },
  "stop": {
-  "declared": 0,
+  "declared": 1,
   "required": 0,
   "sig": "stop"
  },
@@ -430,7 +430,7 @@
   "sig": "uptime"
  },
  "utxoupdatepsbt": {
-  "declared": 4,
+  "declared": 2,
   "required": 1,
   "sig": "utxoupdatepsbt \"psbt\" ( [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] )"
  },

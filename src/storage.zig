@@ -4842,6 +4842,30 @@ pub const ChainState = struct {
         return pruned;
     }
 
+    /// Manual prune (Core PruneBlockFilesManual via the pruneblockchain RPC):
+    /// delete block data for every height in (prune_height, target] and
+    /// advance the watermark.  Unlike `pruneToTarget` there is no size stop and
+    /// no batch cap — the operator asked for exactly this height.  The caller
+    /// clamps `target` to best_height - MIN_BLOCKS_TO_KEEP.  Returns the number
+    /// of heights pruned.
+    pub fn pruneToHeight(self: *ChainState, target: u32) u32 {
+        if (self.prune_target_mib == 0) return 0;
+        if (target <= self.prune_height) return 0;
+        const db = self.utxo_set.db;
+        var pruned: u32 = 0;
+        var h: u32 = self.prune_height + 1;
+        while (h <= target) : (h += 1) {
+            if (db) |d| {
+                if (self.getBlockHashByHeight(h)) |hash| {
+                    d.delete(CF_BLOCKS, &hash) catch {};
+                }
+            }
+            self.prune_height = h;
+            pruned += 1;
+        }
+        return pruned;
+    }
+
     /// Convenience: returns true if the given height has been pruned
     /// (i.e. is at or below the prune watermark). Used by getblock RPC
     /// to return a "block not available (pruned data)" error rather

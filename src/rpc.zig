@@ -14,6 +14,8 @@ const types = @import("types.zig");
 const storage = @import("storage.zig");
 const mempool_mod = @import("mempool.zig");
 const mempool_persist = @import("mempool_persist.zig");
+const addr_error = @import("addr_error.zig");
+const psbt_process = @import("psbt_process.zig");
 const peer_mod = @import("peer.zig");
 const localaddr = @import("localaddr.zig");
 const p2p = @import("p2p.zig");
@@ -200,6 +202,8 @@ pub const RPC_VERIFY_ERROR: i32 = -25;
 pub const RPC_VERIFY_REJECTED: i32 = -26;
 pub const RPC_VERIFY_ALREADY_IN_CHAIN: i32 = -27;
 pub const RPC_IN_WARMUP: i32 = -28;
+/// Core protocol.h RPC_CLIENT_IN_INITIAL_DOWNLOAD — "still downloading initial blocks".
+pub const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
 
 /// P2P client errors (mirror bitcoin-core/src/rpc/protocol.h RPCErrorCode).
 /// `addnode "add"` for a node already on the added-node list
@@ -3305,6 +3309,10 @@ pub const RpcServer = struct {
             return self.handleDumpMempool(params, id);
         } else if (std.mem.eql(u8, method, "loadmempool")) {
             return self.handleLoadMempool(params, id);
+        } else if (std.mem.eql(u8, method, "importmempool")) {
+            return self.handleImportMempool(params, id);
+        } else if (std.mem.eql(u8, method, "pruneblockchain")) {
+            return self.handlePruneBlockchain(params, id);
         } else if (std.mem.eql(u8, method, "sendrawtransaction")) {
             return self.handleSendRawTransaction(params, id);
         } else if (std.mem.eql(u8, method, "getrawtransaction")) {
@@ -3332,6 +3340,10 @@ pub const RpcServer = struct {
         } else if (std.mem.eql(u8, method, "clearbanned")) {
             return self.handleClearBanned(id);
         } else if (std.mem.eql(u8, method, "stop")) {
+            // Core rpc/server.cpp:155: a hidden optional NUM `wait` arg; the
+            // central type check rejects a non-number with -3 BEFORE the
+            // shutdown is requested (a malformed stop must not stop the node).
+            if (try self.checkArgType(params, 0, "wait", .number, true, id)) |resp| return resp;
             self.stop();
             return self.jsonRpcResult("\"clearbit stopping\"", id);
         }
@@ -3404,6 +3416,12 @@ pub const RpcServer = struct {
             return self.handleAnalyzePsbt(params, id);
         } else if (std.mem.eql(u8, method, "combinepsbt")) {
             return self.handleCombinePsbt(params, id);
+        } else if (std.mem.eql(u8, method, "joinpsbts")) {
+            return self.handleJoinPsbts(params, id);
+        } else if (std.mem.eql(u8, method, "utxoupdatepsbt")) {
+            return self.handleUtxoUpdatePsbt(params, id);
+        } else if (std.mem.eql(u8, method, "descriptorprocesspsbt")) {
+            return self.handleDescriptorProcessPsbt(params, id);
         } else if (std.mem.eql(u8, method, "finalizepsbt")) {
             return self.handleFinalizePsbt(params, id);
         } else if (std.mem.eql(u8, method, "converttopsbt")) {
@@ -4654,6 +4672,146 @@ pub const RpcServer = struct {
         );
         defer self.allocator.free(msg);
         return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
+    }
+
+    /// Core univalue `uvTypeName` for a parsed JSON value.
+    pub fn uvTypeName(v: std.json.Value) []const u8 {
+        return switch (v) {
+            .null => "null",
+            .bool => "bool",
+            .object => "object",
+            .array => "array",
+            .string => "string",
+            .integer, .float, .number_string => "number",
+        };
+    }
+
+    /// JSON types Core's RPCArg::MatchesType distinguishes (rpc/util.cpp
+    /// ExpectedType): STR/STR_HEX -> string, NUM -> number, BOOL -> bool,
+    /// OBJ* -> object, ARR -> array.
+    pub const ArgType = enum { string, number, bool, object, array };
+
+    fn argTypeMatches(v: std.json.Value, t: ArgType) bool {
+        return switch (t) {
+            .string => v == .string,
+            .number => v == .integer or v == .float or v == .number_string,
+            .bool => v == .bool,
+            .object => v == .object,
+            .array => v == .array,
+        };
+    }
+
+    /// Core RPCHelpMan::HandleRequest central type check (rpc/util.cpp:647-657),
+    /// for ONE positional argument: runs before the method body, skips an
+    /// omitted/null OPTIONAL argument, and on mismatch throws RPC_TYPE_ERROR
+    /// (-3) "Wrong type passed:\n{\n    \"Position N (name)\": \"JSON value of
+    /// type T is not of expected type E\"\n}".  Returns the rendered error
+    /// body, or null when the argument is acceptable.
+    pub fn checkArgType(
+        self: *RpcServer,
+        params: std.json.Value,
+        pos: usize,
+        name: []const u8,
+        t: ArgType,
+        optional: bool,
+        id: ?std.json.Value,
+    ) !?[]const u8 {
+        // A non-array params value carries no positional args: every position
+        // reads as null, so a REQUIRED arg fails here and callers may index
+        // `params.array` safely after a required-arg check passes.
+        const v: std.json.Value = if (params == .array and pos < params.array.items.len) params.array.items[pos] else .null;
+        if (optional and v == .null) return null;
+        if (argTypeMatches(v, t)) return null;
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "Wrong type passed:\n{{\n    \"Position {d} ({s})\": \"JSON value of type {s} is not of expected type {s}\"\n}}",
+            .{ pos + 1, name, uvTypeName(v), @tagName(t) },
+        );
+        defer self.allocator.free(msg);
+        return try self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
+    }
+
+    /// One positional argument as Core's RPCHelpMan declares it.  `t == null`
+    /// is an argument Core does not type-check centrally (AMOUNT, RANGE, or
+    /// `skip_type_check`).
+    pub const ArgSpec = struct { name: []const u8, t: ?ArgType, optional: bool = true };
+
+    /// Core RPCHelpMan::HandleRequest's full central type check: EVERY
+    /// mismatching position is collected into one -3 "Wrong type passed:"
+    /// object, in position order, exactly as UniValue::write(4) renders it.
+    pub fn checkArgs(self: *RpcServer, params: std.json.Value, specs: []const ArgSpec, id: ?std.json.Value) !?[]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const w = buf.writer();
+        var n: usize = 0;
+        for (specs, 0..) |sp, pos| {
+            const t = sp.t orelse continue;
+            const v: std.json.Value = if (params == .array and pos < params.array.items.len) params.array.items[pos] else .null;
+            if (sp.optional and v == .null) continue;
+            if (argTypeMatches(v, t)) continue;
+            try w.writeAll(if (n == 0) "Wrong type passed:\n{\n" else ",\n");
+            try w.print("    \"Position {d} ({s})\": \"JSON value of type {s} is not of expected type {s}\"", .{ pos + 1, sp.name, uvTypeName(v), @tagName(t) });
+            n += 1;
+        }
+        if (n == 0) return null;
+        try w.writeAll("\n}");
+        return try self.jsonRpcError(RPC_TYPE_ERROR, buf.items, id);
+    }
+
+    /// Result of `parseHexV`: owned decoded bytes, or the finished error body.
+    pub const HexArg = union(enum) { bytes: []u8, response: []const u8 };
+
+    /// Core `IsHex`: non-empty, even length, every char a hex digit.  Strict —
+    /// unlike std.fmt.parseInt it accepts no sign and no '_' separators.
+    pub fn isCoreHex(s: []const u8) bool {
+        if (s.len == 0 or s.len % 2 != 0) return false;
+        for (s) |c| {
+            if (!std.ascii.isHex(c)) return false;
+        }
+        return true;
+    }
+
+    /// Core ParseHexV (rpc/util.cpp:130-137): a string that is not IsHex is
+    /// RPC_INVALID_PARAMETER (-8) "<name> must be hexadecimal string (not
+    /// '<str>')" — NOT a deserialization error; -22 is reserved for bytes
+    /// that decode but do not deserialize.  A non-string is -3 (the central
+    /// type check Core runs before the handler).  On success the caller owns
+    /// `.bytes`.
+    pub fn parseHexV(self: *RpcServer, v: std.json.Value, name: []const u8, id: ?std.json.Value) !HexArg {
+        if (v != .string) return .{ .response = try self.typeErrorNotString(v, id) };
+        const s = v.string;
+        if (!isCoreHex(s)) {
+            const msg = try std.fmt.allocPrint(self.allocator, "{s} must be hexadecimal string (not '{s}')", .{ name, s });
+            defer self.allocator.free(msg);
+            return .{ .response = try self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id) };
+        }
+        const out = try self.allocator.alloc(u8, s.len / 2);
+        _ = std.fmt.hexToBytes(out, s) catch unreachable; // isCoreHex checked every char
+        return .{ .bytes = out };
+    }
+
+    /// Core ParseHashV (rpc/util.cpp:113-125) for an in-object/in-array
+    /// string: -8 "<name> must be of length 64 (not N, for 'S')" or
+    /// "<name> must be hexadecimal string (not 'S')"; returns the INTERNAL
+    /// (reversed) byte order.  A non-string is -3.
+    pub fn parseHashV(self: *RpcServer, v: std.json.Value, name: []const u8, id: ?std.json.Value) !HashArg {
+        if (v != .string) return .{ .response = try self.typeErrorNotString(v, id) };
+        const hex = v.string;
+        if (hex.len != 64) {
+            const msg = try std.fmt.allocPrint(self.allocator, "{s} must be of length 64 (not {d}, for '{s}')", .{ name, hex.len, hex });
+            defer self.allocator.free(msg);
+            return .{ .response = try self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id) };
+        }
+        if (!isCoreHex(hex)) {
+            const msg = try std.fmt.allocPrint(self.allocator, "{s} must be hexadecimal string (not '{s}')", .{ name, hex });
+            defer self.allocator.free(msg);
+            return .{ .response = try self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id) };
+        }
+        var be: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&be, hex) catch unreachable;
+        var hash: types.Hash256 = undefined;
+        for (0..32) |i| hash[i] = be[31 - i];
+        return .{ .hash = hash };
     }
 
     /// Parse a wait-family `timeout` param (Core `getInt<int>()` parity).
@@ -6002,19 +6160,21 @@ pub const RpcServer = struct {
     /// emit and drop from the worklist.  Return early if the worklist is empty.
     /// Otherwise (mempool_only==false) the index must be available + synced,
     /// else RPC_MISC_ERROR; for each remaining outpoint, look it up in the index.
-    fn handleGetTxSpendingPrevout(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // ── [0] outputs array (required, non-empty) ──────────────────────────
-        const output_params: []const std.json.Value = blk: {
-            if (params) |p| {
-                if (p == .array and p.array.items.len > 0 and p.array.items[0] == .array) {
-                    break :blk p.array.items[0].array.items;
-                }
-            }
-            // Either no params at all or params[0] is not an array → Core's
-            // get_array() would throw a type error; we surface the same family.
-            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, outputs are missing", id);
-        };
-        // Core: if (output_params.empty()) throw "Invalid parameter, outputs are missing".
+    fn handleGetTxSpendingPrevout(self: *RpcServer, params_opt: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Core rpc/mempool.cpp gettxspendingprevout, in Core's order:
+        //   central type check: outputs ARR (required), options OBJ (optional) -> -3
+        //   empty outputs -> -8 "Invalid parameter, outputs are missing"
+        //   RPCTypeCheckObj(options, {mempool_only, return_spending_tx}, allowNull, strict) -> -3
+        //   per output: get_obj (-3), RPCTypeCheckObj({txid STR, vout NUM}, strict) (-3,
+        //   keys visited in std::map order), ParseHashO txid (-8), vout getInt<int>
+        //   (non-integral / out-of-int-range -> -1 "JSON integer out of range"),
+        //   vout < 0 -> -8.
+        const params: std.json.Value = params_opt orelse .null;
+        if (try self.checkArgs(params, &.{
+            .{ .name = "outputs", .t = .array, .optional = false },
+            .{ .name = "options", .t = .object, .optional = true },
+        }, id)) |resp| return resp;
+        const output_params: []const std.json.Value = params.array.items[0].array.items;
         if (output_params.len == 0) {
             return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, outputs are missing", id);
         }
@@ -6025,30 +6185,31 @@ pub const RpcServer = struct {
         // ── [1] options (optional, strict {mempool_only, return_spending_tx}) ─
         var mempool_only: bool = !index_available;
         var return_spending_tx: bool = false;
-        if (params) |p| {
-            if (p == .array and p.array.items.len >= 2 and p.array.items[1] != .null) {
-                const opts = p.array.items[1];
-                if (opts != .object) {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid options object", id);
-                }
-                var it = opts.object.iterator();
-                while (it.next()) |kv| {
-                    const k = kv.key_ptr.*;
-                    if (!std.mem.eql(u8, k, "mempool_only") and !std.mem.eql(u8, k, "return_spending_tx")) {
-                        const msg = std.fmt.allocPrint(self.allocator, "Invalid parameter {s}", .{k}) catch
-                            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter", id);
+        if (params.array.items.len >= 2 and params.array.items[1] == .object) {
+            const opts = params.array.items[1].object;
+            inline for (.{ "mempool_only", "return_spending_tx" }) |k| {
+                if (opts.get(k)) |v| {
+                    if (v != .bool and v != .null) {
+                        const msg = try std.fmt.allocPrint(self.allocator, "JSON value of type {s} for field " ++ k ++ " is not of expected type bool", .{uvTypeName(v)});
                         defer self.allocator.free(msg);
-                        return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                        return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
                     }
                 }
-                if (opts.object.get("mempool_only")) |v| {
-                    if (v != .bool) return self.jsonRpcError(RPC_INVALID_PARAMETER, "JSON value is not of expected type bool", id);
-                    mempool_only = v.bool;
+            }
+            var it = opts.iterator();
+            while (it.next()) |kv| {
+                const k = kv.key_ptr.*;
+                if (!std.mem.eql(u8, k, "mempool_only") and !std.mem.eql(u8, k, "return_spending_tx")) {
+                    const msg = try std.fmt.allocPrint(self.allocator, "Unexpected key {s}", .{k});
+                    defer self.allocator.free(msg);
+                    return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
                 }
-                if (opts.object.get("return_spending_tx")) |v| {
-                    if (v != .bool) return self.jsonRpcError(RPC_INVALID_PARAMETER, "JSON value is not of expected type bool", id);
-                    return_spending_tx = v.bool;
-                }
+            }
+            if (opts.get("mempool_only")) |v| {
+                if (v == .bool) mempool_only = v.bool;
+            }
+            if (opts.get("return_spending_tx")) |v| {
+                if (v == .bool) return_spending_tx = v.bool;
             }
         }
 
@@ -6063,41 +6224,49 @@ pub const RpcServer = struct {
 
         for (output_params) |raw| {
             if (raw != .object) {
-                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, output must be an object", id);
+                const msg = try std.fmt.allocPrint(self.allocator, "JSON value of type {s} is not of expected type object", .{uvTypeName(raw)});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
             }
-            // Strict: exactly txid + vout (Core RPCTypeCheckObj fStrict).
+            // RPCTypeCheckObj(fAllowNull=false): "txid" then "vout" (map order).
+            const txid_val: std.json.Value = raw.object.get("txid") orelse .null;
+            if (txid_val == .null) return self.jsonRpcError(RPC_TYPE_ERROR, "Missing txid", id);
+            if (txid_val != .string) {
+                const msg = try std.fmt.allocPrint(self.allocator, "JSON value of type {s} for field txid is not of expected type string", .{uvTypeName(txid_val)});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
+            }
+            const vout_val: std.json.Value = raw.object.get("vout") orelse .null;
+            if (vout_val == .null) return self.jsonRpcError(RPC_TYPE_ERROR, "Missing vout", id);
+            if (!argTypeMatches(vout_val, .number)) {
+                const msg = try std.fmt.allocPrint(self.allocator, "JSON value of type {s} for field vout is not of expected type number", .{uvTypeName(vout_val)});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
+            }
+            // fStrict: unknown keys.
             var oit = raw.object.iterator();
             while (oit.next()) |kv| {
                 const k = kv.key_ptr.*;
                 if (!std.mem.eql(u8, k, "txid") and !std.mem.eql(u8, k, "vout")) {
-                    const msg = std.fmt.allocPrint(self.allocator, "Invalid parameter {s}", .{k}) catch
-                        return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter", id);
+                    const msg = try std.fmt.allocPrint(self.allocator, "Unexpected key {s}", .{k});
                     defer self.allocator.free(msg);
-                    return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+                    return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
                 }
             }
-            const txid_val = raw.object.get("txid") orelse
-                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, missing txid", id);
-            if (txid_val != .string) return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, txid must be a string", id);
             const txid_hex = txid_val.string;
-            const vout_val = raw.object.get("vout") orelse
-                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, missing vout", id);
-            if (vout_val != .integer) return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, vout must be a number", id);
-            const n_output: i64 = vout_val.integer;
+            const txid: types.Hash256 = switch (try self.parseHashV(txid_val, "txid", id)) {
+                .hash => |h| h,
+                .response => |r| return r,
+            };
+            // getInt<int>: only an integral value inside int32 range.  (The
+            // old unchecked @intCast of a u32-overflowing vout panicked the
+            // node — "integer cast truncated bits" — and dropped the RPC.)
+            const n_output: i64 = switch (vout_val) {
+                .integer => |n| if (n >= std.math.minInt(i32) and n <= std.math.maxInt(i32)) n else return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
+                else => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
+            };
             if (n_output < 0) {
                 return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, vout cannot be negative", id);
-            }
-            if (txid_hex.len != 64) {
-                return self.jsonRpcError(RPC_INVALID_PARAMETER, "txid must be of length 64 (not hex)", id);
-            }
-            var txid: types.Hash256 = undefined;
-            for (0..32) |i| {
-                // Display (big-endian) hex → internal little-endian byte order.
-                const hi = std.fmt.charToDigit(txid_hex[i * 2], 16) catch
-                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "txid must be hexadecimal string", id);
-                const lo = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch
-                    return self.jsonRpcError(RPC_INVALID_PARAMETER, "txid must be hexadecimal string", id);
-                txid[31 - i] = (hi << 4) | lo;
             }
             try worklist.append(.{
                 .outpoint = .{ .hash = txid, .index = @intCast(n_output) },
@@ -6379,12 +6548,18 @@ pub const RpcServer = struct {
     /// Block hashes are emitted in DISPLAY (reversed) order via writeHashHex,
     /// matching Core's uint256.GetHex().
     fn handleScanBlocks(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // ── action dispatch (Core: action start/status/abort) ──────────────
-        var action: []const u8 = "";
-        if (params == .array and params.array.items.len >= 1) {
-            const a = params.array.items[0];
-            if (a == .string) action = a.string;
-        }
+        // ── action dispatch (Core rpc/blockchain.cpp scanblocks) ───────────
+        // Central type check first (-3), then status/abort/start, and any
+        // other action is RPC_INVALID_PARAMETER "Invalid action '<a>'".
+        if (try self.checkArgs(params, &.{
+            .{ .name = "action", .t = .string, .optional = false },
+            .{ .name = "scanobjects", .t = .array, .optional = true },
+            .{ .name = "start_height", .t = .number, .optional = true },
+            .{ .name = "stop_height", .t = .number, .optional = true },
+            .{ .name = "filtertype", .t = .string, .optional = true },
+            .{ .name = "options", .t = .object, .optional = true },
+        }, id)) |resp| return resp;
+        const action: []const u8 = params.array.items[0].string;
         if (std.mem.eql(u8, action, "status")) {
             // No background scan is tracked; Core returns NullUniValue.
             return self.jsonRpcResult("null", id);
@@ -6394,7 +6569,9 @@ pub const RpcServer = struct {
             return self.jsonRpcResult("false", id);
         }
         if (!std.mem.eql(u8, action, "start")) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid action; expected start/abort/status", id);
+            const msg = try std.fmt.allocPrint(self.allocator, "Invalid action '{s}'", .{action});
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         }
 
         // ── scanobjects (required for start; Core get_array on params[1]) ───
@@ -7765,79 +7942,35 @@ pub const RpcServer = struct {
     /// Returns boolean `true` on success. Deltas accumulate ("stack on
     /// previous ones" — txmempool.cpp:638) and a sum-to-zero result erases
     /// the entry from mapDeltas.
-    fn handlePrioritiseTransaction(self: *RpcServer, params: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // Param 0: txid (required hex string).
-        const txid_hex = blk: {
-            if (params) |p| {
-                if (p == .array and p.array.items.len > 0) {
-                    if (p.array.items[0] == .string) {
-                        break :blk p.array.items[0].string;
-                    }
-                }
-            }
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "prioritisetransaction requires (txid, dummy, fee_delta)", id);
+    fn handlePrioritiseTransaction(self: *RpcServer, params_opt: ?std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Core rpc/mining.cpp:524-533, in Core's order: central type check
+        // (txid STR_HEX, dummy NUM optional, fee_delta NUM) -> -3;
+        // ParseHashV(txid) -> -8; fee_delta getInt<int64_t> (a non-integral or
+        // out-of-range number -> -1 "JSON integer out of range"); only THEN
+        // the non-zero-dummy rejection (-8).
+        const params: std.json.Value = params_opt orelse .null;
+        if (try self.checkArgs(params, &.{
+            .{ .name = "txid", .t = .string, .optional = false },
+            .{ .name = "dummy", .t = .number, .optional = true },
+            .{ .name = "fee_delta", .t = .number, .optional = false },
+        }, id)) |resp| return resp;
+        const txid: types.Hash256 = switch (try self.parseHashV(params.array.items[0], "txid", id)) {
+            .hash => |h| h,
+            .response => |r| return r,
         };
-        if (txid_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid length", id);
-        }
-        var txid: types.Hash256 = undefined;
-        for (0..32) |i| {
-            const high = std.fmt.charToDigit(txid_hex[i * 2], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
-            };
-            const low = std.fmt.charToDigit(txid_hex[i * 2 + 1], 16) catch {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
-            };
-            // Bitcoin txids are displayed in reverse byte order
-            txid[31 - i] = (high << 4) | low;
-        }
-
-        // Param 1: dummy (BTC). Optional; must be 0 / null if present.
-        // Core (mining.cpp:529): "Priority is no longer supported, dummy
-        // argument to prioritisetransaction must be 0." Reject non-zero
-        // explicit values, accept null / omitted / 0.
-        if (params) |p| {
-            if (p == .array and p.array.items.len > 1) {
-                const dummy = p.array.items[1];
-                switch (dummy) {
-                    .null => {},
-                    .integer => |n| if (n != 0) {
-                        return self.jsonRpcError(RPC_INVALID_PARAMETER, "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.", id);
-                    },
-                    .float => |f| if (f != 0.0) {
-                        return self.jsonRpcError(RPC_INVALID_PARAMETER, "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.", id);
-                    },
-                    .number_string => |s| {
-                        // Treat any literal other than "0" / "0.0" as non-zero.
-                        if (!std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "0.0")) {
-                            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.", id);
-                        }
-                    },
-                    else => return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid dummy parameter type", id),
-                }
-            }
-        }
-
-        // Param 2: fee_delta (required i64 satoshis).
-        const delta_sats: i64 = blk2: {
-            if (params) |p| {
-                if (p == .array and p.array.items.len > 2) {
-                    const v = p.array.items[2];
-                    switch (v) {
-                        .integer => |n| break :blk2 n,
-                        .float => |f| break :blk2 @as(i64, @intFromFloat(f)),
-                        .number_string => |s| {
-                            const parsed = std.fmt.parseInt(i64, s, 10) catch {
-                                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid fee_delta", id);
-                            };
-                            break :blk2 parsed;
-                        },
-                        else => return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid fee_delta type", id),
-                    }
-                }
-            }
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "prioritisetransaction requires (txid, dummy, fee_delta)", id);
+        const delta_sats: i64 = switch (params.array.items[2]) {
+            .integer => |n| n,
+            else => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
         };
+        const dummy_nonzero: bool = switch (params.array.items[1]) {
+            .integer => |n| n != 0,
+            .float => |f| f != 0.0,
+            .number_string => |ns| (std.fmt.parseFloat(f64, ns) catch 1.0) != 0.0,
+            else => false, // null / omitted
+        };
+        if (dummy_nonzero) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.", id);
+        }
 
         // Apply the delta. Works whether or not the tx is in the mempool —
         // Core's PrioritiseTransaction sets the pending delta regardless
@@ -7984,6 +8117,111 @@ pub const RpcServer = struct {
             .{ result.accepted, result.expired, result.failed, result.total },
         );
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// `importmempool` — Core rpc/mempool.cpp importmempool.
+    ///   filepath STR (required), options OBJ (optional)          -3
+    ///   node still in initial block download                     -10
+    ///   option values must be bool                               -3
+    ///   LoadMempool false (unopenable / malformed file)          -1
+    ///     "Unable to import mempool file, see debug log for details."
+    /// Returns {} on success.  clearbit's loader always re-validates every
+    /// transaction and treats entry times as current, which is Core's
+    /// default (use_current_time=true); the two metadata-import options
+    /// (apply_fee_delta_priority / apply_unbroadcast_set) are accepted but the
+    /// fee-delta / unbroadcast metadata is not applied.
+    fn handleImportMempool(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (try self.checkArgs(params, &.{
+            .{ .name = "filepath", .t = .string, .optional = false },
+            .{ .name = "options", .t = .object, .optional = true },
+        }, id)) |resp| return resp;
+        if (self.isInitialBlockDownload()) {
+            return self.jsonRpcError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "Can only import the mempool after the block download and sync is done.", id);
+        }
+        if (params.array.items.len > 1 and params.array.items[1] == .object) {
+            const opts = params.array.items[1].object;
+            inline for (.{ "use_current_time", "apply_fee_delta_priority", "apply_unbroadcast_set" }) |k| {
+                if (opts.get(k)) |v| {
+                    if (v != .bool and v != .null) {
+                        const m = try std.fmt.allocPrint(self.allocator, "JSON value of type {s} is not of expected type bool", .{uvTypeName(v)});
+                        defer self.allocator.free(m);
+                        return self.jsonRpcError(RPC_TYPE_ERROR, m, id);
+                    }
+                }
+            }
+        }
+        const path = params.array.items[0].string;
+        const fail_msg = "Unable to import mempool file, see debug log for details.";
+        // Core's LoadMempool returns false for a file it cannot open; clearbit's
+        // loader treats a missing file as an empty dump, so probe first.
+        const f = std.fs.cwd().openFile(path, .{}) catch
+            return self.jsonRpcError(RPC_MISC_ERROR, fail_msg, id);
+        f.close();
+        _ = mempool_persist.loadMempool(self.mempool, path, self.allocator) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return self.jsonRpcError(RPC_MISC_ERROR, fail_msg, id);
+        };
+        return self.jsonRpcResult("{}", id);
+    }
+
+    /// `pruneblockchain` — Core rpc/blockchain.cpp pruneblockchain.
+    ///   height NUM (required)                                     -3
+    ///   not in prune mode                                        -1
+    ///   height getInt<int> (non-integral / out of range)          -1
+    ///   height < 0                                               -8
+    ///   height > 1e9 is a timestamp: first block with time >= ts-7200
+    ///     (none -> -8 "Could not find block with at least the specified timestamp.")
+    ///   chain shorter than the network's PruneAfterHeight        -1
+    ///   height > chain height                                    -8
+    ///   height within MIN_BLOCKS_TO_KEEP of the tip -> clamped
+    /// Returns the last pruned height, or -1 when nothing is pruned.
+    fn handlePruneBlockchain(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (try self.checkArgType(params, 0, "height", .number, false, id)) |resp| return resp;
+        const cs = self.chain_state;
+        if (cs.prune_target_mib == 0) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Cannot prune blocks because node is not in prune mode.", id);
+        }
+        var height_param: i64 = switch (params.array.items[0]) {
+            .integer => |n| if (n >= std.math.minInt(i32) and n <= std.math.maxInt(i32)) n else return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
+            else => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
+        };
+        if (height_param < 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Negative block height.", id);
+        }
+        const chain_height: u32 = cs.best_height;
+        if (height_param > 1_000_000_000) {
+            // FindEarliestAtLeast(ts - TIMESTAMP_WINDOW, 0): first active-chain
+            // block whose (max) time reaches the target.  Linear walk over the
+            // persisted headers; only reached with a timestamp argument.
+            const target: i64 = height_param - 7200;
+            var found: ?u32 = null;
+            var h: u32 = 0;
+            var max_time: i64 = 0;
+            while (h <= chain_height) : (h += 1) {
+                const hdr = cs.getHeaderAtHeight(h) orelse continue;
+                if (@as(i64, hdr.timestamp) > max_time) max_time = hdr.timestamp;
+                if (max_time >= target) {
+                    found = h;
+                    break;
+                }
+            }
+            height_param = found orelse
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Could not find block with at least the specified timestamp.", id);
+        }
+        const prune_after: u32 = if (self.network_params.magic == consensus.MAINNET.magic) 100_000 else 1_000;
+        if (chain_height < prune_after) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "Blockchain is too short for pruning.", id);
+        }
+        var height: u32 = @intCast(height_param);
+        if (height > chain_height) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Blockchain is shorter than the attempted prune height.", id);
+        }
+        const keep = storage.ChainState.MIN_BLOCKS_TO_KEEP;
+        if (height > chain_height - keep) height = chain_height - keep;
+        _ = cs.pruneToHeight(height);
+        const out = try std.fmt.allocPrint(self.allocator, "{d}", .{if (cs.prune_height > 0) @as(i64, cs.prune_height) else -1});
+        defer self.allocator.free(out);
+        return self.jsonRpcResult(out, id);
     }
 
     // ========================================================================
@@ -11053,23 +11291,15 @@ pub const RpcServer = struct {
     /// Params: [[rawtx1, rawtx2, ...], maxfeerate, maxburnamount]
     /// Returns JSON object with per-tx results keyed by wtxid (Core rpc/mempool.cpp).
     fn handleSubmitPackage(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // Extract parameters
-        if (params != .array or params.array.items.len == 0) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing required parameter: array of raw transactions", id);
-        }
-
-        // First param: array of raw transaction hex strings
+        // Core rpc/mempool.cpp submitpackage: central type check (-3), then
+        // 1..MAX_PACKAGE_COUNT transactions (-8), then each tx DecodeHexTx
+        // (-22 "TX decode failed: <hex> Make sure the tx has at least one input.").
+        if (try self.checkArgType(params, 0, "package", .array, false, id)) |resp| return resp;
         const tx_array = params.array.items[0];
-        if (tx_array != .array) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "First parameter must be array of hex strings", id);
-        }
-
-        if (tx_array.array.items.len == 0) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Package must contain at least one transaction", id);
-        }
-
-        if (tx_array.array.items.len > mempool_mod.MAX_PACKAGE_COUNT) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Package exceeds maximum transaction count (25)", id);
+        if (tx_array.array.items.len == 0 or tx_array.array.items.len > mempool_mod.MAX_PACKAGE_COUNT) {
+            const m = try std.fmt.allocPrint(self.allocator, "Array must contain between 1 and {d} transactions.", .{mempool_mod.MAX_PACKAGE_COUNT});
+            defer self.allocator.free(m);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, m, id);
         }
 
         // TODO: implement maxfeerate check per-tx
@@ -11089,30 +11319,18 @@ pub const RpcServer = struct {
         }
 
         for (tx_array.array.items) |item| {
-            if (item != .string) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "All package elements must be hex strings", id);
-            }
-
+            if (item != .string) return self.typeErrorNotString(item, id);
             const hex = item.string;
-            if (hex.len % 2 != 0) {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length in package", id);
-            }
-
-            if (hex.len == 0) {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Empty transaction in package", id);
+            const decode_fail = try std.fmt.allocPrint(self.allocator, "TX decode failed: {s} Make sure the tx has at least one input.", .{hex});
+            defer self.allocator.free(decode_fail);
+            if (!isCoreHex(hex)) {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_fail, id);
             }
 
             const raw = self.allocator.alloc(u8, hex.len / 2) catch {
                 return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
             };
-            errdefer self.allocator.free(raw);
-
-            for (0..raw.len) |i| {
-                raw[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
-                    self.allocator.free(raw);
-                    return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex character in package", id);
-                };
-            }
+            _ = std.fmt.hexToBytes(raw, hex) catch unreachable;
 
             // Track bytes for deferred cleanup
             tx_bytes_list.append(raw) catch {
@@ -11123,11 +11341,11 @@ pub const RpcServer = struct {
             // Deserialize transaction
             var reader = serialize.Reader{ .data = raw };
             const tx = serialize.readTransaction(&reader, self.allocator) catch {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed in package", id);
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_fail, id);
             };
 
-            if (tx.inputs.len == 0) {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Transaction has no inputs", id);
+            if (tx.inputs.len == 0 or reader.pos != raw.len) {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_fail, id);
             }
 
             transactions.append(tx) catch {
@@ -11210,8 +11428,21 @@ pub const RpcServer = struct {
     /// inputs: [{"txid": "<hex>", "vout": n}, ...]
     /// outputs: [{"<address>": amount}, ...] or [{"data": "<hex>"}]
     fn handleCreatePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (params != .array or params.array.items.len < 2) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "createpsbt requires inputs and outputs arrays", id);
+        // Core CreateTxDoc args + RPCHelpMan central type check (-3): inputs
+        // ARR (required), outputs skip_type_check, locktime NUM, replaceable
+        // BOOL, version NUM; then ConstructTransaction: a null outputs is -8,
+        // a non-array/non-object outputs is get_array's -3.
+        if (try self.checkArgs(params, &.{
+            .{ .name = "inputs", .t = .array, .optional = false },
+            .{ .name = "", .t = null },
+            .{ .name = "locktime", .t = .number, .optional = true },
+            .{ .name = "replaceable", .t = .bool, .optional = true },
+            .{ .name = "version", .t = .number, .optional = true },
+        }, id)) |resp| return resp;
+        {
+            const outs: std.json.Value = if (params.array.items.len > 1) params.array.items[1] else .null;
+            if (outs == .null) return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, output argument must be non-null", id);
+            if (outs != .array and outs != .object) return self.typeErrorNotArray(outs, id);
         }
 
         const inputs_param = params.array.items[0];
@@ -11266,30 +11497,35 @@ pub const RpcServer = struct {
         defer tx_inputs.deinit();
 
         for (inputs_param.array.items) |input_obj| {
+            // Core ConstructTransaction/AddInputs (rawtransaction_util.cpp),
+            // the SAME parser createrawtransaction uses: get_obj (-3),
+            // ParseHashO(o, "txid") (-3 non-string / -8 length or hex), vout
+            // !isNum -> -8 "missing vout key", then getInt<int> (-1) and sign
+            // (-8, below).
             if (input_obj != .object) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Each input must be an object with txid and vout", id);
+                const msg = try std.fmt.allocPrint(self.allocator, "JSON value of type {s} is not of expected type object", .{uvTypeName(input_obj)});
+                defer self.allocator.free(msg);
+                return self.jsonRpcError(RPC_TYPE_ERROR, msg, id);
             }
-
-            const txid_val = input_obj.object.get("txid") orelse {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Input missing txid", id);
+            const txid_val: std.json.Value = input_obj.object.get("txid") orelse .null;
+            const txid: types.Hash256 = switch (try self.parseHashV(txid_val, "txid", id)) {
+                .hash => |h| h,
+                .response => |r| return r,
             };
-            const vout_val = input_obj.object.get("vout") orelse {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Input missing vout", id);
-            };
-
-            if (txid_val != .string or txid_val.string.len != 64) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid format", id);
-            }
-            if (vout_val != .integer) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout format", id);
+            const vout_val: std.json.Value = input_obj.object.get("vout") orelse .null;
+            switch (vout_val) {
+                .integer => {},
+                .float, .number_string => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
+                else => return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, missing vout key", id),
             }
 
-            // Parse txid (displayed in big-endian, stored in little-endian)
-            var txid: types.Hash256 = undefined;
-            for (0..32) |i| {
-                txid[31 - i] = std.fmt.parseInt(u8, txid_val.string[i * 2 ..][0..2], 16) catch {
-                    return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
-                };
+            // Core reads vout with getInt<int>() — a 32-bit parse, so anything
+            // outside int32 is univalue's own -1 before the -8 domain check.
+            if (vout_val.integer < -2147483648 or vout_val.integer > 2147483647) {
+                return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
+            }
+            if (vout_val.integer < 0) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, vout cannot be negative", id);
             }
 
             // Parse sequence
@@ -11307,14 +11543,6 @@ pub const RpcServer = struct {
                 }
             }
 
-            // Core reads vout with getInt<int>() — a 32-bit parse, so anything
-            // outside int32 is univalue's own -1 before the -8 domain check.
-            if (vout_val.integer < -2147483648 or vout_val.integer > 2147483647) {
-                return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
-            }
-            if (vout_val.integer < 0) {
-                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, vout cannot be negative", id);
-            }
             try tx_inputs.append(types.TxIn{
                 .previous_output = .{
                     .hash = txid,
@@ -12015,18 +12243,123 @@ pub const RpcServer = struct {
     }
 
     /// Handle analyzepsbt RPC - analyze a PSBT and provide status.
+    /// Result of `decodePsbtArg`: the decoded PSBT (caller deinits), or the
+    /// finished error body.
+    const PsbtArg = union(enum) { psbt: psbt_mod.Psbt, response: []const u8 };
+
+    /// Core DecodeBase64PSBT (psbt.cpp) as the RPCs report it: a non-string
+    /// is -3 (central type check / get_str); bad base64 is -22 "TX decode
+    /// failed invalid base64"; bytes that do not deserialize as a PSBT are -22
+    /// "TX decode failed <reason>".  `prefix` is the RPC's own wording
+    /// ("TX decode failed " for combine/join/analyze/utxoupdate/descriptor-
+    /// process, which Core formats as "TX decode failed %s").
+    fn decodePsbtArg(self: *RpcServer, v: std.json.Value, id: ?std.json.Value) !PsbtArg {
+        if (v != .string) return .{ .response = try self.typeErrorNotString(v, id) };
+        const b64 = v.string;
+        const dec = std.base64.standard.Decoder;
+        const n = dec.calcSizeForSlice(b64) catch
+            return .{ .response = try self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed invalid base64", id) };
+        const raw = try self.allocator.alloc(u8, n);
+        defer self.allocator.free(raw);
+        dec.decode(raw, b64) catch
+            return .{ .response = try self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed invalid base64", id) };
+        const psbt = psbt_mod.Psbt.deserialize(self.allocator, raw) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            const msg = try std.fmt.allocPrint(self.allocator, "TX decode failed {s}", .{switch (err) {
+                error.InvalidMagic => "Invalid PSBT magic bytes: iostream error",
+                else => "PSBT deserialization failed: iostream error",
+            }});
+            defer self.allocator.free(msg);
+            return .{ .response = try self.jsonRpcError(RPC_DESERIALIZATION_ERROR, msg, id) };
+        };
+        return .{ .psbt = psbt };
+    }
+
+    /// Render a PSBT as a JSON string result (base64).
+    fn psbtResult(self: *RpcServer, psbt: *const psbt_mod.Psbt, id: ?std.json.Value) ![]const u8 {
+        const b64 = try psbt.toBase64(self.allocator);
+        defer self.allocator.free(b64);
+        const quoted = try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{b64});
+        defer self.allocator.free(quoted);
+        return self.jsonRpcResult(quoted, id);
+    }
+
+    /// Core PSBTRole order (psbt.h): CREATOR < UPDATER < SIGNER < FINALIZER < EXTRACTOR.
+    const PsbtRole = enum(u8) {
+        creator,
+        updater,
+        signer,
+        finalizer,
+        extractor,
+    };
+
+    /// Per-input analysis, following Core node/psbt.cpp AnalyzePSBT: no UTXO
+    /// -> updater; already final -> extractor; otherwise what Core's dummy
+    /// signer still lacks — a pubkey (reported as its hash160 under
+    /// missing.pubkeys), a redeem script (missing.redeemscript = the script
+    /// hash) or witness script (missing.witnessscript = its sha256) -> updater;
+    /// only signatures (missing.signatures) -> signer; nothing -> finalizer.
+    const InputAnalysis = struct {
+        role: PsbtRole,
+        missing_pubkey: ?[20]u8 = null,
+        missing_sig: ?[20]u8 = null,
+        missing_redeem: ?[20]u8 = null,
+        missing_witness: ?[32]u8 = null,
+    };
+
+    fn psbtAnalyzeInput(psbt: *const psbt_mod.Psbt, i: usize) InputAnalysis {
+        const input = &psbt.inputs[i];
+        if (input.isFinalized()) return .{ .role = .extractor };
+        var spk: ?[]const u8 = null;
+        if (input.witness_utxo) |u| spk = u.script_pubkey;
+        if (spk == null) {
+            if (input.non_witness_utxo) |t| {
+                const n = psbt.tx.inputs[i].previous_output.index;
+                if (n < t.outputs.len) spk = t.outputs[n].script_pubkey;
+            }
+        }
+        var script = spk orelse return .{ .role = .updater };
+        const have_sigs = input.partial_sigs.count() > 0 or input.tap_key_sig != null or input.tap_script_sigs.items.len > 0;
+        if (have_sigs) return .{ .role = .finalizer };
+        const is_p2sh = script.len == 23 and script[0] == 0xa9 and script[1] == 0x14 and script[22] == 0x87;
+        if (is_p2sh) {
+            const rs = input.redeem_script orelse {
+                var h: [20]u8 = undefined;
+                @memcpy(&h, script[2..22]);
+                return .{ .role = .updater, .missing_redeem = h };
+            };
+            script = rs;
+        }
+        const is_p2wsh = script.len == 34 and script[0] == 0x00 and script[1] == 0x20;
+        if (is_p2wsh) {
+            if (input.witness_script == null) {
+                var h: [32]u8 = undefined;
+                @memcpy(&h, script[2..34]);
+                return .{ .role = .updater, .missing_witness = h };
+            }
+            return .{ .role = .signer };
+        }
+        const is_p2wpkh = script.len == 22 and script[0] == 0x00 and script[1] == 0x14;
+        const is_p2pkh = script.len == 25 and script[0] == 0x76 and script[1] == 0xa9 and script[2] == 0x14;
+        if (is_p2wpkh or is_p2pkh) {
+            var keyid: [20]u8 = undefined;
+            @memcpy(&keyid, if (is_p2wpkh) script[2..22] else script[3..23]);
+            var it = input.bip32_derivation.keyIterator();
+            while (it.next()) |pk| {
+                if (std.mem.eql(u8, &crypto.hash160(pk), &keyid)) return .{ .role = .signer, .missing_sig = keyid };
+            }
+            return .{ .role = .updater, .missing_pubkey = keyid };
+        }
+        // Taproot / bare / other scripts: Core's dummy signer records nothing
+        // missing, which leaves the role at updater.
+        return .{ .role = .updater };
+    }
+
     fn handleAnalyzePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (params != .array or params.array.items.len == 0) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "analyzepsbt requires psbt string", id);
-        }
-
-        const psbt_param = params.array.items[0];
-        if (psbt_param != .string) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "PSBT must be a base64 string", id);
-        }
-
-        var psbt = psbt_mod.Psbt.fromBase64(self.allocator, psbt_param.string) catch {
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to decode PSBT", id);
+        if (try self.checkArgType(params, 0, "psbt", .string, false, id)) |resp| return resp;
+        var psbt = switch (try self.decodePsbtArg(params.array.items[0], id)) {
+            .psbt => |p| p,
+            .response => |r| return r,
         };
         defer psbt.deinit();
 
@@ -12036,98 +12369,295 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.writeAll("{\"inputs\":[");
-
-        for (psbt.inputs, 0..) |*input, i| {
-            if (i > 0) try writer.writeByte(',');
-            try writer.writeAll("{");
-
-            if (input.witness_utxo != null or input.non_witness_utxo != null) {
-                try writer.writeAll("\"has_utxo\":true,");
-            } else {
-                try writer.writeAll("\"has_utxo\":false,");
+        try writer.writeByte('{');
+        // Core: "inputs" only when non-empty; each input has_utxo, is_final,
+        // next (always); psbt-level next = min over inputs (extractor if none).
+        var overall: PsbtRole = .extractor;
+        if (psbt.inputs.len > 0) {
+            try writer.writeAll("\"inputs\":[");
+            for (psbt.inputs, 0..) |*input, i| {
+                if (i > 0) try writer.writeByte(',');
+                const has_utxo = input.witness_utxo != null or input.non_witness_utxo != null;
+                const final = has_utxo and input.isFinalized();
+                const an: InputAnalysis = if (!has_utxo) .{ .role = .updater } else psbtAnalyzeInput(&psbt, i);
+                if (@intFromEnum(an.role) < @intFromEnum(overall)) overall = an.role;
+                try writer.print("{{\"has_utxo\":{},\"is_final\":{},\"next\":\"{s}\"", .{ has_utxo, final, @tagName(an.role) });
+                if (an.missing_pubkey != null or an.missing_sig != null or an.missing_redeem != null or an.missing_witness != null) {
+                    try writer.writeAll(",\"missing\":{");
+                    var first_m = true;
+                    if (an.missing_pubkey) |h| {
+                        try writer.print("\"pubkeys\":[\"{s}\"]", .{std.fmt.fmtSliceHexLower(&h)});
+                        first_m = false;
+                    }
+                    if (an.missing_redeem) |h| {
+                        if (!first_m) try writer.writeByte(',');
+                        try writer.print("\"redeemscript\":\"{s}\"", .{std.fmt.fmtSliceHexLower(&h)});
+                        first_m = false;
+                    }
+                    if (an.missing_witness) |h| {
+                        if (!first_m) try writer.writeByte(',');
+                        try writer.print("\"witnessscript\":\"{s}\"", .{std.fmt.fmtSliceHexLower(&h)});
+                        first_m = false;
+                    }
+                    if (an.missing_sig) |h| {
+                        if (!first_m) try writer.writeByte(',');
+                        try writer.print("\"signatures\":[\"{s}\"]", .{std.fmt.fmtSliceHexLower(&h)});
+                    }
+                    try writer.writeByte('}');
+                }
+                try writer.writeByte('}');
             }
-
-            if (input.isFinalized()) {
-                try writer.writeAll("\"is_final\":true");
-            } else {
-                try writer.writeAll("\"is_final\":false");
-            }
-
-            try writer.writeByte('}');
+            try writer.writeAll("],");
         }
 
-        try writer.writeAll("],");
-
-        // Estimated fee
+        // Core reports `fee` whenever every input's UTXO is known.
         if (analysis.estimated_fee) |fee| {
-            try writer.print("\"estimated_feerate\":{d:.8},", .{@as(f64, @floatFromInt(fee)) / 100_000_000.0});
+            const neg = fee < 0;
+            const mag: u64 = @abs(fee);
+            try writer.print("\"fee\":{s}{d}.{d:0>8},", .{ if (neg) "-" else "", mag / 100_000_000, mag % 100_000_000 });
         }
 
-        try writer.print("\"next\":\"{s}\"", .{analysis.next_role});
-
+        try writer.print("\"next\":\"{s}\"", .{@tagName(overall)});
         try writer.writeByte('}');
 
         return self.jsonRpcResult(buf.items, id);
     }
 
-    /// Handle combinepsbt RPC - combine multiple PSBTs.
+    /// Handle combinepsbt RPC — Core rpc/rawtransaction.cpp combinepsbt:
+    /// empty array -> -8 "Parameter 'txs' cannot be empty"; each element
+    /// decoded (-22 "TX decode failed %s"); a single PSBT is returned as-is;
+    /// PSBTs over different unsigned transactions -> -8 "PSBTs not compatible
+    /// (different transactions)".
     fn handleCombinePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (params != .array or params.array.items.len == 0) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "combinepsbt requires array of PSBTs", id);
+        if (try self.checkArgType(params, 0, "txs", .array, false, id)) |resp| return resp;
+        const items = params.array.items[0].array.items;
+        if (items.len == 0) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Parameter 'txs' cannot be empty", id);
         }
 
-        const psbt_array = params.array.items[0];
-        if (psbt_array != .array or psbt_array.array.items.len < 2) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Must provide at least 2 PSBTs to combine", id);
-        }
-
-        // Parse all PSBTs
         var psbts = std.ArrayList(psbt_mod.Psbt).init(self.allocator);
         defer {
-            for (psbts.items) |*p| {
-                p.deinit();
-            }
+            for (psbts.items) |*p| p.deinit();
             psbts.deinit();
         }
-
-        for (psbt_array.array.items) |item| {
-            if (item != .string) {
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Each PSBT must be a base64 string", id);
+        for (items) |item| {
+            switch (try self.decodePsbtArg(item, id)) {
+                .psbt => |p| try psbts.append(p),
+                .response => |r| return r,
             }
-
-            const psbt = psbt_mod.Psbt.fromBase64(self.allocator, item.string) catch {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to decode PSBT", id);
-            };
-            try psbts.append(psbt);
         }
 
-        // Create pointer array for combine
-        var psbt_ptrs = try self.allocator.alloc(*psbt_mod.Psbt, psbts.items.len);
+        const txid0 = try crypto.computeTxid(&psbts.items[0].tx, self.allocator);
+        for (psbts.items[1..]) |*p| {
+            const t = try crypto.computeTxid(&p.tx, self.allocator);
+            if (!std.mem.eql(u8, &t, &txid0))
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "PSBTs not compatible (different transactions)", id);
+        }
+
+        const psbt_ptrs = try self.allocator.alloc(*psbt_mod.Psbt, psbts.items.len);
         defer self.allocator.free(psbt_ptrs);
-        for (psbts.items, 0..) |*p, i| {
-            psbt_ptrs[i] = p;
-        }
+        for (psbts.items, 0..) |*p, i| psbt_ptrs[i] = p;
 
-        // Combine
-        var combined = psbt_mod.Psbt.combine(self.allocator, psbt_ptrs) catch {
-            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to combine PSBTs", id);
+        var combined = psbt_mod.Psbt.combine(self.allocator, psbt_ptrs) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "PSBTs not compatible (different transactions)", id);
         };
         defer combined.deinit();
+        return self.psbtResult(&combined, id);
+    }
 
-        // Encode result
-        const base64 = combined.toBase64(self.allocator) catch {
-            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to encode combined PSBT", id);
+    /// Handle joinpsbts RPC — Core rpc/rawtransaction.cpp joinpsbts (Joiner
+    /// role): fewer than two -> -8 "At least two PSBTs are required to join
+    /// PSBTs."; each decoded (-22); a duplicated input -> -8 "Input <txid>:<n>
+    /// exists in multiple PSBTs"; inputs/outputs shuffled.
+    fn handleJoinPsbts(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (try self.checkArgType(params, 0, "txs", .array, false, id)) |resp| return resp;
+        const items = params.array.items[0].array.items;
+        if (items.len <= 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "At least two PSBTs are required to join PSBTs.", id);
+        }
+        var psbts = std.ArrayList(psbt_mod.Psbt).init(self.allocator);
+        defer {
+            for (psbts.items) |*p| p.deinit();
+            psbts.deinit();
+        }
+        for (items) |item| {
+            switch (try self.decodePsbtArg(item, id)) {
+                .psbt => |p| try psbts.append(p),
+                .response => |r| return r,
+            }
+        }
+        const ptrs = try self.allocator.alloc(*const psbt_mod.Psbt, psbts.items.len);
+        defer self.allocator.free(ptrs);
+        for (psbts.items, 0..) |*p, i| ptrs[i] = p;
+
+        var dup: types.OutPoint = undefined;
+        var joined = psbt_mod.Psbt.join(self.allocator, ptrs, std.crypto.random, &dup) catch |err| {
+            if (err != error.DuplicateInput) return err;
+            var disp: [32]u8 = dup.hash;
+            std.mem.reverse(u8, &disp);
+            const msg = try std.fmt.allocPrint(self.allocator, "Input {s}:{d} exists in multiple PSBTs", .{ std.fmt.fmtSliceHexLower(&disp), dup.index });
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         };
-        defer self.allocator.free(base64);
+        defer joined.deinit();
+        return self.psbtResult(&joined, id);
+    }
 
+    /// Core ProcessPSBT's UTXO fill (rpc/rawtransaction.cpp:139-186): an
+    /// input without non_witness_utxo gets the full previous transaction from
+    /// the mempool; failing that, a UTXO-set coin becomes its witness_utxo when
+    /// the coin is a segwit output (a witness program, or P2SH whose redeem
+    /// script the provider knows to be one).
+    fn psbtFillUtxos(self: *RpcServer, psbt: *psbt_mod.Psbt, provider: *const psbt_process.Provider) !void {
+        for (psbt.inputs, 0..) |*input, i| {
+            if (input.non_witness_utxo != null) continue;
+            const prevout = psbt.tx.inputs[i].previous_output;
+            {
+                self.mempool.mutex.lock();
+                defer self.mempool.mutex.unlock();
+                if (self.mempool.get(prevout.hash)) |entry| {
+                    input.non_witness_utxo = try psbt_mod.cloneTransaction(self.allocator, &entry.tx);
+                    continue;
+                }
+            }
+            if (input.witness_utxo != null) continue;
+            const coin_opt = self.chain_state.utxo_set.get(&prevout) catch null;
+            if (coin_opt) |coin| {
+                var c = coin;
+                defer c.deinit(self.allocator);
+                const spk = c.reconstructScript(self.allocator) catch continue;
+                var keep = false;
+                defer if (!keep) self.allocator.free(spk);
+                var segwit = psbt_process.isWitnessProgram(spk);
+                if (!segwit and spk.len == 23 and spk[0] == 0xa9 and spk[1] == 0x14 and spk[22] == 0x87) {
+                    for (provider.entries.items) |e| {
+                        if (std.mem.eql(u8, e.spk, spk)) {
+                            if (e.redeem_script) |r| segwit = psbt_process.isWitnessProgram(r);
+                            break;
+                        }
+                    }
+                }
+                if (segwit) {
+                    input.witness_utxo = .{ .value = c.value, .script_pubkey = spk };
+                    keep = true;
+                }
+            }
+        }
+    }
+
+    /// Evaluate a `descriptors` array into a provider (Core
+    /// EvalDescriptorStringOrObject per element).  Returns the error body on a
+    /// Core-reported failure.
+    fn psbtBuildProvider(self: *RpcServer, provider: *psbt_process.Provider, descs: []const std.json.Value, expand_priv: bool, id: ?std.json.Value) !?[]const u8 {
+        for (descs) |d| {
+            if (try psbt_process.evalDescriptor(self.allocator, provider, d, expand_priv)) |e| {
+                defer self.allocator.free(e.msg);
+                return try self.jsonRpcError(e.code, e.msg, id);
+            }
+        }
+        return null;
+    }
+
+    /// `utxoupdatepsbt` — Core rpc/rawtransaction.cpp utxoupdatepsbt (Updater):
+    /// descriptors are evaluated FIRST (-5 / -8), then the PSBT decoded (-22),
+    /// UTXOs filled from the mempool / UTXO set, script and key-path data added
+    /// from the descriptors, and unnecessary full transactions dropped.
+    fn handleUtxoUpdatePsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (try self.checkArgs(params, &.{
+            .{ .name = "psbt", .t = .string, .optional = false },
+            .{ .name = "descriptors", .t = .array, .optional = true },
+        }, id)) |resp| return resp;
+        var provider = psbt_process.Provider.init(self.allocator);
+        defer provider.deinit();
+        if (params.array.items.len > 1 and params.array.items[1] == .array) {
+            if (try self.psbtBuildProvider(&provider, params.array.items[1].array.items, false, id)) |r| return r;
+        }
+        var psbt = switch (try self.decodePsbtArg(params.array.items[0], id)) {
+            .psbt => |p| p,
+            .response => |r| return r,
+        };
+        defer psbt.deinit();
+        try self.psbtFillUtxos(&psbt, &provider);
+        psbt_process.update(self.allocator, &psbt, &provider, null, true, false) catch |err| switch (err) {
+            error.SighashMismatch => return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Specified sighash value does not match value stored in PSBT", id),
+            else => return err,
+        };
+        psbt_process.removeUnnecessaryTransactions(&psbt);
+        return self.psbtResult(&psbt, id);
+    }
+
+    /// `descriptorprocesspsbt` — Core rpc/rawtransaction.cpp
+    /// descriptorprocesspsbt (Updater + Signer + optional Finalizer driven by
+    /// the given descriptors, private keys included).  Result
+    /// {psbt, complete[, hex when complete]}.
+    fn handleDescriptorProcessPsbt(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (try self.checkArgs(params, &.{
+            .{ .name = "psbt", .t = .string, .optional = false },
+            .{ .name = "descriptors", .t = .array, .optional = false },
+            .{ .name = "sighashtype", .t = .string, .optional = true },
+            .{ .name = "bip32derivs", .t = .bool, .optional = true },
+            .{ .name = "finalize", .t = .bool, .optional = true },
+        }, id)) |resp| return resp;
+        const items = params.array.items;
+
+        var provider = psbt_process.Provider.init(self.allocator);
+        defer provider.deinit();
+        if (try self.psbtBuildProvider(&provider, items[1].array.items, true, id)) |r| return r;
+
+        // Core ParseSighashString / SighashFromStr.
+        var sighash: ?u32 = null;
+        if (items.len > 2 and items[2] == .string) {
+            const names = [_]struct { n: []const u8, v: u32 }{
+                .{ .n = "DEFAULT", .v = 0x00 },             .{ .n = "ALL", .v = 0x01 },
+                .{ .n = "NONE", .v = 0x02 },                .{ .n = "SINGLE", .v = 0x03 },
+                .{ .n = "ALL|ANYONECANPAY", .v = 0x81 },    .{ .n = "NONE|ANYONECANPAY", .v = 0x82 },
+                .{ .n = "SINGLE|ANYONECANPAY", .v = 0x83 },
+            };
+            for (names) |nv| {
+                if (std.mem.eql(u8, nv.n, items[2].string)) sighash = nv.v;
+            }
+            if (sighash == null) {
+                const m = try std.fmt.allocPrint(self.allocator, "'{s}' is not a valid sighash parameter.", .{items[2].string});
+                defer self.allocator.free(m);
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, m, id);
+            }
+        }
+        const bip32derivs = !(items.len > 3 and items[3] == .bool and !items[3].bool);
+        const finalize = !(items.len > 4 and items[4] == .bool and !items[4].bool);
+
+        var psbt = switch (try self.decodePsbtArg(items[0], id)) {
+            .psbt => |p| p,
+            .response => |r| return r,
+        };
+        defer psbt.deinit();
+        try self.psbtFillUtxos(&psbt, &provider);
+        psbt_process.update(self.allocator, &psbt, &provider, sighash, bip32derivs, finalize) catch |err| switch (err) {
+            error.SighashMismatch => return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Specified sighash value does not match value stored in PSBT", id),
+            else => return err,
+        };
+        psbt_process.removeUnnecessaryTransactions(&psbt);
+
+        const complete = psbt.inputs.len == 0 or psbt_process.allInputsSigned(&psbt);
+        const b64 = try psbt.toBase64(self.allocator);
+        defer self.allocator.free(b64);
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
-        const writer = buf.writer();
-        try writer.writeByte('"');
-        try writer.writeAll(base64);
-        try writer.writeByte('"');
-
+        const w = buf.writer();
+        try w.print("{{\"psbt\":\"{s}\",\"complete\":{}", .{ b64, complete });
+        if (complete and psbt.inputs.len > 0) {
+            if (psbt.extract()) |tx_const| {
+                var tx = tx_const;
+                defer psbt_mod.freeTransaction(self.allocator, &tx);
+                var tx_writer = serialize.Writer.init(self.allocator);
+                defer tx_writer.deinit();
+                try serialize.writeTransaction(&tx_writer, &tx);
+                try w.writeAll(",\"hex\":\"");
+                for (tx_writer.getWritten()) |b| try w.print("{x:0>2}", .{b});
+                try w.writeByte('"');
+            } else |_| {}
+        }
+        try w.writeByte('}');
         return self.jsonRpcResult(buf.items, id);
     }
 
@@ -14495,14 +15025,10 @@ pub const RpcServer = struct {
     /// Arguments:
     ///   1. hexstring (string, required) - hex-encoded script
     fn handleDecodeScript(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (params != .array or params.array.items.len == 0) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing hexstring", id);
-        }
-
+        // Core rpc/rawtransaction.cpp decodescript: central type check (-3),
+        // then ParseHexV(params[0], "argument") for a non-empty string (-8).
+        if (try self.checkArgType(params, 0, "hexstring", .string, false, id)) |resp| return resp;
         const hex_param = params.array.items[0];
-        if (hex_param != .string) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "hexstring must be a string", id);
-        }
 
         const hex_str = hex_param.string;
 
@@ -14514,20 +15040,11 @@ pub const RpcServer = struct {
             return self.jsonRpcResult("{\"asm\":\"\",\"type\":\"nonstandard\"}", id);
         }
 
-        if (hex_str.len % 2 != 0) {
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length", id);
-        }
-
-        var script_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
-            return self.jsonRpcError(RPC_INTERNAL_ERROR, "Out of memory", id);
+        const script_bytes = switch (try self.parseHexV(hex_param, "argument", id)) {
+            .bytes => |b| b,
+            .response => |r| return r,
         };
         defer self.allocator.free(script_bytes);
-
-        for (0..hex_str.len / 2) |i| {
-            script_bytes[i] = std.fmt.parseInt(u8, hex_str[i * 2 .. i * 2 + 2], 16) catch {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex", id);
-            };
-        }
 
         const network = networkFromMagic(self.network_params.magic);
         const is_regtest = isRegtestMagic(self.network_params.magic);
@@ -14697,117 +15214,98 @@ pub const RpcServer = struct {
     /// Returns: {address, redeemScript, descriptor}
     /// Optional: {warnings} when uncompressed keys force type override.
     fn handleCreateMultisig(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (params != .array or params.array.items.len < 2) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "createmultisig requires nrequired and keys", id);
-        }
+        // Core rpc/output_script.cpp createmultisig + rpc/util.cpp
+        // HexToPubKey / AddAndGetMultisigDestination, in Core's ORDER:
+        //   central type check (nrequired NUM, keys ARR, address_type STR) -3
+        //   nrequired getInt<int> (-1 out of range / non-integral)
+        //   EVERY pubkey: IsHex -> length 33/65 -> IsFullyValid   (-5 each)
+        //   address_type: unknown / bech32m                        (-5)
+        //   nrequired < 1, nrequired > #keys, #keys > 20           (-8)
+        //   legacy redeemScript > 520 bytes                        (-8)
+        // So createmultisig(3, ["deadbeef","deadbeef"]) is -5, not -8.
+        if (try self.checkArgs(params, &.{
+            .{ .name = "nrequired", .t = .number, .optional = false },
+            .{ .name = "keys", .t = .array, .optional = false },
+            .{ .name = "address_type", .t = .string, .optional = true },
+        }, id)) |resp| return resp;
 
-        // --- Parse nrequired ---
         const nreq_val = params.array.items[0];
-        if (nreq_val != .integer) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "nrequired must be an integer", id);
-        }
-        const n_required: i64 = nreq_val.integer;
-        if (n_required < 1) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "a multisignature address must require at least one key to redeem", id);
-        }
+        const n_required: i64 = switch (nreq_val) {
+            .integer => |n| if (n >= std.math.minInt(i32) and n <= std.math.maxInt(i32)) n else return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
+            else => return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
+        };
 
-        // --- Parse keys array ---
-        const keys_val = params.array.items[1];
-        if (keys_val != .array) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "keys must be an array", id);
-        }
-        const keys = keys_val.array.items;
-        const n_keys: i64 = @intCast(keys.len);
+        const keys = params.array.items[1].array.items;
 
-        if (n_keys > 16) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Number of keys involved in the multisignature address creation > 16\nReduce the number", id);
-        }
-        if (n_required > n_keys) {
-            var msg_buf: [128]u8 = undefined;
-            const msg = try std.fmt.bufPrint(&msg_buf, "not enough keys supplied (got {d} keys, but need at least {d} to redeem)", .{ n_keys, n_required });
-            return self.jsonRpcError(RPC_INVALID_PARAMS, msg, id);
-        }
-
-        // --- Parse and validate pubkeys ---
-        // Each pubkey is 33 bytes (compressed) or 65 bytes (uncompressed).
-        // Stored as a flat byte buffer; offsets tracked separately.
-        const MAX_KEYS = 16;
+        // --- Parse and validate EVERY pubkey (HexToPubKey) before any bound.
+        // Only the first MAX_KEYS are stored; a longer list still has every
+        // key validated (Core parses them all) and then fails the > 20 bound.
+        const MAX_KEYS = 20; // MAX_PUBKEYS_PER_MULTISIG (script/script.h)
         var pk_data: [MAX_KEYS][65]u8 = undefined;
         var pk_lens: [MAX_KEYS]usize = undefined;
         var has_uncompressed = false;
 
         for (keys, 0..) |key_val, i| {
-            if (key_val != .string) {
-                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "pubkey must be a hex string", id);
-            }
+            if (key_val != .string) return self.typeErrorNotString(key_val, id);
             const hex_str = key_val.string;
+            if (!isCoreHex(hex_str)) {
+                const m = try std.fmt.allocPrint(self.allocator, "Pubkey \"{s}\" must be a hex string", .{hex_str});
+                defer self.allocator.free(m);
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, m, id);
+            }
+            if (hex_str.len != 66 and hex_str.len != 130) {
+                const m = try std.fmt.allocPrint(self.allocator, "Pubkey \"{s}\" must have a length of either 33 or 65 bytes", .{hex_str});
+                defer self.allocator.free(m);
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, m, id);
+            }
+            var tmp: [65]u8 = undefined;
             const byte_len = hex_str.len / 2;
-
-            // Length check: must be 33 or 65 bytes
-            if ((hex_str.len != 66 and hex_str.len != 130) or hex_str.len % 2 != 0) {
-                var emsg: [256]u8 = undefined;
-                const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must have a length of either 33 or 65 bytes", .{hex_str});
-                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+            _ = std.fmt.hexToBytes(tmp[0..byte_len], hex_str) catch unreachable;
+            const valid = if (byte_len == 33)
+                (tmp[0] == 0x02 or tmp[0] == 0x03) and crypto.decompressPubkey33(tmp[0..33]) != null
+            else
+                tmp[0] == 0x04 and crypto.parseUncompressedPubkey65(tmp[0..65]) != null;
+            if (!valid) {
+                const m = try std.fmt.allocPrint(self.allocator, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
+                defer self.allocator.free(m);
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, m, id);
             }
-
-            // Decode hex
-            for (0..byte_len) |bi| {
-                pk_data[i][bi] = std.fmt.parseInt(u8, hex_str[bi * 2 ..][0..2], 16) catch {
-                    var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be a hex string", .{hex_str});
-                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
-                };
-            }
-            pk_lens[i] = byte_len;
-
-            // Validate via secp256k1: use crypto helpers which call secp256k1_ec_pubkey_parse.
-            // decompressPubkey33 returns null if the point is not on the curve.
-            // parseUncompressedPubkey65 returns null for invalid uncompressed keys.
-            if (byte_len == 33) {
-                if (pk_data[i][0] != 0x02 and pk_data[i][0] != 0x03) {
-                    var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
-                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
-                }
-                const pk33: *const [33]u8 = pk_data[i][0..33];
-                if (crypto.decompressPubkey33(pk33) == null) {
-                    var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
-                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
-                }
-            } else { // 65 bytes
-                if (pk_data[i][0] != 0x04) {
-                    var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
-                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
-                }
-                const pk65: *const [65]u8 = pk_data[i][0..65];
-                if (crypto.parseUncompressedPubkey65(pk65) == null) {
-                    var emsg: [256]u8 = undefined;
-                    const s = try std.fmt.bufPrint(&emsg, "Pubkey \"{s}\" must be cryptographically valid.", .{hex_str});
-                    return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
-                }
-                has_uncompressed = true;
+            if (byte_len == 65) has_uncompressed = true;
+            if (i < MAX_KEYS) {
+                pk_data[i] = tmp;
+                pk_lens[i] = byte_len;
             }
         }
 
-        // --- Parse address_type ---
+        // --- Parse address_type (ParseOutputType) ---
         var addr_type: []const u8 = "legacy";
-        if (params.array.items.len >= 3) {
-            const at = params.array.items[2];
-            if (at == .string) {
-                addr_type = at.string;
+        if (params.array.items.len >= 3 and params.array.items[2] == .string) {
+            addr_type = params.array.items[2].string;
+            if (std.mem.eql(u8, addr_type, "bech32m")) {
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "createmultisig cannot create bech32m multisig addresses", id);
+            }
+            if (!std.mem.eql(u8, addr_type, "legacy") and
+                !std.mem.eql(u8, addr_type, "bech32") and
+                !std.mem.eql(u8, addr_type, "p2sh-segwit"))
+            {
+                const m = try std.fmt.allocPrint(self.allocator, "Unknown address type '{s}'", .{addr_type});
+                defer self.allocator.free(m);
+                return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, m, id);
             }
         }
 
-        // Validate address_type
-        if (!std.mem.eql(u8, addr_type, "legacy") and
-            !std.mem.eql(u8, addr_type, "bech32") and
-            !std.mem.eql(u8, addr_type, "p2sh-segwit"))
-        {
-            var emsg: [128]u8 = undefined;
-            const s = try std.fmt.bufPrint(&emsg, "Unknown address type '{s}'", .{addr_type});
-            return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, s, id);
+        // --- AddAndGetMultisigDestination bounds (-8) ---
+        const n_keys: i64 = @intCast(keys.len);
+        if (n_required < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "a multisignature address must require at least one key to redeem", id);
+        }
+        if (n_keys < n_required) {
+            const m = try std.fmt.allocPrint(self.allocator, "not enough keys supplied (got {d} keys, but need at least {d} to redeem)", .{ n_keys, n_required });
+            defer self.allocator.free(m);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, m, id);
+        }
+        if (n_keys > MAX_KEYS) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Number of keys involved in the multisignature address creation > 20\nReduce the number", id);
         }
 
         // Uncompressed keys → force legacy (Core behaviour: descriptor type mismatch)
@@ -14821,12 +15319,19 @@ pub const RpcServer = struct {
         }
 
         // --- Build redeemScript: OP_M <push><pk1> ... OP_N OP_CHECKMULTISIG ---
-        // Max script length: 1 + 16*(1+65) + 1 + 1 = 1091 bytes
-        var rs_buf: [1 + 16 * (1 + 65) + 1 + 1]u8 = undefined;
+        // GetScriptForMultisig: CScript << m << keys... << n << OP_CHECKMULTISIG.
+        // Small ints 1..16 are OP_1..OP_16; 17..20 are a 1-byte scriptnum push.
+        var rs_buf: [2 + 20 * (1 + 65) + 2 + 1]u8 = undefined;
         var rs_len: usize = 0;
 
-        rs_buf[rs_len] = @intCast(0x50 + n_required);
-        rs_len += 1;
+        if (n_required <= 16) {
+            rs_buf[rs_len] = @intCast(0x50 + n_required);
+            rs_len += 1;
+        } else {
+            rs_buf[rs_len] = 0x01;
+            rs_buf[rs_len + 1] = @intCast(n_required);
+            rs_len += 2;
+        }
 
         for (0..@intCast(n_keys)) |i| {
             rs_buf[rs_len] = @intCast(pk_lens[i]); // push byte: 0x21 or 0x41
@@ -14835,12 +15340,25 @@ pub const RpcServer = struct {
             rs_len += pk_lens[i];
         }
 
-        rs_buf[rs_len] = @intCast(0x50 + n_keys);
-        rs_len += 1;
+        if (n_keys <= 16) {
+            rs_buf[rs_len] = @intCast(0x50 + n_keys);
+            rs_len += 1;
+        } else {
+            rs_buf[rs_len] = 0x01;
+            rs_buf[rs_len + 1] = @intCast(n_keys);
+            rs_len += 2;
+        }
         rs_buf[rs_len] = 0xae; // OP_CHECKMULTISIG
         rs_len += 1;
 
         const rs = rs_buf[0..rs_len];
+
+        // Core: a LEGACY (P2SH) redeemScript must fit one stack element.
+        if (std.mem.eql(u8, effective_type, "legacy") and rs.len > 520) {
+            const m = try std.fmt.allocPrint(self.allocator, "redeemScript exceeds size limit: {d} > 520", .{rs.len});
+            defer self.allocator.free(m);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, m, id);
+        }
 
         // --- Determine network for address encoding ---
         const network = networkFromMagic(self.network_params.magic);
@@ -14995,8 +15513,21 @@ pub const RpcServer = struct {
     }
 
     fn handleCreateRawTransaction(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (params != .array or params.array.items.len < 2) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Requires inputs and outputs", id);
+        // Core CreateTxDoc args + RPCHelpMan central type check (-3): inputs
+        // ARR (required), outputs skip_type_check, locktime NUM, replaceable
+        // BOOL, version NUM; then ConstructTransaction: a null outputs is -8,
+        // a non-array/non-object outputs is get_array's -3.
+        if (try self.checkArgs(params, &.{
+            .{ .name = "inputs", .t = .array, .optional = false },
+            .{ .name = "", .t = null },
+            .{ .name = "locktime", .t = .number, .optional = true },
+            .{ .name = "replaceable", .t = .bool, .optional = true },
+            .{ .name = "version", .t = .number, .optional = true },
+        }, id)) |resp| return resp;
+        {
+            const outs: std.json.Value = if (params.array.items.len > 1) params.array.items[1] else .null;
+            if (outs == .null) return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, output argument must be non-null", id);
+            if (outs != .array and outs != .object) return self.typeErrorNotArray(outs, id);
         }
 
         const inputs_param = params.array.items[0];
@@ -19808,18 +20339,41 @@ pub const RpcServer = struct {
 
     /// validateaddress "address"
     /// Return information about the given bitcoin address.
+    /// Address-decoding parameters of this node's network (Core chainparams:
+    /// Bech32HRP + PUBKEY_ADDRESS / SCRIPT_ADDRESS base58 prefixes).
+    fn addrNetParams(self: *RpcServer) addr_error.NetParams {
+        const m = self.network_params.magic;
+        if (m == consensus.MAINNET.magic) return .{ .hrp = "bc", .pubkey_prefix = 0x00, .script_prefix = 0x05 };
+        if (m == consensus.TESTNET.magic or m == consensus.TESTNET4.magic or m == consensus.SIGNET.magic)
+            return .{ .hrp = "tb", .pubkey_prefix = 0x6f, .script_prefix = 0xc4 };
+        return .{ .hrp = "bcrt", .pubkey_prefix = 0x6f, .script_prefix = 0xc4 };
+    }
+
     fn handleValidateAddress(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        const addr_str = blk: {
-            if (params == .array and params.array.items.len > 0) {
-                const a = params.array.items[0];
-                if (a == .string) break :blk a.string;
-            }
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing address", id);
-        };
+        if (try self.checkArgType(params, 0, "address", .string, false, id)) |resp| return resp;
+        const addr_str = params.array.items[0].string;
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
+
+        // Core key_io.cpp DecodeDestination decides validity and the exact
+        // error text + error_locations (bech32::LocateErrors).  It is also the
+        // network gate: an address for another network is invalid here even
+        // when clearbit's generic decoder can parse it.
+        if (try addr_error.coreDestinationError(self.allocator, addr_str, self.addrNetParams())) |e_const| {
+            var e = e_const;
+            defer e.deinit(self.allocator);
+            try writer.writeAll("{\"isvalid\":false,\"error_locations\":[");
+            for (e.locations, 0..) |loc, i| {
+                if (i > 0) try writer.writeByte(',');
+                try writer.print("{d}", .{loc});
+            }
+            try writer.writeAll("],\"error\":\"");
+            try writeJsonEscapedBody(writer, e.msg);
+            try writer.writeAll("\"}");
+            return self.jsonRpcResult(buf.items, id);
+        }
 
         // Try to decode the address
         const addr = address_mod.Address.decode(addr_str, self.allocator) catch {
@@ -20023,21 +20577,31 @@ pub const RpcServer = struct {
     }
 
     fn handleScanTxOutSet(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        // --- action ---
-        var action: []const u8 = "start";
-        if (params == .array and params.array.items.len >= 1) {
-            const a = params.array.items[0];
-            if (a == .string) action = a.string;
+        // --- action (Core rpc/blockchain.cpp scantxoutset:2380-2471) ---
+        // The scan runs synchronously inside this call, so no scan is ever
+        // in progress when another arrives: status -> null, abort -> false.
+        if (try self.checkArgs(params, &.{
+            .{ .name = "action", .t = .string, .optional = false },
+            .{ .name = "scanobjects", .t = .array, .optional = true },
+        }, id)) |resp| return resp;
+        const action: []const u8 = params.array.items[0].string;
+        if (std.mem.eql(u8, action, "status")) {
+            return self.jsonRpcResult("null", id);
         }
-        if (std.mem.eql(u8, action, "abort") or std.mem.eql(u8, action, "status")) {
+        if (std.mem.eql(u8, action, "abort")) {
             return self.jsonRpcResult("false", id);
         }
         if (!std.mem.eql(u8, action, "start")) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid action; expected start/abort/status", id);
+            const msg = try std.fmt.allocPrint(self.allocator, "Invalid action '{s}'", .{action});
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         }
 
         // --- scanobjects ---
-        if (params != .array or params.array.items.len < 2 or params.array.items[1] != .array) {
+        if (params.array.items.len < 2) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "scanobjects argument is required for the start action", id);
+        }
+        if (params.array.items[1] != .array) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "scanobjects array required for the start action", id);
         }
         const scanobjects = params.array.items[1].array;
@@ -20943,27 +21507,26 @@ pub const RpcServer = struct {
             try writer.writeByte('"');
         } else {
             // List all commands
+            // Core's `help` layout: one "== Category ==" group per RPC
+            // category in Core's order, methods sorted within it.  Every
+            // Core-named method this server dispatches is listed (help-parity:
+            // a method that answers must appear here — R5 probes it).
             try writer.writeAll("\"== Blockchain ==\\n");
+            try writer.writeAll("dumptxoutset\\n");
             try writer.writeAll("getbestblockhash\\n");
             try writer.writeAll("getblock\\n");
             try writer.writeAll("getblockchaininfo\\n");
             try writer.writeAll("getblockcount\\n");
+            try writer.writeAll("getblockfilter\\n");
+            try writer.writeAll("getblockfrompeer\\n");
             try writer.writeAll("getblockhash\\n");
             try writer.writeAll("getblockheader\\n");
-            try writer.writeAll("getdeploymentinfo\\n");
+            try writer.writeAll("getblockstats\\n");
+            try writer.writeAll("getchainstates\\n");
             try writer.writeAll("getchaintips\\n");
             try writer.writeAll("getchaintxstats\\n");
-            try writer.writeAll("getblockstats\\n");
-            try writer.writeAll("getblockfrompeer\\n");
-            try writer.writeAll("getchainstates\\n");
+            try writer.writeAll("getdeploymentinfo\\n");
             try writer.writeAll("getdifficulty\\n");
-            try writer.writeAll("gettxoutproof\\n");
-            try writer.writeAll("preciousblock\\n");
-            try writer.writeAll("verifychain\\n");
-            try writer.writeAll("waitforblock\\n");
-            try writer.writeAll("waitforblockheight\\n");
-            try writer.writeAll("waitfornewblock\\n");
-            try writer.writeAll("\\n== Mempool ==\\n");
             try writer.writeAll("getmempoolancestors\\n");
             try writer.writeAll("getmempooldescendants\\n");
             try writer.writeAll("getmempoolentry\\n");
@@ -20971,77 +21534,115 @@ pub const RpcServer = struct {
             try writer.writeAll("getorphantxs\\n");
             try writer.writeAll("getrawmempool\\n");
             try writer.writeAll("gettxout\\n");
+            try writer.writeAll("gettxoutproof\\n");
+            try writer.writeAll("gettxoutsetinfo\\n");
+            try writer.writeAll("gettxspendingprevout\\n");
+            try writer.writeAll("importmempool\\n");
+            try writer.writeAll("loadtxoutset\\n");
+            try writer.writeAll("preciousblock\\n");
+            try writer.writeAll("pruneblockchain\\n");
             try writer.writeAll("savemempool\\n");
-            try writer.writeAll("testmempoolaccept\\n");
+            try writer.writeAll("scanblocks\\n");
+            try writer.writeAll("scantxoutset\\n");
+            try writer.writeAll("verifychain\\n");
+            try writer.writeAll("verifytxoutproof\\n");
+            try writer.writeAll("waitforblock\\n");
+            try writer.writeAll("waitforblockheight\\n");
+            try writer.writeAll("waitfornewblock\\n");
+            try writer.writeAll("\\n== Control ==\\n");
+            try writer.writeAll("getmemoryinfo\\n");
+            try writer.writeAll("getrpcinfo\\n");
+            try writer.writeAll("help\\n");
+            try writer.writeAll("logging\\n");
+            try writer.writeAll("stop\\n");
+            try writer.writeAll("uptime\\n");
             try writer.writeAll("\\n== Mining ==\\n");
             try writer.writeAll("getblocktemplate\\n");
             try writer.writeAll("getmininginfo\\n");
+            try writer.writeAll("getnetworkhashps\\n");
             try writer.writeAll("getprioritisedtransactions\\n");
             try writer.writeAll("prioritisetransaction\\n");
             try writer.writeAll("submitblock\\n");
             try writer.writeAll("submitheader\\n");
             try writer.writeAll("\\n== Network ==\\n");
             try writer.writeAll("addnode\\n");
-            try writer.writeAll("getaddednodeinfo\\n");
-            try writer.writeAll("disconnectnode\\n");
-            try writer.writeAll("getconnectioncount\\n");
-            try writer.writeAll("getnetworkinfo\\n");
-            try writer.writeAll("getpeerinfo\\n");
-            try writer.writeAll("ping\\n");
-            try writer.writeAll("setnetworkactive\\n");
-            try writer.writeAll("getaddrmaninfo\\n");
-            try writer.writeAll("getnettotals\\n");
-            try writer.writeAll("getnodeaddresses\\n");
-            try writer.writeAll("listbanned\\n");
             try writer.writeAll("clearbanned\\n");
+            try writer.writeAll("disconnectnode\\n");
+            try writer.writeAll("getaddednodeinfo\\n");
+            try writer.writeAll("getaddrmaninfo\\n");
+            try writer.writeAll("getconnectioncount\\n");
+            try writer.writeAll("getnettotals\\n");
+            try writer.writeAll("getnetworkinfo\\n");
+            try writer.writeAll("getnodeaddresses\\n");
+            try writer.writeAll("getpeerinfo\\n");
+            try writer.writeAll("listbanned\\n");
+            try writer.writeAll("ping\\n");
             try writer.writeAll("setban\\n");
+            try writer.writeAll("setnetworkactive\\n");
             try writer.writeAll("\\n== Rawtransactions ==\\n");
+            try writer.writeAll("analyzepsbt\\n");
+            try writer.writeAll("combinepsbt\\n");
             try writer.writeAll("combinerawtransaction\\n");
+            try writer.writeAll("converttopsbt\\n");
+            try writer.writeAll("createpsbt\\n");
             try writer.writeAll("createrawtransaction\\n");
+            try writer.writeAll("decodepsbt\\n");
             try writer.writeAll("decoderawtransaction\\n");
             try writer.writeAll("decodescript\\n");
-            try writer.writeAll("getrawtransaction\\n");
-            try writer.writeAll("sendrawtransaction\\n");
-            try writer.writeAll("converttopsbt\\n");
-            try writer.writeAll("decodepsbt\\n");
+            try writer.writeAll("descriptorprocesspsbt\\n");
             try writer.writeAll("finalizepsbt\\n");
+            try writer.writeAll("fundrawtransaction\\n");
+            try writer.writeAll("getrawtransaction\\n");
+            try writer.writeAll("joinpsbts\\n");
+            try writer.writeAll("sendrawtransaction\\n");
+            try writer.writeAll("signrawtransactionwithkey\\n");
+            try writer.writeAll("submitpackage\\n");
+            try writer.writeAll("testmempoolaccept\\n");
+            try writer.writeAll("utxoupdatepsbt\\n");
+            try writer.writeAll("\\n== Util ==\\n");
+            try writer.writeAll("createmultisig\\n");
+            try writer.writeAll("deriveaddresses\\n");
+            try writer.writeAll("estimaterawfee\\n");
+            try writer.writeAll("estimatesmartfee\\n");
+            try writer.writeAll("getdescriptorinfo\\n");
+            try writer.writeAll("getindexinfo\\n");
+            try writer.writeAll("signmessagewithprivkey\\n");
+            try writer.writeAll("validateaddress\\n");
+            try writer.writeAll("verifymessage\\n");
             try writer.writeAll("\\n== Wallet ==\\n");
             try writer.writeAll("backupwallet\\n");
+            try writer.writeAll("bumpfee\\n");
             try writer.writeAll("createwallet\\n");
+            try writer.writeAll("encryptwallet\\n");
+            try writer.writeAll("getaddressinfo\\n");
             try writer.writeAll("getbalance\\n");
             try writer.writeAll("getbalances\\n");
-            try writer.writeAll("getaddressinfo\\n");
             try writer.writeAll("getnewaddress\\n");
+            try writer.writeAll("gettransaction\\n");
             try writer.writeAll("getwalletinfo\\n");
-            try writer.writeAll("listunspent\\n");
+            try writer.writeAll("importdescriptors\\n");
+            try writer.writeAll("listdescriptors\\n");
+            try writer.writeAll("listlockunspent\\n");
             try writer.writeAll("listtransactions\\n");
+            try writer.writeAll("listunspent\\n");
+            try writer.writeAll("listwalletdir\\n");
             try writer.writeAll("listwallets\\n");
             try writer.writeAll("loadwallet\\n");
+            try writer.writeAll("lockunspent\\n");
+            try writer.writeAll("psbtbumpfee\\n");
+            try writer.writeAll("rescanblockchain\\n");
             try writer.writeAll("restorewallet\\n");
             try writer.writeAll("send\\n");
             try writer.writeAll("sendtoaddress\\n");
+            try writer.writeAll("setlabel\\n");
             try writer.writeAll("signmessage\\n");
             try writer.writeAll("signrawtransactionwithwallet\\n");
-            try writer.writeAll("signrawtransactionwithkey\\n");
-            try writer.writeAll("lockunspent\\n");
-            try writer.writeAll("listlockunspent\\n");
-            try writer.writeAll("walletcreatefundedpsbt\\n");
-            try writer.writeAll("walletprocesspsbt\\n");
-            try writer.writeAll("importdescriptors\\n");
             try writer.writeAll("unloadwallet\\n");
-            try writer.writeAll("\\n== Util ==\\n");
-            try writer.writeAll("validateaddress\\n");
-            try writer.writeAll("estimaterawfee\\n");
-            try writer.writeAll("estimatesmartfee\\n");
-            try writer.writeAll("signmessagewithprivkey\\n");
-            try writer.writeAll("verifymessage\\n");
-            try writer.writeAll("getdescriptorinfo\\n");
-            try writer.writeAll("getmemoryinfo\\n");
-            try writer.writeAll("getrpcinfo\\n");
-            try writer.writeAll("logging\\n");
-            try writer.writeAll("help\\n");
-            try writer.writeAll("stop\\n");
-            try writer.writeAll("uptime\\n");
+            try writer.writeAll("walletcreatefundedpsbt\\n");
+            try writer.writeAll("walletlock\\n");
+            try writer.writeAll("walletpassphrase\\n");
+            try writer.writeAll("walletpassphrasechange\\n");
+            try writer.writeAll("walletprocesspsbt\\n");
             try writer.writeAll("\"");
         }
 
@@ -21081,6 +21682,13 @@ pub const RpcServer = struct {
     /// the same scope — keeps gettxoutsetinfo and dumptxoutset in
     /// agreement, which is what the diff-test harness compares against.
     fn handleGetTxOutSetInfo(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Core central type check: hash_type STR, hash_or_height skip_type_check,
+        // use_index BOOL (all optional).
+        if (try self.checkArgs(params, &.{
+            .{ .name = "hash_type", .t = .string },
+            .{ .name = "hash_or_height", .t = null },
+            .{ .name = "use_index", .t = .bool },
+        }, id)) |resp| return resp;
         // Parse optional hash_type. Default mirrors Core: "hash_serialized_3".
         const HashType = enum { hash_serialized, muhash, none };
         var hash_type: HashType = .hash_serialized;
@@ -21481,6 +22089,11 @@ pub const RpcServer = struct {
     }
 
     fn handleGetNetworkHashPS(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Core central type check (both args NUM, optional) before getInt.
+        if (try self.checkArgs(params, &.{
+            .{ .name = "nblocks", .t = .number },
+            .{ .name = "height", .t = .number },
+        }, id)) |resp| return resp;
         // Parse optional [nblocks, height]
         var nblocks: i64 = 120;
         var target_height: i64 = -1;
@@ -21701,32 +22314,42 @@ pub const RpcServer = struct {
     }
 
     fn handleVerifyTxOutProof(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (params != .array or params.array.items.len < 1 or params.array.items[0] != .string)
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Expected [proof_hex]", id);
-
-        const hex_str = params.array.items[0].string;
-        if (hex_str.len < 168 or hex_str.len % 2 != 0) // 84 bytes min = 168 hex chars
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Proof too short", id);
-
-        const proof_len = hex_str.len / 2;
-        const proof_bytes = try self.allocator.alloc(u8, proof_len);
+        // Core rpc/txoutproof.cpp verifytxoutproof: `ParseHexV(params[0],
+        // "proof")` (-8 on non-hex, -3 on non-string), then `ssMB >>
+        // merkleBlock` — a truncated/garbled proof throws the stream's
+        // std::ios_base::failure, which the RPC server reports as
+        // RPC_MISC_ERROR (-1) with the exception text.  A merkle root that does
+        // not match the header returns an EMPTY array (not an error); only then
+        // is the block looked up (-5 "Block not found in chain").
+        if (try self.checkArgType(params, 0, "proof", .string, false, id)) |resp| return resp;
+        const proof_bytes = switch (try self.parseHexV(params.array.items[0], "proof", id)) {
+            .bytes => |b| b,
+            .response => |r| return r,
+        };
         defer self.allocator.free(proof_bytes);
-        for (0..proof_len) |i| {
-            proof_bytes[i] = std.fmt.parseInt(u8, hex_str[i * 2 ..][0..2], 16) catch
-                return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid hex", id);
-        }
-
+        const proof_len = proof_bytes.len;
+        const eof_msg = "SpanReader::read(): end of data: iostream error";
         if (proof_len < 84)
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Proof too short", id);
+            return self.jsonRpcError(RPC_MISC_ERROR, eof_msg, id);
 
-        // R3(a) 2026-08-12: LOCAL active-chain membership (W68 Core proxy
-        // removed).  Core parity rpc/txoutproof.cpp:161-163: the block must
-        // be indexed AND on the active chain, else -5 "Block not found in
-        // chain".  The persisted H: height index IS the active-chain
-        // projection (written at connect; the ratified R3(b) clause), so a
-        // hash→height→hash round-trip establishes membership without the
-        // in-memory index — including for historical blocks the fast-IBD
-        // path never put in the ChainManager.
+        // merkle_root in header at bytes 36..68 (LE)
+        const merkle_root_in_header = proof_bytes[36..68];
+        // Stream exhaustion is Core's iostream failure (-1).  A proof that
+        // deserializes but whose tree is malformed makes Core's ExtractMatches
+        // return a NULL (all-zero) root with no matches — which is then
+        // compared to the header's root like any other, so a header whose
+        // merkle root is itself zero still proceeds to the block lookup.
+        const parse_result: W47bParseResult = w47bParsePartialMerkleTree(self.allocator, proof_bytes[80..]) catch |err| switch (err) {
+            error.TooShort, error.Truncated => return self.jsonRpcError(RPC_MISC_ERROR, eof_msg, id),
+            error.NonCanonical => return self.jsonRpcError(RPC_MISC_ERROR, "non-canonical ReadCompactSize(): iostream error", id),
+            error.SizeTooLarge => return self.jsonRpcError(RPC_MISC_ERROR, "ReadCompactSize(): size too large: iostream error", id),
+            error.OutOfMemory => return err,
+            else => .{ .matched = try self.allocator.alloc(types.Hash256, 0), .computed_root = [_]u8{0} ** 32 },
+        };
+        defer self.allocator.free(parse_result.matched);
+        if (!std.mem.eql(u8, &parse_result.computed_root, merkle_root_in_header))
+            return self.jsonRpcResult("[]", id);
+
         const block_hash: types.Hash256 = crypto.hash256(proof_bytes[0..80]);
 
         var in_active = std.mem.eql(u8, &block_hash, &self.network_params.genesis_hash);
@@ -21740,16 +22363,6 @@ pub const RpcServer = struct {
         if (!in_active) {
             return self.jsonRpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain", id);
         }
-
-        // merkle_root in header at bytes 36..68 (LE)
-        const merkle_root_in_header = proof_bytes[36..68];
-
-        const parse_result = w47bParsePartialMerkleTree(self.allocator, proof_bytes[80..]) catch
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Failed to parse proof", id);
-        defer self.allocator.free(parse_result.matched);
-
-        if (!std.mem.eql(u8, &parse_result.computed_root, merkle_root_in_header))
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Merkle root mismatch", id);
 
         // Return matched txids in display order (reversed)
         var result_buf = std.ArrayList(u8).init(self.allocator);
@@ -22514,14 +23127,54 @@ fn w47bReadVarInt(data: []const u8, offset: usize) struct { val: usize, next: us
     }
 }
 
+/// Core serialize.h ReadCompactSize(range_check=true), as a stream reader:
+/// missing bytes -> error.Truncated ("end of data"), a non-minimal encoding ->
+/// error.NonCanonical, a value above MAX_SIZE (0x02000000) -> error.SizeTooLarge.
+fn w47bReadCompactSizeStrict(data: []const u8, offset: usize) !struct { val: usize, next: usize } {
+    if (offset >= data.len) return error.Truncated;
+    const first = data[offset];
+    var val: u64 = undefined;
+    var next: usize = undefined;
+    switch (first) {
+        0xFD => {
+            if (offset + 3 > data.len) return error.Truncated;
+            val = std.mem.readInt(u16, data[offset + 1 ..][0..2], .little);
+            if (val < 0xFD) return error.NonCanonical;
+            next = offset + 3;
+        },
+        0xFE => {
+            if (offset + 5 > data.len) return error.Truncated;
+            val = std.mem.readInt(u32, data[offset + 1 ..][0..4], .little);
+            if (val < 0x10000) return error.NonCanonical;
+            next = offset + 5;
+        },
+        0xFF => {
+            if (offset + 9 > data.len) return error.Truncated;
+            val = std.mem.readInt(u64, data[offset + 1 ..][0..8], .little);
+            if (val < 0x100000000) return error.NonCanonical;
+            next = offset + 9;
+        },
+        else => {
+            val = first;
+            next = offset + 1;
+        },
+    }
+    if (val > 0x02000000) return error.SizeTooLarge;
+    return .{ .val = @intCast(val), .next = next };
+}
+
 fn w47bParsePartialMerkleTree(allocator: std.mem.Allocator, data: []const u8) !W47bParseResult {
     if (data.len < 4) return error.TooShort;
     const n_tx = std.mem.readInt(u32, data[0..4], .little);
     var offset: usize = 4;
 
-    const vh = w47bReadVarInt(data, offset);
+    // Stream-strict CompactSize: a missing/short prefix is end-of-data (Core
+    // -1), never a silent 0.  Every count is bounded by the bytes actually
+    // present BEFORE any allocation, so a hostile count cannot OOM the node.
+    const vh = try w47bReadCompactSizeStrict(data, offset);
     offset = vh.next;
     const n_hashes = vh.val;
+    if (n_hashes > (data.len - offset) / 32) return error.Truncated;
 
     var hashes = try allocator.alloc([32]u8, n_hashes);
     defer allocator.free(hashes);
@@ -22531,10 +23184,19 @@ fn w47bParsePartialMerkleTree(allocator: std.mem.Allocator, data: []const u8) !W
         offset += 32;
     }
 
-    const vf = w47bReadVarInt(data, offset);
+    const vf = try w47bReadCompactSizeStrict(data, offset);
     offset = vf.next;
     const n_flag_bytes = vf.val;
-    if (offset + n_flag_bytes > data.len) return error.Truncated;
+    if (n_flag_bytes > data.len - offset) return error.Truncated;
+
+    // The whole CMerkleBlock has now been read (stream errors come first, as
+    // in Core).  CPartialMerkleTree::ExtractMatches sanity bounds
+    // (merkleblock.cpp): any failure yields a NULL root.  Bounding n_tx here
+    // also keeps the u5 height loop below from overflowing.
+    if (n_tx == 0) return error.BadTree;
+    if (n_tx > 4_000_000 / 240) return error.BadTree; // MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT (4*60)
+    if (n_hashes > n_tx) return error.BadTree;
+    if (n_flag_bytes * 8 < n_hashes) return error.BadTree;
     const flag_bytes_raw = data[offset .. offset + n_flag_bytes];
     const all_bits_len = n_flag_bytes * 8;
     var all_bits = try allocator.alloc(bool, all_bits_len);
@@ -22573,14 +23235,16 @@ fn w47bParsePartialMerkleTree(allocator: std.mem.Allocator, data: []const u8) !W
 
             if (frame.h == 0) {
                 // Leaf
-                const cur: [32]u8 = if (hash_idx < hashes.len) hashes[hash_idx] else [_]u8{0} ** 32;
+                if (hash_idx >= hashes.len) return error.BadTree; // Core: overflowed the hash array
+                const cur: [32]u8 = hashes[hash_idx];
                 hash_idx += 1;
                 if (parent_match) try matched.append(cur);
                 return_val = .{ .hash = cur };
                 _ = cstack.pop();
             } else if (!parent_match) {
                 // Non-matching subtree: consume one hash
-                const cur: [32]u8 = if (hash_idx < hashes.len) hashes[hash_idx] else [_]u8{0} ** 32;
+                if (hash_idx >= hashes.len) return error.BadTree; // Core: overflowed the hash array
+                const cur: [32]u8 = hashes[hash_idx];
                 hash_idx += 1;
                 return_val = .{ .hash = cur };
                 _ = cstack.pop();
@@ -22615,6 +23279,9 @@ fn w47bParsePartialMerkleTree(allocator: std.mem.Allocator, data: []const u8) !W
     if (return_val) |rv| {
         result_hash = rv.hash;
     }
+    // Core ExtractMatches: every hash and (to the byte) every bit consumed.
+    if (hash_idx != hashes.len) return error.BadTree;
+    if ((bit_idx + 7) / 8 != n_flag_bytes) return error.BadTree;
 
     return W47bParseResult{
         .matched = try matched.toOwnedSlice(),

@@ -945,6 +945,42 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_r5_di_tests.step);
     }
 
+    // CONTROL for the R5 ERROR-CODE PARITY class (2026-09-26 live + regtest
+    // R5 runs): one test per probe that failed, codes/messages read from a
+    // live Core.  Same project-root package layout as tests_r5_accepts_invalid.zig.
+    {
+        const r5_ec_tests = b.addTest(.{
+            .root_source_file = b.path("tests_r5_errcode.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"r5_errcode"},
+        });
+        r5_ec_tests.linkSystemLibrary("rocksdb");
+        r5_ec_tests.linkSystemLibrary("secp256k1");
+        r5_ec_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        r5_ec_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            r5_ec_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            r5_ec_tests.linkSystemLibrary("minisketch");
+            r5_ec_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        r5_ec_tests.root_module.addOptions("build_options", build_options);
+
+        const run_r5_ec_tests = b.addRunArtifact(r5_ec_tests);
+        const r5_ec_step = b.step(
+            "test-r5-errcode",
+            "Run R5 error-code / help parity controls",
+        );
+        r5_ec_step.dependOn(&run_r5_ec_tests.step);
+        // Also in the default `test` step, so the release gate runs it.
+        test_step.dependOn(&run_r5_ec_tests.step);
+    }
+
     // CONTROL for QUEUES.md T3 createwallet(descriptors=false) / no-name.
     // Same project-root package layout as tests_r5_accepts_invalid.zig.
     {

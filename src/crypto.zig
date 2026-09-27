@@ -1028,6 +1028,32 @@ pub fn messageHash(message: []const u8) Hash256 {
     return out;
 }
 
+/// DER-encoded ECDSA signature of `msg_hash` with `seckey`, exactly as Core's
+/// CKey::Sign(hash, sig, grind=true): RFC6979 nonce, re-signed with a 32-byte
+/// little-endian counter as extra entropy until R is "low" (first compact byte
+/// < 0x80), so the DER encoding is at most 71 bytes.  libsecp256k1 always
+/// normalizes S to low-S.  Returns null on an invalid key.
+pub const DerSig = struct { bytes: [72]u8, len: usize };
+
+pub fn ecdsaSignDer(msg_hash: *const [32]u8, seckey: *const [32]u8) ?DerSig {
+    const ctx = secp_ctx() orelse return null;
+    var sig: secp256k1.secp256k1_ecdsa_signature = undefined;
+    var extra: [32]u8 = [_]u8{0} ** 32;
+    var counter: u32 = 0;
+    if (secp256k1.secp256k1_ecdsa_sign(ctx, &sig, msg_hash, seckey, null, null) != 1) return null;
+    while (true) {
+        var compact: [64]u8 = undefined;
+        _ = secp256k1.secp256k1_ecdsa_signature_serialize_compact(ctx, &compact, &sig);
+        if (compact[0] < 0x80) break;
+        counter += 1;
+        std.mem.writeInt(u32, extra[0..4], counter, .little);
+        if (secp256k1.secp256k1_ecdsa_sign(ctx, &sig, msg_hash, seckey, null, &extra) != 1) return null;
+    }
+    var out: DerSig = .{ .bytes = undefined, .len = 72 };
+    if (secp256k1.secp256k1_ecdsa_signature_serialize_der(ctx, &out.bytes, &out.len, &sig) != 1) return null;
+    return out;
+}
+
 /// Sign a 32-byte hash with `seckey`, producing a 65-byte Bitcoin Core-format
 /// compact-recoverable signature: header byte (27 + recid + 4 if compressed)
 /// followed by 64 bytes of compact-encoded R||S.

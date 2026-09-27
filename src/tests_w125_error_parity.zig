@@ -188,8 +188,11 @@ test "w125 G10 BUG-4 (HIGH-COMPAT): RPC_CLIENT_NOT_CONNECTED constant MISSING (x
 // (mempool.cpp:1141).  clearbit's handleLoadMempool / handleDumpMempool do
 // not check IBD and use RPC_INTERNAL_ERROR for failure (rpc.zig:4865).
 // ---------------------------------------------------------------------------
-test "w125 G11 BUG-5 (HIGH-COMPAT): RPC_CLIENT_IN_INITIAL_DOWNLOAD constant MISSING (xfail)" {
-    try testing.expect(!@hasDecl(rpc, "RPC_CLIENT_IN_INITIAL_DOWNLOAD"));
+// FIX (R5 errcode, 2026-09-27): the -10 constant is defined and importmempool
+// returns it during IBD with Core's message (tests_r5_errcode.zig).
+test "w125 G11 BUG-5 (HIGH-COMPAT): RPC_CLIENT_IN_INITIAL_DOWNLOAD = -10 (PRESENT)" {
+    try testing.expect(@hasDecl(rpc, "RPC_CLIENT_IN_INITIAL_DOWNLOAD"));
+    try testing.expectEqual(@as(i32, -10), rpc.RPC_CLIENT_IN_INITIAL_DOWNLOAD);
 }
 
 // ---------------------------------------------------------------------------

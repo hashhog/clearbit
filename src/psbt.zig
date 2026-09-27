@@ -749,6 +749,136 @@ pub const Psbt = struct {
         return result;
     }
 
+    /// Joiner role — Core rpc/rawtransaction.cpp `joinpsbts` + psbt.cpp
+    /// AddInput/AddOutput.  Concatenates every input and output of `psbts`
+    /// into one PSBT with the HIGHEST version (floor 1, compared unsigned) and
+    /// the LOWEST locktime; each added input loses its partial sigs and final
+    /// scriptSig/witness (Core AddInput); an input whose CTxIn (prevout,
+    /// scriptSig, sequence) already appears is `error.DuplicateInput` and
+    /// `dup_out` names it.  Inputs and outputs are then shuffled independently
+    /// (Core std::shuffle with FastRandomContext), so callers must not rely on
+    /// order.  Global xpubs are dropped exactly as Core's shuffled_psbt does.
+    pub fn join(
+        allocator: std.mem.Allocator,
+        psbts: []const *const Psbt,
+        random: std.Random,
+        dup_out: *types.OutPoint,
+    ) !Psbt {
+        var best_version: u32 = 1;
+        var best_locktime: u32 = 0xffffffff;
+        var n_in: usize = 0;
+        var n_out: usize = 0;
+        for (psbts) |p| {
+            const v: u32 = @bitCast(p.tx.version);
+            if (v > best_version) best_version = v;
+            if (p.tx.lock_time < best_locktime) best_locktime = p.tx.lock_time;
+            n_in += p.tx.inputs.len;
+            n_out += p.tx.outputs.len;
+        }
+
+        // Flattened views, duplicate-checked in Core's merge order.
+        const InRef = struct { p: *const Psbt, i: usize };
+        const in_refs = try allocator.alloc(InRef, n_in);
+        defer allocator.free(in_refs);
+        const out_refs = try allocator.alloc(InRef, n_out);
+        defer allocator.free(out_refs);
+        var ni: usize = 0;
+        var no: usize = 0;
+        for (psbts) |p| {
+            for (p.tx.inputs, 0..) |txin, i| {
+                for (in_refs[0..ni]) |r| {
+                    const o = r.p.tx.inputs[r.i];
+                    if (std.mem.eql(u8, &o.previous_output.hash, &txin.previous_output.hash) and
+                        o.previous_output.index == txin.previous_output.index and
+                        o.sequence == txin.sequence and
+                        std.mem.eql(u8, o.script_sig, txin.script_sig))
+                    {
+                        dup_out.* = txin.previous_output;
+                        return error.DuplicateInput;
+                    }
+                }
+                in_refs[ni] = .{ .p = p, .i = i };
+                ni += 1;
+            }
+            for (0..p.tx.outputs.len) |i| {
+                out_refs[no] = .{ .p = p, .i = i };
+                no += 1;
+            }
+        }
+        random.shuffle(InRef, in_refs);
+        random.shuffle(InRef, out_refs);
+
+        // Build the joined unsigned tx: CTxIn copies WITHOUT witness (a PSBT's
+        // unsigned tx carries none), outputs verbatim.
+        var tmp_inputs = try allocator.alloc(types.TxIn, n_in);
+        defer allocator.free(tmp_inputs);
+        for (in_refs, 0..) |r, k| {
+            const src = r.p.tx.inputs[r.i];
+            tmp_inputs[k] = .{
+                .previous_output = src.previous_output,
+                .script_sig = src.script_sig,
+                .sequence = src.sequence,
+                .witness = &[_][]const u8{},
+            };
+        }
+        var tmp_outputs = try allocator.alloc(types.TxOut, n_out);
+        defer allocator.free(tmp_outputs);
+        for (out_refs, 0..) |r, k| tmp_outputs[k] = r.p.tx.outputs[r.i];
+        const tmp_tx = types.Transaction{
+            .version = @bitCast(best_version),
+            .inputs = tmp_inputs,
+            .outputs = tmp_outputs,
+            .lock_time = best_locktime,
+        };
+
+        var tx = try cloneTransaction(allocator, &tmp_tx);
+        errdefer freeTransaction(allocator, &tx);
+
+        const inputs = try allocator.alloc(PsbtInput, n_in);
+        var built_in: usize = 0;
+        errdefer {
+            for (inputs[0..built_in]) |*x| x.deinit();
+            allocator.free(inputs);
+        }
+        for (in_refs, 0..) |r, k| {
+            inputs[k] = try clonePsbtInput(allocator, &r.p.inputs[r.i]);
+            built_in += 1;
+            // Core AddInput: partial_sigs.clear(), final_script_sig.clear(),
+            // final_script_witness.SetNull().
+            var sit = inputs[k].partial_sigs.iterator();
+            while (sit.next()) |e| allocator.free(e.value_ptr.*);
+            inputs[k].partial_sigs.clearRetainingCapacity();
+            if (inputs[k].final_script_sig) |s| allocator.free(s);
+            inputs[k].final_script_sig = null;
+            if (inputs[k].final_script_witness) |w| {
+                for (w) |item| allocator.free(item);
+                allocator.free(w);
+            }
+            inputs[k].final_script_witness = null;
+        }
+
+        const outputs = try allocator.alloc(PsbtOutput, n_out);
+        var built_out: usize = 0;
+        errdefer {
+            for (outputs[0..built_out]) |*x| x.deinit();
+            allocator.free(outputs);
+        }
+        for (out_refs, 0..) |r, k| {
+            outputs[k] = try clonePsbtOutput(allocator, &r.p.outputs[r.i]);
+            built_out += 1;
+        }
+
+        return Psbt{
+            .tx = tx,
+            .inputs = inputs,
+            .outputs = outputs,
+            .xpubs = std.AutoHashMap([78]u8, KeyOriginInfo).init(allocator),
+            .version = 0,
+            .unknown = std.AutoHashMap(u64, UnknownEntry).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
     /// Merge another PSBT into this one
     pub fn mergeFrom(self: *Psbt, other: *const Psbt) !void {
         // Verify they have the same underlying transaction
@@ -817,7 +947,10 @@ pub const Psbt = struct {
         const script_pubkey = if (input.witness_utxo) |utxo|
             utxo.script_pubkey
         else if (input.non_witness_utxo) |tx|
-            tx.outputs[self.tx.inputs[input_index].previous_output.index].script_pubkey
+            (if (self.tx.inputs[input_index].previous_output.index < tx.outputs.len)
+                tx.outputs[self.tx.inputs[input_index].previous_output.index].script_pubkey
+            else
+                return PsbtError.MissingUtxo)
         else
             return PsbtError.MissingUtxo;
 
@@ -901,7 +1034,10 @@ pub const Psbt = struct {
         const spk: []const u8 = if (input.witness_utxo) |utxo|
             utxo.script_pubkey
         else if (input.non_witness_utxo) |tx|
-            tx.outputs[self.tx.inputs[input_index].previous_output.index].script_pubkey
+            (if (self.tx.inputs[input_index].previous_output.index < tx.outputs.len)
+                tx.outputs[self.tx.inputs[input_index].previous_output.index].script_pubkey
+            else
+                return PsbtError.MissingUtxo)
         else
             return PsbtError.MissingUtxo;
         if (!isP2SH(spk)) {
@@ -1419,8 +1555,16 @@ pub const Psbt = struct {
             switch (key_type) {
                 PSBT_GLOBAL_UNSIGNED_TX => {
                     if (key_data.len != 0) return PsbtError.InvalidKeyLength;
+                    if (tx != null) return PsbtError.DuplicateKey;
+                    // BIP-174 / Core psbt.h: the unsigned tx is serialized
+                    // WITHOUT witness (TX_NO_WITNESS), so a 0x00 after the
+                    // version is an EMPTY input vector, not a segwit marker —
+                    // reading it as witness-format rejected every PSBT with no
+                    // inputs (e.g. the output-only halves joinpsbts takes).
+                    // The value must be consumed exactly (UnserializeFromVector).
                     var tx_reader = serialize_mod.Reader{ .data = value };
-                    tx = try serialize_mod.readTransaction(&tx_reader, allocator);
+                    tx = try serialize_mod.readTransactionNoWitness(&tx_reader, allocator);
+                    if (tx_reader.pos != value.len) return PsbtError.InvalidValueLength;
                 },
                 PSBT_GLOBAL_VERSION => {
                     if (value.len != 4) return PsbtError.InvalidValueLength;

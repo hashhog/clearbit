@@ -100,18 +100,23 @@ test "w137 G1: psbt.zig module docstring lies about BIP-370 support (BUG-1)" {
 // G2 — `key_lookup` set on deserialize prevents duplicate keys
 // Status: MISSING (BUG-3). No duplicate-key detection at all.
 // ===========================================================================
-test "w137 G2: no duplicate-key detection on deserialize (BUG-3)" {
+test "w137 G2: duplicate-key detection on deserialize is global-tx only (BUG-3, partial)" {
     const allocator = testing.allocator;
     const src = try loadSrc(allocator, "psbt");
     defer allocator.free(src);
 
-    // No key_lookup set / Duplicate Key string / .DuplicateKey raise anywhere
-    // in parseInputMap / parseOutputMap / global reader.
+    // Still no general key_lookup set in parseInputMap / parseOutputMap
+    // (G2b below pins the per-input overwrite).
     try testing.expect(!contains(src, "key_lookup"));
     try testing.expect(!contains(src, "Duplicate Key, "));
-    // The error variant is declared but never raised by deserialize-time code.
     try testing.expect(contains(src, "DuplicateKey,"));
-    try testing.expect(!contains(src, "return PsbtError.DuplicateKey"));
+    // R5 errcode work (2026-09-27): a SECOND global unsigned tx is now
+    // rejected (Core: "Duplicate Key, unsigned tx already provided") —
+    // exactly one raise site, in the PSBT_GLOBAL_UNSIGNED_TX arm.
+    const first = std.mem.indexOf(u8, src, "return PsbtError.DuplicateKey").?;
+    try testing.expect(std.mem.indexOfPos(u8, src, first + 1, "return PsbtError.DuplicateKey") == null);
+    const arm = std.mem.indexOf(u8, src, "PSBT_GLOBAL_UNSIGNED_TX => {").?;
+    try testing.expect(first > arm and first - arm < 400);
     try testing.expect(!contains(src, "return error.DuplicateKey"));
 }
 
@@ -679,29 +684,30 @@ test "w137 G22: analyzepsbt missing per-input next + estimated_vsize (BUG-23)" {
 
 // ===========================================================================
 // G23 — `joinpsbts` RPC
-// Status: MISSING (BUG-24). Dispatch arm absent.
+// Status: PRESENT (BUG-24 fixed 2026-09-27, R5 errcode). Dispatch arm absent.
 // ===========================================================================
-test "w137 G23: joinpsbts RPC not dispatched (BUG-24)" {
+test "w137 G23: joinpsbts RPC is dispatched (BUG-24 fixed)" {
     const allocator = testing.allocator;
     const src = try loadSrc(allocator, "rpc");
     defer allocator.free(src);
 
-    try testing.expect(!contains(src, "\"joinpsbts\""));
-    try testing.expect(!contains(src, "handleJoinPsbts"));
-    try testing.expect(!contains(src, "joinPsbts"));
+    // Behaviour (Core-verified codes/results) lives in tests_r5_errcode.zig.
+    try testing.expect(contains(src, "\"joinpsbts\""));
+    try testing.expect(contains(src, "handleJoinPsbts"));
 }
 
 // ===========================================================================
 // G24 — `utxoupdatepsbt` RPC
-// Status: MISSING (BUG-25).
+// Status: PRESENT (BUG-25 fixed 2026-09-27, R5 errcode).
 // ===========================================================================
-test "w137 G24: utxoupdatepsbt RPC not dispatched (BUG-25)" {
+test "w137 G24: utxoupdatepsbt RPC is dispatched (BUG-25 fixed)" {
     const allocator = testing.allocator;
     const src = try loadSrc(allocator, "rpc");
     defer allocator.free(src);
 
-    try testing.expect(!contains(src, "\"utxoupdatepsbt\""));
-    try testing.expect(!contains(src, "handleUtxoUpdatePsbt"));
+    // Behaviour (Core-verified codes/results) lives in tests_r5_errcode.zig.
+    try testing.expect(contains(src, "\"utxoupdatepsbt\""));
+    try testing.expect(contains(src, "handleUtxoUpdatePsbt"));
 }
 
 // ===========================================================================
@@ -722,15 +728,16 @@ test "w137 G25: walletprocesspsbt RPC is dispatched" {
 
 // ===========================================================================
 // G26 — `descriptorprocesspsbt` RPC
-// Status: MISSING (BUG-27).
+// Status: PRESENT (BUG-27 fixed 2026-09-27, R5 errcode).
 // ===========================================================================
-test "w137 G26: descriptorprocesspsbt RPC not dispatched (BUG-27)" {
+test "w137 G26: descriptorprocesspsbt RPC is dispatched (BUG-27 fixed)" {
     const allocator = testing.allocator;
     const src = try loadSrc(allocator, "rpc");
     defer allocator.free(src);
 
-    try testing.expect(!contains(src, "\"descriptorprocesspsbt\""));
-    try testing.expect(!contains(src, "handleDescriptorProcessPsbt"));
+    // Behaviour (Core-verified codes/results) lives in tests_r5_errcode.zig.
+    try testing.expect(contains(src, "\"descriptorprocesspsbt\""));
+    try testing.expect(contains(src, "handleDescriptorProcessPsbt"));
 }
 
 // ===========================================================================
