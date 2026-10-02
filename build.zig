@@ -151,6 +151,10 @@ pub fn build(b: *std.Build) void {
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
+    // Only the aggregate unit-test binary (honours -Dtest-filter); `test`
+    // also runs ~15 unfiltered per-file suites.
+    const unit_only_step = b.step("test-unit", "Run only the aggregate unit tests (honours -Dtest-filter)");
+    unit_only_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_unit_tests.step);
 
     // Operational-parity tests (daemon/PID/SIGHUP/--debug=cat/zmq).
