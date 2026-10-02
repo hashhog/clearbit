@@ -20,6 +20,11 @@
 //!   - On any collision with a built-in entry (same height OR same block
 //!     hash) or a duplicate within the campaign file itself: refuse to start
 //!     (FATAL + exit). Campaign data may never override a production hash.
+//!     Exception: an entry whose commitment (height, blockhash,
+//!     hash_serialized, m_chain_tx_count) is IDENTICAL to the built-in row is
+//!     a confirmation, not an override -- accepted, with the built-in
+//!     commitment kept and only missing supplemental fields filled
+//!     (`loadFromPath`, `mergeWithBuiltin`).
 //!
 //! SECURITY: this module implements only the parse/validate/merge mechanics.
 //! The actual guard against production (mainnet P2P) use is external:
@@ -77,6 +82,44 @@ var g_tail_len: usize = 0;
 /// path that didn't already exit, or before `ensureLoaded` has run once).
 pub fn entries() []const consensus.AssumeUtxoData {
     return g_entries_buf[0..g_entries_len];
+}
+
+/// Merge the campaign entries into a copy of the built-in table, writing into
+/// `out`. A campaign entry that CONFIRMS a built-in row (same height and the
+/// identical commitment -- `loadFromPath` refuses anything else at a built-in
+/// height or hash) REPLACES that row in place, so the gap-filled copy (base_mtp,
+/// base_tail_headers) is what `findAssumeUtxoEntry` -- first match wins -- sees,
+/// and no second row exists at the height. Every other campaign entry is
+/// appended after the built-ins, as before.
+pub fn mergeWithBuiltin(
+    builtin_entries: []const consensus.AssumeUtxoData,
+    campaign_entries: []const consensus.AssumeUtxoData,
+    out: []consensus.AssumeUtxoData,
+) []consensus.AssumeUtxoData {
+    std.debug.assert(out.len >= builtin_entries.len + campaign_entries.len);
+    var n: usize = 0;
+    for (builtin_entries) |b| {
+        out[n] = b;
+        for (campaign_entries) |c| {
+            if (isConfirmationOf(c, b)) out[n] = c;
+        }
+        n += 1;
+    }
+    outer: for (campaign_entries) |c| {
+        for (builtin_entries) |b| {
+            if (isConfirmationOf(c, b)) continue :outer;
+        }
+        out[n] = c;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn isConfirmationOf(c: consensus.AssumeUtxoData, b: consensus.AssumeUtxoData) bool {
+    return c.height == b.height and
+        std.mem.eql(u8, &c.block_hash, &b.block_hash) and
+        std.mem.eql(u8, &c.hash_serialized, &b.hash_serialized) and
+        c.chain_tx_count == b.chain_tx_count;
 }
 
 /// Convert a DISPLAY-order (Core-printed) hex hash string to clearbit's
@@ -375,22 +418,86 @@ fn loadFromPath(
             }
         }
 
-        // Refuse collisions with a built-in (production) entry: same height
-        // OR same block hash. Campaign data may never override a production
-        // hash.
-        for (builtin_entries) |b| {
-            if (b.height == height or std.mem.eql(u8, &b.block_hash, &block_hash)) {
-                return error.CollidesWithBuiltinEntry;
-            }
-        }
-        // Refuse duplicates within the campaign file itself.
+        // Refuse duplicates within the campaign file itself — FIRST, before
+        // any comparison with the built-in table, so a file that repeats a
+        // confirming entry is still refused as a duplicate.
         for (staged[0..staged_len]) |s| {
             if (s.height == height or std.mem.eql(u8, &s.block_hash, &block_hash)) {
                 return error.DuplicateCampaignEntry;
             }
         }
 
+        // Collision with a built-in (production) entry: same height OR same
+        // block hash. Campaign data may never override a production hash.
+        //
+        // The ONE non-refusal: an entry whose whole commitment -- height,
+        // blockhash, hash_serialized AND m_chain_tx_count -- is IDENTICAL to
+        // the built-in row. That is not an override but a second source
+        // agreeing with the first (Core keys an m_assumeutxo_data row by
+        // height+blockhash and checks the snapshot against its
+        // hash_serialized; a byte-identical row adds no new trust). The R4
+        // rung at 910,000 was minted by dumping a Core clone there and came
+        // out equal to Core's own hardcoded anchor; refusing it BLOCKED slice
+        // 910000-920000. Such an entry CONFIRMS the built-in row: the row's
+        // commitment and chain_work are kept, and only supplemental fields the
+        // row lacks (base_mtp, base_tail_headers, chain_work) are filled from
+        // the entry. A value that contradicts one the row already pins is
+        // refused. Every matching built-in (by height OR by hash) must be
+        // identical, so the built-in blockhash at another height still refuses.
+        var confirms: ?consensus.AssumeUtxoData = null;
+        for (builtin_entries) |b| {
+            if (b.height == height or std.mem.eql(u8, &b.block_hash, &block_hash)) {
+                const identical = b.height == height and
+                    std.mem.eql(u8, &b.block_hash, &block_hash) and
+                    std.mem.eql(u8, &b.hash_serialized, &hash_serialized) and
+                    b.chain_tx_count == chain_tx_count;
+                if (!identical) return error.CollidesWithBuiltinEntry;
+                confirms = b;
+            }
+        }
+
         const base_tail = try stageBaseTailHeaders(obj, height, block_hash, params);
+
+        if (confirms) |b| {
+            var row = b; // commitment (height/hash/utxo-hash/tx-count) from the built-in
+            const zero = [_]u8{0} ** 32;
+            if (obj.get("chainwork")) |cw_val| {
+                if (cw_val != .string or cw_val.string.len != 64) return error.InvalidChainwork;
+                var cw: [32]u8 = undefined;
+                for (0..32) |k| {
+                    cw[k] = std.fmt.parseInt(u8, cw_val.string[k * 2 ..][0..2], 16) catch return error.InvalidChainwork;
+                }
+                if (std.mem.eql(u8, &row.chain_work, &zero)) {
+                    row.chain_work = cw;
+                } else if (!std.mem.eql(u8, &row.chain_work, &cw)) {
+                    return error.ConfirmationContradictsBuiltin;
+                }
+            }
+            if (base_mtp != 0) {
+                if (row.base_mtp == 0) {
+                    row.base_mtp = base_mtp;
+                } else if (row.base_mtp != base_mtp) {
+                    return error.ConfirmationContradictsBuiltin;
+                }
+            }
+            if (base_tail.len > 0) {
+                if (row.base_tail_headers.len == 0) {
+                    row.base_tail_headers = base_tail;
+                } else {
+                    if (row.base_tail_headers.len != base_tail.len) return error.ConfirmationContradictsBuiltin;
+                    for (row.base_tail_headers, base_tail) |x, y| {
+                        if (!std.mem.eql(u8, &x.raw, &y.raw)) return error.ConfirmationContradictsBuiltin;
+                    }
+                }
+            }
+            std.debug.print(
+                "[CAMPAIGN-ASSUMEUTXO] entry height {d} is IDENTICAL to the built-in assumeutxo commitment (blockhash, hash_serialized, m_chain_tx_count) -- accepted as a confirmation; commitment kept, base_mtp={d} base_tail_headers={d}\n",
+                .{ height, row.base_mtp, row.base_tail_headers.len },
+            );
+            staged[staged_len] = row;
+            staged_len += 1;
+            continue;
+        }
 
         staged[staged_len] = .{
             .height = height,
@@ -786,5 +893,144 @@ test "campaign_assumeutxo: the height label is NOT validated (documented gap)" {
     const tail = entries()[0].base_tail_headers;
     try testing.expectEqual(@as(u32, 699_999), tail[0].height);
     try testing.expectEqual(@as(u32, 700_000), tail[1].height);
+    resetForTest();
+}
+
+// ── 2026-10-02: an entry IDENTICAL to a built-in row is a confirmation ──────
+// R4 slice 910000-920000 was BLOCKED: the soak-910000 rung (minted by dumping
+// a Core clone at 910,000) carries exactly the commitment Core hardcodes in
+// kernel/chainparams.cpp m_assumeutxo_data, and the loader refused ANY entry
+// at a built-in height. Real values below; the two headers are the last two
+// elements of that fixture's base_tail_headers (the second IS the base, 910000).
+const T910_HASH = "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821";
+const T910_UTXO = "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568";
+const T910_HDR_909999 = "0020592a1970782bb3dff759c58207e20afef8182be097c2e21b0100000000000000000058fd4068421efc07a315277e2bf76425d383016766482030905070cf11d68d766fa99d68b32c021710012e81";
+const T910_HDR_910000 = "00a0572be06d4f01a2ed2228dec965539cc8b96512ccde7d2824010000000000000000006f28c30dc748f6b1430fb2b9a5a94b5b34a5df6e318c6cc5c310a1a35b432b59a3ab9d68b32c021719d103e9";
+const T910_CHAINWORK = "0000000000000000000000000000000000000000da15bcbf68ad7fed795c504f";
+
+fn write910(dir: std.fs.Dir, utxo: []const u8, tx_count: u64, chainwork: []const u8) ![]const u8 {
+    const json = try std.fmt.allocPrint(testing.allocator,
+        \\[ {{ "height": 910000,
+        \\    "blockhash": "{s}",
+        \\    "hash_serialized": "{s}",
+        \\    "m_chain_tx_count": {d},
+        \\    "base_mtp": 1755159732,
+        \\    "chainwork": "{s}",
+        \\    "base_header": "{s}",
+        \\    "base_tail_headers": ["{s}", "{s}"] }} ]
+    , .{ T910_HASH, utxo, tx_count, chainwork, T910_HDR_910000, T910_HDR_909999, T910_HDR_910000 });
+    defer testing.allocator.free(json);
+    return writeTempJson(dir, "campaign.json", json);
+}
+
+test "campaign_assumeutxo: an entry identical to the built-in 910000 row is accepted (real soak-910000 values)" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try write910(tmp_dir.dir, T910_UTXO, 1226586151, T910_CHAINWORK);
+    defer testing.allocator.free(path);
+
+    try loadFromPath(testing.allocator, path, &consensus.MAINNET, consensus.MAINNET.assume_utxo);
+    const got = entries();
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(@as(u32, 910_000), got[0].height);
+    resetForTest();
+}
+
+test "campaign_assumeutxo: a DIFFERENT hash_serialized at the built-in 910000 height is refused" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try write910(tmp_dir.dir, "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1569", 1226586151, T910_CHAINWORK);
+    defer testing.allocator.free(path);
+
+    try testing.expectError(error.CollidesWithBuiltinEntry, loadFromPath(testing.allocator, path, &consensus.MAINNET, consensus.MAINNET.assume_utxo));
+    try testing.expectEqual(@as(usize, 0), entries().len);
+    resetForTest();
+}
+
+test "campaign_assumeutxo: a DIFFERENT m_chain_tx_count at the built-in 910000 height is refused" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try write910(tmp_dir.dir, T910_UTXO, 1226586152, T910_CHAINWORK);
+    defer testing.allocator.free(path);
+
+    try testing.expectError(error.CollidesWithBuiltinEntry, loadFromPath(testing.allocator, path, &consensus.MAINNET, consensus.MAINNET.assume_utxo));
+    resetForTest();
+}
+
+test "campaign_assumeutxo: a confirmation REPLACES the built-in row in place, filling only its gaps" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try write910(tmp_dir.dir, T910_UTXO, 1226586151, T910_CHAINWORK);
+    defer testing.allocator.free(path);
+    const builtin = consensus.MAINNET.assume_utxo;
+    try loadFromPath(testing.allocator, path, &consensus.MAINNET, builtin);
+
+    var buf: [64]consensus.AssumeUtxoData = undefined;
+    const merged = mergeWithBuiltin(builtin, entries(), &buf);
+    // No second row at 910000: same length as the built-in table.
+    try testing.expectEqual(builtin.len, merged.len);
+    var found: ?consensus.AssumeUtxoData = null;
+    for (merged, builtin) |m, b| {
+        try testing.expectEqual(b.height, m.height);
+        try testing.expectEqualSlices(u8, &b.block_hash, &m.block_hash);
+        try testing.expectEqualSlices(u8, &b.hash_serialized, &m.hash_serialized);
+        try testing.expectEqual(b.chain_tx_count, m.chain_tx_count);
+        try testing.expectEqualSlices(u8, &b.chain_work, &m.chain_work);
+        if (m.height == 910_000) found = m;
+    }
+    const row = found orelse return error.TestExpectedRow;
+    // The gaps the built-in row has (no base_mtp, no headers) are filled, so the
+    // import can persist the base's real header instead of the nBits=0 placeholder.
+    try testing.expectEqual(@as(u32, 1_755_159_732), row.base_mtp);
+    try testing.expectEqual(@as(usize, 2), row.base_tail_headers.len);
+    try testing.expectEqual(@as(u32, 910_000), row.base_tail_headers[1].height);
+    try testing.expectEqualSlices(u8, &row.block_hash, &row.base_tail_headers[1].hash);
+    // Built-in table itself untouched.
+    for (builtin) |b| if (b.height == 910_000) try testing.expectEqual(@as(u32, 0), b.base_mtp);
+    resetForTest();
+}
+
+test "campaign_assumeutxo: a confirmation whose chainwork contradicts the built-in row is refused" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try write910(tmp_dir.dir, T910_UTXO, 1226586151, "0000000000000000000000000000000000000000da15bcbf68ad7fed795c5050");
+    defer testing.allocator.free(path);
+    try testing.expectError(error.ConfirmationContradictsBuiltin, loadFromPath(testing.allocator, path, &consensus.MAINNET, consensus.MAINNET.assume_utxo));
+    resetForTest();
+}
+
+test "campaign_assumeutxo: the built-in 910000 blockhash declared at another height is refused" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try writeTempJson(tmp_dir.dir, "campaign.json",
+        \\[ { "height": 910001,
+        \\    "blockhash": "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+        \\    "hash_serialized": "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+        \\    "m_chain_tx_count": 1226586151 } ]
+    );
+    defer testing.allocator.free(path);
+    try testing.expectError(error.CollidesWithBuiltinEntry, loadFromPath(testing.allocator, path, &consensus.MAINNET, consensus.MAINNET.assume_utxo));
+    resetForTest();
+}
+
+test "campaign_assumeutxo: an identical entry repeated in the file is still a duplicate" {
+    resetForTest();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const one =
+        \\{ "height": 910000,
+        \\  "blockhash": "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+        \\  "hash_serialized": "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+        \\  "m_chain_tx_count": 1226586151 }
+    ;
+    const path = try writeTempJson(tmp_dir.dir, "campaign.json", "[" ++ one ++ "," ++ one ++ "]");
+    defer testing.allocator.free(path);
+    try testing.expectError(error.DuplicateCampaignEntry, loadFromPath(testing.allocator, path, &consensus.MAINNET, consensus.MAINNET.assume_utxo));
     resetForTest();
 }

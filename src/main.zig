@@ -240,16 +240,10 @@ pub const Config = struct {
         }
         if (campaign_entries.len > 0) {
             std.debug.assert(base.assume_utxo.len <= MAX_BUILTIN_ASSUME_UTXO);
-            var n: usize = 0;
-            for (base.assume_utxo) |e| {
-                S.merged_assume_utxo[n] = e;
-                n += 1;
-            }
-            for (campaign_entries) |e| {
-                S.merged_assume_utxo[n] = e;
-                n += 1;
-            }
-            p.assume_utxo = S.merged_assume_utxo[0..n];
+            // A campaign entry identical to a built-in row (a confirmation)
+            // replaces that row in place with its gap-filled copy; the rest
+            // are appended (campaign_assumeutxo.mergeWithBuiltin).
+            p.assume_utxo = campaign_assumeutxo.mergeWithBuiltin(base.assume_utxo, campaign_entries, &S.merged_assume_utxo);
         }
         S.patched = p;
         return &S.patched;
