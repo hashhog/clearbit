@@ -2217,6 +2217,17 @@ pub const ChainState = struct {
     /// Both P2P and RPC (submitblock) can connect blocks concurrently;
     /// without serialization the UTXO HashMap corrupts.
     connect_mutex: std.Thread.Mutex = .{},
+    /// Durable BLOCK_FAILED_VALID set (Core: the nStatus bit in the block
+    /// index, flushed by WriteBatchSync of m_dirty_blockindex).  clearbit's
+    /// ChainManager block index is rebuilt lazily after a restart, so the
+    /// invalid status of blocks marked by `invalidateblock` lives here,
+    /// persisted under INVALID_BLOCKS_KEY in CF_DEFAULT.  Every connect path
+    /// (P2P, submitblock, reorg, replay) runs through connectBlockInner,
+    /// which refuses a hash in this set — so a restart can never reconnect
+    /// an invalidated branch.  Cleared by `reconsiderblock`.  Guarded by
+    /// connect_mutex; loaded lazily on first use.
+    invalid_blocks: std.AutoHashMapUnmanaged(types.Hash256, void) = .{},
+    invalid_blocks_loaded: bool = false,
     /// Sticky flag set when a flush() call fails to persist its batch.
     /// connectBlockFast / submitBlock check this on entry and refuse to
     /// connect another block until cleared.  Without this, a transient
@@ -2649,11 +2660,11 @@ pub const ChainState = struct {
     pending_undo_deletes: std.ArrayList(types.Hash256) = undefined,
 
     /// Boot-reconcile only (2026-06-23): per-block H:<height> index DELETEs
-    /// pending durable commit.  Populated EXCLUSIVELY by the boot-time
-    /// reconcileSurplusBlocksOnBoot path (via disconnectBlockByHashCFInner's
-    /// delete_height_index=true), never by reorg/invalidateblock — those
-    /// callers pass delete_height_index=false so their H: behavior is
-    /// untouched.  When a surplus persisted block is disconnected on boot its
+    /// pending durable commit.  Populated by the boot-time
+    /// reconcileSurplusBlocksOnBoot path and the standalone (invalidateblock)
+    /// disconnectBlockByHashCF via disconnectBlockByHashCFInner's
+    /// delete_height_index=true, and by reorgToChain for heights above a
+    /// shortened tip.  When a surplus persisted block is disconnected on boot its
     /// now-orphaned H:<height>→hash entry must be removed atomically with the
     /// UTXO restore + tip rewind; flush() drains this into the SAME WriteBatch
     /// as the tip's H: put so a crash mid-flush leaves a consistent state.
@@ -2978,6 +2989,7 @@ pub const ChainState = struct {
     }
 
     pub fn deinit(self: *ChainState) void {
+        self.invalid_blocks.deinit(self.allocator);
         // Drain any unflushed block bodies. On a clean shutdown
         // these were committed in the last flush()'s cleanup loop;
         // anything still queued here belongs to a flush_error path
@@ -5242,6 +5254,74 @@ pub const ChainState = struct {
         return try db.get(CF_BLOCK_UNDO, hash);
     }
 
+    /// CF_DEFAULT key holding the durable invalid-block set: N x 32-byte hashes.
+    pub const INVALID_BLOCKS_KEY = "invalid_blocks";
+
+    /// Load the durable invalid set once.  Caller holds connect_mutex.
+    fn loadInvalidBlocksLocked(self: *ChainState) !void {
+        if (self.invalid_blocks_loaded) return;
+        if (self.utxo_set.db) |db| {
+            if (try db.get(CF_DEFAULT, INVALID_BLOCKS_KEY)) |bytes| {
+                defer self.allocator.free(bytes);
+                var off: usize = 0;
+                while (off + 32 <= bytes.len) : (off += 32) {
+                    var h: types.Hash256 = undefined;
+                    @memcpy(&h, bytes[off .. off + 32]);
+                    try self.invalid_blocks.put(self.allocator, h, {});
+                }
+            }
+        }
+        self.invalid_blocks_loaded = true;
+    }
+
+    /// Write the whole set back (small: operator-invalidated blocks only).
+    fn storeInvalidBlocksLocked(self: *ChainState) !void {
+        const db = self.utxo_set.db orelse return;
+        if (self.invalid_blocks.count() == 0) {
+            try db.delete(CF_DEFAULT, INVALID_BLOCKS_KEY);
+            return;
+        }
+        const buf = try self.allocator.alloc(u8, 32 * self.invalid_blocks.count());
+        defer self.allocator.free(buf);
+        var it = self.invalid_blocks.keyIterator();
+        var off: usize = 0;
+        while (it.next()) |k| : (off += 32) @memcpy(buf[off .. off + 32], k);
+        try db.put(CF_DEFAULT, INVALID_BLOCKS_KEY, buf);
+    }
+
+    /// Mark (`failed=true`) or clear a block's durable BLOCK_FAILED_VALID.
+    /// Takes connect_mutex: never call while holding it.
+    pub fn setBlockFailedDurable(self: *ChainState, hash: *const types.Hash256, failed: bool) !void {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
+        try self.loadInvalidBlocksLocked();
+        const changed = if (failed)
+            !(try self.invalid_blocks.getOrPut(self.allocator, hash.*)).found_existing
+        else
+            self.invalid_blocks.remove(hash.*);
+        if (changed) try self.storeInvalidBlocksLocked();
+    }
+
+    /// True when `hash` carries a durable BLOCK_FAILED_VALID mark.
+    pub fn isBlockMarkedInvalid(self: *ChainState, hash: *const types.Hash256) bool {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
+        self.loadInvalidBlocksLocked() catch return false;
+        return self.invalid_blocks.contains(hash.*);
+    }
+
+    /// Snapshot of the durable invalid set (caller frees).
+    pub fn invalidBlockList(self: *ChainState, allocator: std.mem.Allocator) ![]types.Hash256 {
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
+        try self.loadInvalidBlocksLocked();
+        const out = try allocator.alloc(types.Hash256, self.invalid_blocks.count());
+        var it = self.invalid_blocks.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) out[i] = k.*;
+        return out;
+    }
+
     /// Boot-time chainstate reconciliation (Core DisconnectTip-to-last-valid-coins-tip parity).
     /// After an unclean restart the durable tip can be BEHIND surplus persisted blocks whose
     /// created UTXOs are still on disk; re-connecting then false-rejects with BIP-30 duplicate.
@@ -5296,6 +5376,47 @@ pub const ChainState = struct {
                 .{ surplus.items.len, self.best_height, MAX_REORG_DEPTH },
             );
             return;
+        }
+
+        // 2c. STALE-INDEX GUARD (2026-10-02).  A surplus H: entry whose
+        //     CF_BLOCK_UNDO record is gone is NOT an unflushed connect: every
+        //     disconnect deletes the undo record in the same WriteBatch as the
+        //     tip rewind, and every connect writes it in the same batch as the
+        //     tip advance.  So "H: above the tip, no undo" means the block was
+        //     already disconnected and only its height entry was left behind
+        //     (pre-fix invalidateblock did exactly this).  Re-disconnecting it
+        //     fails UndoDataNotFound and bricked the node; instead drop those
+        //     stale H: entries (and every one above them) and keep the tip.
+        //     Entries below the first stale one, if any, still have undo and
+        //     are disconnected normally.
+        if (self.utxo_set.db) |db| {
+            var first_stale: ?usize = null;
+            for (surplus.items, 0..) |sb, idx| {
+                const u = try db.get(CF_BLOCK_UNDO, &sb.hash);
+                if (u) |bytes| {
+                    self.allocator.free(bytes);
+                } else {
+                    first_stale = idx;
+                    break;
+                }
+            }
+            if (first_stale) |fs| {
+                std.debug.print(
+                    "boot-reconcile: {d} H: entr(y/ies) {d}..{d} above tip {d} have no undo record — " ++
+                        "already-disconnected blocks (stale height index), dropping the index entries, not disconnecting\n",
+                    .{ surplus.items.len - fs, surplus.items[fs].height, surplus.items[surplus.items.len - 1].height, self.best_height },
+                );
+                var ops = std.ArrayList(BatchOp).init(self.allocator);
+                defer ops.deinit();
+                var keys = std.ArrayList([ChainStore.HEIGHT_HASH_KEY_LEN]u8).init(self.allocator);
+                defer keys.deinit();
+                try keys.ensureTotalCapacity(surplus.items.len - fs);
+                for (surplus.items[fs..]) |sb| keys.appendAssumeCapacity(ChainStore.buildHeightHashKey(sb.height));
+                for (keys.items) |*k| try ops.append(.{ .delete = .{ .cf = CF_DEFAULT, .key = k } });
+                try db.writeBatch(ops.items);
+                surplus.shrinkRetainingCapacity(fs);
+                if (surplus.items.len == 0) return;
+            }
         }
 
         const count: usize = surplus.items.len;
@@ -5369,7 +5490,16 @@ pub const ChainState = struct {
         self: *ChainState,
         hash: *const types.Hash256,
     ) !void {
-        return self.disconnectBlockByHashCFInner(hash, true, false);
+        // delete_height_index=true: this standalone disconnect (its live
+        // caller is invalidateblock via ChainManager.disconnectToBlock) leaves
+        // the tip BELOW the disconnected height, so H:<height> must go in the
+        // same batch as the undo delete + tip rewind.  Leaving it made the
+        // next boot's reconcileSurplusBlocksOnBoot treat the invalidated
+        // block as an unflushed surplus and re-disconnect it with its undo
+        // already gone -> FATAL UndoDataNotFound (bricked node, 2026-10-02).
+        // Core keeps CChain truncated to the tip, so no above-tip height
+        // resolves after DisconnectTip.
+        return self.disconnectBlockByHashCFInner(hash, true, true);
     }
 
     /// Pattern D (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-
@@ -5828,7 +5958,9 @@ pub const ChainState = struct {
         // restores + tip rewind + undo-delete.  `disc_height` was captured
         // above as `self.best_height` BEFORE the tip rewind.  reorg/
         // invalidateblock callers pass delete_height_index=false, so their
-        // H: behavior is completely unchanged.
+        // H: behavior is completely unchanged.  (2026-10-02: the standalone
+        // invalidateblock disconnect, disconnectBlockByHashCF, now passes
+        // true as well — see its comment.)
         if (delete_height_index) {
             try self.pending_height_index_deletes.append(disc_height);
         }
@@ -6583,6 +6715,15 @@ pub const ChainState = struct {
         if (height > 0 and !std.mem.eql(u8, &block.header.prev_block, &self.best_hash)) {
             std.debug.print("connectBlockInner: prev_block mismatch at height {d}\n", .{height});
             return error.PrevBlockMismatch;
+        }
+        // Core: a block whose index entry carries BLOCK_FAILED_VALID (set by
+        // invalidateblock, persisted in the block index) is never connected
+        // again until reconsiderblock clears it.  This is the single choke
+        // point every connect path shares.
+        try self.loadInvalidBlocksLocked();
+        if (self.invalid_blocks.contains(hash.*)) {
+            std.debug.print("connectBlockInner: block at height {d} is marked invalid (invalidateblock); refusing\n", .{height});
+            return error.BlockMarkedInvalid;
         }
 
         // Suppress eviction during block connection to prevent mid-block
@@ -10877,6 +11018,139 @@ test "disconnectBlockByHashCF refuses non-tip block" {
     // Tip unchanged.
     try std.testing.expectEqual(@as(u32, 2), chain_state.best_height);
 }
+
+// invalidateblock + restart bricked the node (2026-10-02, intrablock-
+// disconnect-probe invalidate path): the standalone disconnect left
+// H:<height> behind, and boot-reconcile re-disconnected the already-
+// disconnected blocks -> FATAL UndoDataNotFound.
+test "invalidate-persist: standalone disconnect drops H:<height>; boot-reconcile then boots clean" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    var prev_hash: [32]u8 = [_]u8{0} ** 32;
+    var hashes: [3]types.Hash256 = undefined;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        const block = makeReorgTestBlock(prev_hash, @intCast(h), 0xC1);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        bh[1] = 0xC1;
+        hashes[h - 1] = bh;
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned: []u8 = @constCast(try w.toOwnedSlice());
+        try chain_state.queueBlockWrite(&bh, owned, h);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev_hash = bh;
+    }
+    try std.testing.expect(chain_state.getBlockHashByHeight(3) != null);
+
+    // invalidateblock(2) disconnects 3 then 2 through this path.
+    try chain_state.disconnectBlockByHashCF(&hashes[2]);
+    try chain_state.disconnectBlockByHashCF(&hashes[1]);
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    try std.testing.expect(chain_state.getBlockHashByHeight(2) == null);
+    try std.testing.expect(chain_state.getBlockHashByHeight(3) == null);
+
+    // Boot: nothing above the tip, so reconcile is a clean no-op.
+    try chain_state.reconcileSurplusBlocksOnBoot();
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &hashes[0], &chain_state.best_hash);
+}
+
+// A datadir already carrying the pre-fix stale H: entries (undo gone) must
+// boot: reconcile drops the stale index entries instead of failing.
+test "invalidate-persist: boot-reconcile drops stale H: entries whose undo is gone" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var chain_state = ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+
+    var prev_hash: [32]u8 = [_]u8{0} ** 32;
+    var hashes: [3]types.Hash256 = undefined;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        const block = makeReorgTestBlock(prev_hash, @intCast(h), 0xC2);
+        var bh: [32]u8 = [_]u8{0} ** 32;
+        bh[0] = @intCast(h);
+        bh[1] = 0xC2;
+        hashes[h - 1] = bh;
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned: []u8 = @constCast(try w.toOwnedSlice());
+        try chain_state.queueBlockWrite(&bh, owned, h);
+        try chain_state.connectBlockFastWithUndo(&block, &bh, h);
+        prev_hash = bh;
+    }
+    try chain_state.disconnectBlockByHashCF(&hashes[2]);
+    try chain_state.disconnectBlockByHashCF(&hashes[1]);
+    // Re-create the pre-fix on-disk shape: H:2 / H:3 still resolve.
+    const k2 = ChainStore.buildHeightHashKey(2);
+    const k3 = ChainStore.buildHeightHashKey(3);
+    try db.put(CF_DEFAULT, &k2, &hashes[1]);
+    try db.put(CF_DEFAULT, &k3, &hashes[2]);
+    try std.testing.expect(chain_state.getBlockHashByHeight(3) != null);
+
+    try chain_state.reconcileSurplusBlocksOnBoot();
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &hashes[0], &chain_state.best_hash);
+    try std.testing.expect(chain_state.getBlockHashByHeight(2) == null);
+    try std.testing.expect(chain_state.getBlockHashByHeight(3) == null);
+}
+
+// invalidateblock's mark must survive a restart (Core persists
+// BLOCK_FAILED_VALID) and every connect path must refuse the block until
+// reconsiderblock clears it.
+test "invalidate-persist: durable invalid mark survives reopen and blocks connect until cleared" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+
+    const block1 = makeReorgTestBlock([_]u8{0} ** 32, 1, 0xC3);
+    const bh1 = [_]u8{0xC3} ** 32;
+    const block2 = makeReorgTestBlock(bh1, 2, 0xC3);
+    const bh2 = [_]u8{0xC4} ** 32;
+    {
+        var cs = ChainState.init(&db, 64, allocator);
+        defer cs.deinit();
+        cs.wireUtxoParent();
+        try cs.setBlockFailedDurable(&bh2, true);
+        try std.testing.expect(cs.isBlockMarkedInvalid(&bh2));
+    }
+    // "Restart": a fresh ChainState over the same database.
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    try std.testing.expect(cs.isBlockMarkedInvalid(&bh2));
+    try std.testing.expect(!cs.isBlockMarkedInvalid(&bh1));
+    try cs.connectBlockFastWithUndo(&block1, &bh1, 1);
+    try std.testing.expectError(error.BlockMarkedInvalid, cs.connectBlockFastWithUndo(&block2, &bh2, 2));
+    try std.testing.expectEqual(@as(u32, 1), cs.best_height);
+
+    try cs.setBlockFailedDurable(&bh2, false);
+    try std.testing.expect(!cs.isBlockMarkedInvalid(&bh2));
+    try cs.connectBlockFastWithUndo(&block2, &bh2, 2);
+    try std.testing.expectEqual(@as(u32, 2), cs.best_height);
+}
+
 
 test "connect→disconnect roundtrip restores UTXO set (chainstate equivalence)" {
     const allocator = std.testing.allocator;

@@ -6900,7 +6900,26 @@ pub const ChainManager = struct {
         GenesisCannotBeInvalidated,
         DisconnectFailed,
         OutOfMemory,
+        /// The durable invalid-block mark could not be written/cleared.
+        PersistFailed,
     };
+
+    /// Mirror one block's failure state into the ChainState's durable
+    /// invalid set (Core: m_dirty_blockindex -> WriteBatchSync).  Without
+    /// this the mark lived only in this in-memory index, which is rebuilt
+    /// lazily after a restart, so a restart forgot every invalidateblock.
+    fn persistFailedDurable(self: *ChainManager, entry: *const BlockIndexEntry) ChainError!void {
+        const cs = self.chain_state orelse return;
+        cs.setBlockFailedDurable(&entry.hash, entry.status.isInvalid()) catch return ChainError.PersistFailed;
+    }
+
+    /// Adopt a durable invalid mark for an entry (re)loaded into the index
+    /// after a restart: set failed_valid and drop it from the candidates.
+    pub fn adoptDurableInvalid(self: *ChainManager, entry: *BlockIndexEntry) void {
+        entry.status.failed_valid = true;
+        self.eraseBlockIndexCandidate(entry);
+        self.removeFromChainTips(entry);
+    }
 
     /// Invalidate a block and all its descendants.
     /// This disconnects the block if it's on the active chain and marks
@@ -6924,6 +6943,7 @@ pub const ChainManager = struct {
         // Phase 2: Mark the target block as failed_valid and persist
         target.status.failed_valid = true;
         try self.persistBlockStatus(target);
+        try self.persistFailedDurable(target);
         // W101 P3-4: drop the now-invalid target from the candidate set.
         self.eraseBlockIndexCandidate(target);
 
@@ -6973,6 +6993,10 @@ pub const ChainManager = struct {
             const block = queue.items[i];
             block.status.failed_child = true;
             try self.persistBlockStatus(block);
+            // Durable too: a restart rebuilds this index from the durable
+            // set, and reconsiderblock(ancestor) must find the descendants
+            // to return to them (Core marks them BLOCK_FAILED_VALID).
+            try self.persistFailedDurable(block);
             // W101 P3-4: every descendant marked failed_child is no
             // longer a valid candidate — drop from the candidate set
             // so `activateBestChain` skips it without an ancestor walk.
@@ -7074,9 +7098,30 @@ pub const ChainManager = struct {
     pub fn reconsiderBlock(self: *ChainManager, hash: *const types.Hash256) ChainError!void {
         const target = self.block_index.get(hash.*) orelse return ChainError.BlockNotFound;
 
-        // Phase 1: Clear failed_valid on the target and persist
-        target.status.failed_valid = false;
+        // Phase 1: Clear the failure flags on the target and persist
+        // (memory + the durable set every connect path consults).
+        target.status.clearFailure();
         try self.persistBlockStatus(target);
+        try self.persistFailedDurable(target);
+
+        // Phase 1b: Core ResetBlockFailureFlags also clears the flag on every
+        // ANCESTOR of the target ("this block and all its descendants and
+        // ancestors"), so reconsidering a descendant of an invalidated block
+        // revives the whole path.
+        {
+            var anc = target.parent;
+            while (anc) |a| : (anc = a.parent) {
+                if (a.status.isInvalid()) {
+                    a.status.clearFailure();
+                    try self.persistBlockStatus(a);
+                    try self.persistFailedDurable(a);
+                    try self.tryAddBlockIndexCandidate(a);
+                    if (self.best_invalid) |bi| {
+                        if (bi == a) self.best_invalid = null;
+                    }
+                }
+            }
+        }
         // W101 P3-4: re-admit to the candidate set now that the
         // failed_valid bit is cleared.  tryAdd respects has_data /
         // failed_child gating so a target that's still
@@ -7136,8 +7181,17 @@ pub const ChainManager = struct {
         var i: usize = 0;
         while (i < queue.items.len) : (i += 1) {
             const block = queue.items[i];
-            block.status.failed_child = false;
+            // Core ResetBlockFailureFlags clears BLOCK_FAILED_VALID on every
+            // descendant, including ones that were themselves the target of
+            // an earlier invalidateblock (invalidate A2, invalidate A1,
+            // reconsider A1 -> tip A2).  Clearing only failed_child left A2
+            // failed_valid and the node stopped at A1.
+            block.status.clearFailure();
             try self.persistBlockStatus(block);
+            try self.persistFailedDurable(block);
+            if (self.best_invalid) |bi| {
+                if (bi == block) self.best_invalid = null;
+            }
             // W101 P3-4: a descendant whose failed_child bit just got
             // cleared can be a candidate again iff it also has data
             // and no failed_valid of its own.  tryAdd handles the gate.
@@ -7985,6 +8039,90 @@ test "ChainManager reconsiderBlock clears failure flags" {
     try std.testing.expect(!block1.status.failed_child);
     try std.testing.expect(!block2.status.failed_valid);
     try std.testing.expect(!block2.status.failed_child);
+}
+
+// Core ResetBlockFailureFlags clears BLOCK_FAILED_VALID on the target AND
+// all its descendants: invalidateblock(A2), invalidateblock(A1),
+// reconsiderblock(A1) returns the node to A2 (intrablock-disconnect-probe
+// reconsider path, 2026-10-02).  Pre-fix only failed_child was cleared on
+// descendants, so A2 stayed failed_valid and the tip stopped at A1.
+test "invalidate-persist: reconsiderBlock clears failed_valid on descendants (invalidate A2, A1; reconsider A1 -> A2)" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    var entries: [3]*BlockIndexEntry = undefined;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const e = try allocator.create(BlockIndexEntry);
+        var hash = [_]u8{0} ** 32;
+        hash[0] = @intCast(0x40 + i);
+        var work = [_]u8{0} ** 32;
+        work[31] = @intCast(i + 1);
+        e.* = BlockIndexEntry{
+            .hash = hash,
+            .header = consensus.MAINNET.genesis_header,
+            .height = @intCast(i),
+            .status = BlockStatus{ .has_data = true },
+            .chain_work = work,
+            .sequence_id = 0,
+            .parent = if (i == 0) null else entries[i - 1],
+            .file_number = 0,
+            .file_offset = 0,
+        };
+        entries[i] = e;
+        try manager.addBlock(e);
+    }
+    manager.active_tip = entries[2];
+    const a1 = entries[1];
+    const a2 = entries[2];
+
+    try manager.invalidateBlock(&a2.hash);
+    try std.testing.expect(manager.active_tip.? == a1);
+    try manager.invalidateBlock(&a1.hash);
+    try std.testing.expect(manager.active_tip.? == entries[0]);
+    try std.testing.expect(a2.status.failed_valid);
+
+    try manager.reconsiderBlock(&a1.hash);
+    try std.testing.expect(!a1.status.isInvalid());
+    try std.testing.expect(!a2.status.isInvalid());
+    try std.testing.expect(manager.active_tip.? == a2);
+}
+
+// ... and reconsidering a DESCENDANT also revives its invalidated ancestors.
+test "invalidate-persist: reconsiderBlock clears failure on ancestors" {
+    const allocator = std.testing.allocator;
+    var manager = ChainManager.init(null, null, allocator);
+    defer manager.deinit();
+
+    var entries: [3]*BlockIndexEntry = undefined;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const e = try allocator.create(BlockIndexEntry);
+        var hash = [_]u8{0} ** 32;
+        hash[0] = @intCast(0x50 + i);
+        var work = [_]u8{0} ** 32;
+        work[31] = @intCast(i + 1);
+        e.* = BlockIndexEntry{
+            .hash = hash,
+            .header = consensus.MAINNET.genesis_header,
+            .height = @intCast(i),
+            .status = BlockStatus{ .has_data = true },
+            .chain_work = work,
+            .sequence_id = 0,
+            .parent = if (i == 0) null else entries[i - 1],
+            .file_number = 0,
+            .file_offset = 0,
+        };
+        entries[i] = e;
+        try manager.addBlock(e);
+    }
+    manager.active_tip = entries[2];
+    try manager.invalidateBlock(&entries[1].hash);
+    try manager.reconsiderBlock(&entries[2].hash);
+    try std.testing.expect(!entries[1].status.isInvalid());
+    try std.testing.expect(!entries[2].status.isInvalid());
+    try std.testing.expect(manager.active_tip.? == entries[2]);
 }
 
 test "ChainManager preciousBlock decrements sequence_id" {

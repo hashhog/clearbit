@@ -974,6 +974,28 @@ pub fn ensureIndexed(
     return parent;
 }
 
+/// Bring the lazily-built ChainManager index in line with what is durable:
+/// the active tip (so invalidate/reconsider walk from the real tip, not
+/// genesis) and every block in ChainState's durable invalid set (so
+/// reconsiderblock can find and revive them after a restart).  Core gets
+/// both from LoadBlockIndex at boot.  Bounded by ensureIndexed's walk.
+pub fn syncChainManagerFromDisk(
+    cm: *validation.ChainManager,
+    chain_state: *storage.ChainState,
+    allocator: std.mem.Allocator,
+) void {
+    if (ensureIndexed(cm, chain_state, &chain_state.best_hash, allocator)) |tip| {
+        cm.active_tip = tip;
+    }
+    const list = chain_state.invalidBlockList(allocator) catch return;
+    defer allocator.free(list);
+    for (list) |*h| {
+        if (ensureIndexed(cm, chain_state, h, allocator)) |e| {
+            if (!e.status.isInvalid()) cm.adoptDurableInvalid(e);
+        }
+    }
+}
+
 /// Submit a mined block to the chain.
 ///
 /// This function:
@@ -1269,6 +1291,7 @@ pub fn submitBlockWithIndexAndMempool(
                 .accepted = false,
                 .reject_reason = switch (err) {
                     error.MissingInput => "bad-txns-inputs-missingorspent",
+                    error.BlockMarkedInvalid => "duplicate-invalid",
                     else => "rejected",
                 },
                 .block_hash = block_hash,
@@ -1281,6 +1304,9 @@ pub fn submitBlockWithIndexAndMempool(
                 .accepted = false,
                 .reject_reason = switch (err) {
                     error.MissingInput => "bad-txns-inputs-missingorspent",
+                    // Core submitblock: a block whose index entry has
+                    // BLOCK_FAILED_MASK -> "duplicate-invalid".
+                    error.BlockMarkedInvalid => "duplicate-invalid",
                     error.PrevBlockMismatch, error.HeightMismatch =>
                     // The active-tip pre-check at the top of submitBlockWithIndex
                     // should have routed prev-block mismatch into the side-branch

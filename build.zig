@@ -109,6 +109,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests_all.zig"),
         .target = target,
         .optimize = optimize,
+        // `zig build test -Dtest-filter=<substr>` runs only matching tests
+        // (the aggregate suite is ~2,000 tests).
+        .filters = b.option([]const []const u8, "test-filter", "Only run unit tests whose name contains this substring") orelse &.{},
     });
 
     // RocksDB is always linked for tests

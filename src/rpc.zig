@@ -11228,6 +11228,13 @@ pub const RpcServer = struct {
             return err_resp;
         }
 
+        // After a restart the in-memory index holds only genesis (it is
+        // rebuilt lazily); index the active tip and every durably-invalid
+        // block first so the chain manager sees what Core's LoadBlockIndex
+        // would have loaded.
+        block_template.syncChainManagerFromDisk(chain_manager, self.chain_state, self.allocator);
+        _ = block_template.ensureIndexed(chain_manager, self.chain_state, &blockhash, self.allocator);
+
         // Call the chain manager
         chain_manager.invalidateBlock(&blockhash) catch |err| {
             return switch (err) {
@@ -11235,6 +11242,7 @@ pub const RpcServer = struct {
                 validation.ChainManager.ChainError.GenesisCannotBeInvalidated => self.jsonRpcError(RPC_MISC_ERROR, "Genesis block cannot be invalidated", id),
                 validation.ChainManager.ChainError.DisconnectFailed => self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed to disconnect block", id),
                 validation.ChainManager.ChainError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id),
+                validation.ChainManager.ChainError.PersistFailed => self.jsonRpcError(RPC_DATABASE_ERROR, "Failed to persist block index status", id),
             };
         };
 
@@ -11267,6 +11275,13 @@ pub const RpcServer = struct {
             return err_resp;
         }
 
+        // After a restart the in-memory index holds only genesis (it is
+        // rebuilt lazily); index the active tip and every durably-invalid
+        // block first so the chain manager sees what Core's LoadBlockIndex
+        // would have loaded.
+        block_template.syncChainManagerFromDisk(chain_manager, self.chain_state, self.allocator);
+        _ = block_template.ensureIndexed(chain_manager, self.chain_state, &blockhash, self.allocator);
+
         // Call the chain manager
         chain_manager.reconsiderBlock(&blockhash) catch |err| {
             return switch (err) {
@@ -11274,6 +11289,7 @@ pub const RpcServer = struct {
                 validation.ChainManager.ChainError.GenesisCannotBeInvalidated => self.jsonRpcError(RPC_MISC_ERROR, "Unexpected error", id),
                 validation.ChainManager.ChainError.DisconnectFailed => self.jsonRpcError(RPC_INTERNAL_ERROR, "Failed during chain activation", id),
                 validation.ChainManager.ChainError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id),
+                validation.ChainManager.ChainError.PersistFailed => self.jsonRpcError(RPC_DATABASE_ERROR, "Failed to persist block index status", id),
             };
         };
 
@@ -11307,6 +11323,13 @@ pub const RpcServer = struct {
             return err_resp;
         }
 
+        // After a restart the in-memory index holds only genesis (it is
+        // rebuilt lazily); index the active tip and every durably-invalid
+        // block first so the chain manager sees what Core's LoadBlockIndex
+        // would have loaded.
+        block_template.syncChainManagerFromDisk(chain_manager, self.chain_state, self.allocator);
+        _ = block_template.ensureIndexed(chain_manager, self.chain_state, &blockhash, self.allocator);
+
         // Call the chain manager
         chain_manager.preciousBlock(&blockhash) catch |err| {
             return switch (err) {
@@ -11314,6 +11337,7 @@ pub const RpcServer = struct {
                 validation.ChainManager.ChainError.GenesisCannotBeInvalidated => self.jsonRpcError(RPC_MISC_ERROR, "Unexpected error", id),
                 validation.ChainManager.ChainError.DisconnectFailed => self.jsonRpcError(RPC_INTERNAL_ERROR, "Chain activation failed", id),
                 validation.ChainManager.ChainError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id),
+                validation.ChainManager.ChainError.PersistFailed => self.jsonRpcError(RPC_DATABASE_ERROR, "Failed to persist block index status", id),
             };
         };
 
