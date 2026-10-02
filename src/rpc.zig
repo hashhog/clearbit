@@ -127,6 +127,18 @@ pub const RPC_MISC_ERROR: i32 = -1;
 // script-vector harness.
 const core_arity_json = @embedFile("core-arity.json");
 
+/// RPC `stop` -> the SIGTERM shutdown path (gate 5). Raise SIGTERM in our
+/// own process: main.installSignalHandlers' handler sets
+/// main.shutdown_requested, the main loop falls through to its phased
+/// graceful shutdown (stop RPC, stop P2P, join, persist, flush) -- the same
+/// sequence an operator's `kill -TERM` runs. rpc.zig cannot import main.zig
+/// (main imports rpc), and going through the signal keeps ONE entry point.
+/// The main loop polls every 100 ms and Phase 1 joins the RPC thread, so the
+/// "stopping" reply this request is about to write still goes out.
+pub fn requestNodeShutdown() void {
+    std.posix.kill(std.os.linux.getpid(), std.posix.SIG.TERM) catch {};
+}
+
 pub const CoreArity = struct { required: u32, declared: u32 };
 
 /// Core validates argument COUNT centrally, before any handler runs
@@ -3344,6 +3356,14 @@ pub const RpcServer = struct {
             // central type check rejects a non-number with -3 BEFORE the
             // shutdown is requested (a malformed stop must not stop the node).
             if (try self.checkArgType(params, 0, "wait", .number, true, id)) |resp| return resp;
+            // Gate 5: Core's stop -> StartShutdown(); the process exits via
+            // the SIGTERM path. self.stop() alone only halted THIS RPC
+            // server's accept loop -- main.shutdown_requested was never set,
+            // so P2P + the main loop kept running (harness:
+            // rpc-stop-ignored). requestNodeShutdown() raises SIGTERM in our
+            // own process, so main.signalHandler sets shutdown_requested and
+            // the phased graceful shutdown runs exactly as on `kill -TERM`.
+            requestNodeShutdown();
             self.stop();
             return self.jsonRpcResult("\"clearbit stopping\"", id);
         }

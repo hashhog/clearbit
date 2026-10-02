@@ -419,14 +419,34 @@ test "w124 G28: stop method exists in RPC dispatch" {
     _ = rpc_mod; // import-presence guard
 }
 
-test "w124 G28 BUG-14: stop RPC does not trigger main.shutdown_requested (xfail)" {
-    // Today rpc.zig:3000-3002 calls self.stop() which sets the *RPC server's*
-    // running=false, but does NOT set main.shutdown_requested.  So
-    // `bitcoin-cli stop` halts RPC but leaves the P2P+main loop running.
-    // Probe: a guard symbol `stopRpcSetsShutdownRequested` would be added
-    // by the fix; until then it should be ABSENT.
-    const fixed = @hasDecl(rpc_mod, "stopRpcSetsShutdownRequested");
-    try testing.expect(!fixed);
+// Gate 5 FIX (was BUG-14 xfail): RPC stop used to call only self.stop(),
+// halting the RPC accept loop while P2P + the main loop kept running. The
+// stop branch now calls rpc.requestNodeShutdown(), which raises SIGTERM in
+// process so main.signalHandler sets main.shutdown_requested -- the same
+// path `kill -TERM` takes. Behavioural: install main's real handler, call
+// the helper, and shutdown_requested must flip.
+test "w124 G28: stop RPC sets main.shutdown_requested via the SIGTERM handler" {
+    var old_term: std.posix.Sigaction = undefined;
+    var old_int: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &old_term) catch {};
+    std.posix.sigaction(std.posix.SIG.INT, null, &old_int) catch {};
+    defer std.posix.sigaction(std.posix.SIG.TERM, &old_term, null) catch {};
+    defer std.posix.sigaction(std.posix.SIG.INT, &old_int, null) catch {};
+    main_mod.shutdown_requested.store(false, .release);
+    main_mod.signal_count.store(0, .release);
+    defer {
+        main_mod.shutdown_requested.store(false, .release);
+        main_mod.signal_count.store(0, .release);
+    }
+    main_mod.installSignalHandlers();
+    rpc_mod.requestNodeShutdown();
+    // A process-directed signal to a single-threaded runner is delivered
+    // before kill() returns; allow a short grace for multi-threaded runners.
+    var i: usize = 0;
+    while (!main_mod.shutdown_requested.load(.acquire) and i < 200) : (i += 1) {
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+    try testing.expect(main_mod.shutdown_requested.load(.acquire));
 }
 
 // ===========================================================================
