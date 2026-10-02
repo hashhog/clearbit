@@ -899,6 +899,76 @@ pub fn deriveSubmitHeight(
     return active_best_height + 1;
 }
 
+/// Lazy LoadBlockIndex for the submitblock path.  Returns the ChainManager
+/// entry for `hash`, loading it -- and any ancestors the in-memory index is
+/// missing -- from the persisted headers (CF_BLOCK_INDEX, else the body in
+/// CF_BLOCKS), walking prev links back to an entry that is already indexed.
+///
+/// Why: on boot the ChainManager holds only genesis (main.zig loadGenesis);
+/// Core's LoadBlockIndex loads the whole tree.  After a restart every
+/// submitblock whose parent was connected before the restart missed the
+/// index: deriveSubmitHeight fell back to active_tip+1 (crash-restart
+/// harness gate 4, 2026-10-01: restart at 200A, then side block 176B was
+/// validated as height 201 and rejected bad-cb-height), a side block could
+/// not take the side-branch arm, and the tip-extend arm started the new
+/// entry's chain_work from ZERO.  Bounded walk (100,000 headers); past the
+/// bound the caller keeps its previous behaviour.
+pub fn ensureIndexed(
+    cm: *validation.ChainManager,
+    chain_state: *storage.ChainState,
+    hash: *const types.Hash256,
+    allocator: std.mem.Allocator,
+) ?*validation.BlockIndexEntry {
+    if (cm.getBlock(hash)) |e| return e;
+    const Pending = struct { hash: types.Hash256, header: types.BlockHeader, has_data: bool };
+    var pending = std.ArrayList(Pending).init(allocator);
+    defer pending.deinit();
+    var cursor: types.Hash256 = hash.*;
+    var steps: u32 = 0;
+    const anchor: *validation.BlockIndexEntry = while (steps < 100_000) : (steps += 1) {
+        if (cm.getBlock(&cursor)) |e| break e;
+        const body_hdr = chain_state.getBlockHeaderFromBody(&cursor);
+        const hdr = chain_state.getPersistedHeader(&cursor) orelse body_hdr orelse return null;
+        pending.append(.{ .hash = cursor, .header = hdr, .has_data = body_hdr != null }) catch return null;
+        cursor = hdr.prev_block;
+    } else return null;
+
+    var parent: *validation.BlockIndexEntry = anchor;
+    var i: usize = pending.items.len;
+    while (i > 0) {
+        i -= 1;
+        const it = pending.items[i];
+        var work: [32]u8 = parent.chain_work;
+        const this_work = peer.workFromBits(it.header.bits);
+        peer.addChainWorkBE(&work, &this_work);
+        const entry = allocator.create(validation.BlockIndexEntry) catch return null;
+        entry.* = validation.BlockIndexEntry{
+            .hash = it.hash,
+            .header = it.header,
+            .height = parent.height + 1,
+            .status = .{
+                .valid_header = true,
+                .has_data = it.has_data,
+                .has_undo = false,
+                .failed_valid = false,
+                .failed_child = false,
+                ._padding = 0,
+            },
+            .chain_work = work,
+            .sequence_id = 0,
+            .parent = parent,
+            .file_number = 0,
+            .file_offset = 0,
+        };
+        cm.addBlock(entry) catch {
+            allocator.destroy(entry);
+            return null;
+        };
+        parent = entry;
+    }
+    return parent;
+}
+
 /// Submit a mined block to the chain.
 ///
 /// This function:
@@ -990,6 +1060,7 @@ pub fn submitBlockWithIndexAndMempool(
     // when chain_manager is unset or the parent isn't indexed (genesis-
     // adjacent / pre-IBD). See the doc-comment above this function and
     // `deriveSubmitHeight`.
+    if (chain_manager) |cm| _ = ensureIndexed(cm, chain_state, &block.header.prev_block, allocator);
     const height: u32 = deriveSubmitHeight(
         &block.header.prev_block,
         chain_manager,
@@ -1127,7 +1198,7 @@ pub fn submitBlockWithIndexAndMempool(
     const extends_active_tip = std.mem.eql(u8, &block.header.prev_block, &chain_state.best_hash);
 
     const parent_in_cm: ?*validation.BlockIndexEntry =
-        if (chain_manager) |cm| cm.getBlock(&block.header.prev_block) else null;
+        if (chain_manager) |cm| ensureIndexed(cm, chain_state, &block.header.prev_block, allocator) else null;
 
     if (!extends_active_tip and parent_in_cm != null) {
         return processSideBranchSubmission(
@@ -1242,7 +1313,7 @@ pub fn submitBlockWithIndexAndMempool(
     // the parent (no work increment), which broke the strict-greater
     // comparison in the side-branch arm.
     if (chain_manager) |cm| {
-        const parent = cm.getBlock(&block.header.prev_block);
+        const parent = ensureIndexed(cm, chain_state, &block.header.prev_block, allocator);
         var new_work: [32]u8 = if (parent) |p| p.chain_work else [_]u8{0} ** 32;
         const this_work = peer.workFromBits(block.header.bits);
         peer.addChainWorkBE(&new_work, &this_work);

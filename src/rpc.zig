@@ -9931,6 +9931,12 @@ pub const RpcServer = struct {
         //
         // Falls back to active-tip-relative arithmetic when the parent
         // is not in the block index. See block_template.deriveSubmitHeight.
+        // Load the parent (and missing ancestors) into the block index first:
+        // after a restart the ChainManager holds only genesis (see
+        // block_template.ensureIndexed).
+        if (self.chain_manager) |cm| {
+            _ = block_template.ensureIndexed(cm, self.chain_state, &block_data.header.prev_block, self.allocator);
+        }
         const submit_height: u32 = block_template.deriveSubmitHeight(
             &block_data.header.prev_block,
             self.chain_manager,
@@ -10484,6 +10490,14 @@ pub const RpcServer = struct {
                 .getBlockHashByHeightFn = peer_mod.PeerManager.getBlockHashByHeightTrampoline,
                 .getBlockHashByHeightCtx = @ptrCast(self.peer_manager),
                 .is_requested = true,
+                // A block that does not extend the active tip gets Core's
+                // AcceptBlock checks only (CheckBlock + ContextualCheckBlock);
+                // its ConnectBlock runs in reorgToChain against the coin set
+                // at its own parent.  Validating it here against the ACTIVE
+                // chain's coin set rejected valid side-branch blocks
+                // (2026-10-01 reorg probe: 179B bad-txns-inputs-missingorspent
+                // -- it spent a coin created on branch B, absent from branch A).
+                .context_only = !std.mem.eql(u8, &block.header.prev_block, &self.chain_state.best_hash),
             },
         ) catch |err| {
             const bip22 = validationErrToBip22(err);

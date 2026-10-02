@@ -1315,6 +1315,17 @@ pub const IBDValidationContext = struct {
     /// provided; the AcceptBlock nMinimumChainWork skip is not applied.
     /// Reference: validation.cpp:4345.
     block_chain_work: [32]u8 = [_]u8{0} ** 32,
+    /// AcceptBlock-only mode for a block that does NOT extend the active tip
+    /// (a side-branch block).  Core's AcceptBlock runs only CheckBlock +
+    /// ContextualCheckBlock(pindexPrev = the block's own parent) for such a
+    /// block; ConnectBlock (BIP-30, inputs, amounts, sequence locks, sigops
+    /// cost, scripts) runs later, in ActivateBestChain, against the coin set
+    /// at the block's parent.  When true, validation stops after the
+    /// context checks -- the active chain's coin set is the WRONG view for a
+    /// side-branch block (it does not hold coins created on that branch and
+    /// still holds coins the branch spent).  reorgToChain runs the full
+    /// check when the branch is connected.
+    context_only: bool = false,
 };
 
 /// Information about a previous output, returned by IBDValidationContext.
@@ -1518,6 +1529,10 @@ pub fn validateBlockForIBD(
     // internally; without this the PoW gate would be an un-skippable second
     // check and force_skip_pow would be a silent dead-gate on body mutants).
     try checkBlockPow(block, height, params, allocator, !ctx.force_skip_pow);
+
+    // Side-branch AcceptBlock stops here (see IBDValidationContext.context_only):
+    // everything below needs the coin set at the block's parent.
+    if (ctx.context_only) return;
 
     // 2b. BIP-30: reject any block whose transactions would overwrite an
     // existing unspent output (CVE-2012-1909).
@@ -2105,6 +2120,17 @@ pub const AcceptBlockOptions = struct {
     expected_bits: u32 = 0,
     /// See IBDValidationContext.block_chain_work.
     block_chain_work: [32]u8 = [_]u8{0} ** 32,
+    /// AcceptBlock-only mode for a block that does NOT extend the active tip
+    /// (a side-branch block).  Core's AcceptBlock runs only CheckBlock +
+    /// ContextualCheckBlock(pindexPrev = the block's own parent) for such a
+    /// block; ConnectBlock (BIP-30, inputs, amounts, sequence locks, sigops
+    /// cost, scripts) runs later, in ActivateBestChain, against the coin set
+    /// at the block's parent.  When true, validation stops after the
+    /// context checks -- the active chain's coin set is the WRONG view for a
+    /// side-branch block (it does not hold coins created on that branch and
+    /// still holds coins the branch spent).  reorgToChain runs the full
+    /// check when the branch is connected.
+    context_only: bool = false,
 };
 
 /// Unified block consensus-validation entry point.
@@ -2156,6 +2182,7 @@ pub fn acceptBlock(
         .is_requested = options.is_requested,
         .expected_bits = options.expected_bits,
         .block_chain_work = options.block_chain_work,
+        .context_only = options.context_only,
     };
     return validateBlockForIBD(block, &ctx, allocator);
 }
