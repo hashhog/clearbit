@@ -499,6 +499,69 @@ test "w124 G1b: PeerManager.stop interrupts a blocking outbound handshake (gate 
     try testing.expect(pm.connectOutboundNegotiated(target) == null);
 }
 
+// Gate 5 (real peers): the P2P thread can also be parked in a blocking SEND.
+// Peer.sendMessage -> stream.writeAll to a peer that stops reading blocks for
+// SO_SNDTIMEO (30 s) per write call, re-armed on each partial write. stop()
+// runs on main and cannot touch the P2P thread's peer list, so it must reach
+// the socket through the live-peer fd registry and shutdown(2) it.
+// Discriminator: without the registry shutdown the writer returns only when
+// SO_SNDTIMEO expires (>= 30 s).
+test "w124 G1c: PeerManager.stop interrupts a blocking peer send (gate 5)" {
+    const allocator = std.heap.page_allocator;
+    const listen_addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    var peer = try peer_mod.Peer.connect(server.listen_address, &consensus.REGTEST, allocator);
+    // The remote end accepts and never reads a byte.
+    const remote = try server.accept();
+    defer remote.stream.close();
+    try testing.expect(peer_mod.isPeerFdRegistered(peer.stream.handle));
+
+    const pm = try allocator.create(peer_mod.PeerManager);
+    defer allocator.destroy(pm);
+    pm.* = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    pm.running.store(true, .release);
+
+    const Writer = struct {
+        fn run(s: std.net.Stream, done: *std.atomic.Value(bool)) void {
+            const buf = std.heap.page_allocator.alloc(u8, 64 * 1024 * 1024) catch {
+                done.store(true, .release);
+                return;
+            };
+            defer std.heap.page_allocator.free(buf);
+            @memset(buf, 0xab);
+            s.writeAll(buf) catch {};
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Writer.run, .{ peer.stream, &done });
+
+    // Let the writer fill both socket buffers and block.
+    std.time.sleep(1000 * std.time.ns_per_ms);
+    try testing.expect(!done.load(.acquire));
+
+    const t0 = std.time.milliTimestamp();
+    pm.stop();
+    t.join();
+    const waited_ms = std.time.milliTimestamp() - t0;
+    try testing.expect(waited_ms < 5000); // >= 30_000 without the fd registry
+
+    peer.disconnect();
+    try testing.expect(!peer_mod.isPeerFdRegistered(peer.stream.handle));
+}
+
+test "w124 G1c: live peer fd registry de-duplicates and unregisters" {
+    peer_mod.registerPeerFd(987654);
+    peer_mod.registerPeerFd(987654);
+    try testing.expect(peer_mod.isPeerFdRegistered(987654));
+    peer_mod.unregisterPeerFd(987654);
+    try testing.expect(!peer_mod.isPeerFdRegistered(987654));
+    peer_mod.registerPeerFd(-1);
+    try testing.expect(!peer_mod.isPeerFdRegistered(-1));
+}
+
 // ===========================================================================
 // G29: uptime RPC method
 // Status: PRESENT.

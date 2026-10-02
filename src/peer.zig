@@ -374,6 +374,64 @@ pub fn shouldSkipMinChainWorkGate(parent_in_header_index: bool, parent_is_active
 pub const MAX_TOTAL_CONNECTIONS: usize = MAX_OUTBOUND_CONNECTIONS + MAX_INBOUND_CONNECTIONS;
 
 // ============================================================================
+// Live peer sockets (gate 5: interruptible shutdown)
+// ============================================================================
+
+/// Socket fds of live peers, published for PeerManager.stop(), which runs on
+/// the MAIN thread while the single P2P thread may be parked in a blocking
+/// socket call on one of them: writeAll() of a block to a slow reader (30 s
+/// SO_SNDTIMEO per write, re-armed on every partial write, so unbounded in
+/// total), a receive, a poll. The peer list itself is owned by the P2P thread
+/// and cannot be read from main without racing, so each peer socket is
+/// registered here when its Peer is built and removed in Peer.disconnect().
+/// stop() shutdown(2)s every registered fd: the blocked call returns at once,
+/// the P2P thread sees the stop and the join completes. shutdown(2) does not
+/// close the fd, so the P2P thread's later close() is still the only one.
+/// A stale entry (a socket closed without disconnect()) is harmless: fds are
+/// small reused integers, registration de-duplicates, and shutdown(2) on a
+/// non-socket fails with ENOTSOCK.
+pub const PEER_FD_SLOTS: usize = 1024;
+var live_peer_fds: [PEER_FD_SLOTS]std.atomic.Value(i32) =
+    [_]std.atomic.Value(i32){std.atomic.Value(i32).init(-1)} ** PEER_FD_SLOTS;
+
+pub fn registerPeerFd(fd: std.posix.fd_t) void {
+    if (fd < 0) return;
+    for (&live_peer_fds) |*slot| {
+        if (slot.load(.acquire) == fd) return;
+    }
+    for (&live_peer_fds) |*slot| {
+        if (slot.cmpxchgStrong(-1, fd, .acq_rel, .acquire) == null) return;
+    }
+}
+
+pub fn unregisterPeerFd(fd: std.posix.fd_t) void {
+    if (fd < 0) return;
+    for (&live_peer_fds) |*slot| {
+        _ = slot.cmpxchgStrong(fd, -1, .acq_rel, .acquire);
+    }
+}
+
+pub fn isPeerFdRegistered(fd: std.posix.fd_t) bool {
+    if (fd < 0) return false;
+    for (&live_peer_fds) |*slot| {
+        if (slot.load(.acquire) == fd) return true;
+    }
+    return false;
+}
+
+/// shutdown(2) every registered peer socket. Returns how many were signalled.
+pub fn shutdownAllPeerSockets() usize {
+    var n: usize = 0;
+    for (&live_peer_fds) |*slot| {
+        const fd = slot.load(.acquire);
+        if (fd < 0) continue;
+        std.posix.shutdown(fd, .both) catch {};
+        n += 1;
+    }
+    return n;
+}
+
+// ============================================================================
 // P2P anti-eclipse hardening — Bitcoin Core v31.99 (net.cpp ThreadOpenConnections
 // FEELER branch + net_processing.cpp getaddr/ProcessAddrs anti-DoS).
 // ============================================================================
@@ -1082,6 +1140,7 @@ pub const Peer = struct {
         ) catch {};
 
         const now = std.time.timestamp();
+        registerPeerFd(stream.handle);
         return Peer{
             .stream = stream,
             .address = address,
@@ -1159,6 +1218,7 @@ pub const Peer = struct {
             std.posix.SO.SNDTIMEO,
             std.mem.asBytes(&timeout),
         ) catch {};
+        registerPeerFd(stream.handle);
         return Peer{
             .stream = stream,
             .address = address,
@@ -1209,6 +1269,7 @@ pub const Peer = struct {
         allocator: std.mem.Allocator,
     ) Peer {
         const now = std.time.timestamp();
+        registerPeerFd(stream.handle);
         return Peer{
             .stream = stream,
             .address = address,
@@ -2296,6 +2357,7 @@ pub const Peer = struct {
     /// Disconnect from the peer.
     pub fn disconnect(self: *Peer) void {
         self.state = .disconnected;
+        unregisterPeerFd(self.stream.handle);
         self.stream.close();
         self.recv_buffer.deinit();
         if (self.clean_subver) |s| {
@@ -4926,6 +4988,10 @@ pub const PeerManager = struct {
         // have read are consumed by the outer pass on its next tick, so
         // throughput is unaffected (same rationale as the in_drain guard).
         if (self.in_pam) return;
+        // Shutdown: read nothing more. Leaving peers in the list (rather than
+        // erroring them out of it on their shut-down sockets) also keeps the
+        // anchors that deinit() saves.
+        if (self.stopping()) return;
         self.in_pam = true;
         defer self.in_pam = false;
 
@@ -5006,6 +5072,7 @@ pub const PeerManager = struct {
         var i: usize = num_peers;
         while (i > 0) {
             i -= 1;
+            if (self.stopping()) return;
             if (i >= self.peers.items.len) continue;
 
             const peer_obj = self.peers.items[i];
@@ -5031,6 +5098,7 @@ pub const PeerManager = struct {
             const max_msgs_per_peer: u32 = 256; // Safety limit per cycle
 
             while (msgs_read < max_msgs_per_peer) {
+                if (self.stopping()) break;
                 const msg = peer_obj.receiveMessage() catch |err| {
                     switch (err) {
                         PeerError.Timeout => break, // No more data buffered, done draining
@@ -10127,6 +10195,15 @@ pub const PeerManager = struct {
         // `wave15-2026-04-15/CLEARBIT-STALL-RECOVERY-DIAG.md`.
 
         while (self.connect_cursor < self.expected_blocks.items.len) {
+            // Shutdown: stop between blocks. This loop connected ~400
+            // buffered blocks (22.5 s, two blocks of 5 s and 15 s on a busy
+            // disk) after SIGTERM in the testnet4 gate-5 repro (2026-10-02,
+            // gdb: P2P thread in drainBlockBuffer -> connectBlockInner) while
+            // main sat in `joining P2P thread`. Blocks left in the buffer are
+            // simply re-downloaded; blocks already connected under the batched
+            // path are persisted by main's final chain_state.flush().
+            if (self.stopping()) break;
+
             // The next block we need to connect
             const expected_hash = self.expected_blocks.items[self.connect_cursor];
 
@@ -10952,6 +11029,16 @@ pub const PeerManager = struct {
         // run loop sees running=false. ENOTSOCK/EBADF races are harmless.
         const fd = self.handshake_fd.load(.acquire);
         if (fd >= 0) std.posix.shutdown(fd, .both) catch {};
+        // Unblock any OTHER blocking socket call the P2P thread is in (a
+        // block send to a slow peer, a receive): see live_peer_fds.
+        _ = shutdownAllPeerSockets();
+    }
+
+    /// True once stop() has been called. Long loops on the P2P thread check
+    /// it between units of work so a stop is noticed in one unit, not after
+    /// the whole batch.
+    fn stopping(self: *const PeerManager) bool {
+        return self.stop_requested.load(.acquire);
     }
 
     /// Register `fd` as the socket a blocking handshake is running on, so
