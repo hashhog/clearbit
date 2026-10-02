@@ -2866,6 +2866,17 @@ pub const PeerManager = struct {
     allocator: std.mem.Allocator,
     our_height: i32,
     running: std.atomic.Value(bool),
+    /// Set only by stop(). Blocking dial/accept paths check it so a shutdown
+    /// does not start (or fall back into) another synchronous handshake.
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Socket of the handshake currently blocking the P2P thread (-1 = none).
+    /// stop() shuts it down so the blocked poll()/read() returns at once.
+    /// Gate 5: a SIGTERM that landed during an outbound BIP-324 handshake
+    /// waited out V2_HANDSHAKE_DEADLINE_MS (30 s) in poll() -- then the v1
+    /// fallback dialled again -- while main sat in `joining P2P thread`; the
+    /// 30 s shutdown watchdog fired first and exit(1)'d without the flush
+    /// (live 2026-10-02 ~02:45Z: SIGKILLed by stop_mainnet.sh at 30 s).
+    handshake_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
     last_rotation_time: i64,
     /// Set of netgroups for current outbound connections (for diversity).
     outbound_netgroups: std.AutoHashMap(u32, void),
@@ -3655,6 +3666,7 @@ pub const PeerManager = struct {
         address: std.net.Address,
         relay_self: bool,
     ) ?*Peer {
+        if (self.stop_requested.load(.acquire)) return null;
         const v2_enabled = Peer.bip324V2Enabled();
         const try_v2 = v2_enabled and !self.isV1Only(address);
 
@@ -3670,6 +3682,12 @@ pub const PeerManager = struct {
             peer.advertise_node_bloom = self.peerbloomfilters;
             peer.advertise_node_network_limited = self.advertise_node_network_limited;
             peer.advertise_compact_filters = self.blockfilterindex_enabled;
+            if (!self.armHandshake(peer.stream.handle)) {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+                return null;
+            }
+            defer self.disarmHandshake();
 
             // Attach an initiator-mode V2Transport to the peer and let it
             // drive the cipher handshake.  The transport's init() already
@@ -3692,9 +3710,12 @@ pub const PeerManager = struct {
                 // so std.log.info is silently dropped — and the v2 wiring
                 // probe needs to be observable in production logs).
                 std.debug.print("P2P: BIP-324 v2 outbound handshake failed peer={any} err={any}; falling back to v1\n", .{ address, err });
-                self.markV1Only(address);
                 peer.disconnect();
                 self.allocator.destroy(peer);
+                // Interrupted by stop(): not a v1-only peer, and no fallback
+                // dial -- a fresh v1 handshake would block shutdown again.
+                if (self.stop_requested.load(.acquire)) return null;
+                self.markV1Only(address);
                 // Fall through to v1 path below (preserving relay_self).
                 return self.connectOutboundV1Relay(address, relay_self);
             };
@@ -3727,6 +3748,7 @@ pub const PeerManager = struct {
     /// `connectOutboundV1` with an explicit `relay_self` flag for the version
     /// handshake (false for feeler connections).
     fn connectOutboundV1Relay(self: *PeerManager, address: std.net.Address, relay_self: bool) ?*Peer {
+        if (self.stop_requested.load(.acquire)) return null;
         const peer = self.allocator.create(Peer) catch return null;
         // Use openClearnetOutbound so --proxy is honoured for clearnet.
         peer.* = self.openClearnetOutbound(address) orelse {
@@ -3741,6 +3763,12 @@ pub const PeerManager = struct {
         if (self.asmap_data) |data| {
             peer.mapped_as = getMappedAS(data, address);
         }
+        if (!self.armHandshake(peer.stream.handle)) {
+            peer.disconnect();
+            self.allocator.destroy(peer);
+            return null;
+        }
+        defer self.disarmHandshake();
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -4582,7 +4610,9 @@ pub const PeerManager = struct {
         var attempts: u32 = 0;
         const max_attempts: u32 = if (!self.isIBD()) 8 else if (outbound_count == 0) MAX_OUTBOUND_CONNECTIONS else 1;
 
-        while (outbound_count < MAX_OUTBOUND_CONNECTIONS and attempts < max_attempts) {
+        while (outbound_count < MAX_OUTBOUND_CONNECTIONS and attempts < max_attempts and
+            !self.stop_requested.load(.acquire))
+        {
             attempts += 1;
             const addr = self.selectPeerToConnect() orelse break;
             // BIP-324 negotiation lives inside connectOutboundNegotiated;
@@ -4869,6 +4899,12 @@ pub const PeerManager = struct {
         if (self.asmap_data) |data| {
             peer.mapped_as = getMappedAS(data, conn.address);
         }
+        if (!self.armHandshake(peer.stream.handle)) {
+            peer.disconnect();
+            self.allocator.destroy(peer);
+            return;
+        }
+        defer self.disarmHandshake();
         peer.performHandshake(self.our_height) catch {
             peer.disconnect();
             self.allocator.destroy(peer);
@@ -10908,7 +10944,30 @@ pub const PeerManager = struct {
 
     /// Stop the peer manager.
     pub fn stop(self: *PeerManager) void {
+        self.stop_requested.store(true, .release);
         self.running.store(false, .release);
+        // Unblock a handshake in progress on the P2P thread (see
+        // handshake_fd). shutdown() makes its poll() report HUP and its
+        // blocking read() return 0, so the handshake fails immediately and the
+        // run loop sees running=false. ENOTSOCK/EBADF races are harmless.
+        const fd = self.handshake_fd.load(.acquire);
+        if (fd >= 0) std.posix.shutdown(fd, .both) catch {};
+    }
+
+    /// Register `fd` as the socket a blocking handshake is running on, so
+    /// stop() can interrupt it. Returns false if a stop is already pending
+    /// (caller must abandon the dial/accept).
+    fn armHandshake(self: *PeerManager, fd: std.posix.fd_t) bool {
+        self.handshake_fd.store(fd, .release);
+        if (self.stop_requested.load(.acquire)) {
+            self.handshake_fd.store(-1, .release);
+            return false;
+        }
+        return true;
+    }
+
+    fn disarmHandshake(self: *PeerManager) void {
+        self.handshake_fd.store(-1, .release);
     }
 
     // ========================================================================

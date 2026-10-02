@@ -27,6 +27,8 @@ const main_mod = @import("main.zig");
 const ops = @import("ops.zig");
 const debug_log = @import("debug_log.zig");
 const rpc_mod = @import("rpc.zig");
+const peer_mod = @import("peer.zig");
+const consensus = @import("consensus.zig");
 
 // ===========================================================================
 // G1: SIGINT / SIGTERM → graceful shutdown
@@ -447,6 +449,54 @@ test "w124 G28: stop RPC sets main.shutdown_requested via the SIGTERM handler" {
         std.time.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expect(main_mod.shutdown_requested.load(.acquire));
+}
+
+// Gate 5: PeerManager.stop() must interrupt a handshake that is blocking the
+// P2P thread. Measured on regtest (clearbit bf702eb, a --connect peer that
+// accepts TCP and never answers): SIGTERM -> `joining P2P thread` hung in
+// Peer.performV2Handshake's 30 s poll(); the 30 s shutdown watchdog won and
+// exit(1)'d with no chainstate flush (gdb: posix.poll(timeout=30000) <-
+// performV2Handshake <- connectOutboundNegotiatedRelay <- run). Same
+// signature as the live 2026-10-02 SIGKILL at stop_mainnet.sh's 30 s.
+// Discriminator: without the fix the dial returns only after >= 30 s.
+test "w124 G1b: PeerManager.stop interrupts a blocking outbound handshake (gate 5)" {
+    const allocator = std.heap.page_allocator;
+    // A peer that completes TCP (kernel backlog) and never sends a byte.
+    const listen_addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const target = server.listen_address;
+
+    const pm = try allocator.create(peer_mod.PeerManager);
+    defer allocator.destroy(pm);
+    pm.* = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    pm.running.store(true, .release);
+
+    const Dial = struct {
+        fn run(m: *peer_mod.PeerManager, a: std.net.Address, got_peer: *bool, done: *std.atomic.Value(bool)) void {
+            const p = m.connectOutboundNegotiated(a);
+            got_peer.* = (p != null);
+            done.store(true, .release);
+        }
+    };
+    var got_peer = false;
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Dial.run, .{ pm, target, &got_peer, &done });
+
+    // Let the dial reach the blocking handshake.
+    std.time.sleep(700 * std.time.ns_per_ms);
+    try testing.expect(!done.load(.acquire));
+    try testing.expect(pm.handshake_fd.load(.acquire) >= 0);
+
+    const t0 = std.time.milliTimestamp();
+    pm.stop();
+    t.join();
+    const waited_ms = std.time.milliTimestamp() - t0;
+    try testing.expect(!got_peer);
+    try testing.expect(waited_ms < 5000); // was >= 30_000 before the fix
+    try testing.expect(pm.handshake_fd.load(.acquire) == -1);
+    // A stopped manager refuses new dials outright.
+    try testing.expect(pm.connectOutboundNegotiated(target) == null);
 }
 
 // ===========================================================================
