@@ -10008,7 +10008,10 @@ pub const RpcServer = struct {
             // Block rejected: return the BIP-22 string in the result field.
             // block_template.zig already produces canonical BIP-22 strings
             // ("high-hash", "bad-diffbits", "bad-txnmrklroot", etc.).
-            const reason = result.reject_reason orelse "rejected";
+            const reason = if (result.reject_validation_err) |verr|
+                validationErrToBip22(verr)
+            else
+                result.reject_reason orelse "rejected";
             var buf = std.ArrayList(u8).init(self.allocator);
             defer buf.deinit();
             try std.fmt.format(buf.writer(), "\"{s}\"", .{reason});

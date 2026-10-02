@@ -865,6 +865,11 @@ pub const SubmitResult = struct {
     accepted: bool,
     reject_reason: ?[]const u8,
     block_hash: types.Hash256,
+    /// Set when a side-branch reorg aborted because a block on the new branch
+    /// failed ConnectBlock-level validation (reorgToChain's acceptBlock).
+    /// The RPC maps it to the BIP-22 token (Core: submitblock reports the
+    /// ActivateBestChain failure's reject reason, e.g. bad-cb-amount).
+    reject_validation_err: ?validation.ValidationError = null,
 };
 
 /// Pattern X helper (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md):
@@ -1717,7 +1722,22 @@ fn fireReorgFromSideBranch(
     //      side-branch ones already on disk).
     //   3. connectBlockFastWithUndo each new block (UTXO apply + undo
     //      capture + atomic flush).
-    const connected = try chain_state.reorgToChain(&fp, rb_list.items);
+    var drive_result = storage.ChainState.ReorgDriveResult{};
+    const connected = chain_state.reorgToChainWithOptions(&fp, rb_list.items, .{}, &drive_result) catch |err| {
+        if (drive_result.connect_reject_err) |verr| {
+            std.debug.print(
+                "submitblock side-branch: reorg rejected a new-branch block: {} — keeping active tip\n",
+                .{verr},
+            );
+            return .{
+                .accepted = false,
+                .reject_reason = "rejected",
+                .block_hash = new_tip_hash.*,
+                .reject_validation_err = verr,
+            };
+        }
+        return err;
+    };
     _ = connected;
 
     // Update cm.active_tip to point at the new tip.
