@@ -12844,10 +12844,10 @@ const peer_mod_for_w97 = struct {
 //             ResetBlockFailureFlags re-inserts into setBlockIndexCandidates
 //             every block whose flags are cleared.  clearbit only adds the
 //             direct target.
-// BUG-8  [CORRECTNESS] reconsiderBlock clears best_invalid only if it
-//             points exactly to the target.  If best_invalid points to a
-//             descendant of the reconsidered block it is never cleared;
-//             stale best_invalid persists.
+// BUG-8  [CORRECTNESS — FIXED] reconsiderBlock clears best_invalid when it
+//             points at the target or at a descendant/ancestor whose failure
+//             flag is cleared (clearDescendantFailure / the ancestor walk).
+//             Core: validation.cpp ResetBlockFailureFlags.
 // BUG-9  [OBSERVABILITY] Genesis block added without setting has_data=true.
 //             Core's LoadGenesisBlock calls ReceivedBlockTransactions which
 //             sets BLOCK_HAVE_DATA.  clearbit creates BlockIndexEntry with
@@ -13155,29 +13155,30 @@ test "W101 G7: reconsiderBlock adds target to chain_tips but not cleared descend
     try std.testing.expect(!block2_in_tips);
 }
 
-// ---- G8 (BUG-8): stale best_invalid after reconsiderBlock ------------------
-// Spec: Core's ResetBlockFailureFlags sets m_best_invalid=nullptr for any
-// block on the cleared path that currently equals m_best_invalid.
-// clearbit only clears best_invalid if it points exactly to the target.
+// ---- G8 (BUG-8 — FIXED): best_invalid cleared when it points at a descendant
+// Spec: Core's ResetBlockFailureFlags sets m_best_invalid=nullptr when it
+// points at the reconsidered block or any descendant/ancestor whose failure
+// flag is cleared (validation.cpp). clearDescendantFailure does that pointer
+// clear. The previous assertion expected the stale bug and force-unwrapped a
+// null best_invalid, which aborted `zig build test-unit` (SIGABRT) and hid
+// every later unit result.
 
-test "W101 G8: best_invalid points to descendant not cleared after reconsiderBlock" {
+test "W101 G8: reconsiderBlock clears best_invalid pointing at a descendant" {
     const allocator = std.testing.allocator;
     var chain = try makeLinearChain(allocator);
     defer chain.manager.deinit();
 
-    // Invalidate block1; best_invalid is set to block1 (or possibly block2).
     try chain.manager.invalidateBlock(&chain.block1.hash);
 
-    // Manually set best_invalid to block2 (a descendant of block1).
+    // Points at block2, a descendant — not at block1. Phase 3 only compares
+    // the target hash; the descendant walk is what must null this.
     chain.manager.best_invalid = chain.block2;
 
-    // Reconsider block1.
     try chain.manager.reconsiderBlock(&chain.block1.hash);
 
-    // BUG-8: best_invalid still points to block2 because reconsiderBlock only
-    // clears it if best_invalid == &target (block1).  block2 is a descendant.
-    // Core would have cleared it because block2 is on the reconsidered path.
-    try std.testing.expectEqual(chain.block2, chain.manager.best_invalid.?);
+    try std.testing.expect(chain.manager.best_invalid == null);
+    try std.testing.expect(!chain.block1.status.failed_valid);
+    try std.testing.expect(!chain.block2.status.failed_child);
 }
 
 // ---- G9 (BUG-9 — FIXED): loadGenesis seeds genesis with has_data=true -------

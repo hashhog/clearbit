@@ -4520,9 +4520,24 @@ pub const PeerManager = struct {
     // Eclipse Attack Protection: Anchor Connections
     // ========================================================================
 
+    /// Absolute `anchors_path` is used as given (tests pin `/dev/null` or a
+    /// temp file). A relative name is joined onto `data_dir` when that is
+    /// set, matching Core `GetDataDirNet() / "anchors.dat"` (net.cpp
+    /// DumpAnchors / ReadAnchors). Otherwise the relative name is
+    /// cwd-relative — the historical default, which wrote anchors.dat into
+    /// whatever directory the process was started from.
+    fn resolveAnchorsPath(self: *const PeerManager, buf: *[std.fs.max_path_bytes]u8) []const u8 {
+        if (std.fs.path.isAbsolute(self.anchors_path)) return self.anchors_path;
+        const dir = self.data_dir orelse return self.anchors_path;
+        if (dir.len == 0) return self.anchors_path;
+        return std.fmt.bufPrint(buf, "{s}{c}{s}", .{ dir, std.fs.path.sep, self.anchors_path }) catch self.anchors_path;
+    }
+
     /// Load anchor connections from disk (anchors.dat).
     pub fn loadAnchors(self: *PeerManager) !void {
-        var file = std.fs.cwd().openFile(self.anchors_path, .{}) catch |err| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.resolveAnchorsPath(&path_buf);
+        var file = std.fs.cwd().openFile(path, .{}) catch |err| {
             if (err == error.FileNotFound) return;
             return err;
         };
@@ -4566,12 +4581,14 @@ pub const PeerManager = struct {
             self.anchor_addresses.append(addr) catch continue;
         }
 
-        std.log.info("Loaded {} anchor connections from {s}", .{ self.anchor_addresses.items.len, self.anchors_path });
+        std.log.info("Loaded {} anchor connections from {s}", .{ self.anchor_addresses.items.len, path });
     }
 
     /// Save current block-relay-only connections as anchors.
     pub fn saveAnchors(self: *PeerManager) !void {
-        var file = std.fs.cwd().createFile(self.anchors_path, .{}) catch |err| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.resolveAnchorsPath(&path_buf);
+        var file = std.fs.cwd().createFile(path, .{}) catch |err| {
             std.log.err("Failed to create anchors file: {}", .{err});
             return err;
         };
@@ -4606,7 +4623,7 @@ pub const PeerManager = struct {
         }
 
         try writer.writeAll("\n  ]\n}\n");
-        std.log.info("Saved {} anchor connections to {s}", .{ count, self.anchors_path });
+        std.log.info("Saved {} anchor connections to {s}", .{ count, path });
     }
 
     /// Connect to anchor peers first on startup.

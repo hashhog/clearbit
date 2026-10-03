@@ -519,6 +519,80 @@ test "w104/G18b: PeerManager.data_dir wires addrman peers.dat save->reload round
     }
 }
 
+// G18c: anchors.dat follows data_dir, not the process cwd.
+// Core net.cpp DumpAnchors / ReadAnchors use GetDataDirNet()/"anchors.dat".
+// main.zig sets PeerManager.data_dir from --datadir (the same directory
+// peers.dat uses) but leaves anchors_path at the relative default
+// "anchors.dat". saveAnchors/loadAnchors must resolve that name against
+// data_dir. An absolute anchors_path (tests pin /dev/null) stays as given.
+//
+// Before the fix both calls opened std.fs.cwd() + the relative name, so a
+// process whose cwd was not the datadir wrote anchors.dat in the wrong
+// place and loaded nothing on the next start. The launcher happens to set
+// WorkingDirectory to the datadir; that coincidence is not the contract.
+test "w104/G18c: anchors.dat save/load uses data_dir, not the process cwd" {
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    // Other tests in this process deinit a PeerManager with no data_dir and
+    // leave ./anchors.dat behind. Remove that leftover first so the check
+    // at the end measures this test's save, not a neighbour's.
+    std.fs.cwd().deleteFile("anchors.dat") catch {};
+    defer std.fs.cwd().deleteFile("anchors.dat") catch {};
+
+    // Startup reads the datadir file. A missing cwd anchors.dat must not
+    // hide it (FileNotFound on the cwd path used to return success).
+    try tmp.dir.writeFile(.{
+        .sub_path = "anchors.dat",
+        .data =
+        \\{
+        \\  "anchors": [
+        \\    {"ip": "1.2.3.4", "port": 8333}
+        \\  ]
+        \\}
+        \\
+        ,
+    });
+
+    {
+        var m = PeerManager.init(allocator, &consensus.MAINNET);
+        m.data_dir = dir;
+        defer m.deinit();
+        // Production default. An absolute override would mask the bug
+        // (tests_shutdown_fast_exit sets one).
+        try testing.expectEqualStrings("anchors.dat", m.anchors_path);
+        try m.loadAnchors();
+        try testing.expectEqual(@as(usize, 1), m.anchor_addresses.items.len);
+        const want = std.net.Address.initIp4([4]u8{ 1, 2, 3, 4 }, 8333);
+        try testing.expect(m.anchor_addresses.items[0].eql(want));
+    }
+
+    // Shutdown path: deinit -> persistForShutdown -> saveAnchors. No peers,
+    // so the document is empty, but it must land in the datadir.
+    {
+        var m = PeerManager.init(allocator, &consensus.MAINNET);
+        m.data_dir = dir;
+        m.deinit();
+    }
+
+    {
+        const f = try tmp.dir.openFile("anchors.dat", .{});
+        defer f.close();
+        const body = try f.readToEndAlloc(allocator, 64 * 1024);
+        defer allocator.free(body);
+        try testing.expect(std.mem.indexOf(u8, body, "\"anchors\"") != null);
+    }
+
+    if (std.fs.cwd().openFile("anchors.dat", .{})) |cwd_file| {
+        cwd_file.close();
+        return error.AnchorsWrittenToCwd;
+    } else |_| {}
+}
+
 // ============================================================================
 // Anti-DoS gate tests (G22-G30)
 // ============================================================================
@@ -582,7 +656,9 @@ test "w104/G25: addressKey IPv6 all-zero address produces key == port (can alias
     // IPv6 ::1 (loopback): bytes[15] = 1, rest zero.
     const ipv6_loopback = std.net.Address.initIp6(
         [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
-        8333, 0, 0,
+        8333,
+        0,
+        0,
     );
     const key_ipv6 = PeerManager.addressKey(ipv6_loopback);
 
@@ -597,7 +673,9 @@ test "w104/G25: addressKey IPv6 all-zero address produces key == port (can alias
     // Different, but if all bytes were zero:
     const ipv6_zero = std.net.Address.initIp6(
         [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        8333, 0, 0,
+        8333,
+        0,
+        0,
     );
     const key_ipv6_zero = PeerManager.addressKey(ipv6_zero);
     // BUG documented: IPv6 :: returns key = port XOR 0 = port (= 8333 network-endian).
