@@ -60,10 +60,11 @@ test "w124 G2: signal_count atomic starts at zero" {
 
 // ===========================================================================
 // G3: Bounded shutdown deadline / watchdog
-// Status: PRESENT (fleet-leading).  30-second hard deadline.
-test "w124 G3: SHUTDOWN_DEADLINE_NS = 30s" {
+// Status: PRESENT.  110-second backstop (under stop_mainnet.sh's 120 s grace;
+// 30 s fired mid-write on a disk-saturated host, 2026-10-03).
+test "w124 G3: SHUTDOWN_DEADLINE_NS = 110s" {
     try testing.expectEqual(
-        @as(u64, 30 * std.time.ns_per_s),
+        @as(u64, 110 * std.time.ns_per_s),
         main_mod.SHUTDOWN_DEADLINE_NS,
     );
 }

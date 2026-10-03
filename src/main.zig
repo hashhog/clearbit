@@ -1001,10 +1001,19 @@ pub fn installSignalHandlers() void {
 }
 
 /// Shutdown deadline in nanoseconds. If graceful shutdown has not completed
-/// within this window the watchdog thread forces exit(1). This matches
-/// Bitcoin Core's init.cpp semantics (StartShutdown + bounded thread join)
-/// and guarantees the process never hangs longer than 30s after a signal.
-pub const SHUTDOWN_DEADLINE_NS: u64 = 30 * std.time.ns_per_s;
+/// within this window the watchdog thread forces exit(1).
+///
+/// Bitcoin Core has no such self-imposed deadline: init.cpp Shutdown() runs
+/// the durable writes (mempool dump, fee estimates, chainstate flush) to
+/// completion however long the disk takes, and an operator who wants a bound
+/// sends SIGKILL. This watchdog is only a backstop against a genuinely hung
+/// shutdown, so it must sit well above the slowest *healthy* shutdown. At
+/// 30 s it fired mid-write on a disk-saturated host (2026-10-03 live stop:
+/// P2P joined +6.1 s, mempool + fee-estimate save finished +26.0 s, WAL sync
+/// still running at the 30 s mark) -- a forced exit in the middle of the
+/// durable writes it exists to protect. 110 s keeps it under the operator's
+/// 120 s SIGTERM->SIGKILL grace (tools/stop_mainnet.sh).
+pub const SHUTDOWN_DEADLINE_NS: u64 = 110 * std.time.ns_per_s;
 
 /// Set to true once graceful shutdown has completed. The watchdog checks
 /// this flag before forcing exit so a clean shutdown never gets clobbered
@@ -1019,7 +1028,7 @@ pub var shutdown_complete = std.atomic.Value(bool).init(false);
 fn shutdownWatchdog() void {
     std.time.sleep(SHUTDOWN_DEADLINE_NS);
     if (shutdown_complete.load(.acquire)) return;
-    std.debug.print("shutdown deadline (30s) exceeded, forcing exit\n", .{});
+    std.debug.print("shutdown deadline ({d}s) exceeded, forcing exit\n", .{SHUTDOWN_DEADLINE_NS / std.time.ns_per_s});
     std.debug.print("exit (forced)\n", .{});
     std.posix.exit(1);
 }
@@ -3052,7 +3061,7 @@ pub fn main() !void {
     // had to escalate to SIGKILL.
     //
     // New behaviour (mirrors blockbrew f086d9e / Bitcoin Core init.cpp):
-    //   - Arm a detached 30s watchdog thread. If graceful shutdown has
+    //   - Arm a detached watchdog thread (SHUTDOWN_DEADLINE_NS, 110s). If graceful shutdown has
     //     not completed by SHUTDOWN_DEADLINE_NS it forces exit(1).
     //   - A second SIGTERM/SIGINT (signalHandler, signal_count>=1)
     //     also forces exit(1) immediately.
