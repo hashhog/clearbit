@@ -20,6 +20,7 @@ const testing = std.testing;
 const peer_mod = @import("src/peer.zig");
 const consensus = @import("src/consensus.zig");
 const main_mod = @import("src/main.zig");
+const storage = @import("src/storage.zig");
 
 const main_src = @embedFile("src/main.zig");
 
@@ -201,4 +202,79 @@ test "shutdown_fast_exit: persistForShutdown writes anchors, bans, and peers.dat
     // Not torn down: a second save still writes. deinit would have freed
     // addrman; calling persist again is the use-after-free discriminator.
     pm.persistForShutdown();
+}
+
+// ---------------------------------------------------------------------------
+// The shutdown no longer writes RocksDB memtables to SST (it cost 2.5-4.5 s
+// of the 30 s watchdog). It fsyncs the WAL instead. Claim: everything a
+// committed write put in a memtable is recovered from the WAL on the next
+// open, so a process that exits without close() or a memtable flush loses
+// nothing. Instrument: copy the DB directory while the DB is still open and
+// unflushed -- the files as they are now are exactly what process exit leaves
+// -- and open the copy. Negative control: the same copy WITHOUT the WAL files
+// must lose the write, otherwise the positive check is not measuring the WAL.
+
+fn copyDbFiles(src: std.fs.Dir, dst: std.fs.Dir, keep_wal: bool) !usize {
+    var copied: usize = 0;
+    var it = src.iterate();
+    while (try it.next()) |e| {
+        if (e.kind != .file) continue;
+        // WAL segments are NNNNNN.log; the info log is "LOG".
+        if (!keep_wal and std.mem.endsWith(u8, e.name, ".log")) continue;
+        try src.copyFile(e.name, dst, e.name, .{});
+        copied += 1;
+    }
+    return copied;
+}
+
+fn exitCopyKeepsWrite(keep_wal: bool) !bool {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("live");
+    try tmp.dir.makeDir("exited");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &buf);
+    const live = try std.fmt.allocPrint(testing.allocator, "{s}/live", .{root});
+    defer testing.allocator.free(live);
+    const exited = try std.fmt.allocPrint(testing.allocator, "{s}/exited", .{root});
+    defer testing.allocator.free(exited);
+
+    var db = try storage.Database.open(live, 8, testing.allocator);
+    defer db.close();
+    try db.writeBatch(&[_]storage.BatchOp{
+        .{ .put = .{ .cf = storage.CF_UTXO, .key = "gate5-utxo", .value = "coin" } },
+    });
+    try db.put(storage.CF_BLOCK_INDEX, "gate5-tip", "tip");
+    // What shutdown now does before process exit.
+    try db.syncWal();
+
+    var src = try tmp.dir.openDir("live", .{ .iterate = true });
+    defer src.close();
+    var dst = try tmp.dir.openDir("exited", .{});
+    defer dst.close();
+    _ = try copyDbFiles(src, dst, keep_wal);
+
+    var db2 = try storage.Database.open(exited, 8, testing.allocator);
+    defer db2.close();
+    const a = try db2.get(storage.CF_UTXO, "gate5-utxo");
+    defer if (a) |v| testing.allocator.free(v);
+    const b = try db2.get(storage.CF_BLOCK_INDEX, "gate5-tip");
+    defer if (b) |v| testing.allocator.free(v);
+    return a != null and b != null and std.mem.eql(u8, a.?, "coin") and std.mem.eql(u8, b.?, "tip");
+}
+
+test "shutdown_fast_exit: unflushed memtable writes survive process exit via the WAL" {
+    try testing.expect(try exitCopyKeepsWrite(true));
+}
+
+test "shutdown_fast_exit: negative control -- without the WAL files the same writes are lost" {
+    try testing.expect(!(try exitCopyKeepsWrite(false)));
+}
+
+test "shutdown_fast_exit: shutdown syncs the WAL instead of flushing memtables" {
+    const exit_call = std.mem.indexOf(u8, main_src, "finishShutdown();") orelse return error.Fail;
+    const shutdown_start = std.mem.lastIndexOf(u8, main_src[0..exit_call], "Graceful shutdown") orelse return error.Fail;
+    const window = main_src[shutdown_start..exit_call];
+    try testing.expect(hasCall(window, "p.syncWal()"));
+    try testing.expect(!hasCall(window, "p.flush()"));
 }

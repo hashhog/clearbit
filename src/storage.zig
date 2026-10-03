@@ -222,6 +222,12 @@ pub const Database = struct {
         return storage_rocksdb.dbFlush(self);
     }
 
+    /// fsync the WAL so every committed write survives power loss, without
+    /// writing memtables to SST (see storage_rocksdb.dbSyncWal).
+    pub fn syncWal(self: *Database) StorageError!void {
+        return storage_rocksdb.dbSyncWal(self);
+    }
+
     /// Stop RocksDB background compaction without waiting. In-flight SST
     /// files that never reached the MANIFEST are dropped on the next open.
     /// Shutdown calls this so process exit is not stuck behind a compaction

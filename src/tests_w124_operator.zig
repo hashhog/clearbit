@@ -552,6 +552,117 @@ test "w124 G1c: PeerManager.stop interrupts a blocking peer send (gate 5)" {
     try testing.expect(!peer_mod.isPeerFdRegistered(peer.stream.handle));
 }
 
+/// A loopback listener whose accept queue is full. Linux drops further SYNs
+/// (tcp_conn_request: sk_acceptq_is_full -> drop), so a dial to it sits in
+/// SYN_SENT with no network involved. Peer.connect then waits in its 5 s
+/// connect poll(), which is what a dial to a dead mainnet address does.
+const SynBlackhole = struct {
+    server: std.net.Server,
+    fillers: [16]std.posix.socket_t = undefined,
+    n: usize = 0,
+
+    fn init() !SynBlackhole {
+        const a = try std.net.Address.parseIp4("127.0.0.1", 0);
+        var bh = SynBlackhole{ .server = try a.listen(.{ .reuse_address = true, .kernel_backlog = 0 }) };
+        errdefer bh.deinit();
+        const addr = bh.server.listen_address;
+        while (bh.n < bh.fillers.len) {
+            const s = try std.posix.socket(
+                std.posix.AF.INET,
+                std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
+                0,
+            );
+            bh.fillers[bh.n] = s;
+            bh.n += 1;
+            std.posix.connect(s, &addr.any, addr.getOsSockLen()) catch |e| {
+                if (e != error.WouldBlock) return e;
+            };
+            var pfd = [_]std.posix.pollfd{.{ .fd = s, .events = std.posix.POLL.OUT, .revents = 0 }};
+            if (try std.posix.poll(&pfd, 300) == 0) return bh; // stuck: queue is full
+        }
+        return error.CouldNotFillAcceptQueue;
+    }
+
+    fn deinit(self: *SynBlackhole) void {
+        for (self.fillers[0..self.n]) |s| std.posix.close(s);
+        self.server.deinit();
+    }
+};
+
+// Gate 5: stop() must also interrupt the TCP dial itself. Peer.connect waits
+// up to 5 s in poll() for a non-blocking connect to complete, and the socket
+// was registered in live_peer_fds only AFTER that wait, so stop()'s
+// shutdown(2) sweep could not reach it: a stop during a dial to a dead
+// address (most addrman entries on mainnet) cost the join the rest of the
+// 5 s, once per dial still queued in the same run-loop step.
+// Discriminator: before the fix this join takes ~4.5 s.
+test "w124 G1d: PeerManager.stop interrupts an outbound TCP dial stuck in SYN_SENT (gate 5)" {
+    const allocator = std.heap.page_allocator;
+    var bh = try SynBlackhole.init();
+    defer bh.deinit();
+    const target = bh.server.listen_address;
+
+    const pm = try allocator.create(peer_mod.PeerManager);
+    defer allocator.destroy(pm);
+    pm.* = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    pm.running.store(true, .release);
+
+    const Dial = struct {
+        fn run(m: *peer_mod.PeerManager, a: std.net.Address, got_peer: *bool, done: *std.atomic.Value(bool)) void {
+            const p = m.connectOutboundNegotiated(a);
+            got_peer.* = (p != null);
+            done.store(true, .release);
+        }
+    };
+    var got_peer = false;
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Dial.run, .{ pm, target, &got_peer, &done });
+
+    std.time.sleep(500 * std.time.ns_per_ms);
+    try testing.expect(!done.load(.acquire)); // instrument: the dial really is stuck
+
+    const t0 = std.time.milliTimestamp();
+    pm.stop();
+    t.join();
+    const waited_ms = std.time.milliTimestamp() - t0;
+    std.debug.print("G1d: dial released {d} ms after stop()\n", .{waited_ms});
+    try testing.expect(!got_peer);
+    try testing.expect(waited_ms < 2000); // ~4500 before the fix
+}
+
+// Gate 5, end to end on the P2P thread: PeerManager.run() in --connect mode
+// against a peer whose SYNs are dropped. The thread is joined the way main
+// joins it. Before the fix the join waits out the 5 s connect poll.
+test "w124 G1e: P2P run() thread joins within 2 s of stop() while dialing a dead peer (gate 5)" {
+    const allocator = std.heap.page_allocator;
+    var bh = try SynBlackhole.init();
+    defer bh.deinit();
+
+    const pm = try allocator.create(peer_mod.PeerManager);
+    defer allocator.destroy(pm);
+    pm.* = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    pm.connect_address = bh.server.listen_address;
+
+    const Runner = struct {
+        fn run(m: *peer_mod.PeerManager, done: *std.atomic.Value(bool)) void {
+            m.run() catch {};
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Runner.run, .{ pm, &done });
+
+    std.time.sleep(700 * std.time.ns_per_ms);
+    try testing.expect(!done.load(.acquire)); // instrument: run() is mid-dial, not finished
+
+    const t0 = std.time.milliTimestamp();
+    pm.stop();
+    t.join();
+    const waited_ms = std.time.milliTimestamp() - t0;
+    std.debug.print("G1e: P2P thread joined {d} ms after stop()\n", .{waited_ms});
+    try testing.expect(waited_ms < 2000); // ~4300 before the fix
+}
+
 test "w124 G1c: live peer fd registry de-duplicates and unregisters" {
     peer_mod.registerPeerFd(987654);
     peer_mod.registerPeerFd(987654);

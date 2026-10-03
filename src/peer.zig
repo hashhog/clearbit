@@ -1096,6 +1096,15 @@ pub const Peer = struct {
             std.posix.IPPROTO.TCP,
         ) catch return PeerError.ConnectionFailed;
         errdefer std.posix.close(sock);
+        // Register before the connect wait, not after it: PeerManager.stop()
+        // shutdown(2)s every registered socket, and shutdown of a SYN_SENT
+        // socket disconnects it and wakes the poll() below at once. Registered
+        // only after connect, a stop during the dial waited out the full 5 s
+        // poll on the P2P thread. (A stop that scans the registry between the
+        // caller's stop check and this line still waits <= 5 s; the caller's
+        // armHandshake() then refuses the connected socket.)
+        registerPeerFd(sock);
+        errdefer unregisterPeerFd(sock);
 
         // Initiate non-blocking connect
         std.posix.connect(sock, &address.any, address.getOsSockLen()) catch |err| {
@@ -1140,7 +1149,6 @@ pub const Peer = struct {
         ) catch {};
 
         const now = std.time.timestamp();
-        registerPeerFd(stream.handle);
         return Peer{
             .stream = stream,
             .address = address,
@@ -3928,6 +3936,9 @@ pub const PeerManager = struct {
     /// Perform DNS seed resolution to discover initial peers.
     pub fn dnsSeeds(self: *PeerManager) !void {
         for (self.network_params.dns_seeds) |seed| {
+            // getaddrinfo cannot be interrupted; check between seeds so a
+            // stop during startup waits for at most one resolver timeout.
+            if (self.stopping()) return;
             // Resolve DNS seed to list of addresses
             const addrs = std.net.getAddressList(self.allocator, seed, self.network_params.default_port) catch |err| {
                 std.log.warn("DNS resolution failed for {s}: {}", .{ seed, err });
@@ -4601,6 +4612,7 @@ pub const PeerManager = struct {
     /// Connect to anchor peers first on startup.
     pub fn connectToAnchors(self: *PeerManager) void {
         for (self.anchor_addresses.items) |addr| {
+            if (self.stopping()) return;
             if (self.isConnected(addr)) continue;
             if (self.ban_list.isAddressBanned(addr)) continue;
 
@@ -10924,6 +10936,7 @@ pub const PeerManager = struct {
                 // until reactivated: net.cpp:2351).
                 _ = self.maybeAddFixedSeeds();
             }
+            if (self.stopping()) break;
 
             // 1. Open new outbound connections if needed (skip if --connect mode
             //    and skip entirely while networking is disabled).
@@ -10943,26 +10956,34 @@ pub const PeerManager = struct {
                 // (never appended to self.peers) and skipped in --connect mode.
                 self.maybeOpenFeeler();
             }
+            if (self.stopping()) break;
 
             // 2. Accept inbound connections (skip while networking is disabled —
             //    Core net.cpp:1786 drops new inbound when !fNetworkActive).
             if (network_active) self.acceptInbound() catch {};
+            if (self.stopping()) break;
 
             // 3. Process messages from all peers
             self.processAllMessages() catch {};
+            if (self.stopping()) break;
 
             // 3b. Drain block buffer and pipeline more requests
             self.drainBlockBuffer();
+            if (self.stopping()) break;
             self.pipelineBlockRequests() catch {};
+            if (self.stopping()) break;
 
             // 4. Send pings to idle peers
             self.sendPings() catch {};
+            if (self.stopping()) break;
 
             // 5. Disconnect timed-out peers
             self.disconnectStale();
+            if (self.stopping()) break;
 
             // 6. Check for stale tips and evict peers (runs every 45 seconds)
             self.checkForStaleTipAndEvictPeers();
+            if (self.stopping()) break;
 
             // 6b. Sweep expired orphans (runs every ORPHAN_TX_EXPIRE_INTERVAL seconds)
             self.sweepOrphanPool();
@@ -11000,6 +11021,7 @@ pub const PeerManager = struct {
                     if (self.data_dir) |dir| am.save(dir);
                 }
             }
+            if (self.stopping()) break;
 
             // 6f. Self-address advertisement (Core MaybeSendAddr): discovery
             //     from new peers' addr_recv, the first announcement right

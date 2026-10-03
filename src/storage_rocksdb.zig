@@ -510,6 +510,27 @@ pub fn dbFlush(db: *storage.Database) storage.StorageError!void {
     }
 }
 
+/// fsync the write-ahead log (RocksDB FlushWAL(sync=true)).
+///
+/// Every write clearbit makes goes through `state.write_options`, created by
+/// rocksdb_writeoptions_create() and never modified: WAL on (disableWAL=0),
+/// sync=false, and no manual_wal_flush on the DB options. So each committed
+/// batch is already in the WAL file's page cache when rocksdb_write returns,
+/// and DB::Open replays the WAL into the memtables on the next start. Process
+/// exit therefore loses nothing; the only gap is an OS crash / power loss
+/// before writeback, which this one fsync closes. It replaces a memtable
+/// flush (rocksdb_flush: write up to 4 x 256 MiB memtables as SSTs) that cost
+/// 2.5-4.5 s inside the 30 s shutdown watchdog for the same guarantee.
+pub fn dbSyncWal(db: *storage.Database) storage.StorageError!void {
+    const state: *DbState = @ptrCast(@alignCast(db.handle));
+    var errptr: ?[*:0]u8 = null;
+    c.rocksdb_flush_wal(state.db, 1, &errptr);
+    if (errptr) |err| {
+        c.rocksdb_free(@ptrCast(err));
+        return storage.StorageError.WriteFailed;
+    }
+}
+
 /// Abandon background compaction/flush threads. `wait` is 0: a shutdown
 /// that blocks on a large compaction recreates the grace-period miss this
 /// exists to avoid. Recovery discards SST files that are not in the MANIFEST.

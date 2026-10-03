@@ -3058,6 +3058,7 @@ pub fn main() !void {
     //     also forces exit(1) immediately.
     //   - Phased log output so operators can see where shutdown is
     //     stuck if it ever does exceed the deadline.
+    const shutdown_t0 = std.time.milliTimestamp();
     const sig_num = signal_count.load(.acquire);
     if (sig_num > 0) {
         std.debug.print("received SIGTERM, beginning graceful shutdown\n", .{});
@@ -3091,10 +3092,16 @@ pub fn main() !void {
     // Join subsystem threads. Both loops check their running flag on
     // every iteration so join returns quickly under normal conditions.
     // If either hangs, the watchdog above will force exit.
+    // Each phase logs its elapsed time since the signal. Without a line
+    // after the join, a slow mempool dump or flush reads as a P2P thread
+    // that never stopped (gate 5, 2026-10-03: the log went from "joining P2P
+    // thread" straight to the watchdog, and the fsync-bound dump that
+    // followed the join was invisible).
     std.debug.print("joining RPC thread\n", .{});
     rpc_thread.join();
     std.debug.print("joining P2P thread\n", .{});
     peer_thread.join();
+    std.debug.print("P2P thread joined (+{d} ms)\n", .{std.time.milliTimestamp() - shutdown_t0});
 
     // Join the background wallet-reconcile thread if it is still running.
     // shutdown_requested is already set by this point, so its fetch() callback
@@ -3129,6 +3136,7 @@ pub fn main() !void {
             std.debug.print("Dumped mempool.dat: {d} transactions\n", .{written});
         }
     }
+    std.debug.print("mempool + fee estimates saved (+{d} ms)\n", .{std.time.milliTimestamp() - shutdown_t0});
 
     // Phase 4: flush chainstate — dirty UTXO entries + chain tip,
     // atomically so a crash never leaves the tip out of sync with
@@ -3145,12 +3153,16 @@ pub fn main() !void {
 
     // Durable RocksDB shutdown without rocksdb_close. close() frees the
     // block cache; that is the swapped-out walk that misses the stop grace.
-    // flush() writes memtables to SST. cancel abandons leftover compaction
-    // without waiting — incomplete SSTs are not in the MANIFEST.
-    std.debug.print("flushing DB memtables\n", .{});
+    // Every write above went through the WAL (storage_rocksdb.dbSyncWal has
+    // the write-option audit), so the next open replays it; syncWal() fsyncs
+    // it so that also holds across power loss. This replaced a memtable flush
+    // to SST, which bought the same guarantee for 2.5-4.5 s of the 30 s
+    // watchdog. cancel abandons leftover compaction without waiting —
+    // incomplete SSTs are not in the MANIFEST.
+    std.debug.print("syncing DB WAL (+{d} ms)\n", .{std.time.milliTimestamp() - shutdown_t0});
     if (db_ptr) |p| {
-        p.flush() catch |err| {
-            std.debug.print("Warning: DB memtable flush failed: {}\n", .{err});
+        p.syncWal() catch |err| {
+            std.debug.print("Warning: DB WAL sync failed: {}\n", .{err});
         };
         p.cancelBackgroundWork();
     }
@@ -3173,12 +3185,12 @@ pub fn main() !void {
 
     // These used to run inside defer deinit, after the "exit" log and
     // interleaved with the heap walk. They have to land before we exit.
-    std.debug.print("saving peers, bans, and anchors\n", .{});
+    std.debug.print("saving peers, bans, and anchors (+{d} ms)\n", .{std.time.milliTimestamp() - shutdown_t0});
     peer_manager.persistForShutdown();
     std.debug.print("saving wallets\n", .{});
     wallet_manager.saveAll();
 
-    std.debug.print("{s} stopped.\n", .{VERSION_STRING});
+    std.debug.print("{s} stopped (+{d} ms).\n", .{ VERSION_STRING, std.time.milliTimestamp() - shutdown_t0 });
     std.debug.print("exit\n", .{});
     // Does not return. Returning would run main's defers (UTXO cache,
     // mempool, block index, rocksdb_close) and fault the swapped heap.
