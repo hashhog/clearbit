@@ -4943,17 +4943,33 @@ pub const WalletManager = struct {
         };
     }
 
+    /// Save every loaded wallet. Best effort: one failure does not skip the
+    /// rest. Does not free wallets. Shutdown calls this before
+    /// `std.process.exit` so a skip of `deinit` cannot drop unsaved keys.
+    pub fn saveAll(self: *WalletManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.saveAllUnlocked();
+    }
+
+    fn saveAllUnlocked(self: *WalletManager) void {
+        var it = self.wallets.iterator();
+        while (it.next()) |entry| {
+            self.saveWalletInternal(entry.key_ptr.*, entry.value_ptr.*) catch |err| {
+                std.log.warn("wallet save: failed for '{s}': {s}", .{ entry.key_ptr.*, @errorName(err) });
+            };
+        }
+    }
+
     /// Deinitialize the wallet manager, unloading all wallets.
     pub fn deinit(self: *WalletManager) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Save and deinit all wallets
+        self.saveAllUnlocked();
         var it = self.wallets.iterator();
         while (it.next()) |entry| {
             const wallet = entry.value_ptr.*;
-            // Save wallet before unloading
-            self.saveWalletInternal(entry.key_ptr.*, wallet) catch {};
             wallet.deinit();
             self.allocator.destroy(wallet);
             self.allocator.free(entry.key_ptr.*);

@@ -1024,6 +1024,21 @@ fn shutdownWatchdog() void {
     std.posix.exit(1);
 }
 
+/// Terminate after the durable shutdown writes.
+///
+/// noreturn so main's defers do not run. Those defers free the UTXO cache,
+/// the mempool, the in-memory block index, and (via rocksdb_close) the
+/// RocksDB block cache. On a swapped-out mainnet heap that walk faults
+/// pages back in and is still going when stop_mainnet's grace fires
+/// SIGKILL — observed 2026-10-02 22:39Z after the log had already reached
+/// "exit" and anchors were saved. process.exit does not unwind; the kernel
+/// reclaims the address space without reading swap. Callers must flush
+/// chainstate, wallets, bans, anchors, peers.dat, and DB memtables first.
+pub fn finishShutdown() noreturn {
+    shutdown_complete.store(true, .release);
+    std.process.exit(0);
+}
+
 /// Heap-allocated context for the background wallet-reconcile thread.
 ///
 /// The startup wallet rescan (reconcileToTip) used to run synchronously on
@@ -2094,6 +2109,10 @@ pub fn main() !void {
             std.debug.print("RocksDB storage: {s}/chainstate\n", .{full_datadir});
         }
     }
+    // Early returns (startup failure) still close here. The SIGTERM path
+    // does not: finishShutdown() is noreturn, so this defer — and the
+    // UTXO-cache walk in chain_state.deinit — does not run. Memtables are
+    // flushed explicitly before that exit.
     defer if (db_ptr) |p| {
         p.close();
     };
@@ -3118,11 +3137,23 @@ pub fn main() !void {
     chain_state.flush() catch |err| {
         std.debug.print("Warning: error flushing chain state: {}\n", .{err});
     };
+    // deinit() used to retry deletes a failed flush left queued. This path
+    // never reaches deinit. No-op when the flush above already drained them.
+    chain_state.utxo_set.flushPendingDeletes() catch |err| {
+        std.debug.print("Warning: pending UTXO deletes not persisted: {}\n", .{err});
+    };
 
-    // Phase 5: close the RocksDB handle. The `defer` on db_ptr at
-    // init time will run p.close() after this function returns; we
-    // emit the phase log here so operators see the expected sequence.
-    std.debug.print("closing DB\n", .{});
+    // Durable RocksDB shutdown without rocksdb_close. close() frees the
+    // block cache; that is the swapped-out walk that misses the stop grace.
+    // flush() writes memtables to SST. cancel abandons leftover compaction
+    // without waiting — incomplete SSTs are not in the MANIFEST.
+    std.debug.print("flushing DB memtables\n", .{});
+    if (db_ptr) |p| {
+        p.flush() catch |err| {
+            std.debug.print("Warning: DB memtable flush failed: {}\n", .{err});
+        };
+        p.cancelBackgroundWork();
+    }
 
     // Remove cookie file on clean shutdown
     deleteCookieFile(full_datadir, allocator);
@@ -3140,12 +3171,18 @@ pub fn main() !void {
     // "alive" until we're truly done.
     ops.removePidFile(pid_path);
 
+    // These used to run inside defer deinit, after the "exit" log and
+    // interleaved with the heap walk. They have to land before we exit.
+    std.debug.print("saving peers, bans, and anchors\n", .{});
+    peer_manager.persistForShutdown();
+    std.debug.print("saving wallets\n", .{});
+    wallet_manager.saveAll();
+
     std.debug.print("{s} stopped.\n", .{VERSION_STRING});
     std.debug.print("exit\n", .{});
-
-    // Mark graceful completion so the watchdog's deadline timer
-    // becomes a no-op if it fires after we've already returned.
-    shutdown_complete.store(true, .release);
+    // Does not return. Returning would run main's defers (UTXO cache,
+    // mempool, block index, rocksdb_close) and fault the swapped heap.
+    finishShutdown();
 }
 
 // ============================================================================

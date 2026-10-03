@@ -1319,6 +1319,39 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_spam_tests.step);
     }
 
+    // CONTROL for QUEUES.md gate 5: process still alive after logging `exit`
+    // because main returns into deferred UTXO / block-cache teardown.
+    {
+        const exit_tests = b.addTest(.{
+            .root_source_file = b.path("tests_shutdown_fast_exit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"shutdown_fast_exit"},
+        });
+        exit_tests.linkSystemLibrary("rocksdb");
+        exit_tests.linkSystemLibrary("secp256k1");
+        exit_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        exit_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            exit_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            exit_tests.linkSystemLibrary("minisketch");
+            exit_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        exit_tests.root_module.addOptions("build_options", build_options);
+        const run_exit_tests = b.addRunArtifact(exit_tests);
+        const exit_test_step = b.step(
+            "test-shutdown-fast-exit",
+            "Gate 5: shutdown must process.exit after the exit log (no deferred heap walk)",
+        );
+        exit_test_step.dependOn(&run_exit_tests.step);
+        test_step.dependOn(&run_exit_tests.step);
+    }
+
     // createrawtransaction vout/sequence/locktime range-check regression.
     // Same project-root wrapper as tests_rpc.zig (src/rpc.zig transitively
     // imports src/wallet.zig, whose @embedFile only resolves from the project

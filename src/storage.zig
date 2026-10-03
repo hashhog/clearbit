@@ -222,6 +222,14 @@ pub const Database = struct {
         return storage_rocksdb.dbFlush(self);
     }
 
+    /// Stop RocksDB background compaction without waiting. In-flight SST
+    /// files that never reached the MANIFEST are dropped on the next open.
+    /// Shutdown calls this so process exit is not stuck behind a compaction
+    /// (and so those threads are not mid-malloc when libc exit runs).
+    pub fn cancelBackgroundWork(self: *Database) void {
+        storage_rocksdb.dbCancelBackgroundWork(self);
+    }
+
     /// Fetch an integer-valued RocksDB CF property (e.g. live-data-size).
     /// Returns null if the property name is not supported or the call fails.
     /// Used by the pruner to size CF_BLOCKS against the configured target.
@@ -11150,7 +11158,6 @@ test "invalidate-persist: durable invalid mark survives reopen and blocks connec
     try cs.connectBlockFastWithUndo(&block2, &bh2, 2);
     try std.testing.expectEqual(@as(u32, 2), cs.best_height);
 }
-
 
 test "connect→disconnect roundtrip restores UTXO set (chainstate equivalence)" {
     const allocator = std.testing.allocator;

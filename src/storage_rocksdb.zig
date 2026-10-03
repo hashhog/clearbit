@@ -230,8 +230,7 @@ pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.A
                     &errptr,
                 );
                 if (errptr) |err3| {
-                    std.debug.print("RocksDB: create CF '{s}' failed: {s}\n",
-                        .{ cf_names[i], err3 });
+                    std.debug.print("RocksDB: create CF '{s}' failed: {s}\n", .{ cf_names[i], err3 });
                     c.rocksdb_free(@ptrCast(err3));
                     for (0..num_existing) |k| {
                         if (existing_handles[k] != null) {
@@ -509,6 +508,15 @@ pub fn dbFlush(db: *storage.Database) storage.StorageError!void {
         c.rocksdb_free(@ptrCast(err));
         return storage.StorageError.WriteFailed;
     }
+}
+
+/// Abandon background compaction/flush threads. `wait` is 0: a shutdown
+/// that blocks on a large compaction recreates the grace-period miss this
+/// exists to avoid. Recovery discards SST files that are not in the MANIFEST.
+pub fn dbCancelBackgroundWork(db: *storage.Database) void {
+    const state: *DbState = @ptrCast(@alignCast(db.handle));
+    const raw = state.db orelse return;
+    c.rocksdb_cancel_all_background_work(raw, 0);
 }
 
 /// Fetch an integer-valued RocksDB property for a specific column family.

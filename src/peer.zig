@@ -3423,13 +3423,21 @@ pub const PeerManager = struct {
         return self.network_active;
     }
 
-    pub fn deinit(self: *PeerManager) void {
-        // Save ban list and anchors before shutdown
+    /// Durable shutdown writes only: ban list, anchors, peers.dat.
+    /// Does not disconnect peers or free the block buffer, header index,
+    /// or addrman. `main` calls this and then `std.process.exit` so those
+    /// frees — which fault a swapped-out heap — never run.
+    pub fn persistForShutdown(self: *PeerManager) void {
         self.ban_list.save() catch {};
         self.saveAnchors() catch {};
-        // Persist the bucketed addrman (peers.dat) if a data dir is set.
         if (self.addrman) |*am| {
             if (self.data_dir) |dir| am.save(dir);
+        }
+    }
+
+    pub fn deinit(self: *PeerManager) void {
+        self.persistForShutdown();
+        if (self.addrman) |*am| {
             am.deinit();
         }
         for (self.peers.items) |peer| {
