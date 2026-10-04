@@ -1792,3 +1792,387 @@ test "seedForkRootParent: hash not on the active chain is refused" {
     try testing.expect(!pm.seedForkRootParent(stranger));
     try testing.expect(pm.header_index.get(stranger) == null);
 }
+
+// ====================================================================
+// Invalid block over P2P (2026-10-03): Core InvalidBlockFound /
+// InvalidChainFound / MaybePunishNodeForBlock parity.
+//
+// Real regtest blocks (valid PoW, BIP-34, subsidy) driven through the real
+// `.headers` / `.block` handlers, the drain, and the reorg trigger.
+// ====================================================================
+
+const IbBlock = struct { block: types.Block, hash: types.Hash256 };
+
+/// Coinbase-only regtest block at `height` (<= 16) on `prev`, paying
+/// subsidy + `overpay` sat.  `tag` makes same-height siblings distinct.
+fn mineIbBlock(
+    allocator: std.mem.Allocator,
+    params: *const consensus.NetworkParams,
+    prev: types.Hash256,
+    height: u32,
+    overpay: i64,
+    tag: u8,
+) !IbBlock {
+    std.debug.assert(height >= 1 and height <= 16);
+    const script_sig = try allocator.dupe(u8, &[_]u8{ @as(u8, @intCast(0x50 + height)), 0x01, tag });
+    const inputs = try allocator.alloc(types.TxIn, 1);
+    inputs[0] = .{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = script_sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const spk = try allocator.dupe(u8, &[_]u8{0x51});
+    const outputs = try allocator.alloc(types.TxOut, 1);
+    outputs[0] = .{ .value = 5_000_000_000 + overpay, .script_pubkey = spk };
+    const txs = try allocator.alloc(types.Transaction, 1);
+    txs[0] = .{ .version = 1, .inputs = inputs, .outputs = outputs, .lock_time = 0 };
+    var header = types.BlockHeader{
+        .version = 4,
+        .prev_block = prev,
+        .merkle_root = try crypto.computeTxid(&txs[0], allocator),
+        .timestamp = params.genesis_header.timestamp + height * 600 + tag,
+        .bits = 0x207fffff,
+        .nonce = 0,
+    };
+    while (!consensus.validateProofOfWork(&header, params)) header.nonce +%= 1;
+    const block = types.Block{ .header = header, .transactions = txs };
+    return .{ .block = block, .hash = crypto.computeBlockHash(&block.header) };
+}
+
+/// Heap deep copy (the handlers take ownership of what they are given).
+fn cloneIbBlock(allocator: std.mem.Allocator, b: *const types.Block) !types.Block {
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try serialize.writeBlock(&w, b);
+    var r = serialize.Reader{ .data = w.list.items };
+    return serialize.readBlock(&r, allocator);
+}
+
+fn sendHeaders(pm: *peer_mod.PeerManager, allocator: std.mem.Allocator, from: *peer_mod.Peer, blocks: []const *const IbBlock) !void {
+    const hs = try allocator.alloc(types.BlockHeader, blocks.len);
+    for (blocks, 0..) |b, i| hs[i] = b.block.header;
+    try pm.ingestHeadersMessage(from, hs);
+}
+
+fn sendBlock(pm: *peer_mod.PeerManager, allocator: std.mem.Allocator, from: *peer_mod.Peer, b: *const IbBlock) !void {
+    try pm.ingestBlockMessage(from, try cloneIbBlock(allocator, &b.block));
+}
+
+fn ibPeer(params: *const consensus.NetworkParams, allocator: std.mem.Allocator, ip_last: u8, dir: peer_mod.PeerDirection) !*peer_mod.Peer {
+    const p = try allocator.create(peer_mod.Peer);
+    p.* = makeStubPeer(params, allocator);
+    p.address = std.net.Address.initIp4([4]u8{ 127, 0, 0, ip_last }, 18444);
+    p.direction = dir;
+    p.conn_type = if (dir == .inbound) .inbound else .outbound_full_relay;
+    return p;
+}
+
+fn freeIbPeer(allocator: std.mem.Allocator, p: *peer_mod.Peer) void {
+    p.recv_buffer.deinit();
+    allocator.destroy(p);
+}
+
+fn countQueued(pm: *const peer_mod.PeerManager, h: types.Hash256) usize {
+    var n: usize = 0;
+    var i = pm.connect_cursor;
+    while (i < pm.expected_blocks.items.len) : (i += 1) {
+        if (std.mem.eql(u8, &pm.expected_blocks.items[i], &h)) n += 1;
+    }
+    return n;
+}
+
+test "tests_reorg_p2p: invalid block from X is marked failed, never re-queued; only X punished; valid sibling then connects" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(&params);
+    cs.best_hash = params.genesis_hash;
+    cs.initGenesisTimestamp(params.genesis_header.timestamp);
+    pm.chain_state = &cs;
+
+    const h_peer = try ibPeer(&params, allocator, 3, .outbound);
+    defer freeIbPeer(allocator, h_peer);
+    const x_peer = try ibPeer(&params, allocator, 2, .inbound);
+    defer freeIbPeer(allocator, x_peer);
+    const x_redial = try ibPeer(&params, allocator, 2, .inbound);
+    defer freeIbPeer(allocator, x_redial);
+    try pm.peers.append(h_peer);
+    try pm.peers.append(x_peer);
+    try pm.peers.append(x_redial);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var b1_bad = try mineIbBlock(allocator, &params, a1.hash, 2, 1, 0xBB); // bad-cb-amount
+    defer serialize.freeBlock(allocator, &b1_bad.block);
+    var b2_child = try mineIbBlock(allocator, &params, b1_bad.hash, 3, 0, 0xBC);
+    defer serialize.freeBlock(allocator, &b2_child.block);
+    var b1_ok = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0x11);
+    defer serialize.freeBlock(allocator, &b1_ok.block);
+    var b2_ok = try mineIbBlock(allocator, &params, b1_ok.hash, 3, 0, 0x12);
+    defer serialize.freeBlock(allocator, &b2_ok.block);
+
+    // Honest prefix: A1 from H.
+    try sendHeaders(&pm, allocator, h_peer, &.{&a1});
+    try sendBlock(&pm, allocator, h_peer, &a1);
+    try testing.expectEqual(@as(u32, 1), cs.best_height);
+
+    // X announces + delivers the invalid B1.
+    try sendHeaders(&pm, allocator, x_peer, &.{&b1_bad});
+    try testing.expectEqual(@as(usize, 1), countQueued(&pm, b1_bad.hash));
+    try sendBlock(&pm, allocator, x_peer, &b1_bad);
+
+    // Verdict: tip unchanged, B1 BLOCK_FAILED_VALID, out of the connect queue
+    // (so it is never requested again), deliverer punished, H not.
+    try testing.expectEqual(@as(u32, 1), cs.best_height);
+    try testing.expectEqualSlices(u8, &a1.hash, &cs.best_hash);
+    try testing.expect(!cs.flush_error);
+    try testing.expect(pm.isBlockFailed(&b1_bad.hash));
+    try testing.expectEqual(@as(usize, 0), countQueued(&pm, b1_bad.hash));
+    try testing.expect(!pm.inflight_block_peer.contains(b1_bad.hash));
+    try testing.expect(x_peer.should_ban);
+    try testing.expect(!h_peer.should_ban);
+
+    // X redials (inbound) and re-announces B1: BLOCK_CACHED_INVALID — not
+    // queued, not fetched, inbound announcer NOT punished.
+    try sendHeaders(&pm, allocator, x_redial, &.{&b1_bad});
+    try testing.expectEqual(@as(usize, 0), countQueued(&pm, b1_bad.hash));
+    try testing.expect(!x_redial.should_ban);
+    // ...and the same headers batch extended by a child of B1: still cut at
+    // B1 (cached-invalid, inbound) and the child never queued.
+    try sendHeaders(&pm, allocator, x_redial, &.{ &b1_bad, &b2_child });
+    try testing.expectEqual(@as(usize, 0), countQueued(&pm, b2_child.hash));
+    try testing.expect(!x_redial.should_ban);
+
+    // The honest sibling B1' then B2' connect (most-work valid chain).
+    try sendHeaders(&pm, allocator, h_peer, &.{&b1_ok});
+    try sendBlock(&pm, allocator, h_peer, &b1_ok);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+    try testing.expectEqualSlices(u8, &b1_ok.hash, &cs.best_hash);
+    try sendHeaders(&pm, allocator, h_peer, &.{&b2_ok});
+    try sendBlock(&pm, allocator, h_peer, &b2_ok);
+    try testing.expectEqual(@as(u32, 3), cs.best_height);
+    try testing.expectEqualSlices(u8, &b2_ok.hash, &cs.best_hash);
+    try testing.expect(!h_peer.should_ban);
+}
+
+test "tests_reorg_p2p: header building on a failed block is bad-prevblk (marked, punished); outbound cached-invalid announcer punished" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+
+    const out_peer = try ibPeer(&params, allocator, 4, .outbound);
+    defer freeIbPeer(allocator, out_peer);
+    const in_peer = try ibPeer(&params, allocator, 5, .inbound);
+    defer freeIbPeer(allocator, in_peer);
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var bad = try mineIbBlock(allocator, &params, a1.hash, 2, 1, 0xBB);
+    defer serialize.freeBlock(allocator, &bad.block);
+    var child = try mineIbBlock(allocator, &params, bad.hash, 3, 0, 0xBC);
+    defer serialize.freeBlock(allocator, &child.block);
+
+    try pm.failed_blocks.put(bad.hash, {});
+    const hs = [_]types.BlockHeader{ a1.block.header, bad.block.header, child.block.header };
+    const c1 = pm.failedHeaderCut(&hs);
+    try testing.expectEqual(@as(usize, 1), c1.index);
+    try testing.expectEqual(peer_mod.FailedHeaderReason.cached_invalid, c1.reason);
+    const only_child = [_]types.BlockHeader{child.block.header};
+    const c2 = pm.failedHeaderCut(&only_child);
+    try testing.expectEqual(@as(usize, 0), c2.index);
+    try testing.expectEqual(peer_mod.FailedHeaderReason.invalid_prev, c2.reason);
+    try testing.expect(pm.isBlockFailed(&child.hash)); // BLOCK_FAILED_CHILD
+
+    // Through the handler: an OUTBOUND peer announcing a cached-invalid block
+    // is punished (Core MaybePunishNodeForBlock BLOCK_CACHED_INVALID), an
+    // inbound one is not.
+    try sendHeaders(&pm, allocator, in_peer, &.{&bad});
+    try testing.expect(!in_peer.should_ban);
+    try sendHeaders(&pm, allocator, out_peer, &.{&bad});
+    try testing.expect(out_peer.should_ban);
+}
+
+test "tests_reorg_p2p: failed reorg onto an invalid branch rolls back, punishes only the deliverer, honest extension connects" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(&params);
+    cs.best_hash = params.genesis_hash;
+    cs.initGenesisTimestamp(params.genesis_header.timestamp);
+    pm.chain_state = &cs;
+
+    const h_peer = try ibPeer(&params, allocator, 3, .outbound);
+    defer freeIbPeer(allocator, h_peer);
+    const x_peer = try ibPeer(&params, allocator, 2, .inbound);
+    defer freeIbPeer(allocator, x_peer);
+    try pm.peers.append(h_peer);
+    try pm.peers.append(x_peer);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var b1_ok = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0x11);
+    defer serialize.freeBlock(allocator, &b1_ok.block);
+    var b2_ok = try mineIbBlock(allocator, &params, b1_ok.hash, 3, 0, 0x12);
+    defer serialize.freeBlock(allocator, &b2_ok.block);
+    var b1_bad = try mineIbBlock(allocator, &params, a1.hash, 2, 1, 0xBB);
+    defer serialize.freeBlock(allocator, &b1_bad.block);
+    var b2x = try mineIbBlock(allocator, &params, b1_bad.hash, 3, 0, 0xBC);
+    defer serialize.freeBlock(allocator, &b2x.block);
+
+    // Honest chain A1, B1' from H; tip = B1' (h2).
+    try sendHeaders(&pm, allocator, h_peer, &.{ &a1, &b1_ok });
+    try sendBlock(&pm, allocator, h_peer, &a1);
+    try sendBlock(&pm, allocator, h_peer, &b1_ok);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+    const utxos_before = cs.utxo_set.total_utxos;
+
+    // X: [B1, B2x] — heavier branch through the invalid B1.  It arms a reorg
+    // and X delivers both bodies.
+    try sendHeaders(&pm, allocator, x_peer, &.{ &b1_bad, &b2x });
+    try testing.expect(pm.pending_reorg != null);
+    try sendBlock(&pm, allocator, x_peer, &b1_bad);
+    try sendBlock(&pm, allocator, x_peer, &b2x);
+
+    // The reorg failed on B1: chainstate rolled back and LIVE (no sticky
+    // flush_error), tip still B1', B1 failed + B2x failed-child, only X
+    // punished.
+    try testing.expect(pm.pending_reorg == null);
+    try testing.expect(!cs.flush_error);
+    try testing.expect(cs.last_reorg_rolled_back);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+    try testing.expectEqualSlices(u8, &b1_ok.hash, &cs.best_hash);
+    try testing.expectEqual(utxos_before, cs.utxo_set.total_utxos);
+    try testing.expect(pm.isBlockFailed(&b1_bad.hash));
+    try testing.expect(pm.isBlockFailed(&b2x.hash));
+    try testing.expect(x_peer.should_ban);
+    try testing.expect(!h_peer.should_ban);
+    // B1' coinbase is spendable again (UTXO view restored from the DB).
+    const b1_ok_cb = types.OutPoint{ .hash = try crypto.computeTxid(&b1_ok.block.transactions[0], allocator), .index = 0 };
+    var coin = (try cs.utxo_set.get(&b1_ok_cb)) orelse return error.TestExpectedCoin;
+    coin.deinit(allocator);
+
+    // A re-announcement of the failed branch does not re-arm.
+    try sendHeaders(&pm, allocator, x_peer, &.{ &b1_bad, &b2x });
+    try testing.expect(pm.pending_reorg == null);
+
+    // H announces its branch from the shared prefix, [B1', B2'] (the
+    // instrument's shape): B2' arrives through the reorg-trigger path (fork
+    // point = the active tip B1').  H never punished.
+    try sendHeaders(&pm, allocator, h_peer, &.{ &b1_ok, &b2_ok });
+    try sendBlock(&pm, allocator, h_peer, &b2_ok);
+    try testing.expectEqual(@as(u32, 3), cs.best_height);
+    try testing.expectEqualSlices(u8, &b2_ok.hash, &cs.best_hash);
+    try testing.expect(!h_peer.should_ban);
+
+    // The same B2' re-announced (headers + body) must not be "connected"
+    // again on top of itself and condemned (queue re-based on the new tip);
+    // the next honest block extends normally.
+    var b3_ok = try mineIbBlock(allocator, &params, b2_ok.hash, 4, 0, 0x13);
+    defer serialize.freeBlock(allocator, &b3_ok.block);
+    try sendHeaders(&pm, allocator, h_peer, &.{&b2_ok});
+    try sendHeaders(&pm, allocator, h_peer, &.{&b3_ok});
+    try sendBlock(&pm, allocator, h_peer, &b3_ok);
+    try testing.expectEqual(@as(u32, 4), cs.best_height);
+    try testing.expectEqualSlices(u8, &b3_ok.hash, &cs.best_hash);
+    try testing.expect(!pm.isBlockFailed(&b2_ok.hash));
+    try testing.expect(!h_peer.should_ban);
+}
+
+test "tests_reorg_p2p: NON-verdict — a mutated copy (unexpected witness) punishes the sender but does NOT mark the block; the genuine copy connects" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(&params);
+    cs.best_hash = params.genesis_hash;
+    cs.initGenesisTimestamp(params.genesis_header.timestamp);
+    pm.chain_state = &cs;
+
+    const h_peer = try ibPeer(&params, allocator, 3, .outbound);
+    defer freeIbPeer(allocator, h_peer);
+    const x_peer = try ibPeer(&params, allocator, 2, .inbound);
+    defer freeIbPeer(allocator, x_peer);
+    try pm.peers.append(h_peer);
+    try pm.peers.append(x_peer);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var b1 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0x11);
+    defer serialize.freeBlock(allocator, &b1.block);
+
+    try sendHeaders(&pm, allocator, h_peer, &.{&a1});
+    try sendBlock(&pm, allocator, h_peer, &a1);
+    try sendHeaders(&pm, allocator, h_peer, &.{&b1});
+
+    // Mutated copy: same header (same hash), coinbase witness with no
+    // commitment -> UnexpectedWitness (Core CheckWitnessMalleation,
+    // BLOCK_MUTATED).
+    var mutated = try cloneIbBlock(allocator, &b1.block);
+    const wit = try allocator.alloc([]const u8, 1);
+    wit[0] = try allocator.dupe(u8, &([_]u8{0} ** 32));
+    @constCast(&mutated.transactions[0].inputs[0]).witness = wit;
+    try testing.expectEqualSlices(u8, &b1.hash, &crypto.computeBlockHash(&mutated.header));
+    try pm.ingestBlockMessage(x_peer, mutated);
+
+    try testing.expectEqual(@as(u32, 1), cs.best_height);
+    try testing.expect(x_peer.should_ban); // deliverer of the mutated copy
+    try testing.expect(!pm.isBlockFailed(&b1.hash)); // the HASH is not condemned
+    try testing.expectEqual(@as(usize, 1), countQueued(&pm, b1.hash)); // still wanted
+
+    try sendBlock(&pm, allocator, h_peer, &b1);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+    try testing.expectEqualSlices(u8, &b1.hash, &cs.best_hash);
+    try testing.expect(!h_peer.should_ban);
+}
+
+test "tests_reorg_p2p: classifyBlockFailure maps errors onto Core's verdict classes" {
+    const C = peer_mod.classifyBlockFailure;
+    const K = peer_mod.BlockFailureKind;
+    try testing.expectEqual(K.consensus_invalid, C(error.BadCoinbaseValue));
+    try testing.expectEqual(K.consensus_invalid, C(error.NonFinalTx));
+    try testing.expectEqual(K.consensus_invalid, C(error.SequenceLockNotSatisfied));
+    try testing.expectEqual(K.consensus_invalid, C(error.ScriptVerificationFailed));
+    try testing.expectEqual(K.mutated, C(error.BadMerkleRoot));
+    try testing.expectEqual(K.mutated, C(error.DuplicateTx));
+    try testing.expectEqual(K.mutated, C(error.BadWitnessCommitment));
+    try testing.expectEqual(K.mutated, C(error.BadWitnessNonceSize));
+    try testing.expectEqual(K.mutated, C(error.UnexpectedWitness));
+    try testing.expectEqual(K.not_a_verdict, C(error.OutOfMemory));
+    try testing.expectEqual(K.not_a_verdict, C(error.TooFarAhead));
+    try testing.expectEqual(K.not_a_verdict, C(error.TooLittleChainwork));
+    try testing.expectEqual(K.not_a_verdict, C(error.FutureTimestamp));
+}

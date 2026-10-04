@@ -874,3 +874,114 @@ test "tests_reorg_restore: #53c reorg connect enforces time-based BIP-68 sequenc
     );
     try std.testing.expectError(error.ReorgBlockInvalid, res);
 }
+
+// ====================================================================
+// Clean rollback of a reorg that hits a consensus-invalid side-branch block
+// (2026-10-03, invalid-block-over-P2P).  Core ActivateBestChainStep: a
+// ConnectTip failure leaves the chain where it was and the node keeps
+// validating.  Pre-fix clearbit latched flush_error and refused every later
+// connect until restart.
+// ====================================================================
+
+fn makeRbBlock(
+    allocator: std.mem.Allocator,
+    prev_hash: [32]u8,
+    height: u32,
+    marker: u8,
+    value: i64,
+) !MtpTestBlock {
+    var tb = try makeMtpCoinbaseBlock(allocator, prev_hash, height, MTP_T + height * 600 + marker, marker);
+    @constCast(&tb.block.transactions[0].outputs[0]).value = value;
+    tb.block.header.merkle_root = crypto.computeTxidStreaming(&tb.block.transactions[0]);
+    return tb;
+}
+
+fn rbCoinbaseOutpoint(b: *const types.Block) types.OutPoint {
+    return .{ .hash = crypto.computeTxidStreaming(&b.transactions[0]), .index = 0 };
+}
+
+fn rbHasCoin(cs: *ChainState, op: *const types.OutPoint) !bool {
+    var c = (try cs.utxo_set.get(op)) orelse return false;
+    c.deinit(cs.allocator);
+    return true;
+}
+
+fn rbRun(bad_index: usize) !void {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(consensus_mod.getNetworkParams(.regtest));
+
+    // Active chain A1..A3.
+    var a: [4]MtpTestBlock = undefined;
+    var prev: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= 3) : (h += 1) {
+        a[h] = try makeRbBlock(arena, prev, h, @intCast(0x30 + h), 5_000_000_000);
+        try queueAndConnect(&cs, &a[h].block, &a[h].hash, h);
+        prev = a[h].hash;
+    }
+    try std.testing.expectEqual(@as(u32, 3), cs.best_height);
+    const utxos_before = cs.utxo_set.total_utxos;
+    const amount_before = cs.utxo_set.total_amount;
+    const work_before = cs.total_work;
+    const x3_before = cs.getCumulativeTxCount(3);
+    const w3_before = cs.getCumulativeChainWork(3);
+    try std.testing.expect(x3_before != null);
+
+    // Side branch from A2: B3, B4 — the one at `bad_index` overpays its
+    // coinbase by 1 sat (bad-cb-amount).
+    var b3 = try makeRbBlock(arena, a[2].hash, 3, 0xB3, if (bad_index == 0) 5_000_000_001 else 5_000_000_000);
+    b3.hash = [_]u8{0xB3} ** 32;
+    var b4 = try makeRbBlock(arena, b3.hash, 4, 0xB4, if (bad_index == 1) 5_000_000_001 else 5_000_000_000);
+    b4.hash = [_]u8{0xB4} ** 32;
+    var new_chain = [_]ChainState.ReorgBlock{
+        .{ .hash = b3.hash, .block = b3.block, .height = 3 },
+        .{ .hash = b4.hash, .block = b4.block, .height = 4 },
+    };
+    var dr: ChainState.ReorgDriveResult = .{};
+    const res = cs.reorgToChainWithOptions(&a[2].hash, &new_chain, .{ .connect_force_skip_pow = true }, &dr);
+    try std.testing.expectError(error.ReorgBlockInvalid, res);
+    try std.testing.expectEqual(@as(?@import("validation.zig").ValidationError, error.BadCoinbaseValue), dr.connect_reject_err);
+    try std.testing.expectEqual(@as(u32, @intCast(bad_index)), dr.connected_before_reject);
+
+    // Rolled back, chainstate LIVE.
+    try std.testing.expect(!cs.flush_error);
+    try std.testing.expect(cs.last_reorg_rolled_back);
+    try std.testing.expectEqual(@as(u32, 3), cs.best_height);
+    try std.testing.expectEqualSlices(u8, &a[3].hash, &cs.best_hash);
+    try std.testing.expectEqual(utxos_before, cs.utxo_set.total_utxos);
+    try std.testing.expectEqual(amount_before, cs.utxo_set.total_amount);
+    try std.testing.expectEqualSlices(u8, &work_before, &cs.total_work);
+    try std.testing.expectEqual(x3_before, cs.getCumulativeTxCount(3));
+    try std.testing.expectEqual(w3_before, cs.getCumulativeChainWork(3));
+    // Coin view: A3's coinbase back (the disconnect spent it in cache), no
+    // coin from the rolled-back branch.
+    try std.testing.expect(try rbHasCoin(&cs, &rbCoinbaseOutpoint(&a[3].block)));
+    try std.testing.expect(!try rbHasCoin(&cs, &rbCoinbaseOutpoint(&b3.block)));
+
+    // The node keeps validating: the next block on the active chain connects.
+    const a4 = try makeRbBlock(arena, a[3].hash, 4, 0x34, 5_000_000_000);
+    try queueAndConnect(&cs, &a4.block, &a4.hash, 4);
+    try std.testing.expectEqual(@as(u32, 4), cs.best_height);
+    try std.testing.expect(!cs.flush_error);
+}
+
+test "tests_reorg_restore: reorg rejecting the FIRST side-branch block rolls back cleanly (no sticky flush_error)" {
+    try rbRun(0);
+}
+
+test "tests_reorg_restore: reorg rejecting a LATER side-branch block rolls back the connected one too (UTXO + X:/W: keys)" {
+    try rbRun(1);
+}

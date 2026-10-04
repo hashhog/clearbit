@@ -243,8 +243,51 @@ pub const MAX_SEEN_FORK_BATCHES: usize = 2048;
 
 /// Outcome of `maybeArmReorg` (and of a competing-fork batch that never
 /// reached it). Used to decide whether to ask the peer for more of the fork.
+/// What a block-validation failure says about the block (Core
+/// BlockValidationResult as consumed by InvalidBlockFound + MaybePunishNodeForBlock).
+pub const BlockFailureKind = enum {
+    /// BLOCK_CONSENSUS / INVALID_HEADER / CHECKPOINT: the block is invalid
+    /// whoever sends it.  Mark BLOCK_FAILED_VALID (+ descendants), never fetch
+    /// it again, punish the peer that delivered it.
+    consensus_invalid,
+    /// BLOCK_MUTATED (bad merkle root, merkle-duplicate mutation, witness
+    /// malleation): THIS copy is bad, the block hash may still be valid.  Core
+    /// punishes the deliverer but does NOT mark the hash failed
+    /// (InvalidBlockFound: `state.GetResult() != BLOCK_MUTATED`).
+    mutated,
+    /// Not a verdict on the block at all (local resource error, too far
+    /// ahead / too little work, time-too-new): no mark, no punishment, retry.
+    not_a_verdict,
+};
+
+/// Map a clearbit validation error onto Core's result classes.
+pub fn classifyBlockFailure(err: validation.ValidationError) BlockFailureKind {
+    return switch (err) {
+        // CheckBlock bad-txnmrklroot / bad-txns-duplicate and
+        // CheckWitnessMalleation (validation.cpp:3870-3905) -> BLOCK_MUTATED.
+        error.BadMerkleRoot,
+        error.DuplicateTx,
+        error.BadWitnessCommitment,
+        error.BadWitnessNonceSize,
+        error.UnexpectedWitness,
+        => .mutated,
+        // OOM is ours; TooFarAhead / TooLittleChainwork are AcceptBlock
+        // "not stored" (no state.Invalid); time-too-new is BLOCK_TIME_FUTURE,
+        // which Core neither caches nor punishes.
+        error.OutOfMemory,
+        error.TooFarAhead,
+        error.TooLittleChainwork,
+        error.FutureTimestamp,
+        => .not_a_verdict,
+        else => .consensus_invalid,
+    };
+}
+
+pub const FailedHeaderReason = enum { none, cached_invalid, invalid_prev };
+
 pub const ReorgArmResult = enum {
     armed,
+    refused_invalid,
     already_pending,
     refused_too_deep,
     refused_lower_work,
@@ -276,7 +319,7 @@ pub fn shouldContinueCompetingFork(
     if (newly_inserted == 0) return false;
     return switch (arm) {
         .armed, .already_pending, .refused_lower_work => true,
-        .refused_too_deep, .no_fork_point, .skipped, .unresolved => false,
+        .refused_too_deep, .refused_invalid, .no_fork_point, .skipped, .unresolved => false,
     };
 }
 
@@ -3189,6 +3232,19 @@ pub const PeerManager = struct {
     /// drain time so a disconnected peer is never dereferenced.
     block_source_peers: std.AutoHashMap(types.Hash256, usize),
 
+    /// BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD memory for the P2P layer
+    /// (Core CBlockIndex::nStatus failure bits).  A hash in this set is never
+    /// queued, armed for a reorg, or requested again; a header announcing it
+    /// is BLOCK_CACHED_INVALID and a header building on it is
+    /// BLOCK_INVALID_PREV.  In-memory only (Core persists the bit in the block
+    /// index; here a restart forgets it and the block costs one re-download).
+    failed_blocks: std.AutoHashMap(types.Hash256, void),
+    /// The ValidationError of the last validateBlockForIBDOrReject failure.
+    last_block_reject_err: ?validation.ValidationError = null,
+    /// Observability / tests.
+    invalid_block_verdicts: u64 = 0,
+    cached_invalid_header_hits: u64 = 0,
+
     /// Maps block hash → the peer we REQUESTED it from (as @intFromPtr(*Peer)).
     /// Mirrors Bitcoin Core's `mapBlocksInFlight` (net_processing.cpp). This is
     /// the source of truth for "is this block in-flight": pipelineBlockRequests
@@ -3397,6 +3453,7 @@ pub const PeerManager = struct {
             .seen_fork_batches = std.AutoHashMap(ForkBatchKey, void).init(allocator),
             .pending_reorg = null,
             .block_source_peers = std.AutoHashMap(types.Hash256, usize).init(allocator),
+            .failed_blocks = std.AutoHashMap(types.Hash256, void).init(allocator),
             .inflight_block_peer = std.AutoHashMap(types.Hash256, usize).init(allocator),
             .wedge_since = 0,
             .wedge_timeout = DRAIN_WEDGE_STALL_TIMEOUT,
@@ -3481,6 +3538,7 @@ pub const PeerManager = struct {
         self.seen_fork_batches.deinit();
         if (self.pending_reorg) |*pr| pr.deinit();
         self.block_source_peers.deinit();
+        self.failed_blocks.deinit();
         self.inflight_block_peer.deinit();
         if (self.asmap_data) |data| self.allocator.free(data);
         if (self.proxy_manager) |*pm| pm.deinit();
@@ -5717,6 +5775,128 @@ pub const PeerManager = struct {
         return false;
     }
 
+    // ------------------------------------------------------------------
+    // Invalid-block handling (Core InvalidBlockFound / InvalidChainFound /
+    // MaybePunishNodeForBlock).
+    // ------------------------------------------------------------------
+
+    pub const FailedHeaderCut = struct { index: usize, reason: FailedHeaderReason };
+
+    /// True when `hash` carries BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD.
+    pub fn isBlockFailed(self: *const PeerManager, hash: *const types.Hash256) bool {
+        return self.failed_blocks.contains(hash.*);
+    }
+
+    /// Index of the first header in `headers` that is already marked failed
+    /// (cached_invalid) or builds on a failed block (invalid_prev — that
+    /// header is marked BLOCK_FAILED_CHILD here).  `headers.len` when none.
+    pub fn failedHeaderCut(self: *PeerManager, headers: []const types.BlockHeader) FailedHeaderCut {
+        if (self.failed_blocks.count() == 0) return .{ .index = headers.len, .reason = .none };
+        for (headers, 0..) |hdr, i| {
+            const bh = crypto.computeBlockHash(&hdr);
+            if (self.failed_blocks.contains(bh)) return .{ .index = i, .reason = .cached_invalid };
+            if (self.failed_blocks.contains(hdr.prev_block)) {
+                self.failed_blocks.put(bh, {}) catch {};
+                return .{ .index = i, .reason = .invalid_prev };
+            }
+        }
+        return .{ .index = headers.len, .reason = .none };
+    }
+
+    /// Punish the peer that DELIVERED `hash` (Core mapBlockSource ->
+    /// BlockChecked -> MaybePunishNodeForBlock).  `fallback` (the peer the
+    /// body was requested from) is used only if no delivery was recorded, and
+    /// only while it is still a live peer — never a dangling pointer, and
+    /// never some other peer that merely triggered the attempt.
+    fn punishBlockSource(self: *PeerManager, hash: *const types.Hash256, fallback: ?*Peer, reason: []const u8) void {
+        const src: ?usize = self.block_source_peers.get(hash.*) orelse
+            if (fallback) |f| @intFromPtr(f) else null;
+        const sp = src orelse return;
+        for (self.peers.items) |p| {
+            if (@intFromPtr(p) == sp) {
+                p.misbehaving(100, reason);
+                return;
+            }
+        }
+    }
+
+    /// The block at expected_blocks[connect_cursor] failed with a consensus
+    /// verdict.  Core InvalidBlockFound + InvalidChainFound: mark it
+    /// BLOCK_FAILED_VALID and everything queued after it (all descendants —
+    /// the queue is one linear header chain) BLOCK_FAILED_CHILD, drop them
+    /// from the connect queue, the buffer and the in-flight map, so none of
+    /// them is ever requested again; the active tip stays the best valid
+    /// block.  Then ask peers for headers from that tip, so a valid
+    /// competitor at the same height (which first-seen ordering kept out of
+    /// the queue) is announced and fetched (Core: ActivateBestChain picks the
+    /// most-work valid candidate as soon as the failed one is excluded).
+    pub fn invalidateQueuedBranch(self: *PeerManager) void {
+        var i = self.connect_cursor;
+        while (i < self.expected_blocks.items.len) : (i += 1) {
+            self.failed_blocks.put(self.expected_blocks.items[i], {}) catch {};
+        }
+        self.dropQueuedTail();
+        self.requestHeadersAfterInvalid();
+    }
+
+    /// Drop every queued (not yet connected) hash from the connect queue,
+    /// the buffer and the in-flight map WITHOUT marking anything failed.
+    fn dropQueuedTail(self: *PeerManager) void {
+        var i = self.connect_cursor;
+        while (i < self.expected_blocks.items.len) : (i += 1) {
+            const h = self.expected_blocks.items[i];
+            if (self.block_buffer.fetchRemove(h)) |kv| {
+                var b = kv.value;
+                serialize.freeBlock(self.allocator, &b);
+            }
+            if (self.inflight_block_peer.fetchRemove(h)) |kv| {
+                if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
+                for (self.peers.items) |p| {
+                    if (@intFromPtr(p) == kv.value) {
+                        p.recordBlockReceived();
+                        break;
+                    }
+                }
+            }
+            _ = self.block_source_peers.remove(h);
+        }
+        if (self.expected_blocks.items.len > self.connect_cursor) {
+            self.expected_blocks.shrinkRetainingCapacity(self.connect_cursor);
+        }
+        if (self.download_cursor > self.connect_cursor) self.download_cursor = self.connect_cursor;
+        self.wedge_since = 0;
+    }
+
+    /// After a successful reorg: the queue's connected prefix ends at the OLD
+    /// tip.  Replace the unconnected remainder with the fork hashes just
+    /// connected so the queue tail is the new active tip.
+    fn rebaseQueueOnActiveTip(self: *PeerManager, connected: []const types.Hash256) void {
+        self.dropQueuedTail();
+        self.expected_blocks.appendSlice(connected) catch {};
+        self.connect_cursor = @intCast(self.expected_blocks.items.len);
+        self.download_cursor = self.connect_cursor;
+    }
+
+    /// Mark every block of an armed fork from `first_bad` on as failed
+    /// (BLOCK_FAILED_VALID for the first, FAILED_CHILD for the rest).
+    fn markForkFailedFrom(self: *PeerManager, fork_hashes: []const types.Hash256, first_bad: usize) void {
+        var i = first_bad;
+        while (i < fork_hashes.len) : (i += 1) {
+            self.failed_blocks.put(fork_hashes[i], {}) catch {};
+        }
+    }
+
+    /// One getheaders round to every live peer from our (unchanged) tip, so
+    /// the best VALID chain is re-announced after an invalid block knocked
+    /// the first-seen branch out.
+    fn requestHeadersAfterInvalid(self: *PeerManager) void {
+        for (self.peers.items) |p| {
+            if (p.should_ban) continue;
+            if (p.state != .handshake_complete) continue;
+            self.sendGetHeaders(p) catch {};
+        }
+    }
+
     /// Once a header batch has been ingested AND the first header was
     /// classified as competing_fork, walk through the new headers and
     /// figure out:
@@ -5789,6 +5969,15 @@ pub const PeerManager = struct {
             if (std.mem.eql(u8, &cursor, &self.network_params.genesis_hash)) {
                 fork_point = cursor;
                 break;
+            }
+            // A fork through a block already marked failed is not a
+            // candidate (Core: a BLOCK_FAILED_* index never enters
+            // setBlockIndexCandidates).  Its descendants we walked are
+            // BLOCK_FAILED_CHILD; nothing is requested.
+            if (self.failed_blocks.contains(cursor)) {
+                for (fork_chain.items) |fh| self.failed_blocks.put(fh, {}) catch {};
+                self.last_arm_result = .refused_invalid;
+                return;
             }
             // Otherwise this hash is a fork block — record + walk back.
             const e = self.header_index.get(cursor) orelse {
@@ -6182,7 +6371,10 @@ pub const PeerManager = struct {
         const old_height = cs.best_height;
         const old_hash = cs.best_hash;
 
-        const conn_or_err = cs.reorgToChain(&pr_ptr.fork_point, rb_list.items);
+        var drive_result: storage.ChainState.ReorgDriveResult = .{};
+        const conn_or_err = cs.reorgToChainWithOptions(&pr_ptr.fork_point, rb_list.items, .{}, &drive_result);
+        var found_invalid = false;
+        var reorged = false;
         if (conn_or_err) |connected| {
             std.log.info(
                 "[REORG] disconnected={d} connected={d} new_tip_h={d} old_tip_h={d}",
@@ -6194,12 +6386,49 @@ pub const PeerManager = struct {
                 },
             );
             _ = old_hash;
+            // The active chain is now the fork: re-base the connect queue on
+            // it so the next header extending the new tip is a plain
+            // extension, and the queued remainder of the old (lighter)
+            // branch is not later "connected" on top of the wrong tip.
+            self.rebaseQueueOnActiveTip(pr_ptr.fork_hashes.items);
+            reorged = true;
         } else |err| {
-            std.log.warn("[REORG] FAILED: {} — banning source peer", .{err});
-            if (pr_ptr.source_peer) |sp| {
-                sp.misbehaving(100, "reorg failure");
+            // Only a consensus verdict on a fork block marks anything failed
+            // or punishes anyone, and then only the peer that DELIVERED that
+            // block (Core BlockChecked/mapBlockSource).  A reorg that aborts
+            // for any other reason (depth, fork point, I/O, flush) says
+            // nothing about any peer.  reorgToChain rolled the chainstate back
+            // to the pre-reorg tip (Core: the chain stays where it was and
+            // ActivateBestChain continues with the next-best valid candidate).
+            const kind: BlockFailureKind = if (err == error.ReorgBlockInvalid)
+                (if (drive_result.connect_reject_err) |ve| classifyBlockFailure(ve) else .not_a_verdict)
+            else
+                .not_a_verdict;
+            const bad_idx: usize = drive_result.connected_before_reject;
+            const have_bad = bad_idx < rb_list.items.len;
+            switch (kind) {
+                .consensus_invalid => if (have_bad) {
+                    const bad = rb_list.items[bad_idx].hash;
+                    self.markForkFailedFrom(pr_ptr.fork_hashes.items, bad_idx);
+                    self.punishBlockSource(&bad, pr_ptr.source_peer, "invalid-block");
+                    self.invalid_block_verdicts += 1;
+                    found_invalid = true;
+                    std.log.warn(
+                        "[REORG] FAILED: fork block h={d} is INVALID ({}) — marked failed with {d} descendant(s); delivering peer punished; tip stays h={d}",
+                        .{ rb_list.items[bad_idx].height, drive_result.connect_reject_err.?, rb_list.items.len - bad_idx - 1, cs.best_height },
+                    );
+                },
+                .mutated => if (have_bad) {
+                    const bad = rb_list.items[bad_idx].hash;
+                    self.punishBlockSource(&bad, pr_ptr.source_peer, "mutated-block");
+                    std.log.warn("[REORG] FAILED: fork block h={d} mutated — delivering peer punished, block not marked", .{rb_list.items[bad_idx].height});
+                },
+                .not_a_verdict => {
+                    std.log.warn("[REORG] FAILED: {} — not a block verdict; nothing marked, no peer punished", .{err});
+                },
             }
         }
+        for (pr_ptr.fork_hashes.items) |h| _ = self.block_source_peers.remove(h);
         // Free fork bodies — storage took copies via writeBlock so we
         // can safely free the in-memory Block values now.  (Per
         // serialize.freeBlock semantics: this only frees the
@@ -6211,6 +6440,8 @@ pub const PeerManager = struct {
 
         pr_ptr.deinit();
         self.pending_reorg = null;
+        // Resume header sync from the (new or unchanged) tip.
+        if (found_invalid or reorged) self.requestHeadersAfterInvalid();
     }
 
     /// Helper: look up the height of a given hash via header_index, or
@@ -6425,6 +6656,33 @@ pub const PeerManager = struct {
                     return;
                 }
 
+                // BLOCK_FAILED_VALID memory (Core AcceptBlockHeader,
+                // validation.cpp:4186-4223): a header we already marked
+                // invalid is BLOCK_CACHED_INVALID ("duplicate-invalid"), and a
+                // NEW header whose parent is marked invalid is
+                // BLOCK_INVALID_PREV ("bad-prevblk", and is itself marked).
+                // Either way the batch is cut at that header so the failed
+                // branch is never queued or fetched again.  Punishment follows
+                // MaybePunishNodeForBlock (net_processing.cpp:1906): cached-
+                // invalid only for an OUTBOUND peer; bad-prevblk for any peer.
+                const hdrs: []const types.BlockHeader = blk_cut: {
+                    const cut = self.failedHeaderCut(h.headers);
+                    if (cut.index == h.headers.len) break :blk_cut h.headers;
+                    switch (cut.reason) {
+                        .cached_invalid => {
+                            self.cached_invalid_header_hits += 1;
+                            if (peer.direction == .outbound) peer.misbehaving(100, "duplicate-invalid");
+                        },
+                        .invalid_prev => {
+                            self.cached_invalid_header_hits += 1;
+                            peer.misbehaving(100, "bad-prevblk");
+                        },
+                        .none => {},
+                    }
+                    if (cut.index == 0) return;
+                    break :blk_cut h.headers[0..cut.index];
+                };
+
                 // Deduplicate: only accept headers that chain to our known tip.
                 // The first header's prev_block must match either:
                 // - The last hash in expected_blocks (if any), or
@@ -6462,9 +6720,9 @@ pub const PeerManager = struct {
                 const reorg_enabled = isReorgEnabled();
 
                 const klass: HeaderClass = if (reorg_enabled)
-                    self.classifyHeaderBatch(&h.headers[0], &expected_prev)
+                    self.classifyHeaderBatch(&hdrs[0], &expected_prev)
                 else
-                    (if (std.mem.eql(u8, &h.headers[0].prev_block, &expected_prev))
+                    (if (std.mem.eql(u8, &hdrs[0].prev_block, &expected_prev))
                         HeaderClass.extends_active
                     else
                         HeaderClass.unknown_parent);
@@ -6527,10 +6785,10 @@ pub const PeerManager = struct {
                         // re-requests the same batch forever and starves RPC
                         // via log/CPU).
                         self.reorg_candidate_announcements += 1;
-                        const fork_prev = h.headers[0].prev_block;
+                        const fork_prev = hdrs[0].prev_block;
                         const batch_key = ForkBatchKey{
                             .prev = fork_prev,
-                            .tip = crypto.computeBlockHash(&h.headers[h.headers.len - 1]),
+                            .tip = crypto.computeBlockHash(&hdrs[hdrs.len - 1]),
                         };
                         if (self.ignored_fork_roots.contains(fork_prev) or
                             self.seen_fork_batches.contains(batch_key))
@@ -6541,7 +6799,7 @@ pub const PeerManager = struct {
                             std.debug.print(
                                 "P2P: REORG-CANDIDATE peer announces fork ({d} headers, prev=...{x:0>2}{x:0>2})\n",
                                 .{
-                                    h.headers.len,
+                                    hdrs.len,
                                     fork_prev[30],
                                     fork_prev[31],
                                 },
@@ -6564,7 +6822,7 @@ pub const PeerManager = struct {
                         defer fork_overlay.deinit();
                         var last_inserted: ?BlockHeaderEntry = null;
                         var newly_inserted: usize = 0;
-                        for (h.headers) |hdr| {
+                        for (hdrs) |hdr| {
                             switch (self.validateHeaderContextualStrict(&hdr, now_fork, &fork_overlay)) {
                                 .ok => {},
                                 .undecidable => {
@@ -6611,7 +6869,7 @@ pub const PeerManager = struct {
                             else => {},
                         }
                         if (shouldContinueCompetingFork(
-                            h.headers.len,
+                            hdrs.len,
                             self.last_arm_result,
                             newly_inserted,
                         )) {
@@ -6623,8 +6881,8 @@ pub const PeerManager = struct {
                 }
 
                 std.debug.print("P2P: Received {d} new headers (queue={d})\n", .{
-                    h.headers.len,
-                    self.expected_blocks.items.len + h.headers.len,
+                    hdrs.len,
+                    self.expected_blocks.items.len + hdrs.len,
                 });
 
                 // Contextual header gates, in Core's order
@@ -6654,7 +6912,7 @@ pub const PeerManager = struct {
                 const now_hdr: i64 = std.time.timestamp();
                 var batch_overlay = HeaderBatchOverlay.init(self.allocator);
                 defer batch_overlay.deinit();
-                const outcome = self.validateHeaderBatch(h.headers, now_hdr, &batch_overlay);
+                const outcome = self.validateHeaderBatch(hdrs, now_hdr, &batch_overlay);
                 if (outcome.reject) |verdict| {
                     misbehaveForHeaderVerdict(peer, verdict);
                     return;
@@ -6666,17 +6924,17 @@ pub const PeerManager = struct {
                         "P2P: headers batch undecidable at header 0 from peer={any} (missing ancestors) — dropped, no penalty\n",
                         .{peer.address},
                     );
-                    self.reportUndecidableAtHeaderZero(h.headers);
+                    self.reportUndecidableAtHeaderZero(hdrs);
                     return;
                 }
                 if (outcome.undecidable) {
                     std.debug.print(
                         "P2P: headers batch truncated at {d}/{d} from peer={any} (cannot evaluate difficulty — missing ancestors), no penalty\n",
-                        .{ outcome.accepted, h.headers.len, peer.address },
+                        .{ outcome.accepted, hdrs.len, peer.address },
                     );
                 }
                 // Only the validated prefix may be admitted anywhere below.
-                const admitted: []const types.BlockHeader = h.headers[0..outcome.accepted];
+                const admitted: []const types.BlockHeader = hdrs[0..outcome.accepted];
 
                 // G8 — min_pow_checked / MinimumChainWork (W97 FIX-4)
                 // Reference: bitcoin-core/src/validation.cpp:4226-4232
@@ -6772,7 +7030,7 @@ pub const PeerManager = struct {
                 // Request more headers from this specific peer if we got a full batch
                 // But limit the queue to avoid too many outstanding blocks
                 const remaining_queue = self.expected_blocks.items.len - self.connect_cursor;
-                if (h.headers.len >= 2000 and !outcome.undecidable and remaining_queue < HEADER_PREFETCH_CAP) {
+                if (hdrs.len >= 2000 and !outcome.undecidable and remaining_queue < HEADER_PREFETCH_CAP) {
                     self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                 }
 
@@ -7006,6 +7264,17 @@ pub const PeerManager = struct {
                 }
 
                 const block_hash = header_hash;
+
+                // Never request a block (or a child of one) marked failed.
+                // Core runs the cmpctblock header through
+                // ProcessNewBlockHeaders first; a cached-invalid / bad-prevblk
+                // result stops there (announced via a compact block: no punishment).
+                if (self.failed_blocks.contains(block_hash) or
+                    self.failed_blocks.contains(cb.header.prev_block))
+                {
+                    self.cached_invalid_header_hits += 1;
+                    return;
+                }
 
                 // Every path below ends in a block request (getdata
                 // MSG_WITNESS_BLOCK or getblocktxn) to THIS peer. Never
@@ -8798,6 +9067,10 @@ pub const PeerManager = struct {
     /// Remove and disconnect a peer by index.
     fn removePeerByIndex(self: *PeerManager, index: usize) void {
         const peer = self.peers.swapRemove(index);
+        // pending_reorg.source_peer must never outlive the peer it names.
+        if (self.pending_reorg) |*pr| {
+            if (pr.source_peer == peer) pr.source_peer = null;
+        }
         // Untrack netgroup for outbound connections
         self.untrackOutboundNetgroup(peer);
         // Reclaim in-flight block count for this peer so the global counter
@@ -10041,6 +10314,7 @@ pub const PeerManager = struct {
         block_hash: *const types.Hash256,
         height: u32,
     ) bool {
+        self.last_block_reject_err = null;
         const cs = self.chain_state orelse return false;
 
         // Per-call lookup adapter: closes over the chain state's utxo_set
@@ -10148,6 +10422,7 @@ pub const PeerManager = struct {
                 "P2P: REJECT block height={d} validation={}\n",
                 .{ height, err },
             );
+            self.last_block_reject_err = err;
             return false;
         };
         return true;
@@ -10389,6 +10664,23 @@ pub const PeerManager = struct {
             const block_hash = crypto.computeBlockHash(&block.header);
             const height = cs.best_height + 1;
 
+            // A queued block that does not build on the active tip (the queue
+            // fell out of step with the chain, e.g. it was already connected
+            // through the reorg path) is NOT a verdict on the block: Core
+            // never validates a block against a tip that is not its parent.
+            // Drop the stale queue without marking or punishing anyone and
+            // re-sync headers from the tip.
+            if (cs.best_height > 0 and !std.mem.eql(u8, &block.header.prev_block, &cs.best_hash)) {
+                std.debug.print(
+                    "P2P: queued block at cursor={d} does not extend the active tip (h={d}) — queue resync, no verdict\n",
+                    .{ self.connect_cursor, cs.best_height },
+                );
+                _ = self.block_source_peers.remove(block_hash);
+                self.dropQueuedTail();
+                self.requestHeadersAfterInvalid();
+                break;
+            }
+
             // Timing for per-block diagnostics
             const block_start = std.time.nanoTimestamp();
 
@@ -10408,16 +10700,32 @@ pub const PeerManager = struct {
             // protocol violation.  Mirrors Core's MaybePunishNodeForBlock
             // BLOCK_MUTATED / BLOCK_INVALID_HEADER arms (net_processing.cpp:1919,1935).
             if (!self.validateBlockForIBDOrReject(&block, &block_hash, height)) {
-                // Penalise the supplying peer (G16/G17 fix: was missing before).
-                // Look up source peer by pointer value; linear scan over the live
-                // peer list so a disconnected peer is never dereferenced.
-                if (self.block_source_peers.get(block_hash)) |source_ptr| {
-                    for (self.peers.items) |p| {
-                        if (@intFromPtr(p) == source_ptr) {
-                            p.misbehaving(100, "mutated-block");
-                            break;
-                        }
-                    }
+                const kind: BlockFailureKind = if (self.last_block_reject_err) |e|
+                    classifyBlockFailure(e)
+                else
+                    .not_a_verdict; // no chain_state: nothing was decided
+                switch (kind) {
+                    .consensus_invalid => {
+                        // Core BlockChecked -> MaybePunishNodeForBlock on the
+                        // DELIVERING peer (mapBlockSource), then
+                        // InvalidBlockFound: mark failed (+ queued
+                        // descendants), never re-request, stay on the tip and
+                        // look for the best valid chain.
+                        self.punishBlockSource(&block_hash, null, "invalid-block");
+                        _ = self.block_source_peers.remove(block_hash);
+                        self.invalid_block_verdicts += 1;
+                        std.debug.print(
+                            "P2P: block height={d} marked INVALID (BLOCK_FAILED_VALID); {d} queued descendant(s) marked failed; not re-requested\n",
+                            .{ height, self.expected_blocks.items.len -| (self.connect_cursor + 1) },
+                        );
+                        self.invalidateQueuedBranch();
+                        break;
+                    },
+                    // BLOCK_MUTATED: this copy is bad, the hash may not be.
+                    // Punish the deliverer, do NOT mark; re-fetch below.
+                    .mutated => self.punishBlockSource(&block_hash, null, "mutated-block"),
+                    // Not a verdict: no mark, no punishment; retry below.
+                    .not_a_verdict => {},
                 }
                 _ = self.block_source_peers.remove(block_hash);
                 // Treat as a fatal-for-this-block error: do NOT advance

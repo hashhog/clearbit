@@ -2175,6 +2175,44 @@ pub const RETARGET_RING_SIZE: u32 = 4096;
 pub const RETARGET_RING_EMPTY: u32 = 0xFFFF_FFFF;
 
 /// Chain state tracks the current best chain and supports reorgs.
+/// In-memory ChainState values a reorg mutates outside the UTXO cache and the
+/// pending write queues; restored on a clean reorg rollback.
+pub const ReorgRollbackSnapshot = struct {
+    total_work: [32]u8 = [_]u8{0} ** 32,
+    chain_tx_count: u64 = 0,
+    recent_timestamps: [11]u32 = [_]u32{0} ** 11,
+    recent_ts_count: u32 = 0,
+    retarget_ring_ts: [RETARGET_RING_SIZE]u32 = [_]u32{0} ** RETARGET_RING_SIZE,
+    retarget_ring_bits: [RETARGET_RING_SIZE]u32 = [_]u32{0} ** RETARGET_RING_SIZE,
+    retarget_ring_height: [RETARGET_RING_SIZE]u32 = [_]u32{RETARGET_RING_EMPTY} ** RETARGET_RING_SIZE,
+    blockfilterindex_height: u32 = 0,
+    prev_filter_header: types.Hash256 = [_]u8{0} ** 32,
+    coinstatsindex_height: u32 = 0,
+    coinstats_acc: @import("muhash.zig").MuHash3072 = @import("muhash.zig").MuHash3072.init(),
+    coinstats_txouts: u64 = 0,
+    coinstats_bogo_size: u64 = 0,
+    coinstats_total_amount: i64 = 0,
+    coinstats_total_subsidy: i64 = 0,
+    coinstats_total_prevout_spent: i64 = 0,
+    coinstats_total_new_outputs_ex_coinbase: i64 = 0,
+    coinstats_total_coinbase: i64 = 0,
+    coinstats_unspendables_genesis: i64 = 0,
+    coinstats_unspendables_bip30: i64 = 0,
+    coinstats_unspendables_scripts: i64 = 0,
+    coinstats_unspendables_unclaimed: i64 = 0,
+    txospenderindex_height: u32 = 0,
+    utxo_total_utxos: u64 = 0,
+    utxo_total_amount: i64 = 0,
+};
+
+/// Pre-reorg value of the directly-written (non-batched) per-height keys
+/// "X:" (cumulative tx count) and "W:" (cumulative chain work).
+pub const ReorgKvUndo = struct {
+    height: u32,
+    tx_count: ?u64,
+    work: ?[32]u8,
+};
+
 pub const ChainState = struct {
     /// Block-keep horizon: blocks within this many heights of the tip are
     /// always retained (matches Bitcoin Core's MIN_BLOCKS_TO_KEEP in
@@ -2282,6 +2320,28 @@ pub const ChainState = struct {
     reorg_prev_best_hash: types.Hash256 = [_]u8{0} ** 32,
     reorg_prev_best_height: u32 = 0,
     reorg_snapshot_valid: bool = false,
+
+    /// Clean-rollback state for a reorg that fails BEFORE its terminal flush
+    /// (Core ActivateBestChainStep: a ConnectTip failure leaves the
+    /// CCoinsViewCache uncommitted and the chain where it started, and
+    /// ActivateBestChain goes on to the most-work VALID candidate).
+    ///
+    /// `reorg_rollback_ok` is set at reorgToChain entry only when the durable
+    /// store holds the complete pre-reorg state (everything flushed, no sticky
+    /// flush_error).  Then every in-memory mutation the aborted reorg made can
+    /// be undone exactly: the UTXO cache is dropped (the DB is the pre-reorg
+    /// coin set), the scalar/ring state below is restored, and the per-height
+    /// X:/W: keys that connectBlockInner writes directly are put back.  Without
+    /// this an invalid side-branch block latched flush_error and the node
+    /// could never connect another block — observed 2026-10-03: a consensus-
+    /// invalid B1 under a heavier B2x wedged the node until restart, and the
+    /// next honest block was refused and its peer banned.
+    reorg_rollback_ok: bool = false,
+    reorg_rollback: ReorgRollbackSnapshot = .{},
+    reorg_kv_undo: std.ArrayListUnmanaged(ReorgKvUndo) = .{},
+    /// True when the most recent reorgToChain failure was rolled back cleanly
+    /// (flush_error NOT latched).  Observability + tests.
+    last_reorg_rolled_back: bool = false,
 
     /// Tip-change notifier for the wait-family RPCs (waitfornewblock /
     /// waitforblock / waitforblockheight).  `notify()` is called from every
@@ -3004,6 +3064,7 @@ pub const ChainState = struct {
 
     pub fn deinit(self: *ChainState) void {
         self.invalid_blocks.deinit(self.allocator);
+        self.reorg_kv_undo.deinit(self.allocator);
         // Drain any unflushed block bodies. On a clean shutdown
         // these were committed in the last flush()'s cleanup loop;
         // anything still queued here belongs to a flush_error path
@@ -6279,6 +6340,11 @@ pub const ChainState = struct {
         // set inconsistent → MissingInput on the next forward block).  Reset
         // unconditionally on exit; a post-flush eviction is done explicitly
         // after the terminal flush below.
+        // Arm the clean rollback BEFORE the batch flag is set (it may flush
+        // the pre-reorg pending state, which in_no_flush_batch would refuse).
+        self.armReorgRollback();
+        defer self.reorg_rollback_ok = false;
+
         self.in_no_flush_batch = true;
         defer self.in_no_flush_batch = false;
 
@@ -6533,6 +6599,7 @@ pub const ChainState = struct {
             const owned: []u8 = @constCast(owned_const);
             try self.queueBlockWrite(&entry.hash, owned, entry.height);
 
+            self.recordReorgKvUndo(entry.height);
             try self.connectBlockFastWithUndoNoFlush(&entry.block, &entry.hash, entry.height);
             connect_count += 1;
 
@@ -6578,6 +6645,9 @@ pub const ChainState = struct {
             // paths are unaffected: `defer` (entry) and abortReorgInProgress
             // both reset the flag too.
             self.in_no_flush_batch = false;
+            // A failed terminal flush is an I/O fault with an unknown on-disk
+            // outcome: keep the old sticky flush_error behaviour for it.
+            self.reorg_rollback_ok = false;
             self.flush() catch |err| {
                 std.debug.print("reorgToChain: final flush failed: {}\n", .{err});
                 // flush() already set flush_error and freed batch keys;
@@ -6646,6 +6716,154 @@ pub const ChainState = struct {
     /// observe it, and a restart reloads the pristine on-disk UTXO set.  Only
     /// the tip pointers — which RPC and consensus read directly and which the
     /// collapse corrupted — are restored.
+    /// Arm the clean-rollback path at reorgToChain entry.  Commits any
+    /// pre-reorg pending state first (it is the durable state we roll back
+    /// to), then requires the cache + queues to be empty so that "drop the
+    /// cache, restore the scalars" reproduces the pre-reorg view exactly.
+    /// Leaves `reorg_rollback_ok` false (old sticky behaviour) otherwise.
+    fn armReorgRollback(self: *ChainState) void {
+        self.reorg_rollback_ok = false;
+        self.last_reorg_rolled_back = false;
+        self.reorg_kv_undo.clearRetainingCapacity();
+        if (self.utxo_set.db == null or self.flush_error) return;
+        if (self.utxo_set.dirty_keys.items.len != 0 or
+            self.utxo_set.pending_deletes.items.len != 0 or
+            self.pending_block_writes.items.len != 0 or
+            self.pending_undo_writes.items.len != 0)
+        {
+            self.flush() catch |err| {
+                std.debug.print("reorgToChain: pre-reorg flush failed: {} — no clean rollback\n", .{err});
+                return;
+            };
+        }
+        if (self.flush_error or
+            self.utxo_set.dirty_keys.items.len != 0 or
+            self.utxo_set.pending_deletes.items.len != 0 or
+            self.pending_block_writes.items.len != 0 or
+            self.pending_undo_writes.items.len != 0 or
+            self.pending_tx_index_writes.items.len != 0 or
+            self.pending_tx_index_deletes.items.len != 0 or
+            self.pending_undo_deletes.items.len != 0 or
+            self.pending_height_index_writes.items.len != 0 or
+            self.pending_height_index_deletes.items.len != 0 or
+            self.pending_filter_writes.items.len != 0 or
+            self.pending_filter_deletes.items.len != 0 or
+            self.pending_coinstats_writes.items.len != 0 or
+            self.pending_coinstats_reverts.items.len != 0 or
+            self.pending_txospender_writes.items.len != 0 or
+            self.pending_txospender_deletes.items.len != 0)
+        {
+            return;
+        }
+        const r = &self.reorg_rollback;
+        r.total_work = self.total_work;
+        r.chain_tx_count = self.chain_tx_count;
+        r.recent_timestamps = self.recent_timestamps;
+        r.recent_ts_count = self.recent_ts_count;
+        r.retarget_ring_ts = self.retarget_ring_ts;
+        r.retarget_ring_bits = self.retarget_ring_bits;
+        r.retarget_ring_height = self.retarget_ring_height;
+        r.blockfilterindex_height = self.blockfilterindex_height;
+        r.prev_filter_header = self.prev_filter_header;
+        r.coinstatsindex_height = self.coinstatsindex_height;
+        r.coinstats_acc = self.coinstats_acc;
+        r.coinstats_txouts = self.coinstats_txouts;
+        r.coinstats_bogo_size = self.coinstats_bogo_size;
+        r.coinstats_total_amount = self.coinstats_total_amount;
+        r.coinstats_total_subsidy = self.coinstats_total_subsidy;
+        r.coinstats_total_prevout_spent = self.coinstats_total_prevout_spent;
+        r.coinstats_total_new_outputs_ex_coinbase = self.coinstats_total_new_outputs_ex_coinbase;
+        r.coinstats_total_coinbase = self.coinstats_total_coinbase;
+        r.coinstats_unspendables_genesis = self.coinstats_unspendables_genesis;
+        r.coinstats_unspendables_bip30 = self.coinstats_unspendables_bip30;
+        r.coinstats_unspendables_scripts = self.coinstats_unspendables_scripts;
+        r.coinstats_unspendables_unclaimed = self.coinstats_unspendables_unclaimed;
+        r.txospenderindex_height = self.txospenderindex_height;
+        r.utxo_total_utxos = self.utxo_set.total_utxos;
+        r.utxo_total_amount = self.utxo_set.total_amount;
+        self.reorg_rollback_ok = true;
+    }
+
+    /// Remember the pre-reorg X:/W: values at `height` before a reorg
+    /// connect overwrites them (connectBlockInner writes them directly, not
+    /// through the Pattern-D batch).  A failure to record disables the clean
+    /// rollback (fail closed to the old sticky behaviour).
+    fn recordReorgKvUndo(self: *ChainState, height: u32) void {
+        if (!self.reorg_rollback_ok) return;
+        for (self.reorg_kv_undo.items) |e| {
+            if (e.height == height) return;
+        }
+        self.reorg_kv_undo.append(self.allocator, .{
+            .height = height,
+            .tx_count = self.getCumulativeTxCount(height),
+            .work = self.getCumulativeChainWork(height),
+        }) catch {
+            self.reorg_rollback_ok = false;
+        };
+    }
+
+    /// Undo every in-memory effect of an aborted (unflushed) reorg.  Only
+    /// valid when armReorgRollback succeeded; the pending queues must already
+    /// have been dropped by the caller.
+    fn rollbackReorgInMemory(self: *ChainState) void {
+        // UTXO cache: the DB holds the complete pre-reorg coin set (armed
+        // only after a full flush), and nothing was flushed since, so drop
+        // the cache wholesale; reads fall through to the DB.
+        var it = self.utxo_set.cache.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.utxo_set.cache.clearRetainingCapacity();
+        self.utxo_set.pending_deletes.clearRetainingCapacity();
+        self.utxo_set.dirty_keys.clearRetainingCapacity();
+        self.utxo_set.suppress_eviction = false;
+
+        const r = &self.reorg_rollback;
+        self.total_work = r.total_work;
+        self.chain_tx_count = r.chain_tx_count;
+        self.recent_timestamps = r.recent_timestamps;
+        self.recent_ts_count = r.recent_ts_count;
+        self.retarget_ring_ts = r.retarget_ring_ts;
+        self.retarget_ring_bits = r.retarget_ring_bits;
+        self.retarget_ring_height = r.retarget_ring_height;
+        self.blockfilterindex_height = r.blockfilterindex_height;
+        self.prev_filter_header = r.prev_filter_header;
+        self.coinstatsindex_height = r.coinstatsindex_height;
+        self.coinstats_acc = r.coinstats_acc;
+        self.coinstats_txouts = r.coinstats_txouts;
+        self.coinstats_bogo_size = r.coinstats_bogo_size;
+        self.coinstats_total_amount = r.coinstats_total_amount;
+        self.coinstats_total_subsidy = r.coinstats_total_subsidy;
+        self.coinstats_total_prevout_spent = r.coinstats_total_prevout_spent;
+        self.coinstats_total_new_outputs_ex_coinbase = r.coinstats_total_new_outputs_ex_coinbase;
+        self.coinstats_total_coinbase = r.coinstats_total_coinbase;
+        self.coinstats_unspendables_genesis = r.coinstats_unspendables_genesis;
+        self.coinstats_unspendables_bip30 = r.coinstats_unspendables_bip30;
+        self.coinstats_unspendables_scripts = r.coinstats_unspendables_scripts;
+        self.coinstats_unspendables_unclaimed = r.coinstats_unspendables_unclaimed;
+        self.txospenderindex_height = r.txospenderindex_height;
+        self.utxo_set.total_utxos = r.utxo_total_utxos;
+        self.utxo_set.total_amount = r.utxo_total_amount;
+
+        // Per-height X:/W: keys the connect side wrote directly.
+        if (self.utxo_set.db) |db| {
+            for (self.reorg_kv_undo.items) |e| {
+                if (e.tx_count) |c| {
+                    self.putCumulativeTxCount(e.height, c);
+                } else {
+                    self.deleteCumulativeTxCount(e.height);
+                }
+                if (e.work) |w| {
+                    self.putCumulativeChainWork(e.height, &w);
+                } else {
+                    const k = ChainStore.buildChainWorkKey(e.height);
+                    db.delete(CF_DEFAULT, &k) catch {};
+                }
+            }
+        }
+        self.reorg_kv_undo.clearRetainingCapacity();
+        self.reorg_rollback_ok = false;
+        self.last_reorg_rolled_back = true;
+    }
+
     fn abortReorgInProgress(self: *ChainState) void {
         // Restore the pre-reorg tip so the in-memory view matches the durable
         // (un-flushed) on-disk tip.  Guarded so an abort outside a reorg
@@ -6704,6 +6922,17 @@ pub const ChainState = struct {
         // own `defer` also resets this, but abortReorgInProgress may be called
         // from other error paths.)
         self.in_no_flush_batch = false;
+
+        // Clean rollback (armed at reorgToChain entry, still valid because the
+        // terminal flush was never attempted): the durable store is the
+        // complete pre-reorg state, so restore the in-memory view to it and do
+        // NOT latch flush_error.  Core ActivateBestChainStep: a failed
+        // ConnectTip leaves the chain where it was; the node keeps validating.
+        if (self.reorg_rollback_ok) {
+            self.rollbackReorgInMemory();
+            std.debug.print("reorgToChain: aborted reorg rolled back cleanly (tip h={d}); chainstate stays live\n", .{self.best_height});
+            return;
+        }
 
         self.flush_error = true;
     }
@@ -11939,8 +12168,14 @@ test "Pattern D: failure before final flush leaves pre-reorg state on disk" {
     // CRUCIAL: zero writeBatch calls.  No partial state landed.
     try std.testing.expectEqual(@as(usize, 0), writes_after - writes_before);
 
-    // flush_error sticky-blocks any further mutation; queues are clean.
-    try std.testing.expect(chain_state.flush_error);
+    // The pre-reorg state was fully durable at entry, so the abort is a
+    // clean rollback (Core ActivateBestChainStep: the chain stays where it
+    // was and stays live) — NOT a sticky flush_error.  Queues are clean and
+    // the in-memory tip is back at chain A's tip.
+    try std.testing.expect(!chain_state.flush_error);
+    try std.testing.expect(chain_state.last_reorg_rolled_back);
+    try std.testing.expectEqual(@as(u32, 3), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &hashes_a[2], &chain_state.best_hash);
     try std.testing.expectEqual(@as(usize, 0), chain_state.pending_block_writes.items.len);
     try std.testing.expectEqual(@as(usize, 0), chain_state.pending_undo_writes.items.len);
     try std.testing.expectEqual(@as(usize, 0), chain_state.pending_undo_deletes.items.len);
