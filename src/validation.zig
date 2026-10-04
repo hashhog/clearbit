@@ -98,6 +98,15 @@ pub const ValidationError = error{
 
     // General errors
     OutOfMemory,
+    /// NOT a consensus result: reading the UTXO set failed (RocksDB read
+    /// error, undecodable coin record, OOM reconstructing the script) while
+    /// the block was being checked.  The prevout-lookup callback cannot return
+    /// an error, so a lookup adapter records the failure and its caller
+    /// reports this instead of the MissingInput the adapter had to answer.
+    /// Core: CCoinsViewErrorCatcher::GetCoin turns a coins-DB read failure
+    /// into "Error reading from database, shutting down." + abort — never a
+    /// block verdict.  peer.classifyBlockFailure -> not_a_verdict.
+    UtxoReadError,
 };
 
 // ============================================================================

@@ -1124,7 +1124,12 @@ pub const UtxoSet = struct {
         // Fall back to database if available
         if (self.db) |db| {
             self.misses += 1;
-            const data = db.get(CF_UTXO, &key) catch return null;
+            // A read ERROR is not "no such coin": propagate it.  Answering
+            // null here made a RocksDB fault indistinguishable from a missing
+            // input, i.e. a consensus verdict on a valid block (Core
+            // CCoinsViewErrorCatcher aborts instead).  Callers that genuinely
+            // want best-effort semantics already `catch null` at the call site.
+            const data = try db.get(CF_UTXO, &key);
             if (data == null) return null;
             defer self.allocator.free(data.?);
 
@@ -1168,7 +1173,7 @@ pub const UtxoSet = struct {
 
         // Fall back to database if available
         if (self.db) |db| {
-            const data = db.get(CF_UTXO, &key) catch return false;
+            const data = try db.get(CF_UTXO, &key); // read error != absent (see get)
             if (data) |d| {
                 self.allocator.free(d);
                 return true;
@@ -6487,18 +6492,28 @@ pub const ChainState = struct {
                 // (peer.zig::validateBlockForIBDOrReject).  reconstructScript
                 // heap-allocates via self.allocator; validateBlockForIBD frees
                 // it through the owner_allocator channel on PrevOutInfo.
+                // A read failure is recorded in `read_err` instead of being
+                // answered as a missing coin (MissingInput -> a verdict that
+                // marks the fork block failed); see the check after acceptBlock.
                 const Adapter = struct {
                     cs: *ChainState,
+                    read_err: ?anyerror = null,
 
                     fn lookup(
                         ctx_ptr: *anyopaque,
                         outpoint: *const types.OutPoint,
                     ) ?validation.PrevOutInfo {
                         const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                        const compact_opt = me.cs.utxo_set.get(outpoint) catch return null;
+                        const compact_opt = me.cs.utxo_set.get(outpoint) catch |e| {
+                            if (me.read_err == null) me.read_err = e;
+                            return null;
+                        };
                         var compact = compact_opt orelse return null;
                         defer compact.deinit(me.cs.allocator);
-                        const script = compact.reconstructScript(me.cs.allocator) catch return null;
+                        const script = compact.reconstructScript(me.cs.allocator) catch |e| {
+                            if (me.read_err == null) me.read_err = e;
+                            return null;
+                        };
                         return .{
                             .script_pubkey = script,
                             .amount = compact.value,
@@ -6541,7 +6556,7 @@ pub const ChainState = struct {
                     .fork_height = fork_height,
                 };
 
-                validation.acceptBlock(
+                const accept_res = validation.acceptBlock(
                     &entry.block,
                     &entry.hash,
                     entry.height,
@@ -6570,7 +6585,25 @@ pub const ChainState = struct {
                         .active_tip_height = self.best_height,
                         .is_requested = true,
                     },
-                ) catch |err| {
+                );
+                // A UTXO read failure is a LOCAL fault, not a verdict on this
+                // fork block: abort the reorg (errdefer rolls back exactly as
+                // for a reject) with a distinct error that no caller treats as
+                // "block invalid" — peer.zig only marks/punishes on
+                // error.ReorgBlockInvalid, and classifies UtxoReadError as
+                // not_a_verdict even if it is consulted.
+                if (adapter.read_err) |rerr| {
+                    std.debug.print(
+                        "reorgToChain: UTXO DATABASE READ FAILED at side-branch height {d} ({}) — aborting reorg; NOT a block verdict\n",
+                        .{ entry.height, rerr },
+                    );
+                    if (drive_result) |dr| {
+                        dr.connect_reject_err = error.UtxoReadError;
+                        dr.connected_before_reject = connect_count;
+                    }
+                    return error.UtxoReadFailed;
+                }
+                accept_res catch |err| {
                     std.debug.print(
                         "reorgToChain: REJECT side-branch block at height {d} validation={} — aborting reorg\n",
                         .{ entry.height, err },

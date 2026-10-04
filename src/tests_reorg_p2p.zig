@@ -2176,3 +2176,264 @@ test "tests_reorg_p2p: classifyBlockFailure maps errors onto Core's verdict clas
     try testing.expectEqual(K.not_a_verdict, C(error.TooLittleChainwork));
     try testing.expectEqual(K.not_a_verdict, C(error.FutureTimestamp));
 }
+
+// ====================================================================
+// A UTXO READ FAILURE is a local fault, not a verdict.
+//
+// Core: CCoinsViewErrorCatcher::GetCoin turns a coins-DB read failure into
+// "Error reading from database, shutting down." + abort; the block is never
+// marked BLOCK_FAILED_VALID and no peer is punished.  A coin that is genuinely
+// absent IS a verdict (bad-txns-inputs-missingorspent).
+//
+// The fault is real, not mocked: the spent coin's CF_UTXO record is replaced by
+// one undecodable byte, so UtxoSet.get fails in CompactUtxo.decode exactly as
+// for a damaged record.  Before this fix both lookup adapters (P2P drain and
+// reorg connect) did `utxo_set.get(..) catch return null`, so the coin read as
+// MISSING -> MissingInput -> consensus_invalid: block marked failed, sender
+// banned.  Each scenario runs twice: `.corrupt` (read error) and `.absent`
+// (truly missing — the positive control that must still be a verdict).
+// ====================================================================
+
+const CoinState = enum { corrupt, absent };
+
+fn ghostOutpoint(tag: u8) types.OutPoint {
+    var h = [_]u8{0} ** 32;
+    h[0] = 0xAB;
+    h[1] = tag;
+    return .{ .hash = h, .index = 0 };
+}
+
+/// Regtest block at `height` (<= 16) on `prev`: a valid coinbase plus one tx
+/// spending `spend`.
+fn mineIbBlockSpending(
+    allocator: std.mem.Allocator,
+    params: *const consensus.NetworkParams,
+    prev: types.Hash256,
+    height: u32,
+    tag: u8,
+    spend: types.OutPoint,
+) !IbBlock {
+    std.debug.assert(height >= 1 and height <= 16);
+    const txs = try allocator.alloc(types.Transaction, 2);
+    {
+        const inputs = try allocator.alloc(types.TxIn, 1);
+        inputs[0] = .{
+            .previous_output = types.OutPoint.COINBASE,
+            .script_sig = try allocator.dupe(u8, &[_]u8{ @as(u8, @intCast(0x50 + height)), 0x01, tag }),
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        };
+        const outputs = try allocator.alloc(types.TxOut, 1);
+        outputs[0] = .{ .value = 5_000_000_000, .script_pubkey = try allocator.dupe(u8, &[_]u8{0x51}) };
+        txs[0] = .{ .version = 1, .inputs = inputs, .outputs = outputs, .lock_time = 0 };
+    }
+    {
+        const inputs = try allocator.alloc(types.TxIn, 1);
+        inputs[0] = .{
+            .previous_output = spend,
+            .script_sig = try allocator.dupe(u8, &[_]u8{0x51}),
+            .sequence = 0xFFFFFFFF,
+            .witness = &[_][]const u8{},
+        };
+        const outputs = try allocator.alloc(types.TxOut, 1);
+        outputs[0] = .{ .value = 1000, .script_pubkey = try allocator.dupe(u8, &[_]u8{0x51}) };
+        txs[1] = .{ .version = 1, .inputs = inputs, .outputs = outputs, .lock_time = 0 };
+    }
+    const ids = [_]types.Hash256{
+        try crypto.computeTxid(&txs[0], allocator),
+        try crypto.computeTxid(&txs[1], allocator),
+    };
+    var header = types.BlockHeader{
+        .version = 4,
+        .prev_block = prev,
+        .merkle_root = try crypto.computeMerkleRoot(&ids, allocator),
+        .timestamp = params.genesis_header.timestamp + height * 600 + tag,
+        .bits = 0x207fffff,
+        .nonce = 0,
+    };
+    while (!consensus.validateProofOfWork(&header, params)) header.nonce +%= 1;
+    const block = types.Block{ .header = header, .transactions = txs };
+    return .{ .block = block, .hash = crypto.computeBlockHash(&block.header) };
+}
+
+fn setCoinState(db: *storage.Database, cs: *storage.ChainState, op: types.OutPoint, state: CoinState) !void {
+    const key = storage.makeUtxoKey(&op);
+    switch (state) {
+        .corrupt => {
+            try db.put(storage.CF_UTXO, &key, &[_]u8{0x01});
+            // Instrument check: the fault is live — the raw read errors.
+            if (cs.utxo_set.get(&op)) |got| {
+                if (got) |c| {
+                    var cc = c;
+                    cc.deinit(cs.allocator);
+                }
+                return error.TestFaultNotInjected;
+            } else |_| {}
+        },
+        .absent => {
+            const got = try cs.utxo_set.get(&op);
+            try testing.expect(got == null);
+        },
+    }
+}
+
+fn runTipExtensionReadFault(state: CoinState) !void {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(&params);
+    cs.best_hash = params.genesis_hash;
+    cs.initGenesisTimestamp(params.genesis_header.timestamp);
+    pm.chain_state = &cs;
+
+    const h_peer = try ibPeer(&params, allocator, 3, .outbound);
+    defer freeIbPeer(allocator, h_peer);
+    const x_peer = try ibPeer(&params, allocator, 2, .inbound);
+    defer freeIbPeer(allocator, x_peer);
+    try pm.peers.append(h_peer);
+    try pm.peers.append(x_peer);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    const ghost = ghostOutpoint(0xE1);
+    var b1 = try mineIbBlockSpending(allocator, &params, a1.hash, 2, 0xE1, ghost);
+    defer serialize.freeBlock(allocator, &b1.block);
+
+    try sendHeaders(&pm, allocator, h_peer, &.{&a1});
+    try sendBlock(&pm, allocator, h_peer, &a1);
+    try testing.expectEqual(@as(u32, 1), cs.best_height);
+
+    try setCoinState(&db, &cs, ghost, state);
+    try sendHeaders(&pm, allocator, x_peer, &.{&b1});
+    try sendBlock(&pm, allocator, x_peer, &b1);
+
+    try testing.expectEqual(@as(u32, 1), cs.best_height);
+    switch (state) {
+        .corrupt => {
+            // PRE-FIX: marked failed, dropped from the queue, X banned.
+            try testing.expectEqual(@as(?validation.ValidationError, error.UtxoReadError), pm.last_block_reject_err);
+            try testing.expect(!pm.isBlockFailed(&b1.hash));
+            try testing.expect(!x_peer.should_ban);
+            try testing.expectEqual(@as(usize, 1), countQueued(&pm, b1.hash)); // retried
+        },
+        .absent => {
+            try testing.expectEqual(@as(?validation.ValidationError, error.MissingInput), pm.last_block_reject_err);
+            try testing.expect(pm.isBlockFailed(&b1.hash));
+            try testing.expect(x_peer.should_ban);
+            try testing.expectEqual(@as(usize, 0), countQueued(&pm, b1.hash));
+        },
+    }
+    try testing.expect(!h_peer.should_ban);
+}
+
+fn runReorgReadFault(state: CoinState) !void {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(&params);
+    cs.best_hash = params.genesis_hash;
+    cs.initGenesisTimestamp(params.genesis_header.timestamp);
+    pm.chain_state = &cs;
+
+    const h_peer = try ibPeer(&params, allocator, 3, .outbound);
+    defer freeIbPeer(allocator, h_peer);
+    const x_peer = try ibPeer(&params, allocator, 2, .inbound);
+    defer freeIbPeer(allocator, x_peer);
+    try pm.peers.append(h_peer);
+    try pm.peers.append(x_peer);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var b1_ok = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0x11);
+    defer serialize.freeBlock(allocator, &b1_ok.block);
+    var b2_ok = try mineIbBlock(allocator, &params, b1_ok.hash, 3, 0, 0x12);
+    defer serialize.freeBlock(allocator, &b2_ok.block);
+    const ghost = ghostOutpoint(0xE2);
+    var b1_x = try mineIbBlockSpending(allocator, &params, a1.hash, 2, 0xE2, ghost);
+    defer serialize.freeBlock(allocator, &b1_x.block);
+    var b2x = try mineIbBlock(allocator, &params, b1_x.hash, 3, 0, 0xE3);
+    defer serialize.freeBlock(allocator, &b2x.block);
+
+    try sendHeaders(&pm, allocator, h_peer, &.{ &a1, &b1_ok });
+    try sendBlock(&pm, allocator, h_peer, &a1);
+    try sendBlock(&pm, allocator, h_peer, &b1_ok);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+    const utxos_before = cs.utxo_set.total_utxos;
+
+    try setCoinState(&db, &cs, ghost, state);
+    try sendHeaders(&pm, allocator, x_peer, &.{ &b1_x, &b2x });
+    try testing.expect(pm.pending_reorg != null);
+    try sendBlock(&pm, allocator, x_peer, &b1_x);
+    try sendBlock(&pm, allocator, x_peer, &b2x);
+
+    // Either way the reorg is abandoned and rolled back cleanly.
+    try testing.expect(pm.pending_reorg == null);
+    try testing.expect(!cs.flush_error);
+    try testing.expect(cs.last_reorg_rolled_back);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+    try testing.expectEqualSlices(u8, &b1_ok.hash, &cs.best_hash);
+    try testing.expectEqual(utxos_before, cs.utxo_set.total_utxos);
+    switch (state) {
+        .corrupt => {
+            // PRE-FIX: MissingInput -> ReorgBlockInvalid -> both marked, X banned.
+            try testing.expect(!pm.isBlockFailed(&b1_x.hash));
+            try testing.expect(!pm.isBlockFailed(&b2x.hash));
+            try testing.expect(!x_peer.should_ban);
+        },
+        .absent => {
+            try testing.expect(pm.isBlockFailed(&b1_x.hash));
+            try testing.expect(pm.isBlockFailed(&b2x.hash));
+            try testing.expect(x_peer.should_ban);
+        },
+    }
+    try testing.expect(!h_peer.should_ban);
+
+    // The honest extension still connects.
+    try sendHeaders(&pm, allocator, h_peer, &.{ &b1_ok, &b2_ok });
+    try sendBlock(&pm, allocator, h_peer, &b2_ok);
+    try testing.expectEqual(@as(u32, 3), cs.best_height);
+    try testing.expectEqualSlices(u8, &b2_ok.hash, &cs.best_hash);
+}
+
+test "tests_reorg_p2p: UTXO read error at the tip extension is NOT a verdict (not marked, sender not punished, retried)" {
+    try runTipExtensionReadFault(.corrupt);
+}
+
+test "tests_reorg_p2p: control — a truly missing input at the tip extension IS a verdict (marked, sender punished)" {
+    try runTipExtensionReadFault(.absent);
+}
+
+test "tests_reorg_p2p: UTXO read error inside a reorg is NOT a verdict (rolled back, nothing marked, nobody punished)" {
+    try runReorgReadFault(.corrupt);
+}
+
+test "tests_reorg_p2p: control — a truly missing input inside a reorg IS a verdict (fork marked, deliverer punished)" {
+    try runReorgReadFault(.absent);
+}
+
+test "tests_reorg_p2p: classifyBlockFailure — UtxoReadError is not a verdict, MissingInput is" {
+    try testing.expectEqual(peer_mod.BlockFailureKind.not_a_verdict, peer_mod.classifyBlockFailure(error.UtxoReadError));
+    try testing.expectEqual(peer_mod.BlockFailureKind.consensus_invalid, peer_mod.classifyBlockFailure(error.MissingInput));
+}

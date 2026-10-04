@@ -274,10 +274,13 @@ pub fn classifyBlockFailure(err: validation.ValidationError) BlockFailureKind {
         // OOM is ours; TooFarAhead / TooLittleChainwork are AcceptBlock
         // "not stored" (no state.Invalid); time-too-new is BLOCK_TIME_FUTURE,
         // which Core neither caches nor punishes.
+        // UtxoReadError: OUR coins database could not be read (Core aborts
+        // the node on that; it never marks the block or punishes anyone).
         error.OutOfMemory,
         error.TooFarAhead,
         error.TooLittleChainwork,
         error.FutureTimestamp,
+        error.UtxoReadError,
         => .not_a_verdict,
         else => .consensus_invalid,
     };
@@ -10322,19 +10325,34 @@ pub const PeerManager = struct {
         // caller-side arena can adopt it.  We use `self.allocator` (the
         // PeerManager allocator) for the heap dupe; the validation arena
         // frees via the `owner_allocator` channel on PrevOutInfo.
+        //
+        // A READ FAILURE is recorded in `read_err`, not answered as a missing
+        // coin: the callback can only return null, and null is MissingInput
+        // (bad-txns-inputs-missingorspent), a consensus verdict that would
+        // mark the block BLOCK_FAILED_VALID and punish its sender.  After
+        // acceptBlock returns, a recorded read error overrides its result with
+        // error.UtxoReadError (not_a_verdict).  A coin that is genuinely absent
+        // reads cleanly as null and stays a verdict.
         const Adapter = struct {
             cs_ptr: *storage.ChainState,
             alloc: std.mem.Allocator,
+            read_err: ?anyerror = null,
 
             fn lookup(
                 ctx_ptr: *anyopaque,
                 outpoint: *const types.OutPoint,
             ) ?validation.PrevOutInfo {
                 const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                const compact_opt = me.cs_ptr.utxo_set.get(outpoint) catch return null;
+                const compact_opt = me.cs_ptr.utxo_set.get(outpoint) catch |e| {
+                    if (me.read_err == null) me.read_err = e;
+                    return null;
+                };
                 var compact = compact_opt orelse return null;
                 defer compact.deinit(me.alloc);
-                const script = compact.reconstructScript(me.alloc) catch return null;
+                const script = compact.reconstructScript(me.alloc) catch |e| {
+                    if (me.read_err == null) me.read_err = e;
+                    return null;
+                };
                 return .{
                     .script_pubkey = script,
                     .amount = compact.value,
@@ -10380,7 +10398,7 @@ pub const PeerManager = struct {
             block.header.timestamp,
         );
 
-        validation.acceptBlock(
+        const accept_res = validation.acceptBlock(
             block,
             block_hash,
             height,
@@ -10417,7 +10435,19 @@ pub const PeerManager = struct {
                 .is_requested = true,
                 .block_chain_work = if (self.header_index.get(block_hash.*)) |e| e.chain_work else [_]u8{0} ** 32,
             },
-        ) catch |err| {
+        );
+        // A UTXO read failure voids whatever acceptBlock concluded (a coin it
+        // could not read looked missing).  Local fault: not marked, sender not
+        // punished, the slot is re-fetched and retried by the caller.
+        if (adapter.read_err) |rerr| {
+            std.debug.print(
+                "P2P: UTXO DATABASE READ FAILED validating block height={d} ({}) — NOT a block verdict: not marked, sender not punished, will retry; check the disk / chainstate\n",
+                .{ height, rerr },
+            );
+            self.last_block_reject_err = error.UtxoReadError;
+            return false;
+        }
+        accept_res catch |err| {
             std.debug.print(
                 "P2P: REJECT block height={d} validation={}\n",
                 .{ height, err },
