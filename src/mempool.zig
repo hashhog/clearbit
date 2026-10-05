@@ -1227,7 +1227,7 @@ pub const Mempool = struct {
         if (self.chain_state) |cs| {
             const p = self.params orelse &consensus.MAINNET;
             const next_height: u32 = cs.best_height + 1;
-            const mtp: u32 = cs.computeMTP();
+            const mtp: u32 = cs.tipMtp();
             const lock_time_cutoff: u32 = if (cs.best_height >= p.csv_height)
                 mtp
             else
@@ -1639,7 +1639,7 @@ pub const Mempool = struct {
         if (!any_lock) return;
 
         const next_height: u32 = cs.best_height + 1;
-        const tip_mtp: u32 = cs.computeMTP();
+        const tip_mtp: u32 = cs.tipMtp();
 
         const infos = self.allocator.alloc(validation.UtxoInfo, tx.inputs.len) catch return MempoolError.OutOfMemory;
         defer self.allocator.free(infos);
@@ -3297,7 +3297,7 @@ pub const Mempool = struct {
         if (self.chain_state) |cs| {
             const p = self.params orelse &consensus.MAINNET;
             const next_height: u32 = cs.best_height + 1;
-            const mtp: u32 = cs.computeMTP();
+            const mtp: u32 = cs.tipMtp();
             const lock_time_cutoff: u32 = if (cs.best_height >= p.csv_height)
                 mtp
             else

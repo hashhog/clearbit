@@ -3849,7 +3849,7 @@ pub const RpcServer = struct {
             }
         }
 
-        const mtp = self.chain_state.computeMTP();
+        const mtp = self.chain_state.tipMtp();
 
         try writer.print("{{\"chain\":\"{s}\",\"blocks\":{d},\"headers\":{d},\"bestblockhash\":\"", .{
             chain_name,

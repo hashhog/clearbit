@@ -4456,6 +4456,55 @@ pub const ChainState = struct {
         return @import("validation.zig").medianTimePast(ts[0..want]);
     }
 
+    /// Tip MTP for a consumer deciding about the NEXT block (mempool
+    /// CheckFinalTxAtTip / CheckSequenceLocksAtTip, block template, RPC
+    /// mediantime): the ring when it spans the tip's full window, else the
+    /// window re-derived from `timestampAtActiveHeight`, else 0.
+    ///
+    /// 0 = unknown.  Every mempool / template caller treats 0 as fail-closed:
+    /// with a 0 cutoff no time-based nLockTime is final and no time-based
+    /// relative lock is satisfied (refuse, never admit).
+    pub fn tipMtp(self: *ChainState) u32 {
+        if (self.mtpRingCoversTip()) return self.computeMTP();
+        return self.mtpAtActiveHeight(self.best_height) orelse 0;
+    }
+
+    /// Rewind the BIP-113 ring after the tip moved back to its parent
+    /// (every disconnect path calls this right after `best_hash` /
+    /// `best_height` step back).
+    ///
+    /// Before this, no disconnect path touched the ring: it stayed anchored
+    /// at the OLD tip, so after a disconnect / invalidateblock / reorg the
+    /// tip MTP answered the old window — too HIGH after a plain disconnect
+    /// (mempool admitted txs whose nLockTime / relative time lock is not yet
+    /// satisfied at the new tip, and the template used the same cutoff), and
+    /// a mix of both branches after a reorg — for up to 11 blocks.
+    ///
+    /// The ring is rebuilt from the active chain's timestamps
+    /// (`timestampAtActiveHeight`: in-memory retarget ring, then persisted
+    /// headers).  If that window is not fully resolvable, the disconnected
+    /// tip's slot is dropped instead: the remaining slots still hold the new
+    /// tip and its ancestors in order, the window is one short, so
+    /// `mtpRingCoversTip` is false and `tipMtp` re-derives or fails closed.
+    pub fn rewindMtpRingAfterDisconnect(self: *ChainState) void {
+        const want: usize = @min(@as(usize, 11), @as(usize, self.best_height) +| 1);
+        var ts: [11]u32 = undefined;
+        var n: usize = 0;
+        while (n < want) : (n += 1) {
+            ts[n] = self.timestampAtActiveHeight(self.best_height - @as(u32, @intCast(n))) orelse break;
+        }
+        if (n == want) {
+            @memcpy(self.recent_timestamps[0..n], ts[0..n]);
+            self.recent_ts_count = @intCast(n);
+            return;
+        }
+        const cnt: usize = self.recent_ts_count;
+        if (cnt == 0) return;
+        var i: usize = 0;
+        while (i + 1 < cnt) : (i += 1) self.recent_timestamps[i] = self.recent_timestamps[i + 1];
+        self.recent_ts_count = @intCast(cnt - 1);
+    }
+
     /// Rebuild the BIP-113 MTP ring from persisted headers at boot.
     ///
     /// Before this ran, EVERY restart left the ring holding one entry — the
@@ -6082,6 +6131,8 @@ pub const ChainState = struct {
         // 2245: view.SetBestBlock(pindex->pprev->GetBlockHash())).
         self.best_hash = block.header.prev_block;
         if (self.best_height > 0) self.best_height -= 1;
+        // BIP-113 ring follows the tip back (see rewindMtpRingAfterDisconnect).
+        self.rewindMtpRingAfterDisconnect();
 
         // Rewind nChainWork by this block's GetBlockProof.  Prefer the
         // persisted parent "W:" entry when present so a pre-fix datadir
@@ -7563,6 +7614,7 @@ pub const ChainState = struct {
         // G21 — tip rewind with underflow guard.
         self.best_hash = prev_hash;
         if (self.best_height > 0) self.best_height -= 1;
+        self.rewindMtpRingAfterDisconnect();
 
         // Wake the wait-family RPCs on this tip change (legacy in-memory
         // disconnect path).  Same rationale as disconnectBlockByHashCFInner.
@@ -8524,6 +8576,7 @@ pub const ChainState = struct {
         // genesis (which shouldn't happen, but the guard is cheap).
         self.best_hash = prev_hash;
         if (self.best_height > 0) self.best_height -= 1;
+        self.rewindMtpRingAfterDisconnect();
 
         // Wake the wait-family RPCs on this tip change (file-backed disconnect
         // path).  Same rationale as disconnectBlockByHashCFInner.

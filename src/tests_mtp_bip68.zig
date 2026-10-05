@@ -277,3 +277,165 @@ test "mtp-bip68: nLockTime = tip MTP - 1 is ACCEPTED, nLockTime = tip MTP is REJ
     try testing.expect(!r2.accepted);
     try testing.expectEqualStrings("bad-txns-nonfinal", r2.reject_reason.?);
 }
+
+// ----------------------------------------------------------------------------
+// MTP ring after a disconnect / reorg (DB-backed ChainState, real connect +
+// disconnect paths).  Timestamps are NON-monotone so every window has a
+// distinct median.
+// ----------------------------------------------------------------------------
+
+pub const RING_TS = [_]u32{
+    1_600_000_000, // h1
+    1_600_000_900,
+    1_600_000_300,
+    1_600_002_000,
+    1_600_001_100,
+    1_600_003_500,
+    1_600_002_700,
+    1_600_004_100,
+    1_600_003_900,
+    1_600_005_600,
+    1_600_004_800,
+    1_600_006_900,
+    1_600_006_000,
+    1_600_008_200,
+    1_600_007_300,
+    1_600_009_100, // h16
+};
+
+/// Core GetMedianTimePast for the block at height h of `ts` (ts[0] = height 1),
+/// window min(11, h) because the test chain has no genesis entry in the ring
+/// (ChainState.init leaves it empty; heights start at 1).
+pub fn expectedMtp(ts: []const u32, h: u32) u32 {
+    const n: usize = @min(@as(usize, 11), @as(usize, h));
+    var w: [11]u32 = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) w[i] = ts[h - 1 - i];
+    return validation.medianTimePast(w[0..n]);
+}
+
+pub const BlockStore = struct {
+    cb_in: [1]types.TxIn = undefined,
+    cb_out: [1]types.TxOut = undefined,
+    txs: [1]types.Transaction = undefined,
+    sig: [5]u8 = undefined,
+};
+
+pub fn makeBlock(st: *BlockStore, prev: types.Hash256, height: u32, ts: u32, salt: u8) types.Block {
+    st.sig = .{ 0x04, @truncate(height), @truncate(height >> 8), @truncate(height >> 16), salt };
+    st.cb_in[0] = .{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = &st.sig,
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    st.cb_out[0] = .{ .value = 5_000_000_000, .script_pubkey = &P2WPKH_OUT };
+    st.txs[0] = .{ .version = 1, .inputs = &st.cb_in, .outputs = &st.cb_out, .lock_time = 0 };
+    return .{
+        .header = .{
+            .version = 1,
+            .prev_block = prev,
+            .merkle_root = [_]u8{0} ** 32,
+            .timestamp = ts,
+            .bits = 0,
+            .nonce = 0,
+        },
+        .transactions = &st.txs,
+    };
+}
+
+pub fn hashFor(height: u32, salt: u8) types.Hash256 {
+    var h = [_]u8{0} ** 32;
+    h[0] = @truncate(height);
+    h[1] = @truncate(height >> 8);
+    h[31] = salt;
+    return h;
+}
+
+pub fn connectChain(allocator: std.mem.Allocator, cs: *storage.ChainState, stores: []BlockStore, ts: []const u32) !void {
+    var prev = [_]u8{0} ** 32;
+    for (ts, 0..) |t, i| {
+        const h: u32 = @intCast(i + 1);
+        const block = makeBlock(&stores[i], prev, h, t, 0xA0);
+        const bh = hashFor(h, 0xA0);
+        var w = serialize.Writer.init(allocator);
+        try serialize.writeBlock(&w, &block);
+        const owned: []u8 = @constCast(try w.toOwnedSlice());
+        try cs.queueBlockWrite(&bh, owned, h);
+        try cs.connectBlockFastWithUndo(&block, &bh, h);
+        prev = bh;
+    }
+}
+
+test "mtp-ring: after disconnecting 3 blocks the tip MTP equals the recomputed median of the NEW tip (no stale ring)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    var stores: [RING_TS.len]BlockStore = undefined;
+    try connectChain(allocator, &cs, &stores, &RING_TS);
+    const top: u32 = RING_TS.len;
+    try testing.expectEqual(top, cs.best_height);
+    try testing.expectEqual(expectedMtp(&RING_TS, top), cs.computeMTP());
+
+    var h: u32 = top;
+    while (h > top - 3) : (h -= 1) {
+        const bh = hashFor(h, 0xA0);
+        try cs.disconnectBlockByHashCF(&bh);
+        try testing.expectEqual(h - 1, cs.best_height);
+        const want = expectedMtp(&RING_TS, h - 1);
+        if (cs.computeMTP() != want) {
+            std.debug.print("after disconnect to h={d}: ring MTP {d}, true MTP {d}\n", .{ h - 1, cs.computeMTP(), want });
+        }
+        try testing.expectEqual(want, cs.computeMTP());
+    }
+}
+
+test "mtp-ring: after a reorg (2 disconnected, 3 connected) the tip MTP equals the recomputed median of the new branch" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    var stores: [RING_TS.len]BlockStore = undefined;
+    try connectChain(allocator, &cs, &stores, &RING_TS);
+    const top: u32 = RING_TS.len;
+    const fork_h: u32 = top - 2;
+    const fork_hash = hashFor(fork_h, 0xA0);
+
+    // New branch: 3 blocks on top of fork_h, with timestamps far below the
+    // old branch's (still > the fork's MTP) so a stale ring is visible.
+    const new_ts = [_]u32{ 1_600_009_000, 1_600_008_000, 1_600_009_500 };
+    var nstores: [3]BlockStore = undefined;
+    var rbs: [3]storage.ChainState.ReorgBlock = undefined;
+    var prev = fork_hash;
+    for (new_ts, 0..) |t, i| {
+        const hh: u32 = fork_h + @as(u32, @intCast(i)) + 1;
+        rbs[i] = .{ .hash = hashFor(hh, 0xB0), .block = makeBlock(&nstores[i], prev, hh, t, 0xB0), .height = hh };
+        prev = rbs[i].hash;
+    }
+    _ = try cs.reorgToChain(&fork_hash, &rbs);
+    try testing.expectEqual(fork_h + 3, cs.best_height);
+
+    var all: [RING_TS.len + 1]u32 = undefined;
+    @memcpy(all[0..fork_h], RING_TS[0..fork_h]);
+    @memcpy(all[fork_h .. fork_h + 3], &new_ts);
+    const want = expectedMtp(all[0 .. fork_h + 3], fork_h + 3);
+    if (cs.computeMTP() != want) {
+        std.debug.print("after reorg: ring MTP {d}, true MTP {d}\n", .{ cs.computeMTP(), want });
+    }
+    try testing.expectEqual(want, cs.computeMTP());
+}

@@ -310,14 +310,20 @@ pub fn createBlockTemplate(
     // would accept transactions that are not yet final (locktime in the near
     // future but MTP still below it), or reject ones that already are.
     //
-    // chain_state.computeMTP() returns 0 when the ring buffer is empty (fewer
-    // than 1 block), in which case we fall back to the wall clock — identical
-    // to Core's genesis-adjacent behaviour.
-    const mtp = chain_state.computeMTP();
+    // chain_state.tipMtp() follows the tip back across a disconnect / reorg
+    // (the ring used to stay anchored at the pre-reorg tip — a stale, usually
+    // too-high cutoff for up to 11 blocks).  It returns 0 when the tip's
+    // window cannot be resolved.  An EMPTY ring (no block ever connected —
+    // genesis-adjacent / unit-test chain) keeps the old wall-clock fallback;
+    // a non-empty ring whose window is unresolvable uses cutoff 0, which
+    // excludes every time-locked tx (never includes a non-final one).
+    const mtp = chain_state.tipMtp();
     const lock_time_cutoff: u64 = if (mtp != 0)
         @as(u64, mtp)
+    else if (chain_state.recent_ts_count == 0)
+        @as(u64, @intCast(std.time.timestamp()))
     else
-        @as(u64, @intCast(std.time.timestamp()));
+        0;
 
     // Bug-6 fix: consecutive-failure early-exit, matching Bitcoin Core
     // miner.cpp::addChunks() lines 284-333.  After MAX_CONSECUTIVE_FAILURES
@@ -485,7 +491,7 @@ pub fn createBlockTemplate(
     // when the chain is later served over P2P (the reorg-drop fork case).
     const _wall_ts: i64 = std.time.timestamp();
     const _min_ts: i64 = blk: {
-        const m = chain_state.computeMTP();
+        const m = chain_state.tipMtp();
         const mtp_min: i64 = if (m != 0) @as(i64, m) + 1 else 0;
         // Also strictly exceed the IMMEDIATE parent's timestamp.  A peer
         // validating a freshly-discovered competing fork computes MTP over a

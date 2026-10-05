@@ -1039,6 +1039,7 @@ comptime {
     _ = @import("tests_tip_liveness.zig"); // 2026-10-05 tip stalls + send-stall wedge (base-comparable)
     _ = @import("tests_tip_liveness_fix.zig"); // 2026-10-05 tip stalls + send-stall wedge (new API)
     _ = @import("tests_mtp_bip68.zig"); // 2026-10-05 mempool MTP / BIP68 + MTP ring rewind (base-comparable)
+    _ = @import("tests_mtp_bip68_fix.zig"); // 2026-10-05 mempool MTP / BIP68 (new API: removeForReorg, tipMtp)
     _ = @import("mempool.zig");
     _ = @import("mempool_persist.zig"); // mempool.dat dump/load (Bitcoin Core-compatible)
     _ = @import("storage.zig"); // undo data, UTXO set, chain state, flat file storage
