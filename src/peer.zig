@@ -568,6 +568,51 @@ pub const HEADERS_RESPONSE_TIMEOUT: i64 = 5 * 60;
 /// If a block is in-flight and not received within this time, disconnect.
 pub const BLOCK_DOWNLOAD_TIMEOUT: i64 = 20 * 60;
 
+// ============================================================================
+// Send queue / at-tip liveness (2026-10-05 tip stalls + send-stall wedge)
+// ============================================================================
+
+/// Core DEFAULT_MAXSENDBUFFER = 1000 KB (net.h:99): above this the peer is
+/// fPauseSend (net.cpp:1672) — we stop reading its messages (so it cannot
+/// make us queue more) and stop serving its getdata until it drains.
+pub const SEND_BUFFER_PAUSE_BYTES: usize = 1_000_000;
+
+/// Hard cap on one peer's send queue. Paused peers stop generating replies,
+/// so only unsolicited traffic (announcements, pings) can push past the pause
+/// limit; anything this large means the peer is gone. Disconnect, no ban.
+pub const SEND_QUEUE_HARD_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// A peer whose queued bytes make NO progress for this long has stopped
+/// reading: disconnect it (no ban). Core's InactivityCheck uses 20 min
+/// (TIMEOUT_INTERVAL, net.cpp:2038) but Core's sends never block anything; a
+/// slow-but-draining peer is never cut (progress resets the timer).
+pub const SEND_STALL_TIMEOUT_SECS: i64 = 60;
+
+/// When no new header has arrived and the tip has not moved for this long,
+/// ask several outbound peers for headers (getheaders) every
+/// STALE_CHECK_INTERVAL instead of waiting for an announcement that may never
+/// come (2026-10-05 10:57Z: headers stuck 5 behind Core with 3 peers up).
+pub const HEADERS_QUIET_ASK_SECS: i64 = 3 * 60;
+
+/// Outbound peers asked per quiet-headers round.
+pub const HEADERS_QUIET_ASK_PEERS: usize = 3;
+
+/// Minimum spacing between two "0 headers but behind peers" re-requests.
+/// Without it a single peer advertising a bogus start_height (live:
+/// best_peer=975620 while the real tip was ~970000) made every empty
+/// headers reply trigger another getheaders — 4,194 such lines in one log.
+pub const BEHIND_PEERS_RETRY_SECS: i64 = 10;
+
+/// Outbound dial throttle at tip: one blocking dial per loop tick, and after
+/// a dial that took T ms the next waits at least T ms, so outbound refill can
+/// never hold the single P2P thread more than ~half of the time. Each dial is
+/// a blocking connect + v2 + v1-fallback handshake (tens of seconds against a
+/// silent address); the old 8-dials-per-tick refill froze message
+/// processing and the front-block stall check for minutes (2026-10-05
+/// 09:50Z: a 298 s stuck front block while 57 v2 handshakes timed out at
+/// 30 s each in the same log window).
+pub const OUTBOUND_DIAL_MIN_GAP_MS: i64 = 500;
+
 /// Drain-wedge staller timeout in seconds. When `connect_cursor` is stuck on a
 /// missing FRONT block while LATER blocks sit buffered (the head-of-line wedge a
 /// slow/unresponsive public peer causes), cancel that block's in-flight request
@@ -1091,6 +1136,208 @@ pub const Peer = struct {
     /// a VERSION has been received (matching Core's empty `cleanSubVer`).
     clean_subver: ?[]u8 = null,
 
+    // ------------------------------------------------------------------
+    // Per-peer send queue (Core CNode::vSendMsg + SocketSendData).
+    //
+    // Once the handshake is complete, sendMessage NEVER blocks the single
+    // P2P thread: the encoded message is appended to this queue (v2: to the
+    // V2Transport send buffer, which already holds the ciphertext) and a
+    // non-blocking send(MSG_DONTWAIT) flushes what the kernel will take.
+    // The rest is flushed on later ticks (POLLOUT). Before this, sendMessage
+    // was a blocking writeAll: inbound sockets had no SO_SNDTIMEO at all, so
+    // ONE inbound peer that stopped reading froze block connection
+    // (announceBlock runs inside the connect loop), getdata serving, and
+    // every other peer — the 2026-10-05 send-stall wedge class.
+    // ------------------------------------------------------------------
+
+    /// v1 framed bytes not yet accepted by the kernel; [send_queue_head..]
+    /// is pending. Unused on v2 (the transport's send_buffer is the queue).
+    send_queue: std.ArrayListUnmanaged(u8) = .{},
+    send_queue_head: usize = 0,
+    /// Last time the queue made progress (or went from empty to non-empty).
+    /// A queue with pending bytes and no progress for SEND_STALL_TIMEOUT_SECS
+    /// means the peer stopped reading: PeerManager disconnects it.
+    send_progress_ts: i64 = 0,
+    /// A send failed (EPIPE/ECONNRESET/...) or the queue overflowed its hard
+    /// cap. The peer is disconnected (never banned) at the next sweep, and
+    /// every further sendMessage returns ConnectionClosed at once.
+    send_failed: bool = false,
+    /// getdata items not yet served because the send queue was over
+    /// SEND_BUFFER_PAUSE_BYTES (Core ProcessGetData stops on fPauseSend and
+    /// keeps the rest in m_getdata_requests). Resumed once the peer drains.
+    deferred_getdata: std.ArrayListUnmanaged(p2p.InvVector) = .{},
+    /// Last time this peer announced a header/block we did not have
+    /// (Core CNodeState::m_last_block_announcement) — used to pick which
+    /// extra outbound peer to evict (EvictExtraOutboundPeers).
+    last_block_announcement: i64 = 0,
+    /// Serialises the send queue (and the v2 cipher it feeds): the RPC thread
+    /// also sends to peers (announceMinedBlock, sendrawtransaction broadcast,
+    /// getblockfrompeer). A blocking writeAll from two threads could at worst
+    /// interleave bytes; two threads appending to one ArrayList can corrupt
+    /// memory, so the queue is never touched without this lock.
+    send_mutex: std.Thread.Mutex = .{},
+
+    /// Bytes waiting in the per-peer send queue.
+    pub fn pendingSendBytes(self: *const Peer) usize {
+        if (self.transport_version == .v2) {
+            if (self.v2_transport) |t| return t.send_buffer.items.len;
+        }
+        return self.send_queue.items.len - self.send_queue_head;
+    }
+
+    /// Core fPauseSend (net.cpp:1672 / :4108): while the send queue is over
+    /// the limit, stop processing this peer's incoming messages so it cannot
+    /// make us queue unbounded responses.
+    pub fn sendPaused(self: *const Peer) bool {
+        return self.pendingSendBytes() >= SEND_BUFFER_PAUSE_BYTES;
+    }
+
+    /// True when queued bytes have made no progress for `SEND_STALL_TIMEOUT_SECS`.
+    pub fn sendStalled(self: *const Peer, now: i64) bool {
+        return self.pendingSendBytes() > 0 and self.send_progress_ts != 0 and
+            now - self.send_progress_ts > SEND_STALL_TIMEOUT_SECS;
+    }
+
+    fn consumeSent(self: *Peer, n: usize) void {
+        if (self.transport_version == .v2) {
+            if (self.v2_transport) |t| {
+                t.markBytesSent(n);
+                return;
+            }
+        }
+        self.send_queue_head += n;
+        if (self.send_queue_head >= self.send_queue.items.len) {
+            // Drained: release the buffer (hundreds of mostly idle peers
+            // should not each hold a ~1 MB high-water allocation).
+            self.send_queue.deinit(self.allocator);
+            self.send_queue = .{};
+            self.send_queue_head = 0;
+        } else if (self.send_queue_head >= 1 << 20 and self.send_queue_head * 2 >= self.send_queue.items.len) {
+            const rest = self.send_queue.items.len - self.send_queue_head;
+            std.mem.copyForwards(u8, self.send_queue.items[0..rest], self.send_queue.items[self.send_queue_head..]);
+            self.send_queue.shrinkRetainingCapacity(rest);
+            self.send_queue_head = 0;
+        }
+    }
+
+    /// Non-blocking flush of the send queue: hand the kernel whatever it
+    /// accepts right now and return. Never blocks. A hard socket error marks
+    /// the peer `send_failed` (disconnected at the next sweep).
+    pub fn flushSendQueue(self: *Peer) void {
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
+        self.flushSendQueueLocked();
+    }
+
+    fn flushSendQueueLocked(self: *Peer) void {
+        while (!self.send_failed) {
+            const pending: []const u8 = blk: {
+                if (self.transport_version == .v2) {
+                    if (self.v2_transport) |t| break :blk t.send_buffer.items;
+                }
+                break :blk self.send_queue.items[self.send_queue_head..];
+            };
+            if (pending.len == 0) return;
+            const n = sendNonBlocking(self.stream.handle, pending) catch |err| switch (err) {
+                error.WouldBlock => return,
+                error.SendFailed => {
+                    self.send_failed = true;
+                    return;
+                },
+            };
+            if (n == 0) return;
+            self.consumeSent(n);
+            self.bytes_sent += n;
+            self.send_progress_ts = std.time.timestamp();
+        }
+    }
+
+    /// One non-blocking send(MSG_DONTWAIT|MSG_NOSIGNAL) with every errno
+    /// handled. std.posix.send treats EBADF/ENOTSOCK as `unreachable` (a
+    /// panic in Debug, undefined behaviour in the shipped ReleaseFast); a
+    /// peer fd can be invalid after a racing stop()/shutdown, and unit tests
+    /// drive peers over pipes/files. Not a socket → plain write(2).
+    fn sendNonBlocking(fd: std.posix.fd_t, buf: []const u8) error{ WouldBlock, SendFailed }!usize {
+        while (true) {
+            const rc = std.posix.system.sendto(
+                fd,
+                buf.ptr,
+                buf.len,
+                std.posix.MSG.DONTWAIT | std.posix.MSG.NOSIGNAL,
+                null,
+                0,
+            );
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .NOTSOCK => return std.posix.write(fd, buf) catch |e| switch (e) {
+                    error.WouldBlock => error.WouldBlock,
+                    else => error.SendFailed,
+                },
+                else => return error.SendFailed,
+            }
+        }
+    }
+
+    /// Queue `msg` behind anything already pending and flush non-blockingly.
+    fn queueMessage(self: *Peer, msg: *const p2p.Message) PeerError!void {
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
+        if (self.send_failed) return PeerError.ConnectionClosed;
+        const was_empty = self.pendingSendBytes() == 0;
+        const data = p2p.encodeMessage(msg, self.network_params.magic, self.allocator) catch
+            return PeerError.OutOfMemory;
+        defer self.allocator.free(data);
+        if (self.transport_version == .v2 and self.v2_transport != null) {
+            const t = self.v2_transport.?;
+            if (data.len < 24) return PeerError.ProtocolViolation;
+            var cmd_buf: [12]u8 = undefined;
+            @memcpy(&cmd_buf, data[4..16]);
+            var cmd_len: usize = 12;
+            while (cmd_len > 0 and cmd_buf[cmd_len - 1] == 0) cmd_len -= 1;
+            t.sendMessage(cmd_buf[0..cmd_len], data[24..], false) catch |err| switch (err) {
+                error.NotReady => return PeerError.ProtocolViolation,
+                error.OutOfMemory => return PeerError.OutOfMemory,
+            };
+        } else if (was_empty) {
+            // Fast path: nothing queued, so hand the frame straight to the
+            // kernel and queue only what it would not take (no allocation in
+            // the common case).
+            var off: usize = 0;
+            while (off < data.len) {
+                const n = sendNonBlocking(self.stream.handle, data[off..]) catch |err| switch (err) {
+                    error.WouldBlock => break,
+                    error.SendFailed => {
+                        self.send_failed = true;
+                        return PeerError.ConnectionClosed;
+                    },
+                };
+                if (n == 0) break;
+                off += n;
+                self.bytes_sent += n;
+            }
+            if (off < data.len) {
+                self.send_queue.appendSlice(self.allocator, data[off..]) catch {
+                    // Part of the frame is already on the wire: the stream
+                    // cannot be resynchronised, so the connection is done.
+                    if (off > 0) self.send_failed = true;
+                    return PeerError.OutOfMemory;
+                };
+            }
+        } else {
+            self.send_queue.appendSlice(self.allocator, data) catch return PeerError.OutOfMemory;
+        }
+        const now = std.time.timestamp();
+        if (was_empty) self.send_progress_ts = now;
+        self.last_message_time = now;
+        self.flushSendQueueLocked();
+        if (!self.send_failed and self.pendingSendBytes() > SEND_QUEUE_HARD_MAX_BYTES) {
+            self.send_failed = true;
+        }
+        if (self.send_failed) return PeerError.ConnectionClosed;
+    }
+
     /// Connect to a remote peer.
     pub fn connect(
         address: std.net.Address,
@@ -1287,6 +1534,14 @@ pub const Peer = struct {
         allocator: std.mem.Allocator,
     ) Peer {
         const now = std.time.timestamp();
+        // Inbound sockets got NO SO_SNDTIMEO (only a later SO_RCVTIMEO from
+        // acceptInbound), so a blocking write to an inbound peer that stopped
+        // reading never returned. Bound both directions exactly as the
+        // outbound path does (Peer.connect). After the handshake sends are
+        // queued and non-blocking anyway; this bounds the handshake writes.
+        const timeout = std.posix.timeval{ .tv_sec = 30, .tv_usec = 0 };
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
         registerPeerFd(stream.handle);
         return Peer{
             .stream = stream,
@@ -1341,6 +1596,10 @@ pub const Peer = struct {
     /// the v2 send buffer (which we then drain to the socket).  Otherwise we
     /// fall back to the v1 framing (24-byte header + payload).
     pub fn sendMessage(self: *Peer, msg: *const p2p.Message) PeerError!void {
+        // After the handshake every send is queued + non-blocking (see the
+        // send-queue fields). The handshake itself stays synchronous: it is
+        // a few small messages on a socket with SO_SNDTIMEO set.
+        if (self.state == .handshake_complete) return self.queueMessage(msg);
         if (self.transport_version == .v2 and self.v2_transport != null) {
             return self.sendMessageV2(msg);
         }
@@ -1432,6 +1691,14 @@ pub const Peer = struct {
     ///   `markBytesSent`, so the cipher stream never desyncs; they flush on the
     ///   next send to this peer. We never block the relay thread.
     pub fn trySendMessageNonBlocking(self: *Peer, msg: *const p2p.Message) bool {
+        // Handshake-complete peers have a send queue: relay is skipped only
+        // while the peer is over the pause limit (Core never relays to a
+        // fPauseSend peer either), and never sends a partial v1 frame.
+        if (self.state == .handshake_complete) {
+            if (self.send_failed or self.sendPaused()) return false;
+            self.sendMessage(msg) catch return false;
+            return self.pendingSendBytes() == 0;
+        }
         if (self.transport_version == .v2 and self.v2_transport != null) {
             return self.trySendMessageV2NonBlocking(msg);
         }
@@ -1617,9 +1884,13 @@ pub const Peer = struct {
 
     /// Maximum time we'll spend driving the BIP-324 cipher handshake
     /// (key exchange + garbage-terminator search + version-packet exchange)
-    /// before giving up.  Bitcoin Core uses a 4-minute connection timeout;
-    /// we use 30s to keep failed handshakes from dragging the event loop.
-    pub const V2_HANDSHAKE_DEADLINE_MS: i64 = 30_000;
+    /// before giving up.  Bitcoin Core uses a 4-minute connection timeout,
+    /// but Core's handshake is asynchronous; ours BLOCKS the single P2P
+    /// thread. 30 s here meant every silent v2 dial froze message processing
+    /// for 30 s (57 such timeouts in one 2026-10-05 log window, each followed
+    /// by a v1 re-dial). The cipher handshake is one round trip plus the
+    /// version packet; 10 s is still generous on any real link.
+    pub const V2_HANDSHAKE_DEADLINE_MS: i64 = 10_000;
 
     /// Returns true iff the BIP-324 v2 transport is enabled for new
     /// connections.  Gated behind the `CLEARBIT_BIP324_V2` env var.
@@ -1682,13 +1953,20 @@ pub const Peer = struct {
     /// receive buffer (uses MSG_PEEK).  Returns the number of bytes peeked.
     /// May return less than `out.len` if data is currently unavailable;
     /// poll() before calling to ensure data is ready.
+    /// How long an inbound peer may stay silent before its first bytes.
+    /// Both a v1 and a v2 initiator speak first and at once (VERSION / the
+    /// ellswift pubkey). The inbound handshake runs synchronously on the P2P
+    /// thread, so a silent inbound connection used to hold it 30 s here plus
+    /// a 30 s SO_RCVTIMEO read after it.
+    pub const INBOUND_FIRST_BYTES_TIMEOUT_MS: i64 = 10_000;
+
     pub fn peekBytes(self: *Peer, out: []u8) PeerError!usize {
         var total: usize = 0;
         // Bound the time we spend peeking with a deadline: we may receive
         // partial data for a v1 VERSION (24 header + payload), but the
         // first 16 bytes — magic + command — arrive together in the very
         // first TCP segment in practice.
-        const deadline_ms = std.time.milliTimestamp() + 30_000;
+        const deadline_ms = std.time.milliTimestamp() + INBOUND_FIRST_BYTES_TIMEOUT_MS;
         while (total < out.len) {
             const remaining_ms = deadline_ms - std.time.milliTimestamp();
             if (remaining_ms <= 0) break;
@@ -1921,6 +2199,9 @@ pub const Peer = struct {
         if (self.direction == .inbound and bip324V2Enabled() and self.transport_version == .v1) {
             var peek: [v2_transport.V1_PREFIX_LEN]u8 = undefined;
             const got = self.peekBytes(&peek) catch return PeerError.HandshakeFailed;
+            // Silent for INBOUND_FIRST_BYTES_TIMEOUT_MS: drop it now rather
+            // than block the P2P thread on a further version read.
+            if (got == 0) return PeerError.HandshakeFailed;
             if (got >= v2_transport.V1_PREFIX_LEN) {
                 var magic_le: [4]u8 = undefined;
                 std.mem.writeInt(u32, &magic_le, self.network_params.magic, .little);
@@ -2384,6 +2665,13 @@ pub const Peer = struct {
         unregisterPeerFd(self.stream.handle);
         self.stream.close();
         self.recv_buffer.deinit();
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
+        self.send_queue.deinit(self.allocator);
+        self.send_queue = .{};
+        self.send_queue_head = 0;
+        self.deferred_getdata.deinit(self.allocator);
+        self.deferred_getdata = .{};
         if (self.clean_subver) |s| {
             self.allocator.free(s);
             self.clean_subver = null;
@@ -3248,6 +3536,31 @@ pub const PeerManager = struct {
     /// gets progressively more time to deliver before the front block rotates to
     /// the next peer. Reset to the base whenever a block connects.
     wedge_timeout: i64,
+
+    /// The front block the drain-wedge recovery last cancelled, and the peer
+    /// (as @intFromPtr) it was cancelled from. pipelineBlockRequests will not
+    /// hand that block straight back to the same peer while another eligible
+    /// peer exists (Core disconnects the staller; we rotate away from it).
+    stalled_front_hash: ?types.Hash256 = null,
+    stalled_front_peer: usize = 0,
+    /// Peers dropped by sweepSendQueues (send failed / stalled). Diagnostics.
+    send_stall_disconnects: u64 = 0,
+
+    /// Core m_try_another_outbound_peer (CheckForStaleTipAndEvictPeers):
+    /// set while the tip looks stale, letting maintainOutbound open ONE
+    /// extra full-relay outbound peer; evictExtraOutboundPeers trims back.
+    try_new_outbound: bool = false,
+    /// Earliest wall-clock ms for the next outbound dial at tip.
+    next_outbound_dial_ms: i64 = 0,
+    /// Last time the header chain or the tip advanced (any extends-active
+    /// header batch or connected block).
+    last_header_progress_time: i64 = 0,
+    /// Rate limit for the "0 headers but behind peers" re-request.
+    last_behind_retry_ts: i64 = 0,
+    /// Rate limit for the idle-tick getheaders (processAllMessages).
+    last_idle_getheaders_ts: i64 = 0,
+    /// Round-robin cursor for the quiet-headers getheaders sweep.
+    quiet_ask_rotation: usize = 0,
 
     /// Rotating start offset for the per-peer block-request loop. Advanced once
     /// per `pipelineBlockRequests` call so the FRONT block (lowest
@@ -4744,9 +5057,20 @@ pub const PeerManager = struct {
         // allow up to MAX_OUTBOUND_CONNECTIONS attempts so we recover quickly
         // instead of waiting for the loop to cycle once per peer slot.
         var attempts: u32 = 0;
-        const max_attempts: u32 = if (!self.isIBD()) 8 else if (outbound_count == 0) MAX_OUTBOUND_CONNECTIONS else 1;
+        // Every dial is BLOCKING on the single P2P thread (TCP connect up to
+        // 5 s, v2 handshake, v1 fallback handshake). Up to 8 dials per tick at
+        // tip froze message processing for minutes whenever peers churned.
+        // Now: a full burst only with ZERO outbound peers (bootstrap); else
+        // one dial per tick, spaced by the previous dial's own duration
+        // (OUTBOUND_DIAL_MIN_GAP_MS floor) so dialing gets at most ~half the
+        // thread. Core dials one connection at a time from its own thread.
+        const max_attempts: u32 = if (outbound_count == 0) MAX_OUTBOUND_CONNECTIONS else 1;
+        // Core: one EXTRA full-relay outbound while the tip looks stale.
+        const target: usize = MAX_OUTBOUND_CONNECTIONS + @as(usize, if (self.try_new_outbound) 1 else 0);
+        if (outbound_count > 0 and outbound_count < target and
+            std.time.milliTimestamp() < self.next_outbound_dial_ms) return;
 
-        while (outbound_count < MAX_OUTBOUND_CONNECTIONS and attempts < max_attempts and
+        while (outbound_count < target and attempts < max_attempts and
             !self.stop_requested.load(.acquire))
         {
             attempts += 1;
@@ -4754,7 +5078,11 @@ pub const PeerManager = struct {
             // BIP-324 negotiation lives inside connectOutboundNegotiated;
             // when v2 is disabled (default) this is identical to the old
             // Peer.connect+performHandshake pair.
-            const peer = self.connectOutboundNegotiated(addr) orelse continue;
+            const dial_start_ms = std.time.milliTimestamp();
+            const dialed = self.connectOutboundNegotiated(addr);
+            const dial_end_ms = std.time.milliTimestamp();
+            self.next_outbound_dial_ms = dial_end_ms + @max(OUTBOUND_DIAL_MIN_GAP_MS, dial_end_ms - dial_start_ms);
+            const peer = dialed orelse continue;
 
             // Mark address as successful
             const key = addressKey(addr);
@@ -4779,7 +5107,7 @@ pub const PeerManager = struct {
                 break;
             };
             outbound_count += 1;
-            std.log.info("Connected to outbound peer {} (height={d}, {d}/{d} outbound)", .{ addr, peer.start_height, outbound_count, MAX_OUTBOUND_CONNECTIONS });
+            std.log.info("Connected to outbound peer {} (height={d}, {d}/{d} outbound)", .{ addr, peer.start_height, outbound_count, target });
 
             // Initiate header sync with newly connected peer
             self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
@@ -5027,7 +5355,8 @@ pub const PeerManager = struct {
         // clearbit's inbound port is a trivial remote DoS. Set before
         // performHandshake so the version/verack reads are bounded; the
         // post-handshake processAllMessages path re-sets its own timeout as before.
-        peer.setRecvTimeout(30, 0);
+        // 10 s (was 30 s): this handshake blocks the single P2P thread.
+        peer.setRecvTimeout(10, 0);
         peer.advertise_node_bloom = self.peerbloomfilters;
         peer.advertise_node_network_limited = self.advertise_node_network_limited;
         peer.advertise_compact_filters = self.blockfilterindex_enabled;
@@ -5069,6 +5398,11 @@ pub const PeerManager = struct {
         self.in_pam = true;
         defer self.in_pam = false;
 
+        // Send-queue health: flush every pending queue (non-blocking) and drop
+        // peers whose sends failed or made no progress for
+        // SEND_STALL_TIMEOUT_SECS (they stopped reading). Disconnect only.
+        self.sweepSendQueues();
+
         // First pass: check for peers that need banning
         {
             var i: usize = 0;
@@ -5104,9 +5438,15 @@ pub const PeerManager = struct {
         var pollfds: [MAX_TOTAL_CONNECTIONS]std.posix.pollfd = undefined;
         const num_peers = @min(self.peers.items.len, MAX_TOTAL_CONNECTIONS);
         for (0..num_peers) |idx| {
+            const pp = self.peers.items[idx];
+            // Core fPauseSend: a peer over the send limit is not read from
+            // until it drains; wake on POLLOUT for any peer with queued bytes.
+            var ev: i16 = 0;
+            if (!pp.sendPaused()) ev |= std.posix.POLL.IN;
+            if (pp.pendingSendBytes() > 0) ev |= std.posix.POLL.OUT;
             pollfds[idx] = .{
-                .fd = self.peers.items[idx].stream.handle,
-                .events = std.posix.POLL.IN,
+                .fd = pp.stream.handle,
+                .events = ev,
                 .revents = 0,
             };
         }
@@ -5120,9 +5460,13 @@ pub const PeerManager = struct {
             // Throttle: only send if last attempt was >5s ago (avoid spam)
             const now_ts = std.time.timestamp();
             for (self.peers.items) |peer_obj| {
-                if (now_ts - peer_obj.last_getheaders_time > 5) {
+                // Rate-limited globally, not by the peer's getheaders timer:
+                // that timer is now cleared on every reply, so on its own it
+                // would let this fire on every idle 10-100 ms tick.
+                if (now_ts - self.last_idle_getheaders_ts > 5 and now_ts - peer_obj.last_getheaders_time > 5) {
                     if (self.chain_state) |cs| {
                         if (peer_obj.start_height > 0 and cs.best_height < @as(u32, @intCast(peer_obj.start_height))) {
+                            self.last_idle_getheaders_ts = now_ts;
                             self.sendGetHeaders(peer_obj) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
                             break; // Only send to one peer at a time
                         }
@@ -5161,6 +5505,8 @@ pub const PeerManager = struct {
                 continue;
             }
 
+            if ((revents & std.posix.POLL.OUT) != 0) peer_obj.flushSendQueue();
+
             if (!has_data) {
                 continue;
             }
@@ -5173,6 +5519,9 @@ pub const PeerManager = struct {
 
             while (msgs_read < max_msgs_per_peer) {
                 if (self.stopping()) break;
+                // Core fPauseSend: stop processing this peer's messages once
+                // its replies are backed up; resume when it reads them.
+                if (peer_obj.sendPaused() or peer_obj.send_failed) break;
                 const msg = peer_obj.receiveMessage() catch |err| {
                     switch (err) {
                         PeerError.Timeout => break, // No more data buffered, done draining
@@ -5235,6 +5584,46 @@ pub const PeerManager = struct {
             if (i < self.peers.items.len and self.peers.items[i] == peer_obj) {
                 peer_obj.setRecvTimeout(30, 0);
             }
+        }
+    }
+
+    /// Flush every peer's send queue (non-blocking), disconnect (never ban)
+    /// peers whose send failed or whose queued bytes made no progress for
+    /// SEND_STALL_TIMEOUT_SECS, and resume deferred getdata for peers that
+    /// drained below the pause limit. Called at the top of every
+    /// processAllMessages pass (never re-entrantly: in_pam guards it).
+    pub fn sweepSendQueues(self: *PeerManager) void {
+        const now = std.time.timestamp();
+        var i: usize = 0;
+        while (i < self.peers.items.len) {
+            const p = self.peers.items[i];
+            if (p.pendingSendBytes() > 0) p.flushSendQueue();
+            if (p.send_failed or p.sendStalled(now)) {
+                var addr_buf: [64]u8 = undefined;
+                std.debug.print(
+                    "P2P: disconnecting peer={s}: {s} ({d} bytes unsent) — disconnect only, no ban\n",
+                    .{
+                        p.getAddressString(&addr_buf),
+                        if (p.send_failed) "send failed / send queue overflow" else "send stalled, peer not reading",
+                        p.pendingSendBytes(),
+                    },
+                );
+                self.send_stall_disconnects += 1;
+                self.removePeerByIndex(i);
+                continue;
+            }
+            i += 1;
+        }
+        // Resume deferred getdata (Core: ProcessGetData continues from
+        // m_getdata_requests once fPauseSend clears).
+        i = 0;
+        while (i < self.peers.items.len) : (i += 1) {
+            const p = self.peers.items[i];
+            if (p.deferred_getdata.items.len == 0 or p.sendPaused()) continue;
+            if (p.state != .handshake_complete) continue;
+            const inv = p.deferred_getdata.toOwnedSlice(self.allocator) catch continue;
+            // handleMessage owns and frees `inv` (getdata handler defer-frees).
+            self.handleMessage(p, .{ .getdata = .{ .inventory = inv } }) catch {};
         }
     }
 
@@ -6637,7 +7026,19 @@ pub const PeerManager = struct {
             },
             .headers => |h| {
                 defer self.allocator.free(h.headers);
-                // Don't clear getheaders timeout -- we'll request more below if needed
+                // Core clears m_last_getheaders_timestamp for a headers
+                // message that is empty (net_processing.cpp:2977 "cannot be
+                // an announcement, so assume it is a response") or that
+                // CONNECTS (:3041); only a non-connecting batch leaves it set.
+                // clearbit never cleared it at all, so checkHeadersTimeouts
+                // fired on EVERY peer HEADERS_RESPONSE_TIMEOUT after our last
+                // getheaders to it — and discouraged (24 h ban) it. Live
+                // 2026-10-05: 264 "headers timeout" discourages in one 3 MB
+                // log tail, 236 of the 250 peers being our own fresh outbound
+                // connections: the outbound set was banned out from under
+                // us every ~5 min (1-3/8 outbound, constant re-dialing).
+                // Cleared per-branch below (empty / historical / extends /
+                // competing fork); unknown_parent keeps it.
 
                 if (h.headers.len > 0) {
                     var historical = false;
@@ -6659,6 +7060,7 @@ pub const PeerManager = struct {
                         }
                     }
                     if (historical) {
+                        peer.last_getheaders_time = 0;
                         self.driveHistoricalBackfill(peer);
                         self.finishHistoricalBackfillIfDone();
                         return;
@@ -6666,6 +7068,7 @@ pub const PeerManager = struct {
                 }
 
                 if (h.headers.len == 0) {
+                    peer.last_getheaders_time = 0; // Core :2977
                     // 0 headers from this peer doesn't mean we're synced — the
                     // peer may not have recognized our locator, or it's behind.
                     // Check if we're actually caught up by comparing against
@@ -6673,10 +7076,18 @@ pub const PeerManager = struct {
                     const our_height = if (self.chain_state) |cs| cs.best_height else 0;
                     const best_peer_h = self.getBestPeerHeight();
                     if (our_height + self.expected_blocks.items.len < best_peer_h) {
-                        std.debug.print("P2P: 0 headers but behind peers (ours={d}+{d}, best_peer={d}), retrying\n", .{ our_height, self.expected_blocks.items.len, best_peer_h });
-                        // Try sending getheaders to a different peer
-                        if (self.pickSyncPeer(peer)) |alt_peer| {
-                            self.sendGetHeaders(alt_peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
+                        // start_height is unverified (a single peer can claim
+                        // any height): rate-limit the re-request so an empty
+                        // reply never chains into another getheaders at
+                        // network RTT speed.
+                        const now_retry = std.time.timestamp();
+                        if (now_retry - self.last_behind_retry_ts >= BEHIND_PEERS_RETRY_SECS) {
+                            self.last_behind_retry_ts = now_retry;
+                            std.debug.print("P2P: 0 headers but behind peers (ours={d}+{d}, best_peer={d}), retrying\n", .{ our_height, self.expected_blocks.items.len, best_peer_h });
+                            // Try sending getheaders to a different peer
+                            if (self.pickSyncPeer(peer)) |alt_peer| {
+                                self.sendGetHeaders(alt_peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
+                            }
                         }
                     } else {
                         // Headers are caught up to the network tip.  Only emit
@@ -6777,6 +7188,10 @@ pub const PeerManager = struct {
                         // Mirrors Core's `nUnconnectingHeaders = 0` in
                         // ProcessHeadersMessage's success path.
                         peer.unconnecting_headers_count = 0;
+                        peer.last_getheaders_time = 0; // Core :3041 (connects)
+                        const now_ann = std.time.timestamp();
+                        peer.last_block_announcement = now_ann;
+                        self.last_header_progress_time = now_ann;
                         // Fall through to the existing extension path below.
                     },
                     .unknown_parent => {
@@ -6828,6 +7243,8 @@ pub const PeerManager = struct {
                         // re-requests the same batch forever and starves RPC
                         // via log/CPU).
                         self.reorg_candidate_announcements += 1;
+                        // The batch connects to a known block: a response.
+                        peer.last_getheaders_time = 0; // Core :3041
                         const fork_prev = hdrs[0].prev_block;
                         const batch_key = ForkBatchKey{
                             .prev = fork_prev,
@@ -7707,7 +8124,18 @@ pub const PeerManager = struct {
                     peer.misbehaving(100, "getdata message size exceeds MAX_GETDATA_SZ (1000)");
                     return;
                 }
-                for (gd.inventory) |item| {
+                for (gd.inventory, 0..) |item, gd_idx| {
+                    // Core ProcessGetData: `if (pfrom.fPauseSend) break;` —
+                    // the rest waits in m_getdata_requests until the peer
+                    // drains. Never queue unbounded blocks for a non-reader.
+                    if (peer.sendPaused() or peer.send_failed) {
+                        if (!peer.send_failed and peer.deferred_getdata.items.len < p2p.MAX_GETDATA_SZ) {
+                            const room = p2p.MAX_GETDATA_SZ - peer.deferred_getdata.items.len;
+                            const rest = gd.inventory[gd_idx..];
+                            peer.deferred_getdata.appendSlice(self.allocator, rest[0..@min(rest.len, room)]) catch {};
+                        }
+                        break;
+                    }
                     const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
                     // MSG_WITNESS_FLAG. Core serializes with witness ONLY for
                     // the witness inv types: MSG_BLOCK -> TX_NO_WITNESS(block),
@@ -8840,6 +9268,88 @@ pub const PeerManager = struct {
 
         // 4. Evict stale tip peers - disconnect one outbound peer with stale tip
         self.evictStaleTipPeer();
+
+        // 5. Core CheckForStaleTipAndEvictPeers (net_processing.cpp:5375-5391):
+        //    trim an extra outbound peer if we have one, then allow ONE extra
+        //    full-relay outbound while the tip looks stale.
+        // Core TipMayBeStale seeds m_last_tip_update with "now" on first use.
+        if (self.last_tip_update_time == 0) self.last_tip_update_time = now;
+        self.evictExtraOutboundPeers(now);
+        const stale = self.tipMayBeStale();
+        if (stale and !self.try_new_outbound) {
+            std.log.info("Potential stale tip detected, will try using extra outbound peer (last tip update: {d} seconds ago)", .{now - self.last_tip_update_time});
+        }
+        self.try_new_outbound = stale;
+
+        // 6. Quiet headers: nothing new for HEADERS_QUIET_ASK_SECS — ask.
+        self.askHeadersIfQuiet(now);
+    }
+
+    /// Count full-relay outbound peers (manual / feeler / block-relay-only are
+    /// not part of the 8 full-relay slots Core keeps).
+    fn countFullRelayOutbound(self: *const PeerManager) usize {
+        var n: usize = 0;
+        for (self.peers.items) |p| {
+            if (p.direction == .outbound and p.conn_type == .outbound_full_relay) n += 1;
+        }
+        return n;
+    }
+
+    /// Core EvictExtraOutboundPeers (net_processing.cpp:5300-5370, full-relay
+    /// part): with more than MAX_OUTBOUND_CONNECTIONS full-relay outbound
+    /// peers, disconnect the one whose last new-block announcement is oldest
+    /// (ties: the youngest connection), but only if it has been connected for
+    /// MINIMUM_CONNECT_TIME and has no block in flight. A successful trim ends
+    /// the extra-peer attempt (SetTryNewOutboundPeer(false)).
+    pub fn evictExtraOutboundPeers(self: *PeerManager, now: i64) void {
+        if (self.countFullRelayOutbound() <= MAX_OUTBOUND_CONNECTIONS) return;
+        var worst: ?usize = null;
+        var worst_ann: i64 = std.math.maxInt(i64);
+        var worst_connect: i64 = 0;
+        for (self.peers.items, 0..) |p, i| {
+            if (p.direction != .outbound or p.conn_type != .outbound_full_relay) continue;
+            if (p.state != .handshake_complete) continue;
+            const ann = p.last_block_announcement;
+            if (ann < worst_ann or (ann == worst_ann and p.connect_time > worst_connect)) {
+                worst = i;
+                worst_ann = ann;
+                worst_connect = p.connect_time;
+            }
+        }
+        const idx = worst orelse return;
+        const p = self.peers.items[idx];
+        if (now - p.connect_time > MINIMUM_CONNECT_TIME and p.blocks_in_flight_count == 0) {
+            var addr_buf: [64]u8 = undefined;
+            std.log.info("disconnecting extra outbound peer={s} (last block announcement {d}s ago)", .{ p.getAddressString(&addr_buf), if (worst_ann > 0) now - worst_ann else -1 });
+            self.removePeerByIndex(idx);
+            self.try_new_outbound = false;
+        }
+    }
+
+    /// No new header and no tip movement for HEADERS_QUIET_ASK_SECS: send
+    /// getheaders to up to HEADERS_QUIET_ASK_PEERS handshake-complete outbound
+    /// peers that have no getheaders outstanding, round-robin. An empty reply
+    /// is cheap; a non-empty one is the announcement we were missing. Core's
+    /// equivalent pressure is ConsiderEviction's getheaders to outbound peers
+    /// (net_processing.cpp:5240-5262) plus the stale-tip extra outbound peer.
+    pub fn askHeadersIfQuiet(self: *PeerManager, now: i64) void {
+        // Not gated on isIBD(): that is true whenever expected_blocks is
+        // non-empty, i.e. permanently at tip. During a real sync the tip
+        // moves continuously, so the quiet test below never fires there.
+        const last = @max(self.last_header_progress_time, self.last_tip_update_time);
+        if (last == 0 or now - last < HEADERS_QUIET_ASK_SECS) return;
+        const n = self.peers.items.len;
+        if (n == 0) return;
+        var asked: usize = 0;
+        var k: usize = 0;
+        while (k < n and asked < HEADERS_QUIET_ASK_PEERS) : (k += 1) {
+            const p = self.peers.items[(self.quiet_ask_rotation + k) % n];
+            if (p.direction != .outbound or p.state != .handshake_complete) continue;
+            if (p.last_getheaders_time != 0) continue;
+            self.sendGetHeaders(p) catch continue;
+            asked += 1;
+        }
+        self.quiet_ask_rotation +%= k;
     }
 
     /// Sweep the orphan pool for entries older than `ORPHAN_TX_EXPIRE_TIME`.
@@ -8980,15 +9490,35 @@ pub const PeerManager = struct {
         }
     }
 
-    /// Check for headers request timeouts. Add misbehavior score (5) for non-responsive peers.
-    /// Uses a low penalty since getheaders is sent to multiple peers but only one typically responds.
-    fn checkHeadersTimeouts(self: *PeerManager) void {
-        for (self.peers.items) |peer| {
+    /// Headers request timeouts: DISCONNECT the unresponsive peer, never
+    /// discourage it.
+    ///
+    /// Core never punishes a slow headers response. A stalled initial
+    /// headers-sync peer is disconnected (net_processing.cpp:6124-6153,
+    /// "Timeout downloading headers", noban peers only reset), and an
+    /// outbound peer that will not answer the chain-sync getheaders is
+    /// disconnected by ConsiderEviction (:5213-5262). Neither path calls
+    /// Misbehaving. clearbit used misbehaving(5) here, which under the
+    /// single-event model is a 24 h discourage (ban-list entry) — and since
+    /// the timestamp was never cleared on a reply, it hit every honest peer
+    /// (5,249 such discourages in one log window, 2026-10-05). When WE are the
+    /// slow side (CPU-starved, P2P thread blocked) banning the peers we need
+    /// starves us further. Manual / noban peers are kept (Core resets them).
+    pub fn checkHeadersTimeouts(self: *PeerManager) void {
+        var i: usize = 0;
+        while (i < self.peers.items.len) {
+            const peer = self.peers.items[i];
             if (peer.state == .handshake_complete and peer.hasHeadersTimeout()) {
-                peer.misbehaving(5, "headers timeout");
-                // Clear the timeout to avoid repeated scoring
                 peer.last_getheaders_time = 0;
+                if (!peer.no_ban and peer.conn_type != .manual) {
+                    var addr_buf: [64]u8 = undefined;
+                    const addr_str = peer.getAddressString(&addr_buf);
+                    std.log.info("Disconnecting peer={s}: headers timeout (no reply to getheaders in {d}s) — disconnect only, no discourage", .{ addr_str, HEADERS_RESPONSE_TIMEOUT });
+                    self.removePeerByIndex(i);
+                    continue;
+                }
             }
+            i += 1;
         }
     }
 
@@ -9000,8 +9530,10 @@ pub const PeerManager = struct {
             if (peer.state == .handshake_complete and peer.hasBlockDownloadTimeout()) {
                 var addr_buf: [64]u8 = undefined;
                 const addr_str = peer.getAddressString(&addr_buf);
-                std.log.info("Disconnecting peer={s} due to block download timeout (blocks_in_flight={d})", .{ addr_str, peer.blocks_in_flight_count });
-                peer.misbehaving(50, "block download stalling");
+                // Core (net_processing.cpp:6117-6121) only DISCONNECTS a
+                // block-download-timeout peer ("Timeout downloading block");
+                // it is never Misbehaving — the slow side may be us.
+                std.log.info("Disconnecting peer={s} due to block download timeout (blocks_in_flight={d}) — disconnect only", .{ addr_str, peer.blocks_in_flight_count });
                 self.removePeerByIndex(i);
             } else {
                 i += 1;
@@ -9056,10 +9588,15 @@ pub const PeerManager = struct {
         self.last_tip_update_time = std.time.timestamp();
     }
 
-    /// Check if our tip may be stale (no new blocks for 30 minutes).
+    /// Check if our tip may be stale (no new blocks for 30 minutes and no
+    /// block in flight) — Core TipMayBeStale (net_processing.cpp:1300:
+    /// m_last_tip_update < now - 3 * nPowTargetSpacing && mapBlocksInFlight.empty()).
+    /// last_tip_update_time is stamped by the block-connect path (it was
+    /// never written before, so this always returned false).
     pub fn tipMayBeStale(self: *const PeerManager) bool {
         const now = std.time.timestamp();
         if (self.last_tip_update_time == 0) return false;
+        if (self.inflight_block_peer.count() != 0) return false;
         return now - self.last_tip_update_time > STALE_TIP_THRESHOLD;
     }
 
@@ -9215,6 +9752,17 @@ pub const PeerManager = struct {
     ///
     /// The `download_cursor` rewind on buffer-full drop (wave 9) is preserved
     /// in the `.block` handler — see `peer.zig:2198` and `peer.zig:2215`.
+    /// Another handshake-complete, witness-capable peer with block budget.
+    fn otherBlockPeerAvailable(self: *const PeerManager, exclude: *const Peer) bool {
+        for (self.peers.items) |p| {
+            if (p == exclude) continue;
+            if (p.state != .handshake_complete or !p.canServeWitnesses()) continue;
+            if (p.blocks_in_flight_count >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) continue;
+            return true;
+        }
+        return false;
+    }
+
     pub fn pipelineBlockRequests(self: *PeerManager) !void {
         if (self.chain_state == null) return;
         if (self.download_cursor >= self.expected_blocks.items.len) return;
@@ -9257,6 +9805,17 @@ pub const PeerManager = struct {
 
             if (self.download_cursor >= self.expected_blocks.items.len) break;
             if (self.download_cursor >= self.connect_cursor + max_ahead) break;
+
+            // Re-request of a cancelled stuck front block: skip the peer it
+            // stalled on while any other eligible peer can take it.
+            if (self.stalled_front_hash) |sh| {
+                if (@intFromPtr(tp) == self.stalled_front_peer and
+                    std.mem.eql(u8, &self.expected_blocks.items[self.download_cursor], &sh) and
+                    self.otherBlockPeerAvailable(tp))
+                {
+                    continue;
+                }
+            }
 
             var invs = std.ArrayList(p2p.InvVector).init(self.allocator);
 
@@ -10556,7 +11115,7 @@ pub const PeerManager = struct {
     /// Also re-arms the block download pipeline every 32 blocks so that peer
     /// slots freed during the drain are refilled without waiting for the full
     /// drain to complete.
-    fn drainBlockBuffer(self: *PeerManager) void {
+    pub fn drainBlockBuffer(self: *PeerManager) void {
         const cs = self.chain_state orelse return;
         // W101: mark drain active so nested drain calls from the `.block`
         // handler (invoked transitively by processAllMessages in the
@@ -10754,6 +11313,11 @@ pub const PeerManager = struct {
                                     break;
                                 }
                             }
+                            // Remember the staller so the re-request goes to
+                            // a DIFFERENT peer when one is eligible (the
+                            // rotation alone could hand it straight back).
+                            self.stalled_front_hash = expected_hash;
+                            self.stalled_front_peer = kv.value;
                             std.debug.print(
                                 "P2P: drain-wedge recovery: cancelled stuck front block at connect_cursor={d} (stalled {d}s); re-requesting from another peer\n",
                                 .{ self.connect_cursor, now - self.wedge_since },
@@ -11140,12 +11704,18 @@ pub const PeerManager = struct {
             }
 
             self.our_height = @intCast(cs.best_height);
+            {
+                const now_tip = std.time.timestamp();
+                self.last_tip_update_time = now_tip;
+                self.last_header_progress_time = now_tip;
+            }
             connected += 1;
             fatal.clearSystemFault();
             self.blocks_since_log += 1;
             self.connect_cursor += 1;
             // Cursor advanced → not wedged; clear the drain-wedge staller timer.
             self.wedge_since = 0;
+            self.stalled_front_hash = null;
 
             // Cache the connected block for relay to other peers, as a
             // rolling window of the most recent RELAY_CACHE_DEPTH blocks.
