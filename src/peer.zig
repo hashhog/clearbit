@@ -3422,6 +3422,14 @@ pub const PeerManager = struct {
     seen_fork_batches: std.AutoHashMap(ForkBatchKey, void),
     /// How many competing_fork announcements arrived (including suppressed).
     reorg_candidate_announcements: u64 = 0,
+    /// Header batches whose leading run was already on our committed chain
+    /// (overlapping re-announcements) and was skipped instead of being
+    /// classified as a fork.
+    committed_header_prefix_skips: u64 = 0,
+    /// Pending reorgs whose leading fork blocks were found already on the
+    /// active chain at fire time (fork point advanced past them, never
+    /// re-connected).
+    reorg_active_prefix_trims: u64 = 0,
     /// How many REORG-CANDIDATE lines were actually printed.
     reorg_candidate_logs_emitted: u64 = 0,
     /// How many times the competing_fork arm called sendGetHeaders for more.
@@ -6030,6 +6038,74 @@ pub const PeerManager = struct {
 
     /// Classify the first header in a batch with respect to our current
     /// chain state.  See HeaderClass.  Helper for the .headers handler.
+    /// True iff `hash` is on our COMMITTED header chain: the active chain, or
+    /// the queued (not yet connected) tail of expected_blocks — the chain the
+    /// connect queue will extend the tip along.
+    pub fn isOnCommittedHeaderChain(self: *PeerManager, hash: *const types.Hash256) bool {
+        if (self.chain_state) |cs| {
+            if (std.mem.eql(u8, &cs.best_hash, hash)) return true;
+        }
+        // Queued, unconnected tail (newest first: an overlapping batch
+        // overlaps the tail).
+        var i: usize = self.expected_blocks.items.len;
+        const lo: usize = @min(@as(usize, self.connect_cursor), i);
+        while (i > lo) {
+            i -= 1;
+            if (std.mem.eql(u8, &self.expected_blocks.items[i], hash)) return true;
+        }
+        // Active chain below the tip: by the header's height, then the
+        // persisted height->hash index.
+        if (self.chain_state) |cs| {
+            if (self.header_index.get(hash.*)) |e| {
+                if (e.height <= cs.best_height) {
+                    if (cs.getBlockHashByHeight(e.height)) |hh| {
+                        if (std.mem.eql(u8, &hh, hash)) return true;
+                    }
+                }
+            }
+            if (cs.getBlockHeightByHash(hash)) |hgt| {
+                if (hgt <= cs.best_height) {
+                    if (cs.getBlockHashByHeight(hgt)) |hh| {
+                        if (std.mem.eql(u8, &hh, hash)) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Length of the leading run of `hdrs` that we already hold on our
+    /// committed header chain, linked header-to-header (a known hash is a
+    /// commitment to its whole ancestry, so the run is our own chain).
+    /// Only consulted when hdrs[0] does not already extend the queue tail.
+    pub fn committedHeaderPrefixLen(self: *PeerManager, hdrs: []const types.BlockHeader) usize {
+        if (hdrs.len == 0) return 0;
+        const expected_prev = self.expectedPrevHash();
+        if (std.mem.eql(u8, &hdrs[0].prev_block, &expected_prev)) return 0; // plain extension
+        var n: usize = 0;
+        while (n < hdrs.len) : (n += 1) {
+            const bh = crypto.computeBlockHash(&hdrs[n]);
+            if (!self.isOnCommittedHeaderChain(&bh)) break;
+            // Link check: the known header must sit on its predecessor.
+            if (n > 0) {
+                const prev_hash = crypto.computeBlockHash(&hdrs[n - 1]);
+                if (!std.mem.eql(u8, &hdrs[n].prev_block, &prev_hash)) break;
+            }
+        }
+        return n;
+    }
+
+    /// The hash a header must build on to EXTEND the committed chain: the
+    /// queue tail, else the active tip (genesis on a fresh start).
+    fn expectedPrevHash(self: *PeerManager) types.Hash256 {
+        if (self.expected_blocks.items.len > 0)
+            return self.expected_blocks.items[self.expected_blocks.items.len - 1];
+        if (self.chain_state) |cs| {
+            return if (cs.best_height == 0) self.network_params.genesis_hash else cs.best_hash;
+        }
+        return self.network_params.genesis_hash;
+    }
+
     pub fn classifyHeaderBatch(
         self: *PeerManager,
         first_header: *const types.BlockHeader,
@@ -6676,6 +6752,15 @@ pub const PeerManager = struct {
     /// logs + bans the source peer + clears pending_reorg.
     pub fn tryFireReorg(self: *PeerManager) void {
         if (fatal.isLatched()) return;
+        if (self.chain_state == null) return;
+        // A fork block that is ALREADY on the active chain is never
+        // re-connected (Core ActivateBestChainStep, validation.cpp:3197-3202:
+        // pindexFork = m_chain.FindFork(pindexMostWork) is the LAST common
+        // block, so a candidate that extends the tip disconnects nothing and
+        // connects only what is new).  The fork point recorded at ARM time
+        // goes stale when the drain connects the leading fork blocks before
+        // the bodies of the rest arrive — advance it now.
+        self.trimActivePrefixOfPendingReorg();
         const pr_ptr = if (self.pending_reorg) |*p| p else return;
         const cs = self.chain_state orelse return;
 
@@ -6863,6 +6948,56 @@ pub const PeerManager = struct {
         self.pending_reorg = null;
         // Resume header sync from the (new or unchanged) tip.
         if (found_invalid or reorged) self.requestHeadersAfterInvalid();
+    }
+
+    /// Advance the pending reorg's fork point past every leading fork block
+    /// that is already on the active chain (see tryFireReorg).  When the
+    /// whole fork is active there is nothing to do: the pending reorg is
+    /// dropped (nothing marked, nobody punished).
+    pub fn trimActivePrefixOfPendingReorg(self: *PeerManager) void {
+        const pr_ptr = if (self.pending_reorg) |*p| p else return;
+        const cs = self.chain_state orelse return;
+        if (pr_ptr.fork_hashes.items.len == 0) return;
+        // Unresolvable fork point: leave it to tryFireReorg's own handling.
+        const fph = (self.lookupForkPointHeight(&pr_ptr.fork_point) catch return) orelse return;
+        var k: usize = 0;
+        while (k < pr_ptr.fork_hashes.items.len) : (k += 1) {
+            const h: u32 = fph + @as(u32, @intCast(k + 1));
+            if (h > cs.best_height) break;
+            const active = cs.getBlockHashByHeight(h) orelse break;
+            if (!std.mem.eql(u8, &active, &pr_ptr.fork_hashes.items[k])) break;
+        }
+        if (k == 0) return;
+        self.reorg_active_prefix_trims += 1;
+        // Drop the (duplicate) bodies of the already-connected blocks.
+        for (pr_ptr.fork_hashes.items[0..k]) |fh| {
+            if (self.block_buffer.fetchRemove(fh)) |kv| {
+                var b = kv.value;
+                serialize.freeBlock(self.allocator, &b);
+            }
+            _ = self.block_source_peers.remove(fh);
+        }
+        if (k == pr_ptr.fork_hashes.items.len) {
+            std.log.info(
+                "[REORG] pending fork ({d} block(s)) is already on the active chain — nothing to reorg, dropped (not a verdict)",
+                .{k},
+            );
+            pr_ptr.deinit();
+            self.pending_reorg = null;
+            return;
+        }
+        pr_ptr.fork_point = pr_ptr.fork_hashes.items[k - 1];
+        pr_ptr.fork_hashes.replaceRange(0, k, &[_]types.Hash256{}) catch {
+            // replaceRange with an empty slice never allocates; keep the
+            // compiler happy without a silent fallthrough.
+            pr_ptr.deinit();
+            self.pending_reorg = null;
+            return;
+        };
+        std.log.info(
+            "[REORG] {d} leading fork block(s) already on the active chain — fork point advanced to h={d}, not re-connected",
+            .{ k, fph + @as(u32, @intCast(k)) },
+        );
     }
 
     /// Helper: look up the height of a given hash via header_index, or
@@ -7130,7 +7265,7 @@ pub const PeerManager = struct {
                 // branch is never queued or fetched again.  Punishment follows
                 // MaybePunishNodeForBlock (net_processing.cpp:1906): cached-
                 // invalid only for an OUTBOUND peer; bad-prevblk for any peer.
-                const hdrs: []const types.BlockHeader = blk_cut: {
+                const hdrs_cut: []const types.BlockHeader = blk_cut: {
                     const cut = self.failedHeaderCut(h.headers);
                     if (cut.index == h.headers.len) break :blk_cut h.headers;
                     switch (cut.reason) {
@@ -7146,6 +7281,40 @@ pub const PeerManager = struct {
                     }
                     if (cut.index == 0) return;
                     break :blk_cut h.headers[0..cut.index];
+                };
+
+                // Headers we ALREADY HOLD on our committed header chain (the
+                // active chain, or the queued-but-unconnected tail of
+                // expected_blocks) are not news.  Core AcceptBlockHeader
+                // returns the existing index entry for a known header
+                // (validation.cpp:4192-4198, "Block header is already
+                // known") and the batch continues from it, so a batch that
+                // OVERLAPS our tail — [h9, h10] when h9 is already queued —
+                // is an extension by h10, not a fork rooted at h8.  Pre-fix
+                // the overlap was classified competing_fork, maybeArmReorg
+                // armed a "reorg" from h8 over [h9, h10], the drain connected
+                // h9 meanwhile, and the reorg then disconnected and re-
+                // connected h9 → Bip30DuplicateOutput on its own coinbase →
+                // a VALID block marked BLOCK_FAILED_VALID and the node wedged
+                // (fast P2P sync, 2026-10-05).  Skip the known prefix.
+                const hdrs: []const types.BlockHeader = blk_known: {
+                    const skip = self.committedHeaderPrefixLen(hdrs_cut);
+                    if (skip == 0) break :blk_known hdrs_cut;
+                    self.committed_header_prefix_skips += 1;
+                    if (skip == hdrs_cut.len) {
+                        // Nothing new: a pure re-announcement of headers we
+                        // already hold.  It connects (a response, Core :3041)
+                        // and is not unconnecting.
+                        peer.last_getheaders_time = 0;
+                        peer.unconnecting_headers_count = 0;
+                        // A full batch of known headers: the peer has more —
+                        // continue from our (committed) locator.
+                        if (hdrs_cut.len >= MAX_HEADERS_RESULTS) {
+                            self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
+                        }
+                        return;
+                    }
+                    break :blk_known hdrs_cut[skip..];
                 };
 
                 // Deduplicate: only accept headers that chain to our known tip.

@@ -2102,6 +2102,151 @@ test "tests_reorg_p2p: failed reorg onto an invalid branch rolls back, punishes 
     try testing.expect(!h_peer.should_ban);
 }
 
+fn bip30SelfDupSetup(allocator: std.mem.Allocator, pm: *peer_mod.PeerManager, cs: *storage.ChainState, params: *const consensus.NetworkParams) void {
+    cs.wireUtxoParent();
+    cs.setNetworkParams(params);
+    cs.best_hash = params.genesis_hash;
+    cs.initGenesisTimestamp(params.genesis_header.timestamp);
+    pm.chain_state = cs;
+    _ = allocator;
+}
+
+// The 2026-10-05 fast-P2P-sync wedge, deterministically: H announces A2
+// (queued, body not yet here), then re-announces the OVERLAPPING batch
+// [A2, A3].  Pre-fix the overlap was classified as a fork rooted at A1, a
+// "reorg" over [A2, A3] was armed, the drain connected A2, the reorg then
+// disconnected and re-connected A2 -> Bip30DuplicateOutput on A2's own
+// coinbase -> A2 (valid) BLOCK_FAILED_VALID, H punished, node wedged.
+test "tests_reorg_p2p: bip30-self-dup — an overlapping header batch EXTENDS the tip (no fork, no reorg, valid blocks never marked)" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bip30SelfDupSetup(allocator, &pm, &cs, &params);
+
+    const h_peer = try ibPeer(&params, allocator, 3, .outbound);
+    defer freeIbPeer(allocator, h_peer);
+    try pm.peers.append(h_peer);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var a2 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0xA2);
+    defer serialize.freeBlock(allocator, &a2.block);
+    var a3 = try mineIbBlock(allocator, &params, a2.hash, 3, 0, 0xA3);
+    defer serialize.freeBlock(allocator, &a3.block);
+    var a4 = try mineIbBlock(allocator, &params, a3.hash, 4, 0, 0xA4);
+    defer serialize.freeBlock(allocator, &a4.block);
+
+    try sendHeaders(&pm, allocator, h_peer, &.{&a1});
+    try sendBlock(&pm, allocator, h_peer, &a1);
+    try testing.expectEqual(@as(u32, 1), cs.best_height);
+
+    try sendHeaders(&pm, allocator, h_peer, &.{&a2}); // queued, body in flight
+    const fork_before = pm.reorg_candidate_announcements;
+    try sendHeaders(&pm, allocator, h_peer, &.{ &a2, &a3 }); // overlapping batch
+    try testing.expectEqual(fork_before, pm.reorg_candidate_announcements); // NOT a fork
+    try testing.expect(pm.pending_reorg == null);
+    try testing.expectEqual(@as(usize, 1), countQueued(&pm, a2.hash));
+    try testing.expectEqual(@as(usize, 1), countQueued(&pm, a3.hash));
+
+    // Bodies arrive (A2 twice, as when a reorg getdata re-requested it).
+    try sendBlock(&pm, allocator, h_peer, &a2);
+    try sendBlock(&pm, allocator, h_peer, &a2);
+    try sendBlock(&pm, allocator, h_peer, &a3);
+    try testing.expectEqual(@as(u32, 3), cs.best_height);
+    try testing.expectEqualSlices(u8, &a3.hash, &cs.best_hash);
+
+    // A batch overlapping the ACTIVE chain ([A2, A3, A4] with A2, A3
+    // connected) is an extension by A4 too.
+    try sendHeaders(&pm, allocator, h_peer, &.{ &a2, &a3, &a4 });
+    try testing.expectEqual(fork_before, pm.reorg_candidate_announcements);
+    try testing.expect(pm.pending_reorg == null);
+    try sendBlock(&pm, allocator, h_peer, &a4);
+    try testing.expectEqual(@as(u32, 4), cs.best_height);
+    try testing.expectEqualSlices(u8, &a4.hash, &cs.best_hash);
+
+    // A pure re-announcement of known headers is a no-op.
+    try sendHeaders(&pm, allocator, h_peer, &.{ &a3, &a4 });
+    try testing.expectEqual(fork_before, pm.reorg_candidate_announcements);
+
+    try testing.expect(!pm.isBlockFailed(&a2.hash));
+    try testing.expect(!pm.isBlockFailed(&a3.hash));
+    try testing.expect(!pm.isBlockFailed(&a4.hash));
+    try testing.expect(!h_peer.should_ban);
+    try testing.expect(!cs.flush_error);
+    try testing.expect(pm.committed_header_prefix_skips >= 2);
+}
+
+// Fix (2) in isolation: a pending reorg whose fork point went stale (the
+// leading fork block got connected by the drain after the reorg was armed)
+// must advance its fork point — never disconnect + re-connect that block.
+test "tests_reorg_p2p: bip30-self-dup — a pending reorg never re-connects a fork block already on the active chain" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bip30SelfDupSetup(allocator, &pm, &cs, &params);
+
+    const h_peer = try ibPeer(&params, allocator, 3, .outbound);
+    defer freeIbPeer(allocator, h_peer);
+    try pm.peers.append(h_peer);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var a2 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0xA2);
+    defer serialize.freeBlock(allocator, &a2.block);
+    var a3 = try mineIbBlock(allocator, &params, a2.hash, 3, 0, 0xA3);
+    defer serialize.freeBlock(allocator, &a3.block);
+
+    try sendHeaders(&pm, allocator, h_peer, &.{ &a1, &a2 });
+    try sendBlock(&pm, allocator, h_peer, &a1);
+    try sendBlock(&pm, allocator, h_peer, &a2);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+
+    // A reorg armed from A1 over [A2, A3] (stale: A2 is now the tip), with
+    // both bodies buffered.
+    var hashes = std.ArrayList(types.Hash256).init(allocator);
+    try hashes.append(a2.hash);
+    try hashes.append(a3.hash);
+    pm.pending_reorg = .{
+        .fork_point = a1.hash,
+        .fork_hashes = hashes,
+        .new_tip_chain_work = [_]u8{0xFF} ** 32,
+        .source_peer = h_peer,
+    };
+    try pm.block_buffer.put(a2.hash, try cloneIbBlock(allocator, &a2.block));
+    try pm.block_buffer.put(a3.hash, try cloneIbBlock(allocator, &a3.block));
+    pm.tryFireReorg();
+
+    try testing.expect(pm.pending_reorg == null);
+    try testing.expectEqual(@as(u32, 3), cs.best_height);
+    try testing.expectEqualSlices(u8, &a3.hash, &cs.best_hash);
+    try testing.expect(!pm.isBlockFailed(&a2.hash));
+    try testing.expect(!pm.isBlockFailed(&a3.hash));
+    try testing.expect(!h_peer.should_ban);
+    try testing.expect(!cs.flush_error);
+    try testing.expectEqual(@as(u64, 1), pm.reorg_active_prefix_trims);
+    try testing.expect(!pm.block_buffer.contains(a2.hash));
+}
+
 test "tests_reorg_p2p: NON-verdict — a mutated copy (unexpected witness) punishes the sender but does NOT mark the block; the genuine copy connects" {
     const allocator = testing.allocator;
     const params = consensus.REGTEST;

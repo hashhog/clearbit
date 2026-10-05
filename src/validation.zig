@@ -109,6 +109,18 @@ pub const ValidationError = error{
     /// into "Error reading from database, shutting down." + abort — never a
     /// block verdict.  peer.classifyBlockFailure -> not_a_verdict.
     UtxoReadError,
+    /// NOT a consensus result (gate 6): the coins view answered with a coin
+    /// that cannot exist in a consistent view of the chain this block
+    /// extends — a coin created at or above the height of the block being
+    /// connected (BIP-30 probe hit a "duplicate" created at height >= this
+    /// block's).  A consistent view holds only coins from heights <= tip, so
+    /// that "duplicate" is our own state (typically this very block,
+    /// already connected, or a disconnected block's coin read back from a
+    /// stale disk record) — never a property of the block.  Core never marks
+    /// a block for a coins-view inconsistency (its view cannot hold such a
+    /// coin; a DB fault aborts the node).  peer.classifyBlockFailure ->
+    /// not_a_verdict; isSystemValidationError -> retry once, then latch.
+    UtxoViewInconsistent,
     /// NOT a consensus result (gate 6): an ancestor / block-index read
     /// (median-time-past window, fork-point height) failed with a storage
     /// error.  Pre-fix the readers answered 0 / null, which WAIVED time-based
@@ -169,6 +181,7 @@ pub fn classifyBlockFailure(err: ValidationError) BlockFailureKind {
         // BLOCK_TIME_FUTURE, which Core neither caches nor punishes.
         error.OutOfMemory,
         error.UtxoReadError,
+        error.UtxoViewInconsistent,
         error.BlockIndexReadError,
         error.ScriptCheckInternal,
         error.NodeAborted,
@@ -238,6 +251,7 @@ pub fn isSystemValidationError(err: ValidationError) bool {
     return switch (err) {
         error.OutOfMemory,
         error.UtxoReadError,
+        error.UtxoViewInconsistent,
         error.BlockIndexReadError,
         error.ScriptCheckInternal,
         error.NodeAborted,
@@ -1785,6 +1799,17 @@ pub fn validateBlockForIBD(
                         // it through the arena; this reject path discarded it
                         // and leaked one script per BIP-30 hit).
                         if (hit.owner_allocator) |a| a.free(hit.script_pubkey);
+                        // A coin created at/above THIS block's height cannot
+                        // be in a consistent view of the chain it extends
+                        // (that chain ends at height-1).  It is our own state
+                        // — e.g. this very block already connected, or a
+                        // disconnected block's coin read back from disk —
+                        // not a duplicate the block introduced.  Gate 6: a
+                        // system fault, never a verdict (Core ConnectBlock
+                        // bad-txns-BIP30, validation.cpp:2471, can only see
+                        // coins below the block: CCoinsViewCache holds the
+                        // view at pindex->pprev).
+                        if (hit.height >= height) return ValidationError.UtxoViewInconsistent;
                         return ValidationError.Bip30DuplicateOutput;
                     }
                 }
@@ -11106,6 +11131,10 @@ test "W85: BadVersion v<3 NOT rejected before BIP66 activation (mainnet h=363724
 /// the same txid as the block's coinbase.
 const Bip30LookupCtx = struct {
     target_txid: types.Hash256,
+    /// Height of the colliding coin.  A real BIP-30 duplicate is a coin from
+    /// BELOW the block (default 0); a coin at/above the block's own height
+    /// is a coins-view inconsistency (UtxoViewInconsistent, gate 6).
+    coin_height: u32 = 0,
 };
 
 fn bip30HitLookup(ctx: *anyopaque, outpoint: *const types.OutPoint) ?PrevOutInfo {
@@ -11115,7 +11144,7 @@ fn bip30HitLookup(ctx: *anyopaque, outpoint: *const types.OutPoint) ?PrevOutInfo
         return PrevOutInfo{
             .script_pubkey = &[_]u8{0x51},
             .amount = 100,
-            .height = 1000,
+            .height = bctx.coin_height,
             .is_coinbase = true,
             .owner_allocator = null,
         };
@@ -11227,6 +11256,47 @@ test "validateBlockForIBD: BIP-30 rejects duplicate UTXO (pre-BIP34 height)" {
         .force_skip_scripts = true,
     }, alloc);
     try std.testing.expectError(ValidationError.Bip30DuplicateOutput, result);
+}
+
+fn bip30SelfDupRun(coin_height: u32) ValidationError!void {
+    const alloc = std.testing.allocator;
+    var cb_bufs: Bip30CoinbaseBufs = .{};
+    var cb = bip30MakeCoinbase(100, &cb_bufs);
+    var blk = types.Block{ .header = consensus.REGTEST.genesis_header, .transactions = &[_]types.Transaction{cb} };
+    bip30Mine(&blk, alloc);
+    var hit_ctx = Bip30LookupCtx{ .target_txid = crypto.computeTxidStreaming(&cb), .coin_height = coin_height };
+    var p = consensus.MAINNET;
+    p.genesis_header.bits = 0x207fffff;
+    p.pow_limit = consensus.REGTEST.pow_limit;
+    p.pow_no_retarget = true;
+    return validateBlockForIBD(&blk, &IBDValidationContext{
+        .block_hash = crypto.computeBlockHash(&blk.header),
+        .height = 100,
+        .params = &p,
+        .prevout_lookup_ctx = @ptrCast(&hit_ctx),
+        .prevout_lookupFn = bip30HitLookup,
+        .active_chain = null,
+        .best_tip_chain_work = [_]u8{0} ** 32,
+        .best_tip_timestamp = 0,
+        .prev_mtp = 0,
+        .force_skip_scripts = true,
+    }, alloc);
+}
+
+test "bip30-self-dup: a BIP-30 hit on a coin from AT/ABOVE the block's height is a view fault (gate 6), never a verdict" {
+    // The 2026-10-05 fast-sync wedge: the probe found the block's OWN
+    // coinbase (height == the block's height) and the valid block was marked
+    // BLOCK_FAILED_VALID.  Such a coin cannot exist in a consistent view of
+    // the chain the block extends (it ends at height-1).
+    try std.testing.expectError(ValidationError.UtxoViewInconsistent, bip30SelfDupRun(100));
+    try std.testing.expectError(ValidationError.UtxoViewInconsistent, bip30SelfDupRun(101));
+    try std.testing.expect(isSystemValidationError(ValidationError.UtxoViewInconsistent));
+}
+
+test "bip30-self-dup: CONTROL — a genuine duplicate (colliding coin from below the block) is still rejected" {
+    try std.testing.expectError(ValidationError.Bip30DuplicateOutput, bip30SelfDupRun(99));
+    try std.testing.expectError(ValidationError.Bip30DuplicateOutput, bip30SelfDupRun(1));
+    try std.testing.expect(!isSystemValidationError(ValidationError.Bip30DuplicateOutput));
 }
 
 test "validateBlockForIBD: BIP-30 exempt at h=91842 only when hash matches (W79)" {

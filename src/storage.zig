@@ -1027,6 +1027,21 @@ pub const UtxoSet = struct {
 
     // Batched DB deletes for IBD performance
     pending_deletes: std.ArrayList([36]u8),
+    /// Membership index over `pending_deletes`.  A key in here is SPENT in
+    /// this view even though its record is still on disk until the next
+    /// flush.  Every DB read-through (get / contains / haveCoin / spend /
+    /// prefetchBlockInputs) must consult it — Core's CCoinsViewCache keeps a
+    /// spent coin as a DIRTY spent entry in cacheCoins, so FetchCoin never
+    /// falls through to the base view for it (coins.cpp:68-82, HaveCoin
+    /// :188, SpendCoin :154).  Before this index, get() fell through to the
+    /// stale disk record: a reorg that disconnected block B and reconnected
+    /// it (or any new-branch block re-creating one of B's txids) saw B's
+    /// coin as live → Bip30DuplicateOutput → a VALID block marked invalid
+    /// (fast-P2P-sync wedge, 2026-10-05), and a coin spent by an earlier
+    /// block of the same no-flush batch read as unspent (prefetch even
+    /// resurrected it into the cache as live).
+    /// Mutate only through queueDelete / clearPendingDeletes.
+    pending_delete_set: std.HashMap([36]u8, void, UtxoKeyContext, std.hash_map.default_max_load_percentage),
     adds_since_eviction_check: u32,
     // Track dirty keys for O(dirty) flush instead of O(cache) scan
     dirty_keys: std.ArrayList([36]u8),
@@ -1037,6 +1052,9 @@ pub const UtxoSet = struct {
     // When true, suppress eviction during block connection to prevent
     // mid-block flushes that can write partial state.
     suppress_eviction: bool = false,
+    /// Set when pending_delete_set could not index a key (OOM);
+    /// isPendingDelete then also scans the list.
+    pending_delete_index_degraded: bool = false,
 
     /// Cache entry with ownership tracking.
     const CacheEntry = struct {
@@ -1071,6 +1089,7 @@ pub const UtxoSet = struct {
             .hits = 0,
             .misses = 0,
             .pending_deletes = std.ArrayList([36]u8).init(allocator),
+            .pending_delete_set = std.HashMap([36]u8, void, UtxoKeyContext, std.hash_map.default_max_load_percentage).init(allocator),
             .adds_since_eviction_check = 0,
             .dirty_keys = std.ArrayList([36]u8).init(allocator),
         };
@@ -1079,6 +1098,7 @@ pub const UtxoSet = struct {
     pub fn deinit(self: *UtxoSet) void {
         self.flushPendingDeletes() catch {};
         self.pending_deletes.deinit();
+        self.pending_delete_set.deinit();
         self.dirty_keys.deinit();
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
@@ -1086,6 +1106,40 @@ pub const UtxoSet = struct {
             cache_entry.deinit(self.allocator);
         }
         self.cache.deinit();
+    }
+
+    /// Queue a durable delete for `key` (the coin is spent in this view).
+    pub fn queueDelete(self: *UtxoSet, key: [36]u8) void {
+        const gop = self.pending_delete_set.getOrPut(key) catch {
+            // Index OOM: still queue the delete (durability first); the
+            // linear fallback in isPendingDelete keeps reads correct.
+            self.pending_delete_index_degraded = true;
+            self.pending_deletes.append(key) catch {};
+            return;
+        };
+        if (gop.found_existing) return; // already queued — deletes are idempotent
+        self.pending_deletes.append(key) catch {};
+    }
+
+    /// True iff `key` was spent in this view and its disk record is only
+    /// awaiting the next flush's delete.
+    pub fn isPendingDelete(self: *const UtxoSet, key: *const [36]u8) bool {
+        if (self.pending_deletes.items.len == 0) return false;
+        if (self.pending_delete_set.contains(key.*)) return true;
+        if (self.pending_delete_index_degraded) {
+            for (self.pending_deletes.items) |pk| {
+                if (std.mem.eql(u8, &pk, key)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Drop every queued delete (after a flush committed them, or when an
+    /// aborted batch is discarded).
+    pub fn clearPendingDeletes(self: *UtxoSet) void {
+        self.pending_deletes.clearRetainingCapacity();
+        self.pending_delete_set.clearRetainingCapacity();
+        self.pending_delete_index_degraded = false;
     }
 
     /// W92 — Bitcoin Core CCoinsViewCache::HaveCoin analogue.  Returns
@@ -1111,11 +1165,8 @@ pub const UtxoSet = struct {
         // Fall back to DB.
         if (self.db) |db| {
             // First check pending_deletes — if queued for delete, treat
-            // as spent.  pending_deletes is small (per-block), linear
-            // scan is fine for the disconnect path.
-            for (self.pending_deletes.items) |pkey| {
-                if (std.mem.eql(u8, &pkey, &key)) return false;
-            }
+            // as spent.
+            if (self.isPendingDelete(&key)) return false;
             const data = db.get(CF_UTXO, &key) catch return false;
             if (data) |bytes| {
                 self.allocator.free(bytes);
@@ -1142,6 +1193,10 @@ pub const UtxoSet = struct {
                 .hash_or_script = try self.allocator.dupe(u8, entry.utxo.hash_or_script),
             };
         }
+
+        // Spent in this view, delete not yet flushed: the disk record is
+        // stale.  Core: a DIRTY spent cacheCoins entry (never FetchCoinFromBase).
+        if (self.isPendingDelete(&key)) return null;
 
         // Fall back to database if available
         if (self.db) |db| {
@@ -1192,6 +1247,8 @@ pub const UtxoSet = struct {
         if (self.cache.contains(key)) {
             return true;
         }
+
+        if (self.isPendingDelete(&key)) return false; // spent, delete unflushed
 
         // Fall back to database if available
         if (self.db) |db| {
@@ -1247,6 +1304,10 @@ pub const UtxoSet = struct {
             for (tx.inputs) |input| {
                 const key = makeUtxoKey(&input.previous_output);
                 if (self.cache.contains(key)) continue;
+                // Spent earlier in this flush window: the disk record is
+                // stale and must NOT be warmed into the cache as a live coin
+                // (that resurrected it, so a second spend succeeded).
+                if (self.isPendingDelete(&key)) continue;
                 miss_keys.appendAssumeCapacity(key);
             }
         }
@@ -1503,7 +1564,7 @@ pub const UtxoSet = struct {
             // huge win during IBD where many UTXOs are created and spent
             // within the same flush window.
             if (self.db != null and !old.value.fresh) {
-                self.pending_deletes.append(key) catch {};
+                self.queueDelete(key);
                 // Pending deletes are flushed atomically with the chain tip
                 // in ChainState.flush() (called every 100 blocks from
                 // connectBlockFast).  Do NOT flush here — an independent
@@ -1528,9 +1589,7 @@ pub const UtxoSet = struct {
         // Core rejects via bad-txns-inputs-missingorspent in ConnectBlock
         // (validation.cpp) when the in-place CCoinsViewCache finds the coin
         // already marked spent.  Reference: dup-txid-merkle-malleation corpus.
-        for (self.pending_deletes.items) |pd_key| {
-            if (std.mem.eql(u8, &pd_key, &key)) return null;
-        }
+        if (self.isPendingDelete(&key)) return null;
 
         // Not in cache, try database
         if (self.db) |db| {
@@ -1542,7 +1601,7 @@ pub const UtxoSet = struct {
 
             // Batch the DB delete.  Flush is deferred to ChainState.flush()
             // so that deletes are atomic with the chain tip.
-            self.pending_deletes.append(key) catch {};
+            self.queueDelete(key);
 
             self.total_utxos -|= 1;
             self.total_amount -|= utxo.value;
@@ -1673,7 +1732,7 @@ pub const UtxoSet = struct {
             }
         }
 
-        self.pending_deletes.clearRetainingCapacity();
+        self.clearPendingDeletes();
     }
 
     /// Get cache hit rate.
@@ -6479,11 +6538,49 @@ pub const ChainState = struct {
 
     pub fn reorgToChainWithOptions(
         self: *ChainState,
-        fork_point_hash: *const types.Hash256,
-        new_chain: []const ReorgBlock,
+        fork_point_hash_in: *const types.Hash256,
+        new_chain_in: []const ReorgBlock,
         drive_opts: ReorgDriveOptions,
         drive_result: ?*ReorgDriveResult,
     ) !u32 {
+        // Never DISCONNECT and RE-CONNECT a block that is already on the
+        // active chain.  Core ActivateBestChainStep (validation.cpp:3197-
+        // 3202) disconnects only down to pindexFork = FindFork(most-work),
+        // the LAST common block, so a leading new-chain block that is
+        // already active is simply kept.  A caller whose fork point went
+        // stale (the drain connected the first fork blocks after the reorg
+        // was armed — the 2026-10-05 fast-sync wedge) handed us [h9, h10]
+        // from h8 while h9 was the tip; disconnecting h9 and re-connecting
+        // it is pure churn at best and, with any coins-view staleness, a
+        // Bip30DuplicateOutput "verdict" on our own valid block.  Advance
+        // the fork point past the active prefix here, at the one choke point
+        // every reorg caller goes through.  Index results (connected count,
+        // connected_before_reject) stay relative to the caller's new_chain.
+        var active_prefix: usize = 0;
+        while (active_prefix < new_chain_in.len) : (active_prefix += 1) {
+            const e = &new_chain_in[active_prefix];
+            if (e.height > self.best_height) break;
+            const on = self.getBlockHashByHeight(e.height) orelse break;
+            if (!std.mem.eql(u8, &on, &e.hash)) break;
+        }
+        if (active_prefix > 0 and active_prefix == new_chain_in.len) {
+            std.debug.print(
+                "reorgToChain: all {d} new-chain block(s) are already on the active chain — nothing to reorg (not a verdict)\n",
+                .{active_prefix},
+            );
+            return error.ReorgAlreadyActive;
+        }
+        var fork_point_local: types.Hash256 = fork_point_hash_in.*;
+        if (active_prefix > 0) {
+            fork_point_local = new_chain_in[active_prefix - 1].hash;
+            std.debug.print(
+                "reorgToChain: {d} leading new-chain block(s) already on the active chain — fork point advanced to h={d}, not re-connected\n",
+                .{ active_prefix, new_chain_in[active_prefix - 1].height },
+            );
+        }
+        const fork_point_hash: *const types.Hash256 = &fork_point_local;
+        const new_chain: []const ReorgBlock = new_chain_in[active_prefix..];
+
         // Reorg-depth cap for this node's config: unbounded on an archive
         // node (Core-parity — follow most-work to any depth), 288 only when
         // pruning is enabled.  See `reorgDepthCap`.
@@ -6592,7 +6689,9 @@ pub const ChainState = struct {
         // The fork point is the tip left standing by the disconnect walk;
         // ReorgMtpSource keys its shared-vs-new-branch split off it (#53c).
         const fork_height = self.best_height;
-        var connect_count: u32 = 0;
+        // Counted relative to the caller's new_chain (the active prefix is
+        // already "connected").
+        var connect_count: u32 = @intCast(active_prefix);
         for (new_chain) |entry| {
             // Linkage check: caller is supposed to guarantee this, but
             // double-check so a bad input doesn't corrupt chainstate.
@@ -7038,7 +7137,7 @@ pub const ChainState = struct {
         var it = self.utxo_set.cache.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.utxo_set.cache.clearRetainingCapacity();
-        self.utxo_set.pending_deletes.clearRetainingCapacity();
+        self.utxo_set.clearPendingDeletes();
         self.utxo_set.dirty_keys.clearRetainingCapacity();
         self.utxo_set.suppress_eviction = false;
 
@@ -7140,7 +7239,7 @@ pub const ChainState = struct {
         // sticky-divergent until restart, but flush_error blocks all
         // further reads-after-write through chain_state so the
         // divergence is unobservable to callers.
-        self.utxo_set.pending_deletes.clearRetainingCapacity();
+        self.utxo_set.clearPendingDeletes();
         self.utxo_set.dirty_keys.clearRetainingCapacity();
 
         // The deferred-flush batch is being abandoned; clear the guard so any
@@ -8268,7 +8367,7 @@ pub const ChainState = struct {
             // failed above we kept them so the next flush retries the same
             // set of mutations.
             self.utxo_set.dirty_keys.clearRetainingCapacity();
-            self.utxo_set.pending_deletes.clearRetainingCapacity();
+            self.utxo_set.clearPendingDeletes();
 
             // CF_BLOCKS bodies committed: free the queued bytes and clear
             // the queue. Done before the batch-cleanup loop so the bytes

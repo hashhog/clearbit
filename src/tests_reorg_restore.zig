@@ -985,3 +985,222 @@ test "tests_reorg_restore: reorg rejecting the FIRST side-branch block rolls bac
 test "tests_reorg_restore: reorg rejecting a LATER side-branch block rolls back the connected one too (UTXO + X:/W: keys)" {
     try rbRun(1);
 }
+
+// ====================================================================
+// BIP-30 self-duplicate wedge (2026-10-05, fast P2P sync).  A pending reorg
+// armed from h(N-1) over [hN, hN+1] fired AFTER the drain had connected hN:
+// reorgToChain disconnected hN and re-connected it, and the BIP-30 probe
+// found hN's own coinbase (the disconnect's delete was only PENDING — the
+// coins view fell through to the stale disk record) → Bip30DuplicateOutput
+// → a VALID block marked BLOCK_FAILED_VALID → wedge.  Core never re-connects
+// an active block (ActivateBestChainStep disconnects only to FindFork), and
+// its CCoinsViewCache keeps a spent coin as a DIRTY spent entry so the base
+// view is never consulted for it (coins.cpp FetchCoin/HaveCoin/SpendCoin).
+// ====================================================================
+
+
+fn bip30ChainA(cs: *ChainState, arena: std.mem.Allocator, a: []MtpTestBlock, n: u32) !void {
+    var prev: [32]u8 = [_]u8{0} ** 32;
+    var h: u32 = 1;
+    while (h <= n) : (h += 1) {
+        a[h] = try makeRbBlock(arena, prev, h, @intCast(0x40 + h), 5_000_000_000);
+        try queueAndConnect(cs, &a[h].block, &a[h].hash, h);
+        prev = a[h].hash;
+    }
+}
+
+test "tests_reorg_restore: bip30-self-dup — a stale fork point never re-connects the active tip (valid block NOT rejected)" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(consensus_mod.getNetworkParams(.regtest));
+
+    var a: [5]MtpTestBlock = undefined;
+    try bip30ChainA(&cs, arena, &a, 3); // tip = A3, every block flushed
+    const a4 = try makeRbBlock(arena, a[3].hash, 4, 0x44, 5_000_000_000);
+
+    // The armed reorg: fork point A2 (stale — A3 is already the tip), chain
+    // [A3, A4].  Pre-fix: disconnect A3, re-connect A3 -> Bip30DuplicateOutput.
+    var new_chain = [_]ChainState.ReorgBlock{
+        .{ .hash = a[3].hash, .block = a[3].block, .height = 3 },
+        .{ .hash = a4.hash, .block = a4.block, .height = 4 },
+    };
+    var dr: ChainState.ReorgDriveResult = .{};
+    const connected = cs.reorgToChainWithOptions(&a[2].hash, &new_chain, .{ .connect_force_skip_pow = true }, &dr) catch |err| {
+        std.debug.print("bip30-self-dup: reorg failed {} reject={?}\n", .{ err, dr.connect_reject_err });
+        return err;
+    };
+    try std.testing.expectEqual(@as(u32, 2), connected); // relative to the caller's chain
+    try std.testing.expectEqual(@as(u32, 4), cs.best_height);
+    try std.testing.expectEqualSlices(u8, &a4.hash, &cs.best_hash);
+    try std.testing.expect(!cs.flush_error);
+    try std.testing.expect(try rbHasCoin(&cs, &rbCoinbaseOutpoint(&a[3].block)));
+    try std.testing.expect(try rbHasCoin(&cs, &rbCoinbaseOutpoint(&a4.block)));
+
+    // Whole fork already active -> nothing to do, not a verdict, tip unchanged.
+    var all_active = [_]ChainState.ReorgBlock{
+        .{ .hash = a[3].hash, .block = a[3].block, .height = 3 },
+        .{ .hash = a4.hash, .block = a4.block, .height = 4 },
+    };
+    try std.testing.expectError(error.ReorgAlreadyActive, cs.reorgToChainWithOptions(&a[2].hash, &all_active, .{ .connect_force_skip_pow = true }, null));
+    try std.testing.expectEqual(@as(u32, 4), cs.best_height);
+    try std.testing.expect(!cs.flush_error);
+}
+
+test "tests_reorg_restore: bip30-self-dup — coins view: a coin spent but not yet flushed reads as SPENT (get/contains/prefetch)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    const op = types.OutPoint{ .hash = [_]u8{0xD1} ** 32, .index = 0 };
+    const out = types.TxOut{ .value = 1000, .script_pubkey = &[_]u8{0x51} };
+    try cs.utxo_set.add(&op, &out, 1, false);
+    try cs.flush(); // durable on disk, cache entry clean (not fresh)
+    try std.testing.expect(try rbHasCoin(&cs, &op));
+
+    var spent = (try cs.utxo_set.spend(&op)) orelse return error.TestUnexpectedResult;
+    spent.deinit(allocator);
+    // Delete is pending (no flush yet): the disk record is stale.
+    try std.testing.expect(!try rbHasCoin(&cs, &op));
+    try std.testing.expect(!try cs.utxo_set.contains(&op));
+    try std.testing.expect(!cs.utxo_set.haveCoin(&op));
+    // A block spending it again must not get it warmed back as live.
+    const in_ = [_]types.TxIn{.{ .previous_output = op, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} }};
+    const cb_in = [_]types.TxIn{.{ .previous_output = types.OutPoint.COINBASE, .script_sig = &[_]u8{ 0x51, 0x00 }, .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} }};
+    const txs = [_]types.Transaction{
+        .{ .version = 1, .inputs = &cb_in, .outputs = &[_]types.TxOut{out}, .lock_time = 0 },
+        .{ .version = 1, .inputs = &in_, .outputs = &[_]types.TxOut{out}, .lock_time = 0 },
+    };
+    const blk = types.Block{ .header = std.mem.zeroes(types.BlockHeader), .transactions = &txs };
+    _ = try cs.utxo_set.prefetchBlockInputs(&blk);
+    try std.testing.expect(!try rbHasCoin(&cs, &op));
+    try std.testing.expect((try cs.utxo_set.spend(&op)) == null);
+    // After the flush commits the delete the view still agrees.
+    try cs.flush();
+    try std.testing.expect(!try rbHasCoin(&cs, &op));
+    // Re-adding after the pending delete makes it live again (undo restore).
+    try cs.utxo_set.add(&op, &out, 1, false);
+    try std.testing.expect(try rbHasCoin(&cs, &op));
+}
+
+test "tests_reorg_restore: bip30-self-dup — competing block with a byte-identical coinbase reorgs in (no false BIP-30)" {
+    // Two blocks at the same height that differ only in the header (same
+    // coinbase txid): Core disconnects A3 (its coinbase coin is spent in the
+    // view) and B3's identical coinbase is NOT a BIP-30 duplicate.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(consensus_mod.getNetworkParams(.regtest));
+
+    var a: [5]MtpTestBlock = undefined;
+    try bip30ChainA(&cs, arena, &a, 3);
+    var b3 = a[3];
+    b3.block.header.timestamp += 1; // different header, same transactions
+    b3.hash = [_]u8{0xB3} ** 32;
+    const b4 = try makeRbBlock(arena, b3.hash, 4, 0x54, 5_000_000_000);
+    var b4m = b4;
+    b4m.hash = [_]u8{0xB4} ** 32;
+    var new_chain = [_]ChainState.ReorgBlock{
+        .{ .hash = b3.hash, .block = b3.block, .height = 3 },
+        .{ .hash = b4m.hash, .block = b4m.block, .height = 4 },
+    };
+    var dr: ChainState.ReorgDriveResult = .{};
+    const connected = cs.reorgToChainWithOptions(&a[2].hash, &new_chain, .{ .connect_force_skip_pow = true }, &dr) catch |err| {
+        std.debug.print("identical-coinbase reorg failed {} reject={?}\n", .{ err, dr.connect_reject_err });
+        return err;
+    };
+    try std.testing.expectEqual(@as(u32, 2), connected);
+    try std.testing.expectEqualSlices(u8, &b4m.hash, &cs.best_hash);
+    try std.testing.expect(try rbHasCoin(&cs, &rbCoinbaseOutpoint(&b3.block)));
+}
+
+test "tests_reorg_restore: bip30-self-dup — a coin spent by an earlier new-branch block cannot be spent again in the same reorg" {
+    // Pre-fix the second spend read the stale disk record (get) and
+    // prefetchBlockInputs warmed it back into the cache as LIVE, so a
+    // double-spend across two side-branch blocks was ACCEPTED.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+    cs.setNetworkParams(consensus_mod.getNetworkParams(.regtest));
+
+    // Pre-fork OP_TRUE coin X, durable on disk.
+    const x = types.OutPoint{ .hash = [_]u8{0xEE} ** 32, .index = 0 };
+    const x_out = types.TxOut{ .value = 100_000_000, .script_pubkey = try arena.dupe(u8, &[_]u8{0x51}) };
+    try cs.utxo_set.add(&x, &x_out, 1, false);
+    var a: [5]MtpTestBlock = undefined;
+    try bip30ChainA(&cs, arena, &a, 3);
+
+    const mkSpend = struct {
+        fn f(ar: std.mem.Allocator, base: MtpTestBlock, outpoint: types.OutPoint, val: i64, hash_byte: u8) !MtpTestBlock {
+            var tb = base;
+            const ins = try ar.alloc(types.TxIn, 1);
+            ins[0] = .{ .previous_output = outpoint, .script_sig = try ar.dupe(u8, &[_]u8{}), .sequence = 0xFFFFFFFF, .witness = &[_][]const u8{} };
+            const outs = try ar.alloc(types.TxOut, 1);
+            outs[0] = .{ .value = val, .script_pubkey = try ar.dupe(u8, &[_]u8{0x51}) };
+            const txs = try ar.alloc(types.Transaction, 2);
+            txs[0] = tb.block.transactions[0];
+            txs[1] = .{ .version = 1, .inputs = ins, .outputs = outs, .lock_time = 0 };
+            tb.block.transactions = txs;
+            const leaves = [_]types.Hash256{ crypto.computeTxidStreaming(&txs[0]), crypto.computeTxidStreaming(&txs[1]) };
+            tb.block.header.merkle_root = try crypto.computeMerkleRoot(&leaves, ar);
+            tb.hash = [_]u8{hash_byte} ** 32;
+            return tb;
+        }
+    }.f;
+    const b3 = try mkSpend(arena, try makeRbBlock(arena, a[2].hash, 3, 0xC3, 5_000_000_000), x, 99_000_000, 0xC3);
+    // B4 spends X AGAIN (different tx: different output value -> different txid).
+    const b4 = try mkSpend(arena, try makeRbBlock(arena, b3.hash, 4, 0xC4, 5_000_000_000), x, 98_000_000, 0xC4);
+    const b5 = try makeRbBlock(arena, b4.hash, 5, 0xC5, 5_000_000_000);
+    var b5m = b5;
+    b5m.hash = [_]u8{0xC5} ** 32;
+    var new_chain = [_]ChainState.ReorgBlock{
+        .{ .hash = b3.hash, .block = b3.block, .height = 3 },
+        .{ .hash = b4.hash, .block = b4.block, .height = 4 },
+        .{ .hash = b5m.hash, .block = b5m.block, .height = 5 },
+    };
+    var dr: ChainState.ReorgDriveResult = .{};
+    const res = cs.reorgToChainWithOptions(&a[2].hash, &new_chain, .{ .connect_force_skip_pow = true }, &dr);
+    try std.testing.expectError(error.ReorgBlockInvalid, res);
+    try std.testing.expectEqual(@as(?@import("validation.zig").ValidationError, error.MissingInput), dr.connect_reject_err);
+    try std.testing.expectEqual(@as(u32, 1), dr.connected_before_reject); // B4 is the bad one
+    try std.testing.expectEqual(@as(u32, 3), cs.best_height);
+    try std.testing.expectEqualSlices(u8, &a[3].hash, &cs.best_hash);
+    try std.testing.expect(try rbHasCoin(&cs, &x)); // rolled back: X unspent again
+}
