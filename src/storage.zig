@@ -4407,6 +4407,55 @@ pub const ChainState = struct {
         return 0;
     }
 
+    /// nTime of the ACTIVE-chain block at height `h`, or null when it cannot
+    /// be resolved.
+    ///
+    /// Sources, in order: the in-memory retarget ring (every block connected
+    /// since boot, last RETARGET_RING_SIZE heights — written by
+    /// connectBlockInner, so a height <= best_height always holds the
+    /// active-chain block: a disconnected height is overwritten when the
+    /// replacement block at that height connects); the tip's own persisted
+    /// header; then the H:height→hash index + the persisted header / block
+    /// body; genesis from the network params.  A storage READ error answers
+    /// null as well — every caller treats null as "unknown" and falls back
+    /// to a conservative answer (never a waived lock).
+    pub fn timestampAtActiveHeight(self: *ChainState, h: u32) ?u32 {
+        if (h > self.best_height) return null;
+        if (self.getRetargetEntry(h)) |re| return re.timestamp;
+        if (h == 0) {
+            if (self.network_params) |p| return p.genesis_header.timestamp;
+            return null;
+        }
+        const hash: types.Hash256 = if (h == self.best_height)
+            self.best_hash
+        else
+            (self.getBlockHashByHeight(h) orelse return null);
+        if (self.getPersistedHeader(&hash)) |hdr| return hdr.timestamp;
+        if (self.getBlockHeaderFromBody(&hash)) |hdr| return hdr.timestamp;
+        return null;
+    }
+
+    /// Median-time-past OF the active-chain block at height `h` — Core's
+    /// `chainActive[h]->GetMedianTimePast()` over the full min(11, h + 1)
+    /// window.  null when any timestamp in the window is unresolvable (a
+    /// truncated window is a different median, i.e. a different wrong
+    /// answer).
+    ///
+    /// The BIP-68 per-coin time for a coin confirmed at height H is
+    /// `mtpAtActiveHeight(max(H - 1, 0))` (Core CalculateSequenceLocks,
+    /// consensus/tx_verify.cpp: `block.GetAncestor(max(nCoinHeight-1,0))
+    /// ->GetMedianTimePast()`).
+    pub fn mtpAtActiveHeight(self: *ChainState, h: u32) ?u32 {
+        if (h > self.best_height) return null;
+        const want: usize = @min(@as(usize, 11), @as(usize, h) + 1);
+        var ts: [11]u32 = undefined;
+        var i: usize = 0;
+        while (i < want) : (i += 1) {
+            ts[i] = self.timestampAtActiveHeight(h - @as(u32, @intCast(i))) orelse return null;
+        }
+        return @import("validation.zig").medianTimePast(ts[0..want]);
+    }
+
     /// Rebuild the BIP-113 MTP ring from persisted headers at boot.
     ///
     /// Before this ran, EVERY restart left the ring holding one entry — the

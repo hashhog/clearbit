@@ -1243,11 +1243,6 @@ pub const Mempool = struct {
         var conflicting_txids = std.ArrayList(types.Hash256).init(self.allocator);
         defer conflicting_txids.deinit();
 
-        // Per-input UTXO info for BIP-68 sequence lock calculation.
-        // Mempool-parent inputs use synthetic height tipHeight+1 (Core convention).
-        var seq_utxo_infos = std.ArrayList(validation.UtxoInfo).init(self.allocator);
-        defer seq_utxo_infos.deinit();
-
         for (tx.inputs) |input| {
             // Check mempool first for unconfirmed parent outputs
             if (self.getOutputFromMempool(&input.previous_output)) |mempool_output| {
@@ -1263,12 +1258,6 @@ pub const Mempool = struct {
                 if (!consensus.isValidMoney(total_in)) {
                     return MempoolError.InputValuesOutOfRange;
                 }
-                // Mempool-parent: synthetic confirmed height = tipHeight + 1 (Core PreChecks).
-                const synthetic_height: u32 = if (self.chain_state) |cs2| cs2.best_height + 1 else 1;
-                seq_utxo_infos.append(validation.UtxoInfo{
-                    .height = synthetic_height,
-                    .mtp = if (self.chain_state) |cs2| cs2.computeMTP() else 0,
-                }) catch return MempoolError.OutOfMemory;
             } else if (self.chain_state) |cs| {
                 // Then check UTXO set
                 const utxo = cs.utxo_set.get(&input.previous_output) catch null;
@@ -1297,21 +1286,12 @@ pub const Mempool = struct {
                             return MempoolError.ImmatureCoinbase;
                         }
                     }
-
-                    // Collect per-input UTXO info for BIP-68 checks.
-                    // Use tip MTP conservatively for the coin's MTP (may false-reject
-                    // time-locked txs near the boundary but never false-admits).
-                    seq_utxo_infos.append(validation.UtxoInfo{
-                        .height = u.height,
-                        .mtp = cs.computeMTP(),
-                    }) catch return MempoolError.OutOfMemory;
                 } else {
                     return MempoolError.MissingInputs;
                 }
             } else {
                 // No chain state - for testing, assume inputs exist
                 // In production this would return MissingInputs
-                seq_utxo_infos.append(validation.UtxoInfo{ .height = 0, .mtp = 0 }) catch {};
             }
 
             // Check if another mempool tx spends this outpoint (potential RBF conflict)
@@ -1335,48 +1315,8 @@ pub const Mempool = struct {
 
         // 5b. BIP-68 SequenceLocks: per-input relative locktimes (CSV).
         //     Reference: Bitcoin Core CheckSequenceLocksAtTip() (validation.cpp ~line 887).
-        //     Only enforced when CSV height is active and tx.version >= 2.
-        if (self.chain_state) |cs| {
-            const p2 = self.params orelse &consensus.MAINNET;
-            const next_height: u32 = cs.best_height + 1;
-            const mtp: u32 = cs.computeMTP();
-            if (cs.best_height >= p2.csv_height and
-                // version compared UNSIGNED (Core uint32_t); see validation.bip68VersionActive.
-                validation.bip68VersionActive(tx.version) and
-                seq_utxo_infos.items.len == tx.inputs.len)
-            {
-                // Build a UtxoView backed by the collected infos (indexed by input position).
-                const SeqView = struct {
-                    infos: []const validation.UtxoInfo,
-                    inputs: []const types.TxIn,
-
-                    fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.UtxoInfo {
-                        const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                        for (me.inputs, 0..) |inp, i| {
-                            if (std.mem.eql(u8, &inp.previous_output.hash, &outpoint.hash) and
-                                inp.previous_output.index == outpoint.index)
-                            {
-                                return me.infos[i];
-                            }
-                        }
-                        return null;
-                    }
-                };
-                var sv = SeqView{ .infos = seq_utxo_infos.items, .inputs = tx.inputs };
-                const utxo_view = validation.UtxoView{
-                    .context = @ptrCast(&sv),
-                    .lookupFn = SeqView.lookup,
-                };
-                const tip_index = validation.BlockIndex{
-                    .height = next_height,
-                    .prev_mtp = mtp,
-                };
-                const lock_result = validation.calculateSequenceLocks(&tx, &utxo_view, next_height, p2);
-                if (!validation.checkSequenceLocks(lock_result, &tip_index)) {
-                    return MempoolError.SequenceLockNotSatisfied;
-                }
-            }
-        }
+        //     See checkSequenceLocksAtTip for the per-coin height / time rules.
+        try self.checkSequenceLocksAtTip(&tx);
 
         // 6. Compute size and check minimum fee
         const weight = computeTxWeight(&tx, self.allocator) catch return MempoolError.OutOfMemory;
@@ -1650,6 +1590,113 @@ pub const Mempool = struct {
     /// - test_accept: When true, validate but don't actually add to mempool
     ///
     /// Returns AcceptResult with acceptance status and details.
+    /// BIP-68 nCoinTime for a CONFIRMED coin at `coin_height`: the MTP of the
+    /// block PRIOR to the coin's block — Core CalculateSequenceLocks
+    /// (consensus/tx_verify.cpp): `block.GetAncestor(max(nCoinHeight-1, 0))
+    /// ->GetMedianTimePast()`.
+    ///
+    /// When that window cannot be resolved (pre-snapshot-base coin, read
+    /// error, DB-less test), answer `tip_mtp`: MTP is non-decreasing along a
+    /// chain (each block's nTime must exceed its parent's MTP), so the tip's
+    /// MTP is an UPPER bound on any confirmed coin's nCoinTime, and a larger
+    /// coin time only makes the lock harder to satisfy — it can refuse a valid
+    /// spend but never admit a non-final one.
+    ///
+    /// Before this, EVERY confirmed coin got the tip MTP, so a time-based
+    /// relative lock could never be satisfied in the mempool
+    /// (tipMTP + 512·n − 1 ≥ tipMTP for every n ≥ 1).
+    pub fn confirmedCoinTime(cs: *storage.ChainState, coin_height: u32, tip_mtp: u32) u32 {
+        const prev_h: u32 = if (coin_height > 0) coin_height - 1 else 0;
+        return cs.mtpAtActiveHeight(prev_h) orelse tip_mtp;
+    }
+
+    /// BIP-68 CheckSequenceLocksAtTip for a transaction being considered for
+    /// the NEXT block (Core validation.cpp CalculateLockPointsAtTip +
+    /// CheckSequenceLocksAtTip):
+    ///   * evaluated at height tip+1 against prev_mtp = tip MTP;
+    ///   * a coin created by a MEMPOOL parent counts as confirmed at tip+1
+    ///     (CalculatePrevHeights: MEMPOOL_HEIGHT → tip.nHeight + 1), so its
+    ///     nCoinTime is GetAncestor(tip)->MTP = the tip MTP;
+    ///   * a CONFIRMED coin uses its own height and the MTP of the block
+    ///     before it (confirmedCoinTime).
+    /// Input missing from both the mempool and the UTXO set → MissingInputs
+    /// (Core: CalculateLockPointsAtTip returns nullopt → tx refused).
+    /// Shared by addTransaction, the testmempoolaccept dry run and the
+    /// post-reorg re-check (removeForReorg).
+    pub fn checkSequenceLocksAtTip(self: *Mempool, tx: *const types.Transaction) MempoolError!void {
+        const cs = self.chain_state orelse return;
+        const p = self.params orelse &consensus.MAINNET;
+        if (cs.best_height < p.csv_height) return;
+        // version compared UNSIGNED (Core uint32_t); see validation.bip68VersionActive.
+        if (!validation.bip68VersionActive(tx.version)) return;
+        var any_lock = false;
+        for (tx.inputs) |inp| {
+            if ((inp.sequence & consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0) {
+                any_lock = true;
+                break;
+            }
+        }
+        if (!any_lock) return;
+
+        const next_height: u32 = cs.best_height + 1;
+        const tip_mtp: u32 = cs.computeMTP();
+
+        const infos = self.allocator.alloc(validation.UtxoInfo, tx.inputs.len) catch return MempoolError.OutOfMemory;
+        defer self.allocator.free(infos);
+        for (tx.inputs, 0..) |inp, i| {
+            if ((inp.sequence & consensus.SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0) {
+                infos[i] = .{ .height = 0, .mtp = 0 };
+                continue;
+            }
+            const time_lock = (inp.sequence & consensus.SEQUENCE_LOCKTIME_TYPE_FLAG) != 0;
+            if (self.getOutputFromMempool(&inp.previous_output) != null) {
+                infos[i] = .{ .height = next_height, .mtp = tip_mtp };
+                continue;
+            }
+            const utxo = cs.utxo_set.get(&inp.previous_output) catch null;
+            const u = utxo orelse return MempoolError.MissingInputs;
+            const coin_height = u.height;
+            {
+                var mut_u = u;
+                mut_u.deinit(self.allocator);
+            }
+            infos[i] = .{
+                .height = coin_height,
+                .mtp = if (time_lock) confirmedCoinTime(cs, coin_height, tip_mtp) else 0,
+            };
+        }
+
+        const SeqView = struct {
+            infos: []const validation.UtxoInfo,
+            inputs: []const types.TxIn,
+
+            fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.UtxoInfo {
+                const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                for (me.inputs, 0..) |inp, i| {
+                    if (std.mem.eql(u8, &inp.previous_output.hash, &outpoint.hash) and
+                        inp.previous_output.index == outpoint.index)
+                    {
+                        return me.infos[i];
+                    }
+                }
+                return null;
+            }
+        };
+        var sv = SeqView{ .infos = infos, .inputs = tx.inputs };
+        const utxo_view = validation.UtxoView{
+            .context = @ptrCast(&sv),
+            .lookupFn = SeqView.lookup,
+        };
+        const tip_index = validation.BlockIndex{
+            .height = next_height,
+            .prev_mtp = tip_mtp,
+        };
+        const lock_result = validation.calculateSequenceLocks(tx, &utxo_view, next_height, p);
+        if (!validation.checkSequenceLocks(lock_result, &tip_index)) {
+            return MempoolError.SequenceLockNotSatisfied;
+        }
+    }
+
     pub fn acceptToMemoryPool(self: *Mempool, tx: types.Transaction, test_accept: bool) AcceptResult {
         if (fatal.isLatched()) return AcceptResult{
             .accepted = false,
@@ -1785,6 +1832,7 @@ pub const Mempool = struct {
                     // "non-final" (validation.cpp:820).
                     MempoolError.MissingInputs => "missing-inputs",
                     MempoolError.NonFinal => "non-final",
+                    MempoolError.SequenceLockNotSatisfied => "non-BIP68-final",
                     else => "non-standard",
                 };
                 return AcceptResult{
@@ -3312,6 +3360,13 @@ pub const Mempool = struct {
                 break;
             }
         }
+
+        // 3a. BIP-68 sequence locks (Core PreChecks: CalculateLockPointsAtTip +
+        //     CheckSequenceLocksAtTip run right after the input-existence loop,
+        //     before the fee gate, and testmempoolaccept runs them too). The
+        //     dry run previously skipped them, so a non-BIP68-final tx was
+        //     reported allowed=true while sendrawtransaction refused it.
+        try self.checkSequenceLocksAtTip(tx);
 
         // Hoisted so the RBF conflict gate below can reuse it (Core computes
         // ws.m_vsize once in PreChecks and threads it into ReplacementChecks).

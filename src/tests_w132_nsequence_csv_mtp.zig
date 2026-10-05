@@ -237,10 +237,15 @@ test "w132 G11: height-based lock = coinHeight + (seq & MASK) - 1 (PRESENT)" {
     try testing.expectEqual(@as(i64, -1), r.min_time);
 }
 
-// G12 BUG-2 — Time-based lock formula uses utxo_info.mtp directly.
-// The bug: mempool callers pass `tip MTP` for `utxo_info.mtp` (mempool.zig:1126)
-// instead of `GetAncestor(coinHeight-1)->GetMedianTimePast()` (Core line 74).
-test "w132 G12 BUG-2: time-based lock arithmetic vs mempool tip-MTP misuse (PARTIAL, P1-CDIV)" {
+// G12 FIXED (was BUG-2) — Time-based lock formula uses utxo_info.mtp directly,
+// so the caller must supply GetAncestor(coinHeight-1)->GetMedianTimePast()
+// (Core tx_verify.cpp:74).  The mempool used to pass the TIP's MTP for every
+// confirmed coin, so a time-based relative lock could never be satisfied in
+// the mempool.  Fixed 2026-10-05 (Mempool.confirmedCoinTime →
+// ChainState.mtpAtActiveHeight(coinHeight - 1)); the BEHAVIORAL fail-before /
+// pass-after tests are tests_mtp_bip68.zig ("mtp-bip68: matured TIME-type
+// relative lock on a CONFIRMED coin is ACCEPTED").
+test "w132 G12 FIXED (was BUG-2): time-based lock arithmetic; mempool coin time = MTP(coinHeight-1), not tip MTP" {
     // Local sanity: with coin's MTP = 1_600_000_000 and lock_value = 10:
     // required_time = 1_600_000_000 + (10 << 9) - 1 = 1_600_005_119.
     const tx = makeTx(2, consensus.SEQUENCE_LOCKTIME_TYPE_FLAG | 10, 0);
@@ -250,12 +255,11 @@ test "w132 G12 BUG-2: time-based lock arithmetic vs mempool tip-MTP misuse (PART
     try testing.expectEqual(@as(i32, -1), r.min_height);
     try testing.expectEqual(@as(i64, 1_600_000_000 + (10 << 9) - 1), r.min_time);
 
-    // Source-level guard: mempool.zig populates seq_utxo_infos[i].mtp with
-    // cs.computeMTP() (the TIP's MTP), not getMtpAtHeightFn(coinHeight-1).
+    // Source-level guard: the tip-MTP-for-every-coin pattern is gone and the
+    // per-coin MTP(coinHeight-1) helper is what the mempool uses.
     const src = @embedFile("mempool.zig");
-    try testing.expect(std.mem.indexOf(u8, src, ".mtp = cs.computeMTP()") != null);
-    // And the comment acknowledging the divergence:
-    try testing.expect(std.mem.indexOf(u8, src, "tip MTP conservatively") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".mtp = cs.computeMTP()") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "confirmedCoinTime(cs, coin_height, tip_mtp)") != null);
 }
 
 // ===========================================================================
