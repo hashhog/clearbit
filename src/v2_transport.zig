@@ -1006,6 +1006,11 @@ pub const V2Transport = struct {
     /// ciphertext to `send_buffer`.
     version_packet_sent: bool = false,
 
+    /// Gate 6 (F12): set when a receive-side allocation failed, so the peer
+    /// layer reports OutOfMemory (our fault, no penalty) instead of a
+    /// protocol violation by the remote.
+    recv_oom: bool = false,
+
     pub fn init(
         allocator: std.mem.Allocator,
         initiating: bool,
@@ -1086,7 +1091,10 @@ pub const V2Transport = struct {
     /// Process received bytes.
     /// Returns false on unrecoverable error.
     pub fn processReceivedBytes(self: *V2Transport, data: []const u8) bool {
-        self.recv_buffer.appendSlice(data) catch return false;
+        self.recv_buffer.appendSlice(data) catch {
+            self.recv_oom = true;
+            return false;
+        };
         return self.processRecvBuffer();
     }
 
@@ -1145,7 +1153,10 @@ pub const V2Transport = struct {
                         }
 
                         // Append garbage terminator to send buffer
-                        self.send_buffer.appendSlice(self.cipher.getSendGarbageTerminator()) catch return false;
+                        self.send_buffer.appendSlice(self.cipher.getSendGarbageTerminator()) catch {
+                            self.recv_oom = true;
+                            return false;
+                        };
 
                         self.recv_state = .garbage;
                         self.send_state = .ready;
@@ -1155,7 +1166,10 @@ pub const V2Transport = struct {
                         // sent-garbage so the peer can authenticate the entire
                         // garbage prefix.  This matches Bitcoin Core's
                         // ProcessReceivedKeyBytes (net.cpp:1167).
-                        self.queueVersionPacket() catch return false;
+                        self.queueVersionPacket() catch {
+                            self.recv_oom = true;
+                            return false;
+                        };
                     } else {
                         return true;
                     }
@@ -1178,7 +1192,10 @@ pub const V2Transport = struct {
                         if (found) |idx| {
                             // Stash the garbage as recv_aad for the version packet.
                             if (idx > 0) {
-                                self.recv_aad = self.allocator.alloc(u8, idx) catch return false;
+                                self.recv_aad = self.allocator.alloc(u8, idx) catch {
+                                    self.recv_oom = true;
+                                    return false;
+                                };
                                 @memcpy(self.recv_aad, self.recv_buffer.items[0..idx]);
                             }
                             // Skip garbage + terminator
@@ -1223,7 +1240,10 @@ pub const V2Transport = struct {
 
                     // Decrypt payload (AAD is recv_aad on the first packet,
                     // empty thereafter).
-                    self.recv_decode_buffer.resize(content_len) catch return false;
+                    self.recv_decode_buffer.resize(content_len) catch {
+                        self.recv_oom = true;
+                        return false;
+                    };
                     var ignore: bool = false;
                     const input = self.recv_buffer.items[LENGTH_LEN..total_len];
                     if (!self.cipher.decrypt(input, self.recv_aad, &ignore, self.recv_decode_buffer.items)) {

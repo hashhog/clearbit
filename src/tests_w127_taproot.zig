@@ -178,7 +178,7 @@ test "w127 G12: key-path checkSchnorr against scriptPubKey output key directly (
     // The byte sequence "wp.program[0..32]" at line 1163-1164 in script.zig
     // copies the scriptPubKey program directly into the x-only verify slot.
     try testing.expect(srcContains(SCRIPT_SRC, "@memcpy(&xonly, wp.program[0..32])"));
-    try testing.expect(srcContains(SCRIPT_SRC, "crypto.verifySchnorr(&sig, &sighash, &xonly)"));
+    try testing.expect(srcContains(SCRIPT_SRC, "crypto.verifySchnorrChecked(&sig, &sighash, &xonly)"));
 }
 
 // ===========================================================================
@@ -230,7 +230,7 @@ test "w127 G16: TapTweak verified via xonly_pubkey_tweak_add_check with parity f
 test "w127 G17: commitment-verify failure surfaces SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH (PRESENT)" {
     // Core uses WITNESS_PROGRAM_MISMATCH (not a dedicated BAD_TAPROOT_*)
     // — interpreter.cpp:1975. clearbit matches.
-    try testing.expect(srcContains(SCRIPT_SRC, "if (!crypto.verifyTaprootControlBlock(control, tap_script, wp.program))"));
+    try testing.expect(srcContains(SCRIPT_SRC, "if (!(crypto.verifyTaprootControlBlockChecked(control, tap_script, wp.program)"));
     try testing.expect(srcContains(SCRIPT_SRC, "return ScriptError.WitnessProgramMismatch"));
 }
 

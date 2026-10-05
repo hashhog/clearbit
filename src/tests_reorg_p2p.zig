@@ -2437,3 +2437,385 @@ test "tests_reorg_p2p: classifyBlockFailure — UtxoReadError is not a verdict, 
     try testing.expectEqual(peer_mod.BlockFailureKind.not_a_verdict, peer_mod.classifyBlockFailure(error.UtxoReadError));
     try testing.expectEqual(peer_mod.BlockFailureKind.consensus_invalid, peer_mod.classifyBlockFailure(error.MissingInput));
 }
+
+// ====================================================================
+// Gate 6 (receipts/gate6-resource-limit-audit-2026-10-04.md, clearbit):
+// a SYSTEM fault while validating or connecting a block — no usable secp
+// context, a failed chainstate write, a block-index read error — is never a
+// verdict.  The block is not marked, its sender is not punished, it is never
+// ACCEPTED on the strength of a check that did not run; the fault is retried
+// once and a second fault on the same block latches the node (fatal.zig,
+// Core AbortNode).  Each fault test has a fault-free CONTROL showing the
+// verdict for a genuinely invalid block is unchanged.
+//
+// Faults are injected through test-only hooks compiled out of non-test
+// builds: crypto.test_fault_secp_unavailable, storage.Database
+// .fault_write_batch_failures / .fault_get_cf_mask.
+// ====================================================================
+
+const fatal = @import("fatal.zig");
+const secp_c = @import("secp.zig").c;
+const script_mod = @import("script.zig");
+
+const G6Key = struct { seckey: [32]u8, pubkey: [33]u8 };
+
+fn g6Key(ctx: *secp_c.secp256k1_context) !G6Key {
+    var k = G6Key{ .seckey = [_]u8{0x37} ** 32, .pubkey = undefined };
+    var pk: secp_c.secp256k1_pubkey = undefined;
+    if (secp_c.secp256k1_ec_pubkey_create(ctx, &pk, &k.seckey) != 1) return error.KeyFailed;
+    var len: usize = 33;
+    _ = secp_c.secp256k1_ec_pubkey_serialize(ctx, &k.pubkey, &len, &pk, secp_c.SECP256K1_EC_COMPRESSED);
+    return k;
+}
+
+/// `<pk> CHECKSIG` or `<pk> CHECKSIG NOT`, heap-owned.
+fn g6PkScript(allocator: std.mem.Allocator, key: *const G6Key, with_not: bool) ![]u8 {
+    const s = try allocator.alloc(u8, if (with_not) 36 else 35);
+    s[0] = 33;
+    @memcpy(s[1..34], &key.pubkey);
+    s[34] = 0xac;
+    if (with_not) s[35] = 0x91;
+    return s;
+}
+
+/// One-input spend of `prevout` (heap-owned slices, freed with the block).
+fn g6SpendTx(allocator: std.mem.Allocator, prevout: types.OutPoint, version: i32, sequence: u32) !types.Transaction {
+    const inputs = try allocator.alloc(types.TxIn, 1);
+    inputs[0] = .{
+        .previous_output = prevout,
+        .script_sig = try allocator.dupe(u8, &[_]u8{0x51}),
+        .sequence = sequence,
+        .witness = &[_][]const u8{},
+    };
+    const outputs = try allocator.alloc(types.TxOut, 1);
+    outputs[0] = .{ .value = 40_000, .script_pubkey = try allocator.dupe(u8, &[_]u8{0x51}) };
+    return .{ .version = version, .inputs = inputs, .outputs = outputs, .lock_time = 0 };
+}
+
+/// Sign input 0 of `tx` for `coin_spk` (legacy SIGHASH_ALL); `corrupt` makes
+/// the signature well-formed DER that does not verify.
+fn g6Sign(allocator: std.mem.Allocator, ctx: *secp_c.secp256k1_context, key: *const G6Key, tx: *types.Transaction, coin_spk: []const u8, corrupt: bool) !void {
+    const sh = try script_mod.legacySignatureHash(allocator, tx, 0, coin_spk, 1);
+    var sig: secp_c.secp256k1_ecdsa_signature = undefined;
+    if (secp_c.secp256k1_ecdsa_sign(ctx, &sig, &sh, &key.seckey, null, null) != 1) return error.SignFailed;
+    var der: [72]u8 = undefined;
+    var len: usize = 72;
+    _ = secp_c.secp256k1_ecdsa_signature_serialize_der(ctx, &der, &len, &sig);
+    if (corrupt) der[len - 2] ^= 0x01;
+    const ss = try allocator.alloc(u8, len + 2);
+    ss[0] = @intCast(len + 1);
+    @memcpy(ss[1 .. 1 + len], der[0..len]);
+    ss[1 + len] = 0x01;
+    allocator.free(tx.inputs[0].script_sig);
+    @constCast(&tx.inputs[0]).script_sig = ss;
+}
+
+/// Regtest block at `height` (<= 16) on `prev`: coinbase + `spend`.
+fn g6MineWithTx(allocator: std.mem.Allocator, params: *const consensus.NetworkParams, prev: types.Hash256, height: u32, tag: u8, spend: types.Transaction) !IbBlock {
+    std.debug.assert(height >= 1 and height <= 16);
+    const txs = try allocator.alloc(types.Transaction, 2);
+    const inputs = try allocator.alloc(types.TxIn, 1);
+    inputs[0] = .{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = try allocator.dupe(u8, &[_]u8{ @as(u8, @intCast(0x50 + height)), 0x01, tag }),
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const outputs = try allocator.alloc(types.TxOut, 1);
+    outputs[0] = .{ .value = 5_000_000_000, .script_pubkey = try allocator.dupe(u8, &[_]u8{0x51}) };
+    txs[0] = .{ .version = 1, .inputs = inputs, .outputs = outputs, .lock_time = 0 };
+    txs[1] = spend;
+    const ids = [_]types.Hash256{
+        try crypto.computeTxid(&txs[0], allocator),
+        try crypto.computeTxid(&txs[1], allocator),
+    };
+    var header = types.BlockHeader{
+        .version = 4,
+        .prev_block = prev,
+        .merkle_root = try crypto.computeMerkleRoot(&ids, allocator),
+        .timestamp = params.genesis_header.timestamp + height * 600 + tag,
+        .bits = 0x207fffff,
+        .nonce = 0,
+    };
+    while (!consensus.validateProofOfWork(&header, params)) header.nonce +%= 1;
+    const block = types.Block{ .header = header, .transactions = txs };
+    return .{ .block = block, .hash = crypto.computeBlockHash(&block.header) };
+}
+
+/// A regtest node fixture (PeerManager + RocksDB chainstate in a tmp dir +
+/// an honest outbound peer H and an inbound peer X).
+const G6Node = struct {
+    pm: peer_mod.PeerManager,
+    tmp_dir: testing.TmpDir,
+    path: []u8,
+    db: storage.Database,
+    cs: storage.ChainState,
+    h_peer: *peer_mod.Peer,
+    x_peer: *peer_mod.Peer,
+
+    fn init(self: *G6Node, params: *const consensus.NetworkParams) !void {
+        const allocator = testing.allocator;
+        self.pm = peer_mod.PeerManager.init(allocator, params);
+        self.tmp_dir = testing.tmpDir(.{});
+        self.path = try self.tmp_dir.dir.realpathAlloc(allocator, ".");
+        self.db = try storage.Database.open(self.path, 64, allocator);
+        self.cs = storage.ChainState.init(&self.db, 64, allocator);
+        self.cs.wireUtxoParent();
+        self.cs.setNetworkParams(params);
+        self.cs.best_hash = params.genesis_hash;
+        self.cs.initGenesisTimestamp(params.genesis_header.timestamp);
+        self.pm.chain_state = &self.cs;
+        self.pm.data_dir = self.path; // keep anchors.dat / bans out of the cwd
+        self.h_peer = try ibPeer(params, allocator, 3, .outbound);
+        self.x_peer = try ibPeer(params, allocator, 2, .inbound);
+        try self.pm.peers.append(self.h_peer);
+        try self.pm.peers.append(self.x_peer);
+    }
+
+    fn deinit(self: *G6Node) void {
+        const allocator = testing.allocator;
+        self.pm.peers.clearRetainingCapacity();
+        self.pm.deinit(); // writes anchors/bans under data_dir: before the dir goes
+        freeIbPeer(allocator, self.x_peer);
+        freeIbPeer(allocator, self.h_peer);
+        self.cs.deinit();
+        self.db.close();
+        allocator.free(self.path);
+        self.tmp_dir.cleanup();
+    }
+};
+
+const G6Fault = enum { none, secp };
+
+/// Tip extension: block 2 spends an injected coin whose script is
+/// `<pk> CHECKSIG [NOT]` with a valid (or corrupted) signature.
+fn runG6TipScriptFault(with_not: bool, corrupt_sig: bool, fault: G6Fault) !void {
+    fatal.resetForTest();
+    defer fatal.resetForTest();
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var n: G6Node = undefined;
+    try n.init(&params);
+    defer n.deinit();
+
+    const ctx = secp_c.secp256k1_context_create(secp_c.SECP256K1_CONTEXT_SIGN | secp_c.SECP256K1_CONTEXT_VERIFY) orelse return error.SecpContextFailed;
+    defer secp_c.secp256k1_context_destroy(ctx);
+    const key = try g6Key(ctx);
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    try sendHeaders(&n.pm, allocator, n.h_peer, &.{&a1});
+    try sendBlock(&n.pm, allocator, n.h_peer, &a1);
+    try testing.expectEqual(@as(u32, 1), n.cs.best_height);
+
+    const coin = ghostOutpoint(0xC6);
+    const coin_spk = try g6PkScript(allocator, &key, with_not);
+    defer allocator.free(coin_spk);
+    try n.cs.utxo_set.add(&coin, &types.TxOut{ .value = 50_000, .script_pubkey = coin_spk }, 1, false);
+
+    var spend = try g6SpendTx(allocator, coin, 1, 0xFFFFFFFF);
+    try g6Sign(allocator, ctx, &key, &spend, coin_spk, corrupt_sig);
+    var b2 = try g6MineWithTx(allocator, &params, a1.hash, 2, 0xC6, spend);
+    defer serialize.freeBlock(allocator, &b2.block);
+
+    if (fault == .secp) crypto.test_fault_secp_unavailable = true;
+    defer crypto.test_fault_secp_unavailable = false;
+
+    try sendHeaders(&n.pm, allocator, n.x_peer, &.{&b2});
+    try sendBlock(&n.pm, allocator, n.x_peer, &b2);
+
+    // The script's true verdict: CHECKSIG passes iff the sig is valid;
+    // CHECKSIG NOT passes iff the sig is INVALID (NULLFAIL is off for blocks).
+    const truly_valid = (!with_not) != corrupt_sig;
+    switch (fault) {
+        .none => if (truly_valid) {
+            try testing.expectEqual(@as(u32, 2), n.cs.best_height);
+            try testing.expect(!n.x_peer.should_ban);
+        } else {
+            // CONTROL: a genuinely invalid script keeps its verdict.
+            try testing.expectEqual(@as(u32, 1), n.cs.best_height);
+            try testing.expect(n.pm.isBlockFailed(&b2.hash));
+            try testing.expect(n.x_peer.should_ban);
+        },
+        .secp => {
+            // Never ACCEPTED on a check that did not run (pre-fix: the
+            // `CHECKSIG NOT` block CONNECTED here), never a verdict
+            // (pre-fix: the valid CHECKSIG block was marked + X banned).
+            try testing.expectEqual(@as(u32, 1), n.cs.best_height);
+            try testing.expect(!n.pm.isBlockFailed(&b2.hash));
+            try testing.expect(!n.x_peer.should_ban);
+            try testing.expectEqual(@as(usize, 1), countQueued(&n.pm, b2.hash)); // still wanted
+            // The check was re-run once in place and faulted again: the node
+            // is halted (AbortNode), it did not guess.
+            try testing.expect(fatal.isLatched());
+            try testing.expectEqualStrings("ScriptCheckInternal", @errorName(n.pm.last_block_reject_err orelse return error.NoRejectRecorded));
+        },
+    }
+    try testing.expect(!n.h_peer.should_ban);
+}
+
+test "tests_reorg_p2p: gate6 — secp fault on <validsig> <pk> CHECKSIG NOT: block NOT accepted, not marked, sender not punished; retried once then halts" {
+    try runG6TipScriptFault(true, false, .secp);
+}
+
+test "tests_reorg_p2p: gate6 — secp fault on a VALID <sig> <pk> CHECKSIG spend: not marked, sender not punished; retried once then halts" {
+    try runG6TipScriptFault(false, false, .secp);
+}
+
+test "tests_reorg_p2p: gate6 control — no fault: <validsig> CHECKSIG NOT is INVALID (marked, sender punished)" {
+    try runG6TipScriptFault(true, false, .none);
+}
+
+test "tests_reorg_p2p: gate6 control — no fault: a corrupted sig under plain CHECKSIG is INVALID (marked, sender punished)" {
+    try runG6TipScriptFault(false, true, .none);
+}
+
+test "tests_reorg_p2p: gate6 control — no fault: valid CHECKSIG spend connects; corrupted sig under CHECKSIG NOT connects (NULLFAIL off)" {
+    try runG6TipScriptFault(false, false, .none);
+    try runG6TipScriptFault(true, true, .none);
+}
+
+/// Chainstate write failure while connecting a valid tip block.
+fn runG6WriteFault(failures: u32) !void {
+    fatal.resetForTest();
+    defer fatal.resetForTest();
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var n: G6Node = undefined;
+    try n.init(&params);
+    defer n.deinit();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xB1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var a2 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0xB2);
+    defer serialize.freeBlock(allocator, &a2.block);
+    try sendHeaders(&n.pm, allocator, n.h_peer, &.{ &a1, &a2 });
+    try sendBlock(&n.pm, allocator, n.h_peer, &a1);
+    try testing.expectEqual(@as(u32, 1), n.cs.best_height);
+
+    n.db.fault_write_batch_failures = failures;
+    try sendBlock(&n.pm, allocator, n.x_peer, &a2);
+
+    try testing.expect(!n.pm.isBlockFailed(&a2.hash));
+    try testing.expect(!n.x_peer.should_ban);
+    try testing.expect(!n.h_peer.should_ban);
+    if (failures <= 1) {
+        // A single failed write is retried in place and lands.
+        try testing.expect(!fatal.isLatched());
+        try testing.expect(!n.cs.flush_error);
+        try testing.expectEqual(@as(u32, 2), n.cs.best_height);
+    } else {
+        // Two failed writes: AbortNode — the node stops (main exits
+        // non-zero without flushing), nothing is judged.
+        try testing.expect(fatal.isLatched());
+        try testing.expect(n.cs.flush_error);
+    }
+}
+
+test "tests_reorg_p2p: gate6 — one failed chainstate write is retried and the block lands (no verdict, no halt)" {
+    try runG6WriteFault(1);
+}
+
+test "tests_reorg_p2p: gate6 — a chainstate write failing twice halts the node (latch), never a verdict" {
+    try runG6WriteFault(2);
+}
+
+/// BIP-68 time lock whose coin MTP needs a block-index read: block 3 spends a
+/// coin created at height 2 with a ~388-day relative time lock, so the true
+/// verdict is SequenceLockNotSatisfied.  `fault`: the CF_DEFAULT (height ->
+/// hash) read fails while the coin's MTP is computed.
+fn runG6MtpReadFault(fault: bool) !void {
+    fatal.resetForTest();
+    defer fatal.resetForTest();
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var n: G6Node = undefined;
+    try n.init(&params);
+    defer n.deinit();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xD1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var a2 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0xD2);
+    defer serialize.freeBlock(allocator, &a2.block);
+    try sendHeaders(&n.pm, allocator, n.h_peer, &.{ &a1, &a2 });
+    try sendBlock(&n.pm, allocator, n.h_peer, &a1);
+    try sendBlock(&n.pm, allocator, n.h_peer, &a2);
+    try testing.expectEqual(@as(u32, 2), n.cs.best_height);
+
+    const coin = ghostOutpoint(0xD7);
+    try n.cs.utxo_set.add(&coin, &types.TxOut{ .value = 50_000, .script_pubkey = &[_]u8{0x51} }, 2, false);
+    // nVersion 2, sequence: type flag (time) | 0xFFFF units of 512 s.
+    const spend = try g6SpendTx(allocator, coin, 2, (1 << 22) | 0xFFFF);
+    var b3 = try g6MineWithTx(allocator, &params, a2.hash, 3, 0xD7, spend);
+    defer serialize.freeBlock(allocator, &b3.block);
+
+    try sendHeaders(&n.pm, allocator, n.x_peer, &.{&b3});
+    if (fault) n.db.fault_get_cf_mask = @as(u32, 1) << @intCast(storage.CF_DEFAULT);
+    defer n.db.fault_get_cf_mask = 0;
+    try sendBlock(&n.pm, allocator, n.x_peer, &b3);
+
+    // Never accepted: pre-fix the read error made the coin's MTP 0, which
+    // WAIVED the time lock and connected block 3.
+    try testing.expectEqual(@as(u32, 2), n.cs.best_height);
+    if (fault) {
+        try testing.expect(!n.pm.isBlockFailed(&b3.hash));
+        try testing.expect(!n.x_peer.should_ban);
+        try testing.expectEqualStrings("BlockIndexReadError", @errorName(n.pm.last_block_reject_err orelse return error.NoRejectRecorded));
+    } else {
+        // CONTROL: the lock is real and enforced without the fault.
+        try testing.expect(n.pm.isBlockFailed(&b3.hash));
+        try testing.expect(n.x_peer.should_ban);
+        try testing.expectEqualStrings("SequenceLockNotSatisfied", @errorName(n.pm.last_block_reject_err orelse return error.NoRejectRecorded));
+    }
+}
+
+test "tests_reorg_p2p: gate6 — block-index read error computing a coin's MTP: time lock NOT waived (block not accepted), not marked, not punished" {
+    try runG6MtpReadFault(true);
+}
+
+test "tests_reorg_p2p: gate6 control — the same unexpired BIP-68 time lock without a fault is a verdict (marked, punished)" {
+    try runG6MtpReadFault(false);
+}
+
+/// F12: our allocation failing while DECODING a well-formed message is our
+/// fault, not a protocol violation by the peer (which is scored 20 and leads
+/// to a ban).  A socketpair carries one valid `inv`; the peer's allocator
+/// lets the payload buffer through (#0) and fails the decode (#1).
+fn runG6ReceiveOom(fail_index: usize) !?anyerror {
+    const params = consensus.REGTEST;
+    var fds: [2]i32 = undefined;
+    const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SkipZigTest;
+    defer std.posix.close(fds[1]);
+
+    var payload: [37]u8 = undefined;
+    payload[0] = 1; // one inventory entry
+    std.mem.writeInt(u32, payload[1..5], 2, .little); // MSG_BLOCK
+    @memset(payload[5..37], 0x77);
+    const hdr = p2p.MessageHeader.create(params.magic, "inv", &payload);
+    const hb = hdr.encode();
+    _ = try std.posix.write(fds[1], &hb);
+    _ = try std.posix.write(fds[1], &payload);
+
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+    var p = makeStubPeer(&params, testing.allocator);
+    defer p.recv_buffer.deinit();
+    p.stream = .{ .handle = fds[0] };
+    defer std.posix.close(fds[0]);
+    p.allocator = fa.allocator();
+    if (p.receiveMessage()) |msg| {
+        switch (msg) {
+            .inv => |iv| fa.allocator().free(iv.inventory),
+            else => {},
+        }
+        return null;
+    } else |e| return @as(?anyerror, e); // the receive result, not a setup error
+}
+
+test "tests_reorg_p2p: gate6 F12 — OOM decoding a valid message is OutOfMemory (ours), not ProtocolViolation (the peer's)" {
+    // control: no fault decodes cleanly
+    if (try runG6ReceiveOom(std.math.maxInt(usize))) |e| return e;
+    const e = (try runG6ReceiveOom(1)) orelse return error.FaultNotInjected;
+    if (e == error.ProtocolViolation) std.debug.print("gate6 F12: decode OOM reported as ProtocolViolation (pre-fix: +20 misbehaviour, ban path)\n", .{});
+    try testing.expectEqualStrings("OutOfMemory", @errorName(e));
+}

@@ -16,6 +16,8 @@ const crypto = @import("crypto.zig");
 const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
 const sig_cache_mod = @import("sig_cache.zig");
+const fatal = @import("fatal.zig");
+const builtin = @import("builtin");
 const chainwork = @import("chainwork.zig");
 
 // ============================================================================
@@ -107,7 +109,142 @@ pub const ValidationError = error{
     /// into "Error reading from database, shutting down." + abort — never a
     /// block verdict.  peer.classifyBlockFailure -> not_a_verdict.
     UtxoReadError,
+    /// NOT a consensus result (gate 6): an ancestor / block-index read
+    /// (median-time-past window, fork-point height) failed with a storage
+    /// error.  Pre-fix the readers answered 0 / null, which WAIVED time-based
+    /// relative locks (fail-open) or resolved a fork point to height 0
+    /// (BadCoinbaseHeight verdict + ban).  peer.classifyBlockFailure ->
+    /// not_a_verdict.
+    BlockIndexReadError,
+    /// NOT a consensus result (gate 6): a script check could not be completed
+    /// (allocation failure, no secp context, a job that never produced a
+    /// result) even after one retry.  The node is latched (fatal.abortNode);
+    /// the block is not marked and nobody is punished.
+    ScriptCheckInternal,
+    /// The node is latched after a fatal system fault (fatal.zig); no block
+    /// is judged until restart.  Not a verdict.
+    NodeAborted,
 };
+
+/// What a block-validation failure says about the block (Core
+/// BlockValidationResult as consumed by InvalidBlockFound + MaybePunishNodeForBlock).
+pub const BlockFailureKind = enum {
+    /// BLOCK_CONSENSUS / INVALID_HEADER / CHECKPOINT: the block is invalid
+    /// whoever sends it.  Mark BLOCK_FAILED_VALID (+ descendants), never fetch
+    /// it again, punish the peer that delivered it.
+    consensus_invalid,
+    /// BLOCK_MUTATED (bad merkle root, merkle-duplicate mutation, witness
+    /// malleation): THIS copy is bad, the block hash may still be valid.  Core
+    /// punishes the deliverer but does NOT mark the hash failed
+    /// (InvalidBlockFound: `state.GetResult() != BLOCK_MUTATED`).
+    mutated,
+    /// Not a verdict on the block at all (local resource error, too far
+    /// ahead / too little work, time-too-new): no mark, no punishment, retry.
+    not_a_verdict,
+};
+
+/// Map a clearbit validation error onto Core's result classes.
+///
+/// Gate 6: an EXHAUSTIVE switch with no `else`.  It used to be a deny-list
+/// (`else => .consensus_invalid`), so any error added later — or any system
+/// error that reached here — became a verdict: block marked, sender banned.
+/// Now every error is classified by name and the compiler refuses a new
+/// ValidationError until someone decides which class it is.
+pub fn classifyBlockFailure(err: ValidationError) BlockFailureKind {
+    return switch (err) {
+        // CheckBlock bad-txnmrklroot / bad-txns-duplicate and
+        // CheckWitnessMalleation (validation.cpp:3870-3905) -> BLOCK_MUTATED.
+        error.BadMerkleRoot,
+        error.DuplicateTx,
+        error.BadWitnessCommitment,
+        error.BadWitnessNonceSize,
+        error.UnexpectedWitness,
+        => .mutated,
+
+        // NOT a verdict.
+        // OOM / UtxoReadError / BlockIndexReadError / ScriptCheckInternal /
+        // NodeAborted are ours (Core aborts the node; it never marks the block
+        // or punishes anyone).  TooFarAhead / TooLittleChainwork are
+        // AcceptBlock "not stored" (no state.Invalid); time-too-new is
+        // BLOCK_TIME_FUTURE, which Core neither caches nor punishes.
+        error.OutOfMemory,
+        error.UtxoReadError,
+        error.BlockIndexReadError,
+        error.ScriptCheckInternal,
+        error.NodeAborted,
+        error.TooFarAhead,
+        error.TooLittleChainwork,
+        error.FutureTimestamp,
+        => .not_a_verdict,
+
+        // BLOCK_CONSENSUS / BLOCK_INVALID_HEADER / BLOCK_CHECKPOINT verdicts,
+        // each listed (allow-list, not a default).
+        error.TxTooSmall,
+        error.TxTooLarge,
+        error.NoInputs,
+        error.NoOutputs,
+        error.DuplicateInput,
+        error.NegativeOutput,
+        error.OutputTooLarge,
+        error.TotalOutputTooLarge,
+        error.CoinbaseScriptSize,
+        error.NullInput,
+        error.BadCoinbaseHeight,
+        error.MissingInput,
+        error.InputAlreadySpent,
+        error.InsufficientFunds,
+        error.ScriptVerificationFailed,
+        error.ImmatureCoinbase,
+        error.InputValuesOutOfRange,
+        error.AccumulatedFeeOutOfRange,
+        error.BadDifficulty,
+        error.BadTimestamp,
+        error.TimewarpAttack,
+        error.BadBlockSize,
+        error.BadBlockWeight,
+        error.FirstTxNotCoinbase,
+        error.MultipleCoinbase,
+        error.BadProofOfWork,
+        error.BadCoinbaseValue,
+        error.SequenceLockNotSatisfied,
+        error.TooManySigops,
+        error.BadVersion,
+        error.CheckpointMismatch,
+        error.ForkBelowCheckpoint,
+        error.NonFinalTx,
+        error.Bip30DuplicateOutput,
+        => .consensus_invalid,
+    };
+}
+
+test "gate6: classifyBlockFailure is an allow-list — system errors are never verdicts, consensus errors still are" {
+    const K = BlockFailureKind;
+    for ([_]ValidationError{ error.OutOfMemory, error.UtxoReadError, error.BlockIndexReadError, error.ScriptCheckInternal, error.NodeAborted }) |e| {
+        try std.testing.expectEqual(K.not_a_verdict, classifyBlockFailure(e));
+        try std.testing.expect(isSystemValidationError(e));
+    }
+    for ([_]ValidationError{ error.ScriptVerificationFailed, error.SequenceLockNotSatisfied, error.MissingInput, error.BadCoinbaseHeight }) |e| {
+        try std.testing.expectEqual(K.consensus_invalid, classifyBlockFailure(e));
+        try std.testing.expect(!isSystemValidationError(e));
+    }
+    try std.testing.expectEqual(K.mutated, classifyBlockFailure(error.BadMerkleRoot));
+    try std.testing.expectEqual(K.not_a_verdict, classifyBlockFailure(error.FutureTimestamp));
+}
+
+/// Gate 6: true for the ValidationErrors that are our own failure (resource,
+/// storage, internal) rather than a property of the block.  These are the
+/// errors the retry-once-then-halt rule applies to.
+pub fn isSystemValidationError(err: ValidationError) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.UtxoReadError,
+        error.BlockIndexReadError,
+        error.ScriptCheckInternal,
+        error.NodeAborted,
+        => true,
+        else => false,
+    };
+}
 
 // ============================================================================
 // Script Verification Flags
@@ -467,7 +604,9 @@ pub fn checkTransactionContextual(
 
         if (result) |valid| {
             if (!valid) return ValidationError.ScriptVerificationFailed;
-        } else |_| {
+        } else |err| {
+            // Gate 6: a system fault is not a verdict.
+            if (script.isSystemScriptError(err)) return ValidationError.ScriptCheckInternal;
             return ValidationError.ScriptVerificationFailed;
         }
     }
@@ -2036,7 +2175,7 @@ pub fn validateBlockForIBD(
             &sigop_view,
             .{}, // default ParallelVerifyConfig
             arena_alloc,
-        ) catch return ValidationError.OutOfMemory;
+        ) catch |e| return e; // gate 6: keep the error's class (was: everything -> OutOfMemory)
         if (!ok) return ValidationError.ScriptVerificationFailed;
     }
 }
@@ -2814,6 +2953,9 @@ pub const ScriptCheckFailCode = enum(u32) {
     schnorr_sig_size = 58,
     schnorr_sig_hash_type = 59,
     witness_malleated_p2sh = 60,
+    /// Gate 6: not a script result — the check itself failed (OOM, no secp
+    /// context, deserialization of our OWN serialized tx, bad job index).
+    internal_error = 61,
 };
 
 pub fn failCodeFromScriptError(err: script.ScriptError) u32 {
@@ -2869,6 +3011,7 @@ pub fn failCodeFromScriptError(err: script.ScriptError) u32 {
         error.SchnorrSigSize => ScriptCheckFailCode.schnorr_sig_size,
         error.SchnorrSigHashType => ScriptCheckFailCode.schnorr_sig_hash_type,
         error.WitnessMalleatedP2sh => ScriptCheckFailCode.witness_malleated_p2sh,
+        error.InternalError => ScriptCheckFailCode.internal_error,
     });
 }
 
@@ -2899,6 +3042,11 @@ pub const BatchResult = struct {
     ok: bool,
     first_fail_index: usize = std.math.maxInt(usize),
     first_fail_code: u32 = 0,
+    /// Gate 6: jobs whose check could not be performed (system fault).  A
+    /// batch with internal jobs is NOT ok and NOT a verdict on its own; the
+    /// caller re-runs those jobs once, then halts the node.
+    internal_count: usize = 0,
+    first_internal_index: usize = std.math.maxInt(usize),
 };
 
 /// A job representing a single script verification to be performed.
@@ -2932,6 +3080,8 @@ pub const ScriptCheckJob = struct {
         pending = 0,
         success = 1,
         failure = 2,
+        /// Gate 6: the check could not be performed (system fault).
+        internal = 3,
     };
 
     /// Initialize a new script check job (legacy / SegWit-v0 only).
@@ -3165,23 +3315,33 @@ pub const ScriptCheckQueue = struct {
             }
         }
 
-        var first_fail_index: usize = std.math.maxInt(usize);
-        var first_fail_code: u32 = 0;
-        for (self.jobs[0..self.job_count], 0..) |*job, i| {
-            if (job.result.load(.acquire) != .success) {
-                first_fail_index = i;
-                first_fail_code = job.fail_code.load(.acquire);
-                if (first_fail_code == 0) {
-                    first_fail_code = @intFromEnum(ScriptCheckFailCode.script_false);
-                }
-                break;
+        return summarizeJobs(self.jobs[0..self.job_count]);
+    }
+
+    /// Gate 6: the batch's outcome from its jobs' recorded results.  A job
+    /// still `.pending` never produced a result — that is an internal fault,
+    /// never a pass (per-job accounting: OK only when EVERY job recorded
+    /// success).  The lowest-index genuine script failure is the reason.
+    pub fn summarizeJobs(jobs: []ScriptCheckJob) BatchResult {
+        var r = BatchResult{ .ok = false };
+        for (jobs, 0..) |*job, i| {
+            switch (job.result.load(.acquire)) {
+                .success => {},
+                .failure => if (r.first_fail_index == std.math.maxInt(usize)) {
+                    r.first_fail_index = i;
+                    r.first_fail_code = job.fail_code.load(.acquire);
+                    if (r.first_fail_code == 0) {
+                        r.first_fail_code = @intFromEnum(ScriptCheckFailCode.script_false);
+                    }
+                },
+                .internal, .pending => {
+                    r.internal_count += 1;
+                    if (r.first_internal_index == std.math.maxInt(usize)) r.first_internal_index = i;
+                },
             }
         }
-        return .{
-            .ok = first_fail_index == std.math.maxInt(usize),
-            .first_fail_index = first_fail_index,
-            .first_fail_code = first_fail_code,
-        };
+        r.ok = r.first_fail_index == std.math.maxInt(usize) and r.internal_count == 0;
+        return r;
     }
 
     /// Worker thread loop
@@ -3224,14 +3384,10 @@ pub const ScriptCheckQueue = struct {
             const job_idx = self.next_job.fetchAdd(1, .acq_rel);
             if (job_idx >= self.job_count) break;
 
-            var job = &self.jobs[job_idx];
+            const job = &self.jobs[job_idx];
 
             // Perform the verification (with sig_cache lookup/insert)
-            const result = verifyScriptJob(job, self.allocator, &self.sig_cache);
-            job.result.store(
-                if (result) .success else .failure,
-                .release,
-            );
+            runScriptJob(job, self.allocator, &self.sig_cache);
 
             // Increment completed count
             _ = self.completed_count.fetchAdd(1, .release);
@@ -3252,12 +3408,37 @@ pub const ScriptCheckQueue = struct {
 ///
 /// The `allocator` parameter is intentionally unused here; it is kept in the
 /// signature only because processJobs passes self.allocator for API consistency.
-fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *sig_cache_mod.SigCache) bool {
+/// Gate 6 outcome of one script-check job: OK, a genuine script failure (a
+/// verdict), or INTERNAL (the check could not be performed — never a verdict,
+/// never cached).
+pub const JobOutcome = enum { ok, script_error, internal };
+
+/// Run one job and record its outcome on the job.
+pub fn runScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *sig_cache_mod.SigCache) void {
+    const outcome = verifyScriptJob(job, allocator, cache);
+    job.result.store(switch (outcome) {
+        .ok => .success,
+        .script_error => .failure,
+        .internal => .internal,
+    }, .release);
+}
+
+/// TEST-ONLY fault hook (gate 6; compiled out of non-test builds): when set,
+/// the per-job arena is backed by this allocator instead of libc malloc, so a
+/// test can inject an allocation failure (std.testing.FailingAllocator) into
+/// a script-check job.  Only meaningful with a serial (0-worker) queue.
+pub var test_job_backing_allocator: ?std.mem.Allocator = null;
+
+fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *sig_cache_mod.SigCache) JobOutcome {
     // Per-worker arena backed by libc malloc (thread-safe).
     // All per-job allocations (tx deserialisation, script engine internals)
     // live here and are freed atomically on return via arena.deinit().
     _ = allocator; // not used; see doc-comment above
-    var per_job_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    const backing: std.mem.Allocator = if (builtin.is_test)
+        (test_job_backing_allocator orelse std.heap.c_allocator)
+    else
+        std.heap.c_allocator;
+    var per_job_arena = std.heap.ArenaAllocator.init(backing);
     defer per_job_arena.deinit();
     const job_alloc = per_job_arena.allocator();
 
@@ -3265,17 +3446,21 @@ fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *s
 
     // Deserialize the transaction into the per-job arena.
     var reader = serialize.Reader{ .data = job.tx_bytes };
+    // The bytes are OUR serialization of an already-parsed tx: a failure
+    // here is an allocation failure or our bug, never the block's fault.
     const tx = serialize.readTransaction(&reader, job_alloc) catch {
-        job.fail_code.store(@intFromEnum(ScriptCheckFailCode.deserialize), .release);
-        return false;
+        job.fail_code.store(@intFromEnum(ScriptCheckFailCode.internal_error), .release);
+        return .internal;
     };
     // No manual defer-free needed: per_job_arena.deinit() above reclaims
     // the entire arena (tx.inputs, tx.outputs, script_sig, witness items, etc.)
 
     // Get the input being verified
     if (job.input_index >= tx.inputs.len) {
-        job.fail_code.store(@intFromEnum(ScriptCheckFailCode.bad_input_index), .release);
-        return false;
+        // Jobs are built from the tx's own inputs: an out-of-range index is
+        // our bug (internal), not a property of the block.
+        job.fail_code.store(@intFromEnum(ScriptCheckFailCode.internal_error), .release);
+        return .internal;
     }
     const input = tx.inputs[job.input_index];
 
@@ -3359,7 +3544,7 @@ fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *s
     // SigCache lookup: skip ScriptEngine.verify() if the exact sig material
     // was already successfully verified (e.g. the tx was in the mempool).
     if (cache.lookup(per_input_sighash, job.prev_script_pubkey, sig_material, flags_u32)) {
-        return true;
+        return .ok;
     }
 
     // Create script engine and verify. spent_amounts/spent_scripts are
@@ -3388,14 +3573,17 @@ fn verifyScriptJob(job: *ScriptCheckJob, allocator: std.mem.Allocator, cache: *s
             // Cache the successful verification for future blocks/re-validation.
             // Pass the same per-input sighash-proxy material used in the lookup above
             // (W160 BUG-3 fix — must match the key derived for the lookup).
+            // Only a COMPLETED check reaches here: a system fault is returned
+            // as an error by the interpreter (gate 6) and is never cached.
             cache.insert(per_input_sighash, job.prev_script_pubkey, sig_material, flags_u32);
-            return true;
+            return .ok;
         }
         job.fail_code.store(@intFromEnum(ScriptCheckFailCode.script_false), .release);
-        return false;
+        return .script_error;
     } else |err| {
         job.fail_code.store(failCodeFromScriptError(err), .release);
-        return false;
+        // Gate 6: OutOfMemory / InternalError say nothing about the script.
+        return if (script.isSystemScriptError(err)) .internal else .script_error;
     }
 }
 
@@ -3561,7 +3749,38 @@ pub fn verifyBlockScriptsParallel(
     queue.control_mutex.lock();
     defer queue.control_mutex.unlock();
     queue.submit(jobs);
-    return queue.waitAll();
+    return resolveBatch(queue, jobs, queue.waitAllDetailed());
+}
+
+/// Gate 6: turn a batch outcome into a result.  Jobs that hit a system fault
+/// are re-run ONCE on this thread (Core: CCheckQueue never reports anything
+/// but a ScriptError; the beamchain 30fdcfb pattern re-runs in the caller).
+/// If any still cannot be checked the node is latched (AbortNode) and the
+/// caller gets ScriptCheckInternal — a non-verdict: the block is not marked,
+/// nobody is punished.  Only a batch where every job COMPLETED decides.
+fn resolveBatch(queue: *ScriptCheckQueue, jobs: []ScriptCheckJob, first: BatchResult) ValidationError!bool {
+    var r = first;
+    if (r.internal_count > 0) {
+        std.debug.print(
+            "gate6: {d} script check(s) hit a system fault (first job {d}, code {d}) — retrying once, NOT a verdict\n",
+            .{ r.internal_count, r.first_internal_index, jobs[r.first_internal_index].fail_code.load(.acquire) },
+        );
+        for (jobs) |*job| {
+            switch (job.result.load(.acquire)) {
+                .internal, .pending => runScriptJob(job, queue.allocator, &queue.sig_cache),
+                .success, .failure => {},
+            }
+        }
+        r = ScriptCheckQueue.summarizeJobs(jobs);
+        if (r.internal_count > 0) {
+            fatal.abortNode(
+                "script verification could not be performed for {d} input(s) after one retry (first job {d}, code {d})",
+                .{ r.internal_count, r.first_internal_index, jobs[r.first_internal_index].fail_code.load(.acquire) },
+            );
+            return ValidationError.ScriptCheckInternal;
+        }
+    }
+    return r.ok;
 }
 
 /// Single-threaded script verification fallback.
@@ -3609,8 +3828,28 @@ fn verifyBlockScriptsSingleThreaded(
 
             if (result) |valid| {
                 if (!valid) return false;
-            } else |_| {
-                return false;
+            } else |err| {
+                if (!script.isSystemScriptError(err)) return false;
+                // Gate 6: a system fault is not a verdict.  Retry this input
+                // once on a fresh engine; a second fault latches the node.
+                std.debug.print("gate6: script check input {d} hit {s} — retrying once, NOT a verdict\n", .{ input_idx, @errorName(err) });
+                var retry = script.ScriptEngine.initWithPrevouts(
+                    allocator,
+                    tx,
+                    input_idx,
+                    spent_amounts[input_idx],
+                    flags,
+                    spent_amounts,
+                    spent_scripts,
+                );
+                defer retry.deinit();
+                if (retry.verify(input.script_sig, spent_scripts[input_idx], input.witness)) |valid2| {
+                    if (!valid2) return false;
+                } else |err2| {
+                    if (!script.isSystemScriptError(err2)) return false;
+                    fatal.abortNode("script verification of input {d} failed twice with {s}", .{ input_idx, @errorName(err2) });
+                    return ValidationError.ScriptCheckInternal;
+                }
             }
         }
     }
@@ -7501,31 +7740,42 @@ pub const ChainManager = struct {
             idx -= 1;
             const entry = stack.items[idx];
 
-            const bytes_opt = chain_state.getBlockBytes(&entry.hash) catch {
+            // Gate 6 (B5): a block body we cannot READ, do not HAVE, or
+            // cannot DECODE from our own store says nothing about the chain's
+            // validity — Core never marks a block invalid for missing or
+            // unreadable data (it is simply not a candidate until the data is
+            // there).  These used to markChainFailed(to): a disk error during
+            // invalidate/reconsider/preciousblock permanently failed a valid
+            // chain.  Abort without marking.
+            const bytes_opt = chain_state.getBlockBytes(&entry.hash) catch |err| {
                 std.debug.print(
-                    "executeReorg: getBlockBytes failed for {x}; aborting\n",
-                    .{std.fmt.fmtSliceHexLower(&entry.hash)},
+                    "executeReorg: getBlockBytes failed for {x} ({}); aborting — NOT marked (local read error)\n",
+                    .{ std.fmt.fmtSliceHexLower(&entry.hash), err },
                 );
-                self.markChainFailed(to);
                 return ChainError.DisconnectFailed;
             };
             const bytes = bytes_opt orelse {
+                // Core: a block without data is simply not a candidate
+                // (setBlockIndexCandidates requires BLOCK_HAVE_DATA); it is
+                // never marked invalid for it.  The index entry claimed data
+                // we do not have, so drop the claim + the candidacy (the body
+                // can be fetched again) instead of failing the chain.
                 std.debug.print(
-                    "executeReorg: CF_BLOCKS body missing for {x}; aborting\n",
+                    "executeReorg: CF_BLOCKS body missing for {x}; aborting — NOT marked (no data is not invalid); dropping has_data\n",
                     .{std.fmt.fmtSliceHexLower(&entry.hash)},
                 );
-                self.markChainFailed(to);
+                entry.status.has_data = false;
+                self.eraseBlockIndexCandidate(entry);
                 return ChainError.DisconnectFailed;
             };
             defer self.allocator.free(bytes);
 
             var reader = serialize.Reader{ .data = bytes };
-            const block = serialize.readBlock(&reader, self.allocator) catch {
+            const block = serialize.readBlock(&reader, self.allocator) catch |err| {
                 std.debug.print(
-                    "executeReorg: deserialize failed for {x}; aborting\n",
-                    .{std.fmt.fmtSliceHexLower(&entry.hash)},
+                    "executeReorg: deserialize of stored body failed for {x} ({}); aborting — NOT marked (local store fault)\n",
+                    .{ std.fmt.fmtSliceHexLower(&entry.hash), err },
                 );
-                self.markChainFailed(to);
                 return ChainError.DisconnectFailed;
             };
 
@@ -7589,15 +7839,28 @@ pub const ChainManager = struct {
         // disconnect below genesis and asserts each new block chains
         // forward from the in-memory tip; on success best_hash /
         // best_height in ChainState are updated to `to`.
-        const connected = chain_state.reorgToChain(&fork_point.hash, rb_list.items) catch |err| {
-            std.debug.print(
-                "executeReorg: reorgToChain failed with {} — marking candidate failed_valid\n",
-                .{err},
-            );
-            // Per W101 BUG-4: any block on the broken path must be
-            // marked invalid so it is never re-selected by the next
-            // activateBestChain.
-            self.markChainFailed(to);
+        var drive_result: storage.ChainState.ReorgDriveResult = .{};
+        const connected = chain_state.reorgToChainWithOptions(&fork_point.hash, rb_list.items, .{}, &drive_result) catch |err| {
+            // Gate 6 (B5): only a CONSENSUS verdict on a new-branch block marks
+            // anything — and then the bad block and its descendants, not the
+            // whole branch back to the fork.  A reorg that aborts for any other
+            // reason (I/O, flush, OOM, script-check internal fault, depth,
+            // fork point) is not a statement about the chain.
+            const verdict_err: ?ValidationError = if (err == error.ReorgBlockInvalid) drive_result.connect_reject_err else null;
+            const kind: BlockFailureKind = if (verdict_err) |ve| classifyBlockFailure(ve) else .not_a_verdict;
+            const bad_idx = drive_result.connected_before_reject;
+            if (kind == .consensus_invalid and bad_idx < rb_list.items.len) {
+                std.debug.print(
+                    "executeReorg: reorgToChain rejected block h={d} ({}) — marking it and its descendants failed_valid\n",
+                    .{ rb_list.items[bad_idx].height, verdict_err.? },
+                );
+                self.markChainFailedDownTo(to, &rb_list.items[bad_idx].hash);
+            } else {
+                std.debug.print(
+                    "executeReorg: reorgToChain failed with {} — NOT a block verdict; nothing marked\n",
+                    .{err},
+                );
+            }
             return ChainError.DisconnectFailed;
         };
         _ = connected;
@@ -7669,6 +7932,28 @@ pub const ChainManager = struct {
     ///
     /// `best_invalid` is also updated to point at the highest-work
     /// failed candidate so `getchaintips` / RPC can report it.
+    /// Gate 6: mark `tip` and its ancestors down to and including the block
+    /// `bad` (Core InvalidChainFound: the invalid block + its descendants),
+    /// never the valid ancestors below it.
+    fn markChainFailedDownTo(self: *ChainManager, tip: *BlockIndexEntry, bad: *const types.Hash256) void {
+        var walk: ?*BlockIndexEntry = tip;
+        var depth: usize = 0;
+        while (walk) |w| {
+            w.status.failed_valid = true;
+            self.persistBlockStatus(w) catch {};
+            self.eraseBlockIndexCandidate(w);
+            if (std.mem.eql(u8, &w.hash, bad)) break;
+            walk = w.parent;
+            depth += 1;
+            if (depth > storage.ChainState.MAX_REORG_DEPTH) break;
+        }
+        if (self.best_invalid) |bi| {
+            if (self.compareChainWork(&tip.chain_work, &bi.chain_work) > 0) self.best_invalid = tip;
+        } else {
+            self.best_invalid = tip;
+        }
+    }
+
     fn markChainFailed(self: *ChainManager, tip: *BlockIndexEntry) void {
         var walk: ?*BlockIndexEntry = tip;
         var depth: usize = 0;
@@ -13829,7 +14114,7 @@ test "W101 PR3: fork-point mid-chain — 2 disconnects / 3 connects" {
     try std.testing.expectEqual(b_entries[2], manager.active_tip.?);
 }
 
-test "W101 PR4: missing CF_BLOCKS body — candidate marked failed_valid" {
+test "W101 PR4: missing CF_BLOCKS body — candidate NOT marked failed (gate 6 B5: no data is not invalid), just no longer a candidate" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -13894,18 +14179,21 @@ test "W101 PR4: missing CF_BLOCKS body — candidate marked failed_valid" {
     try std.testing.expectEqual(a1, manager.active_tip.?);
 
     // Activate — finds B1 as best, fork_point = genesis, tries to load
-    // body for B1 from CF_BLOCKS, fails, marks B1 failed_valid.
+    // body for B1 from CF_BLOCKS, finds none.
     const result = manager.activateBestChain();
     try std.testing.expectError(ChainManager.ChainError.DisconnectFailed, result);
 
-    // Post: B1 marked failed_valid; chain stays at A1 (chain_state did
-    // not advance because reorgToChain was never called).
-    try std.testing.expect(b1.status.failed_valid);
+    // Post (gate 6 B5, Core semantics): missing data is NOT a validity
+    // verdict — B1 is not failed_valid and not best_invalid.  It is no longer
+    // a candidate (has_data cleared), so the chain stays at A1 and the next
+    // activation does not keep re-selecting it.
+    try std.testing.expect(!b1.status.failed_valid);
+    try std.testing.expect(!b1.status.has_data);
+    try std.testing.expect(manager.best_invalid == null);
     try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
     try std.testing.expectEqualSlices(u8, &a1_hash, &chain_state.best_hash);
-
-    // best_invalid should now point at B1 (most-work failed candidate).
-    try std.testing.expectEqual(b1, manager.best_invalid.?);
+    try manager.activateBestChain();
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
 }
 
 test "W101 PR5: chain_state=null preserves legacy pointer-swap (in-memory tests)" {
@@ -14531,4 +14819,57 @@ test "validateBlockForIBD: intra-block non-coinbase spend accepted (no false-rej
     };
     // Non-coinbase intra-block spend must remain accepted after the fix.
     try validateBlockForIBD(&block, &ctx, allocator);
+}
+
+test "gate6 B5: executeReorg — a block-body READ ERROR does not mark the candidate chain failed; it connects once the read works" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.wireUtxoParent();
+    var manager = ChainManager.init(&chain_state, null, allocator);
+    defer manager.deinit();
+
+    const genesis = try allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+
+    var a1_hash: types.Hash256 = [_]u8{0} ** 32;
+    a1_hash[0] = 0x01;
+    a1_hash[1] = 0xB5;
+    const a1 = try phase3ConnectAndIndex(&chain_state, &manager, genesis, a1_hash, 0x10, 1, 0xAA);
+    manager.active_tip = a1;
+    var a2_hash: types.Hash256 = [_]u8{0} ** 32;
+    a2_hash[0] = 0x02;
+    a2_hash[1] = 0xB5;
+    const a2 = try phase3IndexOnly(&chain_state, &manager, a1, a2_hash, 0x20, 2, 0xAA);
+
+    // FAULT: CF_BLOCKS reads fail while the reorg loads A2's body.
+    db.fault_get_cf_mask = @as(u32, 1) << @intCast(storage.CF_BLOCKS);
+    manager.activateBestChain() catch {};
+    db.fault_get_cf_mask = 0;
+    // Pre-fix: markChainFailed(A2) — a disk error permanently failed a valid block.
+    try std.testing.expect(!a2.status.failed_valid);
+    try std.testing.expectEqual(@as(u32, 1), chain_state.best_height);
+
+    // The read works again: the same candidate connects.
+    try manager.activateBestChain();
+    try std.testing.expectEqual(@as(u32, 2), chain_state.best_height);
+    try std.testing.expectEqualSlices(u8, &a2_hash, &chain_state.best_hash);
 }

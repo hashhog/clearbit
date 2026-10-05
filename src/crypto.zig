@@ -737,8 +737,23 @@ pub const has_secp256k1: bool = true;
 /// production modules now resolve to the SAME context, not four distinct
 /// ones with four distinct opaque-type identities.
 inline fn secp_ctx() ?*secp.Context {
+    if (builtin.is_test and test_fault_secp_unavailable) return null;
     return secp.context();
 }
+
+/// Gate 6: the signature checks used by the script interpreter report an
+/// INTERNAL failure (no usable secp256k1 context) as an error, never as
+/// "signature invalid".  A `false` here would make `<sig> <pk> CHECKSIG NOT`
+/// evaluate TRUE (block flags have NULLFAIL off), i.e. accept an invalid
+/// spend.  Core: ECC_Start runs at init and aborts if the context cannot be
+/// created; clearbit creates it eagerly at boot (main.zig) and these errors are
+/// unreachable afterwards, but the interpreter must never turn one into a
+/// verdict.
+pub const SecpError = error{SecpContextUnavailable};
+
+/// TEST-ONLY fault hook (compiled out of non-test builds): make every secp
+/// accessor behave as if libsecp256k1 could not provide a context.
+pub var test_fault_secp_unavailable: bool = false;
 
 /// Initialize the secp256k1 context for signature verification.
 /// Now a thin wrapper over the process-global `secp.init()`.
@@ -838,7 +853,12 @@ fn laxDerParse(sig_der: []const u8, compact: *[64]u8) bool {
 ///
 /// Returns true if signature is valid, false otherwise
 pub fn verifyEcdsa(sig_der: []const u8, pubkey_bytes: []const u8, msg_hash: *const [32]u8) bool {
-    const ctx = secp_ctx() orelse return false;
+    return verifyEcdsaChecked(sig_der, pubkey_bytes, msg_hash) catch false;
+}
+
+/// verifyEcdsa for the consensus path: an unusable secp context is an error.
+pub fn verifyEcdsaChecked(sig_der: []const u8, pubkey_bytes: []const u8, msg_hash: *const [32]u8) SecpError!bool {
+    const ctx = secp_ctx() orelse return error.SecpContextUnavailable;
 
     // Parse public key
     var pubkey: secp256k1.secp256k1_pubkey = undefined;
@@ -877,7 +897,12 @@ pub fn verifyEcdsa(sig_der: []const u8, pubkey_bytes: []const u8, msg_hash: *con
 /// Check if a DER signature has low-S value.
 /// BIP-62 rule 5 / BIP-146: S must be at most half the curve order.
 pub fn isLowDERSignature(sig_der: []const u8) bool {
-    const ctx = secp_ctx() orelse return false;
+    return isLowDERSignatureChecked(sig_der) catch false;
+}
+
+/// isLowDERSignature for the script interpreter (gate 6: no context = error).
+pub fn isLowDERSignatureChecked(sig_der: []const u8) SecpError!bool {
+    const ctx = secp_ctx() orelse return error.SecpContextUnavailable;
 
     // Use lax DER parsing to extract R/S into compact format
     var compact: [64]u8 = undefined;
@@ -949,7 +974,12 @@ pub fn decompressPubkey33(pubkey_bytes: *const [33]u8) ?[65]u8 {
 ///
 /// Returns true if signature is valid, false otherwise
 pub fn verifySchnorr(sig: *const [64]u8, msg_hash: *const [32]u8, pubkey_x: *const [32]u8) bool {
-    const ctx = secp_ctx() orelse return false;
+    return verifySchnorrChecked(sig, msg_hash, pubkey_x) catch false;
+}
+
+/// verifySchnorr for the consensus path: an unusable secp context is an error.
+pub fn verifySchnorrChecked(sig: *const [64]u8, msg_hash: *const [32]u8, pubkey_x: *const [32]u8) SecpError!bool {
+    const ctx = secp_ctx() orelse return error.SecpContextUnavailable;
 
     // Parse the 32-byte x-only pubkey.
     var xonly: secp256k1.secp256k1_xonly_pubkey = undefined;
@@ -1697,10 +1727,16 @@ fn appendCompactSize(hasher: *std.crypto.hash.sha2.Sha256, value: u64) void {
 
 /// program: the 32-byte witness program (x-only output key from scriptPubKey)
 pub fn verifyTaprootControlBlock(control: []const u8, tap_script: []const u8, program: []const u8) bool {
+    return verifyTaprootControlBlockChecked(control, tap_script, program) catch false;
+}
+
+/// verifyTaprootControlBlock for the consensus path: an unusable secp context
+/// is an error, not a commitment mismatch (a verdict on a valid spend).
+pub fn verifyTaprootControlBlockChecked(control: []const u8, tap_script: []const u8, program: []const u8) SecpError!bool {
     if (control.len < 33 or program.len != 32) return false;
     if ((control.len - 33) % 32 != 0) return false;
 
-    const ctx = secp_ctx() orelse return false;
+    const ctx = secp_ctx() orelse return error.SecpContextUnavailable;
 
     const leaf_version = control[0] & 0xfe;
     const internal_key = control[1..33];

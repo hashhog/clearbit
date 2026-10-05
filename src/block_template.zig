@@ -19,6 +19,7 @@ const mempool_mod = @import("mempool.zig");
 const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
 const validation = @import("validation.zig");
+const fatal = @import("fatal.zig");
 const peer = @import("peer.zig");
 
 // ============================================================================
@@ -870,7 +871,27 @@ pub const SubmitResult = struct {
     /// The RPC maps it to the BIP-22 token (Core: submitblock reports the
     /// ActivateBestChain failure's reject reason, e.g. bad-cb-amount).
     reject_validation_err: ?validation.ValidationError = null,
+    /// Gate 6: the block was NOT judged — a local system fault (failed
+    /// write/read, OOM, script-check internal error) stopped it.  The RPC
+    /// answers RPC_VERIFY_ERROR (-25), never a BIP-22 reject token.
+    system_fault: ?anyerror = null,
 };
+
+/// Gate 6: errors from the connect / reorg / flush machinery that are OUR
+/// failure, not a property of the submitted block.
+fn isSubmitSystemFault(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.FlushError,
+        error.UtxoReadFailed,
+        error.ReorgSystemFault,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.CorruptData,
+        => true,
+        else => false,
+    };
+}
 
 /// Pattern X helper (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md):
 /// derive the height that should be used to validate a submitted block,
@@ -1285,6 +1306,18 @@ pub fn submitBlockWithIndexAndMempool(
     const ibd_mode = params.assume_valid_height > 0 and height <= params.assume_valid_height;
     if (ibd_mode) {
         chain_state.connectBlockFast(block, &block_hash, height) catch |err| {
+            if (isSubmitSystemFault(err) or fatal.isLatched()) {
+                // Gate 6: the block passed validation; its connect failed on
+                // our side and may have left the UTXO cache partially applied
+                // (connectBlockInner has no undo) — halt, like Core's AbortNode.
+                fatal.abortNode("submitblock: connecting validated block at height {d} failed ({s})", .{ height, @errorName(err) });
+                return .{
+                    .accepted = false,
+                    .reject_reason = null,
+                    .block_hash = block_hash,
+                    .system_fault = err,
+                };
+            }
             // Map to BIP-22 canonical strings (Bitcoin Core BIP22ValidationResult).
             // connectBlockFast propagates errors from connectBlockInner + flush.
             return .{
@@ -1299,6 +1332,18 @@ pub fn submitBlockWithIndexAndMempool(
         };
     } else {
         chain_state.connectBlockFastWithUndo(block, &block_hash, height) catch |err| {
+            if (isSubmitSystemFault(err) or fatal.isLatched()) {
+                // Gate 6: the block passed validation; its connect failed on
+                // our side and may have left the UTXO cache partially applied
+                // (connectBlockInner has no undo) — halt, like Core's AbortNode.
+                fatal.abortNode("submitblock: connecting validated block at height {d} failed ({s})", .{ height, @errorName(err) });
+                return .{
+                    .accepted = false,
+                    .reject_reason = null,
+                    .block_hash = block_hash,
+                    .system_fault = err,
+                };
+            }
             // Map to BIP-22 canonical strings (Bitcoin Core BIP22ValidationResult).
             return .{
                 .accepted = false,
@@ -1330,11 +1375,13 @@ pub fn submitBlockWithIndexAndMempool(
     chain_state.flush() catch |err| {
         std.debug.print("submitblock: atomic flush failed at height {d}: {} — halting\n", .{ height, err });
         chain_state.flush_error = true;
+        // Gate 6: a failed write is not a verdict on the block (Core
+        // FatalError -> RPC error), never the BIP-22 "rejected" token.
         return .{
             .accepted = false,
-            // BIP-22 has no specific string for flush failure; "rejected" is the catch-all.
-            .reject_reason = "rejected",
+            .reject_reason = null,
             .block_hash = block_hash,
+            .system_fault = err,
         };
     };
 
@@ -1564,6 +1611,12 @@ pub fn processSideBranchSubmission(
             "submitblock side-branch: reorg failed at h={d}: {} — keeping active tip\n",
             .{ height, err },
         );
+        if (isSubmitSystemFault(err) or fatal.isLatched()) return .{
+            .accepted = false,
+            .reject_reason = null,
+            .block_hash = block_hash.*,
+            .system_fault = err,
+        };
         return .{
             .accepted = false,
             .reject_reason = "rejected",
@@ -1751,6 +1804,12 @@ fn fireReorgFromSideBranch(
     var drive_result = storage.ChainState.ReorgDriveResult{};
     const connected = chain_state.reorgToChainWithOptions(&fp, rb_list.items, .{}, &drive_result) catch |err| {
         if (drive_result.connect_reject_err) |verr| {
+            if (validation.isSystemValidationError(verr)) return .{
+                .accepted = false,
+                .reject_reason = null,
+                .block_hash = new_tip_hash.*,
+                .system_fault = verr,
+            };
             std.debug.print(
                 "submitblock side-branch: reorg rejected a new-branch block: {} — keeping active tip\n",
                 .{verr},

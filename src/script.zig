@@ -176,7 +176,32 @@ pub const ScriptError = error{
     SchnorrSigSize, // BIP-340/341: Schnorr signature is not 64 or 65 bytes
     SchnorrSigHashType, // BIP-340/341: invalid hashtype byte appended to 65-byte sig
     WitnessMalleatedP2sh, // BIP-141: P2SH-wrapped witness scriptSig is not the minimal canonical push of the redeemScript
+    /// NOT a script result (gate 6): the signature check could not be
+    /// performed (no usable secp256k1 context).  Like OutOfMemory it says
+    /// nothing about the spend; callers must treat it as a system fault —
+    /// never as "signature invalid" (which a CHECKSIG NOT would turn into
+    /// an ACCEPT) and never as a reject verdict.
+    InternalError,
 };
+
+/// Gate 6: the two ScriptError values that are OUR failure, not the
+/// script's.  Every caller that turns a ScriptError into a verdict must
+/// test this first (Core: CCheckQueue reports only ScriptError values;
+/// bad_alloc terminates the process).
+pub fn isSystemScriptError(err: ScriptError) bool {
+    return err == ScriptError.OutOfMemory or err == ScriptError.InternalError;
+}
+
+/// Gate 6: a sighash computation failed.  OutOfMemory is ours — it must
+/// propagate as a system fault.  Pre-fix every site did `catch return false`,
+/// so an allocation failure while hashing a VALID signature made CHECKSIG
+/// push false and `<sig> <pk> CHECKSIG NOT` pass (block flags have NULLFAIL
+/// off).  Any other sighash error keeps its previous consensus answer
+/// (signature check fails).
+fn sighashFailure(err: anyerror) ScriptError!bool {
+    if (err == error.OutOfMemory) return ScriptError.OutOfMemory;
+    return false;
+}
 
 // ============================================================================
 // Script Flags
@@ -1263,12 +1288,13 @@ pub const ScriptEngine = struct {
                             hash_type,
                             self.taproot_annex,
                             null, // ext_flag = 0 (key-path)
-                        ) catch return false;
+                        ) catch |e| return sighashFailure(e);
 
                         var xonly: [32]u8 = undefined;
                         @memcpy(&xonly, wp.program[0..32]);
 
-                        if (crypto.verifySchnorr(&sig, &sighash, &xonly)) {
+                        // Checked: an unusable secp context is a system fault, not "invalid".
+                        if (crypto.verifySchnorrChecked(&sig, &sighash, &xonly) catch return ScriptError.InternalError) {
                             return true;
                         }
                         return false;
@@ -1302,7 +1328,7 @@ pub const ScriptEngine = struct {
                         }
 
                         // Verify control block against the witness program (output key)
-                        if (!crypto.verifyTaprootControlBlock(control, tap_script, wp.program)) {
+                        if (!(crypto.verifyTaprootControlBlockChecked(control, tap_script, wp.program) catch return ScriptError.InternalError)) {
                             return ScriptError.WitnessProgramMismatch;
                         }
 
@@ -2334,7 +2360,7 @@ pub const ScriptEngine = struct {
                     }
                 }
                 if (self.flags.verify_low_s) {
-                    if (!crypto.isLowDERSignature(cur_sig[0 .. cur_sig.len - 1])) {
+                    if (!(crypto.isLowDERSignatureChecked(cur_sig[0 .. cur_sig.len - 1]) catch return ScriptError.InternalError)) {
                         return ScriptError.SigHighS;
                     }
                 }
@@ -2422,7 +2448,7 @@ pub const ScriptEngine = struct {
                 // OP_CODESEPARATOR so the reject fires only when the pushed sig
                 // appears in the post-codesep subscript.
                 const script_code = scriptCodeFromByteOffset(full_script_code, self.codesep_byte_offset);
-                const push_encoded_sig = pushEncode(self.allocator, sig) catch return false;
+                const push_encoded_sig = pushEncode(self.allocator, sig) catch return ScriptError.OutOfMemory;
                 defer self.allocator.free(push_encoded_sig);
                 if (findAndDeleteCount(script_code, push_encoded_sig) > 0) {
                     return ScriptError.SigFindAndDelete;
@@ -2443,7 +2469,7 @@ pub const ScriptEngine = struct {
         // SCRIPT_ERR_SIG_HIGH_S.  Must come after DER check (requires valid DER to parse).
         if (self.flags.verify_low_s) {
             const sig_data_for_low_s = sig[0 .. sig.len - 1];
-            if (!crypto.isLowDERSignature(sig_data_for_low_s)) {
+            if (!(crypto.isLowDERSignatureChecked(sig_data_for_low_s) catch return ScriptError.InternalError)) {
                 return ScriptError.SigHighS;
             }
         }
@@ -2500,8 +2526,8 @@ pub const ScriptEngine = struct {
                 self.amount,
                 @as(u32, hash_type),
                 self.allocator,
-            ) catch return false;
-            return crypto.verifyEcdsa(sig_data, pubkey, &sighash);
+            ) catch |e| return sighashFailure(e);
+            return crypto.verifyEcdsaChecked(sig_data, pubkey, &sighash) catch ScriptError.InternalError;
         }
 
         // LEGACY (BASE). For CHECKMULTISIG, `multisig_script_code` is the
@@ -2518,7 +2544,7 @@ pub const ScriptEngine = struct {
                 self.input_index,
                 ms_sc,
                 @as(u32, hash_type),
-            ) catch return false
+            ) catch |e| return sighashFailure(e)
         else
             legacySignatureHashWithFindAndDelete(
                 self.allocator,
@@ -2527,9 +2553,9 @@ pub const ScriptEngine = struct {
                 script_code,
                 sig, // full sig including hashtype byte for FindAndDelete
                 @as(u32, hash_type),
-            ) catch return false;
+            ) catch |e| return sighashFailure(e);
 
-        return crypto.verifyEcdsa(sig_data, pubkey, &sighash);
+        return crypto.verifyEcdsaChecked(sig_data, pubkey, &sighash) catch ScriptError.InternalError;
     }
 
     fn verifyTaprootSignature(self: *ScriptEngine, sig: []const u8, pubkey: []const u8) !bool {
@@ -2603,12 +2629,12 @@ pub const ScriptEngine = struct {
             hash_type,
             self.taproot_annex,
             tapscript_ctx,
-        ) catch return false;
+        ) catch |e| return sighashFailure(e);
 
         var xonly: [32]u8 = undefined;
         @memcpy(&xonly, pubkey[0..32]);
 
-        return crypto.verifySchnorr(&sig_bytes, &sighash, &xonly);
+        return crypto.verifySchnorrChecked(&sig_bytes, &sighash, &xonly) catch ScriptError.InternalError;
     }
 };
 

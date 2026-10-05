@@ -1034,6 +1034,8 @@ comptime {
     _ = @import("addr_error.zig"); // Core DecodeDestination error text + LocateErrors
     _ = @import("psbt_process.zig"); // descriptor-driven PSBT updater/signer
     _ = @import("validation.zig");
+    _ = @import("fatal.zig"); // gate 6: AbortNode latch
+    _ = @import("tests_gate6.zig"); // gate 6: fault injection (resource faults are never verdicts)
     _ = @import("mempool.zig");
     _ = @import("mempool_persist.zig"); // mempool.dat dump/load (Bitcoin Core-compatible)
     _ = @import("storage.zig"); // undo data, UTXO set, chain state, flat file storage

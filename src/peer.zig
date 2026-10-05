@@ -10,6 +10,7 @@ const storage = @import("storage.zig");
 const serialize = @import("serialize.zig");
 const mempool_mod = @import("mempool.zig");
 const validation = @import("validation.zig");
+const fatal = @import("fatal.zig");
 const asmap_mod = @import("asmap.zig");
 const proxy_mod = @import("proxy.zig");
 const wallet_mod = @import("wallet.zig");
@@ -243,48 +244,11 @@ pub const MAX_SEEN_FORK_BATCHES: usize = 2048;
 
 /// Outcome of `maybeArmReorg` (and of a competing-fork batch that never
 /// reached it). Used to decide whether to ask the peer for more of the fork.
-/// What a block-validation failure says about the block (Core
-/// BlockValidationResult as consumed by InvalidBlockFound + MaybePunishNodeForBlock).
-pub const BlockFailureKind = enum {
-    /// BLOCK_CONSENSUS / INVALID_HEADER / CHECKPOINT: the block is invalid
-    /// whoever sends it.  Mark BLOCK_FAILED_VALID (+ descendants), never fetch
-    /// it again, punish the peer that delivered it.
-    consensus_invalid,
-    /// BLOCK_MUTATED (bad merkle root, merkle-duplicate mutation, witness
-    /// malleation): THIS copy is bad, the block hash may still be valid.  Core
-    /// punishes the deliverer but does NOT mark the hash failed
-    /// (InvalidBlockFound: `state.GetResult() != BLOCK_MUTATED`).
-    mutated,
-    /// Not a verdict on the block at all (local resource error, too far
-    /// ahead / too little work, time-too-new): no mark, no punishment, retry.
-    not_a_verdict,
-};
-
-/// Map a clearbit validation error onto Core's result classes.
-pub fn classifyBlockFailure(err: validation.ValidationError) BlockFailureKind {
-    return switch (err) {
-        // CheckBlock bad-txnmrklroot / bad-txns-duplicate and
-        // CheckWitnessMalleation (validation.cpp:3870-3905) -> BLOCK_MUTATED.
-        error.BadMerkleRoot,
-        error.DuplicateTx,
-        error.BadWitnessCommitment,
-        error.BadWitnessNonceSize,
-        error.UnexpectedWitness,
-        => .mutated,
-        // OOM is ours; TooFarAhead / TooLittleChainwork are AcceptBlock
-        // "not stored" (no state.Invalid); time-too-new is BLOCK_TIME_FUTURE,
-        // which Core neither caches nor punishes.
-        // UtxoReadError: OUR coins database could not be read (Core aborts
-        // the node on that; it never marks the block or punishes anyone).
-        error.OutOfMemory,
-        error.TooFarAhead,
-        error.TooLittleChainwork,
-        error.FutureTimestamp,
-        error.UtxoReadError,
-        => .not_a_verdict,
-        else => .consensus_invalid,
-    };
-}
+/// What a block-validation failure says about the block.  Defined in
+/// validation.zig (gate 6: the reorg engine there must classify the same way);
+/// re-exported so existing call sites keep compiling.
+pub const BlockFailureKind = validation.BlockFailureKind;
+pub const classifyBlockFailure = validation.classifyBlockFailure;
 
 pub const FailedHeaderReason = enum { none, cached_invalid, invalid_prev };
 
@@ -1563,7 +1527,11 @@ pub const Peer = struct {
 
         // Parse payload
         const command = header.commandName();
-        return p2p.decodePayload(command, payload, self.allocator) catch {
+        return p2p.decodePayload(command, payload, self.allocator) catch |err| {
+            // Gate 6 (F12): running out of memory decoding a (say 4 MB) block
+            // is OUR failure, not the peer's — it must not be scored as a
+            // protocol violation (20 points; repeated -> 24 h ban).
+            if (err == error.OutOfMemory) return PeerError.OutOfMemory;
             self.last_recv_undecodable = true;
             return PeerError.ProtocolViolation;
         };
@@ -1589,7 +1557,7 @@ pub const Peer = struct {
             // sitting in `recv_buffer`.  Without this drain, the next
             // `receiveMessage` would call `stream.read` and block waiting for
             // bytes that already arrived, causing a 30s SO_RCVTIMEO timeout.
-            if (!t.processBuffered()) return PeerError.ProtocolViolation;
+            if (!t.processBuffered()) return if (t.recv_oom) PeerError.OutOfMemory else PeerError.ProtocolViolation;
             if (t.isMessageReady()) break;
             if (t.isV1Fallback()) return PeerError.ProtocolViolation;
 
@@ -1603,7 +1571,8 @@ pub const Peer = struct {
             };
             if (n == 0) return PeerError.ConnectionClosed;
             if (!t.processReceivedBytes(read_buf[0..n])) {
-                return PeerError.ProtocolViolation;
+                // Gate 6 (F12): an allocation failure in the transport is ours.
+                return if (t.recv_oom) PeerError.OutOfMemory else PeerError.ProtocolViolation;
             }
             self.bytes_received += n;
         }
@@ -1639,7 +1608,8 @@ pub const Peer = struct {
         if (payload.len > p2p.MAX_MESSAGE_SIZE) return PeerError.MessageTooLarge;
 
         self.last_message_time = std.time.timestamp();
-        return p2p.decodePayload(command, payload, self.allocator) catch {
+        return p2p.decodePayload(command, payload, self.allocator) catch |err| {
+            if (err == error.OutOfMemory) return PeerError.OutOfMemory; // gate 6 (F12)
             self.last_recv_undecodable = true;
             return PeerError.ProtocolViolation;
         };
@@ -3244,6 +3214,12 @@ pub const PeerManager = struct {
     failed_blocks: std.AutoHashMap(types.Hash256, void),
     /// The ValidationError of the last validateBlockForIBDOrReject failure.
     last_block_reject_err: ?validation.ValidationError = null,
+    /// Gate 6: first storage error hit while reading an ancestor header /
+    /// height (MTP windows, fork-point height) during the current block's
+    /// validation.  The MTP helpers can only answer a number and 0 means
+    /// "window not coverable" (time lock waived), so a read ERROR is recorded
+    /// here and voids the block's result (BlockIndexReadError, non-verdict).
+    ancestor_read_err: ?anyerror = null,
     /// Observability / tests.
     invalid_block_verdicts: u64 = 0,
     cached_invalid_header_hits: u64 = 0,
@@ -5216,7 +5192,16 @@ pub const PeerManager = struct {
                         PeerError.ProtocolViolation => {
                             peer_obj.misbehaving(20, "protocol violation");
                         },
-                        else => {
+                        // Gate 6 (F12): OUR allocation failed while receiving /
+                        // decoding.  Not the peer's fault: no score, no ban.
+                        // The stream position is now unknown, so drop the
+                        // connection (it may reconnect).
+                        PeerError.OutOfMemory => {
+                            std.debug.print("P2P: out of memory receiving from a peer — disconnecting WITHOUT penalty (local fault)\n", .{});
+                            self.removePeerByIndex(i);
+                            break;
+                        },
+                        PeerError.ConnectionFailed, PeerError.HandshakeFailed => {
                             peer_obj.misbehaving(10, "message receive error");
                         },
                     }
@@ -6301,6 +6286,7 @@ pub const PeerManager = struct {
     /// blocks, calls reorgToChain, clears pending_reorg.  On failure:
     /// logs + bans the source peer + clears pending_reorg.
     pub fn tryFireReorg(self: *PeerManager) void {
+        if (fatal.isLatched()) return;
         const pr_ptr = if (self.pending_reorg) |*p| p else return;
         const cs = self.chain_state orelse return;
 
@@ -6308,6 +6294,29 @@ pub const PeerManager = struct {
         for (pr_ptr.fork_hashes.items) |h| {
             if (!self.block_buffer.contains(h)) return; // not yet
         }
+
+        // Gate 6 (D1): resolve the fork point's height BEFORE taking the
+        // bodies out of the buffer.  It used to be lookupHeightOrZero, which
+        // answered 0 for a block-index READ ERROR as well as for an unknown
+        // hash: the fork blocks were then numbered 1,2,3,... and a valid
+        // fork failed BIP-34 (BadCoinbaseHeight) -> marked + deliverer banned.
+        // An unresolvable fork point is not a verdict on anyone: drop the
+        // pending reorg (nothing marked, nobody punished) and keep the tip.
+        const fp_height = self.lookupForkPointHeight(&pr_ptr.fork_point) catch |err| {
+            std.log.warn("[REORG] fork-point height read failed ({}) — reorg dropped, NOT a verdict; nothing marked, no peer punished", .{err});
+            if (pr_ptr.fork_hashes.items.len > 0) {
+                const tip_hash = pr_ptr.fork_hashes.items[pr_ptr.fork_hashes.items.len - 1];
+                _ = fatal.noteSystemFault(&tip_hash, "reorg fork-point lookup", err);
+            }
+            pr_ptr.deinit();
+            self.pending_reorg = null;
+            return;
+        } orelse {
+            std.log.warn("[REORG] fork point not in the block index — reorg dropped, NOT a verdict", .{});
+            pr_ptr.deinit();
+            self.pending_reorg = null;
+            return;
+        };
 
         // Build the ReorgBlock array.  We must NOT free the blocks here
         // — reorgToChain will move ownership through queueBlockWrite.
@@ -6331,7 +6340,6 @@ pub const PeerManager = struct {
                 }
                 return;
             };
-            const fp_height = self.lookupHeightOrZero(&pr_ptr.fork_point);
             rb_list.append(.{
                 .hash = h,
                 .block = fetched.value,
@@ -6428,6 +6436,16 @@ pub const PeerManager = struct {
                 },
                 .not_a_verdict => {
                     std.log.warn("[REORG] FAILED: {} — not a block verdict; nothing marked, no peer punished", .{err});
+                    // Gate 6: a system fault while reorging is retried once
+                    // (the fork is re-announced / re-fetched); the same fork
+                    // tip faulting again latches the node.
+                    const sys = err == error.UtxoReadFailed or err == error.ReorgSystemFault or
+                        err == error.FlushError or
+                        (if (drive_result.connect_reject_err) |ve| validation.isSystemValidationError(ve) else false);
+                    if (sys and pr_ptr.fork_hashes.items.len > 0) {
+                        const tip_hash = pr_ptr.fork_hashes.items[pr_ptr.fork_hashes.items.len - 1];
+                        _ = fatal.noteSystemFault(&tip_hash, "reorg connect", err);
+                    }
                 },
             }
         }
@@ -6450,6 +6468,28 @@ pub const PeerManager = struct {
     /// Helper: look up the height of a given hash via header_index, or
     /// fall back to the active tip if it matches.  Returns 0 if not
     /// found (caller should treat 0 as "fork from genesis").
+    /// Gate 6: connecting a block that already PASSED validation failed.  That
+    /// is never the block's fault (OOM, a coin read, a flush), and
+    /// connectBlockInner does not undo the UTXO spends it already applied, so
+    /// the in-memory chainstate may be torn.  Core: FatalError/AbortNode.
+    /// Halt — main exits non-zero without flushing — instead of continuing on
+    /// that state.  BlockMarkedInvalid is a refusal before any mutation.
+    fn abortOnConnectFailure(height: u32, err: anyerror) void {
+        if (err == error.BlockMarkedInvalid) return;
+        fatal.abortNode("connecting validated block at height {d} failed ({s})", .{ height, @errorName(err) });
+    }
+
+    /// Gate 6 (D1): fork-point height for a reorg.  null = genuinely unknown;
+    /// a block-index read error is an ERROR (never "height 0").
+    fn lookupForkPointHeight(self: *PeerManager, hash: *const types.Hash256) storage.StorageError!?u32 {
+        if (self.header_index.get(hash.*)) |e| return e.height;
+        const cs = self.chain_state orelse return null;
+        if (std.mem.eql(u8, &cs.best_hash, hash)) return cs.best_height;
+        if (try cs.getBlockHeightByHashChecked(hash)) |h| return h;
+        if (std.mem.eql(u8, hash, &self.network_params.genesis_hash)) return 0;
+        return null;
+    }
+
     fn lookupHeightOrZero(self: *PeerManager, hash: *const types.Hash256) u32 {
         if (self.header_index.get(hash.*)) |e| return e.height;
         if (self.chain_state) |cs| {
@@ -9304,6 +9344,21 @@ pub const PeerManager = struct {
         self.snapshot_base_height = base_height;
     }
 
+    /// Gate 6: unwrap a checked ancestor read; a storage error is recorded in
+    /// `ancestor_read_err` (first wins) and answered as "not found" so the
+    /// walk's existing fallbacks still run — the caller then voids the
+    /// block's result instead of trusting a waived / wrong MTP.
+    fn noteAncestorRead(self: *PeerManager, comptime T: type, r: storage.StorageError!T) T {
+        return noteReadInto(T, r, &self.ancestor_read_err);
+    }
+
+    fn noteReadInto(comptime T: type, r: storage.StorageError!T, sink: *?anyerror) T {
+        return r catch |e| {
+            if (sink.* == null) sink.* = e;
+            return null;
+        };
+    }
+
     fn computePrevMtp(self: *PeerManager, prev_hash: *const types.Hash256) u32 {
         return self.computePrevMtpEx(prev_hash, null);
     }
@@ -9328,7 +9383,7 @@ pub const PeerManager = struct {
             }
             if (self.header_index.get(prev_hash.*)) |e| break :blk e.height;
             if (self.chain_state) |cs_h| {
-                if (cs_h.getBlockHeightByHash(prev_hash)) |h| break :blk h;
+                if (self.noteAncestorRead(?u32, cs_h.getBlockHeightByHashChecked(prev_hash))) |h| break :blk h;
             }
             break :blk null;
         };
@@ -9361,7 +9416,7 @@ pub const PeerManager = struct {
             // Read the ancestor header from the persisted block index instead —
             // it covers every connected block and survives the restart.
             if (self.chain_state) |cs2| {
-                if (cs2.getPersistedHeader(&cursor)) |hdr| {
+                if (self.noteAncestorRead(?types.BlockHeader, cs2.getPersistedHeaderChecked(&cursor))) |hdr| {
                     timestamps[n] = hdr.timestamp;
                     cursor = hdr.prev_block;
                     n += 1;
@@ -9472,9 +9527,15 @@ pub const PeerManager = struct {
     /// — Core's GetAncestor walks the persistent block index and never
     /// silently fails for an in-chain ancestor.
     fn computeMtpAtHeight(self: *PeerManager, height: u32) u32 {
+        return self.computeMtpAtHeightSink(height, &self.ancestor_read_err);
+    }
+
+    /// computeMtpAtHeight recording ancestor read errors into `sink` (gate 6),
+    /// so a caller on another thread (submitblock) has its own error slot.
+    fn computeMtpAtHeightSink(self: *PeerManager, height: u32, sink: *?anyerror) u32 {
         const cs = self.chain_state orelse return 0;
         // Retrieve the hash of block at `height` from the persistent index.
-        const block_hash = cs.getBlockHashByHeight(height) orelse return 0;
+        const block_hash = noteReadInto(?types.Hash256, cs.getBlockHashByHeightChecked(height), sink) orelse return 0;
         // Collect timestamps: block at `height` then its ancestors.
         var timestamps: [11]u32 = undefined;
         var n: usize = 0;
@@ -9490,7 +9551,7 @@ pub const PeerManager = struct {
             // ancestor header from the persisted block index and continue,
             // exactly as computePrevMtp does.  This keeps the BIP-68 per-coin
             // MTP correct across a restart instead of collapsing to ~0.
-            if (cs.getPersistedHeader(&cursor)) |hdr| {
+            if (noteReadInto(?types.BlockHeader, cs.getPersistedHeaderChecked(&cursor), sink)) |hdr| {
                 timestamps[n] = hdr.timestamp;
                 cursor = hdr.prev_block;
                 n += 1;
@@ -9534,6 +9595,19 @@ pub const PeerManager = struct {
         const self: *PeerManager = @ptrCast(@alignCast(ctx_ptr));
         return self.computeMtpAtHeight(h);
     }
+
+    /// Gate 6: MTP-at-height context with its OWN read-error slot, for
+    /// callers outside the P2P thread (submitblock).  After acceptBlock a
+    /// non-null `err` voids the result (BlockIndexReadError).
+    pub const MtpSink = struct {
+        pm: *PeerManager,
+        err: ?anyerror = null,
+
+        pub fn trampoline(ctx_ptr: *anyopaque, h: u32) u32 {
+            const sink: *MtpSink = @ptrCast(@alignCast(ctx_ptr));
+            return sink.pm.computeMtpAtHeightSink(h, &sink.err);
+        }
+    };
 
     /// Trampoline for IBDValidationContext.getBlockHashByHeightFn: resolve the
     /// active-chain block hash at `target_h` (Core's CBlockIndex::GetAncestor
@@ -10318,7 +10392,13 @@ pub const PeerManager = struct {
         height: u32,
     ) bool {
         self.last_block_reject_err = null;
+        self.ancestor_read_err = null;
         const cs = self.chain_state orelse return false;
+        // Gate 6: a latched node judges nothing.
+        if (fatal.isLatched()) {
+            self.last_block_reject_err = error.NodeAborted;
+            return false;
+        }
 
         // Per-call lookup adapter: closes over the chain state's utxo_set
         // and dupes the reconstructed scriptPubKey onto the heap so the
@@ -10447,6 +10527,16 @@ pub const PeerManager = struct {
             self.last_block_reject_err = error.UtxoReadError;
             return false;
         }
+        // Gate 6: same for an ancestor read failure (MTP window): the time
+        // checks ran against a waived/wrong MTP, so the result is void.
+        if (self.ancestor_read_err) |rerr| {
+            std.debug.print(
+                "P2P: BLOCK INDEX READ FAILED validating block height={d} ({}) — NOT a block verdict: not marked, sender not punished, will retry\n",
+                .{ height, rerr },
+            );
+            self.last_block_reject_err = error.BlockIndexReadError;
+            return false;
+        }
         accept_res catch |err| {
             std.debug.print(
                 "P2P: REJECT block height={d} validation={}\n",
@@ -10518,7 +10608,9 @@ pub const PeerManager = struct {
                 };
                 self.blocks_since_flush = 0;
             }
-            self.tryFireReorg();
+            // Gate 6: never reorg against a chainstate whose last write failed
+            // (flush() already retried once and latched the node).
+            if (!fatal.isLatched() and !cs.flush_error) self.tryFireReorg();
         }
 
         // Stall recovery is now handled in two level-triggered paths,
@@ -10537,6 +10629,8 @@ pub const PeerManager = struct {
         // `wave15-2026-04-15/CLEARBIT-STALL-RECOVERY-DIAG.md`.
 
         while (self.connect_cursor < self.expected_blocks.items.len) {
+            // Gate 6: a latched node (fatal system fault) connects nothing.
+            if (fatal.isLatched()) break;
             // Shutdown: stop between blocks. This loop connected ~400
             // buffered blocks (22.5 s, two blocks of 5 s and 15 s on a busy
             // disk) after SIGTERM in the testnet4 gate-5 repro (2026-10-02,
@@ -10755,7 +10849,14 @@ pub const PeerManager = struct {
                     // Punish the deliverer, do NOT mark; re-fetch below.
                     .mutated => self.punishBlockSource(&block_hash, null, "mutated-block"),
                     // Not a verdict: no mark, no punishment; retry below.
-                    .not_a_verdict => {},
+                    // Gate 6: a SYSTEM fault (read error, OOM, script-check
+                    // internal) is retried once; the same block faulting
+                    // again latches the node (Core AbortNode).
+                    .not_a_verdict => if (self.last_block_reject_err) |e| {
+                        if (validation.isSystemValidationError(e)) {
+                            _ = fatal.noteSystemFault(&block_hash, "P2P block validation", e);
+                        }
+                    },
                 }
                 _ = self.block_source_peers.remove(block_hash);
                 // Treat as a fatal-for-this-block error: do NOT advance
@@ -10822,6 +10923,7 @@ pub const PeerManager = struct {
                 // no-op).  This is Bitcoin Core's dbcache-flush model.
                 cs.connectBlockFastWithUndoNoFlush(&block, &block_hash, height) catch |err| {
                     std.debug.print("P2P: Failed to connect block (with undo) at height {d}: {}\n", .{ height, err });
+                    abortOnConnectFailure(height, err);
                     break;
                 };
                 self.blocks_since_flush += 1;
@@ -10849,6 +10951,7 @@ pub const PeerManager = struct {
                 // During IBD, skip undo data collection for speed
                 cs.connectBlockFast(&block, &block_hash, height) catch |err| {
                     std.debug.print("P2P: Failed to connect block at height {d}: {}\n", .{ height, err });
+                    abortOnConnectFailure(height, err);
                     break;
                 };
             }
@@ -11038,6 +11141,7 @@ pub const PeerManager = struct {
 
             self.our_height = @intCast(cs.best_height);
             connected += 1;
+            fatal.clearSystemFault();
             self.blocks_since_log += 1;
             self.connect_cursor += 1;
             // Cursor advanced → not wedged; clear the drain-wedge staller timer.

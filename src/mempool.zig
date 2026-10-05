@@ -18,6 +18,7 @@ const serialize = @import("serialize.zig");
 const p2p = @import("p2p.zig");
 const zmq = @import("zmq.zig");
 const validation = @import("validation.zig");
+const fatal = @import("fatal.zig");
 
 // ============================================================================
 // Mempool Constants
@@ -245,6 +246,10 @@ pub const MempoolError = error{
     MissingInputs,
     /// Memory allocation failure.
     OutOfMemory,
+    /// Gate 6: the tx was NOT judged — a local system fault (script check
+    /// could not be performed, or the node is latched after a fatal error).
+    /// Never a consensus/policy reject; the tx is not "invalid".
+    SystemFault,
     /// TRUC: v3 transaction is too large (exceeds TRUC_MAX_VSIZE).
     TrucTxTooLarge,
     /// TRUC: v3 child transaction is too large (exceeds TRUC_CHILD_MAX_VSIZE).
@@ -402,6 +407,8 @@ fn rejectReasonForError(err: MempoolError) []const u8 {
         MempoolError.SameNonWitnessDataInMempool => "txn-same-nonwitness-data-in-mempool",
         MempoolError.InsufficientFee => "min relay fee not met",
         MempoolError.MissingInputs => "missing-inputs",
+        // Gate 6: not a reject — the tx was not judged.
+        MempoolError.SystemFault => "system-error",
         MempoolError.NonBIP125Replaceable => "txn-mempool-conflict",
         MempoolError.ReplacementFeeTooLow => "insufficient fee",
         MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
@@ -1156,6 +1163,8 @@ pub const Mempool = struct {
 
     /// Attempt to add a transaction to the mempool.
     pub fn addTransaction(self: *Mempool, tx: types.Transaction) MempoolError!void {
+        // Gate 6: after a fatal system fault the node accepts nothing new.
+        if (fatal.isLatched()) return MempoolError.SystemFault;
         const tx_hash = crypto.computeTxid(&tx, self.allocator) catch return MempoolError.OutOfMemory;
 
         // 1a. CheckTransaction() consensus sanity gate (W96).
@@ -1642,6 +1651,14 @@ pub const Mempool = struct {
     ///
     /// Returns AcceptResult with acceptance status and details.
     pub fn acceptToMemoryPool(self: *Mempool, tx: types.Transaction, test_accept: bool) AcceptResult {
+        if (fatal.isLatched()) return AcceptResult{
+            .accepted = false,
+            .txid = std.mem.zeroes(types.Hash256),
+            .wtxid = std.mem.zeroes(types.Hash256),
+            .fee = 0,
+            .vsize = 0,
+            .reject_reason = "node shutting down after a fatal system error",
+        };
         const tx_hash = crypto.computeTxid(&tx, self.allocator) catch return AcceptResult{
             .accepted = false,
             .txid = std.mem.zeroes(types.Hash256),
@@ -2932,7 +2949,14 @@ pub const Mempool = struct {
                 spent_scripts[input_index],
                 input.witness,
             );
-            const script_ok: bool = if (result) |ok| ok else |_| false;
+            // Gate 6: a system fault (OOM / no secp context) is not "script
+            // failed" — the tx was not judged.
+            const script_ok: bool = if (result) |ok| ok else |e| blk: {
+                if (script.isSystemScriptError(e)) {
+                    return if (e == error.OutOfMemory) MempoolError.OutOfMemory else MempoolError.SystemFault;
+                }
+                break :blk false;
+            };
             if (!script_ok) {
                 // W96: TX_WITNESS_STRIPPED detection.
                 //
@@ -2986,7 +3010,10 @@ pub const Mempool = struct {
             );
             if (result) |ok| {
                 if (!ok) return MempoolError.ScriptVerifyFailed;
-            } else |_| {
+            } else |e| {
+                if (script.isSystemScriptError(e)) {
+                    return if (e == error.OutOfMemory) MempoolError.OutOfMemory else MempoolError.SystemFault;
+                }
                 return MempoolError.ScriptVerifyFailed;
             }
         }

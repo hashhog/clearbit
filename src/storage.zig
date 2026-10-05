@@ -20,6 +20,8 @@ const types = @import("types.zig");
 const serialize = @import("serialize.zig");
 const storage_rocksdb = @import("storage_rocksdb.zig");
 const chainwork = @import("chainwork.zig");
+const builtin = @import("builtin");
+const fatal = @import("fatal.zig");
 
 /// Column family indices for organizing data.
 /// Each stores a different type of data with potentially different
@@ -167,6 +169,20 @@ pub const Database = struct {
     /// no behavior change.
     write_batch_calls: u64 = 0,
 
+    /// TEST-ONLY fault hooks (gate 6).  Compiled out of non-test builds
+    /// (every check is behind `builtin.is_test`), so production behaviour is
+    /// unchanged.  Bit `i` of `fault_get_cf_mask` makes every get / multiGet
+    /// on column family `i` fail with ReadFailed; `fault_write_batch_failures`
+    /// makes the next N writeBatch calls fail with WriteFailed (ENOSPC/EIO).
+    fault_get_cf_mask: u32 = 0,
+    fault_write_batch_failures: u32 = 0,
+
+    inline fn faultGet(self: *const Database, cf_index: usize) bool {
+        if (!builtin.is_test) return false;
+        if (cf_index >= 32) return false;
+        return (self.fault_get_cf_mask >> @as(u5, @intCast(cf_index))) & 1 != 0;
+    }
+
     /// Open or create the database at the given path.
     /// `block_cache_mib` sizes the RocksDB LRU block cache in MiB
     /// (typically the same value as the user's `--dbcache` flag).
@@ -181,6 +197,7 @@ pub const Database = struct {
 
     /// Get a value by key from a column family.
     pub fn get(self: *Database, cf_index: usize, key: []const u8) StorageError!?[]const u8 {
+        if (self.faultGet(cf_index)) return StorageError.ReadFailed;
         return storage_rocksdb.dbGet(self, cf_index, key);
     }
 
@@ -193,6 +210,7 @@ pub const Database = struct {
         keys: []const []const u8,
         results: []?[]u8,
     ) StorageError!void {
+        if (self.faultGet(cf_index)) return StorageError.ReadFailed;
         return storage_rocksdb.dbMultiGet(self, cf_index, keys, results);
     }
 
@@ -209,6 +227,10 @@ pub const Database = struct {
     /// Batch write: apply multiple operations atomically.
     pub fn writeBatch(self: *Database, operations: []const BatchOp) StorageError!void {
         self.write_batch_calls += 1;
+        if (builtin.is_test and self.fault_write_batch_failures > 0) {
+            self.fault_write_batch_failures -= 1;
+            return StorageError.WriteFailed;
+        }
         return storage_rocksdb.dbWriteBatch(self, operations);
     }
 
@@ -4172,12 +4194,21 @@ pub const ChainState = struct {
     /// that was connected before the W37 index was introduced).  Caller
     /// owns lifetime-free semantics: the returned Hash256 is copied out.
     pub fn getBlockHashByHeight(self: *ChainState, height: u32) ?types.Hash256 {
+        return self.getBlockHashByHeightChecked(height) catch null;
+    }
+
+    /// Gate 6: getBlockHashByHeight for consensus callers.  A storage error
+    /// (or an undecodable record) is an ERROR, distinct from "no such height"
+    /// (null).  The best-effort wrapper above answers null for both, which
+    /// the MTP / fork-point callers turned into 0 — waiving time locks or
+    /// mis-numbering a fork.
+    pub fn getBlockHashByHeightChecked(self: *ChainState, height: u32) StorageError!?types.Hash256 {
         const db = self.utxo_set.db orelse return null;
         const key_bytes = ChainStore.buildHeightHashKey(height);
-        const data = db.get(CF_DEFAULT, &key_bytes) catch return null;
+        const data = try db.get(CF_DEFAULT, &key_bytes);
         const bytes = data orelse return null;
         defer self.allocator.free(bytes);
-        if (bytes.len != 32) return null;
+        if (bytes.len != 32) return StorageError.CorruptData;
         var hash: types.Hash256 = undefined;
         @memcpy(&hash, bytes);
         return hash;
@@ -4192,13 +4223,19 @@ pub const ChainState = struct {
     /// otherwise false-rejects blocks carrying a time-based nLockTime tx with a
     /// non-final sequence. Returns null if the hash is not in the block index.
     pub fn getPersistedHeader(self: *ChainState, hash: *const types.Hash256) ?types.BlockHeader {
+        return self.getPersistedHeaderChecked(hash) catch null;
+    }
+
+    /// Gate 6: getPersistedHeader that reports a read error / corrupt record
+    /// as an error (null = genuinely not in the block index).
+    pub fn getPersistedHeaderChecked(self: *ChainState, hash: *const types.Hash256) StorageError!?types.BlockHeader {
         const db = self.utxo_set.db orelse return null;
-        const data = db.get(CF_BLOCK_INDEX, hash) catch return null;
+        const data = try db.get(CF_BLOCK_INDEX, hash);
         const bytes = data orelse return null;
         defer self.allocator.free(bytes);
         var reader = serialize.Reader{ .data = bytes };
-        _ = reader.readInt(u32) catch return null; // height prefix (see getBlockIndex)
-        return serialize.readBlockHeader(&reader) catch return null;
+        _ = reader.readInt(u32) catch return StorageError.CorruptData; // height prefix (see getBlockIndex)
+        return serialize.readBlockHeader(&reader) catch return StorageError.CorruptData;
     }
 
     /// Read a block header from the persisted block BODY in CF_BLOCKS (keyed by
@@ -4209,12 +4246,17 @@ pub const ChainState = struct {
     /// retarget when the in-memory ring is cold (post-restart) and CF_BLOCK_INDEX
     /// is absent.  Returns null when the body is missing (pruned / DB-less).
     pub fn getBlockHeaderFromBody(self: *ChainState, hash: *const types.Hash256) ?types.BlockHeader {
+        return self.getBlockHeaderFromBodyChecked(hash) catch null;
+    }
+
+    /// Gate 6: getBlockHeaderFromBody with read errors reported as errors.
+    pub fn getBlockHeaderFromBodyChecked(self: *ChainState, hash: *const types.Hash256) StorageError!?types.BlockHeader {
         const db = self.utxo_set.db orelse return null;
-        const data = db.get(CF_BLOCKS, hash) catch return null;
+        const data = try db.get(CF_BLOCKS, hash);
         const bytes = data orelse return null;
         defer self.allocator.free(bytes);
         var reader = serialize.Reader{ .data = bytes };
-        return serialize.readBlockHeader(&reader) catch return null;
+        return serialize.readBlockHeader(&reader) catch return StorageError.CorruptData;
     }
 
     /// Read the persisted height for a block hash from CF_BLOCK_INDEX (the
@@ -4222,12 +4264,17 @@ pub const ChainState = struct {
     /// Returns null if the hash is not in the block index.  Used by
     /// gettxoutsetinfo to resolve a hash_or_height block-hash argument.
     pub fn getBlockHeightByHash(self: *ChainState, hash: *const types.Hash256) ?u32 {
+        return self.getBlockHeightByHashChecked(hash) catch null;
+    }
+
+    /// Gate 6: getBlockHeightByHash with read errors reported as errors.
+    pub fn getBlockHeightByHashChecked(self: *ChainState, hash: *const types.Hash256) StorageError!?u32 {
         const db = self.utxo_set.db orelse return null;
-        const data = db.get(CF_BLOCK_INDEX, hash) catch return null;
+        const data = try db.get(CF_BLOCK_INDEX, hash);
         const bytes = data orelse return null;
         defer self.allocator.free(bytes);
         var reader = serialize.Reader{ .data = bytes };
-        return reader.readInt(u32) catch null;
+        return reader.readInt(u32) catch return StorageError.CorruptData;
     }
 
     /// Compute the median-time-past for the active chain tip.
@@ -6141,27 +6188,45 @@ pub const ChainState = struct {
         new_chain: []const ReorgBlock,
         fork_height: u32,
 
-        fn timestampAt(self: *const ReorgMtpSource, h: u32) ?u32 {
+        /// Gate 6: first storage error hit while reading an ancestor.  The
+        /// MTP callback can only answer a number, and 0 means "window not
+        /// coverable" (time lock waived), so a read ERROR is recorded here and
+        /// the caller voids the block's result (BlockIndexReadError).
+        read_err: ?anyerror = null,
+
+        fn timestampAt(self: *ReorgMtpSource, h: u32) ?u32 {
             if (h > self.fork_height) {
                 const idx: usize = h - self.fork_height - 1;
                 if (idx >= self.new_chain.len) return null;
                 return self.new_chain[idx].block.header.timestamp;
             }
-            const hash = self.cs.getBlockHashByHeight(h) orelse {
+            const hash_opt = self.cs.getBlockHashByHeightChecked(h) catch |e| {
+                if (self.read_err == null) self.read_err = e;
+                return null;
+            };
+            const hash = hash_opt orelse {
                 if (h == 0) return self.params.genesis_header.timestamp;
                 return null;
             };
             if (std.mem.eql(u8, &hash, &self.params.genesis_hash)) {
                 return self.params.genesis_header.timestamp;
             }
-            if (self.cs.getPersistedHeader(&hash)) |hdr| return hdr.timestamp;
-            if (self.cs.getBlockHeaderFromBody(&hash)) |hdr| return hdr.timestamp;
+            const ph = self.cs.getPersistedHeaderChecked(&hash) catch |e| blk: {
+                if (self.read_err == null) self.read_err = e;
+                break :blk null;
+            };
+            if (ph) |hdr| return hdr.timestamp;
+            const bh = self.cs.getBlockHeaderFromBodyChecked(&hash) catch |e| blk: {
+                if (self.read_err == null) self.read_err = e;
+                break :blk null;
+            };
+            if (bh) |hdr| return hdr.timestamp;
             return null;
         }
 
         /// Median-time-past OF the block at height `h`
         /// (Core CBlockIndex::GetMedianTimePast).  0 = window not coverable.
-        fn mtpAt(self: *const ReorgMtpSource, h: u32) u32 {
+        fn mtpAt(self: *ReorgMtpSource, h: u32) u32 {
             var ts: [11]u32 = undefined;
             const want: usize = @min(@as(usize, 11), @as(usize, h) + 1);
             var i: usize = 0;
@@ -6172,7 +6237,7 @@ pub const ChainState = struct {
         }
 
         pub fn getMtpTrampoline(ctx_ptr: *anyopaque, h: u32) u32 {
-            const self: *const ReorgMtpSource = @ptrCast(@alignCast(ctx_ptr));
+            const self: *ReorgMtpSource = @ptrCast(@alignCast(ctx_ptr));
             return self.mtpAt(h);
         }
     };
@@ -6603,7 +6668,35 @@ pub const ChainState = struct {
                     }
                     return error.UtxoReadFailed;
                 }
+                // Gate 6: an ancestor (MTP window) read failure is the same
+                // class — the time-lock checks ran against a waived MTP, so
+                // whatever acceptBlock concluded is void.  Not a verdict.
+                if (mtp_src.read_err) |rerr| {
+                    std.debug.print(
+                        "reorgToChain: BLOCK INDEX READ FAILED computing MTP at side-branch height {d} ({}) — aborting reorg; NOT a block verdict\n",
+                        .{ entry.height, rerr },
+                    );
+                    if (drive_result) |dr| {
+                        dr.connect_reject_err = error.BlockIndexReadError;
+                        dr.connected_before_reject = connect_count;
+                    }
+                    return error.ReorgSystemFault;
+                }
                 accept_res catch |err| {
+                    if (validation.isSystemValidationError(err)) {
+                        // Gate 6: OOM / script-check internal fault / latched
+                        // node — abort the reorg as a NON-verdict (rolled back
+                        // by the errdefer exactly like a reject).
+                        std.debug.print(
+                            "reorgToChain: SYSTEM FAULT validating side-branch block at height {d} ({}) — aborting reorg; NOT a block verdict\n",
+                            .{ entry.height, err },
+                        );
+                        if (drive_result) |dr| {
+                            dr.connect_reject_err = err;
+                            dr.connected_before_reject = connect_count;
+                        }
+                        return error.ReorgSystemFault;
+                    }
                     std.debug.print(
                         "reorgToChain: REJECT side-branch block at height {d} validation={} — aborting reorg\n",
                         .{ entry.height, err },
@@ -8019,7 +8112,18 @@ pub const ChainState = struct {
 
         if (batch.items.len > 0) {
             const t_write_start = std.time.nanoTimestamp();
-            db.writeBatch(batch.items) catch |err| {
+            // Gate 6 (Core FatalError/AbortNode, validation.cpp:2779-2836):
+            // a failed chainstate write is retried ONCE; a second failure
+            // latches the node.  Write-before-forget: nothing below this point
+            // (dirty flags, pending deletes, queued bodies/undo) is cleared
+            // unless the write landed.
+            var write_res = db.writeBatch(batch.items);
+            if (write_res) |_| {} else |first_err| {
+                std.debug.print("ChainState flush: writeBatch failed with {} — retrying once\n", .{first_err});
+                write_res = db.writeBatch(batch.items);
+            }
+            write_res catch |err| {
+                fatal.abortNode("chainstate flush failed twice ({s}); {d} batch entries not persisted", .{ @errorName(err), batch.items.len });
                 std.debug.print("ChainState flush: writeBatch failed with {}, {d} entries NOT persisted — setting flush_error\n", .{ err, batch.items.len });
                 // Sticky flush_error so connectBlockFast / submitBlock refuse
                 // to advance the in-memory tip past the last good on-disk tip.

@@ -25,6 +25,7 @@ const consensus = @import("consensus.zig");
 const crypto = @import("crypto.zig");
 const block_template = @import("block_template.zig");
 const validation = @import("validation.zig");
+const fatal = @import("fatal.zig");
 const wallet_mod = @import("wallet.zig");
 const descriptor = @import("descriptor.zig");
 const psbt_mod = @import("psbt.zig");
@@ -9327,6 +9328,8 @@ pub const RpcServer = struct {
                 mempool_mod.MempoolError.ConflictsWithMempool => self.jsonRpcError(RPC_VERIFY_REJECTED, "txn-mempool-conflict", id),
                 mempool_mod.MempoolError.TxValidationFailed => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction validation failed", id),
                 mempool_mod.MempoolError.OutOfMemory => self.jsonRpcError(RPC_OUT_OF_MEMORY, "out of memory", id),
+                // Gate 6: not judged (local system fault / latched node).
+                mempool_mod.MempoolError.SystemFault => self.jsonRpcError(RPC_VERIFY_ERROR, "transaction not checked: local system error", id),
                 else => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction rejected", id),
             };
         };
@@ -9875,6 +9878,11 @@ pub const RpcServer = struct {
     }
 
     fn handleSubmitBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        // Gate 6: after a fatal system fault (AbortNode) the node judges and
+        // connects nothing.  Core: RPC_VERIFY_ERROR, never a BIP-22 token.
+        if (fatal.isLatched()) {
+            return self.jsonRpcError(RPC_VERIFY_ERROR, "node is shutting down after a fatal system error; block not checked", id);
+        }
         // Extract hex-encoded block
         var hex: []const u8 = undefined;
 
@@ -9969,12 +9977,20 @@ pub const RpcServer = struct {
         // so that the "time-too-old" BIP-22 string is returned without needing
         // a UTXO-lookup round-trip.
         // Reference: bitcoin-core/src/validation.cpp:4092-4093
-        const mtp = self.computeSubmitBlockMtp(&block_data.header.prev_block);
+        var mtp_read_err: ?anyerror = null;
+        const mtp = self.computeSubmitBlockMtpChecked(&block_data.header.prev_block, &mtp_read_err);
+        if (mtp_read_err) |rerr| {
+            return self.submitBlockSystemFault(&block_hash, rerr, id);
+        }
         if (mtp != 0 and block_data.header.timestamp <= mtp) {
             return self.jsonRpcResult("\"time-too-old\"", id);
         }
 
-        if (self.validateSubmitBlockOrReject(&block_data, &block_hash, submit_height)) |bip22_str| {
+        const check = self.validateSubmitBlockChecked(&block_data, &block_hash, submit_height);
+        if (check.system_fault) |sys_err| {
+            return self.submitBlockSystemFault(&block_hash, sys_err, id);
+        }
+        if (check.reject) |bip22_str| {
             // Return BIP-22 string result (not a JSON-RPC error) for consensus
             // rejections.  Per BIP-22 and Bitcoin Core BIP22ValidationResult()
             // in src/rpc/mining.cpp, the caller-visible result field carries the
@@ -10016,12 +10032,18 @@ pub const RpcServer = struct {
             self.chain_manager,
             self.mempool,
             self.allocator,
-        ) catch {
-            // Unexpected Zig error (allocator / I/O) — use "rejected" catch-all.
-            return self.jsonRpcResult("\"rejected\"", id);
+        ) catch |err| {
+            // Gate 6: an unexpected Zig error here is a local fault (allocator
+            // / I/O), not a verdict — it used to be the BIP-22 "rejected".
+            return self.submitBlockSystemFault(&block_hash, err, id);
         };
 
+        if (result.system_fault) |sys_err| {
+            return self.submitBlockSystemFault(&block_hash, sys_err, id);
+        }
+
         if (result.accepted) {
+            fatal.clearSystemFault();
             // null = success per BIP-22
             return self.jsonRpcResult("null", id);
         } else {
@@ -10204,6 +10226,18 @@ pub const RpcServer = struct {
         return self.jsonRpcResult("null", id);
     }
 
+    /// Gate 6: a submitblock that hit a local system fault (read / write /
+    /// OOM / script-check internal error) gets RPC_VERIFY_ERROR, never a
+    /// BIP-22 reject token.  The same block faulting twice in a row latches
+    /// the node (retry once, then AbortNode).
+    fn submitBlockSystemFault(self: *RpcServer, block_hash: *const types.Hash256, err: anyerror, id: ?std.json.Value) ![]const u8 {
+        std.debug.print("RPC: submitblock SYSTEM FAULT ({}) — block not judged (NOT a verdict)\n", .{err});
+        _ = fatal.noteSystemFault(block_hash, "submitblock", err);
+        var buf: [160]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "block not checked: local system error ({s})", .{@errorName(err)}) catch "block not checked: local system error";
+        return self.jsonRpcError(RPC_VERIFY_ERROR, msg, id);
+    }
+
     /// Compute the median-time-past for BIP-113 header validation in submitblock.
     ///
     /// Walks prev_hash and up to 10 of its ancestors (11 blocks total, the same
@@ -10225,14 +10259,14 @@ pub const RpcServer = struct {
     /// preserving the existing "mtp==0 -> skip check" semantics.
     ///
     /// Reference: bitcoin-core/src/chain.h CBlockIndex::GetMedianTimePast (line 233).
-    fn computeSubmitBlockMtp(self: *RpcServer, prev_hash: *const types.Hash256) u32 {
+    ///
+    /// Gate 6: records a block-index read error in `err_out`
+    /// (gate 6) instead of silently shortening the window.
+    fn computeSubmitBlockMtpChecked(self: *RpcServer, prev_hash: *const types.Hash256, err_out: *?anyerror) u32 {
         var timestamps: [11]u32 = undefined;
         var n: usize = 0;
         var cursor = prev_hash.*;
-
         while (n < 11) {
-            // Path 1: in-memory chain_manager block_index (covers blocks connected
-            // this session, including both sides of a reorg).
             if (self.chain_manager) |cm| {
                 if (cm.block_index.get(cursor)) |entry| {
                     timestamps[n] = entry.header.timestamp;
@@ -10241,16 +10275,22 @@ pub const RpcServer = struct {
                     continue;
                 }
             }
-            // Path 2: persisted CF_BLOCK_INDEX (survives restarts; same lookup
-            // the clearbit 4aeb681 MTP-at-boot fix uses).
-            const hdr = self.chain_state.getPersistedHeader(&cursor) orelse break;
+            const hdr_opt = self.chain_state.getPersistedHeaderChecked(&cursor) catch |e| {
+                if (err_out.* == null) err_out.* = e;
+                break;
+            };
+            const hdr = hdr_opt orelse break;
             timestamps[n] = hdr.timestamp;
             n += 1;
             cursor = hdr.prev_block;
         }
-
         if (n == 0) return 0;
         return validation.medianTimePast(timestamps[0..n]);
+    }
+
+    fn computeSubmitBlockMtp(self: *RpcServer, prev_hash: *const types.Hash256) u32 {
+        var ignored: ?anyerror = null;
+        return self.computeSubmitBlockMtpChecked(prev_hash, &ignored);
     }
 
     /// Look up the nTime of the parent block identified by `hash` (the parent
@@ -10395,28 +10435,47 @@ pub const RpcServer = struct {
     /// validateBlockForIBD.  Validation now runs unconditionally on both
     /// the IBD (peer.zig) and submitblock (rpc.zig) paths, matching Core.
     /// Supersedes the wave-15 wave-22 holding patches on this function.
-    fn validateSubmitBlockOrReject(
+    /// Gate 6: the submitblock validation outcome with a SYSTEM-FAULT arm.
+    /// `reject` is a BIP-22 token (a verdict); `system_fault` means the block
+    /// was not judged (coin / block-index read error, OOM, script-check
+    /// internal fault) and must be reported as RPC_VERIFY_ERROR.
+    pub const SubmitCheck = struct {
+        reject: ?[]const u8 = null,
+        system_fault: ?anyerror = null,
+    };
+
+    fn validateSubmitBlockChecked(
         self: *RpcServer,
         block: *const types.Block,
         block_hash: *const types.Hash256,
         height: u32,
-    ) ?[]const u8 {
+    ) SubmitCheck {
         // Per-call adapter: closes over chain state's utxo_set and dupes the
         // reconstructed scriptPubKey onto the heap so the caller-side arena
         // can adopt it.  Identical pattern to peer.zig::validateBlockForIBDOrReject.
+        //
+        // Gate 6: a READ FAILURE is recorded in `read_err`, never answered as
+        // a missing coin (which is bad-txns-inputs-missingorspent, a verdict).
         const Adapter = struct {
             cs_ptr: *storage.ChainState,
             alloc: std.mem.Allocator,
+            read_err: ?anyerror = null,
 
             fn lookup(
                 ctx_ptr: *anyopaque,
                 outpoint: *const types.OutPoint,
             ) ?validation.PrevOutInfo {
                 const me: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                const compact_opt = me.cs_ptr.utxo_set.get(outpoint) catch return null;
+                const compact_opt = me.cs_ptr.utxo_set.get(outpoint) catch |e| {
+                    if (me.read_err == null) me.read_err = e;
+                    return null;
+                };
                 var compact = compact_opt orelse return null;
                 defer compact.deinit(me.alloc);
-                const script = compact.reconstructScript(me.alloc) catch return null;
+                const script = compact.reconstructScript(me.alloc) catch |e| {
+                    if (me.read_err == null) me.read_err = e;
+                    return null;
+                };
                 return .{
                     .script_pubkey = script,
                     .amount = compact.value,
@@ -10427,6 +10486,10 @@ pub const RpcServer = struct {
             }
         };
         var adapter = Adapter{ .cs_ptr = self.chain_state, .alloc = self.allocator };
+        // Ancestor (MTP) reads get their own error slot (this is the RPC
+        // thread; the P2P thread owns PeerManager.ancestor_read_err).
+        var mtp_sink = peer_mod.PeerManager.MtpSink{ .pm = self.peer_manager };
+        var anc_err: ?anyerror = null;
 
         // ── Stage split: CheckBlockHeader (high-hash) BEFORE the contextual gate ─
         // Core runs CheckBlockHeader (folds target>powLimit AND hash>target into
@@ -10440,7 +10503,7 @@ pub const RpcServer = struct {
         // "bad-diffbits".  Without this, a block with correct PoW but wrong nBits
         // was mislabeled "high-hash".
         validation.checkBlockHeader(&block.header, self.network_params) catch {
-            return "high-hash";
+            return .{ .reject = "high-hash" };
         };
 
         // Assumevalid script-skip: same logic as the IBD path in peer.zig.
@@ -10488,13 +10551,13 @@ pub const RpcServer = struct {
         );
 
         // MTP-of-11 of the parent (BIP-113 time-too-old + IsFinalTx cutoff).
-        const prev_mtp_val = self.computeSubmitBlockMtp(&block.header.prev_block);
+        const prev_mtp_val = self.computeSubmitBlockMtpChecked(&block.header.prev_block, &anc_err);
         // Parent block nTime (BIP-94 timewarp lower bound).
         const prev_block_ts = self.lookupParentTimestamp(&block.header.prev_block);
         // Wall-clock at validation time (time-too-new gate) — matches peer.zig:8364.
         const current_time_val: i64 = std.time.timestamp();
 
-        validation.acceptBlock(
+        const accept_res = validation.acceptBlock(
             block,
             block_hash,
             height,
@@ -10508,8 +10571,8 @@ pub const RpcServer = struct {
                 .current_time = current_time_val,
                 .force_skip_scripts = false,
                 .expected_bits = expected_bits_val,
-                .getMtpAtHeightFn = peer_mod.PeerManager.getMtpAtHeightTrampoline,
-                .getMtpAtHeightCtx = @ptrCast(self.peer_manager),
+                .getMtpAtHeightFn = peer_mod.PeerManager.MtpSink.trampoline,
+                .getMtpAtHeightCtx = @ptrCast(&mtp_sink),
                 .getBlockHashByHeightFn = peer_mod.PeerManager.getBlockHashByHeightTrampoline,
                 .getBlockHashByHeightCtx = @ptrCast(self.peer_manager),
                 .is_requested = true,
@@ -10522,15 +10585,23 @@ pub const RpcServer = struct {
                 // -- it spent a coin created on branch B, absent from branch A).
                 .context_only = !std.mem.eql(u8, &block.header.prev_block, &self.chain_state.best_hash),
             },
-        ) catch |err| {
+        );
+        // Gate 6: a coin / ancestor read failure voids whatever acceptBlock
+        // concluded (a coin it could not read looked missing; a window it
+        // could not read waived a time lock).  Not a verdict.
+        if (adapter.read_err) |e| return .{ .system_fault = e };
+        if (mtp_sink.err) |e| return .{ .system_fault = e };
+        if (anc_err) |e| return .{ .system_fault = e };
+        accept_res catch |err| {
+            if (validation.isSystemValidationError(err)) return .{ .system_fault = err };
             const bip22 = validationErrToBip22(err);
             std.debug.print(
                 "RPC: REJECT submitblock height={d} validation={} bip22={s}\n",
                 .{ height, err, bip22 },
             );
-            return bip22;
+            return .{ .reject = bip22 };
         };
-        return null;
+        return .{};
     }
 
     // ========================================================================

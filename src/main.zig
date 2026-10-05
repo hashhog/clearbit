@@ -31,6 +31,7 @@ pub const ops = @import("ops.zig");
 pub const debug_log = @import("debug_log.zig");
 pub const zmq = @import("zmq.zig");
 pub const campaign_assumeutxo = @import("campaign_assumeutxo.zig");
+pub const fatal = @import("fatal.zig");
 
 // ============================================================================
 // Version Info
@@ -3031,7 +3032,11 @@ pub fn main() !void {
     // Bounded MAX_PRUNE_BATCH per call keeps tail latency in check.
     const PRUNE_TICK_MS: u64 = 60 * 1000; // every 60 s
     var last_prune_ms: i64 = std.time.milliTimestamp();
-    while (!shutdown_requested.load(.acquire)) {
+    // Gate 6: a fatal system fault (fatal.abortNode — a chainstate write that
+    // failed twice, a script check that could not be performed twice, a
+    // repeated read error) ends the main loop exactly like SIGTERM, but the
+    // shutdown below skips the chainstate flush and exits non-zero.
+    while (!shutdown_requested.load(.acquire) and !fatal.isLatched()) {
         std.time.sleep(100 * std.time.ns_per_ms);
         // SIGHUP-driven log file reopen — if a SIGHUP arrived since the
         // last tick, close + reopen the file. Cheap (atomic-load + maybe
@@ -3069,7 +3074,10 @@ pub fn main() !void {
     //     stuck if it ever does exceed the deadline.
     const shutdown_t0 = std.time.milliTimestamp();
     const sig_num = signal_count.load(.acquire);
-    if (sig_num > 0) {
+    const aborted = fatal.isLatched();
+    if (aborted) {
+        std.debug.print("FATAL system error — shutting down WITHOUT flushing the chainstate: {s}\n", .{fatal.reason()});
+    } else if (sig_num > 0) {
         std.debug.print("received SIGTERM, beginning graceful shutdown\n", .{});
     } else {
         std.debug.print("\nShutting down...\n", .{});
@@ -3150,15 +3158,24 @@ pub fn main() !void {
     // Phase 4: flush chainstate — dirty UTXO entries + chain tip,
     // atomically so a crash never leaves the tip out of sync with
     // the UTXO set (see storage.ChainState.flush).
-    std.debug.print("flushing chainstate\n", .{});
-    chain_state.flush() catch |err| {
-        std.debug.print("Warning: error flushing chain state: {}\n", .{err});
-    };
-    // deinit() used to retry deletes a failed flush left queued. This path
-    // never reaches deinit. No-op when the flush above already drained them.
-    chain_state.utxo_set.flushPendingDeletes() catch |err| {
-        std.debug.print("Warning: pending UTXO deletes not persisted: {}\n", .{err});
-    };
+    //
+    // Gate 6: NOT after a fatal system fault.  The in-memory state is exactly
+    // what could not be committed (or was built from reads that failed);
+    // flushing it would persist a torn chainstate.  The restart resumes from
+    // the last durable flush (Core AbortNode never flushes a failed state).
+    if (aborted or fatal.isLatched()) {
+        std.debug.print("skipping chainstate flush (fatal system error)\n", .{});
+    } else {
+        std.debug.print("flushing chainstate\n", .{});
+        chain_state.flush() catch |err| {
+            std.debug.print("Warning: error flushing chain state: {}\n", .{err});
+        };
+        // deinit() used to retry deletes a failed flush left queued. This path
+        // never reaches deinit. No-op when the flush above already drained them.
+        chain_state.utxo_set.flushPendingDeletes() catch |err| {
+            std.debug.print("Warning: pending UTXO deletes not persisted: {}\n", .{err});
+        };
+    }
 
     // Durable RocksDB shutdown without rocksdb_close. close() frees the
     // block cache; that is the swapped-out walk that misses the stop grace.
@@ -3200,6 +3217,14 @@ pub fn main() !void {
     wallet_manager.saveAll();
 
     std.debug.print("{s} stopped (+{d} ms).\n", .{ VERSION_STRING, std.time.milliTimestamp() - shutdown_t0 });
+    if (aborted or fatal.isLatched()) {
+        // Gate 6: exit non-zero so the supervisor (systemd Restart=on-failure)
+        // restarts the node from its last durable state, and an operator sees
+        // a failed unit rather than a clean stop.
+        std.debug.print("exit (fatal: {s})\n", .{fatal.reason()});
+        shutdown_complete.store(true, .release);
+        std.process.exit(1);
+    }
     std.debug.print("exit\n", .{});
     // Does not return. Returning would run main's defers (UTXO cache,
     // mempool, block index, rocksdb_close) and fault the swapped heap.
