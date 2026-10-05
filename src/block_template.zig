@@ -1858,6 +1858,9 @@ fn fireReorgFromSideBranch(
         for (rb_list.items) |rb| {
             mp.removeForBlock(&rb.block);
         }
+        // Core MaybeUpdateMempoolForReorg → removeForReorg: evict what is no
+        // longer final / BIP-68-final / mature at the NEW tip.
+        _ = mp.removeForReorg();
     }
 
     return .{

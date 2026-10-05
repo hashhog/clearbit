@@ -6792,6 +6792,17 @@ pub const PeerManager = struct {
             // branch is not later "connected" on top of the wrong tip.
             self.rebaseQueueOnActiveTip(pr_ptr.fork_hashes.items);
             reorged = true;
+            // Mempool after a P2P reorg (Core ActivateBestChain: ConnectTip →
+            // removeForBlock per new block, then MaybeUpdateMempoolForReorg →
+            // removeForReorg).  This path previously left the mempool
+            // untouched: txs confirmed on the new branch stayed in it, and
+            // txs final only at the old tip (nLockTime / BIP-68 / maturity)
+            // stayed eligible for the template.
+            if (self.mempool) |mp| {
+                for (rb_list.items) |rb| mp.removeForBlock(&rb.block);
+                const evicted = mp.removeForReorg();
+                if (evicted > 0) std.log.info("[REORG] mempool: evicted {d} tx(s) no longer final / mature at the new tip", .{evicted});
+            }
         } else |err| {
             // Only a consensus verdict on a fork block marks anything failed
             // or punishes anyone, and then only the peer that DELIVERED that

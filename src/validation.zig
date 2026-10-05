@@ -7216,6 +7216,11 @@ pub const ChainManager = struct {
         // Phase 7: Evict conflicting transactions from mempool
         if (self.mempool) |pool| {
             self.evictConflictingTransactions(pool, target);
+            // Core InvalidateBlock → MaybeUpdateMempoolForReorg: the tip moved
+            // back, so txs final only at the old tip (nLockTime, BIP-68,
+            // coinbase maturity) must leave the mempool.  Also covers a
+            // reorg driven by activateBestChain above (idempotent).
+            _ = pool.removeForReorg();
         }
     }
 
@@ -7893,6 +7898,8 @@ pub const ChainManager = struct {
             for (rb_list.items) |rb| {
                 mp.removeForBlock(&rb.block);
             }
+            // Core MaybeUpdateMempoolForReorg → removeForReorg.
+            _ = mp.removeForReorg();
         }
     }
 

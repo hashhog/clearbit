@@ -2107,6 +2107,75 @@ pub const Mempool = struct {
         }
     }
 
+    /// Post-reorg / post-disconnect re-check of every mempool entry against the
+    /// NEW tip — Bitcoin Core `MaybeUpdateMempoolForReorg`'s
+    /// `filter_final_and_mature` predicate (validation.cpp) fed to
+    /// `removeForReorg`.  An entry is evicted, WITH all its in-mempool
+    /// descendants, when at the next block (tip+1) it would be:
+    ///   * non-final: CheckFinalTxAtTip (nLockTime vs tip+1 / tip MTP);
+    ///   * BIP-68 non-final: CheckSequenceLocksAtTip, lock points recomputed
+    ///     from the new chain (checkSequenceLocksAtTip) — includes an input
+    ///     that no longer exists in the UTXO set or the mempool;
+    ///   * an immature coinbase spend: tip+1 − coin height < COINBASE_MATURITY.
+    ///
+    /// Without it a disconnect / invalidateblock / reorg left txs in the
+    /// mempool that were final only on the OLD (higher / later) tip; the
+    /// block template re-checks nLockTime alone (as Core's miner does — Core
+    /// relies on this eviction for BIP-68 and maturity), so such a tx could
+    /// be mined into an invalid block.
+    ///
+    /// Takes `self.mutex` (every call site runs outside it).  Returns the
+    /// number of entries removed (descendants included).
+    pub fn removeForReorg(self: *Mempool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const cs = self.chain_state orelse return 0;
+        const p = self.params orelse &consensus.MAINNET;
+        const next_height: u32 = cs.best_height + 1;
+        const lock_time_cutoff: u32 = if (cs.best_height >= p.csv_height)
+            cs.tipMtp()
+        else
+            next_height;
+
+        var doomed = std.ArrayList(types.Hash256).init(self.allocator);
+        defer doomed.deinit();
+
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            const entry = kv.value_ptr.*;
+            const tx = &entry.tx;
+            var drop = !validation.isFinalTx(tx, next_height, lock_time_cutoff);
+            if (!drop) {
+                if (self.checkSequenceLocksAtTip(tx)) |_| {} else |_| drop = true;
+            }
+            if (!drop) {
+                for (tx.inputs) |inp| {
+                    if (self.entries.contains(inp.previous_output.hash)) continue;
+                    const utxo = cs.utxo_set.get(&inp.previous_output) catch null;
+                    const u = utxo orelse {
+                        drop = true;
+                        break;
+                    };
+                    const immature = u.is_coinbase and
+                        (next_height -| u.height) < consensus.COINBASE_MATURITY;
+                    var mut_u = u;
+                    mut_u.deinit(self.allocator);
+                    if (immature) {
+                        drop = true;
+                        break;
+                    }
+                }
+            }
+            if (drop) doomed.append(kv.key_ptr.*) catch break;
+        }
+
+        const before = self.entries.count();
+        for (doomed.items) |txid| {
+            if (self.entries.contains(txid)) self.removeTransactionWithDescendants(txid);
+        }
+        return before - self.entries.count();
+    }
+
     // ========================================================================
     // Orphan Transaction Pool
     // ========================================================================
