@@ -18,6 +18,7 @@ const serialize = @import("serialize.zig");
 const p2p = @import("p2p.zig");
 const zmq = @import("zmq.zig");
 const validation = @import("validation.zig");
+const chain_lock = @import("chain_lock.zig");
 const fatal = @import("fatal.zig");
 
 // ============================================================================
@@ -990,8 +991,13 @@ pub const Mempool = struct {
     /// Whether linearizations need recomputation.
     linearization_dirty: bool,
 
-    /// Mutex for thread-safe access.
-    mutex: std.Thread.Mutex,
+    /// Bitcoin Core `CTxMemPool::cs`: held by EVERY writer (admission,
+    /// removal, orphan pool, prioritisation, expiry) and by readers that run
+    /// off the chain lock (metrics `stats()`, RPC readers).  Recursive, so a
+    /// public writer may call another.  Lock order: cs_main -> mempool.cs
+    /// (chain_lock.zig); writers on the P2P and RPC threads already hold
+    /// cs_main.  Before 2026-10-07 only RPC readers took it (audit CB-3).
+    mutex: chain_lock.RecursiveMutex,
 
     /// Fee estimator for smart fee estimation.
     fee_estimator: FeeEstimator,
@@ -1096,7 +1102,7 @@ pub const Mempool = struct {
             .next_cluster_index = 0,
             .cluster_linearizations = std.AutoHashMap(u32, Linearization).init(allocator),
             .linearization_dirty = true,
-            .mutex = std.Thread.Mutex{},
+            .mutex = chain_lock.RecursiveMutex.init(.mempool),
             .fee_estimator = FeeEstimator.init(allocator),
             .full_rbf = false,
             .orphans = std.AutoHashMap(types.Hash256, *OrphanTx).init(allocator),
@@ -1113,6 +1119,18 @@ pub const Mempool = struct {
     }
 
     /// Deinitialize the mempool and free all resources.
+    /// Lock order cs_main -> mempool.cs for paths that read the coin view.
+    /// Both recursive: free when the caller (P2P handler, RPC dispatch)
+    /// already holds them.
+    fn lockChainThenPool(self: *Mempool) void {
+        if (self.chain_state) |cs| cs.connect_mutex.lock();
+        self.mutex.lock();
+    }
+    fn unlockPoolThenChain(self: *Mempool) void {
+        self.mutex.unlock();
+        if (self.chain_state) |cs| cs.connect_mutex.unlock();
+    }
+
     pub fn deinit(self: *Mempool) void {
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
@@ -1163,6 +1181,10 @@ pub const Mempool = struct {
 
     /// Attempt to add a transaction to the mempool.
     pub fn addTransaction(self: *Mempool, tx: types.Transaction) MempoolError!void {
+        // Reads the coin view: cs_main first, then mempool.cs (Core ATMP:
+        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
         // Gate 6: after a fatal system fault the node accepts nothing new.
         if (fatal.isLatched()) return MempoolError.SystemFault;
         const tx_hash = crypto.computeTxid(&tx, self.allocator) catch return MempoolError.OutOfMemory;
@@ -1700,6 +1722,10 @@ pub const Mempool = struct {
     }
 
     pub fn acceptToMemoryPool(self: *Mempool, tx: types.Transaction, test_accept: bool) AcceptResult {
+        // Reads the coin view: cs_main first, then mempool.cs (Core ATMP:
+        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
         if (fatal.isLatched()) return AcceptResult{
             .accepted = false,
             .txid = std.mem.zeroes(types.Hash256),
@@ -1891,6 +1917,8 @@ pub const Mempool = struct {
 
     /// Remove a transaction from the mempool (e.g., when mined).
     pub fn removeTransaction(self: *Mempool, txid_hash: types.Hash256) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         // Snapshot size/fee BEFORE removal so we can update ancestor/descendant stats.
         const removed_vsize: usize = if (self.entries.get(txid_hash)) |e| e.vsize else 0;
         const removed_fee: i64 = if (self.entries.get(txid_hash)) |e| e.fee else 0;
@@ -2003,6 +2031,8 @@ pub const Mempool = struct {
 
     /// Remove a transaction and all its descendants.
     pub fn removeTransactionWithDescendants(self: *Mempool, txid_hash: types.Hash256) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         // Get descendants first
         const descendants = self.getDescendantTxids(txid_hash);
         defer self.allocator.free(descendants);
@@ -2024,6 +2054,8 @@ pub const Mempool = struct {
     /// CTxMemPool::blockConnected sets blockSinceLastRollingFeeBump = true,
     /// txmempool.cpp:1143).
     pub fn removeForBlock(self: *Mempool, block: *const types.Block) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         // Determine the block height for fee-estimator hooks.
         // Core uses pindexNew->nHeight (validation.cpp:3074).  clearbit derives
         // the height from chain_state.best_height when available; falls back to
@@ -2076,6 +2108,10 @@ pub const Mempool = struct {
     /// after `chain_state.reorgToChain` succeeds, once per disconnected
     /// block.
     pub fn blockDisconnected(self: *Mempool, txs: []const types.Transaction) void {
+        // Reads the coin view: cs_main first, then mempool.cs (Core ATMP:
+        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
         for (txs, 0..) |tx, i| {
             // Skip the coinbase (always at index 0; coinbases can't
             // enter the mempool anyway).
@@ -2129,8 +2165,10 @@ pub const Mempool = struct {
     /// Takes `self.mutex` (every call site runs outside it).  Returns the
     /// number of entries removed (descendants included).
     pub fn removeForReorg(self: *Mempool) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Reads the coin view: cs_main first, then mempool.cs (Core ATMP:
+        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
         const cs = self.chain_state orelse return 0;
         const p = self.params orelse &consensus.MAINNET;
         const next_height: u32 = cs.best_height + 1;
@@ -2216,6 +2254,8 @@ pub const Mempool = struct {
         tx: *const types.Transaction,
         peer_id: u64,
     ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         // Compute txid and wtxid up-front; drop silently on hash failure.
         const txid = crypto.computeTxid(tx, self.allocator) catch return false;
         const wtxid = crypto.computeWtxid(tx, self.allocator) catch return false;
@@ -2327,6 +2367,8 @@ pub const Mempool = struct {
     /// Remove a specific orphan by txid.  Looks up the wtxid via the secondary
     /// index and delegates to removeOrphanByWtxid.  Returns true if removed.
     pub fn removeOrphan(self: *Mempool, txid: types.Hash256) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const wtxid = self.orphans_by_txid.get(txid) orelse return false;
         return self.removeOrphanByWtxid(wtxid);
     }
@@ -2335,6 +2377,8 @@ pub const Mempool = struct {
     /// manager when a peer disconnects so its orphans don't pin pool slots
     /// forever.  Mirrors Core's `EraseOrphansFor`.
     pub fn eraseOrphansForPeer(self: *Mempool, peer_id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (peer_id == 0) return;
         // Collect wtxids first to avoid mutating the map mid-iteration.
         var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
@@ -2354,12 +2398,16 @@ pub const Mempool = struct {
     /// Check whether an orphan exists by txid.  Looks up via the secondary
     /// txid→wtxid index.  Test / introspection helper.
     pub fn hasOrphan(self: *Mempool, txid: types.Hash256) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const wtxid = self.orphans_by_txid.get(txid) orelse return false;
         return self.orphans.contains(wtxid);
     }
 
     /// Number of orphans currently held.  Test / introspection helper.
     pub fn orphanCount(self: *Mempool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.orphans.count();
     }
 
@@ -2374,6 +2422,8 @@ pub const Mempool = struct {
     /// `now` is a Unix timestamp in seconds (e.g. `std.time.timestamp()`).
     /// Returns the number of orphans removed.
     pub fn sweepExpiredOrphans(self: *Mempool, now: i64) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
         defer to_remove.deinit();
 
@@ -2411,6 +2461,8 @@ pub const Mempool = struct {
         self: *Mempool,
         parent_txid: types.Hash256,
     ) usize {
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
         var promoted: usize = 0;
         // Seed worklist with the freshly-arrived parent; new admissions
         // append themselves so their children get a chance too.
@@ -2481,6 +2533,8 @@ pub const Mempool = struct {
     /// confirmed elsewhere).  Called after a block is connected.  Mirrors
     /// Core's `TxOrphanage::EraseForBlock`.
     pub fn eraseOrphansForBlock(self: *Mempool, block: *const types.Block) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
         defer to_remove.deinit();
 
@@ -2607,6 +2661,8 @@ pub const Mempool = struct {
     ///
     /// Returns the post-update delta value (0 means the entry was erased).
     pub fn prioritiseTransaction(self: *Mempool, txid: types.Hash256, delta_sats: i64) std.mem.Allocator.Error!i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         // Saturating add — Core uses SaturatingAdd(delta, nFeeDelta).
         const existing: i64 = self.map_deltas.get(txid) orelse 0;
         const new_delta: i64 = saturatingAddI64(existing, delta_sats);
@@ -4222,6 +4278,8 @@ pub const Mempool = struct {
 
     /// Get mempool statistics.
     pub fn stats(self: *Mempool) struct { count: usize, size: usize, total_fee: i64 } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var total_fee: i64 = 0;
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
@@ -4241,6 +4299,8 @@ pub const Mempool = struct {
     /// After a bump, `block_since_last_rolling_fee_bump` is set to false so
     /// that `getMinFee` holds the bumped value until the next block arrives.
     pub fn trackPackageRemoved(self: *Mempool, rate_sat_kvb: f64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (rate_sat_kvb > self.rolling_minimum_fee_rate) {
             self.rolling_minimum_fee_rate = rate_sat_kvb;
             self.block_since_last_rolling_fee_bump = false;
@@ -4309,6 +4369,8 @@ pub const Mempool = struct {
 
     /// Check if mempool contains a transaction.
     pub fn contains(self: *Mempool, txid: types.Hash256) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.entries.contains(txid);
     }
 
@@ -4336,6 +4398,8 @@ pub const Mempool = struct {
     /// Bug that was here before: called removeTransaction (no descendants) so
     /// child transactions of expired parents were orphaned in the mempool.
     pub fn removeExpired(self: *Mempool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const now = std.time.timestamp();
         var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
         defer to_remove.deinit();
@@ -4359,6 +4423,10 @@ pub const Mempool = struct {
     /// This allows transactions with individual fee rates below minimum
     /// when the package fee rate is sufficient.
     pub fn addTransactionWithPackageRate(self: *Mempool, tx: types.Transaction, package_fee_rate: f64) MempoolError!void {
+        // Reads the coin view: cs_main first, then mempool.cs (Core ATMP:
+        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
         const tx_hash = crypto.computeTxid(&tx, self.allocator) catch return MempoolError.OutOfMemory;
 
         // 1. Check if already in mempool — BIP-339 two-step wtxid/txid split (W96).
@@ -4978,6 +5046,8 @@ pub const Mempool = struct {
 
     /// Update mining scores for all transactions by recomputing linearizations.
     pub fn updateMiningScores(self: *Mempool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (!self.linearization_dirty) return;
 
         // Find all unique cluster roots

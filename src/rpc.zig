@@ -3243,6 +3243,14 @@ pub const RpcServer = struct {
         return self.handleSingleRequest(root.object);
     }
 
+    /// Methods dispatched WITHOUT the chain lock (they take it themselves for
+    /// the parts that touch shared state).
+    fn methodRunsWithoutChainLock(method: []const u8) bool {
+        return std.mem.eql(u8, method, "waitfornewblock") or
+            std.mem.eql(u8, method, "waitforblock") or
+            std.mem.eql(u8, method, "waitforblockheight");
+    }
+
     /// Handle a single JSON-RPC request.
     fn handleSingleRequest(self: *RpcServer, obj: std.json.ObjectMap) ![]const u8 {
         // Get method
@@ -3265,6 +3273,20 @@ pub const RpcServer = struct {
         if (coreArityViolated(method, params)) {
             return try self.jsonRpcError(RPC_MISC_ERROR, "Wrong number of arguments", id);
         }
+
+        // The chain lock (cs_main).  Every handler below reads or writes state
+        // the P2P thread mutates — the coin cache (a gettxout read-through can
+        // insert, evict and FLUSH), the tip, the block and header index, the
+        // mempool, the peer list and address book — so the whole call runs
+        // under it, the way Core's handlers open with LOCK(cs_main) (and
+        // LOCK2(cs_main, mempool.cs)).  Before 2026-10-07 no RPC reader took it
+        // (audit CB-1..CB-13).  Exceptions: the waitfor* family sleeps on the
+        // tip notifier and must not hold it (waitForTip locks per check), and
+        // handlers that do long or blocking work release it themselves
+        // (scantxoutset's walk, addnode's DNS) through chain_lock.IoWindow.
+        const chain_locked = !methodRunsWithoutChainLock(method);
+        if (chain_locked) self.chain_state.connect_mutex.lock();
+        defer if (chain_locked) self.chain_state.connect_mutex.unlock();
 
         // Dispatch by method name
         if (std.mem.eql(u8, method, "getblockchaininfo")) {
@@ -4931,8 +4953,14 @@ pub const RpcServer = struct {
             // Snapshot the generation BEFORE reading the tip so a notify that
             // races in between the predicate check and the wait is observed.
             const gen = notifier.currentGeneration();
-            if (predicate.match(&self.chain_state.best_hash, self.chain_state.best_height)) {
-                return self.writeWaitTipResult(id);
+            {
+                // The tip is read under the chain lock (no torn hash/height);
+                // the wait below is NOT (it would stall every block connect).
+                self.chain_state.connect_mutex.lock();
+                defer self.chain_state.connect_mutex.unlock();
+                if (predicate.match(&self.chain_state.best_hash, self.chain_state.best_height)) {
+                    return self.writeWaitTipResult(id);
+                }
             }
 
             if (have_deadline) {
@@ -4940,6 +4968,8 @@ pub const RpcServer = struct {
                 const remaining = deadline_ns - now;
                 if (remaining <= 0) {
                     // Timed out — return the current tip (Core's behaviour).
+                    self.chain_state.connect_mutex.lock();
+                    defer self.chain_state.connect_mutex.unlock();
                     return self.writeWaitTipResult(id);
                 }
                 _ = notifier.wait(gen, @intCast(remaining));
@@ -4962,7 +4992,11 @@ pub const RpcServer = struct {
         // given) is parsed as a 64-hex uint256 (ParseHashV → -8 on malformed,
         // same display→internal byte reversal getblock uses).  When omitted,
         // snapshot the live tip.
-        var ref_hash: types.Hash256 = self.chain_state.best_hash;
+        var ref_hash: types.Hash256 = blk: {
+            self.chain_state.connect_mutex.lock();
+            defer self.chain_state.connect_mutex.unlock();
+            break :blk self.chain_state.best_hash;
+        };
         if (params == .array and params.array.items.len > 1) {
             const ct = params.array.items[1];
             if (ct != .null) {
@@ -16608,7 +16642,11 @@ pub const RpcServer = struct {
             // getpeerinfo reports id as the index into peer_manager.peers, so
             // by-id disconnect must use the SAME mapping or the two disagree.
             if (raw >= 0 and raw < @as(i64, @intCast(self.peer_manager.peers.items.len))) {
-                self.peer_manager.peers.items[@intCast(raw)].disconnect();
+                // Request only (Core CNode::fDisconnect): the P2P loop reaps
+                // it.  Closing the socket here raced the P2P thread's poll/
+                // read and its own later disconnect() (double close + double
+                // free, audit CB-5).
+                self.peer_manager.peers.items[@intCast(raw)].disconnect_requested = true;
                 return self.jsonRpcResult("null", id);
             }
             return self.jsonRpcError(RPC_CLIENT_NODE_NOT_CONNECTED, "Node not found in connected nodes", id);
@@ -16627,7 +16665,7 @@ pub const RpcServer = struct {
             var addr_buf: [64]u8 = undefined;
             const peer_addr = peer.getAddressString(&addr_buf);
             if (std.mem.eql(u8, peer_addr, addr_str)) {
-                peer.disconnect();
+                peer.disconnect_requested = true; // reaped by the P2P loop
                 found = true;
                 break;
             }
@@ -20791,61 +20829,150 @@ pub const RpcServer = struct {
             needles.append(.{ .spk = spk, .desc = spec }) catch return error.OutOfMemory;
         }
 
-        // --- single-pass UTXO cache walk (mirrors computeHashSerializedTxOutSet) ---
+        // --- the scan (Core rpc/blockchain.cpp scantxoutset) ---
+        // Core: under LOCK(cs_main) ForceFlushStateToDisk() + CoinsDB().Cursor()
+        // + Tip(); then FindScriptPubKey walks the cursor with cs_main
+        // RELEASED.  clearbit used to iterate the in-memory cache HashMap
+        // (a) unlocked while the P2P thread inserted into it (audit CB-2: a
+        // resize mid-iteration is a use-after-free) and (b) ONLY the cache —
+        // every coin evicted to disk was invisible, so the answer was wrong.
+        // Now: flush under the chain lock (held by dispatch), pin a snapshot,
+        // walk the FULL on-disk set with the lock released.
+        const Match = struct {
+            key: [36]u8,
+            value: i64,
+            height: u32,
+            is_coinbase: bool,
+            script: []const u8,
+            desc: []const u8,
+        };
+        var matches = std.ArrayList(Match).init(self.allocator);
+        defer {
+            for (matches.items) |m| self.allocator.free(m.script);
+            matches.deinit();
+        }
+        const tip_height = self.chain_state.best_height;
+        const tip_hash = self.chain_state.best_hash;
+        var scanned: u64 = 0;
+
+        if (self.chain_state.utxo_set.db) |db| {
+            self.chain_state.flush() catch |e| {
+                if (e == error.ReorgBatchInProgress) {
+                    return self.jsonRpcError(RPC_MISC_ERROR, "UTXO set busy (reorg in progress), retry", id);
+                }
+                return self.jsonRpcError(RPC_MISC_ERROR, "Failed to flush the UTXO set", id);
+            };
+            storage.allow_unlocked_utxo_walk = true;
+            defer storage.allow_unlocked_utxo_walk = false;
+            var walk = storage.UnlockedUtxoWalk.begin(&self.chain_state.utxo_set);
+            defer walk.end();
+            var it = db.iterator(storage.CF_UTXO);
+            defer it.deinit();
+            it.seekToFirst();
+            while (it.valid()) : (it.next()) {
+                const k = it.getKey();
+                if (k.len != 36) continue;
+                scanned += 1;
+                var coin = storage.CompactUtxo.decode(it.getValue(), self.allocator) catch continue;
+                defer coin.deinit(self.allocator);
+                const script = coin.reconstructScript(self.allocator) catch continue;
+                var matched_desc: ?[]const u8 = null;
+                for (needles.items) |n| {
+                    if (std.mem.eql(u8, n.spk, script)) {
+                        matched_desc = n.desc;
+                        break;
+                    }
+                }
+                const desc = matched_desc orelse {
+                    self.allocator.free(script);
+                    continue;
+                };
+                var key: [36]u8 = undefined;
+                @memcpy(&key, k[0..36]);
+                matches.append(.{
+                    .key = key,
+                    .value = coin.value,
+                    .height = coin.height,
+                    .is_coinbase = coin.is_coinbase,
+                    .script = script,
+                    .desc = desc,
+                }) catch {
+                    self.allocator.free(script);
+                    return error.OutOfMemory;
+                };
+            }
+        } else {
+            // Memory-only chainstate (tests / loaded snapshot): the cache is
+            // the whole set.  The chain lock is held (dispatch).
+            var iter = self.chain_state.utxo_set.cache.iterator();
+            while (iter.next()) |entry| {
+                scanned += 1;
+                const utxo = entry.value_ptr.*.utxo;
+                const script = utxo.reconstructScript(self.allocator) catch continue;
+                var matched_desc: ?[]const u8 = null;
+                for (needles.items) |n| {
+                    if (std.mem.eql(u8, n.spk, script)) {
+                        matched_desc = n.desc;
+                        break;
+                    }
+                }
+                const desc = matched_desc orelse {
+                    self.allocator.free(script);
+                    continue;
+                };
+                matches.append(.{
+                    .key = entry.key_ptr.*,
+                    .value = utxo.value,
+                    .height = utxo.height,
+                    .is_coinbase = utxo.is_coinbase,
+                    .script = script,
+                    .desc = desc,
+                }) catch {
+                    self.allocator.free(script);
+                    return error.OutOfMemory;
+                };
+            }
+        }
+
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
+        // Core reports the number of coins scanned (`count`) and the tip the
+        // cursor was taken at.
         try writer.writeAll("{\"success\":true,\"txouts\":");
-        try writer.print("{d}", .{self.chain_state.utxo_set.total_utxos});
-        try writer.print(",\"height\":{d},\"bestblock\":\"", .{self.chain_state.best_height});
-        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writer.print("{d}", .{scanned});
+        try writer.print(",\"height\":{d},\"bestblock\":\"", .{tip_height});
+        try writeHashHex(writer, &tip_hash);
         try writer.writeAll("\",\"unspents\":[");
 
         var total_amount: i64 = 0;
-        var match_count: usize = 0;
-        var iter = self.chain_state.utxo_set.cache.iterator();
-        while (iter.next()) |entry| {
-            const key = entry.key_ptr.*;
-            const utxo = entry.value_ptr.*.utxo;
-            const script = utxo.reconstructScript(self.allocator) catch continue;
-            defer self.allocator.free(script);
-
-            var matched_desc: ?[]const u8 = null;
-            for (needles.items) |n| {
-                if (std.mem.eql(u8, n.spk, script)) {
-                    matched_desc = n.desc;
-                    break;
-                }
-            }
-            const desc = matched_desc orelse continue;
-
-            if (match_count > 0) try writer.writeByte(',');
-            match_count += 1;
-            total_amount += utxo.value;
+        for (matches.items, 0..) |m, mi| {
+            if (mi > 0) try writer.writeByte(',');
+            total_amount += m.value;
 
             // key = txid(32, internal order) || LE32(vout). JSON reports
             // txid in display (reversed) order, matching gettxout / Core.
             try writer.writeAll("{\"txid\":\"");
-            for (0..32) |j| try writer.print("{x:0>2}", .{key[31 - j]});
-            const vout = std.mem.readInt(u32, key[32..36], .little);
+            for (0..32) |j| try writer.print("{x:0>2}", .{m.key[31 - j]});
+            const vout = std.mem.readInt(u32, m.key[32..36], .little);
             try writer.print("\",\"vout\":{d},\"scriptPubKey\":\"", .{vout});
-            for (script) |b| try writer.print("{x:0>2}", .{b});
-            try writer.print("\",\"desc\":\"{s}\",\"amount\":", .{desc});
-            const amt_btc: f64 = @as(f64, @floatFromInt(utxo.value)) / 100_000_000.0;
-            try writer.print("{d:.8},\"coinbase\":{},\"height\":{d}", .{ amt_btc, utxo.is_coinbase, utxo.height });
+            for (m.script) |b| try writer.print("{x:0>2}", .{b});
+            try writer.print("\",\"desc\":\"{s}\",\"amount\":", .{m.desc});
+            const amt_btc: f64 = @as(f64, @floatFromInt(m.value)) / 100_000_000.0;
+            try writer.print("{d:.8},\"coinbase\":{},\"height\":{d}", .{ amt_btc, m.is_coinbase, m.height });
 
             // blockhash: hash of the block at the coin's height, rendered as
             // big-endian DISPLAY hex (Core: coinb_block.GetBlockHash().GetHex()).
             try writer.writeAll(",\"blockhash\":\"");
-            if (self.resolveBlockHashAtHeight(utxo.height)) |bh| {
+            if (self.resolveBlockHashAtHeight(m.height)) |bh| {
                 try writeHashHex(writer, &bh);
             }
             try writer.writeByte('"');
 
             // confirmations = tip height - coin height + 1 (Core:
             // tip->nHeight - coin.nHeight + 1; signed to match Core).
-            const confs: i64 = @as(i64, self.chain_state.best_height) - @as(i64, utxo.height) + 1;
+            const confs: i64 = @as(i64, tip_height) - @as(i64, m.height) + 1;
             try writer.print(",\"confirmations\":{d}}}", .{confs});
         }
 
@@ -21973,31 +22100,38 @@ pub const RpcServer = struct {
             .muhash => 2,
         };
         var set_hash: types.Hash256 = undefined;
-        self.chain_state.connect_mutex.lock();
-        const stats = storage.computeTxOutSetStats(
+        // The chain lock is held (dispatch) from here through the flush inside
+        // computeTxOutSetStats, so this tip IS the state the walk reads.  The
+        // walk itself runs on a RocksDB snapshot with the lock released
+        // (storage.UnlockedUtxoWalk; Core: cs_main only for flush + cursor),
+        // so the P2P thread keeps connecting blocks meanwhile (audit CB-7).
+        const snap_height = self.chain_state.best_height;
+        const snap_hash = self.chain_state.best_hash;
+        storage.allow_unlocked_utxo_walk = true;
+        const stats_res = storage.computeTxOutSetStats(
             &self.chain_state.utxo_set,
             self.allocator,
             hash_kind,
             &set_hash,
-        ) catch |e| {
-            self.chain_state.connect_mutex.unlock();
+        );
+        storage.allow_unlocked_utxo_walk = false;
+        const stats = stats_res catch |e| {
             if (e == error.ReorgBatchInProgress) {
                 return self.jsonRpcError(RPC_MISC_ERROR, "UTXO set busy (reorg in progress), retry", id);
             }
             return self.jsonRpcError(RPC_MISC_ERROR, "Failed to compute UTXO set stats", id);
         };
-        self.chain_state.connect_mutex.unlock();
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
-        const height = self.chain_state.best_height;
+        const height = snap_height;
 
         try writer.writeAll("{\"height\":");
         try writer.print("{d}", .{height});
         try writer.writeAll(",\"bestblock\":\"");
-        try writeHashHex(writer, &self.chain_state.best_hash);
+        try writeHashHex(writer, &snap_hash);
         try writer.print("\",\"txouts\":{d},\"bogosize\":{d}", .{ stats.txouts, stats.bogosize });
 
         // Emit the requested UTXO-set hash. For hash_serialized we also mirror
@@ -30662,7 +30796,7 @@ test "#41 disconnectnode: nodeid selects THE PEER AT THAT ID" {
     const both = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"192.0.2.10:8333\",0]}");
     defer allocator.free(both);
     try std.testing.expect(std.mem.indexOf(u8, both, "Only one of address and nodeid should be provided.") != null);
-    try std.testing.expect(peer_manager.peers.items[0].state != .disconnected);
+    try std.testing.expect(peer_manager.peers.items[0].disconnect_requested == false);
 
     // An id past the end is Core's -29, not a type error about the address.
     const miss = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"\",99]}");
@@ -30675,7 +30809,7 @@ test "#41 disconnectnode: nodeid selects THE PEER AT THAT ID" {
     const wide = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"\",4294967296]}");
     defer allocator.free(wide);
     try std.testing.expect(std.mem.indexOf(u8, wide, "\"code\":-29") != null);
-    for (peer_manager.peers.items) |p| try std.testing.expect(p.state != .disconnected);
+    for (peer_manager.peers.items) |p| try std.testing.expect(p.disconnect_requested == false);
 
     // THE TEETH: id 1 must succeed and must disconnect peer 1 -- the same
     // index getpeerinfo reports as "id" -- leaving 0 and 2 connected.
@@ -30683,28 +30817,23 @@ test "#41 disconnectnode: nodeid selects THE PEER AT THAT ID" {
     defer allocator.free(byid);
     try std.testing.expect(std.mem.indexOf(u8, byid, "\"result\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, byid, "\"code\":") == null);
-    try std.testing.expect(peer_manager.peers.items[1].state == .disconnected);
-    try std.testing.expect(peer_manager.peers.items[0].state != .disconnected);
-    try std.testing.expect(peer_manager.peers.items[2].state != .disconnected);
+    try std.testing.expect(peer_manager.peers.items[1].disconnect_requested);
+    try std.testing.expect(peer_manager.peers.items[0].disconnect_requested == false);
+    try std.testing.expect(peer_manager.peers.items[2].disconnect_requested == false);
 
     // CONTROL: by-address still selects by address -- peer 2, not peer 0.
     const byaddr = try server.dispatch("{\"id\":1,\"method\":\"disconnectnode\",\"params\":[\"192.0.2.12:8333\"]}");
     defer allocator.free(byaddr);
     try std.testing.expect(std.mem.indexOf(u8, byaddr, "\"result\":null") != null);
-    try std.testing.expect(peer_manager.peers.items[2].state == .disconnected);
-    try std.testing.expect(peer_manager.peers.items[0].state != .disconnected);
+    try std.testing.expect(peer_manager.peers.items[2].disconnect_requested);
+    try std.testing.expect(peer_manager.peers.items[0].disconnect_requested == false);
 
-    // OWNERSHIP: PeerManager.deinit() calls peer.disconnect() unconditionally,
-    // which would deinit an already-freed recv_buffer.  Drop the two we
-    // disconnected and destroy them ourselves.
-    var j: usize = peer_manager.peers.items.len;
-    while (j > 0) {
-        j -= 1;
-        if (peer_manager.peers.items[j].state == .disconnected) {
-            const dead = peer_manager.peers.orderedRemove(j);
-            allocator.destroy(dead);
-        }
-    }
+    // disconnectnode only REQUESTS the disconnect (Core fDisconnect): the
+    // P2P loop reaps it.  It used to close the socket and free the buffers
+    // on the RPC thread, and the loop then did it again (double close +
+    // double free; audit CB-5).  Peer 1 and 2 are flagged, nothing is freed
+    // yet; PeerManager.deinit() owns all three.
+    for (peer_manager.peers.items) |p| try std.testing.expect(!p.closed);
 }
 
 test "#41 setban: absolute is read, already-banned is -23, unban failure is -30" {

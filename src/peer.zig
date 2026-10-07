@@ -7,6 +7,7 @@ const crypto = @import("crypto.zig");
 const banlist = @import("banlist.zig");
 const v2_transport = @import("v2_transport.zig");
 const storage = @import("storage.zig");
+const chain_lock = storage.chain_lock;
 const serialize = @import("serialize.zig");
 const mempool_mod = @import("mempool.zig");
 const validation = @import("validation.zig");
@@ -1176,6 +1177,14 @@ pub const Peer = struct {
     /// interleave bytes; two threads appending to one ArrayList can corrupt
     /// memory, so the queue is never touched without this lock.
     send_mutex: std.Thread.Mutex = .{},
+    /// Set by disconnectnode / addnode-remove on the RPC thread (Core
+    /// CNode::fDisconnect); the P2P loop reaps the peer on its next pass.
+    /// The RPC thread never closes the socket or frees the Peer itself: the
+    /// P2P thread may be polling or reading that fd (audit CB-5).  Guarded by
+    /// the chain lock (both sides hold it).
+    disconnect_requested: bool = false,
+    /// disconnect() ran (socket closed, buffers freed).  Makes it idempotent.
+    closed: bool = false,
 
     /// Bytes waiting in the per-peer send queue.
     pub fn pendingSendBytes(self: *const Peer) usize {
@@ -2662,6 +2671,10 @@ pub const Peer = struct {
     /// Disconnect from the peer.
     pub fn disconnect(self: *Peer) void {
         self.state = .disconnected;
+        // Idempotent: a second close() would hit an fd number the process
+        // may already have reused, and a second deinit double-frees.
+        if (self.closed) return;
+        self.closed = true;
         unregisterPeerFd(self.stream.handle);
         self.stream.close();
         self.recv_buffer.deinit();
@@ -3251,6 +3264,16 @@ pub const PeerManager = struct {
     /// 30 s shutdown watchdog fired first and exit(1)'d without the flush
     /// (live 2026-10-02 ~02:45Z: SIGKILLed by stop_mainnet.sh at 30 s).
     handshake_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    /// Inbound handshakes run on short-lived worker threads (audit CB-8):
+    /// a peer that trickles its version used to hold the single P2P thread
+    /// for up to HANDSHAKE_TIMEOUT_SECS.  Workers touch only their own Peer;
+    /// a completed one is queued here and adopted by the loop under the
+    /// chain lock.  `inbound_hs_mutex` guards the queue and the per-IP set.
+    inbound_hs_mutex: std.Thread.Mutex = .{},
+    inbound_hs_done: std.ArrayListUnmanaged(*Peer) = .{},
+    /// Source-IP key -> socket of each in-flight handshake (one per IP).
+    inbound_hs_ips: std.AutoHashMapUnmanaged(u64, std.posix.fd_t) = .{},
+    inbound_hs_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     last_rotation_time: i64,
     /// Set of netgroups for current outbound connections (for diversity).
     outbound_netgroups: std.AutoHashMap(u32, void),
@@ -3800,7 +3823,53 @@ pub const PeerManager = struct {
         }
     }
 
+    // ====================================================================
+    // Chain lock (cs_main) plumbing.  See storage.ChainState.connect_mutex.
+    // ====================================================================
+
+    /// The chain lock, or null when no chainstate is wired (unit tests).
+    pub fn chainLock(self: *PeerManager) ?*chain_lock.RecursiveMutex {
+        const cs = self.chain_state orelse return null;
+        return &cs.connect_mutex;
+    }
+    pub fn lockChain(self: *PeerManager) void {
+        if (self.chainLock()) |l| l.lock();
+    }
+    pub fn unlockChain(self: *PeerManager) void {
+        if (self.chainLock()) |l| l.unlock();
+    }
+    /// Release the chain lock (all depths) around blocking I/O — poll, a
+    /// socket read, a dial, a handshake, DNS, a sleep.  Callers must hold no
+    /// pointer into chain-lock-guarded state that another thread may
+    /// invalidate across the window (peers are never freed off this thread).
+    fn ioWindow(self: *PeerManager) chain_lock.IoWindow {
+        return chain_lock.IoWindow.begin(self.chainLock());
+    }
+    /// Let a waiting RPC in at a safe point between units of work.
+    fn yieldChain(self: *PeerManager) void {
+        if (self.chainLock()) |l| {
+            if (l.heldByCurrentThread()) l.yieldIfContended();
+        }
+    }
+    /// All peer-list appends go through here (chain lock held).
+    fn appendPeer(self: *PeerManager, peer: *Peer) !void {
+        self.lockChain();
+        defer self.unlockChain();
+        try self.peers.append(peer);
+    }
+
     pub fn deinit(self: *PeerManager) void {
+        self.waitInboundHandshakes(10_000);
+        {
+            self.inbound_hs_mutex.lock();
+            defer self.inbound_hs_mutex.unlock();
+            for (self.inbound_hs_done.items) |p| {
+                p.disconnect();
+                self.allocator.destroy(p);
+            }
+            self.inbound_hs_done.deinit(self.allocator);
+            self.inbound_hs_ips.deinit(self.allocator);
+        }
         self.persistForShutdown();
         if (self.addrman) |*am| {
             am.deinit();
@@ -4034,6 +4103,8 @@ pub const PeerManager = struct {
             break :blk false;
         };
         if (!proxied) {
+            const w = self.ioWindow();
+            defer w.end();
             return Peer.connect(address, self.network_params, self.allocator) catch return null;
         }
 
@@ -4063,7 +4134,11 @@ pub const PeerManager = struct {
             },
             else => return null,
         };
-        const stream = self.connectViaProxy(&ma) orelse return null;
+        const stream = blk: {
+            const w = self.ioWindow();
+            defer w.end();
+            break :blk self.connectViaProxy(&ma) orelse return null;
+        };
         return Peer.fromOutboundStream(stream, address, self.network_params, self.allocator);
     }
 
@@ -4140,7 +4215,12 @@ pub const PeerManager = struct {
             );
             peer.v2_transport = t;
 
-            peer.performV2Handshake(Peer.V2_HANDSHAKE_DEADLINE_MS) catch |err| {
+            const v2_res = blk: {
+                const w = self.ioWindow();
+                defer w.end();
+                break :blk peer.performV2Handshake(Peer.V2_HANDSHAKE_DEADLINE_MS);
+            };
+            v2_res catch |err| {
                 // Use std.debug.print so the line is visible in ReleaseFast
                 // (Zig 0.13's default `log_level` for ReleaseFast is `.err`,
                 // so std.log.info is silently dropped — and the v2 wiring
@@ -4158,7 +4238,13 @@ pub const PeerManager = struct {
 
             // V2 cipher handshake complete — run the application
             // version/verack on the encrypted transport.
-            peer.performHandshake(self.our_height) catch |hs_err| {
+            const app_height = self.our_height;
+            const app_res = blk: {
+                const w = self.ioWindow();
+                defer w.end();
+                break :blk peer.performHandshake(app_height);
+            };
+            app_res catch |hs_err| {
                 std.debug.print("P2P: BIP-324 v2 app-handshake failed peer={any} err={any} (cipher OK)\n", .{ address, hs_err });
                 peer.disconnect();
                 self.allocator.destroy(peer);
@@ -4205,7 +4291,13 @@ pub const PeerManager = struct {
             return null;
         }
         defer self.disarmHandshake();
-        peer.performHandshake(self.our_height) catch {
+        const v1_height = self.our_height;
+        const v1_res = blk: {
+            const w = self.ioWindow();
+            defer w.end();
+            break :blk peer.performHandshake(v1_height);
+        };
+        v1_res catch {
             peer.disconnect();
             self.allocator.destroy(peer);
             return null;
@@ -4298,7 +4390,12 @@ pub const PeerManager = struct {
             // stop during startup waits for at most one resolver timeout.
             if (self.stopping()) return;
             // Resolve DNS seed to list of addresses
-            const addrs = std.net.getAddressList(self.allocator, seed, self.network_params.default_port) catch |err| {
+            const addrs_res = blk: {
+                const w = self.ioWindow();
+                defer w.end();
+                break :blk std.net.getAddressList(self.allocator, seed, self.network_params.default_port);
+            };
+            const addrs = addrs_res catch |err| {
                 std.log.warn("DNS resolution failed for {s}: {}", .{ seed, err });
                 continue;
             };
@@ -4703,7 +4800,12 @@ pub const PeerManager = struct {
                 return addr;
             } else |_| {}
             // Not a literal IP — try DNS resolution with the parsed port.
-            const addrs = std.net.getAddressList(self.allocator, host, port) catch {
+            const addrs_res = blk: {
+                const w = self.ioWindow(); // RPC addnode <hostname>: no cs_main across DNS
+                defer w.end();
+                break :blk std.net.getAddressList(self.allocator, host, port);
+            };
+            const addrs = addrs_res catch {
                 return error.InvalidAddress;
             };
             defer addrs.deinit();
@@ -4714,7 +4816,12 @@ pub const PeerManager = struct {
         if (std.net.Address.parseIp(node, default_port)) |addr| {
             return addr;
         } else |_| {}
-        const addrs = std.net.getAddressList(self.allocator, node, default_port) catch {
+        const addrs_res = blk: {
+            const w = self.ioWindow();
+            defer w.end();
+            break :blk std.net.getAddressList(self.allocator, node, default_port);
+        };
+        const addrs = addrs_res catch {
             return error.InvalidAddress;
         };
         defer addrs.deinit();
@@ -4785,17 +4892,12 @@ pub const PeerManager = struct {
         // Remove from known addresses
         _ = self.known_addresses.remove(key);
 
-        // Disconnect if connected
-        var i: usize = 0;
-        while (i < self.peers.items.len) {
-            const peer = self.peers.items[i];
-            if (addressKey(peer.address) == key) {
-                peer.disconnect();
-                self.allocator.destroy(peer);
-                _ = self.peers.orderedRemove(i);
-            } else {
-                i += 1;
-            }
+        // Disconnect if connected.  Called from the RPC thread (addnode
+        // remove): only REQUEST it; the P2P loop reaps the peer (Core
+        // fDisconnect).  Destroying it here freed a Peer the P2P thread could
+        // be reading (audit CB-5).
+        for (self.peers.items) |peer| {
+            if (addressKey(peer.address) == key) peer.disconnect_requested = true;
         }
     }
 
@@ -4849,27 +4951,40 @@ pub const PeerManager = struct {
     pub fn maintainManualConnections(self: *PeerManager) void {
         const now = std.time.timestamp();
 
+        // Collect first, dial second.  A dial releases the chain lock for its
+        // network I/O, and the RPC thread may then add/remove addresses
+        // (addnode, addpeeraddress): an iterator or `value_ptr` held across
+        // the dial would point into a rehashed map.
+        var due: [16]std.net.Address = undefined;
+        var n_due: usize = 0;
         var iter = self.known_addresses.iterator();
         while (iter.next()) |entry| {
             const info = entry.value_ptr;
             if (info.source != .manual) continue;
             if (self.isConnected(info.address)) continue;
             if (info.last_tried > 0 and now - info.last_tried < MANUAL_RECONNECT_INTERVAL) continue;
-            if (self.peers.items.len >= MAX_TOTAL_CONNECTIONS) break;
-
             info.last_tried = now;
             info.attempts += 1;
+            due[n_due] = info.address;
+            n_due += 1;
+            if (n_due == due.len) break;
+        }
 
+        for (due[0..n_due]) |addr| {
+            if (self.stopping()) return;
+            if (self.peers.items.len >= MAX_TOTAL_CONNECTIONS) break;
             // Use connectToPeer (matches tryConnectNode/onetry path) so the
             // message loop drives the handshake.  Calling performHandshake
             // synchronously here was racing the loop and silently failing.
-            const peer = self.connectToPeer(info.address) catch continue;
+            const peer = self.connectToPeer(addr) catch continue;
             peer.conn_type = .manual;
-            info.success = true;
-            info.last_seen = now;
+            if (self.known_addresses.getPtr(addressKey(addr))) |info| {
+                info.success = true;
+                info.last_seen = now;
+            }
             // Promote NEW -> TRIED in the bucketed addrman (Core Good).
             if (self.ensureAddrman()) |am| {
-                _ = am.good(info.address, if (now < 0) 0 else @intCast(now)) catch {};
+                _ = am.good(addr, if (now < 0) 0 else @intCast(now)) catch {};
             }
         }
     }
@@ -5000,7 +5115,7 @@ pub const PeerManager = struct {
             // Track netgroup (ASN-keyed when asmap is loaded)
             self.outbound_netgroups.put(self.getNetGroup(addr), {}) catch {};
 
-            self.peers.append(peer) catch {
+            self.appendPeer(peer) catch {
                 peer.disconnect();
                 self.allocator.destroy(peer);
                 continue;
@@ -5108,7 +5223,7 @@ pub const PeerManager = struct {
             // Track netgroup for diversity enforcement
             self.trackOutboundNetgroup(peer);
 
-            self.peers.append(peer) catch {
+            self.appendPeer(peer) catch {
                 self.untrackOutboundNetgroup(peer);
                 peer.disconnect();
                 self.allocator.destroy(peer);
@@ -5325,8 +5440,8 @@ pub const PeerManager = struct {
             return;
         }
 
-        // Count inbound connections
-        var inbound_count: usize = 0;
+        // Count inbound connections (established + handshaking).
+        var inbound_count: usize = self.inbound_hs_workers.load(.acquire);
         for (self.peers.items) |peer| {
             if (peer.direction == .inbound) inbound_count += 1;
         }
@@ -5351,19 +5466,43 @@ pub const PeerManager = struct {
             }
         }
 
-        const peer = try self.allocator.create(Peer);
+        // At most MAX_INBOUND_HANDSHAKES in flight, one per source IP (a
+        // single remote host cannot occupy every slot).  Loopback is exempt
+        // from the per-IP rule: local harnesses and replay feeders open
+        // several connections at once from 127.0.0.1.
+        const ip_key = inboundIpKey(conn.address);
+        const per_ip_exempt = isLoopback(conn.address);
+        // Loopback keys must still be unique in the fd map.
+        const slot_key: u64 = if (per_ip_exempt) ip_key ^ (@as(u64, @intCast(conn.stream.handle)) << 32) else ip_key;
+        {
+            self.inbound_hs_mutex.lock();
+            defer self.inbound_hs_mutex.unlock();
+            if (self.inbound_hs_workers.load(.acquire) >= MAX_INBOUND_HANDSHAKES or
+                self.inbound_hs_ips.contains(slot_key))
+            {
+                conn.stream.close();
+                return;
+            }
+            self.inbound_hs_ips.put(self.allocator, slot_key, conn.stream.handle) catch {
+                conn.stream.close();
+                return;
+            };
+            _ = self.inbound_hs_workers.fetchAdd(1, .acq_rel);
+        }
+
+        const peer = self.allocator.create(Peer) catch |err| {
+            self.releaseInboundSlot(slot_key);
+            conn.stream.close();
+            return err;
+        };
         peer.* = Peer.accept(conn.stream, conn.address, self.network_params, self.allocator);
-        // P1.4 Finding 4: the inbound accept path drives performHandshake
-        // SYNCHRONOUSLY on the single P2P run-loop thread, but Peer.accept never
-        // set a receive timeout — so a peer that completes the TCP handshake and
-        // then sends nothing (or a partial header) blocks readExact in the kernel
-        // forever and wedges the whole node (no drain/heartbeat/eviction runs).
-        // The outbound path already sets this 30s SO_RCVTIMEO (peer.zig connect);
-        // mirror it here BEFORE the blocking handshake read. Without this, opening
-        // clearbit's inbound port is a trivial remote DoS. Set before
-        // performHandshake so the version/verack reads are bounded; the
-        // post-handshake processAllMessages path re-sets its own timeout as before.
-        // 10 s (was 30 s): this handshake blocks the single P2P thread.
+        // P1.4 Finding 4: bound every handshake read (a peer that completes
+        // the TCP handshake and then sends nothing).  The handshake itself now
+        // runs on a worker thread (audit CB-8): it used to run SYNCHRONOUSLY
+        // on the P2P thread, where a peer trickling its version a byte at a
+        // time held the whole node — no block, ping or timer — for up to
+        // HANDSHAKE_TIMEOUT_SECS (60 s) per connection.  Core runs the
+        // version handshake as ordinary messages in its message loop.
         peer.setRecvTimeout(10, 0);
         peer.advertise_node_bloom = self.peerbloomfilters;
         peer.advertise_node_network_limited = self.advertise_node_network_limited;
@@ -5372,18 +5511,116 @@ pub const PeerManager = struct {
         if (self.asmap_data) |data| {
             peer.mapped_as = getMappedAS(data, conn.address);
         }
-        if (!self.armHandshake(peer.stream.handle)) {
+        // Slot released BEFORE the socket closes (waitInboundHandshakes must
+        // never shut down a reused fd number).
+        if (self.stopping()) {
+            self.releaseInboundSlot(slot_key);
             peer.disconnect();
             self.allocator.destroy(peer);
             return;
         }
-        defer self.disarmHandshake();
-        peer.performHandshake(self.our_height) catch {
+        const th = std.Thread.spawn(.{}, inboundHandshakeWorker, .{ self, peer, slot_key, self.our_height }) catch {
+            self.releaseInboundSlot(slot_key);
             peer.disconnect();
             self.allocator.destroy(peer);
             return;
         };
-        try self.peers.append(peer);
+        th.detach();
+    }
+
+    /// Concurrent inbound handshakes (worker threads).  Core has no thread
+    /// per handshake; it bounds them by -peertimeout and maxconnections.
+    pub const MAX_INBOUND_HANDSHAKES: u32 = 8;
+
+    fn isLoopback(address: std.net.Address) bool {
+        switch (address.any.family) {
+            std.posix.AF.INET => return (std.mem.toBytes(address.in.sa.addr))[0] == 127,
+            std.posix.AF.INET6 => {
+                const a = address.in6.sa.addr;
+                for (a[0..15]) |b| if (b != 0) return false;
+                return a[15] == 1;
+            },
+            else => return false,
+        }
+    }
+
+    fn inboundIpKey(address: std.net.Address) u64 {
+        var a = address;
+        a.setPort(0);
+        return addressKey(a);
+    }
+
+    fn releaseInboundSlot(self: *PeerManager, ip_key: u64) void {
+        self.inbound_hs_mutex.lock();
+        defer self.inbound_hs_mutex.unlock();
+        _ = self.inbound_hs_ips.remove(ip_key);
+        _ = self.inbound_hs_workers.fetchSub(1, .acq_rel);
+    }
+
+    /// Worker: run one inbound version handshake off the P2P thread.  Touches
+    /// only its own Peer (plus the hand-off queue under inbound_hs_mutex),
+    /// never chain-lock state.  stop() interrupts it through the global
+    /// peer-fd registry (Peer.accept registers the socket).
+    fn inboundHandshakeWorker(self: *PeerManager, peer: *Peer, ip_key: u64, our_height: i32) void {
+        // Last access to `self`: deinit waits for this counter to reach 0.
+        defer _ = self.inbound_hs_workers.fetchSub(1, .acq_rel);
+        const ok = if (peer.performHandshake(our_height)) |_| true else |_| false;
+        var queued = false;
+        {
+            // Unregister the socket BEFORE it can be closed, so
+            // waitInboundHandshakes never shuts down a reused fd number.
+            self.inbound_hs_mutex.lock();
+            defer self.inbound_hs_mutex.unlock();
+            _ = self.inbound_hs_ips.remove(ip_key);
+            if (ok) {
+                if (self.inbound_hs_done.append(self.allocator, peer)) |_| {
+                    queued = true;
+                } else |_| {}
+            }
+        }
+        if (!queued) {
+            peer.disconnect();
+            self.allocator.destroy(peer);
+        }
+    }
+
+    /// Move handshake-complete inbound peers into `peers` (P2P thread).
+    pub fn adoptInboundHandshakes(self: *PeerManager) void {
+        var ready: std.ArrayListUnmanaged(*Peer) = .{};
+        {
+            self.inbound_hs_mutex.lock();
+            defer self.inbound_hs_mutex.unlock();
+            if (self.inbound_hs_done.items.len == 0) return;
+            ready = self.inbound_hs_done;
+            self.inbound_hs_done = .{};
+        }
+        defer ready.deinit(self.allocator);
+        for (ready.items) |peer| {
+            if (self.stopping() or self.peers.items.len >= MAX_TOTAL_CONNECTIONS) {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+                continue;
+            }
+            self.appendPeer(peer) catch {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+            };
+        }
+    }
+
+    /// Shut down every in-flight inbound handshake socket and wait (bounded)
+    /// for the workers to exit.  Called by deinit: workers hold `self`.
+    pub fn waitInboundHandshakes(self: *PeerManager, timeout_ms: u64) void {
+        {
+            self.inbound_hs_mutex.lock();
+            defer self.inbound_hs_mutex.unlock();
+            var it = self.inbound_hs_ips.valueIterator();
+            while (it.next()) |fd| std.posix.shutdown(fd.*, .both) catch {};
+        }
+        var waited: u64 = 0;
+        while (self.inbound_hs_workers.load(.acquire) != 0 and waited < timeout_ms) : (waited += 5) {
+            std.time.sleep(5 * std.time.ns_per_ms);
+        }
     }
 
     /// Process messages from all connected peers using multiplexed I/O.
@@ -5416,6 +5653,10 @@ pub const PeerManager = struct {
             var i: usize = 0;
             while (i < self.peers.items.len) {
                 const peer_obj = self.peers.items[i];
+                if (peer_obj.disconnect_requested and !peer_obj.should_ban) {
+                    self.removePeerByIndex(i);
+                    continue;
+                }
                 if (peer_obj.should_ban) {
                     // Core MaybeDiscourageAndDisconnect (net_processing.cpp:5083):
                     // a local/loopback peer is DISCONNECT-ONLY — no discourage
@@ -5461,7 +5702,11 @@ pub const PeerManager = struct {
 
         // Poll all sockets at once. During IBD use 10ms timeout, otherwise 100ms.
         const timeout_ms: i32 = if (self.isIBD()) 10 else 100;
-        const ready = std.posix.poll(pollfds[0..num_peers], timeout_ms) catch 0;
+        const ready = blk: {
+            const w = self.ioWindow();
+            defer w.end();
+            break :blk std.posix.poll(pollfds[0..num_peers], timeout_ms) catch 0;
+        };
 
         if (ready == 0) {
             // No data on any socket - send getheaders to ONE peer if needed
@@ -5530,7 +5775,15 @@ pub const PeerManager = struct {
                 // Core fPauseSend: stop processing this peer's messages once
                 // its replies are backed up; resume when it reads them.
                 if (peer_obj.sendPaused() or peer_obj.send_failed) break;
-                const msg = peer_obj.receiveMessage() catch |err| {
+                const recv_res = blk: {
+                    // A mid-payload stall can block here up to
+                    // READ_EXACT_PARTIAL_TIMEOUT_MS: never hold cs_main.
+                    // Only this thread frees peers, so peer_obj survives.
+                    const w = self.ioWindow();
+                    defer w.end();
+                    break :blk peer_obj.receiveMessage();
+                };
+                const msg = recv_res catch |err| {
                     switch (err) {
                         PeerError.Timeout => break, // No more data buffered, done draining
                         PeerError.ConnectionClosed => {
@@ -7044,6 +7297,10 @@ pub const PeerManager = struct {
 
     /// Handle a received message.
     fn handleMessage(self: *PeerManager, peer: *Peer, msg: p2p.Message) !void {
+        // Core ProcessMessage: chain/mempool/header state is read and
+        // written under cs_main.  Recursive: the run loop already holds it.
+        self.lockChain();
+        defer self.unlockChain();
         switch (msg) {
             .ping => |pp| {
                 // BIP-31: Core answers only when GetCommonVersion() >
@@ -9826,6 +10083,11 @@ pub const PeerManager = struct {
 
     /// Remove and disconnect a peer by index.
     fn removePeerByIndex(self: *PeerManager, index: usize) void {
+        // Peers are freed only on the P2P thread and only under the chain
+        // lock, so an RPC walking the list under the lock never sees a
+        // destroyed Peer (audit CB-4; Core: m_nodes_mutex + refcount).
+        self.lockChain();
+        defer self.unlockChain();
         const peer = self.peers.swapRemove(index);
         // pending_reorg.source_peer must never outlive the peer it names.
         if (self.pending_reorg) |*pr| {
@@ -11331,6 +11593,11 @@ pub const PeerManager = struct {
         // the steady-state cost is one HashMap.contains() per fork
         // hash — bounded by the fork length, typically 1-3 blocks.
         if (reorg_enabled and self.pending_reorg != null) {
+            // The whole reorg (pre-flush, disconnects, connects, terminal
+            // flush) is one chain-lock hold, as Core's ActivateBestChainStep
+            // runs under cs_main: no RPC may read the half-applied view.
+            self.lockChain();
+            defer self.unlockChain();
             // PERF batching invariant: a reorg reads undo data from the DB
             // (disconnectBlockByHashCF -> getBlockUndoBytes -> CF_BLOCK_UNDO).
             // The batched IBD path below may still hold the most-recent blocks'
@@ -11368,6 +11635,16 @@ pub const PeerManager = struct {
         // `wave15-2026-04-15/CLEARBIT-STALL-RECOVERY-DIAG.md`.
 
         while (self.connect_cursor < self.expected_blocks.items.len) {
+            // One block = one critical section, from the "extends the tip"
+            // check through validation, connect, mempool removal and wallet
+            // bookkeeping (Core AcceptBlock + ConnectTip under cs_main).  The
+            // RPC thread cannot move the tip between our parent check and our
+            // connect (audit CB-6/CB-9).  Between blocks, a waiting RPC gets in.
+            self.lockChain();
+            defer {
+                self.unlockChain();
+                self.yieldChain();
+            }
             // Gate 6: a latched node (fatal system fault) connects nothing.
             if (fatal.isLatched()) break;
             // Shutdown: stop between blocks. This loop connected ~400
@@ -11820,6 +12097,8 @@ pub const PeerManager = struct {
                     @divTrunc(prefetch_ns, std.time.ns_per_ms),
                     cs.profile_cur_prefetch_hits,
                 });
+                const w = self.ioWindow();
+                defer w.end();
                 std.time.sleep(100 * std.time.ns_per_ms);
             }
 
@@ -12044,6 +12323,13 @@ pub const PeerManager = struct {
     /// Main peer management loop.
     pub fn run(self: *PeerManager) !void {
         self.running.store(true, .release);
+        // The P2P thread holds cs_main for everything it does except blocking
+        // I/O (ioWindow): poll, socket reads, dials, handshakes, DNS, sleeps.
+        // Every structure it shares with the RPC thread — coins, tip, block
+        // and header index, download queue, mempool, peer list, address book
+        // — is therefore only touched under the lock (audit 2026-10-07).
+        self.lockChain();
+        defer self.unlockChain();
 
         // Anchor the fixed-seed grace window at connection-loop entry, BEFORE
         // the initial DNS resolve — matches Core net.cpp `auto start = GetTime()`
@@ -12096,7 +12382,7 @@ pub const PeerManager = struct {
                 new_peer.conn_type = .manual;
                 std.debug.print("P2P: Handshake complete with --connect peer (height={d})\n", .{new_peer.start_height});
 
-                if (self.peers.append(new_peer)) |_| {
+                if (self.appendPeer(new_peer)) |_| {
                     self.sendGetHeaders(new_peer) catch |err| {
                         std.debug.print("P2P: Failed to send getheaders: {}\n", .{err});
                     };
@@ -12119,6 +12405,9 @@ pub const PeerManager = struct {
         }
 
         while (self.running.load(.acquire)) {
+            // Inbound peers whose handshake finished on a worker thread.
+            self.adoptInboundHandshakes();
+
             // Network-active gate (Core CConnman.fNetworkActive). When false
             // (`setnetworkactive false`) we suppress establishing NEW
             // connections only: skip the manual/--connect reconnect loop, the
@@ -12255,7 +12544,11 @@ pub const PeerManager = struct {
             // that state — reconnect is driven by the 30s manual-reconnect
             // interval, not by loop frequency.
             if (!self.isIBD() or self.peers.items.len == 0) {
+                const w = self.ioWindow();
+                defer w.end();
                 std.time.sleep(50 * std.time.ns_per_ms);
+            } else {
+                self.yieldChain();
             }
         }
     }
@@ -12317,7 +12610,7 @@ pub const PeerManager = struct {
         }
 
         const peer = self.connectOutboundNegotiated(address) orelse return error.ConnectFailed;
-        self.peers.append(peer) catch |err| {
+        self.appendPeer(peer) catch |err| {
             peer.disconnect();
             self.allocator.destroy(peer);
             return err;
@@ -12327,6 +12620,8 @@ pub const PeerManager = struct {
 
     /// Remove a peer from the manager (legacy API).
     pub fn removePeer(self: *PeerManager, peer: *Peer) void {
+        self.lockChain();
+        defer self.unlockChain();
         for (self.peers.items, 0..) |p, i| {
             if (p == peer) {
                 peer.disconnect();

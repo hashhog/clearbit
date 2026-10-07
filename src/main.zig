@@ -2922,6 +2922,11 @@ pub fn main() !void {
         std.debug.print("Note: could not load ban list: {}\n", .{err});
     };
 
+    // CLEARBIT_LOCK_DEBUG=1: from here on (other threads exist) report every
+    // coin-cache access made without the chain lock, and lock-order
+    // inversions, with a stack trace (chain_lock.zig).
+    storage.chain_lock.setDebugFromEnv();
+
     // Start peer manager in background thread
     const peer_thread = std.Thread.spawn(.{}, peer.PeerManager.run, .{&peer_manager}) catch |err| {
         std.debug.print("Warning: could not start peer thread: {}\n", .{err});
@@ -3167,6 +3172,10 @@ pub fn main() !void {
         std.debug.print("skipping chainstate flush (fatal system error)\n", .{});
     } else {
         std.debug.print("flushing chainstate\n", .{});
+        // Threads are joined; the lock is for the instrument's benefit and in
+        // case a detached waitfor*/inbound worker is still unwinding.
+        chain_state.connect_mutex.lock();
+        defer chain_state.connect_mutex.unlock();
         chain_state.flush() catch |err| {
             std.debug.print("Warning: error flushing chain state: {}\n", .{err});
         };
@@ -3272,7 +3281,11 @@ fn metricsServerThread(
         if (is_health) {
             // /health: 200 OK + tiny JSON. Designed to be parseable
             // without a JSON lib (curl + grep is fine).
-            const tip = chain_state.best_height;
+            const tip = blk: {
+                chain_state.connect_mutex.lock();
+                defer chain_state.connect_mutex.unlock();
+                break :blk chain_state.best_height;
+            };
             var hbuf: [256]u8 = undefined;
             const hbody = std.fmt.bufPrint(
                 &hbuf,
@@ -3292,10 +3305,14 @@ fn metricsServerThread(
             continue;
         }
 
-        // Gather metrics
+        // Gather metrics under the chain lock (then mempool.cs inside
+        // stats(): the documented order).  stats() walks every mempool entry
+        // and the peer count reads the P2P thread's list (audit CB-12).
+        chain_state.connect_mutex.lock();
         const height = chain_state.best_height;
         const mstats = mempool_inst.stats();
         const peers = peer_mgr.getPeerCount();
+        chain_state.connect_mutex.unlock();
 
         // Format response body
         var body_buf: [1024]u8 = undefined;

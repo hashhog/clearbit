@@ -571,7 +571,33 @@ pub fn dbGetCfPropertyInt(
 const IterState = struct {
     inner: *c.rocksdb_iterator_t,
     allocator: std.mem.Allocator,
+    /// Read options owned by this iterator (snapshot reads), else null.
+    own_ro: ?*c.rocksdb_readoptions_t = null,
 };
+
+/// Pin a point-in-time view of the whole DB (rocksdb_create_snapshot).
+pub fn dbCreateSnapshot(db: *storage.Database) ?*anyopaque {
+    const state: *DbState = @ptrCast(@alignCast(db.handle));
+    const snap = c.rocksdb_create_snapshot(state.db) orelse return null;
+    return @ptrCast(@constCast(snap));
+}
+
+pub fn dbReleaseSnapshot(db: *storage.Database, snap: *anyopaque) void {
+    const state: *DbState = @ptrCast(@alignCast(db.handle));
+    c.rocksdb_release_snapshot(state.db, @ptrCast(@alignCast(snap)));
+}
+
+/// Iterator reading `snap` (see dbCreateSnapshot).
+pub fn dbIteratorAt(db: *storage.Database, cf_index: usize, snap: *anyopaque) storage.Iterator {
+    const state: *DbState = @ptrCast(@alignCast(db.handle));
+    const ro = c.rocksdb_readoptions_create() orelse @panic("rocksdb_readoptions_create returned null");
+    c.rocksdb_readoptions_set_snapshot(ro, @ptrCast(@alignCast(snap)));
+    const it = c.rocksdb_create_iterator_cf(state.db, ro, state.cf_handles[cf_index]) orelse
+        @panic("rocksdb_create_iterator_cf returned null");
+    const iter_state = state.allocator.create(IterState) catch @panic("OOM");
+    iter_state.* = .{ .inner = it, .allocator = state.allocator, .own_ro = ro };
+    return storage.Iterator{ .handle = iter_state };
+}
 
 /// Create an iterator for scanning a column family.
 ///
@@ -648,6 +674,7 @@ pub fn iterGetValue(it: *storage.Iterator) []const u8 {
 pub fn iterDeinit(it: *storage.Iterator) void {
     const st: *IterState = @ptrCast(@alignCast(it.handle.?));
     c.rocksdb_iter_destroy(st.inner);
+    if (st.own_ro) |ro| c.rocksdb_readoptions_destroy(ro);
     st.allocator.destroy(st);
 }
 

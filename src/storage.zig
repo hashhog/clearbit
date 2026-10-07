@@ -22,6 +22,7 @@ const storage_rocksdb = @import("storage_rocksdb.zig");
 const chainwork = @import("chainwork.zig");
 const builtin = @import("builtin");
 const fatal = @import("fatal.zig");
+pub const chain_lock = @import("chain_lock.zig");
 
 /// Column family indices for organizing data.
 /// Each stores a different type of data with potentially different
@@ -234,8 +235,10 @@ pub const Database = struct {
         return storage_rocksdb.dbWriteBatch(self, operations);
     }
 
-    /// Create an iterator for scanning a column family.
+    /// Create an iterator for scanning a column family.  Reads the
+    /// calling thread's `iter_snapshot` when one is set (UnlockedUtxoWalk).
     pub fn iterator(self: *Database, cf_index: usize) Iterator {
+        if (iter_snapshot) |snap| return storage_rocksdb.dbIteratorAt(self, cf_index, snap);
         return storage_rocksdb.dbIterator(self, cf_index);
     }
 
@@ -1157,6 +1160,7 @@ pub const UtxoSet = struct {
     /// This matches Core's CCoinsViewCache semantics where a spent
     /// (null-coin) entry in the cache is reported HaveCoin=false.
     pub fn haveCoin(self: *UtxoSet, outpoint: *const types.OutPoint) bool {
+        self.assertChainLocked("UtxoSet.haveCoin");
         const key = makeUtxoKey(outpoint);
         if (self.cache.get(key)) |entry| {
             _ = entry; // existing entries in the in-memory cache are unspent
@@ -1176,9 +1180,17 @@ pub const UtxoSet = struct {
         return false;
     }
 
+    /// Instrument (CLEARBIT_LOCK_DEBUG=1): a live chainstate's coin cache is
+    /// only touched under the chain lock.  Every read can insert + evict +
+    /// flush, so readers count (audit 2026-10-07 CB-1).
+    inline fn assertChainLocked(self: *const UtxoSet, comptime where: []const u8) void {
+        if (self.parent) |cs| cs.connect_mutex.assertHeld(where);
+    }
+
     /// Look up a UTXO by outpoint.
     pub fn get(self: *UtxoSet, outpoint: *const types.OutPoint) !?CompactUtxo {
         @setRuntimeSafety(true);
+        self.assertChainLocked("UtxoSet.get");
         const key = makeUtxoKey(outpoint);
 
         // Check cache first
@@ -1242,6 +1254,7 @@ pub const UtxoSet = struct {
 
     /// Check if a UTXO exists without returning it.
     pub fn contains(self: *UtxoSet, outpoint: *const types.OutPoint) !bool {
+        self.assertChainLocked("UtxoSet.contains");
         const key = makeUtxoKey(outpoint);
 
         // Check cache first
@@ -1287,6 +1300,7 @@ pub const UtxoSet = struct {
     /// set.  Cache size accounting falls out of evictCache's existing
     /// sizing, so no new footgun vs. the read-through path in `get()`.
     pub fn prefetchBlockInputs(self: *UtxoSet, block: *const types.Block) !usize {
+        self.assertChainLocked("UtxoSet.prefetchBlockInputs");
         if (self.db == null) return 0;
         if (block.transactions.len <= 1) return 0;
 
@@ -1371,6 +1385,7 @@ pub const UtxoSet = struct {
         is_coinbase: bool,
     ) !void {
         @setRuntimeSafety(true);
+        self.assertChainLocked("UtxoSet.add");
         const key = makeUtxoKey(outpoint);
 
         // Classify script for compact storage
@@ -1449,6 +1464,7 @@ pub const UtxoSet = struct {
     /// safely flush partial state, so the fallback `evictCleanOnly` drops
     /// only clean non-fresh entries.
     fn evictCache(self: *UtxoSet) void {
+        self.assertChainLocked("UtxoSet.evictCache");
         // Without a DB backend, eviction permanently loses UTXO data.
         // Only evict when we have a database to fall back to.
         if (self.db == null) return;
@@ -1552,6 +1568,7 @@ pub const UtxoSet = struct {
 
     /// Remove a UTXO (spend it). Returns the spent UTXO for undo data.
     pub fn spend(self: *UtxoSet, outpoint: *const types.OutPoint) !?CompactUtxo {
+        self.assertChainLocked("UtxoSet.spend");
         @setRuntimeSafety(true);
         const key = makeUtxoKey(outpoint);
 
@@ -1617,6 +1634,7 @@ pub const UtxoSet = struct {
     /// Uses the dirty_keys tracker for O(dirty) performance instead of
     /// scanning the entire cache.
     pub fn flush(self: *UtxoSet) !void {
+        self.assertChainLocked("UtxoSet.flush");
         if (self.db == null) return;
 
         // Flush pending deletes first
@@ -2352,10 +2370,18 @@ pub const ChainState = struct {
     /// mainnet only matters at exactly two historical heights).
     /// Set via `setNetworkParams` after init.
     network_params: ?*const @import("consensus.zig").NetworkParams = null,
-    /// Mutex protecting block connection/disconnection.
-    /// Both P2P and RPC (submitblock) can connect blocks concurrently;
-    /// without serialization the UTXO HashMap corrupts.
-    connect_mutex: std.Thread.Mutex = .{},
+    /// THE CHAIN LOCK (Bitcoin Core `cs_main`).  Guards the coin cache and
+    /// coin DB view, the tip (best_hash/best_height/total_work/...), the block
+    /// index, the P2P header index and download queue, and the peer list.
+    /// Held by: the P2P thread for its whole loop tick except blocking I/O
+    /// (poll, socket reads, dials, DNS, sleeps), so validate-then-connect of
+    /// a block is one critical section; every RPC except the waitfor* family
+    /// (rpc.zig handleSingleRequest); mempool admission; the metrics thread.
+    /// Recursive + FIFO-fair (chain_lock.zig).  Lock order:
+    ///   cs_main (this) -> mempool.cs -> Peer.send_mutex / TipNotifier.mutex.
+    /// Never held across network I/O (chain_lock.IoWindow).  The historical
+    /// name is kept: every connect/disconnect/flush path already took it.
+    connect_mutex: chain_lock.RecursiveMutex = chain_lock.RecursiveMutex.init(.chain),
     /// Durable BLOCK_FAILED_VALID set (Core: the nStatus bit in the block
     /// index, flushed by WriteBatchSync of m_dirty_blockindex).  clearbit's
     /// ChainManager block index is rebuilt lazily after a restart, so the
@@ -7740,6 +7766,7 @@ pub const ChainState = struct {
     /// re-process a block whose inputs had already been deleted, hitting
     /// error.MissingInput (the stuck-at-370001 bug).
     pub fn flush(self: *ChainState) !void {
+        self.connect_mutex.assertHeld("ChainState.flush");
         if (self.utxo_set.db == null) {
             // Memory-only mode, nothing to persist
             return;
@@ -9087,6 +9114,48 @@ fn writeTxOutSer(
 /// (`in_no_flush_batch` -> error.ReorgBatchInProgress) is honoured — identical
 /// to evictCache.  Falls back to the tip-less `UtxoSet.flush()` when no parent
 /// is wired.  No-op for memory-only sets (db == null).
+/// Per-thread RocksDB snapshot that `Database.iterator` reads, set only for
+/// the duration of an UnlockedUtxoWalk on that thread.
+threadlocal var iter_snapshot: ?*anyopaque = null;
+
+/// Per-thread opt-in: the caller (an RPC handler) allows a full CF_UTXO walk
+/// to run WITHOUT the chain lock.  Never set by a caller that has mutated the
+/// chain and relies on the lock to keep the P2P thread out (dumptxoutset's
+/// rollback holds cs_main across disconnect -> dump -> reconnect).
+pub threadlocal var allow_unlocked_utxo_walk: bool = false;
+
+/// Core rpc/blockchain.cpp (gettxoutsetinfo / scantxoutset): cs_main is held
+/// only for ForceFlushStateToDisk + CoinsDB().Cursor(); the cursor then walks
+/// its own snapshot with cs_main released.  clearbit held the chain lock for
+/// the whole ~165M-coin walk, freezing the P2P thread for minutes (audit
+/// CB-7).  `begin` must be called right after the flush, with the lock held:
+/// it pins a snapshot (= the flushed state), then releases the lock if the
+/// caller opted in.  `end` re-takes the lock and drops the snapshot.
+pub const UnlockedUtxoWalk = struct {
+    db: ?*Database = null,
+    snap: ?*anyopaque = null,
+    prev_snap: ?*anyopaque = null,
+    window: chain_lock.IoWindow = .{ .m = null, .depth = 0 },
+
+    pub fn begin(utxo_set: *UtxoSet) UnlockedUtxoWalk {
+        const db = utxo_set.db orelse return .{};
+        var w = UnlockedUtxoWalk{ .db = db, .prev_snap = iter_snapshot };
+        w.snap = storage_rocksdb.dbCreateSnapshot(db);
+        if (w.snap) |sn| iter_snapshot = sn;
+        if (allow_unlocked_utxo_walk and w.snap != null) {
+            if (utxo_set.parent) |cs| w.window = chain_lock.IoWindow.begin(&cs.connect_mutex);
+        }
+        return w;
+    }
+
+    pub fn end(self: *UnlockedUtxoWalk) void {
+        self.window.end();
+        iter_snapshot = self.prev_snap;
+        if (self.snap) |sn| storage_rocksdb.dbReleaseSnapshot(self.db.?, sn);
+        self.snap = null;
+    }
+};
+
 fn syncUtxoToDb(utxo_set: *UtxoSet) !void {
     if (utxo_set.db == null) return;
     if (utxo_set.parent) |cs| {
@@ -9529,8 +9598,12 @@ pub fn computeTxOutSetStats(
     };
 
     if (utxo_set.db != null) {
-        // Full on-disk set: flush dirty cache -> CF_UTXO, then cursor-walk it.
+        // Full on-disk set: flush dirty cache -> CF_UTXO, then cursor-walk it
+        // (on a snapshot of the flushed state, chain lock released when the
+        // caller opted in: UnlockedUtxoWalk).
         try syncUtxoToDb(utxo_set);
+        var walk = UnlockedUtxoWalk.begin(utxo_set);
+        defer walk.end();
         try forEachCoinInDbOrder(utxo_set, allocator, &sink);
     } else {
         // Memory-only set (loaded snapshot / tests): the cache IS the full set.
