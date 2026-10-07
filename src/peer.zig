@@ -11549,6 +11549,8 @@ pub const PeerManager = struct {
                 break;
             }
 
+            @import("test_hooks.zig").park(.drain_after_parent_check, &block_hash);
+
             // Timing for per-block diagnostics
             const block_start = std.time.nanoTimestamp();
 

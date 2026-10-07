@@ -6779,6 +6779,7 @@ pub const RpcServer = struct {
 
         for (self.peer_manager.peers.items, 0..) |peer, i| {
             if (i > 0) try writer.writeByte(',');
+            @import("test_hooks.zig").park(.getpeerinfo_peer, null);
 
             var addr_buf: [64]u8 = undefined;
             const addr_str = peer.getAddressString(&addr_buf);

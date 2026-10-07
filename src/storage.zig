@@ -1211,6 +1211,7 @@ pub const UtxoSet = struct {
             defer self.allocator.free(data.?);
 
             const utxo = try CompactUtxo.decode(data.?, self.allocator);
+            @import("test_hooks.zig").park(.utxo_get_after_db_read, &key);
 
             // Cache the result (clone for cache storage)
             const cache_utxo = CompactUtxo{

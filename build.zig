@@ -294,6 +294,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_reorg_p2p_tests.step);
     }
 
+    // Cross-thread chain-lock reproducers (CB-1/3/4/5/6/8, audit
+    // 2026-10-07).  Park hooks are test-only (src/test_hooks.zig).  NOT folded
+    // into `test`: on a build without the chain lock some of these crash the
+    // binary on purpose (double free / use-after-free) — run them per test
+    // with -Dchain-lock-filter.
+    {
+        const cl_filter = b.option([]const u8, "chain-lock-filter", "Substring filter for test-chain-lock") orelse "tests_chain_lock";
+        const chain_lock_tests = b.addTest(.{
+            .root_source_file = b.path("tests_chain_lock.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{cl_filter},
+        });
+        chain_lock_tests.linkSystemLibrary("rocksdb");
+        chain_lock_tests.linkSystemLibrary("secp256k1");
+        chain_lock_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        chain_lock_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            chain_lock_tests.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+        }
+        if (minisketch_enabled) {
+            chain_lock_tests.linkSystemLibrary("minisketch");
+            chain_lock_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        chain_lock_tests.root_module.addOptions("build_options", build_options);
+        const run_chain_lock_tests = b.addRunArtifact(chain_lock_tests);
+        run_chain_lock_tests.has_side_effects = true;
+        const chain_lock_step = b.step("test-chain-lock", "Run the cross-thread chain-lock reproducers");
+        chain_lock_step.dependOn(&run_chain_lock_tests.step);
+    }
+
     // Reorg disconnect -> spent-coin RESTORE persistence tests.  Dedicated
     // root (imports storage.zig only) with a name-substring filter so it does
     // not drag in drifted inline tests from heavier modules.

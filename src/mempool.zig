@@ -1367,6 +1367,8 @@ pub const Mempool = struct {
         // by WITNESS_SCALE_FACTOR per transaction.
         const cluster_weight = clusterWeightContribution(@intCast(weight), sigop_cost);
 
+        @import("test_hooks.zig").park(.mempool_pre_insert, null);
+
         // 7. Handle RBF conflicts
         // FIX-73 / W120 BUG-3+5+8: collect the full evicted set (direct
         // conflicts + their descendants) BEFORE removal so we can populate
