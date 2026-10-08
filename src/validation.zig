@@ -7309,6 +7309,11 @@ pub const ChainManager = struct {
     /// block bytes itself from CF_BLOCKS so this class of bug is gone.
     fn disconnectToBlock(self: *ChainManager, target: ?*BlockIndexEntry) ChainError!void {
         const chain_state = self.chain_state orelse return;
+        // Core InvalidateBlock: MaybeUpdateMempoolForReorg after EACH
+        // DisconnectTip, re-adding only for the first 10 disconnected blocks
+        // (`++disconnected <= 10`); beyond that the disconnected txs are not
+        // re-added and their in-mempool children are removed.
+        var n_disconnected: usize = 0;
 
         while (self.active_tip) |tip| {
             // Stop if we've reached the target
@@ -7317,6 +7322,18 @@ pub const ChainManager = struct {
             } else {
                 // Target is null (disconnecting genesis), stop
                 break;
+            }
+
+            // Snapshot the body BEFORE the disconnect (Core DisconnectTip
+            // reads the block and hands block.vtx to the disconnectpool).
+            var disc_block: ?types.Block = null;
+            defer if (disc_block) |*db| serialize.freeBlock(self.allocator, db);
+            if (self.mempool != null) {
+                if (chain_state.getBlockBytes(&tip.hash) catch null) |bytes| {
+                    defer self.allocator.free(bytes);
+                    var r = serialize.Reader{ .data = bytes };
+                    disc_block = serialize.readBlock(&r, self.allocator) catch null;
+                }
             }
 
             // Prefer the CF_BLOCK_UNDO path: same undo source that the
@@ -7361,6 +7378,12 @@ pub const ChainManager = struct {
 
             // Update active tip
             self.active_tip = tip.parent;
+
+            n_disconnected += 1;
+            if (self.mempool) |pool| {
+                const one: []const types.Block = if (disc_block) |*db| @as(*const [1]types.Block, db) else &.{};
+                pool.updateForReorg(one, &.{}, n_disconnected <= 10);
+            }
         }
     }
 
@@ -7917,14 +7940,11 @@ pub const ChainManager = struct {
         // replacements on the new branch trigger double-spend
         // rejections.
         if (self.mempool) |mp| {
-            for (disconnected_blocks.items) |*b| {
-                mp.blockDisconnected(b.transactions);
-            }
-            for (rb_list.items) |rb| {
-                mp.removeForBlock(&rb.block);
-            }
-            // Core MaybeUpdateMempoolForReorg → removeForReorg.
-            _ = mp.removeForReorg();
+            // ConnectTip removeForBlock per new block (confirmed txs +
+            // conflicts), then MaybeUpdateMempoolForReorg: disconnected txs
+            // re-accepted earliest first, failures removeRecursive'd,
+            // UpdateTransactionsFromBlock, removeForReorg, LimitMempoolSize.
+            mp.updateForReorg(disconnected_blocks.items, rb_list.items, true);
         }
     }
 
