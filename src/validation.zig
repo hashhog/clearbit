@@ -14682,6 +14682,331 @@ test "W101 PR10: executeReorg fires mempool.blockDisconnected on each disconnect
 }
 
 // ============================================================================
+// Mempool consistent with the chain on invalidateblock / reorg (2026-10-08)
+// ============================================================================
+//
+// Core: DisconnectTip hands block.vtx to the DisconnectedBlockTransactions
+// pool; InvalidateBlock runs MaybeUpdateMempoolForReorg after EACH disconnect
+// and ActivateBestChainStep once at the end; ConnectTip runs removeForBlock
+// (confirmed + conflicts) for every connected block.  MaybeUpdateMempoolFor-
+// Reorg re-accepts EARLIEST FIRST (bypass_limits), removeRecursive's what
+// fails, and UpdateTransactionsFromBlock links a re-added parent to children
+// already in the pool.  clearbit's invalidateBlock re-added nothing (and
+// removeForReorg then evicted every in-mempool child of a disconnected tx);
+// executeReorg re-added tip-block-first (a child before its parent -> lost)
+// and never linked existing children.  These tests drive the real
+// ChainManager paths over a RocksDB-backed chainstate.
+
+const mr_mempool = @import("mempool.zig");
+
+/// P2WSH(OP_TRUE) — standard, spendable with witness [OP_TRUE].
+fn mrOpTrueP2wsh() [34]u8 {
+    var out: [34]u8 = undefined;
+    out[0] = 0x00;
+    out[1] = 0x20;
+    std.crypto.hash.sha2.Sha256.hash(&[_]u8{0x51}, out[2..34], .{});
+    return out;
+}
+const MR_OP_TRUE_ITEM = [_]u8{0x51};
+const mr_op_true_witness = [_][]const u8{&MR_OP_TRUE_ITEM};
+const MR_P2WPKH = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xDD} ** 20;
+
+/// One-in one-out v2 spend of an OP_TRUE P2WSH coin, allocated in `a`.
+fn mrSpend(a: std.mem.Allocator, prev: types.OutPoint, value: i64, spk: []const u8) !types.Transaction {
+    const ins = try a.alloc(types.TxIn, 1);
+    ins[0] = .{ .previous_output = prev, .script_sig = &[_]u8{}, .sequence = 0xFFFF_FFFF, .witness = &mr_op_true_witness };
+    const outs = try a.alloc(types.TxOut, 1);
+    outs[0] = .{ .value = value, .script_pubkey = try a.dupe(u8, spk) };
+    return .{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+}
+
+fn mrTxid(a: std.mem.Allocator, tx: *const types.Transaction) types.Hash256 {
+    return crypto.computeTxid(tx, a) catch unreachable;
+}
+
+/// coinbase + `txs`, allocated in `a`.
+fn mrBlock(a: std.mem.Allocator, prev: types.Hash256, tag: u8, txs: []const types.Transaction) !types.Block {
+    const all = try a.alloc(types.Transaction, txs.len + 1);
+    const cb_in = try a.alloc(types.TxIn, 1);
+    cb_in[0] = .{
+        .previous_output = types.OutPoint.COINBASE,
+        .script_sig = try a.dupe(u8, &[_]u8{ 0x03, tag, 0x00, 0x00 }),
+        .sequence = 0xFFFFFFFF,
+        .witness = &[_][]const u8{},
+    };
+    const cb_out = try a.alloc(types.TxOut, 1);
+    cb_out[0] = .{ .value = 5_000_000_000, .script_pubkey = &MR_P2WPKH };
+    all[0] = .{ .version = 1, .inputs = cb_in, .outputs = cb_out, .lock_time = 0 };
+    @memcpy(all[1..], txs);
+    return .{
+        .header = .{ .version = 1, .prev_block = prev, .merkle_root = [_]u8{tag} ** 32, .timestamp = 0, .bits = 0, .nonce = 0 },
+        .transactions = all,
+    };
+}
+
+fn mrIndex(manager: *ChainManager, parent: *BlockIndexEntry, hash: types.Hash256, block: *const types.Block, work: u8, seq: i64) !*BlockIndexEntry {
+    const entry = try manager.allocator.create(BlockIndexEntry);
+    entry.* = BlockIndexEntry{
+        .hash = hash,
+        .header = block.header,
+        .height = parent.height + 1,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0x00} ** 31 ++ [_]u8{work},
+        .sequence_id = seq,
+        .parent = parent,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(entry);
+    return entry;
+}
+
+fn mrStore(cs: *storage.ChainState, hash: types.Hash256, block: *const types.Block, height: u32, connect: bool) !void {
+    var writer = serialize.Writer.init(cs.allocator);
+    try serialize.writeBlock(&writer, block);
+    const owned: []u8 = @constCast(try writer.toOwnedSlice());
+    try cs.queueBlockWrite(&hash, owned, height);
+    if (connect) try cs.connectBlockFastWithUndo(block, &hash, height) else try cs.flush();
+}
+
+fn mrHash(h: u8, branch: u8) types.Hash256 {
+    var x: types.Hash256 = [_]u8{0} ** 32;
+    x[0] = h;
+    x[1] = branch;
+    return x;
+}
+
+fn mrGenesis(manager: *ChainManager) !*BlockIndexEntry {
+    const genesis = try manager.allocator.create(BlockIndexEntry);
+    genesis.* = BlockIndexEntry{
+        .hash = [_]u8{0} ** 32,
+        .header = consensus.MAINNET.genesis_header,
+        .height = 0,
+        .status = BlockStatus{ .has_data = true },
+        .chain_work = [_]u8{0} ** 32,
+        .sequence_id = 0,
+        .parent = null,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    try manager.addBlock(genesis);
+    manager.active_tip = genesis;
+    return genesis;
+}
+
+fn mrSeedCoin(cs: *storage.ChainState, tag: u8, spk: []const u8) !types.OutPoint {
+    const op = types.OutPoint{ .hash = [_]u8{tag} ** 32, .index = 0 };
+    const out = types.TxOut{ .value = 100_000, .script_pubkey = spk };
+    try cs.utxo_set.add(&op, &out, 0, false);
+    return op;
+}
+
+test "mempool-reorg: invalidateblock re-adds the disconnected tx and keeps its in-mempool child (Core InvalidateBlock -> MaybeUpdateMempoolForReorg)" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    // Test-built txs live on the arena; the pool (like the chainstate, whose
+    // coin copies it frees) uses the testing allocator.  Txs re-admitted from
+    // a block are owned by the pool's allocator and freed at the end.
+    var pool = mr_mempool.Mempool.init(&cs, &consensus.REGTEST, allocator);
+    defer pool.deinit();
+    var manager = ChainManager.init(&cs, &pool, allocator);
+    defer manager.deinit();
+    const genesis = try mrGenesis(&manager);
+
+    const wsh = mrOpTrueP2wsh();
+    const s = try mrSeedCoin(&cs, 0x71, &wsh);
+
+    // Block 1: [cb, A <- S].  Mempool: M <- A:0.
+    const tx_a = try mrSpend(arena, s, 90_000, &wsh);
+    const a_id = mrTxid(arena, &tx_a);
+    const h1 = mrHash(1, 0xA1);
+    const b1 = try mrBlock(arena, genesis.hash, 1, &.{tx_a});
+    try mrStore(&cs, h1, &b1, 1, true);
+    const e1 = try mrIndex(&manager, genesis, h1, &b1, 0x40, 1);
+    manager.active_tip = e1;
+
+    const tx_m = try mrSpend(arena, .{ .hash = a_id, .index = 0 }, 80_000, &MR_P2WPKH);
+    const m_id = mrTxid(arena, &tx_m);
+    try pool.addTransaction(tx_m);
+    try std.testing.expectEqual(@as(usize, 1), pool.entries.count());
+
+    try manager.invalidateBlock(&h1);
+    try std.testing.expectEqual(@as(u32, 0), cs.best_height);
+
+    // Core: mempool = {A, M}; M is A's child (one cluster, aggregates linked).
+    try std.testing.expect(pool.entries.contains(a_id));
+    try std.testing.expect(pool.entries.contains(m_id));
+    try std.testing.expectEqual(@as(usize, 2), pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 2), pool.entries.get(a_id).?.descendant_count);
+    try std.testing.expectEqual(@as(usize, 2), pool.entries.get(m_id).?.ancestor_count);
+    serialize.freeTransaction(allocator, &pool.entries.get(a_id).?.tx);
+}
+
+test "mempool-reorg: a reorg re-adds disconnected txs earliest first, keeps their children, drops conflicts (Core ActivateBestChainStep)" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    var pool = mr_mempool.Mempool.init(&cs, &consensus.REGTEST, allocator);
+    defer pool.deinit();
+    var manager = ChainManager.init(&cs, &pool, allocator);
+    defer manager.deinit();
+    const genesis = try mrGenesis(&manager);
+
+    const wsh = mrOpTrueP2wsh();
+    const s1 = try mrSeedCoin(&cs, 0x81, &wsh);
+    const s2 = try mrSeedCoin(&cs, 0x82, &wsh);
+
+    // Active: A1 [cb, P <- S1], A2 [cb, C <- P:0].
+    const tx_p = try mrSpend(arena, s1, 90_000, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const tx_c = try mrSpend(arena, .{ .hash = p_id, .index = 0 }, 80_000, &wsh);
+    const c_id = mrTxid(arena, &tx_c);
+    const ha1 = mrHash(1, 0xA0);
+    const ba1 = try mrBlock(arena, genesis.hash, 0xA1, &.{tx_p});
+    try mrStore(&cs, ha1, &ba1, 1, true);
+    const a1 = try mrIndex(&manager, genesis, ha1, &ba1, 0x40, 1);
+    manager.active_tip = a1;
+    const ha2 = mrHash(2, 0xA0);
+    const ba2 = try mrBlock(arena, ha1, 0xA2, &.{tx_c});
+    try mrStore(&cs, ha2, &ba2, 2, true);
+    const a2 = try mrIndex(&manager, a1, ha2, &ba2, 0x80, 2);
+    manager.active_tip = a2;
+
+    // Mempool at A2: M1 <- C:0 (child of a block tx), M3 <- S2.
+    const tx_m1 = try mrSpend(arena, .{ .hash = c_id, .index = 0 }, 70_000, &MR_P2WPKH);
+    const m1_id = mrTxid(arena, &tx_m1);
+    try pool.addTransaction(tx_m1);
+    const tx_m3 = try mrSpend(arena, s2, 85_000, &MR_P2WPKH);
+    const m3_id = mrTxid(arena, &tx_m3);
+    try pool.addTransaction(tx_m3);
+
+    // Side branch, more work: B1 [cb, Z <- S2] (conflicts M3), B2, B3.
+    const tx_z = try mrSpend(arena, s2, 60_000, &MR_P2WPKH);
+    const hb1 = mrHash(1, 0xB0);
+    const bb1 = try mrBlock(arena, genesis.hash, 0xB1, &.{tx_z});
+    try mrStore(&cs, hb1, &bb1, 1, false);
+    const b1 = try mrIndex(&manager, genesis, hb1, &bb1, 0x40, 10);
+    const hb2 = mrHash(2, 0xB0);
+    const bb2 = try mrBlock(arena, hb1, 0xB2, &.{});
+    try mrStore(&cs, hb2, &bb2, 2, false);
+    const b2 = try mrIndex(&manager, b1, hb2, &bb2, 0x80, 11);
+    const hb3 = mrHash(3, 0xB0);
+    const bb3 = try mrBlock(arena, hb2, 0xB3, &.{});
+    try mrStore(&cs, hb3, &bb3, 3, false);
+    _ = try mrIndex(&manager, b2, hb3, &bb3, 0xC0, 12);
+
+    try manager.activateBestChain();
+    try std.testing.expectEqualSlices(u8, &hb3, &cs.best_hash);
+
+    // Core: {P, C, M1}; M3 conflicted with Z.  P -> C -> M1 is one chain.
+    try std.testing.expect(pool.entries.contains(p_id));
+    try std.testing.expect(pool.entries.contains(c_id));
+    try std.testing.expect(pool.entries.contains(m1_id));
+    try std.testing.expect(!pool.entries.contains(m3_id));
+    try std.testing.expectEqual(@as(usize, 3), pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 3), pool.entries.get(p_id).?.descendant_count);
+    try std.testing.expectEqual(@as(usize, 3), pool.entries.get(m1_id).?.ancestor_count);
+    serialize.freeTransaction(allocator, &pool.entries.get(p_id).?.tx);
+    serialize.freeTransaction(allocator, &pool.entries.get(c_id).?.tx);
+}
+
+test "mempool-reorg: removeForBlock removes a mempool tx that double-spends a block tx, with descendants (Core removeForBlock -> removeConflicts)" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cs = storage.ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_height = 200;
+    var pool = mr_mempool.Mempool.init(&cs, &consensus.REGTEST, allocator);
+    defer pool.deinit();
+
+    const wsh = mrOpTrueP2wsh();
+    const s = try mrSeedCoin(&cs, 0x91, &wsh);
+    const keep = try mrSeedCoin(&cs, 0x92, &wsh);
+
+    const tx_t = try mrSpend(arena, s, 90_000, &wsh);
+    const t_id = mrTxid(arena, &tx_t);
+    try pool.addTransaction(tx_t);
+    const tx_tc = try mrSpend(arena, .{ .hash = t_id, .index = 0 }, 80_000, &MR_P2WPKH);
+    try pool.addTransaction(tx_tc);
+    const tx_k = try mrSpend(arena, keep, 90_000, &MR_P2WPKH);
+    const k_id = mrTxid(arena, &tx_k);
+    try pool.addTransaction(tx_k);
+    try std.testing.expectEqual(@as(usize, 3), pool.entries.count());
+
+    // A block confirms X <- S (a different spend of S).
+    const tx_x = try mrSpend(arena, s, 50_000, &MR_P2WPKH);
+    const blk = try mrBlock(arena, [_]u8{0} ** 32, 0x93, &.{tx_x});
+    pool.removeForBlock(&blk);
+
+    try std.testing.expectEqual(@as(usize, 1), pool.entries.count());
+    try std.testing.expect(pool.entries.contains(k_id));
+}
+
+test "mempool-reorg: getblocktemplate puts an in-mempool parent before its child even when the child's ancestor feerate sorts first (Core addPackageTxs)" {
+    const allocator = std.testing.allocator;
+    const block_template = @import("block_template.zig");
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cs = storage.ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_height = 200;
+    var pool = mr_mempool.Mempool.init(&cs, &consensus.REGTEST, allocator);
+    defer pool.deinit();
+
+    const wsh = mrOpTrueP2wsh();
+    const s = try mrSeedCoin(&cs, 0xA5, &wsh);
+    // Parent pays 1,000 sat; child pays 60,000 sat -> the child's ancestor
+    // feerate is far above the parent's, so it sorts first.
+    const tx_p = try mrSpend(arena, s, 99_000, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    try pool.addTransaction(tx_p);
+    const tx_c = try mrSpend(arena, .{ .hash = p_id, .index = 0 }, 39_000, &MR_P2WPKH);
+    const c_id = mrTxid(arena, &tx_c);
+    try pool.addTransaction(tx_c);
+
+    const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+    var tmpl = try block_template.createBlockTemplate(&cs, &pool, &consensus.REGTEST, .{
+        .payout_script = &payout,
+        .override_bits = consensus.REGTEST.genesis_header.bits,
+    }, allocator);
+    defer tmpl.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), tmpl.transactions.items.len);
+    try std.testing.expectEqualSlices(u8, &p_id, &tmpl.transactions.items[0].txid);
+    try std.testing.expectEqualSlices(u8, &c_id, &tmpl.transactions.items[1].txid);
+}
+
+// ============================================================================
 // wave-4 audit: same-block coinbase spend — HIGH consensus false-accept fix
 // ============================================================================
 //
