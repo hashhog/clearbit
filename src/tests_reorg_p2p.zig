@@ -2964,3 +2964,90 @@ test "tests_reorg_p2p: gate6 F12 — OOM decoding a valid message is OutOfMemory
     if (e == error.ProtocolViolation) std.debug.print("gate6 F12: decode OOM reported as ProtocolViolation (pre-fix: +20 misbehaviour, ban path)\n", .{});
     try testing.expectEqualStrings("OutOfMemory", @errorName(e));
 }
+
+// fleet-conformance SUBP2P (2026-10-08): an RPC writer (submitblock) connects
+// blocks under the chain lock without touching the P2P connect queue.  Pre-fix
+// the queue tail stayed one block behind the tip, so the next header (built on
+// the submitted block) was classified a competing fork rooted at our own tip,
+// refused as equal/lower work, and the node wedged at the submitted height.
+// Core derives "what extends the chain" from the active chain
+// (ProcessHeadersMessage / FindNextBlocksToDownload) and treats a block it
+// already has as a no-op (AcceptBlock fAlreadyHave).
+test "tests_reorg_p2p: submitblock then the same block over P2P — next headers EXTEND the tip; a queued block connected by RPC is skipped" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bip30SelfDupSetup(allocator, &pm, &cs, &params);
+
+    const h_peer = try ibPeer(&params, allocator, 3, .outbound);
+    defer freeIbPeer(allocator, h_peer);
+    try pm.peers.append(h_peer);
+    defer pm.peers.clearRetainingCapacity();
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var a2 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0xA2);
+    defer serialize.freeBlock(allocator, &a2.block);
+    var a3 = try mineIbBlock(allocator, &params, a2.hash, 3, 0, 0xA3);
+    defer serialize.freeBlock(allocator, &a3.block);
+    var a4 = try mineIbBlock(allocator, &params, a3.hash, 4, 0, 0xA4);
+    defer serialize.freeBlock(allocator, &a4.block);
+    var a5 = try mineIbBlock(allocator, &params, a4.hash, 5, 0, 0xA5);
+    defer serialize.freeBlock(allocator, &a5.block);
+
+    // A1 over P2P.
+    try sendHeaders(&pm, allocator, h_peer, &.{&a1});
+    try sendBlock(&pm, allocator, h_peer, &a1);
+    try testing.expectEqual(@as(u32, 1), cs.best_height);
+
+    // (a) submitblock A2 (RPC path, no queue update), then the same A2 over P2P.
+    const r2 = try block_template.submitBlockWithIndexAndMempool(&a2.block, &cs, &params, null, null, allocator);
+    try testing.expect(r2.accepted);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+    try testing.expect(pm.isOnActiveChain(&a2.hash));
+    try testing.expect(!pm.isOnActiveChain(&a3.hash));
+    try sendBlock(&pm, allocator, h_peer, &a2);
+    try testing.expectEqual(@as(u32, 2), cs.best_height);
+
+    // A3's header builds on the submitted A2: an extension, not a fork.
+    const fork_before = pm.reorg_candidate_announcements;
+    try sendHeaders(&pm, allocator, h_peer, &.{&a3});
+    try testing.expectEqual(fork_before, pm.reorg_candidate_announcements);
+    try testing.expect(pm.pending_reorg == null);
+    try testing.expectEqual(@as(usize, 1), countQueued(&pm, a3.hash));
+    try testing.expect(pm.queue_tip_realigns >= 1);
+    try sendBlock(&pm, allocator, h_peer, &a3);
+    try testing.expectEqual(@as(u32, 3), cs.best_height);
+    try testing.expectEqualSlices(u8, &a3.hash, &cs.best_hash);
+
+    // (b) A4 queued over P2P (body in flight), submitblock A4 wins the race,
+    // then the P2P body arrives: a duplicate — skipped, nothing dropped.
+    try sendHeaders(&pm, allocator, h_peer, &.{&a4});
+    try testing.expectEqual(@as(usize, 1), countQueued(&pm, a4.hash));
+    const r4 = try block_template.submitBlockWithIndexAndMempool(&a4.block, &cs, &params, null, null, allocator);
+    try testing.expect(r4.accepted);
+    try testing.expectEqual(@as(u32, 4), cs.best_height);
+    try sendHeaders(&pm, allocator, h_peer, &.{&a5}); // queued behind A4
+    try testing.expectEqual(@as(usize, 1), countQueued(&pm, a5.hash));
+    try sendBlock(&pm, allocator, h_peer, &a4);
+    try testing.expect(pm.queue_already_connected_skips >= 1);
+    try testing.expectEqual(@as(usize, 0), countQueued(&pm, a4.hash));
+    try testing.expectEqual(@as(usize, 1), countQueued(&pm, a5.hash)); // A5 still queued
+    try sendBlock(&pm, allocator, h_peer, &a5);
+    try testing.expectEqual(@as(u32, 5), cs.best_height);
+    try testing.expectEqualSlices(u8, &a5.hash, &cs.best_hash);
+
+    try testing.expect(!pm.isBlockFailed(&a2.hash));
+    try testing.expect(!pm.isBlockFailed(&a4.hash));
+    try testing.expect(!h_peer.should_ban);
+    try testing.expect(!cs.flush_error);
+}
