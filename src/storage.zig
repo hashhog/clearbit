@@ -9698,10 +9698,16 @@ pub fn dumpTxOutSet(
     // leftover temp from a previous crashed dump (truncate=true on
     // createFile would do this for us, but having an explicit removal
     // handle simplifies the on-error cleanup below).
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.incomplete", .{path});
+    // Core: `temppath = fs::is_fifo(path) ? path : path + ".incomplete"`;
+    // a named pipe is written directly, never synced or renamed.
+    const to_fifo = isNamedPipe(path);
+    const tmp_path = if (to_fifo)
+        try allocator.dupe(u8, path)
+    else
+        try std.fmt.allocPrint(allocator, "{s}.incomplete", .{path});
     defer allocator.free(tmp_path);
 
-    const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = !to_fifo });
     var file_open = true;
     // Best-effort cleanup on any error past createFile. We have to
     // capture the path because `errdefer` runs after locals go out of
@@ -9709,7 +9715,7 @@ pub fn dumpTxOutSet(
     // defer above frees it, so referencing it here is fine.
     errdefer {
         if (file_open) file.close();
-        std.fs.cwd().deleteFile(tmp_path) catch {};
+        if (!to_fifo) std.fs.cwd().deleteFile(tmp_path) catch {};
     }
 
     var buffered = std.io.bufferedWriter(file.writer());
@@ -9783,7 +9789,17 @@ pub fn dumpTxOutSet(
     // Durability barrier: fsync the bytes before the atomic rename. A
     // power loss after rename but before page-cache flush could otherwise
     // leave <path> visible with zero-length / torn contents.
-    try file.sync();
+    // Only a regular file: fsync(2) on a pipe/char device is EINVAL, which
+    // Zig's std.posix.fsync maps to `unreachable` -- a ReleaseSafe PANIC of
+    // the whole node from an RPC argument (named pipe at <path>.incomplete).
+    const kind = (try file.stat()).kind;
+    if (kind == .file) try file.sync();
+
+    if (to_fifo) {
+        file.close();
+        file_open = false;
+        return;
+    }
 
     // Close before rename. POSIX allows renaming an open fd, but Windows
     // (where rename-over-existing fails on a held fd) is the conservative
@@ -9797,6 +9813,12 @@ pub fn dumpTxOutSet(
         std.fs.cwd().deleteFile(tmp_path) catch {};
         return e;
     };
+}
+
+/// True when `path` names a FIFO (Core dumptxoutset: `fs::is_fifo`).
+pub fn isNamedPipe(path: []const u8) bool {
+    const st = std.fs.cwd().statFile(path) catch return false;
+    return st.kind == .named_pipe;
 }
 
 /// Load a UTXO set snapshot in Core's wire format. The reader expects the

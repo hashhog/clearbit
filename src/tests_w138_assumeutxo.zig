@@ -692,32 +692,38 @@ test "w138 G24: SnapshotMetadata.network_magic is u32, not [4]u8 (BUG-24)" {
 }
 
 // ===========================================================================
-// G25 — dumptxoutset rollback succeeds on pruned datadir
-// Status: DIVERGE (BUG-25). Aborts if CF_BLOCKS body is missing.
+// G25 — dumptxoutset rollback on a datadir missing block data
+// Status: MATCHES Core (2026-10-07).  Core refuses up front ("Could not roll
+// back to requested height since necessary block data is already pruned.");
+// clearbit checks every block on the disconnect path for a readable body
+// before touching state, because the restore must reconnect each one.
 // ===========================================================================
 test "w138 G25: dumptxoutset rollback aborts on missing CF_BLOCKS body (BUG-25)" {
     const allocator = testing.allocator;
     const rpc_src = try loadSrc(allocator, "rpc");
     defer allocator.free(rpc_src);
 
-    // The error string exists.
-    try testing.expect(contains(rpc_src, "rollback aborted: CF_BLOCKS missing body"));
-    // The guard explicitly references CF_BLOCKS.
-    try testing.expect(contains(rpc_src, "getBlockBytes(&entry.hash)"));
+    try testing.expect(contains(rpc_src, "Could not roll back to requested height since necessary block data is not available."));
+    try testing.expect(contains(rpc_src, "getBlockBytes(&cursor.hash)"));
 }
 
 // ===========================================================================
 // G26 — dumptxoutset rollback succeeds after IBD fast-path
-// Status: DIVERGE (BUG-26). Rejects if undo data missing.
+// Status: FIXED (BUG-26, 2026-10-07).  The rollback used to drive the rev*.dat
+// undo path (undo_manager), which a production ChainState never has, so it was
+// refused on every real datadir.  It is now Core's TemporaryRollback:
+// invalidateBlock(next) -> dump -> reconsiderBlock(next), on the CF_BLOCK_UNDO
+// path invalidateblock uses.
 // ===========================================================================
 test "w138 G26: dumptxoutset rollback aborts on missing undo data (BUG-26)" {
     const allocator = testing.allocator;
     const rpc_src = try loadSrc(allocator, "rpc");
     defer allocator.free(rpc_src);
 
-    try testing.expect(contains(rpc_src, "rollback aborted: undo data unreadable"));
-    try testing.expect(contains(rpc_src, "rollback aborted: undo data missing"));
-    try testing.expect(contains(rpc_src, "IBD fast-path"));
+    try testing.expect(contains(rpc_src, "cm.invalidateBlock(&invalidate_hash)"));
+    try testing.expect(contains(rpc_src, "cm.reconsiderBlock(&invalidate_hash)"));
+    // The old gate on the rev*.dat undo manager is gone.
+    try testing.expect(!contains(rpc_src, "self.chain_state.undo_manager == null"));
 }
 
 // ===========================================================================

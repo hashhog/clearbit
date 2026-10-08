@@ -13869,7 +13869,7 @@ fn phase3MakeBlock(prev_hash: [32]u8, comptime script_byte: u8) types.Block {
 /// AND insert a matching BlockIndexEntry into the ChainManager.  Returns
 /// the heap-owned BlockIndexEntry so the caller can chain subsequent
 /// blocks off it.
-fn phase3ConnectAndIndex(
+pub fn phase3ConnectAndIndex(
     chain_state: *storage.ChainState,
     manager: *ChainManager,
     parent: *BlockIndexEntry,
@@ -13909,7 +13909,7 @@ fn phase3ConnectAndIndex(
 /// block body is stored in CF_BLOCKS (so executeReorg can load it) but
 /// the chainstate tip does not move.  Used to plant side-branch blocks
 /// that the chain_manager can later reorg to.
-fn phase3IndexOnly(
+pub fn phase3IndexOnly(
     chain_state: *storage.ChainState,
     manager: *ChainManager,
     parent: *BlockIndexEntry,
