@@ -3449,6 +3449,12 @@ pub const PeerManager = struct {
     /// (overlapping re-announcements) and was skipped instead of being
     /// classified as a fork.
     committed_header_prefix_skips: u64 = 0,
+    /// Times alignQueueWithActiveTip appended RPC-connected active blocks
+    /// to the connect queue (diagnostics / tests).
+    queue_tip_realigns: u64 = 0,
+    /// Queued hashes the drain skipped because an RPC writer had already
+    /// connected them (Core AcceptBlock fAlreadyHave: a no-op).
+    queue_already_connected_skips: u64 = 0,
     /// Pending reorgs whose leading fork blocks were found already on the
     /// active chain at fire time (fork point advanced past them, never
     /// re-connected).
@@ -6331,6 +6337,58 @@ pub const PeerManager = struct {
     /// committed header chain, linked header-to-header (a known hash is a
     /// commitment to its whole ancestry, so the run is our own chain).
     /// Only consulted when hdrs[0] does not already extend the queue tail.
+    /// True when `hash` is the block at its own height on the ACTIVE chain
+    /// (connected; not a stored side-branch body).  Two point reads.
+    pub fn isOnActiveChain(self: *PeerManager, hash: *const types.Hash256) bool {
+        const cs = self.chain_state orelse return false;
+        if (std.mem.eql(u8, &cs.best_hash, hash)) return true;
+        const h = cs.getBlockHeightByHash(hash) orelse return false;
+        if (h > cs.best_height) return false;
+        const at = cs.getBlockHashByHeight(h) orelse return false;
+        return std.mem.eql(u8, &at, hash);
+    }
+
+    /// I2 (docs/CORE-INVARIANTS.md): what extends the chain is derived from
+    /// the ACTIVE chain, not from the queue's private tail.  An RPC writer
+    /// (submitblock, generate*) runs under the chain lock and connects blocks
+    /// without touching expected_blocks, so after `submitblock 111` the queue
+    /// tail stayed at 110 while the tip was 111.  The next header (112, prev
+    /// 111) then did not "extend" the tail, was classified a competing fork
+    /// rooted at our own tip, priced on a placeholder chainwork basis and
+    /// refused as equal/lower work — the node wedged at 111 forever, and a
+    /// later submitblock(113) failed the side-branch reorg with
+    /// SideBranchBodyNotFound -> "rejected" (fleet-conformance SUBP2P,
+    /// 2026-10-08).  Core has no such cursor: ProcessHeadersMessage accepts
+    /// a header whose parent is in the block index and
+    /// FindNextBlocksToDownload walks from the active chain
+    /// (net_processing.cpp).
+    ///
+    /// When nothing is pending and the queue tail is a strict ancestor of
+    /// the active tip ON the active chain, append the active blocks above it
+    /// as already connected, so the tail IS the active tip again.  Any other
+    /// shape (a tip that moved backwards or sideways: invalidateblock,
+    /// reorg) is left to the existing paths.  Called with the chain lock
+    /// held (the P2P thread holds it per loop iteration).
+    pub fn alignQueueWithActiveTip(self: *PeerManager) void {
+        const cs = self.chain_state orelse return;
+        const n = self.expected_blocks.items.len;
+        if (n == 0 or self.connect_cursor < n) return;
+        const tail = self.expected_blocks.items[n - 1];
+        if (std.mem.eql(u8, &tail, &cs.best_hash)) return;
+        const th = cs.getBlockHeightByHash(&tail) orelse return;
+        if (th >= cs.best_height) return;
+        const on = cs.getBlockHashByHeight(th) orelse return;
+        if (!std.mem.eql(u8, &on, &tail)) return;
+        var h: u32 = th + 1;
+        while (h <= cs.best_height) : (h += 1) {
+            const hh = cs.getBlockHashByHeight(h) orelse break;
+            self.expected_blocks.append(hh) catch break;
+            self.connect_cursor = @intCast(self.expected_blocks.items.len);
+        }
+        if (self.download_cursor < self.connect_cursor) self.download_cursor = self.connect_cursor;
+        self.queue_tip_realigns += 1;
+    }
+
     pub fn committedHeaderPrefixLen(self: *PeerManager, hdrs: []const types.BlockHeader) usize {
         if (hdrs.len == 0) return 0;
         const expected_prev = self.expectedPrevHash();
@@ -6524,6 +6582,30 @@ pub const PeerManager = struct {
                 return;
             }
         }
+    }
+
+    /// The queue front `hash` (== expected_blocks[connect_cursor]) is
+    /// already connected: drop its buffered body / in-flight record and
+    /// advance both cursors.  No verdict, no punishment.
+    fn skipAlreadyConnectedFront(self: *PeerManager, hash: *const types.Hash256) void {
+        if (self.block_buffer.fetchRemove(hash.*)) |kv| {
+            var b = kv.value;
+            serialize.freeBlock(self.allocator, &b);
+        }
+        if (self.inflight_block_peer.fetchRemove(hash.*)) |kv| {
+            if (self.blocks_in_flight > 0) self.blocks_in_flight -= 1;
+            for (self.peers.items) |p| {
+                if (@intFromPtr(p) == kv.value) {
+                    p.recordBlockReceived();
+                    break;
+                }
+            }
+        }
+        _ = self.block_source_peers.remove(hash.*);
+        self.connect_cursor += 1;
+        if (self.download_cursor < self.connect_cursor) self.download_cursor = self.connect_cursor;
+        self.wedge_since = 0;
+        self.queue_already_connected_skips += 1;
     }
 
     /// The block at expected_blocks[connect_cursor] failed with a consensus
@@ -7554,6 +7636,9 @@ pub const PeerManager = struct {
                 // connected h9 → Bip30DuplicateOutput on its own coinbase →
                 // a VALID block marked BLOCK_FAILED_VALID and the node wedged
                 // (fast P2P sync, 2026-10-05).  Skip the known prefix.
+                // I2: re-derive the queue tail from the active chain first
+                // (an RPC writer may have connected past it).
+                self.alignQueueWithActiveTip();
                 const hdrs: []const types.BlockHeader = blk_known: {
                     const skip = self.committedHeaderPrefixLen(hdrs_cut);
                     if (skip == 0) break :blk_known hdrs_cut;
@@ -11659,6 +11744,15 @@ pub const PeerManager = struct {
             // The next block we need to connect
             const expected_hash = self.expected_blocks.items[self.connect_cursor];
 
+            // An RPC writer (submitblock / generate*, under this same chain
+            // lock) already connected exactly this block: Core AcceptBlock
+            // with fAlreadyHave is a no-op (validation.cpp:4318-4335).  Step
+            // past it instead of validating it against itself.
+            if (std.mem.eql(u8, &expected_hash, &cs.best_hash)) {
+                self.skipAlreadyConnectedFront(&expected_hash);
+                continue;
+            }
+
             // Is it in the buffer?
             const entry = self.block_buffer.fetchRemove(expected_hash);
             if (entry == null) {
@@ -11816,6 +11910,13 @@ pub const PeerManager = struct {
             // Drop the stale queue without marking or punishing anyone and
             // re-sync headers from the tip.
             if (cs.best_height > 0 and !std.mem.eql(u8, &block.header.prev_block, &cs.best_hash)) {
+                // Already on the active chain (connected by an RPC writer
+                // while it sat in the queue): a duplicate, not a fork and not
+                // a reason to drop the rest of the queue.
+                if (self.isOnActiveChain(&block_hash)) {
+                    self.skipAlreadyConnectedFront(&block_hash);
+                    continue;
+                }
                 std.debug.print(
                     "P2P: queued block at cursor={d} does not extend the active tip (h={d}) — queue resync, no verdict\n",
                     .{ self.connect_cursor, cs.best_height },
