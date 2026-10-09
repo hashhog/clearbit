@@ -749,3 +749,166 @@ test "tests_chain_lock CB-8: a trickling inbound peer must not hold the P2P thre
     std.debug.print("\n[CB-8] acceptInbound held the P2P thread for {d} ms\n", .{held_ms});
     try testing.expect(held_ms < 1000);
 }
+
+// ====================================================================
+// CB-7: UTXO-set walks (dumptxoutset, gettxoutsetinfo) hold connect_mutex
+// for the whole CF_UTXO scan, so a block connect cannot proceed.
+// ====================================================================
+
+const Cb7Kind = enum { dump, info };
+
+fn jsonField(src: []const u8, key: []const u8) ?[]const u8 {
+    var buf: [96]u8 = undefined;
+    const pat = std.fmt.bufPrint(&buf, "\"{s}\":", .{key}) catch return null;
+    const at = std.mem.indexOf(u8, src, pat) orelse return null;
+    var rest = src[at + pat.len ..];
+    if (rest.len > 0 and rest[0] == '"') {
+        rest = rest[1..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+        return rest[0..end];
+    }
+    const end = std.mem.indexOfAny(u8, rest, ",}") orelse return null;
+    return rest[0..end];
+}
+
+fn cb7Run(kind: Cb7Kind) !void {
+    const allocator = testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.init(allocator);
+    defer fx.deinit();
+
+    var b1 = try mineBlock(allocator, &fx.params, fx.params.genesis_hash, 1, 0xC7, null);
+    defer serialize.freeBlock(allocator, &b1.block);
+    try fx.p2pDeliver(&b1);
+    try testing.expectEqual(@as(u32, 1), fx.cs.best_height);
+
+    const info_body = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"gettxoutsetinfo\",\"params\":[\"hash_serialized_3\"]}";
+    const pre = try fx.rpcCall(info_body);
+    defer allocator.free(pre);
+    const pre_height = jsonField(pre, "height") orelse return error.MissingField;
+    const pre_best = jsonField(pre, "bestblock") orelse return error.MissingField;
+    const pre_txouts = jsonField(pre, "txouts") orelse return error.MissingField;
+    const pre_amount = jsonField(pre, "total_amount") orelse return error.MissingField;
+    const pre_hash = jsonField(pre, "hash_serialized_3") orelse return error.MissingField;
+    try testing.expectEqualStrings("1", pre_height);
+    try testing.expect(pre_txouts.len > 0 and !std.mem.eql(u8, pre_txouts, "0"));
+
+    var b2 = try mineBlock(allocator, &fx.params, b1.hash, 2, 0xC8, null);
+    defer serialize.freeBlock(allocator, &b2.block);
+
+    const dump_path = try std.fmt.allocPrint(allocator, "{s}/cb7-utxo.dat", .{fx.path});
+    defer allocator.free(dump_path);
+    defer std.fs.cwd().deleteFile(dump_path) catch {};
+
+    const body = switch (kind) {
+        .info => info_body,
+        .dump => try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"dumptxoutset\",\"params\":[\"{s}\"]}}",
+            .{dump_path},
+        ),
+    };
+    defer if (kind == .dump) allocator.free(body);
+
+    hooks.arm(.utxo_db_walk, null);
+    var rctx = GetTxOutCtx{ .fx = &fx, .body = body };
+    var walker = Racer(GetTxOutCtx, GetTxOutCtx.run){ .ctx = &rctx };
+    try walker.start();
+    const parked = hooks.waitParked(.utxo_db_walk, 5000);
+
+    const Probe = struct {
+        cs: *storage.ChainState,
+        fn run(self: *@This()) void {
+            self.cs.connect_mutex.lock();
+            self.cs.connect_mutex.unlock();
+        }
+    };
+    var pctx = Probe{ .cs = &fx.cs };
+    var probe = Racer(Probe, Probe.run){ .ctx = &pctx };
+    const probe_t0 = std.time.milliTimestamp();
+    if (parked) try probe.start();
+    const lock_acquired_during_walk = if (parked) probe.finishesWithin(RACE_WINDOW_MS) else false;
+    const probe_ms = std.time.milliTimestamp() - probe_t0;
+
+    var connect_during_walk = false;
+    var connect_ms: i64 = -1;
+    var connector = Racer(DeliverCtx, DeliverCtx.run){ .ctx = undefined };
+    var dctx = DeliverCtx{ .fx = &fx, .blk = &b2 };
+    if (lock_acquired_during_walk) {
+        connector.ctx = &dctx;
+        const c0 = std.time.milliTimestamp();
+        try connector.start();
+        connect_during_walk = connector.finishesWithin(RACE_WINDOW_MS);
+        connect_ms = std.time.milliTimestamp() - c0;
+    }
+
+    hooks.release(.utxo_db_walk);
+    walker.join();
+    if (parked) probe.join();
+    if (lock_acquired_during_walk) connector.join();
+    defer if (rctx.response) |resp| allocator.free(resp);
+
+    const resp = rctx.response orelse "";
+    const walk_height = switch (kind) {
+        .info => jsonField(resp, "height") orelse "",
+        .dump => jsonField(resp, "base_height") orelse "",
+    };
+    const walk_best = switch (kind) {
+        .info => jsonField(resp, "bestblock") orelse "",
+        .dump => jsonField(resp, "base_hash") orelse "",
+    };
+    const walk_txouts = switch (kind) {
+        .info => jsonField(resp, "txouts") orelse "",
+        .dump => jsonField(resp, "coins_written") orelse "",
+    };
+    const walk_amount = switch (kind) {
+        .info => jsonField(resp, "total_amount") orelse "",
+        .dump => "",
+    };
+    const walk_hash = switch (kind) {
+        .info => jsonField(resp, "hash_serialized_3") orelse "",
+        .dump => jsonField(resp, "txoutset_hash") orelse "",
+    };
+    const matches_pre = std.mem.eql(u8, walk_height, pre_height) and
+        std.mem.eql(u8, walk_best, pre_best) and
+        std.mem.eql(u8, walk_txouts, pre_txouts) and
+        std.mem.eql(u8, walk_hash, pre_hash) and
+        (kind == .dump or std.mem.eql(u8, walk_amount, pre_amount));
+    const rpc_error = std.mem.indexOf(u8, resp, "\"error\":null") == null;
+
+    std.debug.print(
+        "\n[CB-7 {s}] parked={} lock_acquired_during_walk={} probe_ms={d} connect_during_walk={} connect_ms={d} matches_pre={} rpc_error={} tip_after={d}\n  pre  height={s} txouts={s} amount={s} best={s} hash={s}\n  walk height={s} txouts={s} amount={s} best={s} hash={s}\n  resp {s}\n",
+        .{
+            @tagName(kind), parked, lock_acquired_during_walk, probe_ms,
+            connect_during_walk,   connect_ms,                matches_pre, rpc_error, fx.cs.best_height,
+            pre_height,             pre_txouts,                pre_amount,  pre_best,  pre_hash,
+            walk_height,            walk_txouts,               walk_amount, walk_best, walk_hash,
+            resp,
+        },
+    );
+
+    try testing.expect(parked);
+    try testing.expect(!rpc_error);
+    try testing.expect(lock_acquired_during_walk);
+    try testing.expect(connect_during_walk);
+    try testing.expect(matches_pre);
+    try testing.expectEqual(@as(u32, 2), fx.cs.best_height);
+    try testing.expect(std.mem.eql(u8, &fx.cs.best_hash, &b2.hash));
+
+    // The connect landed: a later read sees the new coin.  The walk above
+    // must have stayed on the pre-connect snapshot anyway.
+    const after = try fx.rpcCall(info_body);
+    defer allocator.free(after);
+    const after_txouts = jsonField(after, "txouts") orelse return error.MissingField;
+    const after_height = jsonField(after, "height") orelse return error.MissingField;
+    try testing.expectEqualStrings("2", after_height);
+    try testing.expect(!std.mem.eql(u8, after_txouts, pre_txouts));
+}
+
+test "tests_chain_lock CB-7: dumptxoutset walk must let a block connect and keep the pre-connect snapshot" {
+    try cb7Run(.dump);
+}
+
+test "tests_chain_lock CB-7: gettxoutsetinfo walk must let a block connect and keep the pre-connect snapshot" {
+    try cb7Run(.info);
+}

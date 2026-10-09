@@ -325,6 +325,35 @@ pub fn build(b: *std.Build) void {
         chain_lock_step.dependOn(&run_chain_lock_tests.step);
     }
 
+    // CB-7: dumptxoutset / gettxoutsetinfo must drop connect_mutex for the
+    // CF_UTXO walk.  Folded into `test` (the other chain-lock reproducers are
+    // not: some of them crash on a build without the chain lock).
+    {
+        const cb7_tests = b.addTest(.{
+            .root_source_file = b.path("tests_chain_lock.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"CB-7"},
+        });
+        cb7_tests.linkSystemLibrary("rocksdb");
+        cb7_tests.linkSystemLibrary("secp256k1");
+        cb7_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        cb7_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            cb7_tests.addCSourceFile(.{ .file = b.path("src/sha256_shani.c"), .flags = shani_cflags });
+        }
+        if (minisketch_enabled) {
+            cb7_tests.linkSystemLibrary("minisketch");
+            cb7_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        cb7_tests.root_module.addOptions("build_options", build_options);
+        const run_cb7_tests = b.addRunArtifact(cb7_tests);
+        run_cb7_tests.has_side_effects = true;
+        const cb7_step = b.step("test-cb7", "CB-7: UTXO walk must not hold connect_mutex");
+        cb7_step.dependOn(&run_cb7_tests.step);
+        test_step.dependOn(&run_cb7_tests.step);
+    }
+
     // Reorg disconnect -> spent-coin RESTORE persistence tests.  Dedicated
     // root (imports storage.zig only) with a name-substring filter so it does
     // not drag in drifted inline tests from heavier modules.

@@ -9191,6 +9191,7 @@ fn forEachCoinInDbOrder(
     sink: anytype,
 ) !void {
     const db = utxo_set.db orelse return;
+    @import("test_hooks.zig").park(.utxo_db_walk, null);
 
     const GroupCoin = struct {
         vout: u32,
@@ -9260,6 +9261,7 @@ fn forEachCoinInDbOrder(
 /// walk.  No-op-safe (returns 0) for memory-only sets.
 fn countCoinsInDb(utxo_set: *UtxoSet) u64 {
     const db = utxo_set.db orelse return 0;
+    @import("test_hooks.zig").park(.utxo_db_walk, null);
     var n: u64 = 0;
     var it = db.iterator(CF_UTXO);
     defer it.deinit();
