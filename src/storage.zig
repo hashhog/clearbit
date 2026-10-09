@@ -9169,8 +9169,10 @@ fn syncUtxoToDb(utxo_set: *UtxoSet) !void {
 /// coin_ptr)` once per coin in Bitcoin Core's canonical order: txids ascending
 /// by their raw 32-byte key, and WITHIN each txid outputs ascending by NUMERIC
 /// vout.  Caller must have already flushed via `syncUtxoToDb` (this fn does not
-/// mutate the cache/DB) and, for consistency, hold the chainstate's
-/// `connect_mutex` so no block connects mid-walk.
+/// mutate the cache/DB).  Consistency against later connects is the RocksDB
+/// snapshot pinned by `UnlockedUtxoWalk` (iterators on this thread read it);
+/// holding `connect_mutex` across the walk is the fallback when no snapshot
+/// was opened.
 ///
 /// clearbit stores the outpoint key as `txid(32) || LE32(vout)`, so a raw
 /// RocksDB byte-order walk yields txids in the correct global order but would
@@ -9191,6 +9193,7 @@ fn forEachCoinInDbOrder(
     sink: anytype,
 ) !void {
     const db = utxo_set.db orelse return;
+    @import("test_hooks.zig").park(.utxo_db_walk, null);
 
     const GroupCoin = struct {
         vout: u32,
@@ -9255,11 +9258,13 @@ fn forEachCoinInDbOrder(
 
 /// Count the coins persisted in CF_UTXO (36-byte outpoint keys).  Used by
 /// `dumpTxOutSet` to write the snapshot header's `coins_count` up front from the
-/// flushed on-disk set.  Caller must have flushed (`syncUtxoToDb`) and hold
-/// `connect_mutex` so this count matches the subsequent `forEachCoinInDbOrder`
-/// walk.  No-op-safe (returns 0) for memory-only sets.
+/// flushed on-disk set.  Caller must have flushed (`syncUtxoToDb`).  The count
+/// matches a later `forEachCoinInDbOrder` when both run on the same
+/// `UnlockedUtxoWalk` snapshot (or both under `connect_mutex`).  No-op-safe
+/// (returns 0) for memory-only sets.
 fn countCoinsInDb(utxo_set: *UtxoSet) u64 {
     const db = utxo_set.db orelse return 0;
+    @import("test_hooks.zig").park(.utxo_db_walk, null);
     var n: u64 = 0;
     var it = db.iterator(CF_UTXO);
     defer it.deinit();
@@ -9435,16 +9440,7 @@ pub fn computeHashSerializedTxOutSet(utxo_set: *UtxoSet, allocator: std.mem.Allo
         // the SHA256d over the concatenated per-coin TxOutSer streams matches
         // Core's `hash_serialized_3`.
         try syncUtxoToDb(utxo_set);
-        const Sink = struct {
-            hw: *crypto.Sha256Writer,
-            allocator: std.mem.Allocator,
-            fn emit(self: *@This(), txid: *const [32]u8, vout: u32, coin: *const CompactUtxo) !void {
-                try writeTxOutSer(self.hw, txid, vout, coin, self.allocator);
-            }
-        };
-        var sink = Sink{ .hw = &hw, .allocator = allocator };
-        try forEachCoinInDbOrder(utxo_set, allocator, &sink);
-        return hw.finalHash256();
+        return hashSerializedDbNoFlush(utxo_set, allocator);
     }
 
     // Memory-only set (loaded snapshot / tests): the cache IS the full set.
@@ -9463,6 +9459,25 @@ pub fn computeHashSerializedTxOutSet(utxo_set: *UtxoSet, allocator: std.mem.Allo
         try writeTxOutSer(&hw, key[0..32], std.mem.readInt(u32, key[32..36], .little), &entry.utxo, allocator);
     }
 
+    return hw.finalHash256();
+}
+
+/// SHA256d over CF_UTXO in canonical order.  Does not flush: the caller has
+/// already synced, and a flush here would race a block connect once
+/// `UnlockedUtxoWalk` has dropped `connect_mutex`.  Iterators follow
+/// `iter_snapshot` when a walk is open.
+fn hashSerializedDbNoFlush(utxo_set: *UtxoSet, allocator: std.mem.Allocator) !types.Hash256 {
+    const crypto = @import("crypto.zig");
+    var hw = crypto.Sha256Writer.init();
+    const Sink = struct {
+        hw: *crypto.Sha256Writer,
+        allocator: std.mem.Allocator,
+        fn emit(self: *@This(), txid: *const [32]u8, vout: u32, coin: *const CompactUtxo) !void {
+            try writeTxOutSer(self.hw, txid, vout, coin, self.allocator);
+        }
+    };
+    var sink = Sink{ .hw = &hw, .allocator = allocator };
+    try forEachCoinInDbOrder(utxo_set, allocator, &sink);
     return hw.finalHash256();
 }
 
@@ -9694,6 +9709,20 @@ pub fn dumpTxOutSet(
     path: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
+    _ = try dumpTxOutSetInner(chainstate, network_magic, path, allocator, null);
+}
+
+/// `pinned_base` set: the caller already flushed and opened an
+/// `UnlockedUtxoWalk`.  Do not flush again (the chain lock may already be
+/// dropped) and write `pinned_base` into the header — `best_hash` can move
+/// once a block connects.  Returns the number of coins written.
+fn dumpTxOutSetInner(
+    chainstate: *ChainState,
+    network_magic: u32,
+    path: []const u8,
+    allocator: std.mem.Allocator,
+    pinned_base: ?types.Hash256,
+) !u64 {
     // Compute the .incomplete temp path. Best-effort cleanup of any
     // leftover temp from a previous crashed dump (truncate=true on
     // createFile would do this for us, but having an explicit removal
@@ -9727,7 +9756,8 @@ pub fn dumpTxOutSet(
     // walk the DB.  Memory-only chainstates (loaded snapshots, tests) keep
     // using the cache, which for them holds the entire set (no eviction).
     const use_db = chainstate.utxo_set.db != null;
-    if (use_db) try syncUtxoToDb(&chainstate.utxo_set);
+    if (use_db and pinned_base == null) try syncUtxoToDb(&chainstate.utxo_set);
+    const base_hash = pinned_base orelse chainstate.best_hash;
 
     const coins_count: u64 = if (use_db)
         countCoinsInDb(&chainstate.utxo_set)
@@ -9738,7 +9768,7 @@ pub fn dumpTxOutSet(
     //    written count equals it below).
     const metadata = SnapshotMetadata{
         .network_magic = network_magic,
-        .base_blockhash = chainstate.best_hash,
+        .base_blockhash = base_hash,
         .coins_count = coins_count,
     };
     const header = try metadata.toBytes(allocator);
@@ -9798,7 +9828,7 @@ pub fn dumpTxOutSet(
     if (to_fifo) {
         file.close();
         file_open = false;
-        return;
+        return dsink.written_coins;
     }
 
     // Close before rename. POSIX allows renaming an open fd, but Windows
@@ -9813,6 +9843,7 @@ pub fn dumpTxOutSet(
         std.fs.cwd().deleteFile(tmp_path) catch {};
         return e;
     };
+    return dsink.written_coins;
 }
 
 /// True when `path` names a FIFO (Core dumptxoutset: `fs::is_fifo`).
@@ -10327,19 +10358,35 @@ pub fn dumpTxOutSetWithResult(
     path: []const u8,
     allocator: std.mem.Allocator,
 ) !SnapshotDumpResult {
-    // Count coins before dumping
+    // Live chainstate: Core PrepareUTXOSnapshot holds cs_main only long enough
+    // to ForceFlushStateToDisk, read the tip, and open a cursor on a DB
+    // snapshot (rpc/blockchain.cpp PrepareUTXOSnapshot / WriteUTXOSnapshot).
+    // The count, file write and hash_serialized walks then run on that
+    // snapshot.  `UnlockedUtxoWalk` drops connect_mutex for those walks when
+    // the caller set `allow_unlocked_utxo_walk` (the tip dumptxoutset path).
+    // The rollback path leaves the flag clear so the lock stays held across
+    // disconnect -> dump -> reconnect.
+    if (chainstate.utxo_set.db != null) {
+        try syncUtxoToDb(&chainstate.utxo_set);
+        const base_hash = chainstate.best_hash;
+        const base_height = chainstate.best_height;
+        var walk = UnlockedUtxoWalk.begin(&chainstate.utxo_set);
+        defer walk.end();
+        const coins_written = try dumpTxOutSetInner(chainstate, network_magic, path, allocator, base_hash);
+        const txoutset_hash = try hashSerializedDbNoFlush(&chainstate.utxo_set, allocator);
+        return SnapshotDumpResult{
+            .coins_written = coins_written,
+            .base_hash = base_hash,
+            .base_height = base_height,
+            .txoutset_hash = txoutset_hash,
+        };
+    }
+
+    // Memory-only (tests / a loaded snapshot with no DB): the cache is the
+    // whole set, and there is no cursor to snapshot.
     const coins_count = chainstate.utxo_set.cache.count();
-
-    // Dump to file
     try dumpTxOutSet(chainstate, network_magic, path, allocator);
-
-    // `hash_serialized` (SHA256d via HashWriter) over the same UTXO set
-    // we just dumped — Core reports this as `txoutset_hash` in the
-    // dumptxoutset response (rpc/blockchain.cpp:3345 +
-    // PrepareUTXOSnapshot:3259, which selects
-    // CoinStatsHashType::HASH_SERIALIZED — not MuHash3072).
     const txoutset_hash = try computeHashSerializedTxOutSet(&chainstate.utxo_set, allocator);
-
     return SnapshotDumpResult{
         .coins_written = coins_count,
         .base_hash = chainstate.best_hash,

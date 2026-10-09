@@ -26,6 +26,10 @@ pub const Point = enum(u8) {
     /// PeerManager.drainBlockBuffer: the queued block passed the "extends the
     /// active tip" check, before it is validated and connected.
     drain_after_parent_check,
+    /// CF_UTXO cursor walk (countCoinsInDb / forEachCoinInDbOrder), at entry,
+    /// before the first coin is read.  One-shot, so a dump's later passes do
+    /// not park again.
+    utxo_db_walk,
 };
 
 const N = @typeInfo(Point).Enum.fields.len;
