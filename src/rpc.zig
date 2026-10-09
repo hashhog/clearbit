@@ -13606,17 +13606,18 @@ pub const RpcServer = struct {
         }
 
         // Fast path: target == current tip. This is also the path Core
-        // takes when `target_index == tip` (rpc/blockchain.cpp:3161,
-        // "we don't have to roll back at all"). Cover both
-        // `latest`/no-arg and the rollback-resolved-to-tip case.
+        // takes when `target_index == tip` (rpc/blockchain.cpp WriteUTXOSnapshot
+        // runs after the cs_main scope that only flushed and opened the
+        // cursor).  Cover both `latest`/no-arg and rollback-resolved-to-tip.
         //
-        // dumpTxOutSetWithResult now flushes the dirty UTXO cache down to
-        // CF_UTXO and walks the full on-disk set (count pass + write pass +
-        // hash pass). Hold connect_mutex across it so those passes see a
-        // quiescent CF_UTXO (no concurrent block connect) — mirrors Core
-        // holding cs_main across PrepareUTXOSnapshot's flush+stats+cursor
-        // (rpc/blockchain.cpp:3255-3266), and matches the rollback branch
-        // above which already holds connect_mutex.
+        // Dispatch already holds connect_mutex.  dumpTxOutSetWithResult flushes,
+        // records the tip, and opens a RocksDB snapshot under that lock, then
+        // drops it for the count / write / hash walks (allow_unlocked_utxo_walk
+        // -> UnlockedUtxoWalk).  Coins connected after the snapshot are not
+        // visible to the dump.  The rollback branch above does not set the
+        // flag: it keeps the lock across disconnect -> dump -> reconnect.
+        storage.allow_unlocked_utxo_walk = true;
+        defer storage.allow_unlocked_utxo_walk = false;
         self.chain_state.connect_mutex.lock();
         const dump_result = storage.dumpTxOutSetWithResult(
             self.chain_state,
@@ -22004,13 +22005,13 @@ pub const RpcServer = struct {
         const snap_height = self.chain_state.best_height;
         const snap_hash = self.chain_state.best_hash;
         storage.allow_unlocked_utxo_walk = true;
+        defer storage.allow_unlocked_utxo_walk = false;
         const stats_res = storage.computeTxOutSetStats(
             &self.chain_state.utxo_set,
             self.allocator,
             hash_kind,
             &set_hash,
         );
-        storage.allow_unlocked_utxo_walk = false;
         const stats = stats_res catch |e| {
             if (e == error.ReorgBatchInProgress) {
                 return self.jsonRpcError(RPC_MISC_ERROR, "UTXO set busy (reorg in progress), retry", id);
