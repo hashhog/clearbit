@@ -122,7 +122,7 @@ fn readOneMessage(allocator: std.mem.Allocator, fd: std.posix.fd_t) !?Read {
 fn freeRead(allocator: std.mem.Allocator, r: Read) void {
     switch (r.msg) {
         .addr => |a| allocator.free(a.addrs),
-        .addrv2 => |a2| allocator.free(a2.entries),
+        .addrv2 => |a2| p2p.freeAddrV2Message(allocator, a2),
         else => {},
     }
     allocator.free(r.payload);

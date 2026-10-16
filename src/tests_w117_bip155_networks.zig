@@ -731,9 +731,8 @@ test "W117/G29: addrv2 message encode/decode round-trip for IPv4 entry" {
     const payload = encoded[24..];
     const decoded = try p2p.decodePayload("addrv2", payload, allocator);
     const decoded_entries = decoded.addrv2.entries;
-    // addr_bytes are borrowed slices pointing into payload; only the entries
-    // slice itself is heap-allocated and needs freeing.
-    defer allocator.free(decoded_entries);
+    // addr_bytes are owned copies (not borrowed from payload): free via helper.
+    defer p2p.freeAddrV2Message(allocator, decoded.addrv2);
 
     try testing.expectEqual(@as(usize, 1), decoded_entries.len);
     try testing.expectEqual(@as(u32, 1700000000), decoded_entries[0].timestamp);
@@ -764,7 +763,7 @@ test "W117/G29: addrv2 message encode/decode round-trip for Tor v3 entry" {
     const payload = encoded[24..];
     const decoded = try p2p.decodePayload("addrv2", payload, allocator);
     const decoded_entries = decoded.addrv2.entries;
-    defer allocator.free(decoded_entries);
+    defer p2p.freeAddrV2Message(allocator, decoded.addrv2);
 
     try testing.expectEqual(@as(usize, 1), decoded_entries.len);
     try testing.expectEqual(@as(u8, 4), decoded_entries[0].network_id);
