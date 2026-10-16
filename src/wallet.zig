@@ -1466,6 +1466,15 @@ pub const WalletTxDetail = struct {
     vout: u32,
 };
 
+/// A wallet coin spent by an unconfirmed wallet tx (see Wallet.spent_pending).
+pub const SpentCoin = struct {
+    outpoint: types.OutPoint,
+    value: i64,
+};
+
+/// Bound on Wallet.spent_pending: txs that never confirm leave entries behind.
+const MAX_SPENT_PENDING: usize = 4096;
+
 /// A wallet-relevant transaction recorded at block-connect time.
 ///
 /// `is_from_me` is true when any of the tx's inputs spent a wallet UTXO (the
@@ -1654,6 +1663,12 @@ pub const Wallet = struct {
     /// `listtransactions` / `gettransaction`. See WalletTxRecord.
     tx_history: std.ArrayList(WalletTxRecord),
 
+    /// Values of wallet coins dropped from the ledger by `removeUtxo` (i.e. by
+    /// `commitWalletSend` at mempool-accept time) whose spending tx has not been
+    /// scanned in a block yet. `scanBlockForWallet` needs the value to compute
+    /// the debit, otherwise the confirmed spend looks like a pure receive.
+    spent_pending: std.ArrayList(SpentCoin),
+
     /// In-memory locked UTXO set (cleared on process exit, matching Core's
     /// non-persistent default). Key is a 36-byte packed outpoint
     /// (32 little-endian txid + 4 LE vout). Locked UTXOs are skipped by
@@ -1696,6 +1711,7 @@ pub const Wallet = struct {
             .imported_scripts = std.ArrayList(ImportedScript).init(allocator),
             .locked_outpoints = std.AutoHashMap([36]u8, void).init(allocator),
             .tx_history = std.ArrayList(WalletTxRecord).init(allocator),
+            .spent_pending = std.ArrayList(SpentCoin).init(allocator),
         };
     }
 
@@ -1773,6 +1789,7 @@ pub const Wallet = struct {
             rec.deinit(self.allocator);
         }
         self.tx_history.deinit();
+        self.spent_pending.deinit();
 
         // Free label strings
         var it = self.labels.iterator();
@@ -2109,17 +2126,33 @@ pub const Wallet = struct {
         try self.utxos.append(utxo);
     }
 
-    /// Remove a UTXO from the wallet by outpoint.
+    /// Remove a UTXO from the wallet by outpoint. The coin's value is
+    /// remembered until the spending tx is scanned in a block, so the history
+    /// can still compute the debit (see `spent_pending`).
     pub fn removeUtxo(self: *Wallet, outpoint: types.OutPoint) bool {
         for (self.utxos.items, 0..) |utxo, i| {
             if (std.mem.eql(u8, &utxo.outpoint.hash, &outpoint.hash) and
                 utxo.outpoint.index == outpoint.index)
             {
+                if (self.spent_pending.items.len >= MAX_SPENT_PENDING) _ = self.spent_pending.orderedRemove(0);
+                self.spent_pending.append(.{ .outpoint = outpoint, .value = utxo.output.value }) catch {};
                 _ = self.utxos.orderedRemove(i);
                 return true;
             }
         }
         return false;
+    }
+
+    /// Take (and forget) the remembered value of a coin that `removeUtxo`
+    /// dropped ahead of its spending block.
+    fn takeSpentPending(self: *Wallet, outpoint: types.OutPoint) ?i64 {
+        for (self.spent_pending.items, 0..) |c, i| {
+            if (std.mem.eql(u8, &c.outpoint.hash, &outpoint.hash) and c.outpoint.index == outpoint.index) {
+                _ = self.spent_pending.orderedRemove(i);
+                return c.value;
+            }
+        }
+        return null;
     }
 
     /// Get total balance of all UTXOs (excluding watch-only coins — Core keeps
@@ -3565,8 +3598,13 @@ pub const Wallet = struct {
                 for (tx.inputs) |input| {
                     if (self.findUtxoValue(input.previous_output)) |v| {
                         debit += v;
+                        _ = self.removeUtxo(input.previous_output);
+                        // removeUtxo remembered it; this block consumes it.
+                        _ = self.takeSpentPending(input.previous_output);
+                    } else if (self.takeSpentPending(input.previous_output)) |v| {
+                        // Already dropped at send time (commitWalletSend).
+                        debit += v;
                     }
-                    _ = self.removeUtxo(input.previous_output);
                 }
             }
             const is_from_me = debit > 0;
