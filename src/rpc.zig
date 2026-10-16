@@ -17408,7 +17408,9 @@ pub const RpcServer = struct {
 
             // AvailableCoins drops immature coinbase unless
             // query_options.include_immature_coinbase (default false).
-            if (utxo.is_coinbase and confirmations < consensus.COINBASE_MATURITY) continue;
+            // Core: GetBlocksToMaturity = max(0, COINBASE_MATURITY + 1 - depth),
+            // immature while > 0, i.e. depth (= confirmations) <= 100.
+            if (utxo.is_coinbase and confirmations <= consensus.COINBASE_MATURITY) continue;
 
             const safe = confirmations > 0;
             if (!include_unsafe and !safe) continue;

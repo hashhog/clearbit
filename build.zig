@@ -1515,6 +1515,37 @@ pub fn build(b: *std.Build) void {
         // gotcha as test-rpc above.
     }
 
+    // listunspent coinbase-maturity off-by-one regression (wallet-import arm).
+    {
+        const lumat_tests = b.addTest(.{
+            .root_source_file = b.path("tests_listunspent_maturity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_listunspent_maturity"},
+        });
+        lumat_tests.linkSystemLibrary("rocksdb");
+        lumat_tests.linkSystemLibrary("secp256k1");
+        lumat_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        lumat_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            lumat_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            lumat_tests.linkSystemLibrary("minisketch");
+            lumat_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        lumat_tests.root_module.addOptions("build_options", build_options);
+
+        const run_lumat_tests = b.addRunArtifact(lumat_tests);
+        const crt_step = b.step("test-listunspent-maturity", "Run the listunspent coinbase maturity regression tests");
+        crt_step.dependOn(&run_lumat_tests.step);
+        // NOT folded into the default `test` step — same wallet.zig selectCoins
+        // gotcha as test-rpc above.
+    }
+
     // getnodeaddresses Core-parity regression. Same wrapper as test-rpc
     // (tests_rpc.zig re-exposes src/rpc.zig's tests), filtered to just the
     // getnodeaddresses test names so the run isn't contaminated by the
