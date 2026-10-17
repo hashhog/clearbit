@@ -1,353 +1,92 @@
 # clearbit
 
-A Bitcoin full node written from scratch in Zig. Part of the Hashhog project.
+A Bitcoin full node written from scratch in Zig. One of the ten [hashhog](https://github.com/hashhog) nodes.
 
-## Status — v1.0.2
+> **Experimental.** hashhog nodes are independent re-implementations of Bitcoin Core for research and testing. Do not use them with real funds.
 
-> **Every `receipts/…`, `tools/…`, `docs/…` and `CORE-PARITY-AUDIT/…` path cited in
-> this section is in the hashhog meta-repo, which is permanently private.** Those
-> citations are maintainer provenance, not evidence you can check. The full note on
-> what that does and does not leave verifiable is further down this section.
+## Status
 
-**Label: "Validated — reproduced Core's UTXO set from genesis with all scripts
-verified"** (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That
-label means one specific thing: clearbit connected every mainnet block from block 0
-to height 958,794 with its assumevalid gate off, serialized its entire UTXO set,
-and produced the byte string
-`29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over
-166,180,925 coins — the same value Bitcoin Core's `dumptxoutset` produced at that
-height. A single wrong coin anywhere in fifteen years changes that hash — the *capture* is unfakeable. **The lineage under it is not checkable from a clone:** what the ledger row records is height, hash and coin count; that the chain beneath was built from genesis with assumevalid off rests on the row's `lineage receipt` column, and four of the five rows point at logs under `/home/work/genesis-ibd/logs/` — outside any repository and uncommitted — while blockbrew's says only `--commit` (`receipts/TRUST-ANCHOR.md:141-145`). The git
-tag `v0.1.0-rc2` (`receipts/RELEASE-v1.0-FREEZE.md`) marks the same bar: `rc` in this
-project certifies that reproduction and nothing else
-(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
-or fund-custody readiness — see `SECURITY.md`.
+| Area | State |
+|---|---|
+| Block validation | Full consensus rules (BIP-16/34/65/66/68/112/113/141/143/147/341/342). The script interpreter runs Core's `script_tests.json` and `sighash.json` vectors (`zig build test-script test-sighash`, see [docs/status.md](docs/status.md)). |
+| UTXO set vs Core | `gettxoutsetinfo` `hash_serialized_3` matches Bitcoin Core v31.1 on the same chain; [docs/status.md](docs/status.md) has a 5-minute regtest check and the mainnet method. |
+| RPC | 139 JSON-RPC methods with Core's names and result shapes; error codes for missing or malformed parameters often differ. See [docs/rpc.md](docs/rpc.md). |
+| P2P | Headers-first sync, BIP-324 v2 transport, addrv2, compact blocks, BIP-157/158 filters (opt-in), Tor/I2P proxies. Tests in `src/tests_*.zig`. |
+| Test suite | `zig build test`: 4,893 of 4,905 tests pass, 12 skipped, none fail. See [docs/status.md](docs/status.md#test-suite). |
+| Wallet | Descriptor wallet, PSBT and coin selection work on regtest and are unit-tested. Not reviewed for custody: see [SECURITY.md](SECURITY.md). |
 
-Two things that reproduction does not cover, stated plainly. The committed
-genesis → 250000 replay ledger
-(`CORE-PARITY-AUDIT/replay-ledgers/clearbit-av0-danger-ledger.txt`) is a
-**pre-fix** run that never reached 250000: it ends
-`overall=FAIL@~76871 (validation-worker crash)`, before the script-check
-worker-pool fix `a6300ff`. And on 2026-08-19, a month *after* the reproduction,
-a one-token `OP_PUSHDATA1` overflow in the BIP-342 tapscript pre-scan
-(`2 + script[i+1]` in `u8`) took the mainnet node down and would have been a
-silent consensus split in the documented `ReleaseFast` build mode — fixed in
-`fa71198` (`receipts/clearbit-tapscript-pushdata1-overflow-2026-08-19.md`). A
-from-genesis reproduction is evidence about the code as it stood, not a
-guarantee about later code.
+Last updated: 2026-10-16.
 
-**Operator RPC parity: 56 of Bitcoin Core's 85.** From the 103-method R5
-operator probe run 2026-09-01
-(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): clearbit 56 PASS /
-29 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
-(`SKIP-REGTEST`) for every node including Core.
+## Quick start
 
-**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
-unit suite went 18 failing → 0 with no skips and no documented gaps carried;
-four of those were real bugs, each mutation-verified (`7bd3a4f` a per-call leak
-in `signrawtransactionwithkey`, `3c37e49` `loadtxoutset` on an unopenable path,
-`3758e26` `getdeploymentinfo` off-by-one at activation height, `6a745d7`
-template retarget ancestors read from the in-memory ring before the persisted
-height index).
-
-**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the hashhog
-meta-repo, which is **not public** — see the note below.
-
-> **The cited paths are NOT publicly readable — do not treat them as evidence.**
-> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
-> the hashhog meta-repo, which is a **permanently private** repository, not to
-> this one. They are provenance for the maintainers. From outside, any claim
-> resting only on such a path is **unverified**, and you should read it as such.
->
-> Two of those paths are unreadable even with the meta-repo in hand: the R5 probe
-> JSON is gitignored (`.gitignore:60  tools/diff-test-artifacts/`) and so are the
-> nightly `diffguard-*.log` files (`.gitignore:43  *.log`). Regenerate the probe
-> JSON with `python3 tools/r5_probe.py` against a running fleet.
->
-> **What you can check from this repository alone:** build it, run its own test
-> suite, and reproduce its behaviour against Bitcoin Core yourself. That is the
-> evidence this repo actually ships.
-
-## Quick Start
-
-### Build from Source
-
-Requires **Zig 0.13.0** exactly (the version `Dockerfile` pins; other Zig releases do not build this tree). System libraries `librocksdb` and `libsecp256k1` are always linked by `build.zig` (secp256k1 is not optional despite the `-Dsecp256k1` flag below).
+Tested on Debian 13 with Zig 0.13.0. Other Zig versions do not build this tree; download 0.13.0 from <https://ziglang.org/download/>.
 
 ```bash
-# Install dependencies (Debian/Ubuntu)
-sudo apt-get install -y librocksdb-dev libsecp256k1-dev
-
-# Build
-zig build -Doptimize=ReleaseFast
-
-# Run on testnet4
-./zig-out/bin/clearbit --testnet
-
-# Show help
-./zig-out/bin/clearbit --help
-
-# Run performance benchmarks
-./zig-out/bin/clearbit --benchmark
+sudo apt-get install -y librocksdb-dev libsecp256k1-dev curl git
+git clone https://github.com/hashhog/clearbit.git && cd clearbit
+zig build -Doptimize=ReleaseFast        # a few minutes; binary in zig-out/bin/clearbit
+DATADIR=$(mktemp -d)
+./zig-out/bin/clearbit --regtest --datadir="$DATADIR" --metricsport=0 &
+sleep 5
+curl -s --user "$(cat "$DATADIR/regtest/.cookie")" \
+  -d '{"method":"getblockchaininfo","params":[]}' http://127.0.0.1:18443/
+curl -s --user "$(cat "$DATADIR/regtest/.cookie")" -d '{"method":"stop","params":[]}' http://127.0.0.1:18443/
 ```
 
-### Build with Optional Features
+The first `curl` prints the regtest genesis state (`"chain":"regtest","blocks":0`). `--metricsport=0` turns off the Prometheus endpoint, which otherwise listens on all interfaces on port 9332.
+
+## Running
+
+The default network is mainnet. Select another with `--testnet4`, `--testnet` (testnet3) or `--regtest`. Data goes under `--datadir` (default `~/.clearbit`), in a per-network subdirectory:
+
+| Network | Flag | P2P port | RPC port | Data subdirectory |
+|---|---|---|---|---|
+| mainnet | (none) | 8333 | 8332 | `<datadir>/` |
+| testnet4 | `--testnet4` | 48333 | 48332 | `<datadir>/testnet4/` |
+| testnet3 | `--testnet` | 18333 | 18332 | `<datadir>/testnet3/` |
+| regtest | `--regtest` | 18444 | 18443 | `<datadir>/regtest/` |
+
+Signet is not supported. For mainnet, plan for the same disk as an unpruned Bitcoin Core node (several hundred GB; blocks are stored inside RocksDB), or pass `--prune=<MiB>` (at least 550). Memory use is driven mostly by the UTXO cache, `--dbcache=<MiB>` (default 450); a larger cache makes the initial sync much faster.
+
+Flags take the form `--name=value`. Every flag, the config file, environment variables and the datadir layout are in [docs/running.md](docs/running.md).
+
+## RPC
+
+clearbit serves Bitcoin Core's JSON-RPC interface on the RPC port above. On startup it writes a Core-style cookie to `<datadir>/<network>/.cookie`, or you can set `--rpcuser` / `--rpcpassword`. Any JSON-RPC client that works with `bitcoind` should work. With the quick-start node running (before the final `stop`):
 
 ```bash
-# With wallet/secp256k1 support
-zig build -Dsecp256k1=true
-
-# With BIP-324 ElligatorSwift support
-zig build -Dsecp256k1=true -Dsecp256k1-include=../bitcoin/src/secp256k1/include
-
-# With Erlay/minisketch support
-zig build -Dminisketch=true
+curl -s --user "$(cat "$DATADIR/regtest/.cookie")" -d '{"method":"createwallet","params":["demo"]}' http://127.0.0.1:18443/
+curl -s --user "$(cat "$DATADIR/regtest/.cookie")" -d '{"method":"getnewaddress","params":[]}' http://127.0.0.1:18443/wallet/demo
+curl -s http://127.0.0.1:18443/rest/chaininfo.json
 ```
 
-## Features
+As in Core, wallet calls go to a named wallet through the `/wallet/<name>` URL path. A Core-style REST interface is always on under `/rest/` and has no authentication. The method list and known differences from Core are in [docs/rpc.md](docs/rpc.md).
 
-- Full block and transaction validation (BIP-16, BIP-34, BIP-68, BIP-141, BIP-143, BIP-146, BIP-341)
-- Script interpreter supporting P2PKH, P2SH, P2WPKH, P2WSH, P2TR, and P2A anchor outputs
-- SegWit-aware serialization with witness discount and sigop cost counting
-- Witness cleanstack enforcement (unconditional for P2WPKH, P2WSH, tapscript)
-- Sighash computation (legacy with FindAndDelete/OP_CODESEPARATOR, BIP-143 SegWit, BIP-341 Taproot)
-- Headers-first sync with anti-DoS (PRESYNC/REDOWNLOAD, min_chain_work threshold)
-- Parallel block downloads with timeout handling
-- Multi-layer UTXO cache (CoinsViewCache with FRESH/DIRTY optimization, batch flush)
-- RocksDB storage with column families for blocks, UTXOs, and chain state
-- Flat file block storage (blk*.dat, 128 MiB max, pre-allocation, RocksDB index)
-- Transaction mempool (full RBF, TRUC v3 policy, cluster linearization, mining score, eviction)
-- Package relay (BIP-331: ancpkginfo/getpkgtxns/pkgtxns, CPFP, child-with-parents)
-- Fee estimation (confirmation tracking, exponential buckets, decay)
-- Block template construction (BIP-34 coinbase, BIP-141 witness, locktime validation, anti-fee-sniping)
-- HD wallet (BIP-32: P2PKH, P2SH-P2WPKH, P2WPKH, P2TR address types)
-- Branch-and-Bound + Knapsack coin selection
-- Wallet encryption (scrypt key derivation)
-- Address labels (setlabel RPC)
-- PSBT support (BIP-174/370: create, decode, analyze, combine, finalize, convert)
-- Output descriptors (BIP-380-386: recursive parser, BCH checksum, WIF/xpub/xprv key derivation)
-- Miniscript (AST, type system B/V/K/W, wrappers, script compilation, satisfaction, witness analysis)
-- Block indexes (txindex, BIP-157/158 blockfilterindex, coinstatsindex)
-- BIP-324 v2 P2P transport (ElligatorSwift, HKDF-SHA256, FSChaCha20-Poly1305, V1 fallback)
-- BIP-330 Erlay (set reconciliation via libminisketch FFI, SipHash short IDs)
-- BIP-9 version bits (soft fork deployment state machine, signaling, caching)
-- BIP-133 feefilter (Poisson delay, hysteresis, incremental relay fee)
-- assumeUTXO (snapshot creation/loading, hash verification, dual chainstate)
-- Tor/I2P proxy support (SOCKS5 RFC 1928, Tor control for hidden services, I2P SAM v3.1)
-- Chain management RPCs (invalidateblock, reconsiderblock, preciousblock)
-- Eclipse attack protections (netgroup diversity, anchor connections, inbound eviction)
-- Misbehavior scoring (100-point threshold, persistent ban list with JSON)
-- Stale peer eviction (chain sync timeout, block download timeout, ping timeout)
-- Checkpoint verification (comptime checkpoints, binary search, fork rejection)
-- Regtest mode with generatetoaddress, generatetodescriptor, generateblock RPCs
-- Hardware crypto detection (comptime/runtime: SHA-NI, SSE4.1, AVX2, ARM SHA2)
-- Arena allocators, SIMD optimizations, and comptime lookup tables
-- Block import from file or stdin
-
-## Configuration
-
-### CLI Flags
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--testnet` | Use testnet network | |
-| `--regtest` | Use regtest network | |
-| `--port=<port>` | P2P listen port | `8333` |
-| `--maxconnections=<n>` | Maximum total connections | `125` |
-| `--connect=<addr>` | Connect only to specified peer | |
-| `--nodnsseed` | Disable DNS seeding | |
-| `--rpcbind=<addr>` | RPC bind address | `127.0.0.1` |
-| `--rpcport=<port>` | RPC port | `8332` |
-| `--rpcuser=<user>` | RPC username | |
-| `--rpcpassword=<pw>` | RPC password | |
-| `--datadir=<dir>` | Data directory | `~/.clearbit` |
-| `--dbcache=<MiB>` | UTXO cache size in MiB | `450` |
-| `--prune=<MiB>` | Prune target in MiB (0 = disabled) | `0` |
-| `--txindex` | Enable transaction index | disabled |
-| `--blockfilterindex` | Enable BIP-157/158 block filter index | disabled |
-| `--coinstatsindex` | Enable UTXO statistics index | disabled |
-| `--maxmempool=<MiB>` | Max mempool size in MiB | `300` |
-| `--mempoolexpiry=<hrs>` | Mempool expiry in hours | `336` |
-| `--debug` | Enable debug logging | disabled |
-| `--printtoconsole` | Print logs to console | disabled |
-| `--benchmark` | Run performance benchmarks and exit | |
-| `--import-blocks=<path>` | Import blocks from file (`-` for stdin) | |
-| `--load-snapshot=<path>` | Load a Bitcoin Core-format UTXO snapshot (as produced by Core's `dumptxoutset` RPC) | |
-
-## RPC API
-
-> **Parity note.** These methods are modelled on Bitcoin Core's, but shape parity is not
-> behaviour parity. On the 2026-09-01 operator probe clearbit answers 56 of the 103
-> probed methods correctly against Core's 85, and 29 probes fail — mostly on error
-> codes (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
-
-### Blockchain
-
-| Method | Description |
-|--------|-------------|
-| `getblockchaininfo` | Returns blockchain processing state info |
-| `getblockcount` | Returns height of the most-work fully-validated chain |
-| `getbestblockhash` | Returns hash of the best (tip) block |
-| `getblockhash` | Returns hash of block at given height |
-| `getblock` | Returns block data for a given hash |
-| `getblockheader` | Returns block header data |
-| `getdifficulty` | Returns proof-of-work difficulty |
-| `getchaintips` | Returns information about all known tips in the block tree |
-| `gettxout` | Returns details about an unspent transaction output |
-| `invalidateblock` | Marks a block as invalid |
-| `reconsiderblock` | Removes invalidity status from a block |
-| `preciousblock` | Treats a block as if it were received first at its height |
-| `dumptxoutset` | Dumps the UTXO set to a file |
-| `loadtxoutset` | Loads a UTXO snapshot for assumeUTXO |
-
-### Transactions
-
-| Method | Description |
-|--------|-------------|
-| `getrawtransaction` | Returns raw transaction data |
-| `sendrawtransaction` | Submits a raw transaction to the network |
-| `decoderawtransaction` | Decodes a hex-encoded raw transaction |
-| `createrawtransaction` | Creates an unsigned raw transaction |
-| `signrawtransactionwithwallet` | Signs a raw transaction with wallet keys |
-| `decodescript` | Decodes a hex-encoded script |
-| `testmempoolaccept` | Tests whether a raw transaction would be accepted by the mempool |
-
-### Mempool
-
-| Method | Description |
-|--------|-------------|
-| `getmempoolinfo` | Returns mempool state details |
-| `getrawmempool` | Returns all transaction IDs in the mempool |
-| `getmempoolentry` | Returns mempool data for a given transaction |
-| `getmempoolancestors` | Returns all in-mempool ancestors for a transaction |
-| `getmempooldescendants` | Returns all in-mempool descendants for a transaction |
-| `submitpackage` | Submits a package of transactions (BIP-331) |
-
-### Network
-
-| Method | Description |
-|--------|-------------|
-| `getnetworkinfo` | Returns P2P networking state info |
-| `getpeerinfo` | Returns data about each connected peer |
-| `getconnectioncount` | Returns the number of connections |
-| `addnode` | Adds or removes a peer |
-| `listbanned` | Lists all banned IPs/subnets |
-| `setban` | Adds or removes an IP/subnet from the ban list |
-| `clearbanned` | Clears all banned IPs |
-
-### Mining
-
-| Method | Description |
-|--------|-------------|
-| `getblocktemplate` | Returns a block template for mining |
-| `submitblock` | Submits a new block to the network |
-| `getmininginfo` | Returns mining-related information |
-| `estimatesmartfee` | Estimates fee rate for confirmation within N blocks |
-| `generatetoaddress` | Mines blocks to an address (regtest only) |
-| `generatetodescriptor` | Mines blocks to a descriptor (regtest only) |
-| `generateblock` | Mines a block with specific transactions (regtest only) |
-
-### Wallet
-
-| Method | Description |
-|--------|-------------|
-| `createwallet` | Creates a new wallet |
-| `loadwallet` | Loads a wallet from disk |
-| `unloadwallet` | Unloads a wallet |
-| `listwallets` | Lists loaded wallets |
-| `listwalletdir` | Lists wallet files in the wallet directory |
-| `getnewaddress` | Generates a new receiving address |
-| `getbalance` | Returns wallet balance |
-| `sendtoaddress` | Sends bitcoin to an address |
-| `listunspent` | Lists unspent outputs |
-| `listtransactions` | Lists wallet transactions |
-| `getwalletinfo` | Returns wallet state info |
-| `getaddressinfo` | Returns address info |
-| `encryptwallet` | Encrypts the wallet with a passphrase |
-| `walletpassphrase` | Unlocks an encrypted wallet |
-| `walletlock` | Locks the wallet |
-| `walletpassphrasechange` | Changes the wallet passphrase |
-| `setlabel` | Sets an address label |
-| `importdescriptors` | Imports output descriptors into the wallet |
-
-### Descriptors and PSBT
-
-| Method | Description |
-|--------|-------------|
-| `getdescriptorinfo` | Analyzes and checksums an output descriptor |
-| `deriveaddresses` | Derives addresses from a descriptor |
-| `createpsbt` | Creates a PSBT |
-| `decodepsbt` | Decodes a base64 PSBT |
-| `analyzepsbt` | Analyzes a PSBT for completion status |
-| `combinepsbt` | Combines multiple PSBTs |
-| `finalizepsbt` | Finalizes a PSBT |
-| `converttopsbt` | Converts a raw transaction to a PSBT |
-
-### Utility
-
-| Method | Description |
-|--------|-------------|
-| `validateaddress` | Validates a Bitcoin address |
-| `stop` | Stops the node |
-| `help` | Lists available RPC commands |
-
-## Architecture
-
-clearbit exploits Zig's unique language features -- comptime evaluation, explicit allocators, and zero-cost safety checks -- to build a Bitcoin full node that is both memory-efficient and fast. Core Bitcoin types (Transaction, Block, BlockHeader, OutPoint) use Zig's packed structs where possible, and binary serialization employs custom Reader/Writer types with CompactSize encoding and SegWit witness support. Cryptographic hashing (SHA256d, RIPEMD160, HASH160) uses comptime-generated lookup tables and runtime CPU feature detection to select hardware-accelerated implementations (SHA-NI, SSE4.1, AVX2, ARM SHA2) when available. libsecp256k1 is integrated via Zig's C interop for ECDSA and Schnorr signature verification.
-
-The script interpreter implements all standard Bitcoin script types (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A anchor outputs) with full BIP rule enforcement. Sighash computation covers legacy (with FindAndDelete/OP_CODESEPARATOR), SegWit v0, and Taproot. The consensus module includes difficulty adjustment for all networks, BIP-9 version bits with signaling state caching, and checkpoint verification using comptime-embedded checkpoint data with binary search lookup.
-
-Storage uses RocksDB with separate column families, and block data lives in flat blk*.dat files (128 MiB max) with pre-allocation and a RocksDB index. The UTXO cache implements a CoinsViewCache layer with FRESH/DIRTY optimization for efficient batch flushing. Undo data for reorgs is persisted in rev*.dat files. The assumeUTXO feature supports snapshot creation and loading with hash verification and dual chainstate management.
-
-P2P networking supports both v1 plaintext and BIP-324 v2 encrypted transport (ElligatorSwift key exchange, FSChaCha20-Poly1305 encryption, short message IDs). BIP-330 Erlay provides bandwidth-efficient transaction relay via set reconciliation using libminisketch. The peer manager handles DNS discovery, misbehavior scoring (100-point threshold with JSON-persisted ban lists), and eclipse attack protections (netgroup diversity for /16 IPv4 and /32 IPv6, anchor connections, and an inbound eviction path modelled on Bitcoin Core's). No committed artifact in this project measures that eviction path against Core, so read the parity claim as intent, not as a measured result. Tor and I2P connectivity is supported via SOCKS5 proxying and control protocols.
-
-The mempool implements full RBF with TRUC v3 transaction relay policy and cluster-based linearization for accurate mining score computation. Package relay follows BIP-331 with child-with-parents support. Fee estimation tracks confirmations across exponential buckets with decay. Block template construction selects transactions by ancestor feerate with BIP-34 coinbase height encoding, BIP-141 witness commitment, sigops limits, locktime finality checks, and anti-fee-sniping nLockTime. Arena allocators are used throughout for predictable memory management, and SIMD intrinsics accelerate hot paths like merkle root computation and block deserialization.
-
-## Project Structure
-
-```
-src/
-  main.zig           # CLI entry point, config, signal handling
-  types.zig          # core bitcoin types
-  serialize.zig      # binary serialization
-  crypto.zig         # hash functions, merkle trees, sighash, CPU feature detection
-  address.zig        # address encoding (Base58, Bech32)
-  script.zig         # script interpreter and opcodes
-  consensus.zig      # consensus rules, network params, difficulty, BIP-9
-  storage.zig        # RocksDB storage, UTXO set, chain state, flat file blocks
-  validation.zig     # block and transaction validation, chain management
-  p2p.zig            # P2P protocol message serialization
-  peer.zig           # TCP peer connections, handshake, misbehavior scoring
-  banlist.zig        # ban list management with JSON persistence
-  sync.zig           # header sync, block download, IBD, anti-DoS
-  mempool.zig        # transaction memory pool with RBF and fee estimation
-  block_template.zig # block template construction for mining
-  rpc.zig            # JSON-RPC server over HTTP
-  wallet.zig         # key management, address derivation, tx signing
-  descriptor.zig     # output descriptors (BIP-380-386), checksum, derivation
-  miniscript.zig     # miniscript AST, type system, satisfaction, compilation
-  indexes.zig        # block indexes (txindex, blockfilterindex, coinstatsindex)
-  v2_transport.zig   # BIP-324 encrypted P2P transport
-  erlay.zig          # BIP-330 Erlay set reconciliation
-  proxy.zig          # Tor SOCKS5 and I2P SAM proxy support
-  psbt.zig           # PSBT (BIP-174/370) partially signed transactions
-  perf.zig           # performance utilities (arena, SIMD, comptime tables)
-  bench.zig          # benchmarking suite
-  tests.zig          # comprehensive test suite with test vectors
-resources/
-  bip39-english.txt  # BIP-39 mnemonic wordlist
-```
-
-## Running Tests
+## Development
 
 ```bash
-zig build test                    # run all tests (includes RocksDB storage tests)
-zig build test --summary all      # run tests with detailed summary
-
-# Optional tests with external dependencies:
-zig build -Dsecp256k1=true test   # include wallet/crypto tests
-zig build -Dminisketch=true test  # include Erlay/minisketch FFI tests
+zig build test                   # unit and integration tests (about 4,900; a few minutes)
 ```
+
+```
+src/main.zig          CLI, config file, startup and shutdown
+src/consensus.zig     chain parameters, difficulty, BIP-9 deployments
+src/script.zig        script interpreter
+src/validation.zig    block and transaction validation, chain management
+src/storage.zig       RocksDB chainstate, UTXO cache, block index
+src/p2p.zig, peer.zig  P2P messages, peers, header sync, block download
+src/mempool.zig       mempool, RBF, package relay, fee estimation
+src/rpc.zig           JSON-RPC and REST server
+src/wallet.zig        descriptor wallet, PSBT, coin selection
+tests_*.zig           roots for the extra `zig build test-*` steps
+```
+
+[docs/architecture.md](docs/architecture.md) describes how the parts fit together, [docs/building.md](docs/building.md) covers the toolchain and build options, and [CONTRIBUTING.md](CONTRIBUTING.md) explains how to send changes.
+
+## Security
+
+Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

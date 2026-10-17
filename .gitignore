@@ -12,6 +12,17 @@ banlist.json
 .claude/skills/
 .claude/
 
-# Project-meta audit artifacts live in the meta-repo (audit-archive/).
+# Audit scratch directories (not part of the source tree).
 audit/
 CORE-PARITY-AUDIT/
+
+# Node runtime state and logs, if a node is ever run with the repo as datadir
+*.log
+*.pid
+.cookie
+peers.dat
+mempool.dat
+fee_estimates.dat
+# Local Bitcoin Core checkout used by `zig build test-script test-sighash`
+/bitcoin-core/
+clearbit.stripped

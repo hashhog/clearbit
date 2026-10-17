@@ -1,72 +1,42 @@
-# Security Policy — clearbit
+# Security policy
 
-clearbit is a from-scratch Bitcoin full-node implementation in Zig, part of the
-[hashhog](https://github.com/hashhog) fleet of ten independent nodes that
-cross-validate each other and Bitcoin Core. Tracking Bitcoin consensus exactly is
-the entire purpose of the node.
-
-## Project maturity — read this first
-
-clearbit is released on the **tagged-validator** bar: a node you can build, run
-*beside* Bitcoin Core in watchtower mode, and trust to track consensus. It is one of
-the flagship implementations, with a completed **trustless-from-genesis validation**
-(`--noassumevalid`, scripts on) whose UTXO set is captured **byte-exact against
-Bitcoin Core** at a common height (T2: `hash_serialized_3` @ C(958794), verified),
-and it is byte-exact with Core at the live chain tip. P0 is fully green: T2 ✓,
-crash-recovery 3/3 ✓, reorg-prove 11/11 ✓, boot-smoke ✓.
-
-**It is NOT yet fund-capable.** Do not custody funds on clearbit. The intended trust
-model is: run it alongside Core with `consensus-diff` as a live divergence alarm. The
-funds-grade ladder (see `../receipts/PRODUCTION-GATE.md`) is a separate, in-progress
-track — see the scope note below.
-
-There are no fund-grade guarantees, and until the first tag ships no versioned
-release. Run from a pinned commit.
+clearbit is an experimental, independent implementation of a Bitcoin full node. It is meant for research and testing. Do not use it to hold or move real funds.
 
 ## Supported versions
 
-| Version | Supported |
-|---------|-----------|
-| `v0.1.0-rc2` (pinned `bc7cb98`) | Validator RC — best-effort; no security SLA until the final `v0.1.0` |
-| `v0.1.0-rc1` (pinned `e173d5b`) | **SUPERSEDED — do not run.** Carries a latent consensus defect: `connectBlock` skipped Core's `script_flag_exceptions` lookup, so blocks **170060** and **692261** would be false-rejected on any full revalidation (`--noassumevalid`, a reorg, the import tool). Fixed in rc2 (`bc7cb98`). Latent rather than exploitable — zero reachability on the canonical chain — but a genuine rule divergence. |
-| pre-release (`master`) | Best-effort |
+Only the latest `master` receives fixes. There are no long-term support releases and no response-time guarantee.
 
 ## Reporting a vulnerability
 
-**Please do NOT open a public GitHub issue** for anything in the consensus, P2P, or
-resource-handling paths.
+Please do not open a public GitHub issue for a problem in consensus, P2P or wallet code. A public report can put other nodes at risk before a fix exists.
 
-Report privately to the maintainer:
+Email the maintainer at `max@dockyard.navy` with:
 
-- **Email:** `max@dockyard.navy`  <!-- TODO(max): confirm or replace with a dedicated security alias -->
+- the affected component and commit,
+- a reproduction: a regtest script, a block or transaction in hex, or a malformed P2P message,
+- what happens and what you expected (ideally what Bitcoin Core does with the same input),
+- a suggested fix, if you have one.
 
-Include the affected path, a deterministic reproduction (diff-test corpus entry,
-regtest script, or malformed message), impact, and any suggested fix.
+You will get an acknowledgement, a fix and disclosure timeline agreed with you, and credit if you want it.
 
-## In scope (highest priority)
+## In scope
 
-- **Consensus divergence** — clearbit accepting a block/tx Core rejects, or vice-versa.
-- **Remotely-triggerable crashes / OOM / resource exhaustion** in the P2P or decode paths.
-- **Chainstate corruption on crash** (clearbit passes crash-recovery 3/3; regressions
-  are in scope).
-
-## Scope note — P2P hardening for hostile *inbound* exposure
-
-clearbit's watchtower-validator use runs it *beside Core*, typically without accepting
-inbound connections (behind NAT), so hostile-peer robustness is not required for this
-bar. A known **P2P decoder count-amplification** gap (6 decoder sites bounded by
-`MAX_SIZE` rather than remaining payload bytes — see
-`../receipts/clearbit-decoder-amplification-2026-07-23.md`) is a **custody/hostile-
-exposure hardening item**, filed and tracked. It is *not* a consensus issue and does
-**not** gate the watchtower-validator tag; it must close before clearbit accepts open
-public inbound (the fund-track P1.3 exposure), not before it validates beside Core.
+- Consensus divergence: clearbit accepting a block or transaction that Bitcoin Core rejects, or rejecting one Core accepts.
+- Remotely triggerable crashes, hangs, memory exhaustion or disk exhaustion through P2P messages, or through RPC on a port bound beyond localhost.
+- Chainstate corruption after a crash or power loss.
+- Wallet bugs that sign with the wrong key, produce a transaction the network rejects, compute a wrong fee, or lose keys.
 
 ## Out of scope
 
-- IBD/sync performance characteristics.
-- Issues requiring an already-compromised host.
+- Sync speed and resource use that is merely high.
+- Attacks that need an already compromised host or access to the datadir.
+- Exposing the RPC, REST or metrics port to an untrusted network. RPC is protected by the cookie or password, but REST and metrics have no authentication. The metrics port (9332) listens on all interfaces by default; turn it off with `--metricsport=0` or firewall it.
 
-## Disclosure
+## Known hardening gaps
 
-Coordinated disclosure. Consensus fixes are verified with `../tools/verify-fix.sh` and
-gated through the differential corpus before they are considered landed.
+- Some P2P message decoders bound element counts by the protocol maximum rather than by the bytes actually remaining in the message, so a hostile peer can make the node allocate more than the message size justifies. Prefer outbound-only operation, or a firewall in front of the P2P port, until this is fixed.
+- Release builds use `ReleaseFast`, which removes Zig's runtime safety checks (integer overflow, bounds). A bug that a `ReleaseSafe` or Debug build would stop with a panic can instead continue silently in a `ReleaseFast` build. Build with `-Doptimize=ReleaseSafe` if you prefer a crash to undefined behaviour.
+
+## Wallet caveats
+
+The wallet has not been reviewed for custody. Wallet files live under `<datadir>/<network>/wallets/<name>/` and include the HD seed. They are not encrypted unless you call `encryptwallet`; protect the datadir accordingly.
