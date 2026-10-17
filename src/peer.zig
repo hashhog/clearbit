@@ -7109,6 +7109,35 @@ pub const PeerManager = struct {
         const old_height = cs.best_height;
         const old_hash = cs.best_hash;
 
+        // Snapshot the active-chain blocks this reorg disconnects (tip
+        // first, Core's disconnectpool order) so their txs can go back to
+        // the mempool after the commit (Core DisconnectTip ->
+        // AddTransactionsFromBlock; MaybeUpdateMempoolForReorg at the end of
+        // ActivateBestChainStep).  Bodies stay in CF_BLOCKS across the
+        // disconnect, but are read up front like executeReorg does.
+        var disconnected_blocks = std.ArrayList(types.Block).init(allocator);
+        defer {
+            for (disconnected_blocks.items) |*b| serialize.freeBlock(allocator, b);
+            disconnected_blocks.deinit();
+        }
+        if (self.mempool != null) {
+            var walk_hash: types.Hash256 = cs.best_hash;
+            var walk_depth: u32 = 0;
+            const depth_cap = cs.reorgDepthCap();
+            while (walk_depth < depth_cap and !std.mem.eql(u8, &walk_hash, &pr_ptr.fork_point)) : (walk_depth += 1) {
+                const bytes = (cs.getBlockBytes(&walk_hash) catch null) orelse break;
+                defer allocator.free(bytes);
+                var dreader = serialize.Reader{ .data = bytes };
+                const disc_block = serialize.readBlock(&dreader, allocator) catch break;
+                disconnected_blocks.append(disc_block) catch {
+                    var to_free = disc_block;
+                    serialize.freeBlock(allocator, &to_free);
+                    break;
+                };
+                walk_hash = disc_block.header.prev_block;
+            }
+        }
+
         var drive_result: storage.ChainState.ReorgDriveResult = .{};
         const conn_or_err = cs.reorgToChainWithOptions(&pr_ptr.fork_point, rb_list.items, .{}, &drive_result);
         var found_invalid = false;
@@ -7136,10 +7165,17 @@ pub const PeerManager = struct {
             // untouched: txs confirmed on the new branch stayed in it, and
             // txs final only at the old tip (nLockTime / BIP-68 / maturity)
             // stayed eligible for the template.
+            //
+            // ...and the disconnected txs never came back: the pool lost
+            // every tx of the old branch, plus every in-mempool child of one
+            // (removeForReorg saw its input missing).  updateForReorg does
+            // the whole Core sequence: removeForBlock (confirmed + conflicts)
+            // per new block, then re-accept earliest first, removeRecursive
+            // failures, link children, removeForReorg, limit size.
             if (self.mempool) |mp| {
-                for (rb_list.items) |rb| mp.removeForBlock(&rb.block);
-                const evicted = mp.removeForReorg();
-                if (evicted > 0) std.log.info("[REORG] mempool: evicted {d} tx(s) no longer final / mature at the new tip", .{evicted});
+                const before = mp.entries.count();
+                mp.updateForReorg(disconnected_blocks.items, rb_list.items, true);
+                std.log.info("[REORG] mempool: {d} -> {d} tx(s) ({d} disconnected block(s) re-offered)", .{ before, mp.entries.count(), disconnected_blocks.items.len });
             }
         } else |err| {
             // Only a consensus verdict on a fork block marks anything failed

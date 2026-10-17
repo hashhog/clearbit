@@ -331,6 +331,13 @@ pub fn createBlockTemplate(
     // of the limit we give up rather than iterating the entire mempool.
     var consecutive_failed: u32 = 0;
 
+    var in_block = std.AutoHashMap(types.Hash256, void).init(allocator);
+    defer in_block.deinit();
+    var package = std.ArrayList(*mempool_mod.MempoolEntry).init(allocator);
+    defer package.deinit();
+    var ordered = std.ArrayList(*mempool_mod.MempoolEntry).init(allocator);
+    defer ordered.deinit();
+
     for (candidates) |entry| {
         // Bug-5 fix: block_min_fee_rate gate.  Bitcoin Core addChunks() bails
         // early when chunk_feerate < blockMinFeeRate (miner.cpp:298-301).
@@ -352,8 +359,85 @@ pub fn createBlockTemplate(
             }
         }
 
-        // Check transaction finality (locktime validation)
-        if (!isFinalTx(&entry.tx, height, lock_time_cutoff)) {
+        if (in_block.contains(entry.txid)) continue;
+
+        // Core addPackageTxs: a candidate enters the block TOGETHER WITH every
+        // in-mempool ancestor not already in it, parents first (SortForBlock).
+        // The candidates are sorted by ancestor feerate only, which is not a
+        // topological order: a child whose ancestor feerate ties or beats its
+        // parent's came out first, and the template put the spend before the
+        // output it spends (bad-txns-inputs-missingorspent on submit).  Seen
+        // with the parent/child chains a disconnect puts back in the pool.
+        package.clearRetainingCapacity();
+        {
+            var qi: usize = 0;
+            try package.append(entry);
+            while (qi < package.items.len) : (qi += 1) {
+                const cur = package.items[qi];
+                for (cur.tx.inputs) |inp| {
+                    const ph = inp.previous_output.hash;
+                    if (in_block.contains(ph)) continue;
+                    const pe = mempool.entries.get(ph) orelse continue;
+                    var dup = false;
+                    for (package.items) |x| {
+                        if (x == pe) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) try package.append(pe);
+                }
+            }
+        }
+        // Topological order within the package: emit an entry once every
+        // in-package parent has been emitted (packages are cluster-bounded).
+        ordered.clearRetainingCapacity();
+        while (ordered.items.len < package.items.len) {
+            var progressed = false;
+            for (package.items) |pe| {
+                var placed = false;
+                for (ordered.items) |o| {
+                    if (o == pe) {
+                        placed = true;
+                        break;
+                    }
+                }
+                if (placed) continue;
+                var ready = true;
+                for (pe.tx.inputs) |inp| {
+                    const ph = inp.previous_output.hash;
+                    for (package.items) |q| {
+                        if (q == pe) continue;
+                        if (!std.mem.eql(u8, &q.txid, &ph)) continue;
+                        var q_placed = false;
+                        for (ordered.items) |o| {
+                            if (o == q) {
+                                q_placed = true;
+                                break;
+                            }
+                        }
+                        if (!q_placed) ready = false;
+                    }
+                }
+                if (ready) {
+                    try ordered.append(pe);
+                    progressed = true;
+                }
+            }
+            if (!progressed) break; // cycle: impossible for valid txs
+        }
+
+        var pkg_weight: usize = 0;
+        var pkg_sigops: usize = 0;
+        var pkg_final = ordered.items.len == package.items.len;
+        for (ordered.items) |pe| {
+            // Check transaction finality (locktime validation)
+            if (!isFinalTx(&pe.tx, height, lock_time_cutoff)) pkg_final = false;
+            pkg_weight += pe.weight;
+            pkg_sigops += estimateSigops(&pe.tx);
+        }
+
+        if (!pkg_final) {
             consecutive_failed += 1;
             if (consecutive_failed > MAX_CONSECUTIVE_FAILURES and
                 total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > opts.max_weight)
@@ -368,7 +452,7 @@ pub fn createBlockTemplate(
         //   if (nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight) return false
         // Using strict > would allow a block of exactly max_weight WU, which
         // would then fail block weight validation during connect (bad-blk-weight).
-        if (total_weight + entry.weight >= opts.max_weight) {
+        if (total_weight + pkg_weight >= opts.max_weight) {
             consecutive_failed += 1;
             if (consecutive_failed > MAX_CONSECUTIVE_FAILURES and
                 total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > opts.max_weight)
@@ -381,8 +465,7 @@ pub fn createBlockTemplate(
         // Bug-3 fix: use >= for the sigops limit check.
         // Bitcoin Core TestChunkBlockLimits (miner.cpp:244):
         //   if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST) return false
-        const tx_sigops: usize = estimateSigops(&entry.tx);
-        if (total_sigops + tx_sigops >= opts.max_sigops) {
+        if (total_sigops + pkg_sigops >= opts.max_sigops) {
             consecutive_failed += 1;
             if (consecutive_failed > MAX_CONSECUTIVE_FAILURES and
                 total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > opts.max_weight)
@@ -392,21 +475,23 @@ pub fn createBlockTemplate(
             continue;
         }
 
-        // Transaction fits — add it and reset the failure counter.
+        // Package fits — add it (parents first) and reset the failure counter.
         consecutive_failed = 0;
 
-        // Add transaction to selection
-        try selected.append(.{
-            .tx = entry.tx,
-            .txid = entry.txid,
-            .weight = entry.weight,
-            .fee = entry.fee,
-            .sigops = tx_sigops,
-        });
-
-        total_weight += entry.weight;
-        total_fees += entry.fee;
-        total_sigops += tx_sigops;
+        for (ordered.items) |pe| {
+            const tx_sigops: usize = estimateSigops(&pe.tx);
+            try selected.append(.{
+                .tx = pe.tx,
+                .txid = pe.txid,
+                .weight = pe.weight,
+                .fee = pe.fee,
+                .sigops = tx_sigops,
+            });
+            try in_block.put(pe.txid, {});
+            total_weight += pe.weight;
+            total_fees += pe.fee;
+            total_sigops += tx_sigops;
+        }
     }
 
     // 4. Extract transactions for witness commitment computation
@@ -1837,30 +1922,15 @@ fn fireReorgFromSideBranch(
     // Pattern B refill — fire AFTER the new chain is fully connected
     // (Core orders things the same way: ActivateBestChain finishes the
     // reorg, then MaybeUpdateMempoolForReorg re-admits disconnected txs
-    // against the new tip's UTXO state).  Each block hands its txs to
-    // mempool.blockDisconnected, which round-trips per non-coinbase tx
-    // through serialize → deserialize so the mempool entry owns its
-    // own slices regardless of when the source block is freed.
+    // against the new tip's UTXO state).
     if (mempool) |mp| {
-        for (disconnected_blocks.items) |*b| {
-            mp.blockDisconnected(b.transactions);
-        }
-
-        // W93 G15: after re-admitting txs from the disconnected blocks,
-        // evict any tx that the NEW active branch confirmed.  Two-step
-        // dance mirrors Core's MaybeUpdateMempoolForReorg + per-tip
-        // ConnectTip-time removeForBlock: an RBF tx that confirmed on the
-        // new branch must NOT be re-admitted from the disconnected side
-        // (re-admit happens above; this loop drops it again).  Without
-        // this, the mempool ends up with stale entries for any tx already
-        // on the heavier chain.  Iterates the new-branch blocks in chain
-        // order (rb_list is already [fork_point + 1 ... new_tip]).
-        for (rb_list.items) |rb| {
-            mp.removeForBlock(&rb.block);
-        }
-        // Core MaybeUpdateMempoolForReorg → removeForReorg: evict what is no
-        // longer final / BIP-68-final / mature at the NEW tip.
-        _ = mp.removeForReorg();
+        // Core order: ConnectTip removeForBlock per new-branch block
+        // (confirmed txs + conflicts), then MaybeUpdateMempoolForReorg
+        // (disconnected txs re-accepted earliest first with bypass_limits,
+        // failures removeRecursive'd, UpdateTransactionsFromBlock,
+        // removeForReorg, LimitMempoolSize).  rb_list is [fork+1 .. tip];
+        // disconnected_blocks is tip-first.
+        mp.updateForReorg(disconnected_blocks.items, rb_list.items, true);
     }
 
     return .{

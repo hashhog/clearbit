@@ -851,6 +851,10 @@ pub const MempoolEntry = struct {
     size: usize,
     /// Transaction weight in weight units.
     weight: usize,
+    /// Sigop-adjusted weight this transaction contributes to its cluster
+    /// (Core `GetSigOpsAdjustedWeight`). Summed, unrounded, against
+    /// `MAX_CLUSTER_WEIGHT`.
+    cluster_weight: u64 = 0,
     /// Virtual size (weight / 4, rounded up).
     vsize: usize,
     /// Fee per virtual byte in satoshis.
@@ -998,6 +1002,13 @@ pub const Mempool = struct {
     /// (chain_lock.zig); writers on the P2P and RPC threads already hold
     /// cs_main.  Before 2026-10-07 only RPC readers took it (audit CB-3).
     mutex: chain_lock.RecursiveMutex,
+
+    /// Core ATMP `bypass_limits`: set (under `mutex`) only while
+    /// `updateForReorg` re-admits transactions from disconnected blocks.
+    /// Skips the fee floor (min relay / rolling minimum) and the size-limit
+    /// eviction; every other check still runs.  `updateForReorg` trims the
+    /// pool afterwards (Core LimitMempoolSize).
+    bypass_limits: bool = false,
 
     /// Fee estimator for smart fee estimation.
     fee_estimator: FeeEstimator,
@@ -1358,7 +1369,7 @@ pub const Mempool = struct {
         // FIX-72 / W120 BUG-11: include any pre-set priority delta on this txid
         // (set via `prioritisetransaction` before broadcast). Core does this via
         // `CheckFeeRate(ws.m_vsize, ws.m_modified_fees, state)` at validation.cpp:948.
-        if (total_in > 0) {
+        if (total_in > 0 and !self.bypass_limits) {
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
             const modified_fee = fee + self.applyDelta(tx_hash);
             const modified_fee_rate: f64 = if (vsize > 0)
@@ -1480,7 +1491,7 @@ pub const Mempool = struct {
         }
 
         // 10. Check mempool size limit
-        if (self.total_size + vsize > MAX_MEMPOOL_SIZE) {
+        if (!self.bypass_limits and self.total_size + vsize > MAX_MEMPOOL_SIZE) {
             // Try to evict lowest-fee-rate transactions
             self.evict(vsize) catch return MempoolError.MempoolFull;
         }
@@ -1515,6 +1526,7 @@ pub const Mempool = struct {
             .fee = fee,
             .size = vsize,
             .weight = weight,
+            .cluster_weight = cluster_weight,
             .vsize = vsize,
             .fee_rate = fee_rate,
             .time_added = std.time.timestamp(),
@@ -2073,6 +2085,20 @@ pub const Mempool = struct {
             // (Core: CBlockPolicyEstimator::processBlockTx via MempoolTransactionsRemovedForBlock).
             self.fee_estimator.confirmTransaction(tx_hash, block_height);
             self.removeTransaction(tx_hash);
+            // Core CTxMemPool::removeForBlock -> removeConflicts: any OTHER
+            // mempool tx spending an input this block tx spends is now a
+            // double spend of a confirmed coin; it goes with all its
+            // descendants (MemPoolRemovalReason::CONFLICT).  Without this a
+            // P2P block / reorg left the conflicting tx (and its children) in
+            // the pool and in the next getblocktemplate.
+            if (tx.isCoinbase()) continue;
+            for (tx.inputs) |input| {
+                if (self.spenders.get(input.previous_output)) |conflict| {
+                    if (!std.mem.eql(u8, &conflict, &tx_hash) and self.entries.contains(conflict)) {
+                        self.removeTransactionWithDescendants(conflict);
+                    }
+                }
+            }
         }
         // Update estimator state for the new block: apply decay, advance height.
         // Core: CBlockPolicyEstimator::processBlock() via UpdateMovingAverages.
@@ -2109,39 +2135,686 @@ pub const Mempool = struct {
     /// block.
     pub fn blockDisconnected(self: *Mempool, txs: []const types.Transaction) void {
         // Reads the coin view: cs_main first, then mempool.cs (Core ATMP:
-        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).
+        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).  Re-admission only; the
+        // chain paths use `updateForReorg`, which also removes conflicts,
+        // links in-mempool children and runs removeForReorg.
         self.lockChainThenPool();
         defer self.unlockPoolThenChain();
-        for (txs, 0..) |tx, i| {
-            // Skip the coinbase (always at index 0; coinbases can't
-            // enter the mempool anyway).
+        for (txs, 0..) |*tx, i| {
+            // Skip the coinbase (always at index 0).
             if (i == 0) continue;
+            _ = self.readmitDisconnectedTx(tx);
+        }
+    }
 
-            // Round-trip via serialize so the mempool's MempoolEntry
-            // ends up with a tx whose script_sig / script_pubkey /
-            // witness slices live in fresh allocator-owned buffers.
-            var tx_writer = serialize.Writer.init(self.allocator);
-            serialize.writeTransaction(&tx_writer, &tx) catch {
-                tx_writer.deinit();
-                continue;
-            };
-            const buf = tx_writer.toOwnedSlice() catch {
-                tx_writer.deinit();
-                continue;
-            };
-            defer self.allocator.free(buf);
+    /// Re-admit one transaction from a disconnected block (Core
+    /// MaybeUpdateMempoolForReorg -> AcceptToMemoryPool(bypass_limits=true)).
+    /// The tx is round-tripped through serialize so the mempool entry owns its
+    /// slices independently of the caller's block.  Returns true when the tx
+    /// is in the pool afterwards as a NEW entry.  Caller holds both locks.
+    fn readmitDisconnectedTx(self: *Mempool, tx: *const types.Transaction) bool {
+        var tx_writer = serialize.Writer.init(self.allocator);
+        serialize.writeTransaction(&tx_writer, tx) catch {
+            tx_writer.deinit();
+            return false;
+        };
+        const buf = tx_writer.toOwnedSlice() catch {
+            tx_writer.deinit();
+            return false;
+        };
+        defer self.allocator.free(buf);
+        var tx_reader = serialize.Reader{ .data = buf };
+        var owned_tx = serialize.readTransaction(&tx_reader, self.allocator) catch return false;
 
-            var tx_reader = serialize.Reader{ .data = buf };
-            var owned_tx = serialize.readTransaction(&tx_reader, self.allocator) catch continue;
+        const prev_bypass = self.bypass_limits;
+        self.bypass_limits = true;
+        defer self.bypass_limits = prev_bypass;
+        if (self.addTransaction(owned_tx)) |_| {
+            return true;
+        } else |_| {
+            serialize.freeTransaction(self.allocator, &owned_tx);
+            return false;
+        }
+    }
 
-            // addTransaction failure → silent free (camlcoin parity).
-            // Any tx that no longer fits the standardness / UTXO / dup
-            // gates drops on the floor.  Successful add transfers
-            // ownership of owned_tx into the mempool entry.
-            const accepted = if (self.addTransaction(owned_tx)) |_| true else |_| false;
-            if (!accepted) {
-                serialize.freeTransaction(self.allocator, &owned_tx);
+    /// Core CTxMemPool::removeRecursive for a tx that may or may not be in the
+    /// pool: the tx itself (if present) and every in-mempool spender of any of
+    /// its outputs, each with all descendants.  Used when a disconnected tx is
+    /// not re-admitted, so its in-mempool children (now orphans) go too.
+    fn removeRecursiveForTx(self: *Mempool, txid: types.Hash256, n_outputs: usize) void {
+        if (self.entries.contains(txid)) {
+            self.removeTransactionWithDescendants(txid);
+            return;
+        }
+        var i: usize = 0;
+        while (i < n_outputs) : (i += 1) {
+            const op = types.OutPoint{ .hash = txid, .index = @intCast(i) };
+            if (self.spenders.get(op)) |child| {
+                if (self.entries.contains(child)) self.removeTransactionWithDescendants(child);
             }
+        }
+    }
+
+    /// A parent/child edge discovered while relinking a re-admitted tx to
+    /// children that were already in the pool (Core `TxGraph::AddDependency`
+    /// inside `UpdateTransactionsFromBlock`).
+    const Relink = struct {
+        parent: types.Hash256,
+        child: types.Hash256,
+    };
+
+    /// Core CTxMemPool::UpdateTransactionsFromBlock: a re-admitted tx may
+    /// already have in-mempool children (they were admitted while it was
+    /// confirmed).  addTransaction assumes a new entry has none, so link
+    /// them now: children map, cluster union, and the cached ancestor /
+    /// descendant aggregates of every entry whose relatives changed.
+    /// Linking can exceed the cluster count or weight limit (the children
+    /// were each their own cluster while the parent was confirmed). Core
+    /// then calls `TxGraphImpl::Trim` once, after every re-add.
+    fn updateTransactionsFromBlock(self: *Mempool, readded: []const types.Hash256) void {
+        // Snapshot cluster identity BEFORE any unite. Trim's chunk feerates
+        // are the pre-merge clusters' feerates (txgraph.cpp AppendTrimData).
+        var pre_root = std.AutoHashMap(types.Hash256, u32).init(self.allocator);
+        defer pre_root.deinit();
+        var hot_roots = std.AutoHashMap(u32, void).init(self.allocator);
+        defer hot_roots.deinit();
+        if (self.cluster_union) |*uf| {
+            var sit = self.txid_to_index.iterator();
+            while (sit.next()) |e| {
+                const r = uf.find(e.value_ptr.*);
+                pre_root.put(e.key_ptr.*, r) catch {};
+                if (uf.setSize(r) > MAX_CLUSTER_SIZE or uf.setWeightTotal(r) > MAX_CLUSTER_WEIGHT) {
+                    hot_roots.put(r, {}) catch {};
+                }
+            }
+        }
+        var new_links = std.ArrayList(Relink).init(self.allocator);
+        defer new_links.deinit();
+
+        var affected = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer affected.deinit();
+        for (readded) |parent| {
+            const pe = self.entries.get(parent) orelse continue;
+            var linked_any = false;
+            for (0..pe.tx.outputs.len) |i| {
+                const op = types.OutPoint{ .hash = parent, .index = @intCast(i) };
+                const child = self.spenders.get(op) orelse continue;
+                if (!self.entries.contains(child)) continue;
+                const gop = self.children.getOrPut(parent) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(types.Hash256).init(self.allocator);
+                var dup = false;
+                for (gop.value_ptr.items) |c| {
+                    if (std.mem.eql(u8, &c, &child)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                gop.value_ptr.append(child) catch continue;
+                new_links.append(.{ .parent = parent, .child = child }) catch {};
+                linked_any = true;
+                if (self.txid_to_index.get(parent)) |pi| {
+                    if (self.txid_to_index.get(child)) |ci| {
+                        if (self.cluster_union) |*uf| _ = uf.unite(pi, ci);
+                    }
+                }
+            }
+            if (!linked_any) continue;
+            // Everything related to `parent` may have stale aggregates.
+            affected.put(parent, {}) catch {};
+            const descs = self.getDescendantTxids(parent);
+            defer self.allocator.free(descs);
+            for (descs) |d| affected.put(d, {}) catch {};
+            var anc_queue = std.ArrayList(types.Hash256).init(self.allocator);
+            defer anc_queue.deinit();
+            anc_queue.append(parent) catch {};
+            while (anc_queue.popOrNull()) |cur| {
+                const ce = self.entries.get(cur) orelse continue;
+                for (ce.tx.inputs) |inp| {
+                    const ph = inp.previous_output.hash;
+                    if (!self.entries.contains(ph) or affected.contains(ph)) continue;
+                    affected.put(ph, {}) catch {};
+                    anc_queue.append(ph) catch {};
+                }
+            }
+        }
+        self.trimAfterRelink(&pre_root, &hot_roots, new_links.items);
+        if (affected.count() == 0) return;
+        self.linearization_dirty = true;
+        var it = affected.keyIterator();
+        while (it.next()) |k| self.recomputeRelativeAggregates(k.*);
+    }
+
+    fn entryClusterWeight(entry: *const MempoolEntry) u64 {
+        if (entry.cluster_weight != 0) return entry.cluster_weight;
+        return @intCast(entry.weight);
+    }
+
+    /// True when `a` is a strictly better chunk than `b` in Core's FeeFrac
+    /// order: higher fee/size, then smaller size (util/feefrac.h).
+    fn chunkBetter(a_fee: i64, a_size: u64, b_fee: i64, b_size: u64) bool {
+        if (a_size == 0 or b_size == 0) return a_fee > b_fee;
+        const cross_a = @as(i128, a_fee) * @as(i128, @intCast(b_size));
+        const cross_b = @as(i128, b_fee) * @as(i128, @intCast(a_size));
+        if (cross_a != cross_b) return cross_a > cross_b;
+        return a_size < b_size;
+    }
+
+    const TrimTx = struct {
+        txid: types.Hash256,
+        chunk_fee: i64,
+        chunk_size: u64,
+        tx_size: u64,
+        pred: ?types.Hash256,
+        deps_left: u32 = 0,
+        included: bool = false,
+    };
+
+    /// Linearize one pre-merge cluster and append one TrimTx per transaction.
+    /// Chunk feerate is the chunk's total modified fee over its total cluster
+    /// weight. Consecutive linearization entries get an implicit dependency
+    /// (Core AppendTrimData). Clusters of 16 or fewer are chunked exactly;
+    /// larger ones fall back to topo-feasible singletons.
+    fn appendClusterTrim(
+        self: *Mempool,
+        txids: []const types.Hash256,
+        out: *std.ArrayList(TrimTx),
+        a: std.mem.Allocator,
+    ) void {
+        const n = txids.len;
+        if (n == 0) return;
+        if (n == 1) {
+            const e = self.entries.get(txids[0]) orelse return;
+            const sz = entryClusterWeight(e);
+            out.append(.{
+                .txid = txids[0],
+                .chunk_fee = self.getModifiedFee(e),
+                .chunk_size = sz,
+                .tx_size = sz,
+                .pred = null,
+            }) catch {};
+            return;
+        }
+        if (n > 64) return;
+
+        var fees = a.alloc(i64, n) catch return;
+        var sizes = a.alloc(u64, n) catch return;
+        var anc = a.alloc(u64, n) catch return;
+        var index_of = std.AutoHashMap(types.Hash256, usize).init(a);
+        for (txids, 0..) |id, i| {
+            index_of.put(id, i) catch return;
+            const e = self.entries.get(id) orelse return;
+            fees[i] = self.getModifiedFee(e);
+            sizes[i] = entryClusterWeight(e);
+            anc[i] = @as(u64, 1) << @intCast(i);
+        }
+        // Direct in-cluster parents, then the transitive closure.
+        for (txids, 0..) |id, i| {
+            const e = self.entries.get(id) orelse continue;
+            for (e.tx.inputs) |inp| {
+                if (index_of.get(inp.previous_output.hash)) |p| anc[i] |= anc[p];
+            }
+        }
+        var grew = true;
+        while (grew) {
+            grew = false;
+            for (0..n) |i| {
+                var bits = anc[i];
+                var b: usize = 0;
+                while (b < n) : (b += 1) {
+                    if ((bits >> @intCast(b)) & 1 == 1) {
+                        const merged = bits | anc[b];
+                        if (merged != bits) {
+                            bits = merged;
+                            grew = true;
+                        }
+                    }
+                }
+                anc[i] = bits;
+            }
+        }
+
+        var remaining: u64 = if (n == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(n)) - 1;
+        var order = a.alloc(usize, n) catch return;
+        var order_len: usize = 0;
+        var chunk_fee_of = a.alloc(i64, n) catch return;
+        var chunk_size_of = a.alloc(u64, n) catch return;
+
+        while (remaining != 0) {
+            var best_mask: u64 = 0;
+            var best_fee: i64 = 0;
+            var best_size: u64 = 1;
+            var have = false;
+            if (n <= 16) {
+                const limit = @as(u64, 1) << @intCast(n);
+                var mask: u64 = 1;
+                while (mask < limit) : (mask += 1) {
+                    if ((mask & remaining) != mask) continue;
+                    var closed = true;
+                    var bit: usize = 0;
+                    while (bit < n) : (bit += 1) {
+                        if ((mask >> @intCast(bit)) & 1 == 0) continue;
+                        const need = anc[bit] & remaining;
+                        if ((need & mask) != need) {
+                            closed = false;
+                            break;
+                        }
+                    }
+                    if (!closed) continue;
+                    var fee: i64 = 0;
+                    var size: u64 = 0;
+                    bit = 0;
+                    while (bit < n) : (bit += 1) {
+                        if ((mask >> @intCast(bit)) & 1 == 0) continue;
+                        fee += fees[bit];
+                        size += sizes[bit];
+                    }
+                    if (size == 0) continue;
+                    if (!have or chunkBetter(fee, size, best_fee, best_size)) {
+                        have = true;
+                        best_mask = mask;
+                        best_fee = fee;
+                        best_size = size;
+                    }
+                }
+            } else {
+                var bit: usize = 0;
+                while (bit < n) : (bit += 1) {
+                    const m = @as(u64, 1) << @intCast(bit);
+                    if ((remaining & m) == 0) continue;
+                    if (@popCount(anc[bit] & remaining) != 1) continue;
+                    if (!have or chunkBetter(fees[bit], sizes[bit], best_fee, best_size)) {
+                        have = true;
+                        best_mask = m;
+                        best_fee = fees[bit];
+                        best_size = sizes[bit];
+                    }
+                }
+            }
+            if (!have or best_mask == 0) break;
+
+            var left = best_mask;
+            while (left != 0) {
+                var picked = false;
+                var bit: usize = 0;
+                while (bit < n) : (bit += 1) {
+                    const m = @as(u64, 1) << @intCast(bit);
+                    if ((left & m) == 0) continue;
+                    if (@popCount(anc[bit] & left) != 1) continue;
+                    order[order_len] = bit;
+                    chunk_fee_of[order_len] = best_fee;
+                    chunk_size_of[order_len] = best_size;
+                    order_len += 1;
+                    left &= ~m;
+                    picked = true;
+                    break;
+                }
+                if (!picked) break;
+            }
+            remaining &= ~best_mask;
+        }
+
+        var prev: ?types.Hash256 = null;
+        for (0..order_len) |i| {
+            const id = txids[order[i]];
+            out.append(.{
+                .txid = id,
+                .chunk_fee = chunk_fee_of[i],
+                .chunk_size = chunk_size_of[i],
+                .tx_size = sizes[order[i]],
+                .pred = prev,
+            }) catch {};
+            prev = id;
+        }
+    }
+
+    fn ufFind(parent: []u32, x: u32) u32 {
+        var cur = x;
+        while (parent[cur] != cur) {
+            parent[cur] = parent[parent[cur]];
+            cur = parent[cur];
+        }
+        return cur;
+    }
+
+    /// Core `TxGraphImpl::Trim` for the clusters this relink would merge.
+    /// Transactions are considered in decreasing chunk feerate among those
+    /// whose dependencies are met. One whose addition would put its would-be
+    /// cluster over 64 txs or 404_000 WU is skipped, and so are its
+    /// descendants (their dependencies stay unmet). Runs once per reorg,
+    /// after every re-add has been linked.
+    fn trimAfterRelink(
+        self: *Mempool,
+        pre_root: *const std.AutoHashMap(types.Hash256, u32),
+        hot_roots: *const std.AutoHashMap(u32, void),
+        links: []const Relink,
+    ) void {
+        if (links.len == 0 and hot_roots.count() == 0) return;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+
+        var roots = std.AutoHashMap(u32, void).init(a);
+        for (links) |lk| {
+            if (pre_root.get(lk.parent)) |r| roots.put(r, {}) catch return;
+            if (pre_root.get(lk.child)) |r| roots.put(r, {}) catch return;
+        }
+        var hot_it = hot_roots.keyIterator();
+        while (hot_it.next()) |r| roots.put(r.*, {}) catch return;
+        if (roots.count() == 0) return;
+
+        var uf_parent = std.AutoHashMap(u32, u32).init(a);
+        var rit = roots.keyIterator();
+        while (rit.next()) |r| uf_parent.put(r.*, r.*) catch return;
+        const findR = struct {
+            fn f(map: *std.AutoHashMap(u32, u32), x: u32) u32 {
+                var cur = x;
+                while (map.get(cur)) |p| {
+                    if (p == cur) return cur;
+                    cur = p;
+                }
+                return cur;
+            }
+        }.f;
+        for (links) |lk| {
+            const rp = pre_root.get(lk.parent) orelse continue;
+            const rc = pre_root.get(lk.child) orelse continue;
+            const ap = findR(&uf_parent, rp);
+            const bp = findR(&uf_parent, rc);
+            if (ap != bp) uf_parent.put(bp, ap) catch return;
+        }
+
+        var reps = std.AutoHashMap(u32, void).init(a);
+        rit = roots.keyIterator();
+        while (rit.next()) |r| reps.put(findR(&uf_parent, r.*), {}) catch return;
+
+        var removed_any = false;
+        var rep_it = reps.keyIterator();
+        while (rep_it.next()) |rep_ptr| {
+            const rep = rep_ptr.*;
+            var group_txids = std.ArrayList(types.Hash256).init(a);
+            var tx_it = pre_root.iterator();
+            while (tx_it.next()) |e| {
+                if (findR(&uf_parent, e.value_ptr.*) == rep) group_txids.append(e.key_ptr.*) catch return;
+            }
+            if (group_txids.items.len == 0) continue;
+
+            var total_w: u64 = 0;
+            for (group_txids.items) |id| {
+                const e = self.entries.get(id) orelse continue;
+                total_w += entryClusterWeight(e);
+            }
+            if (group_txids.items.len <= MAX_CLUSTER_SIZE and total_w <= MAX_CLUSTER_WEIGHT) continue;
+
+            // Split back into pre-merge clusters so chunk feerates stay
+            // per-cluster, then trim the merged group.
+            var by_root = std.AutoHashMap(u32, std.ArrayList(types.Hash256)).init(a);
+            for (group_txids.items) |id| {
+                const r = pre_root.get(id) orelse continue;
+                const gop = by_root.getOrPut(r) catch return;
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(types.Hash256).init(a);
+                gop.value_ptr.append(id) catch return;
+            }
+            var trim = std.ArrayList(TrimTx).init(a);
+            var brit = by_root.iterator();
+            while (brit.next()) |e| self.appendClusterTrim(e.value_ptr.items, &trim, a);
+            if (trim.items.len == 0) continue;
+
+            const m = trim.items.len;
+            var loc = std.AutoHashMap(types.Hash256, usize).init(a);
+            for (trim.items, 0..) |tx, i| loc.put(tx.txid, i) catch return;
+
+            var parents = a.alloc(std.ArrayList(usize), m) catch return;
+            var children = a.alloc(std.ArrayList(usize), m) catch return;
+            for (0..m) |i| {
+                parents[i] = std.ArrayList(usize).init(a);
+                children[i] = std.ArrayList(usize).init(a);
+            }
+            const addDep = struct {
+                fn add(ps: []std.ArrayList(usize), cs: []std.ArrayList(usize), p: usize, c: usize) void {
+                    for (ps[c].items) |existing| if (existing == p) return;
+                    ps[c].append(p) catch {};
+                    cs[p].append(c) catch {};
+                }
+            }.add;
+            for (trim.items, 0..) |tx, i| {
+                if (tx.pred) |pred| {
+                    if (loc.get(pred)) |p| addDep(parents, children, p, i);
+                }
+            }
+            for (links) |lk| {
+                const pi = loc.get(lk.parent) orelse continue;
+                const ci = loc.get(lk.child) orelse continue;
+                if (pre_root.get(lk.parent)) |rp| {
+                    if (findR(&uf_parent, rp) != rep) continue;
+                }
+                addDep(parents, children, pi, ci);
+            }
+            for (trim.items, 0..) |*tx, i| tx.deps_left = @intCast(parents[i].items.len);
+
+            var heap = std.ArrayList(usize).init(a);
+            for (trim.items, 0..) |tx, i| {
+                if (tx.deps_left == 0 and tx.tx_size <= MAX_CLUSTER_WEIGHT) heap.append(i) catch return;
+            }
+
+            var part_parent = a.alloc(u32, m) catch return;
+            var part_count = a.alloc(u32, m) catch return;
+            var part_size = a.alloc(u64, m) catch return;
+
+            while (heap.items.len > 0) {
+                var best_at: usize = 0;
+                for (heap.items, 0..) |idx, hi| {
+                    const cur = trim.items[idx];
+                    const best = trim.items[heap.items[best_at]];
+                    if (chunkBetter(cur.chunk_fee, cur.chunk_size, best.chunk_fee, best.chunk_size)) best_at = hi;
+                }
+                const bi = heap.swapRemove(best_at);
+                var entry = &trim.items[bi];
+                part_parent[bi] = @intCast(bi);
+                part_count[bi] = 1;
+                part_size[bi] = entry.tx_size;
+
+                var reps_dep = std.ArrayList(u32).init(a);
+                for (parents[bi].items) |p| {
+                    if (!trim.items[p].included) continue;
+                    const r = ufFind(part_parent, @intCast(p));
+                    var seen = false;
+                    for (reps_dep.items) |old| if (old == r) {
+                        seen = true;
+                        break;
+                    };
+                    if (!seen) reps_dep.append(r) catch return;
+                }
+                var new_count: u32 = 1;
+                var new_size: u64 = entry.tx_size;
+                for (reps_dep.items) |r| {
+                    new_count += part_count[r];
+                    new_size += part_size[r];
+                }
+                if (@as(usize, new_count) > MAX_CLUSTER_SIZE or new_size > MAX_CLUSTER_WEIGHT) continue;
+
+                var rep_i: u32 = @intCast(bi);
+                for (reps_dep.items) |r| {
+                    const a_rep = ufFind(part_parent, rep_i);
+                    const b_rep = ufFind(part_parent, r);
+                    if (a_rep == b_rep) {
+                        rep_i = a_rep;
+                        continue;
+                    }
+                    const hi_rep = if (part_count[a_rep] >= part_count[b_rep]) a_rep else b_rep;
+                    const lo_rep = if (hi_rep == a_rep) b_rep else a_rep;
+                    part_parent[lo_rep] = hi_rep;
+                    part_count[hi_rep] += part_count[lo_rep];
+                    part_size[hi_rep] += part_size[lo_rep];
+                    rep_i = hi_rep;
+                }
+                entry.included = true;
+                for (children[bi].items) |c| {
+                    if (trim.items[c].deps_left > 0) trim.items[c].deps_left -= 1;
+                    if (trim.items[c].deps_left == 0 and trim.items[c].tx_size <= MAX_CLUSTER_WEIGHT) {
+                        heap.append(c) catch return;
+                    }
+                }
+            }
+
+            for (trim.items) |tx| {
+                if (tx.included) continue;
+                if (self.entries.contains(tx.txid)) {
+                    self.removeTransactionWithDescendants(tx.txid);
+                    removed_any = true;
+                }
+            }
+        }
+        if (removed_any) self.rebuildClusterUnion();
+    }
+
+    /// Union-find cannot drop a member. Rebuild count and weight from the
+    /// transactions still in the pool so a trimmed cluster reports the
+    /// post-trim size.
+    fn rebuildClusterUnion(self: *Mempool) void {
+        const cap: u32 = @max(self.next_cluster_index, 1);
+        if (self.cluster_union) |*uf| uf.deinit();
+        self.cluster_union = UnionFind.init(self.allocator, cap) catch {
+            self.cluster_union = null;
+            return;
+        };
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+            if (e.cluster_index >= cap) continue;
+            self.cluster_union.?.setWeight(e.cluster_index, entryClusterWeight(e));
+        }
+        it = self.entries.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+            if (e.cluster_index >= cap) continue;
+            for (e.tx.inputs) |inp| {
+                const pi = self.txid_to_index.get(inp.previous_output.hash) orelse continue;
+                if (pi >= cap) continue;
+                _ = self.cluster_union.?.unite(e.cluster_index, pi);
+            }
+        }
+    }
+
+    /// Recompute an entry's ancestor_* and descendant_* aggregates from the
+    /// current graph (self included, as addTransaction initialises them).
+    fn recomputeRelativeAggregates(self: *Mempool, txid: types.Hash256) void {
+        const e = self.entries.get(txid) orelse return;
+        var seen = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer seen.deinit();
+        var queue = std.ArrayList(types.Hash256).init(self.allocator);
+        defer queue.deinit();
+
+        // Ancestors (via inputs).
+        var a_count: usize = 1;
+        var a_size: usize = e.vsize;
+        var a_fees: i64 = e.fee;
+        queue.append(txid) catch return;
+        seen.put(txid, {}) catch return;
+        while (queue.popOrNull()) |cur| {
+            const ce = self.entries.get(cur) orelse continue;
+            for (ce.tx.inputs) |inp| {
+                const ph = inp.previous_output.hash;
+                if (seen.contains(ph)) continue;
+                const pe = self.entries.get(ph) orelse continue;
+                seen.put(ph, {}) catch continue;
+                a_count += 1;
+                a_size += pe.vsize;
+                a_fees += pe.fee;
+                queue.append(ph) catch {};
+            }
+        }
+
+        // Descendants (via the children map).
+        seen.clearRetainingCapacity();
+        queue.clearRetainingCapacity();
+        var d_count: usize = 1;
+        var d_size: usize = e.vsize;
+        var d_fees: i64 = e.fee;
+        queue.append(txid) catch return;
+        seen.put(txid, {}) catch return;
+        while (queue.popOrNull()) |cur| {
+            const kids = self.children.get(cur) orelse continue;
+            for (kids.items) |k| {
+                if (seen.contains(k)) continue;
+                const ke = self.entries.get(k) orelse continue;
+                seen.put(k, {}) catch continue;
+                d_count += 1;
+                d_size += ke.vsize;
+                d_fees += ke.fee;
+                queue.append(k) catch {};
+            }
+        }
+
+        e.ancestor_count = a_count;
+        e.ancestor_size = a_size;
+        e.ancestor_fees = a_fees;
+        e.descendant_count = d_count;
+        e.descendant_size = d_size;
+        e.descendant_fees = d_fees;
+    }
+
+    /// The mempool side of a chain-tip change, in Bitcoin Core's order, under
+    /// cs_main -> mempool.cs so no RPC can observe the pool disagreeing with
+    /// the tip:
+    ///   1. ConnectTip -> removeForBlock for every newly connected block
+    ///      (`connected`, ascending height): confirmed txs and their
+    ///      CONFLICTS (with descendants) leave the pool; a tx confirmed on the
+    ///      new branch is also dropped from the disconnected set
+    ///      (DisconnectedBlockTransactions::removeForBlock).
+    ///   2. MaybeUpdateMempoolForReorg: the disconnected blocks'
+    ///      non-coinbase txs (`disconnected_tip_first`, most recent block
+    ///      first like Core's disconnectpool) are re-accepted EARLIEST FIRST
+    ///      with bypass_limits; a tx that is not re-accepted (or
+    ///      `add_to_mempool` false) is removeRecursive'd so its in-mempool
+    ///      children go too; UpdateTransactionsFromBlock links re-added
+    ///      parents to children already in the pool; removeForReorg drops
+    ///      what is non-final / BIP-68-locked / immature at tip+1; then
+    ///      LimitMempoolSize.
+    /// Must run AFTER the chainstate is at the new tip.
+    pub fn updateForReorg(
+        self: *Mempool,
+        disconnected_tip_first: []const types.Block,
+        connected: []const storage.ChainState.ReorgBlock,
+        add_to_mempool: bool,
+    ) void {
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
+
+        var confirmed = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer confirmed.deinit();
+        for (connected) |*rb| {
+            self.removeForBlock(&rb.block);
+            for (rb.block.transactions) |*tx| {
+                const id = crypto.computeTxid(tx, self.allocator) catch continue;
+                confirmed.put(id, {}) catch {};
+            }
+        }
+
+        var readded = std.ArrayList(types.Hash256).init(self.allocator);
+        defer readded.deinit();
+        var bi: usize = disconnected_tip_first.len;
+        while (bi > 0) {
+            bi -= 1;
+            const blk = &disconnected_tip_first[bi];
+            for (blk.transactions, 0..) |*tx, i| {
+                if (i == 0) continue; // coinbase
+                const txid = crypto.computeTxid(tx, self.allocator) catch continue;
+                if (confirmed.contains(txid)) continue;
+                if (add_to_mempool and self.readmitDisconnectedTx(tx)) {
+                    readded.append(txid) catch {};
+                    continue;
+                }
+                self.removeRecursiveForTx(txid, tx.outputs.len);
+            }
+        }
+
+        self.updateTransactionsFromBlock(readded.items);
+        _ = self.removeForReorg();
+        // Core LimitMempoolSize: the bypass_limits re-adds may have pushed
+        // the pool over its size limit.
+        if (self.total_size > MAX_MEMPOOL_SIZE) {
+            self.evict(self.total_size - MAX_MEMPOOL_SIZE) catch {};
         }
     }
 
@@ -4609,6 +5282,7 @@ pub const Mempool = struct {
             .fee = fee,
             .size = vsize,
             .weight = weight,
+            .cluster_weight = cluster_weight,
             .vsize = vsize,
             .fee_rate = individual_fee_rate,
             .time_added = std.time.timestamp(),
