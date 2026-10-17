@@ -9912,6 +9912,24 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    const KnownSubmit = enum { unknown, duplicate, duplicate_invalid };
+
+    /// submitblock's answer for a block hash the node already knows (see
+    /// handleSubmitBlock).  Failed = the durable invalidateblock mark, a
+    /// BLOCK_FAILED_VALID/CHILD index entry, or the P2P layer's failed set.
+    /// Duplicate = connected on the active chain.
+    fn knownBlockSubmitAnswer(self: *RpcServer, hash: *const types.Hash256) KnownSubmit {
+        if (self.chain_state.isBlockMarkedInvalid(hash)) return .duplicate_invalid;
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(hash)) |e| {
+                if (e.status.isInvalid()) return .duplicate_invalid;
+            }
+        }
+        if (self.peer_manager.failed_blocks.contains(hash.*)) return .duplicate_invalid;
+        if (self.peer_manager.isOnActiveChain(hash)) return .duplicate;
+        return .unknown;
+    }
+
     fn handleSubmitBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Gate 6: after a fatal system fault (AbortNode) the node judges and
         // connects nothing.  Core: RPC_VERIFY_ERROR, never a BIP-22 token.
@@ -9979,6 +9997,24 @@ pub const RpcServer = struct {
         // validateSubmitBlockOrReject routes through validation.acceptBlock
         // (the unified entry point, Core ProcessNewBlock parity).
         const block_hash = crypto.computeBlockHash(&block_data.header);
+
+        // A block the node already knows is answered from the block index
+        // before any validation (the RPC runs under the chain lock, so the
+        // answer and the chain agree).  Core ProcessNewBlock ->
+        // AcceptBlockHeader: a known header whose entry is BLOCK_FAILED_*
+        // fails with "duplicate-invalid" (validation.cpp:4192-4204,
+        // BLOCK_CACHED_INVALID); AcceptBlock with fAlreadyHave returns
+        // accepted with new_block=false (validation.cpp:4318-4335) and
+        // submitblock answers "duplicate" (rpc/mining.cpp:1095-1098).
+        // Pre-fix, a block connected over P2P while submitblock waited for
+        // the chain lock (or a resubmission of the tip) fell through to the
+        // side-branch arm / validation against its own coins and came back
+        // "rejected" for a VALID block (fleet-conformance SUBP2P, 2026-10-08).
+        switch (self.knownBlockSubmitAnswer(&block_hash)) {
+            .duplicate => return self.jsonRpcResult("\"duplicate\"", id),
+            .duplicate_invalid => return self.jsonRpcResult("\"duplicate-invalid\"", id),
+            .unknown => {},
+        }
 
         // Pattern X (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md):
         // Derive submit_height from the BLOCK'S parent in the block index,
