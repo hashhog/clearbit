@@ -7342,7 +7342,7 @@ pub const PeerManager = struct {
                 }
             },
             .addrv2 => |a2| {
-                defer self.allocator.free(a2.entries);
+                defer p2p.freeAddrV2Message(self.allocator, a2);
                 // Same inbound token-bucket as the legacy addr handler above,
                 // sharing the SAME per-peer bucket (Core routes addr and addrv2
                 // through the same ProcessAddrs path) so an attacker cannot
@@ -8849,9 +8849,8 @@ pub const PeerManager = struct {
                 defer self.allocator.free(gb.block_locator_hashes);
             },
             .reject => |rj| {
-                // reject message fields are slices into the payload buffer,
-                // which is freed by receiveMessage's defer. No extra free needed.
-                _ = rj;
+                // reject fields are owned copies (decodeReject).
+                defer p2p.freeRejectMessage(self.allocator, rj);
             },
             .mempool => {
                 // BIP-35: serve our mempool inventory to the requesting peer.

@@ -885,6 +885,20 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+/// Free a message produced by `decodeAddrV2`: the per-entry address copies
+/// and the entries slice.
+pub fn freeAddrV2Message(allocator: std.mem.Allocator, m: AddrV2Message) void {
+    for (m.entries) |e| allocator.free(e.addr_bytes);
+    allocator.free(m.entries);
+}
+
+/// Free a message produced by `decodeReject`.
+pub fn freeRejectMessage(allocator: std.mem.Allocator, r: RejectMessage) void {
+    allocator.free(r.message);
+    allocator.free(r.reason);
+    allocator.free(r.data);
+}
+
 /// Deserialize a message payload given the command name.
 /// Release every heap allocation `decodePayload` made for `msg`, for a
 /// message the receiver drops WITHOUT handling it (e.g. a message that
@@ -892,9 +906,9 @@ pub const ParseError = error{
 /// net_processing.cpp "Unsupported message prior to verack").
 ///
 /// Ownership mirrors decodePayload exactly: only fields decodePayload
-/// allocated (or duped) are freed. Fields that are zero-copy slices into the
-/// transport payload buffer — addrv2 `addr_bytes`, every `reject` field —
-/// are NOT freed here (they die with the payload). Variants decodePayload
+/// allocated (or duped) are freed. addrv2 `addr_bytes` and the `reject`
+/// fields are owned copies (they used to borrow the transport payload buffer
+/// and dangled once receiveMessage freed it). Variants decodePayload
 /// never produces (package relay, the outgoing-only *_no_witness/ping
 /// variants) have nothing to free.
 pub fn freeDecodedMessage(allocator: std.mem.Allocator, msg: Message) void {
@@ -906,7 +920,8 @@ pub fn freeDecodedMessage(allocator: std.mem.Allocator, msg: Message) void {
         .block => |blk| serialize.freeBlock(allocator, &blk),
         .tx => |t| serialize.freeTransaction(allocator, &t),
         .addr => |a| allocator.free(a.addrs),
-        .addrv2 => |a2| allocator.free(a2.entries),
+        .addrv2 => |a2| freeAddrV2Message(allocator, a2),
+        .reject => |r| freeRejectMessage(allocator, r),
         .reqrecon => |r| allocator.free(r.sketch_data),
         .sketch => |sk| allocator.free(sk.sketch_data),
         .reconcildiff => |rd| {
@@ -1310,6 +1325,12 @@ fn decodeAddrV2(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseEr
     const count = try reader.readCompactSize();
     if (count > MAX_ADDR_SIZE) return ParseError.InvalidData;
     var entries = try allocator.alloc(AddrV2Entry, @intCast(count));
+    // On any failure free the address copies made so far plus the slice.
+    var filled: usize = 0;
+    errdefer {
+        for (entries[0..filled]) |e| allocator.free(e.addr_bytes);
+        allocator.free(entries);
+    }
     for (0..@intCast(count)) |i| {
         const timestamp = try reader.readInt(u32);
         // BIP-155 §2 / Bitcoin Core protocol.h:446: the services field in
@@ -1321,7 +1342,11 @@ fn decodeAddrV2(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseEr
         const network_id = (try reader.readBytes(1))[0];
         const addr_len = try reader.readCompactSize();
         if (addr_len > 512) return ParseError.InvalidData;
-        const addr_bytes = try reader.readBytes(@intCast(addr_len));
+        // OWNED COPY: readBytes returns a slice into the transport payload,
+        // which receiveMessage frees on return.
+        const addr_raw = try reader.readBytes(@intCast(addr_len));
+        const addr_bytes = try allocator.dupe(u8, addr_raw);
+        errdefer allocator.free(addr_bytes);
         // Port is big-endian in addrv2 (network byte order)
         const port_bytes = try reader.readBytes(2);
         const port = std.mem.readInt(u16, port_bytes[0..2], .big);
@@ -1332,6 +1357,7 @@ fn decodeAddrV2(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseEr
             .addr_bytes = addr_bytes,
             .port = port,
         };
+        filled = i + 1;
     }
     return AddrV2Message{ .entries = entries };
 }
@@ -1348,12 +1374,17 @@ fn decodeReject(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseEr
         try reader.readBytes(reader.remaining())
     else
         &[_]u8{};
-    _ = allocator; // Data is borrowed from the reader
+    // OWNED COPIES: the slices above point into the transport payload.
+    const message_owned = try allocator.dupe(u8, message);
+    errdefer allocator.free(message_owned);
+    const reason_owned = try allocator.dupe(u8, reason);
+    errdefer allocator.free(reason_owned);
+    const data_owned = try allocator.dupe(u8, data);
     return RejectMessage{
-        .message = message,
+        .message = message_owned,
         .code = code,
-        .reason = reason,
-        .data = data,
+        .reason = reason_owned,
+        .data = data_owned,
     };
 }
 
@@ -1773,7 +1804,7 @@ test "addrv2 services field accepts values above MAX_SIZE (7A regression)" {
     };
 
     const msg = try decodePayload("addrv2", &payload, allocator);
-    defer allocator.free(msg.addrv2.entries);
+    defer freeAddrV2Message(allocator, msg.addrv2);
 
     try std.testing.expectEqual(@as(usize, 1), msg.addrv2.entries.len);
     try std.testing.expectEqual(@as(u64, 0x80000000), msg.addrv2.entries[0].services);
@@ -1792,7 +1823,7 @@ test "addrv2 services field accepts values above MAX_SIZE (7A regression)" {
     };
 
     const msg2 = try decodePayload("addrv2", &payload_allbits, allocator);
-    defer allocator.free(msg2.addrv2.entries);
+    defer freeAddrV2Message(allocator, msg2.addrv2);
 
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), msg2.addrv2.entries[0].services);
 }

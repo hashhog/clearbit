@@ -2964,3 +2964,54 @@ test "tests_reorg_p2p: gate6 F12 — OOM decoding a valid message is OutOfMemory
     if (e == error.ProtocolViolation) std.debug.print("gate6 F12: decode OOM reported as ProtocolViolation (pre-fix: +20 misbehaviour, ban path)\n", .{});
     try testing.expectEqualStrings("OutOfMemory", @errorName(e));
 }
+
+/// Push one framed message through a real socketpair and `receiveMessage`.
+/// The returned message is owned by the caller (release with
+/// `p2p.freeDecodedMessage`); the receive buffer has already been freed by
+/// `receiveMessage`, so a message that still borrows from it dangles.
+fn receiveFramed(params: *const consensus.NetworkParams, command: []const u8, payload: []const u8) !p2p.Message {
+    var fds: [2]i32 = undefined;
+    const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SkipZigTest;
+    defer std.posix.close(fds[1]);
+    defer std.posix.close(fds[0]);
+    const hb = p2p.MessageHeader.create(params.magic, command, payload).encode();
+    _ = try std.posix.write(fds[1], &hb);
+    _ = try std.posix.write(fds[1], payload);
+    var p = makeStubPeer(params, testing.allocator);
+    defer p.recv_buffer.deinit();
+    p.stream = .{ .handle = fds[0] };
+    return p.receiveMessage();
+}
+
+test "tests_reorg_p2p: addrv2 addr_bytes survive receiveMessage freeing its payload buffer (UAF)" {
+    const params = consensus.REGTEST;
+    const payload = [_]u8{
+        0x01, // count
+        0x00, 0x00, 0x00, 0x00, // timestamp
+        0x01, // services
+        0x01, // network_id = IPv4
+        0x04, // addr_len
+        0x7F, 0x00, 0x00, 0x01, // 127.0.0.1
+        0x20, 0x8D, // port 8333 BE
+    };
+    const msg = try receiveFramed(&params, "addrv2", &payload);
+    defer p2p.freeDecodedMessage(testing.allocator, msg);
+    try testing.expectEqual(@as(usize, 1), msg.addrv2.entries.len);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x7F, 0x00, 0x00, 0x01 }, msg.addrv2.entries[0].addr_bytes);
+}
+
+test "tests_reorg_p2p: reject fields survive receiveMessage freeing its payload buffer (UAF)" {
+    const params = consensus.REGTEST;
+    const payload = [_]u8{
+        0x02, 't', 'x', // message
+        0x10, // code
+        0x03, 'b', 'a', 'd', // reason
+        0xAA, 0xBB, 0xCC, // data
+    };
+    const msg = try receiveFramed(&params, "reject", &payload);
+    defer p2p.freeDecodedMessage(testing.allocator, msg);
+    try testing.expectEqualStrings("tx", msg.reject.message);
+    try testing.expectEqualStrings("bad", msg.reject.reason);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC }, msg.reject.data);
+}
