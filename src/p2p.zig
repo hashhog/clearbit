@@ -885,18 +885,6 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-/// Deserialize a message payload given the command name.
-/// Release every heap allocation `decodePayload` made for `msg`, for a
-/// message the receiver drops WITHOUT handling it (e.g. a message that
-/// arrives between VERSION and VERACK, which Core logs and ignores:
-/// net_processing.cpp "Unsupported message prior to verack").
-///
-/// Ownership mirrors decodePayload exactly: only fields decodePayload
-/// allocated (or duped) are freed. addrv2 `addr_bytes` and the `reject`
-/// fields are owned copies (they used to borrow the transport payload buffer
-/// and dangled once receiveMessage freed it). Variants decodePayload
-/// never produces (package relay, the outgoing-only *_no_witness/ping
-/// variants) have nothing to free.
 /// Free a message produced by `decodeAddrV2`: the per-entry address copies
 /// and the entries slice.
 pub fn freeAddrV2Message(allocator: std.mem.Allocator, m: AddrV2Message) void {
@@ -911,6 +899,18 @@ pub fn freeRejectMessage(allocator: std.mem.Allocator, r: RejectMessage) void {
     allocator.free(r.data);
 }
 
+/// Deserialize a message payload given the command name.
+/// Release every heap allocation `decodePayload` made for `msg`, for a
+/// message the receiver drops WITHOUT handling it (e.g. a message that
+/// arrives between VERSION and VERACK, which Core logs and ignores:
+/// net_processing.cpp "Unsupported message prior to verack").
+///
+/// Ownership mirrors decodePayload exactly: only fields decodePayload
+/// allocated (or duped) are freed. addrv2 `addr_bytes` and the `reject`
+/// fields are owned copies (they used to borrow the transport payload buffer
+/// and dangled once receiveMessage freed it). Variants decodePayload
+/// never produces (package relay, the outgoing-only *_no_witness/ping
+/// variants) have nothing to free.
 pub fn freeDecodedMessage(allocator: std.mem.Allocator, msg: Message) void {
     switch (msg) {
         .version => |v| allocator.free(v.user_agent),

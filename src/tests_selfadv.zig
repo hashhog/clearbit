@@ -97,9 +97,9 @@ fn stubIbd(_: *anyopaque) bool {
 }
 
 /// Read one v1-framed message from `fd` (non-blocking: null if the pipe is
-/// empty) and decode it. decodePayload is ZERO-COPY for some fields (addrv2
-/// addr_bytes point into the payload), so the payload is returned too and the
-/// caller frees it (and the decoded slices) only after its checks.
+/// empty) and decode it. The decoded message owns its slices (addrv2
+/// addr_bytes are copies, not views into the payload); the payload is
+/// returned too and the caller frees both via freeRead after its checks.
 const Read = struct { msg: p2p.Message, payload: []u8 };
 fn readOneMessage(allocator: std.mem.Allocator, fd: std.posix.fd_t) !?Read {
     var hdr: [24]u8 = undefined;
