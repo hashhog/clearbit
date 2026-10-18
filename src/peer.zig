@@ -3877,7 +3877,11 @@ pub const PeerManager = struct {
     }
 
     pub fn deinit(self: *PeerManager) void {
-        self.waitOutboundDials(10_000);
+        // Unbounded: a dial worker dereferences `self` until its last
+        // instruction, so nothing below may be freed while one is alive.
+        // Every socket a worker can block on is in the peer-fd registry
+        // (direct dials and SOCKS5 alike) and is shut down here.
+        self.waitOutboundDials(null);
         {
             self.dial_mutex.lock();
             defer self.dial_mutex.unlock();
@@ -4046,6 +4050,9 @@ pub const PeerManager = struct {
         // takes the existing direct route with zero overhead.
         if (clearnet.proxy_type != .none or tor.proxy_type != .none or i2p.proxy_type != .none) {
             self.proxy_manager = proxy_mod.ProxyManager.init(clearnet, tor, i2p, self.allocator);
+            // SOCKS5 sockets join the peer-fd registry as soon as they exist,
+            // so stop() interrupts a dial worker inside the proxy exchange.
+            self.proxy_manager.?.fd_hooks = .{ .register = registerPeerFd, .unregister = unregisterPeerFd };
         }
     }
 
@@ -5240,7 +5247,7 @@ pub const PeerManager = struct {
         for (self.peers.items) |p| {
             if (p.direction == .outbound) outbound_count += 1;
         }
-        var inflight: usize = self.dial_workers.load(.acquire);
+        var inflight: usize = self.outboundDialsInFlight();
 
         // A burst of concurrent dials only with ZERO outbound peers
         // (bootstrap / post-eviction wipeout); otherwise one at a time,
@@ -5265,6 +5272,16 @@ pub const PeerManager = struct {
             inflight += 1;
             self.next_outbound_dial_ms = std.time.milliTimestamp() + OUTBOUND_DIAL_MIN_GAP_MS;
         }
+    }
+
+    /// Dials started and not yet adopted: running workers plus results
+    /// queued in `dial_done`.  Read under `dial_mutex`, so a worker that has
+    /// queued its result but not yet decremented `dial_workers` counts twice
+    /// (harmless) rather than zero times (an extra dial past the target).
+    fn outboundDialsInFlight(self: *PeerManager) usize {
+        self.dial_mutex.lock();
+        defer self.dial_mutex.unlock();
+        return self.dial_workers.load(.acquire) + self.dial_done.items.len;
     }
 
     /// Worker: one outbound dial + handshake, off the P2P thread.  Touches
@@ -5296,13 +5313,22 @@ pub const PeerManager = struct {
             self.dial_done = .{};
         }
         defer ready.deinit(self.allocator);
+        var outbound_count: usize = 0;
+        for (self.peers.items) |p| {
+            if (p.direction == .outbound) outbound_count += 1;
+        }
+        const target: usize = MAX_OUTBOUND_CONNECTIONS + @as(usize, if (self.try_new_outbound) 1 else 0);
         for (ready.items) |r| {
             if (r.v1_fallback) self.markV1Only(r.addr);
             const peer = r.peer orelse continue;
             const addr = r.addr;
             // Concurrent dials can land in one netgroup; keep the diversity
-            // the sequential dialer enforced at selection time.
+            // the sequential dialer enforced at selection time.  The target
+            // is re-checked too: the slot a dial was started for may have
+            // been filled (inbound-to-outbound churn, a feeler, addnode)
+            // while it ran.
             if (self.stopping() or self.peers.items.len >= MAX_TOTAL_CONNECTIONS or
+                outbound_count >= target or
                 self.isConnected(addr) or self.violatesNetgroupDiversity(addr))
             {
                 peer.disconnect();
@@ -5332,7 +5358,8 @@ pub const PeerManager = struct {
                 self.allocator.destroy(peer);
                 continue;
             };
-            std.log.info("Connected to outbound peer {} (height={d})", .{ addr, peer.start_height });
+            outbound_count += 1;
+            std.log.info("Connected to outbound peer {} (height={d}, {d}/{d} outbound)", .{ addr, peer.start_height, outbound_count, target });
 
             // Initiate header sync with newly connected peer
             self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
@@ -5342,16 +5369,21 @@ pub const PeerManager = struct {
     }
 
     /// Shut down every socket (stop() already flagged the dials; this is for
-    /// a deinit without stop) and wait, bounded, for dial workers to exit.
-    pub fn waitOutboundDials(self: *PeerManager, timeout_ms: u64) void {
+    /// a deinit without stop) and wait for dial workers to exit; `timeout_ms`
+    /// null = until none is left (what deinit needs: a worker dereferences
+    /// the manager until it exits).  The sweep repeats because a worker may
+    /// register its socket after the first one.
+    pub fn waitOutboundDials(self: *PeerManager, timeout_ms: ?u64) void {
         if (self.dial_workers.load(.acquire) == 0) return;
         self.stop_requested.store(true, .release);
         _ = shutdownAllPeerSockets();
         var waited: u64 = 0;
-        while (self.dial_workers.load(.acquire) != 0 and waited < timeout_ms) : (waited += 5) {
+        while (self.dial_workers.load(.acquire) != 0) : (waited += 5) {
+            if (timeout_ms) |t| if (waited >= t) return;
             std.time.sleep(5 * std.time.ns_per_ms);
-            // A worker may register its socket just after the first sweep.
             if (waited % 100 == 0) _ = shutdownAllPeerSockets();
+            if (waited > 0 and waited % 10_000 == 0)
+                std.log.warn("P2P: still waiting for {d} outbound dial worker(s) to exit", .{self.dial_workers.load(.acquire)});
         }
     }
 

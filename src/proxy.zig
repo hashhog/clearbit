@@ -93,6 +93,16 @@ pub const SOCKS5_RECV_TIMEOUT_SEC: u32 = 20;
 /// Connect timeout (30 seconds).
 pub const SOCKS5_CONNECT_TIMEOUT_SEC: u32 = 30;
 
+/// Socket hooks a caller can install so a SOCKS5 socket is visible to its
+/// shutdown machinery from the moment it exists.  The P2P layer passes its
+/// peer-fd registry here: an outbound dial worker parked in the SOCKS5
+/// exchange (each read may block SOCKS5_RECV_TIMEOUT_SEC) is then woken by
+/// PeerManager.stop()'s shutdown(2) sweep instead of outliving the manager.
+pub const FdHooks = struct {
+    register: *const fn (fd: std.posix.fd_t) void,
+    unregister: *const fn (fd: std.posix.fd_t) void,
+};
+
 // ============================================================================
 // I2P SAM Protocol Constants
 // ============================================================================
@@ -261,6 +271,9 @@ pub const Socks5Client = struct {
     proxy_port: u16,
     credentials: ?Socks5Credentials,
     allocator: std.mem.Allocator,
+    /// See FdHooks.  On success the socket stays registered; the caller's
+    /// owner of the stream unregisters it when it closes the socket.
+    fd_hooks: ?FdHooks = null,
 
     /// Create a new SOCKS5 client.
     pub fn init(
@@ -291,9 +304,20 @@ pub const Socks5Client = struct {
         const proxy_address = std.net.Address.resolveIp(self.proxy_host, self.proxy_port) catch
             return ProxyError.ConnectionFailed;
 
-        var stream = std.net.tcpConnectToAddress(proxy_address) catch
-            return ProxyError.ConnectionFailed;
+        // Socket + connect by hand (not tcpConnectToAddress) so the fd is
+        // registered with fd_hooks BEFORE the blocking connect: shutdown(2)
+        // aborts a connect in progress as well as a later SOCKS5 read.
+        const sock = std.posix.socket(
+            proxy_address.any.family,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            std.posix.IPPROTO.TCP,
+        ) catch return ProxyError.ConnectionFailed;
+        var stream = std.net.Stream{ .handle = sock };
         errdefer stream.close();
+        if (self.fd_hooks) |h| h.register(sock);
+        errdefer if (self.fd_hooks) |h| h.unregister(sock);
+        std.posix.connect(sock, &proxy_address.any, proxy_address.getOsSockLen()) catch
+            return ProxyError.ConnectionFailed;
 
         // Set socket timeout
         const timeout = std.posix.timeval{ .tv_sec = @intCast(SOCKS5_RECV_TIMEOUT_SEC), .tv_usec = 0 };
@@ -956,6 +980,8 @@ pub const ProxyManager = struct {
     socks5_client: ?Socks5Client = null,
     tor_control: ?TorControlClient = null,
     i2p_client: ?I2pSamClient = null,
+    /// Passed to every SOCKS5 client this manager creates; see FdHooks.
+    fd_hooks: ?FdHooks = null,
 
     /// Initialize proxy manager with configurations.
     pub fn init(
@@ -985,6 +1011,7 @@ pub const ProxyManager = struct {
                             self.clearnet_config.credentials,
                             self.allocator,
                         );
+                        self.socks5_client.?.fd_hooks = self.fd_hooks;
                     }
                     const hostname = addr.toHostname(self.allocator) catch return ProxyError.InvalidAddress;
                     defer self.allocator.free(hostname);
@@ -1007,6 +1034,7 @@ pub const ProxyManager = struct {
                         self.tor_config.credentials,
                         self.allocator,
                     );
+                    self.socks5_client.?.fd_hooks = self.fd_hooks;
                 }
                 const hostname = addr.toHostname(self.allocator) catch return ProxyError.InvalidAddress;
                 defer self.allocator.free(hostname);
