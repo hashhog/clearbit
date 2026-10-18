@@ -613,6 +613,16 @@ pub const BEHIND_PEERS_RETRY_SECS: i64 = 10;
 /// 09:50Z: a 298 s stuck front block while 57 v2 handshakes timed out at
 /// 30 s each in the same log window).
 pub const OUTBOUND_DIAL_MIN_GAP_MS: i64 = 500;
+/// Most outbound auto-dials in flight at once (worker threads).
+pub const MAX_CONCURRENT_OUTBOUND_DIALS: u32 = 4;
+
+/// Outcome of one outbound dial worker.  `peer` is null on failure.
+const DialResult = struct {
+    addr: std.net.Address,
+    peer: ?*Peer,
+    /// The v2 probe failed and the address should be remembered as v1-only.
+    v1_fallback: bool,
+};
 
 /// Drain-wedge staller timeout in seconds. When `connect_cursor` is stuck on a
 /// missing FRONT block while LATER blocks sit buffered (the head-of-line wedge a
@@ -3274,6 +3284,14 @@ pub const PeerManager = struct {
     /// Source-IP key -> socket of each in-flight handshake (one per IP).
     inbound_hs_ips: std.AutoHashMapUnmanaged(u64, std.posix.fd_t) = .{},
     inbound_hs_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Outbound auto-dials run on short-lived worker threads: a blackholed
+    /// peer used to cost the single P2P thread up to 5 s connect + 10 s v2
+    /// handshake + 60 s v1 fallback with no message processing at all.
+    /// Workers touch only their own Peer; results are queued here under
+    /// `dial_mutex` and adopted by the loop under the chain lock.
+    dial_mutex: std.Thread.Mutex = .{},
+    dial_done: std.ArrayListUnmanaged(DialResult) = .{},
+    dial_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     last_rotation_time: i64,
     /// Set of netgroups for current outbound connections (for diversity).
     outbound_netgroups: std.AutoHashMap(u32, void),
@@ -3859,6 +3877,18 @@ pub const PeerManager = struct {
     }
 
     pub fn deinit(self: *PeerManager) void {
+        self.waitOutboundDials(10_000);
+        {
+            self.dial_mutex.lock();
+            defer self.dial_mutex.unlock();
+            for (self.dial_done.items) |r| {
+                if (r.peer) |p| {
+                    p.disconnect();
+                    self.allocator.destroy(p);
+                }
+            }
+            self.dial_done.deinit(self.allocator);
+        }
         self.waitInboundHandshakes(10_000);
         {
             self.inbound_hs_mutex.lock();
@@ -4178,8 +4208,32 @@ pub const PeerManager = struct {
         relay_self: bool,
     ) ?*Peer {
         if (self.stop_requested.load(.acquire)) return null;
-        const v2_enabled = Peer.bip324V2Enabled();
-        const try_v2 = v2_enabled and !self.isV1Only(address);
+        const try_v2 = Peer.bip324V2Enabled() and !self.isV1Only(address);
+        var fell_back = false;
+        const peer = self.dialNegotiate(address, relay_self, try_v2, self.our_height, &fell_back, true);
+        if (fell_back) self.markV1Only(address);
+        return peer;
+    }
+
+    /// The dial + handshake itself, free of PeerManager state that the P2P
+    /// thread owns (v2 fallback set, our_height, the single handshake_fd
+    /// slot): everything it needs comes in as arguments and the one thing it
+    /// learns (the peer is v1-only) goes out through `fell_back`.  That is
+    /// what lets an outbound dial worker run it off the P2P thread.
+    ///
+    /// `armed` = running on the P2P thread, so stop() is routed through the
+    /// single `handshake_fd` slot.  A worker passes false: its socket is in
+    /// the global peer-fd registry (Peer.connect registers it), which stop()
+    /// also shuts down.
+    fn dialNegotiate(
+        self: *PeerManager,
+        address: std.net.Address,
+        relay_self: bool,
+        try_v2: bool,
+        our_height: i32,
+        fell_back: *bool,
+        armed: bool,
+    ) ?*Peer {
 
         // Phase 1: try BIP-324 v2 directly on a fresh socket.
         if (try_v2) {
@@ -4193,12 +4247,12 @@ pub const PeerManager = struct {
             peer.advertise_node_bloom = self.peerbloomfilters;
             peer.advertise_node_network_limited = self.advertise_node_network_limited;
             peer.advertise_compact_filters = self.blockfilterindex_enabled;
-            if (!self.armHandshake(peer.stream.handle)) {
+            if (!self.armDial(peer.stream.handle, armed)) {
                 peer.disconnect();
                 self.allocator.destroy(peer);
                 return null;
             }
-            defer self.disarmHandshake();
+            defer if (armed) self.disarmHandshake();
 
             // Attach an initiator-mode V2Transport to the peer and let it
             // drive the cipher handshake.  The transport's init() already
@@ -4231,14 +4285,14 @@ pub const PeerManager = struct {
                 // Interrupted by stop(): not a v1-only peer, and no fallback
                 // dial -- a fresh v1 handshake would block shutdown again.
                 if (self.stop_requested.load(.acquire)) return null;
-                self.markV1Only(address);
+                fell_back.* = true;
                 // Fall through to v1 path below (preserving relay_self).
-                return self.connectOutboundV1Relay(address, relay_self);
+                return self.dialV1(address, relay_self, our_height, armed);
             };
 
             // V2 cipher handshake complete — run the application
             // version/verack on the encrypted transport.
-            const app_height = self.our_height;
+            const app_height = our_height;
             const app_res = blk: {
                 const w = self.ioWindow();
                 defer w.end();
@@ -4256,7 +4310,7 @@ pub const PeerManager = struct {
         }
 
         // Phase 2: v1 handshake on a fresh connection.
-        return self.connectOutboundV1Relay(address, relay_self);
+        return self.dialV1(address, relay_self, our_height, armed);
     }
 
     /// Open a fresh TCP connection and run the v1 handshake.  Used both as
@@ -4270,6 +4324,11 @@ pub const PeerManager = struct {
     /// `connectOutboundV1` with an explicit `relay_self` flag for the version
     /// handshake (false for feeler connections).
     fn connectOutboundV1Relay(self: *PeerManager, address: std.net.Address, relay_self: bool) ?*Peer {
+        return self.dialV1(address, relay_self, self.our_height, true);
+    }
+
+    /// v1 dial + handshake; see `dialNegotiate` for `armed`.
+    fn dialV1(self: *PeerManager, address: std.net.Address, relay_self: bool, our_height: i32, armed: bool) ?*Peer {
         if (self.stop_requested.load(.acquire)) return null;
         const peer = self.allocator.create(Peer) catch return null;
         // Use openClearnetOutbound so --proxy is honoured for clearnet.
@@ -4285,13 +4344,13 @@ pub const PeerManager = struct {
         if (self.asmap_data) |data| {
             peer.mapped_as = getMappedAS(data, address);
         }
-        if (!self.armHandshake(peer.stream.handle)) {
+        if (!self.armDial(peer.stream.handle, armed)) {
             peer.disconnect();
             self.allocator.destroy(peer);
             return null;
         }
-        defer self.disarmHandshake();
-        const v1_height = self.our_height;
+        defer if (armed) self.disarmHandshake();
+        const v1_height = our_height;
         const v1_res = blk: {
             const w = self.ioWindow();
             defer w.end();
@@ -5168,44 +5227,88 @@ pub const PeerManager = struct {
 
     /// Connect to peers until we have MAX_OUTBOUND_CONNECTIONS outbound.
     /// Enforces netgroup diversity by tracking connected netgroups.
-    /// During IBD, only attempts one connection per call to avoid blocking.
+    ///
+    /// Never blocks on the network: each dial (TCP connect, v2 handshake, v1
+    /// fallback) runs on a worker thread, at most MAX_CONCURRENT_OUTBOUND_DIALS
+    /// at once; finished dials are adopted by `adoptOutboundDials`.  The old
+    /// inline version froze message processing for minutes (8 dials x (5 s +
+    /// 10 s + 60 s)) whenever peers churned.
     pub fn maintainOutbound(self: *PeerManager) !void {
+        self.adoptOutboundDials();
+
         var outbound_count: usize = 0;
         for (self.peers.items) |p| {
             if (p.direction == .outbound) outbound_count += 1;
         }
+        var inflight: usize = self.dial_workers.load(.acquire);
 
-        // During IBD, only try one connection per call to avoid blocking the loop.
-        // Exception: if we have zero outbound peers (post-eviction peer wipeout),
-        // allow up to MAX_OUTBOUND_CONNECTIONS attempts so we recover quickly
-        // instead of waiting for the loop to cycle once per peer slot.
-        var attempts: u32 = 0;
-        // Every dial is BLOCKING on the single P2P thread (TCP connect up to
-        // 5 s, v2 handshake, v1 fallback handshake). Up to 8 dials per tick at
-        // tip froze message processing for minutes whenever peers churned.
-        // Now: a full burst only with ZERO outbound peers (bootstrap); else
-        // one dial per tick, spaced by the previous dial's own duration
-        // (OUTBOUND_DIAL_MIN_GAP_MS floor) so dialing gets at most ~half the
-        // thread. Core dials one connection at a time from its own thread.
-        const max_attempts: u32 = if (outbound_count == 0) MAX_OUTBOUND_CONNECTIONS else 1;
+        // A burst of concurrent dials only with ZERO outbound peers
+        // (bootstrap / post-eviction wipeout); otherwise one at a time,
+        // spaced OUTBOUND_DIAL_MIN_GAP_MS apart, like Core's single dial
+        // thread.
+        const max_inflight: usize = if (outbound_count == 0) MAX_CONCURRENT_OUTBOUND_DIALS else 1;
         // Core: one EXTRA full-relay outbound while the tip looks stale.
         const target: usize = MAX_OUTBOUND_CONNECTIONS + @as(usize, if (self.try_new_outbound) 1 else 0);
-        if (outbound_count > 0 and outbound_count < target and
-            std.time.milliTimestamp() < self.next_outbound_dial_ms) return;
+        if (outbound_count > 0 and std.time.milliTimestamp() < self.next_outbound_dial_ms) return;
 
-        while (outbound_count < target and attempts < max_attempts and
+        while (outbound_count + inflight < target and inflight < max_inflight and
             !self.stop_requested.load(.acquire))
         {
-            attempts += 1;
             const addr = self.selectPeerToConnect() orelse break;
-            // BIP-324 negotiation lives inside connectOutboundNegotiated;
-            // when v2 is disabled (default) this is identical to the old
-            // Peer.connect+performHandshake pair.
-            const dial_start_ms = std.time.milliTimestamp();
-            const dialed = self.connectOutboundNegotiated(addr);
-            const dial_end_ms = std.time.milliTimestamp();
-            self.next_outbound_dial_ms = dial_end_ms + @max(OUTBOUND_DIAL_MIN_GAP_MS, dial_end_ms - dial_start_ms);
-            const peer = dialed orelse continue;
+            const try_v2 = Peer.bip324V2Enabled() and !self.isV1Only(addr);
+            _ = self.dial_workers.fetchAdd(1, .acq_rel);
+            const th = std.Thread.spawn(.{}, outboundDialWorker, .{ self, addr, try_v2, self.our_height }) catch {
+                _ = self.dial_workers.fetchSub(1, .acq_rel);
+                break;
+            };
+            th.detach();
+            inflight += 1;
+            self.next_outbound_dial_ms = std.time.milliTimestamp() + OUTBOUND_DIAL_MIN_GAP_MS;
+        }
+    }
+
+    /// Worker: one outbound dial + handshake, off the P2P thread.  Touches
+    /// only its own Peer and the hand-off queue under `dial_mutex`.
+    fn outboundDialWorker(self: *PeerManager, addr: std.net.Address, try_v2: bool, our_height: i32) void {
+        // Last access to `self`: deinit waits for this counter to reach 0.
+        defer _ = self.dial_workers.fetchSub(1, .acq_rel);
+        var fell_back = false;
+        const peer = self.dialNegotiate(addr, true, try_v2, our_height, &fell_back, false);
+        self.dial_mutex.lock();
+        defer self.dial_mutex.unlock();
+        self.dial_done.append(self.allocator, .{ .addr = addr, .peer = peer, .v1_fallback = fell_back }) catch {
+            if (peer) |p| {
+                p.disconnect();
+                self.allocator.destroy(p);
+            }
+        };
+    }
+
+    /// Fold finished outbound dials into the peer list (P2P thread, chain
+    /// lock held).
+    pub fn adoptOutboundDials(self: *PeerManager) void {
+        var ready: std.ArrayListUnmanaged(DialResult) = .{};
+        {
+            self.dial_mutex.lock();
+            defer self.dial_mutex.unlock();
+            if (self.dial_done.items.len == 0) return;
+            ready = self.dial_done;
+            self.dial_done = .{};
+        }
+        defer ready.deinit(self.allocator);
+        for (ready.items) |r| {
+            if (r.v1_fallback) self.markV1Only(r.addr);
+            const peer = r.peer orelse continue;
+            const addr = r.addr;
+            // Concurrent dials can land in one netgroup; keep the diversity
+            // the sequential dialer enforced at selection time.
+            if (self.stopping() or self.peers.items.len >= MAX_TOTAL_CONNECTIONS or
+                self.isConnected(addr) or self.violatesNetgroupDiversity(addr))
+            {
+                peer.disconnect();
+                self.allocator.destroy(peer);
+                continue;
+            }
 
             // Mark address as successful
             const key = addressKey(addr);
@@ -5227,15 +5330,28 @@ pub const PeerManager = struct {
                 self.untrackOutboundNetgroup(peer);
                 peer.disconnect();
                 self.allocator.destroy(peer);
-                break;
+                continue;
             };
-            outbound_count += 1;
-            std.log.info("Connected to outbound peer {} (height={d}, {d}/{d} outbound)", .{ addr, peer.start_height, outbound_count, target });
+            std.log.info("Connected to outbound peer {} (height={d})", .{ addr, peer.start_height });
 
             // Initiate header sync with newly connected peer
             self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
             self.driveHistoricalBackfill(peer);
             self.finishHistoricalBackfillIfDone();
+        }
+    }
+
+    /// Shut down every socket (stop() already flagged the dials; this is for
+    /// a deinit without stop) and wait, bounded, for dial workers to exit.
+    pub fn waitOutboundDials(self: *PeerManager, timeout_ms: u64) void {
+        if (self.dial_workers.load(.acquire) == 0) return;
+        self.stop_requested.store(true, .release);
+        _ = shutdownAllPeerSockets();
+        var waited: u64 = 0;
+        while (self.dial_workers.load(.acquire) != 0 and waited < timeout_ms) : (waited += 5) {
+            std.time.sleep(5 * std.time.ns_per_ms);
+            // A worker may register its socket just after the first sweep.
+            if (waited % 100 == 0) _ = shutdownAllPeerSockets();
         }
     }
 
@@ -12406,6 +12522,7 @@ pub const PeerManager = struct {
         while (self.running.load(.acquire)) {
             // Inbound peers whose handshake finished on a worker thread.
             self.adoptInboundHandshakes();
+            self.adoptOutboundDials();
 
             // Network-active gate (Core CConnman.fNetworkActive). When false
             // (`setnetworkactive false`) we suppress establishing NEW
@@ -12584,6 +12701,14 @@ pub const PeerManager = struct {
             return false;
         }
         return true;
+    }
+
+    /// `armHandshake` for the P2P thread; a dial worker only checks for a
+    /// pending stop (its socket is already in the peer-fd registry, so a stop
+    /// that lands after this check still shuts the socket down).
+    fn armDial(self: *PeerManager, fd: std.posix.fd_t, armed: bool) bool {
+        if (armed) return self.armHandshake(fd);
+        return !self.stop_requested.load(.acquire);
     }
 
     fn disarmHandshake(self: *PeerManager) void {
