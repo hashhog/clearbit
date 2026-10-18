@@ -1412,6 +1412,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_exit_tests.step);
     }
 
+    {
+        const dial_tests = b.addTest(.{
+            .root_source_file = b.path("tests_async_dials.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"async_dials"},
+        });
+        dial_tests.linkSystemLibrary("rocksdb");
+        dial_tests.linkSystemLibrary("secp256k1");
+        dial_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        dial_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            dial_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            dial_tests.linkSystemLibrary("minisketch");
+            dial_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        dial_tests.root_module.addOptions("build_options", build_options);
+        const run_dial_tests = b.addRunArtifact(dial_tests);
+        const dial_test_step = b.step(
+            "test-async-dials",
+            "Outbound dials must not block the P2P message thread; stop stays prompt",
+        );
+        dial_test_step.dependOn(&run_dial_tests.step);
+        test_step.dependOn(&run_dial_tests.step);
+    }
+
     // createrawtransaction vout/sequence/locktime range-check regression.
     // Same project-root wrapper as tests_rpc.zig (src/rpc.zig transitively
     // imports src/wallet.zig, whose @embedFile only resolves from the project
