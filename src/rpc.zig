@@ -13971,12 +13971,27 @@ pub const RpcServer = struct {
         // Bitcoin Core node answered for us).  Order:
         //   1. In-memory index entry (this session's scale).
         //   2. Persisted full CF_BLOCK_INDEX record's chain_work.
-        //   3. chainWorkFromHeight(h) — the same synthetic monotone scale the
-        //      in-memory header index roots on.  A snapshot-bootstrapped
-        //      clearbit CANNOT compute true cumulative work (no pre-base
-        //      headers); the ~height-magnitude sentinel is obviously not a
-        //      real 2^90-scale work value, so it cannot be mistaken for one.
-        //      True chainwork requires a genesis header backfill (R4-class).
+        //   3. Active-chain block: genesis-scale nChainWork anchored on the
+        //      hardcoded assumeutxo / snapshot checkpoints
+        //      (ChainState.chainWorkAtHeight).  Core keeps the full header
+        //      chain under assumeUTXO, so its value at and below the base is
+        //      the true cumulative work; the checkpoint's chain_work is that
+        //      value, and the GetBlockProof walk reaches heights above and
+        //      below it from headers clearbit holds.
+        //   4. chainWorkFromHeight(h) — the synthetic monotone scale the
+        //      in-memory header index roots on, only when no checkpoint basis
+        //      exists (no matching checkpoint, or headers missing on the
+        //      walk).  It is obviously not a real 2^90-scale work value.
+        var active_chainwork: ?[32]u8 = null;
+        if (cm_chainwork == null and idx_chainwork == null) {
+            if (height) |h| {
+                if (self.chain_state.getBlockHashByHeight(h)) |hh| {
+                    if (std.mem.eql(u8, &hh, &hash)) {
+                        active_chainwork = self.chain_state.chainWorkAtHeight(self.network_params, h);
+                    }
+                }
+            }
+        }
         if (cm_chainwork) |cw| {
             var tmp_buf: [64]u8 = undefined;
             for (cw, 0..) |byte, i| {
@@ -13989,6 +14004,8 @@ pub const RpcServer = struct {
                 _ = try std.fmt.bufPrint(tmp_buf[i * 2 ..][0..2], "{x:0>2}", .{byte});
             }
             @memcpy(&chainwork_str, &tmp_buf);
+        } else if (active_chainwork) |cw| {
+            chainwork_str = chainwork.toHex(&cw);
         } else if (height) |h| {
             const cw = peer_mod.chainWorkFromHeight(h);
             var tmp_buf: [64]u8 = undefined;
@@ -26444,6 +26461,250 @@ test "getblockchaininfo after boot on pre-fix snapshot index: Core chainwork, IB
     try std.testing.expect(std.mem.indexOf(u8, result, "\"chainwork\":\"00000000000000000000000000000000000000011de786def83d604b77454dd0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"initialblockdownload\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"chainwork\":\"0000000000000000000000000000000000000000000000000000000100010001\"") == null);
+}
+
+// Core v31.1 mainnet getblockheader fixtures (hash, raw header, chainwork).
+const cw_fixture = struct {
+    const h944999 = consensus.hexToHash("000000000000000000015ad45acd5aed5a1e047175082880b71c804cc7be363b");
+    const r944999 = consensus.hexToBytes80("00406d3278d8edc240abcd7040b919851c248ae0e08dc74cd6020100000000000000000002e620cc95188051d27632f8799f2688f0f67b79e2dccc929dc54382130cf49247ebdd69840602177e689b51");
+    const cw944999 = consensus.hexToBytes32BE("00000000000000000000000000000000000000011f79699a51e351af10cb2600");
+    const h945000 = consensus.hexToHash("0000000000000000000176404852119a2b1268c41789a2ba78737deacc88fa74");
+    const r945000 = consensus.hexToBytes80("00a01a263b36bec74c801cb78028087571041e5aed5acd5ad45a01000000000000000000a7f2a5fa8ec39a07b4f9df6fb43705c0c8faf878f8e97b957dde4071c37bbc7829eedd698406021723695a18");
+    const cw945000_hex = "00000000000000000000000000000000000000011f79e7fe8f532b4c1f226da8";
+    const h945001 = consensus.hexToHash("0000000000000000000148da9424ddc94a6c97e9f46ae71d4a94998f2dc67fa4");
+    const r945001 = consensus.hexToBytes80("0000002c74fa88ccea7d7378baa28917c468122b9a11524840760100000000000000000005f403139f814f5f17069235fa89885f6debb5e2d5999b3d867dca75c4ad86284beedd6984060217c903284d");
+    const cw945001 = consensus.hexToBytes32BE("00000000000000000000000000000000000000011f7a6662ccc304e92d79b550");
+    const cw945001_hex = "00000000000000000000000000000000000000011f7a6662ccc304e92d79b550";
+    // chainWorkFromHeight(945000): the value the live node served.
+    const synthetic945000_hex = "00000000000000000000000000000000000000000000000000000000000e6b69";
+
+    /// Active-chain H: row + 84-byte CF_BLOCK_INDEX record (height + header),
+    /// the shape the snapshot bootstrap and header-sync paths persist.
+    fn putActive(db: *storage.Database, height: u32, hash: types.Hash256, raw: [80]u8) !void {
+        const hh = storage.ChainStore.buildHeightHashKey(height);
+        try db.put(storage.CF_DEFAULT, &hh, &hash);
+        var rec: [84]u8 = undefined;
+        std.mem.writeInt(u32, rec[0..4], height, .little);
+        @memcpy(rec[4..84], &raw);
+        try db.put(storage.CF_BLOCK_INDEX, &hash, &rec);
+    }
+
+    fn checkpoint(height: u32, hash: types.Hash256, work: [32]u8) consensus.AssumeUtxoData {
+        return .{
+            .height = height,
+            .block_hash = hash,
+            .hash_serialized = [_]u8{0} ** 32,
+            .chain_tx_count = 0,
+            .chain_work = work,
+        };
+    }
+
+    fn getHeader(
+        allocator: std.mem.Allocator,
+        chain_state: *storage.ChainState,
+        params: *const consensus.NetworkParams,
+        display_hash: []const u8,
+    ) ![]const u8 {
+        var mempool = mempool_mod.Mempool.init(null, null, allocator);
+        defer mempool.deinit();
+        var peer_manager = peer_mod.PeerManager.init(allocator, params);
+        defer peer_manager.deinit();
+        var server = RpcServer.init(allocator, chain_state, &mempool, &peer_manager, params, .{});
+        defer server.deinit();
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockheader\",\"params\":[\"{s}\",true]}}",
+            .{display_hash},
+        );
+        defer allocator.free(request);
+        return server.dispatch(request);
+    }
+};
+
+test "getblockheader chainwork below a snapshot base is Core nChainWork (945000)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    // Snapshot base at 945001: Core's nChainWork there is the checkpoint;
+    // 945000 sits below it and has no in-memory or W: work.
+    const F = cw_fixture;
+    var params = consensus.MAINNET;
+    params.assume_utxo = &.{};
+    const cps = [_]consensus.AssumeUtxoData{F.checkpoint(945_001, F.h945001, F.cw945001)};
+    params.snapshot_bootstrap = &cps;
+    try F.putActive(&db, 945_000, F.h945000, F.r945000);
+    try F.putActive(&db, 945_001, F.h945001, F.r945001);
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 945_001;
+    chain_state.best_hash = F.h945001;
+
+    const result = try F.getHeader(allocator, &chain_state, &params, "0000000000000000000176404852119a2b1268c41789a2ba78737deacc88fa74");
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"height\":945000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"chainwork\":\"" ++ F.cw945000_hex ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, F.synthetic945000_hex) == null);
+}
+
+test "getblockheader chainwork above a snapshot base sums GetBlockProof (945000, 945001)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    const F = cw_fixture;
+    var params = consensus.MAINNET;
+    params.assume_utxo = &.{};
+    const cps = [_]consensus.AssumeUtxoData{F.checkpoint(944_999, F.h944999, F.cw944999)};
+    params.snapshot_bootstrap = &cps;
+    try F.putActive(&db, 944_999, F.h944999, F.r944999);
+    try F.putActive(&db, 945_000, F.h945000, F.r945000);
+    try F.putActive(&db, 945_001, F.h945001, F.r945001);
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 945_001;
+    chain_state.best_hash = F.h945001;
+
+    const r0 = try F.getHeader(allocator, &chain_state, &params, "0000000000000000000176404852119a2b1268c41789a2ba78737deacc88fa74");
+    defer allocator.free(r0);
+    try std.testing.expect(std.mem.indexOf(u8, r0, "\"chainwork\":\"" ++ F.cw945000_hex ++ "\"") != null);
+    const r1 = try F.getHeader(allocator, &chain_state, &params, "0000000000000000000148da9424ddc94a6c97e9f46ae71d4a94998f2dc67fa4");
+    defer allocator.free(r1);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "\"chainwork\":\"" ++ F.cw945001_hex ++ "\"") != null);
+}
+
+test "getblockheader chainwork of mainnet base-tail headers below 944183 is Core's" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    // Exactly what the snapshot bootstrap persists on the live node
+    // (main.zig base-tail loop), with the production MAINNET params.
+    const snap = consensus.MAINNET.snapshot_bootstrap[0];
+    for (snap.base_tail_headers) |bh| try cw_fixture.putActive(&db, bh.height, bh.hash, bh.raw);
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = snap.height;
+    chain_state.best_hash = snap.block_hash;
+
+    // Core v31.1 getblockheader chainwork at 944182 and 944172.
+    const r182 = try cw_fixture.getHeader(allocator, &chain_state, &consensus.MAINNET, "00000000000000000000d6e603dff7e37cffedb78c4d090436cc428e956a6904");
+    defer allocator.free(r182);
+    try std.testing.expect(std.mem.indexOf(u8, r182, "\"chainwork\":\"00000000000000000000000000000000000000011de60bb23fedd3744c3f76d8\"") != null);
+    const r172 = try cw_fixture.getHeader(allocator, &chain_state, &consensus.MAINNET, "00000000000000000001fc4e424ba9c0b4f1d4e1ac48ee12ba62c645e8921250");
+    defer allocator.free(r172);
+    try std.testing.expect(std.mem.indexOf(u8, r172, "\"chainwork\":\"00000000000000000000000000000000000000011de11bc7d98f5351bcd6aa48\"") != null);
+}
+
+test "getblockheader chainwork: no checkpoint basis is never borrowed by another chain" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    // The active chain at the checkpoint height is NOT the checkpoint block
+    // (a different, possibly low-work chain): its headers must not inherit
+    // the checkpoint's nChainWork.
+    const F = cw_fixture;
+    var params = consensus.MAINNET;
+    params.assume_utxo = &.{};
+    const cps = [_]consensus.AssumeUtxoData{F.checkpoint(945_001, F.h945001, F.cw945001)};
+    params.snapshot_bootstrap = &cps;
+    var other = F.h945001;
+    other[0] ^= 0xff;
+    try F.putActive(&db, 945_000, F.h945000, F.r945000);
+    const hh = storage.ChainStore.buildHeightHashKey(945_001);
+    try db.put(storage.CF_DEFAULT, &hh, &other);
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 945_001;
+    chain_state.best_hash = other;
+    try std.testing.expect(chain_state.chainWorkAtHeight(&params, 945_000) == null);
+
+    const result = try F.getHeader(allocator, &chain_state, &params, "0000000000000000000176404852119a2b1268c41789a2ba78737deacc88fa74");
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, F.cw945000_hex) == null);
+
+    // A block at the height that is not the active-chain block there (a
+    // side branch) must not be priced from the active chain either.
+    var db2_dir = std.testing.tmpDir(.{});
+    defer db2_dir.cleanup();
+    const path2 = try db2_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path2);
+    var db2 = try storage.Database.open(path2, 64, allocator);
+    defer db2.close();
+    try F.putActive(&db2, 945_001, F.h945001, F.r945001);
+    var side_rec: [84]u8 = undefined;
+    std.mem.writeInt(u32, side_rec[0..4], 945_000, .little);
+    @memcpy(side_rec[4..84], &F.r945000);
+    try db2.put(storage.CF_BLOCK_INDEX, &F.h945000, &side_rec);
+    const hh2 = storage.ChainStore.buildHeightHashKey(945_000);
+    try db2.put(storage.CF_DEFAULT, &hh2, &F.h944999);
+    var cs2 = storage.ChainState.init(&db2, 64, allocator);
+    defer cs2.deinit();
+    cs2.best_height = 945_001;
+    cs2.best_hash = F.h945001;
+    const r2 = try F.getHeader(allocator, &cs2, &params, "0000000000000000000176404852119a2b1268c41789a2ba78737deacc88fa74");
+    defer allocator.free(r2);
+    try std.testing.expect(std.mem.indexOf(u8, r2, F.cw945000_hex) == null);
+}
+
+test "chainWorkAtHeight: W: row is used only when consistent with the checkpoints" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    // Checkpoint at 944999, but the 945000 header is missing so the walk
+    // cannot run; only the persisted W: row remains.
+    const F = cw_fixture;
+    var params = consensus.MAINNET;
+    params.assume_utxo = &.{};
+    const cps = [_]consensus.AssumeUtxoData{F.checkpoint(944_999, F.h944999, F.cw944999)};
+    params.snapshot_bootstrap = &cps;
+    try F.putActive(&db, 944_999, F.h944999, F.r944999);
+    const hh = storage.ChainStore.buildHeightHashKey(945_000);
+    try db.put(storage.CF_DEFAULT, &hh, &F.h945000);
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 945_000;
+    chain_state.best_hash = F.h945000;
+
+    // Seed-poisoned row (GetBlockProof(genesis) grown by a few blocks) is
+    // below the checkpoint: rejected, not served as the block's work.
+    const poisoned = chainwork.workFromBits(0x1d00ffff);
+    chain_state.putCumulativeChainWork(945_000, &poisoned);
+    try std.testing.expect(chain_state.chainWorkAtHeight(&params, 945_000) == null);
+
+    var real: [32]u8 = F.cw944999;
+    const proof = chainwork.workFromBits(0x17020684);
+    chainwork.addChainWorkBE(&real, &proof);
+    chain_state.putCumulativeChainWork(945_000, &real);
+    const got = chain_state.chainWorkAtHeight(&params, 945_000) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(F.cw945000_hex, &chainwork.toHex(&got));
 }
 
 test "getnetworkhashps sums GetBlockProof over persisted headers" {

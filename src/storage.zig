@@ -4984,10 +4984,6 @@ pub const ChainState = struct {
     /// assumeutxo/snapshot_bootstrap checkpoint at or below the tip whose
     /// H: hash matches, then SUM(GetBlockProof) over headers base+1..tip.
     /// Returns null if any header in the walk is missing (fail closed).
-    ///
-    /// On networks that do not allow min-difficulty blocks, nBits is
-    /// constant inside a 2016-block retarget window, so the walk reads the
-    /// first and last header of each window instead of every body.
     fn reconstructTotalWork(self: *ChainState, params: *const @import("consensus.zig").NetworkParams) ?[32]u8 {
         var base_h: u32 = 0;
         var acc: [32]u8 = chainwork.workFromBits(params.genesis_header.bits);
@@ -5027,6 +5023,25 @@ pub const ChainState = struct {
             acc = chainwork.workFromBits(params.genesis_header.bits);
         }
 
+        if (!self.applyProofRange(params, base_h + 1, self.best_height, &acc, .add)) return null;
+        return acc;
+    }
+
+    /// Add (or subtract) GetBlockProof for every active-chain header in
+    /// `from..to` (inclusive) to `acc`.  Returns false if any header in the
+    /// walk is missing (fail closed).  Empty range when from > to.
+    ///
+    /// On networks that do not allow min-difficulty blocks, nBits is
+    /// constant inside a 2016-block retarget window, so the walk reads the
+    /// first and last header of each window instead of every body.
+    fn applyProofRange(
+        self: *ChainState,
+        params: *const @import("consensus.zig").NetworkParams,
+        from: u32,
+        to: u32,
+        acc: *[32]u8,
+        op: enum { add, sub },
+    ) bool {
         const interval: u32 = if (params.pow_target_spacing == 0)
             1
         else
@@ -5036,28 +5051,99 @@ pub const ChainState = struct {
         else
             interval;
 
-        var h: u32 = base_h + 1;
-        while (h <= self.best_height) {
-            const hdr = self.getHeaderAtHeight(h) orelse return null;
+        var h: u32 = from;
+        while (h <= to) {
+            const hdr = self.getHeaderAtHeight(h) orelse return false;
             const proof = chainwork.workFromBits(hdr.bits);
             var run_last: u32 = h;
             if (stride > 1) {
                 const rem = h % stride;
                 const next_retarget = if (rem == 0) h + stride else h + (stride - rem);
-                run_last = @min(self.best_height, next_retarget - 1);
+                run_last = @min(to, next_retarget - 1);
                 if (run_last > h) {
-                    const last_hdr = self.getHeaderAtHeight(run_last) orelse return null;
+                    const last_hdr = self.getHeaderAtHeight(run_last) orelse return false;
                     if (last_hdr.bits != hdr.bits) run_last = h;
                 }
             }
             const count: u32 = run_last - h + 1;
             var n: u32 = 0;
             while (n < count) : (n += 1) {
-                chainwork.addChainWorkBE(&acc, &proof);
+                switch (op) {
+                    .add => chainwork.addChainWorkBE(acc, &proof),
+                    .sub => chainwork.subChainWorkBE(acc, &proof),
+                }
             }
             h = run_last + 1;
         }
-        return acc;
+        return true;
+    }
+
+    /// Genesis-scale nChainWork (Core CBlockIndex::nChainWork) of the
+    /// active-chain block at `height`, for blocks whose work is not held in
+    /// memory — e.g. headers at or below an assumeUTXO / snapshot base, or
+    /// blocks connected before the W: index existed.
+    ///
+    /// Anchored on the hardcoded checkpoints, never on synthetic or
+    /// since-root scales: the nearest assumeutxo / snapshot_bootstrap entry
+    /// whose hash matches H: at its height, then GetBlockProof summed up
+    /// from a checkpoint below (cw(cp) + proofs cp+1..height) or peeled off
+    /// a checkpoint above (cw(cp) - proofs height+1..cp).  Falls back to a
+    /// persisted W: row only when it is consistent with those checkpoints,
+    /// and to a genesis walk only on short chains.  Null when no basis
+    /// exists; callers must not invent one.
+    pub fn chainWorkAtHeight(
+        self: *ChainState,
+        params: *const @import("consensus.zig").NetworkParams,
+        height: u32,
+    ) ?[32]u8 {
+        if (height > self.best_height) return null;
+
+        var lo: ?@import("consensus.zig").AssumeUtxoData = null;
+        var hi: ?@import("consensus.zig").AssumeUtxoData = null;
+        const pick = struct {
+            fn go(
+                cs: *ChainState,
+                e: @import("consensus.zig").AssumeUtxoData,
+                target: u32,
+                below: *?@import("consensus.zig").AssumeUtxoData,
+                above: *?@import("consensus.zig").AssumeUtxoData,
+            ) void {
+                if (chainwork.isZero(&e.chain_work)) return;
+                if (e.height > cs.best_height) return;
+                const hh = cs.getBlockHashByHeight(e.height) orelse return;
+                if (!std.mem.eql(u8, &hh, &e.block_hash)) return;
+                if (e.height <= target) {
+                    if (below.* == null or e.height > below.*.?.height) below.* = e;
+                } else {
+                    if (above.* == null or e.height < above.*.?.height) above.* = e;
+                }
+            }
+        };
+        for (params.assume_utxo) |e| pick.go(self, e, height, &lo, &hi);
+        for (params.snapshot_bootstrap) |e| pick.go(self, e, height, &lo, &hi);
+
+        if (lo) |cp| {
+            var acc = cp.chain_work;
+            if (self.applyProofRange(params, cp.height + 1, height, &acc, .add)) return acc;
+        }
+        if (hi) |cp| {
+            var acc = cp.chain_work;
+            if (self.applyProofRange(params, height + 1, cp.height, &acc, .sub)) return acc;
+        }
+
+        if (self.getCumulativeChainWork(height)) |w| {
+            const genesis = chainwork.workFromBits(params.genesis_header.bits);
+            const ok_floor = height == 0 or chainwork.cmpChainWorkBE(&w, &genesis) > 0;
+            const ok_lo = if (lo) |cp| chainwork.cmpChainWorkBE(&w, &cp.chain_work) >= 0 else true;
+            const ok_hi = if (hi) |cp| chainwork.cmpChainWorkBE(&w, &cp.chain_work) < 0 else true;
+            if (ok_floor and ok_lo and ok_hi) return w;
+        }
+
+        if (height <= 10_000) {
+            var acc = chainwork.workFromBits(params.genesis_header.bits);
+            if (self.applyProofRange(params, 1, height, &acc, .add)) return acc;
+        }
+        return null;
     }
 
     /// Header at an active-chain height: CF_BLOCK_INDEX, else CF_BLOCKS.
