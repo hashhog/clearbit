@@ -2518,6 +2518,40 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_w150_live.step);
     }
 
+    // getblocktxn — BIP-152 serve path.  Drives handleMessage's `.getblocktxn`
+    // arm and reads the reply off a socketpair (Core SendBlockTransactions:
+    // index/depth gates, out-of-bounds misbehaving).  peer.zig-rooted for the
+    // same reason as W150 LIVE above.
+    // Run with `zig build test-getblocktxn`.
+    {
+        const gbt_tests = b.addTest(.{
+            .root_source_file = b.path("src/peer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"getblocktxn"},
+        });
+        gbt_tests.linkSystemLibrary("rocksdb");
+        gbt_tests.linkSystemLibrary("secp256k1");
+        gbt_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        gbt_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            gbt_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            gbt_tests.linkSystemLibrary("minisketch");
+            gbt_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        gbt_tests.root_module.addOptions("build_options", build_options);
+
+        const run_gbt_tests = b.addRunArtifact(gbt_tests);
+        const gbt_step = b.step("test-getblocktxn", "Run BIP-152 getblocktxn serve-path tests (peer.zig-rooted)");
+        gbt_step.dependOn(&run_gbt_tests.step);
+        test_step.dependOn(&run_gbt_tests.step);
+    }
+
     // FIX-3G — ADDR/ADDRV2 peer-timestamp clamp (3G policy, fleet-wide).
     // Reference: bitcoin-core/src/net_processing.cpp:5678-5679.
     // Clamps peer-advertised nTime that is pre-2001 (≤100_000_000s) or more than
