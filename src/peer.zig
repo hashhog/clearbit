@@ -8552,13 +8552,16 @@ pub const PeerManager = struct {
                 // Core: pushes MSG_WITNESS_BLOCK to peer.m_getdata_requests for
                 // the next loop. Clearbit: serve directly from the relay cache.
                 const gbt_tip_height: u32 = if (self.chain_state) |cs| cs.best_height else 0;
-                const gbt_block_height_opt: ?u32 = blk: {
-                    if (self.header_index.get(gbt.block_hash)) |entry| {
-                        break :blk entry.height;
-                    }
-                    break :blk null;
+                // Core answers only for a block it has indexed
+                // (LookupBlockIndex): a hash we cannot place at a height gets
+                // no reply, even if some cache still holds its body.  The
+                // persisted block index covers the post-restart window when
+                // header_index is still empty.
+                const gbt_block_height: u32 = (self.lookupForkPointHeight(&gbt.block_hash) catch null) orelse {
+                    std.log.debug("P2P: getblocktxn for a block we have not indexed; ignored", .{});
+                    return;
                 };
-                if (gbt_block_height_opt) |gbt_block_height| {
+                {
                     const gbt_depth = if (gbt_tip_height >= gbt_block_height)
                         gbt_tip_height - gbt_block_height
                     else
@@ -8587,8 +8590,40 @@ pub const PeerManager = struct {
                         return;
                     }
                 }
-                // Block is within depth (or depth unknown) — we don't yet serve
-                // blocktxn responses (BUG-7, separate from BUG-8). Ignore.
+                // Within MAX_BLOCKTXN_DEPTH: answer with blocktxn, Core's
+                // SendBlockTransactions (net_processing.cpp ProcessMessage
+                // GETBLOCKTXN). No body: ignore, as Core does.
+                // Without this a compact-block peer that misses a tx waits on
+                // blocktxn until its in-flight request times out.
+                var gbt_owned: ?types.Block = null;
+                defer if (gbt_owned) |*ob| serialize.freeBlock(self.allocator, ob);
+                var gbt_raw: ?[]const u8 = null;
+                defer if (gbt_raw) |raw| self.allocator.free(raw);
+                const gbt_block: types.Block = blk: {
+                    if (self.served_blocks.get(gbt.block_hash)) |data| {
+                        var r = serialize.Reader{ .data = data };
+                        gbt_owned = serialize.readBlock(&r, self.allocator) catch return;
+                        break :blk gbt_owned.?;
+                    }
+                    if (self.block_buffer.get(gbt.block_hash)) |buffered| break :blk buffered;
+                    gbt_raw = self.readStoredBlockBytes(&gbt.block_hash);
+                    if (gbt_raw) |raw| {
+                        var r = serialize.Reader{ .data = raw };
+                        gbt_owned = serialize.readBlock(&r, self.allocator) catch return;
+                        break :blk gbt_owned.?;
+                    }
+                    return;
+                };
+                const picked = selectBlockTxns(self.allocator, &gbt_block, gbt.indexes) catch return;
+                if (picked) |txs| {
+                    defer self.allocator.free(txs);
+                    const bt_msg = p2p.Message{ .blocktxn = .{ .block_hash = gbt.block_hash, .transactions = txs } };
+                    peer.sendMessage(&bt_msg) catch {};
+                } else {
+                    // Core: Misbehaving(peer, "getblocktxn with out-of-bounds
+                    // tx indices") and no blocktxn.
+                    peer.misbehaving(100, "getblocktxn with out-of-bounds tx indices");
+                }
             },
             .blocktxn => |bt| {
                 // Free allocated transactions.
@@ -12927,6 +12962,23 @@ pub const PeerManager = struct {
     }
 };
 
+/// The transactions of `block` at `indexes`, in request order, for a BIP-152
+/// `blocktxn` reply. The returned slice is allocator-owned; the transactions in
+/// it BORROW `block`'s memory. Null when any index is out of range (Core
+/// treats that as misbehaviour and answers nothing).
+pub fn selectBlockTxns(
+    allocator: std.mem.Allocator,
+    block: *const types.Block,
+    indexes: []const u16,
+) !?[]types.Transaction {
+    for (indexes) |idx| {
+        if (idx >= block.transactions.len) return null;
+    }
+    const out = try allocator.alloc(types.Transaction, indexes.len);
+    for (indexes, 0..) |idx, i| out[i] = block.transactions[idx];
+    return out;
+}
+
 /// Serialize a block body and hand it to ChainState's pending_block_writes
 /// queue so the next flush() commits CF_BLOCKS atomically with the chain
 /// advance. Free-standing rather than a method on PeerManager so the
@@ -15487,4 +15539,184 @@ test "W150 LIVE: unresolvable parent drops the batch WITHOUT punishing the peer"
 
     try std.testing.expect(!peer.should_ban);
     try std.testing.expectEqual(@as(usize, 0), pm.expected_blocks.items.len);
+}
+
+test "getblocktxn: selectBlockTxns returns the requested txs in request order" {
+    const allocator = std.testing.allocator;
+    var txs: [4]types.Transaction = undefined;
+    for (&txs, 0..) |*t, i| {
+        t.* = .{ .version = 1, .inputs = &.{}, .outputs = &.{}, .lock_time = @intCast(i) };
+    }
+    const block = types.Block{
+        .header = .{ .version = 4, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32, .timestamp = 0, .bits = 0, .nonce = 0 },
+        .transactions = &txs,
+    };
+    const got = (try selectBlockTxns(allocator, &block, &[_]u16{ 1, 3 })).?;
+    defer allocator.free(got);
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqual(@as(u32, 1), got[0].lock_time);
+    try std.testing.expectEqual(@as(u32, 3), got[1].lock_time);
+}
+
+test "getblocktxn: selectBlockTxns rejects an out-of-range index (Core: misbehaving, no reply)" {
+    const allocator = std.testing.allocator;
+    var txs: [2]types.Transaction = undefined;
+    for (&txs) |*t| t.* = .{ .version = 1, .inputs = &.{}, .outputs = &.{}, .lock_time = 0 };
+    const block = types.Block{
+        .header = .{ .version = 4, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32, .timestamp = 0, .bits = 0, .nonce = 0 },
+        .transactions = &txs,
+    };
+    try std.testing.expectEqual(@as(?[]types.Transaction, null), try selectBlockTxns(allocator, &block, &[_]u16{ 0, 2 }));
+}
+
+// getblocktxn LIVE: drive the real `.getblocktxn` arm of handleMessage and read
+// what the peer is actually sent off the far end of a socketpair.  The tip is
+// at height 100 on a scratch ChainState (no DB), the block has three txs, and
+// it sits in the relay cache — so the only thing deciding the reply is the
+// handler's own index / depth / bounds logic.
+const GbtLive = struct {
+    allocator: std.mem.Allocator,
+    cs: storage.ChainState,
+    pm: PeerManager,
+    peer: Peer,
+    far: std.posix.fd_t,
+    near: std.posix.fd_t,
+    block: types.Block,
+    hash: types.Hash256,
+
+    const TIP_HEIGHT: u32 = 100;
+    var ins: [3][1]types.TxIn = undefined;
+    var txs: [3]types.Transaction = undefined;
+
+    fn init(self: *GbtLive, allocator: std.mem.Allocator) !void {
+        self.allocator = allocator;
+        self.cs = storage.ChainState.init(null, 64, allocator);
+        self.cs.best_height = TIP_HEIGHT;
+        self.cs.best_hash = [_]u8{0xEE} ** 32;
+        self.pm = PeerManager.init(allocator, &consensus.MAINNET);
+        self.pm.anchors_path = "/dev/null";
+        self.pm.chain_state = &self.cs;
+        var fds: [2]i32 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+        self.near = fds[0];
+        self.far = fds[1];
+        self.peer = w150StubPeer(&consensus.MAINNET, allocator);
+        self.peer.stream = .{ .handle = self.near };
+        for (&txs, 0..) |*t, i| {
+            ins[i][0] = .{
+                .previous_output = .{ .hash = [_]u8{@intCast(0x10 + i)} ** 32, .index = 0 },
+                .script_sig = &.{},
+                .sequence = 0xFFFFFFFF,
+                .witness = &.{},
+            };
+            t.* = .{ .version = 2, .inputs = &ins[i], .outputs = &.{}, .lock_time = @intCast(1000 + i) };
+        }
+        self.block = .{
+            .header = .{ .version = 4, .prev_block = [_]u8{0x22} ** 32, .merkle_root = [_]u8{0x33} ** 32, .timestamp = 1_700_000_000, .bits = 0x207fffff, .nonce = 7 },
+            .transactions = &txs,
+        };
+        self.hash = crypto.computeBlockHash(&self.block.header);
+        self.pm.cacheBlockForRelay(&self.hash, &self.block);
+    }
+
+    fn deinit(self: *GbtLive) void {
+        self.pm.chain_state = null;
+        self.pm.deinit();
+        self.cs.deinit();
+        self.peer.recv_buffer.deinit();
+        self.peer.send_queue.deinit(self.allocator);
+        std.posix.close(self.near);
+        std.posix.close(self.far);
+    }
+
+    /// Index the block at `height` (as the headers path would).
+    fn index(self: *GbtLive, height: u32) !void {
+        try self.pm.header_index.put(self.hash, .{
+            .hash = self.hash,
+            .prev_hash = self.block.header.prev_block,
+            .height = height,
+            .chain_work = [_]u8{0} ** 32,
+            .timestamp = self.block.header.timestamp,
+            .header = self.block.header,
+            .last_seen = 0,
+        });
+    }
+
+    fn request(self: *GbtLive, indexes: []const u16) !void {
+        const owned = try self.allocator.dupe(u16, indexes); // the arm frees it
+        try self.pm.handleMessage(&self.peer, .{ .getblocktxn = .{ .block_hash = self.hash, .indexes = owned } });
+    }
+
+    /// The one message the peer was sent, or null if it was sent nothing.
+    /// Caller frees with p2p.freeDecodedMessage.
+    fn reply(self: *GbtLive) !?p2p.Message {
+        var buf: [8192]u8 = undefined;
+        const n = std.posix.recv(self.far, &buf, std.posix.MSG.DONTWAIT) catch |err| switch (err) {
+            error.WouldBlock => return null,
+            else => return err,
+        };
+        try std.testing.expect(n >= 24);
+        const hdr = p2p.MessageHeader.decode(buf[0..24]);
+        try std.testing.expectEqual(@as(usize, 24 + hdr.length), n);
+        return try p2p.decodePayload(hdr.commandName(), buf[24..n], self.allocator);
+    }
+};
+
+test "getblocktxn LIVE: out-of-range index marks the peer misbehaving and sends nothing" {
+    var h: GbtLive = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+    try h.index(GbtLive.TIP_HEIGHT);
+
+    try h.request(&[_]u16{ 0, 3 }); // the block has 3 txs: index 3 is out of range
+
+    // Core SendBlockTransactions: Misbehaving(...) and return before pushing.
+    try std.testing.expect(h.peer.should_ban);
+    try std.testing.expectEqual(@as(?p2p.Message, null), try h.reply());
+}
+
+test "getblocktxn LIVE: a block we have not indexed gets no reply, though its body is cached" {
+    var h: GbtLive = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+    // No index(): header_index, the tip and the (absent) block index all miss.
+
+    try h.request(&[_]u16{0});
+
+    // Core: LookupBlockIndex fails -> "a block we don't have", no reply.
+    try std.testing.expectEqual(@as(?p2p.Message, null), try h.reply());
+    try std.testing.expect(!h.peer.should_ban);
+}
+
+test "getblocktxn LIVE: deeper than MAX_BLOCKTXN_DEPTH gets the full block, not blocktxn" {
+    var h: GbtLive = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+    try h.index(GbtLive.TIP_HEIGHT - p2p.MAX_BLOCKTXN_DEPTH - 1);
+
+    try h.request(&[_]u16{0});
+
+    const msg = (try h.reply()) orelse return error.NoReply;
+    defer p2p.freeDecodedMessage(std.testing.allocator, msg);
+    try std.testing.expect(msg == .block);
+    try std.testing.expectEqualSlices(u8, &h.hash, &crypto.computeBlockHash(&msg.block.header));
+    try std.testing.expect(!h.peer.should_ban);
+}
+
+test "getblocktxn LIVE: at MAX_BLOCKTXN_DEPTH gets blocktxn for the requested hash, txs in request order" {
+    var h: GbtLive = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+    try h.index(GbtLive.TIP_HEIGHT - p2p.MAX_BLOCKTXN_DEPTH);
+
+    try h.request(&[_]u16{ 0, 2 });
+
+    const msg = (try h.reply()) orelse return error.NoReply;
+    defer p2p.freeDecodedMessage(std.testing.allocator, msg);
+    try std.testing.expect(msg == .blocktxn);
+    try std.testing.expectEqualSlices(u8, &h.hash, &msg.blocktxn.block_hash);
+    try std.testing.expectEqual(@as(usize, 2), msg.blocktxn.transactions.len);
+    try std.testing.expectEqual(@as(u32, 1000), msg.blocktxn.transactions[0].lock_time);
+    try std.testing.expectEqual(@as(u32, 1002), msg.blocktxn.transactions[1].lock_time);
+    try std.testing.expect(!h.peer.should_ban);
 }
