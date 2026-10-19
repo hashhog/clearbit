@@ -324,18 +324,17 @@ test "w126 G10 BUG-3: reconstruction success path is dead-helper-at-tail (xfail)
 // G11: getblocktxn SERVE path emits blocktxn for depth <= MAX_BLOCKTXN_DEPTH.
 // Status: PARTIAL — BUG-4 (P1).
 // Core net_processing.cpp:4276+SendBlockTransactions  serves blocktxn at depth<=10
-// clearbit peer.zig:4990-4992  literal "we don't yet serve blocktxn responses"
+// clearbit: served since the getblocktxn arm builds a blocktxn (selectBlockTxns)
 // ===========================================================================
 
-test "w126 G11 BUG-4: in-depth getblocktxn handler does not emit blocktxn (xfail)" {
+test "w126 G11 BUG-4 fixed: in-depth getblocktxn handler emits blocktxn" {
     const src = @embedFile("peer.zig");
-    // Confession comment present (exact phrasing from peer.zig:4991-4992:
-    // "we don't yet serve\n                // blocktxn responses (BUG-7,...").
-    // The comment may be wrapped across lines, so look for the BUG-7 marker
-    // which is unique enough.
-    try testing.expect(std.mem.indexOf(u8, src, "BUG-7, separate from BUG-8") != null);
-    // No outgoing .blocktxn = {} message constructor anywhere in peer.zig.
-    try testing.expect(std.mem.indexOf(u8, src, ".blocktxn = .{") == null);
+    // The "we don't yet serve blocktxn" confession is gone ...
+    try testing.expect(std.mem.indexOf(u8, src, "BUG-7, separate from BUG-8") == null);
+    // ... and the getblocktxn arm builds an outgoing blocktxn message.
+    const arm = std.mem.indexOf(u8, src, ".getblocktxn => |gbt|") orelse return error.ArmNotFound;
+    const arm_end = std.mem.indexOfPos(u8, src, arm, ".blocktxn => |bt|") orelse return error.ArmNotFound;
+    try testing.expect(std.mem.indexOf(u8, src[arm..arm_end], ".blocktxn = .{") != null);
 }
 
 test "w126 G11 PASS pin: MAX_BLOCKTXN_DEPTH=10 fallback path serves full block" {

@@ -8587,8 +8587,38 @@ pub const PeerManager = struct {
                         return;
                     }
                 }
-                // Block is within depth (or depth unknown) — we don't yet serve
-                // blocktxn responses (BUG-7, separate from BUG-8). Ignore.
+                // Within depth (or depth unknown): answer with blocktxn, Core's
+                // SendBlockTransactions (net_processing.cpp ProcessMessage
+                // GETBLOCKTXN). Unknown block or no body: ignore, as Core does.
+                // Without this a compact-block peer that misses a tx waits on
+                // blocktxn until its in-flight request times out.
+                var gbt_owned: ?types.Block = null;
+                defer if (gbt_owned) |*ob| serialize.freeBlock(self.allocator, ob);
+                var gbt_raw: ?[]const u8 = null;
+                defer if (gbt_raw) |raw| self.allocator.free(raw);
+                const gbt_block: types.Block = blk: {
+                    if (self.served_blocks.get(gbt.block_hash)) |data| {
+                        var r = serialize.Reader{ .data = data };
+                        gbt_owned = serialize.readBlock(&r, self.allocator) catch return;
+                        break :blk gbt_owned.?;
+                    }
+                    if (self.block_buffer.get(gbt.block_hash)) |buffered| break :blk buffered;
+                    gbt_raw = self.readStoredBlockBytes(&gbt.block_hash);
+                    if (gbt_raw) |raw| {
+                        var r = serialize.Reader{ .data = raw };
+                        gbt_owned = serialize.readBlock(&r, self.allocator) catch return;
+                        break :blk gbt_owned.?;
+                    }
+                    return;
+                };
+                const picked = selectBlockTxns(self.allocator, &gbt_block, gbt.indexes) catch return;
+                if (picked) |txs| {
+                    defer self.allocator.free(txs);
+                    const bt_msg = p2p.Message{ .blocktxn = .{ .block_hash = gbt.block_hash, .transactions = txs } };
+                    peer.sendMessage(&bt_msg) catch {};
+                } else {
+                    std.log.warn("P2P: getblocktxn with out-of-bounds tx indices; ignored", .{});
+                }
             },
             .blocktxn => |bt| {
                 // Free allocated transactions.
@@ -12927,6 +12957,23 @@ pub const PeerManager = struct {
     }
 };
 
+/// The transactions of `block` at `indexes`, in request order, for a BIP-152
+/// `blocktxn` reply. The returned slice is allocator-owned; the transactions in
+/// it BORROW `block`'s memory. Null when any index is out of range (Core
+/// treats that as misbehaviour and answers nothing).
+pub fn selectBlockTxns(
+    allocator: std.mem.Allocator,
+    block: *const types.Block,
+    indexes: []const u16,
+) !?[]types.Transaction {
+    for (indexes) |idx| {
+        if (idx >= block.transactions.len) return null;
+    }
+    const out = try allocator.alloc(types.Transaction, indexes.len);
+    for (indexes, 0..) |idx, i| out[i] = block.transactions[idx];
+    return out;
+}
+
 /// Serialize a block body and hand it to ChainState's pending_block_writes
 /// queue so the next flush() commits CF_BLOCKS atomically with the chain
 /// advance. Free-standing rather than a method on PeerManager so the
@@ -15487,4 +15534,32 @@ test "W150 LIVE: unresolvable parent drops the batch WITHOUT punishing the peer"
 
     try std.testing.expect(!peer.should_ban);
     try std.testing.expectEqual(@as(usize, 0), pm.expected_blocks.items.len);
+}
+
+test "getblocktxn: selectBlockTxns returns the requested txs in request order" {
+    const allocator = std.testing.allocator;
+    var txs: [4]types.Transaction = undefined;
+    for (&txs, 0..) |*t, i| {
+        t.* = .{ .version = 1, .inputs = &.{}, .outputs = &.{}, .lock_time = @intCast(i) };
+    }
+    const block = types.Block{
+        .header = .{ .version = 4, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32, .timestamp = 0, .bits = 0, .nonce = 0 },
+        .transactions = &txs,
+    };
+    const got = (try selectBlockTxns(allocator, &block, &[_]u16{ 1, 3 })).?;
+    defer allocator.free(got);
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqual(@as(u32, 1), got[0].lock_time);
+    try std.testing.expectEqual(@as(u32, 3), got[1].lock_time);
+}
+
+test "getblocktxn: selectBlockTxns rejects an out-of-range index (Core: misbehaving, no reply)" {
+    const allocator = std.testing.allocator;
+    var txs: [2]types.Transaction = undefined;
+    for (&txs) |*t| t.* = .{ .version = 1, .inputs = &.{}, .outputs = &.{}, .lock_time = 0 };
+    const block = types.Block{
+        .header = .{ .version = 4, .prev_block = [_]u8{0} ** 32, .merkle_root = [_]u8{0} ** 32, .timestamp = 0, .bits = 0, .nonce = 0 },
+        .transactions = &txs,
+    };
+    try std.testing.expectEqual(@as(?[]types.Transaction, null), try selectBlockTxns(allocator, &block, &[_]u16{ 0, 2 }));
 }
