@@ -26,6 +26,8 @@ const serialize = @import("serialize.zig");
 const p2p = @import("p2p.zig");
 const validation = @import("validation.zig");
 const block_template = @import("block_template.zig");
+const rpc = @import("rpc.zig");
+const mempool_mod = @import("mempool.zig");
 
 // ====================================================================
 // Helpers
@@ -3101,4 +3103,125 @@ test "tests_reorg_p2p: submitblock then the same block over P2P — next headers
     try testing.expect(!pm.isBlockFailed(&a4.hash));
     try testing.expect(!h_peer.should_ban);
     try testing.expect(!cs.flush_error);
+}
+
+fn rpcCall(server: *rpc.RpcServer, allocator: std.mem.Allocator, method: []const u8, arg: []const u8) ![]const u8 {
+    const req = try std.fmt.allocPrint(allocator, "{{\"id\":1,\"method\":\"{s}\",\"params\":[\"{s}\"]}}", .{ method, arg });
+    defer allocator.free(req);
+    return server.dispatch(req);
+}
+
+fn blockHex(allocator: std.mem.Allocator, b: *const types.Block) ![]u8 {
+    var w = serialize.Writer.init(allocator);
+    defer w.deinit();
+    try serialize.writeBlock(&w, b);
+    return std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(w.list.items)});
+}
+
+fn hashDisplayHex(h: types.Hash256) [64]u8 {
+    var rev: [32]u8 = undefined;
+    for (h, 0..) |byte, i| rev[31 - i] = byte;
+    var out: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&out, "{}", .{std.fmt.fmtSliceHexLower(&rev)}) catch unreachable;
+    return out;
+}
+
+fn expectTip(cs: *const storage.ChainState, want: u32, step: []const u8) !void {
+    if (cs.best_height != want) {
+        std.debug.print("{s}: tip height {d}, want {d}\n", .{ step, cs.best_height, want });
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectResult(resp: []const u8, want: []const u8) !void {
+    if (std.mem.indexOf(u8, resp, want) == null) {
+        std.debug.print("want {s}, got {s}\n", .{ want, resp });
+        return error.TestUnexpectedResult;
+    }
+}
+
+// Warden review of clearbit#20: the P2P failed set is append-only (here
+// failedHeaderCut marks a never-validated child FAILED_CHILD because its
+// parent is in the set) and reconsiderblock does not clear it.  Core answers
+// duplicate-invalid only while the block index entry is BLOCK_FAILED_*;
+// after ReconsiderBlock clears that, the same block is processed again.
+test "tests_reorg_p2p: reconsiderblock of a failed parent — submitblock of a child failed only in the P2P set connects, not duplicate-invalid" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bip30SelfDupSetup(allocator, &pm, &cs, &params);
+    var cm = validation.ChainManager.init(&cs, null, allocator);
+    defer cm.deinit();
+    try cm.loadGenesis(&params);
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var server = rpc.RpcServer.init(allocator, &cs, &mempool, &pm, &params, .{});
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var a2 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0xA2);
+    defer serialize.freeBlock(allocator, &a2.block);
+    const a1_hex = try blockHex(allocator, &a1.block);
+    defer allocator.free(a1_hex);
+    const a2_hex = try blockHex(allocator, &a2.block);
+    defer allocator.free(a2_hex);
+    const a1_id = hashDisplayHex(a1.hash);
+
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", a1_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 1, "after submitblock(A1)");
+
+    // Parent marked failed (invalidateblock) and, as the P2P layer would,
+    // put in the P2P failed set; the child's header then arrives over P2P
+    // and is marked FAILED_CHILD in that set only.
+    {
+        const r = try rpcCall(&server, allocator, "invalidateblock", &a1_id);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 0, "after invalidateblock(A1)");
+    try pm.failed_blocks.put(a1.hash, {});
+    const cut = pm.failedHeaderCut(&.{a2.block.header});
+    try testing.expectEqual(peer_mod.FailedHeaderReason.invalid_prev, cut.reason);
+    try testing.expect(pm.isBlockFailed(&a2.hash));
+    try testing.expect(!cs.isBlockMarkedInvalid(&a2.hash));
+    try testing.expect(cm.getBlock(&a2.hash) == null); // in the P2P set only
+
+    {
+        const r = try rpcCall(&server, allocator, "reconsiderblock", &a1_id);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 1, "after reconsiderblock(A1)");
+    try testing.expect(pm.isBlockFailed(&a2.hash)); // the P2P set is still stale
+
+    // The child is valid again: it connects (null), it is not duplicate-invalid.
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", a2_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 2, "after submitblock(A2)");
+    try testing.expectEqualSlices(u8, &a2.hash, &cs.best_hash);
+
+    // Resubmitting the tip is a duplicate.
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", a2_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":\"duplicate\"");
+    }
 }

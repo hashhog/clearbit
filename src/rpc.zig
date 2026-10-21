@@ -9915,8 +9915,12 @@ pub const RpcServer = struct {
     const KnownSubmit = enum { unknown, duplicate, duplicate_invalid };
 
     /// submitblock's answer for a block hash the node already knows (see
-    /// handleSubmitBlock).  Failed = the durable invalidateblock mark, a
-    /// BLOCK_FAILED_VALID/CHILD index entry, or the P2P layer's failed set.
+    /// handleSubmitBlock).  Failed = the durable invalidateblock mark or a
+    /// BLOCK_FAILED_VALID/CHILD index entry: exactly what reconsiderblock
+    /// clears.  The P2P layer's failed_blocks set is NOT consulted: it is
+    /// append-only (reconsiderblock never clears it), so a block made valid
+    /// again would answer duplicate-invalid forever and never connect (Core
+    /// re-processes a block whose index entry is no longer failed).
     /// Duplicate = connected on the active chain.
     fn knownBlockSubmitAnswer(self: *RpcServer, hash: *const types.Hash256) KnownSubmit {
         if (self.chain_state.isBlockMarkedInvalid(hash)) return .duplicate_invalid;
@@ -9925,7 +9929,6 @@ pub const RpcServer = struct {
                 if (e.status.isInvalid()) return .duplicate_invalid;
             }
         }
-        if (self.peer_manager.failed_blocks.contains(hash.*)) return .duplicate_invalid;
         if (self.peer_manager.isOnActiveChain(hash)) return .duplicate;
         return .unknown;
     }
