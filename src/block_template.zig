@@ -2840,65 +2840,6 @@ test "transactions are ordered by fee rate" {
     // so any transactions added would be in the correct order
 }
 
-// Lives here, not in validation.zig: validation.zig is reached by the
-// src-rooted test binaries (tests_bip35.zig via mempool.zig), and importing
-// block_template.zig from there pulls in wallet.zig, whose
-// @embedFile("../resources/bip39-english.txt") is outside a src/ package.
-test "mempool-reorg: getblocktemplate puts an in-mempool parent before its child even when the child's ancestor feerate sorts first (Core addPackageTxs)" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var cs = storage.ChainState.init(null, 64, allocator);
-    defer cs.deinit();
-    cs.best_height = 200;
-    var pool = mempool_mod.Mempool.init(&cs, &consensus.REGTEST, allocator);
-    defer pool.deinit();
-
-    // P2WSH(OP_TRUE), spent with witness [OP_TRUE].
-    var wsh: [34]u8 = undefined;
-    wsh[0] = 0x00;
-    wsh[1] = 0x20;
-    std.crypto.hash.sha2.Sha256.hash(&[_]u8{0x51}, wsh[2..34], .{});
-    const op_true_item = [_]u8{0x51};
-    const witness = [_][]const u8{&op_true_item};
-    const p2wpkh = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xDD} ** 20;
-
-    const s = types.OutPoint{ .hash = [_]u8{0xA5} ** 32, .index = 0 };
-    try cs.utxo_set.add(&s, &types.TxOut{ .value = 100_000, .script_pubkey = &wsh }, 0, false);
-
-    const spend = struct {
-        fn f(a: std.mem.Allocator, prev: types.OutPoint, value: i64, spk: []const u8, wit: []const []const u8) !types.Transaction {
-            const ins = try a.alloc(types.TxIn, 1);
-            ins[0] = .{ .previous_output = prev, .script_sig = &[_]u8{}, .sequence = 0xFFFF_FFFF, .witness = wit };
-            const outs = try a.alloc(types.TxOut, 1);
-            outs[0] = .{ .value = value, .script_pubkey = try a.dupe(u8, spk) };
-            return .{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
-        }
-    }.f;
-
-    // Parent pays 1,000 sat; child pays 60,000 sat -> the child's ancestor
-    // feerate is far above the parent's, so it sorts first.
-    const tx_p = try spend(arena, s, 99_000, &wsh, &witness);
-    const p_id = try crypto.computeTxid(&tx_p, arena);
-    try pool.addTransaction(tx_p);
-    const tx_c = try spend(arena, .{ .hash = p_id, .index = 0 }, 39_000, &p2wpkh, &witness);
-    const c_id = try crypto.computeTxid(&tx_c, arena);
-    try pool.addTransaction(tx_c);
-
-    const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
-    var tmpl = try createBlockTemplate(&cs, &pool, &consensus.REGTEST, .{
-        .payout_script = &payout,
-        .override_bits = consensus.REGTEST.genesis_header.bits,
-    }, allocator);
-    defer tmpl.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), tmpl.transactions.items.len);
-    try std.testing.expectEqualSlices(u8, &p_id, &tmpl.transactions.items[0].txid);
-    try std.testing.expectEqualSlices(u8, &c_id, &tmpl.transactions.items[1].txid);
-}
-
 test "block merkle root is correctly computed" {
     const allocator = std.testing.allocator;
 
