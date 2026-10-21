@@ -15007,6 +15007,364 @@ test "mempool-reorg: getblocktemplate puts an in-mempool parent before its child
 }
 
 // ============================================================================
+// Cluster trim on reorg refill (Core TxGraphImpl::Trim)
+// ============================================================================
+//
+// MaybeUpdateMempoolForReorg re-adds disconnected txs with bypass_limits,
+// then UpdateTransactionsFromBlock links in-mempool children. That link can
+// build a cluster bigger than DEFAULT_CLUSTER_LIMIT (64) or
+// DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000*4 (404_000 WU). Core's Trim then drops
+// txs from the worst (lowest chunk-feerate) chunks, plus their descendants,
+// until every cluster fits. Trim runs once after the re-adds of that reorg.
+
+fn mrSeedCoinValue(cs: *storage.ChainState, tag: u8, value: i64, spk: []const u8) !types.OutPoint {
+    const op = types.OutPoint{ .hash = [_]u8{tag} ** 32, .index = 0 };
+    const out = types.TxOut{ .value = value, .script_pubkey = spk };
+    try cs.utxo_set.add(&op, &out, 0, false);
+    return op;
+}
+
+fn mrFanout(a: std.mem.Allocator, prev: types.OutPoint, values: []const i64, spk: []const u8) !types.Transaction {
+    const ins = try a.alloc(types.TxIn, 1);
+    ins[0] = .{ .previous_output = prev, .script_sig = &[_]u8{}, .sequence = 0xFFFF_FFFF, .witness = &mr_op_true_witness };
+    const outs = try a.alloc(types.TxOut, values.len);
+    for (values, 0..) |v, i| {
+        outs[i] = .{ .value = v, .script_pubkey = try a.dupe(u8, spk) };
+    }
+    return .{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+}
+
+/// OP_RETURN PUSHDATA2 payload. `fill` is the repeated byte so two scripts of
+/// the same length still hash to different txids.
+fn mrNullScript(a: std.mem.Allocator, data_len: usize, fill: u8) ![]u8 {
+    const bytes = try a.alloc(u8, 4 + data_len);
+    bytes[0] = 0x6a;
+    bytes[1] = 0x4d;
+    bytes[2] = @intCast(data_len & 0xff);
+    bytes[3] = @intCast((data_len >> 8) & 0xff);
+    @memset(bytes[4..], fill);
+    return bytes;
+}
+
+fn mrHeavySpend(
+    a: std.mem.Allocator,
+    prev: types.OutPoint,
+    spendable_value: ?i64,
+    spendable_spk: []const u8,
+    data_len: usize,
+    fill: u8,
+) !types.Transaction {
+    const nout: usize = if (spendable_value != null) 2 else 1;
+    const ins = try a.alloc(types.TxIn, 1);
+    ins[0] = .{ .previous_output = prev, .script_sig = &[_]u8{}, .sequence = 0xFFFF_FFFF, .witness = &mr_op_true_witness };
+    const outs = try a.alloc(types.TxOut, nout);
+    var i: usize = 0;
+    if (spendable_value) |v| {
+        outs[i] = .{ .value = v, .script_pubkey = try a.dupe(u8, spendable_spk) };
+        i += 1;
+    }
+    outs[i] = .{ .value = 0, .script_pubkey = try mrNullScript(a, data_len, fill) };
+    return .{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+}
+
+const MrEnv = struct {
+    allocator: std.mem.Allocator,
+    arena_state: std.heap.ArenaAllocator,
+    tmp_dir: std.testing.TmpDir,
+    path: []u8,
+    db: storage.Database,
+    cs: storage.ChainState,
+    pool: mr_mempool.Mempool,
+    manager: ChainManager,
+    genesis: *BlockIndexEntry,
+
+    fn deinit(self: *MrEnv) void {
+        self.manager.deinit();
+        self.pool.deinit();
+        self.cs.deinit();
+        self.db.close();
+        self.allocator.free(self.path);
+        self.tmp_dir.cleanup();
+        self.arena_state.deinit();
+    }
+};
+
+fn mrOpen(allocator: std.mem.Allocator) !*MrEnv {
+    const env = try allocator.create(MrEnv);
+    errdefer allocator.destroy(env);
+    env.allocator = allocator;
+    env.arena_state = std.heap.ArenaAllocator.init(allocator);
+    env.tmp_dir = std.testing.tmpDir(.{});
+    errdefer env.tmp_dir.cleanup();
+    env.path = try env.tmp_dir.dir.realpathAlloc(allocator, ".");
+    errdefer allocator.free(env.path);
+    env.db = try storage.Database.open(env.path, 64, allocator);
+    errdefer env.db.close();
+    env.cs = storage.ChainState.init(&env.db, 64, allocator);
+    env.cs.wireUtxoParent();
+    env.pool = mr_mempool.Mempool.init(&env.cs, &consensus.REGTEST, allocator);
+    env.manager = ChainManager.init(&env.cs, &env.pool, allocator);
+    env.genesis = try mrGenesis(&env.manager);
+    return env;
+}
+
+fn mrFreePoolTxs(env: *MrEnv, ids: []const types.Hash256) void {
+    for (ids) |id| {
+        if (env.pool.entries.get(id)) |e| serialize.freeTransaction(env.allocator, &e.tx);
+    }
+}
+
+fn mrHashGt(a: types.Hash256, b: types.Hash256) bool {
+    return std.mem.order(u8, &a, &b) == .gt;
+}
+
+test "mempool-reorg: invalidateblock trims a 65-tx cluster to 64, dropping the lowest-chunk-feerate child (Core TxGraph::Trim)" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const seed = try mrSeedCoinValue(&env.cs, 0xB1, 3_000_000, &wsh);
+
+    // Parent pays child i a value whose fee (value - 10_000) rises with i.
+    // Every child is the same shape, so child 0 is the unique lowest chunk feerate.
+    const child_out: i64 = 10_000;
+    var values: [64]i64 = undefined;
+    for (0..64) |i| values[i] = child_out + @as(i64, @intCast((i + 1) * 1000));
+    const tx_p = try mrFanout(arena, seed, &values, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const h1 = mrHash(1, 0xC1);
+    const b1 = try mrBlock(arena, env.genesis.hash, 0xC1, &.{tx_p});
+    try mrStore(&env.cs, h1, &b1, 1, true);
+    const e1 = try mrIndex(&env.manager, env.genesis, h1, &b1, 0x40, 1);
+    env.manager.active_tip = e1;
+
+    var child_ids: [64]types.Hash256 = undefined;
+    for (0..64) |i| {
+        const tx_c = try mrSpend(arena, .{ .hash = p_id, .index = @intCast(i) }, child_out, &MR_P2WPKH);
+        child_ids[i] = mrTxid(arena, &tx_c);
+        try env.pool.addTransaction(tx_c);
+    }
+    try std.testing.expectEqual(@as(usize, 64), env.pool.entries.count());
+
+    try env.manager.invalidateBlock(&h1);
+    try std.testing.expectEqual(@as(u32, 0), env.cs.best_height);
+
+    // Parent + 63 children. child[0] (lowest fee, same size) is the one Trim drops.
+    try std.testing.expect(env.pool.entries.contains(p_id));
+    try std.testing.expect(!env.pool.entries.contains(child_ids[0]));
+    for (child_ids[1..]) |id| try std.testing.expect(env.pool.entries.contains(id));
+    try std.testing.expectEqual(@as(usize, 64), env.pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 64), env.pool.getClusterSize(p_id));
+    try std.testing.expectEqual(@as(usize, 64), env.pool.entries.get(p_id).?.descendant_count);
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.get(child_ids[1]).?.ancestor_count);
+    mrFreePoolTxs(env, &.{p_id});
+}
+
+test "mempool-reorg: invalidateblock keeps a parent and 63 children (cluster of 64 is within Core's limit)" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const seed = try mrSeedCoinValue(&env.cs, 0xB2, 3_000_000, &wsh);
+
+    const child_out: i64 = 10_000;
+    var values: [63]i64 = undefined;
+    for (0..63) |i| values[i] = child_out + @as(i64, @intCast((i + 1) * 1000));
+    const tx_p = try mrFanout(arena, seed, &values, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const h1 = mrHash(1, 0xC2);
+    const b1 = try mrBlock(arena, env.genesis.hash, 0xC2, &.{tx_p});
+    try mrStore(&env.cs, h1, &b1, 1, true);
+    const e1 = try mrIndex(&env.manager, env.genesis, h1, &b1, 0x40, 1);
+    env.manager.active_tip = e1;
+
+    var child_ids: [63]types.Hash256 = undefined;
+    for (0..63) |i| {
+        const tx_c = try mrSpend(arena, .{ .hash = p_id, .index = @intCast(i) }, child_out, &MR_P2WPKH);
+        child_ids[i] = mrTxid(arena, &tx_c);
+        try env.pool.addTransaction(tx_c);
+    }
+
+    try env.manager.invalidateBlock(&h1);
+
+    try std.testing.expect(env.pool.entries.contains(p_id));
+    for (child_ids) |id| try std.testing.expect(env.pool.entries.contains(id));
+    try std.testing.expectEqual(@as(usize, 64), env.pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 64), env.pool.getClusterSize(p_id));
+    mrFreePoolTxs(env, &.{p_id});
+}
+
+test "mempool-reorg: invalidateblock trims the lower-feerate heavy child when cluster weight exceeds 404000 WU" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    // Low child fee 50_000 over ~250_000 WU; high child fee 4_000_000 over ~200_000 WU.
+    const low_value: i64 = 50_000;
+    const high_value: i64 = 4_000_000;
+    const seed = try mrSeedCoinValue(&env.cs, 0xB3, low_value + high_value + 20_000, &wsh);
+
+    const tx_p = try mrFanout(arena, seed, &.{ low_value, high_value }, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const h1 = mrHash(1, 0xC3);
+    const b1 = try mrBlock(arena, env.genesis.hash, 0xC3, &.{tx_p});
+    try mrStore(&env.cs, h1, &b1, 1, true);
+    const e1 = try mrIndex(&env.manager, env.genesis, h1, &b1, 0x40, 1);
+    env.manager.active_tip = e1;
+
+    // data_len chosen so weight = 269 + 4*data_len (1-in, 1 OP_RETURN, witness).
+    const tx_low = try mrHeavySpend(arena, .{ .hash = p_id, .index = 0 }, null, &wsh, 62_433, 0x11);
+    const low_id = mrTxid(arena, &tx_low);
+    try env.pool.addTransaction(tx_low);
+    const tx_high = try mrHeavySpend(arena, .{ .hash = p_id, .index = 1 }, null, &wsh, 49_933, 0x22);
+    const high_id = mrTxid(arena, &tx_high);
+    try env.pool.addTransaction(tx_high);
+
+    const w_low = env.pool.entries.get(low_id).?.weight;
+    const w_high = env.pool.entries.get(high_id).?.weight;
+    try std.testing.expect(w_low > w_high);
+    try std.testing.expect(env.pool.entries.get(low_id).?.fee * @as(i64, @intCast(w_high)) <
+        env.pool.entries.get(high_id).?.fee * @as(i64, @intCast(w_low)));
+
+    try env.manager.invalidateBlock(&h1);
+
+    try std.testing.expect(env.pool.entries.contains(p_id));
+    try std.testing.expect(env.pool.entries.contains(high_id));
+    try std.testing.expect(!env.pool.entries.contains(low_id));
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.count());
+    try std.testing.expect(env.pool.cluster_union.?.setWeightTotal(env.pool.txid_to_index.get(p_id).?) <= mr_mempool.MAX_CLUSTER_WEIGHT);
+    mrFreePoolTxs(env, &.{p_id});
+}
+
+test "mempool-reorg: reorg trim drops the lowest chunk-feerate tx, not the topological tail or highest txid" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    // A is a low-fee child of P with a high-fee descendant D, so {A,D} is one
+    // high chunk. B is a sibling with a worse chunk feerate and enough weight
+    // that the merged cluster exceeds 404_000 WU. D is added last, is the
+    // deepest tx, and has the highest txid — Trim must still drop B.
+    const a_fee: i64 = 20_000;
+    const d_fee: i64 = 6_000_000;
+    const b_fee: i64 = 40_000;
+    const a_in = d_fee + a_fee;
+    const seed = try mrSeedCoinValue(&env.cs, 0xB4, a_in + b_fee + 20_000, &wsh);
+
+    const tx_p = try mrFanout(arena, seed, &.{ a_in, b_fee }, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const h1 = mrHash(1, 0xC4);
+    const b1 = try mrBlock(arena, env.genesis.hash, 0xC4, &.{tx_p});
+    try mrStore(&env.cs, h1, &b1, 1, true);
+    const e1 = try mrIndex(&env.manager, env.genesis, h1, &b1, 0x40, 1);
+    env.manager.active_tip = e1;
+
+    // A: 2 outputs (spendable + OP_RETURN). weight = 441 + 4*data_len.
+    const tx_a = try mrHeavySpend(arena, .{ .hash = p_id, .index = 0 }, d_fee, &wsh, 37_390, 0x31);
+    const a_id = mrTxid(arena, &tx_a);
+    try env.pool.addTransaction(tx_a);
+    const tx_b = try mrHeavySpend(arena, .{ .hash = p_id, .index = 1 }, null, &wsh, 62_433, 0x32);
+    const b_id = mrTxid(arena, &tx_b);
+    try env.pool.addTransaction(tx_b);
+
+    var tx_d: types.Transaction = undefined;
+    var d_id: types.Hash256 = undefined;
+    var fill: u16 = 1;
+    while (fill < 256) : (fill += 1) {
+        tx_d = try mrHeavySpend(arena, .{ .hash = a_id, .index = 0 }, null, &wsh, 19_933, @intCast(fill));
+        d_id = mrTxid(arena, &tx_d);
+        if (mrHashGt(d_id, a_id) and mrHashGt(d_id, b_id) and mrHashGt(d_id, p_id)) break;
+    }
+    try std.testing.expect(mrHashGt(d_id, b_id));
+    try std.testing.expect(mrHashGt(d_id, a_id));
+    try std.testing.expect(mrHashGt(d_id, p_id));
+    try env.pool.addTransaction(tx_d);
+
+    const chunk_ad_fee = env.pool.entries.get(a_id).?.fee + env.pool.entries.get(d_id).?.fee;
+    const chunk_ad_w = env.pool.entries.get(a_id).?.weight + env.pool.entries.get(d_id).?.weight;
+    const b_fee_w = env.pool.entries.get(b_id).?.fee;
+    const b_w = env.pool.entries.get(b_id).?.weight;
+    // {A,D} chunk feerate beats B's own feerate (cross-multiply, weight units).
+    try std.testing.expect(chunk_ad_fee * @as(i64, @intCast(b_w)) > b_fee_w * @as(i64, @intCast(chunk_ad_w)));
+
+    try env.manager.invalidateBlock(&h1);
+
+    try std.testing.expect(env.pool.entries.contains(p_id));
+    try std.testing.expect(env.pool.entries.contains(a_id));
+    try std.testing.expect(env.pool.entries.contains(d_id));
+    try std.testing.expect(!env.pool.entries.contains(b_id));
+    try std.testing.expectEqual(@as(usize, 3), env.pool.entries.count());
+    // D is the topological tail (ancestor depth 3) and was kept.
+    try std.testing.expectEqual(@as(usize, 3), env.pool.entries.get(d_id).?.ancestor_count);
+    try std.testing.expect(env.pool.cluster_union.?.setWeightTotal(env.pool.txid_to_index.get(p_id).?) <= mr_mempool.MAX_CLUSTER_WEIGHT);
+    mrFreePoolTxs(env, &.{p_id});
+}
+
+test "mempool-reorg: multi-block invalidateblock trims once the parent is relinked to in-mempool children" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const seed = try mrSeedCoinValue(&env.cs, 0xB5, 3_000_000, &wsh);
+
+    // Output i's child fee rises with i. Output 63 (highest fee) is confirmed
+    // in block 2; outputs 0..62 sit in the mempool. Invalidating block 1
+    // disconnects both blocks. The merged cluster is 65; Trim drops child 0.
+    const child_out: i64 = 10_000;
+    var values: [64]i64 = undefined;
+    for (0..64) |i| values[i] = child_out + @as(i64, @intCast((i + 1) * 1000));
+    const tx_p = try mrFanout(arena, seed, &values, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const h1 = mrHash(1, 0xC5);
+    const b1 = try mrBlock(arena, env.genesis.hash, 0xC5, &.{tx_p});
+    try mrStore(&env.cs, h1, &b1, 1, true);
+    const e1 = try mrIndex(&env.manager, env.genesis, h1, &b1, 0x40, 1);
+    env.manager.active_tip = e1;
+
+    const tx_top = try mrSpend(arena, .{ .hash = p_id, .index = 63 }, child_out, &wsh);
+    const top_id = mrTxid(arena, &tx_top);
+    const h2 = mrHash(2, 0xC5);
+    const b2 = try mrBlock(arena, h1, 0xC6, &.{tx_top});
+    try mrStore(&env.cs, h2, &b2, 2, true);
+    const e2 = try mrIndex(&env.manager, e1, h2, &b2, 0x80, 2);
+    env.manager.active_tip = e2;
+
+    var child_ids: [63]types.Hash256 = undefined;
+    for (0..63) |i| {
+        const tx_c = try mrSpend(arena, .{ .hash = p_id, .index = @intCast(i) }, child_out, &MR_P2WPKH);
+        child_ids[i] = mrTxid(arena, &tx_c);
+        try env.pool.addTransaction(tx_c);
+    }
+    try std.testing.expectEqual(@as(usize, 63), env.pool.entries.count());
+
+    try env.manager.invalidateBlock(&h1);
+    try std.testing.expectEqual(@as(u32, 0), env.cs.best_height);
+
+    try std.testing.expect(env.pool.entries.contains(p_id));
+    try std.testing.expect(env.pool.entries.contains(top_id));
+    try std.testing.expect(!env.pool.entries.contains(child_ids[0]));
+    for (child_ids[1..]) |id| try std.testing.expect(env.pool.entries.contains(id));
+    try std.testing.expectEqual(@as(usize, 64), env.pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 64), env.pool.getClusterSize(p_id));
+    mrFreePoolTxs(env, &.{ p_id, top_id });
+}
+
+// ============================================================================
 // wave-4 audit: same-block coinbase spend — HIGH consensus false-accept fix
 // ============================================================================
 //
