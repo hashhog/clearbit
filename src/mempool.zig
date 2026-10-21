@@ -999,6 +999,13 @@ pub const Mempool = struct {
     /// cs_main.  Before 2026-10-07 only RPC readers took it (audit CB-3).
     mutex: chain_lock.RecursiveMutex,
 
+    /// Core ATMP `bypass_limits`: set (under `mutex`) only while
+    /// `updateForReorg` re-admits transactions from disconnected blocks.
+    /// Skips the fee floor (min relay / rolling minimum) and the size-limit
+    /// eviction; every other check still runs.  `updateForReorg` trims the
+    /// pool afterwards (Core LimitMempoolSize).
+    bypass_limits: bool = false,
+
     /// Fee estimator for smart fee estimation.
     fee_estimator: FeeEstimator,
 
@@ -1358,7 +1365,7 @@ pub const Mempool = struct {
         // FIX-72 / W120 BUG-11: include any pre-set priority delta on this txid
         // (set via `prioritisetransaction` before broadcast). Core does this via
         // `CheckFeeRate(ws.m_vsize, ws.m_modified_fees, state)` at validation.cpp:948.
-        if (total_in > 0) {
+        if (total_in > 0 and !self.bypass_limits) {
             const min_fee_sat_kvb = @as(f64, @floatFromInt(self.getMinFee()));
             const modified_fee = fee + self.applyDelta(tx_hash);
             const modified_fee_rate: f64 = if (vsize > 0)
@@ -1480,7 +1487,7 @@ pub const Mempool = struct {
         }
 
         // 10. Check mempool size limit
-        if (self.total_size + vsize > MAX_MEMPOOL_SIZE) {
+        if (!self.bypass_limits and self.total_size + vsize > MAX_MEMPOOL_SIZE) {
             // Try to evict lowest-fee-rate transactions
             self.evict(vsize) catch return MempoolError.MempoolFull;
         }
@@ -2073,6 +2080,20 @@ pub const Mempool = struct {
             // (Core: CBlockPolicyEstimator::processBlockTx via MempoolTransactionsRemovedForBlock).
             self.fee_estimator.confirmTransaction(tx_hash, block_height);
             self.removeTransaction(tx_hash);
+            // Core CTxMemPool::removeForBlock -> removeConflicts: any OTHER
+            // mempool tx spending an input this block tx spends is now a
+            // double spend of a confirmed coin; it goes with all its
+            // descendants (MemPoolRemovalReason::CONFLICT).  Without this a
+            // P2P block / reorg left the conflicting tx (and its children) in
+            // the pool and in the next getblocktemplate.
+            if (tx.isCoinbase()) continue;
+            for (tx.inputs) |input| {
+                if (self.spenders.get(input.previous_output)) |conflict| {
+                    if (!std.mem.eql(u8, &conflict, &tx_hash) and self.entries.contains(conflict)) {
+                        self.removeTransactionWithDescendants(conflict);
+                    }
+                }
+            }
         }
         // Update estimator state for the new block: apply decay, advance height.
         // Core: CBlockPolicyEstimator::processBlock() via UpdateMovingAverages.
@@ -2109,39 +2130,243 @@ pub const Mempool = struct {
     /// block.
     pub fn blockDisconnected(self: *Mempool, txs: []const types.Transaction) void {
         // Reads the coin view: cs_main first, then mempool.cs (Core ATMP:
-        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).
+        // AssertLockHeld(cs_main); LOCK(m_pool.cs)).  Re-admission only; the
+        // chain paths use `updateForReorg`, which also removes conflicts,
+        // links in-mempool children and runs removeForReorg.
         self.lockChainThenPool();
         defer self.unlockPoolThenChain();
-        for (txs, 0..) |tx, i| {
-            // Skip the coinbase (always at index 0; coinbases can't
-            // enter the mempool anyway).
+        for (txs, 0..) |*tx, i| {
+            // Skip the coinbase (always at index 0).
             if (i == 0) continue;
+            _ = self.readmitDisconnectedTx(tx);
+        }
+    }
 
-            // Round-trip via serialize so the mempool's MempoolEntry
-            // ends up with a tx whose script_sig / script_pubkey /
-            // witness slices live in fresh allocator-owned buffers.
-            var tx_writer = serialize.Writer.init(self.allocator);
-            serialize.writeTransaction(&tx_writer, &tx) catch {
-                tx_writer.deinit();
-                continue;
-            };
-            const buf = tx_writer.toOwnedSlice() catch {
-                tx_writer.deinit();
-                continue;
-            };
-            defer self.allocator.free(buf);
+    /// Re-admit one transaction from a disconnected block (Core
+    /// MaybeUpdateMempoolForReorg -> AcceptToMemoryPool(bypass_limits=true)).
+    /// The tx is round-tripped through serialize so the mempool entry owns its
+    /// slices independently of the caller's block.  Returns true when the tx
+    /// is in the pool afterwards as a NEW entry.  Caller holds both locks.
+    fn readmitDisconnectedTx(self: *Mempool, tx: *const types.Transaction) bool {
+        var tx_writer = serialize.Writer.init(self.allocator);
+        serialize.writeTransaction(&tx_writer, tx) catch {
+            tx_writer.deinit();
+            return false;
+        };
+        const buf = tx_writer.toOwnedSlice() catch {
+            tx_writer.deinit();
+            return false;
+        };
+        defer self.allocator.free(buf);
+        var tx_reader = serialize.Reader{ .data = buf };
+        var owned_tx = serialize.readTransaction(&tx_reader, self.allocator) catch return false;
 
-            var tx_reader = serialize.Reader{ .data = buf };
-            var owned_tx = serialize.readTransaction(&tx_reader, self.allocator) catch continue;
+        const prev_bypass = self.bypass_limits;
+        self.bypass_limits = true;
+        defer self.bypass_limits = prev_bypass;
+        if (self.addTransaction(owned_tx)) |_| {
+            return true;
+        } else |_| {
+            serialize.freeTransaction(self.allocator, &owned_tx);
+            return false;
+        }
+    }
 
-            // addTransaction failure → silent free (camlcoin parity).
-            // Any tx that no longer fits the standardness / UTXO / dup
-            // gates drops on the floor.  Successful add transfers
-            // ownership of owned_tx into the mempool entry.
-            const accepted = if (self.addTransaction(owned_tx)) |_| true else |_| false;
-            if (!accepted) {
-                serialize.freeTransaction(self.allocator, &owned_tx);
+    /// Core CTxMemPool::removeRecursive for a tx that may or may not be in the
+    /// pool: the tx itself (if present) and every in-mempool spender of any of
+    /// its outputs, each with all descendants.  Used when a disconnected tx is
+    /// not re-admitted, so its in-mempool children (now orphans) go too.
+    fn removeRecursiveForTx(self: *Mempool, txid: types.Hash256, n_outputs: usize) void {
+        if (self.entries.contains(txid)) {
+            self.removeTransactionWithDescendants(txid);
+            return;
+        }
+        var i: usize = 0;
+        while (i < n_outputs) : (i += 1) {
+            const op = types.OutPoint{ .hash = txid, .index = @intCast(i) };
+            if (self.spenders.get(op)) |child| {
+                if (self.entries.contains(child)) self.removeTransactionWithDescendants(child);
             }
+        }
+    }
+
+    /// Core CTxMemPool::UpdateTransactionsFromBlock: a re-admitted tx may
+    /// already have in-mempool children (they were admitted while it was
+    /// confirmed).  addTransaction assumes a new entry has none, so link
+    /// them now: children map, cluster union, and the cached ancestor /
+    /// descendant aggregates of every entry whose relatives changed.
+    fn updateTransactionsFromBlock(self: *Mempool, readded: []const types.Hash256) void {
+        var affected = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer affected.deinit();
+        for (readded) |parent| {
+            const pe = self.entries.get(parent) orelse continue;
+            var linked_any = false;
+            for (0..pe.tx.outputs.len) |i| {
+                const op = types.OutPoint{ .hash = parent, .index = @intCast(i) };
+                const child = self.spenders.get(op) orelse continue;
+                if (!self.entries.contains(child)) continue;
+                const gop = self.children.getOrPut(parent) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(types.Hash256).init(self.allocator);
+                var dup = false;
+                for (gop.value_ptr.items) |c| {
+                    if (std.mem.eql(u8, &c, &child)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                gop.value_ptr.append(child) catch continue;
+                linked_any = true;
+                if (self.txid_to_index.get(parent)) |pi| {
+                    if (self.txid_to_index.get(child)) |ci| {
+                        if (self.cluster_union) |*uf| _ = uf.unite(pi, ci);
+                    }
+                }
+            }
+            if (!linked_any) continue;
+            // Everything related to `parent` may have stale aggregates.
+            affected.put(parent, {}) catch {};
+            const descs = self.getDescendantTxids(parent);
+            defer self.allocator.free(descs);
+            for (descs) |d| affected.put(d, {}) catch {};
+            var anc_queue = std.ArrayList(types.Hash256).init(self.allocator);
+            defer anc_queue.deinit();
+            anc_queue.append(parent) catch {};
+            while (anc_queue.popOrNull()) |cur| {
+                const ce = self.entries.get(cur) orelse continue;
+                for (ce.tx.inputs) |inp| {
+                    const ph = inp.previous_output.hash;
+                    if (!self.entries.contains(ph) or affected.contains(ph)) continue;
+                    affected.put(ph, {}) catch {};
+                    anc_queue.append(ph) catch {};
+                }
+            }
+        }
+        if (affected.count() == 0) return;
+        self.linearization_dirty = true;
+        var it = affected.keyIterator();
+        while (it.next()) |k| self.recomputeRelativeAggregates(k.*);
+    }
+
+    /// Recompute an entry's ancestor_* and descendant_* aggregates from the
+    /// current graph (self included, as addTransaction initialises them).
+    fn recomputeRelativeAggregates(self: *Mempool, txid: types.Hash256) void {
+        const e = self.entries.get(txid) orelse return;
+        var seen = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer seen.deinit();
+        var queue = std.ArrayList(types.Hash256).init(self.allocator);
+        defer queue.deinit();
+
+        // Ancestors (via inputs).
+        var a_count: usize = 1;
+        var a_size: usize = e.vsize;
+        var a_fees: i64 = e.fee;
+        queue.append(txid) catch return;
+        seen.put(txid, {}) catch return;
+        while (queue.popOrNull()) |cur| {
+            const ce = self.entries.get(cur) orelse continue;
+            for (ce.tx.inputs) |inp| {
+                const ph = inp.previous_output.hash;
+                if (seen.contains(ph)) continue;
+                const pe = self.entries.get(ph) orelse continue;
+                seen.put(ph, {}) catch continue;
+                a_count += 1;
+                a_size += pe.vsize;
+                a_fees += pe.fee;
+                queue.append(ph) catch {};
+            }
+        }
+
+        // Descendants (via the children map).
+        seen.clearRetainingCapacity();
+        queue.clearRetainingCapacity();
+        var d_count: usize = 1;
+        var d_size: usize = e.vsize;
+        var d_fees: i64 = e.fee;
+        queue.append(txid) catch return;
+        seen.put(txid, {}) catch return;
+        while (queue.popOrNull()) |cur| {
+            const kids = self.children.get(cur) orelse continue;
+            for (kids.items) |k| {
+                if (seen.contains(k)) continue;
+                const ke = self.entries.get(k) orelse continue;
+                seen.put(k, {}) catch continue;
+                d_count += 1;
+                d_size += ke.vsize;
+                d_fees += ke.fee;
+                queue.append(k) catch {};
+            }
+        }
+
+        e.ancestor_count = a_count;
+        e.ancestor_size = a_size;
+        e.ancestor_fees = a_fees;
+        e.descendant_count = d_count;
+        e.descendant_size = d_size;
+        e.descendant_fees = d_fees;
+    }
+
+    /// The mempool side of a chain-tip change, in Bitcoin Core's order, under
+    /// cs_main -> mempool.cs so no RPC can observe the pool disagreeing with
+    /// the tip:
+    ///   1. ConnectTip -> removeForBlock for every newly connected block
+    ///      (`connected`, ascending height): confirmed txs and their
+    ///      CONFLICTS (with descendants) leave the pool; a tx confirmed on the
+    ///      new branch is also dropped from the disconnected set
+    ///      (DisconnectedBlockTransactions::removeForBlock).
+    ///   2. MaybeUpdateMempoolForReorg: the disconnected blocks'
+    ///      non-coinbase txs (`disconnected_tip_first`, most recent block
+    ///      first like Core's disconnectpool) are re-accepted EARLIEST FIRST
+    ///      with bypass_limits; a tx that is not re-accepted (or
+    ///      `add_to_mempool` false) is removeRecursive'd so its in-mempool
+    ///      children go too; UpdateTransactionsFromBlock links re-added
+    ///      parents to children already in the pool; removeForReorg drops
+    ///      what is non-final / BIP-68-locked / immature at tip+1; then
+    ///      LimitMempoolSize.
+    /// Must run AFTER the chainstate is at the new tip.
+    pub fn updateForReorg(
+        self: *Mempool,
+        disconnected_tip_first: []const types.Block,
+        connected: []const storage.ChainState.ReorgBlock,
+        add_to_mempool: bool,
+    ) void {
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
+
+        var confirmed = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer confirmed.deinit();
+        for (connected) |*rb| {
+            self.removeForBlock(&rb.block);
+            for (rb.block.transactions) |*tx| {
+                const id = crypto.computeTxid(tx, self.allocator) catch continue;
+                confirmed.put(id, {}) catch {};
+            }
+        }
+
+        var readded = std.ArrayList(types.Hash256).init(self.allocator);
+        defer readded.deinit();
+        var bi: usize = disconnected_tip_first.len;
+        while (bi > 0) {
+            bi -= 1;
+            const blk = &disconnected_tip_first[bi];
+            for (blk.transactions, 0..) |*tx, i| {
+                if (i == 0) continue; // coinbase
+                const txid = crypto.computeTxid(tx, self.allocator) catch continue;
+                if (confirmed.contains(txid)) continue;
+                if (add_to_mempool and self.readmitDisconnectedTx(tx)) {
+                    readded.append(txid) catch {};
+                    continue;
+                }
+                self.removeRecursiveForTx(txid, tx.outputs.len);
+            }
+        }
+
+        self.updateTransactionsFromBlock(readded.items);
+        _ = self.removeForReorg();
+        // Core LimitMempoolSize: the bypass_limits re-adds may have pushed
+        // the pool over its size limit.
+        if (self.total_size > MAX_MEMPOOL_SIZE) {
+            self.evict(self.total_size - MAX_MEMPOOL_SIZE) catch {};
         }
     }
 
