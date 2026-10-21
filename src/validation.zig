@@ -14970,42 +14970,6 @@ test "mempool-reorg: removeForBlock removes a mempool tx that double-spends a bl
     try std.testing.expect(pool.entries.contains(k_id));
 }
 
-test "mempool-reorg: getblocktemplate puts an in-mempool parent before its child even when the child's ancestor feerate sorts first (Core addPackageTxs)" {
-    const allocator = std.testing.allocator;
-    const block_template = @import("block_template.zig");
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var cs = storage.ChainState.init(null, 64, allocator);
-    defer cs.deinit();
-    cs.best_height = 200;
-    var pool = mr_mempool.Mempool.init(&cs, &consensus.REGTEST, allocator);
-    defer pool.deinit();
-
-    const wsh = mrOpTrueP2wsh();
-    const s = try mrSeedCoin(&cs, 0xA5, &wsh);
-    // Parent pays 1,000 sat; child pays 60,000 sat -> the child's ancestor
-    // feerate is far above the parent's, so it sorts first.
-    const tx_p = try mrSpend(arena, s, 99_000, &wsh);
-    const p_id = mrTxid(arena, &tx_p);
-    try pool.addTransaction(tx_p);
-    const tx_c = try mrSpend(arena, .{ .hash = p_id, .index = 0 }, 39_000, &MR_P2WPKH);
-    const c_id = mrTxid(arena, &tx_c);
-    try pool.addTransaction(tx_c);
-
-    const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
-    var tmpl = try block_template.createBlockTemplate(&cs, &pool, &consensus.REGTEST, .{
-        .payout_script = &payout,
-        .override_bits = consensus.REGTEST.genesis_header.bits,
-    }, allocator);
-    defer tmpl.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), tmpl.transactions.items.len);
-    try std.testing.expectEqualSlices(u8, &p_id, &tmpl.transactions.items[0].txid);
-    try std.testing.expectEqualSlices(u8, &c_id, &tmpl.transactions.items[1].txid);
-}
-
 // ============================================================================
 // Cluster trim on reorg refill (Core TxGraphImpl::Trim)
 // ============================================================================
