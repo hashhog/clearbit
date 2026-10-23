@@ -1018,23 +1018,16 @@ pub fn checkBlock(
     return checkBlockPow(block, height, params, allocator, true);
 }
 
-/// CheckBlock with an explicit fCheckPOW flag, mirroring Core's
-/// `CheckBlock(block, state, params, fCheckPOW, fCheckMerkleRoot)`
-/// (validation.cpp).  `check_pow=false` bypasses ONLY the header PoW gate;
-/// every other structural check still runs.  The public `checkBlock` wrapper
-/// passes `check_pow=true` so existing callers/tests are unaffected.
-pub fn checkBlockPow(
+/// Steps 2-7b of `checkBlockPow`: merkle root, size limits, coinbase
+/// structure, per-tx CheckTransaction, block weight.  Everything here is
+/// independent of the block's height and parent, so a caller may run it
+/// before the parent is resolved (Core ProcessNewBlock runs CheckBlock before
+/// AcceptBlockHeader looks the parent up, validation.cpp).  The legacy sigop
+/// gate (step 10 of `checkBlockPow`) is `checkBlockLegacySigops`.
+pub fn checkBlockContextFree(
     block: *const types.Block,
-    height: u32,
-    params: *const consensus.NetworkParams,
     allocator: std.mem.Allocator,
-    check_pow: bool,
 ) ValidationError!void {
-    // 1. Validate header
-    if (check_pow) {
-        try checkBlockHeader(&block.header, params);
-    }
-
     // Steps 2-6 mirror Core CheckBlock's EXACT gate order (validation.cpp
     // :3936-:3968): merkle root -> size limits -> cb-missing -> cb-multiple ->
     // per-tx CheckTransaction.  The order is observable through the reject
@@ -1133,6 +1126,42 @@ pub fn checkBlockPow(
     if (weight > consensus.MAX_BLOCK_WEIGHT) {
         return ValidationError.BadBlockWeight;
     }
+}
+
+/// Legacy-sigop gate of Core CheckBlock (step 10 of `checkBlockPow`):
+/// "bad-blk-sigops".  Context-free, like `checkBlockContextFree`.
+pub fn checkBlockLegacySigops(block: *const types.Block) ValidationError!void {
+    var legacy_sigops: u64 = 0;
+    for (block.transactions) |*tx| {
+        legacy_sigops += getLegacySigOpCount(tx);
+    }
+    if (legacy_sigops * consensus.WITNESS_SCALE_FACTOR > consensus.MAX_BLOCK_SIGOPS_COST) {
+        return ValidationError.TooManySigops;
+    }
+}
+
+/// CheckBlock with an explicit fCheckPOW flag, mirroring Core's
+/// `CheckBlock(block, state, params, fCheckPOW, fCheckMerkleRoot)`
+/// (validation.cpp).  `check_pow=false` bypasses ONLY the header PoW gate;
+/// every other structural check still runs.  The public `checkBlock` wrapper
+/// passes `check_pow=true` so existing callers/tests are unaffected.
+pub fn checkBlockPow(
+    block: *const types.Block,
+    height: u32,
+    params: *const consensus.NetworkParams,
+    allocator: std.mem.Allocator,
+    check_pow: bool,
+) ValidationError!void {
+    // 1. Validate header
+    if (check_pow) {
+        try checkBlockHeader(&block.header, params);
+    }
+
+    // Steps 2-7b: the context-free part of Core CheckBlock (no height, no
+    // parent).  Split out so submitblock can run it before the parent lookup,
+    // in Core's order (ProcessNewBlock: CheckBlock, then AcceptBlockHeader's
+    // prev-blk-not-found / bad-prevblk).
+    try checkBlockContextFree(block, allocator);
 
     // 8. BIP-34: coinbase must include block height (after BIP34_HEIGHT)
     if (height >= params.bip34_height) {
@@ -1160,13 +1189,7 @@ pub fn checkBlockPow(
     // This is a conservative check - full sigop counting with P2SH and witness
     // sigops requires UTXO access and is done in connectBlock.
     // Reference: Bitcoin Core validation.cpp CheckBlock() nSigOps check
-    var legacy_sigops: u64 = 0;
-    for (block.transactions) |*tx| {
-        legacy_sigops += getLegacySigOpCount(tx);
-    }
-    if (legacy_sigops * consensus.WITNESS_SCALE_FACTOR > consensus.MAX_BLOCK_SIGOPS_COST) {
-        return ValidationError.TooManySigops;
-    }
+    try checkBlockLegacySigops(block);
 
     // 11. BIP-141 witness commitment + unexpected-witness check.
     // Mirrors Bitcoin Core's CheckWitnessMalleation called from

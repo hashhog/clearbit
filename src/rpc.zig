@@ -9933,6 +9933,52 @@ pub const RpcServer = struct {
         return .unknown;
     }
 
+    /// Is `prev` a header the node knows?  Core: LookupBlockIndex(hashPrevBlock)
+    /// — the block index holds every header (active chain, side branches,
+    /// headers-only).  clearbit's equivalents, in insertHeader's order:
+    ///   (a) lookupParentChainWork — genesis-rooted, active-chain tip,
+    ///       in-memory header_index (the headers-first store).
+    ///   (b) ChainManager.getBlock — in-memory block index (blocks/headers
+    ///       connected this session, incl. side branches).
+    ///   (c) genesis hash (covers a fresh node whose tip IS genesis).
+    ///   (d) CF_BLOCKS — persisted active-chain block bodies.
+    fn parentHeaderKnown(self: *RpcServer, prev: *const types.Hash256) bool {
+        if (self.peer_manager.lookupParentChainWork(prev) != null) return true;
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(prev) != null) return true;
+        }
+        if (std.mem.eql(u8, prev, &self.network_params.genesis_hash)) return true;
+        if (self.chain_state.utxo_set.db) |db| {
+            if (db.get(storage.CF_BLOCKS, prev) catch null) |raw_blk| {
+                self.allocator.free(raw_blk);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Is `prev` (or an ancestor of it off the active chain) failed?  Core
+    /// AcceptBlockHeader: `pindexPrev->nStatus & BLOCK_FAILED_VALID` ->
+    /// "bad-prevblk" (validation.cpp:4220-4223).  Core marks every
+    /// descendant of a failed block failed too, so its one-entry test covers
+    /// a grandchild; here the walk up the in-memory block index does the
+    /// same in case a descendant was never marked.  The walk stops at the
+    /// first block on the active chain (a connected block is not failed).
+    /// Failed = the same marks knownBlockSubmitAnswer reads (the durable
+    /// invalidateblock mark or a BLOCK_FAILED_* index entry), never the
+    /// append-only P2P failed set.
+    fn parentHeaderFailed(self: *RpcServer, prev: *const types.Hash256) bool {
+        if (self.chain_state.isBlockMarkedInvalid(prev)) return true;
+        const cm = self.chain_manager orelse return false;
+        var cursor = cm.getBlock(prev);
+        while (cursor) |e| {
+            if (e.status.isInvalid() or self.chain_state.isBlockMarkedInvalid(&e.hash)) return true;
+            if (self.peer_manager.isOnActiveChain(&e.hash)) return false;
+            cursor = e.parent;
+        }
+        return false;
+    }
+
     fn handleSubmitBlock(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Gate 6: after a fatal system fault (AbortNode) the node judges and
         // connects nothing.  Core: RPC_VERIFY_ERROR, never a BIP-22 token.
@@ -10039,6 +10085,32 @@ pub const RpcServer = struct {
         if (self.chain_manager) |cm| {
             _ = block_template.ensureIndexed(cm, self.chain_state, &block_data.header.prev_block, self.allocator);
         }
+
+        // Core ProcessNewBlock: CheckBlock (context-free), then
+        // AcceptBlockHeader resolves the parent BEFORE any contextual check:
+        // unknown -> "prev-blk-not-found", failed -> "bad-prevblk"
+        // (validation.cpp:4212-4223).  Neither block is stored.  Pre-fix, an
+        // unknown parent fell back to tip-relative height and answered
+        // "bad-cb-height"; a child of an invalidated block was stored as a
+        // side branch (answering "rejected") and connected by a later
+        // reconsiderblock — a block Core never accepted.
+        {
+            const prev = &block_data.header.prev_block;
+            const failed = self.parentHeaderFailed(prev);
+            if (failed or !self.parentHeaderKnown(prev)) {
+                validation.checkBlockHeader(&block_data.header, self.network_params) catch {
+                    return self.jsonRpcResult("\"high-hash\"", id);
+                };
+                validation.checkBlockContextFree(&block_data, self.allocator) catch |verr| {
+                    return self.submitBlockReject(validationErrToBip22(verr), id);
+                };
+                validation.checkBlockLegacySigops(&block_data) catch |verr| {
+                    return self.submitBlockReject(validationErrToBip22(verr), id);
+                };
+                return self.submitBlockReject(if (failed) "bad-prevblk" else "prev-blk-not-found", id);
+            }
+        }
+
         const submit_height: u32 = block_template.deriveSubmitHeight(
             &block_data.header.prev_block,
             self.chain_manager,
@@ -10202,34 +10274,9 @@ pub const RpcServer = struct {
         const block_hash = crypto.computeBlockHash(&header);
 
         // ── Step 2: parent (prev block) must be known to the node ───────────
-        // Core: chainman.m_blockman.LookupBlockIndex(h.hashPrevBlock).  The
-        // block index holds EVERY header the node knows (active chain + side
-        // branches + headers-only).  clearbit's equivalents, checked in the
-        // same priority insertHeader uses:
-        //   (a) lookupParentChainWork — genesis-rooted, active-chain tip,
-        //       in-memory header_index (the headers-first store).
-        //   (b) ChainManager.getBlock — in-memory block index (blocks/headers
-        //       connected this session, incl. side branches).
-        //   (c) genesis hash (covers a fresh node whose tip IS genesis).
-        //   (d) CF_BLOCKS — persisted active-chain block bodies.
+        // Core: chainman.m_blockman.LookupBlockIndex(h.hashPrevBlock).
         const prev = &header.prev_block;
-        var parent_known: bool = self.peer_manager.lookupParentChainWork(prev) != null;
-        if (!parent_known) {
-            if (self.chain_manager) |cm| {
-                if (cm.getBlock(prev) != null) parent_known = true;
-            }
-        }
-        if (!parent_known and std.mem.eql(u8, prev, &self.network_params.genesis_hash)) {
-            parent_known = true;
-        }
-        if (!parent_known) {
-            if (self.chain_state.utxo_set.db) |db| {
-                if (db.get(storage.CF_BLOCKS, prev) catch null) |raw_blk| {
-                    self.allocator.free(raw_blk);
-                    parent_known = true;
-                }
-            }
-        }
+        const parent_known = self.parentHeaderKnown(prev);
 
         if (!parent_known) {
             // Core (mining.cpp:1133):
@@ -10267,6 +10314,13 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_VERIFY_ERROR, "high-hash", id);
         };
 
+        // ── Step 4b: failed parent (Core AcceptBlockHeader "bad-prevblk",
+        // validation.cpp:4220-4223), before the contextual checks.  Pre-fix
+        // the header of a child of an invalidated block was admitted (null).
+        if (self.parentHeaderFailed(prev)) {
+            return self.jsonRpcError(RPC_VERIFY_ERROR, "bad-prevblk", id);
+        }
+
         // ── Step 5: contextual checks (Core ContextualCheckBlockHeader) ─────
         // STRICT variant: bad-diffbits + BIP-113 MTP + BIP-94 timewarp +
         // future-time, with ancestors resolved by prev-pointer walk.  Map to
@@ -10298,6 +10352,14 @@ pub const RpcServer = struct {
 
         // Success — Core returns UniValue::VNULL.
         return self.jsonRpcResult("null", id);
+    }
+
+    /// submitblock's BIP-22 reject: the reason string as the JSON result.
+    fn submitBlockReject(self: *RpcServer, reason: []const u8, id: ?std.json.Value) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        try std.fmt.format(buf.writer(), "\"{s}\"", .{reason});
+        return self.jsonRpcResult(buf.items, id);
     }
 
     /// Gate 6: a submitblock that hit a local system fault (read / write /
