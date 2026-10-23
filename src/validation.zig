@@ -15516,9 +15516,9 @@ test "mempool-reorg: invalidateblock evicts an nLockTime tx and a BIP68-locked t
     const ld_id = mrTxid(arena, &tx_ld);
     try env.pool.addTransaction(tx_ld);
     // C: v2, nSequence 1 (one-block relative lock) on P:0 + child CD.  At tip
-    // 2, P:0 is confirmed at height 2 and C may enter block 3.  Once P is back
-    // in the pool its coin counts at tip+1 = 2, so C could enter block 3 at
-    // the earliest while the next block is 2.
+    // 2, P:0 is confirmed at height 2 and C may enter block 3, the next one.
+    // Once P is back in the pool its coin counts at tip+1 = 2, so C's
+    // earliest block is still 3 while the next block is now 2.
     const tx_c = try mrSpendSeq(arena, .{ .hash = p_id, .index = 0 }, 80_000, &wsh, 1, 0);
     const c_id = mrTxid(arena, &tx_c);
     try env.pool.addTransaction(tx_c);
@@ -15528,6 +15528,125 @@ test "mempool-reorg: invalidateblock evicts an nLockTime tx and a BIP68-locked t
     try std.testing.expectEqual(@as(usize, 4), env.pool.entries.count());
 
     try env.manager.invalidateBlock(&hd2);
+    try std.testing.expectEqual(@as(u32, 1), env.cs.best_height);
+
+    try std.testing.expect(env.pool.entries.contains(p_id));
+    try std.testing.expect(!env.pool.entries.contains(l_id));
+    try std.testing.expect(!env.pool.entries.contains(ld_id));
+    try std.testing.expect(!env.pool.entries.contains(c_id));
+    try std.testing.expect(!env.pool.entries.contains(cd_id));
+    try std.testing.expectEqual(@as(usize, 1), env.pool.entries.count());
+    try mrExpectNoOrphans(env);
+    mrFreePoolTxs(env, &.{p_id});
+}
+
+// invalidateBlock also calls removeForReorg itself after its own Phase 7, so
+// the two tests above stay green if updateForReorg stops calling it.  A reorg
+// (executeReorg) has no second call, so these reorg-path twins catch that.
+// The new branch is shorter but heavier, so the tip height drops.
+
+test "mempool-reorg: a reorg to a shorter heavier branch evicts a spend of a coinbase that is immature at the new tip, with descendants (Core ActivateBestChainStep -> removeForReorg)" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const s = try mrSeedCoin(&env.cs, 0xEA, &wsh);
+    const tx_a = try mrSpend(arena, s, 90_000, &wsh);
+    const a_id = mrTxid(arena, &tx_a);
+
+    // Active blocks 1..101 (chain work = height); block 101 carries A.
+    var prev = env.genesis;
+    var cb_ids: [102]types.Hash256 = undefined;
+    var e98: *BlockIndexEntry = undefined;
+    var h: usize = 1;
+    while (h <= 101) : (h += 1) {
+        const txs: []const types.Transaction = if (h == 101) &.{tx_a} else &.{};
+        const hash = mrHash(@intCast(h), 0xDA);
+        const blk = try mrBlockPayTo(arena, prev.hash, @intCast(h), &wsh, txs);
+        cb_ids[h] = mrTxid(arena, &blk.transactions[0]);
+        try mrStore(&env.cs, hash, &blk, @intCast(h), true);
+        const entry = try mrIndex(&env.manager, prev, hash, &blk, @intCast(h), @intCast(h));
+        env.manager.active_tip = entry;
+        prev = entry;
+        if (h == 98) e98 = entry;
+    }
+
+    const tx_k = try mrSpend(arena, .{ .hash = cb_ids[1], .index = 0 }, 4_999_990_000, &wsh);
+    const k_id = mrTxid(arena, &tx_k);
+    try env.pool.addTransaction(tx_k);
+    const tx_kd = try mrSpend(arena, .{ .hash = k_id, .index = 0 }, 4_999_980_000, &MR_P2WPKH);
+    const kd_id = mrTxid(arena, &tx_kd);
+    try env.pool.addTransaction(tx_kd);
+
+    // Side branch: G99 on block 98 with more work than block 101.
+    const hg = mrHash(99, 0xDB);
+    const bg = try mrBlock(arena, e98.hash, 0xDB, &.{});
+    try mrStore(&env.cs, hg, &bg, 99, false);
+    _ = try mrIndex(&env.manager, e98, hg, &bg, 0xFF, 200);
+
+    try env.manager.activateBestChain();
+    try std.testing.expectEqualSlices(u8, &hg, &env.cs.best_hash);
+    try std.testing.expectEqual(@as(u32, 99), env.cs.best_height);
+
+    try std.testing.expect(env.pool.entries.contains(a_id));
+    try std.testing.expect(!env.pool.entries.contains(k_id));
+    try std.testing.expect(!env.pool.entries.contains(kd_id));
+    for (cb_ids[99..]) |id| try std.testing.expect(!env.pool.entries.contains(id));
+    try std.testing.expectEqual(@as(usize, 1), env.pool.entries.count());
+    try mrExpectNoOrphans(env);
+    mrFreePoolTxs(env, &.{a_id});
+}
+
+test "mempool-reorg: a reorg to a shorter heavier branch evicts an nLockTime tx and a BIP68-locked tx that are final only on the old tip, with descendants (Core ActivateBestChainStep -> removeForReorg)" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const s = try mrSeedCoin(&env.cs, 0xEB, &wsh);
+    const s_lt = try mrSeedCoin(&env.cs, 0xEC, &wsh);
+
+    // Active: E1 [cb], E2 [cb, P <- S].
+    const he1 = mrHash(1, 0xDC);
+    const be1 = try mrBlock(arena, env.genesis.hash, 0xDC, &.{});
+    try mrStore(&env.cs, he1, &be1, 1, true);
+    const e1 = try mrIndex(&env.manager, env.genesis, he1, &be1, 0x40, 1);
+    env.manager.active_tip = e1;
+    const tx_p = try mrSpend(arena, s, 90_000, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const he2 = mrHash(2, 0xDC);
+    const be2 = try mrBlock(arena, he1, 0xDD, &.{tx_p});
+    try mrStore(&env.cs, he2, &be2, 2, true);
+    const e2 = try mrIndex(&env.manager, e1, he2, &be2, 0x80, 2);
+    env.manager.active_tip = e2;
+
+    const tx_l = try mrSpendSeq(arena, s_lt, 90_000, &wsh, 0xFFFF_FFFE, 2);
+    const l_id = mrTxid(arena, &tx_l);
+    try env.pool.addTransaction(tx_l);
+    const tx_ld = try mrSpend(arena, .{ .hash = l_id, .index = 0 }, 80_000, &MR_P2WPKH);
+    const ld_id = mrTxid(arena, &tx_ld);
+    try env.pool.addTransaction(tx_ld);
+    const tx_c = try mrSpendSeq(arena, .{ .hash = p_id, .index = 0 }, 80_000, &wsh, 1, 0);
+    const c_id = mrTxid(arena, &tx_c);
+    try env.pool.addTransaction(tx_c);
+    const tx_cd = try mrSpend(arena, .{ .hash = c_id, .index = 0 }, 70_000, &MR_P2WPKH);
+    const cd_id = mrTxid(arena, &tx_cd);
+    try env.pool.addTransaction(tx_cd);
+    try std.testing.expectEqual(@as(usize, 4), env.pool.entries.count());
+
+    // Side branch: F1 on genesis with more work than E2.  Tip height 2 -> 1.
+    const hf1 = mrHash(1, 0xDE);
+    const bf1 = try mrBlock(arena, env.genesis.hash, 0xDE, &.{});
+    try mrStore(&env.cs, hf1, &bf1, 1, false);
+    _ = try mrIndex(&env.manager, env.genesis, hf1, &bf1, 0xC0, 10);
+
+    try env.manager.activateBestChain();
+    try std.testing.expectEqualSlices(u8, &hf1, &env.cs.best_hash);
     try std.testing.expectEqual(@as(u32, 1), env.cs.best_height);
 
     try std.testing.expect(env.pool.entries.contains(p_id));
