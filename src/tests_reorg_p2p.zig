@@ -3225,3 +3225,222 @@ test "tests_reorg_p2p: reconsiderblock of a failed parent — submitblock of a c
         try expectResult(r, "\"result\":\"duplicate\"");
     }
 }
+
+// Core regtest rows chain/submit/bad-prevblk, chain/reconsider/*, chain/*/final
+// and {seed,warden}_invalidated_submit/submit/bad-prevblk-*.  Core
+// AcceptBlockHeader refuses a block whose parent is BLOCK_FAILED_VALID with
+// "bad-prevblk" and does not add it to the block index
+// (validation.cpp:4220-4223).  clearbit stored the child as a side branch
+// (answering "rejected"), so the reconsiderblock of its parent then
+// connected a block Core never accepted, one block past Core's tip.
+test "tests_reorg_p2p: chain-rows — submitblock of a child of an invalidated block is bad-prevblk, is not stored, and reconsiderblock restores the old tip" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bip30SelfDupSetup(allocator, &pm, &cs, &params);
+    var cm = validation.ChainManager.init(&cs, null, allocator);
+    defer cm.deinit();
+    try cm.loadGenesis(&params);
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var server = rpc.RpcServer.init(allocator, &cs, &mempool, &pm, &params, .{});
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    var a2 = try mineIbBlock(allocator, &params, a1.hash, 2, 0, 0xA2);
+    defer serialize.freeBlock(allocator, &a2.block);
+    var c3 = try mineIbBlock(allocator, &params, a2.hash, 3, 0, 0xC3);
+    defer serialize.freeBlock(allocator, &c3.block);
+    var g3 = try mineIbBlock(allocator, &params, a2.hash, 3, 0, 0xD3);
+    defer serialize.freeBlock(allocator, &g3.block);
+    const a1_hex = try blockHex(allocator, &a1.block);
+    defer allocator.free(a1_hex);
+    const a2_hex = try blockHex(allocator, &a2.block);
+    defer allocator.free(a2_hex);
+    const c3_hex = try blockHex(allocator, &c3.block);
+    defer allocator.free(c3_hex);
+    const g3_hex = try blockHex(allocator, &g3.block);
+    defer allocator.free(g3_hex);
+    const a1_id = hashDisplayHex(a1.hash);
+    const a2_id = hashDisplayHex(a2.hash);
+
+    for ([_][]const u8{ a1_hex, a2_hex }) |h| {
+        const r = try rpcCall(&server, allocator, "submitblock", h);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 2, "after submitblock(A1, A2)");
+
+    {
+        const r = try rpcCall(&server, allocator, "invalidateblock", &a2_id);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 1, "after invalidateblock(A2)");
+
+    // Child of the invalidated tip: bad-prevblk, and not in the block index.
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", c3_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":\"bad-prevblk\"");
+    }
+    try testing.expect(cm.getBlock(&c3.hash) == null);
+    try expectTip(&cs, 1, "after submitblock(C3)");
+
+    // Its header is refused the same way (Core submitheader -> -25 bad-prevblk).
+    {
+        const hdr_hex = c3_hex[0..160];
+        const r = try rpcCall(&server, allocator, "submitheader", hdr_hex);
+        defer allocator.free(r);
+        try expectResult(r, "bad-prevblk");
+        try expectResult(r, "\"code\":-25");
+    }
+
+    // A grandchild path: invalidate A1 as well; a child of A2 (now a
+    // descendant of a failed block) is still bad-prevblk.
+    {
+        const r = try rpcCall(&server, allocator, "invalidateblock", &a1_id);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 0, "after invalidateblock(A1)");
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", g3_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":\"bad-prevblk\"");
+    }
+    try testing.expect(cm.getBlock(&g3.hash) == null);
+
+    // reconsiderblock(A1) clears A1 and its descendants: the tip is A2 again,
+    // not the refused child.
+    {
+        const r = try rpcCall(&server, allocator, "reconsiderblock", &a1_id);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 2, "after reconsiderblock(A1)");
+    try testing.expectEqualSlices(u8, &a2.hash, &cs.best_hash);
+
+    // Control: with the parent valid again the same child connects (null).
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", c3_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 3, "after resubmitting C3");
+}
+
+// Core regtest row chain/submit/prev-not-found.  Core ProcessNewBlock runs
+// CheckBlock, then AcceptBlockHeader answers "prev-blk-not-found" for an
+// unknown parent before any contextual check (validation.cpp:4212-4217).
+// clearbit guessed the height from its tip and answered "bad-cb-height".
+test "tests_reorg_p2p: chain-rows — submitblock with an unknown parent is prev-blk-not-found; a context-free defect still wins" {
+    const allocator = testing.allocator;
+    const params = consensus.REGTEST;
+    var pm = peer_mod.PeerManager.init(allocator, &params);
+    defer pm.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    bip30SelfDupSetup(allocator, &pm, &cs, &params);
+    var cm = validation.ChainManager.init(&cs, null, allocator);
+    defer cm.deinit();
+    try cm.loadGenesis(&params);
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var server = rpc.RpcServer.init(allocator, &cs, &mempool, &pm, &params, .{});
+    defer server.deinit();
+    server.setChainManager(&cm);
+
+    // Height-1 coinbase on a parent nobody has seen (the harness's block).
+    var orphan = try mineIbBlock(allocator, &params, [_]u8{0x11} ** 32, 1, 0, 0x22);
+    defer serialize.freeBlock(allocator, &orphan.block);
+    const orphan_hex = try blockHex(allocator, &orphan.block);
+    defer allocator.free(orphan_hex);
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", orphan_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":\"prev-blk-not-found\"");
+    }
+    try testing.expect(cm.getBlock(&orphan.hash) == null);
+    try expectTip(&cs, 0, "after the orphan");
+
+    // A height-5 coinbase on that unknown parent: still prev-blk-not-found
+    // (the height is never guessed).
+    var orphan5 = try mineIbBlock(allocator, &params, [_]u8{0x11} ** 32, 5, 0, 0x23);
+    defer serialize.freeBlock(allocator, &orphan5.block);
+    const orphan5_hex = try blockHex(allocator, &orphan5.block);
+    defer allocator.free(orphan5_hex);
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", orphan5_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":\"prev-blk-not-found\"");
+    }
+
+    // CheckBlock runs first: a bad merkle root on an unknown parent is
+    // bad-txnmrklroot, as in Core.
+    var bad = try mineIbBlock(allocator, &params, [_]u8{0x11} ** 32, 1, 0, 0x24);
+    defer serialize.freeBlock(allocator, &bad.block);
+    bad.block.header.merkle_root[0] ^= 0xff;
+    while (!consensus.validateProofOfWork(&bad.block.header, &params)) bad.block.header.nonce +%= 1;
+    const bad_hex = try blockHex(allocator, &bad.block);
+    defer allocator.free(bad_hex);
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", bad_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":\"bad-txnmrklroot\"");
+    }
+
+    // Control: a block on a known parent (genesis) still connects.
+    var a1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xA1);
+    defer serialize.freeBlock(allocator, &a1.block);
+    const a1_hex = try blockHex(allocator, &a1.block);
+    defer allocator.free(a1_hex);
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", a1_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":null");
+    }
+    try expectTip(&cs, 1, "after A1");
+
+    // Control: a parent known only as a stored side branch is known — its
+    // child is processed and stored, never prev-blk-not-found.  (Whether the
+    // reorg to B2 then succeeds depends on header-index state this fixture
+    // does not build; that path is covered by the reorg tests above.)
+    var b1 = try mineIbBlock(allocator, &params, params.genesis_hash, 1, 0, 0xB1);
+    defer serialize.freeBlock(allocator, &b1.block);
+    var b2 = try mineIbBlock(allocator, &params, b1.hash, 2, 0, 0xB2);
+    defer serialize.freeBlock(allocator, &b2.block);
+    const b1_hex = try blockHex(allocator, &b1.block);
+    defer allocator.free(b1_hex);
+    const b2_hex = try blockHex(allocator, &b2.block);
+    defer allocator.free(b2_hex);
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", b1_hex);
+        defer allocator.free(r);
+        try expectResult(r, "\"result\":\"inconclusive\"");
+    }
+    {
+        const r = try rpcCall(&server, allocator, "submitblock", b2_hex);
+        defer allocator.free(r);
+        try testing.expect(std.mem.indexOf(u8, r, "prev-blk-not-found") == null);
+        try testing.expect(std.mem.indexOf(u8, r, "bad-prevblk") == null);
+    }
+    try testing.expect(cm.getBlock(&b2.hash) != null);
+}

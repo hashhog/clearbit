@@ -15032,3 +15032,54 @@ test "FIX-12 G3: P2SH prevout with 16 sigops in redeemScript rejects with NonSta
         Mempool.validateInputsStandardness(&tx, spent),
     );
 }
+
+// Core Consensus::CheckTxInputs with nSpendHeight = tip + 1: a height-1
+// coinbase is premature at tip 99 (100 - 1 = 99 < 100) and spendable at
+// tip 100.  Core regtest rows seed_invalidated_submit/maturity/* and
+// warden_invalidated_submit/maturity/*: testmempoolaccept said allowed=true at
+// tip 99 (the dry run had no maturity check) and sendrawtransaction refused
+// the spend at tip 100 (tip - coin height, one block late).
+test "mempool maturity: a height-1 coinbase spend is premature at tip 99 and accepted at tip 100 (Core CheckTxInputs, spend height tip+1)" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = Mempool.init(&chain_state, &consensus.REGTEST, allocator);
+    defer mempool.deinit();
+
+    // Height-1 coinbase output to P2SH(OP_TRUE), as the regtest harness pays.
+    const p2sh_true = [_]u8{ 0xa9, 0x14, 0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e, 0xba, 0x30, 0xcd, 0x5a, 0x4b, 0x87 };
+    const coin = types.OutPoint{ .hash = [_]u8{0x5c} ** 32, .index = 0 };
+    try chain_state.utxo_set.add(&coin, &types.TxOut{ .value = 5_000_000_000, .script_pubkey = &p2sh_true }, 1, true);
+
+    const redeem_push = [_]u8{ 0x01, 0x51 }; // push OP_TRUE
+    const out_script = testP2wpkhScript();
+    const spend = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = coin,
+            .script_sig = &redeem_push,
+            .sequence = 0xFFFF_FFFF,
+            .witness = &[_][]const u8{},
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 5_000_000_000 - 10_000, .script_pubkey = &out_script }},
+        .lock_time = 0,
+    };
+
+    chain_state.best_height = 99;
+    const dry99 = mempool.acceptToMemoryPool(spend, true);
+    try std.testing.expect(!dry99.accepted);
+    try std.testing.expectEqualStrings("bad-txns-premature-spend-of-coinbase", dry99.reject_reason.?);
+    const full99 = mempool.acceptToMemoryPool(spend, false);
+    try std.testing.expect(!full99.accepted);
+    try std.testing.expectEqualStrings("bad-txns-premature-spend-of-coinbase", full99.reject_reason.?);
+    try std.testing.expectEqual(@as(usize, 0), mempool.entries.count());
+
+    chain_state.best_height = 100;
+    const dry100 = mempool.acceptToMemoryPool(spend, true);
+    if (dry100.reject_reason) |r| std.debug.print("tip 100 dry run: {s}\n", .{r});
+    try std.testing.expect(dry100.accepted);
+    const full100 = mempool.acceptToMemoryPool(spend, false);
+    if (full100.reject_reason) |r| std.debug.print("tip 100 send: {s}\n", .{r});
+    try std.testing.expect(full100.accepted);
+    try std.testing.expectEqual(@as(usize, 1), mempool.entries.count());
+}
