@@ -975,6 +975,13 @@ pub const Peer = struct {
     next_send_feefilter: i64 = 0,
     /// Best known block height from this peer (from headers or blocks).
     best_known_height: u32 = 0,
+    /// Highest height on OUR chain (active or queued) this peer has shown it
+    /// has: a header / inv / cmpctblock announcement of it, or delivering it.
+    /// The block-download pipeline reads this (with the version
+    /// start_height) through `hasBlockAtHeight`, like Core's
+    /// pindexBestKnownBlock in FindNextBlocksToDownload. Kept apart from
+    /// `best_known_height`, which drives stale-tip eviction.
+    blocks_available_height: u32 = 0,
     /// Time when we last sent a getheaders request to this peer.
     last_getheaders_time: i64 = 0,
     /// Time when the oldest block-in-flight was requested (0 if no blocks in flight).
@@ -2957,6 +2964,14 @@ pub const Peer = struct {
         if (height > self.best_known_height) {
             self.best_known_height = height;
         }
+    }
+
+    /// True when this peer has shown it holds our block at `height`: its
+    /// version start_height covers it, or it announced or delivered a block
+    /// at or above it on our chain.
+    pub fn hasBlockAtHeight(self: *const Peer, height: i64) bool {
+        const start: i64 = if (self.start_height > 0) self.start_height else 0;
+        return height <= @max(start, @as(i64, self.blocks_available_height));
     }
 
     /// Record that we sent a getheaders request.
@@ -7648,6 +7663,7 @@ pub const PeerManager = struct {
                     const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
                     if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_block))) {
                         has_block_inv = true;
+                        self.noteBlockAvailability(peer, &item.hash);
                     } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
                         // Legacy txid inv: request if not already in mempool by txid.
                         // Core requests `MSG_TX | GetFetchFlags(peer)`: with the
@@ -7830,7 +7846,9 @@ pub const PeerManager = struct {
                     if (skip == hdrs_cut.len) {
                         // Nothing new: a pure re-announcement of headers we
                         // already hold.  It connects (a response, Core :3041)
-                        // and is not unconnecting.
+                        // and is not unconnecting.  It still tells us this
+                        // peer has the blocks (block download asks it).
+                        self.noteBlockAvailability(peer, &crypto.computeBlockHash(&hdrs_cut[hdrs_cut.len - 1]));
                         peer.last_getheaders_time = 0;
                         peer.unconnecting_headers_count = 0;
                         // A full batch of known headers: the peer has more —
@@ -8192,6 +8210,9 @@ pub const PeerManager = struct {
                     self.expected_blocks.append(block_hash) catch continue;
                     _ = self.insertHeader(&header, &block_hash) catch null;
                 }
+                // Before the pipeline call below: the announcer is the peer
+                // known to hold these blocks.
+                self.noteBlockAvailability(peer, &crypto.computeBlockHash(&admitted[admitted.len - 1]));
 
                 // Request more headers from this specific peer if we got a full batch
                 // But limit the queue to avoid too many outstanding blocks
@@ -8208,6 +8229,7 @@ pub const PeerManager = struct {
                 const in_window = self.isConnectWindowHash(&block_hash);
                 const was_requested = self.inflight_block_peer.contains(block_hash);
                 const reorg_body = self.isPendingReorgHash(&block_hash);
+                if (in_window) self.noteBlockAvailability(peer, &block_hash);
 
                 var historical_body = false;
                 // Do not steal a forward-window / in-flight hash into the
@@ -8430,6 +8452,8 @@ pub const PeerManager = struct {
                 }
 
                 const block_hash = header_hash;
+                self.noteBlockAvailability(peer, &block_hash);
+                self.noteBlockAvailability(peer, &cb.header.prev_block);
 
                 // Never request a block (or a child of one) marked failed.
                 // Core runs the cmpctblock header through
@@ -10498,14 +10522,64 @@ pub const PeerManager = struct {
     /// The `download_cursor` rewind on buffer-full drop (wave 9) is preserved
     /// in the `.block` handler — see `peer.zig:2198` and `peer.zig:2215`.
     /// Another handshake-complete, witness-capable peer with block budget.
-    fn otherBlockPeerAvailable(self: *const PeerManager, exclude: *const Peer) bool {
+    fn otherBlockPeerAvailable(self: *const PeerManager, exclude: *const Peer, height: i64) bool {
         for (self.peers.items) |p| {
             if (p == exclude) continue;
             if (p.state != .handshake_complete or !p.canServeWitnesses()) continue;
             if (p.blocks_in_flight_count >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) continue;
+            if (!self.mayRequestFrom(p, height)) continue;
             return true;
         }
         return false;
+    }
+
+    /// Some handshake-complete witness peer has shown it holds our block at
+    /// `height` (see `Peer.hasBlockAtHeight`).
+    fn anyPeerHasBlockAtHeight(self: *const PeerManager, height: i64) bool {
+        for (self.peers.items) |p| {
+            if (p.state != .handshake_complete or !p.canServeWitnesses()) continue;
+            if (p.hasBlockAtHeight(height)) return true;
+        }
+        return false;
+    }
+
+    /// Ask `p` for our block at `height` only if it has shown it holds it,
+    /// as Core's FindNextBlocksToDownload only walks a peer's
+    /// pindexBestKnownBlock. A peer without the block ignores the getdata
+    /// (Core sends no notfound for blocks), so asking it costs a full
+    /// drain-wedge stall: at tip the next block went to whichever peer the
+    /// rotation offered, and every 2s→64s cancel handed it to another peer
+    /// that had not seen it either (live DRAIN-BREAK-WEDGE, 3-5 blocks
+    /// behind). When no peer has shown the block yet, any peer may be asked,
+    /// so this never leaves a block unrequested that was requested before.
+    fn mayRequestFrom(self: *const PeerManager, p: *const Peer, height: i64) bool {
+        return p.hasBlockAtHeight(height) or !self.anyPeerHasBlockAtHeight(height);
+    }
+
+    /// Height of `hash` on our chain: the queued tail of expected_blocks
+    /// (index i connects at tip + 1 + (i - connect_cursor)) or the active
+    /// chain. Null for a hash on neither (unknown or another branch).
+    fn committedHeightOf(self: *PeerManager, hash: *const types.Hash256) ?u32 {
+        const cs = self.chain_state orelse return null;
+        // Forward from the connect front: a delivered block is within the
+        // 512-block download window, so the per-block cost stays small even
+        // with a long IBD header queue.
+        var i: usize = self.connect_cursor;
+        while (i < self.expected_blocks.items.len) : (i += 1) {
+            if (std.mem.eql(u8, &self.expected_blocks.items[i], hash)) {
+                return @intCast(@as(usize, cs.best_height) + 1 + (i - self.connect_cursor));
+            }
+        }
+        if (!self.isOnActiveChain(hash)) return null;
+        if (std.mem.eql(u8, &cs.best_hash, hash)) return cs.best_height;
+        return cs.getBlockHeightByHash(hash);
+    }
+
+    /// `peer` announced or delivered `hash`: if it is on our chain, the peer
+    /// holds every block up to that height (Core UpdateBlockAvailability).
+    pub fn noteBlockAvailability(self: *PeerManager, peer: *Peer, hash: *const types.Hash256) void {
+        const h = self.committedHeightOf(hash) orelse return;
+        if (h > peer.blocks_available_height) peer.blocks_available_height = h;
     }
 
     pub fn pipelineBlockRequests(self: *PeerManager) !void {
@@ -10551,12 +10625,16 @@ pub const PeerManager = struct {
             if (self.download_cursor >= self.expected_blocks.items.len) break;
             if (self.download_cursor >= self.connect_cursor + max_ahead) break;
 
+            const cs_tip: i64 = if (self.chain_state) |cs| @intCast(cs.best_height) else 0;
+
             // Re-request of a cancelled stuck front block: skip the peer it
             // stalled on while any other eligible peer can take it.
             if (self.stalled_front_hash) |sh| {
+                const front_height: i64 = cs_tip + 1 +
+                    (@as(i64, @intCast(self.download_cursor)) - @as(i64, @intCast(self.connect_cursor)));
                 if (@intFromPtr(tp) == self.stalled_front_peer and
                     std.mem.eql(u8, &self.expected_blocks.items[self.download_cursor], &sh) and
-                    self.otherBlockPeerAvailable(tp))
+                    self.otherBlockPeerAvailable(tp, front_height))
                 {
                     continue;
                 }
@@ -10571,7 +10649,6 @@ pub const PeerManager = struct {
             // (#29). Computed once per peer; the block-height check is per block.
             const tp_limited = (tp.services & p2p.NODE_NETWORK) == 0 and
                 (tp.services & p2p.NODE_NETWORK_LIMITED) != 0;
-            const cs_tip: i64 = if (self.chain_state) |cs| @intCast(cs.best_height) else 0;
 
             var batch_count: u32 = 0;
             while (batch_count < peer_budget and
@@ -10595,6 +10672,10 @@ pub const PeerManager = struct {
                 {
                     break;
                 }
+                // Same BREAK for a block this peer has not shown it holds
+                // while another peer has (`mayRequestFrom`); heights only
+                // rise from here, so the rest of the window is left too.
+                if (!self.mayRequestFrom(tp, h_height)) break;
                 // SKIP if already buffered OR already in-flight to some peer
                 // (Core mapBlocksInFlight: never request the same block twice).
                 // This is what makes a download_cursor rewind drift-free — the
