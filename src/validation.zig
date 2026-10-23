@@ -14726,6 +14726,11 @@ fn mrTxid(a: std.mem.Allocator, tx: *const types.Transaction) types.Hash256 {
 
 /// coinbase + `txs`, allocated in `a`.
 fn mrBlock(a: std.mem.Allocator, prev: types.Hash256, tag: u8, txs: []const types.Transaction) !types.Block {
+    return mrBlockPayTo(a, prev, tag, &MR_P2WPKH, txs);
+}
+
+/// mrBlock with a coinbase that pays `cb_spk`, so a test can spend it.
+fn mrBlockPayTo(a: std.mem.Allocator, prev: types.Hash256, tag: u8, cb_spk: []const u8, txs: []const types.Transaction) !types.Block {
     const all = try a.alloc(types.Transaction, txs.len + 1);
     const cb_in = try a.alloc(types.TxIn, 1);
     cb_in[0] = .{
@@ -14735,7 +14740,7 @@ fn mrBlock(a: std.mem.Allocator, prev: types.Hash256, tag: u8, txs: []const type
         .witness = &[_][]const u8{},
     };
     const cb_out = try a.alloc(types.TxOut, 1);
-    cb_out[0] = .{ .value = 5_000_000_000, .script_pubkey = &MR_P2WPKH };
+    cb_out[0] = .{ .value = 5_000_000_000, .script_pubkey = try a.dupe(u8, cb_spk) };
     all[0] = .{ .version = 1, .inputs = cb_in, .outputs = cb_out, .lock_time = 0 };
     @memcpy(all[1..], txs);
     return .{
@@ -15326,6 +15331,269 @@ test "mempool-reorg: multi-block invalidateblock trims once the parent is relink
     try std.testing.expectEqual(@as(usize, 64), env.pool.entries.count());
     try std.testing.expectEqual(@as(usize, 64), env.pool.getClusterSize(p_id));
     mrFreePoolTxs(env, &.{ p_id, top_id });
+}
+
+// ============================================================================
+// What a reorg must take OUT of the pool (Core MaybeUpdateMempoolForReorg)
+// ============================================================================
+//
+// Each test below goes through ChainManager.invalidateBlock or
+// activateBestChain, so it fails if updateForReorg stops removeRecursive'ing
+// a failed re-add, stops calling removeForReorg, or trims a parent and keeps
+// its child.  Calling removeForReorg directly (tests_mtp_bip68_fix.zig)
+// cannot catch the first two.
+
+/// mrSpend with an explicit nSequence and nLockTime.
+fn mrSpendSeq(a: std.mem.Allocator, prev: types.OutPoint, value: i64, spk: []const u8, sequence: u32, lock_time: u32) !types.Transaction {
+    var tx = try mrSpend(a, prev, value, spk);
+    const ins = try a.alloc(types.TxIn, 1);
+    ins[0] = tx.inputs[0];
+    ins[0].sequence = sequence;
+    tx.inputs = ins;
+    tx.lock_time = lock_time;
+    return tx;
+}
+
+/// Every input of every pool entry is an in-pool output or an unspent coin:
+/// no entry outlived the parent it spends.
+fn mrExpectNoOrphans(env: *MrEnv) !void {
+    var it = env.pool.entries.iterator();
+    while (it.next()) |kv| {
+        for (kv.value_ptr.*.tx.inputs) |inp| {
+            if (env.pool.entries.contains(inp.previous_output.hash)) continue;
+            const coin = env.cs.utxo_set.get(&inp.previous_output) catch null;
+            try std.testing.expect(coin != null);
+            var c = coin.?;
+            c.deinit(env.pool.allocator);
+        }
+    }
+}
+
+test "mempool-reorg: a reorg whose new branch spends a disconnected tx's input drops that tx and its in-mempool child (Core MaybeUpdateMempoolForReorg -> removeRecursive)" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const s = try mrSeedCoin(&env.cs, 0xE1, &wsh);
+    const s_ok = try mrSeedCoin(&env.cs, 0xE2, &wsh);
+
+    // Active: A1 [cb, T <- S, U <- S_ok].  Mempool: TC <- T:0, UC <- U:0.
+    const tx_t = try mrSpend(arena, s, 90_000, &wsh);
+    const t_id = mrTxid(arena, &tx_t);
+    const tx_u = try mrSpend(arena, s_ok, 90_000, &wsh);
+    const u_id = mrTxid(arena, &tx_u);
+    const ha1 = mrHash(1, 0xE0);
+    const ba1 = try mrBlock(arena, env.genesis.hash, 0xE1, &.{ tx_t, tx_u });
+    try mrStore(&env.cs, ha1, &ba1, 1, true);
+    const a1 = try mrIndex(&env.manager, env.genesis, ha1, &ba1, 0x40, 1);
+    env.manager.active_tip = a1;
+
+    const tx_tc = try mrSpend(arena, .{ .hash = t_id, .index = 0 }, 80_000, &MR_P2WPKH);
+    const tc_id = mrTxid(arena, &tx_tc);
+    try env.pool.addTransaction(tx_tc);
+    const tx_uc = try mrSpend(arena, .{ .hash = u_id, .index = 0 }, 80_000, &MR_P2WPKH);
+    const uc_id = mrTxid(arena, &tx_uc);
+    try env.pool.addTransaction(tx_uc);
+
+    // Side branch, more work: B1 [cb, X <- S] spends T's input; B2 [cb].
+    // TC does not touch S, so removeForBlock(B1) leaves it; only the failed
+    // re-add of T can take it out.
+    const tx_x = try mrSpend(arena, s, 60_000, &MR_P2WPKH);
+    const x_id = mrTxid(arena, &tx_x);
+    const hb1 = mrHash(1, 0xE8);
+    const bb1 = try mrBlock(arena, env.genesis.hash, 0xE8, &.{tx_x});
+    try mrStore(&env.cs, hb1, &bb1, 1, false);
+    const b1 = try mrIndex(&env.manager, env.genesis, hb1, &bb1, 0x40, 10);
+    const hb2 = mrHash(2, 0xE8);
+    const bb2 = try mrBlock(arena, hb1, 0xE9, &.{});
+    try mrStore(&env.cs, hb2, &bb2, 2, false);
+    _ = try mrIndex(&env.manager, b1, hb2, &bb2, 0x80, 11);
+
+    try env.manager.activateBestChain();
+    try std.testing.expectEqualSlices(u8, &hb2, &env.cs.best_hash);
+
+    // Core: T fails re-acceptance (S spent by X) and is removeRecursive'd, so
+    // TC leaves with it.  U is re-added and relinked to UC.
+    try std.testing.expect(!env.pool.entries.contains(t_id));
+    try std.testing.expect(!env.pool.entries.contains(tc_id));
+    try std.testing.expect(!env.pool.entries.contains(x_id));
+    try std.testing.expect(env.pool.entries.contains(u_id));
+    try std.testing.expect(env.pool.entries.contains(uc_id));
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.get(u_id).?.descendant_count);
+    try mrExpectNoOrphans(env);
+    mrFreePoolTxs(env, &.{u_id});
+}
+
+test "mempool-reorg: invalidateblock keeps disconnected coinbases out and evicts a spend of a coinbase that is immature at the new tip, with descendants (Core removeForReorg via MaybeUpdateMempoolForReorg)" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const s = try mrSeedCoin(&env.cs, 0xE3, &wsh);
+    const tx_a = try mrSpend(arena, s, 90_000, &wsh);
+    const a_id = mrTxid(arena, &tx_a);
+
+    // Blocks 1..101; every coinbase pays OP_TRUE P2WSH.  Block 101 carries A.
+    var prev = env.genesis;
+    var cb_ids: [102]types.Hash256 = undefined;
+    var h100: types.Hash256 = undefined;
+    var h: usize = 1;
+    while (h <= 101) : (h += 1) {
+        const txs: []const types.Transaction = if (h == 101) &.{tx_a} else &.{};
+        const hash = mrHash(@intCast(h), 0xD0);
+        const blk = try mrBlockPayTo(arena, prev.hash, @intCast(h), &wsh, txs);
+        cb_ids[h] = mrTxid(arena, &blk.transactions[0]);
+        try mrStore(&env.cs, hash, &blk, @intCast(h), true);
+        const entry = try mrIndex(&env.manager, prev, hash, &blk, @intCast(h), @intCast(h));
+        env.manager.active_tip = entry;
+        prev = entry;
+        if (h == 100) h100 = hash;
+    }
+    try std.testing.expectEqual(@as(u32, 101), env.cs.best_height);
+
+    // K spends block 1's coinbase (mature at tip 101); KD spends K.
+    const tx_k = try mrSpend(arena, .{ .hash = cb_ids[1], .index = 0 }, 4_999_990_000, &wsh);
+    const k_id = mrTxid(arena, &tx_k);
+    try env.pool.addTransaction(tx_k);
+    const tx_kd = try mrSpend(arena, .{ .hash = k_id, .index = 0 }, 4_999_980_000, &MR_P2WPKH);
+    const kd_id = mrTxid(arena, &tx_kd);
+    try env.pool.addTransaction(tx_kd);
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.count());
+
+    // Disconnect 101 and 100.  Tip 99: a spend at height 100 of a height-1
+    // coinbase has 99 confirmations, under COINBASE_MATURITY.
+    try env.manager.invalidateBlock(&h100);
+    try std.testing.expectEqual(@as(u32, 99), env.cs.best_height);
+
+    try std.testing.expect(env.pool.entries.contains(a_id));
+    try std.testing.expect(!env.pool.entries.contains(k_id));
+    try std.testing.expect(!env.pool.entries.contains(kd_id));
+    try std.testing.expect(!env.pool.entries.contains(cb_ids[100]));
+    try std.testing.expect(!env.pool.entries.contains(cb_ids[101]));
+    try std.testing.expectEqual(@as(usize, 1), env.pool.entries.count());
+    try mrExpectNoOrphans(env);
+    mrFreePoolTxs(env, &.{a_id});
+}
+
+test "mempool-reorg: invalidateblock evicts an nLockTime tx and a BIP68-locked tx that are final only on the old tip, with descendants (Core removeForReorg via MaybeUpdateMempoolForReorg)" {
+    const allocator = std.testing.allocator;
+    const env = try mrOpen(allocator);
+    defer allocator.destroy(env);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const s = try mrSeedCoin(&env.cs, 0xE4, &wsh);
+    const s_lt = try mrSeedCoin(&env.cs, 0xE5, &wsh);
+
+    // Block 1 is empty so the new tip (1) is still at CSV height on regtest.
+    // Block 2: [cb, P <- S].
+    const hd1 = mrHash(1, 0xD4);
+    const bd1 = try mrBlock(arena, env.genesis.hash, 0xD4, &.{});
+    try mrStore(&env.cs, hd1, &bd1, 1, true);
+    const e1 = try mrIndex(&env.manager, env.genesis, hd1, &bd1, 0x40, 1);
+    env.manager.active_tip = e1;
+    const tx_p = try mrSpend(arena, s, 90_000, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const hd2 = mrHash(2, 0xD4);
+    const bd2 = try mrBlock(arena, hd1, 0xD5, &.{tx_p});
+    try mrStore(&env.cs, hd2, &bd2, 2, true);
+    const e2 = try mrIndex(&env.manager, e1, hd2, &bd2, 0x80, 2);
+    env.manager.active_tip = e2;
+
+    // L: nLockTime 2 (final at height 3, not at 2) + child LD.
+    const tx_l = try mrSpendSeq(arena, s_lt, 90_000, &wsh, 0xFFFF_FFFE, 2);
+    const l_id = mrTxid(arena, &tx_l);
+    try env.pool.addTransaction(tx_l);
+    const tx_ld = try mrSpend(arena, .{ .hash = l_id, .index = 0 }, 80_000, &MR_P2WPKH);
+    const ld_id = mrTxid(arena, &tx_ld);
+    try env.pool.addTransaction(tx_ld);
+    // C: v2, nSequence 1 (one-block relative lock) on P:0 + child CD.  At tip
+    // 2, P:0 is confirmed at height 2 and C may enter block 3.  Once P is back
+    // in the pool its coin counts at tip+1 = 2, so C could enter block 3 at
+    // the earliest while the next block is 2.
+    const tx_c = try mrSpendSeq(arena, .{ .hash = p_id, .index = 0 }, 80_000, &wsh, 1, 0);
+    const c_id = mrTxid(arena, &tx_c);
+    try env.pool.addTransaction(tx_c);
+    const tx_cd = try mrSpend(arena, .{ .hash = c_id, .index = 0 }, 70_000, &MR_P2WPKH);
+    const cd_id = mrTxid(arena, &tx_cd);
+    try env.pool.addTransaction(tx_cd);
+    try std.testing.expectEqual(@as(usize, 4), env.pool.entries.count());
+
+    try env.manager.invalidateBlock(&hd2);
+    try std.testing.expectEqual(@as(u32, 1), env.cs.best_height);
+
+    try std.testing.expect(env.pool.entries.contains(p_id));
+    try std.testing.expect(!env.pool.entries.contains(l_id));
+    try std.testing.expect(!env.pool.entries.contains(ld_id));
+    try std.testing.expect(!env.pool.entries.contains(c_id));
+    try std.testing.expect(!env.pool.entries.contains(cd_id));
+    try std.testing.expectEqual(@as(usize, 1), env.pool.entries.count());
+    try mrExpectNoOrphans(env);
+    mrFreePoolTxs(env, &.{p_id});
+}
+
+test "mempool-reorg: invalidateblock trim drops a low-feerate re-added parent that does not fit, and its in-mempool child with it (Core TxGraph::Trim)" {
+    // The pool never frees the body of a removed tx, and this test removes a
+    // re-admitted (pool-owned) one, so the whole env lives on an arena.
+    var env_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer env_arena.deinit();
+    const allocator = env_arena.allocator();
+    const env = try mrOpen(allocator);
+    defer env.deinit();
+    const arena = env.arena_state.allocator();
+
+    const wsh = mrOpTrueP2wsh();
+    const seed = try mrSeedCoinValue(&env.cs, 0xE6, 3_000_000, &wsh);
+
+    // Block 1: [cb, R, P].  R pays 63 children (fee rising with i) and P on
+    // R:63; P pays 100 sat, the lowest feerate in the cluster.  Mempool: the
+    // 63 children of R and PC <- P:0 (high fee).
+    const child_out: i64 = 10_000;
+    var values: [64]i64 = undefined;
+    for (0..63) |i| values[i] = child_out + @as(i64, @intCast((i + 1) * 1000));
+    values[63] = 50_000;
+    const tx_r = try mrFanout(arena, seed, &values, &wsh);
+    const r_id = mrTxid(arena, &tx_r);
+    const tx_p = try mrSpend(arena, .{ .hash = r_id, .index = 63 }, 49_900, &wsh);
+    const p_id = mrTxid(arena, &tx_p);
+    const h1 = mrHash(1, 0xC9);
+    const b1 = try mrBlock(arena, env.genesis.hash, 0xC9, &.{ tx_r, tx_p });
+    try mrStore(&env.cs, h1, &b1, 1, true);
+    const e1 = try mrIndex(&env.manager, env.genesis, h1, &b1, 0x40, 1);
+    env.manager.active_tip = e1;
+
+    var child_ids: [63]types.Hash256 = undefined;
+    for (0..63) |i| {
+        const tx_c = try mrSpend(arena, .{ .hash = r_id, .index = @intCast(i) }, child_out, &MR_P2WPKH);
+        child_ids[i] = mrTxid(arena, &tx_c);
+        try env.pool.addTransaction(tx_c);
+    }
+    const tx_pc = try mrSpend(arena, .{ .hash = p_id, .index = 0 }, 29_900, &MR_P2WPKH);
+    const pc_id = mrTxid(arena, &tx_pc);
+    try env.pool.addTransaction(tx_pc);
+    try std.testing.expectEqual(@as(usize, 64), env.pool.entries.count());
+
+    // Relinked cluster: R, P, 63 children, PC = 66.  Trim takes R, then the
+    // 63 children (each better than P) to reach 64; P would be the 65th, so
+    // it is skipped, and PC (waiting on P) is never reached.
+    try env.manager.invalidateBlock(&h1);
+    try std.testing.expectEqual(@as(u32, 0), env.cs.best_height);
+
+    try std.testing.expect(env.pool.entries.contains(r_id));
+    for (child_ids) |id| try std.testing.expect(env.pool.entries.contains(id));
+    try std.testing.expect(!env.pool.entries.contains(p_id));
+    try std.testing.expect(!env.pool.entries.contains(pc_id));
+    try std.testing.expectEqual(@as(usize, 64), env.pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 64), env.pool.getClusterSize(r_id));
+    try mrExpectNoOrphans(env);
 }
 
 // ============================================================================
