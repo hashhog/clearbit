@@ -15574,6 +15574,10 @@ test "mempool-reorg: a reorg to a shorter heavier branch evicts a spend of a coi
         if (h == 98) e98 = entry;
     }
 
+    // AC spends A (block 101) and must be relinked to A once A is re-added.
+    const tx_ac = try mrSpend(arena, .{ .hash = a_id, .index = 0 }, 80_000, &MR_P2WPKH);
+    const ac_id = mrTxid(arena, &tx_ac);
+    try env.pool.addTransaction(tx_ac);
     const tx_k = try mrSpend(arena, .{ .hash = cb_ids[1], .index = 0 }, 4_999_990_000, &wsh);
     const k_id = mrTxid(arena, &tx_k);
     try env.pool.addTransaction(tx_k);
@@ -15592,10 +15596,12 @@ test "mempool-reorg: a reorg to a shorter heavier branch evicts a spend of a coi
     try std.testing.expectEqual(@as(u32, 99), env.cs.best_height);
 
     try std.testing.expect(env.pool.entries.contains(a_id));
+    try std.testing.expect(env.pool.entries.contains(ac_id));
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.get(a_id).?.descendant_count);
     try std.testing.expect(!env.pool.entries.contains(k_id));
     try std.testing.expect(!env.pool.entries.contains(kd_id));
     for (cb_ids[99..]) |id| try std.testing.expect(!env.pool.entries.contains(id));
-    try std.testing.expectEqual(@as(usize, 1), env.pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.count());
     try mrExpectNoOrphans(env);
     mrFreePoolTxs(env, &.{a_id});
 }
@@ -15611,13 +15617,13 @@ test "mempool-reorg: a reorg to a shorter heavier branch evicts an nLockTime tx 
     const s = try mrSeedCoin(&env.cs, 0xEB, &wsh);
     const s_lt = try mrSeedCoin(&env.cs, 0xEC, &wsh);
 
-    // Active: E1 [cb], E2 [cb, P <- S].
+    // Active: E1 [cb], E2 [cb, P <- S] (two outputs).
     const he1 = mrHash(1, 0xDC);
     const be1 = try mrBlock(arena, env.genesis.hash, 0xDC, &.{});
     try mrStore(&env.cs, he1, &be1, 1, true);
     const e1 = try mrIndex(&env.manager, env.genesis, he1, &be1, 0x40, 1);
     env.manager.active_tip = e1;
-    const tx_p = try mrSpend(arena, s, 90_000, &wsh);
+    const tx_p = try mrFanout(arena, s, &.{ 45_000, 45_000 }, &wsh);
     const p_id = mrTxid(arena, &tx_p);
     const he2 = mrHash(2, 0xDC);
     const be2 = try mrBlock(arena, he1, 0xDD, &.{tx_p});
@@ -15631,13 +15637,18 @@ test "mempool-reorg: a reorg to a shorter heavier branch evicts an nLockTime tx 
     const tx_ld = try mrSpend(arena, .{ .hash = l_id, .index = 0 }, 80_000, &MR_P2WPKH);
     const ld_id = mrTxid(arena, &tx_ld);
     try env.pool.addTransaction(tx_ld);
-    const tx_c = try mrSpendSeq(arena, .{ .hash = p_id, .index = 0 }, 80_000, &wsh, 1, 0);
+    // C: BIP68 one-block lock on P:0 (+ CD).  PK: an unlocked spend of P:1
+    // that must stay and be relinked to the re-added P.
+    const tx_c = try mrSpendSeq(arena, .{ .hash = p_id, .index = 0 }, 35_000, &wsh, 1, 0);
     const c_id = mrTxid(arena, &tx_c);
     try env.pool.addTransaction(tx_c);
-    const tx_cd = try mrSpend(arena, .{ .hash = c_id, .index = 0 }, 70_000, &MR_P2WPKH);
+    const tx_cd = try mrSpend(arena, .{ .hash = c_id, .index = 0 }, 25_000, &MR_P2WPKH);
     const cd_id = mrTxid(arena, &tx_cd);
     try env.pool.addTransaction(tx_cd);
-    try std.testing.expectEqual(@as(usize, 4), env.pool.entries.count());
+    const tx_pk = try mrSpend(arena, .{ .hash = p_id, .index = 1 }, 35_000, &MR_P2WPKH);
+    const pk_id = mrTxid(arena, &tx_pk);
+    try env.pool.addTransaction(tx_pk);
+    try std.testing.expectEqual(@as(usize, 5), env.pool.entries.count());
 
     // Side branch: F1 on genesis with more work than E2.  Tip height 2 -> 1.
     const hf1 = mrHash(1, 0xDE);
@@ -15650,11 +15661,13 @@ test "mempool-reorg: a reorg to a shorter heavier branch evicts an nLockTime tx 
     try std.testing.expectEqual(@as(u32, 1), env.cs.best_height);
 
     try std.testing.expect(env.pool.entries.contains(p_id));
+    try std.testing.expect(env.pool.entries.contains(pk_id));
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.get(p_id).?.descendant_count);
     try std.testing.expect(!env.pool.entries.contains(l_id));
     try std.testing.expect(!env.pool.entries.contains(ld_id));
     try std.testing.expect(!env.pool.entries.contains(c_id));
     try std.testing.expect(!env.pool.entries.contains(cd_id));
-    try std.testing.expectEqual(@as(usize, 1), env.pool.entries.count());
+    try std.testing.expectEqual(@as(usize, 2), env.pool.entries.count());
     try mrExpectNoOrphans(env);
     mrFreePoolTxs(env, &.{p_id});
 }
