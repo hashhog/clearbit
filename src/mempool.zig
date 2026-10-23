@@ -397,6 +397,18 @@ fn sanityErrorToMempoolError(err: anyerror) MempoolError {
     };
 }
 
+/// Core Consensus::CheckTxInputs (consensus/tx_verify.cpp): a coinbase output
+/// is spendable in a block at height nSpendHeight only when
+/// nSpendHeight - coin.nHeight >= COINBASE_MATURITY.  The mempool checks a
+/// tx for the NEXT block, so nSpendHeight = tip + 1 (Core passes
+/// m_active_chainstate.m_chain.Height() + 1).  Using the tip height instead
+/// refused a height-1 coinbase spend at tip 100, one block late.
+fn coinbaseImmatureAtNextBlock(cs: *const storage.ChainState, u: anytype) bool {
+    if (!u.is_coinbase) return false;
+    const spend_height: u32 = cs.best_height + 1;
+    return spend_height -| u.height < consensus.COINBASE_MATURITY;
+}
+
 /// Map a MempoolError to Bitcoin Core's BARE reject-reason token.
 ///
 /// Single source of truth for reject-reason strings, so the full
@@ -1313,11 +1325,8 @@ pub const Mempool = struct {
 
                     // Coinbase maturity check: coinbase outputs require 100 confirmations.
                     // Reference: Bitcoin Core CheckTxInputs() in consensus/tx_verify.cpp.
-                    if (u.is_coinbase) {
-                        const age: u32 = cs.best_height -| u.height;
-                        if (age < consensus.COINBASE_MATURITY) {
-                            return MempoolError.ImmatureCoinbase;
-                        }
+                    if (coinbaseImmatureAtNextBlock(cs, &u)) {
+                        return MempoolError.ImmatureCoinbase;
                     }
                 } else {
                     return MempoolError.MissingInputs;
@@ -1873,6 +1882,7 @@ pub const Mempool = struct {
                     MempoolError.MissingInputs => "missing-inputs",
                     MempoolError.NonFinal => "non-final",
                     MempoolError.SequenceLockNotSatisfied => "non-BIP68-final",
+                    MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
                     else => "non-standard",
                 };
                 return AcceptResult{
@@ -4139,6 +4149,13 @@ pub const Mempool = struct {
                     total_in += u.value;
                     if (!consensus.isValidMoney(total_in)) {
                         return MempoolError.InputValuesOutOfRange;
+                    }
+                    // Coinbase maturity, as addTransaction (Core PreChecks ->
+                    // Consensus::CheckTxInputs runs for testmempoolaccept too).
+                    // The dry run used to skip it and answered allowed=true for
+                    // a premature coinbase spend.
+                    if (coinbaseImmatureAtNextBlock(cs, &u)) {
+                        return MempoolError.ImmatureCoinbase;
                     }
                     have_inputs = true;
                 } else {
