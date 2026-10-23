@@ -304,3 +304,78 @@ test "r5_errcode getnetworkhashps / gettxoutsetinfo central type check" {
     try expectError("gettxoutsetinfo", "[1]", -3, "Wrong type passed:\n{\n    \"Position 1 (hash_type)\": \"JSON value of type number is not of expected type string\"\n}");
     try expectError("gettxoutsetinfo", "[\"bogus\"]", -8, "'bogus' is not a valid hash_type");
 }
+
+// core-regtest operator/decoderawtransaction + operator/getrawtransaction rows:
+// DecodeHexTx reports every failure as -22 "TX decode failed", and the txid
+// length error carries Core's "(not N, for 'S')" suffix.
+const LEGACY_TX = "01000000" ++ "01" ++ ("11" ** 32) ++ "00000000" ++ "00" ++ "fdffffff" ++ "01" ++ "0000000000000000" ++ "00" ++ "00000000";
+
+test "r5_errcode decoderawtransaction: every bad hex is -22 TX decode failed" {
+    try expectError("decoderawtransaction", "[\"zz\"]", -22, "TX decode failed");
+    try expectError("decoderawtransaction", "[\"abc\"]", -22, "TX decode failed");
+    try expectError("decoderawtransaction", "[\"" ++ LEGACY_TX ++ "00\"]", -22, "TX decode failed");
+    // iswitness=false: a segwit-marker serialization is not a legacy tx
+    try expectError("decoderawtransaction", "[\"01000000000101" ++ ("11" ** 32) ++ "0000000000fdffffff0100000000000000000000000000\", false]", -22, "TX decode failed");
+}
+
+test "r5_errcode decoderawtransaction accepts a legacy tx exactly" {
+    const a = testing.allocator;
+    const body = try dispatch(a, "decoderawtransaction", "[\"" ++ LEGACY_TX ++ "\"]");
+    defer a.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"error\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"locktime\":0") != null);
+}
+
+test "r5_errcode getrawtransaction short txid carries the length suffix" {
+    try expectError("getrawtransaction", "[\"00\"]", -8, "parameter 1 must be of length 64 (not 2, for '00')");
+}
+
+test "r5_errcode getmempoolentry/getmempoolinfo report depends, spentby and total_fee" {
+    const a = testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, a);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, a);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(a, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = rpc.RpcServer.init(a, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const types = @import("src/types.zig");
+    const spk = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+    const parent = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{ .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFD, .witness = &[_][]const u8{} }},
+        .outputs = &[_]types.TxOut{.{ .value = 100000, .script_pubkey = &spk }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(parent);
+    var parent_txid: types.Hash256 = undefined;
+    {
+        var it = mempool.entries.iterator();
+        parent_txid = it.next().?.key_ptr.*;
+    }
+    const child = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{ .previous_output = .{ .hash = parent_txid, .index = 0 }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFD, .witness = &[_][]const u8{} }},
+        .outputs = &[_]types.TxOut{.{ .value = 90000, .script_pubkey = &spk }},
+        .lock_time = 0,
+    };
+    try mempool.addTransaction(child);
+
+    var phex: [64]u8 = undefined;
+    for (0..32) |i| _ = std.fmt.bufPrint(phex[i * 2 ..][0..2], "{x:0>2}", .{parent_txid[31 - i]}) catch unreachable;
+    const req = try std.fmt.allocPrint(a, "{{\"id\":1,\"method\":\"getmempoolentry\",\"params\":[\"{s}\"]}}", .{phex});
+    defer a.free(req);
+    const body = try server.dispatch(req);
+    defer a.free(body);
+    // parent has a child: spentby is non-empty, depends is empty
+    try testing.expect(std.mem.indexOf(u8, body, "\"depends\":[]") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"spentby\":[\"") != null);
+
+    const info = try server.dispatch("{\"id\":1,\"method\":\"getmempoolinfo\",\"params\":[]}");
+    defer a.free(info);
+    // total_fee is the sum of base fees, not a hardcoded 0.0
+    try testing.expect(std.mem.indexOf(u8, info, "\"total_fee\":0.0,") == null);
+    try testing.expect(std.mem.indexOf(u8, info, "\"total_fee\":0.") != null);
+}

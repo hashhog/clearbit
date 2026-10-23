@@ -5821,7 +5821,7 @@ pub const RpcServer = struct {
         if (verbosity >= 1) {
             try w.writeByte(',');
             if (is_genesis) {
-                try w.writeAll("\"coinbase_tx\":{\"version\":1,\"locktime\":0,\"sequence\":4294967295,\"coinbase\":\"04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f6620736563636f6e64206261696c6f757420666f722062616e6b73\",\"witness\":null}");
+                try w.writeAll("\"coinbase_tx\":{\"version\":1,\"locktime\":0,\"sequence\":4294967295,\"coinbase\":\"04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f6620736563636f6e64206261696c6f757420666f722062616e6b73\"}");
             } else if (block_opt) |blk| {
                 if (blk.transactions.len > 0) {
                     const cb = &blk.transactions[0];
@@ -5841,9 +5841,9 @@ pub const RpcServer = struct {
                         try w.writeAll(",\"witness\":\"");
                         for (cb.inputs[0].witness[0]) |b| try w.print("{x:0>2}", .{b});
                         try w.writeByte('"');
-                    } else {
-                        try w.writeAll(",\"witness\":null");
                     }
+                    // Core (coinbaseTxToJSON) omits `witness` when the
+                    // coinbase has no witness stack; never emits null.
                     try w.writeByte('}');
                 } else {
                     try w.writeAll("\"coinbase_tx\":null");
@@ -7828,10 +7828,12 @@ pub const RpcServer = struct {
         const mempool_min_fee_btc: f64 = @as(f64, @floatFromInt(self.mempool.getMinFee())) / 100_000_000.0;
         const min_relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.MIN_RELAY_FEE)) / 100_000_000.0;
         const incremental_relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.INCREMENTAL_RELAY_FEE)) / 100_000_000.0;
-        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":0.0,\"maxmempool\":{d},\"mempoolminfee\":{d:.8},\"minrelaytxfee\":{d:.8},\"incrementalrelayfee\":{d:.8},\"unbroadcastcount\":0,\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
+        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":{d}.{d:0>8},\"maxmempool\":{d},\"mempoolminfee\":{d:.8},\"minrelaytxfee\":{d:.8},\"incrementalrelayfee\":{d:.8},\"unbroadcastcount\":0,\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
             mempool_stats.count,
             mempool_stats.size,
             mempool_stats.size,
+            @divTrunc(mempool_stats.total_fee, 100_000_000),
+            @as(u64, @intCast(@mod(mempool_stats.total_fee, 100_000_000))),
             mempool_mod.MAX_MEMPOOL_SIZE,
             mempool_min_fee_btc,
             min_relay_fee_btc,
@@ -7945,7 +7947,14 @@ pub const RpcServer = struct {
         // `depends` and `spentby` are correct-shape empty arrays; clearbit
         // does not yet walk ancestor/child edges to populate them
         // (TODO: populate from ancestor/descendant maps when added).
-        try writer.print("\",\"depends\":[],\"spentby\":[],\"bip125-replaceable\":{s},\"unbroadcast\":false,\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}", .{
+        try writer.writeAll("\",\"depends\":");
+        // The parent/child maps are walked below; hold the (recursive) pool lock.
+        self.mempool.mutex.lock();
+        defer self.mempool.mutex.unlock();
+        try writeMempoolDepends(writer, self.mempool, entry);
+        try writer.writeAll(",\"spentby\":");
+        try writeMempoolSpentBy(writer, self.mempool, entry);
+        try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":false,\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}", .{
             if (bip125_replaceable) "true" else "false",
             // fees.base
             @divTrunc(entry.fee, 100_000_000),
@@ -9527,7 +9536,9 @@ pub const RpcServer = struct {
         // well-formed-but-not-found txid to -5 (RPC_INVALID_ADDRESS_OR_KEY)
         // exactly like Core (rpc/rawtransaction.cpp:329).
         if (txid_hex.len != 64) {
-            return self.jsonRpcError(RPC_INVALID_PARAMETER, "parameter 1 must be of length 64", id);
+            const msg = try std.fmt.allocPrint(self.allocator, "parameter 1 must be of length 64 (not {d}, for '{s}')", .{ txid_hex.len, txid_hex });
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         }
 
         var txid: types.Hash256 = undefined;
@@ -14785,7 +14796,11 @@ pub const RpcServer = struct {
                 for (0..32) |wi| {
                     try writer.print("{x:0>2}", .{e.wtxid[31 - wi]});
                 }
-                try writer.print("\",\"depends\":[],\"spentby\":[],\"bip125-replaceable\":{s},\"unbroadcast\":false,\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}}", .{
+                try writer.writeAll("\",\"depends\":");
+                try writeMempoolDepends(writer, self.mempool, e);
+                try writer.writeAll(",\"spentby\":");
+                try writeMempoolSpentBy(writer, self.mempool, e);
+                try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":false,\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}}", .{
                     if (rbf) "true" else "false",
                     @divTrunc(e.fee, 100_000_000),
                     @as(u64, @intCast(@mod(e.fee, 100_000_000))),
@@ -15155,9 +15170,15 @@ pub const RpcServer = struct {
 
         const hex_str = hex_param.string;
 
-        // Decode hex
+        // Optional 2nd arg iswitness (Core DecodeHexTx: false = legacy
+        // serialization only, otherwise witness serialization).
+        var try_witness = true;
+        if (params.array.items.len > 1 and params.array.items[1] == .bool) try_witness = params.array.items[1].bool;
+
+        // Core DecodeHexTx reports EVERY failure (odd length, non-hex,
+        // truncated, trailing bytes) as -22 "TX decode failed".
         if (hex_str.len % 2 != 0) {
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length", id);
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
         }
 
         var tx_bytes = self.allocator.alloc(u8, hex_str.len / 2) catch {
@@ -15167,15 +15188,19 @@ pub const RpcServer = struct {
 
         for (0..hex_str.len / 2) |i| {
             tx_bytes[i] = std.fmt.parseInt(u8, hex_str[i * 2 .. i * 2 + 2], 16) catch {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex", id);
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
             };
         }
 
-        // Deserialize transaction
+        // Deserialize transaction; the whole string must be consumed.
         var reader = serialize.Reader{ .data = tx_bytes };
-        const tx = serialize.readTransaction(&reader, self.allocator) catch {
+        const tx = (if (try_witness) serialize.readTransaction(&reader, self.allocator) else serialize.readTransactionNoWitness(&reader, self.allocator)) catch {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
         };
+        defer serialize.freeTransaction(self.allocator, &tx);
+        if (reader.pos != tx_bytes.len) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed", id);
+        }
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
@@ -20975,7 +21000,11 @@ pub const RpcServer = struct {
             const vout = std.mem.readInt(u32, m.key[32..36], .little);
             try writer.print("\",\"vout\":{d},\"scriptPubKey\":\"", .{vout});
             for (m.script) |b| try writer.print("{x:0>2}", .{b});
-            try writer.print("\",\"desc\":\"{s}\",\"amount\":", .{m.desc});
+            // Core: InferDescriptor(scriptPubKey) -- addr(<dest>)#checksum or
+            // raw(<hex>)#checksum, never the caller's input spelling.
+            const inferred = try inferDescriptorForSpk(self.allocator, m.script, networkFromMagic(self.network_params.magic), isRegtestMagic(self.network_params.magic));
+            defer self.allocator.free(inferred);
+            try writer.print("\",\"desc\":\"{s}\",\"amount\":", .{inferred});
             const amt_btc: f64 = @as(f64, @floatFromInt(m.value)) / 100_000_000.0;
             try writer.print("{d:.8},\"coinbase\":{},\"height\":{d}", .{ amt_btc, m.is_coinbase, m.height });
 
@@ -25441,6 +25470,48 @@ fn writeTxToUnivWithHexOpenInner(
     try writer.writeAll("\"hex\":\"");
     for (tx_bytes) |byte| try writer.print("{x:0>2}", .{byte});
     try writer.writeByte('"');
+}
+
+/// Core entryToJSON `depends`: txids of in-mempool parents (each once, in
+/// input order). Caller holds the mempool lock.
+fn writeMempoolDepends(writer: anytype, pool: *mempool_mod.Mempool, e: *const mempool_mod.MempoolEntry) !void {
+    try writer.writeByte('[');
+    var n: usize = 0;
+    for (e.tx.inputs, 0..) |in, i| {
+        const ph = in.previous_output.hash;
+        if (!pool.entries.contains(ph)) continue;
+        var dup = false;
+        for (e.tx.inputs[0..i]) |prev| {
+            if (std.mem.eql(u8, &prev.previous_output.hash, &ph)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (n > 0) try writer.writeByte(',');
+        n += 1;
+        try writer.writeByte('"');
+        try writeHashHex(writer, &ph);
+        try writer.writeByte('"');
+    }
+    try writer.writeByte(']');
+}
+
+/// Core entryToJSON `spentby`: txids of in-mempool children.
+fn writeMempoolSpentBy(writer: anytype, pool: *mempool_mod.Mempool, e: *const mempool_mod.MempoolEntry) !void {
+    try writer.writeByte('[');
+    if (pool.children.get(e.txid)) |kids| {
+        var n: usize = 0;
+        for (kids.items) |k| {
+            if (!pool.entries.contains(k)) continue;
+            if (n > 0) try writer.writeByte(',');
+            n += 1;
+            try writer.writeByte('"');
+            try writeHashHex(writer, &k);
+            try writer.writeByte('"');
+        }
+    }
+    try writer.writeByte(']');
 }
 
 /// Try to extract a Bitcoin Core-compatible bech32/base58 address from a
