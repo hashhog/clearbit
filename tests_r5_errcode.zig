@@ -346,7 +346,7 @@ test "r5_errcode getmempoolentry/getmempoolinfo report depends, spentby and tota
     const parent = types.Transaction{
         .version = 2,
         .inputs = &[_]types.TxIn{.{ .previous_output = .{ .hash = [_]u8{0x11} ** 32, .index = 0 }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFD, .witness = &[_][]const u8{} }},
-        .outputs = &[_]types.TxOut{.{ .value = 100000, .script_pubkey = &spk }},
+        .outputs = &[_]types.TxOut{ .{ .value = 100000, .script_pubkey = &spk }, .{ .value = 100000, .script_pubkey = &spk } },
         .lock_time = 0,
     };
     try mempool.addTransaction(parent);
@@ -355,23 +355,55 @@ test "r5_errcode getmempoolentry/getmempoolinfo report depends, spentby and tota
         var it = mempool.entries.iterator();
         parent_txid = it.next().?.key_ptr.*;
     }
-    const child = types.Transaction{
-        .version = 2,
-        .inputs = &[_]types.TxIn{.{ .previous_output = .{ .hash = parent_txid, .index = 0 }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFD, .witness = &[_][]const u8{} }},
-        .outputs = &[_]types.TxOut{.{ .value = 90000, .script_pubkey = &spk }},
-        .lock_time = 0,
-    };
-    try mempool.addTransaction(child);
+    var kids: [2]types.Hash256 = undefined;
+    for (0..2) |n| {
+        const child = types.Transaction{
+            .version = 2,
+            .inputs = &[_]types.TxIn{.{ .previous_output = .{ .hash = parent_txid, .index = @intCast(n) }, .script_sig = &[_]u8{}, .sequence = 0xFFFFFFFD, .witness = &[_][]const u8{} }},
+            .outputs = &[_]types.TxOut{.{ .value = 90000 - @as(i64, @intCast(n)) * 1000, .script_pubkey = &spk }},
+            .lock_time = 0,
+        };
+        try mempool.addTransaction(child);
+    }
+    {
+        var k: usize = 0;
+        var it = mempool.entries.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, &e.key_ptr.*, &parent_txid)) continue;
+            kids[k] = e.key_ptr.*;
+            k += 1;
+        }
+    }
+    // Core lists spentby ascending by uint256 (internal byte order).
+    const lo = if (std.mem.lessThan(u8, &kids[0], &kids[1])) kids[0] else kids[1];
+    const hi = if (std.mem.lessThan(u8, &kids[0], &kids[1])) kids[1] else kids[0];
 
-    var phex: [64]u8 = undefined;
-    for (0..32) |i| _ = std.fmt.bufPrint(phex[i * 2 ..][0..2], "{x:0>2}", .{parent_txid[31 - i]}) catch unreachable;
+    const hex = struct {
+        fn of(h: types.Hash256) [64]u8 {
+            var out: [64]u8 = undefined;
+            for (0..32) |i| _ = std.fmt.bufPrint(out[i * 2 ..][0..2], "{x:0>2}", .{h[31 - i]}) catch unreachable;
+            return out;
+        }
+    }.of;
+    const phex = hex(parent_txid);
     const req = try std.fmt.allocPrint(a, "{{\"id\":1,\"method\":\"getmempoolentry\",\"params\":[\"{s}\"]}}", .{phex});
     defer a.free(req);
     const body = try server.dispatch(req);
     defer a.free(body);
-    // parent has a child: spentby is non-empty, depends is empty
+    // the parent has no in-pool parent; both children are listed, sorted
     try testing.expect(std.mem.indexOf(u8, body, "\"depends\":[]") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"spentby\":[\"") != null);
+    const want = try std.fmt.allocPrint(a, "\"spentby\":[\"{s}\",\"{s}\"]", .{ hex(lo), hex(hi) });
+    defer a.free(want);
+    try testing.expect(std.mem.indexOf(u8, body, want) != null);
+
+    // and a child names its parent in depends
+    const creq = try std.fmt.allocPrint(a, "{{\"id\":1,\"method\":\"getmempoolentry\",\"params\":[\"{s}\"]}}", .{hex(lo)});
+    defer a.free(creq);
+    const cbody = try server.dispatch(creq);
+    defer a.free(cbody);
+    const wantdep = try std.fmt.allocPrint(a, "\"depends\":[\"{s}\"]", .{phex});
+    defer a.free(wantdep);
+    try testing.expect(std.mem.indexOf(u8, cbody, wantdep) != null);
 
     const info = try server.dispatch("{\"id\":1,\"method\":\"getmempoolinfo\",\"params\":[]}");
     defer a.free(info);

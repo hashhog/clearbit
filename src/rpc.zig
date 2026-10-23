@@ -25472,46 +25472,55 @@ fn writeTxToUnivWithHexOpenInner(
     try writer.writeByte('"');
 }
 
-/// Core entryToJSON `depends`: txids of in-mempool parents (each once, in
-/// input order). Caller holds the mempool lock.
-fn writeMempoolDepends(writer: anytype, pool: *mempool_mod.Mempool, e: *const mempool_mod.MempoolEntry) !void {
-    try writer.writeByte('[');
-    var n: usize = 0;
-    for (e.tx.inputs, 0..) |in, i| {
-        const ph = in.previous_output.hash;
-        if (!pool.entries.contains(ph)) continue;
-        var dup = false;
-        for (e.tx.inputs[0..i]) |prev| {
-            if (std.mem.eql(u8, &prev.previous_output.hash, &ph)) {
-                dup = true;
-                break;
-            }
+/// Write a txid set as a JSON array in Core's order: entryToJSON takes
+/// GetMemPoolParentsConst / GetMemPoolChildrenConst, sets ordered by
+/// CompareIteratorByHash, i.e. ascending uint256 (internal byte order).
+fn writeSortedTxidArray(writer: anytype, txids: []types.Hash256) !void {
+    std.mem.sort(types.Hash256, txids, {}, struct {
+        fn lt(_: void, a: types.Hash256, b: types.Hash256) bool {
+            return std.mem.lessThan(u8, &a, &b);
         }
-        if (dup) continue;
+    }.lt);
+    try writer.writeByte('[');
+    for (txids, 0..) |t, n| {
         if (n > 0) try writer.writeByte(',');
-        n += 1;
         try writer.writeByte('"');
-        try writeHashHex(writer, &ph);
+        try writeHashHex(writer, &t);
         try writer.writeByte('"');
     }
     try writer.writeByte(']');
 }
 
+/// Core entryToJSON `depends`: txids of in-mempool parents (each once).
+/// Caller holds the mempool lock.
+fn writeMempoolDepends(writer: anytype, pool: *mempool_mod.Mempool, e: *const mempool_mod.MempoolEntry) !void {
+    var list = std.ArrayList(types.Hash256).init(pool.allocator);
+    defer list.deinit();
+    for (e.tx.inputs) |in| {
+        const ph = in.previous_output.hash;
+        if (!pool.entries.contains(ph)) continue;
+        var dup = false;
+        for (list.items) |seen| {
+            if (std.mem.eql(u8, &seen, &ph)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try list.append(ph);
+    }
+    try writeSortedTxidArray(writer, list.items);
+}
+
 /// Core entryToJSON `spentby`: txids of in-mempool children.
 fn writeMempoolSpentBy(writer: anytype, pool: *mempool_mod.Mempool, e: *const mempool_mod.MempoolEntry) !void {
-    try writer.writeByte('[');
+    var list = std.ArrayList(types.Hash256).init(pool.allocator);
+    defer list.deinit();
     if (pool.children.get(e.txid)) |kids| {
-        var n: usize = 0;
         for (kids.items) |k| {
-            if (!pool.entries.contains(k)) continue;
-            if (n > 0) try writer.writeByte(',');
-            n += 1;
-            try writer.writeByte('"');
-            try writeHashHex(writer, &k);
-            try writer.writeByte('"');
+            if (pool.entries.contains(k)) try list.append(k);
         }
     }
-    try writer.writeByte(']');
+    try writeSortedTxidArray(writer, list.items);
 }
 
 /// Try to extract a Bitcoin Core-compatible bech32/base58 address from a
