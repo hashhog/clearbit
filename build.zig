@@ -1514,6 +1514,37 @@ pub fn build(b: *std.Build) void {
         // gotcha as test-rpc above.
     }
 
+    // setmocktime suite: regtest-only clock override RPC.
+    {
+        const mocktime_tests = b.addTest(.{
+            .root_source_file = b.path("tests_setmocktime.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_setmocktime"},
+        });
+        mocktime_tests.linkSystemLibrary("rocksdb");
+        mocktime_tests.linkSystemLibrary("secp256k1");
+        mocktime_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        mocktime_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            mocktime_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            mocktime_tests.linkSystemLibrary("minisketch");
+            mocktime_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        mocktime_tests.root_module.addOptions("build_options", build_options);
+
+        const run_mocktime_tests = b.addRunArtifact(mocktime_tests);
+        const mt_step = b.step("test-setmocktime", "Run the setmocktime RPC tests");
+        mt_step.dependOn(&run_mocktime_tests.step);
+        // NOT folded into the default `test` step — same wallet.zig selectCoins
+        // gotcha as test-rpc above.
+    }
+
     // createpsbt output-building suite (#82): shares createrawtransaction's
     // builder, so the address is decoded and amounts are range-checked.
     {

@@ -3313,6 +3313,8 @@ pub const RpcServer = struct {
             return self.handleGetBlockFromPeer(params, id);
         } else if (std.mem.eql(u8, method, "getnetworkinfo")) {
             return self.handleGetNetworkInfo(id);
+        } else if (std.mem.eql(u8, method, "setmocktime")) {
+            return self.handleSetMockTime(params, id);
         } else if (std.mem.eql(u8, method, "setnetworkactive")) {
             return self.handleSetNetworkActive(params, id);
         } else if (std.mem.eql(u8, method, "getnodeaddresses")) {
@@ -7162,6 +7164,31 @@ pub const RpcServer = struct {
     /// re-seed / --connect+addnode reconnect); existing peers are NOT dropped.
     /// Idempotent: passing the already-current value is an accepted no-op.
     /// Surfaced read-only as getnetworkinfo.networkactive.  Not persisted.
+    /// setmocktime <timestamp> (regtest only). Core rpc/node.cpp setmocktime:
+    /// non-regtest is a plain runtime_error (RPC_MISC_ERROR), the range is
+    /// [0, max_time] with RPC_INVALID_PARAMETER, 0 restores the system clock.
+    fn handleSetMockTime(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (!isRegtestMagic(self.network_params.magic)) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "setmocktime is for regression testing (-regtest mode) only", id);
+        }
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Missing required argument: timestamp", id);
+        }
+        const v = params.array.items[0];
+        if (v != .integer) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value is not of expected type number", id);
+        }
+        // max_time = nanoseconds::max() in seconds.
+        const max_time: i64 = std.math.maxInt(i64) / 1_000_000_000;
+        if (v.integer < 0 or v.integer > max_time) {
+            const msg = try std.fmt.allocPrint(self.allocator, "Mocktime must be in the range [0, {d}], not {d}.", .{ max_time, v.integer });
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+        }
+        mempool_mod.setMockTime(v.integer);
+        return self.jsonRpcResult("null", id);
+    }
+
     fn handleSetNetworkActive(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Required positional bool. A missing arg (empty params array) mirrors
         // Core's dispatcher arity failure for a no-default required param.
