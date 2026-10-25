@@ -13883,6 +13883,43 @@ pub const RpcServer = struct {
     // Phase 8: Additional RPC Methods
     // ========================================================================
 
+    /// Core CBlockIndex::nChainWork for a header that is off the active chain
+    /// and not in the in-memory index (after a restart the index is rebuilt
+    /// lazily, so a block displaced before the restart is in neither): its
+    /// own proof plus each ancestor's, down to the first ancestor whose work
+    /// is known -- an in-memory index entry, or an active-chain block
+    /// (ChainState.chainWorkAtHeight).  Read-only: it indexes nothing, so a
+    /// getblockheader call cannot change what chain selection sees.  Null when
+    /// the walk cannot reach a known base; the caller then keeps its fallback.
+    fn sideBranchChainWork(self: *RpcServer, header: *const types.BlockHeader, height: u32) ?[32]u8 {
+        var acc = chainwork.workFromBits(header.bits);
+        var cursor = header.prev_block;
+        var h = height;
+        var steps: u32 = 0;
+        while (h > 0 and steps < 100_000) : (steps += 1) {
+            h -= 1;
+            if (self.chain_manager) |cm| {
+                if (cm.getBlock(&cursor)) |e| {
+                    chainwork.addChainWorkBE(&acc, &e.chain_work);
+                    return acc;
+                }
+            }
+            if (self.chain_state.getBlockHashByHeight(h)) |hh| {
+                if (std.mem.eql(u8, &hh, &cursor)) {
+                    const base = self.chain_state.chainWorkAtHeight(self.network_params, h) orelse return null;
+                    chainwork.addChainWorkBE(&acc, &base);
+                    return acc;
+                }
+            }
+            const hdr = self.chain_state.getPersistedHeader(&cursor) orelse
+                self.chain_state.getBlockHeaderFromBody(&cursor) orelse return null;
+            const proof = chainwork.workFromBits(hdr.bits);
+            chainwork.addChainWorkBE(&acc, &proof);
+            cursor = hdr.prev_block;
+        }
+        return null;
+    }
+
     /// Handle getblockheader RPC - get block header by hash.
     /// Reference: Bitcoin Core rpc/blockchain.cpp getblockheader
     ///
@@ -14209,7 +14246,11 @@ pub const RpcServer = struct {
         } else if (active_chainwork) |cw| {
             chainwork_str = chainwork.toHex(&cw);
         } else if (height) |h| {
-            const cw = peer_mod.chainWorkFromHeight(h);
+            // A block off the active chain and in no index (e.g. displaced by
+            // invalidateblock / reconsiderblock before a restart): sum the
+            // proofs back to a block whose work is known.  The synthetic
+            // scale would report height + 1, not the block's work.
+            const cw = self.sideBranchChainWork(&header, h) orelse peer_mod.chainWorkFromHeight(h);
             var tmp_buf: [64]u8 = undefined;
             for (cw, 0..) |byte, i| {
                 _ = try std.fmt.bufPrint(tmp_buf[i * 2 ..][0..2], "{x:0>2}", .{byte});
