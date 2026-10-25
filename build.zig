@@ -1443,6 +1443,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_dial_tests.step);
     }
 
+    {
+        const slot_tests = b.addTest(.{
+            .root_source_file = b.path("tests_outbound_slots.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"outbound_slots"},
+        });
+        slot_tests.linkSystemLibrary("rocksdb");
+        slot_tests.linkSystemLibrary("secp256k1");
+        slot_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        slot_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            slot_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            slot_tests.linkSystemLibrary("minisketch");
+            slot_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        slot_tests.root_module.addOptions("build_options", build_options);
+        const run_slot_tests = b.addRunArtifact(slot_tests);
+        const slot_test_step = b.step(
+            "test-outbound-slots",
+            "Outbound slot accounting: 8 full-relay + 2 block-relay-only",
+        );
+        slot_test_step.dependOn(&run_slot_tests.step);
+        test_step.dependOn(&run_slot_tests.step);
+    }
+
     // createrawtransaction vout/sequence/locktime range-check regression.
     // Same project-root wrapper as tests_rpc.zig (src/rpc.zig transitively
     // imports src/wallet.zig, whose @embedFile only resolves from the project
@@ -1510,6 +1541,37 @@ pub fn build(b: *std.Build) void {
         const run_cast_tests = b.addRunArtifact(cast_tests);
         const crt_step = b.step("test-cast-hazards", "Run the RPC narrowing-cast hazard regression tests (#81)");
         crt_step.dependOn(&run_cast_tests.step);
+        // NOT folded into the default `test` step — same wallet.zig selectCoins
+        // gotcha as test-rpc above.
+    }
+
+    // setmocktime suite: regtest-only clock override RPC.
+    {
+        const mocktime_tests = b.addTest(.{
+            .root_source_file = b.path("tests_setmocktime.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_setmocktime"},
+        });
+        mocktime_tests.linkSystemLibrary("rocksdb");
+        mocktime_tests.linkSystemLibrary("secp256k1");
+        mocktime_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        mocktime_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            mocktime_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            mocktime_tests.linkSystemLibrary("minisketch");
+            mocktime_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        mocktime_tests.root_module.addOptions("build_options", build_options);
+
+        const run_mocktime_tests = b.addRunArtifact(mocktime_tests);
+        const mt_step = b.step("test-setmocktime", "Run the setmocktime RPC tests");
+        mt_step.dependOn(&run_mocktime_tests.step);
         // NOT folded into the default `test` step — same wallet.zig selectCoins
         // gotcha as test-rpc above.
     }

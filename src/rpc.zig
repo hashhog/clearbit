@@ -1384,6 +1384,77 @@ pub fn handleSendPayjoinRequest(
 }
 
 /// JSON-RPC server over HTTP.
+/// BIP-22/23/145 getblocktemplate response body.  `rules` and
+/// `default_witness_commitment` follow Core mining.cpp (aRules: csv,
+/// !segwit, taproot once segwit is active, which getblocktemplate requires of
+/// the caller; default_witness_commitment = scriptPubKey of the coinbase's
+/// required witness-commitment output).
+pub fn writeBlockTemplateJson(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    template: *const block_template.BlockTemplate,
+    params: *const consensus.NetworkParams,
+) !void {
+    // Format BIP-22/23 response
+    try writer.print("{{\"capabilities\":[\"proposal\"],\"version\":{d},\"rules\":[\"csv\",\"!segwit\",\"taproot\"],\"previousblockhash\":\"", .{
+        template.header.version,
+    });
+    try writeHashHex(writer, &template.header.prev_block);
+    try writer.print("\",\"transactions\":[", .{});
+
+    for (template.transactions.items, 0..) |tx, i| {
+        if (i > 0) try writer.writeByte(',');
+
+        // Serialize transaction to hex
+        var tx_writer = serialize.Writer.init(allocator);
+        defer tx_writer.deinit();
+        serialize.writeTransaction(&tx_writer, &tx.tx) catch continue;
+        const tx_bytes = tx_writer.getWritten();
+
+        try writer.print("{{\"data\":\"", .{});
+        for (tx_bytes) |byte| {
+            try writer.print("{x:0>2}", .{byte});
+        }
+        try writer.print("\",\"txid\":\"", .{});
+        try writeHashHex(writer, &tx.txid);
+        try writer.print("\",\"fee\":{d},\"weight\":{d}}}", .{
+            tx.fee,
+            tx.weight,
+        });
+    }
+
+    try writer.print("],\"coinbasevalue\":{d},\"target\":\"", .{
+        template.getBlockReward(params),
+    });
+
+    // Write target as hex (big-endian display)
+    for (0..32) |i| {
+        try writer.print("{x:0>2}", .{template.target[31 - i]});
+    }
+
+    try writer.print("\",\"mintime\":{d},\"curtime\":{d},\"bits\":\"{x:0>8}\",\"height\":{d},\"mutable\":[\"time\",\"transactions\",\"prevblock\"]", .{
+        template.header.timestamp,
+        template.header.timestamp,
+        template.header.bits,
+        template.height,
+    });
+
+    // Core: HexStr(coinbase.required_outputs[0].scriptPubKey), the
+    // OP_RETURN 0xaa21a9ed witness-commitment output (optional in Core).
+    for (template.coinbase_tx.outputs) |out| {
+        const sp = out.script_pubkey;
+        if (sp.len == 38 and sp[0] == 0x6a and sp[1] == 0x24 and
+            sp[2] == 0xaa and sp[3] == 0x21 and sp[4] == 0xa9 and sp[5] == 0xed)
+        {
+            try writer.writeAll(",\"default_witness_commitment\":\"");
+            for (sp) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeByte('"');
+            break;
+        }
+    }
+    try writer.writeByte('}');
+}
+
 pub const RpcServer = struct {
     listener: ?std.net.Server,
     allocator: std.mem.Allocator,
@@ -3313,6 +3384,8 @@ pub const RpcServer = struct {
             return self.handleGetBlockFromPeer(params, id);
         } else if (std.mem.eql(u8, method, "getnetworkinfo")) {
             return self.handleGetNetworkInfo(id);
+        } else if (std.mem.eql(u8, method, "setmocktime")) {
+            return self.handleSetMockTime(params, id);
         } else if (std.mem.eql(u8, method, "setnetworkactive")) {
             return self.handleSetNetworkActive(params, id);
         } else if (std.mem.eql(u8, method, "getnodeaddresses")) {
@@ -7162,6 +7235,31 @@ pub const RpcServer = struct {
     /// re-seed / --connect+addnode reconnect); existing peers are NOT dropped.
     /// Idempotent: passing the already-current value is an accepted no-op.
     /// Surfaced read-only as getnetworkinfo.networkactive.  Not persisted.
+    /// setmocktime <timestamp> (regtest only). Core rpc/node.cpp setmocktime:
+    /// non-regtest is a plain runtime_error (RPC_MISC_ERROR), the range is
+    /// [0, max_time] with RPC_INVALID_PARAMETER, 0 restores the system clock.
+    fn handleSetMockTime(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
+        if (!isRegtestMagic(self.network_params.magic)) {
+            return self.jsonRpcError(RPC_MISC_ERROR, "setmocktime is for regression testing (-regtest mode) only", id);
+        }
+        if (params != .array or params.array.items.len < 1) {
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Missing required argument: timestamp", id);
+        }
+        const v = params.array.items[0];
+        if (v != .integer) {
+            return self.jsonRpcError(RPC_TYPE_ERROR, "JSON value is not of expected type number", id);
+        }
+        // max_time = nanoseconds::max() in seconds.
+        const max_time: i64 = std.math.maxInt(i64) / 1_000_000_000;
+        if (v.integer < 0 or v.integer > max_time) {
+            const msg = try std.fmt.allocPrint(self.allocator, "Mocktime must be in the range [0, {d}], not {d}.", .{ max_time, v.integer });
+            defer self.allocator.free(msg);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
+        }
+        mempool_mod.setMockTime(v.integer);
+        return self.jsonRpcResult("null", id);
+    }
+
     fn handleSetNetworkActive(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
         // Required positional bool. A missing arg (empty params array) mirrors
         // Core's dispatcher arity failure for a no-default required param.
@@ -7828,7 +7926,7 @@ pub const RpcServer = struct {
         const mempool_min_fee_btc: f64 = @as(f64, @floatFromInt(self.mempool.getMinFee())) / 100_000_000.0;
         const min_relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.MIN_RELAY_FEE)) / 100_000_000.0;
         const incremental_relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.INCREMENTAL_RELAY_FEE)) / 100_000_000.0;
-        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":{d}.{d:0>8},\"maxmempool\":{d},\"mempoolminfee\":{d:.8},\"minrelaytxfee\":{d:.8},\"incrementalrelayfee\":{d:.8},\"unbroadcastcount\":0,\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
+        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":{d}.{d:0>8},\"maxmempool\":{d},\"mempoolminfee\":{d:.8},\"minrelaytxfee\":{d:.8},\"incrementalrelayfee\":{d:.8},\"unbroadcastcount\":{d},\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
             mempool_stats.count,
             mempool_stats.size,
             mempool_stats.usage,
@@ -7838,6 +7936,7 @@ pub const RpcServer = struct {
             mempool_min_fee_btc,
             min_relay_fee_btc,
             incremental_relay_fee_btc,
+            self.mempool.unbroadcastCount(),
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -7954,8 +8053,9 @@ pub const RpcServer = struct {
         try writeMempoolDepends(writer, self.mempool, entry);
         try writer.writeAll(",\"spentby\":");
         try writeMempoolSpentBy(writer, self.mempool, entry);
-        try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":false,\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}", .{
+        try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}", .{
             if (bip125_replaceable) "true" else "false",
+            if (self.mempool.isUnbroadcastTx(txid)) "true" else "false",
             // fees.base
             @divTrunc(entry.fee, 100_000_000),
             @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
@@ -9378,6 +9478,10 @@ pub const RpcServer = struct {
             };
         };
 
+        // Core BroadcastTransaction: a locally submitted tx is tracked as
+        // unbroadcast until a peer requests it (node/transaction.cpp:102).
+        self.mempool.addUnbroadcastTx(txid);
+
         // FIX-73 / W120 BUG-3: when this admission replaced BIP-125 conflicts,
         // surface the evicted-txids set so wallets watching for confirmation
         // of replaced txs can detect the replacement directly from the JSON
@@ -9874,51 +9978,7 @@ pub const RpcServer = struct {
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
-        const writer = buf.writer();
-
-        // Format BIP-22/23 response
-        try writer.print("{{\"capabilities\":[\"proposal\"],\"version\":{d},\"previousblockhash\":\"", .{
-            template.header.version,
-        });
-        try writeHashHex(writer, &template.header.prev_block);
-        try writer.print("\",\"transactions\":[", .{});
-
-        for (template.transactions.items, 0..) |tx, i| {
-            if (i > 0) try writer.writeByte(',');
-
-            // Serialize transaction to hex
-            var tx_writer = serialize.Writer.init(self.allocator);
-            defer tx_writer.deinit();
-            serialize.writeTransaction(&tx_writer, &tx.tx) catch continue;
-            const tx_bytes = tx_writer.getWritten();
-
-            try writer.print("{{\"data\":\"", .{});
-            for (tx_bytes) |byte| {
-                try writer.print("{x:0>2}", .{byte});
-            }
-            try writer.print("\",\"txid\":\"", .{});
-            try writeHashHex(writer, &tx.txid);
-            try writer.print("\",\"fee\":{d},\"weight\":{d}}}", .{
-                tx.fee,
-                tx.weight,
-            });
-        }
-
-        try writer.print("],\"coinbasevalue\":{d},\"target\":\"", .{
-            template.getBlockReward(self.network_params),
-        });
-
-        // Write target as hex (big-endian display)
-        for (0..32) |i| {
-            try writer.print("{x:0>2}", .{template.target[31 - i]});
-        }
-
-        try writer.print("\",\"mintime\":{d},\"curtime\":{d},\"bits\":\"{x:0>8}\",\"height\":{d},\"mutable\":[\"time\",\"transactions\",\"prevblock\"]}}", .{
-            template.header.timestamp,
-            template.header.timestamp,
-            template.header.bits,
-            template.height,
-        });
+        try writeBlockTemplateJson(self.allocator, buf.writer(), &template, self.network_params);
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -11632,6 +11692,16 @@ pub const RpcServer = struct {
             };
         }
 
+        // Core submitpackage only marks txs newly accepted by this call as
+        // unbroadcast (BroadcastTransaction skips ones already in the pool).
+        const pre_present = self.allocator.alloc(bool, transactions.items.len) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer self.allocator.free(pre_present);
+        for (transactions.items, 0..) |*ptx, pi| {
+            pre_present[pi] = self.mempool.contains(crypto.computeTxidStreaming(ptx));
+        }
+
         // Validate and accept the package
         var result = mempool_mod.acceptPackage(self.mempool, transactions.items, self.allocator) catch |err| {
             return switch (err) {
@@ -11649,6 +11719,17 @@ pub const RpcServer = struct {
             };
         };
         defer result.deinit();
+
+        for (result.tx_results) |tx_result| {
+            if (!tx_result.accepted) continue;
+            for (transactions.items, 0..) |*ptx, pi| {
+                if (pre_present[pi]) continue;
+                if (std.mem.eql(u8, &crypto.computeTxidStreaming(ptx), &tx_result.txid)) {
+                    self.mempool.addUnbroadcastTx(tx_result.txid);
+                    break;
+                }
+            }
+        }
 
         // Build response JSON
         var buf = std.ArrayList(u8).init(self.allocator);
@@ -14800,8 +14881,9 @@ pub const RpcServer = struct {
                 try writeMempoolDepends(writer, self.mempool, e);
                 try writer.writeAll(",\"spentby\":");
                 try writeMempoolSpentBy(writer, self.mempool, e);
-                try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":false,\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}}", .{
+                try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}}", .{
                     if (rbf) "true" else "false",
+                    if (self.mempool.isUnbroadcastTx(e_txid)) "true" else "false",
                     @divTrunc(e.fee, 100_000_000),
                     @as(u64, @intCast(@mod(e.fee, 100_000_000))),
                     @divTrunc(modified_fee, 100_000_000),
