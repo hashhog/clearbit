@@ -7831,10 +7831,10 @@ pub const RpcServer = struct {
         try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":{d}.{d:0>8},\"maxmempool\":{d},\"mempoolminfee\":{d:.8},\"minrelaytxfee\":{d:.8},\"incrementalrelayfee\":{d:.8},\"unbroadcastcount\":0,\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
             mempool_stats.count,
             mempool_stats.size,
-            mempool_stats.size,
+            mempool_stats.usage,
             @divTrunc(mempool_stats.total_fee, 100_000_000),
             @as(u64, @intCast(@mod(mempool_stats.total_fee, 100_000_000))),
-            mempool_mod.MAX_MEMPOOL_SIZE,
+            self.mempool.max_size,
             mempool_min_fee_btc,
             min_relay_fee_btc,
             incremental_relay_fee_btc,
