@@ -120,6 +120,12 @@ pub const BlockHeaderEntry = struct {
     timestamp: u32,
     /// Original 80-byte serialized header (for getdata replay if needed).
     header: types.BlockHeader,
+    /// Genesis-scale cumulative work (Core CBlockIndex::nChainWork), unlike
+    /// `chain_work` which sits on the since-root comparison scale.  Zero when
+    /// the parent's genesis-scale work could not be resolved.  Used only for
+    /// the best-header record (getblockchaininfo.headers), never for reorg
+    /// decisions.
+    genesis_work: [32]u8 = [_]u8{0} ** 32,
     /// Last access timestamp (seconds since epoch).  Used by the LRU
     /// eviction sweep to keep recently-touched entries.
     last_seen: i64,
@@ -3556,6 +3562,14 @@ pub const PeerManager = struct {
     best_header_chain_work: [32]u8 = [_]u8{0} ** 32,
     best_header_timestamp: u32 = 0,
 
+    /// Core m_best_header for RPC (getblockchaininfo.headers): the accepted
+    /// header with the most GENESIS-SCALE work, headers-only entries
+    /// included.  Persisted (storage BEST_HEADER_KEY) so it survives a
+    /// restart; loaded lazily on the first insert so a post-restart header
+    /// with less work never overwrites the recorded best.
+    best_header: ?storage.ChainState.BestHeader = null,
+    best_header_loaded: bool = false,
+
     /// Maps block hash → source peer pointer (as usize) so drainBlockBuffer
     /// can penalise the supplying peer when validateBlockForIBDOrReject rejects
     /// a block.  Mirrors Bitcoin Core's mapBlockSource (net_processing.cpp:834).
@@ -6327,6 +6341,50 @@ pub const PeerManager = struct {
         return null;
     }
 
+    /// Genesis-scale nChainWork of a header's parent, for
+    /// BlockHeaderEntry.genesis_work.  Zero when unresolvable (the entry then
+    /// never becomes the best-header record).  The parent is either in the
+    /// header index, the active tip (ChainState.total_work), genesis, or an
+    /// active-chain block priced by ChainState.chainWorkAtHeight.
+    fn parentGenesisWork(self: *PeerManager, prev_hash: *const types.Hash256, parent_height: u32) [32]u8 {
+        const zero = [_]u8{0} ** 32;
+        if (self.header_index.get(prev_hash.*)) |e| {
+            if (!chainwork_mod.isZero(&e.genesis_work)) return e.genesis_work;
+        }
+        if (std.mem.eql(u8, prev_hash, &self.network_params.genesis_hash)) {
+            return workFromBits(self.network_params.genesis_header.bits);
+        }
+        const cs = self.chain_state orelse return zero;
+        if (std.mem.eql(u8, prev_hash, &cs.best_hash) and !chainwork_mod.isZero(&cs.total_work)) {
+            return cs.total_work;
+        }
+        if (parent_height <= cs.best_height) {
+            if (cs.getBlockHashByHeight(parent_height)) |at| {
+                if (std.mem.eql(u8, &at, prev_hash)) {
+                    return cs.chainWorkAtHeight(self.network_params, parent_height) orelse zero;
+                }
+            }
+        }
+        return zero;
+    }
+
+    /// Core AcceptBlockHeader: `if (!m_best_header || m_best_header->nChainWork
+    /// < pindex->nChainWork) m_best_header = pindex;` on the genesis scale.
+    fn noteBestHeader(self: *PeerManager, entry: *const BlockHeaderEntry) void {
+        if (chainwork_mod.isZero(&entry.genesis_work)) return;
+        if (!self.best_header_loaded) {
+            self.best_header_loaded = true;
+            if (self.best_header == null) {
+                if (self.chain_state) |cs| self.best_header = cs.loadBestHeader();
+            }
+        }
+        if (self.best_header) |b| {
+            if (cmpChainWorkBE(&entry.genesis_work, &b.work) <= 0) return;
+        }
+        self.best_header = .{ .hash = entry.hash, .height = entry.height, .work = entry.genesis_work };
+        if (self.chain_state) |cs| cs.persistBestHeader(&self.best_header.?);
+    }
+
     /// Insert a header into the in-memory index.  Computes height +
     /// chain_work from the parent.  No-op if the header is already
     /// present (so duplicate batches don't bloat the index).  Returns
@@ -6369,6 +6427,8 @@ pub const PeerManager = struct {
         var new_work: [32]u8 = p.work;
         const this_work = workFromBits(header.bits);
         addChainWorkBE(&new_work, &this_work);
+        var genesis_work: [32]u8 = self.parentGenesisWork(&header.prev_block, p.height);
+        if (!chainwork_mod.isZero(&genesis_work)) addChainWorkBE(&genesis_work, &this_work);
 
         const entry: BlockHeaderEntry = .{
             .hash = block_hash.*,
@@ -6378,6 +6438,7 @@ pub const PeerManager = struct {
             .timestamp = header.timestamp,
             .header = header.*,
             .last_seen = std.time.timestamp(),
+            .genesis_work = genesis_work,
         };
 
         try self.header_index.put(block_hash.*, entry);
@@ -6397,6 +6458,7 @@ pub const PeerManager = struct {
             self.best_header_chain_work = entry.chain_work;
             self.best_header_timestamp = entry.timestamp;
         }
+        self.noteBestHeader(&entry);
 
         // Cap at MAX_HEADER_INDEX entries.  Eviction is amortized: only
         // sweep when we cross the cap, drop the oldest 10% by
