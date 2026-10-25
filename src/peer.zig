@@ -5253,7 +5253,21 @@ pub const PeerManager = struct {
         }
     }
 
-    /// Connect to peers until we have MAX_OUTBOUND_CONNECTIONS outbound.
+    /// Full-relay outbound slots to fill.  Core keeps separate pools
+    /// (net.cpp MAX_OUTBOUND_FULL_RELAY_CONNECTIONS = 8,
+    /// MAX_BLOCK_RELAY_ONLY_CONNECTIONS = 2): anchors (block-relay-only),
+    /// addnode/manual and feelers must not eat the 8 full-relay slots.  One
+    /// EXTRA full-relay outbound is allowed while the tip looks stale.
+    pub fn fullRelayOutboundTarget(self: *const PeerManager) usize {
+        return MAX_OUTBOUND_CONNECTIONS + @as(usize, if (self.try_new_outbound) 1 else 0);
+    }
+
+    /// Full-relay dials still wanted (excluding dials already in flight).
+    pub fn outboundDialHeadroom(self: *const PeerManager) usize {
+        return self.fullRelayOutboundTarget() -| self.countFullRelayOutbound();
+    }
+
+    /// Connect to peers until we have MAX_OUTBOUND_CONNECTIONS full-relay outbound.
     /// Enforces netgroup diversity by tracking connected netgroups.
     ///
     /// Never blocks on the network: each dial (TCP connect, v2 handshake, v1
@@ -5264,10 +5278,7 @@ pub const PeerManager = struct {
     pub fn maintainOutbound(self: *PeerManager) !void {
         self.adoptOutboundDials();
 
-        var outbound_count: usize = 0;
-        for (self.peers.items) |p| {
-            if (p.direction == .outbound) outbound_count += 1;
-        }
+        const outbound_count: usize = self.countFullRelayOutbound();
         var inflight: usize = self.outboundDialsInFlight();
 
         // A burst of concurrent dials only with ZERO outbound peers
@@ -5275,11 +5286,10 @@ pub const PeerManager = struct {
         // spaced OUTBOUND_DIAL_MIN_GAP_MS apart, like Core's single dial
         // thread.
         const max_inflight: usize = if (outbound_count == 0) MAX_CONCURRENT_OUTBOUND_DIALS else 1;
-        // Core: one EXTRA full-relay outbound while the tip looks stale.
-        const target: usize = MAX_OUTBOUND_CONNECTIONS + @as(usize, if (self.try_new_outbound) 1 else 0);
+        const headroom = self.outboundDialHeadroom();
         if (outbound_count > 0 and std.time.milliTimestamp() < self.next_outbound_dial_ms) return;
 
-        while (outbound_count + inflight < target and inflight < max_inflight and
+        while (inflight < headroom and inflight < max_inflight and
             !self.stop_requested.load(.acquire))
         {
             const addr = self.selectPeerToConnect() orelse break;
@@ -5334,11 +5344,8 @@ pub const PeerManager = struct {
             self.dial_done = .{};
         }
         defer ready.deinit(self.allocator);
-        var outbound_count: usize = 0;
-        for (self.peers.items) |p| {
-            if (p.direction == .outbound) outbound_count += 1;
-        }
-        const target: usize = MAX_OUTBOUND_CONNECTIONS + @as(usize, if (self.try_new_outbound) 1 else 0);
+        var outbound_count: usize = self.countFullRelayOutbound();
+        const target = self.fullRelayOutboundTarget();
         for (ready.items) |r| {
             if (r.v1_fallback) self.markV1Only(r.addr);
             const peer = r.peer orelse continue;
@@ -10051,7 +10058,7 @@ pub const PeerManager = struct {
 
     /// Count full-relay outbound peers (manual / feeler / block-relay-only are
     /// not part of the 8 full-relay slots Core keeps).
-    fn countFullRelayOutbound(self: *const PeerManager) usize {
+    pub fn countFullRelayOutbound(self: *const PeerManager) usize {
         var n: usize = 0;
         for (self.peers.items) |p| {
             if (p.direction == .outbound and p.conn_type == .outbound_full_relay) n += 1;
