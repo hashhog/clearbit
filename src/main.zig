@@ -2255,6 +2255,7 @@ pub fn main() !void {
 
     var mempool_instance = mempool.Mempool.init(&chain_state, params, allocator);
     defer mempool_instance.deinit();
+    mempool_instance.max_size = @intCast(config.maxmempool *| 1_000_000);
 
     // Load persisted fee estimator state
     const fee_est_path = std.fmt.allocPrint(allocator, "{s}/fee_estimates.dat", .{full_datadir}) catch null;
