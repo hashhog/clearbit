@@ -1614,11 +1614,12 @@ pub fn processSideBranchSubmission(
     // BEFORE deciding reorg vs. inconclusive: we want the entry to exist
     // even if the chain_work comparison says "stay on active". Skip
     // duplicates (a re-submission of an already-known side-branch block
-    // is a no-op + return "duplicate-inconclusive" per Core convention).
+    // is a no-op returning "duplicate": Core submitblock answers "duplicate"
+    // for a known block with data, rpc/mining.cpp).
     if (cm.getBlock(block_hash)) |_| {
         return .{
             .accepted = false,
-            .reject_reason = "duplicate-inconclusive",
+            .reject_reason = "duplicate",
             .block_hash = block_hash.*,
         };
     }
