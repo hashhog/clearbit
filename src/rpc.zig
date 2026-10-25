@@ -3924,13 +3924,8 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        // Headers height = validated blocks + queued headers not yet validated
-        const queued_count: usize = if (self.peer_manager.expected_blocks.items.len > self.peer_manager.connect_cursor)
-            self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor
-        else
-            0;
-        const headers_height = self.chain_state.best_height +
-            @as(u32, @intCast(queued_count));
+        // Headers height = Core m_best_header->nHeight (bestHeaderHeight).
+        const headers_height = self.bestHeaderHeight();
 
         // Calculate initialblockdownload status
         // IBD = true if chainwork < minimum chain work OR tip age > 24 hours
@@ -5255,15 +5250,9 @@ pub const RpcServer = struct {
         const writer = buf.writer();
 
         // headers: Core emits chainman.m_best_header->nHeight (-1 if none).
-        // clearbit always has at least the genesis header, so headers is the
-        // best-header height = validated tip + headers queued but not yet
-        // connected — the same source getblockchaininfo("headers") uses.
-        const queued_count: usize = if (self.peer_manager.expected_blocks.items.len > self.peer_manager.connect_cursor)
-            self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor
-        else
-            0;
-        const headers_height: i64 = @as(i64, self.chain_state.best_height) +
-            @as(i64, @intCast(queued_count));
+        // clearbit always has at least the genesis header; the same source
+        // getblockchaininfo("headers") uses (bestHeaderHeight).
+        const headers_height: i64 = self.bestHeaderHeight();
 
         // Active chainstate tip header (bits/difficulty/target): read the REAL
         // tip header via resolveTipHeader (CF_BLOCKS → chain_manager → genesis),
@@ -14130,9 +14119,17 @@ pub const RpcServer = struct {
 
         var height: ?u32 = cm_height;
         if (height == null) height = idx_height;
+        if (height == null) {
+            if (self.peer_manager.header_index.get(hash)) |e| height = e.height;
+        }
         if (height == null and std.mem.eql(u8, &hash, &self.chain_state.best_hash)) {
             height = self.chain_state.best_height;
         }
+        // Core blockheaderToJSON: confirmations = tip height - height + 1 only
+        // when chainActive.Contains(blockindex), else -1; nextblockhash only
+        // for an active block.  A side-branch or headers-only block at a
+        // height the active chain also has is NOT confirmed by it.
+        const on_active: bool = if (height) |h| self.isActiveAt(&hash, h) else false;
 
         var chainwork_str: [64]u8 = [_]u8{'0'} ** 64;
         // ntx: from local block bytes only (R3(a) — the Core-meta fill is
@@ -14159,7 +14156,15 @@ pub const RpcServer = struct {
                 mtp_resolved = true;
             }
         }
-        if (!mtp_resolved) {
+        // Off the active chain the by-height MTP below would read the ACTIVE
+        // chain's timestamps at those heights; walk this block's own parents.
+        if (!mtp_resolved and !on_active) {
+            if (self.computeMTPByHash(&hash)) |mtp| {
+                mediantime = @intCast(mtp);
+                mtp_resolved = true;
+            }
+        }
+        if (!mtp_resolved and on_active) {
             if (height) |h| {
                 if (self.computeMTPAtHeight(h)) |mtp| {
                     mediantime = @intCast(mtp);
@@ -14184,6 +14189,10 @@ pub const RpcServer = struct {
         //      in-memory header index roots on, only when no checkpoint basis
         //      exists (no matching checkpoint, or headers missing on the
         //      walk).  It is obviously not a real 2^90-scale work value.
+        //   3b. Off-chain (side-branch / headers-only) block: the fork
+        //      point's genesis-scale work plus GetBlockProof of each header
+        //      above it (genesisChainWorkOf) — Core's nChainWork is
+        //      pprev->nChainWork + GetBlockProof for every index entry.
         var active_chainwork: ?[32]u8 = null;
         if (cm_chainwork == null and idx_chainwork == null) {
             if (height) |h| {
@@ -14191,6 +14200,9 @@ pub const RpcServer = struct {
                     if (std.mem.eql(u8, &hh, &hash)) {
                         active_chainwork = self.chain_state.chainWorkAtHeight(self.network_params, h);
                     }
+                }
+                if (active_chainwork == null and !on_active) {
+                    active_chainwork = self.genesisChainWorkOf(&hash, h);
                 }
             }
         }
@@ -14217,22 +14229,25 @@ pub const RpcServer = struct {
             @memcpy(&chainwork_str, &tmp_buf);
         }
 
-        // Try H: index for nextblockhash if Core didn't provide it.
-        if (nextblockhash_opt == null) {
+        // nextblockhash from the H: index, active blocks only.
+        if (nextblockhash_opt == null and on_active) {
             if (height) |h| {
-                if (self.chain_state.getBlockHashByHeight(h + 1)) |nbh| {
-                    var nbh_hex: [64]u8 = undefined;
-                    for (0..32) |i| {
-                        _ = try std.fmt.bufPrint(nbh_hex[i * 2 ..][0..2], "{x:0>2}", .{nbh[31 - i]});
+                // h + 1 above the tip is a stale H: row left by a disconnect.
+                if (h < self.chain_state.best_height) {
+                    if (self.chain_state.getBlockHashByHeight(h + 1)) |nbh| {
+                        var nbh_hex: [64]u8 = undefined;
+                        for (0..32) |i| {
+                            _ = try std.fmt.bufPrint(nbh_hex[i * 2 ..][0..2], "{x:0>2}", .{nbh[31 - i]});
+                        }
+                        nextblockhash_opt = nbh_hex;
                     }
-                    nextblockhash_opt = nbh_hex;
                 }
             }
         }
 
-        // Confirmations.
+        // Confirmations (-1 off the active chain, Core blockheaderToJSON).
         const confirmations: i64 = if (height) |h|
-            @as(i64, @intCast(self.chain_state.best_height)) - @as(i64, @intCast(h)) + 1
+            (if (on_active) @as(i64, @intCast(self.chain_state.best_height)) - @as(i64, @intCast(h)) + 1 else -1)
         else
             -1;
 
@@ -14364,6 +14379,134 @@ pub const RpcServer = struct {
     /// then falls back to CF_BLOCKS / H:-index MTP or, last, the header's own
     /// nTime).  This is what lets getblockheader emit a Core-correct `mediantime`
     /// on a standalone node WITHOUT proxying to a live Bitcoin Core.
+    /// Header of any block the node knows: genesis, the in-memory block
+    /// index, the header index (headers-only entries), CF_BLOCK_INDEX, then
+    /// CF_BLOCKS.
+    fn headerByHashAny(self: *RpcServer, hash: *const types.Hash256) ?types.BlockHeader {
+        if (std.mem.eql(u8, hash, &self.network_params.genesis_hash)) return self.network_params.genesis_header;
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(hash)) |e| return e.header;
+        }
+        if (self.peer_manager.header_index.get(hash.*)) |e| return e.header;
+        if (self.chain_state.getPersistedHeader(hash)) |hdr| {
+            const hh = crypto.computeBlockHash(&hdr);
+            if (std.mem.eql(u8, &hh, hash)) return hdr;
+        }
+        return self.chain_state.getBlockHeaderFromBody(hash);
+    }
+
+    /// Core CChain::Contains: is `hash` the active-chain block at `height`?
+    /// The H: index decides; when it holds no row at that height (DB-less /
+    /// in-memory-only state) the in-memory active chain is walked, and if
+    /// neither can tell, the block is treated as active (the prior answer).
+    fn isActiveAt(self: *RpcServer, hash: *const types.Hash256, height: u32) bool {
+        if (height > self.chain_state.best_height) return false;
+        if (height == self.chain_state.best_height) return std.mem.eql(u8, hash, &self.chain_state.best_hash);
+        if (height == 0) return std.mem.eql(u8, hash, &self.network_params.genesis_hash);
+        if (self.chain_state.getBlockHashByHeight(height)) |at| return std.mem.eql(u8, &at, hash);
+        if (self.chain_manager) |cm| {
+            if (cm.active_tip) |tip| {
+                if (tip.height == self.chain_state.best_height) {
+                    var cur: ?*validation.BlockIndexEntry = tip;
+                    while (cur) |e| {
+                        if (e.height == height) return std.mem.eql(u8, &e.hash, hash);
+                        if (e.height < height) break;
+                        cur = e.parent;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Genesis-scale nChainWork (Core CBlockIndex::nChainWork) of a block that
+    /// is off the active chain (side branch or headers-only): the work of its
+    /// first active-chain ancestor plus GetBlockProof of every header above
+    /// it.  Null when an ancestor header is missing or the fork point has no
+    /// genesis-scale basis; callers must not invent one.
+    fn genesisChainWorkOf(self: *RpcServer, hash: *const types.Hash256, height: u32) ?[32]u8 {
+        var acc: [32]u8 = [_]u8{0} ** 32;
+        var cursor = hash.*;
+        var h = height;
+        var steps: u32 = 0;
+        while (steps <= 10_000) : (steps += 1) {
+            if (self.isActiveAt(&cursor, h)) {
+                var base: [32]u8 = if (h == self.chain_state.best_height and !chainwork.isZero(&self.chain_state.total_work))
+                    self.chain_state.total_work
+                else
+                    self.chain_state.chainWorkAtHeight(self.network_params, h) orelse return null;
+                chainwork.addChainWorkBE(&base, &acc);
+                return base;
+            }
+            const hdr = self.headerByHashAny(&cursor) orelse return null;
+            const proof = chainwork.workFromBits(hdr.bits);
+            chainwork.addChainWorkBE(&acc, &proof);
+            if (h == 0) return null;
+            cursor = hdr.prev_block;
+            h -= 1;
+        }
+        return null;
+    }
+
+    /// Core CBlockIndex::GetMedianTimePast by prev-pointer walk from `hash`
+    /// (the block itself plus up to 10 ancestors), so a side-branch or
+    /// headers-only block uses ITS ancestors, not the active chain's at the
+    /// same heights.  Null when a non-genesis ancestor header is missing.
+    fn computeMTPByHash(self: *RpcServer, hash: *const types.Hash256) ?i64 {
+        var samples: [11]u32 = undefined;
+        var n: usize = 0;
+        var cursor = hash.*;
+        while (n < 11) {
+            const hdr = self.headerByHashAny(&cursor) orelse return null;
+            samples[n] = hdr.timestamp;
+            n += 1;
+            if (std.mem.allEqual(u8, &hdr.prev_block, 0)) break;
+            cursor = hdr.prev_block;
+        }
+        std.mem.sort(u32, samples[0..n], {}, std.sort.asc(u32));
+        return @intCast(samples[n / 2]);
+    }
+
+    /// getblockchaininfo / getchainstates `headers`: Core m_best_header->nHeight.
+    /// The validated tip plus queued-but-unconnected headers, raised to the
+    /// recorded best header (the most-work accepted header, headers-only
+    /// entries from submitheader / P2P included, persisted across restarts)
+    /// unless that header or an ancestor of it is now invalid.
+    fn bestHeaderHeight(self: *RpcServer) u32 {
+        const queued_count: usize = if (self.peer_manager.expected_blocks.items.len > self.peer_manager.connect_cursor)
+            self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor
+        else
+            0;
+        const tip_based: u32 = self.chain_state.best_height + @as(u32, @intCast(queued_count));
+        const best = self.chain_state.loadBestHeader() orelse self.peer_manager.best_header orelse return tip_based;
+        if (best.height <= tip_based) return tip_based;
+        if (chainwork.cmpChainWorkBE(&best.work, &self.chain_state.total_work) <= 0) return tip_based;
+        // Core keeps m_best_header free of BLOCK_FAILED_VALID: a best header
+        // that is, or descends from, a failed block does not count.  The
+        // durable failed set is almost always empty, so the walk (down to
+        // the active chain, at most 2016 headers) runs only when it is not.
+        const failed = self.chain_state.invalidBlockList(self.allocator) catch return best.height;
+        defer self.allocator.free(failed);
+        if (failed.len == 0) return best.height;
+        var cursor = best.hash;
+        var h = best.height;
+        var steps: u32 = 0;
+        while (steps < 2016) : (steps += 1) {
+            if (self.isActiveAt(&cursor, h)) return best.height;
+            for (failed) |f| if (std.mem.eql(u8, &f, &cursor)) return tip_based;
+            if (self.chain_manager) |cm| {
+                if (cm.getBlock(&cursor)) |e| {
+                    if (e.status.isInvalid()) return tip_based;
+                }
+            }
+            const hdr = self.headerByHashAny(&cursor) orelse return tip_based;
+            if (h == 0) return tip_based;
+            cursor = hdr.prev_block;
+            h -= 1;
+        }
+        return best.height;
+    }
+
     fn computeMTPViaChainManager(self: *RpcServer, entry: *validation.BlockIndexEntry) ?i64 {
         _ = self;
         var samples: [11]u32 = undefined;
@@ -31424,4 +31567,251 @@ test "submitblock resubmit of an invalidated block returns duplicate-invalid" {
     const resp = try server.dispatch(req);
     defer allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"duplicate-invalid\"") != null);
+}
+
+// ── Block-index RPC fields for off-chain and headers-only blocks ─────────
+// Core rpc/blockchain.cpp blockheaderToJSON: confirmations is -1 and
+// nextblockhash absent unless chainActive.Contains(blockindex); chainwork is
+// CBlockIndex::nChainWork (pprev->nChainWork + GetBlockProof) and mediantime
+// GetMedianTimePast over the block's OWN ancestors.  getblockchaininfo.headers
+// is m_best_header->nHeight, headers-only entries included, across restarts.
+// Regtest work per block is GetBlockProof(0x207fffff) = 2.
+const index_rpc_fixture = struct {
+    const T: u32 = 1_296_688_602; // regtest genesis nTime
+
+    fn mk(prev: types.Hash256, ts: u32, nonce: u32) types.BlockHeader {
+        return .{
+            .version = 0x20000000,
+            .prev_block = prev,
+            .merkle_root = [_]u8{0x11} ** 32,
+            .timestamp = ts,
+            .bits = 0x207fffff,
+            .nonce = nonce,
+        };
+    }
+
+    fn rec(db: *storage.Database, height: u32, hdr: *const types.BlockHeader) !types.Hash256 {
+        const hash = crypto.computeBlockHash(hdr);
+        var w = serialize.Writer.init(std.testing.allocator);
+        defer w.deinit();
+        try w.writeInt(u32, height);
+        try serialize.writeBlockHeader(&w, hdr);
+        try db.put(storage.CF_BLOCK_INDEX, &hash, w.getWritten());
+        return hash;
+    }
+
+    fn active(db: *storage.Database, height: u32, hdr: *const types.BlockHeader) !types.Hash256 {
+        const hash = try rec(db, height, hdr);
+        const hh = storage.ChainStore.buildHeightHashKey(height);
+        try db.put(storage.CF_DEFAULT, &hh, &hash);
+        return hash;
+    }
+
+    fn hexOf(hash: *const types.Hash256) [64]u8 {
+        var out: [64]u8 = undefined;
+        for (0..32) |i| _ = std.fmt.bufPrint(out[i * 2 ..][0..2], "{x:0>2}", .{hash[31 - i]}) catch unreachable;
+        return out;
+    }
+
+    fn call(allocator: std.mem.Allocator, server: *RpcServer, method: []const u8, hash: ?*const types.Hash256) ![]const u8 {
+        const req = if (hash) |h| blk: {
+            const hx = hexOf(h);
+            break :blk try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"{s}\",\"params\":[\"{s}\",true]}}", .{ method, &hx });
+        } else try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"{s}\",\"params\":[]}}", .{method});
+        defer allocator.free(req);
+        return server.dispatch(req);
+    }
+
+    fn has(hay: []const u8, needle: []const u8) bool {
+        return std.mem.indexOf(u8, hay, needle) != null;
+    }
+};
+
+test "getblockheader of a side-branch block: confirmations -1, no nextblockhash, own-ancestor chainwork and mediantime" {
+    const allocator = std.testing.allocator;
+    const F = index_rpc_fixture;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    // Active: genesis-b1-b2-b3-b4-b5.  Side: b2-s3-s4 with timestamps BELOW
+    // the active chain's, so a by-height (active-chain) MTP, the header's
+    // own nTime, and the true own-ancestor MTP are three different values.
+    const g = consensus.REGTEST.genesis_hash;
+    const hh0 = storage.ChainStore.buildHeightHashKey(0);
+    try db.put(storage.CF_DEFAULT, &hh0, &g);
+    const h1 = F.mk(g, F.T + 600, 1);
+    const b1 = try F.active(&db, 1, &h1);
+    const h2 = F.mk(b1, F.T + 1200, 2);
+    const b2 = try F.active(&db, 2, &h2);
+    const h3 = F.mk(b2, F.T + 1800, 3);
+    const b3 = try F.active(&db, 3, &h3);
+    const h4 = F.mk(b3, F.T + 2400, 4);
+    const b4 = try F.active(&db, 4, &h4);
+    const h5 = F.mk(b4, F.T + 3000, 5);
+    const b5 = try F.active(&db, 5, &h5);
+    const hs3 = F.mk(b2, F.T + 300, 33);
+    const s3 = try F.rec(&db, 3, &hs3);
+    const hs4 = F.mk(s3, F.T + 150, 44);
+    const s4 = try F.rec(&db, 4, &hs4);
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 5;
+    chain_state.best_hash = b5;
+    chain_state.total_work = chainwork.workFromBits(0x207fffff);
+    for (0..5) |_| {
+        const p = chainwork.workFromBits(0x207fffff);
+        chainwork.addChainWorkBE(&chain_state.total_work, &p);
+    }
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.REGTEST, .{});
+    defer server.deinit();
+
+    // s4: Core says confirmations -1; nChainWork = work(b2)=6 + 2 + 2 = 10;
+    // MTP = median(T, T+600, T+1200, T+300, T+150) = T+300.
+    const r4 = try F.call(allocator, &server, "getblockheader", &s4);
+    defer allocator.free(r4);
+    try std.testing.expect(F.has(r4, "\"confirmations\":-1,"));
+    try std.testing.expect(F.has(r4, "\"height\":4,"));
+    try std.testing.expect(F.has(r4, "\"chainwork\":\"000000000000000000000000000000000000000000000000000000000000000a\""));
+    const mtp4 = try std.fmt.allocPrint(allocator, "\"mediantime\":{d},", .{F.T + 300});
+    defer allocator.free(mtp4);
+    try std.testing.expect(F.has(r4, mtp4));
+    try std.testing.expect(!F.has(r4, "nextblockhash"));
+
+    // s3: the active chain has a block at height 4 (b4), which is NOT s3's
+    // child: no nextblockhash.  nChainWork = 6 + 2 = 8.
+    const r3 = try F.call(allocator, &server, "getblockheader", &s3);
+    defer allocator.free(r3);
+    try std.testing.expect(F.has(r3, "\"confirmations\":-1,"));
+    try std.testing.expect(F.has(r3, "\"chainwork\":\"0000000000000000000000000000000000000000000000000000000000000008\""));
+    try std.testing.expect(!F.has(r3, "nextblockhash"));
+
+    // Control: the active block at the same height keeps its count, its
+    // next block and its active-chain work.
+    const rb3 = try F.call(allocator, &server, "getblockheader", &b3);
+    defer allocator.free(rb3);
+    try std.testing.expect(F.has(rb3, "\"confirmations\":3,"));
+    try std.testing.expect(F.has(rb3, "\"chainwork\":\"0000000000000000000000000000000000000000000000000000000000000008\""));
+    const nb = F.hexOf(&b4);
+    const nb_kv = try std.fmt.allocPrint(allocator, "\"nextblockhash\":\"{s}\"", .{&nb});
+    defer allocator.free(nb_kv);
+    try std.testing.expect(F.has(rb3, nb_kv));
+
+    // The tip has no next block even if a stale H: row sits above it (a
+    // disconnect leaves one behind).
+    const hh6 = storage.ChainStore.buildHeightHashKey(6);
+    try db.put(storage.CF_DEFAULT, &hh6, &s4);
+    const rb5 = try F.call(allocator, &server, "getblockheader", &b5);
+    defer allocator.free(rb5);
+    try std.testing.expect(F.has(rb5, "\"confirmations\":1,"));
+    try std.testing.expect(!F.has(rb5, "nextblockhash"));
+}
+
+test "getblockchaininfo.headers counts headers-only entries, survives restart, drops an invalid best header" {
+    const allocator = std.testing.allocator;
+    const F = index_rpc_fixture;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+
+    const g = consensus.REGTEST.genesis_hash;
+    const hh0 = storage.ChainStore.buildHeightHashKey(0);
+    try db.put(storage.CF_DEFAULT, &hh0, &g);
+    var prev = g;
+    var hdrs: [5]types.BlockHeader = undefined;
+    for (0..5) |i| {
+        hdrs[i] = F.mk(prev, F.T + @as(u32, @intCast(i + 1)) * 600, @intCast(i + 1));
+        prev = try F.active(&db, @intCast(i + 1), &hdrs[i]);
+    }
+    const b5 = prev;
+
+    var chain_state = storage.ChainState.init(&db, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 5;
+    chain_state.best_hash = b5;
+    chain_state.total_work = chainwork.workFromBits(0x207fffff);
+    for (0..5) |_| {
+        const p = chainwork.workFromBits(0x207fffff);
+        chainwork.addChainWorkBE(&chain_state.total_work, &p);
+    }
+
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // submitheader x2 (headers-only 6 and 7 on top of the tip).
+    const hh6 = F.mk(b5, F.T + 3600, 66);
+    const h6 = crypto.computeBlockHash(&hh6);
+    const hh7 = F.mk(h6, F.T + 4200, 77);
+    const h7 = crypto.computeBlockHash(&hh7);
+    {
+        var pm = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+        defer pm.deinit();
+        pm.chain_state = &chain_state;
+        const e6 = (try pm.insertHeader(&hh6, &h6)) orelse return error.TestUnexpectedResult;
+        _ = (try pm.insertHeader(&hh7, &h7)) orelse return error.TestUnexpectedResult;
+        // The reorg-comparison scale is untouched: chain_work stays
+        // since-root (chainWorkFromHeight(tip) + proof).
+        var since_root = peer_mod.chainWorkFromHeight(5);
+        const proof = chainwork.workFromBits(0x207fffff);
+        chainwork.addChainWorkBE(&since_root, &proof);
+        try std.testing.expectEqualSlices(u8, &since_root, &e6.chain_work);
+        var server = RpcServer.init(allocator, &chain_state, &mempool, &pm, &consensus.REGTEST, .{});
+        defer server.deinit();
+        const r = try F.call(allocator, &server, "getblockchaininfo", null);
+        defer allocator.free(r);
+        try std.testing.expect(F.has(r, "\"blocks\":5,\"headers\":7,"));
+        const cs = try F.call(allocator, &server, "getchainstates", null);
+        defer allocator.free(cs);
+        try std.testing.expect(F.has(cs, "{\"headers\":7,"));
+    }
+
+    // Restart: a fresh PeerManager (empty header_index) on the same DB.
+    // Then a P2P header g6 on the tip, with less work than h7.
+    const hg6 = F.mk(b5, F.T + 3601, 600);
+    const g6 = crypto.computeBlockHash(&hg6);
+    {
+        var pm = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+        defer pm.deinit();
+        pm.chain_state = &chain_state;
+        var server = RpcServer.init(allocator, &chain_state, &mempool, &pm, &consensus.REGTEST, .{});
+        defer server.deinit();
+        const r = try F.call(allocator, &server, "getblockchaininfo", null);
+        defer allocator.free(r);
+        try std.testing.expect(F.has(r, "\"blocks\":5,\"headers\":7,"));
+
+        _ = try pm.insertHeader(&hg6, &g6);
+        const r2 = try F.call(allocator, &server, "getblockchaininfo", null);
+        defer allocator.free(r2);
+        try std.testing.expect(F.has(r2, "\"blocks\":5,\"headers\":7,"));
+
+        // The P2P headers-only g6: not active, nChainWork 12 + 2 = 14,
+        // MTP = median of b1..b5 + g6 + genesis = T+1800.
+        const rh = try F.call(allocator, &server, "getblockheader", &g6);
+        defer allocator.free(rh);
+        try std.testing.expect(F.has(rh, "\"confirmations\":-1,"));
+        try std.testing.expect(F.has(rh, "\"height\":6,"));
+        try std.testing.expect(F.has(rh, "\"chainwork\":\"000000000000000000000000000000000000000000000000000000000000000e\""));
+        const mtp = try std.fmt.allocPrint(allocator, "\"mediantime\":{d},", .{F.T + 1800});
+        defer allocator.free(mtp);
+        try std.testing.expect(F.has(rh, mtp));
+
+        // h6 marked failed: h7 descends from it, so it is no longer a valid
+        // best header (Core keeps m_best_header free of BLOCK_FAILED_VALID).
+        try chain_state.setBlockFailedDurable(&h6, true);
+        const r3 = try F.call(allocator, &server, "getblockchaininfo", null);
+        defer allocator.free(r3);
+        try std.testing.expect(F.has(r3, "\"blocks\":5,\"headers\":5,"));
+    }
 }

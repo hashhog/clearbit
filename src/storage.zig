@@ -2338,6 +2338,12 @@ pub const ChainState = struct {
     /// (headers AND bodies). Needed so a restart after height 1 is indexed
     /// still resumes the remaining gap.
     pub const HISTORICAL_BACKFILL_FLOOR_KEY: []const u8 = "historical_backfill_floor";
+    /// Core m_best_header (the most-work header the node has accepted,
+    /// headers-only entries included): 32-byte hash + 4-byte LE height +
+    /// 32-byte BE genesis-scale nChainWork.  The in-memory header_index is
+    /// empty after a restart, but Core reloads m_best_header from its block
+    /// index, so getblockchaininfo.headers must survive the restart too.
+    pub const BEST_HEADER_KEY: []const u8 = "best_header";
 
     best_hash: types.Hash256,
     best_height: u32,
@@ -4660,6 +4666,36 @@ pub const ChainState = struct {
         writer.writeInt(u32, height) catch return;
         serialize.writeBlockHeader(&writer, header) catch return;
         db.put(CF_BLOCK_INDEX, hash, writer.getWritten()) catch return;
+    }
+
+    pub const BestHeader = struct {
+        hash: types.Hash256,
+        height: u32,
+        /// Genesis-scale nChainWork, big-endian.
+        work: [32]u8,
+    };
+
+    /// Persisted best header (see BEST_HEADER_KEY); null when none recorded.
+    pub fn loadBestHeader(self: *ChainState) ?BestHeader {
+        const db = self.utxo_set.db orelse return null;
+        const data = db.get(CF_DEFAULT, BEST_HEADER_KEY) catch return null;
+        const bytes = data orelse return null;
+        defer self.allocator.free(bytes);
+        if (bytes.len != 68) return null;
+        return .{
+            .hash = bytes[0..32].*,
+            .height = std.mem.readInt(u32, bytes[32..36], .little),
+            .work = bytes[36..68].*,
+        };
+    }
+
+    pub fn persistBestHeader(self: *ChainState, best: *const BestHeader) void {
+        const db = self.utxo_set.db orelse return;
+        var buf: [68]u8 = undefined;
+        @memcpy(buf[0..32], &best.hash);
+        std.mem.writeInt(u32, buf[32..36], best.height, .little);
+        @memcpy(buf[36..68], &best.work);
+        db.put(CF_DEFAULT, BEST_HEADER_KEY, &buf) catch return;
     }
 
     /// Persist a raw block body in CF_BLOCKS. Does not connect UTXO.
