@@ -61,6 +61,21 @@ pub const MAX_DESCENDANT_SIZE: usize = 101_000;
 /// Transaction expiry time: 2 weeks in seconds.
 pub const MEMPOOL_EXPIRY: i64 = 14 * 24 * 60 * 60;
 
+/// Mocked clock (regtest only, set by the `setmocktime` RPC). 0 = use the
+/// system clock, matching Core's SetMockTime(0).
+var mock_time = std.atomic.Value(i64).init(0);
+
+pub fn setMockTime(t: i64) void {
+    mock_time.store(t, .monotonic);
+}
+
+/// Core's GetTime(): the mocked time when set, else the wall clock. Mempool
+/// expiry, entry timestamps and the rolling-minimum-fee decay all read this.
+pub fn currentTime() i64 {
+    const m = mock_time.load(.monotonic);
+    return if (m != 0) m else std.time.timestamp();
+}
+
 /// Minimum relay fee in satoshis per 1000 vbytes.
 /// Bitcoin Core: DEFAULT_MIN_RELAY_TX_FEE = 100 (policy/policy.h:70).
 /// Was wrongly set to 1000 (10× too high), causing over-rejection of valid relay txs.
@@ -1139,7 +1154,7 @@ pub const Mempool = struct {
             .orphans_by_peer = std.AutoHashMap(u64, u32).init(allocator),
             // Rolling minimum fee rate state (Core txmempool.cpp:829-859).
             .rolling_minimum_fee_rate = 0.0,
-            .last_rolling_fee_update = std.time.timestamp(),
+            .last_rolling_fee_update = currentTime(),
             .block_since_last_rolling_fee_bump = false,
             // FIX-72 / W120 BUG-11 — prioritisetransaction fee deltas.
             // Empty on init; deltas are not persisted across restarts (Core parity).
@@ -1573,7 +1588,7 @@ pub const Mempool = struct {
             .cluster_weight = cluster_weight,
             .vsize = vsize,
             .fee_rate = fee_rate,
-            .time_added = std.time.timestamp(),
+            .time_added = currentTime(),
             .height_added = if (self.chain_state) |cs| cs.best_height else 0,
             .ancestor_count = ancestors.count,
             .ancestor_size = ancestors.size + vsize, // Include self
@@ -3019,7 +3034,7 @@ pub const Mempool = struct {
             .txid = txid,
             .wtxid = wtxid,
             .size = sz,
-            .time_added = std.time.timestamp(),
+            .time_added = currentTime(),
             .peer_id = peer_id,
         };
 
@@ -5063,7 +5078,7 @@ pub const Mempool = struct {
             return @max(rolling, @as(u64, @intCast(MIN_RELAY_FEE)));
         }
 
-        const now = std.time.timestamp();
+        const now = currentTime();
 
         // Step 3: only decay when > 10 s have elapsed.
         if (now > self.last_rolling_fee_update + 10) {
@@ -5128,7 +5143,7 @@ pub const Mempool = struct {
     pub fn removeExpired(self: *Mempool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const now = std.time.timestamp();
+        const now = currentTime();
         var to_remove = std.ArrayList(types.Hash256).init(self.allocator);
         defer to_remove.deinit();
 
@@ -5340,7 +5355,7 @@ pub const Mempool = struct {
             .cluster_weight = cluster_weight,
             .vsize = vsize,
             .fee_rate = individual_fee_rate,
-            .time_added = std.time.timestamp(),
+            .time_added = currentTime(),
             .height_added = if (self.chain_state) |cs| cs.best_height else 0,
             .ancestor_count = ancestors.count,
             .ancestor_size = ancestors.size + vsize, // Include self
