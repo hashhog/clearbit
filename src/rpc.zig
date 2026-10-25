@@ -1384,6 +1384,77 @@ pub fn handleSendPayjoinRequest(
 }
 
 /// JSON-RPC server over HTTP.
+/// BIP-22/23/145 getblocktemplate response body.  `rules` and
+/// `default_witness_commitment` follow Core mining.cpp (aRules: csv,
+/// !segwit, taproot once segwit is active, which getblocktemplate requires of
+/// the caller; default_witness_commitment = scriptPubKey of the coinbase's
+/// required witness-commitment output).
+pub fn writeBlockTemplateJson(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    template: *const block_template.BlockTemplate,
+    params: *const consensus.NetworkParams,
+) !void {
+    // Format BIP-22/23 response
+    try writer.print("{{\"capabilities\":[\"proposal\"],\"version\":{d},\"rules\":[\"csv\",\"!segwit\",\"taproot\"],\"previousblockhash\":\"", .{
+        template.header.version,
+    });
+    try writeHashHex(writer, &template.header.prev_block);
+    try writer.print("\",\"transactions\":[", .{});
+
+    for (template.transactions.items, 0..) |tx, i| {
+        if (i > 0) try writer.writeByte(',');
+
+        // Serialize transaction to hex
+        var tx_writer = serialize.Writer.init(allocator);
+        defer tx_writer.deinit();
+        serialize.writeTransaction(&tx_writer, &tx.tx) catch continue;
+        const tx_bytes = tx_writer.getWritten();
+
+        try writer.print("{{\"data\":\"", .{});
+        for (tx_bytes) |byte| {
+            try writer.print("{x:0>2}", .{byte});
+        }
+        try writer.print("\",\"txid\":\"", .{});
+        try writeHashHex(writer, &tx.txid);
+        try writer.print("\",\"fee\":{d},\"weight\":{d}}}", .{
+            tx.fee,
+            tx.weight,
+        });
+    }
+
+    try writer.print("],\"coinbasevalue\":{d},\"target\":\"", .{
+        template.getBlockReward(params),
+    });
+
+    // Write target as hex (big-endian display)
+    for (0..32) |i| {
+        try writer.print("{x:0>2}", .{template.target[31 - i]});
+    }
+
+    try writer.print("\",\"mintime\":{d},\"curtime\":{d},\"bits\":\"{x:0>8}\",\"height\":{d},\"mutable\":[\"time\",\"transactions\",\"prevblock\"]", .{
+        template.header.timestamp,
+        template.header.timestamp,
+        template.header.bits,
+        template.height,
+    });
+
+    // Core: HexStr(coinbase.required_outputs[0].scriptPubKey), the
+    // OP_RETURN 0xaa21a9ed witness-commitment output (optional in Core).
+    for (template.coinbase_tx.outputs) |out| {
+        const sp = out.script_pubkey;
+        if (sp.len == 38 and sp[0] == 0x6a and sp[1] == 0x24 and
+            sp[2] == 0xaa and sp[3] == 0x21 and sp[4] == 0xa9 and sp[5] == 0xed)
+        {
+            try writer.writeAll(",\"default_witness_commitment\":\"");
+            for (sp) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeByte('"');
+            break;
+        }
+    }
+    try writer.writeByte('}');
+}
+
 pub const RpcServer = struct {
     listener: ?std.net.Server,
     allocator: std.mem.Allocator,
@@ -9874,51 +9945,7 @@ pub const RpcServer = struct {
 
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
-        const writer = buf.writer();
-
-        // Format BIP-22/23 response
-        try writer.print("{{\"capabilities\":[\"proposal\"],\"version\":{d},\"previousblockhash\":\"", .{
-            template.header.version,
-        });
-        try writeHashHex(writer, &template.header.prev_block);
-        try writer.print("\",\"transactions\":[", .{});
-
-        for (template.transactions.items, 0..) |tx, i| {
-            if (i > 0) try writer.writeByte(',');
-
-            // Serialize transaction to hex
-            var tx_writer = serialize.Writer.init(self.allocator);
-            defer tx_writer.deinit();
-            serialize.writeTransaction(&tx_writer, &tx.tx) catch continue;
-            const tx_bytes = tx_writer.getWritten();
-
-            try writer.print("{{\"data\":\"", .{});
-            for (tx_bytes) |byte| {
-                try writer.print("{x:0>2}", .{byte});
-            }
-            try writer.print("\",\"txid\":\"", .{});
-            try writeHashHex(writer, &tx.txid);
-            try writer.print("\",\"fee\":{d},\"weight\":{d}}}", .{
-                tx.fee,
-                tx.weight,
-            });
-        }
-
-        try writer.print("],\"coinbasevalue\":{d},\"target\":\"", .{
-            template.getBlockReward(self.network_params),
-        });
-
-        // Write target as hex (big-endian display)
-        for (0..32) |i| {
-            try writer.print("{x:0>2}", .{template.target[31 - i]});
-        }
-
-        try writer.print("\",\"mintime\":{d},\"curtime\":{d},\"bits\":\"{x:0>8}\",\"height\":{d},\"mutable\":[\"time\",\"transactions\",\"prevblock\"]}}", .{
-            template.header.timestamp,
-            template.header.timestamp,
-            template.header.bits,
-            template.height,
-        });
+        try writeBlockTemplateJson(self.allocator, buf.writer(), &template, self.network_params);
 
         return self.jsonRpcResult(buf.items, id);
     }

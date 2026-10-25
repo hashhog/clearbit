@@ -174,6 +174,7 @@ const storage = @import("storage.zig");
 const mempool_mod = @import("mempool.zig");
 const types = @import("types.zig");
 const crypto = @import("crypto.zig");
+const rpc = @import("rpc.zig");
 
 // ---------------------------------------------------------------------------
 // G1 — params parsing: mode/rules/capabilities/longpollid (BUG-1: ignored)
@@ -1268,4 +1269,57 @@ test "mempool-reorg: getblocktemplate puts an in-mempool parent before its child
     try testing.expectEqual(@as(usize, 2), tmpl.transactions.items.len);
     try testing.expectEqualSlices(u8, &p_id, &tmpl.transactions.items[0].txid);
     try testing.expectEqualSlices(u8, &c_id, &tmpl.transactions.items[1].txid);
+}
+
+test "gbt-segwit-fields: getblocktemplate emits rules and default_witness_commitment like Core mining.cpp" {
+    const allocator = testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    chain_state.best_height = 144;
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+    var tmpl = try block_template.createBlockTemplate(
+        &chain_state,
+        &mempool,
+        &consensus.REGTEST,
+        .{
+            .payout_script = &payout,
+            .include_witness_commitment = true,
+            .override_bits = consensus.REGTEST.genesis_header.bits,
+        },
+        allocator,
+    );
+    defer tmpl.deinit();
+
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    try rpc.writeBlockTemplateJson(allocator, buf.writer(), &tmpl, &consensus.REGTEST);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, buf.items, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    // Core: aRules = csv, !segwit, taproot (in that order).
+    const rules = (obj.get("rules") orelse return error.TestMissingRules).array.items;
+    try testing.expectEqual(@as(usize, 3), rules.len);
+    try testing.expectEqualStrings("csv", rules[0].string);
+    try testing.expectEqualStrings("!segwit", rules[1].string);
+    try testing.expectEqualStrings("taproot", rules[2].string);
+
+    // Core: HexStr(coinbase.required_outputs[0].scriptPubKey) = the
+    // OP_RETURN 0xaa21a9ed commitment script.
+    const dwc = (obj.get("default_witness_commitment") orelse return error.TestMissingDefaultWitnessCommitment).string;
+    var want: ?[]const u8 = null;
+    for (tmpl.coinbase_tx.outputs) |out| {
+        if (out.script_pubkey.len == 38 and out.script_pubkey[0] == 0x6a and
+            out.script_pubkey[2] == 0xaa and out.script_pubkey[3] == 0x21)
+            want = out.script_pubkey;
+    }
+    try testing.expect(want != null);
+    try testing.expectEqual(@as(usize, 76), dwc.len);
+    try testing.expect(std.mem.startsWith(u8, dwc, "6a24aa21a9ed"));
+    const expect_hex = try std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(want.?)});
+    defer allocator.free(expect_hex);
+    try testing.expectEqualStrings(expect_hex, dwc);
 }
