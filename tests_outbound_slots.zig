@@ -77,6 +77,9 @@ test "outbound_slots: anchors and manual peers do not use the 8 full-relay slots
     try testing.expectEqual(@as(usize, 2), peer_mod.MAX_BLOCK_RELAY_ONLY_CONNECTIONS);
     // Two more full-relay dials wanted (old accounting: 9 >= 8 -> none).
     try testing.expectEqual(@as(usize, 2), manager.outboundDialHeadroom());
+    // Both block-relay-only slots are held by the anchors: no further dial.
+    try testing.expectEqual(@as(usize, 2), manager.countBlockRelayOutbound());
+    try testing.expectEqual(@as(usize, 0), manager.blockRelayDialHeadroom());
 
     // Fill the 8 full-relay slots: headroom closes, extra stale-tip peer opens one.
     try manager.peers.append(try outboundPeer(allocator, 10, .outbound_full_relay));
@@ -119,4 +122,12 @@ test "outbound_slots: rotation never opens a hole in the 8 full-relay slots" {
     const victim = manager.rotationVictimIndex(now).?;
     try testing.expectEqual(peer_mod.ConnectionType.outbound_full_relay, manager.peers.items[victim].conn_type);
     try testing.expectEqual(@as(usize, 2), victim);
+}
+
+test "outbound_slots: 8 full-relay + 2 block-relay-only are both wanted from an empty node" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+    try testing.expectEqual(@as(usize, 8), manager.outboundDialHeadroom());
+    try testing.expectEqual(@as(usize, 2), manager.blockRelayDialHeadroom());
 }

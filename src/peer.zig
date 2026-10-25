@@ -622,6 +622,8 @@ const DialResult = struct {
     peer: ?*Peer,
     /// The v2 probe failed and the address should be remembered as v1-only.
     v1_fallback: bool,
+    /// Dialled for a block-relay-only slot (version relay=false).
+    block_relay: bool = false,
 };
 
 /// Drain-wedge staller timeout in seconds. When `connect_cursor` is stuck on a
@@ -3307,6 +3309,8 @@ pub const PeerManager = struct {
     dial_mutex: std.Thread.Mutex = .{},
     dial_done: std.ArrayListUnmanaged(DialResult) = .{},
     dial_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Subset of `dial_workers` dialling for a block-relay-only slot.
+    dial_workers_br: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     last_rotation_time: i64,
     /// Set of netgroups for current outbound connections (for diversity).
     outbound_netgroups: std.AutoHashMap(u32, void),
@@ -5262,6 +5266,20 @@ pub const PeerManager = struct {
         return MAX_OUTBOUND_CONNECTIONS + @as(usize, if (self.try_new_outbound) 1 else 0);
     }
 
+    /// Outbound block-relay-only peers (anchors + auto-dialled).
+    pub fn countBlockRelayOutbound(self: *const PeerManager) usize {
+        var n: usize = 0;
+        for (self.peers.items) |p| {
+            if (p.direction == .outbound and p.conn_type == .block_relay) n += 1;
+        }
+        return n;
+    }
+
+    /// Block-relay-only dials still wanted (excluding dials in flight).
+    pub fn blockRelayDialHeadroom(self: *const PeerManager) usize {
+        return MAX_BLOCK_RELAY_ONLY_CONNECTIONS -| self.countBlockRelayOutbound();
+    }
+
     /// Full-relay dials still wanted (excluding dials already in flight).
     pub fn outboundDialHeadroom(self: *const PeerManager) usize {
         return self.fullRelayOutboundTarget() -| self.countFullRelayOutbound();
@@ -5292,17 +5310,46 @@ pub const PeerManager = struct {
         while (inflight < headroom and inflight < max_inflight and
             !self.stop_requested.load(.acquire))
         {
-            const addr = self.selectPeerToConnect() orelse break;
-            const try_v2 = Peer.bip324V2Enabled() and !self.isV1Only(addr);
-            _ = self.dial_workers.fetchAdd(1, .acq_rel);
-            const th = std.Thread.spawn(.{}, outboundDialWorker, .{ self, addr, try_v2, self.our_height }) catch {
-                _ = self.dial_workers.fetchSub(1, .acq_rel);
-                break;
-            };
-            th.detach();
+            if (!self.spawnOutboundDial(false)) break;
             inflight += 1;
-            self.next_outbound_dial_ms = std.time.milliTimestamp() + OUTBOUND_DIAL_MIN_GAP_MS;
         }
+
+        // Block-relay-only pool (Core MAX_BLOCK_RELAY_ONLY_CONNECTIONS = 2),
+        // filled once the full-relay pool is, one dial at a time.
+        if (headroom == 0 and inflight == 0 and
+            self.blockRelayDialsInFlight() < self.blockRelayDialHeadroom() and
+            std.time.milliTimestamp() >= self.next_outbound_dial_ms and
+            !self.stop_requested.load(.acquire))
+        {
+            _ = self.spawnOutboundDial(true);
+        }
+    }
+
+    /// Start one dial worker for a full-relay (or block-relay-only) slot.
+    fn spawnOutboundDial(self: *PeerManager, block_relay: bool) bool {
+        const addr = self.selectPeerToConnect() orelse return false;
+        const try_v2 = Peer.bip324V2Enabled() and !self.isV1Only(addr);
+        _ = self.dial_workers.fetchAdd(1, .acq_rel);
+        if (block_relay) _ = self.dial_workers_br.fetchAdd(1, .acq_rel);
+        const th = std.Thread.spawn(.{}, outboundDialWorker, .{ self, addr, try_v2, self.our_height, block_relay }) catch {
+            if (block_relay) _ = self.dial_workers_br.fetchSub(1, .acq_rel);
+            _ = self.dial_workers.fetchSub(1, .acq_rel);
+            return false;
+        };
+        th.detach();
+        self.next_outbound_dial_ms = std.time.milliTimestamp() + OUTBOUND_DIAL_MIN_GAP_MS;
+        return true;
+    }
+
+    /// Block-relay-only dials started and not yet adopted.
+    fn blockRelayDialsInFlight(self: *PeerManager) usize {
+        self.dial_mutex.lock();
+        defer self.dial_mutex.unlock();
+        var n: usize = self.dial_workers_br.load(.acquire);
+        for (self.dial_done.items) |r| {
+            if (r.block_relay) n += 1;
+        }
+        return n;
     }
 
     /// Dials started and not yet adopted: running workers plus results
@@ -5312,19 +5359,27 @@ pub const PeerManager = struct {
     fn outboundDialsInFlight(self: *PeerManager) usize {
         self.dial_mutex.lock();
         defer self.dial_mutex.unlock();
-        return self.dial_workers.load(.acquire) + self.dial_done.items.len;
+        var n: usize = self.dial_workers.load(.acquire) -| self.dial_workers_br.load(.acquire);
+        for (self.dial_done.items) |r| {
+            if (!r.block_relay) n += 1;
+        }
+        return n;
     }
 
     /// Worker: one outbound dial + handshake, off the P2P thread.  Touches
     /// only its own Peer and the hand-off queue under `dial_mutex`.
-    fn outboundDialWorker(self: *PeerManager, addr: std.net.Address, try_v2: bool, our_height: i32) void {
+    fn outboundDialWorker(self: *PeerManager, addr: std.net.Address, try_v2: bool, our_height: i32, block_relay: bool) void {
         // Last access to `self`: deinit waits for this counter to reach 0.
         defer _ = self.dial_workers.fetchSub(1, .acq_rel);
+        defer if (block_relay) {
+            _ = self.dial_workers_br.fetchSub(1, .acq_rel);
+        };
         var fell_back = false;
-        const peer = self.dialNegotiate(addr, true, try_v2, our_height, &fell_back, false);
+        // Block-relay-only: version relay=false so the peer sends no tx inv.
+        const peer = self.dialNegotiate(addr, !block_relay, try_v2, our_height, &fell_back, false);
         self.dial_mutex.lock();
         defer self.dial_mutex.unlock();
-        self.dial_done.append(self.allocator, .{ .addr = addr, .peer = peer, .v1_fallback = fell_back }) catch {
+        self.dial_done.append(self.allocator, .{ .addr = addr, .peer = peer, .v1_fallback = fell_back, .block_relay = block_relay }) catch {
             if (peer) |p| {
                 p.disconnect();
                 self.allocator.destroy(p);
@@ -5345,6 +5400,7 @@ pub const PeerManager = struct {
         }
         defer ready.deinit(self.allocator);
         var outbound_count: usize = self.countFullRelayOutbound();
+        var br_count: usize = self.countBlockRelayOutbound();
         const target = self.fullRelayOutboundTarget();
         for (ready.items) |r| {
             if (r.v1_fallback) self.markV1Only(r.addr);
@@ -5356,7 +5412,7 @@ pub const PeerManager = struct {
             // been filled (inbound-to-outbound churn, a feeler, addnode)
             // while it ran.
             if (self.stopping() or self.peers.items.len >= MAX_TOTAL_CONNECTIONS or
-                outbound_count >= target or
+                (if (r.block_relay) br_count >= MAX_BLOCK_RELAY_ONLY_CONNECTIONS else outbound_count >= target) or
                 self.isConnected(addr) or self.violatesNetgroupDiversity(addr))
             {
                 peer.disconnect();
@@ -5377,6 +5433,8 @@ pub const PeerManager = struct {
                 _ = am.good(addr, if (succ_ts < 0) 0 else @intCast(succ_ts)) catch {};
             }
 
+            if (r.block_relay) peer.conn_type = .block_relay;
+
             // Track netgroup for diversity enforcement
             self.trackOutboundNetgroup(peer);
 
@@ -5386,8 +5444,16 @@ pub const PeerManager = struct {
                 self.allocator.destroy(peer);
                 continue;
             };
-            outbound_count += 1;
-            std.log.info("Connected to outbound peer {} (height={d}, {d}/{d} outbound)", .{ addr, peer.start_height, outbound_count, target });
+            if (r.block_relay) br_count += 1 else outbound_count += 1;
+            std.log.info("Connected to outbound {s} peer {} (height={d}, {d}/{d} full-relay, {d}/{d} block-relay-only)", .{
+                if (r.block_relay) "block-relay-only" else "full-relay",
+                addr,
+                peer.start_height,
+                outbound_count,
+                target,
+                br_count,
+                MAX_BLOCK_RELAY_ONLY_CONNECTIONS,
+            });
 
             // Initiate header sync with newly connected peer
             self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
