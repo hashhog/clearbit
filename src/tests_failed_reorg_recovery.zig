@@ -30,6 +30,9 @@ const crypto = @import("crypto.zig");
 const serialize = @import("serialize.zig");
 const validation = @import("validation.zig");
 const block_template = @import("block_template.zig");
+const rpc = @import("rpc.zig");
+const mempool_mod = @import("mempool.zig");
+const peer_mod = @import("peer.zig");
 
 const params = &consensus.REGTEST;
 
@@ -82,6 +85,9 @@ const Node = struct {
         cs.best_hash = params.genesis_hash;
         cs.initGenesisTimestamp(params.genesis_header.timestamp);
         cs.initGenesisRetarget(params.genesis_header.timestamp, params.genesis_header.bits);
+        // main.zig: nChainWork(genesis) = GetBlockProof(genesis), so the
+        // persisted per-height work is genesis-scale (Core's).
+        cs.seedGenesisTotalWork(params.genesis_header.bits);
         // main.zig: load the persisted tip.
         if (try db.get(storage.CF_DEFAULT, "chain_tip")) |data| {
             defer allocator.free(data);
@@ -342,4 +348,86 @@ test "failed_reorg_recovery: reconsiderblock keeps a heavier side branch" {
 
     try node.reconsider(d4a.hash);
     try node.expectTip(&d5s, 5);
+}
+
+/// getblockheader(hash).chainwork through the RPC handler, on the node's
+/// current chain state and chain manager.
+fn headerChainwork(node: *Node, hash: types.Hash256) ![64]u8 {
+    const allocator = testing.allocator;
+    var mp = mempool_mod.Mempool.init(null, null, allocator);
+    defer mp.deinit();
+    var pm = peer_mod.PeerManager.init(allocator, params);
+    defer pm.deinit();
+    var srv = rpc.RpcServer.init(allocator, node.cs, &mp, &pm, params, .{});
+    defer srv.deinit();
+    srv.setChainManager(node.cm);
+
+    var hex: [64]u8 = undefined;
+    for (0..32) |i| _ = try std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{hash[31 - i]});
+    const req = try std.fmt.allocPrint(allocator, "{{\"id\":1,\"method\":\"getblockheader\",\"params\":[\"{s}\"]}}", .{&hex});
+    defer allocator.free(req);
+    const resp = try srv.dispatch(req);
+    defer allocator.free(resp);
+    var p = try std.json.parseFromSlice(std.json.Value, allocator, resp, .{});
+    defer p.deinit();
+    const result = p.value.object.get("result") orelse return error.NoResult;
+    if (result != .object) {
+        std.debug.print("getblockheader: {s}\n", .{resp});
+        return error.NoResult;
+    }
+    const cw = result.object.get("chainwork").?.string;
+    var out: [64]u8 = undefined;
+    if (cw.len != 64) return error.BadChainwork;
+    @memcpy(&out, cw);
+    return out;
+}
+
+// Scenario E's displaced header: Core reports a block's nChainWork whether or
+// not it is on the active chain, and a restart does not change it.  After the
+// restart the in-memory index holds only genesis, so x4 (displaced by
+// invalidateblock, then reconsidered but losing the tie) is in no index the
+// handler looked at, and it fell back to the synthetic height scale (height
+// + 1 = 5, Core 10).  Core core-regtest rows failed_reorg/e-restart and
+// e-restart-invalidated /displaced-header:chainwork.
+test "failed_reorg_recovery: getblockheader reports a displaced block's chainwork after a restart" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    var node = try Node.boot(testing.allocator, fx.db);
+    defer node.shutdown();
+
+    const r1 = try mine(a, params.genesis_hash, 1, 0, 0xC1);
+    const r2 = try mine(a, r1.hash, 2, 0, 0xC2);
+    const x3 = try mine(a, r2.hash, 3, 0, 0xC3);
+    const x4 = try mine(a, x3.hash, 4, 0, 0xC4);
+    const y3 = try mine(a, r2.hash, 3, 0, 0xD3);
+    const y4 = try mine(a, y3.hash, 4, 0, 0xD4);
+    for ([_]*const Blk{ &r1, &r2, &x3, &x4 }) |b| try expectAccepted(try node.submit(b));
+    for ([_]*const Blk{ &y3, &y4 }) |b| _ = try node.submit(b);
+
+    // Genesis plus four blocks, each regtest proof 2: 10.
+    const want = "000000000000000000000000000000000000000000000000000000000000000a";
+
+    try node.invalidate(x4.hash);
+    try node.expectTip(&y4, 4);
+    try testing.expectEqualStrings(want, &try headerChainwork(&node, x4.hash));
+
+    // e-restart-invalidated.
+    try node.restart();
+    try node.expectTip(&y4, 4);
+    // Control: the active block at the same height, same work.
+    try testing.expectEqualStrings(want, &try headerChainwork(&node, y4.hash));
+    try testing.expectEqualStrings(want, &try headerChainwork(&node, x4.hash));
+    // Its side-branch parent too (one proof less).
+    try testing.expectEqualStrings(
+        "0000000000000000000000000000000000000000000000000000000000000008",
+        &try headerChainwork(&node, x3.hash),
+    );
+
+    // e-restart: reconsider, x4 loses the tie, restart again.
+    try node.reconsider(x4.hash);
+    try node.expectTip(&y4, 4);
+    try node.restart();
+    try node.expectTip(&y4, 4);
+    try testing.expectEqualStrings(want, &try headerChainwork(&node, x4.hash));
 }
