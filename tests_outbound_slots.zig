@@ -85,3 +85,38 @@ test "outbound_slots: anchors and manual peers do not use the 8 full-relay slots
     manager.try_new_outbound = true;
     try testing.expectEqual(@as(usize, 1), manager.outboundDialHeadroom());
 }
+
+test "outbound_slots: rotation never opens a hole in the 8 full-relay slots" {
+    const allocator = testing.allocator;
+    var manager = PeerManager.init(allocator, &consensus.MAINNET);
+    defer manager.deinit();
+    defer {
+        for (manager.peers.items) |p| {
+            p.recv_buffer.deinit();
+            allocator.destroy(p);
+        }
+        manager.peers.clearRetainingCapacity();
+    }
+    const now = std.time.timestamp();
+
+    // 8 full-relay + 2 anchors, anchors the oldest.
+    var i: u8 = 0;
+    while (i < 10) : (i += 1) {
+        const kind: peer_mod.ConnectionType = if (i < 2) .block_relay else .outbound_full_relay;
+        const p = try outboundPeer(allocator, i + 1, kind);
+        p.last_message_time = now - 1000 + @as(i64, i);
+        try manager.peers.append(p);
+    }
+    // Exactly 8 full-relay: rotation must not drop one (old code dropped the
+    // oldest outbound, taking the node to 7 every 30 min).
+    try testing.expectEqual(@as(?usize, null), manager.rotationVictimIndex(now));
+
+    // A 9th full-relay peer (stale-tip extra): trim the oldest FULL-RELAY
+    // one, never an anchor.
+    const extra = try outboundPeer(allocator, 20, .outbound_full_relay);
+    extra.last_message_time = now;
+    try manager.peers.append(extra);
+    const victim = manager.rotationVictimIndex(now).?;
+    try testing.expectEqual(peer_mod.ConnectionType.outbound_full_relay, manager.peers.items[victim].conn_type);
+    try testing.expectEqual(@as(usize, 2), victim);
+}

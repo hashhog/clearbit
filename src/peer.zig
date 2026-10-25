@@ -10381,38 +10381,38 @@ pub const PeerManager = struct {
         self.outbound_protected_count += 1;
     }
 
-    /// Rotate peers: disconnect longest-connected outbound and connect a new one.
+    /// Index of the full-relay outbound peer rotation may drop, or null.
+    ///
+    /// Rotation only ever trims a full-relay peer while there are MORE than
+    /// MAX_OUTBOUND_CONNECTIONS of them.  It used to drop the oldest outbound
+    /// peer whenever the total reached 8, so every PEER_ROTATION_INTERVAL
+    /// (30 min) the node fell to 7 full-relay outbound until a replacement
+    /// dialled in (live clearbit sampler: 7 at :04/:34 every half hour for
+    /// days).  Core never rotates healthy outbound peers; the stale-tip
+    /// extra-peer path (evictExtraOutboundPeers) does the trimming.
+    /// Manual (addnode / --connect) and block-relay-only peers are exempt.
+    pub fn rotationVictimIndex(self: *const PeerManager, now: i64) ?usize {
+        if (self.countFullRelayOutbound() <= MAX_OUTBOUND_CONNECTIONS) return null;
+        var oldest_idx: ?usize = null;
+        var oldest_time: i64 = now;
+        for (self.peers.items, 0..) |peer, i| {
+            if (peer.direction != .outbound or peer.conn_type != .outbound_full_relay) continue;
+            if (peer.state != .handshake_complete) continue;
+            // Use last_message_time as a proxy for connection age
+            if (peer.last_message_time < oldest_time) {
+                oldest_time = peer.last_message_time;
+                oldest_idx = i;
+            }
+        }
+        return oldest_idx;
+    }
+
+    /// Rotate peers: disconnect the longest-connected surplus full-relay outbound.
     pub fn rotatePeers(self: *PeerManager) void {
         const now = std.time.timestamp();
         if (now - self.last_rotation_time < PEER_ROTATION_INTERVAL) return;
         self.last_rotation_time = now;
-
-        // Find the oldest outbound peer.  Manual peers (set via addnode RPC
-        // or --connect) are exempt: rotation would silently break the
-        // localhost IBD mesh.  Matches Bitcoin Core net.cpp ThreadOpenConnections.
-        var oldest_idx: ?usize = null;
-        var oldest_time: i64 = now;
-
-        for (self.peers.items, 0..) |peer, i| {
-            if (peer.conn_type == .manual) continue;
-            if (peer.direction == .outbound and peer.state == .handshake_complete) {
-                // Use last_message_time as a proxy for connection age
-                if (peer.last_message_time < oldest_time) {
-                    oldest_time = peer.last_message_time;
-                    oldest_idx = i;
-                }
-            }
-        }
-
-        // Disconnect the oldest if we have enough outbound connections
-        var outbound_count: usize = 0;
-        for (self.peers.items) |peer| {
-            if (peer.direction == .outbound) outbound_count += 1;
-        }
-
-        if (oldest_idx != null and outbound_count >= MAX_OUTBOUND_CONNECTIONS) {
-            self.removePeerByIndex(oldest_idx.?);
-        }
+        if (self.rotationVictimIndex(now)) |idx| self.removePeerByIndex(idx);
     }
 
     /// Remove and disconnect a peer by index.
