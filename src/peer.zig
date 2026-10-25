@@ -9126,6 +9126,8 @@ pub const PeerManager = struct {
                                 else
                                     p2p.Message{ .tx_no_witness = entry.tx };
                                 peer.sendMessage(&tx_msg) catch {};
+                                // Core ProcessGetData: a peer fetched it, so it is broadcast.
+                                pool.removeUnbroadcastTx(item.hash);
                             } else {
                                 const not_found_inv = [_]p2p.InvVector{.{
                                     .inv_type = item.inv_type,
@@ -9146,6 +9148,7 @@ pub const PeerManager = struct {
                             if (entry_opt) |entry| {
                                 const tx_msg = p2p.Message{ .tx = entry.tx };
                                 peer.sendMessage(&tx_msg) catch {};
+                                pool.removeUnbroadcastTx(txid_opt.?);
                             } else {
                                 const not_found_inv = [_]p2p.InvVector{.{
                                     .inv_type = item.inv_type,
