@@ -1058,11 +1058,19 @@ pub fn ensureIndexed(
         var work: [32]u8 = parent.chain_work;
         const this_work = peer.workFromBits(it.header.bits);
         peer.addChainWorkBE(&work, &this_work);
+        // Core LoadBlockIndex: blocks on the active chain get
+        // SEQ_ID_BEST_CHAIN_FROM_DISK, the rest SEQ_ID_INIT_FROM_DISK, so a
+        // restart keeps the pre-restart tip on an equal-work tie.
+        const height = parent.height + 1;
+        const on_active = if (chain_state.getBlockHashByHeight(height)) |h|
+            height <= chain_state.best_height and std.mem.eql(u8, &h, &it.hash)
+        else
+            false;
         const entry = allocator.create(validation.BlockIndexEntry) catch return null;
         entry.* = validation.BlockIndexEntry{
             .hash = it.hash,
             .header = it.header,
-            .height = parent.height + 1,
+            .height = height,
             .status = .{
                 .valid_header = true,
                 .has_data = it.has_data,
@@ -1072,7 +1080,10 @@ pub fn ensureIndexed(
                 ._padding = 0,
             },
             .chain_work = work,
-            .sequence_id = 0,
+            .sequence_id = if (on_active)
+                validation.ChainManager.SEQ_ID_BEST_CHAIN_FROM_DISK
+            else
+                validation.ChainManager.SEQ_ID_INIT_FROM_DISK,
             .parent = parent,
             .file_number = 0,
             .file_offset = 0,
@@ -1497,7 +1508,7 @@ pub fn submitBlockWithIndexAndMempool(
             .height = height,
             .status = .{ .valid_header = true, .has_data = true, .has_undo = !ibd_mode, .failed_valid = false, .failed_child = false, ._padding = 0 },
             .chain_work = new_work,
-            .sequence_id = 0,
+            .sequence_id = cm.nextSequenceId(),
             .parent = parent,
             .file_number = 0,
             .file_offset = 0,
@@ -1643,7 +1654,7 @@ pub fn processSideBranchSubmission(
             ._padding = 0,
         },
         .chain_work = new_work,
-        .sequence_id = 0,
+        .sequence_id = cm.nextSequenceId(),
         .parent = parent_entry,
         .file_number = 0,
         .file_offset = 0,

@@ -7026,6 +7026,12 @@ pub const ChainManager = struct {
     reverse_sequence_id: i64,
     /// Chain work at last precious block call (for reset detection)
     last_precious_chainwork: [32]u8,
+    /// Next receive-order sequence id (Core nBlockSequenceId).  Blocks
+    /// whose data arrives while the node runs get increasing ids, so on
+    /// an equal-work tie the block received first wins.  Ids 0 and 1 are
+    /// for entries loaded from disk (SEQ_ID_BEST_CHAIN_FROM_DISK /
+    /// SEQ_ID_INIT_FROM_DISK).
+    next_sequence_id: i64,
     /// Chain state for UTXO operations
     chain_state: ?*storage.ChainState,
     /// Mempool for evicting conflicting transactions
@@ -7048,6 +7054,7 @@ pub const ChainManager = struct {
             .best_invalid = null,
             .reverse_sequence_id = -1,
             .last_precious_chainwork = [_]u8{0} ** 32,
+            .next_sequence_id = SEQ_ID_INIT_FROM_DISK + 1,
             .chain_state = chain_state,
             .mempool = mempool,
             .chain_store = null,
@@ -7070,6 +7077,7 @@ pub const ChainManager = struct {
             .best_invalid = null,
             .reverse_sequence_id = -1,
             .last_precious_chainwork = [_]u8{0} ** 32,
+            .next_sequence_id = SEQ_ID_INIT_FROM_DISK + 1,
             .chain_state = chain_state,
             .mempool = mempool,
             .chain_store = chain_store,
@@ -7105,6 +7113,20 @@ pub const ChainManager = struct {
     pub fn addBlock(self: *ChainManager, entry: *BlockIndexEntry) !void {
         try self.block_index.put(entry.hash, entry);
         try self.tryAddBlockIndexCandidate(entry);
+    }
+
+    /// Core chain.h: a block on the best chain when the index is loaded
+    /// from disk gets 0, every other loaded block 1, so after a restart the
+    /// tip from before the restart wins any equal-work tie.
+    pub const SEQ_ID_BEST_CHAIN_FROM_DISK: i64 = 0;
+    pub const SEQ_ID_INIT_FROM_DISK: i64 = 1;
+
+    /// Sequence id for a block whose data was just received (Core
+    /// ReceivedBlockTransactions: nSequenceId = nBlockSequenceId++).
+    pub fn nextSequenceId(self: *ChainManager) i64 {
+        const id = self.next_sequence_id;
+        self.next_sequence_id += 1;
+        return id;
     }
 
     /// Get a block by hash.
@@ -7607,7 +7629,26 @@ pub const ChainManager = struct {
     }
 
     /// Find and activate the best valid chain.
+    ///
+    /// Core ActivateBestChain loops: when ConnectTip fails a block of the
+    /// most-work candidate, InvalidBlockFound marks it (and its descendants)
+    /// and the loop picks the next most-work chain, which is often the valid
+    /// prefix of the branch that just failed.  A failed connect is not an
+    /// error for the caller (invalidateblock / reconsiderblock answer null).
+    /// Each failed round marks at least one candidate invalid, so the loop
+    /// ends; the bound is a backstop.
     fn activateBestChain(self: *ChainManager) ChainError!void {
+        var rounds: usize = 0;
+        while (rounds < 1000) : (rounds += 1) {
+            if (try self.activateBestChainStep()) return;
+        }
+        return ChainError.DisconnectFailed;
+    }
+
+    /// One selection + switch.  Returns false when the chosen candidate
+    /// failed to connect and a block of it was marked invalid (the caller
+    /// selects again), true otherwise.
+    fn activateBestChainStep(self: *ChainManager) ChainError!bool {
         // Find the best valid candidate using a full ancestor-path walk.
         // BUG-3 fix: mirror Core's FindMostWorkChain: walk every intermediate
         // block back to the active chain verifying BLOCK_HAVE_DATA and no
@@ -7703,7 +7744,7 @@ pub const ChainManager = struct {
                         // chain is never re-selected (W101 BUG-4
                         // InvalidBlockFound equivalent — Core
                         // ActivateBestChainStep on ConnectTip failure).
-                        try self.executeReorg(tip, b);
+                        return try self.executeReorg(tip, b);
                     } else {
                         // In-memory / no chain_state: legacy pointer swap.
                         self.active_tip = b;
@@ -7718,6 +7759,7 @@ pub const ChainManager = struct {
                 self.active_tip = b;
             }
         }
+        return true;
     }
 
     /// Execute a chain-tip switch from `from` to `to`.
@@ -7745,8 +7787,8 @@ pub const ChainManager = struct {
         self: *ChainManager,
         from: *BlockIndexEntry,
         to: *BlockIndexEntry,
-    ) ChainError!void {
-        const chain_state = self.chain_state orelse return;
+    ) ChainError!bool {
+        const chain_state = self.chain_state orelse return true;
 
         // Find the most-recent common ancestor.  Two-pointer walk:
         // step the deeper side up first, then walk both up together
@@ -7931,12 +7973,14 @@ pub const ChainManager = struct {
                     .{ rb_list.items[bad_idx].height, verdict_err.? },
                 );
                 self.markChainFailedDownTo(to, &rb_list.items[bad_idx].hash);
-            } else {
-                std.debug.print(
-                    "executeReorg: reorgToChain failed with {} — NOT a block verdict; nothing marked\n",
-                    .{err},
-                );
+                // The reorg rolled back to `from`; the caller selects again
+                // (Core ActivateBestChain after InvalidBlockFound).
+                return false;
             }
+            std.debug.print(
+                "executeReorg: reorgToChain failed with {} — NOT a block verdict; nothing marked\n",
+                .{err},
+            );
             return ChainError.DisconnectFailed;
         };
         _ = connected;
@@ -7969,6 +8013,7 @@ pub const ChainManager = struct {
             // UpdateTransactionsFromBlock, removeForReorg, LimitMempoolSize.
             mp.updateForReorg(disconnected_blocks.items, rb_list.items, true);
         }
+        return true;
     }
 
     /// Find the most-recent common ancestor of two block index entries.
