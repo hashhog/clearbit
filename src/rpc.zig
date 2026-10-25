@@ -7828,7 +7828,7 @@ pub const RpcServer = struct {
         const mempool_min_fee_btc: f64 = @as(f64, @floatFromInt(self.mempool.getMinFee())) / 100_000_000.0;
         const min_relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.MIN_RELAY_FEE)) / 100_000_000.0;
         const incremental_relay_fee_btc: f64 = @as(f64, @floatFromInt(mempool_mod.INCREMENTAL_RELAY_FEE)) / 100_000_000.0;
-        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":{d}.{d:0>8},\"maxmempool\":{d},\"mempoolminfee\":{d:.8},\"minrelaytxfee\":{d:.8},\"incrementalrelayfee\":{d:.8},\"unbroadcastcount\":0,\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
+        try writer.print("{{\"loaded\":true,\"size\":{d},\"bytes\":{d},\"usage\":{d},\"total_fee\":{d}.{d:0>8},\"maxmempool\":{d},\"mempoolminfee\":{d:.8},\"minrelaytxfee\":{d:.8},\"incrementalrelayfee\":{d:.8},\"unbroadcastcount\":{d},\"fullrbf\":true,\"permitbaremultisig\":true,\"maxdatacarriersize\":100000,\"limitclustercount\":64,\"limitclustersize\":101000,\"optimal\":true}}", .{
             mempool_stats.count,
             mempool_stats.size,
             mempool_stats.size,
@@ -7838,6 +7838,7 @@ pub const RpcServer = struct {
             mempool_min_fee_btc,
             min_relay_fee_btc,
             incremental_relay_fee_btc,
+            self.mempool.unbroadcastCount(),
         });
 
         return self.jsonRpcResult(buf.items, id);
@@ -7954,8 +7955,9 @@ pub const RpcServer = struct {
         try writeMempoolDepends(writer, self.mempool, entry);
         try writer.writeAll(",\"spentby\":");
         try writeMempoolSpentBy(writer, self.mempool, entry);
-        try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":false,\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}", .{
+        try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}", .{
             if (bip125_replaceable) "true" else "false",
+            if (self.mempool.isUnbroadcastTx(txid)) "true" else "false",
             // fees.base
             @divTrunc(entry.fee, 100_000_000),
             @as(u64, @intCast(@mod(entry.fee, 100_000_000))),
@@ -9377,6 +9379,10 @@ pub const RpcServer = struct {
                 else => self.jsonRpcError(RPC_VERIFY_REJECTED, "transaction rejected", id),
             };
         };
+
+        // Core BroadcastTransaction: a locally submitted tx is tracked as
+        // unbroadcast until a peer requests it (node/transaction.cpp:102).
+        self.mempool.addUnbroadcastTx(txid);
 
         // FIX-73 / W120 BUG-3: when this admission replaced BIP-125 conflicts,
         // surface the evicted-txids set so wallets watching for confirmation
@@ -11632,6 +11638,16 @@ pub const RpcServer = struct {
             };
         }
 
+        // Core submitpackage only marks txs newly accepted by this call as
+        // unbroadcast (BroadcastTransaction skips ones already in the pool).
+        const pre_present = self.allocator.alloc(bool, transactions.items.len) catch {
+            return self.jsonRpcError(RPC_OUT_OF_MEMORY, "Out of memory", id);
+        };
+        defer self.allocator.free(pre_present);
+        for (transactions.items, 0..) |*ptx, pi| {
+            pre_present[pi] = self.mempool.contains(crypto.computeTxidStreaming(ptx));
+        }
+
         // Validate and accept the package
         var result = mempool_mod.acceptPackage(self.mempool, transactions.items, self.allocator) catch |err| {
             return switch (err) {
@@ -11649,6 +11665,17 @@ pub const RpcServer = struct {
             };
         };
         defer result.deinit();
+
+        for (result.tx_results) |tx_result| {
+            if (!tx_result.accepted) continue;
+            for (transactions.items, 0..) |*ptx, pi| {
+                if (pre_present[pi]) continue;
+                if (std.mem.eql(u8, &crypto.computeTxidStreaming(ptx), &tx_result.txid)) {
+                    self.mempool.addUnbroadcastTx(tx_result.txid);
+                    break;
+                }
+            }
+        }
 
         // Build response JSON
         var buf = std.ArrayList(u8).init(self.allocator);
@@ -14800,8 +14827,9 @@ pub const RpcServer = struct {
                 try writeMempoolDepends(writer, self.mempool, e);
                 try writer.writeAll(",\"spentby\":");
                 try writeMempoolSpentBy(writer, self.mempool, e);
-                try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":false,\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}}", .{
+                try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}}", .{
                     if (rbf) "true" else "false",
+                    if (self.mempool.isUnbroadcastTx(e_txid)) "true" else "false",
                     @divTrunc(e.fee, 100_000_000),
                     @as(u64, @intCast(@mod(e.fee, 100_000_000))),
                     @divTrunc(modified_fee, 100_000_000),

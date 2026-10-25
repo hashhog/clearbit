@@ -1103,6 +1103,12 @@ pub const Mempool = struct {
     ///     pending delta that applies on subsequent admission).
     map_deltas: std.AutoHashMap(types.Hash256, i64),
 
+    /// Locally submitted transactions no peer has requested yet (Core
+    /// `CTxMemPool::m_unbroadcast_txids`, txmempool.h). Set by
+    /// sendrawtransaction / submitpackage, cleared when a peer fetches the tx
+    /// by getdata or when the tx leaves the pool.
+    unbroadcast: std.AutoHashMap(types.Hash256, void),
+
     /// Initialize a new mempool.
     pub fn init(
         chain_state: ?*storage.ChainState,
@@ -1138,6 +1144,7 @@ pub const Mempool = struct {
             // FIX-72 / W120 BUG-11 — prioritisetransaction fee deltas.
             // Empty on init; deltas are not persisted across restarts (Core parity).
             .map_deltas = std.AutoHashMap(types.Hash256, i64).init(allocator),
+            .unbroadcast = std.AutoHashMap(types.Hash256, void).init(allocator),
         };
     }
 
@@ -1200,6 +1207,34 @@ pub const Mempool = struct {
 
         // FIX-72 / W120 BUG-11 — prioritisetransaction fee deltas.
         self.map_deltas.deinit();
+        self.unbroadcast.deinit();
+    }
+
+    /// Core CTxMemPool::AddUnbroadcastTx: only a tx that is in the pool.
+    pub fn addUnbroadcastTx(self: *Mempool, txid: types.Hash256) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.entries.contains(txid)) return;
+        self.unbroadcast.put(txid, {}) catch {};
+    }
+
+    /// Core CTxMemPool::RemoveUnbroadcastTx.
+    pub fn removeUnbroadcastTx(self: *Mempool, txid: types.Hash256) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.unbroadcast.remove(txid);
+    }
+
+    pub fn isUnbroadcastTx(self: *Mempool, txid: types.Hash256) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.unbroadcast.contains(txid);
+    }
+
+    pub fn unbroadcastCount(self: *Mempool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.unbroadcast.count();
     }
 
     /// Attempt to add a transaction to the mempool.
@@ -2027,6 +2062,9 @@ pub const Mempool = struct {
 
             // Remove wtxid index
             _ = self.by_wtxid.remove(entry.wtxid);
+
+            // Core removeUnchecked: a tx leaving the pool is no longer unbroadcast.
+            _ = self.unbroadcast.remove(txid_hash);
 
             // Remove from children lists and free the ArrayList
             if (self.children.fetchRemove(txid_hash)) |children_kv| {
