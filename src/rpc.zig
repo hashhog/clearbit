@@ -2200,12 +2200,21 @@ pub const RpcServer = struct {
                 try self.sendRestResponse(stream, 404, "text/plain", "output format not found (available: json)");
                 return;
             }
-            // Re-use getrawmempool dispatch with verbose=false — Core's REST
-            // mempool/contents accepts ?verbose=true via the query string,
-            // which we strip above; emit the non-verbose array form (txids).
-            // Verbose support can be added by re-parsing the query later.
+            // Core rest_mempool (rest.cpp): verbose defaults to true; the
+            // query string was stripped from rest_path above, so re-read it.
+            const query: []const u8 = if (std.mem.indexOfScalar(u8, url_path, '?')) |q| url_path[q + 1 ..] else "";
+            const opts = parseRestMempoolQuery(query) catch |e| {
+                const msg = switch (e) {
+                    error.BadVerbose => "The \"verbose\" query parameter must be either \"true\" or \"false\".",
+                    error.BadMempoolSequence => "The \"mempool_sequence\" query parameter must be either \"true\" or \"false\".",
+                    error.VerboseWithSequence => "Verbose results cannot contain mempool sequence values. (hint: set \"verbose=false\")",
+                };
+                try self.sendRestResponse(stream, 400, "text/plain", msg);
+                return;
+            };
             var params = std.json.Array.init(self.allocator);
             defer params.deinit();
+            try params.append(.{ .bool = opts.verbose });
             const result = try self.handleGetRawMempool(.{ .array = params }, null);
             defer self.allocator.free(result);
             const rest_body = extractJsonResult(result) orelse result;
@@ -30201,6 +30210,40 @@ test "writeBlockHeaderBin produces 80 little-endian bytes (Core wire format)" {
     // nonce little-endian 0xDEADBEEF → EF BE AD DE
     try std.testing.expectEqual(@as(u8, 0xEF), written[76]);
     try std.testing.expectEqual(@as(u8, 0xDE), written[79]);
+}
+
+const RestMempoolOpts = struct { verbose: bool, mempool_sequence: bool };
+
+/// Parse the query of /rest/mempool/contents.json like Core's rest_mempool:
+/// verbose defaults to true, mempool_sequence to false, values must be the
+/// literal "true"/"false", and verbose+mempool_sequence is rejected.
+fn parseRestMempoolQuery(query: []const u8) error{ BadVerbose, BadMempoolSequence, VerboseWithSequence }!RestMempoolOpts {
+    var verbose: bool = true;
+    var seq: bool = false;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=');
+        const k = if (eq) |i| kv[0..i] else kv;
+        const v = if (eq) |i| kv[i + 1 ..] else "";
+        if (std.mem.eql(u8, k, "verbose")) {
+            if (std.mem.eql(u8, v, "true")) verbose = true else if (std.mem.eql(u8, v, "false")) verbose = false else return error.BadVerbose;
+        } else if (std.mem.eql(u8, k, "mempool_sequence")) {
+            if (std.mem.eql(u8, v, "true")) seq = true else if (std.mem.eql(u8, v, "false")) seq = false else return error.BadMempoolSequence;
+        }
+    }
+    if (verbose and seq) return error.VerboseWithSequence;
+    return .{ .verbose = verbose, .mempool_sequence = seq };
+}
+
+test "REST mempool/contents query defaults to verbose like Core" {
+    const d = try parseRestMempoolQuery("");
+    try std.testing.expect(d.verbose);
+    try std.testing.expect(!(try parseRestMempoolQuery("verbose=false")).verbose);
+    try std.testing.expect((try parseRestMempoolQuery("verbose=true")).verbose);
+    try std.testing.expect((try parseRestMempoolQuery("verbose=false&mempool_sequence=true")).mempool_sequence);
+    try std.testing.expectError(error.BadVerbose, parseRestMempoolQuery("verbose=1"));
+    try std.testing.expectError(error.BadMempoolSequence, parseRestMempoolQuery("verbose=false&mempool_sequence=yes"));
+    try std.testing.expectError(error.VerboseWithSequence, parseRestMempoolQuery("mempool_sequence=true"));
 }
 
 test "REST chaininfo returns JSON via dispatch" {
