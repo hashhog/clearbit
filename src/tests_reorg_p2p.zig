@@ -994,6 +994,63 @@ test "Pattern Y: side-branch storage preserves active tip when chain_work <= act
     try testing.expectEqualSlices(u8, &a1_work, &b1_entry.chain_work);
 }
 
+test "Pattern Y: resubmitting a stored side-branch block answers duplicate" {
+    // Core submitblock (rpc/mining.cpp): a block already in the index with
+    // data and no failure flag returns "duplicate"; "duplicate-inconclusive"
+    // is not a string Core's submitblock produces for a stored block.
+    const allocator = testing.allocator;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try storage.Database.open(path, 64, allocator);
+    defer db.close();
+    var cs = storage.ChainState.init(&db, 64, allocator);
+    defer cs.deinit();
+    cs.wireUtxoParent();
+
+    var manager = validation.ChainManager.init(&cs, null, allocator);
+    defer manager.deinit();
+
+    const reg_bits: u32 = 0x207fffff;
+    const per_block_work = peer_mod.workFromBits(reg_bits);
+
+    const a0_hash: types.Hash256 = [_]u8{0xA0} ** 32;
+    var a0_work: [32]u8 = [_]u8{0} ** 32;
+    peer_mod.addChainWorkBE(&a0_work, &per_block_work);
+    const a0 = try makePatternXEntryWithWork(allocator, a0_hash, 110, null, a0_work);
+    try manager.addBlock(a0);
+
+    const a1_hash: types.Hash256 = [_]u8{0xA1} ** 32;
+    var a1_work: [32]u8 = a0_work;
+    peer_mod.addChainWorkBE(&a1_work, &per_block_work);
+    const a1 = try makePatternXEntryWithWork(allocator, a1_hash, 111, a0, a1_work);
+    try manager.addBlock(a1);
+
+    const a2_hash: types.Hash256 = [_]u8{0xA2} ** 32;
+    var a2_work: [32]u8 = a1_work;
+    peer_mod.addChainWorkBE(&a2_work, &per_block_work);
+    const a2 = try makePatternXEntryWithWork(allocator, a2_hash, 112, a1, a2_work);
+    try manager.addBlock(a2);
+    manager.active_tip = a2;
+    cs.best_hash = a2_hash;
+    cs.best_height = 112;
+
+    const b1_blk = try makeForkTestBlock(allocator, a0_hash, 0xB1, reg_bits, 200);
+    defer freeTestBlock(allocator, b1_blk.block);
+
+    const first = try block_template.processSideBranchSubmission(
+        &b1_blk.block, &b1_blk.hash, 111, &cs, &manager, a0, null, allocator);
+    try testing.expectEqualStrings("inconclusive", first.reject_reason.?);
+
+    const second = try block_template.processSideBranchSubmission(
+        &b1_blk.block, &b1_blk.hash, 111, &cs, &manager, a0, null, allocator);
+    try testing.expect(!second.accepted);
+    try testing.expectEqualStrings("duplicate", second.reject_reason.?);
+    try testing.expect(manager.active_tip == a2);
+}
+
 test "Pattern Y: side-branch parent lookup succeeds for B2's submission off B1" {
     // Setup: same as above (active chain A0..A2). After B1 has been
     // accepted as a side-branch (storage decoupled from selection),
