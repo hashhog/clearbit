@@ -426,6 +426,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_reorg_backwalk_tests.step);
     }
 
+    // Failed-reorg recovery through invalidateblock / reconsiderblock
+    // (core-regtest failed_reorg B/C/D/E shapes) on real regtest blocks.
+    // Dedicated root + name filter, same layout as test-reorg-backwalk.
+    {
+        const failed_reorg_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_failed_reorg_recovery.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"failed_reorg_recovery"},
+        });
+        failed_reorg_tests.linkSystemLibrary("rocksdb");
+        failed_reorg_tests.linkSystemLibrary("secp256k1");
+        failed_reorg_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        failed_reorg_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            failed_reorg_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            failed_reorg_tests.linkSystemLibrary("minisketch");
+            failed_reorg_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        failed_reorg_tests.root_module.addOptions("build_options", build_options);
+
+        const run_failed_reorg_tests = b.addRunArtifact(failed_reorg_tests);
+        const failed_reorg_step = b.step(
+            "test-failed-reorg-recovery",
+            "Run failed-reorg recovery (invalidateblock/reconsiderblock) tests",
+        );
+        failed_reorg_step.dependOn(&run_failed_reorg_tests.step);
+        test_step.dependOn(&run_failed_reorg_tests.step);
+    }
+
     // Advertised P2P service-flag tests (Peer.localServices()).
     // Dedicated test root so it can import peer.zig and EXECUTE the real
     // localServices() without dragging in the pre-existing (drifted)
