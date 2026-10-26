@@ -15474,3 +15474,175 @@ test "txDynamicUsage matches Core's calibration for an 800-input P2WSH spend" {
     const usage = txDynamicUsage(&tx);
     try std.testing.expect(usage > 394_000 and usage < 401_000);
 }
+
+// ============================================================================
+// RBF Rule 5 counts conflicting CLUSTERS, not evicted transactions
+// (Core v31 policy/rbf.cpp GetEntriesForConflicts -> GetUniqueClusterCount,
+// limit MAX_REPLACEMENT_CANDIDATES = 100).
+// ============================================================================
+
+const rule5_spk = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAB} ** 20;
+
+/// Build a tx in `arena` spending `prevs` (each output 0 unless `vouts` is
+/// given), paying `n_out` outputs of `each` sats.
+fn rule5Tx(
+    arena: std.mem.Allocator,
+    prevs: []const types.Hash256,
+    vouts: ?[]const u32,
+    n_out: usize,
+    each: i64,
+    lock_time: u32,
+) !types.Transaction {
+    const ins = try arena.alloc(types.TxIn, prevs.len);
+    for (prevs, 0..) |p, i| ins[i] = .{
+        .previous_output = .{ .hash = p, .index = if (vouts) |v| v[i] else 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const outs = try arena.alloc(types.TxOut, n_out);
+    for (outs) |*o| o.* = .{ .value = each, .script_pubkey = &rule5_spk };
+    return .{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = lock_time };
+}
+
+/// A confirmed-looking funding tx (its own input is unknown to the pool).
+fn rule5Funding(arena: std.mem.Allocator, tag: u32, value: i64) !types.Transaction {
+    return rule5Tx(arena, &[_]types.Hash256{rule5Prev(tag)}, null, 1, value, 0);
+}
+
+test "rbf rule 5: five conflicting clusters of 21 txs (105 evictions) are one replacement" {
+    // Core regtest group rbf/clusters: Core v31.1 accepts and its pool drops
+    // from 107 to 3. Counting evictions (105 > 100) rejected it.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+
+    // As in the harness, the roots spend confirmed coins (outside the pool);
+    // an unrelated in-pool funding tx gives the replacement a known fee.
+    const funding = try rule5Funding(arena, 0xFFFF, 10_000_000);
+    try mempool.addTransaction(funding);
+    const funding_id = try crypto.computeTxid(&funding, allocator);
+
+    const children = 20;
+    var prevs: [6]types.Hash256 = undefined;
+    var root_ids: [5]types.Hash256 = undefined;
+    for (0..5) |c| {
+        prevs[c] = rule5Prev(@intCast(c));
+        // root: 1 in, 20 outs of 50_000.
+        const root = try rule5Tx(arena, prevs[c .. c + 1], null, children, 50_000, 0);
+        try mempool.addTransaction(root);
+        root_ids[c] = try crypto.computeTxid(&root, allocator);
+
+        for (0..children) |k| {
+            const vout = [_]u32{@intCast(k)};
+            const child = try rule5Tx(arena, &[_]types.Hash256{root_ids[c]}, &vout, 1, 49_000, 0);
+            try mempool.addTransaction(child);
+        }
+    }
+    prevs[5] = funding_id;
+    try std.testing.expectEqual(@as(usize, 1 + 5 * (1 + children)), mempool.entries.count());
+
+    // Replacement spends the five roots' coins: conflicts with five clusters,
+    // evicts 5 * 21 = 105 transactions.
+    const replacement = try rule5Tx(arena, &prevs, null, 1, 10_000_000 - 200_000, 0);
+    try mempool.addTransaction(replacement);
+    const replacement_id = try crypto.computeTxid(&replacement, allocator);
+
+    // Pool: the funding tx and the replacement.
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+    try std.testing.expect(mempool.contains(replacement_id));
+    for (root_ids) |r| try std.testing.expect(!mempool.contains(r));
+}
+
+fn rule5Prev(tag: u32) types.Hash256 {
+    var prev: types.Hash256 = [_]u8{0xF0} ** 32;
+    std.mem.writeInt(u32, prev[0..4], tag, .little);
+    return prev;
+}
+
+/// Fill `mempool` with `n_clusters` clusters, each holding `per_cluster`
+/// direct conflicts: a chain X_1 -> X_2 -> ... where X_k also spends the
+/// outside-pool coin rule5Prev(base + k). Returns a replacement spending every
+/// one of those coins (so it conflicts with every X_k) plus output 0 of an
+/// in-pool funding tx, which gives it a known fee without joining any of the
+/// conflicting clusters.
+fn rule5ConflictPool(arena: std.mem.Allocator, mempool: *Mempool, n_clusters: usize, per_cluster: usize) !types.Transaction {
+    const funding = try rule5Funding(arena, 0xFFFF, 10_000_000);
+    try mempool.addTransaction(funding);
+    const funding_id = try crypto.computeTxid(&funding, arena);
+
+    const n = n_clusters * per_cluster;
+    const prevs = try arena.alloc(types.Hash256, n + 1);
+    const vouts = try arena.alloc(u32, n + 1);
+    for (0..n_clusters) |c| {
+        var parent: ?types.Hash256 = null;
+        for (0..per_cluster) |k| {
+            const coin = rule5Prev(@intCast(10_000 + c * per_cluster + k));
+            prevs[c * per_cluster + k] = coin;
+            vouts[c * per_cluster + k] = 0;
+            // X_k pays 10_000 sats out of its in-pool parent's output.
+            const value: i64 = 100_000 - @as(i64, @intCast(k)) * 10_000;
+            const tx = if (parent) |p|
+                try rule5Tx(arena, &[_]types.Hash256{ coin, p }, null, 1, value, 0)
+            else
+                try rule5Tx(arena, &[_]types.Hash256{coin}, null, 1, value, 0);
+            try mempool.addTransaction(tx);
+            parent = try crypto.computeTxid(&tx, arena);
+        }
+    }
+    prevs[n] = funding_id;
+    vouts[n] = 0;
+    return rule5Tx(arena, prevs, vouts, 1, 10_000_000 - 1_000_000, 0);
+}
+
+test "rbf rule 5: 100 conflicting clusters are accepted" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    const replacement = try rule5ConflictPool(arena_state.allocator(), &mempool, MAX_REPLACEMENT_EVICTIONS, 1);
+    try mempool.addTransaction(replacement);
+    // The funding tx and the replacement.
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+}
+
+test "rbf rule 5: 101 conflicting clusters are refused (too many potential replacements)" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    const replacement = try rule5ConflictPool(arena_state.allocator(), &mempool, MAX_REPLACEMENT_EVICTIONS + 1, 1);
+    try std.testing.expectError(MempoolError.TooManyEvictions, mempool.addTransaction(replacement));
+    try std.testing.expectEqual(@as(usize, MAX_REPLACEMENT_EVICTIONS + 2), mempool.entries.count());
+}
+
+test "rbf rule 5: 102 direct conflicts in 51 clusters count as 51" {
+    // Two direct conflicts per cluster (X_1 and its child X_2): 102 direct
+    // conflicts, 102 evictions, 51 clusters. Core counts 51 and accepts.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    const replacement = try rule5ConflictPool(arena_state.allocator(), &mempool, 51, 2);
+    try std.testing.expectEqual(@as(usize, 1 + 102), mempool.entries.count());
+    try mempool.addTransaction(replacement);
+    try std.testing.expectEqual(@as(usize, 2), mempool.entries.count());
+}
+
+test "rbf rule 5: 101 clusters of two direct conflicts are refused" {
+    // Negative twin of the test above: same shape, 101 clusters of two.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var mempool = Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    const replacement = try rule5ConflictPool(arena_state.allocator(), &mempool, MAX_REPLACEMENT_EVICTIONS + 1, 2);
+    try std.testing.expectError(MempoolError.TooManyEvictions, mempool.addTransaction(replacement));
+}
