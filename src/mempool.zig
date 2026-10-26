@@ -93,8 +93,9 @@ pub const INCREMENTAL_RELAY_FEE: i64 = 100;
 /// below 1/2 full it is divided by 2 (→ 6h) — see GetMinFee / getMinFee.
 pub const ROLLING_FEE_HALFLIFE: f64 = 60.0 * 60.0 * 12.0;
 
-/// Maximum number of transactions that can be evicted by a single RBF replacement.
-/// This includes direct conflicts and all their descendants.
+/// Maximum number of distinct clusters a replacement may conflict with
+/// directly (BIP-125 Rule 5 as redefined by Core v31 cluster mempool); the
+/// number of transactions it evicts is not limited by this.
 /// Mirrors Bitcoin Core's MAX_REPLACEMENT_CANDIDATES in policy/rbf.h.
 pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
 
@@ -238,7 +239,7 @@ pub const MempoolError = error{
     /// Core's `EntriesAndTxidsDisjoint` reject ("spends conflicting
     /// transaction") in policy/rbf.cpp.
     ReplacementSpendsConflicting,
-    /// Replacement would evict too many transactions (exceeds MAX_REPLACEMENT_EVICTIONS).
+    /// Replacement conflicts with too many clusters (exceeds MAX_REPLACEMENT_EVICTIONS).
     TooManyEvictions,
     /// Mempool is full and transaction's fee is too low for eviction.
     MempoolFull,
@@ -4365,7 +4366,8 @@ pub const Mempool = struct {
     ///    Core error: "spends conflicting transaction".
     ///    Reference: policy/rbf.cpp::EntriesAndTxidsDisjoint.
     ///
-    /// 3. [Gate 3] Total evicted transactions must not exceed MAX_REPLACEMENT_EVICTIONS.
+    /// 3. [Gate 3] Distinct clusters of the direct conflicts must not exceed
+    ///    MAX_REPLACEMENT_EVICTIONS (Core counts clusters, not evicted txs).
     ///    Core error: "too many potential replacements".
     ///    Reference: policy/rbf.cpp::GetEntriesForConflicts.
     ///
@@ -4459,8 +4461,13 @@ pub const Mempool = struct {
             }
         }
 
-        // Gate 3 / Rule 5: Check max eviction limit
-        if (all_evicted.count() > MAX_REPLACEMENT_EVICTIONS) {
+        // Gate 3 / Rule 5: at most MAX_REPLACEMENT_EVICTIONS distinct
+        // clusters may conflict DIRECTLY with the replacement. Core v31
+        // (cluster mempool) counts clusters, not evicted transactions: a
+        // replacement conflicting with five 21-tx clusters evicts 105 and is
+        // accepted. Reference: policy/rbf.cpp::GetEntriesForConflicts ->
+        // CTxMemPool::GetUniqueClusterCount.
+        if (try self.conflictingClusterCount(conflicting_txids) > MAX_REPLACEMENT_EVICTIONS) {
             return MempoolError.TooManyEvictions;
         }
 
@@ -5093,6 +5100,43 @@ pub const Mempool = struct {
         }
 
         return result.toOwnedSlice() catch &[_]types.Hash256{};
+    }
+
+    /// Number of distinct mempool clusters (connected components of the
+    /// in-pool parent/child graph) that contain one of `txids`. Walks the graph
+    /// rather than reading the union-find, which cannot split a cluster when a
+    /// member leaves and so may merge clusters Core keeps apart.
+    /// Core: CTxMemPool::GetUniqueClusterCount (txmempool.cpp).
+    pub fn conflictingClusterCount(self: *Mempool, txids: []const types.Hash256) MempoolError!usize {
+        var seen = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer seen.deinit();
+        var queue = std.ArrayList(types.Hash256).init(self.allocator);
+        defer queue.deinit();
+
+        var count: usize = 0;
+        for (txids) |start| {
+            if (seen.contains(start) or !self.entries.contains(start)) continue;
+            count += 1;
+            seen.put(start, {}) catch return MempoolError.OutOfMemory;
+            queue.append(start) catch return MempoolError.OutOfMemory;
+            while (queue.popOrNull()) |cur| {
+                const e = self.entries.get(cur) orelse continue;
+                for (e.tx.inputs) |inp| {
+                    const parent = inp.previous_output.hash;
+                    if (seen.contains(parent) or !self.entries.contains(parent)) continue;
+                    seen.put(parent, {}) catch return MempoolError.OutOfMemory;
+                    queue.append(parent) catch return MempoolError.OutOfMemory;
+                }
+                if (self.children.get(cur)) |kids| {
+                    for (kids.items) |kid| {
+                        if (seen.contains(kid) or !self.entries.contains(kid)) continue;
+                        seen.put(kid, {}) catch return MempoolError.OutOfMemory;
+                        queue.append(kid) catch return MempoolError.OutOfMemory;
+                    }
+                }
+            }
+        }
+        return count;
     }
 
     /// Get an output from a mempool transaction.
