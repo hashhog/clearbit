@@ -1673,6 +1673,11 @@ pub fn processSideBranchSubmission(
     if (cm.chain_store) |cs| {
         cs.putBlockIndex(block_hash, &block.header, height) catch {};
     }
+    // Durable fork-block record, so getchaintips still lists this block
+    // after a restart (Core keeps it in the block index).  Reporting only.
+    chain_state.noteForkBlock(block_hash, &block.header, height, body_persisted, false) catch |err| {
+        std.debug.print("submitblock side-branch: noteForkBlock failed: {}\n", .{err});
+    };
 
     // Compare chain_work: do we have strictly more work than the active
     // tip?  Core's `ActivateBestChain` uses strict-greater (first-seen
@@ -1897,6 +1902,19 @@ fn fireReorgFromSideBranch(
         }
     }
 
+    // The active-chain blocks the reorg disconnects (fork point + 1 .. tip),
+    // for the fork-block record once it commits.
+    const OldBlock = struct { hash: types.Hash256, height: u32 };
+    var old_branch = std.ArrayList(OldBlock).init(allocator);
+    defer old_branch.deinit();
+    {
+        const fp_height = fork_chain.items[0].height - 1;
+        var h: u32 = chain_state.best_height;
+        while (h > fp_height) : (h -= 1) {
+            if (chain_state.getBlockHashByHeight(h)) |bh| try old_branch.append(.{ .hash = bh, .height = h });
+        }
+    }
+
     // Fire the reorg.  reorgToChain will:
     //   1. Disconnect blocks from current tip back to fp (UTXO rewind +
     //      best_hash/best_height update).
@@ -1917,6 +1935,14 @@ fn fireReorgFromSideBranch(
                 "submitblock side-branch: reorg rejected a new-branch block: {} — keeping active tip\n",
                 .{verr},
             );
+            // Core ActivateBestChainStep -> InvalidBlockFound: a consensus
+            // verdict marks the failed block and its descendants (here, up
+            // to the submitted tip) BLOCK_FAILED_VALID, durably.  A mutated
+            // body or a non-verdict marks nothing.
+            const bad_idx = drive_result.connected_before_reject;
+            if (validation.classifyBlockFailure(verr) == .consensus_invalid and bad_idx < rb_list.items.len) {
+                cm.markChainFailedDownTo(new_tip_entry, &rb_list.items[bad_idx].hash);
+            }
             return .{
                 .accepted = false,
                 .reject_reason = "rejected",
@@ -1930,6 +1956,12 @@ fn fireReorgFromSideBranch(
 
     // Update cm.active_tip to point at the new tip.
     cm.active_tip = new_tip_entry;
+    for (old_branch.items) |*ob| {
+        const hdr = chain_state.getPersistedHeader(&ob.hash) orelse chain_state.getBlockHeaderFromBody(&ob.hash) orelse continue;
+        chain_state.noteForkBlock(&ob.hash, &hdr, ob.height, true, true) catch |err| {
+            std.debug.print("submitblock side-branch: noteForkBlock failed: {}\n", .{err});
+        };
+    }
 
     // Pattern B refill — fire AFTER the new chain is fully connected
     // (Core orders things the same way: ActivateBestChain finishes the

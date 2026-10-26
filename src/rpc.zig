@@ -14999,19 +14999,113 @@ pub const RpcServer = struct {
 
     /// Handle getchaintips RPC - return information about chain tips.
     /// Reference: Bitcoin Core rpc/blockchain.cpp getchaintips
+    ///
+    /// Core walks its whole block index: every block off the active chain
+    /// that is no other such block's parent is a tip, plus the active tip.
+    /// clearbit's in-memory index is rebuilt lazily after a restart, so the
+    /// blocks off the active chain come from it AND from the durable
+    /// fork-block set (side-branch submissions and disconnected blocks).
+    /// Status follows Core's order: active, invalid (the block or an
+    /// ancestor failed; Core marks every descendant BLOCK_FAILED_VALID),
+    /// headers-only (data missing for it or an ancestor), valid-fork (it
+    /// was connected once: BLOCK_VALID_SCRIPTS), valid-headers.
     fn handleGetChainTips(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
+        const Off = struct { prev: types.Hash256, height: u32, has_data: bool, connected: bool, failed: bool };
+        var off = std.AutoHashMap(types.Hash256, Off).init(self.allocator);
+        defer off.deinit();
+
+        const invalid = self.chain_state.invalidBlockList(self.allocator) catch &[_]types.Hash256{};
+        defer if (invalid.len > 0) self.allocator.free(invalid);
+        var invalid_set = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer invalid_set.deinit();
+        for (invalid) |h| try invalid_set.put(h, {});
+
+        const forks = self.chain_state.forkBlockList(self.allocator) catch &[_]storage.ChainState.ForkBlockEntry{};
+        defer if (forks.len > 0) self.allocator.free(forks);
+        for (forks) |f| {
+            if (self.isOnActiveChain(&f.hash, f.block.height)) continue;
+            try off.put(f.hash, .{
+                .prev = f.block.prev,
+                .height = f.block.height,
+                .has_data = f.block.has_data,
+                .connected = f.block.connected,
+                .failed = invalid_set.contains(f.hash),
+            });
+        }
+        if (self.chain_manager) |cm| {
+            var it = cm.block_index.valueIterator();
+            while (it.next()) |ep| {
+                const e = ep.*;
+                if (self.isOnActiveChain(&e.hash, e.height)) continue;
+                const gop = try off.getOrPut(e.hash);
+                if (!gop.found_existing) gop.value_ptr.* = .{
+                    .prev = e.header.prev_block,
+                    .height = e.height,
+                    .has_data = false,
+                    .connected = false,
+                    .failed = invalid_set.contains(e.hash),
+                };
+                gop.value_ptr.has_data = gop.value_ptr.has_data or e.status.has_data;
+                gop.value_ptr.failed = gop.value_ptr.failed or e.status.isInvalid();
+            }
+        }
+
+        var prevs = std.AutoHashMap(types.Hash256, void).init(self.allocator);
+        defer prevs.deinit();
+        var vit = off.valueIterator();
+        while (vit.next()) |o| try prevs.put(o.prev, {});
+
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const writer = buf.writer();
 
-        // Return the active chain tip
+        // Always report the currently active tip.
         try writer.writeAll("[{\"height\":");
         try writer.print("{d}", .{self.chain_state.best_height});
         try writer.writeAll(",\"hash\":\"");
         try writeHashHex(writer, &self.chain_state.best_hash);
-        try writer.writeAll("\",\"branchlen\":0,\"status\":\"active\"}]");
+        try writer.writeAll("\",\"branchlen\":0,\"status\":\"active\"}");
+
+        var kit = off.iterator();
+        while (kit.next()) |kv| {
+            if (prevs.contains(kv.key_ptr.*)) continue;
+            const tip = kv.value_ptr.*;
+            // Walk down to the fork point (Core CChain::FindFork).
+            var failed = false;
+            var has_data = true;
+            var cur = tip;
+            while (true) {
+                failed = failed or cur.failed;
+                has_data = has_data and cur.has_data;
+                cur = off.get(cur.prev) orelse break;
+            }
+            // `cur` is the lowest block off the active chain; its parent
+            // must be on it, or this branch hangs off a block we do not
+            // know (Core never holds such a block).
+            if (cur.height == 0 or !self.isOnActiveChain(&cur.prev, cur.height - 1)) continue;
+            const status: []const u8 = if (failed)
+                "invalid"
+            else if (!has_data)
+                "headers-only"
+            else if (tip.connected)
+                "valid-fork"
+            else
+                "valid-headers";
+            try writer.print(",{{\"height\":{d},\"hash\":\"", .{tip.height});
+            try writeHashHex(writer, kv.key_ptr);
+            try writer.print("\",\"branchlen\":{d},\"status\":\"{s}\"}}", .{ tip.height - (cur.height - 1), status });
+        }
+        try writer.writeByte(']');
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// True when `hash` is the active-chain block at `height`.
+    fn isOnActiveChain(self: *RpcServer, hash: *const types.Hash256, height: u32) bool {
+        if (height > self.chain_state.best_height) return false;
+        if (height == 0) return std.mem.eql(u8, hash, &self.network_params.genesis_hash);
+        const h = self.chain_state.getBlockHashByHeight(height) orelse return false;
+        return std.mem.eql(u8, &h, hash);
     }
 
     /// Handle getrawmempool RPC - return mempool transaction IDs.
