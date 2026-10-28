@@ -2399,6 +2399,15 @@ pub const ChainState = struct {
     /// connect_mutex; loaded lazily on first use.
     invalid_blocks: std.AutoHashMapUnmanaged(types.Hash256, void) = .{},
     invalid_blocks_loaded: bool = false,
+    /// Blocks known off the active chain: side-branch bodies submitblock
+    /// stored and blocks disconnected from the active chain.  Persisted
+    /// under FORK_BLOCKS_KEY so getchaintips can list fork tips after a
+    /// restart (Core reads them from the block index in LoadBlockIndex;
+    /// clearbit's in-memory index is rebuilt lazily and does not hold
+    /// them).  Guarded by fork_blocks_mutex; loaded lazily on first use.
+    fork_blocks: std.AutoHashMapUnmanaged(types.Hash256, ForkBlock) = .{},
+    fork_blocks_loaded: bool = false,
+    fork_blocks_mutex: std.Thread.Mutex = .{},
     /// Sticky flag set when a flush() call fails to persist its batch.
     /// connectBlockFast / submitBlock check this on entry and refuse to
     /// connect another block until cleared.  Without this, a transient
@@ -3183,6 +3192,7 @@ pub const ChainState = struct {
 
     pub fn deinit(self: *ChainState) void {
         self.invalid_blocks.deinit(self.allocator);
+        self.fork_blocks.deinit(self.allocator);
         self.reorg_kv_undo.deinit(self.allocator);
         // Drain any unflushed block bodies. On a clean shutdown
         // these were committed in the last flush()'s cleanup loop;
@@ -5752,6 +5762,110 @@ pub const ChainState = struct {
         var it = self.invalid_blocks.keyIterator();
         var i: usize = 0;
         while (it.next()) |k| : (i += 1) out[i] = k.*;
+        return out;
+    }
+
+    /// A block known off the active chain (see `fork_blocks`).
+    pub const ForkBlock = struct {
+        prev: types.Hash256,
+        height: u32,
+        /// Block data is stored (Core BLOCK_HAVE_DATA).
+        has_data: bool,
+        /// The block was connected at least once (Core BLOCK_VALID_SCRIPTS,
+        /// which DisconnectTip never clears).
+        connected: bool,
+    };
+
+    /// CF_DEFAULT key holding the fork-block set: N x 69-byte records
+    /// (hash 32, prev 32, height u32 LE, flags u8: bit0 has_data,
+    /// bit1 connected).
+    pub const FORK_BLOCKS_KEY = "fork_blocks";
+    const FORK_BLOCK_RECORD_LEN = 69;
+
+    fn loadForkBlocksLocked(self: *ChainState) !void {
+        if (self.fork_blocks_loaded) return;
+        if (self.utxo_set.db) |db| {
+            if (try db.get(CF_DEFAULT, FORK_BLOCKS_KEY)) |bytes| {
+                defer self.allocator.free(bytes);
+                var off: usize = 0;
+                while (off + FORK_BLOCK_RECORD_LEN <= bytes.len) : (off += FORK_BLOCK_RECORD_LEN) {
+                    const rec = bytes[off .. off + FORK_BLOCK_RECORD_LEN];
+                    var h: types.Hash256 = undefined;
+                    @memcpy(&h, rec[0..32]);
+                    var fb: ForkBlock = .{
+                        .prev = undefined,
+                        .height = std.mem.readInt(u32, rec[64..68], .little),
+                        .has_data = rec[68] & 1 != 0,
+                        .connected = rec[68] & 2 != 0,
+                    };
+                    @memcpy(&fb.prev, rec[32..64]);
+                    try self.fork_blocks.put(self.allocator, h, fb);
+                }
+            }
+        }
+        self.fork_blocks_loaded = true;
+    }
+
+    fn storeForkBlocksLocked(self: *ChainState) !void {
+        const db = self.utxo_set.db orelse return;
+        const buf = try self.allocator.alloc(u8, FORK_BLOCK_RECORD_LEN * self.fork_blocks.count());
+        defer self.allocator.free(buf);
+        var it = self.fork_blocks.iterator();
+        var off: usize = 0;
+        while (it.next()) |kv| : (off += FORK_BLOCK_RECORD_LEN) {
+            const rec = buf[off .. off + FORK_BLOCK_RECORD_LEN];
+            @memcpy(rec[0..32], kv.key_ptr);
+            @memcpy(rec[32..64], &kv.value_ptr.prev);
+            std.mem.writeInt(u32, rec[64..68], kv.value_ptr.height, .little);
+            rec[68] = @as(u8, @intFromBool(kv.value_ptr.has_data)) | (@as(u8, @intFromBool(kv.value_ptr.connected)) << 1);
+        }
+        try db.put(CF_DEFAULT, FORK_BLOCKS_KEY, buf);
+    }
+
+    /// Record a block that is, or may become, off the active chain.  Flags
+    /// only ever turn on (Core never clears BLOCK_HAVE_DATA or
+    /// BLOCK_VALID_SCRIPTS on a disconnect), so noting a block again is
+    /// safe.  Being on the active chain is decided by the reader, against
+    /// the height index, not here.
+    pub fn noteForkBlock(
+        self: *ChainState,
+        hash: *const types.Hash256,
+        header: *const types.BlockHeader,
+        height: u32,
+        has_data: bool,
+        connected: bool,
+    ) !void {
+        self.fork_blocks_mutex.lock();
+        defer self.fork_blocks_mutex.unlock();
+        try self.loadForkBlocksLocked();
+        const gop = try self.fork_blocks.getOrPut(self.allocator, hash.*);
+        if (gop.found_existing) {
+            const fb = gop.value_ptr;
+            if ((fb.has_data or !has_data) and (fb.connected or !connected)) return;
+            fb.has_data = fb.has_data or has_data;
+            fb.connected = fb.connected or connected;
+        } else {
+            gop.value_ptr.* = .{
+                .prev = header.prev_block,
+                .height = height,
+                .has_data = has_data,
+                .connected = connected,
+            };
+        }
+        try self.storeForkBlocksLocked();
+    }
+
+    pub const ForkBlockEntry = struct { hash: types.Hash256, block: ForkBlock };
+
+    /// Snapshot of the fork-block set (caller frees).
+    pub fn forkBlockList(self: *ChainState, allocator: std.mem.Allocator) ![]ForkBlockEntry {
+        self.fork_blocks_mutex.lock();
+        defer self.fork_blocks_mutex.unlock();
+        try self.loadForkBlocksLocked();
+        const out = try allocator.alloc(ForkBlockEntry, self.fork_blocks.count());
+        var it = self.fork_blocks.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) out[i] = .{ .hash = kv.key_ptr.*, .block = kv.value_ptr.* };
         return out;
     }
 

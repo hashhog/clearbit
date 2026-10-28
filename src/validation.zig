@@ -7423,6 +7423,9 @@ pub const ChainManager = struct {
 
             // Update active tip
             self.active_tip = tip.parent;
+            // getchaintips lists the disconnected block as a fork tip (Core
+            // keeps it in the block index with BLOCK_VALID_SCRIPTS).
+            noteDisconnected(chain_state, tip);
 
             n_disconnected += 1;
             if (self.mempool) |pool| {
@@ -7988,6 +7991,13 @@ pub const ChainManager = struct {
         // Commit succeeded — adopt the new tip.  Both the on-disk
         // chainstate and the in-memory ChainManager pointer now agree.
         self.active_tip = to;
+        {
+            var old_walk: ?*BlockIndexEntry = from;
+            while (old_walk) |w| : (old_walk = w.parent) {
+                if (w == fork_point) break;
+                noteDisconnected(chain_state, w);
+            }
+        }
 
         // W101 P3-5 mempool update — fire AFTER the new chain is fully
         // committed (Core's MaybeUpdateMempoolForReorg also runs post-
@@ -8014,6 +8024,15 @@ pub const ChainManager = struct {
             mp.updateForReorg(disconnected_blocks.items, rb_list.items, true);
         }
         return true;
+    }
+
+    /// Record a block just disconnected from the active chain in the
+    /// durable fork-block set.  Reporting only (getchaintips), so a failed
+    /// write is logged, not raised: the disconnect itself has committed.
+    fn noteDisconnected(chain_state: *storage.ChainState, entry: *const BlockIndexEntry) void {
+        chain_state.noteForkBlock(&entry.hash, &entry.header, entry.height, true, true) catch |err| {
+            std.debug.print("noteForkBlock {x}: {}\n", .{ std.fmt.fmtSliceHexLower(&entry.hash), err });
+        };
     }
 
     /// Find the most-recent common ancestor of two block index entries.
@@ -8055,12 +8074,16 @@ pub const ChainManager = struct {
     /// Gate 6: mark `tip` and its ancestors down to and including the block
     /// `bad` (Core InvalidChainFound: the invalid block + its descendants),
     /// never the valid ancestors below it.
-    fn markChainFailedDownTo(self: *ChainManager, tip: *BlockIndexEntry, bad: *const types.Hash256) void {
+    pub fn markChainFailedDownTo(self: *ChainManager, tip: *BlockIndexEntry, bad: *const types.Hash256) void {
         var walk: ?*BlockIndexEntry = tip;
         var depth: usize = 0;
         while (walk) |w| {
             w.status.failed_valid = true;
             self.persistBlockStatus(w) catch {};
+            // Durable, as Core's BLOCK_FAILED_VALID is: the in-memory mark
+            // alone was gone after a restart (the index is rebuilt from the
+            // durable set), so getchaintips reported the block valid again.
+            self.persistFailedDurable(w) catch {};
             self.eraseBlockIndexCandidate(w);
             if (std.mem.eql(u8, &w.hash, bad)) break;
             walk = w.parent;

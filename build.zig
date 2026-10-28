@@ -461,6 +461,40 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_failed_reorg_tests.step);
     }
 
+    // getchaintips after failed reorgs / round trips / restarts.  Own root
+    // and name filter, same layout as test-failed-reorg-recovery.
+    {
+        const chain_tips_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_chain_tips.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"chain_tips"},
+        });
+        chain_tips_tests.linkSystemLibrary("rocksdb");
+        chain_tips_tests.linkSystemLibrary("secp256k1");
+        chain_tips_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        chain_tips_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            chain_tips_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            chain_tips_tests.linkSystemLibrary("minisketch");
+            chain_tips_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        chain_tips_tests.root_module.addOptions("build_options", build_options);
+
+        const run_chain_tips_tests = b.addRunArtifact(chain_tips_tests);
+        const chain_tips_step = b.step(
+            "test-chain-tips",
+            "Run getchaintips fork-tip tests",
+        );
+        chain_tips_step.dependOn(&run_chain_tips_tests.step);
+        test_step.dependOn(&run_chain_tips_tests.step);
+    }
+
     // Advertised P2P service-flag tests (Peer.localServices()).
     // Dedicated test root so it can import peer.zig and EXECUTE the real
     // localServices() without dragging in the pre-existing (drifted)
