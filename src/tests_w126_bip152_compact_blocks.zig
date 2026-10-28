@@ -438,20 +438,15 @@ test "w126 G15 BUG-8: no anti-DoS PoW preliminary gate before reconstruction (xf
 // clearbit peer.zig:7134-7160        announceBlock sends only inv/headers.
 // ===========================================================================
 
-test "w126 G16 BUG-9: announceBlock body does not branch on bip152_highbandwidth_from (xfail)" {
+test "w126 G16 BUG-9 FIXED: announceBlock branches on bip152_highbandwidth_from and pushes cmpctblock" {
     const src = @embedFile("peer.zig");
-    const fn_start = std.mem.indexOf(u8, src, "pub fn announceBlock(") orelse
+    const fn_start = std.mem.indexOf(u8, src, "pub fn announceBlockWithBody(") orelse
         return error.TestUnexpectedResult;
-    // The function ends at the next "\n    }\n" marker.
     const fn_end_marker = std.mem.indexOfPos(u8, src, fn_start, "\n    }\n") orelse
         return error.TestUnexpectedResult;
     const body = src[fn_start..fn_end_marker];
-    // Body sends inv and headers only — no cmpctblock constructor.
-    try testing.expect(std.mem.indexOf(u8, body, "cmpctblock") == null);
-    try testing.expect(std.mem.indexOf(u8, body, ".cmpctblock") == null);
-    // bip152_highbandwidth_from flag is NOT read here (W123 G12 confirmed).
-    try testing.expect(std.mem.indexOf(u8, body, "bip152_highbandwidth_from") == null);
-    // Sanity: the function DOES exist and DOES send headers/inv.
+    try testing.expect(std.mem.indexOf(u8, body, "bip152_highbandwidth_from") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "sendCompactBlock") != null);
     try testing.expect(std.mem.indexOf(u8, body, ".headers") != null);
     try testing.expect(std.mem.indexOf(u8, body, ".inv") != null);
 }

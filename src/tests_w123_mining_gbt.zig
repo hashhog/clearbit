@@ -620,19 +620,17 @@ test "w123 G11 BUG-11 no template cache in handleGetBlockTemplate" {
 // G12 — BUG-12 P0-CDIV: no proactive cmpctblock push to HB peers
 // ---------------------------------------------------------------------------
 
-test "w123 G12 BUG-12 announceBlock does not push cmpctblock to HB peers" {
+test "w123 G12 BUG-12 FIXED: announceBlock pushes cmpctblock to HB peers" {
     const src = @embedFile("peer.zig");
-    // Locate announceBlock body.
-    const fn_start = std.mem.indexOf(u8, src, "pub fn announceBlock(") orelse
+    // announceBlock delegates to announceBlockWithBody, which carries the HB branch.
+    const fn_start = std.mem.indexOf(u8, src, "pub fn announceBlockWithBody(") orelse
         return error.TestUnexpectedResult;
     const fn_end_marker_pos = std.mem.indexOfPos(u8, src, fn_start, "\n    }\n") orelse
         return error.TestUnexpectedResult;
     const body = src[fn_start..fn_end_marker_pos];
-    // Body sends `inv` and `headers` only. No `cmpctblock` constructor.
-    try testing.expect(std.mem.indexOf(u8, body, "cmpctblock") == null);
-    // bip152_highbandwidth_from flag is NOT branched on here.
-    try testing.expect(std.mem.indexOf(u8, body, "bip152_highbandwidth_from") == null);
-    // Sanity: the function DOES exist and DOES send headers/inv.
+    try testing.expect(std.mem.indexOf(u8, body, "sendCompactBlock") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "bip152_highbandwidth_from") != null);
+    // Still falls back to headers/inv for everyone else.
     try testing.expect(std.mem.indexOf(u8, body, ".headers") != null);
     try testing.expect(std.mem.indexOf(u8, body, ".inv") != null);
 }

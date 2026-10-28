@@ -9117,7 +9117,12 @@ pub const PeerManager = struct {
                             if (self.header_index.get(item.hash)) |entry| {
                                 break :blk entry.height;
                             }
-                            break :blk null;
+                            // Blocks that never went through header sync
+                            // (submitblock / generate*) are not in header_index;
+                            // the block index knows them.
+                            const cs = self.chain_state orelse break :blk null;
+                            if (std.mem.eql(u8, &cs.best_hash, &item.hash)) break :blk cs.best_height;
+                            break :blk cs.getBlockHeightByHash(&item.hash);
                         };
                         const depth: u32 = if (block_height_opt) |bh|
                             (if (tip_height >= bh) tip_height - bh else 0)
@@ -9142,83 +9147,19 @@ pub const PeerManager = struct {
                                 const owns_block = self.served_blocks.contains(item.hash);
                                 defer if (owns_block) serialize.freeBlock(self.allocator, &cmpct_block);
 
-                                // Build CBlockHeaderAndShortTxIDs inline.
-                                // Reference: bitcoin-core/src/blockencodings.cpp
-                                //   CBlockHeaderAndShortTxIDs::CBlockHeaderAndShortTxIDs(const CBlock&, bool).
-                                // Nonce: 64-bit CSPRNG per Core (m_rng.rand64()).
-                                const cb_nonce = std.crypto.random.int(u64);
-
-                                // Derive SipHash key: SHA256(header_bytes || nonce_LE)[0..16]
-                                var cb_key_data: [88]u8 = undefined;
-                                std.mem.writeInt(i32, cb_key_data[0..4], cmpct_block.header.version, .little);
-                                @memcpy(cb_key_data[4..36], &cmpct_block.header.prev_block);
-                                @memcpy(cb_key_data[36..68], &cmpct_block.header.merkle_root);
-                                std.mem.writeInt(u32, cb_key_data[68..72], cmpct_block.header.timestamp, .little);
-                                std.mem.writeInt(u32, cb_key_data[72..76], cmpct_block.header.bits, .little);
-                                std.mem.writeInt(u32, cb_key_data[76..80], cmpct_block.header.nonce, .little);
-                                std.mem.writeInt(u64, cb_key_data[80..88], cb_nonce, .little);
-                                const cb_key_hash = crypto.sha256(&cb_key_data);
-                                const cb_k0 = std.mem.readInt(u64, cb_key_hash[0..8], .little);
-                                const cb_k1 = std.mem.readInt(u64, cb_key_hash[8..16], .little);
-                                var cb_sip_key: [16]u8 = undefined;
-                                std.mem.writeInt(u64, cb_sip_key[0..8], cb_k0, .little);
-                                std.mem.writeInt(u64, cb_sip_key[8..16], cb_k1, .little);
-
-                                const SipHash64 = std.crypto.auth.siphash.SipHash64(2, 4);
-
-                                // Build short_ids for non-coinbase transactions (index ≥ 1).
-                                // Coinbase is always prefilled at index 0.
-                                var short_ids = std.ArrayList([6]u8).init(self.allocator);
-                                defer short_ids.deinit();
-                                var cb_alloc_err = false;
-                                for (cmpct_block.transactions, 0..) |*tx, ti| {
-                                    if (ti == 0) continue; // coinbase → prefilled
-                                    const wtxid = crypto.computeWtxidStreaming(tx);
-                                    var cb_hasher = SipHash64.init(&cb_sip_key);
-                                    cb_hasher.update(&wtxid);
-                                    const short_val = cb_hasher.finalInt() & 0x0000ffffffffffff;
-                                    var sid6: [6]u8 = undefined;
-                                    // Write 6-byte little-endian short ID manually
-                                    // (u48 is not a valid writeInt type in Zig 0.13).
-                                    var tmp64: [8]u8 = undefined;
-                                    std.mem.writeInt(u64, &tmp64, short_val, .little);
-                                    @memcpy(&sid6, tmp64[0..6]);
-                                    short_ids.append(sid6) catch {
-                                        cb_alloc_err = true;
-                                        break;
-                                    };
-                                }
-
-                                if (!cb_alloc_err and cmpct_block.transactions.len > 0) {
-                                    // Coinbase prefilled (index 0 in wire, delta 0).
-                                    const coinbase_prefilled = [_]p2p.PrefilledTransaction{.{
-                                        .index = 0,
-                                        .tx = cmpct_block.transactions[0],
-                                    }};
-                                    const cmpct_msg = p2p.Message{ .cmpctblock = .{
-                                        .header = cmpct_block.header,
-                                        .nonce = cb_nonce,
-                                        .short_ids = short_ids.items,
-                                        .prefilled_txs = &coinbase_prefilled,
-                                    } };
-                                    peer.sendMessage(&cmpct_msg) catch {};
-                                    std.log.debug("P2P: served cmpctblock depth={d} to peer", .{depth});
-                                } else {
-                                    // Alloc failure or empty block — fall back to full block.
-                                    const fb_msg = p2p.Message{ .block = cmpct_block };
-                                    peer.sendMessage(&fb_msg) catch {};
-                                }
+                                _ = sendCompactBlock(self.allocator, peer, &cmpct_block);
+                                std.log.debug("P2P: served cmpctblock depth={d} to peer", .{depth});
                             } else if (self.readStoredBlockBytes(&item.hash)) |raw| {
-                                // Not in the relay caches: serve the full block
-                                // from CF_BLOCKS (Core's own reply for
-                                // MSG_CMPCT_BLOCK when it will not build one).
+                                // Not in the relay caches (a block we learned via
+                                // submitblock/generate and have since evicted, or
+                                // after a restart): build the cmpctblock from
+                                // CF_BLOCKS, as Core does from disk.
                                 defer self.allocator.free(raw);
                                 var cb_disk_reader = serialize.Reader{ .data = raw };
                                 if (serialize.readBlock(&cb_disk_reader, self.allocator)) |disk_block| {
                                     const owned = disk_block;
                                     defer serialize.freeBlock(self.allocator, &owned);
-                                    const fb_msg = p2p.Message{ .block = owned };
-                                    peer.sendMessage(&fb_msg) catch {};
+                                    _ = sendCompactBlock(self.allocator, peer, &owned);
                                 } else |_| {}
                             } else {
                                 // Block not in cache — notfound.
@@ -12579,7 +12520,7 @@ pub const PeerManager = struct {
                 // mining RPCs, so P2P-received blocks were connected but never
                 // relayed: two Core peers linked only through clearbit never
                 // converged (regtest relay test 2026-09-26).
-                self.announceBlock(&block.header, &block_hash);
+                self.announceBlockWithBody(&block.header, &block_hash, &block);
                 if (zmq.global.initialized) {
                     var raw_alloc: ?[]const u8 = null;
                     defer if (raw_alloc) |b| self.allocator.free(b);
@@ -13274,6 +13215,21 @@ pub const PeerManager = struct {
         header: *const types.BlockHeader,
         hash: *const types.Hash256,
     ) void {
+        self.announceBlockWithBody(header, hash, null);
+    }
+
+    /// announceBlock plus BIP-152 high-bandwidth push.  Core:
+    /// PeerManagerImpl::NewPoWValidBlock sends an unsolicited `cmpctblock` to
+    /// every peer that selected us as a high-bandwidth source (sendcmpct v2,
+    /// announce=1) instead of the headers/inv announcement.  `body` is the block
+    /// when the caller has it; otherwise it is looked up in the relay caches and
+    /// CF_BLOCKS, and an HB peer falls back to headers/inv if it cannot be found.
+    pub fn announceBlockWithBody(
+        self: *PeerManager,
+        header: *const types.BlockHeader,
+        hash: *const types.Hash256,
+        body: ?*const types.Block,
+    ) void {
         // Reuse the inv message (allocated on the stack) for non-opt-in peers.
         var inv_items = [_]p2p.InvVector{.{
             .inv_type = .msg_block,
@@ -13287,14 +13243,45 @@ pub const PeerManager = struct {
         var hdrs = [_]types.BlockHeader{header.*};
         const hdrs_msg = p2p.Message{ .headers = .{ .headers = &hdrs } };
 
+        // Resolve the block body once, and only if some peer wants a cmpctblock.
+        var owned_body: ?types.Block = null;
+        defer if (owned_body) |*b| serialize.freeBlock(self.allocator, b);
+        var body_tried = false;
+
         for (self.peers.items) |peer| {
             if (peer.state != .handshake_complete) continue;
+            if (peer.bip152_provides_cmpctblocks and peer.bip152_highbandwidth_from) {
+                if (!body_tried and body == null) {
+                    body_tried = true;
+                    owned_body = self.loadBlockBody(hash);
+                }
+                const blk: ?*const types.Block = body orelse
+                    (if (owned_body) |*b| b else null);
+                if (blk) |b| {
+                    // On a build failure sendCompactBlock already sent the full block.
+                    _ = sendCompactBlock(self.allocator, peer, b);
+                    continue;
+                }
+            }
             if (peer.send_headers) {
                 peer.sendMessage(&hdrs_msg) catch continue;
             } else {
                 peer.sendMessage(&inv_msg) catch continue;
             }
         }
+    }
+
+    /// A parsed copy of the block `hash` from the relay caches or CF_BLOCKS.
+    /// Caller frees with serialize.freeBlock.
+    fn loadBlockBody(self: *PeerManager, hash: *const types.Hash256) ?types.Block {
+        if (self.served_blocks.get(hash.*)) |data| {
+            var r = serialize.Reader{ .data = data };
+            if (serialize.readBlock(&r, self.allocator)) |b| return b else |_| {}
+        }
+        const raw = self.readStoredBlockBytes(hash) orelse return null;
+        defer self.allocator.free(raw);
+        var r = serialize.Reader{ .data = raw };
+        return serialize.readBlock(&r, self.allocator) catch null;
     }
 
     /// Feed a just-connected block into every loaded wallet.  Called from the
@@ -13317,6 +13304,67 @@ pub const PeerManager = struct {
         }
     }
 };
+
+/// Build and send a BIP-152 `cmpctblock` (coinbase prefilled, everything else
+/// as short ids) for `block`.  Core: CBlockHeaderAndShortTxIDs(block, rng.rand64()).
+/// Returns true iff a cmpctblock went out; on an allocation failure or an
+/// empty block it sends the full block instead and returns false.
+fn sendCompactBlock(allocator: std.mem.Allocator, peer: *Peer, block: *const types.Block) bool {
+    // Nonce: 64-bit CSPRNG per Core (m_rng.rand64()).
+    const nonce = std.crypto.random.int(u64);
+
+    // SipHash key: SHA256(header_bytes || nonce_LE)[0..16]
+    var key_data: [88]u8 = undefined;
+    std.mem.writeInt(i32, key_data[0..4], block.header.version, .little);
+    @memcpy(key_data[4..36], &block.header.prev_block);
+    @memcpy(key_data[36..68], &block.header.merkle_root);
+    std.mem.writeInt(u32, key_data[68..72], block.header.timestamp, .little);
+    std.mem.writeInt(u32, key_data[72..76], block.header.bits, .little);
+    std.mem.writeInt(u32, key_data[76..80], block.header.nonce, .little);
+    std.mem.writeInt(u64, key_data[80..88], nonce, .little);
+    const key_hash = crypto.sha256(&key_data);
+    var sip_key: [16]u8 = undefined;
+    @memcpy(&sip_key, key_hash[0..16]);
+
+    const SipHash64 = std.crypto.auth.siphash.SipHash64(2, 4);
+
+    // Short ids for the non-coinbase transactions; the coinbase is prefilled.
+    var short_ids = std.ArrayList([6]u8).init(allocator);
+    defer short_ids.deinit();
+    var alloc_err = false;
+    for (block.transactions, 0..) |*tx, ti| {
+        if (ti == 0) continue;
+        const wtxid = crypto.computeWtxidStreaming(tx);
+        var hasher = SipHash64.init(&sip_key);
+        hasher.update(&wtxid);
+        const short_val = hasher.finalInt() & 0x0000ffffffffffff;
+        // 6-byte little-endian (u48 is not a valid writeInt type in Zig 0.13).
+        var tmp64: [8]u8 = undefined;
+        std.mem.writeInt(u64, &tmp64, short_val, .little);
+        short_ids.append(tmp64[0..6].*) catch {
+            alloc_err = true;
+            break;
+        };
+    }
+
+    if (!alloc_err and block.transactions.len > 0) {
+        const coinbase_prefilled = [_]p2p.PrefilledTransaction{.{
+            .index = 0,
+            .tx = block.transactions[0],
+        }};
+        const cmpct_msg = p2p.Message{ .cmpctblock = .{
+            .header = block.header,
+            .nonce = nonce,
+            .short_ids = short_ids.items,
+            .prefilled_txs = &coinbase_prefilled,
+        } };
+        peer.sendMessage(&cmpct_msg) catch return false;
+        return true;
+    }
+    const fb_msg = p2p.Message{ .block = block.* };
+    peer.sendMessage(&fb_msg) catch {};
+    return false;
+}
 
 /// The transactions of `block` at `indexes`, in request order, for a BIP-152
 /// `blocktxn` reply. The returned slice is allocator-owned; the transactions in
