@@ -91,8 +91,11 @@ fn makeHeaderChain(
             .merkle_root = merkle,
             .timestamp = ts,
             .bits = bits,
-            .nonce = @intCast(i),
+            .nonce = 0,
         };
+        // Real proof of work: the .headers handler refuses the whole message
+        // otherwise (Core CheckHeadersPoW), before the fork path under test.
+        while (!consensus.validateProofOfWork(h, &consensus.REGTEST)) h.nonce +%= 1;
         prev = crypto.computeBlockHash(h);
         ts += 1;
     }
