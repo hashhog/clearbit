@@ -432,7 +432,7 @@ test "w136/G22b: drainBlockBuffer announces the connected tip" {
         return error.TipAgeGateNotFound;
     const gate = drain_idx + gate_rel;
     const window = peer_src[gate..@min(gate + 1500, peer_src.len)];
-    try testing.expect(std.mem.indexOf(u8, window, "self.announceBlock(&block.header, &block_hash);") != null);
+    try testing.expect(std.mem.indexOf(u8, window, "self.announceBlockWithBody(&block.header, &block_hash, &block);") != null);
 }
 
 // G22c FIX (2026-09-26): getheaders at/after our tip gets an EMPTY headers
