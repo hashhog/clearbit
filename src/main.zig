@@ -89,6 +89,11 @@ pub const Config = struct {
     // `getpayjoinrequest` (G26) + `sendpayjoinrequest` (G27).
     payjoin_server_url: ?[]const u8 = null,
 
+    // Serve the BIP-78 PayJoin receiver route (POST /payjoin) on the RPC
+    // port.  Off by default: the route is unauthenticated by design, so it
+    // must be an explicit operator choice (security audit C6).
+    payjoin_receiver: bool = false,
+
     // Wallet auto-load list.  `-wallet=<name>` (repeatable) selects exactly
     // which wallets to load at startup, mirroring Bitcoin Core's `-wallet`
     // (init.cpp / wallet settings).  When empty, the wallet directory is
@@ -332,6 +337,8 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             config.rpc_tls_cert = arg["--rpc-tls-cert=".len..];
         } else if (std.mem.startsWith(u8, arg, "--rpc-tls-key=")) {
             config.rpc_tls_key = arg["--rpc-tls-key=".len..];
+        } else if (std.mem.eql(u8, arg, "--payjoin-receiver")) {
+            config.payjoin_receiver = true;
         } else if (std.mem.startsWith(u8, arg, "--payjoin-server-url=")) {
             // W119/G27 + FIX-66 — operator-supplied BIP-78 PayJoin
             // receiver endpoint.  Must start with `http://` (plain HTTP
@@ -624,6 +631,9 @@ pub fn printUsage() void {
         \\                         time with a TlsClientUnavailable-shape
         \\                         JSON error.  Front receiver endpoints
         \\                         with nginx / Caddy / Tor for production.
+        \\  --payjoin-receiver     Serve the BIP-78 receiver route POST /payjoin
+        \\                         on the RPC port (default: off). The route
+        \\                         takes no RPC credentials, by design.
         \\
         \\Storage options:
         \\  --datadir=<dir>        Data directory (default: ~/.clearbit)
@@ -832,6 +842,8 @@ pub fn loadConfigFile(
             // W119 + FIX-66: BIP-78 PayJoin receiver endpoint URL.
             else if (std.mem.eql(u8, key, "payjoin-server-url") or std.mem.eql(u8, key, "payjoinserverurl")) {
                 config.payjoin_server_url = value;
+            } else if (std.mem.eql(u8, key, "payjoin-receiver") or std.mem.eql(u8, key, "payjoinreceiver")) {
+                config.payjoin_receiver = std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
             }
             // P2P settings
             else if (std.mem.eql(u8, key, "port")) {
@@ -2461,6 +2473,7 @@ pub fn main() !void {
             // until Zig stdlib / a deliberate C-dep adds server TLS.
             .tls_cert_path = config.rpc_tls_cert,
             .tls_key_path = config.rpc_tls_key,
+            .payjoin_receiver = config.payjoin_receiver,
         },
     );
     defer rpc_server.deinit();
