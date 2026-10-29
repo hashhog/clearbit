@@ -2259,10 +2259,6 @@ pub const Wallet = struct {
             if (self.fee_rate_sat_per_kvb) |k| return @intCast((vsize * k + 999) / 1000);
             return @intCast(vsize * self.fee_rate);
         }
-
-        fn rateSatPerKvb(self: CoinSelectOptions) u64 {
-            return self.fee_rate_sat_per_kvb orelse self.fee_rate * 1000;
-        }
     };
 
     /// Result of a coin-selection call. Named (rather than per-function
@@ -2412,7 +2408,10 @@ pub const Wallet = struct {
         var best_waste: i64 = std.math.maxInt(i64);
 
         // Is current fee rate higher than long term? Affects waste calculation
-        const is_feerate_high = options.rateSatPerKvb() > options.long_term_fee_rate * 1000;
+        const is_feerate_high = if (options.fee_rate_sat_per_kvb) |k|
+            k > options.long_term_fee_rate * 1000
+        else
+            options.fee_rate > options.long_term_fee_rate;
 
         var utxo_pool_index: usize = 0;
         var iterations: usize = 0;
