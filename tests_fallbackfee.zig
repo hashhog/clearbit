@@ -1,8 +1,11 @@
 //! Core-style -fallbackfee: wallet sends take their fee rate from the fee
 //! estimator, then -fallbackfee, and fail like Core when neither exists
-//! (spend.cpp:1164 "Fee estimation failed. Fallbackfee is disabled...",
-//! thrown as RPC_WALLET_INSUFFICIENT_FUNDS -6). Pre-fix sendtoaddress/send
-//! used a hardcoded 5 sat/vB and never failed.
+//! (spend.cpp:1166 "Fee estimation failed. Fallbackfee is disabled...":
+//! sendtoaddress surfaces it as RPC_WALLET_INSUFFICIENT_FUNDS -6, `send`
+//! throws RPC_WALLET_ERROR -4 at wallet/rpc/spend.cpp:1438). Pre-fix
+//! sendtoaddress/send used a hardcoded 5 sat/vB and never failed. The rate is
+//! GetMinimumFeeRate's: exact sat/kvB, raised to the mempool and required
+//! minimums; -fallbackfee is ParseMoney'd and a bad one refuses startup.
 //!
 //! Run with `zig build test-fallbackfee`. Filter `fallbackfee`.
 
@@ -15,6 +18,7 @@ const peer_mod = @import("src/peer.zig");
 const consensus = @import("src/consensus.zig");
 const wallet_mod = @import("src/wallet.zig");
 const types = @import("src/types.zig");
+const main_mod = @import("src/main.zig");
 
 fn has(body: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, body, needle) != null;
@@ -125,7 +129,7 @@ test "fallbackfee sendtoaddress with a fallback gets past the fee check" {
     try testing.expect(!has(resp, FEE_ERR));
 }
 
-test "fallbackfee send with no estimate and no fallback fails -6" {
+test "fallbackfee send with no estimate and no fallback fails -4" {
     // Arena: the post-fee error paths in the send handlers (mempool reject on
     // this empty fixture) leak by design of the existing code; not under test.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -137,7 +141,7 @@ test "fallbackfee send with no estimate and no fallback fails -6" {
     try fund(&fx, allocator);
     const resp = try fx.dispatch("{\"id\":2,\"method\":\"send\",\"params\":[[{\"" ++ DEST ++ "\":1.0}]]}");
     defer allocator.free(resp);
-    try testing.expect(has(resp, "\"code\":-6"));
+    try testing.expect(has(resp, "\"code\":-4"));
     try testing.expect(has(resp, FEE_ERR));
 }
 
@@ -156,11 +160,89 @@ test "fallbackfee send with explicit fee_rate needs no fallback" {
     try testing.expect(!has(resp, FEE_ERR));
 }
 
-test "fallbackfee rate selection: estimate wins, fallback rounds up, 0 disables" {
-    try testing.expectEqual(@as(?u64, 20), rpc.walletFeeRate(null, 20_000));
-    try testing.expectEqual(@as(?u64, 21), rpc.walletFeeRate(null, 20_001));
-    try testing.expectEqual(@as(?u64, 7), rpc.walletFeeRate(6.2, 20_000));
-    try testing.expectEqual(@as(?u64, null), rpc.walletFeeRate(null, 0));
+test "fallbackfee sendtoaddress keeps a fractional fallback rate" {
+    // 1001 sat/kvB = 1.001 sat/vB. Core keeps it: a 68-vB P2WPKH input costs
+    // ceil(68 * 1.001) = 69 sat, so 50 BTC covers 49.999999 BTC (100 sat
+    // spare). Rounding the rate up to 2 sat/vB charges 136 and reports
+    // "Insufficient funds".
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var fx: Fixture = undefined;
+    try fx.init(allocator, "fr", 1001);
+    defer fx.deinit();
+    try fund(&fx, allocator);
+    const resp = try fx.dispatch("{\"id\":2,\"method\":\"sendtoaddress\",\"params\":[\"" ++ DEST ++ "\",49.999999]}");
+    defer allocator.free(resp);
+    try testing.expect(!has(resp, FEE_ERR));
+    try testing.expect(!has(resp, "Insufficient funds"));
+}
+
+test "fallbackfee parse refuses what Core ParseMoney refuses" {
+    // MAX_MONEY is the ceiling, even though 21000001 BTC fits in a u64.
+    try testing.expectEqual(@as(?u64, 2_100_000_000_000_000), rpc.parseFallbackFee("21000000"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("21000000.00000001"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("21000001"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("99999999999"));
+    // Surrounding whitespace is trimmed; anything else is junk.
+    try testing.expectEqual(@as(?u64, 20_000), rpc.parseFallbackFee(" \t0.0002\n"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("   "));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("0. 0002"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("0 .0002"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("-0.0002"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("+0.0002"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("0.0002x"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("0.0002.1"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("1e-4"));
+    try testing.expectEqual(@as(?u64, null), rpc.parseFallbackFee("0.0002\x00"));
+    // Core accepts these edge forms.
+    try testing.expectEqual(@as(?u64, 100_000_000), rpc.parseFallbackFee("1."));
+    try testing.expectEqual(@as(?u64, 50_000_000), rpc.parseFallbackFee(".5"));
+    try testing.expectEqual(@as(?u64, 1), rpc.parseFallbackFee("0.00000001"));
+}
+
+fn writeConf(dir: []const u8, body: []const u8) !void {
+    std.fs.deleteTreeAbsolute(dir) catch {};
+    try std.fs.makeDirAbsolute(dir);
+    var d = try std.fs.openDirAbsolute(dir, .{});
+    defer d.close();
+    try d.writeFile(.{ .sub_path = "clearbit.conf", .data = body });
+}
+
+test "fallbackfee bad config-file value refuses startup" {
+    const dir = "/tmp/clearbit_fallbackfee_conf_bad";
+    defer std.fs.deleteTreeAbsolute(dir) catch {};
+    try writeConf(dir, "fallbackfee=21000001\n");
+    var config = main_mod.Config{};
+    try testing.expectError(error.InvalidFallbackFee, main_mod.loadConfigFile(dir, &config, testing.allocator));
+    try writeConf(dir, "fallbackfee=abc\n");
+    try testing.expectError(error.InvalidFallbackFee, main_mod.loadConfigFile(dir, &config, testing.allocator));
+}
+
+test "fallbackfee high config-file value is kept, not refused" {
+    const dir = "/tmp/clearbit_fallbackfee_conf_high";
+    defer std.fs.deleteTreeAbsolute(dir) catch {};
+    // 0.02 BTC/kvB > HIGH_TX_FEE_PER_KB (0.01): Core warns and stores it.
+    try writeConf(dir, "fallbackfee=0.02\n");
+    var config = main_mod.Config{};
+    try main_mod.loadConfigFile(dir, &config, testing.allocator);
+    try testing.expectEqual(@as(u64, 2_000_000), config.fallbackfee_sat_per_kvb);
+}
+
+test "fallbackfee rate selection keeps the feerate, raises to mempool and required minimums" {
+    // walletFeeRate(estimate, fallback, mempool_min, relay_min), all sat/kvB.
+    // Estimate wins; with no estimate the fallback, unrounded.
+    try testing.expectEqual(@as(?u64, 6200), rpc.walletFeeRate(6200, 20_000, 100, 100));
+    try testing.expectEqual(@as(?u64, 20_001), rpc.walletFeeRate(null, 20_001, 100, 100));
+    try testing.expectEqual(@as(?u64, 20_000), rpc.walletFeeRate(0, 20_000, 100, 100));
+    // A zero fallback is disabled, never raised to a minimum.
+    try testing.expectEqual(@as(?u64, null), rpc.walletFeeRate(null, 0, 5000, 100));
+    // Raised to the mempool minimum fee...
+    try testing.expectEqual(@as(?u64, 5000), rpc.walletFeeRate(3000, 0, 5000, 100));
+    try testing.expectEqual(@as(?u64, 5000), rpc.walletFeeRate(null, 3000, 5000, 100));
+    // ...then to the required fee, max(-mintxfee 1000, relay minimum).
+    try testing.expectEqual(@as(?u64, 1000), rpc.walletFeeRate(null, 500, 100, 100));
+    try testing.expectEqual(@as(?u64, 1500), rpc.walletFeeRate(null, 500, 100, 1500));
 }
 
 test "fallbackfee parse BTC/kvB to sat/kvB" {

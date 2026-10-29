@@ -2246,9 +2246,23 @@ pub const Wallet = struct {
     /// Coin selection options
     pub const CoinSelectOptions = struct {
         fee_rate: u64 = 1, // sat/vB
+        /// Exact rate in sat/kvB; overrides `fee_rate` when set so a
+        /// fractional sat/vB (Core CFeeRate) is not rounded to a whole one.
+        fee_rate_sat_per_kvb: ?u64 = null,
         long_term_fee_rate: u64 = 10, // sat/vB for waste calculation
         cost_of_change: i64 = 34 * 10, // cost to create + spend change output
         min_change: i64 = 546, // minimum change to avoid dust
+
+        /// Fee for `vsize` vbytes at this rate, rounded up like Core's
+        /// CFeeRate::GetFee (EvaluateFeeUp).
+        pub fn feeFor(self: CoinSelectOptions, vsize: u64) i64 {
+            if (self.fee_rate_sat_per_kvb) |k| return @intCast((vsize * k + 999) / 1000);
+            return @intCast(vsize * self.fee_rate);
+        }
+
+        fn rateSatPerKvb(self: CoinSelectOptions) u64 {
+            return self.fee_rate_sat_per_kvb orelse self.fee_rate * 1000;
+        }
     };
 
     /// Result of a coin-selection call. Named (rather than per-function
@@ -2320,7 +2334,7 @@ pub const Wallet = struct {
 
         var total_available: i64 = 0;
         for (candidates, 0..) |utxo, i| {
-            const input_fee = @as(i64, @intCast(estimateInputSize(utxo.address_type) * options.fee_rate));
+            const input_fee = options.feeFor(estimateInputSize(utxo.address_type));
             effective_values[i] = utxo.output.value - input_fee;
             if (effective_values[i] > 0) {
                 total_available += effective_values[i];
@@ -2398,7 +2412,7 @@ pub const Wallet = struct {
         var best_waste: i64 = std.math.maxInt(i64);
 
         // Is current fee rate higher than long term? Affects waste calculation
-        const is_feerate_high = options.fee_rate > options.long_term_fee_rate;
+        const is_feerate_high = options.rateSatPerKvb() > options.long_term_fee_rate * 1000;
 
         var utxo_pool_index: usize = 0;
         var iterations: usize = 0;
@@ -2492,7 +2506,7 @@ pub const Wallet = struct {
     /// Calculate waste for a single input (fee - long_term_fee)
     fn calculateWaste(addr_type: AddressType, options: CoinSelectOptions) i64 {
         const input_size = estimateInputSize(addr_type);
-        const fee = @as(i64, @intCast(input_size * options.fee_rate));
+        const fee = options.feeFor(input_size);
         const long_term_fee = @as(i64, @intCast(input_size * options.long_term_fee_rate));
         return fee - long_term_fee;
     }
