@@ -70,6 +70,20 @@ pub const Reader = struct {
         return value;
     }
 
+    /// Read a CompactSize element count for a vector whose elements each take
+    /// at least `min_size` bytes on the wire, and fail with EndOfStream if the
+    /// rest of the stream cannot hold that many. Callers allocate
+    /// `count * @sizeOf(T)` next, so without this a 5-byte count of MAX_SIZE
+    /// commits gigabytes before the first element is read (security audit
+    /// 2026-10-29 C1). Core reaches the same EOF while reading the elements,
+    /// having allocated at most MAX_VECTOR_ALLOCATE (serialize.h); honest
+    /// input always passes, since its elements are actually there.
+    pub fn readCount(self: *Reader, min_size: usize) Error!usize {
+        const n = try self.readCompactSize();
+        if (n > self.remaining() / min_size) return Error.EndOfStream;
+        return @intCast(n);
+    }
+
     /// Read a CompactSize WITHOUT the MAX_SIZE (0x02000000) range check.
     ///
     /// Use this for fields that are bitfields rather than container lengths —
@@ -226,6 +240,25 @@ pub const Writer = struct {
     }
 };
 
+/// Minimum wire size of one TxIn: prevout (36) + empty scriptSig (1) + sequence (4).
+const MIN_TXIN_SIZE: usize = 41;
+/// Minimum wire size of one TxOut: value (8) + empty scriptPubKey (1).
+const MIN_TXOUT_SIZE: usize = 9;
+/// Lower bound on one serialized transaction: version, two counts, locktime.
+pub const MIN_TX_SIZE: usize = 10;
+
+/// Free the parts of a transaction decoded so far: the first `inputs_done`
+/// inputs (scriptSig and witness) and the first `outputs_done` outputs.
+/// Inputs whose witness was not read yet hold the static empty slice.
+fn freePartialTx(allocator: std.mem.Allocator, inputs: []const types.TxIn, inputs_done: usize, outputs: []const types.TxOut, outputs_done: usize) void {
+    for (inputs[0..inputs_done]) |input| {
+        allocator.free(input.script_sig);
+        for (input.witness) |item| allocator.free(item);
+        if (input.witness.len > 0) allocator.free(input.witness);
+    }
+    for (outputs[0..outputs_done]) |output| allocator.free(output.script_pubkey);
+}
+
 /// Read a transaction from the binary stream
 pub fn readTransaction(reader: *Reader, allocator: std.mem.Allocator) !types.Transaction {
     @setRuntimeSafety(true);
@@ -241,31 +274,36 @@ pub fn readTransaction(reader: *Reader, allocator: std.mem.Allocator) !types.Tra
         is_segwit = true;
     }
 
-    // Read inputs
-    const input_count = try reader.readCompactSize();
-    const inputs = try allocator.alloc(types.TxIn, @intCast(input_count));
-    errdefer allocator.free(inputs);
+    // Everything decoded so far is freed if any later read fails.
+    var inputs: []types.TxIn = &.{};
+    var outputs: []types.TxOut = &.{};
+    var inputs_done: usize = 0;
+    var outputs_done: usize = 0;
+    errdefer {
+        freePartialTx(allocator, inputs, inputs_done, outputs, outputs_done);
+        allocator.free(inputs);
+        allocator.free(outputs);
+    }
 
+    // Read inputs
+    inputs = try allocator.alloc(types.TxIn, try reader.readCount(MIN_TXIN_SIZE));
     for (inputs) |*input| {
         const prev_hash = try reader.readHash();
         const prev_index = try reader.readInt(u32);
         const script_len = try reader.readCompactSize();
         const script_sig = try allocator.dupe(u8, try reader.readBytes(@intCast(script_len)));
-        const sequence = try reader.readInt(u32);
-
         input.* = .{
             .previous_output = .{ .hash = prev_hash, .index = prev_index },
             .script_sig = script_sig,
-            .sequence = sequence,
+            .sequence = 0,
             .witness = &[_][]const u8{},
         };
+        inputs_done += 1;
+        input.sequence = try reader.readInt(u32);
     }
 
     // Read outputs
-    const output_count = try reader.readCompactSize();
-    const outputs = try allocator.alloc(types.TxOut, @intCast(output_count));
-    errdefer allocator.free(outputs);
-
+    outputs = try allocator.alloc(types.TxOut, try reader.readCount(MIN_TXOUT_SIZE));
     for (outputs) |*output| {
         const value = try reader.readInt(i64);
         const script_len = try reader.readCompactSize();
@@ -275,18 +313,29 @@ pub fn readTransaction(reader: *Reader, allocator: std.mem.Allocator) !types.Tra
             .value = value,
             .script_pubkey = script_pubkey,
         };
+        outputs_done += 1;
     }
 
     // Read witness data if segwit
     if (is_segwit) {
         for (inputs) |*input| {
-            const witness_count = try reader.readCompactSize();
-            var witness_items = try allocator.alloc([]const u8, @intCast(witness_count));
-            for (0..@intCast(witness_count)) |i| {
-                const item_len = try reader.readCompactSize();
-                witness_items[i] = try allocator.dupe(u8, try reader.readBytes(@intCast(item_len)));
+            // Each item is at least its 1-byte length prefix.
+            const witness_items = try allocator.alloc([]const u8, try reader.readCount(1));
+            var items_done: usize = 0;
+            errdefer {
+                for (witness_items[0..items_done]) |item| allocator.free(item);
+                allocator.free(witness_items);
             }
-            input.witness = witness_items;
+            for (witness_items) |*item| {
+                const item_len = try reader.readCompactSize();
+                item.* = try allocator.dupe(u8, try reader.readBytes(@intCast(item_len)));
+                items_done += 1;
+            }
+            if (witness_items.len > 0) {
+                input.witness = witness_items;
+            } else {
+                allocator.free(witness_items);
+            }
         }
         // Core primitives/transaction.h:228-231: "It's illegal to encode witnesses
         // when all witness stacks are empty." (HasWitness() == false after parse).
@@ -326,31 +375,39 @@ pub fn readTransactionNoWitness(reader: *Reader, allocator: std.mem.Allocator) !
     @setRuntimeSafety(true);
     const version = try reader.readInt(i32);
 
-    const input_count = try reader.readCompactSize();
-    const inputs = try allocator.alloc(types.TxIn, @intCast(input_count));
-    errdefer allocator.free(inputs);
+    var inputs: []types.TxIn = &.{};
+    var outputs: []types.TxOut = &.{};
+    var inputs_done: usize = 0;
+    var outputs_done: usize = 0;
+    errdefer {
+        freePartialTx(allocator, inputs, inputs_done, outputs, outputs_done);
+        allocator.free(inputs);
+        allocator.free(outputs);
+    }
+
+    inputs = try allocator.alloc(types.TxIn, try reader.readCount(MIN_TXIN_SIZE));
     for (inputs) |*input| {
         const prev_hash = try reader.readHash();
         const prev_index = try reader.readInt(u32);
         const script_len = try reader.readCompactSize();
         const script_sig = try allocator.dupe(u8, try reader.readBytes(@intCast(script_len)));
-        const sequence = try reader.readInt(u32);
         input.* = .{
             .previous_output = .{ .hash = prev_hash, .index = prev_index },
             .script_sig = script_sig,
-            .sequence = sequence,
+            .sequence = 0,
             .witness = &[_][]const u8{},
         };
+        inputs_done += 1;
+        input.sequence = try reader.readInt(u32);
     }
 
-    const output_count = try reader.readCompactSize();
-    const outputs = try allocator.alloc(types.TxOut, @intCast(output_count));
-    errdefer allocator.free(outputs);
+    outputs = try allocator.alloc(types.TxOut, try reader.readCount(MIN_TXOUT_SIZE));
     for (outputs) |*output| {
         const value = try reader.readInt(i64);
         const script_len = try reader.readCompactSize();
         const script_pubkey = try allocator.dupe(u8, try reader.readBytes(@intCast(script_len)));
         output.* = .{ .value = value, .script_pubkey = script_pubkey };
+        outputs_done += 1;
     }
 
     const lock_time = try reader.readInt(u32);
@@ -384,13 +441,16 @@ pub fn readBlockHeader(reader: *Reader) Error!types.BlockHeader {
 /// Read a full block from the binary stream
 pub fn readBlock(reader: *Reader, allocator: std.mem.Allocator) !types.Block {
     const header = try readBlockHeader(reader);
-    const tx_count = try reader.readCompactSize();
+    const transactions = try allocator.alloc(types.Transaction, try reader.readCount(MIN_TX_SIZE));
+    var done: usize = 0;
+    errdefer {
+        for (transactions[0..done]) |*tx| freeTransaction(allocator, tx);
+        allocator.free(transactions);
+    }
 
-    var transactions = try allocator.alloc(types.Transaction, @intCast(tx_count));
-    errdefer allocator.free(transactions);
-
-    for (0..@intCast(tx_count)) |i| {
-        transactions[i] = try readTransaction(reader, allocator);
+    for (transactions) |*tx| {
+        tx.* = try readTransaction(reader, allocator);
+        done += 1;
     }
 
     return .{

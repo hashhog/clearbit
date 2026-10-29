@@ -8469,10 +8469,11 @@ pub const PeerManager = struct {
                 }
 
                 // Buffer the block (transfer ownership - do NOT free here).
-                // Note: AutoHashMap.put replaces on duplicate-hash, so a
-                // duplicate block response correctly ends up as a no-op
-                // relative to buffer count (decrement already happened above).
-                self.block_buffer.put(block_hash, block) catch |err| {
+                // A duplicate response for a buffered hash replaces the old
+                // body, which must be freed: plain `put` overwrote it and
+                // leaked ~4 MB per re-sent body (audit C5). Buffer count is
+                // unchanged (the in-flight decrement already happened above).
+                const gop = self.block_buffer.getOrPut(block_hash) catch |err| {
                     // If we can't buffer it, free and drop. The in-flight
                     // decrement above has already run, so the download slot
                     // is freed for the pipeline to re-issue. Log every drop
@@ -8492,6 +8493,8 @@ pub const PeerManager = struct {
                     serialize.freeBlock(self.allocator, &block);
                     return;
                 };
+                if (gop.found_existing) serialize.freeBlock(self.allocator, gop.value_ptr);
+                gop.value_ptr.* = block;
                 // Record which peer supplied this block so drainBlockBuffer can
                 // penalise them if validation rejects it.  Mirrors Core's
                 // mapBlockSource (net_processing.cpp:4805).  Best-effort; OOM
@@ -8551,13 +8554,15 @@ pub const PeerManager = struct {
                     // stxr parameters stored for future Erlay use
                 }
             },
-            .reqrecon => {
+            .reqrecon => |rr| {
                 // BIP-330 Erlay: Peer is requesting set reconciliation.
-                // No heap allocations in reqrecon (sketch_data is a slice into payload).
+                // sketch_data is an owned copy (p2p.decodePayload); a peer
+                // repeating 4 MB reqrecons leaked it every time (audit C4).
+                self.allocator.free(rr.sketch_data);
             },
-            .sketch => {
-                // BIP-330 Erlay: Peer sent their sketch data.
-                // No heap allocations in sketch (sketch_data is a slice into payload).
+            .sketch => |sk| {
+                // BIP-330 Erlay: Peer sent their sketch data. Owned copy, as above.
+                self.allocator.free(sk.sketch_data);
             },
             .reconcildiff => |rd| {
                 // BIP-330 Erlay: Peer reports the reconciliation results.
@@ -9408,7 +9413,17 @@ pub const PeerManager = struct {
                     .{peer.address},
                 );
             },
-            else => {},
+            .version => |v| {
+                // Core net_processing.cpp: a version after the handshake is
+                // "redundant version message" — logged and ignored. The
+                // decoder's owned user_agent (up to the 4 MB message cap)
+                // used to fall to the `else` below and leak (audit C4).
+                std.log.debug("redundant version message from peer={any}", .{peer.address});
+                self.allocator.free(v.user_agent);
+            },
+            // Anything else owns nothing today; free it anyway so a variant
+            // that gains a heap field cannot start leaking silently here.
+            else => p2p.freeDecodedMessage(self.allocator, msg),
         }
     }
 

@@ -329,3 +329,99 @@ test "sec_p2p_decode: C5 a re-sent body for a buffered hash does not leak the ol
     try testing.expectEqual(@as(u32, 1), pm.block_buffer.count());
     try testing.expect(pm.block_buffer.contains(h));
 }
+
+// --- Consensus guard: honest encodings decode exactly as before ------------
+//
+// readTransaction / readBlock are on the block-validation path. The only way
+// the C1 cap could turn a valid block invalid is a per-element minimum that
+// is too large (41 / 9 / 1 / 10 bytes for TxIn / TxOut / witness item / tx).
+// These pin the exact boundary and full round-trips; the C4 errdefers only
+// run on a decode that already failed, so they cannot make anything valid.
+
+fn roundTripBlock(a: std.mem.Allocator, block: *const types.Block) !void {
+    var w = serialize.Writer.init(a);
+    defer w.deinit();
+    try serialize.writeBlock(&w, block);
+    var ba = BoundedAllocator{ .inner = a };
+    const msg = try p2p.decodePayload("block", w.getWritten(), ba.allocator());
+    defer p2p.freeDecodedMessage(ba.allocator(), msg);
+    var w2 = serialize.Writer.init(a);
+    defer w2.deinit();
+    try serialize.writeBlock(&w2, &msg.block);
+    try testing.expectEqualSlices(u8, w.getWritten(), w2.getWritten());
+    try testing.expectEqualSlices(u8, &crypto.computeBlockHash(&block.header), &crypto.computeBlockHash(&msg.block.header));
+}
+
+test "sec_p2p_decode: consensus guard regtest blocks round-trip byte-identically" {
+    const a = testing.allocator;
+    const blocks = try hb.buildRegtestChain(a, &consensus.REGTEST, 5);
+    defer hb.freeRegtestChain(a, blocks);
+    for (blocks[1..]) |*b| try roundTripBlock(a, b);
+}
+
+test "sec_p2p_decode: consensus guard segwit tx with minimal inputs and mixed witness round-trips" {
+    // 3 inputs with empty scriptSigs (exactly MIN_TXIN_SIZE each), 1 output
+    // with an empty scriptPubKey (exactly MIN_TXOUT_SIZE), witness stacks of
+    // 0, 2 (one empty item) and 1 items.
+    const raw = comptime cat(&.{
+        &VERSION1,            &[_]u8{ 0x00, 0x01, 0x03 }, &INPUT_EMPTY, &INPUT_EMPTY, &INPUT_EMPTY,
+        &[_]u8{0x01},         &[_]u8{0} ** 8,             &[_]u8{0x00}, &[_]u8{0x00}, &[_]u8{ 0x02, 0x00, 0x01, 0xAB },
+        &[_]u8{ 0x01, 0x00 }, &ZERO4,
+    });
+    const a = testing.allocator;
+    const msg = try p2p.decodePayload("tx", &raw, a);
+    defer p2p.freeDecodedMessage(a, msg);
+    try testing.expectEqual(@as(usize, 3), msg.tx.inputs.len);
+    try testing.expectEqual(@as(usize, 0), msg.tx.inputs[0].witness.len);
+    try testing.expectEqual(@as(usize, 2), msg.tx.inputs[1].witness.len);
+    try testing.expectEqual(@as(usize, 1), msg.tx.inputs[2].witness.len);
+    var w = serialize.Writer.init(a);
+    defer w.deinit();
+    try serialize.writeTransaction(&w, &msg.tx);
+    try testing.expectEqualSlices(u8, &raw, w.getWritten());
+
+    // A block carrying it as its second tx decodes too.
+    const blk = comptime cat(&.{ &HEADER80, &[_]u8{0x02}, &TX_OK, &raw });
+    const bmsg = try p2p.decodePayload("block", &blk, a);
+    defer p2p.freeDecodedMessage(a, bmsg);
+    try testing.expectEqual(@as(usize, 2), bmsg.block.transactions.len);
+}
+
+test "sec_p2p_decode: consensus guard a count that exactly fills the payload is accepted" {
+    const a = testing.allocator;
+    // getblocktxn: 3 one-byte deltas and nothing after them.
+    const g = try p2p.decodePayload("getblocktxn", &cat(&.{ &ZERO32, &[_]u8{ 0x03, 0x00, 0x00, 0x00 } }), a);
+    defer p2p.freeDecodedMessage(a, g);
+    try testing.expectEqualSlices(u16, &[_]u16{ 0, 1, 2 }, g.getblocktxn.indexes);
+    // reconcildiff: the extra ids end the payload exactly.
+    const r = try p2p.decodePayload("reconcildiff", &[_]u8{ 0x01, 0x00, 0x02, 1, 0, 0, 0, 2, 0, 0, 0 }, a);
+    defer p2p.freeDecodedMessage(a, r);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 2 }, r.reconcildiff.extra_short_ids);
+    // One more claimed element than the bytes hold is refused.
+    try expectDecodeFailsCleanly("getblocktxn", &cat(&.{ &ZERO32, &[_]u8{ 0x04, 0x00, 0x00, 0x00 } }));
+}
+
+test "sec_p2p_decode: consensus guard minimum-size inputs, outputs and txs at the tightest boundary" {
+    // Tight enough that a per-element minimum 1 byte too large rejects them
+    // (negative control in the PR: MIN_TXIN_SIZE 42 / MIN_TXOUT_SIZE 10 /
+    // MIN_TX_SIZE 52 each fail this test).
+    const a = testing.allocator;
+    // 6 empty-scriptSig inputs, 0 outputs: 6*42 = 252 > 6*41 + 5 = 251.
+    const ins = comptime cat(&.{ &VERSION1, &[_]u8{0x06}, &(INPUT_EMPTY ** 6), &[_]u8{0x00}, &ZERO4 });
+    const t1 = try p2p.decodePayload("tx", &ins, a);
+    defer p2p.freeDecodedMessage(a, t1);
+    try testing.expectEqual(@as(usize, 6), t1.tx.inputs.len);
+    // 1 input, 5 empty-scriptPubKey outputs: 5*10 = 50 > 5*9 + 4 = 49.
+    const empty_out = [_]u8{0} ** 8 ++ [_]u8{0x00};
+    const outs = comptime cat(&.{ &VERSION1, &[_]u8{0x01}, &INPUT_EMPTY, &[_]u8{0x05}, &(empty_out ** 5), &ZERO4 });
+    const t2 = try p2p.decodePayload("tx", &outs, a);
+    defer p2p.freeDecodedMessage(a, t2);
+    try testing.expectEqual(@as(usize, 5), t2.tx.outputs.len);
+    // A block whose txs are the smallest decodable tx (51 bytes) and end the
+    // payload: 3*52 > 3*51.
+    const min_tx = comptime cat(&.{ &VERSION1, &[_]u8{0x01}, &INPUT_EMPTY, &[_]u8{0x00}, &ZERO4 });
+    const blk = comptime cat(&.{ &HEADER80, &[_]u8{0x03}, &(min_tx ** 3) });
+    const b = try p2p.decodePayload("block", &blk, a);
+    defer p2p.freeDecodedMessage(a, b);
+    try testing.expectEqual(@as(usize, 3), b.block.transactions.len);
+}
