@@ -108,6 +108,7 @@ pub const Config = struct {
     dbcache: u64 = 450, // UTXO cache size in MiB
     txindex: bool = false,
     blockfilterindex: bool = false, // BIP-157/158 compact block filters
+    fallbackfee_sat_per_kvb: u64 = 0, // -fallbackfee (Core default 0 = disabled)
     coinstatsindex: bool = false, // Per-block UTXO statistics
     txospenderindex: bool = false, // Spent outpoint -> spending tx index
 
@@ -390,6 +391,9 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             config.txindex = true;
         } else if (std.mem.eql(u8, arg, "--blockfilterindex")) {
             config.blockfilterindex = true;
+        } else if (std.mem.startsWith(u8, arg, "--fallbackfee=")) {
+            applyFallbackFee(config, arg["--fallbackfee=".len..]) catch
+                return ArgParseError.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--coinstatsindex")) {
             config.coinstatsindex = true;
         } else if (std.mem.eql(u8, arg, "--txospenderindex")) {
@@ -627,6 +631,7 @@ pub fn printUsage() void {
         \\  --prune=<MiB>          Prune target in MiB (0 = disabled)
         \\  --txindex              Enable transaction index
         \\  --blockfilterindex     Enable BIP-157/158 block filter index
+        \\  --fallbackfee=<BTC/kvB> Wallet fee rate when estimation has no data (default: 0 = disabled)
         \\  --coinstatsindex       Enable UTXO statistics index
         \\  --txospenderindex      Enable spent-outpoint -> spending-tx index
         \\
@@ -724,7 +729,24 @@ pub const ConfigFileError = error{
     ReadError,
     ParseError,
     OutOfMemory,
+    /// A bad `fallbackfee=` refuses startup, as Core does (wallet.cpp).
+    InvalidFallbackFee,
 };
+
+/// Set -fallbackfee from the command line or config file. Core wallet.cpp
+/// runs the value through ParseMoney: a bad amount refuses startup with
+/// "Invalid amount for -fallbackfee=<amount>: '<raw>'", and a value above
+/// HIGH_TX_FEE_PER_KB is kept but warned about.
+pub fn applyFallbackFee(config: *Config, raw: []const u8) error{InvalidFallbackFee}!void {
+    const v = rpc.parseFallbackFee(raw) orelse {
+        std.debug.print("Error: Invalid amount for -fallbackfee=<amount>: '{s}'\n", .{raw});
+        return error.InvalidFallbackFee;
+    };
+    if (v > rpc.HIGH_TX_FEE_PER_KB) {
+        std.debug.print("Warning: -fallbackfee is set very high! This is the transaction fee you may pay when fee estimates are not available.\n", .{});
+    }
+    config.fallbackfee_sat_per_kvb = v;
+}
 
 /// Load configuration from clearbit.conf file.
 /// Format: key=value per line, # for comments.
@@ -831,6 +853,8 @@ pub fn loadConfigFile(
                 config.prune = std.fmt.parseInt(u64, value, 10) catch continue;
             } else if (std.mem.eql(u8, key, "txindex")) {
                 config.txindex = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "fallbackfee")) {
+                applyFallbackFee(config, value) catch return ConfigFileError.InvalidFallbackFee;
             } else if (std.mem.eql(u8, key, "blockfilterindex")) {
                 config.blockfilterindex = std.mem.eql(u8, value, "1");
             } else if (std.mem.eql(u8, key, "coinstatsindex")) {
@@ -2040,6 +2064,7 @@ pub fn main() !void {
     {
         const conf_target: []const u8 = config.conf_path orelse datadir;
         loadConfigFile(conf_target, &config, allocator) catch |err| {
+            if (err == ConfigFileError.InvalidFallbackFee) std.process.exit(1);
             if (err != ConfigFileError.ReadError) {
                 std.debug.print("Warning: error loading config file: {}\n", .{err});
             }
@@ -2429,6 +2454,7 @@ pub fn main() !void {
             .auth_token = auth_token,
             .cookie_token = cookie_token,
             .datadir = full_datadir,
+            .fallback_fee_sat_per_kvb = config.fallbackfee_sat_per_kvb,
             // W119 + FIX-64: HTTPS/TLS termination flag plumbing.  Today
             // both unset → HTTP (backward-compatible default).  Either alone
             // → startup error.  Both set → TlsServerUnavailable error
