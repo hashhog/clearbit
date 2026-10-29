@@ -6798,6 +6798,12 @@ pub const PeerManager = struct {
         try self.handleMessage(peer, .{ .block = block });
     }
 
+    /// Test wrapper around the private handler for any decoded message.
+    /// Takes ownership of `msg`, exactly as processAllMessages hands it over.
+    pub fn ingestMessage(self: *PeerManager, peer: *Peer, msg: p2p.Message) !void {
+        try self.handleMessage(peer, msg);
+    }
+
     /// True when the forward connect queue still has unconnected hashes.
     /// One-peer IBD (range-runner `--connect`) must not share that peer's
     /// getdata budget with historical backfill while this is true.
