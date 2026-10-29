@@ -77,7 +77,6 @@ const Fixture = struct {
     }
 };
 
-
 const DEST = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 const FEE_ERR = "Fee estimation failed. Fallbackfee is disabled";
 
