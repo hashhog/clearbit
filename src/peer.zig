@@ -65,6 +65,16 @@ fn isReorgEnabled() bool {
     return true;
 }
 
+/// Core HasValidProofOfWork (validation.cpp): CheckProofOfWork on every
+/// header of a `headers` message.  Context-free, so it runs before any
+/// parent lookup, queueing or storage.
+pub fn headersHaveValidPoW(headers: []const types.BlockHeader, params: *const consensus.NetworkParams) bool {
+    for (headers) |*hdr| {
+        if (!consensus.validateProofOfWork(hdr, params)) return false;
+    }
+    return true;
+}
+
 /// Mirror of storage.MAX_REORG_DEPTH (= MIN_BLOCKS_TO_KEEP, 288).  Headers
 /// for a competing fork whose split-point is more than this many blocks
 /// behind the active tip are refused: we cannot disconnect that far without
@@ -7859,6 +7869,20 @@ pub const PeerManager = struct {
                 // us every ~5 min (1-3/8 outbound, constant re-dialing).
                 // Cleared per-branch below (empty / historical / extends /
                 // competing fork); unknown_parent keeps it.
+
+                // Core CheckHeadersPoW (net_processing.cpp:2617-2623, called
+                // at :2985 before anything else looks at the batch): every
+                // header must meet its own nBits target, and that target must
+                // be within powLimit, or the whole message is refused and the
+                // peer is punished.  Without it a peer could feed headers with
+                // the right nBits and timestamps but no hashing at all: they
+                // became the connect queue (tip halt), grew expected_blocks
+                // and the header DB without bound, and armed pending_reorg on
+                // a fake fork (security audit 2026-10-29, finding C2).
+                if (!headersHaveValidPoW(h.headers, self.network_params)) {
+                    peer.misbehaving(100, "header with invalid proof of work");
+                    return;
+                }
 
                 if (h.headers.len > 0) {
                     var historical = false;
