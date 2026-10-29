@@ -108,6 +108,7 @@ pub const Config = struct {
     dbcache: u64 = 450, // UTXO cache size in MiB
     txindex: bool = false,
     blockfilterindex: bool = false, // BIP-157/158 compact block filters
+    fallbackfee_sat_per_kvb: u64 = 0, // -fallbackfee (Core default 0 = disabled)
     coinstatsindex: bool = false, // Per-block UTXO statistics
     txospenderindex: bool = false, // Spent outpoint -> spending tx index
 
@@ -390,6 +391,9 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
             config.txindex = true;
         } else if (std.mem.eql(u8, arg, "--blockfilterindex")) {
             config.blockfilterindex = true;
+        } else if (std.mem.startsWith(u8, arg, "--fallbackfee=")) {
+            config.fallbackfee_sat_per_kvb = rpc.parseFallbackFee(arg["--fallbackfee=".len..]) orelse
+                return ArgParseError.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--coinstatsindex")) {
             config.coinstatsindex = true;
         } else if (std.mem.eql(u8, arg, "--txospenderindex")) {
@@ -627,6 +631,7 @@ pub fn printUsage() void {
         \\  --prune=<MiB>          Prune target in MiB (0 = disabled)
         \\  --txindex              Enable transaction index
         \\  --blockfilterindex     Enable BIP-157/158 block filter index
+        \\  --fallbackfee=<BTC/kvB> Wallet fee rate when estimation has no data (default: 0 = disabled)
         \\  --coinstatsindex       Enable UTXO statistics index
         \\  --txospenderindex      Enable spent-outpoint -> spending-tx index
         \\
@@ -831,6 +836,8 @@ pub fn loadConfigFile(
                 config.prune = std.fmt.parseInt(u64, value, 10) catch continue;
             } else if (std.mem.eql(u8, key, "txindex")) {
                 config.txindex = std.mem.eql(u8, value, "1");
+            } else if (std.mem.eql(u8, key, "fallbackfee")) {
+                config.fallbackfee_sat_per_kvb = rpc.parseFallbackFee(value) orelse continue;
             } else if (std.mem.eql(u8, key, "blockfilterindex")) {
                 config.blockfilterindex = std.mem.eql(u8, value, "1");
             } else if (std.mem.eql(u8, key, "coinstatsindex")) {
@@ -2429,6 +2436,7 @@ pub fn main() !void {
             .auth_token = auth_token,
             .cookie_token = cookie_token,
             .datadir = full_datadir,
+            .fallback_fee_sat_per_kvb = config.fallbackfee_sat_per_kvb,
             // W119 + FIX-64: HTTPS/TLS termination flag plumbing.  Today
             // both unset → HTTP (backward-compatible default).  Either alone
             // → startup error.  Both set → TlsServerUnavailable error

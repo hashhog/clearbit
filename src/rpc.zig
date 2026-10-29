@@ -262,7 +262,45 @@ pub const RPC_WALLET_ALREADY_EXISTS: i32 = -36;
 // ============================================================================
 
 /// JSON-RPC server configuration.
+/// Core's default wallet confirmation target (DEFAULT_TX_CONFIRM_TARGET).
+const WALLET_DEFAULT_CONF_TARGET: usize = 6;
+
+/// Pick the sat/vB rate for a send: the estimate when present, else the
+/// fallback (sat/kvB, rounded up to a whole sat/vB), else null (disabled).
+pub fn walletFeeRate(estimate_sat_per_vb: ?f64, fallback_sat_per_kvb: u64) ?u64 {
+    if (estimate_sat_per_vb) |e| {
+        if (e > 0) return @max(1, @as(u64, @intFromFloat(@ceil(e))));
+    }
+    if (fallback_sat_per_kvb == 0) return null;
+    return @max(1, (fallback_sat_per_kvb + 999) / 1000);
+}
+
+/// Parse a `-fallbackfee` value (BTC/kvB decimal, up to 8 places) to sat/kvB.
+/// Null on malformed input. "0" and "0.0" are valid (fallback disabled).
+pub fn parseFallbackFee(text: []const u8) ?u64 {
+    if (text.len == 0) return null;
+    const dot = std.mem.indexOfScalar(u8, text, '.');
+    const whole = if (dot) |d| text[0..d] else text;
+    const frac = if (dot) |d| text[d + 1 ..] else "";
+    if (frac.len > 8) return null;
+    if (whole.len == 0 and frac.len == 0) return null;
+    const w = if (whole.len == 0) 0 else std.fmt.parseInt(u64, whole, 10) catch return null;
+    var f: u64 = 0;
+    for (frac) |c| {
+        if (c < '0' or c > '9') return null;
+        f = f * 10 + (c - '0');
+    }
+    var pad = 8 - frac.len;
+    while (pad > 0) : (pad -= 1) f *= 10;
+    const sat = std.math.mul(u64, w, 100_000_000) catch return null;
+    return std.math.add(u64, sat, f) catch null;
+}
+
 pub const RpcConfig = struct {
+    /// `-fallbackfee` in sat/kvB. Used by wallet sends when the fee estimator
+    /// has no data. 0 (Core's DEFAULT_FALLBACK_FEE) disables the fallback, so
+    /// a send with no estimate fails with "Fee estimation failed".
+    fallback_fee_sat_per_kvb: u64 = 0,
     bind_address: []const u8 = "127.0.0.1",
     port: u16 = 8332,
     auth_token: ?[]const u8 = null, // Base64-encoded "user:pass"
@@ -17350,6 +17388,22 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// Fee rate (sat/vB) for a wallet send that gave no explicit fee_rate.
+    /// Core wallet/fees.cpp GetMinimumFeeRate: use the estimator at the default
+    /// 6-block target; with no data use -fallbackfee; if that is 0 the send
+    /// fails (spend.cpp:1164, surfaced as RPC_WALLET_INSUFFICIENT_FUNDS).
+    fn walletFeeRateOrError(self: *RpcServer, id: ?std.json.Value) !union(enum) { rate: u64, err: []const u8 } {
+        self.mempool.mutex.lock();
+        const est = self.mempool.fee_estimator.estimateFee(WALLET_DEFAULT_CONF_TARGET);
+        self.mempool.mutex.unlock();
+        if (walletFeeRate(est, self.config.fallback_fee_sat_per_kvb)) |r| return .{ .rate = r };
+        return .{ .err = try self.jsonRpcError(
+            RPC_WALLET_INSUFFICIENT_FUNDS,
+            "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee.",
+            id,
+        ) };
+    }
+
     /// Handle sendtoaddress RPC - send to a bitcoin address.
     /// Reference: Bitcoin Core wallet/rpc/spend.cpp sendtoaddress
     ///
@@ -17414,12 +17468,11 @@ pub const RpcServer = struct {
         var dest_spk_owned = true;
         defer if (dest_spk_owned) self.allocator.free(dest_spk);
 
-        // Fee rate: 5 sat/vB. Comfortably clears the 0.1 sat/vB (MIN_RELAY_FEE
-        // = 100 sat/kvB) relay floor the mempool enforces in addTransaction,
-        // while keeping the implied fee small (a 1-input/2-output P2WPKH spend
-        // is ~140 vB -> a few hundred sats). The coin selector charges this
-        // rate per input when computing change.
-        const fee_rate: u64 = 5;
+        // Estimator, else -fallbackfee, else Core's -6 (no hardcoded rate).
+        const fee_rate: u64 = switch (try self.walletFeeRateOrError(id)) {
+            .rate => |r| r,
+            .err => |e| return e,
+        };
 
         // Coin selection over the wallet's mature spendable set.
         const sel = wallet.selectCoinsWithOptions(amount_sats, .{ .fee_rate = fee_rate }) catch |e| switch (e) {
@@ -17576,7 +17629,7 @@ pub const RpcServer = struct {
             return self.jsonRpcError(RPC_INVALID_PARAMETER, "TX must have at least one output", id);
         }
 
-        var fee_rate: u64 = 5;
+        var fee_rate: ?u64 = null;
         if (items.len >= 4 and items[3] != .null) {
             switch (items[3]) {
                 .integer => |n| {
@@ -17589,7 +17642,15 @@ pub const RpcServer = struct {
             }
         }
 
-        return self.broadcastWalletPayment(wallet, dests.items, fee_rate, id, .send_object);
+        // No explicit fee_rate: estimator, else -fallbackfee, else Core's -6.
+        if (fee_rate == null) {
+            switch (try self.walletFeeRateOrError(id)) {
+                .rate => |r| fee_rate = r,
+                .err => |e| return e,
+            }
+        }
+
+        return self.broadcastWalletPayment(wallet, dests.items, fee_rate.?, id, .send_object);
     }
 
     fn appendSendOutput(

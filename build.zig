@@ -1216,6 +1216,35 @@ pub fn build(b: *std.Build) void {
         r5_lu_step.dependOn(&run_r5_lu_tests.step);
     }
 
+    // Core-style -fallbackfee (wallet sends: estimator, then -fallbackfee, else -6).
+    {
+        const ff_tests = b.addTest(.{
+            .root_source_file = b.path("tests_fallbackfee.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"fallbackfee"},
+        });
+        ff_tests.linkSystemLibrary("rocksdb");
+        ff_tests.linkSystemLibrary("secp256k1");
+        ff_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        ff_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            ff_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            ff_tests.linkSystemLibrary("minisketch");
+            ff_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        ff_tests.root_module.addOptions("build_options", build_options);
+
+        const run_ff_tests = b.addRunArtifact(ff_tests);
+        const ff_step = b.step("test-fallbackfee", "Run -fallbackfee wallet fee-source tests");
+        ff_step.dependOn(&run_ff_tests.step);
+    }
+
     // CONTROL for QUEUES.md T3 missing surface: send / backupwallet / restorewallet.
     {
         const r5_sbr_tests = b.addTest(.{
