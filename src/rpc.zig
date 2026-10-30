@@ -357,6 +357,9 @@ pub const RpcConfig = struct {
     /// Optional path to the PEM-encoded private key matching `tls_cert_path`.
     /// See the field comment on `tls_cert_path` for the deferral rationale.
     tls_key_path: ?[]const u8 = null,
+    /// Serve the unauthenticated BIP-78 receiver route `POST /payjoin`.
+    /// Default off (security audit C6); main.zig `--payjoin-receiver`.
+    payjoin_receiver: bool = false,
 };
 
 /// RPC Server error set.
@@ -1580,6 +1583,15 @@ pub const RpcServer = struct {
     /// Number of wait-family requests currently parked on their own thread.
     /// See MAX_WAIT_WORKERS and handleConnection's hand-off below.
     wait_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Connections currently being served on their own thread (audit H5).
+    /// See MAX_CONN_WORKERS and run().
+    conn_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Serialises request HANDLING across connection workers (audit H5).
+    /// Reading a request off the socket happens outside it, so a silent or
+    /// trickling client holds only its own worker; everything from wallet
+    /// routing through the reply runs one request at a time, exactly as the
+    /// old single accept/serve loop did, so no handler sees new concurrency.
+    serve_mutex: std.Thread.Mutex = .{},
 
     /// Initialize the RPC server.
     pub fn init(
@@ -1794,6 +1806,14 @@ pub const RpcServer = struct {
     /// we check running on every iteration (including after accept
     /// returns) so shutdown is prompt.
     pub fn run(self: *RpcServer) !void {
+        // Give in-flight connection workers a short window to finish before
+        // the caller tears the server down (they hold `self`).
+        defer {
+            var waited: u32 = 0;
+            while (self.conn_workers.load(.acquire) > 0 and waited < 200) : (waited += 1) {
+                std.time.sleep(10 * std.time.ns_per_ms);
+            }
+        }
         while (self.running.load(.acquire)) {
             const listener = &(self.listener orelse return);
             const conn = listener.accept() catch |err| {
@@ -1815,8 +1835,39 @@ pub const RpcServer = struct {
                 conn.stream.close();
                 return;
             }
-            self.handleConnection(conn) catch {};
+            // Security audit H5: the loop used to call handleConnection
+            // inline, so one connection that sent nothing held the only RPC
+            // thread for its full 30s read timeout, and four of them delayed
+            // a getblockcount by 122s.  Each connection now gets its own
+            // worker (bounded, like Core's -rpcthreads/-rpcworkqueue), and
+            // the accept loop goes straight back to accept().
+            if (self.conn_workers.load(.acquire) >= MAX_CONN_WORKERS) {
+                // Core's reply when its work queue is full (httpserver.cpp).
+                self.sendHttpError(conn.stream, 503, "Work queue depth exceeded") catch {};
+                conn.stream.close();
+                continue;
+            }
+            _ = self.conn_workers.fetchAdd(1, .acquire);
+            if (std.Thread.spawn(.{}, connWorker, .{ self, conn })) |th| {
+                th.detach();
+            } else |_| {
+                // Could not spawn: serve inline, as before.
+                _ = self.conn_workers.fetchSub(1, .release);
+                self.handleConnection(conn) catch {};
+            }
         }
+    }
+
+    /// Upper bound on connections served concurrently (audit H5).  Core
+    /// runs 16 HTTP threads behind a 64-deep work queue (httpserver.h
+    /// DEFAULT_HTTP_THREADS / DEFAULT_HTTP_WORKQUEUE); clearbit's workers
+    /// also hold a connection while it is still being READ, so the bound
+    /// is the queue depth, not the thread count.
+    pub const MAX_CONN_WORKERS: u32 = 64;
+
+    fn connWorker(self: *RpcServer, conn: std.net.Server.Connection) void {
+        defer _ = self.conn_workers.fetchSub(1, .release);
+        self.handleConnection(conn) catch {};
     }
 
     /// Upper bound on wait-family requests parked on their own threads.
@@ -1933,6 +1984,8 @@ pub const RpcServer = struct {
 
         // Handle REST API requests (GET /rest/...)
         if (is_get and std.mem.startsWith(u8, url_path, "/rest/")) {
+            self.serve_mutex.lock();
+            defer self.serve_mutex.unlock();
             self.handleRestRequest(conn.stream, url_path) catch {
                 try self.sendHttpError(conn.stream, 500, "Internal Server Error");
             };
@@ -1948,7 +2001,21 @@ pub const RpcServer = struct {
         // the endpoint publicly.  This matches Bitcoin Core's own
         // operational model (Core has no native TLS for its HTTP server;
         // operators terminate elsewhere).
+        //
+        // Security audit C6: this route is answered BEFORE the auth check
+        // below (BIP-78 senders hold no RPC credentials), so any local
+        // process -- or any web page, since a text/plain POST is a CORS
+        // simple request -- could reach the PSBT parser unauthenticated.
+        // It is therefore off unless the operator opts in with
+        // --payjoin-receiver; when off, the request is refused here having
+        // read nothing past the headers.
         if (is_post and std.mem.startsWith(u8, url_path, "/payjoin")) {
+            if (!self.config.payjoin_receiver) {
+                try self.sendHttpError(conn.stream, 404, "Not Found");
+                return;
+            }
+            self.serve_mutex.lock();
+            defer self.serve_mutex.unlock();
             self.handlePayjoinRequest(conn.stream, url_path, headers, request_data, headers_end, total_read) catch {
                 // Fallback: emit a BIP-78 "unavailable" JSON error so the
                 // sender's anti-snoop loop falls back to broadcasting the
@@ -1964,29 +2031,6 @@ pub const RpcServer = struct {
         if (!is_post) {
             try self.sendHttpError(conn.stream, 405, "Method Not Allowed");
             return;
-        }
-
-        // Set target wallet based on URL path
-        self.current_wallet = null;
-        if (self.wallet_manager) |wm| {
-            self.current_wallet = wm.getTargetWallet(url_path) catch |err| blk: {
-                if (err == error.WalletNotFound) {
-                    const error_response = self.jsonRpcError(
-                        RPC_WALLET_NOT_FOUND,
-                        "Requested wallet does not exist or is not loaded",
-                        null,
-                    ) catch return;
-                    defer self.allocator.free(error_response);
-                    try self.sendHttpResponse(conn.stream, 200, error_response);
-                    return;
-                } else {
-                    // WalletNotSpecified or other - continue and let individual handlers decide
-                    break :blk null;
-                }
-            };
-        } else if (self.wallet) |w| {
-            // Single wallet mode (backwards compatible)
-            self.current_wallet = w;
         }
 
         // Check authentication if configured (accepts either rpcuser/rpcpassword or cookie token)
@@ -2061,6 +2105,36 @@ pub const RpcServer = struct {
             body = body_buf;
         }
         defer if (body_allocated) self.allocator.free(body);
+
+        // Audit H5: from here on the request is HANDLED, one at a time.  The
+        // reads above ran unlocked, so a stalled client no longer blocks
+        // anyone else.  (Wallet routing moved below the auth check with it:
+        // it writes the shared `current_wallet`.)
+        self.serve_mutex.lock();
+        defer self.serve_mutex.unlock();
+
+        // Set target wallet based on URL path
+        self.current_wallet = null;
+        if (self.wallet_manager) |wm| {
+            self.current_wallet = wm.getTargetWallet(url_path) catch |err| blk: {
+                if (err == error.WalletNotFound) {
+                    const error_response = self.jsonRpcError(
+                        RPC_WALLET_NOT_FOUND,
+                        "Requested wallet does not exist or is not loaded",
+                        null,
+                    ) catch return;
+                    defer self.allocator.free(error_response);
+                    try self.sendHttpResponse(conn.stream, 200, error_response);
+                    return;
+                } else {
+                    // WalletNotSpecified or other - continue and let individual handlers decide
+                    break :blk null;
+                }
+            };
+        } else if (self.wallet) |w| {
+            // Single wallet mode (backwards compatible)
+            self.current_wallet = w;
+        }
 
         // Process JSON-RPC request
         // Wait-family hand-off.
@@ -6808,7 +6882,7 @@ pub const RpcServer = struct {
             const sv = params.array.items[2];
             switch (sv) {
                 .integer => |n| start_h = n,
-                .float => |f| start_h = @intFromFloat(f),
+                .float => |f| start_h = floatToIntChecked(i64, f) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                 else => {},
             }
         }
@@ -6820,7 +6894,7 @@ pub const RpcServer = struct {
             const ev = params.array.items[3];
             switch (ev) {
                 .integer => |n| stop_h = n,
-                .float => |f| stop_h = @intFromFloat(f),
+                .float => |f| stop_h = floatToIntChecked(i64, f) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                 else => {},
             }
         }
@@ -7588,7 +7662,8 @@ pub const RpcServer = struct {
             if (sv == .integer and sv.integer >= 0) {
                 services = @intCast(sv.integer);
             } else if (sv == .float and sv.float >= 0) {
-                services = @intFromFloat(sv.float);
+                services = floatToIntChecked(u64, sv.float) orelse
+                    return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
             }
         }
 
@@ -8557,7 +8632,8 @@ pub const RpcServer = struct {
                     .integer => ban_time = bt.integer,
                     // A float bantime was silently DISCARDED and the default
                     // used -- an argument read and then not honoured.
-                    .float => ban_time = @intFromFloat(bt.float),
+                    .float => ban_time = floatToIntChecked(i64, bt.float) orelse
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                     .null => {},
                     else => return self.jsonRpcError(RPC_INVALID_PARAMS, "bantime must be a number", id),
                 }
@@ -8999,7 +9075,7 @@ pub const RpcServer = struct {
             if (params.array.items.len >= 2) {
                 const t = params.array.items[1];
                 if (t == .integer and t.integer > 0) {
-                    timeout = @intCast(t.integer);
+                    timeout = std.math.cast(u32, t.integer) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 }
             }
         } else {
@@ -9383,7 +9459,8 @@ pub const RpcServer = struct {
                 if (feerate_param == .float) {
                     // Convert BTC/kvB to satoshis/kvB
                     const btc_per_kvb = feerate_param.float;
-                    max_feerate = @intFromFloat(btc_per_kvb * 100_000_000.0);
+                    max_feerate = btcFloatToSatsChecked(btc_per_kvb) orelse
+                        return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
                 } else if (feerate_param == .integer) {
                     // Assume already in satoshis/kvB
                     max_feerate = feerate_param.integer;
@@ -9392,7 +9469,8 @@ pub const RpcServer = struct {
                     const btc_per_kvb = std.fmt.parseFloat(f64, feerate_param.string) catch {
                         return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid maxfeerate", id);
                     };
-                    max_feerate = @intFromFloat(btc_per_kvb * 100_000_000.0);
+                    max_feerate = btcFloatToSatsChecked(btc_per_kvb) orelse
+                        return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
                 }
             }
         } else {
@@ -11145,7 +11223,7 @@ pub const RpcServer = struct {
             if (params.array.items.len >= 3) {
                 const m = params.array.items[2];
                 if (m == .integer) {
-                    max_tries = @intCast(m.integer);
+                    max_tries = std.math.cast(@TypeOf(max_tries), m.integer) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 }
             }
         } else {
@@ -11305,7 +11383,7 @@ pub const RpcServer = struct {
             if (params.array.items.len >= 3) {
                 const m = params.array.items[2];
                 if (m == .integer) {
-                    max_tries = @intCast(m.integer);
+                    max_tries = std.math.cast(@TypeOf(max_tries), m.integer) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 }
             }
         } else {
@@ -14701,7 +14779,7 @@ pub const RpcServer = struct {
             const nb = params.array.items[0];
             blockcount = switch (nb) {
                 .integer => nb.integer,
-                .float => @intFromFloat(nb.float),
+                .float => floatToIntChecked(i64, nb.float) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                 else => return self.jsonRpcError(RPC_INVALID_PARAMS, "JSON value of type for nblocks is not an integer as expected", id),
             };
             // Core reads nblocks as getInt<int>, and getInt runs std::from_chars
@@ -14820,7 +14898,7 @@ pub const RpcServer = struct {
             // RPC frontend coerces a numeric string to the NUM arg type).
             const as_height: ?i64 = switch (arg0) {
                 .integer => arg0.integer,
-                .float => @as(i64, @intFromFloat(arg0.float)),
+                .float => floatToIntChecked(i64, arg0.float) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                 .string => blk: {
                     // A 64-char string is treated as a hash, never a height
                     // (Core's get_str path), even though "0000…" is all digits.
@@ -17117,7 +17195,7 @@ pub const RpcServer = struct {
         if (have_nodeid and !have_address) {
             const raw: i64 = switch (nodeid_param) {
                 .integer => nodeid_param.integer,
-                .float => @intFromFloat(nodeid_param.float),
+                .float => floatToIntChecked(i64, nodeid_param.float) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
                 else => return self.jsonRpcError(RPC_INVALID_PARAMS, "nodeid must be a number", id),
             };
             // getpeerinfo reports id as the index into peer_manager.peers, so
@@ -17342,13 +17420,15 @@ pub const RpcServer = struct {
                     if (v < 0) {
                         return self.jsonRpcError(RPC_INVALID_PARAMS, "minconf must be non-negative", id);
                     }
-                    minconf = @intCast(v);
+                    minconf = std.math.cast(u32, v) orelse
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 },
                 .float => |v| {
                     if (v < 0) {
                         return self.jsonRpcError(RPC_INVALID_PARAMS, "minconf must be non-negative", id);
                     }
-                    minconf = @intFromFloat(v);
+                    minconf = floatToIntChecked(u32, v) orelse
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 },
                 .null => {},
                 else => return self.jsonRpcError(RPC_INVALID_PARAMS, "minconf must be a number", id),
@@ -17485,9 +17565,11 @@ pub const RpcServer = struct {
 
         var amount_sats: i64 = 0;
         if (amount_param == .float) {
-            amount_sats = @intFromFloat(amount_param.float * 100_000_000.0);
+            amount_sats = btcFloatToSatsChecked(amount_param.float) orelse
+                return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
         } else if (amount_param == .integer) {
-            amount_sats = @intCast(amount_param.integer * 100_000_000);
+            amount_sats = std.math.mul(i64, amount_param.integer, 100_000_000) catch
+                return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
         } else {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
         }
@@ -17675,10 +17757,10 @@ pub const RpcServer = struct {
         if (items.len >= 4 and items[3] != .null) {
             switch (items[3]) {
                 .integer => |n| {
-                    if (n > 0) fee_rate_kvb = @as(u64, @intCast(n)) * 1000;
+                    if (n > 0) fee_rate_kvb = std.math.mul(u64, @as(u64, @intCast(n)), 1000) catch return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
                 },
                 .float => |f| {
-                    if (f > 0) fee_rate_kvb = @as(u64, @intFromFloat(@round(f))) * 1000;
+                    if (f > 0) fee_rate_kvb = std.math.mul(u64, floatToIntChecked(u64, @round(f)) orelse return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id), 1000) catch return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
                 },
                 else => {},
             }
@@ -17709,7 +17791,7 @@ pub const RpcServer = struct {
             var amount_sats: i64 = 0;
             switch (entry.value_ptr.*) {
                 .float => |f| {
-                    if (f < 0 or f > 21_000_000) {
+                    if (!(f >= 0 and f <= 21_000_000)) {
                         return try self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
                     }
                     amount_sats = @intFromFloat(@round(f * 100_000_000.0));
@@ -18178,7 +18260,8 @@ pub const RpcServer = struct {
                             if (v < 0) {
                                 return .{ .err = try self.jsonRpcError(RPC_INVALID_PARAMS, "fee_rate must be non-negative", id) };
                             }
-                            options.fee_rate = @intFromFloat(v);
+                            options.fee_rate = floatToIntChecked(u64, v) orelse
+                                return .{ .err = try self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id) };
                         },
                         .null => {},
                         else => return .{ .err = try self.jsonRpcError(RPC_INVALID_PARAMS, "fee_rate must be numeric", id) },
@@ -18706,7 +18789,7 @@ pub const RpcServer = struct {
         const target_param = params.?.array.items[0];
         const conf_target_i: i64 = switch (target_param) {
             .integer => target_param.integer,
-            .float => @intFromFloat(target_param.float),
+            .float => floatToIntChecked(i64, target_param.float) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id),
             else => return self.jsonRpcError(RPC_INVALID_PARAMS, "conf_target must be numeric", id),
         };
         if (conf_target_i < 1 or conf_target_i > 1008) {
@@ -19469,7 +19552,10 @@ pub const RpcServer = struct {
                     }
                     if (!ok) continue;
                     if (!std.mem.eql(u8, &txid, &outpoint.hash)) continue;
-                    if (@as(u32, @intCast(vout_v.integer)) != outpoint.index) continue;
+                    // A vout outside u32 (e.g. -1) matches no outpoint; the
+                    // bare @intCast aborted the node on it (audit H4).
+                    const prev_vout = std.math.cast(u32, vout_v.integer) orelse continue;
+                    if (prev_vout != outpoint.index) continue;
 
                     const spk_hex = spk_v.string;
                     if (spk_hex.len % 2 != 0) continue;
@@ -19488,9 +19574,15 @@ pub const RpcServer = struct {
                     var amount: i64 = 0;
                     if (entry.object.get("amount")) |a| {
                         if (a == .float) {
-                            amount = @intFromFloat(a.float * 100_000_000.0);
+                            amount = btcFloatToSatsChecked(a.float) orelse {
+                                self.allocator.free(spk);
+                                continue;
+                            };
                         } else if (a == .integer) {
-                            amount = @intCast(a.integer * 100_000_000);
+                            amount = std.math.mul(i64, a.integer, 100_000_000) catch {
+                                self.allocator.free(spk);
+                                continue;
+                            };
                         }
                     }
                     return types.TxOut{ .value = amount, .script_pubkey = spk };
@@ -19574,7 +19666,7 @@ pub const RpcServer = struct {
             }
 
             // Bitcoin RPC txid is big-endian; on-the-wire is little-endian.
-            var op: types.OutPoint = .{ .hash = undefined, .index = @intCast(vout_v.integer) };
+            var op: types.OutPoint = .{ .hash = undefined, .index = std.math.cast(u32, vout_v.integer) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id) };
             for (0..32) |i| {
                 op.hash[31 - i] = std.fmt.parseInt(u8, txid_v.string[i * 2 ..][0..2], 16) catch {
                     return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
@@ -19715,7 +19807,7 @@ pub const RpcServer = struct {
             // value, which is what the harness and mainnet relay care about).
             if (opts.get("fee_rate")) |fr| {
                 if (fr == .float) {
-                    fee_rate = @max(1, @as(u64, @intFromFloat(fr.float)));
+                    fee_rate = @max(1, floatToIntChecked(u64, fr.float) orelse return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id));
                     fee_rate_set = true;
                 } else if (fr == .integer and fr.integer > 0) {
                     fee_rate = @max(1, @as(u64, @intCast(fr.integer)));
@@ -19727,9 +19819,9 @@ pub const RpcServer = struct {
             if (!fee_rate_set) {
                 if (opts.get("feeRate")) |fr| {
                     if (fr == .float) {
-                        fee_rate = @max(1, @as(u64, @intFromFloat(fr.float * 100_000.0)));
+                        fee_rate = @max(1, floatToIntChecked(u64, fr.float * 100_000.0) orelse return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id));
                     } else if (fr == .integer) {
-                        fee_rate = @max(1, @as(u64, @intCast(fr.integer * 100_000)));
+                        fee_rate = @max(1, std.math.cast(u64, std.math.mul(i64, fr.integer, 100_000) catch -1) orelse return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id));
                     }
                 }
             }
@@ -19778,9 +19870,9 @@ pub const RpcServer = struct {
                     const amt_v = entry.value_ptr.*;
                     var sats: i64 = 0;
                     if (amt_v == .float) {
-                        sats = @intFromFloat(amt_v.float * 100_000_000.0);
+                        sats = btcFloatToSatsChecked(amt_v.float) orelse return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
                     } else if (amt_v == .integer) {
-                        sats = @intCast(amt_v.integer * 100_000_000);
+                        sats = std.math.mul(i64, amt_v.integer, 100_000_000) catch return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
                     } else {
                         return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid amount", id);
                     }
@@ -19819,8 +19911,13 @@ pub const RpcServer = struct {
             if (vout_v != .integer) {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid vout", id);
             }
+            // Core AddInputs: getInt<int>, then "vout cannot be negative".
+            // The bare @intCast below aborted the node on -1 (audit H4).
+            if (vout_v.integer < 0) {
+                return self.jsonRpcError(RPC_INVALID_PARAMETER, "Invalid parameter, vout cannot be negative", id);
+            }
 
-            var op: types.OutPoint = .{ .hash = undefined, .index = @intCast(vout_v.integer) };
+            var op: types.OutPoint = .{ .hash = undefined, .index = std.math.cast(u32, vout_v.integer) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id) };
             for (0..32) |i| {
                 op.hash[31 - i] = std.fmt.parseInt(u8, txid_v.string[i * 2 ..][0..2], 16) catch {
                     return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid txid hex", id);
@@ -20329,15 +20426,17 @@ pub const RpcServer = struct {
             // fee_rate (sat/vB) takes precedence over feeRate (BTC/kvB) in Core.
             if (opts.get("fee_rate")) |fr| {
                 if (fr == .float) {
-                    fee_rate = @max(1, @as(u64, @intFromFloat(fr.float)));
+                    fee_rate = @max(1, floatToIntChecked(u64, fr.float) orelse return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id));
                 } else if (fr == .integer) {
+                    // A negative fee_rate was cast straight to u64 (audit H4).
+                    if (fr.integer < 0) return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
                     fee_rate = @max(1, @as(u64, @intCast(fr.integer)));
                 }
             } else if (opts.get("feeRate")) |fr| {
                 if (fr == .float) {
-                    fee_rate = @max(1, @as(u64, @intFromFloat(fr.float * 100_000.0)));
+                    fee_rate = @max(1, floatToIntChecked(u64, fr.float * 100_000.0) orelse return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id));
                 } else if (fr == .integer) {
-                    fee_rate = @max(1, @as(u64, @intCast(fr.integer * 100_000)));
+                    fee_rate = @max(1, std.math.cast(u64, std.math.mul(i64, fr.integer, 100_000) catch -1) orelse return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id));
                 }
             }
             if (opts.get("changeAddress")) |ca| {
@@ -20835,7 +20934,8 @@ pub const RpcServer = struct {
                 wants_rescan = true;
             },
             .float => |v| {
-                const iv: i64 = @intFromFloat(v);
+                const iv: i64 = floatToIntChecked(i64, v) orelse
+                    return dupErr(self, RPC_MISC_ERROR, "JSON integer out of range");
                 ts = if (iv < 1) 1 else iv;
                 wants_rescan = true;
             },
@@ -20897,21 +20997,35 @@ pub const RpcServer = struct {
                     .integer => |v| {
                         if (v < 0) return dupErr(self, RPC_INVALID_PARAMETER, "End of range is too high");
                         range_start = 0;
-                        range_end = @intCast(v);
+                        range_end = std.math.cast(u32, v) orelse
+                            return dupErr(self, RPC_INVALID_PARAMETER, "End of range is too high");
                     },
                     .array => |arr| {
                         if (arr.items.len == 2 and arr.items[0] == .integer and arr.items[1] == .integer) {
                             const a = arr.items[0].integer;
                             const b = arr.items[1].integer;
                             if (a < 0 or b < a) return dupErr(self, RPC_INVALID_PARAMETER, "Invalid descriptor range specified");
-                            range_start = @intCast(a);
-                            range_end = @intCast(b);
+                            range_start = std.math.cast(u32, a) orelse
+                                return dupErr(self, RPC_INVALID_PARAMETER, "End of range is too high");
+                            range_end = std.math.cast(u32, b) orelse
+                                return dupErr(self, RPC_INVALID_PARAMETER, "End of range is too high");
                         } else {
                             return dupErr(self, RPC_INVALID_PARAMETER, "Invalid descriptor range specified");
                         }
                     },
                     else => return dupErr(self, RPC_INVALID_PARAMETER, "Invalid descriptor range specified"),
                 }
+            }
+            // Security audit H6 (and the H4 overflow at end 4294967295):
+            // Core ParseDescriptorRange (rpc/util.cpp) bounds the end below
+            // 2^31 and the width below 1,000,000.  clearbit had neither, so
+            // `range:[0,200000]` derived synchronously for minutes holding the
+            // RPC thread, and `range:4294967295` overflowed `end - start + 1`.
+            if ((range_end >> 31) != 0) {
+                return dupErr(self, RPC_INVALID_PARAMETER, "End of range is too high");
+            }
+            if (@as(u64, range_end) >= @as(u64, range_start) + 1_000_000) {
+                return dupErr(self, RPC_INVALID_PARAMETER, "Range is too large");
             }
         }
 
@@ -21539,7 +21653,7 @@ pub const RpcServer = struct {
                 switch (sh) {
                     .integer => |v| {
                         if (v < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid start_height", id);
-                        start_height = @intCast(v);
+                        start_height = std.math.cast(u32, v) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     },
                     .null => {},
                     else => return self.jsonRpcError(RPC_INVALID_PARAMS, "start_height must be an integer", id),
@@ -21550,7 +21664,7 @@ pub const RpcServer = struct {
                 switch (st) {
                     .integer => |v| {
                         if (v < 0) return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid stop_height", id);
-                        stop_height = @intCast(v);
+                        stop_height = std.math.cast(u32, v) orelse return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                     },
                     .null => {},
                     else => return self.jsonRpcError(RPC_INVALID_PARAMS, "stop_height must be an integer", id),
@@ -23477,7 +23591,8 @@ pub const RpcServer = struct {
                     query.min_fee_rate = @intCast(i);
                 },
                 .float => |f| if (f >= 0) {
-                    query.min_fee_rate = @intFromFloat(f);
+                    query.min_fee_rate = floatToIntChecked(@TypeOf(query.min_fee_rate), f) orelse
+                        return self.jsonRpcError(RPC_MISC_ERROR, "JSON integer out of range", id);
                 },
                 else => {},
             }
@@ -24093,6 +24208,33 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
         diff |= ca ^ cb;
     }
     return diff == 0;
+}
+
+/// Security audit H4 (2026-10-29): a JSON float converted to `T` only when it
+/// is finite and its truncation fits `T`; null otherwise.  `@intFromFloat` on
+/// 1e300, NaN or a negative value for an unsigned `T` is a checked panic in
+/// ReleaseSafe and undefined behaviour in ReleaseFast, so one RPC request
+/// aborted the node.  Core's getInt<T>() throws instead ("JSON integer out of
+/// range") and the daemon stays up.  In-range values truncate exactly as the
+/// bare `@intFromFloat` did, so no answer that used to succeed changes.
+pub fn floatToIntChecked(comptime T: type, f: f64) ?T {
+    if (!std.math.isFinite(f)) return null;
+    const info = @typeInfo(T).Int;
+    const t = @trunc(f);
+    // 2^bits (unsigned) / 2^(bits-1) (signed) is exact in f64, unlike maxInt.
+    const hi: f64 = std.math.ldexp(@as(f64, 1.0), if (info.signedness == .signed) info.bits - 1 else info.bits);
+    const lo: f64 = if (info.signedness == .signed) -hi else 0.0;
+    if (!(t >= lo and t < hi)) return null;
+    return @intFromFloat(t);
+}
+
+/// BTC (as a JSON float) to satoshis, or null when the result is not finite or
+/// outside +/-MAX_MONEY.  Sign is the caller's domain check.
+pub fn btcFloatToSatsChecked(btc: f64) ?i64 {
+    const MAX_MONEY: f64 = 21_000_000.0 * 100_000_000.0;
+    const scaled = btc * 100_000_000.0;
+    if (!std.math.isFinite(scaled) or scaled > MAX_MONEY or scaled < -MAX_MONEY) return null;
+    return @intFromFloat(scaled);
 }
 
 fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {

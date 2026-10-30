@@ -1063,6 +1063,7 @@ comptime {
     _ = @import("tests_w112_compact_blocks.zig"); // W112 BIP-152 compact blocks 30-gate fleet audit
     _ = @import("tests_w116_package_relay.zig"); // W116 package relay 30-gate audit
     _ = @import("tests_w117_bip155_networks.zig"); // W117 BIP-155 anonymous networks 30-gate audit
+    _ = @import("tests_sec_rpc_payjoin_auth_args.zig"); // security audit C6/H4/H5/H6: payjoin auth, RPC casts, serial RPC, descriptor range
     // rpc.zig is exercised in its own dedicated test step (`zig build
     // test-rpc` and folded into `zig build test` via build.zig). Importing
     // it here would transitively pull wallet.zig, which uses an

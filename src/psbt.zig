@@ -1796,10 +1796,22 @@ fn parseInputMap(allocator: std.mem.Allocator, reader: *serialize_mod.Reader, in
             PSBT_IN_SCRIPTWITNESS => {
                 var witness_reader = serialize_mod.Reader{ .data = value };
                 const witness_count = try witness_reader.readCompactSize();
-                var witness = try allocator.alloc([]const u8, @intCast(witness_count));
+                // Security audit C6: every witness item takes at least one
+                // byte (its length), so a count above the bytes left cannot
+                // be honest.  Unbounded, a 104-byte PayJoin POST asked for
+                // MAX_SIZE * 16 B ~= 512 MiB here, and with no errdefer the
+                // whole of it leaked when the first item read failed.
+                if (witness_count > value.len - witness_reader.pos) return error.EndOfStream;
+                const witness = try allocator.alloc([]const u8, @intCast(witness_count));
+                var filled: usize = 0;
+                errdefer {
+                    for (witness[0..filled]) |item| allocator.free(item);
+                    allocator.free(witness);
+                }
                 for (0..@intCast(witness_count)) |i| {
                     const item_len = try witness_reader.readCompactSize();
                     witness[i] = try allocator.dupe(u8, try witness_reader.readBytes(@intCast(item_len)));
+                    filled += 1;
                 }
                 input.final_script_witness = witness;
             },
