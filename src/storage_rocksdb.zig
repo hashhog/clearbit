@@ -53,21 +53,15 @@ const DbState = struct {
 };
 
 /// Open or create the database at the given path.
-/// Removes stale LOCK files from unclean shutdowns before opening.
 /// `block_cache_mib` sizes the RocksDB LRU block cache in MiB.
+///
+/// RocksDB's `LOCK` file is left alone. Its lock is an fcntl record lock,
+/// which the kernel drops when the holder exits, so a LOCK file left by a
+/// crash never blocks a reopen; a LOCK that does block one belongs to a live
+/// process. Deleting it before every open (as this function used to) let a
+/// second process open a live chainstate and destroy acknowledged blocks
+/// (security audit H10).
 pub fn openDatabase(path: []const u8, block_cache_mib: u64, allocator: std.mem.Allocator) storage.StorageError!storage.Database {
-    // Remove stale LOCK file left by a previous unclean shutdown.
-    // RocksDB uses this file to prevent concurrent access, but if the
-    // previous process crashed or was killed, the LOCK remains and blocks
-    // reopening.  It is safe to remove because we are the only process
-    // that should be accessing this database directory.
-    {
-        const lock_path = std.fmt.allocPrint(allocator, "{s}/LOCK", .{path}) catch
-            return storage.StorageError.OutOfMemory;
-        defer allocator.free(lock_path);
-        std.fs.deleteFileAbsolute(lock_path) catch {};
-    }
-
     var errptr: ?[*:0]u8 = null;
 
     const options = c.rocksdb_options_create();
