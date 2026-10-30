@@ -4966,6 +4966,69 @@ pub const WalletOptions = struct {
 // Wallet Manager - Multi-wallet support
 // ============================================================================
 
+/// True if any JSON object in `json` repeats a key.  Malformed JSON is an
+/// error (the caller treats both as an unloadable wallet).
+fn jsonHasDuplicateKey(allocator: std.mem.Allocator, json: []const u8) !bool {
+    var scanner = std.json.Scanner.initCompleteInput(allocator, json);
+    defer scanner.deinit();
+    // One key set per open container; null for arrays.
+    var stack = std.ArrayList(?std.StringHashMap(void)).init(allocator);
+    defer {
+        for (stack.items) |*entry| if (entry.*) |*keys| freeKeySet(allocator, keys);
+        stack.deinit();
+    }
+    var expect_key = false;
+    while (true) {
+        const tok = try scanner.nextAlloc(allocator, .alloc_always);
+        switch (tok) {
+            .object_begin => {
+                try stack.append(std.StringHashMap(void).init(allocator));
+                expect_key = true;
+                continue;
+            },
+            .array_begin => {
+                try stack.append(null);
+                expect_key = false;
+                continue;
+            },
+            .object_end, .array_end => {
+                if (stack.popOrNull()) |entry| {
+                    var e = entry;
+                    if (e) |*keys| freeKeySet(allocator, keys);
+                }
+            },
+            .allocated_string => |str| {
+                if (expect_key) {
+                    var keys = &(stack.items[stack.items.len - 1].?);
+                    const gop = keys.getOrPut(str) catch |err| {
+                        allocator.free(str);
+                        return err;
+                    };
+                    if (gop.found_existing) {
+                        allocator.free(str);
+                        return true;
+                    }
+                    expect_key = false;
+                    continue;
+                }
+                allocator.free(str);
+            },
+            .allocated_number => |num| allocator.free(num),
+            .true, .false, .null => {},
+            .end_of_document => return false,
+            else => return error.UnexpectedToken,
+        }
+        // A value just ended: inside an object the next token is a key.
+        expect_key = stack.items.len > 0 and stack.items[stack.items.len - 1] != null;
+    }
+}
+
+fn freeKeySet(allocator: std.mem.Allocator, keys: *std.StringHashMap(void)) void {
+    var it = keys.keyIterator();
+    while (it.next()) |k| allocator.free(k.*);
+    keys.deinit();
+}
+
 pub const WalletManager = struct {
     wallets: std.StringHashMap(*Wallet),
     mutex: std.Thread.Mutex,
@@ -4976,7 +5039,7 @@ pub const WalletManager = struct {
     /// Initialize the wallet manager.
     pub fn init(allocator: std.mem.Allocator, wallets_dir: []const u8, network: Network) !WalletManager {
         // Ensure wallets directory exists
-        std.fs.makeDirAbsolute(wallets_dir) catch |err| {
+        makeDirPrivate(wallets_dir) catch |err| {
             if (err != error.PathAlreadyExists) {
                 return error.WalletDirCreationFailed;
             }
@@ -5051,7 +5114,7 @@ pub const WalletManager = struct {
         } else |_| {}
 
         // Create wallet directory
-        std.fs.makeDirAbsolute(wallet_dir) catch |err| {
+        makeDirPrivate(wallet_dir) catch |err| {
             if (err != error.PathAlreadyExists) {
                 return error.WalletDirCreationFailed;
             }
@@ -5286,6 +5349,15 @@ pub const WalletManager = struct {
         return true;
     }
 
+    /// Owner-only, whatever the process umask (audit H9).  wallet.dat holds
+    /// master_key in cleartext when the wallet is not encrypted.
+    const WALLET_FILE_MODE: std.fs.File.Mode = 0o600;
+    const WALLET_DIR_MODE: std.posix.mode_t = 0o700;
+
+    fn makeDirPrivate(path: []const u8) !void {
+        try std.posix.mkdir(path, WALLET_DIR_MODE);
+    }
+
     fn getWalletDir(self: *WalletManager, name: []const u8) ![]const u8 {
         if (name.len == 0) {
             // Default wallet is in wallets_dir root
@@ -5315,7 +5387,7 @@ pub const WalletManager = struct {
         defer self.allocator.free(wallet_dir);
 
         // Ensure directory exists
-        std.fs.makeDirAbsolute(wallet_dir) catch |err| {
+        makeDirPrivate(wallet_dir) catch |err| {
             if (err != error.PathAlreadyExists) {
                 return error.WalletDirCreationFailed;
             }
@@ -5333,7 +5405,7 @@ pub const WalletManager = struct {
         defer self.allocator.free(temp_file);
 
         {
-            const file = std.fs.createFileAbsolute(temp_file, .{ .truncate = true }) catch {
+            const file = std.fs.createFileAbsolute(temp_file, .{ .truncate = true, .mode = WALLET_FILE_MODE }) catch {
                 return error.WalletSaveFailed;
             };
             // From here on, any error must clean up the partial temp file so a
@@ -5342,6 +5414,10 @@ pub const WalletManager = struct {
                 file.close();
                 std.fs.deleteFileAbsolute(temp_file) catch {};
             }
+            // .mode only applies when the file is created: a stale tmp left by
+            // an older build keeps its loose mode, and the rename would carry
+            // it onto wallet.dat.
+            file.chmod(WALLET_FILE_MODE) catch return error.WalletSaveFailed;
             file.writeAll(json) catch return error.WalletSaveFailed;
             // Durability: force the bytes to stable storage BEFORE the rename.
             file.sync() catch return error.WalletSaveFailed;
@@ -5407,7 +5483,7 @@ pub const WalletManager = struct {
             }
         }
 
-        std.fs.copyFileAbsolute(src, final_dest, .{}) catch return error.WalletBackupFailed;
+        std.fs.copyFileAbsolute(src, final_dest, .{ .override_mode = WALLET_FILE_MODE }) catch return error.WalletBackupFailed;
     }
 
     /// Restore a wallet from a backupwallet file and load it.
@@ -5432,10 +5508,10 @@ pub const WalletManager = struct {
             }
         }
 
-        std.fs.makeDirAbsolute(wallet_dir) catch |err| {
+        makeDirPrivate(wallet_dir) catch |err| {
             if (err != error.PathAlreadyExists) return error.WalletRestoreFailed;
         };
-        std.fs.copyFileAbsolute(backup_file, dest_db, .{}) catch {
+        std.fs.copyFileAbsolute(backup_file, dest_db, .{ .override_mode = WALLET_FILE_MODE }) catch {
             return error.WalletRestoreFailed;
         };
 
@@ -5878,11 +5954,12 @@ pub const WalletManager = struct {
         while (label_iter.next()) |entry| {
             if (!first_label) try json.append(',');
             first_label = false;
-            try json.append('"');
-            try json.appendSlice(entry.key_ptr.*);
-            try json.appendSlice("\":\"");
-            try json.appendSlice(entry.value_ptr.*);
-            try json.append('"');
+            // Labels and their addresses come straight from RPC (setlabel,
+            // getnewaddress): escape them, or a quote ends the string and the
+            // rest is parsed as wallet keys (audit H11).
+            try std.json.encodeJsonString(entry.key_ptr.*, .{}, json.writer());
+            try json.append(':');
+            try std.json.encodeJsonString(entry.value_ptr.*, .{}, json.writer());
         }
         try json.appendSlice("}");
 
@@ -5902,13 +5979,12 @@ pub const WalletManager = struct {
             const spk_hex = try std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(s.spk)});
             defer self.allocator.free(spk_hex);
             try json.appendSlice(spk_hex);
-            try json.appendSlice("\",\"address\":\"");
-            try json.appendSlice(s.address);
-            try json.appendSlice("\",\"desc\":\"");
-            // The descriptor string is restricted to descriptor charset (no
-            // quotes/backslashes), so a raw copy is JSON-safe.
-            try json.appendSlice(s.desc);
-            try json.appendSlice("\",\"is_change\":");
+            try json.appendSlice("\",\"address\":");
+            try std.json.encodeJsonString(s.address, .{}, json.writer());
+            try json.appendSlice(",\"desc\":");
+            // Core's descriptor charset includes '"' and '\\', so escape.
+            try std.json.encodeJsonString(s.desc, .{}, json.writer());
+            try json.appendSlice(",\"is_change\":");
             try json.appendSlice(if (s.is_change) "true" else "false");
             try json.appendSlice(",\"solvable\":");
             try json.appendSlice(if (s.solvable) "true" else "false");
@@ -5922,15 +5998,24 @@ pub const WalletManager = struct {
     }
 
     fn deserializeWallet(self: *WalletManager, json: []const u8) !*Wallet {
+        // The dynamic parser keeps the last of two equal keys, so a file that
+        // says two things about master_key or network would be read as the
+        // second.  Refuse it (audit H11).
+        if (jsonHasDuplicateKey(self.allocator, json) catch return error.WalletLoadFailed) {
+            return error.WalletLoadFailed;
+        }
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json, .{}) catch {
             return error.WalletLoadFailed;
         };
         defer parsed.deinit();
 
+        if (parsed.value != .object) return error.WalletLoadFailed;
         const obj = parsed.value.object;
 
         // Get network
-        const network_str = obj.get("network").?.string;
+        const network_v = obj.get("network") orelse return error.WalletLoadFailed;
+        if (network_v != .string) return error.WalletLoadFailed;
+        const network_str = network_v.string;
         const network: Network = if (std.mem.eql(u8, network_str, "mainnet"))
             .mainnet
         else if (std.mem.eql(u8, network_str, "testnet"))
@@ -6178,8 +6263,10 @@ pub const WalletManager = struct {
 
         // Labels
         if (obj.get("labels")) |labels_obj| {
+            if (labels_obj != .object) return error.WalletLoadFailed;
             var label_iter = labels_obj.object.iterator();
             while (label_iter.next()) |entry| {
+                if (entry.value_ptr.* != .string) return error.WalletLoadFailed;
                 try wallet.setLabel(entry.key_ptr.*, entry.value_ptr.string);
             }
         }
