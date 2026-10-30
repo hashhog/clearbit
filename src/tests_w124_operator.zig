@@ -119,14 +119,11 @@ test "w124 G5 BUG-1: no stale-PID detection helper (xfail)" {
 }
 
 // ===========================================================================
-// G6: Datadir lock file (`.lock`) — MISSING.  P1-OPS.
-// XFAIL: there is no `lockDatadir` / `acquireDatadirLock` helper.
-test "w124 G6 BUG-2: no datadir flock helper (xfail / P1-OPS)" {
-    const has_lock_fn = @hasDecl(ops, "lockDatadir") or
-        @hasDecl(ops, "acquireDatadirLock");
-    try testing.expect(!has_lock_fn); // assert ABSENT; double-launch races on
-    // the same datadir corrupt RocksDB chainstate. Fix is one std.posix.flock
-    // call on `<datadir>/.lock` held for process lifetime.
+// G6: Datadir lock file (`.lock`) — PRESENT (security audit H10).
+// Was an xfail asserting the helper was ABSENT; flipped when it landed.
+// Behaviour is covered in tests_sec_rocksdb_lock.zig.
+test "w124 G6: datadir flock helper exists" {
+    try testing.expect(@hasDecl(ops, "lockDatadir"));
 }
 
 // ===========================================================================

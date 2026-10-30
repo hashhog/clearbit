@@ -16,6 +16,7 @@ comptime {
     _ = descriptor;
     _ = proxy;
     _ = @import("ops.zig");
+    _ = @import("tests_sec_rocksdb_lock.zig"); // security audit H10: datadir lock, RocksDB LOCK kept
     _ = @import("debug_log.zig");
     _ = @import("zmq.zig");
     _ = @import("muhash.zig");

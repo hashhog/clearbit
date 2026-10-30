@@ -121,6 +121,52 @@ pub fn removePidFile(path: []const u8) void {
 }
 
 // ---------------------------------------------------------------------------
+// Datadir lock
+// ---------------------------------------------------------------------------
+
+pub const DatadirLockError = error{
+    /// Another process (or another open of the same file) holds the lock.
+    AlreadyLocked,
+    OpenFailed,
+    NameTooLong,
+};
+
+/// Exclusive lock on `<datadir>/.lock`, held for as long as `file` stays open.
+pub const DatadirLock = struct {
+    file: std.fs.File,
+
+    pub fn release(self: *DatadirLock) void {
+        self.file.close();
+    }
+};
+
+/// Take `flock(LOCK_EX|LOCK_NB)` on `<datadir>/.lock`, as Core's
+/// LockDataDirectory does (bitcoin-core/src/init.cpp, util/fs_helpers.cpp
+/// LockDirectory). Returns `AlreadyLocked` instead of waiting when another
+/// process holds it. Must be taken before the chainstate is opened and kept
+/// for the life of the process: it is the only thing stopping a second
+/// clearbit from opening the same RocksDB.
+///
+/// flock, not fcntl: an flock lock belongs to the open file description, so
+/// it survives the fork in `daemonize()` and is dropped by the kernel when
+/// the last holder exits, so a crash never leaves a stale lock behind.
+pub fn lockDatadir(datadir: []const u8) DatadirLockError!DatadirLock {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/.lock", .{datadir}) catch
+        return DatadirLockError.NameTooLong;
+    const file = std.fs.cwd().createFile(path, .{
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .mode = 0o600,
+    }) catch |err| return switch (err) {
+        error.WouldBlock => DatadirLockError.AlreadyLocked,
+        else => DatadirLockError.OpenFailed,
+    };
+    return .{ .file = file };
+}
+
+// ---------------------------------------------------------------------------
 // SIGHUP — log reopen
 // ---------------------------------------------------------------------------
 

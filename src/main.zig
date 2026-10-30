@@ -1252,6 +1252,26 @@ fn readCompressedScriptStreaming(
     return buf;
 }
 
+/// Take the datadir lock or exit, as Core's LockDataDirectory does
+/// (bitcoin-core/src/init.cpp). Every path that opens the chainstate calls
+/// this first, so a second clearbit on the same datadir stops here instead
+/// of opening a RocksDB another process is writing (security audit H10).
+fn lockDatadirOrExit(full_datadir: []const u8) ops.DatadirLock {
+    return ops.lockDatadir(full_datadir) catch |err| {
+        switch (err) {
+            error.AlreadyLocked => std.debug.print(
+                "FATAL: Cannot obtain a lock on data directory {s}. clearbit is probably already running.\n",
+                .{full_datadir},
+            ),
+            else => std.debug.print(
+                "FATAL: Cannot obtain a lock on data directory {s}: {}\n",
+                .{ full_datadir, err },
+            ),
+        }
+        std.process.exit(1);
+    };
+}
+
 /// Load a Bitcoin Core-format UTXO snapshot from disk into RocksDB. This
 /// is the streaming counterpart to `storage.loadTxOutSet` (which expects
 /// the whole file in memory and is only suitable for small test
@@ -1293,6 +1313,9 @@ fn loadSnapshotFromFile(config: *Config, allocator: std.mem.Allocator) !void {
         if (err != error.PathAlreadyExists)
             std.debug.print("Warning: could not create chainstate directory: {}\n", .{err});
     };
+
+    var datadir_lock = lockDatadirOrExit(full_datadir);
+    defer datadir_lock.release();
 
     var db = storage.Database.open(chainstate_path, config.dbcache, allocator) catch |err| {
         std.debug.print("FATAL: Failed to open RocksDB at {s}: {}\n", .{ chainstate_path, err });
@@ -1701,6 +1724,9 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
         };
     }
     defer if (subdir.len > 0) allocator.free(full_datadir);
+
+    var datadir_lock = lockDatadirOrExit(full_datadir);
+    defer datadir_lock.release();
 
     // Open RocksDB
     var db: ?storage.Database = null;
@@ -2115,6 +2141,12 @@ pub fn main() !void {
         };
     }
     defer validation.deinitScriptCheckPool();
+
+    // Datadir lock, held until the process exits (never released here: the
+    // DB is not closed on shutdown and wallets/peers are saved after the PID
+    // file goes, so only process exit makes it safe for the next instance).
+    const datadir_lock = lockDatadirOrExit(full_datadir);
+    _ = datadir_lock;
 
     // Open RocksDB for disk-backed UTXO persistence.
     var db: ?storage.Database = null;
