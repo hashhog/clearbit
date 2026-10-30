@@ -23,6 +23,7 @@ comptime {
     _ = @import("campaign_assumeutxo.zig");
     _ = @import("chainwork.zig");
     _ = @import("historical_backfill.zig");
+    _ = @import("tests_sec_metrics_bind.zig"); // security audit H7: metrics bind, timeout, routes
 }
 
 // ============================================================
