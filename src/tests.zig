@@ -1044,6 +1044,7 @@ comptime {
     _ = @import("tests_mtp_bip68_fix.zig"); // 2026-10-05 mempool MTP / BIP68 (new API: removeForReorg, tipMtp)
     _ = @import("mempool.zig");
     _ = @import("tests_unbroadcast.zig"); // unbroadcast set (Core m_unbroadcast_txids)
+    _ = @import("tests_sec_wallet_files_perms.zig"); // security audit H8/H9/H11: datadir paths, private umask + wallet modes, label escaping
     _ = @import("mempool_persist.zig"); // mempool.dat dump/load (Bitcoin Core-compatible)
     _ = @import("storage.zig"); // undo data, UTXO set, chain state, flat file storage
     _ = @import("compressor.zig"); // CompressAmount / CompressScript (Coin wire format)
