@@ -65,6 +65,16 @@ fn isReorgEnabled() bool {
     return true;
 }
 
+/// Core HasValidProofOfWork (validation.cpp): CheckProofOfWork on every
+/// header of a `headers` message.  Context-free, so it runs before any
+/// parent lookup, queueing or storage.
+pub fn headersHaveValidPoW(headers: []const types.BlockHeader, params: *const consensus.NetworkParams) bool {
+    for (headers) |*hdr| {
+        if (!consensus.validateProofOfWork(hdr, params)) return false;
+    }
+    return true;
+}
+
 /// Mirror of storage.MAX_REORG_DEPTH (= MIN_BLOCKS_TO_KEEP, 288).  Headers
 /// for a competing fork whose split-point is more than this many blocks
 /// behind the active tip are refused: we cannot disconnect that far without
@@ -7865,6 +7875,20 @@ pub const PeerManager = struct {
                 // us every ~5 min (1-3/8 outbound, constant re-dialing).
                 // Cleared per-branch below (empty / historical / extends /
                 // competing fork); unknown_parent keeps it.
+
+                // Core CheckHeadersPoW (net_processing.cpp:2617-2623, called
+                // at :2985 before anything else looks at the batch): every
+                // header must meet its own nBits target, and that target must
+                // be within powLimit, or the whole message is refused and the
+                // peer is punished.  Without it a peer could feed headers with
+                // the right nBits and timestamps but no hashing at all: they
+                // became the connect queue (tip halt), grew expected_blocks
+                // and the header DB without bound, and armed pending_reorg on
+                // a fake fork (security audit 2026-10-29, finding C2).
+                if (!headersHaveValidPoW(h.headers, self.network_params)) {
+                    peer.misbehaving(100, "header with invalid proof of work");
+                    return;
+                }
 
                 if (h.headers.len > 0) {
                     var historical = false;
@@ -15855,17 +15879,21 @@ fn w150StubPeer(params: *const consensus.NetworkParams, allocator: std.mem.Alloc
     };
 }
 
-/// Build a mainnet-rooted header chain of `n` headers starting at height 1
-/// (parent = the real mainnet genesis block).  `cheat_index`, when non-null,
-/// gets deliberately wrong nBits.
-fn w150MainnetChain(
+/// Build a regtest-rooted header chain of `n` headers starting at height 1
+/// (parent = the regtest genesis block), each with real proof of work: the
+/// `.headers` arm refuses a message whose headers miss their own target
+/// (Core CheckHeadersPoW) before the contextual gates under test run, and
+/// mainnet difficulty is far too expensive to grind in a unit test.
+/// `cheat_index`, when non-null, gets deliberately wrong nBits that still
+/// lie within powLimit, so it passes proof of work and fails bad-diffbits.
+fn w150RegtestChain(
     allocator: std.mem.Allocator,
     n: usize,
     cheat_index: ?usize,
 ) ![]types.BlockHeader {
-    const g = consensus.MAINNET.genesis_header;
+    const g = consensus.REGTEST.genesis_header;
     const hdrs = try allocator.alloc(types.BlockHeader, n);
-    var prev = consensus.MAINNET.genesis_hash;
+    var prev = consensus.REGTEST.genesis_hash;
     var ts: u32 = g.timestamp + 600;
     for (hdrs, 0..) |*hp, i| {
         const cheat = if (cheat_index) |ci| ci == i else false;
@@ -15874,12 +15902,13 @@ fn w150MainnetChain(
             .prev_block = prev,
             .merkle_root = [_]u8{0} ** 32,
             .timestamp = ts,
-            // Mainnet is non-retarget at these heights, so the required nBits
-            // is the parent's == the genesis bits.  A "cheat" header claims an
-            // arbitrary, much easier target.
-            .bits = if (cheat) 0x1e0fffff else g.bits,
+            // Regtest never retargets, so the required nBits is the
+            // powLimit bits == the genesis bits.  A "cheat" header claims a
+            // different (slightly harder, still in-range) target.
+            .bits = if (cheat) 0x207ffffe else g.bits,
             .nonce = 0,
         };
+        while (!consensus.validateProofOfWork(hp, &consensus.REGTEST)) hp.nonce +%= 1;
         prev = crypto.computeBlockHash(hp);
         ts += 600;
     }
@@ -15888,13 +15917,13 @@ fn w150MainnetChain(
 
 test "W150 LIVE: .headers handler gates EVERY header, not just headers[0]" {
     const allocator = std.testing.allocator;
-    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    var pm = PeerManager.init(allocator, &consensus.REGTEST);
     defer pm.deinit();
-    var peer = w150StubPeer(&consensus.MAINNET, allocator);
+    var peer = w150StubPeer(&consensus.REGTEST, allocator);
     defer peer.recv_buffer.deinit();
 
-    // 5 honest headers rooted at the real mainnet genesis block.
-    const hdrs = try w150MainnetChain(allocator, 5, null);
+    // 5 honest headers rooted at the regtest genesis block.
+    const hdrs = try w150RegtestChain(allocator, 5, null);
     // handleMessage's `.headers` arm frees the slice via `defer`.
     const msg = p2p.Message{ .headers = .{ .headers = hdrs } };
 
@@ -15912,14 +15941,14 @@ test "W150 LIVE: .headers handler gates EVERY header, not just headers[0]" {
 
 test "W150 LIVE: mid-batch bad nBits is rejected by the .headers handler" {
     const allocator = std.testing.allocator;
-    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    var pm = PeerManager.init(allocator, &consensus.REGTEST);
     defer pm.deinit();
-    var peer = w150StubPeer(&consensus.MAINNET, allocator);
+    var peer = w150StubPeer(&consensus.REGTEST, allocator);
     defer peer.recv_buffer.deinit();
 
     // headers[3] claims an arbitrary easy target.  Its parent is headers[2],
     // i.e. inside the SAME message — the exact case that used to skip the gate.
-    const hdrs = try w150MainnetChain(allocator, 5, 3);
+    const hdrs = try w150RegtestChain(allocator, 5, 3);
     const msg = p2p.Message{ .headers = .{ .headers = hdrs } };
 
     const before = pm.header_diffbits_checks;
@@ -15936,9 +15965,9 @@ test "W150 LIVE: mid-batch bad nBits is rejected by the .headers handler" {
 
 test "W150 LIVE: unresolvable parent drops the batch WITHOUT punishing the peer" {
     const allocator = std.testing.allocator;
-    var pm = PeerManager.init(allocator, &consensus.MAINNET);
+    var pm = PeerManager.init(allocator, &consensus.REGTEST);
     defer pm.deinit();
-    var peer = w150StubPeer(&consensus.MAINNET, allocator);
+    var peer = w150StubPeer(&consensus.REGTEST, allocator);
     defer peer.recv_buffer.deinit();
 
     // A batch rooted at a hash we have never seen.  classifyHeaderBatch sends
@@ -15953,9 +15982,11 @@ test "W150 LIVE: unresolvable parent drops the batch WITHOUT punishing the peer"
             .prev_block = prev,
             .merkle_root = [_]u8{0} ** 32,
             .timestamp = 1_600_000_000,
-            .bits = 0x1e0fffff, // arbitrary/wrong, but unevaluable
+            .bits = 0x207ffffe, // arbitrary/wrong, but unevaluable
             .nonce = 0,
         };
+        // Real proof of work, so the batch reaches the parent lookup.
+        while (!consensus.validateProofOfWork(hp, &consensus.REGTEST)) hp.nonce +%= 1;
         prev = crypto.computeBlockHash(hp);
     }
     const msg = p2p.Message{ .headers = .{ .headers = hdrs } };
