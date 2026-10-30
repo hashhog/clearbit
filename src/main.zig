@@ -126,6 +126,9 @@ pub const Config = struct {
 
     // Metrics
     metrics_port: u16 = 9332, // 0 = disabled
+    // The metrics listener has no auth, so it binds loopback unless the
+    // operator asks otherwise (security audit H7; it used to bind 0.0.0.0).
+    metrics_bind: []const u8 = "127.0.0.1",
 
     // Debug
     debug: bool = false,
@@ -341,6 +344,10 @@ pub fn parseArgs(args: *std.process.ArgIterator, config: *Config) ArgParseError!
         } else if (std.mem.startsWith(u8, arg, "--metricsport=")) {
             config.metrics_port = std.fmt.parseInt(u16, arg["--metricsport=".len..], 10) catch
                 return ArgParseError.InvalidPortNumber;
+        } else if (std.mem.startsWith(u8, arg, "--metricsbind=")) {
+            const bind = arg["--metricsbind=".len..];
+            _ = std.net.Address.parseIp(bind, 0) catch return ArgParseError.InvalidArgument;
+            config.metrics_bind = bind;
         }
         // P2P settings
         else if (std.mem.startsWith(u8, arg, "--port=")) {
@@ -606,6 +613,9 @@ pub fn printUsage() void {
         \\
         \\RPC server options:
         \\  --rpcbind=<addr>       Bind RPC to address (default: 127.0.0.1)
+        \\  --metricsport=<port>   Prometheus /metrics + /health port
+        \\                         (default: 9332, 0 = off). No auth.
+        \\  --metricsbind=<addr>   Bind metrics to address (default: 127.0.0.1)
         \\  --rpcport=<port>       RPC port (default: 8332)
         \\  --rpcuser=<user>       RPC username
         \\  --rpcpassword=<pw>     RPC password
@@ -3037,6 +3047,7 @@ pub fn main() !void {
     // Start Prometheus metrics server
     if (config.metrics_port > 0) {
         _ = std.Thread.spawn(.{}, metricsServerThread, .{
+            config.metrics_bind,
             config.metrics_port,
             &chain_state,
             &mempool_instance,
@@ -3045,7 +3056,7 @@ pub fn main() !void {
             std.debug.print("Warning: could not start metrics thread: {}\n", .{err});
             return;
         };
-        std.debug.print("Prometheus metrics server on port {d}\n", .{config.metrics_port});
+        std.debug.print("Prometheus metrics server on {s}:{d}\n", .{ config.metrics_bind, config.metrics_port });
     }
 
     std.debug.print("Node running. Press Ctrl+C to stop.\n", .{});
@@ -3271,105 +3282,179 @@ pub fn main() !void {
 // Prometheus Metrics Server
 // ============================================================================
 
+/// Bound on how long one metrics client may hold the listener (security
+/// audit H7). The accept loop serves one connection at a time, and a client
+/// that connected and sent nothing used to hold it forever. This is a total
+/// deadline for the request line, so trickling bytes cannot extend it.
+pub const METRICS_IO_TIMEOUT_MS: i64 = 5_000;
+
+pub const MetricsSnapshot = struct {
+    height: u32,
+    peers: usize,
+    mempool_count: usize,
+};
+
+/// Where the metrics handler reads its gauges. main wires it to the live
+/// chain state; tests pass fixed values.
+pub const MetricsSource = struct {
+    ctx: *anyopaque,
+    heightFn: *const fn (ctx: *anyopaque) u32,
+    snapshotFn: *const fn (ctx: *anyopaque) MetricsSnapshot,
+};
+
+pub const MetricsRoute = enum { metrics, health, not_found, bad_method };
+
+/// Only `GET /metrics` and `GET /health` are answered (audit H7). Anything
+/// else used to get the /metrics body.
+pub fn metricsRoute(request_line: []const u8) MetricsRoute {
+    var it = std.mem.splitScalar(u8, request_line, ' ');
+    const method = it.next() orelse return .bad_method;
+    if (!std.mem.eql(u8, method, "GET")) return .bad_method;
+    const target_full = it.next() orelse return .not_found;
+    const target = if (std.mem.indexOfScalar(u8, target_full, '?')) |q| target_full[0..q] else target_full;
+    if (std.mem.eql(u8, target, "/metrics")) return .metrics;
+    if (std.mem.eql(u8, target, "/health")) return .health;
+    return .not_found;
+}
+
+pub fn metricsListen(bind: []const u8, port: u16) !std.net.Server {
+    const addr = try std.net.Address.parseIp(bind, port);
+    return addr.listen(.{ .reuse_address = true });
+}
+
+/// Serve metrics connections one at a time until `stop` is set. `stop` is
+/// checked between connections, so a stopper must also connect once to wake
+/// a blocked accept.
+pub fn serveMetrics(server: *std.net.Server, source: MetricsSource, stop: *const std.atomic.Value(bool)) void {
+    while (!stop.load(.acquire)) {
+        const conn = server.accept() catch continue;
+        defer conn.stream.close();
+        serveMetricsConn(conn.stream, source);
+    }
+}
+
+/// Read the request line within METRICS_IO_TIMEOUT_MS in total. Each read
+/// blocks at most 1 s (SO_RCVTIMEO), then the deadline is re-checked.
+fn readMetricsRequestLine(stream: std.net.Stream, buf: []u8) ?[]const u8 {
+    const deadline = std.time.milliTimestamp() + METRICS_IO_TIMEOUT_MS;
+    var n: usize = 0;
+    while (n < buf.len and std.time.milliTimestamp() < deadline) {
+        const got = stream.read(buf[n..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return null,
+        };
+        if (got == 0) return null;
+        n += got;
+        if (std.mem.indexOfScalar(u8, buf[0..n], '\n')) |end| {
+            return std.mem.trimRight(u8, buf[0..end], "\r");
+        }
+    }
+    return null;
+}
+
+fn writeMetricsResponse(stream: std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
+    var resp_buf: [2048]u8 = undefined;
+    const resp = std.fmt.bufPrint(
+        &resp_buf,
+        "HTTP/1.1 {s}\r\n" ++
+            "Content-Type: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n{s}",
+        .{ status, content_type, body.len, body },
+    ) catch return;
+    stream.writeAll(resp) catch {};
+}
+
+pub fn serveMetricsConn(stream: std.net.Stream, source: MetricsSource) void {
+    const read_slice = std.posix.timeval{ .tv_sec = 1, .tv_usec = 0 };
+    const write_bound = std.posix.timeval{ .tv_sec = 5, .tv_usec = 0 };
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&read_slice)) catch return;
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&write_bound)) catch return;
+
+    var buf: [4096]u8 = undefined;
+    const line = readMetricsRequestLine(stream, &buf) orelse return;
+
+    switch (metricsRoute(line)) {
+        .health => {
+            // /health: 200 OK + tiny JSON. Designed to be parseable
+            // without a JSON lib (curl + grep is fine).
+            var hbuf: [256]u8 = undefined;
+            const hbody = std.fmt.bufPrint(
+                &hbuf,
+                "{{\"status\":\"ok\",\"height\":{d},\"version\":\"{s}\"}}\n",
+                .{ source.heightFn(source.ctx), VERSION_STRING },
+            ) catch return;
+            writeMetricsResponse(stream, "200 OK", "application/json", hbody);
+        },
+        .metrics => {
+            const s = source.snapshotFn(source.ctx);
+            var body_buf: [1024]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &body_buf,
+                "# HELP bitcoin_blocks_total Current block height\n" ++
+                    "# TYPE bitcoin_blocks_total gauge\n" ++
+                    "bitcoin_blocks_total {d}\n" ++
+                    "# HELP bitcoin_peers_connected Number of connected peers\n" ++
+                    "# TYPE bitcoin_peers_connected gauge\n" ++
+                    "bitcoin_peers_connected {d}\n" ++
+                    "# HELP bitcoin_mempool_size Mempool transaction count\n" ++
+                    "# TYPE bitcoin_mempool_size gauge\n" ++
+                    "bitcoin_mempool_size {d}\n",
+                .{ s.height, s.peers, s.mempool_count },
+            ) catch return;
+            writeMetricsResponse(stream, "200 OK", "text/plain; version=0.0.4; charset=utf-8", body);
+        },
+        .not_found => writeMetricsResponse(stream, "404 Not Found", "text/plain", "not found\n"),
+        .bad_method => writeMetricsResponse(stream, "405 Method Not Allowed", "text/plain", "method not allowed\n"),
+    }
+}
+
+const LiveMetrics = struct {
+    chain_state: *storage.ChainState,
+    mempool_inst: *mempool.Mempool,
+    peer_mgr: *peer.PeerManager,
+
+    fn height(ctx: *anyopaque) u32 {
+        const self: *LiveMetrics = @ptrCast(@alignCast(ctx));
+        self.chain_state.connect_mutex.lock();
+        defer self.chain_state.connect_mutex.unlock();
+        return self.chain_state.best_height;
+    }
+
+    fn snapshot(ctx: *anyopaque) MetricsSnapshot {
+        const self: *LiveMetrics = @ptrCast(@alignCast(ctx));
+        // Gather metrics under the chain lock (then mempool.cs inside
+        // stats(): the documented order).  stats() walks every mempool entry
+        // and the peer count reads the P2P thread's list (audit CB-12).
+        self.chain_state.connect_mutex.lock();
+        defer self.chain_state.connect_mutex.unlock();
+        return .{
+            .height = self.chain_state.best_height,
+            .peers = self.peer_mgr.getPeerCount(),
+            .mempool_count = self.mempool_inst.stats().count,
+        };
+    }
+};
+
 fn metricsServerThread(
+    bind: []const u8,
     port: u16,
     chain_state: *storage.ChainState,
     mempool_inst: *mempool.Mempool,
     peer_mgr: *peer.PeerManager,
 ) void {
-    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
-    var server = std.net.Address.listen(addr, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("Metrics: failed to bind port {d}: {}\n", .{ port, err });
+    var server = metricsListen(bind, port) catch |err| {
+        std.debug.print("Metrics: failed to bind {s}:{d}: {}\n", .{ bind, port, err });
         return;
     };
     defer server.deinit();
 
-    while (!shutdown_requested.load(.acquire)) {
-        const conn = server.accept() catch continue;
-        var stream = conn.stream;
-        defer stream.close();
-
-        // Read request line so we can route /health vs /metrics. We only
-        // peek the first 4 KiB and look at the request-target — there's
-        // no body or headers we care about for either endpoint.
-        var buf: [4096]u8 = undefined;
-        const n = stream.read(&buf) catch continue;
-        const req = buf[0..n];
-
-        // Detect "GET /health" — used by supervisors and load balancers.
-        // Anything else falls through to the existing /metrics body.
-        const is_health = blk: {
-            if (n < 12) break :blk false;
-            // Look for "/health" after the verb.
-            if (std.mem.indexOf(u8, req, " /health")) |_| break :blk true;
-            break :blk false;
-        };
-
-        if (is_health) {
-            // /health: 200 OK + tiny JSON. Designed to be parseable
-            // without a JSON lib (curl + grep is fine).
-            const tip = blk: {
-                chain_state.connect_mutex.lock();
-                defer chain_state.connect_mutex.unlock();
-                break :blk chain_state.best_height;
-            };
-            var hbuf: [256]u8 = undefined;
-            const hbody = std.fmt.bufPrint(
-                &hbuf,
-                "{{\"status\":\"ok\",\"height\":{d},\"version\":\"{s}\"}}\n",
-                .{ tip, VERSION_STRING },
-            ) catch continue;
-            var hresp_buf: [512]u8 = undefined;
-            const hresp = std.fmt.bufPrint(
-                &hresp_buf,
-                "HTTP/1.1 200 OK\r\n" ++
-                    "Content-Type: application/json\r\n" ++
-                    "Content-Length: {d}\r\n" ++
-                    "Connection: close\r\n\r\n{s}",
-                .{ hbody.len, hbody },
-            ) catch continue;
-            _ = stream.write(hresp) catch {};
-            continue;
-        }
-
-        // Gather metrics under the chain lock (then mempool.cs inside
-        // stats(): the documented order).  stats() walks every mempool entry
-        // and the peer count reads the P2P thread's list (audit CB-12).
-        chain_state.connect_mutex.lock();
-        const height = chain_state.best_height;
-        const mstats = mempool_inst.stats();
-        const peers = peer_mgr.getPeerCount();
-        chain_state.connect_mutex.unlock();
-
-        // Format response body
-        var body_buf: [1024]u8 = undefined;
-        const body = std.fmt.bufPrint(
-            &body_buf,
-            "# HELP bitcoin_blocks_total Current block height\n" ++
-                "# TYPE bitcoin_blocks_total gauge\n" ++
-                "bitcoin_blocks_total {d}\n" ++
-                "# HELP bitcoin_peers_connected Number of connected peers\n" ++
-                "# TYPE bitcoin_peers_connected gauge\n" ++
-                "bitcoin_peers_connected {d}\n" ++
-                "# HELP bitcoin_mempool_size Mempool transaction count\n" ++
-                "# TYPE bitcoin_mempool_size gauge\n" ++
-                "bitcoin_mempool_size {d}\n",
-            .{ height, peers, mstats.count },
-        ) catch continue;
-
-        // Format HTTP response
-        var resp_buf: [2048]u8 = undefined;
-        const resp = std.fmt.bufPrint(
-            &resp_buf,
-            "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n\r\n{s}",
-            .{ body.len, body },
-        ) catch continue;
-
-        _ = stream.write(resp) catch {};
-    }
+    var live = LiveMetrics{ .chain_state = chain_state, .mempool_inst = mempool_inst, .peer_mgr = peer_mgr };
+    serveMetrics(&server, .{
+        .ctx = &live,
+        .heightFn = LiveMetrics.height,
+        .snapshotFn = LiveMetrics.snapshot,
+    }, &shutdown_requested);
 }
 
 // ============================================================================
