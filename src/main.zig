@@ -1990,6 +1990,9 @@ fn importBlocks(config: *Config, allocator: std.mem.Allocator) !void {
 }
 
 pub fn main() !void {
+    // Owner-only files and dirs (datadir, wallet.dat, snapshots), as Core.
+    ops.applyPrivateUmask();
+
     // Use c_allocator for release builds (faster, no safety overhead).
     // GPA is kept for debug builds for leak detection and safety checks.
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

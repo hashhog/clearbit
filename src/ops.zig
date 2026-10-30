@@ -91,6 +91,21 @@ pub fn daemonize(keep_stderr: bool) DaemonError!void {
 }
 
 // ---------------------------------------------------------------------------
+// Private umask
+// ---------------------------------------------------------------------------
+
+/// Core's umask (bitcoin-core/src/common/system.cpp:92-93, SetupEnvironment):
+/// every file and directory the node creates is owner-only unless it asks
+/// for an explicit mode.  wallet.dat holds master_key in cleartext when the
+/// wallet is not encrypted, so the inherited umask (often 0002/0022) is not
+/// good enough.  Call before anything is created.
+pub const PRIVATE_UMASK: u32 = 0o077;
+
+pub fn applyPrivateUmask() void {
+    _ = linux.syscall1(.umask, PRIVATE_UMASK);
+}
+
+// ---------------------------------------------------------------------------
 // PID file
 // ---------------------------------------------------------------------------
 

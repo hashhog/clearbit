@@ -1527,6 +1527,41 @@ pub fn writeBlockTemplateJson(
     try writer.writeByte('}');
 }
 
+/// Resolve `user_path` (relative to `datadir`, or absolute) and refuse it
+/// unless it names something strictly inside `datadir`, lexically and after
+/// following symlinks in its parent directory.  Caller owns the result.
+pub fn resolvePathInDatadir(allocator: std.mem.Allocator, datadir: []const u8, user_path: []const u8) ![]u8 {
+    if (user_path.len == 0 or std.mem.indexOfScalar(u8, user_path, 0) != null) return error.PathOutsideDatadir;
+    const base = try std.fs.path.resolve(allocator, &.{datadir});
+    defer allocator.free(base);
+    const joined = if (std.fs.path.isAbsolute(user_path))
+        try std.fs.path.resolve(allocator, &.{user_path})
+    else
+        try std.fs.path.resolve(allocator, &.{ datadir, user_path });
+    errdefer allocator.free(joined);
+    if (!isStrictlyUnder(base, joined)) return error.PathOutsideDatadir;
+
+    // A symlinked directory inside the datadir must not lead out of it.
+    const parent = std.fs.path.dirname(joined) orelse return error.PathOutsideDatadir;
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var parent_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_base = std.fs.realpath(base, &base_buf) catch return joined;
+    // A missing parent cannot be written into or read from; let the caller
+    // report the I/O error.
+    const real_parent = std.fs.realpath(parent, &parent_buf) catch return joined;
+    if (!std.mem.eql(u8, real_base, real_parent) and !isStrictlyUnder(real_base, real_parent)) {
+        return error.PathOutsideDatadir;
+    }
+    return joined;
+}
+
+fn isStrictlyUnder(base: []const u8, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, base)) return false;
+    if (path.len <= base.len) return false;
+    // base "/" ends in a separator already.
+    return base[base.len - 1] == '/' or path[base.len] == '/';
+}
+
 pub const RpcServer = struct {
     listener: ?std.net.Server,
     allocator: std.mem.Allocator,
@@ -8256,6 +8291,13 @@ pub const RpcServer = struct {
         return self.jsonRpcResult(buf.items, id);
     }
 
+    /// A relative `path` joined onto the datadir, as Core's AbsPathJoin; an
+    /// absolute one (or no datadir) is returned as given, not copied.
+    fn datadirRelative(self: *RpcServer, path: []const u8) ![]const u8 {
+        if (self.config.datadir.len == 0 or std.fs.path.isAbsolute(path)) return path;
+        return std.fs.path.join(self.allocator, &.{ self.config.datadir, path });
+    }
+
     /// `dumpmempool` — write the mempool to disk in Bitcoin Core mempool.dat
     /// format (XOR-obfuscated v2). On success returns
     /// `{"filename":"<path>"}` matching Bitcoin Core's response shape.
@@ -8274,13 +8316,16 @@ pub const RpcServer = struct {
                 }
             }
         }
-        if (path.len == 0) {
-            if (self.config.datadir.len == 0) {
-                return self.jsonRpcError(RPC_INTERNAL_ERROR, "datadir not configured", id);
-            }
-            path_buf = try std.fmt.allocPrint(self.allocator, "{s}/mempool.dat", .{self.config.datadir});
-            path = path_buf.?;
+        if (self.config.datadir.len == 0) {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "datadir not configured", id);
         }
+        // Core's savemempool only ever writes <datadir>/mempool.dat; the
+        // override path stays inside the datadir (audit H8).
+        path_buf = resolvePathInDatadir(self.allocator, self.config.datadir, if (path.len == 0) "mempool.dat" else path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return self.jsonRpcError(RPC_INVALID_PARAMETER, "path must be inside the data directory", id),
+        };
+        path = path_buf.?;
 
         const written = mempool_persist.dumpMempool(self.mempool, path, self.allocator) catch |err| {
             // Best-effort allocate a detailed message; fall back to a fixed
@@ -8328,13 +8373,16 @@ pub const RpcServer = struct {
                 }
             }
         }
-        if (path.len == 0) {
-            if (self.config.datadir.len == 0) {
-                return self.jsonRpcError(RPC_INTERNAL_ERROR, "datadir not configured", id);
-            }
-            path_buf = try std.fmt.allocPrint(self.allocator, "{s}/mempool.dat", .{self.config.datadir});
-            path = path_buf.?;
+        if (self.config.datadir.len == 0) {
+            return self.jsonRpcError(RPC_INTERNAL_ERROR, "datadir not configured", id);
         }
+        // Core's savemempool only ever writes <datadir>/mempool.dat; the
+        // override path stays inside the datadir (audit H8).
+        path_buf = resolvePathInDatadir(self.allocator, self.config.datadir, if (path.len == 0) "mempool.dat" else path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return self.jsonRpcError(RPC_INVALID_PARAMETER, "path must be inside the data directory", id),
+        };
+        path = path_buf.?;
 
         const result = mempool_persist.loadMempool(self.mempool, path, self.allocator) catch |err| {
             if (std.fmt.allocPrint(self.allocator, "loadmempool failed: {}", .{err})) |msg| {
@@ -9258,13 +9306,18 @@ pub const RpcServer = struct {
             },
         }
 
+        // Labels are caller text (setlabel): escape them (audit H11).
         if (wallet.getLabel(addr)) |label| {
-            try writer.print(",\"label\":\"{s}\"", .{label});
+            try writer.writeAll(",\"label\":\"");
+            try writeJsonEscaped(writer, label);
+            try writer.writeByte('"');
         }
 
         try writer.writeAll(",\"labels\":[");
         if (wallet.getLabel(addr)) |label| {
-            try writer.print("\"{s}\"", .{label});
+            try writer.writeByte('"');
+            try writeJsonEscaped(writer, label);
+            try writer.writeByte('"');
         }
         try writer.writeByte(']');
 
@@ -13309,7 +13362,10 @@ pub const RpcServer = struct {
         if (path_param != .string) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Path must be a string", id);
         }
-        const path = path_param.string;
+        // Core: AbsPathForConfigVal(args, path) — relative to the datadir
+        // (rpc/blockchain.cpp:3408).
+        const path = try self.datadirRelative(path_param.string);
+        defer if (path.ptr != path_param.string.ptr) self.allocator.free(path);
 
         // Core rpc/blockchain.cpp:3410-3416 opens the file FIRST and reports
         // an unopenable path as RPC_INVALID_PARAMETER ("Couldn't open file
@@ -13544,7 +13600,10 @@ pub const RpcServer = struct {
         if (path_param != .string) {
             return self.jsonRpcError(RPC_INVALID_PARAMS, "Path must be a string", id);
         }
-        const path = path_param.string;
+        // Core: AbsPathJoin(GetDataDirNet(), path) — relative to the datadir,
+        // not the process CWD (rpc/blockchain.cpp:3133).
+        const path = try self.datadirRelative(path_param.string);
+        defer if (path.ptr != path_param.string.ptr) self.allocator.free(path);
 
         // Refuse to clobber an existing destination — matches Core's
         // "<path> already exists" guard in rpc/blockchain.cpp::dumptxoutset.
