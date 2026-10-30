@@ -954,27 +954,31 @@ pub fn decodePayload(
     var reader = serialize.Reader{ .data = payload };
 
     if (std.mem.eql(u8, command, "version")) {
-        return Message{ .version = VersionMessage{
+        var v = VersionMessage{
             .version = try reader.readInt(i32),
             .services = try reader.readInt(u64),
             .timestamp = try reader.readInt(i64),
             .addr_recv = try decodeNetworkAddress(&reader),
             .addr_from = try decodeNetworkAddress(&reader),
             .nonce = try reader.readInt(u64),
-            .user_agent = blk: {
-                const len = try reader.readCompactSize();
-                // OWNED COPY. readBytes returns a slice into `payload`, which
-                // receiveMessage frees on return — every borrower was dangling
-                // the moment the caller saw it (the long-standing #31 UAF; the
-                // hardening in recordVersion could only blank the stored copy,
-                // not fix the read). The receiver owns this and must free it:
-                // handshake arms do so via defer, including on early returns.
-                const raw = try reader.readBytes(@intCast(len));
-                break :blk allocator.dupe(u8, raw) catch return ParseError.OutOfMemory;
-            },
-            .start_height = try reader.readInt(i32),
-            .relay = if (reader.pos < payload.len) (try reader.readBytes(1))[0] != 0 else true,
-        } };
+            .user_agent = &.{},
+            .start_height = 0,
+            .relay = true,
+        };
+        const ua_len = try reader.readCompactSize();
+        const ua_raw = try reader.readBytes(@intCast(ua_len));
+        // OWNED COPY. readBytes returns a slice into `payload`, which
+        // receiveMessage frees on return — every borrower was dangling
+        // the moment the caller saw it (the long-standing #31 UAF; the
+        // hardening in recordVersion could only blank the stored copy,
+        // not fix the read). The receiver owns this and must free it:
+        // handshake arms do so via defer, including on early returns.
+        // Freed here if a field after it is truncated (audit C4).
+        v.user_agent = allocator.dupe(u8, ua_raw) catch return ParseError.OutOfMemory;
+        errdefer allocator.free(v.user_agent);
+        v.start_height = try reader.readInt(i32);
+        v.relay = if (reader.pos < payload.len) (try reader.readBytes(1))[0] != 0 else true;
+        return Message{ .version = v };
     } else if (std.mem.eql(u8, command, "verack")) {
         return Message{ .verack = {} };
     } else if (std.mem.eql(u8, command, "ping")) {
@@ -1050,16 +1054,12 @@ pub fn decodePayload(
         } };
     } else if (std.mem.eql(u8, command, "reconcildiff")) {
         const success = (try reader.readBytes(1))[0] != 0;
-        const missing_count = try reader.readCompactSize();
-        var missing_ids = try allocator.alloc(u32, @intCast(missing_count));
-        for (0..@intCast(missing_count)) |i| {
-            missing_ids[i] = try reader.readInt(u32);
-        }
-        const extra_count = try reader.readCompactSize();
-        var extra_ids = try allocator.alloc(u32, @intCast(extra_count));
-        for (0..@intCast(extra_count)) |i| {
-            extra_ids[i] = try reader.readInt(u32);
-        }
+        const missing_ids = try allocator.alloc(u32, try reader.readCount(4));
+        errdefer allocator.free(missing_ids);
+        for (missing_ids) |*id| id.* = try reader.readInt(u32);
+        const extra_ids = try allocator.alloc(u32, try reader.readCount(4));
+        errdefer allocator.free(extra_ids);
+        for (extra_ids) |*id| id.* = try reader.readInt(u32);
         return Message{ .reconcildiff = .{
             .success = success,
             .missing_short_ids = missing_ids,
@@ -1075,6 +1075,7 @@ pub fn decodePayload(
         // blockencodings.h:125 — BlockTxCount() must fit in uint16).
         if (short_id_count > 100_000) return ParseError.InvalidData;
         if (short_id_count > 0xffff) return ParseError.InvalidData;
+        if (short_id_count > reader.remaining() / 6) return ParseError.EndOfStream;
         var short_ids = try allocator.alloc([6]u8, @intCast(short_id_count));
         errdefer allocator.free(short_ids);
         for (0..@intCast(short_id_count)) |i| {
@@ -1086,8 +1087,14 @@ pub fn decodePayload(
         // Core blockencodings.h:125: BlockTxCount() = shorttxids.size() +
         // prefilledtxn.size() must fit in uint16_t (≤ 65535).
         if (short_id_count + prefilled_count > 0xffff) return ParseError.InvalidData;
+        // Each prefilled entry is an index (>= 1 byte) plus a transaction.
+        if (prefilled_count > reader.remaining() / (1 + serialize.MIN_TX_SIZE)) return ParseError.EndOfStream;
         var prefilled_txs = try allocator.alloc(PrefilledTransaction, @intCast(prefilled_count));
-        errdefer allocator.free(prefilled_txs);
+        var prefilled_done: usize = 0;
+        errdefer {
+            for (prefilled_txs[0..prefilled_done]) |pt| serialize.freeTransaction(allocator, &pt.tx);
+            allocator.free(prefilled_txs);
+        }
         for (0..@intCast(prefilled_count)) |i| {
             // Index is a compact-size differential offset from the previous
             // prefilled position (Core blockencodings.h DifferenceFormatter).
@@ -1098,6 +1105,7 @@ pub fn decodePayload(
                 .index = @intCast(index),
                 .tx = transaction,
             };
+            prefilled_done += 1;
         }
         return Message{ .cmpctblock = .{
             .header = header,
@@ -1107,8 +1115,9 @@ pub fn decodePayload(
         } };
     } else if (std.mem.eql(u8, command, "getblocktxn")) {
         const block_hash = try reader.readHash();
-        const index_count = try reader.readCompactSize();
-        var indexes = try allocator.alloc(u16, @intCast(index_count));
+        // Each differential index is at least one CompactSize byte.
+        const index_count = try reader.readCount(1);
+        var indexes = try allocator.alloc(u16, index_count);
         errdefer allocator.free(indexes);
         // Core blockencodings.h DifferenceFormatter: each encoded value is the
         // delta from (previous_absolute_index + 1), so we accumulate.
@@ -1126,10 +1135,15 @@ pub fn decodePayload(
         } };
     } else if (std.mem.eql(u8, command, "blocktxn")) {
         const block_hash = try reader.readHash();
-        const tx_count = try reader.readCompactSize();
-        var transactions = try allocator.alloc(types.Transaction, @intCast(tx_count));
-        for (0..@intCast(tx_count)) |i| {
-            transactions[i] = try serialize.readTransaction(&reader, allocator);
+        const transactions = try allocator.alloc(types.Transaction, try reader.readCount(serialize.MIN_TX_SIZE));
+        var done: usize = 0;
+        errdefer {
+            for (transactions[0..done]) |*t| serialize.freeTransaction(allocator, t);
+            allocator.free(transactions);
+        }
+        for (transactions) |*t| {
+            t.* = try serialize.readTransaction(&reader, allocator);
+            done += 1;
         }
         return Message{ .blocktxn = .{
             .block_hash = block_hash,
@@ -1209,7 +1223,9 @@ pub fn decodePayload(
         // BEFORE allocating to prevent unbounded memory allocation via a
         // crafted message.
         if (count > MAX_GETCFHEADERS_SIZE) return ParseError.InvalidData;
+        if (count > reader.remaining() / 32) return ParseError.EndOfStream;
         var hashes = try allocator.alloc(types.Hash256, @intCast(count));
+        errdefer allocator.free(hashes);
         for (0..@intCast(count)) |i| {
             hashes[i] = try reader.readHash();
         }
@@ -1235,7 +1251,9 @@ pub fn decodePayload(
         // theoretical absolute max (UINT32_MAX/CFCHECKPT_INTERVAL ≈ 4.2M)
         // — use 200_000 as a conservative cap (well above 2026 tip).
         if (count > 200_000) return ParseError.InvalidData;
+        if (count > reader.remaining() / 32) return ParseError.EndOfStream;
         var hashes = try allocator.alloc(types.Hash256, @intCast(count));
+        errdefer allocator.free(hashes);
         for (0..@intCast(count)) |i| {
             hashes[i] = try reader.readHash();
         }
@@ -1265,7 +1283,9 @@ fn decodeNetworkAddress(reader: *serialize.Reader) !types.NetworkAddress {
 fn decodeInv(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseError!InvMessage {
     const count = try reader.readCompactSize();
     if (count > MAX_INV_SIZE) return ParseError.InvalidData;
+    if (count > reader.remaining() / 36) return ParseError.EndOfStream;
     var inventory = try allocator.alloc(InvVector, @intCast(count));
+    errdefer allocator.free(inventory);
     for (0..@intCast(count)) |i| {
         inventory[i] = InvVector{
             .inv_type = @enumFromInt(try reader.readInt(u32)),
@@ -1283,7 +1303,9 @@ fn decodeGetHeaders(reader: *serialize.Reader, allocator: std.mem.Allocator) Par
     // before allocating to prevent unbounded memory allocation via a
     // crafted `getheaders` / `getblocks` message.
     if (count > MAX_LOCATOR_SIZE) return ParseError.InvalidData;
+    if (count > reader.remaining() / 32) return ParseError.EndOfStream;
     var locators = try allocator.alloc(types.Hash256, @intCast(count));
+    errdefer allocator.free(locators);
     for (0..@intCast(count)) |i| {
         locators[i] = try reader.readHash();
     }
@@ -1298,7 +1320,10 @@ fn decodeGetHeaders(reader: *serialize.Reader, allocator: std.mem.Allocator) Par
 fn decodeHeaders(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseError!HeadersMessage {
     const count = try reader.readCompactSize();
     if (count > MAX_HEADERS_SIZE) return ParseError.InvalidData;
+    // 80-byte header + 1-byte tx_count each.
+    if (count > reader.remaining() / 81) return ParseError.EndOfStream;
     var headers = try allocator.alloc(types.BlockHeader, @intCast(count));
+    errdefer allocator.free(headers);
     for (0..@intCast(count)) |i| {
         headers[i] = try serialize.readBlockHeader(reader);
         _ = try reader.readCompactSize(); // tx_count (always 0)
@@ -1310,7 +1335,10 @@ fn decodeHeaders(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseE
 fn decodeAddr(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseError!AddrMessage {
     const count = try reader.readCompactSize();
     if (count > MAX_ADDR_SIZE) return ParseError.InvalidData;
+    // 4-byte time + 26-byte address each.
+    if (count > reader.remaining() / 30) return ParseError.EndOfStream;
     var addrs = try allocator.alloc(TimestampedAddr, @intCast(count));
+    errdefer allocator.free(addrs);
     for (0..@intCast(count)) |i| {
         addrs[i] = TimestampedAddr{
             .timestamp = try reader.readInt(u32),
@@ -1324,6 +1352,8 @@ fn decodeAddr(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseErro
 fn decodeAddrV2(reader: *serialize.Reader, allocator: std.mem.Allocator) ParseError!AddrV2Message {
     const count = try reader.readCompactSize();
     if (count > MAX_ADDR_SIZE) return ParseError.InvalidData;
+    // time 4 + services >= 1 + network 1 + addr length >= 1 + port 2.
+    if (count > reader.remaining() / 9) return ParseError.EndOfStream;
     var entries = try allocator.alloc(AddrV2Entry, @intCast(count));
     // On any failure free the address copies made so far plus the slice.
     var filled: usize = 0;
@@ -1794,13 +1824,13 @@ test "addrv2 services field accepts values above MAX_SIZE (7A regression)" {
     //   addr_bytes(4)          = 7F 00 00 01  (127.0.0.1)
     //   port(u16 BE)           = 20 8D        (8333)
     const payload = [_]u8{
-        0x01,                   // count = 1
+        0x01, // count = 1
         0x00, 0x00, 0x00, 0x00, // timestamp = 0
         0xFE, 0x00, 0x00, 0x00, 0x80, // services = 0x80000000 (5-byte CompactSize)
-        0x01,                   // network_id = 1 (IPv4)
-        0x04,                   // addr_len = 4
+        0x01, // network_id = 1 (IPv4)
+        0x04, // addr_len = 4
         0x7F, 0x00, 0x00, 0x01, // 127.0.0.1
-        0x20, 0x8D,             // port = 8333 (big-endian)
+        0x20, 0x8D, // port = 8333 (big-endian)
     };
 
     const msg = try decodePayload("addrv2", &payload, allocator);
@@ -1814,12 +1844,12 @@ test "addrv2 services field accepts values above MAX_SIZE (7A regression)" {
     // This would encode as: FF FF FF FF FF FF FF FF FF
     const payload_allbits = [_]u8{
         0x01,
-        0x00, 0x00, 0x00, 0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // services = u64::MAX
-        0x01,
-        0x04,
-        0x7F, 0x00, 0x00, 0x01,
-        0x20, 0x8D,
+        0x01, 0x04, 0x7F, 0x00, 0x00, 0x01, 0x20, 0x8D,
     };
 
     const msg2 = try decodePayload("addrv2", &payload_allbits, allocator);
