@@ -571,6 +571,20 @@ pub const PING_TIMEOUT: i64 = 20 * 60;
 /// Testnet4 peers are slower, so use 5 minutes instead of Bitcoin Core's 2 minutes.
 pub const HEADERS_RESPONSE_TIMEOUT: i64 = 5 * 60;
 
+/// Core HEADERS_RESPONSE_TIME (net_processing.cpp:100). MaybeSendGetHeaders
+/// (:2823-2835) sends a getheaders only when none went to the peer in the
+/// last 2 min; a headers reply clears the timestamp and re-opens it at once.
+pub const HEADERS_RESPONSE_TIME: i64 = 2 * 60;
+
+/// Core MAX_PEER_TX_ANNOUNCEMENTS (node/txdownloadman.h:30). clearbit has no
+/// deferred request queue, so this caps the txs requested from one peer and
+/// not yet answered (tx / notfound) or expired (GETDATA_TX_INTERVAL).
+pub const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5000;
+
+/// Core GETDATA_TX_INTERVAL (node/txdownloadman.h:38): a tx request left
+/// unanswered this long is dropped and may be asked for again.
+pub const GETDATA_TX_INTERVAL: i64 = 60;
+
 /// Block download timeout in seconds (20 minutes as per Bitcoin Core).
 /// If a block is in-flight and not received within this time, disconnect.
 pub const BLOCK_DOWNLOAD_TIMEOUT: i64 = 20 * 60;
@@ -1210,6 +1224,17 @@ pub const Peer = struct {
     disconnect_requested: bool = false,
     /// disconnect() ran (socket closed, buffers freed).  Makes it idempotent.
     closed: bool = false,
+    /// Tx hashes (txid or wtxid, as announced) requested from this peer and
+    /// not yet answered, with the request time. Bounded by
+    /// MAX_PEER_TX_ANNOUNCEMENTS (audit 2026-10-29 H2). Owned by the
+    /// PeerManager's allocator; freed by `PeerManager.destroyPeer`.
+    tx_requested: std.AutoHashMapUnmanaged(types.Hash256, i64) = .{},
+    /// Last time expired `tx_requested` entries were swept (at most 1/s).
+    tx_requested_swept_at: i64 = 0,
+    /// The last cmpctblock this peer had us reconstruct. A repeat is
+    /// ignored (Core: "Peer sent us compact block we were already
+    /// syncing!"), so one valid header cannot buy a mempool scan per copy.
+    last_cmpct_hash: ?types.Hash256 = null,
 
     /// Bytes waiting in the per-peer send queue.
     pub fn pendingSendBytes(self: *const Peer) usize {
@@ -3363,6 +3388,11 @@ pub const PeerManager = struct {
     /// Index 0 = first block after genesis (height 1 at start of sync).
     /// We track which height we've queued up to and which we've connected up to.
     expected_blocks: std.ArrayList(types.Hash256),
+    /// hash -> position in expected_blocks, extended lazily up to
+    /// `expected_indexed_upto` (see expectedPosOf). Replaces a linear queue
+    /// scan per block-inv item (audit 2026-10-29 H2).
+    expected_index: std.AutoHashMapUnmanaged(types.Hash256, u32) = .{},
+    expected_indexed_upto: usize = 0,
 
     /// Next index to request blocks for (index into expected_blocks).
     download_cursor: u32,
@@ -3949,6 +3979,7 @@ pub const PeerManager = struct {
         }
         for (self.peers.items) |peer| {
             peer.disconnect();
+            peer.tx_requested.deinit(self.allocator);
             self.allocator.destroy(peer);
         }
         self.peers.deinit();
@@ -3965,6 +3996,7 @@ pub const PeerManager = struct {
             self.block_buffer.deinit();
         }
         self.expected_blocks.deinit();
+        self.expected_index.deinit(self.allocator);
         // Free cached block data for relay
         {
             var iter = self.served_blocks.valueIterator();
@@ -6948,6 +6980,7 @@ pub const PeerManager = struct {
         }
         if (self.expected_blocks.items.len > self.connect_cursor) {
             self.expected_blocks.shrinkRetainingCapacity(self.connect_cursor);
+            self.resetExpectedIndex();
         }
         if (self.download_cursor > self.connect_cursor) self.download_cursor = self.connect_cursor;
         self.wedge_since = 0;
@@ -7789,48 +7822,61 @@ pub const PeerManager = struct {
                 // drainBlockBuffer.  Directly requesting blocks via getdata
                 // without adding them to expected_blocks causes them to sit
                 // in block_buffer forever (chain tip never advances).
-                var has_block_inv = false;
+                //
+                // Throttles (audit 2026-10-29 H2, Core net_processing.cpp
+                // INV handler): a getheaders only for a block we do not
+                // already have or have requested, at most one per
+                // HEADERS_RESPONSE_TIME (MaybeSendGetHeaders); txs never
+                // requested during IBD, never accepted from a block-relay-only
+                // link (RejectIncomingTxs -> disconnect), and capped per peer.
+                var has_unknown_block = false;
+                // Core RejectIncomingTxs: pfrom.IsBlockOnlyConn().
+                const reject_tx_invs = peer.conn_type == .block_relay;
+                const in_ibd = self.selfAdvIbd();
+                const now = std.time.timestamp();
                 // Collect tx inv items we want to request (not already in mempool)
                 var tx_requests = std.ArrayList(p2p.InvVector).init(self.allocator);
                 defer tx_requests.deinit();
 
                 for (inv_msg.inventory) |item| {
                     const base_type = @as(u32, @intFromEnum(item.inv_type)) & ~@as(u32, 0x40000000);
+                    const is_tx = base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx));
+                    const is_wtx = base_type == @as(u32, @intFromEnum(p2p.InvType.msg_wtx));
                     if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_block))) {
-                        has_block_inv = true;
-                        self.noteBlockAvailability(peer, &item.hash);
-                    } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_tx))) {
+                        // Core UpdateBlockAvailability, then
+                        // !AlreadyHaveBlock && !IsBlockRequested.
+                        if (self.committedHeightOf(&item.hash)) |hgt| {
+                            if (hgt > peer.blocks_available_height) peer.blocks_available_height = hgt;
+                        } else if (!has_unknown_block and !self.blockKnownOffQueue(&item.hash)) {
+                            has_unknown_block = true;
+                        }
+                    } else if (is_tx or is_wtx) {
+                        if (reject_tx_invs) {
+                            std.log.info("P2P: tx inv on a block-relay-only connection, disconnecting", .{});
+                            peer.disconnect_requested = true;
+                            return;
+                        }
+                        if (in_ibd) continue;
+                        const pool = self.mempool orelse continue;
                         // Legacy txid inv: request if not already in mempool by txid.
                         // Core requests `MSG_TX | GetFetchFlags(peer)`: with the
                         // witness flag from a NODE_WITNESS peer (a plain MSG_TX
                         // would be answered witness-stripped, and a stripped
                         // segwit tx fails validation), plain MSG_TX otherwise.
-                        if (self.mempool) |pool| {
-                            if (!pool.entries.contains(item.hash)) {
-                                tx_requests.append(.{
-                                    .inv_type = if (peer.canServeWitnesses()) .msg_witness_tx else .msg_tx,
-                                    .hash = item.hash,
-                                }) catch {};
-                            }
-                        }
-                    } else if (base_type == @as(u32, @intFromEnum(p2p.InvType.msg_wtx))) {
-                        // BIP-339 wtxid inv: item.hash is a wtxid.
-                        // Request if we don't already have this wtxid in the mempool.
-                        // Use MSG_WTX in the outgoing getdata so the peer responds with
-                        // the witness-serialised transaction.
-                        if (self.mempool) |pool| {
-                            if (!pool.by_wtxid.contains(item.hash)) {
-                                tx_requests.append(.{
-                                    .inv_type = .msg_wtx,
-                                    .hash = item.hash,
-                                }) catch {};
-                            }
-                        }
+                        // BIP-339 wtxid inv: item.hash is a wtxid; request it
+                        // with MSG_WTX so the peer answers witness-serialised.
+                        const have = if (is_tx) pool.entries.contains(item.hash) else pool.by_wtxid.contains(item.hash);
+                        if (have) continue;
+                        if (!self.noteTxRequest(peer, &item.hash, now)) continue;
+                        tx_requests.append(.{
+                            .inv_type = if (is_wtx) .msg_wtx else if (peer.canServeWitnesses()) .msg_witness_tx else .msg_tx,
+                            .hash = item.hash,
+                        }) catch {
+                            _ = peer.tx_requested.remove(item.hash);
+                        };
                     }
                 }
-                if (has_block_inv) {
-                    self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
-                }
+                if (has_unknown_block) self.maybeSendGetHeaders(peer);
                 // Request unknown transactions via getdata, batched at MAX_GETDATA_SZ=1000.
                 // Core net_processing.cpp:6205-6210 batches outgoing getdata at MAX_GETDATA_SZ.
                 // Sending more than 1000 items in a single getdata violates the protocol limit
@@ -8601,6 +8647,53 @@ pub const PeerManager = struct {
                     return;
                 }
 
+                // Audit 2026-10-29 H1: everything below SipHashes the whole
+                // mempool, so it runs only for a header Core would reconstruct
+                // (net_processing.cpp:4475-4508): parent known, enough work,
+                // header valid. clearbit reconstructs only a child of the
+                // active tip; that one header is checked like Core's
+                // ProcessNewBlockHeaders (PoW, then nBits / MTP / timewarp /
+                // future time against the tip).
+                {
+                    const cs = self.chain_state orelse return;
+                    if (!std.mem.eql(u8, &cs.best_hash, &cb.header.prev_block)) {
+                        // Not a child of our tip: never reconstruct. If the
+                        // block is new to us, ask for headers instead (Core:
+                        // "Doesn't connect ... request deeper headers", or
+                        // revert to header processing), throttled and not
+                        // during IBD. A stale block on our chain is ignored.
+                        if (self.committedHeightOf(&block_hash) == null and
+                            !self.blockKnownOffQueue(&block_hash) and
+                            !self.selfAdvIbd())
+                        {
+                            self.maybeSendGetHeaders(peer);
+                        }
+                        return;
+                    }
+                    if (!consensus.validateProofOfWork(&cb.header, self.network_params)) {
+                        // Core: high-hash is BLOCK_INVALID_HEADER, punished
+                        // even via a compact block (MaybePunishNodeForBlock).
+                        peer.misbehaving(100, "cmpctblock header fails proof of work (high-hash)");
+                        return;
+                    }
+                    switch (self.validateHeaderContextualStrict(&cb.header, std.time.timestamp(), null)) {
+                        .ok => {},
+                        // Core: BLOCK_TIME_FUTURE is not punished.
+                        .undecidable, .future_time => return,
+                        else => |verdict| {
+                            misbehaveForHeaderVerdict(peer, verdict);
+                            return;
+                        },
+                    }
+                    // Already have the body, or this peer already had us
+                    // reconstruct it (Core: BLOCK_HAVE_DATA / "already syncing").
+                    if (self.block_buffer.contains(block_hash)) return;
+                    if (peer.last_cmpct_hash) |last| {
+                        if (std.mem.eql(u8, &last, &block_hash)) return;
+                    }
+                    peer.last_cmpct_hash = block_hash;
+                }
+
                 // Every path below ends in a block request (getdata
                 // MSG_WITNESS_BLOCK or getblocktxn) to THIS peer. Never
                 // request blocks from a peer that cannot serve witnesses
@@ -8947,6 +9040,12 @@ pub const PeerManager = struct {
                 //   reference is dropped after the message is handled, but the
                 //   underlying transaction data lives as long as the mempool
                 //   entry does.
+                // This answers our request, if we made one (Core
+                // ReceivedResponse): free the peer's request slot.
+                if (peer.tx_requested.count() > 0) {
+                    _ = peer.tx_requested.remove(crypto.computeTxidStreaming(&tx_msg));
+                    _ = peer.tx_requested.remove(crypto.computeWtxidStreaming(&tx_msg));
+                }
                 var tx_taken_by_mempool = false;
                 defer if (!tx_taken_by_mempool) serialize.freeTransaction(self.allocator, &tx_msg);
                 if (self.mempool) |pool| {
@@ -9240,6 +9339,9 @@ pub const PeerManager = struct {
             .notfound => |nf| {
                 // Free the allocated inventory array.
                 defer self.allocator.free(nf.inventory);
+                // The peer does not have these txs: free their request slots
+                // (Core ReceivedResponse for each notfound tx).
+                for (nf.inventory) |item| _ = peer.tx_requested.remove(item.hash);
             },
             .getheaders => |gh| {
                 // Free the allocated locator hashes.
@@ -10572,6 +10674,7 @@ pub const PeerManager = struct {
             pool.eraseOrphansForPeer(@intFromPtr(peer));
         }
         peer.disconnect();
+        peer.tx_requested.deinit(self.allocator);
         self.allocator.destroy(peer);
     }
 
@@ -10640,18 +10743,107 @@ pub const PeerManager = struct {
     /// chain. Null for a hash on neither (unknown or another branch).
     fn committedHeightOf(self: *PeerManager, hash: *const types.Hash256) ?u32 {
         const cs = self.chain_state orelse return null;
-        // Forward from the connect front: a delivered block is within the
-        // 512-block download window, so the per-block cost stays small even
-        // with a long IBD header queue.
-        var i: usize = self.connect_cursor;
-        while (i < self.expected_blocks.items.len) : (i += 1) {
-            if (std.mem.eql(u8, &self.expected_blocks.items[i], hash)) {
-                return @intCast(@as(usize, cs.best_height) + 1 + (i - self.connect_cursor));
-            }
+        if (self.expectedPosOf(hash, self.connect_cursor)) |i| {
+            return @intCast(@as(usize, cs.best_height) + 1 + (i - self.connect_cursor));
         }
         if (!self.isOnActiveChain(hash)) return null;
         if (std.mem.eql(u8, &cs.best_hash, hash)) return cs.best_height;
         return cs.getBlockHeightByHash(hash);
+    }
+
+    /// Position of `hash` in expected_blocks at or after `from`, or null.
+    ///
+    /// Each block-inv item used to scan the queue from the connect front to
+    /// the end, so one 50,000-item inv cost 50,000 x queue-length compares
+    /// on the single P2P thread (audit 2026-10-29 H2; Core looks the hash
+    /// up in its block index). The index is only ever a hint: every hit is
+    /// checked against the queue, and a stale hit (the queue was truncated
+    /// or compacted) rebuilds the index once, so a miss here is a real miss.
+    fn expectedPosOf(self: *PeerManager, hash: *const types.Hash256, from: usize) ?usize {
+        const items = self.expected_blocks.items;
+        var rebuilt = false;
+        if (items.len < self.expected_indexed_upto) {
+            self.resetExpectedIndex();
+            rebuilt = true;
+        }
+        while (true) {
+            while (self.expected_indexed_upto < items.len) : (self.expected_indexed_upto += 1) {
+                const at = self.expected_indexed_upto;
+                self.expected_index.put(self.allocator, items[at], @intCast(at)) catch {
+                    // Out of memory: drop the index and answer by scanning.
+                    self.resetExpectedIndex();
+                    var i: usize = from;
+                    while (i < items.len) : (i += 1) {
+                        if (std.mem.eql(u8, &items[i], hash)) return i;
+                    }
+                    return null;
+                };
+            }
+            const pos: usize = self.expected_index.get(hash.*) orelse return null;
+            if (pos < items.len and std.mem.eql(u8, &items[pos], hash)) {
+                return if (pos >= from) pos else null;
+            }
+            // Stale position: the queue moved under the index. Rebuild once.
+            if (rebuilt) return null;
+            self.resetExpectedIndex();
+            rebuilt = true;
+        }
+    }
+
+    fn resetExpectedIndex(self: *PeerManager) void {
+        self.expected_index.clearRetainingCapacity();
+        self.expected_indexed_upto = 0;
+    }
+
+    /// Core AlreadyHaveBlock || IsBlockRequested for a hash that is not on
+    /// our chain or in the download queue: stored off-chain, buffered,
+    /// in flight, or a known header.
+    fn blockKnownOffQueue(self: *PeerManager, hash: *const types.Hash256) bool {
+        if (self.block_buffer.contains(hash.*)) return true;
+        if (self.inflight_block_peer.contains(hash.*)) return true;
+        if (self.header_index.contains(hash.*)) return true;
+        if (self.chain_state) |cs| {
+            if (cs.getBlockHeightByHash(hash) != null) return true;
+        }
+        return false;
+    }
+
+    /// Core MaybeSendGetHeaders (net_processing.cpp:2823-2835): at most one
+    /// getheaders to a peer per HEADERS_RESPONSE_TIME. Its headers reply
+    /// clears last_getheaders_time, so an answering peer is never held back.
+    fn maybeSendGetHeaders(self: *PeerManager, peer: *Peer) void {
+        const now = std.time.timestamp();
+        if (peer.last_getheaders_time != 0 and now - peer.last_getheaders_time <= HEADERS_RESPONSE_TIME) return;
+        self.sendGetHeaders(peer) catch |err| std.log.warn("P2P: getheaders send failed: {}", .{err});
+    }
+
+    /// Record a tx request to `peer`; false if it must not be sent: already
+    /// requested from this peer within GETDATA_TX_INTERVAL, or the peer
+    /// holds MAX_PEER_TX_ANNOUNCEMENTS unanswered requests (Core
+    /// txdownloadman.h:30; audit 2026-10-29 H2).
+    fn noteTxRequest(self: *PeerManager, peer: *Peer, hash: *const types.Hash256, now: i64) bool {
+        if (peer.tx_requested.get(hash.*)) |t| {
+            if (now - t < GETDATA_TX_INTERVAL) return false;
+        } else if (peer.tx_requested.count() >= MAX_PEER_TX_ANNOUNCEMENTS) {
+            self.sweepTxRequests(peer, now);
+            if (peer.tx_requested.count() >= MAX_PEER_TX_ANNOUNCEMENTS) return false;
+        }
+        peer.tx_requested.put(self.allocator, hash.*, now) catch return false;
+        return true;
+    }
+
+    /// Drop this peer's tx requests older than GETDATA_TX_INTERVAL, at most
+    /// once a second.
+    fn sweepTxRequests(self: *PeerManager, peer: *Peer, now: i64) void {
+        if (now == peer.tx_requested_swept_at) return;
+        peer.tx_requested_swept_at = now;
+        var stale = std.ArrayList(types.Hash256).init(self.allocator);
+        defer stale.deinit();
+        var it = peer.tx_requested.iterator();
+        while (it.next()) |kv| {
+            if (now - kv.value_ptr.* >= GETDATA_TX_INTERVAL) stale.append(kv.key_ptr.*) catch break;
+        }
+        for (stale.items) |k| _ = peer.tx_requested.remove(k);
     }
 
     /// `peer` announced or delivered `hash`: if it is on our chain, the peer
@@ -12688,6 +12880,7 @@ pub const PeerManager = struct {
                     );
                 }
                 self.expected_blocks.shrinkRetainingCapacity(remaining);
+                self.resetExpectedIndex();
                 self.download_cursor -= @min(self.download_cursor, self.connect_cursor);
                 self.connect_cursor = 0;
             }
