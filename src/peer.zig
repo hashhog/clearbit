@@ -10757,8 +10757,9 @@ pub const PeerManager = struct {
     /// the end, so one 50,000-item inv cost 50,000 x queue-length compares
     /// on the single P2P thread (audit 2026-10-29 H2; Core looks the hash
     /// up in its block index). The index is only ever a hint: every hit is
-    /// checked against the queue, and a stale hit (the queue was truncated
-    /// or compacted) rebuilds the index once, so a miss here is a real miss.
+    /// checked against the queue, and a stale hit rebuilds it once. Appends
+    /// are indexed on the next lookup; every path that shrinks or shifts the
+    /// queue calls resetExpectedIndex, so a miss is a real miss.
     fn expectedPosOf(self: *PeerManager, hash: *const types.Hash256, from: usize) ?usize {
         const items = self.expected_blocks.items;
         var rebuilt = false;
