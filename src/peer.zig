@@ -966,6 +966,19 @@ pub const Peer = struct {
     network_params: *const consensus.NetworkParams,
     allocator: std.mem.Allocator,
     recv_buffer: std.ArrayList(u8),
+    /// v1 framing bytes received but not yet a whole message (audit C3).
+    /// A peer that sends part of a message costs only this buffer: the
+    /// receive returns Timeout and resumes here on the next call, the way
+    /// Core's V1Transport::ReceivedBytes keeps per-peer state, instead of
+    /// holding the single P2P thread until the message completes.
+    v1_hdr: [24]u8 = undefined,
+    v1_hdr_len: usize = 0,
+    v1_payload: std.ArrayListUnmanaged(u8) = .{},
+    /// Absolute wall-clock deadline (ms) that bounds every socket read, set
+    /// for the duration of the version handshake (audit H3). 0 = none.
+    recv_deadline_ms: i64 = 0,
+    /// The SO_RCVTIMEO last set by setRecvTimeout, in ms (0 = blocking).
+    recv_timeout_ms: i64 = 0,
     is_witness_capable: bool,
     is_headers_first: bool,
     ban_score: u32,
@@ -1803,30 +1816,55 @@ pub const Peer = struct {
             return self.receiveMessageV2();
         }
 
-        // Read header (24 bytes)
-        var header_buf: [24]u8 = undefined;
-        self.readExact(&header_buf) catch |err| {
-            return if (err == error.Timeout) PeerError.Timeout else PeerError.ConnectionClosed;
-        };
+        // Accumulate the 24-byte header and then the payload in the per-peer
+        // v1 state. Timeout means "not whole yet": the bytes so far stay
+        // buffered and the next call resumes. Any other error ends the
+        // connection, so the partial state is dropped.
+        const slice_end_ms = std.time.milliTimestamp() + RECV_SLICE_MS;
+        while (self.v1_hdr_len < self.v1_hdr.len) {
+            const n = self.recvSome(self.v1_hdr[self.v1_hdr_len..], slice_end_ms) catch |err| {
+                if (err != PeerError.Timeout) self.resetV1Recv();
+                return err;
+            };
+            self.v1_hdr_len += n;
+        }
 
-        const header = p2p.MessageHeader.decode(&header_buf);
+        const header = p2p.MessageHeader.decode(&self.v1_hdr);
 
         // Validate magic
-        if (header.magic != self.network_params.magic)
+        if (header.magic != self.network_params.magic) {
+            self.resetV1Recv();
             return PeerError.BadMagic;
+        }
 
         // Validate payload size
-        if (header.length > p2p.MAX_MESSAGE_SIZE)
+        if (header.length > p2p.MAX_MESSAGE_SIZE) {
+            self.resetV1Recv();
             return PeerError.MessageTooLarge;
-
-        // Read payload
-        const payload = self.allocator.alloc(u8, header.length) catch
-            return PeerError.OutOfMemory;
-        defer self.allocator.free(payload);
-
-        if (header.length > 0) {
-            self.readExact(payload) catch return PeerError.ConnectionClosed;
         }
+
+        // Read payload. The buffer grows with the bytes that actually
+        // arrive (Core: at most 256 KiB past what has been received), so a
+        // header that claims 4 MB does not allocate 4 MB up front.
+        while (self.v1_payload.items.len < header.length) {
+            const have = self.v1_payload.items.len;
+            if (self.v1_payload.capacity == have) {
+                const want = @min(@as(usize, header.length), have + RECV_GROW_BYTES);
+                self.v1_payload.ensureTotalCapacityPrecise(self.allocator, want) catch {
+                    self.resetV1Recv();
+                    return PeerError.OutOfMemory;
+                };
+            }
+            const room_end = @min(self.v1_payload.capacity, @as(usize, header.length));
+            const room = self.v1_payload.allocatedSlice()[have..room_end];
+            const n = self.recvSome(room, slice_end_ms) catch |err| {
+                if (err != PeerError.Timeout) self.resetV1Recv();
+                return err;
+            };
+            self.v1_payload.items.len += n;
+        }
+        const payload = self.v1_payload.items;
+        defer self.resetV1Recv();
 
         // Verify checksum
         const computed_hash = crypto.hash256(payload);
@@ -1857,6 +1895,7 @@ pub const Peer = struct {
         // Pull bytes off the socket until V2Transport has a complete app
         // packet (or we hit a non-recoverable error).
         var read_buf: [16384]u8 = undefined;
+        const slice_end_ms = std.time.milliTimestamp() + RECV_SLICE_MS;
         while (!t.isMessageReady()) {
             if (t.isV1Fallback()) return PeerError.ProtocolViolation;
 
@@ -1872,15 +1911,10 @@ pub const Peer = struct {
             if (t.isMessageReady()) break;
             if (t.isV1Fallback()) return PeerError.ProtocolViolation;
 
-            const n = self.stream.read(&read_buf) catch |err| {
-                if (err == error.WouldBlock) {
-                    // No bytes available — surface as Timeout so the caller
-                    // (PeerManager event loop) can move on.
-                    return PeerError.Timeout;
-                }
-                return PeerError.ConnectionClosed;
-            };
-            if (n == 0) return PeerError.ConnectionClosed;
+            // Timeout (no bytes, the slice used up, or the handshake
+            // deadline passed) lets the caller move on; V2Transport keeps
+            // the partial packet.
+            const n = try self.recvSome(&read_buf, slice_end_ms);
             if (!t.processReceivedBytes(read_buf[0..n])) {
                 // Gate 6 (F12): an allocation failure in the transport is ours.
                 return if (t.recv_oom) PeerError.OutOfMemory else PeerError.ProtocolViolation;
@@ -2296,6 +2330,12 @@ pub const Peer = struct {
         // deadline is what bounds a peer that keeps the handshake open by
         // trickling ignorable messages.
         const deadline = now + HANDSHAKE_TIMEOUT_SECS;
+        // The check above runs only between messages; this one bounds every
+        // read inside a message too, so a peer trickling its VERSION (or any
+        // pre-verack message) a byte at a time cannot hold a handshake slot
+        // past the deadline (audit H3).
+        self.recv_deadline_ms = now * 1000 + HANDSHAKE_TIMEOUT_SECS * 1000;
+        defer self.recv_deadline_ms = 0;
 
         if (self.direction == .outbound) {
             // Send our version
@@ -2713,6 +2753,7 @@ pub const Peer = struct {
         unregisterPeerFd(self.stream.handle);
         self.stream.close();
         self.recv_buffer.deinit();
+        self.resetV1Recv();
         self.send_mutex.lock();
         defer self.send_mutex.unlock();
         self.send_queue.deinit(self.allocator);
@@ -2752,49 +2793,55 @@ pub const Peer = struct {
             std.posix.SO.RCVTIMEO,
             std.mem.asBytes(&timeout),
         ) catch {};
+        self.recv_timeout_ms = sec * 1000 + @divTrunc(usec, 1000);
     }
 
-    /// Read exactly n bytes from the stream.
-    /// If we've read zero bytes and get WouldBlock, returns Timeout (no data available).
-    /// If we've already read some bytes and get WouldBlock, sleeps briefly and retries.
-    ///
-    /// W53: the partial-read retry path must not spin forever — a peer that
-    /// opens a payload (sends the 24-byte header) and then stalls mid-stream
-    /// will return EAGAIN indefinitely, and because PeerManager drives ALL
-    /// peers from a single thread, any stuck readExact wedges the entire
-    /// node (no drain, no timeout checks, no heartbeats — exactly the silent
-    /// stall observed at block 479,888 on 2026-04-17). Bound the total time
-    /// spent in partial-read retries and give up as ConnectionClosed so the
-    /// peer is disconnected and the download slots are reclaimed.
-    pub const READ_EXACT_PARTIAL_TIMEOUT_MS: i64 = 30_000;
-    fn readExact(self: *Peer, buf: []u8) !void {
-        var total: usize = 0;
-        var partial_deadline_ms: i64 = 0;
-        while (total < buf.len) {
-            const n = self.stream.read(buf[total..]) catch |err| {
-                if (err == error.WouldBlock) {
-                    if (total == 0) {
-                        return error.Timeout; // No data at all - truly no message waiting
-                    }
-                    // Partial read — data may be arriving. Bound retry time
-                    // so a mid-payload stall doesn't wedge the peer thread.
-                    const now_ms = std.time.milliTimestamp();
-                    if (partial_deadline_ms == 0) {
-                        partial_deadline_ms = now_ms + READ_EXACT_PARTIAL_TIMEOUT_MS;
-                    } else if (now_ms >= partial_deadline_ms) {
-                        return error.ConnectionClosed;
-                    }
-                    std.time.sleep(1 * std.time.ns_per_ms);
-                    continue;
-                }
-                return error.ConnectionClosed;
-            };
-            if (n == 0) return error.ConnectionClosed;
-            total += n;
-            // Progress resets the partial-read deadline so a slow-but-live
-            // peer is still allowed to finish a large payload.
-            if (partial_deadline_ms != 0) partial_deadline_ms = 0;
+    /// One message receive spends at most this long reading a message that
+    /// keeps arriving but is not yet whole, then returns Timeout with the
+    /// bytes kept (audit C3). Without it a peer sending one byte just
+    /// inside every SO_RCVTIMEO would still hold the single P2P thread.
+    pub const RECV_SLICE_MS: i64 = 50;
+    /// Payload buffer growth step (Core V1Transport::readData: 256 KiB).
+    pub const RECV_GROW_BYTES: usize = 256 * 1024;
+
+    /// One socket read for the receive paths. WouldBlock (SO_RCVTIMEO
+    /// expired with nothing to read) is Timeout; EOF or a socket error is
+    /// ConnectionClosed. While `recv_deadline_ms` is set (the version
+    /// handshake) no read waits past it, however the peer paces its bytes
+    /// (audit H3; Core's -peertimeout is absolute, net.cpp InactivityCheck).
+    /// Otherwise, once `slice_end_ms` has passed, a read starts only if
+    /// bytes are already waiting: a sender at line rate finishes its (4 MB
+    /// capped) message, a slow one yields the thread.
+    fn recvSome(self: *Peer, buf: []u8, slice_end_ms: i64) PeerError!usize {
+        const now_ms = std.time.milliTimestamp();
+        if (self.recv_deadline_ms != 0) {
+            const remaining_ms = self.recv_deadline_ms - now_ms;
+            if (remaining_ms <= 0) return PeerError.Timeout;
+            const wait_ms = if (self.recv_timeout_ms > 0) @min(remaining_ms, self.recv_timeout_ms) else remaining_ms;
+            var pollfds = [_]std.posix.pollfd{.{
+                .fd = self.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&pollfds, @intCast(@min(wait_ms, std.math.maxInt(i32)))) catch
+                return PeerError.ConnectionClosed;
+            if (ready == 0) return PeerError.Timeout;
+        } else if (now_ms >= slice_end_ms and !self.hasDataAvailable()) {
+            return PeerError.Timeout;
         }
+        const n = self.stream.read(buf) catch |err| {
+            if (err == error.WouldBlock) return PeerError.Timeout;
+            return PeerError.ConnectionClosed;
+        };
+        if (n == 0) return PeerError.ConnectionClosed;
+        return n;
+    }
+
+    /// Drop any partially received v1 message.
+    fn resetV1Recv(self: *Peer) void {
+        self.v1_hdr_len = 0;
+        self.v1_payload.deinit(self.allocator);
+        self.v1_payload = .{};
     }
 
     /// Check if the peer has timed out (no messages for 20 minutes, no pong for 5 minutes).
@@ -6042,8 +6089,8 @@ pub const PeerManager = struct {
                 // its replies are backed up; resume when it reads them.
                 if (peer_obj.sendPaused() or peer_obj.send_failed) break;
                 const recv_res = blk: {
-                    // A mid-payload stall can block here up to
-                    // READ_EXACT_PARTIAL_TIMEOUT_MS: never hold cs_main.
+                    // A slow peer returns Timeout within RECV_SLICE_MS
+                    // with its partial message kept; never hold cs_main.
                     // Only this thread frees peers, so peer_obj survives.
                     const w = self.ioWindow();
                     defer w.end();
