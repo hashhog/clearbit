@@ -275,11 +275,11 @@ pub fn createBlockTemplate(
     };
     const bits: u32 = opts.override_bits orelse
         (consensus.getNextWorkRequiredChecked(
-            height,
-            @intCast(std.time.timestamp()),
-            &index_view,
-            params,
-        ) orelse return error.DifficultyUnavailable);
+        height,
+        @intCast(std.time.timestamp()),
+        &index_view,
+        params,
+    ) orelse return error.DifficultyUnavailable);
     const target = consensus.bitsToTarget(bits);
 
     // 2. Reserve weight for the block header, tx-count varint, and coinbase tx.
@@ -1547,6 +1547,107 @@ pub fn submitBlockWithIndexAndMempool(
     };
 }
 
+/// Queue the submitted block's body for CF_BLOCKS and flush (the active-tip
+/// arm's queueBlockWrite + flush).  Returns whether the body was queued.
+fn persistSubmittedBody(
+    block: *const types.Block,
+    block_hash: *const types.Hash256,
+    height: u32,
+    chain_state: *storage.ChainState,
+) bool {
+    var body_persisted = false;
+    var writer = serialize.Writer.init(chain_state.allocator);
+    const queued = blk: {
+        serialize.writeBlock(&writer, block) catch {
+            writer.deinit();
+            break :blk false;
+        };
+        const owned_const = writer.toOwnedSlice() catch {
+            writer.deinit();
+            break :blk false;
+        };
+        const owned: []u8 = @constCast(owned_const);
+        chain_state.queueBlockWrite(block_hash, owned, height) catch {
+            chain_state.allocator.free(owned);
+            break :blk false;
+        };
+        break :blk true;
+    };
+    if (queued) {
+        chain_state.flush() catch |err| {
+            std.debug.print(
+                "submitblock: body flush failed at h={d}: {}\n",
+                .{ height, err },
+            );
+        };
+        body_persisted = true;
+    } else {
+        std.debug.print(
+            "submitblock: queueBlockWrite skipped at h={d}\n",
+            .{height},
+        );
+    }
+    return body_persisted;
+}
+
+/// Store a submitted block that extends the active tip and failed a
+/// ConnectBlock-stage check, marked BLOCK_FAILED_VALID.  Core's AcceptBlock
+/// writes the block (BLOCK_HAVE_DATA) and adds it to the block index before
+/// ActivateBestChain connects it; when ConnectBlock fails, ConnectTip ->
+/// InvalidBlockFound sets BLOCK_FAILED_VALID and the entry stays, so
+/// getchaintips lists it "invalid", a resubmission answers
+/// "duplicate-invalid" and a child "bad-prevblk" (validation.cpp
+/// AcceptBlock, ConnectTip, InvalidBlockFound; rpc/blockchain.cpp
+/// getchaintips).  The durable invalid mark and fork-block record keep that
+/// across a restart.  Reporting only: the active chain is not touched.
+pub fn recordFailedTipBlock(
+    block: *const types.Block,
+    block_hash: *const types.Hash256,
+    height: u32,
+    chain_state: *storage.ChainState,
+    chain_manager: ?*validation.ChainManager,
+    allocator: std.mem.Allocator,
+) !void {
+    const has_data = persistSubmittedBody(block, block_hash, height, chain_state);
+    try chain_state.setBlockFailedDurable(block_hash, true);
+    try chain_state.noteForkBlock(block_hash, &block.header, height, has_data, false);
+    const cm = chain_manager orelse return;
+    if (cm.chain_store) |store| {
+        store.putBlockIndex(block_hash, &block.header, height) catch {};
+    }
+    if (cm.getBlock(block_hash)) |e| {
+        cm.adoptDurableInvalid(e);
+        return;
+    }
+    const parent = cm.getBlock(&block.header.prev_block) orelse return;
+    var work: [32]u8 = parent.chain_work;
+    const this_work = peer.workFromBits(block.header.bits);
+    peer.addChainWorkBE(&work, &this_work);
+    const entry = try allocator.create(validation.BlockIndexEntry);
+    entry.* = validation.BlockIndexEntry{
+        .hash = block_hash.*,
+        .header = block.header,
+        .height = height,
+        .status = .{
+            .valid_header = true,
+            .has_data = has_data,
+            .has_undo = false,
+            .failed_valid = true,
+            .failed_child = false,
+            ._padding = 0,
+        },
+        .chain_work = work,
+        .sequence_id = cm.nextSequenceId(),
+        .parent = parent,
+        .file_number = 0,
+        .file_offset = 0,
+    };
+    cm.addBlock(entry) catch |err| {
+        allocator.destroy(entry);
+        return err;
+    };
+}
+
 /// Pattern Y side-branch arm of submitBlockWithIndex.
 ///
 /// Called when `block.prev != chain_state.best_hash` BUT the parent is in
@@ -1582,44 +1683,10 @@ pub fn processSideBranchSubmission(
     peer.addChainWorkBE(&new_work, &this_work);
 
     // Persist the raw block body to CF_BLOCKS so a future reorg-connect
-    // can replay this block from disk. Same path as the active-tip arm
-    // (queueBlockWrite + flush). Failure here is non-fatal at the
+    // can replay this block from disk. Failure here is non-fatal at the
     // body-write level; we still register the index entry so a later
     // resubmission can fill in the gap.
-    var body_persisted = false;
-    {
-        var writer = serialize.Writer.init(chain_state.allocator);
-        const queued = blk: {
-            serialize.writeBlock(&writer, block) catch {
-                writer.deinit();
-                break :blk false;
-            };
-            const owned_const = writer.toOwnedSlice() catch {
-                writer.deinit();
-                break :blk false;
-            };
-            const owned: []u8 = @constCast(owned_const);
-            chain_state.queueBlockWrite(block_hash, owned, height) catch {
-                chain_state.allocator.free(owned);
-                break :blk false;
-            };
-            break :blk true;
-        };
-        if (queued) {
-            chain_state.flush() catch |err| {
-                std.debug.print(
-                    "submitblock side-branch: body flush failed at h={d}: {}\n",
-                    .{ height, err },
-                );
-            };
-            body_persisted = true;
-        } else {
-            std.debug.print(
-                "submitblock side-branch: queueBlockWrite skipped at h={d}\n",
-                .{height},
-            );
-        }
-    }
+    const body_persisted = persistSubmittedBody(block, block_hash, height, chain_state);
 
     // Register the side-branch entry in the chain_manager block_index
     // BEFORE deciding reorg vs. inconclusive: we want the entry to exist
@@ -2931,7 +2998,7 @@ test "isFinalTx with locktime 0 is always final" {
     };
     const output = types.TxOut{
         .value = 100000,
-        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20,
     };
 
     const tx = types.Transaction{
@@ -2956,7 +3023,7 @@ test "isFinalTx with height-based locktime" {
     };
     const output = types.TxOut{
         .value = 100000,
-        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20,
     };
 
     // Locktime = 100000 (height-based, < LOCKTIME_THRESHOLD)
@@ -2989,7 +3056,7 @@ test "isFinalTx with time-based locktime" {
     };
     const output = types.TxOut{
         .value = 100000,
-        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20,
     };
 
     // Locktime = 1600000000 (time-based, >= LOCKTIME_THRESHOLD = 500000000)
@@ -3019,7 +3086,7 @@ test "isFinalTx with all SEQUENCE_FINAL inputs" {
     };
     const output = types.TxOut{
         .value = 100000,
-        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20,
     };
 
     // Locktime = 100000 (not yet reached)
@@ -3051,7 +3118,7 @@ test "isFinalTx with mixed sequences" {
     };
     const output = types.TxOut{
         .value = 100000,
-        .script_pubkey = &[_]u8{0x00, 0x14} ++ [_]u8{0xAA} ** 20,
+        .script_pubkey = &[_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20,
     };
 
     // Locktime = 100000 (not yet reached)
