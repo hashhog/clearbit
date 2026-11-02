@@ -1323,3 +1323,128 @@ test "gbt-segwit-fields: getblocktemplate emits rules and default_witness_commit
     defer allocator.free(expect_hex);
     try testing.expectEqualStrings(expect_hex, dwc);
 }
+
+test "gbt-core-fields: getblocktemplate emits the Core limits, per-tx hash/depends/sigops and MTP+1 mintime" {
+    const allocator = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cs = storage.ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+    cs.best_height = 200;
+    var pool = mempool_mod.Mempool.init(&cs, &consensus.REGTEST, allocator);
+    defer pool.deinit();
+
+    var wsh: [34]u8 = undefined;
+    wsh[0] = 0x00;
+    wsh[1] = 0x20;
+    std.crypto.hash.sha2.Sha256.hash(&[_]u8{0x51}, wsh[2..34], .{});
+    const op_true_item = [_]u8{0x51};
+    const witness = [_][]const u8{&op_true_item};
+    const s = types.OutPoint{ .hash = [_]u8{0xA5} ** 32, .index = 0 };
+    try cs.utxo_set.add(&s, &types.TxOut{ .value = 100_000, .script_pubkey = &wsh }, 0, false);
+
+    const spend = struct {
+        fn f(a: std.mem.Allocator, prev: types.OutPoint, value: i64, spk: []const u8, wit: []const []const u8) !types.Transaction {
+            const ins = try a.alloc(types.TxIn, 1);
+            ins[0] = .{ .previous_output = prev, .script_sig = &[_]u8{}, .sequence = 0xFFFF_FFFF, .witness = wit };
+            const outs = try a.alloc(types.TxOut, 1);
+            outs[0] = .{ .value = value, .script_pubkey = try a.dupe(u8, spk) };
+            return .{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+        }
+    }.f;
+
+    const tx_p = try spend(arena, s, 99_000, &wsh, &witness);
+    const p_id = try crypto.computeTxid(&tx_p, arena);
+    try pool.addTransaction(tx_p);
+    const tx_c = try spend(arena, .{ .hash = p_id, .index = 0 }, 98_000, &wsh, &witness);
+    try pool.addTransaction(tx_c);
+
+    const payout = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xAA} ** 20;
+    var tmpl = try block_template.createBlockTemplate(&cs, &pool, &consensus.REGTEST, .{
+        .payout_script = &payout,
+        .include_witness_commitment = true,
+        .override_bits = consensus.REGTEST.genesis_header.bits,
+    }, allocator);
+    defer tmpl.deinit();
+    try testing.expectEqual(@as(usize, 2), tmpl.transactions.items.len);
+    // Force a known mintime so the test does not depend on a chain MTP.
+    tmpl.min_time = 1_700_000_106;
+
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    try rpc.writeBlockTemplateJson(allocator, buf.writer(), &tmpl, &consensus.REGTEST);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, buf.items, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    // mining.cpp: coinbaseaux {}, vbavailable {}, vbrequired 0, limits.
+    try testing.expectEqual(@as(usize, 0), (obj.get("coinbaseaux") orelse return error.TestMissingCoinbaseaux).object.count());
+    try testing.expectEqual(@as(usize, 0), (obj.get("vbavailable") orelse return error.TestMissingVbavailable).object.count());
+    try testing.expectEqual(@as(i64, 0), (obj.get("vbrequired") orelse return error.TestMissingVbrequired).integer);
+    try testing.expectEqualStrings("00000000ffffffff", (obj.get("noncerange") orelse return error.TestMissingNoncerange).string);
+    try testing.expectEqual(@as(i64, 80000), (obj.get("sigoplimit") orelse return error.TestMissingSigoplimit).integer);
+    try testing.expectEqual(@as(i64, 4000000), (obj.get("sizelimit") orelse return error.TestMissingSizelimit).integer);
+    try testing.expectEqual(@as(i64, 4000000), (obj.get("weightlimit") orelse return error.TestMissingWeightlimit).integer);
+    try testing.expectEqual(@as(i64, 1_700_000_106), obj.get("mintime").?.integer);
+
+    const txs = obj.get("transactions").?.array.items;
+    try testing.expectEqual(@as(usize, 2), txs.len);
+    for (txs) |t| {
+        const o = t.object;
+        try testing.expect(o.get("hash") != null);
+        try testing.expect(o.get("depends") != null);
+        try testing.expect(o.get("sigops") != null);
+    }
+    // hash is the wtxid; the witness makes it differ from the txid.
+    const w0 = try crypto.computeWtxid(&tx_p, arena);
+    const want_hash = try std.fmt.allocPrint(arena, "{}", .{std.fmt.fmtSliceHexLower(&reverseHash(w0))});
+    try testing.expectEqualStrings(want_hash, txs[0].object.get("hash").?.string);
+    // parent has no deps; child depends on template position 1 (1-based).
+    try testing.expectEqual(@as(usize, 0), txs[0].object.get("depends").?.array.items.len);
+    const d1 = txs[1].object.get("depends").?.array.items;
+    try testing.expectEqual(@as(usize, 1), d1.len);
+    try testing.expectEqual(@as(i64, 1), d1[0].integer);
+}
+
+fn reverseHash(h: types.Hash256) types.Hash256 {
+    var out: types.Hash256 = undefined;
+    for (0..32) |i| out[i] = h[31 - i];
+    return out;
+}
+
+test "gbt-core-fields: per-tx sigops is Core's GetTransactionSigOpCost (a P2WPKH spend costs 1, a P2PKH output costs 4)" {
+    const allocator = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cs = storage.ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+
+    const p2wpkh = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xCC} ** 20;
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xDD} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const s = types.OutPoint{ .hash = [_]u8{0xB6} ** 32, .index = 0 };
+    try cs.utxo_set.add(&s, &types.TxOut{ .value = 100_000, .script_pubkey = &p2wpkh }, 0, false);
+
+    const sig = [_]u8{0x30} ** 71;
+    const pub_key = [_]u8{0x02} ** 33;
+    const wit = try arena.dupe([]const u8, &[_][]const u8{ &sig, &pub_key });
+    const ins = try arena.alloc(types.TxIn, 1);
+    ins[0] = .{ .previous_output = s, .script_sig = &[_]u8{}, .sequence = 0xFFFF_FFFF, .witness = wit };
+    const outs = try arena.alloc(types.TxOut, 1);
+    outs[0] = .{ .value = 90_000, .script_pubkey = &p2pkh };
+    const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+
+    var selected = [_]block_template.BlockTemplate.SelectedTx{.{
+        .tx = tx,
+        .txid = try crypto.computeTxid(&tx, arena),
+        .weight = 400,
+        .fee = 10_000,
+        .sigops = 4,
+    }};
+    block_template.fillExactSigopCosts(&cs, &selected, 200, &consensus.REGTEST, allocator);
+    // 1 legacy sigop in the P2PKH output (x4) + 1 witness-v0 P2WPKH sigop.
+    try testing.expectEqual(@as(?usize, 5), selected[0].sigop_cost);
+}
