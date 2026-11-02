@@ -23,6 +23,10 @@ test "wallet-history: wallet spend committed before its block is a send, not a r
     const ki = try w.generateKey();
     const own_spk = try w.getScriptPubKey(ki, .p2wpkh);
     defer allocator.free(own_spk);
+    // The change output pays a key from the internal chain.
+    const change = try w.getnewaddress(.p2wpkh, true);
+    const change_spk = try w.getScriptPubKey(change.key_index, .p2wpkh);
+    defer allocator.free(change_spk);
 
     // A confirmed wallet coin of 50 BTC.
     const funding = types.OutPoint{ .hash = [_]u8{0xA1} ** 32, .index = 0 };
@@ -39,7 +43,7 @@ test "wallet-history: wallet spend committed before its block is a send, not a r
     const inputs = [_]types.TxIn{.{ .previous_output = funding, .script_sig = &.{}, .sequence = 0xffffffff, .witness = &.{} }};
     const outputs = [_]types.TxOut{
         .{ .value = 1_000_000_000, .script_pubkey = &foreign_spk },
-        .{ .value = 3_999_900_000, .script_pubkey = own_spk },
+        .{ .value = 3_999_900_000, .script_pubkey = change_spk },
     };
     const tx = types.Transaction{ .version = 2, .inputs = &inputs, .outputs = &outputs, .lock_time = 0 };
 
@@ -59,18 +63,12 @@ test "wallet-history: wallet spend committed before its block is a send, not a r
     try std.testing.expect(rec.is_from_me);
     try std.testing.expectEqual(@as(i64, 5_000_000_000), rec.debit);
     try std.testing.expectEqual(@as(i64, 100_000), rec.fee);
-    var sends: usize = 0;
-    var receives: usize = 0;
-    for (rec.details.items) |d| {
-        if (d.category == .send) {
-            sends += 1;
-            try std.testing.expectEqual(@as(u32, 0), d.vout);
-            try std.testing.expectEqual(@as(i64, 1_000_000_000), d.amount);
-        } else if (d.category == .receive) {
-            receives += 1;
-            try std.testing.expectEqual(@as(u32, 1), d.vout);
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 1), sends);
-    try std.testing.expectEqual(@as(usize, 1), receives);
+    // Core CachedTxGetAmounts (include_change=false): the foreign output is
+    // the one "send"; the change output gets no detail line.
+    try std.testing.expectEqual(@as(usize, 1), rec.details.items.len);
+    try std.testing.expect(rec.details.items[0].category == .send);
+    try std.testing.expectEqual(@as(u32, 0), rec.details.items[0].vout);
+    try std.testing.expectEqual(@as(i64, 1_000_000_000), rec.details.items[0].amount);
+    // The change is still the wallet's coin.
+    try std.testing.expectEqual(@as(i64, 3_999_900_000), rec.net_credit);
 }

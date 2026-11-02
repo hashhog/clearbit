@@ -617,6 +617,9 @@ pub const KeyPair = struct {
     // silently succeeding (as the old XOR path did).
     encryption_nonce: ?[12]u8 = null,
     encryption_tag: ?[16]u8 = null,
+    /// Derived on the internal (change) chain. Core's OutputIsChange: a wallet
+    /// output to such a key is change, left out of a from-me tx's details.
+    is_change: bool = false,
 };
 
 // ============================================================================
@@ -1921,6 +1924,7 @@ pub const Wallet = struct {
         if (self.master_key == null) {
             // Non-HD wallet: fall back to random key generation
             const key_index = try self.generateKey();
+            if (is_change) self.keys.items[key_index].is_change = true;
             const addr = try self.getAddress(key_index, addr_type);
             return .{ .address = addr, .key_index = key_index };
         }
@@ -1965,6 +1969,7 @@ pub const Wallet = struct {
 
         // Import the derived key
         const key_index = try self.importKey(derived.key);
+        if (is_change) self.keys.items[key_index].is_change = true;
 
         // Get the address
         const addr = try self.getAddress(key_index, addr_type);
@@ -3655,6 +3660,22 @@ pub const Wallet = struct {
                     match_addr_type = scriptToAddressType(out.script_pubkey) orelse .p2wpkh;
                 }
 
+                // Core CachedTxGetAmounts (include_change=false): a from-me tx
+                // lists every non-change output as "send", and one that pays
+                // the wallet also as "receive". Change is credited to the
+                // ledger but gets no detail line at all.
+                const is_change_out = matched and !match_watchonly and
+                    self.keys.items[match_key_index].is_change;
+                if (is_from_me and !is_change_out) {
+                    const dst_addr = scriptToAddress(out.script_pubkey, self.network, self.allocator) catch null;
+                    try details.append(.{
+                        .address = dst_addr,
+                        .category = .send,
+                        .amount = out.value,
+                        .vout = @intCast(vout),
+                    });
+                }
+
                 if (matched) {
                     // CREDIT: a wallet-paying output. Record the credit detail
                     // (receive / generate / immature) and add the coin to the
@@ -3662,34 +3683,41 @@ pub const Wallet = struct {
                     // net_credit so a touching tx is recorded in history, but
                     // they are flagged so spend/balance accounting excludes them.
                     net_credit += out.value;
-                    const recv_addr = if (match_watchonly) blk: {
-                        // Use the imported script's recorded address (if any).
-                        if (self.watchedScriptForSpk(out.script_pubkey)) |s| {
-                            if (s.address.len > 0) break :blk self.allocator.dupe(u8, s.address) catch null;
-                        }
-                        break :blk scriptToAddress(out.script_pubkey, self.network, self.allocator) catch null;
-                    } else self.getAddress(match_key_index, match_addr_type) catch null;
                     const depth = if (self.tip_height >= height) self.tip_height - height else 0;
-                    const cat: WalletTxCategory = if (is_cb)
-                        (if (depth >= consensus.COINBASE_MATURITY) .generate else .immature)
-                    else
-                        .receive;
-                    try details.append(.{
-                        .address = recv_addr,
-                        .category = cat,
-                        .amount = out.value,
-                        .vout = @intCast(vout),
-                    });
+                    if (!(is_from_me and is_change_out)) {
+                        const recv_addr = if (match_watchonly) blk: {
+                            // Use the imported script's recorded address (if any).
+                            if (self.watchedScriptForSpk(out.script_pubkey)) |s| {
+                                if (s.address.len > 0) break :blk self.allocator.dupe(u8, s.address) catch null;
+                            }
+                            break :blk scriptToAddress(out.script_pubkey, self.network, self.allocator) catch null;
+                        } else self.getAddress(match_key_index, match_addr_type) catch null;
+                        const cat: WalletTxCategory = if (is_cb)
+                            (if (depth >= consensus.COINBASE_MATURITY) .generate else .immature)
+                        else
+                            .receive;
+                        try details.append(.{
+                            .address = recv_addr,
+                            .category = cat,
+                            .amount = out.value,
+                            .vout = @intCast(vout),
+                        });
+                    }
 
                     const outpoint = types.OutPoint{ .hash = txid, .index = @intCast(vout) };
 
-                    // Idempotent ledger add: skip if we already track it.
+                    // Idempotent ledger add: skip if we already track it. A
+                    // coin commitWalletSend added at send time (stamped with
+                    // the pre-block tip) is confirmed by THIS block, so its
+                    // height becomes this block's.
                     var already = false;
-                    for (self.utxos.items) |u| {
+                    for (self.utxos.items) |*u| {
                         if (std.mem.eql(u8, &u.outpoint.hash, &outpoint.hash) and
                             u.outpoint.index == outpoint.index)
                         {
                             already = true;
+                            u.height = height;
+                            u.confirmations = depth + 1;
                             break;
                         }
                     }
@@ -3710,19 +3738,6 @@ pub const Wallet = struct {
                             .is_watchonly = match_watchonly,
                         });
                     }
-                } else if (is_from_me) {
-                    // SEND: a foreign output of a tx we funded. Core lists this
-                    // as a "send" entry with the output value (rendered negative
-                    // at the RPC). Wallet-paying outputs are change and are NOT
-                    // listed as send (Core default include_change=false — they
-                    // are handled by the credit branch above).
-                    const dst_addr = scriptToAddress(out.script_pubkey, self.network, self.allocator) catch null;
-                    try details.append(.{
-                        .address = dst_addr,
-                        .category = .send,
-                        .amount = out.value,
-                        .vout = @intCast(vout),
-                    });
                 }
             }
 
@@ -5888,6 +5903,7 @@ pub const WalletManager = struct {
                 try json.appendSlice(n_hex);
                 try json.append('"');
             }
+            if (keypair.is_change) try json.appendSlice(",\"change\":true");
             if (keypair.encryption_tag) |tag| {
                 try json.appendSlice(",\"tag\":\"");
                 var tag_hex: [32]u8 = undefined;
@@ -6139,6 +6155,7 @@ pub const WalletManager = struct {
                     .x_only_pubkey = x_only,
                     .encryption_nonce = enc_nonce,
                     .encryption_tag = enc_tag,
+                    .is_change = if (kobj.get("change")) |c| c == .bool and c.bool else false,
                 });
             }
         }

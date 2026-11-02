@@ -10467,6 +10467,12 @@ pub const RpcServer = struct {
 
         if (result.accepted) {
             fatal.clearSystemFault();
+            // Wallet ledger: a submitted block that became the tip must be
+            // scanned like a generated or peer-relayed one (Core's
+            // CWallet::blockConnected runs for every connected block), or
+            // getbalance / listunspent / sendtoaddress never see its coins.
+            // A side-branch block that did not take the tip is not connected.
+            self.scanSubmittedTipBlock(&block_data, &block_hash);
             // null = success per BIP-22
             return self.jsonRpcResult("null", id);
         } else {
@@ -11382,6 +11388,17 @@ pub const RpcServer = struct {
         try writer.writeByte(']');
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    /// Scan a block accepted by submitblock into the wallets when it is now the
+    /// active tip. Best-effort like scanMinedBlocksIntoWallets.
+    fn scanSubmittedTipBlock(self: *RpcServer, block: *const types.Block, block_hash: *const types.Hash256) void {
+        if (!std.mem.eql(u8, &self.chain_state.best_hash, block_hash)) return;
+        var w = serialize.Writer.init(self.allocator);
+        defer w.deinit();
+        serialize.writeBlock(&w, block) catch return;
+        const raw = [_][]const u8{w.list.items};
+        self.scanMinedBlocksIntoWallets(&raw, self.chain_state.best_height -| 1);
     }
 
     /// Scan a set of freshly mined+connected blocks (in connect order) into
