@@ -10409,6 +10409,11 @@ pub const RpcServer = struct {
             return self.submitBlockSystemFault(&block_hash, sys_err, id);
         }
         if (check.reject) |bip22_str| {
+            if (check.connect_failed) {
+                block_template.recordFailedTipBlock(&block_data, &block_hash, submit_height, self.chain_state, self.chain_manager, self.allocator) catch |err| {
+                    std.debug.print("RPC: submitblock: could not record the failed block: {}\n", .{err});
+                };
+            }
             // Return BIP-22 string result (not a JSON-RPC error) for consensus
             // rejections.  Per BIP-22 and Bitcoin Core BIP22ValidationResult()
             // in src/rpc/mining.cpp, the caller-visible result field carries the
@@ -10850,6 +10855,12 @@ pub const RpcServer = struct {
     pub const SubmitCheck = struct {
         reject: ?[]const u8 = null,
         system_fault: ?anyerror = null,
+        /// The block extends the active tip, passes CheckBlock and
+        /// ContextualCheckBlock, and failed a ConnectBlock-stage check
+        /// (inputs, amounts, BIP-30, sequence locks, sigops cost, scripts).
+        /// Core stores such a block and InvalidBlockFound marks it
+        /// BLOCK_FAILED_VALID; see handleSubmitBlock.
+        connect_failed: bool = false,
     };
 
     fn validateSubmitBlockChecked(
@@ -10965,6 +10976,26 @@ pub const RpcServer = struct {
         // Wall-clock at validation time (time-too-new gate) — matches peer.zig:8364.
         const current_time_val: i64 = std.time.timestamp();
 
+        const opts: validation.AcceptBlockOptions = .{
+            .prev_mtp = prev_mtp_val,
+            .prev_block_timestamp = prev_block_ts,
+            .current_time = current_time_val,
+            .force_skip_scripts = false,
+            .expected_bits = expected_bits_val,
+            .getMtpAtHeightFn = peer_mod.PeerManager.MtpSink.trampoline,
+            .getMtpAtHeightCtx = @ptrCast(&mtp_sink),
+            .getBlockHashByHeightFn = peer_mod.PeerManager.getBlockHashByHeightTrampoline,
+            .getBlockHashByHeightCtx = @ptrCast(self.peer_manager),
+            .is_requested = true,
+            // A block that does not extend the active tip gets Core's
+            // AcceptBlock checks only (CheckBlock + ContextualCheckBlock);
+            // its ConnectBlock runs in reorgToChain against the coin set
+            // at its own parent.  Validating it here against the ACTIVE
+            // chain's coin set rejected valid side-branch blocks
+            // (2026-10-01 reorg probe: 179B bad-txns-inputs-missingorspent
+            // -- it spent a coin created on branch B, absent from branch A).
+            .context_only = !std.mem.eql(u8, &block.header.prev_block, &self.chain_state.best_hash),
+        };
         const accept_res = validation.acceptBlock(
             block,
             block_hash,
@@ -10973,26 +11004,7 @@ pub const RpcServer = struct {
             @ptrCast(&adapter),
             Adapter.lookup,
             self.allocator,
-            .{
-                .prev_mtp = prev_mtp_val,
-                .prev_block_timestamp = prev_block_ts,
-                .current_time = current_time_val,
-                .force_skip_scripts = false,
-                .expected_bits = expected_bits_val,
-                .getMtpAtHeightFn = peer_mod.PeerManager.MtpSink.trampoline,
-                .getMtpAtHeightCtx = @ptrCast(&mtp_sink),
-                .getBlockHashByHeightFn = peer_mod.PeerManager.getBlockHashByHeightTrampoline,
-                .getBlockHashByHeightCtx = @ptrCast(self.peer_manager),
-                .is_requested = true,
-                // A block that does not extend the active tip gets Core's
-                // AcceptBlock checks only (CheckBlock + ContextualCheckBlock);
-                // its ConnectBlock runs in reorgToChain against the coin set
-                // at its own parent.  Validating it here against the ACTIVE
-                // chain's coin set rejected valid side-branch blocks
-                // (2026-10-01 reorg probe: 179B bad-txns-inputs-missingorspent
-                // -- it spent a coin created on branch B, absent from branch A).
-                .context_only = !std.mem.eql(u8, &block.header.prev_block, &self.chain_state.best_hash),
-            },
+            opts,
         );
         // Gate 6: a coin / ancestor read failure voids whatever acceptBlock
         // concluded (a coin it could not read looked missing; a window it
@@ -11007,7 +11019,26 @@ pub const RpcServer = struct {
                 "RPC: REJECT submitblock height={d} validation={} bip22={s}\n",
                 .{ height, err, bip22 },
             );
-            return .{ .reject = bip22 };
+            // Which stage failed?  The checks up to and including
+            // ContextualCheckBlock are the context_only run; when that run
+            // passes, the failure came from the ConnectBlock stage.  Core
+            // indexes only blocks that pass CheckBlock and
+            // AcceptBlockHeader, and InvalidBlockFound skips BLOCK_MUTATED
+            // (validation.cpp ProcessNewBlock / AcceptBlock /
+            // InvalidBlockFound), so only a ConnectBlock-stage failure is
+            // reported for marking.  A ContextualCheckBlock failure that
+            // Core would also mark stays unmarked here.
+            var connect_failed = false;
+            if (!opts.context_only) {
+                var ctx_opts = opts;
+                ctx_opts.context_only = true;
+                if (validation.acceptBlock(block, block_hash, height, self.network_params, @ptrCast(&adapter), Adapter.lookup, self.allocator, ctx_opts)) |_| {
+                    connect_failed = true;
+                } else |_| {}
+                if (adapter.read_err) |e| return .{ .system_fault = e };
+                if (mtp_sink.err) |e| return .{ .system_fault = e };
+            }
+            return .{ .reject = bip22, .connect_failed = connect_failed };
         };
         return .{};
     }

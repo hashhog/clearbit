@@ -495,6 +495,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_chain_tips_tests.step);
     }
 
+    // submitblock of a tip child that fails ConnectBlock: indexed as failed
+    // (getchaintips "invalid").  Own root and name filter, same layout as
+    // test-chain-tips.
+    {
+        const failed_tip_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_submitblock_failed_tip.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"submitblock_failed_tip"},
+        });
+        failed_tip_tests.linkSystemLibrary("rocksdb");
+        failed_tip_tests.linkSystemLibrary("secp256k1");
+        failed_tip_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        failed_tip_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            failed_tip_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            failed_tip_tests.linkSystemLibrary("minisketch");
+            failed_tip_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        failed_tip_tests.root_module.addOptions("build_options", build_options);
+
+        const run_failed_tip_tests = b.addRunArtifact(failed_tip_tests);
+        const failed_tip_step = b.step(
+            "test-submitblock-failed-tip",
+            "Run submitblock failed-tip-child (getchaintips invalid) tests",
+        );
+        failed_tip_step.dependOn(&run_failed_tip_tests.step);
+        test_step.dependOn(&run_failed_tip_tests.step);
+    }
+
     // Advertised P2P service-flag tests (Peer.localServices()).
     // Dedicated test root so it can import peer.zig and EXECUTE the real
     // localServices() without dragging in the pre-existing (drifted)
