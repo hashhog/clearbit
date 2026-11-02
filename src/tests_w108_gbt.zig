@@ -1413,3 +1413,38 @@ fn reverseHash(h: types.Hash256) types.Hash256 {
     for (0..32) |i| out[i] = h[31 - i];
     return out;
 }
+
+test "gbt-core-fields: per-tx sigops is Core's GetTransactionSigOpCost (a P2WPKH spend costs 1, a P2PKH output costs 4)" {
+    const allocator = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cs = storage.ChainState.init(null, 64, allocator);
+    defer cs.deinit();
+
+    const p2wpkh = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xCC} ** 20;
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0xDD} ** 20 ++ [_]u8{ 0x88, 0xac };
+    const s = types.OutPoint{ .hash = [_]u8{0xB6} ** 32, .index = 0 };
+    try cs.utxo_set.add(&s, &types.TxOut{ .value = 100_000, .script_pubkey = &p2wpkh }, 0, false);
+
+    const sig = [_]u8{0x30} ** 71;
+    const pub_key = [_]u8{0x02} ** 33;
+    const wit = try arena.dupe([]const u8, &[_][]const u8{ &sig, &pub_key });
+    const ins = try arena.alloc(types.TxIn, 1);
+    ins[0] = .{ .previous_output = s, .script_sig = &[_]u8{}, .sequence = 0xFFFF_FFFF, .witness = wit };
+    const outs = try arena.alloc(types.TxOut, 1);
+    outs[0] = .{ .value = 90_000, .script_pubkey = &p2pkh };
+    const tx = types.Transaction{ .version = 2, .inputs = ins, .outputs = outs, .lock_time = 0 };
+
+    var selected = [_]block_template.BlockTemplate.SelectedTx{.{
+        .tx = tx,
+        .txid = try crypto.computeTxid(&tx, arena),
+        .weight = 400,
+        .fee = 10_000,
+        .sigops = 4,
+    }};
+    block_template.fillExactSigopCosts(&cs, &selected, 200, &consensus.REGTEST, allocator);
+    // 1 legacy sigop in the P2PKH output (x4) + 1 witness-v0 P2WPKH sigop.
+    try testing.expectEqual(@as(?usize, 5), selected[0].sigop_cost);
+}

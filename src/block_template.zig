@@ -59,6 +59,9 @@ pub const BlockTemplate = struct {
         weight: usize,
         fee: i64,
         sigops: usize,
+        /// Exact GetTransactionSigOpCost (legacy + P2SH + witness) for the
+        /// getblocktemplate "sigops" field; null when prevouts are unresolved.
+        sigop_cost: ?usize = null,
     };
 
     /// Coinbase transaction with mutable fields.
@@ -496,6 +499,8 @@ pub fn createBlockTemplate(
         }
     }
 
+    fillExactSigopCosts(chain_state, selected.items, height, params, allocator);
+
     // 4. Extract transactions for witness commitment computation
     var txs_for_witness = try allocator.alloc(types.Transaction, selected.items.len);
     defer allocator.free(txs_for_witness);
@@ -837,6 +842,58 @@ pub fn encodeHeightPush(script: *std.ArrayList(u8), height: u32) !void {
             try script.append(@as(u8, @intCast(h & 0xFF)));
             h >>= 8;
         }
+    }
+}
+
+const SigopCostCtx = struct {
+    chain_state: *storage.ChainState,
+    selected: []const BlockTemplate.SelectedTx,
+    index: *const std.AutoHashMap(types.Hash256, usize),
+    allocator: std.mem.Allocator,
+
+    fn lookup(ctx_ptr: *anyopaque, outpoint: *const types.OutPoint) ?validation.SigopUtxoEntry {
+        const self: *SigopCostCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (self.index.get(outpoint.hash)) |i| {
+            const outs = self.selected[i].tx.outputs;
+            if (outpoint.index >= outs.len) return null;
+            return .{ .script_pubkey = outs[outpoint.index].script_pubkey, .amount = outs[outpoint.index].value };
+        }
+        var coin = (self.chain_state.utxo_set.get(outpoint) catch return null) orelse return null;
+        defer coin.deinit(self.chain_state.utxo_set.allocator);
+        const spk = coin.reconstructScript(self.allocator) catch return null;
+        return .{ .script_pubkey = spk, .amount = coin.value };
+    }
+};
+
+/// Set `sigop_cost` on every selected transaction to Core's
+/// GetTransactionSigOpCost, which getblocktemplate reports per transaction.
+/// Selection keeps using `estimateSigops` (a lower bound); this only fills
+/// the reported figure.  Scripts rebuilt from the UTXO set are allocated in
+/// an arena that is freed here, so only the numbers survive.
+pub fn fillExactSigopCosts(
+    chain_state: *storage.ChainState,
+    selected: []BlockTemplate.SelectedTx,
+    height: u32,
+    params: *const consensus.NetworkParams,
+    allocator: std.mem.Allocator,
+) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var index = std.AutoHashMap(types.Hash256, usize).init(arena.allocator());
+    for (selected, 0..) |stx, i| index.put(stx.txid, i) catch return;
+
+    chain_state.connect_mutex.lock();
+    defer chain_state.connect_mutex.unlock();
+    var ctx = SigopCostCtx{
+        .chain_state = chain_state,
+        .selected = selected,
+        .index = &index,
+        .allocator = arena.allocator(),
+    };
+    const view = validation.SigopUtxoView{ .context = @ptrCast(&ctx), .lookupFn = SigopCostCtx.lookup };
+    const flags = validation.getBlockScriptFlags(height, params);
+    for (selected) |*stx| {
+        stx.sigop_cost = @intCast(validation.getTransactionSigOpCost(&stx.tx, &view, flags));
     }
 }
 

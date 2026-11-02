@@ -1512,7 +1512,7 @@ pub fn writeBlockTemplateJson(
         }
         try writer.print("],\"fee\":{d},\"sigops\":{d},\"weight\":{d}}}", .{
             tx.fee,
-            tx.sigops,
+            tx.sigop_cost orelse tx.sigops,
             tx.weight,
         });
         try tx_pos.put(tx.txid, i + 1);
