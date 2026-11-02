@@ -3901,4 +3901,33 @@ pub fn build(b: *std.Build) void {
         const fuzz_decode_step = b.step("fuzz-decode", "Run the P2P decodePayload smoke-fuzzer (args: [iterations] [seed])");
         fuzz_decode_step.dependOn(&run_fuzz_decode.step);
     }
+
+    // submitblock scans a block that became the tip into the wallets.
+    {
+        const sw_tests = b.addTest(.{
+            .root_source_file = b.path("tests_submitblock_wallet.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"submitblock-wallet"},
+        });
+        sw_tests.linkSystemLibrary("rocksdb");
+        sw_tests.linkSystemLibrary("secp256k1");
+        sw_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        sw_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            sw_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            sw_tests.linkSystemLibrary("minisketch");
+            sw_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        sw_tests.root_module.addOptions("build_options", build_options);
+
+        const run_sw_tests = b.addRunArtifact(sw_tests);
+        const sw_step = b.step("test-submitblock-wallet", "Run submitblock wallet-scan tests");
+        sw_step.dependOn(&run_sw_tests.step);
+    }
 }
