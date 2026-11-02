@@ -621,6 +621,10 @@ pub fn createBlockTemplate(
         .height = height,
         .target = target,
         .mutable = mutable,
+        .min_time = blk: {
+            const m = chain_state.tipMtp();
+            break :blk if (m != 0) m + 1 else 0;
+        },
         .allocator = allocator,
     };
 }

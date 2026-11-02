@@ -1477,6 +1477,12 @@ pub fn writeBlockTemplateJson(
     try writeHashHex(writer, &template.header.prev_block);
     try writer.print("\",\"transactions\":[", .{});
 
+    // Core mining.cpp: "depends" holds the 1-based template positions of
+    // earlier template transactions whose outputs this one spends (the
+    // coinbase is position 0), one entry per matching input in input order.
+    var tx_pos = std.AutoHashMap(types.Hash256, usize).init(allocator);
+    defer tx_pos.deinit();
+
     for (template.transactions.items, 0..) |tx, i| {
         if (i > 0) try writer.writeByte(',');
 
@@ -1492,10 +1498,24 @@ pub fn writeBlockTemplateJson(
         }
         try writer.print("\",\"txid\":\"", .{});
         try writeHashHex(writer, &tx.txid);
-        try writer.print("\",\"fee\":{d},\"weight\":{d}}}", .{
+        try writer.print("\",\"hash\":\"", .{});
+        const wtxid = crypto.computeWtxid(&tx.tx, allocator) catch tx.txid;
+        try writeHashHex(writer, &wtxid);
+        try writer.writeAll("\",\"depends\":[");
+        var first_dep = true;
+        for (tx.tx.inputs) |in| {
+            if (tx_pos.get(in.previous_output.hash)) |pos| {
+                if (!first_dep) try writer.writeByte(',');
+                first_dep = false;
+                try writer.print("{d}", .{pos});
+            }
+        }
+        try writer.print("],\"fee\":{d},\"sigops\":{d},\"weight\":{d}}}", .{
             tx.fee,
+            tx.sigops,
             tx.weight,
         });
+        try tx_pos.put(tx.txid, i + 1);
     }
 
     try writer.print("],\"coinbasevalue\":{d},\"target\":\"", .{
@@ -1507,11 +1527,17 @@ pub fn writeBlockTemplateJson(
         try writer.print("{x:0>2}", .{template.target[31 - i]});
     }
 
-    try writer.print("\",\"mintime\":{d},\"curtime\":{d},\"bits\":\"{x:0>8}\",\"height\":{d},\"mutable\":[\"time\",\"transactions\",\"prevblock\"]", .{
-        template.header.timestamp,
+    // Core: coinbaseaux {}, mintime = MTP(prev)+1, noncerange, sigoplimit /
+    // sizelimit / weightlimit, vbavailable {} and vbrequired 0 (no BIP9
+    // deployment is signalling on the networks clearbit serves).
+    try writer.print("\",\"coinbaseaux\":{{}},\"mintime\":{d},\"curtime\":{d},\"bits\":\"{x:0>8}\",\"height\":{d},\"mutable\":[\"time\",\"transactions\",\"prevblock\"],\"noncerange\":\"00000000ffffffff\",\"sigoplimit\":{d},\"sizelimit\":{d},\"weightlimit\":{d},\"vbavailable\":{{}},\"vbrequired\":0", .{
+        if (template.min_time != 0) template.min_time else template.header.timestamp,
         template.header.timestamp,
         template.header.bits,
         template.height,
+        consensus.MAX_BLOCK_SIGOPS_COST,
+        consensus.MAX_BLOCK_WEIGHT,
+        consensus.MAX_BLOCK_WEIGHT,
     });
 
     // Core: HexStr(coinbase.required_outputs[0].scriptPubKey), the
