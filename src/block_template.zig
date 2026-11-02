@@ -45,6 +45,8 @@ pub const BlockTemplate = struct {
     height: u32,
     /// Difficulty target (256-bit, little-endian).
     target: [32]u8,
+    /// getblocktemplate "mintime": MTP(prev)+1 (Core GetMinimumTime); 0 = unknown.
+    min_time: u32 = 0,
     /// Fields the miner can modify: "time", "transactions", "prevblock", "coinbase/append".
     mutable: []const []const u8,
     /// Allocator used for template construction.
