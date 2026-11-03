@@ -28614,7 +28614,7 @@ test "sendrawtransaction rejects odd-length hex string" {
 
     // Should return deserialization error for invalid hex length
     try std.testing.expect(std.mem.indexOf(u8, result, "-22") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Invalid hex length") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "TX decode failed") != null);
 }
 
 test "sendrawtransaction rejects empty hex string" {
