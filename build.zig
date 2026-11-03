@@ -530,6 +530,40 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_failed_tip_tests.step);
     }
 
+    // getchaintips headers-only tips (submitheader / P2P headers, across a
+    // restart).  Own root and name filter, same layout as test-chain-tips.
+    {
+        const headers_only_tips_tests = b.addTest(.{
+            .root_source_file = b.path("src/tests_headers_only_tips.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"headers_only_tips"},
+        });
+        headers_only_tips_tests.linkSystemLibrary("rocksdb");
+        headers_only_tips_tests.linkSystemLibrary("secp256k1");
+        headers_only_tips_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        headers_only_tips_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            headers_only_tips_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            headers_only_tips_tests.linkSystemLibrary("minisketch");
+            headers_only_tips_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        headers_only_tips_tests.root_module.addOptions("build_options", build_options);
+
+        const run_headers_only_tips_tests = b.addRunArtifact(headers_only_tips_tests);
+        const headers_only_tips_step = b.step(
+            "test-headers-only-tips",
+            "Run getchaintips headers-only tip tests",
+        );
+        headers_only_tips_step.dependOn(&run_headers_only_tips_tests.step);
+        test_step.dependOn(&run_headers_only_tips_tests.step);
+    }
+
     // Advertised P2P service-flag tests (Peer.localServices()).
     // Dedicated test root so it can import peer.zig and EXECUTE the real
     // localServices() without dragging in the pre-existing (drifted)
