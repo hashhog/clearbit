@@ -9586,6 +9586,12 @@ pub const RpcServer = struct {
             // (mempool takes ownership on success)
         }
 
+        // Core DecodeHexTx (core_read.cpp) requires the whole buffer be
+        // consumed: trailing bytes are a decode failure (-22).
+        if (reader.pos != raw.len) {
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.", id);
+        }
+
         // Basic validation: tx must have at least one input and output
         if (tx.inputs.len == 0) {
             return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.", id);
@@ -14224,6 +14230,10 @@ pub const RpcServer = struct {
             } else {
                 return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing blockhash", id);
             }
+            // Core getblockheader declares verbose as BOOL: the central type
+            // check (rpc/util.cpp HandleRequest) rejects any other JSON type
+            // with -3 before the handler runs.
+            if (try self.checkArgType(params, 1, "verbose", .bool, true, id)) |resp| return resp;
             if (params.array.items.len > 1) {
                 const v = params.array.items[1];
                 if (v == .bool) verbose = v.bool;
@@ -15675,6 +15685,10 @@ pub const RpcServer = struct {
             const tx = serialize.readTransaction(&reader, self.allocator) catch {
                 return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_fail_msg, id);
             };
+            // DecodeHexTx: trailing bytes after the tx are a decode failure.
+            if (reader.pos != tx_bytes.len) {
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, decode_fail_msg, id);
+            }
             try txns.append(tx);
             try decode_errors.append(null);
         }
