@@ -15286,8 +15286,10 @@ pub const RpcServer = struct {
     /// Core walks its whole block index: every block off the active chain
     /// that is no other such block's parent is a tip, plus the active tip.
     /// clearbit's in-memory index is rebuilt lazily after a restart, so the
-    /// blocks off the active chain come from it AND from the durable
-    /// fork-block set (side-branch submissions and disconnected blocks).
+    /// blocks off the active chain come from it, from the durable
+    /// fork-block set (side-branch submissions and disconnected blocks)
+    /// AND from the durable header-tip set (accepted headers, with or
+    /// without data).
     /// Status follows Core's order: active, invalid (the block or an
     /// ancestor failed; Core marks every descendant BLOCK_FAILED_VALID),
     /// headers-only (data missing for it or an ancestor), valid-fork (it
@@ -15330,6 +15332,32 @@ pub const RpcServer = struct {
                 };
                 gop.value_ptr.has_data = gop.value_ptr.has_data or e.status.has_data;
                 gop.value_ptr.failed = gop.value_ptr.failed or e.status.isInvalid();
+            }
+        }
+        // Accepted headers (submitheader, P2P `headers`): Core's
+        // AcceptBlockHeader adds each to m_block_index, so a header past
+        // the tip or on a side branch is a tip of its own, "headers-only"
+        // until its data arrives.  Each leaf is walked down to the active
+        // chain so branchlen counts the whole branch.
+        const htips = self.chain_state.headerTipList(self.allocator) catch &[_]storage.ChainState.HeaderTipEntry{};
+        defer if (htips.len > 0) self.allocator.free(htips);
+        for (htips) |t| {
+            var hash = t.hash;
+            var link: HeaderLink = .{ .prev = t.tip.prev, .height = t.tip.height };
+            while (!self.isOnActiveChain(&hash, link.height)) {
+                const gop = try off.getOrPut(hash);
+                if (gop.found_existing) break;
+                gop.value_ptr.* = .{
+                    .prev = link.prev,
+                    .height = link.height,
+                    .has_data = false,
+                    .connected = false,
+                    .failed = invalid_set.contains(hash),
+                };
+                if (link.height == 0) break;
+                const parent = self.lookupHeaderLink(&link.prev) orelse break;
+                hash = link.prev;
+                link = parent;
             }
         }
 
@@ -15381,6 +15409,19 @@ pub const RpcServer = struct {
         try writer.writeByte(']');
 
         return self.jsonRpcResult(buf.items, id);
+    }
+
+    const HeaderLink = struct { prev: types.Hash256, height: u32 };
+
+    /// Parent pointer and height of a known header: the in-memory header
+    /// index, then the block index, then CF_BLOCK_INDEX (restart-safe).
+    fn lookupHeaderLink(self: *RpcServer, hash: *const types.Hash256) ?HeaderLink {
+        if (self.peer_manager.header_index.get(hash.*)) |e| return .{ .prev = e.prev_hash, .height = e.height };
+        if (self.chain_manager) |cm| {
+            if (cm.getBlock(hash)) |e| return .{ .prev = e.header.prev_block, .height = e.height };
+        }
+        if (self.chain_state.getPersistedIndexEntry(hash)) |e| return .{ .prev = e.header.prev_block, .height = e.height };
+        return null;
     }
 
     /// True when `hash` is the active-chain block at `height`.

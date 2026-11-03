@@ -6611,6 +6611,12 @@ pub const PeerManager = struct {
         // header_index dropped made the next headers batch undecidable.
         if (self.chain_state) |cs| {
             cs.putPersistedHeader(block_hash, header, height);
+            // getchaintips lists the leaves of this tree, headers-only ones
+            // included, across a restart (Core getchaintips walks
+            // m_block_index, which AcceptBlockHeader extends).
+            cs.noteHeaderTip(block_hash, &header.prev_block, height) catch |err| {
+                std.debug.print("insertHeader: noteHeaderTip failed: {}\n", .{err});
+            };
         }
 
         // Track the highest-chainwork header seen (Core m_best_header,

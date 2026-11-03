@@ -2408,6 +2408,15 @@ pub const ChainState = struct {
     fork_blocks: std.AutoHashMapUnmanaged(types.Hash256, ForkBlock) = .{},
     fork_blocks_loaded: bool = false,
     fork_blocks_mutex: std.Thread.Mutex = .{},
+    /// Leaves of the accepted-header tree (Core: block-index entries with
+    /// no child), whether or not their block data ever arrived.  Every
+    /// header PeerManager.insertHeader admits (submitheader and P2P
+    /// `headers`) replaces its parent here.  Persisted under
+    /// HEADER_TIPS_KEY so getchaintips lists headers-only tips after a
+    /// restart, as Core does from LoadBlockIndex.  Guarded by
+    /// fork_blocks_mutex; loaded lazily on first use.
+    header_tips: std.AutoHashMapUnmanaged(types.Hash256, HeaderTip) = .{},
+    header_tips_loaded: bool = false,
     /// Sticky flag set when a flush() call fails to persist its batch.
     /// connectBlockFast / submitBlock check this on entry and refuse to
     /// connect another block until cleared.  Without this, a transient
@@ -3193,6 +3202,7 @@ pub const ChainState = struct {
     pub fn deinit(self: *ChainState) void {
         self.invalid_blocks.deinit(self.allocator);
         self.fork_blocks.deinit(self.allocator);
+        self.header_tips.deinit(self.allocator);
         self.reorg_kv_undo.deinit(self.allocator);
         // Drain any unflushed block bodies. On a clean shutdown
         // these were committed in the last flush()'s cleanup loop;
@@ -5867,6 +5877,89 @@ pub const ChainState = struct {
         var i: usize = 0;
         while (it.next()) |kv| : (i += 1) out[i] = .{ .hash = kv.key_ptr.*, .block = kv.value_ptr.* };
         return out;
+    }
+
+    /// A leaf of the accepted-header tree (see `header_tips`).
+    pub const HeaderTip = struct { prev: types.Hash256, height: u32 };
+
+    /// CF_DEFAULT key holding the header-tip set: N x 68-byte records
+    /// (hash 32, prev 32, height u32 LE).
+    pub const HEADER_TIPS_KEY = "header_tips";
+    const HEADER_TIP_RECORD_LEN = 68;
+
+    fn loadHeaderTipsLocked(self: *ChainState) !void {
+        if (self.header_tips_loaded) return;
+        if (self.utxo_set.db) |db| {
+            if (try db.get(CF_DEFAULT, HEADER_TIPS_KEY)) |bytes| {
+                defer self.allocator.free(bytes);
+                var off: usize = 0;
+                while (off + HEADER_TIP_RECORD_LEN <= bytes.len) : (off += HEADER_TIP_RECORD_LEN) {
+                    const rec = bytes[off .. off + HEADER_TIP_RECORD_LEN];
+                    var h: types.Hash256 = undefined;
+                    @memcpy(&h, rec[0..32]);
+                    var ht: HeaderTip = .{ .prev = undefined, .height = std.mem.readInt(u32, rec[64..68], .little) };
+                    @memcpy(&ht.prev, rec[32..64]);
+                    try self.header_tips.put(self.allocator, h, ht);
+                }
+            }
+        }
+        self.header_tips_loaded = true;
+    }
+
+    fn storeHeaderTipsLocked(self: *ChainState) !void {
+        const db = self.utxo_set.db orelse return;
+        const buf = try self.allocator.alloc(u8, HEADER_TIP_RECORD_LEN * self.header_tips.count());
+        defer self.allocator.free(buf);
+        var it = self.header_tips.iterator();
+        var off: usize = 0;
+        while (it.next()) |kv| : (off += HEADER_TIP_RECORD_LEN) {
+            const rec = buf[off .. off + HEADER_TIP_RECORD_LEN];
+            @memcpy(rec[0..32], kv.key_ptr);
+            @memcpy(rec[32..64], &kv.value_ptr.prev);
+            std.mem.writeInt(u32, rec[64..68], kv.value_ptr.height, .little);
+        }
+        try db.put(CF_DEFAULT, HEADER_TIPS_KEY, buf);
+    }
+
+    /// Record an accepted header: it becomes a leaf and its parent stops
+    /// being one.  The set stays about one entry per branch, so the
+    /// rewrite per header is small.  Noting a known header again is a
+    /// no-op.  Whether a leaf is on the active chain is decided by the
+    /// reader, as for the fork-block set.
+    pub fn noteHeaderTip(self: *ChainState, hash: *const types.Hash256, prev: *const types.Hash256, height: u32) !void {
+        self.fork_blocks_mutex.lock();
+        defer self.fork_blocks_mutex.unlock();
+        try self.loadHeaderTipsLocked();
+        if (self.header_tips.contains(hash.*)) return;
+        _ = self.header_tips.remove(prev.*);
+        try self.header_tips.put(self.allocator, hash.*, .{ .prev = prev.*, .height = height });
+        try self.storeHeaderTipsLocked();
+    }
+
+    pub const HeaderTipEntry = struct { hash: types.Hash256, tip: HeaderTip };
+
+    /// Snapshot of the header-tip set (caller frees).
+    pub fn headerTipList(self: *ChainState, allocator: std.mem.Allocator) ![]HeaderTipEntry {
+        self.fork_blocks_mutex.lock();
+        defer self.fork_blocks_mutex.unlock();
+        try self.loadHeaderTipsLocked();
+        const out = try allocator.alloc(HeaderTipEntry, self.header_tips.count());
+        var it = self.header_tips.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) out[i] = .{ .hash = kv.key_ptr.*, .tip = kv.value_ptr.* };
+        return out;
+    }
+
+    /// CF_BLOCK_INDEX row (height + header) by hash; null when absent or
+    /// unreadable.
+    pub fn getPersistedIndexEntry(self: *ChainState, hash: *const types.Hash256) ?struct { header: types.BlockHeader, height: u32 } {
+        const db = self.utxo_set.db orelse return null;
+        const bytes = (db.get(CF_BLOCK_INDEX, hash) catch return null) orelse return null;
+        defer self.allocator.free(bytes);
+        var reader = serialize.Reader{ .data = bytes };
+        const height = reader.readInt(u32) catch return null;
+        const header = serialize.readBlockHeader(&reader) catch return null;
+        return .{ .header = header, .height = height };
     }
 
     /// Boot-time chainstate reconciliation (Core DisconnectTip-to-last-valid-coins-tip parity).
