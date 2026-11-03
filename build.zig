@@ -1712,6 +1712,39 @@ pub fn build(b: *std.Build) void {
         // gotcha as test-rpc above.
     }
 
+    // Cast-hazard suite (#81): every RPC integer argument that reaches a
+    // narrowing @intCast must be range-checked first.  Same rig and same
+    // filtering rationale as test-createrawtx above.
+    {
+        const strict_tests = b.addTest(.{
+            .root_source_file = b.path("tests_strict_decode.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_strict_decode"},
+        });
+        strict_tests.linkSystemLibrary("rocksdb");
+        strict_tests.linkSystemLibrary("secp256k1");
+        strict_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        strict_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            strict_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            strict_tests.linkSystemLibrary("minisketch");
+            strict_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        strict_tests.root_module.addOptions("build_options", build_options);
+
+        const run_strict_tests = b.addRunArtifact(strict_tests);
+        const sd_step = b.step("test-strict-decode", "Run strict-input parity tests (getblockheader verbose, trailing tx bytes)");
+        sd_step.dependOn(&run_strict_tests.step);
+        // NOT folded into the default `test` step — same wallet.zig selectCoins
+        // gotcha as test-rpc above.
+    }
+
     // sendrawtransaction error code/message parity (own root, not in `test`).
     {
         const sre_tests = b.addTest(.{
