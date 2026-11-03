@@ -1712,6 +1712,35 @@ pub fn build(b: *std.Build) void {
         // gotcha as test-rpc above.
     }
 
+    // sendrawtransaction error code/message parity (own root, not in `test`).
+    {
+        const sre_tests = b.addTest(.{
+            .root_source_file = b.path("tests_sendraw_errors.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_sendraw_errors"},
+        });
+        sre_tests.linkSystemLibrary("rocksdb");
+        sre_tests.linkSystemLibrary("secp256k1");
+        sre_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        sre_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            sre_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            sre_tests.linkSystemLibrary("minisketch");
+            sre_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        sre_tests.root_module.addOptions("build_options", build_options);
+
+        const run_sre_tests = b.addRunArtifact(sre_tests);
+        const sre_step = b.step("test-sendraw-errors", "Run sendrawtransaction error parity tests");
+        sre_step.dependOn(&run_sre_tests.step);
+    }
+
     // setmocktime suite: regtest-only clock override RPC.
     {
         const mocktime_tests = b.addTest(.{
