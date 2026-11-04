@@ -9546,7 +9546,7 @@ pub const RpcServer = struct {
                 } else if (feerate_param == .string) {
                     // Parse string as float (BTC/kvB)
                     const btc_per_kvb = std.fmt.parseFloat(f64, feerate_param.string) catch {
-                        return self.jsonRpcError(RPC_INVALID_PARAMS, "Invalid maxfeerate", id);
+                        return self.jsonRpcError(RPC_TYPE_ERROR, "Invalid amount", id);
                     };
                     max_feerate = btcFloatToSatsChecked(btc_per_kvb) orelse
                         return self.jsonRpcError(RPC_TYPE_ERROR, "Amount out of range", id);
@@ -9558,7 +9558,7 @@ pub const RpcServer = struct {
 
         // Decode hex to bytes
         if (hex.len % 2 != 0) {
-            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex length", id);
+            return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.", id);
         }
 
         if (hex.len == 0) {
@@ -9572,7 +9572,7 @@ pub const RpcServer = struct {
 
         for (0..raw.len) |i| {
             raw[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
-                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "Invalid hex character", id);
+                return self.jsonRpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.", id);
             };
         }
 
@@ -9615,7 +9615,7 @@ pub const RpcServer = struct {
         // Bitcoin Core checks if any output of this tx exists in the UTXO set
         const is_confirmed = self.isTransactionConfirmed(&txid, &tx);
         if (is_confirmed) {
-            return self.jsonRpcError(RPC_VERIFY_ALREADY_IN_CHAIN, "Transaction already in block chain", id);
+            return self.jsonRpcError(RPC_VERIFY_ALREADY_IN_CHAIN, "Transaction outputs already in utxo set", id);
         }
 
         // Compute transaction weight and vsize for fee rate validation
@@ -9680,7 +9680,7 @@ pub const RpcServer = struct {
                 mempool_mod.MempoolError.InsufficientFee => self.jsonRpcError(RPC_VERIFY_REJECTED, "min relay fee not met", id),
                 mempool_mod.MempoolError.DustOutput => self.jsonRpcError(RPC_VERIFY_REJECTED, "dust output", id),
                 mempool_mod.MempoolError.NonStandard => self.jsonRpcError(RPC_VERIFY_REJECTED, "non-standard transaction", id),
-                mempool_mod.MempoolError.MissingInputs => self.jsonRpcError(RPC_VERIFY_REJECTED, "missing inputs", id),
+                mempool_mod.MempoolError.MissingInputs => self.jsonRpcError(RPC_VERIFY_ERROR, "bad-txns-inputs-missingorspent", id),
                 mempool_mod.MempoolError.TooManyAncestors => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many unconfirmed ancestors", id),
                 mempool_mod.MempoolError.TooManyDescendants => self.jsonRpcError(RPC_VERIFY_REJECTED, "too many unconfirmed descendants", id),
                 mempool_mod.MempoolError.AncestorSizeLimitExceeded => self.jsonRpcError(RPC_VERIFY_REJECTED, "ancestor size limit exceeded", id),
@@ -28628,7 +28628,7 @@ test "sendrawtransaction rejects odd-length hex string" {
 
     // Should return deserialization error for invalid hex length
     try std.testing.expect(std.mem.indexOf(u8, result, "-22") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Invalid hex length") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "TX decode failed") != null);
 }
 
 test "sendrawtransaction rejects empty hex string" {
