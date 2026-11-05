@@ -15757,8 +15757,13 @@ pub const RpcServer = struct {
                         try writer.writeAll(reason);
                         try writer.writeByte('"');
                         // Core adds reject-details (TxValidationState::ToString)
-                        // for every reject except missing-inputs.
-                        if (!std.mem.eql(u8, reason, "missing-inputs")) {
+                        // for every reject except missing-inputs.  ToString is
+                        // "<reason>, <debug message>" when Core attaches a debug
+                        // message (e.g. "..., tried to spend coinbase at depth
+                        // 99").  Only the tokens Core raises WITHOUT a debug
+                        // message are emitted, so details == reason is exact;
+                        // the others stay absent rather than wrong.
+                        if (rejectDetailsEqualReason(reason)) {
                             try writer.writeAll(",\"reject-details\":\"");
                             try writer.writeAll(reason);
                             try writer.writeByte('"');
@@ -24946,6 +24951,27 @@ fn writeBlockStatValue(
 }
 
 /// Write a hash as hex in reverse byte order (big-endian display).
+/// Reject tokens Core's testmempoolaccept reports with reject-details equal to
+/// the reason (validation.cpp raises them with an empty debug message).
+fn rejectDetailsEqualReason(reason: []const u8) bool {
+    const bare = [_][]const u8{
+        "txn-already-in-mempool",
+        "txn-already-known",
+        "txn-same-nonwitness-data-in-mempool",
+        "coinbase",
+        "non-final",
+        "non-BIP68-final",
+        "version",
+        "tx-size",
+        "tx-size-small",
+        "scriptsig-size",
+        "scriptsig-not-pushonly",
+        "dust",
+    };
+    for (bare) |t| if (std.mem.eql(u8, reason, t)) return true;
+    return false;
+}
+
 /// Write a satoshi amount as Core's ValueFromAmount: "<whole>.<8 digits>"
 /// (each placeholder formatted on its own; see the Zig 0.13 note in
 /// handleTestMempoolAccept).
