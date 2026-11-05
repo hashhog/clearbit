@@ -1712,6 +1712,35 @@ pub fn build(b: *std.Build) void {
         // gotcha as test-rpc above.
     }
 
+    // initialblockdownload on regtest follows Core (stale tip => IBD).
+    {
+        const ibd_tests = b.addTest(.{
+            .root_source_file = b.path("tests_ibd_regtest.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_ibd_regtest"},
+        });
+        ibd_tests.linkSystemLibrary("rocksdb");
+        ibd_tests.linkSystemLibrary("secp256k1");
+        ibd_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        ibd_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            ibd_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            ibd_tests.linkSystemLibrary("minisketch");
+            ibd_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        ibd_tests.root_module.addOptions("build_options", build_options);
+
+        const run_ibd_tests = b.addRunArtifact(ibd_tests);
+        const ibd_step = b.step("test-ibd-regtest", "Run regtest initialblockdownload parity tests");
+        ibd_step.dependOn(&run_ibd_tests.step);
+    }
+
     // Cast-hazard suite (#81): every RPC integer argument that reaches a
     // narrowing @intCast must be range-checked first.  Same rig and same
     // filtering rationale as test-createrawtx above.
