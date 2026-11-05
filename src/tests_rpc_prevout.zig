@@ -106,8 +106,12 @@ test "tests_prevout getrawtransaction verbosity 2 has fee and vin prevout" {
 
     const p = try getraw(a, f, 2);
     const res = p.value.object.get("result").?.object;
+    // Explicit presence checks: this builds ReleaseFast, where `.?` on null is
+    // undefined behaviour rather than a test failure.
+    try testing.expect(res.get("fee") != null);
     try testing.expectApproxEqAbs(@as(f64, 0.0001), res.get("fee").?.float, 1e-12);
     const vin0 = res.get("vin").?.array.items[0].object;
+    try testing.expect(vin0.get("prevout") != null);
     const po = vin0.get("prevout").?.object;
     try testing.expectEqual(true, po.get("generated").?.bool);
     try testing.expectEqual(@as(i64, 3), po.get("height").?.integer);

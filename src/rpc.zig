@@ -6156,25 +6156,21 @@ pub const RpcServer = struct {
             if (block_opt) |blk| {
                 for (blk.transactions, 0..) |*tx, ti| {
                     if (ti > 0) try w.writeByte(',');
-                    // Per-tx fee from undo: tx_undo[ti-1] for non-coinbase tx ti.
-                    // Coinbase (ti==0) gets no fee. Misaligned/short undo => null.
-                    var fee_opt: ?i64 = null;
+                    // Per-tx undo: tx_undo[ti-1] for non-coinbase tx ti.
+                    // Coinbase (ti==0) gets none. Misaligned/short undo => null
+                    // (no fee, no prevout), as Core degrades for pruned blocks.
+                    var undo_opt: ?*const storage.TxUndo = null;
                     if (ti > 0 and !tx.isCoinbase()) {
-                        if (owned_undo) |u| {
+                        if (owned_undo) |*u| {
                             if (ti - 1 < u.tx_undo.len) {
-                                const tu = u.tx_undo[ti - 1];
-                                if (tu.prev_outputs.len == tx.inputs.len) {
-                                    var spent: i64 = 0;
-                                    for (tu.prev_outputs) |po| spent += po.value;
-                                    var out_sum: i64 = 0;
-                                    for (tx.outputs) |o| out_sum += o.value;
-                                    fee_opt = spent - out_sum;
-                                }
+                                const tu = &u.tx_undo[ti - 1];
+                                if (tu.prev_outputs.len == tx.inputs.len) undo_opt = tu;
                             }
                         }
                     }
-                    // Write TxToUniv shape (like writeTxToUnivForPsbt) + fee + hex.
-                    try writeBlockTxToUniv(self, w, tx, fee_opt);
+                    // Core getblock: verbosity >= 3 is SHOW_DETAILS_AND_PREVOUT
+                    // (rpc/blockchain.cpp:874), so 9 behaves as 3.
+                    try writeBlockTxToUniv(self, w, tx, undo_opt, verbosity >= 3);
                 }
             } else if (is_genesis) {
                 // Genesis coinbase txid placeholder.
@@ -6210,10 +6206,19 @@ pub const RpcServer = struct {
         self: *RpcServer,
         writer: anytype,
         tx: *const types.Transaction,
-        fee_opt: ?i64,
+        undo: ?*const storage.TxUndo,
+        show_prevout: bool,
     ) !void {
         const txid = crypto.computeTxidStreaming(tx);
         const hash = crypto.computeWtxidStreaming(tx);
+        var fee_opt: ?i64 = null;
+        if (undo) |u| {
+            var spent: i64 = 0;
+            for (u.prev_outputs) |po| spent += po.value;
+            var out_sum: i64 = 0;
+            for (tx.outputs) |o| out_sum += o.value;
+            fee_opt = spent - out_sum;
+        }
 
         // Full serialized bytes (with witness) for size + hex.
         var tx_full_writer = serialize.Writer.init(self.allocator);
@@ -6287,6 +6292,7 @@ pub const RpcServer = struct {
                     }
                     try writer.writeByte(']');
                 }
+                if (show_prevout) if (undo) |u| try writePrevoutJson(self, writer, &u.prev_outputs[idx]);
                 try writer.print(",\"sequence\":{d}}}", .{inp.sequence});
             }
         }
@@ -9949,6 +9955,7 @@ pub const RpcServer = struct {
         var ctx_block_height: u32 = 0;
         var ctx_block_time: u32 = 0;
         var ctx_in_active_chain: bool = false;
+        var ctx_tx_index: usize = 0;
 
         // Helper closure (inline): given a block hash, load its raw bytes,
         // decode it, and search for `txid`.  On hit, copies the tx out (owned)
@@ -9964,6 +9971,7 @@ pub const RpcServer = struct {
                 out_time: *u32,
                 out_in_chain: *bool,
                 out_ctx_hash: *?types.Hash256,
+                out_tx_index: *usize,
             ) !bool {
                 const db = srv.chain_state.utxo_set.db orelse return false;
                 const block_bytes = (db.get(storage.CF_BLOCKS, block_hash) catch return false) orelse return false;
@@ -9973,9 +9981,10 @@ pub const RpcServer = struct {
                 var block_data = serialize.readBlock(&block_reader, srv.allocator) catch return false;
                 defer serialize.freeBlock(srv.allocator, &block_data);
 
-                for (block_data.transactions) |btx| {
+                for (block_data.transactions, 0..) |btx, btx_i| {
                     const this_txid = crypto.computeTxidStreaming(&btx);
                     if (std.mem.eql(u8, &this_txid, want_txid)) {
+                        out_tx_index.* = btx_i;
                         // Resolve height + active-chain membership for the block.
                         var height: u32 = 0;
                         var height_known = false;
@@ -10029,6 +10038,7 @@ pub const RpcServer = struct {
                 &ctx_block_time,
                 &ctx_in_active_chain,
                 &ctx_block_hash,
+                &ctx_tx_index,
             );
         } else {
             // No blockhash arg: mempool first, then txindex → block.
@@ -10050,6 +10060,7 @@ pub const RpcServer = struct {
                     &ctx_block_time,
                     &ctx_in_active_chain,
                     &ctx_block_hash,
+                    &ctx_tx_index,
                 );
             }
         }
@@ -10104,13 +10115,36 @@ pub const RpcServer = struct {
         // We need in_active_chain pushed FIRST (Core pushes it before TxToJSON),
         // but the body helper opens the object with '{'.  So emit the opening
         // brace + in_active_chain manually, then have the helper continue.
+        // Core rpc/rawtransaction.cpp: verbosity 2 on a confirmed tx loads the
+        // block's undo data and adds `fee` and each vin's `prevout`
+        // (TxVerbosity::SHOW_DETAILS_AND_PREVOUT); both are omitted when the
+        // tx is unconfirmed, a coinbase, or the undo data is unavailable.
+        var owned_undo: ?storage.BlockUndoData = null;
+        defer if (owned_undo) |*u| u.deinit(self.allocator);
+        var undo_opt: ?*const storage.TxUndo = null;
+        if (verbosity == 2 and ctx_tx_index > 0 and !tx_ptr.isCoinbase()) {
+            if (ctx_block_hash) |bh| {
+                if (self.chain_state.utxo_set.db) |db| {
+                    if (db.get(storage.CF_BLOCK_UNDO, &bh) catch null) |undo_bytes| {
+                        defer self.allocator.free(undo_bytes);
+                        owned_undo = storage.BlockUndoData.fromBytes(undo_bytes, self.allocator) catch null;
+                    }
+                }
+                if (owned_undo) |*u| {
+                    if (ctx_tx_index - 1 < u.tx_undo.len) {
+                        const tu = &u.tx_undo[ctx_tx_index - 1];
+                        if (tu.prev_outputs.len == tx_ptr.inputs.len) undo_opt = tu;
+                    }
+                }
+            }
+        }
         if (have_blockhash_arg) {
             try writer.print("{{\"in_active_chain\":{s},", .{if (ctx_in_active_chain) "true" else "false"});
             // Re-open: writeTxToUnivWithHexOpen starts with '{"txid"...'.  We
             // already wrote the '{', so emit the body without its leading brace.
-            try writeTxToUnivWithHexOpenNoBrace(self, writer, tx_ptr);
+            try writeTxToUnivWithHexOpenNoBrace(self, writer, tx_ptr, undo_opt);
         } else {
-            try writeTxToUnivWithHexOpen(self, writer, tx_ptr);
+            try writeTxToUnivWithHexOpen(self, writer, tx_ptr, undo_opt);
         }
 
         // TxToJSON envelope: only when the tx is in a block.  Core emits
@@ -26155,12 +26189,33 @@ fn writeTxToUnivForPsbt(
 ///
 /// Unlike `writeTxToUnivForPsbt`, this variant emits the top-level `hex`
 /// (Core passes include_hex=true here) and leaves the object open.
+/// Core TxToUniv `prevout` (core_io.cpp, SHOW_DETAILS_AND_PREVOUT), written as
+/// `,"prevout":{...}` right after txinwitness and before sequence:
+/// generated, height, value, scriptPubKey (asm, desc, hex, address, type).
+fn writePrevoutJson(self: *RpcServer, writer: anytype, po: *const storage.TxUndo.TxOut) !void {
+    const network = networkFromMagic(self.network_params.magic);
+    const is_regtest = isRegtestMagic(self.network_params.magic);
+    try writer.print(",\"prevout\":{{\"generated\":{s},\"height\":{d},\"value\":", .{
+        if (po.is_coinbase) "true" else "false",
+        po.height,
+    });
+    if (po.value == 0) {
+        try writer.writeAll("0E-8");
+    } else {
+        try writer.print("{d:.8}", .{@as(f64, @floatFromInt(po.value)) / 100_000_000.0});
+    }
+    try writer.writeAll(",\"scriptPubKey\":");
+    try writeScriptPubKeyUniv(self.allocator, writer, po.script_pubkey, network, is_regtest);
+    try writer.writeByte('}');
+}
+
 fn writeTxToUnivWithHexOpen(
     self: *RpcServer,
     writer: anytype,
     tx: *const types.Transaction,
+    undo: ?*const storage.TxUndo,
 ) !void {
-    try writeTxToUnivWithHexOpenInner(self, writer, tx, true);
+    try writeTxToUnivWithHexOpenInner(self, writer, tx, true, undo);
 }
 
 /// Same as `writeTxToUnivWithHexOpen` but the caller has already emitted the
@@ -26170,8 +26225,9 @@ fn writeTxToUnivWithHexOpenNoBrace(
     self: *RpcServer,
     writer: anytype,
     tx: *const types.Transaction,
+    undo: ?*const storage.TxUndo,
 ) !void {
-    try writeTxToUnivWithHexOpenInner(self, writer, tx, false);
+    try writeTxToUnivWithHexOpenInner(self, writer, tx, false, undo);
 }
 
 fn writeTxToUnivWithHexOpenInner(
@@ -26179,6 +26235,7 @@ fn writeTxToUnivWithHexOpenInner(
     writer: anytype,
     tx: *const types.Transaction,
     emit_open_brace: bool,
+    undo: ?*const storage.TxUndo,
 ) !void {
     const txid = crypto.computeTxidStreaming(tx);
     const hash = crypto.computeWtxidStreaming(tx);
@@ -26242,6 +26299,7 @@ fn writeTxToUnivWithHexOpenInner(
                 }
                 try writer.writeByte(']');
             }
+            if (undo) |u| try writePrevoutJson(self, writer, &u.prev_outputs[idx]);
             try writer.print(",\"sequence\":{d}}}", .{inp.sequence});
         }
     }
@@ -26266,6 +26324,18 @@ fn writeTxToUnivWithHexOpenInner(
         try writer.writeByte('}');
     }
     try writer.writeAll("],");
+
+    if (undo) |u| {
+        var spent: i64 = 0;
+        for (u.prev_outputs) |po| spent += po.value;
+        var out_sum: i64 = 0;
+        for (tx.outputs) |o| out_sum += o.value;
+        if (spent == out_sum) {
+            try writer.writeAll("\"fee\":0E-8,");
+        } else {
+            try writer.print("\"fee\":{d:.8},", .{@as(f64, @floatFromInt(spent - out_sum)) / 100_000_000.0});
+        }
+    }
 
     // top-level hex (Core: include_hex=true for getrawtransaction).  Object
     // left OPEN — caller appends envelope fields + closing brace.
