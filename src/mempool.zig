@@ -1940,28 +1940,6 @@ pub const Mempool = struct {
                     .reject_reason = "txn-same-nonwitness-data-in-mempool",
                 };
             }
-            // Core PreChecks "Do we already have it?": a tx whose outputs are
-            // already in the UTXO set is confirmed -> TX_CONFLICT
-            // "txn-already-known" (validation.cpp), reported before the
-            // missing-inputs check (its inputs are spent by then).
-            if (self.chain_state) |cs| {
-                for (0..tx.outputs.len) |out_i| {
-                    const op = types.OutPoint{ .hash = tx_hash, .index = @intCast(out_i) };
-                    const known = cs.utxo_set.get(&op) catch null;
-                    if (known) |k| {
-                        var mut_k = k;
-                        mut_k.deinit(self.allocator);
-                        return AcceptResult{
-                            .accepted = false,
-                            .txid = tx_hash,
-                            .wtxid = wtxid,
-                            .fee = 0,
-                            .vsize = 0,
-                            .reject_reason = "txn-already-known",
-                        };
-                    }
-                }
-            }
             // For test_accept, run the SAME relay-policy floor as the full
             // addTransaction path, but WITHOUT persisting to the mempool. This
             // mirrors Bitcoin Core's testmempoolaccept, which runs the complete
@@ -2002,7 +1980,14 @@ pub const Mempool = struct {
                     // to match Core PreChecks). testmempoolaccept reports these with
                     // Core's exact tokens: "missing-inputs" (rpc/mempool.cpp:400) and
                     // "non-final" (validation.cpp:820).
-                    MempoolError.MissingInputs => "missing-inputs",
+                    // Core PreChecks (validation.cpp): when an input is missing,
+                    // "Are inputs missing because we already have the tx?" -- if
+                    // any of the tx's own outputs is already a coin, answer
+                    // TX_CONFLICT "txn-already-known"; otherwise missing-inputs.
+                    MempoolError.MissingInputs => if (self.ownOutputsInUtxoSet(&tx, tx_hash))
+                        "txn-already-known"
+                    else
+                        "missing-inputs",
                     MempoolError.NonFinal => "non-final",
                     MempoolError.SequenceLockNotSatisfied => "non-BIP68-final",
                     MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
@@ -4188,6 +4173,22 @@ pub const Mempool = struct {
                 }
             }
         }
+    }
+
+    /// Core's "Are inputs missing because we already have the tx?" probe: true
+    /// when any output of `tx` (txid `tx_hash`) is already a coin in the UTXO set.
+    fn ownOutputsInUtxoSet(self: *Mempool, tx: *const types.Transaction, tx_hash: types.Hash256) bool {
+        const cs = self.chain_state orelse return false;
+        for (0..tx.outputs.len) |out_i| {
+            const op = types.OutPoint{ .hash = tx_hash, .index = @intCast(out_i) };
+            const known = cs.utxo_set.get(&op) catch null;
+            if (known) |k| {
+                var mut_k = k;
+                mut_k.deinit(self.allocator);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Run the relay-policy floor for testmempoolaccept (test_accept=true)
