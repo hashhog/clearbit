@@ -70,16 +70,14 @@ test "tests_tma_parity an allowed tx reports effective-feerate and effective-inc
     try testing.expectEqualStrings(row.get("wtxid").?.string, inc[0].string);
 }
 
-test "tests_tma_parity a rejected tx other than missing-inputs carries reject-details" {
+test "tests_tma_parity a rejected tx carries reject-details equal to the reason" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const p = try call(arena.allocator(), "[[\"" ++ TX ++ "\"]]");
+    // Version 5 is non-standard: Core rejects with reason "version" and, as for
+    // every reject except missing-inputs, adds reject-details.
+    const p = try call(arena.allocator(), "[[\"05" ++ TX[2..] ++ "\"]]");
     const row = p.value.object.get("result").?.array.items[0].object;
-    if (row.get("allowed").?.bool) return error.SkipZigTest;
-    const reason = row.get("reject-reason").?.string;
-    if (std.mem.eql(u8, reason, "missing-inputs")) {
-        try testing.expect(row.get("reject-details") == null);
-    } else {
-        try testing.expectEqualStrings(reason, row.get("reject-details").?.string);
-    }
+    try testing.expect(!row.get("allowed").?.bool);
+    try testing.expectEqualStrings("version", row.get("reject-reason").?.string);
+    try testing.expectEqualStrings("version", row.get("reject-details").?.string);
 }

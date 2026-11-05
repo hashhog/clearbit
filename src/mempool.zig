@@ -1940,6 +1940,28 @@ pub const Mempool = struct {
                     .reject_reason = "txn-same-nonwitness-data-in-mempool",
                 };
             }
+            // Core PreChecks "Do we already have it?": a tx whose outputs are
+            // already in the UTXO set is confirmed -> TX_CONFLICT
+            // "txn-already-known" (validation.cpp), reported before the
+            // missing-inputs check (its inputs are spent by then).
+            if (self.chain_state) |cs| {
+                for (0..tx.outputs.len) |out_i| {
+                    const op = types.OutPoint{ .hash = tx_hash, .index = @intCast(out_i) };
+                    const known = cs.utxo_set.get(&op) catch null;
+                    if (known) |k| {
+                        var mut_k = k;
+                        mut_k.deinit(self.allocator);
+                        return AcceptResult{
+                            .accepted = false,
+                            .txid = tx_hash,
+                            .wtxid = wtxid,
+                            .fee = 0,
+                            .vsize = 0,
+                            .reject_reason = "txn-already-known",
+                        };
+                    }
+                }
+            }
             // For test_accept, run the SAME relay-policy floor as the full
             // addTransaction path, but WITHOUT persisting to the mempool. This
             // mirrors Bitcoin Core's testmempoolaccept, which runs the complete
