@@ -143,3 +143,47 @@ test "tests_prevout getrawtransaction verbosity 1 control has neither fee nor pr
     try testing.expect(res.get("fee") == null);
     try testing.expect(res.get("vin").?.array.items[0].object.get("prevout") == null);
 }
+
+fn getblock(a: std.mem.Allocator, f: Fixture, verbosity: u8) !std.json.Parsed(std.json.Value) {
+    const req = try std.fmt.allocPrint(a, "{{\"id\":1,\"method\":\"getblock\",\"params\":[\"" ++ BLOCK_HEX ++ "\",{d}]}}", .{verbosity});
+    const resp = try f.srv.dispatch(req);
+    return std.json.parseFromSlice(std.json.Value, a, resp, .{ .allocate = .alloc_always });
+}
+
+/// vin[0] of the block's second tx (the spend) from a getblock verbose result.
+fn spendVin0(p: std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
+    const res = p.value.object.get("result") orelse return error.NoResult;
+    if (res != .object) return error.NoResult;
+    const txs = res.object.get("tx").?.array.items;
+    try testing.expectEqual(@as(usize, 2), txs.len);
+    return txs[1].object.get("vin").?.array.items[0].object;
+}
+
+test "tests_prevout getblock verbosity 3 and 9 add vin prevout, verbosity 2 does not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(a, ".");
+    const f = try setup(a, path);
+    defer f.db.close();
+
+    // Control first: verbosity 2 has the fee (undo was found) but no prevout.
+    const v2 = try getblock(a, f, 2);
+    const v2_tx = v2.value.object.get("result").?.object.get("tx").?.array.items[1].object;
+    try testing.expect(v2_tx.get("fee") != null);
+    try testing.expect((try spendVin0(v2)).get("prevout") == null);
+
+    // Core: verbosity >= 3 is SHOW_DETAILS_AND_PREVOUT, so 9 behaves as 3.
+    for ([_]u8{ 3, 9 }) |v| {
+        const p = try getblock(a, f, v);
+        const vin0 = try spendVin0(p);
+        try testing.expect(vin0.get("prevout") != null);
+        const po = vin0.get("prevout").?.object;
+        try testing.expectEqual(true, po.get("generated").?.bool);
+        try testing.expectEqual(@as(i64, 3), po.get("height").?.integer);
+        try testing.expectApproxEqAbs(@as(f64, 50.0), po.get("value").?.float, 1e-12);
+        try testing.expectEqualStrings("0014" ++ "75" ** 20, po.get("scriptPubKey").?.object.get("hex").?.string);
+    }
+}
