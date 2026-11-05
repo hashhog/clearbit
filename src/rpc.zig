@@ -23551,35 +23551,21 @@ pub const RpcServer = struct {
             return true;
         }
 
-        // Regtest-scoped exit: regtest mines blocks under mocktime (years
-        // behind real wall-clock), so the Condition-2 24h tip-age check below
-        // would ALWAYS keep a freshly-mined regtest chain stuck in IBD. Core
-        // never reports IBD on a caught-up regtest tip; mirror rustoshi
-        // server.rs should_exit_ibd (network==Regtest && best==header => not in
-        // IBD). Gated STRICTLY on regtest — mainnet/testnet keep the real
-        // wall-clock+chainwork gate. Condition 1 has already passed (regtest
-        // min_chain_work=0), so a caught-up regtest tip latches sticky-OFF.
-        if (isRegtestMagic(self.network_params.magic)) {
-            const queued_count: usize = if (self.peer_manager.expected_blocks.items.len > self.peer_manager.connect_cursor)
-                self.peer_manager.expected_blocks.items.len - self.peer_manager.connect_cursor
-            else
-                0;
-            const header_tip_height = self.chain_state.best_height +
-                @as(u32, @intCast(queued_count));
-            if (self.chain_state.best_height == header_tip_height) {
-                self.ibd_latched_off.store(true, .monotonic);
-                return false;
-            }
-            // Headers ahead of validated tip: still catching up, stay in IBD.
-            return true;
-        }
+        // No regtest exemption: Core's IsInitialBlockDownload
+        // (validation.cpp) has none.  A regtest chain whose tip is older than
+        // 24h (blocks mined or submitted with historic timestamps) IS in
+        // initial block download on Core, and getblockchaininfo reports
+        // initialblockdownload=true until a recent block arrives.  The former
+        // "caught up => not IBD" shortcut made the Core regtest ratchet rows
+        // chain/info/clean, chain/info/final and chain/invalidate/info differ.
 
         // Condition 2: tip wallclock age must be < max_tip_age (24h).
         // Core's IsTipRecent uses the tip's own block time vs now.
         // Prefer in-memory active_tip (tests pin a fresh timestamp);
         // otherwise the persisted tip header (CF_BLOCKS).
         const max_tip_age_seconds: i64 = 24 * 60 * 60;
-        const now = std.time.timestamp();
+        // Core IsTipRecent compares against GetTime(), which honours setmocktime.
+        const now = mempool_mod.currentTime();
         const tip_time: i64 = blk: {
             if (self.chain_manager) |cm| {
                 if (cm.active_tip) |tip| {
