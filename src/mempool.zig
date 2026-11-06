@@ -10618,6 +10618,17 @@ pub const PackageTxResult = struct {
     error_message: ?[]const u8,
     /// Effective fee rate within the package.
     effective_fee_rate: ?f64,
+    /// This transaction's own fee in satoshis (Core `fees.base`).
+    fee: i64 = 0,
+    /// This transaction's virtual size (Core `vsize`).
+    vsize: usize = 0,
+    /// Already in the mempool before this call (Core MEMPOOL_ENTRY result:
+    /// vsize and fees.base only, no effective-feerate/-includes).
+    was_in_mempool: bool = false,
+    /// Admitted by this call through package evaluation because its own
+    /// feerate is below the relay minimum (Core: it joins the
+    /// effective-includes group instead of being its own).
+    package_eval: bool = false,
 };
 
 /// Result of package validation.
@@ -10925,6 +10936,9 @@ pub fn acceptPackage(
                 .accepted = true,
                 .error_message = null,
                 .effective_fee_rate = entry.fee_rate,
+                .fee = entry.fee,
+                .vsize = entry.vsize,
+                .was_in_mempool = true,
             };
             continue;
         }
@@ -10989,6 +11003,8 @@ pub fn acceptPackage(
             .accepted = false, // Will be updated after package fee rate check
             .error_message = null,
             .effective_fee_rate = null,
+            .fee = tx_fee,
+            .vsize = vsize,
         };
     }
 
@@ -11027,6 +11043,21 @@ pub fn acceptPackage(
         if (result) |_| {
             tx_results[i].accepted = true;
             tx_results[i].effective_fee_rate = package_fee_rate;
+            // Core's AcceptPackage tries each tx alone first; those that fail
+            // there (below the relay minimum, or spending a package parent that
+            // did not get in alone) are evaluated together as a package.
+            var needs_pkg = tx_results[i].fee * 1000 < MIN_RELAY_FEE * @as(i64, @intCast(tx_results[i].vsize));
+            if (!needs_pkg) {
+                outer: for (tx.inputs) |input| {
+                    for (txns[0..i], 0..) |_, j| {
+                        if (tx_results[j].package_eval and std.mem.eql(u8, &tx_results[j].txid, &input.previous_output.hash)) {
+                            needs_pkg = true;
+                            break :outer;
+                        }
+                    }
+                }
+            }
+            tx_results[i].package_eval = needs_pkg;
         } else |err| {
             tx_results[i].accepted = false;
             tx_results[i].error_message = switch (err) {

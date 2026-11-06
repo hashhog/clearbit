@@ -12051,7 +12051,21 @@ pub const RpcServer = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.writeAll("{\"package_msg\":\"\",\"tx-results\":{");
+        // Core rpc/mempool.cpp submitpackage: package_msg is "success" when
+        // every tx is in the pool, else the package error ("transaction
+        // failed" for per-tx failures).
+        try writer.print("{{\"package_msg\":\"{s}\",\"tx-results\":{{", .{if (result.package_accepted) "success" else "transaction failed"});
+
+        // Core groups the txs that needed package evaluation: they share one
+        // effective feerate and one effective-includes list.
+        var grp_fee: i64 = 0;
+        var grp_vsize: i64 = 0;
+        for (result.tx_results) |r| {
+            if (r.accepted and !r.was_in_mempool and r.package_eval) {
+                grp_fee += r.fee;
+                grp_vsize += @intCast(r.vsize);
+            }
+        }
 
         for (result.tx_results, 0..) |tx_result, i| {
             if (i > 0) try writer.writeByte(',');
@@ -12061,15 +12075,43 @@ pub const RpcServer = struct {
             try writeHashHex(writer, &tx_result.wtxid);
             try writer.writeAll("\":{");
 
-            // Write per-tx result
+            try writer.print("\"txid\":\"", .{});
+            try writeHashHex(writer, &tx_result.txid);
+            try writer.writeByte('"');
             if (tx_result.accepted) {
-                try writer.print("\"txid\":\"", .{});
-                try writeHashHex(writer, &tx_result.txid);
-                try writer.print("\",\"allowed\":true", .{});
+                // Core VALID / MEMPOOL_ENTRY: vsize + fees{base[, effective-*]}.
+                // No "allowed" key (that is testmempoolaccept's).
+                try writer.print(",\"vsize\":{d},\"fees\":{{\"base\":", .{tx_result.vsize});
+                try writeSatsAsBtc(writer, tx_result.fee);
+                if (!tx_result.was_in_mempool) {
+                    const in_grp = tx_result.package_eval and grp_vsize > 0;
+                    const f: i64 = if (in_grp) grp_fee else tx_result.fee;
+                    const v: i64 = if (in_grp) grp_vsize else @intCast(tx_result.vsize);
+                    try writer.writeAll(",\"effective-feerate\":");
+                    try writeSatsAsBtc(writer, if (v == 0) 0 else @divTrunc(f * 1000, v));
+                    try writer.writeAll(",\"effective-includes\":[");
+                    if (in_grp) {
+                        var first = true;
+                        for (result.tx_results) |g| {
+                            if (!(g.accepted and !g.was_in_mempool and g.package_eval)) continue;
+                            if (!first) try writer.writeByte(',');
+                            first = false;
+                            try writer.writeByte('"');
+                            try writeHashHex(writer, &g.wtxid);
+                            try writer.writeByte('"');
+                        }
+                    } else {
+                        try writer.writeByte('"');
+                        try writeHashHex(writer, &tx_result.wtxid);
+                        try writer.writeByte('"');
+                    }
+                    try writer.writeByte(']');
+                }
+                try writer.writeByte('}');
             } else {
-                try writer.print("\"txid\":\"", .{});
-                try writeHashHex(writer, &tx_result.txid);
-                try writer.print("\",\"error\":\"rejected\"", .{});
+                // Core INVALID: the reject string; "package-not-validated"
+                // when the package aborted before this tx was tried.
+                try writer.print(",\"error\":\"{s}\"", .{tx_result.error_message orelse "package-not-validated"});
             }
 
             try writer.writeByte('}');
@@ -12087,9 +12129,7 @@ pub const RpcServer = struct {
             try writeHashHex(writer, &rtxid);
             try writer.writeByte('"');
         }
-        try writer.writeAll("],\"package_feerate\":");
-        try writer.print("{d:.8}", .{result.package_fee_rate / 100000.0}); // Convert sat/vB to BTC/kvB
-        try writer.writeByte('}');
+        try writer.writeAll("]}");
 
         return self.jsonRpcResult(buf.items, id);
     }
