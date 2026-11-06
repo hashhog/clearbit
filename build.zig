@@ -1804,6 +1804,35 @@ pub fn build(b: *std.Build) void {
         tma_step.dependOn(&run_tma_tests.step);
     }
 
+    // submitpackage response shape vs Core.  Same rig as test-tma-parity above.
+    {
+        const sps_tests = b.addTest(.{
+            .root_source_file = b.path("tests_submitpackage_shape.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_submitpackage_shape"},
+        });
+        sps_tests.linkSystemLibrary("rocksdb");
+        sps_tests.linkSystemLibrary("secp256k1");
+        sps_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        sps_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            sps_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            sps_tests.linkSystemLibrary("minisketch");
+            sps_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        sps_tests.root_module.addOptions("build_options", build_options);
+
+        const run_sps_tests = b.addRunArtifact(sps_tests);
+        const sps_step = b.step("test-submitpackage-shape", "Run submitpackage shape tests");
+        sps_step.dependOn(&run_sps_tests.step);
+    }
+
     // sendrawtransaction error code/message parity (own root, not in `test`).
     {
         const sre_tests = b.addTest(.{

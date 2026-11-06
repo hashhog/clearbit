@@ -785,18 +785,20 @@ test "w116 G11 BUG-10: package_msg always empty string (should be 'success' on a
 // G12 — submitpackage: per-tx result missing vsize and fees (BUG-8, BUG-9)
 // ============================================================================
 
-test "w116 G12 BUG-8+9: PackageTxResult missing vsize and fees fields" {
+test "w116 G12 BUG-8+9 (audit-flip): PackageTxResult carries vsize and the tx's own fee" {
     // Core per-tx result: vsize, fees{base, effective-feerate, effective-includes}.
+    // Prior assertion was "no vsize field"; the submitpackage shape fix adds
+    // vsize/fee/was_in_mempool/package_eval so the RPC can emit them.
     comptime {
         const PKT = mempool_mod.PackageTxResult;
-        const info = @typeInfo(PKT).Struct;
         var has_vsize = false;
-        for (info.fields) |f| {
+        var has_fee = false;
+        for (@typeInfo(PKT).Struct.fields) |f| {
             if (std.mem.eql(u8, f.name, "vsize")) has_vsize = true;
+            if (std.mem.eql(u8, f.name, "fee")) has_fee = true;
         }
-        if (has_vsize) @compileError("PackageTxResult has vsize already — BUG-8 fixed, update test");
+        if (!has_vsize or !has_fee) @compileError("PackageTxResult lost vsize/fee — submitpackage shape regression");
     }
-    // BUG-8: add vsize; BUG-9: add fees{base, effective-feerate, effective-includes}.
     try testing.expect(true);
 }
 
