@@ -4056,4 +4056,33 @@ pub fn build(b: *std.Build) void {
         const sw_step = b.step("test-submitblock-wallet", "Run submitblock wallet-scan tests");
         sw_step.dependOn(&run_sw_tests.step);
     }
+
+    // getrawtransaction/getblock fee + prevout from undo data (Core TxToUniv).
+    {
+        const prevout_tests = b.addTest(.{
+            .root_source_file = b.path("tests_prevout.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_prevout"},
+        });
+        prevout_tests.linkSystemLibrary("rocksdb");
+        prevout_tests.linkSystemLibrary("secp256k1");
+        prevout_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        prevout_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            prevout_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            prevout_tests.linkSystemLibrary("minisketch");
+            prevout_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        prevout_tests.root_module.addOptions("build_options", build_options);
+
+        const run_prevout_tests = b.addRunArtifact(prevout_tests);
+        const prevout_step = b.step("test-prevout", "Run getrawtransaction/getblock prevout+fee tests");
+        prevout_step.dependOn(&run_prevout_tests.step);
+    }
 }
