@@ -163,3 +163,73 @@ test "tests_tma_parity standardness is checked before txn-already-known" {
     try testing.expectEqualStrings("version", row.get("reject-reason").?.string);
     try testing.expectEqualStrings("version", row.get("reject-details").?.string);
 }
+
+fn hexOf(a: std.mem.Allocator, tx: *const types.Transaction) ![]u8 {
+    var w = serialize.Writer.init(a);
+    try serialize.writeTransaction(&w, tx);
+    const bytes = try w.toOwnedSlice();
+    return std.fmt.allocPrint(a, "{s}", .{std.fmt.fmtSliceHexLower(bytes)});
+}
+
+// Core rpc/mempool.cpp testmempoolaccept: every allowed tx of a package carries
+// fees{base, effective-feerate, effective-includes}.  Rows (package/accept/
+// parent-child:[0|1].fees.*): base was a hard 0.0 and the other two were absent.
+test "tests_tma_parity package members report base fee and effective-* fields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Signature-free fixture: every output is P2WSH(OP_TRUE) (a standard
+    // prevout), spent with witness [OP_TRUE].
+    const cs = try a.create(storage.ChainState);
+    cs.* = storage.ChainState.init(null, 64, a);
+    cs.best_height = 800_000;
+    cs.best_hash = [_]u8{0xB7} ** 32;
+    const coin_op = types.OutPoint{ .hash = [_]u8{0xAB} ** 32, .index = 0 };
+    const op_true = [_]u8{0x51};
+    const wsh_hash = crypto.sha256(&op_true);
+    const wsh_spk = [_]u8{ 0x00, 0x20 } ++ wsh_hash;
+    const coin = types.TxOut{ .value = 1_000_000, .script_pubkey = &wsh_spk };
+    try cs.utxo_set.add(&coin_op, &coin, 799_000, false);
+    const wit = [_][]const u8{&op_true};
+    const wpkh_spk = [_]u8{ 0x00, 0x14 } ++ [_]u8{0x75} ** 20;
+    const parent = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = coin_op,
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFF_FFFD,
+            .witness = &wit,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 990_000, .script_pubkey = &wsh_spk }},
+        .lock_time = 0,
+    };
+    const ptxid = try crypto.computeTxid(&parent, a);
+    const child = types.Transaction{
+        .version = 2,
+        .inputs = &[_]types.TxIn{.{
+            .previous_output = .{ .hash = ptxid, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFF_FFFD,
+            .witness = &wit,
+        }},
+        .outputs = &[_]types.TxOut{.{ .value = 980_000, .script_pubkey = &wpkh_spk }},
+        .lock_time = 0,
+    };
+    const params = try std.fmt.allocPrint(a, "[[\"{s}\",\"{s}\"]]", .{ try hexOf(a, &parent), try hexOf(a, &child) });
+    const p = try callWith(a, cs, params);
+    const rows = (p.value.object.get("result") orelse return error.TestUnexpectedResult).array.items;
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows) |r| {
+        const row = r.object;
+        // Not vacuous: both members must be allowed for fees to be emitted.
+        try testing.expect(row.get("allowed").?.bool);
+        const fees = row.get("fees").?.object;
+        try testing.expectApproxEqAbs(@as(f64, 0.0001), fees.get("base").?.float, 1e-12);
+        const vsize: i64 = row.get("vsize").?.integer;
+        const per_k: f64 = @floatFromInt(@divTrunc(@as(i64, 10_000) * 1000, vsize));
+        try testing.expectApproxEqAbs(per_k / 1e8, fees.get("effective-feerate").?.float, 1e-12);
+        const inc = fees.get("effective-includes").?.array.items;
+        try testing.expectEqual(@as(usize, 1), inc.len);
+        try testing.expectEqualStrings(row.get("wtxid").?.string, inc[0].string);
+    }
+}
