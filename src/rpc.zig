@@ -15615,21 +15615,18 @@ pub const RpcServer = struct {
     ///   2. maxfeerate (numeric, optional) - max fee rate in BTC/kvB (parsed,
     ///      enforcement is a documented future item — BUG-9)
     fn handleTestMempoolAccept(self: *RpcServer, params: std.json.Value, id: ?std.json.Value) ![]const u8 {
-        if (params != .array or params.array.items.len == 0) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Missing rawtxs array", id);
-        }
+        // Core RPCHelpMan::HandleRequest type-checks rawtxs before the body
+        // runs: a missing or non-array value is RPC_TYPE_ERROR (-3) "Wrong
+        // type passed:" (rpc/util.cpp:647-657).
+        if (try self.checkArgType(params, 0, "rawtxs", .array, false, id)) |resp| return resp;
 
-        const rawtxs_param = params.array.items[0];
-        if (rawtxs_param != .array) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "rawtxs must be an array", id);
-        }
+        const rawtxs = params.array.items[0].array.items;
 
-        const rawtxs = rawtxs_param.array.items;
-
-        // Core enforces 1..MAX_PACKAGE_COUNT (25): "Array must contain between
-        // 1 and 25 transactions." (BUG-4 fix)
+        // Core enforces 1..MAX_PACKAGE_COUNT (25) with RPC_INVALID_PARAMETER
+        // (-8): "Array must contain between 1 and 25 transactions."
+        // (rpc/mempool.cpp testmempoolaccept).
         if (rawtxs.len < 1 or rawtxs.len > mempool_mod.MAX_PACKAGE_COUNT) {
-            return self.jsonRpcError(RPC_INVALID_PARAMS, "Array must contain between 1 and 25 transactions.", id);
+            return self.jsonRpcError(RPC_INVALID_PARAMETER, "Array must contain between 1 and 25 transactions.", id);
         }
 
         var buf = std.ArrayList(u8).init(self.allocator);
@@ -15742,13 +15739,35 @@ pub const RpcServer = struct {
                         }
                         try writer.writeAll(&fbuf);
                     }
-                    try writer.writeByte('}');
+                    // effective-feerate: CFeeRate(fee, vsize).GetFeePerK() in
+                    // BTC/kvB, i.e. floor(fee * 1000 / vsize) sat/kvB, and
+                    // effective-includes: the wtxids whose fees went into it
+                    // (just this tx for a single-tx call). Core
+                    // rpc/mempool.cpp testmempoolaccept.
+                    const per_k: i64 = if (result.vsize == 0) 0 else @divTrunc(result.fee * 1000, @as(i64, @intCast(result.vsize)));
+                    try writer.writeAll(",\"effective-feerate\":");
+                    try writeSatsAsBtc(writer, per_k);
+                    try writer.writeAll(",\"effective-includes\":[\"");
+                    try writeHashHex(writer, &result.wtxid);
+                    try writer.writeAll("\"]}");
                 } else {
                     try writer.writeAll("false");
                     if (result.reject_reason) |reason| {
                         try writer.writeAll(",\"reject-reason\":\"");
                         try writer.writeAll(reason);
                         try writer.writeByte('"');
+                        // Core adds reject-details (TxValidationState::ToString)
+                        // for every reject except missing-inputs.  ToString is
+                        // "<reason>, <debug message>" when Core attaches a debug
+                        // message (e.g. "..., tried to spend coinbase at depth
+                        // 99").  Only the tokens Core raises WITHOUT a debug
+                        // message are emitted, so details == reason is exact;
+                        // the others stay absent rather than wrong.
+                        if (rejectDetailsEqualReason(reason)) {
+                            try writer.writeAll(",\"reject-details\":\"");
+                            try writer.writeAll(reason);
+                            try writer.writeByte('"');
+                        }
                     }
                 }
                 try writer.writeByte('}');
@@ -24932,6 +24951,46 @@ fn writeBlockStatValue(
 }
 
 /// Write a hash as hex in reverse byte order (big-endian display).
+/// Reject tokens Core's testmempoolaccept reports with reject-details equal to
+/// the reason (validation.cpp raises them with an empty debug message).
+fn rejectDetailsEqualReason(reason: []const u8) bool {
+    const bare = [_][]const u8{
+        "txn-already-in-mempool",
+        "txn-already-known",
+        "txn-same-nonwitness-data-in-mempool",
+        "coinbase",
+        "non-final",
+        "non-BIP68-final",
+        "version",
+        "tx-size",
+        "tx-size-small",
+        "scriptsig-size",
+        "scriptsig-not-pushonly",
+        "dust",
+    };
+    for (bare) |t| if (std.mem.eql(u8, reason, t)) return true;
+    return false;
+}
+
+/// Write a satoshi amount as Core's ValueFromAmount: "<whole>.<8 digits>"
+/// (each placeholder formatted on its own; see the Zig 0.13 note in
+/// handleTestMempoolAccept).
+fn writeSatsAsBtc(writer: anytype, sats: i64) !void {
+    const whole = @divTrunc(sats, 100_000_000);
+    const frac: u64 = @intCast(@mod(sats, 100_000_000));
+    try writer.print("{d}", .{whole});
+    try writer.writeByte('.');
+    var fbuf: [8]u8 = undefined;
+    var i: usize = 8;
+    var f = frac;
+    while (i > 0) {
+        i -= 1;
+        fbuf[i] = '0' + @as(u8, @intCast(f % 10));
+        f /= 10;
+    }
+    try writer.writeAll(&fbuf);
+}
+
 fn writeHashHex(writer: anytype, hash: *const types.Hash256) !void {
     for (0..32) |i| {
         try writer.print("{x:0>2}", .{hash[31 - i]});

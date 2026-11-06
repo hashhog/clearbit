@@ -1745,6 +1745,36 @@ pub fn build(b: *std.Build) void {
         // gotcha as test-rpc above.
     }
 
+    // testmempoolaccept parity with Core (type check, -8 range, effective-*
+    // fees, reject-details).  Same rig as test-strict-decode above.
+    {
+        const tma_tests = b.addTest(.{
+            .root_source_file = b.path("tests_tma_parity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"tests_tma_parity"},
+        });
+        tma_tests.linkSystemLibrary("rocksdb");
+        tma_tests.linkSystemLibrary("secp256k1");
+        tma_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        tma_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            tma_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            tma_tests.linkSystemLibrary("minisketch");
+            tma_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        tma_tests.root_module.addOptions("build_options", build_options);
+
+        const run_tma_tests = b.addRunArtifact(tma_tests);
+        const tma_step = b.step("test-tma-parity", "Run testmempoolaccept parity tests");
+        tma_step.dependOn(&run_tma_tests.step);
+    }
+
     // sendrawtransaction error code/message parity (own root, not in `test`).
     {
         const sre_tests = b.addTest(.{
