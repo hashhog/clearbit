@@ -15852,6 +15852,17 @@ pub const RpcServer = struct {
                 self.mempool.mutex.lock();
                 const pkg_result_or_err = mempool_mod.acceptPackage(self.mempool, valid_txns.items, self.allocator);
                 if (pkg_result_or_err) |pkg_result| {
+                    // Capture each accepted member's fee before the rollback drops
+                    // its entry: Core reports fees.base from the real fee.
+                    // isWellFormedPackage caps a package at MAX_PACKAGE_COUNT, so a
+                    // fixed buffer needs no allocation (an OOM path here would skip
+                    // the rollback below).
+                    var member_fees = [_]i64{0} ** mempool_mod.MAX_PACKAGE_COUNT;
+                    for (pkg_result.tx_results, 0..) |tx_res, i| {
+                        if (i < member_fees.len) {
+                            member_fees[i] = if (self.mempool.entries.get(tx_res.txid)) |e| e.fee else 0;
+                        }
+                    }
                     // Roll back: remove any transactions acceptPackage added (test_accept semantics).
                     for (pkg_result.tx_results) |tx_res| {
                         if (tx_res.accepted) {
@@ -15876,7 +15887,18 @@ pub const RpcServer = struct {
                             const vsize = (weight + 3) / 4;
                             try writer.writeAll(",\"vsize\":");
                             try writer.print("{d}", .{vsize});
-                            try writer.writeAll(",\"fees\":{\"base\":0.00000000}");
+                            // Core: fees.base is the tx's own fee; effective-feerate is
+                            // CFeeRate(fee, vsize).GetFeePerK() and effective-includes
+                            // the wtxids that fed it (just this tx).
+                            const fee = member_fees[i];
+                            try writer.writeAll(",\"fees\":{\"base\":");
+                            try writeSatsAsBtc(writer, fee);
+                            const per_k: i64 = if (vsize == 0) 0 else @divTrunc(fee * 1000, @as(i64, @intCast(vsize)));
+                            try writer.writeAll(",\"effective-feerate\":");
+                            try writeSatsAsBtc(writer, per_k);
+                            try writer.writeAll(",\"effective-includes\":[\"");
+                            try writeHashHex(writer, &tx_res.wtxid);
+                            try writer.writeAll("\"]}");
                         } else {
                             try writer.writeAll("false");
                             if (tx_res.error_message) |reason| {
