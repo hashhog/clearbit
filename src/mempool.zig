@@ -5718,6 +5718,11 @@ pub const Mempool = struct {
                 .allocator = allocator,
             };
         }
+        // The ancestor and remaining sets below are 64-bit; a larger cluster
+        // (over MAX_CLUSTER_SIZE, e.g. transiently after a reorg re-adds
+        // blocks' transactions) would index past them. Refuse it; callers
+        // fall back to per-transaction values.
+        if (n > 64) return error.ClusterTooLarge;
 
         // Build local index mapping
         var txid_to_local = std.AutoHashMap(types.Hash256, u32).init(allocator);
@@ -5858,26 +5863,30 @@ pub const Mempool = struct {
         const remaining_count = remaining.count();
 
         if (remaining_count <= 12) {
-            // Enumerate all non-empty subsets for small clusters
-            const max_subset: u64 = @as(u64, 1) << @intCast(n);
+            // Enumerate all non-empty subsets of the REMAINING transactions.
+            // Bit k of `subset` stands for the k-th remaining index, in
+            // ascending order, so the enumeration is 2^remaining_count long.
+            // It used to range over 2^n subsets of the whole cluster and skip
+            // those touching removed indices: the same candidates in the same
+            // order, but `1 << n` panics for a 64-transaction cluster (shift
+            // amount does not fit u6) and 2^n is unbounded work for n in 13..63.
+            var pos: [12]u32 = undefined;
+            var pos_len: u32 = 0;
+            var pos_iter = remaining.iterator(.{});
+            while (pos_iter.next()) |ri| {
+                if (ri >= n) continue;
+                pos[pos_len] = @intCast(ri);
+                pos_len += 1;
+            }
+            const max_subset: u64 = @as(u64, 1) << @intCast(pos_len);
             var subset: u64 = 1;
             while (subset < max_subset) : (subset += 1) {
                 var candidate = std.bit_set.IntegerBitSet(64).initEmpty();
-                var valid = true;
-
-                // Check if this subset is valid (all ancestors in subset are included)
-                var idx: u32 = 0;
-                while (idx < n) : (idx += 1) {
-                    if ((subset >> @intCast(idx)) & 1 == 1) {
-                        if (!remaining.isSet(idx)) {
-                            valid = false;
-                            break;
-                        }
-                        candidate.set(idx);
-                    }
+                var k: u32 = 0;
+                while (k < pos_len) : (k += 1) {
+                    if ((subset >> @intCast(k)) & 1 == 1) candidate.set(pos[k]);
                 }
 
-                if (!valid) continue;
                 if (candidate.count() == 0) continue;
 
                 // Check topological validity: all ancestors must be in the subset

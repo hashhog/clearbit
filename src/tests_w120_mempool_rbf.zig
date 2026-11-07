@@ -1469,3 +1469,63 @@ test "w120 chunk: parent and child share chunkweight and fees.chunk" {
     try testing.expect(std.mem.indexOf(u8, rr, want_fee) != null);
     try testing.expect(std.mem.indexOf(u8, rr, "\"mining_score\"") == null);
 }
+
+// A 64-transaction chain is a legal cluster (MAX_CLUSTER_SIZE). Linearising it
+// for chunkweight once evaluated `1 << 64` in findBestChunk, which aborts the
+// node under ReleaseSafe/Debug ("integer cast truncated bits"). getrawmempool
+// (true) and getmempoolentry must answer with a document instead.
+test "w120 chunk: 64-transaction chain answers getrawmempool(true) and getmempoolentry" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = rpc_mod.RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const spk = w120FixP2WPKHScript();
+    const depth = mempool_mod.MAX_CLUSTER_SIZE;
+    var prev: types.Hash256 = .{0xB7} ** 32;
+    var txids: [depth]types.Hash256 = undefined;
+    var outs: [depth][1]types.TxOut = undefined;
+    var ins: [depth][1]types.TxIn = undefined;
+    var txs: [depth]types.Transaction = undefined;
+    for (0..depth) |i| {
+        outs[i] = .{.{ .value = 1_000_000 - @as(i64, @intCast(i)) * 1_000, .script_pubkey = &spk }};
+        ins[i] = .{.{
+            .previous_output = .{ .hash = prev, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD,
+            .witness = &[_][]const u8{},
+        }};
+        txs[i] = .{ .version = 2, .inputs = &ins[i], .outputs = &outs[i], .lock_time = 0 };
+        txids[i] = try crypto_mod.computeTxid(&txs[i], allocator);
+        _ = try mempool.prioritiseTransaction(txids[i], 1_000);
+        try mempool.addTransaction(txs[i]);
+        prev = txids[i];
+    }
+    try testing.expectEqual(@as(usize, depth), mempool.entries.count());
+    try testing.expectEqual(@as(usize, depth), mempool.getClusterSize(txids[depth - 1]));
+
+    const rr = try server.dispatch("{\"id\":1,\"method\":\"getrawmempool\",\"params\":[true]}");
+    defer allocator.free(rr);
+    var rr_parsed = try std.json.parseFromSlice(std.json.Value, allocator, rr, .{});
+    defer rr_parsed.deinit();
+    const res = rr_parsed.value.object.get("result").?;
+    try testing.expectEqual(@as(usize, depth), res.object.count());
+    var it = res.object.iterator();
+    while (it.next()) |kv| try testing.expect(kv.value_ptr.object.get("chunkweight") != null);
+
+    var hex: [64]u8 = undefined;
+    const tail = txids[depth - 1];
+    for (0..32) |i| _ = try std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{tail[31 - i]});
+    var req_buf: [200]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":1,\"method\":\"getmempoolentry\",\"params\":[\"{s}\"]}}", .{hex});
+    const result = try server.dispatch(req);
+    defer allocator.free(result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("result").?.object.get("chunkweight") != null);
+}
