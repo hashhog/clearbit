@@ -59,7 +59,7 @@ curl -s http://127.0.0.1:18443/rest/chaininfo.json
 | `getsyncstate` † | clearbit only: tip and best-header heights and hashes. |
 | `gettxout` |  |
 | `gettxoutproof` |  |
-| `gettxoutsetinfo` | Also returns a `hash_serialized_2` field holding the same value as `hash_serialized_3`; Core v31 has no such field. |
+| `gettxoutsetinfo` |  |
 | `gettxspendingprevout` | |
 | `importmempool` |  |
 | `invalidateblock` † |  |
