@@ -723,15 +723,15 @@ test "w120 G17: error codes — all four BIP-125 variants exist in enum" {
 // BUG-8 (MEDIUM) FIXED in FIX-73 (W120 follow-up):
 // Operators can now detect RBF events via JSON-RPC.
 
-test "w120 G18 (FIX-73): getmempoolentry handler emits replaces array" {
-    // Source-level guard. The handler now appends `,"replaces":[...]` after
-    // the `mining_score` field. Future drive-by changes that drop this must
-    // fail FIRST inside the W120 file.
+test "w120 G18 (FIX-73): getmempoolentry handler no longer emits replaces array" {
+    // Core's entryToJSON (rpc/mempool.cpp) has no `replaces` key; it was a
+    // clearbit-only extension and a Core regtest mismatch. sendrawtransaction
+    // and submitpackage still report the replaced set.
     const src = @embedFile("rpc.zig");
     const marker = "// FIX-73 / W120 BUG-8: emit the `replaces` array";
-    try testing.expect(std.mem.indexOf(u8, src, marker) != null);
+    try testing.expect(std.mem.indexOf(u8, src, marker) == null);
     const emit_marker = "try writer.writeAll(\",\\\"replaces\\\":[\");";
-    try testing.expect(std.mem.indexOf(u8, src, emit_marker) != null);
+    try testing.expect(std.mem.indexOf(u8, src, emit_marker) == null);
 }
 
 test "w120 G18 (FIX-73): sendrawtransaction emits replaces on RBF replacement" {
@@ -750,7 +750,7 @@ test "w120 G18 (FIX-73): sendrawtransaction emits replaces on RBF replacement" {
 // output contains the `replaces` key whether the entry replaced anything or
 // not (empty array on the no-RBF entry; populated on the replacement). This
 // catches drift between the entry-level wiring and the JSON emission.
-test "w120 G18 (FIX-73): getmempoolentry JSON contains replaces key (empty when no RBF)" {
+test "w120 G18 (FIX-73): getmempoolentry JSON has Core keys and no replaces or mining_score" {
     const allocator = std.testing.allocator;
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
@@ -800,11 +800,15 @@ test "w120 G18 (FIX-73): getmempoolentry JSON contains replaces key (empty when 
     const result = try server.dispatch(req);
     defer allocator.free(result);
 
-    // Field MUST exist; MUST be empty array for non-RBF entry.
-    try testing.expect(std.mem.indexOf(u8, result, "\"replaces\":[]") != null);
+    // Core's getmempoolentry has no `replaces` or `mining_score` key, and
+    // does carry `chunkweight` and `fees.chunk`.
+    try testing.expect(std.mem.indexOf(u8, result, "\"replaces\"") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"mining_score\"") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"chunkweight\":") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"chunk\":") != null);
 }
 
-test "w120 G18 (FIX-73): getmempoolentry JSON populates replaces on RBF entry" {
+test "w120 G18 (FIX-73): getmempoolentry JSON omits replaces on an RBF entry" {
     const allocator = std.testing.allocator;
     var chain_state = storage.ChainState.init(null, 64, allocator);
     defer chain_state.deinit();
@@ -882,10 +886,9 @@ test "w120 G18 (FIX-73): getmempoolentry JSON populates replaces on RBF entry" {
         _ = try std.fmt.bufPrint(hex_a_buf[i * 2 ..][0..2], "{x:0>2}", .{txid_a[31 - i]});
     }
 
-    // The `replaces` array must be non-empty AND include txid_a.
-    try testing.expect(std.mem.indexOf(u8, result, "\"replaces\":[]") == null);
-    try testing.expect(std.mem.indexOf(u8, result, "\"replaces\":[") != null);
-    try testing.expect(std.mem.indexOf(u8, result, &hex_a_buf) != null);
+    // Core does not list the replaced txids on getmempoolentry.
+    try testing.expect(std.mem.indexOf(u8, result, "\"replaces\"") == null);
+    try testing.expect(std.mem.indexOf(u8, result, &hex_a_buf) == null);
 }
 
 // ===========================================================================
@@ -1391,4 +1394,138 @@ test "w120 G29: RBF stats/metrics counters — MISSING" {
 
 test "w120 G30: ZMQ replaced-tx notification — MISSING" {
     return error.SkipZigTest;
+}
+
+// Core's getmempoolentry / getrawmempool(true) report the weight and fee of the
+// transaction's CHUNK (`chunkweight`, `fees.chunk`). A CPFP child that lifts its
+// parent shares one chunk, so both entries report the pair's totals.
+test "w120 chunk: parent and child share chunkweight and fees.chunk" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = rpc_mod.RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const spk = w120FixP2WPKHScript();
+    const out_p = types.TxOut{ .value = 90_000, .script_pubkey = &spk };
+    const in_p = types.TxIn{
+        .previous_output = .{ .hash = .{0xA1} ** 32, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_p = types.Transaction{ .version = 2, .inputs = &[_]types.TxIn{in_p}, .outputs = &[_]types.TxOut{out_p}, .lock_time = 0 };
+    const txid_p = try crypto_mod.computeTxid(&tx_p, allocator);
+    const out_c = types.TxOut{ .value = 80_000, .script_pubkey = &spk };
+    const in_c = types.TxIn{
+        .previous_output = .{ .hash = txid_p, .index = 0 },
+        .script_sig = &[_]u8{},
+        .sequence = 0xFFFFFFFD,
+        .witness = &[_][]const u8{},
+    };
+    const tx_c = types.Transaction{ .version = 2, .inputs = &[_]types.TxIn{in_c}, .outputs = &[_]types.TxOut{out_c}, .lock_time = 0 };
+    const txid_c = try crypto_mod.computeTxid(&tx_c, allocator);
+    // Parent pays 1000 sat, child 50000 sat (as fee deltas; no chain state).
+    _ = try mempool.prioritiseTransaction(txid_p, 1_000);
+    _ = try mempool.prioritiseTransaction(txid_c, 50_000);
+    try mempool.addTransaction(tx_p);
+    try mempool.addTransaction(tx_c);
+
+    const wp = mempool.entries.get(txid_p).?.cluster_weight;
+    const wc = mempool.entries.get(txid_c).?.cluster_weight;
+    var want_w: [48]u8 = undefined;
+    const want_weight = try std.fmt.bufPrint(&want_w, "\"chunkweight\":{d}", .{wp + wc});
+
+    const chunk_fee = mempool.getModifiedFee(mempool.entries.get(txid_p).?) + mempool.getModifiedFee(mempool.entries.get(txid_c).?);
+    var want_f: [48]u8 = undefined;
+    const want_fee = try std.fmt.bufPrint(&want_f, "\"chunk\":{d}.{d:0>8}", .{ @divTrunc(chunk_fee, 100_000_000), @as(u64, @intCast(@mod(chunk_fee, 100_000_000))) });
+    // The pair is one chunk, so the total exceeds either member's own fee.
+    try testing.expect(chunk_fee > mempool.getModifiedFee(mempool.entries.get(txid_c).?));
+
+    for ([_]types.Hash256{ txid_p, txid_c }) |t| {
+        var hex: [64]u8 = undefined;
+        for (0..32) |i| _ = try std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{t[31 - i]});
+        var req_buf: [200]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":1,\"method\":\"getmempoolentry\",\"params\":[\"{s}\"]}}", .{hex});
+        const result = try server.dispatch(req);
+        defer allocator.free(result);
+        try testing.expect(std.mem.indexOf(u8, result, want_weight) != null);
+        try testing.expect(std.mem.indexOf(u8, result, want_fee) != null);
+        // The reply must be one well-formed JSON document (a stray closing
+        // brace once made the harness fail with "Extra data").
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+        parsed.deinit();
+    }
+
+    const rr = try server.dispatch("{\"id\":1,\"method\":\"getrawmempool\",\"params\":[true]}");
+    defer allocator.free(rr);
+    var rr_parsed = try std.json.parseFromSlice(std.json.Value, allocator, rr, .{});
+    rr_parsed.deinit();
+    try testing.expect(std.mem.indexOf(u8, rr, want_weight) != null);
+    try testing.expect(std.mem.indexOf(u8, rr, want_fee) != null);
+    try testing.expect(std.mem.indexOf(u8, rr, "\"mining_score\"") == null);
+}
+
+// A 64-transaction chain is a legal cluster (MAX_CLUSTER_SIZE). Linearising it
+// for chunkweight once evaluated `1 << 64` in findBestChunk, which aborts the
+// node under ReleaseSafe/Debug ("integer cast truncated bits"). getrawmempool
+// (true) and getmempoolentry must answer with a document instead.
+test "w120 chunk: 64-transaction chain answers getrawmempool(true) and getmempoolentry" {
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = rpc_mod.RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    const spk = w120FixP2WPKHScript();
+    const depth = mempool_mod.MAX_CLUSTER_SIZE;
+    var prev: types.Hash256 = .{0xB7} ** 32;
+    var txids: [depth]types.Hash256 = undefined;
+    var outs: [depth][1]types.TxOut = undefined;
+    var ins: [depth][1]types.TxIn = undefined;
+    var txs: [depth]types.Transaction = undefined;
+    for (0..depth) |i| {
+        outs[i] = .{.{ .value = 1_000_000 - @as(i64, @intCast(i)) * 1_000, .script_pubkey = &spk }};
+        ins[i] = .{.{
+            .previous_output = .{ .hash = prev, .index = 0 },
+            .script_sig = &[_]u8{},
+            .sequence = 0xFFFFFFFD,
+            .witness = &[_][]const u8{},
+        }};
+        txs[i] = .{ .version = 2, .inputs = &ins[i], .outputs = &outs[i], .lock_time = 0 };
+        txids[i] = try crypto_mod.computeTxid(&txs[i], allocator);
+        _ = try mempool.prioritiseTransaction(txids[i], 1_000);
+        try mempool.addTransaction(txs[i]);
+        prev = txids[i];
+    }
+    try testing.expectEqual(@as(usize, depth), mempool.entries.count());
+    try testing.expectEqual(@as(usize, depth), mempool.getClusterSize(txids[depth - 1]));
+
+    const rr = try server.dispatch("{\"id\":1,\"method\":\"getrawmempool\",\"params\":[true]}");
+    defer allocator.free(rr);
+    var rr_parsed = try std.json.parseFromSlice(std.json.Value, allocator, rr, .{});
+    defer rr_parsed.deinit();
+    const res = rr_parsed.value.object.get("result").?;
+    try testing.expectEqual(@as(usize, depth), res.object.count());
+    var it = res.object.iterator();
+    while (it.next()) |kv| try testing.expect(kv.value_ptr.object.get("chunkweight") != null);
+
+    var hex: [64]u8 = undefined;
+    const tail = txids[depth - 1];
+    for (0..32) |i| _ = try std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{tail[31 - i]});
+    var req_buf: [200]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "{{\"id\":1,\"method\":\"getmempoolentry\",\"params\":[\"{s}\"]}}", .{hex});
+    const result = try server.dispatch(req);
+    defer allocator.free(result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("result").?.object.get("chunkweight") != null);
 }

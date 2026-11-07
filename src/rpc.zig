@@ -8221,12 +8221,27 @@ pub const RpcServer = struct {
         // zero so this collapses to the raw fee — backward compatible.
         const modified_fee_sat: i64 = self.mempool.getModifiedFee(entry);
 
+        // Core entryToJSON `chunkweight` and `fees.chunk` (rpc/mempool.cpp).
+        self.mempool.mutex.lock();
+        var chunk_map = self.mempool.buildChunkInfoMap(self.allocator, txid) catch |err| {
+            self.mempool.mutex.unlock();
+            return err;
+        };
+        self.mempool.mutex.unlock();
+        defer chunk_map.deinit();
+        // The entry can leave the pool between the lookup above and the lock
+        // taken for the map; report it as its own chunk rather than trap.
+        const chunk = chunk_map.get(txid) orelse mempool_mod.Mempool.ChunkInfo{
+            .fee = modified_fee_sat,
+            .weight = if (entry.cluster_weight != 0) entry.cluster_weight else entry.weight,
+        };
+
         // Core's entryToJSON (rpc/mempool.cpp:515-523) emits vsize, weight,
         // time, height, descendantcount, descendantsize, ancestorcount,
         // ancestorsize, wtxid — NO flat fee/modifiedfee/ancestorfees/
         // descendantfees at the top level (those are inside the nested
         // `fees` object only). Flat fee fields removed for Core parity.
-        try writer.print("{{\"vsize\":{d},\"weight\":{d},\"time\":{d},\"height\":{d},\"descendantcount\":{d},\"descendantsize\":{d},\"ancestorcount\":{d},\"ancestorsize\":{d},\"wtxid\":\"", .{
+        try writer.print("{{\"vsize\":{d},\"weight\":{d},\"time\":{d},\"height\":{d},\"descendantcount\":{d},\"descendantsize\":{d},\"ancestorcount\":{d},\"ancestorsize\":{d},\"chunkweight\":{d},\"wtxid\":\"", .{
             entry.vsize,
             entry.weight,
             entry.time_added,
@@ -8235,18 +8250,13 @@ pub const RpcServer = struct {
             entry.descendant_size,
             entry.ancestor_count,
             entry.ancestor_size,
+            chunk.weight,
         });
 
         // Write wtxid in reverse byte order
         for (0..32) |i| {
             try writer.print("{x:0>2}", .{entry.wtxid[31 - i]});
         }
-
-        // Add mining_score (cluster mempool linearization score)
-        // Format: sat/vB with 8 decimal places
-        const mining_score_int = @as(i64, @intFromFloat(entry.mining_score * 100_000_000));
-        const mining_score_whole = @divTrunc(mining_score_int, 100_000_000);
-        const mining_score_frac = @as(u64, @intCast(@mod(mining_score_int, 100_000_000)));
 
         // Core rpc/mempool.cpp entryToJSON order: depends, spentby,
         // bip125-replaceable, unbroadcast (line 568), then the `fees`
@@ -8265,7 +8275,7 @@ pub const RpcServer = struct {
         try writeMempoolDepends(writer, self.mempool, entry);
         try writer.writeAll(",\"spentby\":");
         try writeMempoolSpentBy(writer, self.mempool, entry);
-        try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}},\"mining_score\":{d}.{d:0>8}", .{
+        try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8},\"chunk\":{d}.{d:0>8}}}}}", .{
             if (bip125_replaceable) "true" else "false",
             if (self.mempool.isUnbroadcastTx(txid)) "true" else "false",
             // fees.base
@@ -8280,28 +8290,15 @@ pub const RpcServer = struct {
             // fees.descendant
             @divTrunc(entry.descendant_fees, 100_000_000),
             @as(u64, @intCast(@mod(entry.descendant_fees, 100_000_000))),
-            // mining_score (clearbit cluster-mempool extension, sat/vB × 1e8)
-            mining_score_whole,
-            mining_score_frac,
+            // fees.chunk
+            @divTrunc(chunk.fee, 100_000_000),
+            @as(u64, @intCast(@mod(@abs(chunk.fee), 100_000_000))),
         });
 
-        // FIX-73 / W120 BUG-8: emit the `replaces` array of txids this entry
-        // replaced via BIP-125 RBF when admitted. Empty array when the tx
-        // didn't replace anything (clearer for operator scripts than
-        // omitting the field). Mirrors the W120 audit gate G18 requirement;
-        // Bitcoin Core itself does NOT emit this field on getmempoolentry —
-        // this is an impl-convenient extension to surface RBF visibility
-        // (see `bitcoin-core/src/rpc/mempool.cpp entryToJSON`).
-        try writer.writeAll(",\"replaces\":[");
-        if (entry.replaces) |rset| {
-            for (rset, 0..) |rtxid, ri| {
-                if (ri > 0) try writer.writeByte(',');
-                try writer.writeByte('"');
-                try writeHashHex(writer, &rtxid);
-                try writer.writeByte('"');
-            }
-        }
-        try writer.writeAll("]}");
+        // Core's entryToJSON has no `replaces` or `mining_score` key; both
+        // used to be clearbit-only extensions and showed up as mismatches in
+        // the Core regtest comparison. The replaced set is still returned by
+        // sendrawtransaction and submitpackage.
 
         return self.jsonRpcResult(buf.items, id);
     }
@@ -15544,6 +15541,8 @@ pub const RpcServer = struct {
             // Core MempoolToJSON (rpc/mempool.cpp:571) delegates to entryToJSON
             // which emits the same fields as getmempoolentry.  The previous
             // minimal shape (vsize/weight/fee/time/height) was not Core-parity.
+            var chunk_map = try self.mempool.buildChunkInfoMap(self.allocator, null);
+            defer chunk_map.deinit();
             try writer.writeByte('{');
             var first = true;
             var it = self.mempool.entries.iterator();
@@ -15553,13 +15552,14 @@ pub const RpcServer = struct {
 
                 const e = entry.value_ptr.*;
                 const e_txid = e.txid;
+                const chunk = chunk_map.get(e_txid).?;
                 const modified_fee: i64 = self.mempool.getModifiedFee(e);
                 const rbf: bool = self.mempool.isRBFOptIn(e_txid) orelse false;
 
                 try writer.writeByte('"');
                 try writeHashHex(writer, &e_txid);
                 try writer.writeAll("\":{");
-                try writer.print("\"vsize\":{d},\"weight\":{d},\"time\":{d},\"height\":{d},\"descendantcount\":{d},\"descendantsize\":{d},\"ancestorcount\":{d},\"ancestorsize\":{d},\"wtxid\":\"", .{
+                try writer.print("\"vsize\":{d},\"weight\":{d},\"time\":{d},\"height\":{d},\"descendantcount\":{d},\"descendantsize\":{d},\"ancestorcount\":{d},\"ancestorsize\":{d},\"chunkweight\":{d},\"wtxid\":\"", .{
                     e.vsize,
                     e.weight,
                     e.time_added,
@@ -15568,6 +15568,7 @@ pub const RpcServer = struct {
                     e.descendant_size,
                     e.ancestor_count,
                     e.ancestor_size,
+                    chunk.weight,
                 });
                 for (0..32) |wi| {
                     try writer.print("{x:0>2}", .{e.wtxid[31 - wi]});
@@ -15576,7 +15577,7 @@ pub const RpcServer = struct {
                 try writeMempoolDepends(writer, self.mempool, e);
                 try writer.writeAll(",\"spentby\":");
                 try writeMempoolSpentBy(writer, self.mempool, e);
-                try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8}}}", .{
+                try writer.print(",\"bip125-replaceable\":{s},\"unbroadcast\":{s},\"fees\":{{\"base\":{d}.{d:0>8},\"modified\":{d}.{d:0>8},\"ancestor\":{d}.{d:0>8},\"descendant\":{d}.{d:0>8},\"chunk\":{d}.{d:0>8}}}", .{
                     if (rbf) "true" else "false",
                     if (self.mempool.isUnbroadcastTx(e_txid)) "true" else "false",
                     @divTrunc(e.fee, 100_000_000),
@@ -15587,6 +15588,8 @@ pub const RpcServer = struct {
                     @as(u64, @intCast(@mod(e.ancestor_fees, 100_000_000))),
                     @divTrunc(e.descendant_fees, 100_000_000),
                     @as(u64, @intCast(@mod(e.descendant_fees, 100_000_000))),
+                    @divTrunc(chunk.fee, 100_000_000),
+                    @as(u64, @intCast(@mod(@abs(chunk.fee), 100_000_000))),
                 });
                 try writer.writeByte('}');
             }

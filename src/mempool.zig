@@ -5718,6 +5718,11 @@ pub const Mempool = struct {
                 .allocator = allocator,
             };
         }
+        // The ancestor and remaining sets below are 64-bit; a larger cluster
+        // (over MAX_CLUSTER_SIZE, e.g. transiently after a reorg re-adds
+        // blocks' transactions) would index past them. Refuse it; callers
+        // fall back to per-transaction values.
+        if (n > 64) return error.ClusterTooLarge;
 
         // Build local index mapping
         var txid_to_local = std.AutoHashMap(types.Hash256, u32).init(allocator);
@@ -5858,26 +5863,30 @@ pub const Mempool = struct {
         const remaining_count = remaining.count();
 
         if (remaining_count <= 12) {
-            // Enumerate all non-empty subsets for small clusters
-            const max_subset: u64 = @as(u64, 1) << @intCast(n);
+            // Enumerate all non-empty subsets of the REMAINING transactions.
+            // Bit k of `subset` stands for the k-th remaining index, in
+            // ascending order, so the enumeration is 2^remaining_count long.
+            // It used to range over 2^n subsets of the whole cluster and skip
+            // those touching removed indices: the same candidates in the same
+            // order, but `1 << n` panics for a 64-transaction cluster (shift
+            // amount does not fit u6) and 2^n is unbounded work for n in 13..63.
+            var pos: [12]u32 = undefined;
+            var pos_len: u32 = 0;
+            var pos_iter = remaining.iterator(.{});
+            while (pos_iter.next()) |ri| {
+                if (ri >= n) continue;
+                pos[pos_len] = @intCast(ri);
+                pos_len += 1;
+            }
+            const max_subset: u64 = @as(u64, 1) << @intCast(pos_len);
             var subset: u64 = 1;
             while (subset < max_subset) : (subset += 1) {
                 var candidate = std.bit_set.IntegerBitSet(64).initEmpty();
-                var valid = true;
-
-                // Check if this subset is valid (all ancestors in subset are included)
-                var idx: u32 = 0;
-                while (idx < n) : (idx += 1) {
-                    if ((subset >> @intCast(idx)) & 1 == 1) {
-                        if (!remaining.isSet(idx)) {
-                            valid = false;
-                            break;
-                        }
-                        candidate.set(idx);
-                    }
+                var k: u32 = 0;
+                while (k < pos_len) : (k += 1) {
+                    if ((subset >> @intCast(k)) & 1 == 1) candidate.set(pos[k]);
                 }
 
-                if (!valid) continue;
                 if (candidate.count() == 0) continue;
 
                 // Check topological validity: all ancestors must be in the subset
@@ -6007,6 +6016,49 @@ pub const Mempool = struct {
         }
 
         self.linearization_dirty = false;
+    }
+
+    /// Fee and sigop-adjusted weight of the chunk a transaction sits in, as
+    /// reported by Core's `chunkweight` and `fees.chunk` mempool fields
+    /// (rpc/mempool.cpp entryToJSON, `GetMainChunkFeerate`).
+    pub const ChunkInfo = struct { fee: i64, weight: u64 };
+
+    /// Map every pool transaction to its chunk's totals. The caller owns the
+    /// map. Fees are the MODIFIED fees, as Core's cluster graph sees them.
+    /// A transaction whose cluster cannot be linearised is its own chunk.
+    /// With `only` set, just that transaction's chunk is filled in.
+    pub fn buildChunkInfoMap(self: *Mempool, allocator: std.mem.Allocator, only: ?types.Hash256) !std.AutoHashMap(types.Hash256, ChunkInfo) {
+        var map = std.AutoHashMap(types.Hash256, ChunkInfo).init(allocator);
+        errdefer map.deinit();
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            const txid = kv.key_ptr.*;
+            if (map.contains(txid)) continue;
+            if (only) |o| if (!std.mem.eql(u8, &o, &txid)) continue;
+            const me = kv.value_ptr.*;
+            const solo = ChunkInfo{
+                .fee = self.getModifiedFee(me),
+                .weight = if (me.cluster_weight != 0) me.cluster_weight else me.weight,
+            };
+            if (self.txid_to_index.get(txid)) |idx| lin: {
+                const uf = if (self.cluster_union) |*u| u else break :lin;
+                const cluster = self.getClusterTxidsForRoot(uf.find(idx)) catch break :lin;
+                defer self.allocator.free(cluster);
+                var lin = self.linearizeCluster(cluster, self.allocator) catch break :lin;
+                defer lin.deinit();
+                for (lin.chunks) |c| {
+                    var info = ChunkInfo{ .fee = 0, .weight = 0 };
+                    for (c.tx_indices) |i| {
+                        const e = self.entries.get(cluster[i]) orelse continue;
+                        info.fee += self.getModifiedFee(e);
+                        info.weight += if (e.cluster_weight != 0) e.cluster_weight else e.weight;
+                    }
+                    for (c.tx_indices) |i| try map.put(cluster[i], info);
+                }
+            }
+            if (!map.contains(txid)) try map.put(txid, solo);
+        }
+        return map;
     }
 
     /// Get all txids for a given cluster root.
