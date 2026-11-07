@@ -14321,7 +14321,7 @@ pub const RpcServer = struct {
         // boundary, before any block-index lookup.  A well-formed but absent
         // hash stays "Block not found" (-5) further down.
         if (blockhash_hex.len != 64) {
-            const msg = try std.fmt.allocPrint(self.allocator, "blockhash must be of length 64 (not {d}, for '{s}')", .{ blockhash_hex.len, blockhash_hex });
+            const msg = try std.fmt.allocPrint(self.allocator, "hash must be of length 64 (not {d}, for '{s}')", .{ blockhash_hex.len, blockhash_hex });
             defer self.allocator.free(msg);
             return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
         }
@@ -14330,7 +14330,7 @@ pub const RpcServer = struct {
         var hash: types.Hash256 = undefined;
         for (0..32) |i| {
             hash[31 - i] = std.fmt.parseInt(u8, blockhash_hex[i * 2 .. i * 2 + 2], 16) catch {
-                const msg = try std.fmt.allocPrint(self.allocator, "blockhash must be hexadecimal string (not '{s}')", .{blockhash_hex});
+                const msg = try std.fmt.allocPrint(self.allocator, "hash must be hexadecimal string (not '{s}')", .{blockhash_hex});
                 defer self.allocator.free(msg);
                 return self.jsonRpcError(RPC_INVALID_PARAMETER, msg, id);
             };
@@ -29063,6 +29063,33 @@ test "getdeploymentinfo invalid blockhash returns error" {
     // "blockhash must be of length 64 (not 63, for '…')".
     try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":-8") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "blockhash must be of length 64 (not 63") != null);
+}
+
+test "getblockheader malformed hash names the argument \"hash\" like Core" {
+    // Core rpc/blockchain.cpp:639 `ParseHashV(request.params[0], "hash")`, so
+    // the -8 text is "hash must be ..." where getblock says "blockhash must be".
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.REGTEST, .{});
+    defer server.deinit();
+
+    const short = try server.dispatch("{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockheader\",\"params\":[\"00\"]}");
+    defer allocator.free(short);
+    try std.testing.expect(std.mem.indexOf(u8, short, "\"message\":\"hash must be of length 64 (not 2, for '00')\"") != null);
+
+    const bad = try server.dispatch("{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblockheader\",\"params\":[\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"]}");
+    defer allocator.free(bad);
+    try std.testing.expect(std.mem.indexOf(u8, bad, "\"message\":\"hash must be hexadecimal string (not 'zzzz") != null);
+
+    // CONTROL: getblock keeps Core's "blockhash" name.
+    const gb = try server.dispatch("{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"getblock\",\"params\":[\"00\"]}");
+    defer allocator.free(gb);
+    try std.testing.expect(std.mem.indexOf(u8, gb, "\"message\":\"blockhash must be of length 64 (not 2, for '00')\"") != null);
 }
 
 test "ParseHashV parity: malformed txid/blockhash -> -8, well-formed-absent -> -5/null" {
