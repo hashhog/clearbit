@@ -23069,14 +23069,13 @@ pub const RpcServer = struct {
         try writeHashHex(writer, &snap_hash);
         try writer.print("\",\"txouts\":{d},\"bogosize\":{d}", .{ stats.txouts, stats.bogosize });
 
-        // Emit the requested UTXO-set hash. For hash_serialized we also mirror
-        // it under `hash_serialized_2` for backward-compatible harness scrapes
-        // (Core renamed the field but old harnesses read either).
+        // Emit the requested UTXO-set hash. Core v31.1 reports only
+        // `hash_serialized_3` (kernel/coinstats.cpp); the old
+        // `hash_serialized_2` mirror was a clearbit-only key and showed up as
+        // an extra field in the Core regtest comparison.
         switch (hash_type) {
             .hash_serialized => {
-                try writer.writeAll(",\"hash_serialized_2\":\"");
-                try writeHashHex(writer, &set_hash);
-                try writer.writeAll("\",\"hash_serialized_3\":\"");
+                try writer.writeAll(",\"hash_serialized_3\":\"");
                 try writeHashHex(writer, &set_hash);
                 try writer.writeAll("\"");
             },
@@ -32585,5 +32584,30 @@ test "getblockchaininfo.headers counts headers-only entries, survives restart, d
         const r3 = try F.call(allocator, &server, "getblockchaininfo", null);
         defer allocator.free(r3);
         try std.testing.expect(F.has(r3, "\"blocks\":5,\"headers\":5,"));
+    }
+}
+
+test "gettxoutsetinfo reports hash_serialized_3 and no hash_serialized_2 like Core" {
+    // Core v31.1 kernel/coinstats.cpp emits only `hash_serialized_3`; the extra
+    // `hash_serialized_2` mirror made clearbit differ in the Core regtest run.
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.REGTEST, .{});
+    defer server.deinit();
+
+    const requests = [_][]const u8{
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"gettxoutsetinfo\",\"params\":[]}",
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"gettxoutsetinfo\",\"params\":[\"hash_serialized_3\"]}",
+    };
+    for (requests) |req| {
+        const result = try server.dispatch(req);
+        defer allocator.free(result);
+        try std.testing.expect(std.mem.indexOf(u8, result, "\"hash_serialized_3\":\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result, "hash_serialized_2") == null);
     }
 }
