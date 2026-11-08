@@ -7117,6 +7117,103 @@ pub const RpcServer = struct {
         return std.fmt.bufPrint(buf, "{}", .{addr}) catch null;
     }
 
+    /// One getpeerinfo entry. `i` is the peer's id (its index in peer_manager.peers).
+    fn writePeerInfoEntry(self: *RpcServer, writer: anytype, peer: *const peer_mod.Peer, i: usize) !void {
+        _ = self;
+        var addr_buf: [64]u8 = undefined;
+        const addr_str = peer.getAddressString(&addr_buf);
+
+        const services: u64 = if (peer.version_info) |v| v.services else 0;
+        const is_inbound = peer.direction == .inbound;
+
+        // Compute network type from the peer's TCP socket address family.
+        // Mirrors Bitcoin Core's CNetAddr::GetNetClass() (netaddress.cpp).
+        // Tor/I2P connections go through a SOCKS5 proxy so the stored
+        // `peer.address` is the clearnet proxy address — we cannot
+        // distinguish "onion"/"i2p" without a stored overlay NetworkId.
+        // For clearnet TCP we can distinguish IPv4, IPv6, and CJDNS
+        // (fc00::/8, i.e. first byte == 0xfc) accurately.
+        const peer_network: []const u8 = switch (peer.address.any.family) {
+            std.posix.AF.INET => "ipv4",
+            std.posix.AF.INET6 => blk: {
+                const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&peer.address.any)));
+                break :blk if (ip6.addr[0] == 0xfc) "cjdns" else "ipv6";
+            },
+            else => "not_publicly_routable",
+        };
+
+        try writer.print("{{\"id\":{d},\"addr\":\"{s}\"", .{ i, addr_str });
+        // Core rpc/net.cpp:229-234: addrbind (our end of the socket) when
+        // valid, addrlocal (the address the peer reported seeing us at in
+        // its VERSION) when set; both are omitted otherwise.
+        var bind_buf: [64]u8 = undefined;
+        if (peerAddrBind(peer, &bind_buf)) |bind_str| {
+            try writer.print(",\"addrbind\":\"{s}\"", .{bind_str});
+        }
+        var local_buf: [64]u8 = undefined;
+        if (peer.version_info) |v| {
+            if (peerAddrLocal(v.addr_recv, &local_buf)) |local_str| {
+                try writer.print(",\"addrlocal\":\"{s}\"", .{local_str});
+            }
+        }
+        try writer.print(",\"network\":\"{s}\"", .{peer_network});
+        // Core net.cpp:236: mapped_as only when the asmap mapped the peer.
+        if (peer.mapped_as != 0) {
+            try writer.print(",\"mapped_as\":{d}", .{peer.mapped_as});
+        }
+        try writer.print(",\"services\":\"{x:0>16}\",\"servicesnames\":[", .{services});
+
+        // Service names
+        var first_svc = true;
+        if (services & 1 != 0) {
+            try writer.writeAll("\"NETWORK\"");
+            first_svc = false;
+        }
+        if (services & 8 != 0) {
+            if (!first_svc) try writer.writeByte(',');
+            try writer.writeAll("\"WITNESS\"");
+            first_svc = false;
+        }
+        if (services & 1024 != 0) {
+            if (!first_svc) try writer.writeByte(',');
+            try writer.writeAll("\"NETWORK_LIMITED\"");
+        }
+
+        const ping_display: i64 = if (peer.min_ping_time == std.math.maxInt(i64)) 0 else peer.min_ping_time;
+        const ping_f64: f64 = @as(f64, @floatFromInt(ping_display)) / 1000.0;
+        // Core v31.99 (rpc/net.cpp:242-245) emits last_inv_sequence then
+        // inv_to_send between relaytxes and lastsend; clearbit tracks
+        // neither at the manager layer, so it emits 0 for both (same
+        // pattern as the addr_processed/addr_rate_limited = 0 fields).
+        // Core v31.99 also REMOVED startingheight from getpeerinfo
+        // (net.cpp:269-270 goes bip152_hb_from -> presynced_headers with
+        // no startingheight pushKV), so it is no longer emitted here.
+        try writer.print("],\"relaytxes\":{},\"last_inv_sequence\":0,\"inv_to_send\":0,\"lastsend\":{d},\"lastrecv\":{d},\"last_transaction\":0,\"last_block\":0,\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d:.6},\"minping\":{d:.6},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"presynced_headers\":-1,\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"addr_relay_enabled\":true,\"addr_processed\":0,\"addr_rate_limited\":0,\"permissions\":[],\"minfeefilter\":0.0,\"bytessent_per_msg\":{{}},\"bytesrecv_per_msg\":{{}},\"connection_type\":\"{s}\",\"transport_protocol_type\":\"v1\",\"session_id\":\"\"}}", .{
+            peer.relay_txs,
+            peer.last_message_time,
+            peer.last_message_time,
+            peer.bytes_sent,
+            peer.bytes_received,
+            peer.connect_time,
+            peer.time_offset,
+            ping_f64,
+            ping_f64,
+            if (peer.version_info) |v| v.version else 0,
+            // `subver` is the peer-advertised user-agent — attacker-controlled.
+            // Emit the sanitized, OWNED copy (Core's cleanSubVer), NOT the raw
+            // version_info.user_agent.  The raw bytes may contain control chars,
+            // non-UTF8, or JSON metacharacters (`"`/`\`) that would poison this
+            // JSON response (remote DoS); they also dangle into a freed receive
+            // buffer.  clean_subver is printable-ASCII and JSON-safe by
+            // construction (see peer.sanitizeSubVer / Peer.clean_subver).
+            if (peer.clean_subver) |s| s else "",
+            is_inbound,
+            peer.best_known_height,
+            peer.best_known_height,
+            if (is_inbound) "inbound" else "outbound-full-relay",
+        });
+    }
+
     fn handleGetPeerInfo(self: *RpcServer, id: ?std.json.Value) ![]const u8 {
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
@@ -7127,99 +7224,25 @@ pub const RpcServer = struct {
         for (self.peer_manager.peers.items, 0..) |peer, i| {
             if (i > 0) try writer.writeByte(',');
             @import("test_hooks.zig").park(.getpeerinfo_peer, null);
+            try self.writePeerInfoEntry(writer, peer, i);
+        }
 
-            var addr_buf: [64]u8 = undefined;
-            const addr_str = peer.getAddressString(&addr_buf);
-
-            const services: u64 = if (peer.version_info) |v| v.services else 0;
-            const is_inbound = peer.direction == .inbound;
-
-            // Compute network type from the peer's TCP socket address family.
-            // Mirrors Bitcoin Core's CNetAddr::GetNetClass() (netaddress.cpp).
-            // Tor/I2P connections go through a SOCKS5 proxy so the stored
-            // `peer.address` is the clearnet proxy address — we cannot
-            // distinguish "onion"/"i2p" without a stored overlay NetworkId.
-            // For clearnet TCP we can distinguish IPv4, IPv6, and CJDNS
-            // (fc00::/8, i.e. first byte == 0xfc) accurately.
-            const peer_network: []const u8 = switch (peer.address.any.family) {
-                std.posix.AF.INET => "ipv4",
-                std.posix.AF.INET6 => blk: {
-                    const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&peer.address.any)));
-                    break :blk if (ip6.addr[0] == 0xfc) "cjdns" else "ipv6";
-                },
-                else => "not_publicly_routable",
-            };
-
-            try writer.print("{{\"id\":{d},\"addr\":\"{s}\"", .{ i, addr_str });
-            // Core rpc/net.cpp:229-234: addrbind (our end of the socket) when
-            // valid, addrlocal (the address the peer reported seeing us at in
-            // its VERSION) when set; both are omitted otherwise.
-            var bind_buf: [64]u8 = undefined;
-            if (peerAddrBind(peer, &bind_buf)) |bind_str| {
-                try writer.print(",\"addrbind\":\"{s}\"", .{bind_str});
+        // Core lists an inbound connection from the moment it is accepted.
+        // clearbit finishes the inbound handshake on a worker thread and only
+        // moves the peer into `peers` on the next P2P tick, so a client that
+        // has just completed its handshake could see an empty list. Report
+        // those peers too; the mutex keeps the P2P thread from adopting or
+        // freeing them while they are read.
+        {
+            const pm = self.peer_manager;
+            pm.inbound_hs_mutex.lock();
+            defer pm.inbound_hs_mutex.unlock();
+            var next_id = pm.peers.items.len;
+            for (pm.inbound_hs_done.items) |peer| {
+                if (next_id > 0) try writer.writeByte(',');
+                try self.writePeerInfoEntry(writer, peer, next_id);
+                next_id += 1;
             }
-            var local_buf: [64]u8 = undefined;
-            if (peer.version_info) |v| {
-                if (peerAddrLocal(v.addr_recv, &local_buf)) |local_str| {
-                    try writer.print(",\"addrlocal\":\"{s}\"", .{local_str});
-                }
-            }
-            try writer.print(",\"network\":\"{s}\"", .{peer_network});
-            // Core net.cpp:236: mapped_as only when the asmap mapped the peer.
-            if (peer.mapped_as != 0) {
-                try writer.print(",\"mapped_as\":{d}", .{peer.mapped_as});
-            }
-            try writer.print(",\"services\":\"{x:0>16}\",\"servicesnames\":[", .{services});
-
-            // Service names
-            var first_svc = true;
-            if (services & 1 != 0) {
-                try writer.writeAll("\"NETWORK\"");
-                first_svc = false;
-            }
-            if (services & 8 != 0) {
-                if (!first_svc) try writer.writeByte(',');
-                try writer.writeAll("\"WITNESS\"");
-                first_svc = false;
-            }
-            if (services & 1024 != 0) {
-                if (!first_svc) try writer.writeByte(',');
-                try writer.writeAll("\"NETWORK_LIMITED\"");
-            }
-
-            const ping_display: i64 = if (peer.min_ping_time == std.math.maxInt(i64)) 0 else peer.min_ping_time;
-            const ping_f64: f64 = @as(f64, @floatFromInt(ping_display)) / 1000.0;
-            // Core v31.99 (rpc/net.cpp:242-245) emits last_inv_sequence then
-            // inv_to_send between relaytxes and lastsend; clearbit tracks
-            // neither at the manager layer, so it emits 0 for both (same
-            // pattern as the addr_processed/addr_rate_limited = 0 fields).
-            // Core v31.99 also REMOVED startingheight from getpeerinfo
-            // (net.cpp:269-270 goes bip152_hb_from -> presynced_headers with
-            // no startingheight pushKV), so it is no longer emitted here.
-            try writer.print("],\"relaytxes\":{},\"last_inv_sequence\":0,\"inv_to_send\":0,\"lastsend\":{d},\"lastrecv\":{d},\"last_transaction\":0,\"last_block\":0,\"bytessent\":{d},\"bytesrecv\":{d},\"conntime\":{d},\"timeoffset\":{d},\"pingtime\":{d:.6},\"minping\":{d:.6},\"version\":{d},\"subver\":\"{s}\",\"inbound\":{},\"bip152_hb_to\":false,\"bip152_hb_from\":false,\"presynced_headers\":-1,\"synced_headers\":{d},\"synced_blocks\":{d},\"inflight\":[],\"addr_relay_enabled\":true,\"addr_processed\":0,\"addr_rate_limited\":0,\"permissions\":[],\"minfeefilter\":0.0,\"bytessent_per_msg\":{{}},\"bytesrecv_per_msg\":{{}},\"connection_type\":\"{s}\",\"transport_protocol_type\":\"v1\",\"session_id\":\"\"}}", .{
-                peer.relay_txs,
-                peer.last_message_time,
-                peer.last_message_time,
-                peer.bytes_sent,
-                peer.bytes_received,
-                peer.connect_time,
-                peer.time_offset,
-                ping_f64,
-                ping_f64,
-                if (peer.version_info) |v| v.version else 0,
-                // `subver` is the peer-advertised user-agent — attacker-controlled.
-                // Emit the sanitized, OWNED copy (Core's cleanSubVer), NOT the raw
-                // version_info.user_agent.  The raw bytes may contain control chars,
-                // non-UTF8, or JSON metacharacters (`"`/`\`) that would poison this
-                // JSON response (remote DoS); they also dangle into a freed receive
-                // buffer.  clean_subver is printable-ASCII and JSON-safe by
-                // construction (see peer.sanitizeSubVer / Peer.clean_subver).
-                if (peer.clean_subver) |s| s else "",
-                is_inbound,
-                peer.best_known_height,
-                peer.best_known_height,
-                if (is_inbound) "inbound" else "outbound-full-relay",
-            });
         }
 
         try writer.writeByte(']');
@@ -28267,6 +28290,39 @@ test "getpeerinfo: addrbind and addrlocal are reported and mapped_as only when a
     try std.testing.expect(i_addr < i_bind and i_bind < i_local and i_local < i_network);
     // Core pushes mapped_as only when the asmap mapped the peer (net.cpp:236).
     try std.testing.expect(std.mem.indexOf(u8, res, "\"mapped_as\"") == null);
+}
+
+test "getpeerinfo: an inbound peer whose handshake finished but is not yet adopted is listed" {
+    const allocator = std.testing.allocator;
+
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.MAINNET);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.MAINNET, .{});
+    defer server.deinit();
+
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer std.posix.close(fds[1]);
+    const peer = try allocator.create(peer_mod.Peer);
+    peer.* = makeTestPeerForGbfp(.{ .handle = fds[0] }, &consensus.MAINNET, allocator);
+    peer.direction = .inbound;
+    // The state an inbound handshake worker leaves a finished peer in: queued
+    // for the P2P thread, which has not adopted it into `peers` yet.
+    {
+        peer_manager.inbound_hs_mutex.lock();
+        defer peer_manager.inbound_hs_mutex.unlock();
+        try peer_manager.inbound_hs_done.append(allocator, peer);
+    }
+
+    const res = try server.handleGetPeerInfo(null);
+    defer allocator.free(res);
+    // Core lists a connection from accept; an empty list here is the bug.
+    try std.testing.expect(std.mem.indexOf(u8, res, "\"result\":[{\"id\":0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "\"inbound\":true") != null);
 }
 
 // Build a minimal Peer for the getblockfrompeer test, backed by a caller-owned
