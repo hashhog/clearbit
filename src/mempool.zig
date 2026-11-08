@@ -281,6 +281,11 @@ pub const MempoolError = error{
     TrucNonV3SpendsV3,
     /// Cluster would exceed maximum size limit.
     ClusterSizeLimitExceeded,
+    /// The tx spends an outpoint a mempool tx already spends, in a context
+    /// that allows no replacement (Core ATMPArgs m_allow_replacement=false,
+    /// e.g. testmempoolaccept with several txs).
+    /// Core reject code: "bip125-replacement-disallowed".
+    ReplacementDisallowed,
     /// Script verification failed for one of the inputs (Core
     /// "mandatory-script-verify-flag-failed" / "non-mandatory-script-verify-flag-failed").
     /// Mirrors AcceptToMemoryPool's `PolicyScriptChecks` and
@@ -478,6 +483,7 @@ fn rejectReasonForError(err: MempoolError) []const u8 {
         // {Ancestor,Descendant}SizeLimitExceeded are no longer reachable from
         // either admission path and therefore map to nothing here.
         MempoolError.ClusterSizeLimitExceeded => "too-large-cluster",
+        MempoolError.ReplacementDisallowed => "bip125-replacement-disallowed",
         MempoolError.ScriptVerifyFailed => "mandatory-script-verify-flag-failed",
         MempoolError.NonFinal => "bad-txns-nonfinal",
         MempoolError.ImmatureCoinbase => "bad-txns-premature-spend-of-coinbase",
@@ -1082,6 +1088,17 @@ pub const Mempool = struct {
     /// eviction; every other check still runs.  `updateForReorg` trims the
     /// pool afterwards (Core LimitMempoolSize).
     bypass_limits: bool = false,
+
+    /// testmempoolaccept with several txs: the earlier txs of the array, whose
+    /// outputs the later ones may spend (Core AcceptMultipleTransactions:
+    /// m_viewmempool.PackageAddTransaction).  `getOutputFromMempool` falls
+    /// back to these.  Set only by `testAcceptMultiple`, under `mutex`, and
+    /// reset before it returns; empty otherwise.
+    test_package_view: []const types.Transaction = &.{},
+    test_package_txids: []const types.Hash256 = &.{},
+    /// Core ATMPArgs m_allow_replacement=false for the same call: a tx that
+    /// conflicts with the pool is refused, not judged as a replacement.
+    test_disallow_replacement: bool = false,
 
     /// Fee estimator for smart fee estimation.
     fee_estimator: FeeEstimator,
@@ -1976,6 +1993,7 @@ pub const Mempool = struct {
                     MempoolError.ReplacementSpendsConflicting => "replacement-adds-unconfirmed",
                     MempoolError.TooManyEvictions => "too many potential replacements",
                     MempoolError.DiagramNotImproved => "insufficient fee",
+                    MempoolError.ReplacementDisallowed => "bip125-replacement-disallowed",
                     // Input-existence + finality gates (added to checkTestAcceptPolicy
                     // to match Core PreChecks). testmempoolaccept reports these with
                     // Core's exact tokens: "missing-inputs" (rpc/mempool.cpp:400) and
@@ -4243,6 +4261,18 @@ pub const Mempool = struct {
             }
         }
 
+        // 2c. No replacement in this context (Core PreChecks, validation.cpp:
+        //     the conflict loop runs after IsStandardTx, finality and the
+        //     already-in-mempool checks, before the coin lookups; with
+        //     m_allow_replacement=false any conflict is
+        //     "bip125-replacement-disallowed").  Set only by
+        //     testAcceptMultiple (ATMPArgs::PackageTestAccept).
+        if (self.test_disallow_replacement) {
+            for (tx.inputs) |input| {
+                if (self.spenders.contains(input.previous_output)) return MempoolError.ReplacementDisallowed;
+            }
+        }
+
         // 3. Min-relay-fee gate. Compute the fee read-only by summing input
         //    values from the UTXO set (and any unconfirmed mempool parents),
         //    exactly as addTransaction does, then compare the modified fee rate
@@ -5164,9 +5194,135 @@ pub const Mempool = struct {
 
     /// Get an output from a mempool transaction.
     pub fn getOutputFromMempool(self: *Mempool, outpoint: *const types.OutPoint) ?types.TxOut {
-        const entry = self.entries.get(outpoint.hash) orelse return null;
-        if (outpoint.index >= entry.tx.outputs.len) return null;
-        return entry.tx.outputs[outpoint.index];
+        if (self.entries.get(outpoint.hash)) |entry| {
+            if (outpoint.index >= entry.tx.outputs.len) return null;
+            return entry.tx.outputs[outpoint.index];
+        }
+        for (self.test_package_txids, 0..) |id, i| {
+            if (!std.mem.eql(u8, &id, &outpoint.hash)) continue;
+            const ptx = self.test_package_view[i];
+            if (outpoint.index >= ptx.outputs.len) return null;
+            return ptx.outputs[outpoint.index];
+        }
+        return null;
+    }
+
+    /// One transaction's verdict from `testAcceptMultiple`.
+    pub const MultiTestResult = struct {
+        txid: types.Hash256,
+        wtxid: types.Hash256,
+        /// `unfinished`: validation stopped at an earlier tx (Core reports
+        /// txid and wtxid only).
+        state: enum { allowed, rejected, unfinished } = .unfinished,
+        fee: i64 = 0,
+        vsize: usize = 0,
+        reject_reason: ?[]const u8 = null,
+        /// Core's TxValidationState::ToString when it carries a debug
+        /// message; owned by the allocator passed to `testAcceptMultiple`.
+        /// Null when clearbit does not know Core's debug message.
+        reject_details: ?[]const u8 = null,
+    };
+
+    /// testmempoolaccept for more than one transaction, as Core's
+    /// ProcessNewPackage(test_accept=true) -> AcceptMultipleTransactions
+    /// (validation.cpp).  Under ATMPArgs::PackageTestAccept
+    /// m_package_feerates is false, so there is no CPFP: every tx must pay
+    /// the relay minimum on its own.  PreChecks run for every tx first, then
+    /// the script checks; the first failure ends validation and every tx not
+    /// yet judged stays `unfinished`.  Later txs see earlier txs' outputs
+    /// (PackageAddTransaction).  Replacement is not allowed: a tx that
+    /// conflicts with the pool is "bip125-replacement-disallowed".  Nothing
+    /// is added to the pool.
+    ///
+    /// The caller checks IsWellFormedPackage first.  `results.len` must equal
+    /// `txns.len`.
+    pub fn testAcceptMultiple(
+        self: *Mempool,
+        txns: []const types.Transaction,
+        results: []MultiTestResult,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}!void {
+        std.debug.assert(results.len == txns.len);
+        const txids = try allocator.alloc(types.Hash256, txns.len);
+        defer allocator.free(txids);
+        for (txns, 0..) |*tx, i| {
+            const txid = crypto.computeTxid(tx, allocator) catch return error.OutOfMemory;
+            txids[i] = txid;
+            results[i] = .{ .txid = txid, .wtxid = crypto.computeWtxid(tx, allocator) catch txid };
+        }
+
+        self.lockChainThenPool();
+        defer self.unlockPoolThenChain();
+        // ATMPArgs::PackageTestAccept: allow_replacement=false.
+        self.test_disallow_replacement = true;
+        defer {
+            self.test_package_view = &.{};
+            self.test_package_txids = &.{};
+            self.test_disallow_replacement = false;
+        }
+
+        // PreChecks for every tx (the dry run of acceptToMemoryPool), each
+        // against the pool plus the txs before it.
+        for (txns, 0..) |tx, i| {
+            self.test_package_view = txns[0..i];
+            self.test_package_txids = txids[0..i];
+            const r = self.acceptToMemoryPool(tx, true);
+            if (!r.accepted) {
+                results[i].state = .rejected;
+                results[i].reject_reason = r.reject_reason;
+                if (r.reject_reason) |reason| {
+                    if (std.mem.eql(u8, reason, "min relay fee not met")) {
+                        results[i].reject_details = try self.minRelayFeeDetails(&tx, txids[i], allocator);
+                    }
+                }
+                return;
+            }
+            results[i].fee = r.fee;
+            results[i].vsize = r.vsize;
+        }
+
+        // Script checks (Core PolicyScriptChecks), in order.  A tx that
+        // passes is allowed; the first that fails ends validation.
+        for (txns, 0..) |*tx, i| {
+            self.test_package_view = txns[0..i];
+            self.test_package_txids = txids[0..i];
+            _ = self.verifyInputScripts(tx) catch |err| {
+                if (err == MempoolError.OutOfMemory) return error.OutOfMemory;
+                results[i].state = .rejected;
+                results[i].reject_reason = rejectReasonForError(err);
+                return;
+            };
+            results[i].state = .allowed;
+        }
+    }
+
+    /// Core CheckFeeRate's debug message for "min relay fee not met":
+    /// "min relay fee not met, <modified fee> < <min_relay_feerate.GetFee(vsize)>"
+    /// (validation.cpp; CFeeRate::GetFee rounds up).  Null when the fee is
+    /// not below the relay minimum (the rolling mempool minimum refused it,
+    /// which Core reports as "mempool min fee not met") or an input value is
+    /// unknown.
+    fn minRelayFeeDetails(self: *Mempool, tx: *const types.Transaction, txid: types.Hash256, allocator: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+        const cs = self.chain_state orelse return null;
+        var total_in: i64 = 0;
+        for (tx.inputs) |input| {
+            if (self.getOutputFromMempool(&input.previous_output)) |o| {
+                total_in += o.value;
+            } else {
+                const utxo = cs.utxo_set.get(&input.previous_output) catch return null;
+                var u = utxo orelse return null;
+                total_in += u.value;
+                u.deinit(self.allocator);
+            }
+        }
+        var total_out: i64 = 0;
+        for (tx.outputs) |o| total_out += o.value;
+        const modified_fee = total_in - total_out + self.applyDelta(txid);
+        const weight = computeTxWeight(tx, allocator) catch return error.OutOfMemory;
+        const vsize: i64 = @intCast((weight + 3) / 4);
+        const relay_min = @divTrunc(MIN_RELAY_FEE * vsize + 999, 1000);
+        if (modified_fee >= relay_min) return null;
+        return try std.fmt.allocPrint(allocator, "min relay fee not met, {d} < {d}", .{ modified_fee, relay_min });
     }
 
     /// Get all transactions sorted by ancestor fee rate (for mining).
