@@ -1641,6 +1641,37 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_slot_tests.step);
     }
 
+    {
+        const hto_tests = b.addTest(.{
+            .root_source_file = b.path("tests_headers_timeout_at_tip.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = &[_][]const u8{"headers_timeout_at_tip"},
+        });
+        hto_tests.linkSystemLibrary("rocksdb");
+        hto_tests.linkSystemLibrary("secp256k1");
+        hto_tests.addIncludePath(.{ .cwd_relative = secp256k1_include });
+        hto_tests.linkLibC();
+        if (target.result.cpu.arch == .x86_64) {
+            hto_tests.addCSourceFile(.{
+                .file = b.path("src/sha256_shani.c"),
+                .flags = shani_cflags,
+            });
+        }
+        if (minisketch_enabled) {
+            hto_tests.linkSystemLibrary("minisketch");
+            hto_tests.addIncludePath(.{ .cwd_relative = minisketch_include });
+        }
+        hto_tests.root_module.addOptions("build_options", build_options);
+        const run_hto_tests = b.addRunArtifact(hto_tests);
+        const hto_test_step = b.step(
+            "test-headers-timeout-at-tip",
+            "Headers timeout keeps peers level with our tip (Core ConsiderEviction)",
+        );
+        hto_test_step.dependOn(&run_hto_tests.step);
+        test_step.dependOn(&run_hto_tests.step);
+    }
+
     // createrawtransaction vout/sequence/locktime range-check regression.
     // Same project-root wrapper as tests_rpc.zig (src/rpc.zig transitively
     // imports src/wallet.zig, whose @embedFile only resolves from the project
