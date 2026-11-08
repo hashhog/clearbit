@@ -7101,8 +7101,9 @@ pub const RpcServer = struct {
     }
 
     /// The address a peer reported seeing us at (its VERSION addr_recv) as
-    /// "ip:port" (Core CNode::addrLocal), or null when it is not a valid
-    /// address (unspecified or all-ones, Core CNetAddr::IsValid).
+    /// "ip:port" (Core CNode::addrLocal), or null when it is the unspecified
+    /// or all-ones address. Core's CNetAddr::IsValid also rejects the RFC3849
+    /// documentation range and internal addresses; those are not reproduced.
     fn peerAddrLocal(addr_recv: types.NetworkAddress, buf: []u8) ?[]const u8 {
         const ip = addr_recv.ip;
         const v4_mapped = std.mem.eql(u8, ip[0..10], &[_]u8{0} ** 10) and ip[10] == 0xff and ip[11] == 0xff;
