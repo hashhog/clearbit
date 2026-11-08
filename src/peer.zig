@@ -10547,12 +10547,26 @@ pub const PeerManager = struct {
     /// (5,249 such discourages in one log window, 2026-10-05). When WE are the
     /// slow side (CPU-starved, P2P thread blocked) banning the peers we need
     /// starves us further. Manual / noban peers are kept (Core resets them).
+    ///
+    /// A peer level with our tip is kept. Core's ConsiderEviction
+    /// (net_processing.cpp:5213-5262) resets the chain-sync timeout whenever
+    /// the peer's best known block has at least our tip's work, so it never
+    /// disconnects such a peer over a getheaders it did not answer; the
+    /// headers-sync timeout (:6124-6153) only fires while our headers are
+    /// behind. clearbit dropped those peers too: on mainnet (2026-11-07/08)
+    /// 24 outbound headers-timeout disconnects, 9 of them peers that had
+    /// reported our tip height at connect, three or four at a time, each
+    /// burst taking the node from 8 to 3-6 full-relay outbound.
     pub fn checkHeadersTimeouts(self: *PeerManager) void {
         var i: usize = 0;
         while (i < self.peers.items.len) {
             const peer = self.peers.items[i];
             if (peer.state == .handshake_complete and peer.hasHeadersTimeout()) {
                 peer.last_getheaders_time = 0;
+                if (self.peerLevelWithOurTip(peer)) {
+                    i += 1;
+                    continue;
+                }
                 if (!peer.no_ban and peer.conn_type != .manual) {
                     var addr_buf: [64]u8 = undefined;
                     const addr_str = peer.getAddressString(&addr_buf);
@@ -10563,6 +10577,24 @@ pub const PeerManager = struct {
             }
             i += 1;
         }
+    }
+
+    /// True when `peer` has shown it holds our active tip (version
+    /// start_height or a block it announced/delivered on our chain, the same
+    /// signal block download uses) and claims nothing beyond our header
+    /// tip. Such a peer has no headers we are waiting for, so an unanswered
+    /// getheaders is not a reason to drop it (Core ConsiderEviction). A peer
+    /// that claims more than our header tip still gets the timeout: then we
+    /// are the side that is behind and need its headers.
+    pub fn peerLevelWithOurTip(self: *const PeerManager, peer: *const Peer) bool {
+        const cs = self.chain_state orelse return false;
+        if (cs.best_height == 0) return false;
+        const tip: i64 = cs.best_height;
+        if (!peer.hasBlockAtHeight(tip)) return false;
+        const queued: i64 = @intCast(self.expected_blocks.items.len -| self.connect_cursor);
+        const start: i64 = if (peer.start_height > 0) peer.start_height else 0;
+        const claimed = @max(start, @as(i64, peer.blocks_available_height));
+        return claimed <= tip + queued;
     }
 
     /// Check for block download timeouts. Disconnect peers with stalled block downloads.
