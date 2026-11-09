@@ -3677,7 +3677,8 @@ pub const RpcServer = struct {
             // the phased graceful shutdown runs exactly as on `kill -TERM`.
             requestNodeShutdown();
             self.stop();
-            return self.jsonRpcResult("\"clearbit stopping\"", id);
+            // Core rpc/server.cpp:147: RESULT{CLIENT_NAME " stopping"}.
+            return self.jsonRpcResult("\"Bitcoin Core stopping\"", id);
         }
         // Wallet management RPC methods (multi-wallet)
         else if (std.mem.eql(u8, method, "createwallet")) {
@@ -29226,6 +29227,36 @@ test "getdeploymentinfo invalid blockhash returns error" {
     // "blockhash must be of length 64 (not 63, for '…')".
     try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":-8") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "blockhash must be of length 64 (not 63") != null);
+}
+
+test "stop replies with Core's \"Bitcoin Core stopping\" result" {
+    // Core rpc/server.cpp:147: RESULT{CLIENT_NAME " stopping"}, CLIENT_NAME
+    // being "Bitcoin Core". The stop branch raises SIGTERM in this process
+    // (requestNodeShutdown), so ignore SIGTERM for the duration of the call.
+    var old_term: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &old_term) catch {};
+    defer std.posix.sigaction(std.posix.SIG.TERM, &old_term, null) catch {};
+    const ignore = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &ignore, null) catch {};
+
+    const allocator = std.testing.allocator;
+    var chain_state = storage.ChainState.init(null, 64, allocator);
+    defer chain_state.deinit();
+    var mempool = mempool_mod.Mempool.init(null, null, allocator);
+    defer mempool.deinit();
+    var peer_manager = peer_mod.PeerManager.init(allocator, &consensus.REGTEST);
+    defer peer_manager.deinit();
+    var server = RpcServer.init(allocator, &chain_state, &mempool, &peer_manager, &consensus.REGTEST, .{});
+    defer server.deinit();
+
+    const result = try server.dispatch("{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"stop\",\"params\":[]}");
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":\"Bitcoin Core stopping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "clearbit stopping") == null);
 }
 
 test "getblockheader malformed hash names the argument \"hash\" like Core" {
